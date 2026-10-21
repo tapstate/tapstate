@@ -172,7 +172,7 @@ final class McpOperationExecutor {
     private McpResult connectionWrite(Map<String, Object> arguments, String path) {
         Map<String, Object> expanded = new LinkedHashMap<>(arguments);
         expanded.put("settings", EnvironmentExpander.expand(arguments.get("settings"), environment));
-        return post(path, expanded, RequestBudget.HEAVY);
+        return post(path, expanded, RequestBudget.CONNECTION);
     }
 
     private McpResult sourceDraft(Map<String, Object> arguments) {
@@ -338,6 +338,7 @@ final class McpOperationExecutor {
                     source.mode(),
                     source.tables(),
                     source.srs(),
+                    source.execution(),
                     source.experimental());
             Map<String, Object> body = new LinkedHashMap<>(result.body());
             body.put("yaml", writer.write(redacted));

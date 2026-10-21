@@ -173,7 +173,10 @@ public final class RowExpressions {
         if (result.hasError()) {
             return null;
         }
-        CelExpr root = checked(result).getExpr();
+        return movedColumn(checked(result).getExpr());
+    }
+
+    private static String movedColumn(CelExpr root) {
         if (root.getKind() != CelExpr.ExprKind.Kind.SELECT || root.select().testOnly()) {
             return null;
         }
@@ -194,9 +197,23 @@ public final class RowExpressions {
         return error(typed(expr, columns).setResultType(SimpleType.BOOL).build(), expr);
     }
 
-    /** Checks a computed value the same way {@link #typedPredicateError} checks a predicate. */
+    /**
+     * Checks a computed value against the discovered types. A decimal result must be a bare column
+     * read so its source's precision, scale and bounds can describe the column a target builds.
+     */
     public static String typedValueError(String expr, Map<String, TapstateType> columns) {
-        return error(typed(expr, columns).build(), expr);
+        CelValidationResult result = typed(expr, columns).build().compile(expr);
+        if (result.hasError()) {
+            return result.getErrorString();
+        }
+        CelAbstractSyntaxTree ast = checked(result);
+        String diagnostic = indexedRow(ast);
+        if (diagnostic == null && ast.getResultType().equals(celTypeOf(TapstateType.DECIMAL))
+                && movedColumn(ast.getExpr()) == null) {
+            return "a computed tapstate.decimal result has no declared precision, scale or bounds; "
+                    + "use a bare column read";
+        }
+        return diagnostic;
     }
 
     /**

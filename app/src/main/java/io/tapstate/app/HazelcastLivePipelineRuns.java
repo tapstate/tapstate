@@ -5,6 +5,7 @@ import com.hazelcast.core.HazelcastInstanceNotActiveException;
 import com.hazelcast.jet.Job;
 import com.hazelcast.jet.core.metrics.JobMetrics;
 import com.hazelcast.jet.core.metrics.Measurement;
+import com.hazelcast.jet.core.metrics.MetricNames;
 import com.hazelcast.jet.core.metrics.MetricTags;
 import com.hazelcast.spi.exception.RetryableException;
 import io.tapstate.control.core.ClusterError;
@@ -13,6 +14,9 @@ import io.tapstate.control.core.LivePipelineRun;
 import io.tapstate.control.core.LivePipelineRuns;
 import io.tapstate.control.core.LivePipelineVertex;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.runtime.engine.FrontierMetricNames;
+import io.tapstate.runtime.engine.PinnedStandIns;
+import io.tapstate.runtime.engine.SinkWaitingMetricNames;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -23,6 +27,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -52,12 +57,6 @@ import java.util.concurrent.TimeoutException;
  * which members the picture was assembled from is reported with it.
  */
 final class HazelcastLivePipelineRuns implements LivePipelineRuns {
-
-    /**
-     * The types the engine gives the instances that stand in for a pinned vertex on the members that are
-     * not running it. Neither does any work, and neither is ours.
-     */
-    private static final Set<String> PLACEHOLDER_TYPES = Set.of("ExpectNothingP", "NoopP");
 
     /**
      * How long this member waits for the engine to list its jobs before saying it cannot answer.
@@ -135,7 +134,7 @@ final class HazelcastLivePipelineRuns implements LivePipelineRuns {
                 if (job.getName() == null || job.getStatus().isTerminal()) {
                     continue;
                 }
-                live.add(runOf(job));
+                live.add(runOf(job.getName(), job.getMetrics()));
             }
         } catch (RuntimeException failed) {
             if (!theClusterIsChanging(failed)) {
@@ -161,7 +160,7 @@ final class HazelcastLivePipelineRuns implements LivePipelineRuns {
      * as it came: a failure filed under a code that says the cluster is merely busy is one nobody goes
      * looking for.
      */
-    private static boolean theClusterIsChanging(Throwable failed) {
+    static boolean theClusterIsChanging(Throwable failed) {
         Throwable cause = failed;
         for (int depth = 0; cause != null && depth < 16; depth++, cause = cause.getCause()) {
             if (cause instanceof HazelcastInstanceNotActiveException || cause instanceof RetryableException) {
@@ -171,13 +170,13 @@ final class HazelcastLivePipelineRuns implements LivePipelineRuns {
         return false;
     }
 
-    private static LivePipelineRun runOf(Job job) {
+    /** The run named {@code pipelineId}, as the statistics its job last collected describe it. */
+    static LivePipelineRun runOf(String pipelineId, JobMetrics collected) {
         // Ordered by first appearance, which is the order the engine names the vertices in.
-        Map<String, Map<Integer, LivePipelineProcessor>> byVertex = new LinkedHashMap<>();
+        Map<String, Map<Integer, Reading>> byVertex = new LinkedHashMap<>();
         Set<String> measuredFrom = new HashSet<>();
         String executionId = null;
         Instant measuredAt = null;
-        JobMetrics collected = job.getMetrics();
         for (String metric : collected.metrics()) {
             for (Measurement measurement : collected.get(metric)) {
                 String vertex = measurement.tag(MetricTags.VERTEX);
@@ -198,18 +197,65 @@ final class HazelcastLivePipelineRuns implements LivePipelineRuns {
                     continue;
                 }
                 byVertex.computeIfAbsent(vertex, ignored -> new LinkedHashMap<>())
-                        .putIfAbsent(
-                                Integer.parseInt(index),
-                                new LivePipelineProcessor(
-                                        Integer.parseInt(index),
-                                        memberUuid,
-                                        !PLACEHOLDER_TYPES.contains(
-                                                measurement.tag(MetricTags.PROCESSOR_TYPE))));
+                        .computeIfAbsent(Integer.parseInt(index), processor -> new Reading(processor, memberUuid,
+                                !PinnedStandIns.isStandIn(measurement.tag(MetricTags.PROCESSOR_TYPE))))
+                        .take(metric, measurement.value());
             }
         }
         List<LivePipelineVertex> vertices = new ArrayList<>();
-        byVertex.forEach((name, processors) ->
-                vertices.add(new LivePipelineVertex(name, List.copyOf(processors.values()))));
-        return new LivePipelineRun(job.getName(), executionId, measuredAt, measuredFrom, vertices);
+        byVertex.forEach((name, processors) -> vertices.add(new LivePipelineVertex(name,
+                processors.values().stream().map(Reading::processor).toList())));
+        return new LivePipelineRun(pipelineId, executionId, measuredAt, measuredFrom, vertices);
+    }
+
+    /**
+     * What one processor was read to be carrying: the rows queued into it, which the engine reports for every
+     * processor, and a sink writer's frontier readings, which it leaves under its own name for each chain.
+     */
+    private static final class Reading {
+
+        private final int index;
+        private final String memberUuid;
+        private final boolean working;
+        private Long backlog;
+        private final Map<String, Long> frontierGaps = new TreeMap<>();
+        private final Map<String, Long> frontierStalledMillis = new TreeMap<>();
+        private final Map<String, Long> queuedByStream = new TreeMap<>();
+        private final Map<String, Long> inFlightByTable = new TreeMap<>();
+
+        Reading(int index, String memberUuid, boolean working) {
+            this.index = index;
+            this.memberUuid = memberUuid;
+            this.working = working;
+        }
+
+        Reading take(String metric, long value) {
+            if (MetricNames.QUEUES_SIZE.equals(metric)) {
+                backlog = value;
+            }
+            String gapChain = FrontierMetricNames.chainOf(metric);
+            if (gapChain != null) {
+                frontierGaps.put(gapChain, value);
+            }
+            String stalledChain = FrontierMetricNames.stalledChainOf(metric);
+            if (stalledChain != null) {
+                frontierStalledMillis.put(stalledChain, value);
+            }
+            // Zero is a stream or table that had rows waiting and has none now; nothing waiting is absent.
+            String queuedStream = SinkWaitingMetricNames.streamOfQueued(metric);
+            if (queuedStream != null && value > 0) {
+                queuedByStream.put(queuedStream, value);
+            }
+            String inFlightTable = SinkWaitingMetricNames.tableOfInFlight(metric);
+            if (inFlightTable != null && value > 0) {
+                inFlightByTable.put(inFlightTable, value);
+            }
+            return this;
+        }
+
+        LivePipelineProcessor processor() {
+            return new LivePipelineProcessor(index, memberUuid, working, backlog, frontierGaps,
+                    frontierStalledMillis, queuedByStream, inFlightByTable);
+        }
     }
 }

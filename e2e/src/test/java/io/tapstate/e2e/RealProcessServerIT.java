@@ -4,6 +4,7 @@ import io.tapstate.testsupport.DockerGate;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -44,6 +45,27 @@ class RealProcessServerIT {
             control.apply(Map.of("e2e_probe.tap.yml", SOURCE));
 
             assertThat(control.artifactIds()).contains("e2e_probe");
+        }
+    }
+
+    @Test
+    void publishesTheConfiguredSingleMemberIdentityThroughTheShippedJar() {
+        String nodeId = "configured-single-member";
+        try (ServerHandle server = RealProcessServer.start(
+                SharedMongo.replicaSetUrl("e2e_realproc_identity"),
+                port -> List.of(
+                        "--tapstate.cluster.id=e2e-local-single",
+                        "--tapstate.cluster.node-id=" + nodeId,
+                        "--tapstate.control.advertise-url=http://127.0.0.1:" + port))) {
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            control.bootstrapAndLogin("e2e-single", "e2e-single-password");
+
+            assertThat(control.clusterMembers()).singleElement().satisfies(member -> {
+                assertThat(member.nodeId()).isEqualTo(nodeId);
+                assertThat(member.memberUuid()).isNotBlank();
+                assertThat(member.bootId()).isNotBlank();
+                assertThat(member.controlUrl()).isEqualTo(server.baseUrl().toString());
+            });
         }
     }
 

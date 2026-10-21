@@ -75,13 +75,34 @@ STUB
   printf '%s' "$shim"
 }
 
-# A checkout with the three default modules plus one extra, so a case can ask for something outside
+# Pretend this host needs the pinned x86_64 protoc but cannot execute it. The
+# Atlas and AWS RDS MySQL reactors have no protobuf module, so neither probes curl.
+make_arm_no_protoc_shim() {
+  local shim
+  shim="$(make_shim)"
+  cat > "$shim/uname" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in
+  -s) echo Darwin ;;
+  -m) echo arm64 ;;
+esac
+STUB
+  cat > "$shim/curl" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$SMOKE_CURL_SEEN"
+exit 1
+STUB
+  chmod +x "$shim/uname" "$shim/curl"
+  printf '%s' "$shim"
+}
+
+# A checkout with the default OSS modules plus one extra, so a case can ask for something outside
 # the default list and be seen to get it.
 fresh_checkout() {
   rm -rf "${scratch:?}/checkout" "${scratch:?}/enterprise" "${scratch:?}/dest"
   mkdir -p "$scratch/enterprise/connectors/oracle-connector" "$scratch/enterprise/connectors/mssql-connector"
   : > "$scratch/enterprise/pom.xml"
-  for module in mysql-connector mongodb-connector postgres-connector redis-connector; do
+  for module in mysql-connector mongodb-connector postgres-connector mongodb-atlas-connector aws-rds-mysql-connector redis-connector; do
     mkdir -p "$scratch/checkout/connectors/$module/src/main/resources"
   done
   mkdir -p "$scratch/checkout/connectors-common/debezium-bucket/debezium-bom"
@@ -187,6 +208,12 @@ help_prints_no_shell() {
   fi
 }
 
+# Maven is stubbed, so default cases use a fixture JDK rather than the host's JDK.
+# The JDK selection cases below supply their own versions and selectors.
+JAVA_HOME="$(make_jdk default-jdk17 17.0.12)"
+export JAVA_HOME
+unset TAPSTATE_CONNECTOR_JAVA_HOME
+
 echo "build-real-connectors cases:"
 
 fresh_checkout
@@ -200,18 +227,107 @@ fresh_checkout
 expect "a checkout that is not one" 2 "no connectors/ directory" \
   --modules "mysql=connectors/mysql-connector" --checkout "$scratch/checkout/connectors" "$scratch/dest"
 
-# The default is what the nightly witness lane gets by passing no list at all. Pinned by name and by
-# order: this is the one input whose regression the lane that uses it cannot report.
+# The default remains the verified support promise, independent of the extra compatibility
+# artifacts explicitly selected by the nightly lane.
 fresh_checkout
-expect "the default list still builds the witness lane's connectors" 0 "Connector jars staged" \
+expect "the default list still builds the verified database kinds" 0 "Connector jars staged" \
   --checkout "$scratch/checkout" --checkout "$scratch/enterprise" "$scratch/dest"
 expect_modules "the default list, by name and in order" \
   $'connectors/mysql-connector,connectors/mongodb-connector,connectors/postgres-connector\nconnectors/oracle-connector,connectors/mssql-connector'
 
 fresh_checkout
+expect "the explicit witness selection builds all seven artifacts" 0 "Connector jars staged" \
+  --modules "mysql=connectors/mysql-connector,mongodb=connectors/mongodb-connector,postgres=connectors/postgres-connector,oracle=connectors/oracle-connector,sqlserver=connectors/mssql-connector,mongodb-atlas=connectors/mongodb-atlas-connector,aws-rds-mysql=connectors/aws-rds-mysql-connector" \
+  --checkout "$scratch/checkout" --checkout "$scratch/enterprise" "$scratch/dest"
+expect_modules "all seven selected modules, by checkout" \
+  $'connectors/mysql-connector,connectors/mongodb-connector,connectors/postgres-connector,connectors/mongodb-atlas-connector,connectors/aws-rds-mysql-connector\nconnectors/oracle-connector,connectors/mssql-connector'
+
+fresh_checkout
 expect "a named list is built instead of the default" 0 "Connector jars staged" \
   --modules "redis=connectors/redis-connector" --checkout "$scratch/checkout" "$scratch/dest"
 expect_modules "only what was named" "connectors/redis-connector"
+
+# A build-wide protoc preflight used to demand Rosetta even for Atlas and AWS RDS
+# MySQL, whose selected Maven reactors contain no protobuf compiler module. Keep the default
+# witness lane as the control: it still includes PostgreSQL and must probe.
+fresh_checkout
+mkdir -p "$scratch/checkout/connectors/mongodb-atlas-connector"
+shim="$(make_arm_no_protoc_shim)"
+: > "$scratch/curl-seen"
+out="$(env PATH="$shim:$PATH" SMOKE_MODULES_SEEN="$scratch/modules-seen" \
+    SMOKE_JAVA_HOME_SEEN="$scratch/java-home-seen" SMOKE_CURL_SEEN="$scratch/curl-seen" \
+    bash "$builder" --modules "mongodb-atlas=connectors/mongodb-atlas-connector" \
+    --checkout "$scratch/checkout" "$scratch/dest" 2>&1)"; code=$?
+if [ "$code" = 0 ] && [ ! -s "$scratch/curl-seen" ] \
+    && [ -f "$scratch/dest/mongodb-atlas-connector-v1.0.0.jar" ]; then
+  printf '  ok    %s\n' "Atlas-only build needs no protoc or Rosetta"
+  passed=$((passed + 1))
+else
+  printf '  FAIL  %s: exit %s, curl calls %s\n' \
+      "Atlas-only build needs no protoc or Rosetta" "$code" "$(wc -l < "$scratch/curl-seen" | tr -d ' ')"
+  printf '%s\n' "$out" | sed 's/^/        /'
+  failed=$((failed + 1))
+fi
+
+fresh_checkout
+mkdir -p "$scratch/checkout/connectors/aws-rds-mysql-connector"
+shim="$(make_arm_no_protoc_shim)"
+: > "$scratch/curl-seen"
+out="$(env PATH="$shim:$PATH" SMOKE_MODULES_SEEN="$scratch/modules-seen" \
+    SMOKE_JAVA_HOME_SEEN="$scratch/java-home-seen" SMOKE_CURL_SEEN="$scratch/curl-seen" \
+    bash "$builder" --modules "aws-rds-mysql=connectors/aws-rds-mysql-connector" \
+    --checkout "$scratch/checkout" "$scratch/dest" 2>&1)"; code=$?
+if [ "$code" = 0 ] && [ ! -s "$scratch/curl-seen" ] \
+    && [ -f "$scratch/dest/aws-rds-mysql-connector-v1.0.0.jar" ]; then
+  printf '  ok    %s\n' "AWS RDS MySQL-only build needs no protoc or Rosetta"
+  passed=$((passed + 1))
+else
+  printf '  FAIL  %s: exit %s, curl calls %s\n' \
+      "AWS RDS MySQL-only build needs no protoc or Rosetta" "$code" "$(wc -l < "$scratch/curl-seen" | tr -d ' ')"
+  printf '%s\n' "$out" | sed 's/^/        /'
+  failed=$((failed + 1))
+fi
+
+fresh_checkout
+mkdir -p "$scratch/checkout/connectors/mongodb-atlas-connector"
+mkdir -p "$scratch/checkout/connectors/aws-rds-mysql-connector"
+shim="$(make_arm_no_protoc_shim)"
+: > "$scratch/curl-seen"
+out="$(env PATH="$shim:$PATH" SMOKE_MODULES_SEEN="$scratch/modules-seen" \
+    SMOKE_JAVA_HOME_SEEN="$scratch/java-home-seen" SMOKE_CURL_SEEN="$scratch/curl-seen" \
+    bash "$builder" --modules \
+    "mongodb-atlas=connectors/mongodb-atlas-connector,aws-rds-mysql=connectors/aws-rds-mysql-connector" \
+    --checkout "$scratch/checkout" "$scratch/dest" 2>&1)"; code=$?
+if [ "$code" = 0 ] && [ ! -s "$scratch/curl-seen" ] \
+    && [ -f "$scratch/dest/mongodb-atlas-connector-v1.0.0.jar" ] \
+    && [ -f "$scratch/dest/aws-rds-mysql-connector-v1.0.0.jar" ]; then
+  printf '  ok    %s\n' "Atlas and AWS RDS MySQL pair needs no protoc or Rosetta"
+  passed=$((passed + 1))
+else
+  printf '  FAIL  %s: exit %s, curl calls %s\n' \
+      "Atlas and AWS RDS MySQL pair needs no protoc or Rosetta" "$code" \
+      "$(wc -l < "$scratch/curl-seen" | tr -d ' ')"
+  printf '%s\n' "$out" | sed 's/^/        /'
+  failed=$((failed + 1))
+fi
+
+fresh_checkout
+shim="$(make_arm_no_protoc_shim)"
+: > "$scratch/curl-seen"
+out="$(env PATH="$shim:$PATH" SMOKE_MODULES_SEEN="$scratch/modules-seen" \
+    SMOKE_JAVA_HOME_SEEN="$scratch/java-home-seen" SMOKE_CURL_SEEN="$scratch/curl-seen" \
+    bash "$builder" --checkout "$scratch/checkout" --checkout "$scratch/enterprise" \
+    "$scratch/dest" 2>&1)"; code=$?
+if [ "$code" != 0 ] && [ -s "$scratch/curl-seen" ] \
+    && printf '%s' "$out" | grep -q 'protoc .* publishes no arm64 build'; then
+  printf '  ok    %s\n' "default PostgreSQL witness still probes protoc"
+  passed=$((passed + 1))
+else
+  printf '  FAIL  %s: exit %s, curl calls %s\n' \
+      "default PostgreSQL witness still probes protoc" "$code" "$(wc -l < "$scratch/curl-seen" | tr -d ' ')"
+  printf '%s\n' "$out" | sed 's/^/        /'
+  failed=$((failed + 1))
+fi
 
 fresh_checkout
 expect "an existing checkout is not cloned over" 0 "Building from the existing checkout" \
@@ -265,13 +381,21 @@ expect "SQL Server stages by connector id" 0 "Staged sqlserver-connector-v1.0.0.
   --modules "sqlserver=connectors/mssql-connector" \
   --checkout "$scratch/checkout" --checkout "$scratch/enterprise" "$scratch/dest"
 
-# The other rule still has to hold for the lane that uses it: the witnesses take the default list and
-# resolve by id, so a sibling sharing an id's prefix makes their lookup ambiguous.
+# Witnesses resolve exact public ids, so a sibling connector can share a prefix.
 fresh_checkout
 mkdir -p "$scratch/dest"
 : > "$scratch/dest/mysql-pxc-connector-v1.0.0.jar"
-expect "a sibling jar makes the witnesses' id lookup ambiguous" 1 "require exactly one" \
+expect "a sibling connector does not collide with the exact public id" 0 "Connector jars staged" \
   --checkout "$scratch/checkout" --checkout "$scratch/enterprise" "$scratch/dest"
+
+# Both legacy aliases still collide with the staged runtime jar for the same id.
+for alias in mysql.jar mysql-connector.jar; do
+  fresh_checkout
+  mkdir -p "$scratch/dest"
+  : > "$scratch/dest/$alias"
+  expect "legacy alias $alias remains ambiguous" 1 "require exactly one" \
+    --checkout "$scratch/checkout" --checkout "$scratch/enterprise" "$scratch/dest"
+done
 
 # The destination is not cleared, so a jar left there by an earlier run with a different version can
 # sit beside the one just staged - and derive's rule fails loud on two, which is a refusal this

@@ -10,6 +10,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.UUID;
 
 /**
  * Every collection this product keeps, written out one row per collection — and the only place in the
@@ -84,7 +85,8 @@ public enum SystemCollections {
      */
     CONNECTOR_ARTIFACTS(MongoStorePort.CONNECTOR_ARTIFACTS, Database.STORE, MongoConnectorRegistry.class,
             Strategy.IMMUTABLE, 0, Kind.GRIDFS_BUCKET,
-            new IndexSpec(List.of("metadata.connectorId"), false)),
+            new IndexSpec(List.of("metadata.connectorId"), false),
+            new IndexSpec(List.of("filename"), true)),
 
     /**
      * One coordination record per mining chain. Another line owns what this record means and how its
@@ -259,12 +261,28 @@ public enum SystemCollections {
         return database.getCollection(collectionName);
     }
 
+    /**
+     * A unique, uncommitted startup probe rather than a collection the product keeps.
+     * The connection uses this handle only inside transactions it always aborts.
+     */
+    static MongoCollection<Document> accessProbeOn(MongoDatabase database, UUID id) {
+        return database.getCollection("tapstate_access_probe_" + id.toString().replace("-", ""));
+    }
+
     /** The handle on this GridFS bucket — the one call to {@code GridFSBuckets.create}, for the same reason. */
     public GridFSBucket bucketOn(MongoDatabase database) {
         if (kind != Kind.GRIDFS_BUCKET) {
             throw new IllegalStateException(collectionName + " is a plain collection; ask for the collection");
         }
         return GridFSBuckets.create(database, collectionName);
+    }
+
+    /** The chunks half of a declared bucket, for cleanup of one unpublished upload's own chunks. */
+    public MongoCollection<Document> chunksOn(MongoDatabase database) {
+        if (kind != Kind.GRIDFS_BUCKET) {
+            throw new IllegalStateException(collectionName + " is a plain collection; it has no chunks");
+        }
+        return database.getCollection(physicalNames().get(1));
     }
 
     public String collectionName() {

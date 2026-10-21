@@ -119,6 +119,23 @@ class ConnectorArtifactRegistrarTest {
     }
 
     @Test
+    void refusesNonZipArtifactBytesWithACodedConnectorError() {
+        byte[] artifact = "<html><body>Download failed</body></html>".getBytes(UTF_8);
+        InMemoryConnectorRegistry registry = new InMemoryConnectorRegistry();
+        ConnectorArtifactRegistrar registrar = registrarOver(registry);
+
+        assertThatThrownBy(() -> registrar.register(artifact, RegistrationSource.REGISTER))
+                .as("an unreadable upload must reach the connector-domain HTTP 400 mapping")
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code().code()).startsWith("connector.");
+                    assertThat(error.args()).containsKey("artifact");
+                    assertThat(error.args().get("artifact")).asString()
+                            .contains("tapstate-connector-").endsWith(".jar");
+                });
+        assertThat(registry.list()).isEmpty();
+    }
+
+    @Test
     void refusesADifferentArtifactUnderAnAlreadyRegisteredId(@TempDir Path dir) {
         // Same bytes re-registering is a no-op (idempotent by hash); a DIFFERENT artifact claiming an
         // already-registered id is a conflict — selecting among versions is out of scope, so it is
@@ -188,7 +205,8 @@ class ConnectorArtifactRegistrarTest {
                 "mysql", "aliyun-rds-mysql", "aws-rds-mysql", "polar-db-mysql", "mysql-pxc",
                 "postgres", "aliyun-rds-postgres", "aliyun-adb-postgres", "polar-db-postgres",
                 "tencent-db-postgres",
-                "mongodb", "mongodb-atlas", "aliyun-db-mongodb", "tencent-db-mongodb", "oracle", "sqlserver");
+                "mongodb", "mongodb-atlas", "aliyun-db-mongodb", "tencent-db-mongodb", "oracle", "sqlserver",
+                "db2", "db2i");
     }
 
     @Test
@@ -557,6 +575,27 @@ class ConnectorArtifactRegistrarTest {
             InMemoryConnectorRegistry registry, InMemoryConnectorCatalogStore rows, InMemoryConnectorSpecStore specs) {
         return new ConnectorArtifactRegistrar(registry, new ConnectorIntrospector(),
                 id -> new ConnectorCapabilities(Set.of("batch_read_function")), rows, specs);
+    }
+
+    @Test
+    void aRegisteredSourceOnlyConnectorIsNoTargetEvenThoughItsJarWrites(@TempDir Path dir) {
+        // The row a registration derives shadows the bundled one, so the source-only boundary has to
+        // reach it too or a registered db2 would be offered as a target the moment it is installed.
+        // The mysql arm is the control: the same capabilities and the same path make it a sink, so a
+        // red db2 arm can only mean the boundary, not a fixture that never derives a sink at all.
+        Set<String> writes = Set.of("batch_read_function", "stream_read_function", "write_record_function");
+        InMemoryConnectorCatalogStore rows = new InMemoryConnectorCatalogStore();
+        ConnectorArtifactRegistrar registrar = new ConnectorArtifactRegistrar(
+                new InMemoryConnectorRegistry(), new ConnectorIntrospector(),
+                id -> new ConnectorCapabilities(writes), rows, new InMemoryConnectorSpecStore());
+
+        registrar.register(Synthetic.seedableConnector(dir.resolve("db2"), "db2"), RegistrationSource.REGISTER);
+        registrar.register(Synthetic.seedableMysqlConnector(dir.resolve("mysql")), RegistrationSource.REGISTER);
+
+        ConnectorCatalogEntry db2 = rows.get("db2").orElseThrow();
+        assertThat(db2.sink().capable()).as("registered db2 row").isFalse();
+        assertThat(db2.modes()).containsExactlyInAnyOrder(SourceMode.SNAPSHOT, SourceMode.CDC);
+        assertThat(rows.get("mysql").orElseThrow().sink().capable()).as("registered mysql row").isTrue();
     }
 
     @Test

@@ -3,6 +3,8 @@ package io.tapstate.cli;
 import com.sun.net.httpserver.HttpServer;
 import io.tapstate.core.catalog.OfficialConnectors;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -13,6 +15,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
 import java.util.Map;
+import java.util.stream.Stream;
 import java.util.jar.JarEntry;
 import java.util.jar.JarOutputStream;
 
@@ -24,6 +27,34 @@ class PublishedConnectorArtifactsTest {
     @Test
     void everyPublishedIdIsInsideTheSupportedConnectorBoundary() {
         assertThat(PublishedConnectorArtifacts.IDS).isSubsetOf(OfficialConnectors.IDS);
+    }
+
+    static Stream<String> publishedIds() {
+        return PublishedConnectorArtifacts.IDS.stream();
+    }
+
+    @ParameterizedTest(name = "download metadata for {0}")
+    @MethodSource("publishedIds")
+    void everyDownloadPassesItsTrustedPinToTheFetcher(String id) throws Exception {
+        URI source = PublishedConnectorArtifacts.artifact(id, ignored -> null);
+        assertThat(source).isEqualTo(URI.create("https://github.com/tapstate/tapstate/releases/download/"
+                + "connectors-preview/" + id + "-connector.jar"));
+        byte[] bytes = {1, 2, 3};
+        PublishedConnectorArtifacts.Artifact trusted = PublishedConnectorArtifacts.ARTIFACTS.get(id);
+        assertThat(PublishedConnectorArtifacts.download(id, source, (from, expected) -> {
+            assertThat(from).isEqualTo(source);
+            assertThat(expected.bytes()).isPositive();
+            assertThat(expected.sha256()).matches("[0-9a-f]{64}");
+            assertThat(expected).as("the requested connector's release pin").isSameAs(trusted);
+            return PublishedConnectorArtifacts.Fetched.verified(bytes);
+        })).isEqualTo(bytes);
+        URI mirror = URI.create("https://mirror.example.test/" + id + "-connector.jar");
+        assertThat(PublishedConnectorArtifacts.download(id, mirror, (from, expected) -> {
+            assertThat(from).isEqualTo(mirror);
+            assertThat(expected).as("changing the download origin must not change trusted metadata")
+                    .isSameAs(trusted);
+            return PublishedConnectorArtifacts.Fetched.verified(bytes);
+        })).isEqualTo(bytes);
     }
 
     @Test
@@ -85,14 +116,14 @@ class PublishedConnectorArtifactsTest {
 
     @Test
     void theHttpFetcherRejectsAnOversizedDeclaredBodyBeforeReadingIt() {
-        HttpServer server = declaredLengthServer(70L * 1024 * 1024, new byte[0]);
+        HttpServer server = declaredLengthServer(257L * 1024 * 1024, new byte[0]);
         try {
             URI source = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/connector.jar");
 
             assertThatThrownBy(() -> PublishedConnectorArtifacts.download(
                     expected(completeJar()), source, PublishedConnectorArtifacts.Fetcher.http()))
                     .isInstanceOf(IOException.class)
-                    .hasMessageContaining("exceeds the 64 MiB connector artifact limit");
+                    .hasMessageContaining("exceeds the 256 MiB connector artifact limit");
         } finally {
             server.stop(0);
         }
@@ -100,16 +131,16 @@ class PublishedConnectorArtifactsTest {
 
     @Test
     void theHttpFetcherBoundsAnOversizedChunkedBody() {
-        HttpServer server = chunkedServer(64L * 1024 * 1024 + 1);
+        HttpServer server = chunkedServer(256L * 1024 * 1024 + 1);
         PublishedConnectorArtifacts.Artifact maximum =
-                new PublishedConnectorArtifacts.Artifact(64L * 1024 * 1024, "unused-after-size-refusal");
+                new PublishedConnectorArtifacts.Artifact(256L * 1024 * 1024, "unused-after-size-refusal");
         try {
             URI source = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/connector.jar");
 
             assertThatThrownBy(() -> PublishedConnectorArtifacts.download(
                     maximum, source, PublishedConnectorArtifacts.Fetcher.http()))
                     .isInstanceOf(IOException.class)
-                    .hasMessageContaining("exceeds the 64 MiB connector artifact limit");
+                    .hasMessageContaining("exceeds the 256 MiB connector artifact limit");
         } finally {
             server.stop(0);
         }

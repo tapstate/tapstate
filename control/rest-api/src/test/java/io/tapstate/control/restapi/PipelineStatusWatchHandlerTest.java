@@ -2,6 +2,7 @@ package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.ArtifactQueryService;
 import io.tapstate.control.core.PipelineObservationQueryService;
+import io.tapstate.core.lifecycle.ExecutionPlans;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.model.Resource;
@@ -25,21 +26,34 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.Predicate;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * The status watch channel re-polls the same store-backed status read the one-shot {@code GET} uses.
- * That read now answers two different exceptions for "no observation": {@code monitor.no-observation}
- * (applied, not yet converged -- transient, worth waiting out) and {@code lifecycle.unknown-pipeline}
- * (no such pipeline, ever -- permanent). A watch loop that cannot tell them apart hangs silently forever
- * on the permanent case, which is exactly the ambiguity the read side was fixed to remove.
+ * The status watch channel streams runtime observations only. An applied pipeline without an observation and a
+ * known draft both keep the connection open; an id that is neither closes with the coded unknown-pipeline reason.
  */
 class PipelineStatusWatchHandlerTest {
 
     private static final MessageCatalog CATALOG = MessageCatalog.bundled();
 
+    private static PipelineStatusWatchHandler handler(PipelineObservationQueryService observations) {
+        return handler(observations, ignored -> false);
+    }
+
+    private static PipelineStatusWatchHandler handler(
+            PipelineObservationQueryService observations, Predicate<String> knownPipeline) {
+        return new PipelineStatusWatchHandler(
+                observations, knownPipeline, CATALOG, new NoOpTaskScheduler(), Duration.ofSeconds(1));
+    }
+
     private static PipelineObservationQueryService serviceWith(ObservationStore observations, String... pipelineIds) {
+        return serviceWith(observations, ExecutionPlans.NONE, pipelineIds);
+    }
+
+    private static PipelineObservationQueryService serviceWith(ObservationStore observations, ExecutionPlans plans,
+            String... pipelineIds) {
         Map<String, Resource> byId = new HashMap<>();
         for (String id : pipelineIds) {
             byId.put(id, new io.tapstate.core.dsl.DslParser().parse("""
@@ -72,7 +86,7 @@ class PipelineStatusWatchHandlerTest {
                 return List.copyOf(byId.values());
             }
         });
-        return new PipelineObservationQueryService(artifacts, observations);
+        return new PipelineObservationQueryService(artifacts, observations, plans);
     }
 
     private static ObservationStore emptyObservations() {
@@ -97,11 +111,22 @@ class PipelineStatusWatchHandlerTest {
     void aPipelineAppliedButNotYetConvergedKeepsThePollLoopOpen() {
         // monitor.no-observation is transient: nothing to stream yet, but the watch must not give up.
         PipelineObservationQueryService observations = serviceWith(emptyObservations(), "orders");
-        PipelineStatusWatchHandler handler =
-                new PipelineStatusWatchHandler(observations, CATALOG, new NoOpTaskScheduler(), Duration.ofSeconds(1));
+        PipelineStatusWatchHandler handler = handler(observations);
         FakeWebSocketSession session = new FakeWebSocketSession();
 
         handler.poll(session, "orders");
+
+        assertThat(session.closeStatus).isNull();
+        assertThat(session.sent).isEmpty();
+    }
+
+    @Test
+    void aKnownDraftWithoutAnObservationKeepsTheWatchOpen() {
+        PipelineObservationQueryService observations = serviceWith(emptyObservations());
+        PipelineStatusWatchHandler handler = handler(observations, "draft-only"::equals);
+        FakeWebSocketSession session = new FakeWebSocketSession();
+
+        handler.poll(session, "draft-only");
 
         assertThat(session.closeStatus).isNull();
         assertThat(session.sent).isEmpty();
@@ -113,8 +138,7 @@ class PipelineStatusWatchHandlerTest {
         // treating it like the transient case would hang the watch silently for as long as the client
         // holds the socket open.
         PipelineObservationQueryService observations = serviceWith(emptyObservations());
-        PipelineStatusWatchHandler handler =
-                new PipelineStatusWatchHandler(observations, CATALOG, new NoOpTaskScheduler(), Duration.ofSeconds(1));
+        PipelineStatusWatchHandler handler = handler(observations);
         FakeWebSocketSession session = new FakeWebSocketSession();
 
         handler.poll(session, "ghost");
@@ -154,8 +178,7 @@ class PipelineStatusWatchHandlerTest {
         });
         PipelineObservationQueryService observations =
                 new PipelineObservationQueryService(artifacts, emptyObservations());
-        PipelineStatusWatchHandler handler =
-                new PipelineStatusWatchHandler(observations, CATALOG, new NoOpTaskScheduler(), Duration.ofSeconds(1));
+        PipelineStatusWatchHandler handler = handler(observations);
         FakeWebSocketSession session = new FakeWebSocketSession();
 
         handler.poll(session, "src_orders");
@@ -183,14 +206,48 @@ class PipelineStatusWatchHandlerTest {
             }
         };
         PipelineObservationQueryService observations = serviceWith(store, "orders");
-        PipelineStatusWatchHandler handler =
-                new PipelineStatusWatchHandler(observations, CATALOG, new NoOpTaskScheduler(), Duration.ofSeconds(1));
+        PipelineStatusWatchHandler handler = handler(observations);
         FakeWebSocketSession session = new FakeWebSocketSession();
 
         handler.poll(session, "orders");
 
         assertThat(session.sent).hasSize(1);
         assertThat(session.closeStatus).isNull();
+    }
+
+    @Test
+    void aWatchFollowsTheStateWithoutReadingThePlanOnEveryPoll() {
+        // A frame does not carry the plan, and the plan changes only when a new run is submitted: read on every
+        // poll, it would be read once a second for every open watch and thrown away each time.
+        Observation running = new Observation("orders", PipelineState.RUNNING, Map.of(), Map.of());
+        ObservationStore store = new ObservationStore() {
+            @Override
+            public void delete(String pipelineId) {
+                throw new UnsupportedOperationException("removal is not exercised by this double");
+            }
+
+            @Override
+            public void save(Observation observation) {
+            }
+
+            @Override
+            public Optional<Observation> read(String pipelineId) {
+                return Optional.of(running);
+            }
+        };
+        List<List<String>> planReads = new ArrayList<>();
+        ExecutionPlans plans = pipelineIds -> {
+            planReads.add(List.copyOf(pipelineIds));
+            return Map.of();
+        };
+        PipelineStatusWatchHandler handler = handler(serviceWith(store, plans, "orders"));
+        FakeWebSocketSession session = new FakeWebSocketSession();
+
+        handler.poll(session, "orders");
+        handler.poll(session, "orders");
+
+        assertThat(session.sent).hasSize(1);
+        assertThat(planReads).isEmpty();
     }
 
     @Test
@@ -217,8 +274,7 @@ class PipelineStatusWatchHandlerTest {
             }
         };
         PipelineObservationQueryService observations = serviceWith(store, "orders");
-        PipelineStatusWatchHandler handler =
-                new PipelineStatusWatchHandler(observations, CATALOG, new NoOpTaskScheduler(), Duration.ofSeconds(1));
+        PipelineStatusWatchHandler handler = handler(observations);
         FakeWebSocketSession session = new FakeWebSocketSession();
 
         handler.poll(session, "orders");

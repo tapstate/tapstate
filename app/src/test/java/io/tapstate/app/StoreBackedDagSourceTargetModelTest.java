@@ -21,6 +21,8 @@ import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TableRef;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
+import io.tapstate.runtime.engine.PipelineDagBuilder;
+import io.tapstate.runtime.engine.SinkTarget;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.TargetField;
 import io.tapstate.spi.sink.TargetIndex;
@@ -439,6 +441,69 @@ class StoreBackedDagSourceTargetModelTest {
 
         assertThat(bound).containsOnlyKeys("AA_0716");
         assertThat(bound.get("AA_0716").name()).isEqualTo("k2");
+    }
+
+    @Test
+    void a_qualified_rename_routes_the_sink_by_the_collection_its_writers_bind() {
+        InMemoryStorePort store = new InMemoryStorePort();
+        store.artifacts().save(new SourceResource("mysql", null, "mysql", Map.of("host", "h"),
+                SourceMode.CDC, List.of(TableRef.literal("AA_0716")), null, null));
+        store.artifacts().save(new SourceResource("mongo", null, "mongodb", Map.of("uri", "u"),
+                null, null, null, null));
+        SyncElement sync = new SyncElement("mongo_k2", "mongo", null,
+                new RenameSpec(Map.of("mysql.AA_0716", "k2"), null, null, null), null);
+        store.artifacts().save(new PipelineResource("k2", null, List.of(SourceRef.bare("mysql")), null,
+                null, new ServeBlock.Inline("target", FromRef.literal("mysql.AA_0716"), List.of(sync), null, null),
+                null, null));
+        store.schemas().save(discovered("mysql", "mysql", new SourceTable("AA_0716",
+                List.of(new SourceField("ID", "INT")), List.of("ID"), List.of())));
+        OpenRingGenerations.forSources(store, "mysql");
+
+        DagSource.PlannedDag planned = new StoreBackedDagSource(store).plannedDagFor("k2", null);
+
+        // A sink's writers share out its rows by the table each lands in and that table's key, so the plan has
+        // to name the table they are bound to: naming another would let two streams renamed into one collection
+        // be split across writers by the tables they started from.
+        assertThat(planned.shape().sinkTargetsOf(PipelineDagBuilder.serveVertex(sync, 0)))
+                .isEqualTo(Map.of("AA_0716", new SinkTarget("k2", List.of("ID"))));
+    }
+
+    @Test
+    void qualified_sync_renames_keep_same_table_sources_in_distinct_targets() {
+        for (List<String> sourceIds : List.of(List.of("left", "right"), List.of("right", "left"))) {
+            InMemoryStorePort store = new InMemoryStorePort();
+            for (String sourceId : sourceIds) {
+                store.artifacts().save(new SourceResource(sourceId, null, "mysql", Map.of("host", "h"),
+                        SourceMode.CDC, List.of(TableRef.literal("orders")), null, null));
+                store.schemas().save(discovered(sourceId, "mysql", new SourceTable("orders",
+                        List.of(new SourceField("id", "INT")), List.of("id"), List.of())));
+            }
+            store.artifacts().save(new SourceResource("dest", null, "mongodb", Map.of("uri", "u"),
+                    null, null, null, null));
+            SyncElement sync = new SyncElement("sync_1", "dest", null,
+                    new RenameSpec(Map.of("left.orders", "left_orders", "right.orders", "right_orders"),
+                            null, null, null), null);
+            store.artifacts().save(new PipelineResource("p", null,
+                    sourceIds.stream().<SourceRef>map(SourceRef::bare).toList(),
+                    List.of(Step.inline("merged", FromClause.list(
+                                    FromRef.literal("left.orders"), FromRef.literal("right.orders")),
+                            new TransformBody.Union(), null)), null,
+                    new ServeBlock.Inline(null, FromRef.literal("merged"), List.of(sync), null, null),
+                    null, null));
+            OpenRingGenerations.forSources(store, "left", "right");
+            Map<String, TargetTable> bound = new LinkedHashMap<>();
+
+            DagSource.PlannedDag planned = new StoreBackedDagSource(store, capturingMapBinder(bound))
+                    .plannedDagFor("p", null);
+
+            assertThat(planned.shape().sinkTargetsOf(PipelineDagBuilder.serveVertex(sync, 0)))
+                    .as("source order: %s", sourceIds)
+                    .isEqualTo(Map.of("left.orders", new SinkTarget("left_orders", List.of("id")),
+                            "right.orders", new SinkTarget("right_orders", List.of("id"))));
+            assertThat(bound).containsOnlyKeys("left.orders", "right.orders");
+            assertThat(bound.get("left.orders").name()).isEqualTo("left_orders");
+            assertThat(bound.get("right.orders").name()).isEqualTo("right_orders");
+        }
     }
 
     @Test

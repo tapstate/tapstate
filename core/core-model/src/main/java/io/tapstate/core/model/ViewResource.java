@@ -24,9 +24,16 @@ public record ViewResource(
         @Doc(value = "Treatment of existing view rows before a new full load; resume, recovery and CDC-only never clear rows.",
                 def = "append")
         OnFullLoad onFullLoad,
+        @Doc("How this node runs: its target total parallelism across the cluster and its batch.")
+        ExecutionSpec execution,
         @Doc("Experimental fields, exempt from the v1 compatibility freeze.")
         Map<String, Object> experimental)
         implements Resource {
+
+    public ViewResource(String id, Metadata metadata, String primaryKey, Storage storage,
+            ExecutionSpec execution, Map<String, Object> experimental) {
+        this(id, metadata, primaryKey, storage, null, null, execution, experimental);
+    }
 
     public ViewResource {
         Objects.requireNonNull(id, "id");
@@ -37,7 +44,12 @@ public record ViewResource(
     /** A view definition written with the default write settings: upsert, and keep rows on a full load. */
     public ViewResource(String id, Metadata metadata, String primaryKey, Storage storage,
             Map<String, Object> experimental) {
-        this(id, metadata, primaryKey, storage, null, null, experimental);
+        this(id, metadata, primaryKey, storage, null, null, null, experimental);
+    }
+
+    public ViewResource(String id, Metadata metadata, String primaryKey, Storage storage,
+            WriteMode writeMode, OnFullLoad onFullLoad, Map<String, Object> experimental) {
+        this(id, metadata, primaryKey, storage, writeMode, onFullLoad, null, experimental);
     }
 
     @Override

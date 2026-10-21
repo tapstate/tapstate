@@ -4,6 +4,7 @@ import io.tapstate.core.catalog.ConnectorCatalogEntry;
 import io.tapstate.core.catalog.DerivedCapability;
 import io.tapstate.core.catalog.ModeResolver;
 import io.tapstate.core.catalog.ModeSource;
+import io.tapstate.core.catalog.OfficialConnectors;
 import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.model.SourceMode;
 import org.junit.jupiter.api.Test;
@@ -115,7 +116,10 @@ class CapabilityHarnessRealJarTest {
 
             ConnectorCatalogEntry snapshot = catalog.byId(row.id());
             Set<DerivedCapability> derived = DerivedCapability.fromCapabilityIds(live);
-            assertThat(derived.contains(DerivedCapability.WRITE_RECORD))
+            // A source-only connector may well register write_record; the catalog merge withdraws its
+            // sink as a support boundary, so that is the row both derivations have to arrive at.
+            assertThat(derived.contains(DerivedCapability.WRITE_RECORD)
+                    && !OfficialConnectors.isSourceOnly(row.id()))
                     .as("live-derived sink capability for %s", row.id())
                     .isEqualTo(snapshot.sink().capable());
 

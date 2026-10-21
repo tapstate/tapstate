@@ -100,6 +100,19 @@ class StartLoadAgreementTest {
     }
 
     @Test
+    void aDirectSourcesOwnChannelProgressIsAResume() {
+        Cell cell = directCell();
+        SourceResource source = StoredArtifacts.requireSource(cell.store.artifacts(), "src");
+        String directChain = SourceCaptureResolution.forPipeline(cell.pipeline(), source,
+                SourceDiscovery.model(cell.store, source)).orElseThrow().chainId().value();
+        assertThat(directChain).isNotEqualTo(cell.chain);
+        cell.store.meta().create(directChain, null);
+        cell.store.meta().openEpoch(directChain);
+        cell.seed(store -> store.meta().markSnapshotComplete(directChain, NODE, "orders"));
+        assertThat(cell.agree(Optional.empty(), StartIntent.START, false)).isEqualTo(StartLoad.RESUME);
+    }
+
+    @Test
     void aChangesOnlyReadIsNeverLoaded() {
         Cell cell = cell(ReadMode.CDC_ONLY, false);
         assertThat(cell.agree(Optional.empty(), StartIntent.START, false)).isEqualTo(StartLoad.CDC_ONLY);

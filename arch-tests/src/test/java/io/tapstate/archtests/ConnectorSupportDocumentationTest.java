@@ -58,22 +58,41 @@ class ConnectorSupportDocumentationTest {
                             "| MongoDB | `mongodb` | Read and write |",
                             "| Oracle | `oracle` | Read |",
                             "| SQL Server | `sqlserver` | Read |",
-                            "cloud deployment profile installs only onto MongoDB Atlas",
-                            "On-prem deployments may write to any catalog connector marked sink-capable",
-                            "private connectors",
+                            "cloud mode installs only onto `mongodb` or `mongodb-atlas`",
+                            "On-prem deployments may write to catalog connectors marked sink-capable",
+                            "except source-only ids",
+                            "Private connectors",
+                            "source-only **preview**", "outside the certified table",
+                            "verified by hand against Db2 LUW 11.5.5", "not supported for",
+                            "Db2 is supported as a source only", "refused on-prem as well as in",
+                            "DATA CAPTURE CHANGES", "useNativeMiner: true", "Linux x86_64",
+                            "db2-native-runtime-setup.sh", "raw log server",
+                            "Db2 for i is supported as a source only", "a `serve.sync` naming a `db2i` connection",
+                            "`journalLibraryName`", "`QSYS2.DISPLAY_JOURNAL`", "by hand against IBM i 7.4",
                             "remain the operator's responsibility",
                             "This deployment allowance is not a",
                             "certification claim",
-                            "this preview certifies MongoDB write support only",
                             "Applying a cloud pipeline",
                             "whose sync names another connector is refused",
                             "Oracle Free 23", "SQL Server 2022", "DECIMAL(18,4)", "schema rediscovery",
-                            "16 connector ids", "managed variants", "not been live-verified",
+                            "18 connector ids", "16 across these five database kinds",
+                            "managed variants", "Except for `mongodb-atlas`",
+                            "live-verified individually", "Atlas connector was verified",
+                            "`aws-rds-mysql`", "unverified preview",
+                            "issue #529",
                             "on this server", "outside the supported configuration",
                             "server's actual accepted set", "including any additional ids",
                             "separate assets", "`connectors-preview`", "versioned Tapstate releases",
-                            "register oracle", "register sqlserver", "Oracle Free Use Terms",
-                            "Microsoft JDBC Driver 12.2.0", "no LICENSE file");
+                            "register oracle", "register sqlserver", "register mongodb-atlas",
+                            "register aws-rds-mysql", "register db2", "register db2i", "Oracle Free Use Terms",
+                            "Microsoft JDBC Driver 12.2.0", "IBM Data Server Driver for JDBC and SQLJ 4.25.13",
+                            "International Program License Agreement", "IBM Public License 1.0",
+                            "no LICENSE file");
+            assertThat(text).as("certification remains narrower than allowed deployment targets in %s", document)
+                    .containsPattern("this preview certifies MongoDB write\\s+support only")
+                    .containsPattern("real Atlas deployment in both cloud\\s+and on-prem runtimes")
+                    .containsPattern("does not establish an exhaustive\\s+Atlas version or tier compatibility matrix")
+                    .doesNotContain("Cloud-mode verification is pending");
         }
     }
 

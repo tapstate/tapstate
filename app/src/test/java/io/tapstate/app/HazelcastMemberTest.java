@@ -39,6 +39,7 @@ import org.springframework.context.ConfigurableApplicationContext;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.time.Duration;
 
@@ -56,6 +57,58 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * loopback-only: the same port also serves the client protocol, which has no authentication.
  */
 class HazelcastMemberTest {
+
+    @Test
+    void optionalSingleIdentityKeepsLocalControlUrlsWithoutEnablingDiscovery() {
+        ClusterProperties cluster = new ClusterProperties();
+        ControlEndpointProperties control = new ControlEndpointProperties();
+        Config anonymous = HazelcastConfiguration.memberConfig(new HazelcastProperties());
+        HazelcastConfiguration.identifyConfiguredSingleMember(anonymous, cluster, control, new BootId("boot-a"));
+        assertThat(anonymous.getMemberAttributeConfig().getAttributes()).isEmpty();
+        cluster.setId(" cluster-a ");
+        cluster.setNodeId(" node-a ");
+        for (String url : new String[]{null, "http://localhost:8080/"}) {
+            control.setAdvertiseUrl(url);
+            Config config = HazelcastConfiguration.memberConfig(new HazelcastProperties());
+            HazelcastConfiguration.identifyConfiguredSingleMember(config, cluster, control, new BootId("boot-a"));
+            assertThat(config.getMemberAttributeConfig().getAttributes())
+                    .containsEntry(ClusterMembershipGate.NODE_ID_ATTRIBUTE, "node-a")
+                    .containsEntry(ClusterMembershipGate.BOOT_ID_ATTRIBUTE, "boot-a");
+            if (url == null) {
+                assertThat(config.getMemberAttributeConfig().getAttributes())
+                        .doesNotContainKey(ClusterMembershipGate.CONTROL_URL_ATTRIBUTE);
+            } else {
+                assertThat(config.getMemberAttributeConfig().getAttributes())
+                        .containsEntry(ClusterMembershipGate.CONTROL_URL_ATTRIBUTE, url);
+            }
+            assertThat(config.getNetworkConfig().getJoin().getTcpIpConfig().isEnabled()).isFalse();
+        }
+        cluster.setNodeId(" ");
+        Config blank = HazelcastConfiguration.memberConfig(new HazelcastProperties());
+        HazelcastConfiguration.identifyConfiguredSingleMember(blank, cluster, control, new BootId("boot-a"));
+        assertThat(blank.getMemberAttributeConfig().getAttributes()).isEmpty();
+    }
+
+    @Test
+    void singleIdentityUsesTheSharedClusterAndControlUrlValidation() {
+        ClusterProperties cluster = new ClusterProperties();
+        cluster.setNodeId("node-a");
+        ControlEndpointProperties control = new ControlEndpointProperties();
+        Config config = HazelcastConfiguration.memberConfig(new HazelcastProperties());
+        for (String id : new String[]{null, " ", "bad:cluster"}) {
+            cluster.setId(id);
+            BootError expected = id != null && id.contains(":") ? BootError.CLUSTER_ID_INVALID : BootError.CLUSTER_ID_REQUIRED;
+            assertThatThrownBy(() -> HazelcastConfiguration.identifyConfiguredSingleMember(config, cluster, control, new BootId("boot-a")))
+                    .isInstanceOfSatisfying(TapstateException.class, coded -> assertThat(coded.code()).isEqualTo(expected));
+        }
+        cluster.setId("cluster-a");
+        for (String url : List.of("relative/path", "ftp://localhost/file", "http://", "http://bad host/")) {
+            control.setAdvertiseUrl(url);
+            assertThatThrownBy(() -> HazelcastConfiguration.identifyConfiguredSingleMember(config, cluster, control, new BootId("boot-a")))
+                    .isInstanceOfSatisfying(TapstateException.class, coded ->
+                            assertThat(coded.code()).isEqualTo(BootError.CONTROL_ADVERTISE_URL_INVALID));
+        }
+    }
 
     @Test
     void memberConfigDisablesAllJoinDiscovery() {
@@ -658,7 +711,10 @@ class HazelcastMemberTest {
         try (ConfigurableApplicationContext context = new SpringApplicationBuilder(Bootstrap.class)
                 .web(WebApplicationType.NONE)
                 .properties("tapstate.store.mongo.enabled=false",
-                        "tapstate.hz.jet.cooperative-thread-count=2")
+                        "tapstate.hz.jet.cooperative-thread-count=2",
+                        "tapstate.cluster.id=local-single",
+                        "tapstate.cluster.node-id=stable-single",
+                        "tapstate.control.advertise-url=http://localhost:28081")
                 .run()) {
             member = context.getBean(HazelcastInstance.class);
             assertThat(member.getLifecycleService().isRunning()).isTrue();
@@ -671,34 +727,57 @@ class HazelcastMemberTest {
             assertThat(member.getConfig().getJetConfig().getCooperativeThreadCount()).isEqualTo(2);
             // The Jet engine is up and reachable; no jobs exist at the substrate level.
             assertThat(member.getJet().getJobs()).isEmpty();
+            assertThat(new HazelcastLiveClusterMembers(member).members()).singleElement()
+                    .satisfies(live -> {
+                        assertThat(live.nodeId()).isEqualTo("stable-single");
+                        assertThat(live.bootId()).isEqualTo(context.getBean(BootId.class).value());
+                        assertThat(live.controlUrl()).isEqualTo("http://localhost:28081");
+                    });
         }
         // The member's lifecycle is bound to the context: closing the context shuts it down.
         assertThat(member.getLifecycleService().isRunning()).isFalse();
     }
 
-    /**
-     * The mirror of what {@code makeJoinCapable} is for, and a regression that would say nothing.
-     *
-     * <p>The substrate resolves a map's configuration by looking through the static configuration by
-     * pattern first and only then at what was added while the member ran. A {@code join.*} pattern left
-     * here therefore answers for every join namespace, and an exact configuration behind it is never
-     * reached - with nothing about the run saying which one was in force. The nest maps were moved out
-     * of here for exactly that; this holds the join maps to the same place before the same thing can
-     * happen to them.
-     *
-     * <p>It is not hypothetical: {@code JoinMaps.backedStateMaps(name, entries)} - the exact-name form -
-     * already exists, so the configuration that would be shadowed is one call away rather than a
-     * future design. A store is passed because that is the case that used to declare these statically;
-     * with none, there would be nothing to find either way and the case would pass vacuously.
-     */
+    /** Preview state has bounded scratch configuration without matching a user Pipeline namespace. */
     @Test
-    @DisplayName("the static config declares no join state map, because a pattern here outranks an exact one added later")
-    void memberConfigDeclaresNoJoinStateMapPattern() {
+    @DisplayName("preview Nest and Join map patterns cannot capture durable user state")
+    void previewMapPatternsAreDisjointFromUserPipelineNamespaces() {
         Config config = HazelcastConfiguration.memberConfig(
                 new HazelcastProperties(), new InMemoryKeyedStateStore());
 
+        MapConfig previewJoin = config.getMapConfigs().get("join..preview_*");
+        MapConfig previewNest = config.getMapConfigs().get("nest..preview_*");
+        MapConfig previewSamples = config.getMapConfigs().get(PreviewSampleCache.MAP_NAME);
+        MapConfig previewSampleIndex = config.getMapConfigs().get(PreviewSampleCache.INDEX_MAP_NAME);
+        assertThat(previewJoin).isNotNull();
+        assertThat(previewNest).isNotNull();
+        assertThat(previewSamples).isNotNull();
+        assertThat(previewSamples.getInMemoryFormat()).isEqualTo(InMemoryFormat.BINARY);
+        assertThat(previewSamples.getBackupCount()).isZero();
+        assertThat(previewSamples.getTimeToLiveSeconds()).isEqualTo(300);
+        assertThat(previewSamples.getMapStoreConfig().isEnabled()).isFalse();
+        assertThat(previewSampleIndex).isNotNull();
+        assertThat(previewSampleIndex.getTimeToLiveSeconds())
+                .isEqualTo(PreviewSampleCache.INDEX_TTL.toSeconds());
+        assertThat(previewSampleIndex.getMaxIdleSeconds()).isZero();
+        for (MapConfig preview : List.of(previewJoin, previewNest)) {
+            assertThat(preview.getBackupCount()).isZero();
+            assertThat(preview.getAsyncBackupCount()).isZero();
+            assertThat(preview.getTimeToLiveSeconds()).isEqualTo(300);
+            assertThat(preview.getMaxIdleSeconds()).isEqualTo(300);
+            assertThat(preview.getMapStoreConfig().isEnabled()).isFalse();
+        }
+
+        assertThat(config.findMapConfig("join..preview_run.step.fact").getName())
+                .isEqualTo(previewJoin.getName());
+        assertThat(config.findMapConfig("nest..preview_run.step.table").getName())
+                .isEqualTo(previewNest.getName());
+        assertThat(config.findMapConfig("join.preview_customer.step.fact").getName())
+                .isNotEqualTo(previewJoin.getName());
+        assertThat(config.findMapConfig("nest.preview_customer.step.table").getName())
+                .isNotEqualTo(previewNest.getName());
         assertThat(config.getMapConfigs().keySet())
-                .noneMatch(name -> name.startsWith(JoinMaps.NAMESPACE_PREFIX));
+                .doesNotContain(JoinMaps.NAMESPACE_PREFIX + "*");
     }
 
     private static HazelcastProperties bind(Map<String, String> values) {
@@ -717,7 +796,9 @@ class HazelcastMemberTest {
     }
 
     private static int[] twoFreePorts() throws Exception {
-        try (ServerSocket first = new ServerSocket(0); ServerSocket second = new ServerSocket(0)) {
+        InetAddress loopback = InetAddress.getByName("127.0.0.1");
+        try (ServerSocket first = new ServerSocket(0, 0, loopback);
+                ServerSocket second = new ServerSocket(0, 0, loopback)) {
             return new int[] {first.getLocalPort(), second.getLocalPort()};
         }
     }

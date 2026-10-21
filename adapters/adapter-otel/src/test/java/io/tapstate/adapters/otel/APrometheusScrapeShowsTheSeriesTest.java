@@ -4,6 +4,7 @@ import io.tapstate.core.lifecycle.PipelineState;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -23,7 +24,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class APrometheusScrapeShowsTheSeriesTest {
 
     private static int freePort() throws IOException {
-        try (ServerSocket socket = new ServerSocket(0)) {
+        try (ServerSocket socket = new ServerSocket(0, 0, InetAddress.getByName("127.0.0.1"))) {
             return socket.getLocalPort();
         }
     }

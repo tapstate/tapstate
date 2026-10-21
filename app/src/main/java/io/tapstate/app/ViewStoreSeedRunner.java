@@ -1,8 +1,11 @@
 package io.tapstate.app;
 
+import io.tapstate.adapters.mongostore.MongoConnection;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.store.ArtifactMutation;
 import io.tapstate.spi.store.ArtifactStore;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.Objects;
 import java.util.regex.Pattern;
@@ -11,8 +14,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.SmartInitializingSingleton;
 
 /**
- * Registers the managed state store views materialize into, once at startup, so a deployment has one
- * without anyone declaring it.
+ * Registers the managed state store views materialize into, once at on-prem startup, so a deployment
+ * has one without anyone declaring it. Cloud startup disables this runner.
  *
  * <p>It used to be a file the demo script wrote and the user applied, which made the store look like part
  * of the workspace an author owns. It is not: it is the deployment's, the same store the server already
@@ -25,9 +28,8 @@ import org.springframework.beans.factory.SmartInitializingSingleton;
  * and a second setting would be one more thing to get wrong for a deployment that has no second instance
  * to name.
  *
- * <p>Seeding never overwrites. The insert is the store's atomic create, so an author who has declared
- * their own resource under this id keeps it, and the seed reports that it found one rather than replacing
- * what somebody meant to put there.
+ * <p>Seeding never overwrites an existing resource. Cloud startup neither creates a views Source nor
+ * renews an existing connection from deployment credentials.
  */
 final class ViewStoreSeedRunner implements SmartInitializingSingleton {
 
@@ -45,11 +47,17 @@ final class ViewStoreSeedRunner implements SmartInitializingSingleton {
     private final ArtifactStore artifacts;
     private final String serverStoreUri;
     private final String tlsCaFile;
+    private final boolean enabled;
 
     ViewStoreSeedRunner(ArtifactStore artifacts, String serverStoreUri, String tlsCaFile) {
+        this(artifacts, serverStoreUri, tlsCaFile, true);
+    }
+
+    ViewStoreSeedRunner(ArtifactStore artifacts, String serverStoreUri, String tlsCaFile, boolean enabled) {
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
-        this.serverStoreUri = Objects.requireNonNull(serverStoreUri, "serverStoreUri");
-        this.tlsCaFile = tlsCaFile;
+        this.serverStoreUri = enabled ? Objects.requireNonNull(serverStoreUri, "serverStoreUri") : null;
+        this.tlsCaFile = enabled ? tlsCaFile : null;
+        this.enabled = enabled;
     }
 
     @Override
@@ -58,6 +66,7 @@ final class ViewStoreSeedRunner implements SmartInitializingSingleton {
     }
 
     void seed() {
+        if (!enabled) return;
         String id = ViewTargetResolver.STATE_STORE_SOURCE_ID;
         if (trustCannotTravelInTheUri()) {
             // Seeding anyway would register a connection that can never be made: the connector would
@@ -91,8 +100,8 @@ final class ViewStoreSeedRunner implements SmartInitializingSingleton {
      * other. Host, credentials and every option are carried across, because whatever it took to reach the
      * one database is what it takes to reach the other on the same server.
      *
-     * <p>Which is why the database is not the only thing the path decides. With no explicit
-     * {@code authSource}, the connection string spec authenticates against the database named in the URI
+     * <p>For an ordinary {@code mongodb} URI, the database is not the only thing the path decides. With
+     * no explicit {@code authSource}, the driver authenticates against the database named in the URI
      * -- so rewriting the path alone moves the authentication database too, and a deployment whose
      * credentials live in the control-plane database would derive a URI that authenticates against one
      * where that user does not exist. The store would be registered and permanently unusable, and the
@@ -103,9 +112,17 @@ final class ViewStoreSeedRunner implements SmartInitializingSingleton {
      * falls back to {@code admin} only because no database was named -- which stops being true of the
      * derived URI the moment this method names one, so an inherited default would land on the view store
      * exactly as a rewritten path does.
+     *
+     * <p>An SRV URI may instead authenticate against a database supplied by DNS TXT records. For a
+     * credential-bearing SRV URI without an explicit source, the driver resolves the effective source
+     * before it is pinned; the original path alone does not determine where those credentials live.
      */
     static String viewsUri(String serverStoreUri) {
-        String database = ViewTargetResolver.STATE_STORE_SOURCE_ID;
+        return viewsUri(serverStoreUri, ViewTargetResolver.STATE_STORE_SOURCE_ID);
+    }
+
+    static String viewsUri(String serverStoreUri, String database) {
+        Objects.requireNonNull(database, "database");
         int scheme = serverStoreUri.indexOf("://");
         int authorityStart = scheme < 0 ? 0 : scheme + 3;
         int query = serverStoreUri.indexOf('?', authorityStart);
@@ -115,7 +132,8 @@ final class ViewStoreSeedRunner implements SmartInitializingSingleton {
         String authority = path < 0 ? beforeQuery : beforeQuery.substring(0, path);
         String originalDatabase = path < 0 ? "" : beforeQuery.substring(path + 1);
         return authority + "/" + database
-                + withAuthSource(fromQuery, originalDatabase, carriesCredentials(authority, authorityStart));
+                + withAuthSource(serverStoreUri, fromQuery, originalDatabase,
+                        carriesCredentials(authority, authorityStart));
     }
 
     /** Whether the URI carries credentials at all -- userinfo ahead of the host list. */
@@ -131,13 +149,17 @@ final class ViewStoreSeedRunner implements SmartInitializingSingleton {
      * but only for a URI that actually carries credentials, since the option means nothing otherwise and
      * would have to be explained to whoever reads the seeded resource.
      */
-    private static String withAuthSource(String query, String originalDatabase, boolean carriesCredentials) {
+    private static String withAuthSource(
+            String serverStoreUri, String query, String originalDatabase, boolean carriesCredentials) {
         if (namesAuthSource(query)) {
             return query;
         }
         String source = originalDatabase.isEmpty()
                 ? (carriesCredentials ? SPEC_DEFAULT_AUTH_SOURCE : "")
                 : originalDatabase;
+        if (carriesCredentials && serverStoreUri.startsWith("mongodb+srv://")) {
+            source = URLEncoder.encode(MongoConnection.authenticationSource(serverStoreUri), StandardCharsets.UTF_8);
+        }
         if (source.isEmpty()) {
             return query;
         }

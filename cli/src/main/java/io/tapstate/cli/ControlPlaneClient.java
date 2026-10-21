@@ -92,6 +92,14 @@ interface ControlPlaneClient extends AutoCloseable {
     GetOutcome get(URI baseUrl, String credential, String id);
 
     /**
+     * Reads secret-redacted connection settings from the existing Source API, for probing only.
+     * Generic artifact reads deliberately omit the entire config and cannot supply these settings.
+     */
+    default ConnectionSettingsOutcome connectionSettings(URI baseUrl, String credential, String id) {
+        return new ConnectionSettingsOutcome.Unreachable();
+    }
+
+    /**
      * Removes one artifact by id via {@code DELETE {baseUrl}/api/artifacts/{id}}, authenticated by the
      * bearer {@code credential} and conditioned on {@code expectedContentHash} travelling as a quoted
      * {@code If-Match}: removed on success, a coded rejection carrying the server's named parameters when
@@ -249,9 +257,9 @@ interface ControlPlaneClient extends AutoCloseable {
 
     /**
      * Reads a pipeline's lifecycle state via {@code GET {baseUrl}/api/pipelines/{pipelineId}/status},
-     * authenticated by the bearer {@code credential}: the state on success, a coded rejection when the
-     * server refuses (a pipeline with no published observation is {@code monitor.no-observation}), or
-     * unreachable on any I/O failure. Never throws.
+     * authenticated by the bearer {@code credential}: the observed state on success, no-observation when a
+     * known aggregate status has not yet published runtime state, a coded rejection when the server refuses,
+     * or unreachable on any I/O failure. Never throws.
      */
     StatusOutcome status(URI baseUrl, String credential, String pipelineId);
 

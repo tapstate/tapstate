@@ -5,12 +5,15 @@ import com.hazelcast.jet.core.test.TestOutbox;
 import com.hazelcast.jet.core.test.TestProcessorContext;
 import io.tapstate.core.common.TapstateType;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Op;
+import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.sql.Expr;
 import io.tapstate.core.sql.JoinKind;
 import io.tapstate.core.sql.JoinPlan;
 import io.tapstate.core.sql.JoinTree;
 import io.tapstate.core.sql.OutputField;
+import io.tapstate.runtime.engine.SettledPositions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -161,6 +164,54 @@ class JoinProcessorTest {
                 .assertThatThrownBy(() -> offer(7, insert(Map.of("id", 1L))))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("names no source");
+    }
+
+    @Test
+    void aSettlementMarkerFollowsTheWholeRecomputeBeforeLaterChanges() {
+        offer(DIMENSION, insert(Map.of("id", 1L, "name", "Ada")));
+        for (long id = 0; id < 5; id++) {
+            offerUntilTaken(FACT, insert(Map.of("id", id, "cust_id", 1L)));
+        }
+        forgetWhatWasPublished();
+        SettledPositions word = new SettledPositions(
+                Map.of("customers", new ChainPosition(new SourceOrder(1, 7), "p7")));
+        TestInbox inbox = new TestInbox(List.of(
+                update(Map.of("id", 1L, "name", "Ada"), Map.of("id", 1L, "name", "Grace")),
+                word,
+                update(Map.of("id", 1L, "name", "Grace"), Map.of("id", 1L, "name", "Hopper"))));
+        List<Object> emitted = new ArrayList<>();
+
+        processor.process(DIMENSION, inbox);
+        assertThat(inbox.isEmpty()).as("the recompute exceeds the two-slot outbox").isFalse();
+        assertThat(driver.hasPending()).isTrue();
+        for (int attempt = 0; attempt < 20 && !inbox.isEmpty(); attempt++) {
+            outbox.drainQueueAndReset(0, emitted, false);
+            processor.process(DIMENSION, inbox);
+        }
+        outbox.drainQueueAndReset(0, emitted, false);
+
+        assertThat(inbox.isEmpty()).isTrue();
+        assertThat(emitted).extracting(item -> item instanceof JoinUpdate row
+                        ? row.event().after().get("customer_name") : item)
+                .containsExactly("Grace", "Grace", "Grace", "Grace", "Grace", word,
+                        "Hopper", "Hopper", "Hopper", "Hopper", "Hopper");
+    }
+
+    @Test
+    void aSettlementMarkerWithNoRowsIsForwardedWithoutChangingState() {
+        SettledPositions word = new SettledPositions(
+                Map.of("orders", new ChainPosition(new SourceOrder(1, 7), "p7")));
+        stores.forgetCounts();
+        TestInbox inbox = new TestInbox(List.of(word));
+
+        processor.process(FACT, inbox);
+        List<Object> emitted = new ArrayList<>();
+        outbox.drainQueueAndReset(0, emitted, false);
+
+        assertThat(inbox.isEmpty()).isTrue();
+        assertThat(emitted).containsExactly(word);
+        assertThat(stores.writes).isZero();
+        assertThat(stores.batchReads).isZero();
     }
 
     /** Offers {@code items} as one delivery, and says whether all of it went out in that one call. */

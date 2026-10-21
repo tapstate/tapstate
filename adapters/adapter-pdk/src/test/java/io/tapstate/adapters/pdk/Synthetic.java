@@ -538,6 +538,197 @@ final class Synthetic {
     }
 
     /**
+     * Streams one insert from a reader that wraps whatever its hand-over throws in an exception of its own,
+     * the way a binlog reader reports why it stopped.
+     */
+    static Path wrappingStreamSource(Path dir) {
+        String register = "functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
+                + "  consumer.streamReadStarted();"
+                + row("a", 1)
+                + "  List<TapEvent> ins = new ArrayList<>();"
+                + "  ins.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime(1L).after(a));"
+                + "  try { consumer.accept(ins, null); }"
+                + "  catch (Throwable t) { throw new RuntimeException(\"the reader stopped\", t); }"
+                + "  consumer.streamReadEnded();"
+                + "});";
+        return SyntheticJar.compileToJar(dir, "synthetic.WrappingStream", source("WrappingStream", "", register));
+    }
+
+    /**
+     * A source that reads on a thread of its own and delivers from it, the way a polling connector does, but
+     * only when it is told to; its flush function records every call it gets.
+     *
+     * <p>It takes its orders from, and reports through, the channel kept in the system properties under
+     * {@code channel}: the connector runs in a loader of its own, and those are one thing both sides of that
+     * boundary reach. An order of {@code rows} delivers one change closed by a fresh offset of the connector's
+     * own class; any other order delivers a heartbeat alone, naming no offset. It reports each offset it names
+     * under {@code named}, the thread of each delivery under {@code deliveredOn} as it begins and again under
+     * {@code handedOver} once its hand-over returns, and, for every flush call,
+     * the object it was handed, that object's loader, the connector's own loader and the calling thread under
+     * {@code flushes}.
+     *
+     * <p>Stopped, it makes one last heartbeat-only delivery on its way out, as a source may while it winds
+     * down, so a case can see what a delivery made after close does.
+     */
+    static Path acknowledgingSource(Path dir, String channel) {
+        return pollingSource(dir, "AcknowledgingSource", channel, flushFunction(""));
+    }
+
+    /** The same source, whose flush function records the call and then throws. */
+    static Path refusingAcknowledgementSource(Path dir, String channel) {
+        return pollingSource(dir, "RefusingAcknowledgementSource", channel,
+                flushFunction("throw new IllegalStateException(\"flush boom\");"));
+    }
+
+    /** The same source with no flush function at all. */
+    static Path unacknowledgingSource(Path dir, String channel) {
+        return pollingSource(dir, "UnacknowledgingSource", channel, "");
+    }
+
+    /**
+     * A source that, as the postgres connector does, creates a slot the first time a drive reads it and keeps
+     * the slot's name in its notes under {@code tapdata_pg_slot}; each read answers one row naming the slot it
+     * read through. Its release function reports the slot its notes name under {@code released} in the
+     * {@code channel} map. With {@code unreachable} in the map it then throws, as a source that cannot be
+     * reached does; with {@code hang} it waits until interrupted, and reports that under {@code interrupted} --
+     * having first, with {@code writeAfterInterrupt}, tried to write a note, reporting under {@code lateWrite}
+     * whether the write was taken.
+     */
+    static Path slotKeepingSource(Path dir, String channel) {
+        String register = ""
+                + "functions.supportBatchRead((context, table, offset, size, consumer) -> {"
+                + "  Object slot = context.getStateMap().get(\"tapdata_pg_slot\");"
+                + "  if (slot == null) {"
+                + "    slot = \"slot-\" + java.util.UUID.randomUUID();"
+                + "    context.getStateMap().put(\"tapdata_pg_slot\", slot);"
+                + "  }"
+                + "  Map<String,Object> r = new LinkedHashMap<>();"
+                + "  r.put(\"id\", 1); r.put(\"slot\", String.valueOf(slot));"
+                + "  List<TapEvent> evs = new ArrayList<>();"
+                + "  evs.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime(100L).after(r));"
+                + "  consumer.accept(evs, null);"
+                + "});"
+                + "functions.supportReleaseExternalFunction(context -> {"
+                + "  @SuppressWarnings(\"unchecked\") List<Object> released = (List<Object>) channel().get(\"released\");"
+                + "  released.add(String.valueOf(context.getStateMap().get(\"tapdata_pg_slot\")));"
+                + "  if (channel().containsKey(\"hang\")) {"
+                + "    try {"
+                + "      Thread.sleep(Long.MAX_VALUE);"
+                + "    } catch (InterruptedException e) {"
+                + "      channel().put(\"interrupted\", true);"
+                + "      if (channel().containsKey(\"writeAfterInterrupt\")) {"
+                + "        try {"
+                + "          context.getStateMap().put(\"late\", \"written after the release was given up on\");"
+                + "          channel().put(\"lateWrite\", \"written\");"
+                + "        } catch (RuntimeException refused) {"
+                + "          channel().put(\"lateWrite\", \"refused\");"
+                + "        }"
+                + "      }"
+                + "      throw e;"
+                + "    }"
+                + "  }"
+                + "  if (channel().containsKey(\"unreachable\")) {"
+                + "    throw new IllegalStateException(\"connection refused\");"
+                + "  }"
+                + "});";
+        String members = ""
+                + "@SuppressWarnings(\"unchecked\")"
+                + "private static Map<String,Object> channel() {"
+                + "  return (Map<String,Object>) System.getProperties().get(\"" + channel + "\");"
+                + "}";
+        return SyntheticJar.compileToJar(dir, "synthetic.SlotKeepingSource",
+                source("SlotKeepingSource", "", register, members));
+    }
+
+    /** A flush function that records each call under {@code flushes}, then runs {@code after}. */
+    private static String flushFunction(String after) {
+        return ""
+                + "functions.supportFlushOffsetFunction((context, offset) -> {"
+                + "  Map<String,Object> call = new java.util.HashMap<>();"
+                + "  call.put(\"offset\", offset);"
+                + "  call.put(\"offsetLoader\", offset == null ? null : offset.getClass().getClassLoader());"
+                + "  call.put(\"connectorLoader\", Offset.class.getClassLoader());"
+                + "  call.put(\"thread\", Thread.currentThread());"
+                + "  @SuppressWarnings(\"unchecked\") List<Object> flushes = (List<Object>) channel().get(\"flushes\");"
+                + "  flushes.add(call);"
+                + after
+                + "});";
+    }
+
+    private static Path pollingSource(Path dir, String simpleName, String channel, String flushFunction) {
+        String members = ""
+                + "public static class Offset implements java.io.Serializable {"
+                + "  public String mark;"
+                + "  public Offset() {}"
+                + "  public Offset(String mark) { this.mark = mark; }"
+                + "  public boolean equals(Object o) {"
+                + "    return o instanceof Offset && java.util.Objects.equals(mark, ((Offset) o).mark);"
+                + "  }"
+                + "  public int hashCode() { return java.util.Objects.hashCode(mark); }"
+                + "  public String toString() { return \"Offset(\" + mark + \")\"; }"
+                + "}"
+                + "private volatile boolean stopped;"
+                + "@SuppressWarnings(\"unchecked\")"
+                + "private static Map<String,Object> channel() {"
+                + "  return (Map<String,Object>) System.getProperties().get(\"" + channel + "\");"
+                + "}";
+        String register = ""
+                + "functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
+                + "  @SuppressWarnings(\"unchecked\") java.util.concurrent.BlockingQueue<String> orders ="
+                + "      (java.util.concurrent.BlockingQueue<String>) channel().get(\"orders\");"
+                + "  @SuppressWarnings(\"unchecked\") List<Object> named = (List<Object>) channel().get(\"named\");"
+                + "  @SuppressWarnings(\"unchecked\") List<Object> deliveredOn ="
+                + "      (List<Object>) channel().get(\"deliveredOn\");"
+                + "  @SuppressWarnings(\"unchecked\") List<Object> handedOver ="
+                + "      (List<Object>) channel().get(\"handedOver\");"
+                + "  consumer.streamReadStarted();"
+                + "  Thread poll = new Thread(() -> {"
+                + "    int rows = 0;"
+                + "    while (!stopped) {"
+                + "      String order;"
+                + "      try {"
+                + "        order = orders.poll(10, java.util.concurrent.TimeUnit.MILLISECONDS);"
+                + "      } catch (InterruptedException e) {"
+                + "        return;"
+                + "      }"
+                + "      if (order == null) continue;"
+                + "      List<TapEvent> batch = new ArrayList<>();"
+                + "      Offset at = null;"
+                + "      if (order.equals(\"rows\")) {"
+                + "        rows++;"
+                + "        Map<String,Object> row = new LinkedHashMap<>(); row.put(\"id\", rows);"
+                + "        batch.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime((long) rows).after(row));"
+                + "        at = new Offset(\"batch-\" + rows);"
+                + "        named.add(at);"
+                + "      } else {"
+                + "        batch.add(new io.tapdata.entity.event.control.HeartbeatEvent().init());"
+                + "      }"
+                + "      deliveredOn.add(Thread.currentThread());"
+                + "      consumer.accept(batch, at);"
+                + "      handedOver.add(Thread.currentThread());"
+                + "    }"
+                + "    List<TapEvent> last = new ArrayList<>();"
+                + "    last.add(new io.tapdata.entity.event.control.HeartbeatEvent().init());"
+                + "    deliveredOn.add(Thread.currentThread());"
+                + "    consumer.accept(last, null);"
+                + "  }, \"synthetic-poll\");"
+                + "  poll.start();"
+                + "  while (poll.isAlive()) {"
+                + "    try { poll.join(); } catch (InterruptedException stopping) { }"
+                + "  }"
+                + "  consumer.streamReadEnded();"
+                + "});"
+                + flushFunction;
+        String discovery = "TapTable table = new TapTable(\"t1\");"
+                + "table.add(new TapField(\"id\", \"int\"));"
+                + "List<TapTable> tables = new ArrayList<>();"
+                + "tables.add(table);"
+                + "s.accept(tables);";
+        return SyntheticJar.compileToJar(dir, "synthetic." + simpleName,
+                source(simpleName, "", register, members, discovery, "stopped = true;"));
+    }
+
+    /**
      * Streams one insert whose row holds values no JSON writer knows, at three depths. A connector
      * hands on whatever its driver produced, and a document store's own key arrives as a driver object
      * rather than as a string or a number; {@code UUID} stands in for one here, because what matters is
@@ -699,6 +890,41 @@ final class Synthetic {
                 .replace("public void stop(TapConnectionContext c) {}",
                         "public void stop(TapConnectionContext c) throws Throwable { mark(\"stop\"); }");
         return SyntheticJar.compileToJar(dir, "synthetic.PreparationSink", code);
+    }
+
+    /**
+     * A sink connector that writes one line to {@code trace} as it starts ({@code init}), as each write call
+     * reaches it ({@code write}) and as it stops ({@code stop}) - which is what tells one instance serving several
+     * writers apart from one instance each.
+     */
+    static Path lifecycleSink(Path dir, Path trace) {
+        return lifecycleSink(dir, trace, "LifecycleSink", LIFECYCLE_WRITES, "mark(\"init\");");
+    }
+
+    /** As {@link #lifecycleSink}, but a sink that offers no write at all, so no writer of it can open. */
+    static Path lifecycleSinkThatCannotWrite(Path dir, Path trace) {
+        return lifecycleSink(dir, trace, "SilentLifecycleSink", "", "mark(\"init\");");
+    }
+
+    /** As {@link #lifecycleSink}, but one that fails as it starts, having written {@code init}. */
+    static Path lifecycleSinkThatFailsToStart(Path dir, Path trace) {
+        return lifecycleSink(dir, trace, "FailingLifecycleSink", LIFECYCLE_WRITES,
+                "mark(\"init\"); throw new IllegalStateException(\"the target refused the connection\");");
+    }
+
+    private static final String LIFECYCLE_WRITES = "functions.supportWriteRecord((c, e, t, r) -> { mark(\"write\");"
+            + "  r.accept(new io.tapdata.pdk.apis.entity.WriteListResult<>((long) e.size(), 0L, 0L)); });";
+
+    private static Path lifecycleSink(Path dir, Path trace, String simpleName, String register, String init) {
+        String members = "private void mark(String value) throws Exception {"
+                + "java.nio.file.Files.writeString(java.nio.file.Path.of(\"" + trace + "\"), value + \"\\n\","
+                + "java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND); }";
+        String code = source(simpleName, "", register, members)
+                .replace("public void init(TapConnectionContext c) {}",
+                        "public void init(TapConnectionContext c) throws Throwable { " + init + " }")
+                .replace("public void stop(TapConnectionContext c) {}",
+                        "public void stop(TapConnectionContext c) throws Throwable { mark(\"stop\"); }");
+        return SyntheticJar.compileToJar(dir, "synthetic." + simpleName, code);
     }
 
     /** A sink connector whose writeRecord counts events and reports them all inserted. */
@@ -1288,6 +1514,16 @@ final class Synthetic {
                 Map.of());
     }
 
+    /** A MongoDB target connector that restores portable string keys through its registered codec. */
+    static Path mongoPreviewTarget(Path dir) {
+        String register = "codecs.registerFromTapValue(io.tapdata.entity.schema.value.TapStringValue.class, "
+                + "value -> new org.bson.types.ObjectId(value.getValue()));"
+                + "codecs.registerFromTapValue(io.tapdata.entity.schema.value.TapDateTimeValue.class, "
+                + "value -> java.util.Date.from(value.getValue().toInstant()));";
+        return SyntheticJar.compileToJar(dir, "synthetic.MongoPreviewTarget",
+                source("MongoPreviewTarget", "", register));
+    }
+
     /** A second registrable connector under a distinct id, whose manifest declares no PDK API version. */
     static Path seedablePaymentsConnector(Path dir) {
         String src = SELF_SCAN_IMPORTS
@@ -1583,5 +1819,90 @@ final class Synthetic {
                 + "  throw new RuntimeException(\"execute boom\");"
                 + "});";
         return SyntheticJar.compileToJar(dir, "synthetic.ThrowingQuery", readFace("ThrowingQuery", register));
+    }
+
+    /** A finite-query source with composite-key matches and a query limit that it honors. */
+    static Path exactTupleQuerySource(Path dir) {
+        String source = ""
+                + "package synthetic;"
+                + "import io.tapdata.pdk.apis.TapConnector;"
+                + "import io.tapdata.pdk.apis.functions.ConnectorFunctions;"
+                + "import io.tapdata.entity.codec.TapCodecsRegistry;"
+                + "import io.tapdata.pdk.apis.context.TapConnectionContext;"
+                + "import io.tapdata.pdk.apis.entity.ConnectionOptions;"
+                + "import io.tapdata.pdk.apis.entity.TestItem;"
+                + "import io.tapdata.pdk.apis.entity.FilterResults;"
+                + "import io.tapdata.entity.schema.TapTable;"
+                + "import io.tapdata.entity.schema.TapField;"
+                + "import java.util.ArrayList;"
+                + "import java.util.LinkedHashMap;"
+                + "import java.util.List;"
+                + "import java.util.Map;"
+                + "import java.util.Objects;"
+                + "import java.util.function.Consumer;"
+                + "public class ExactTupleQuery implements TapConnector {"
+                + "  public void registerCapabilities(ConnectorFunctions f, TapCodecsRegistry codecs) {"
+                + "    f.supportQueryByAdvanceFilter((c, filter, table, consumer) -> {"
+                + "      List<Map<String,Object>> matches = new ArrayList<>();"
+                + "      for (Map<String,Object> row : rows()) {"
+                + "        boolean match = filter.getMatch() == null || filter.getMatch().entrySet().stream()"
+                + "          .allMatch(entry -> Objects.equals(row.get(entry.getKey()), entry.getValue()));"
+                + "        if (match) matches.add(row);"
+                + "      }"
+                + "      int limit = filter.getLimit() == null ? Integer.MAX_VALUE : filter.getLimit();"
+                + "      if (matches.size() > limit) matches = new ArrayList<>(matches.subList(0, limit));"
+                + "      FilterResults results = new FilterResults(); results.setResults(matches); consumer.accept(results);"
+                + "    });"
+                + "  }"
+                + "  private List<Map<String,Object>> rows() {"
+                + "    List<Map<String,Object>> rows = new ArrayList<>();"
+                + "    rows.add(row(1, 1, \"a\")); rows.add(row(1, 2, \"cross-a\"));"
+                + "    rows.add(row(2, 1, \"cross-b\")); rows.add(row(2, 2, \"b\"));"
+                + "    return rows;"
+                + "  }"
+                + "  private Map<String,Object> row(int tenant, int order, String value) {"
+                + "    Map<String,Object> row = new LinkedHashMap<>(); row.put(\"tenant_id\", tenant);"
+                + "    row.put(\"order_id\", order); row.put(\"value\", value); return row;"
+                + "  }"
+                + "  public void init(TapConnectionContext c) {}"
+                + "  public void stop(TapConnectionContext c) {}"
+                + "  public void discoverSchema(TapConnectionContext c, List<String> names, int limit, Consumer<List<TapTable>> sink) {"
+                + "    TapTable table = new TapTable(\"t1\");"
+                + "    table.add(new TapField(\"tenant_id\", \"int\").isPrimaryKey(true));"
+                + "    table.add(new TapField(\"order_id\", \"int\").isPrimaryKey(true));"
+                + "    table.add(new TapField(\"value\", \"string\"));"
+                + "    sink.accept(List.of(table));"
+                + "  }"
+                + "  public ConnectionOptions connectionTest(TapConnectionContext c, Consumer<TestItem> sink) {"
+                + "    sink.accept(new TestItem(\"ping\", TestItem.RESULT_SUCCESSFULLY)); return ConnectionOptions.create();"
+                + "  }"
+                + "  public int tableCount(TapConnectionContext c) { return 1; }"
+                + "}";
+        return SyntheticJar.compileToJar(dir, "synthetic.ExactTupleQuery", source);
+    }
+
+    static Path boundedQuerySource(Path dir, String mode) {
+        String query = switch (mode) {
+            case "throw" -> "throw new IllegalStateException(\"query failed\");";
+            case "null-result" -> "consumer.accept(null);";
+            case "empty-results" -> "io.tapdata.pdk.apis.entity.FilterResults r = "
+                    + "new io.tapdata.pdk.apis.entity.FilterResults(); consumer.accept(r);";
+            case "null-row" -> "java.util.List<java.util.Map<String,Object>> rows = new java.util.ArrayList<>(); "
+                    + "rows.add(null); io.tapdata.pdk.apis.entity.FilterResults r = "
+                    + "new io.tapdata.pdk.apis.entity.FilterResults(); r.setResults(rows); consumer.accept(r);";
+            case "null-field" -> "java.util.Map<String,Object> row = new java.util.LinkedHashMap<>(); "
+                    + "row.put(null, 1); io.tapdata.pdk.apis.entity.FilterResults r = "
+                    + "new io.tapdata.pdk.apis.entity.FilterResults(); r.setResults(java.util.List.of(row)); "
+                    + "consumer.accept(r);";
+            case "reported-error" -> "io.tapdata.pdk.apis.entity.FilterResults r = "
+                    + "new io.tapdata.pdk.apis.entity.FilterResults(); "
+                    + "r.setError(new IllegalStateException(\"reported query failure\")); consumer.accept(r);";
+            default -> throw new IllegalArgumentException("unsupported bounded query mode: " + mode);
+        };
+        String register = "functions.supportQueryByAdvanceFilter((context, filter, table, consumer) -> {"
+                + query + "});";
+        String className = "BoundedQuery" + mode.replace('-', '_');
+        return SyntheticJar.compileToJar(dir, "synthetic." + className,
+                source(className, "", register));
     }
 }

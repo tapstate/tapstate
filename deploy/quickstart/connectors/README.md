@@ -5,7 +5,9 @@ This directory is bind-mounted into the server as its connector seed directory. 
 startup, through the same register-if-absent path `tapstate register` uses. It is a convenience
 for staging jars offline or in bulk.
 
-This preview certifies the following database kinds, with certification scoped by direction:
+This preview certifies the following database kinds, with certification scoped by direction.
+The certified `mongodb-atlas` managed id belongs to the MongoDB kind and is described below rather
+than being presented as another database kind:
 
 | Database | Connector kind | Certified use |
 |---|---|---|
@@ -15,20 +17,78 @@ This preview certifies the following database kinds, with certification scoped b
 | Oracle | `oracle` | Read |
 | SQL Server | `sqlserver` | Read |
 
-A `serve.sync` element in the cloud deployment profile installs only onto MongoDB Atlas.
-On-prem deployments may write to any catalog connector marked sink-capable; private connectors
-outside the catalog remain the operator's responsibility. This deployment allowance is not a
-certification claim: this preview certifies MongoDB write support only. Applying a cloud pipeline
-whose sync names another connector is refused; reading through it is unaffected.
+`aws-rds-mysql` is available as a source-only **unverified preview**, outside the certified table.
+Its shaded PDK JAR exposes batch and stream read functions, but no real Amazon RDS for MySQL
+snapshot, binlog CDC, or restart-continuation run has been completed. It is not a write target.
+Real-service validation is tracked in [issue #529](https://github.com/tapstate/tapstate/issues/529).
 
-Reads are verified on Oracle Free 23 and SQL Server 2022, and across the other kinds,
-with snapshot and CDC inserts, updates and deletes.
+A `serve.sync` element in cloud mode installs only onto `mongodb` or `mongodb-atlas`.
+On-prem deployments may write to catalog connectors marked sink-capable, except source-only ids
+such as `aws-rds-mysql`. Private connectors outside the catalog remain the operator's responsibility.
+This deployment allowance is not a certification claim: this preview certifies MongoDB write
+support only. Applying a cloud pipeline whose sync names another connector is refused; reading
+through it is unaffected.
+
+Db2 is accepted as a source-only **preview**, outside the certified table: no release lane
+reads a live Db2 database. The earlier preview was verified by hand against Db2 LUW 11.5.5
+for snapshot, change capture of inserts, updates and deletes, and continuation across a server
+restart in both change-capture modes below. Replacing the floating preview JAR does not transfer
+that database certification to the replacement bytes.
+Db2 is supported as a source only. Its connector can write, but the server enforces the source-only policy even if
+its catalog row is missing, so a `serve.sync` naming a `db2` connection is refused on-prem as well as in
+the cloud profile. Change capture needs archive logging on the database and
+`DATA CAPTURE CHANGES` on each captured table. With `useNativeMiner: true` the connector reads
+the log in-process; that needs the server on Linux x86_64, running as root at least for the
+first Db2 connection. Every native-mode JVM, including on-prem hosts, must have `libxml2.so.2`
+available and preload shared `libstdc++.so.6` before Java starts. Set `LD_PRELOAD=libstdc++.so.6`
+in the server process environment; the Cloud image supplies it, while on-prem operators configure
+it themselves. This prevents the current bridge's older static C++ locale symbols from overriding
+the IBM client's constructors. The current preview JAR bundles the IBM Db2 runtime client and initializes
+it on first native use. Older preview JARs need the runtime prepared once on that host with
+`db2-native-runtime-setup.sh` from the same release. Otherwise it reads from a raw log server
+at `rawLogServerHost` and `rawLogServerPort`; that mode is experimental and not supported for
+production use.
+
+The Cloud image runs its Java process as root so the bundled runtime can register its installation
+and create the private client instance. Its Ubuntu 24.04 base and `libxml2.so.2` dependency are
+included in the image. It preloads shared `libstdc++.so.6` so the bundled bridge's older static C++
+locale symbols do not override the IBM client's constructors and abort Java during library loading.
+The ordinary on-prem image continues to run as UID 10001; native Db2 setup
+there remains the operator's responsibility. The Cloud arm64 image still cannot execute the
+connector's Linux x86_64 native bridge. Image initialization does not certify live Db2 CDC.
+
+Db2 for i (IBM i, formerly AS/400) is accepted as a source-only **preview** under the id
+`db2i`, outside the certified table: no release lane reads a live IBM i system. Snapshot, journal
+capture of inserts, updates and deletes, and continuation across a server restart were verified
+by hand against IBM i 7.4.
+Db2 for i is supported as a source only. Its connector can write, but the server enforces the source-only policy even if
+its catalog row is missing, so a `serve.sync` naming a `db2i` connection is refused on-prem as well as in
+the cloud profile. Reads take a snapshot through the IBM Toolbox for Java JDBC driver and then
+capture inserts, updates and deletes from the journal named by `journalLibraryName` and
+`journalName`; every captured table must be journaled to it. The connection user needs `*USE`
+authority on the data library and its files, on that journal and its attached receiver, and on
+the `DSPJRN` command; `SELECT` on the `QSYS2` catalog views `SYSSCHEMAS`, `SYSTABLES`,
+`SYSCOLUMNS`, `SYSKEYCST`, `SYSINDEXES`, `OBJECT_PRIVILEGES`, `JOURNAL_INFO` and
+`JOURNAL_RECEIVER_INFO`; and `EXECUTE` on `QSYS2.DISPLAY_JOURNAL`. Change capture carries
+neither large-object values nor DDL changes; a snapshot reads large objects in full.
+
+Both image targets use the Ubuntu 24.04 Noble JRE base. Cloud runs can create root-owned files in
+the persistent `/var/lib/tapstate` working volume. Reusing that volume unchanged with an earlier
+UID-10001 Cloud image is not rollback-safe. Stop the cluster before restoring a pre-upgrade working
+volume or preparing its ownership for the earlier image; automatic ownership repair is not provided.
+
+Reads are verified on Oracle Free 23 and SQL Server 2022, and across MySQL, PostgreSQL and
+MongoDB, with snapshot and CDC inserts, updates and deletes.
 Decimal validation includes a persisted MySQL DECIMAL(18,4) model, large values,
 negative fractions and CDC updates. This is not an exhaustive cross-version or
-all-data-type matrix. The default accepted set contains 16 connector ids
-across these five database kinds, including existing managed variants of MySQL,
-PostgreSQL and MongoDB. Those managed variants have not been live-verified individually.
-Other managed variants of Oracle and SQL Server are outside the default accepted set.
+all-data-type matrix. The default accepted set contains 18 connector ids: the Db2 and
+Db2 for i previews, and 16 across these five database kinds, including existing managed variants of MySQL,
+PostgreSQL and MongoDB. Except for `mongodb-atlas`, those managed variants have not been
+live-verified individually. The Atlas connector was verified with snapshot and change-stream
+reads, restart continuation, and target writes against a real Atlas deployment in both cloud
+and on-prem runtimes. This verifies the tested deployment and does not establish an exhaustive
+Atlas version or tier compatibility matrix.
+Other managed variants of Oracle, SQL Server and Db2 are outside the default accepted set.
 
 `tapstate.connectors.also-accept-ids` lets an operator accept additional connector ids
 on this server. Configuring it puts that server outside the supported configuration;
@@ -44,23 +104,41 @@ stored by an older build need schema rediscovery before automatic target creatio
 Missing or inconsistent decimal metadata is refused before writing; computed decimal
 outputs without a declared numeric domain cannot be auto-created safely.
 
-Oracle and SQL Server connector jars are separate assets on the floating
+Oracle, SQL Server, Db2, MongoDB Atlas, and AWS RDS MySQL connector jars are separate assets on the floating
 `connectors-preview` release. They remain outside versioned Tapstate releases and this
 three-database quickstart does not fetch them automatically. An authenticated CLI can
-download and register either one explicitly:
+download and register each one explicitly:
 
 ```
 tapstate register oracle
 tapstate register sqlserver
+tapstate register mongodb-atlas
+tapstate register aws-rds-mysql
+tapstate register db2
 ```
 
+The Db2 for i asset is scheduled for publication after this connector change is merged.
+Until `db2i-connector.jar` appears on that release, register an available local JAR with
+`tapstate register /path/to/db2i-connector.jar`. After publication, `tapstate register db2i`
+downloads and verifies the pinned asset automatically.
+
 The Oracle jar bundles `ojdbc8`, `orai18n`, and `xdb` 21.5.0.0 under the
-Oracle Free Use Terms; the SQL Server jar bundles Microsoft JDBC Driver 12.2.0 under the MIT License.
+Oracle Free Use Terms; the SQL Server jar bundles Microsoft JDBC Driver 12.2.0 under the MIT License;
+the Db2 jar bundles IBM Data Server Driver for JDBC and SQLJ 4.25.13 under
+IBM's International Program License Agreement; the Db2 for i jar bundles IBM Toolbox for Java
+(JTOpen) 21.0.5 under the IBM Public License 1.0; the complete license text is
+`license.html` at the JAR root.
 Those dependency terms govern only the bundled drivers and do not change Tapstate's Apache-2.0
-license. The Oracle and SQL Server implementations are paid connector implementations; their use
+license. The Oracle, SQL Server, Db2 and Db2 for i implementations are paid connector implementations; their use
 remains subject to the applicable Tapdata agreement.
 The upstream enterprise connector repository has no LICENSE file; publishing these binary
 assets does not relicense that source repository.
+
+The `mongodb-atlas` jar carries bundled third-party license and notice texts under `META-INF/`;
+publishing the binary does not grant a license to the upstream connector source repository.
+Publishing and registering the `aws-rds-mysql` jar does not certify snapshot or CDC against a real
+Amazon RDS instance. It bundles MySQL Connector/J 8.0; see the in-JAR license manual and
+[`NOTICE`](../../../NOTICE).
 
 The Oracle Free 23 source example selects `autoLog: false` and uses schema, table
 and column identifiers no longer than 30 characters. The automatic miner requests

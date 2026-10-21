@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.adapters.mongostore.SourceConfigKeyringSession;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import org.slf4j.Logger;
@@ -8,6 +9,7 @@ import org.slf4j.LoggerFactory;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -37,8 +39,10 @@ final class NodeSessionLease implements AutoCloseable {
     private final AtomicReference<WorkloadClaim> current;
     private final Duration ttl;
     private final Runnable lost;
+    private final SourceConfigKeyringSession sourceConfigKeyring;
     private final ScheduledExecutorService renewer;
     private final AtomicBoolean closed = new AtomicBoolean();
+    private final AtomicBoolean firstRenewal = new AtomicBoolean(true);
 
     /** When the lease the last accepted renewal bought runs out, on the monotonic clock. */
     private volatile long provenUntil;
@@ -48,6 +52,7 @@ final class NodeSessionLease implements AutoCloseable {
         this.current = null;
         this.ttl = Duration.ZERO;
         this.lost = () -> { };
+        this.sourceConfigKeyring = null;
         this.renewer = null;
         this.closed.set(true);
     }
@@ -67,10 +72,22 @@ final class NodeSessionLease implements AutoCloseable {
             Duration ttl,
             Duration renewInterval,
             Runnable lost) {
+        this(store, initial, askedAt, ttl, renewInterval, null, lost);
+    }
+
+    NodeSessionLease(
+            WorkloadClaimStore store,
+            WorkloadClaim initial,
+            long askedAt,
+            Duration ttl,
+            Duration renewInterval,
+            SourceConfigKeyringSession sourceConfigKeyring,
+            Runnable lost) {
         this.store = Objects.requireNonNull(store, "store");
         this.current = new AtomicReference<>(Objects.requireNonNull(initial, "initial"));
         this.ttl = Objects.requireNonNull(ttl, "ttl");
         this.lost = Objects.requireNonNull(lost, "lost");
+        this.sourceConfigKeyring = sourceConfigKeyring;
         Objects.requireNonNull(renewInterval, "renewInterval");
         this.provenUntil = askedAt + ttl.toNanos();
         // Two threads: a renewal the store never answers holds one of them, and the lapse still has to be
@@ -80,29 +97,87 @@ final class NodeSessionLease implements AutoCloseable {
             thread.setDaemon(true);
             return thread;
         });
-        renewer.scheduleWithFixedDelay(
-                this::renew, renewInterval.toMillis(), renewInterval.toMillis(), TimeUnit.MILLISECONDS);
-        long lapseCheck = Math.max(1L, Math.min(renewInterval.toMillis(), LAPSE_CHECK.toMillis()));
-        renewer.scheduleWithFixedDelay(this::loseALapsedSession, lapseCheck, lapseCheck, TimeUnit.MILLISECONDS);
+        long adoptedAt = System.nanoTime();
+        LOG.info("Node session maintenance adopted [proof_age_ms={}, proof_remaining_ms={}, ttl_ms={}, renew_interval_ms={}].",
+                TimeUnit.NANOSECONDS.toMillis(adoptedAt - askedAt),
+                TimeUnit.NANOSECONDS.toMillis(provenUntil - adoptedAt), ttl.toMillis(), renewInterval.toMillis());
+        CountDownLatch registered = new CountDownLatch(1);
+        try {
+            renewer.scheduleWithFixedDelay(() -> afterRegistration(registered, this::renew),
+                    0, renewInterval.toMillis(), TimeUnit.MILLISECONDS);
+            long lapseCheck = Math.max(1L, Math.min(renewInterval.toMillis(), LAPSE_CHECK.toMillis()));
+            renewer.scheduleWithFixedDelay(() -> afterRegistration(registered, this::loseALapsedSession),
+                    lapseCheck, lapseCheck, TimeUnit.MILLISECONDS);
+        } catch (RuntimeException | Error setupFailure) {
+            renewer.shutdownNow();
+            throw setupFailure;
+        } finally {
+            // A fast first refusal must not shut down the executor while its other task is being registered.
+            registered.countDown();
+        }
+    }
+
+    private static void afterRegistration(CountDownLatch registered, Runnable action) {
+        try {
+            registered.await();
+        } catch (InterruptedException cancelled) {
+            Thread.currentThread().interrupt();
+            return;
+        }
+        action.run();
     }
 
     private void renew() {
         if (closed.get()) {
             return;
         }
-        WorkloadClaim expected = current.get();
+        long priorProofUntil = provenUntil;
         long askedAt = System.nanoTime();
+        if (!proofRemainsLive(priorProofUntil)) return;
+        WorkloadClaim expected = current.get();
+        boolean first = firstRenewal.compareAndSet(true, false);
+        if (first) {
+            LOG.info("Node session first renewal started [proof_remaining_ms={}].",
+                    TimeUnit.NANOSECONDS.toMillis(provenUntil - askedAt));
+        }
         try {
             Optional<WorkloadClaim> renewed = store.renew(expected, ttl);
+            long storeReturnedAt = System.nanoTime();
+            if (first) {
+                LOG.info("Node session first renewal store returned [elapsed_ms={}, matched={}].",
+                        TimeUnit.NANOSECONDS.toMillis(storeReturnedAt - askedAt), renewed.isPresent());
+            }
             if (renewed.isPresent()) {
-                current.set(renewed.get());
+                // A late store response cannot authorize an ACK after the preceding local proof lapsed.
+                if (!proofRemainsLive(priorProofUntil)) return;
+                WorkloadClaim accepted = renewed.get();
+                if (sourceConfigKeyring != null) sourceConfigKeyring.acknowledge(accepted, ttl);
+                // A late ACK or independent close cannot publish a replacement for an already-lapsed proof.
+                if (!proofRemainsLive(priorProofUntil)) return;
+                current.set(accepted);
                 provenUntil = askedAt + ttl.toNanos();
+                if (first) {
+                    long completedAt = System.nanoTime();
+                    LOG.info("Node session first renewal accepted [ack_ms={}, elapsed_ms={}, proof_remaining_ms={}].",
+                            TimeUnit.NANOSECONDS.toMillis(completedAt - storeReturnedAt),
+                            TimeUnit.NANOSECONDS.toMillis(completedAt - askedAt),
+                            TimeUnit.NANOSECONDS.toMillis(provenUntil - completedAt));
+                }
                 return;
             }
             lose("the stored owner or generation no longer matches", null);
         } catch (RuntimeException unavailable) {
             lose("the coordination store could not renew the node session", unavailable);
         }
+    }
+
+    private boolean proofRemainsLive(long deadline) {
+        if (closed.get()) return false;
+        if (System.nanoTime() - deadline >= 0) {
+            lose("no renewal was accepted within the lease the last one bought", null);
+            return false;
+        }
+        return true;
     }
 
     private void loseALapsedSession() {
@@ -140,10 +215,19 @@ final class NodeSessionLease implements AutoCloseable {
             return;
         }
         renewer.shutdownNow();
+        WorkloadClaim ending = current.get();
         try {
-            store.release(current.get());
+            store.release(ending);
         } catch (RuntimeException unavailable) {
             LOG.warn("Could not release the node session during shutdown; it will expire by lease.", unavailable);
+        }
+        if (sourceConfigKeyring != null) {
+            try {
+                sourceConfigKeyring.release(ending);
+            } catch (RuntimeException unavailable) {
+                LOG.warn("Could not release the Source config keyring acknowledgement; it will expire by lease.",
+                        unavailable);
+            }
         }
     }
 }

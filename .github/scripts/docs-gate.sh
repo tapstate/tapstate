@@ -72,6 +72,8 @@ if [ -n "$list_open" ] && ! : > "$list_open"; then
 fi
 
 here="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=.github/scripts/_pr-read.sh
+. "$here/_pr-read.sh"
 docs_repo="${DOCS_FOLLOWUP_REPO:-tapstate/docs}"
 
 git rev-parse -q --verify "${base}^{commit}" >/dev/null 2>&1 || {
@@ -90,9 +92,11 @@ fail=0
 seen=0
 carried=0
 for n in $numbers; do
-  # A number in a commit subject can be an issue, or another repository's pull request. Being
-  # refused is the answer; it is not this gate's business and never was.
-  pr="$(gh pr view "$n" --json body,labels,author,url 2>/dev/null)" || continue
+  if ! pr="$(read_pr "$n" --json body,labels,author,url)"; then
+    # The post-release report remains best-effort; the failed read has been reported above.
+    [ "$report_only" = 1 ] && continue
+    exit 1
+  fi
   [ -n "$pr" ] || continue
   seen=$((seen + 1))
 

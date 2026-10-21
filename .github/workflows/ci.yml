@@ -76,6 +76,32 @@ jobs:
         run: .github/scripts/ci-maven-cache.sh seed "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
       - name: Build the reactor without running tests
         run: mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipTests install
+      - name: Prepare pinned public inputs for Cloud startup witnesses
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          needs_cloud_release=false
+          if [ "$SHARD" = rest ]; then
+            needs_cloud_release=true
+          else
+            needs_cloud_release="$(python3 - "$RUNNER_TEMP/shards.json" "$SHARD" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as source:
+              plan = json.load(source)
+          shard = next((item for item in plan["shards"] if item["id"] == sys.argv[2]), None)
+          if shard is None:
+              raise SystemExit("unknown test shard")
+          cloud_context_test = "io.tapstate.e2e.CloudClusterContextCarriesTheCurrentEgressAddressIT"
+          print("true" if any(test["class"] == cloud_context_test for test in shard["tests"]) else "false")
+          PY
+          )"
+          fi
+          if [ "$needs_cloud_release" = true ]; then
+            python3 deploy/cloud/prepare-test-inputs.py --output "$RUNNER_TEMP/cloud-test-release"
+            echo "TAPSTATE_TEST_CLOUD_RELEASE_DIR=$RUNNER_TEMP/cloud-test-release" >> "$GITHUB_ENV"
+          fi
       - name: Execute exactly this shard
         env:
           SHARD: ${{ matrix.shard }}
@@ -373,12 +399,16 @@ jobs:
           shellcheck -s sh deploy/quickstart/quickstart.sh
           shellcheck deploy/quickstart/quickstart-smoke.sh install/_event-sink.sh
           shellcheck deploy/quickstart/quickstart-smoke-test.sh
-          shellcheck deploy/docker/image-smoke.sh
+          shellcheck deploy/docker/image-smoke.sh deploy/docker/image-smoke-test.sh deploy/docker/image-smoke-fixture-test.sh
           shellcheck deploy/docker/dockerfile-smoke.sh
           shellcheck deploy/docker/dockerfile-smoke-test.sh
           shellcheck scripts/prepare-web-assets.sh
+          shellcheck scripts/build-web-assets.sh
           shellcheck scripts/prepare-web-assets-smoke.sh
+          shellcheck deploy/cloud/ghcr-publish.sh deploy/cloud/ghcr-publish-smoke.sh
+          shellcheck deploy/cloud/cloud-image-smoke.sh
           python3 -m py_compile .github/scripts/web-provenance.py .github/scripts/web-provenance-smoke.py
+          python3 -m py_compile scripts/web-assets-profile.py scripts/web-assets-profile-smoke.py
           shellcheck -s sh deploy/install-site/assemble.sh
           shellcheck -s sh deploy/install-site/verify-published.sh
           shellcheck deploy/install-site/verify-smoke.sh
@@ -398,10 +428,28 @@ jobs:
         run: bash deploy/quickstart/quickstart-smoke-test.sh
       - name: Dockerfile smoke verdict tests
         run: bash deploy/docker/dockerfile-smoke-test.sh
+      - name: Image smoke fixture diagnostics tests
+        run: |
+          bash deploy/docker/image-smoke-test.sh
+          bash deploy/docker/image-smoke-fixture-test.sh
       - name: Web asset packaging cases
         run: bash scripts/prepare-web-assets-smoke.sh
       - name: Web release provenance cases
         run: python3 .github/scripts/web-provenance-smoke.py
+      - name: Cloud connector input and test-preparation cases
+        run: python3 deploy/cloud/stage-connectors-test.py
+      - name: Cloud image runtime helper cases
+        run: |
+          node --test deploy/cloud/image-runtime-probe.test.mjs
+          PYTHONDONTWRITEBYTECODE=1 python3 deploy/cloud/image-runtime-metadata-test.py
+      - name: Public Cloud GHCR publisher cases
+        run: bash deploy/cloud/ghcr-publish-smoke.sh
+      - name: Authenticated Cloud artifact cases
+        run: node --test scripts/seal-cloud-artifact.test.mjs
+      - name: Cloud release registration cases
+        run: node --test scripts/notify-cloud-release.test.mjs
+      - name: Cloud dev version notification cases
+        run: node --test scripts/notify-cloud-dev.test.mjs
       - name: install-site verifier smoke
         run: bash deploy/install-site/verify-smoke.sh
 
@@ -439,7 +487,7 @@ jobs:
         # checked - which reads as "the rest were clean". The installer job above lost three scripts
         # that way for three sessions. Checked against 0.9.0, which is what the runner's apt ships and
         # is stricter here than a current local build.
-        run: shellcheck scripts/refresh-catalog.sh scripts/refresh-catalog-smoke.sh scripts/build-real-connectors.sh scripts/build-real-connectors-smoke.sh .github/scripts/catalog-age-days.sh .github/scripts/catalog-age-days-smoke.sh .github/scripts/diff-coverage.sh .github/scripts/diff-coverage-smoke.sh .github/scripts/translate-intake.sh .github/scripts/translate-intake-smoke.sh .github/scripts/fork-sonar-smoke.sh .github/scripts/issue-templates-smoke.sh .github/scripts/latest-release-tag.sh .github/scripts/latest-release-tag-smoke.sh .github/scripts/set-version.sh .github/scripts/set-version-smoke.sh .github/scripts/next-version.sh .github/scripts/next-version-smoke.sh .github/scripts/release-manifest.sh .github/scripts/release-manifest-smoke.sh .github/scripts/site-from-tag.sh .github/scripts/site-from-tag-smoke.sh .github/scripts/changeset-parity.sh .github/scripts/changeset-parity-smoke.sh .github/scripts/_pr-section.sh .github/scripts/docs-impact.sh .github/scripts/checks-on-commit.sh .github/scripts/checks-on-commit-smoke.sh .github/scripts/docs-gate.sh .github/scripts/docs-gate-smoke.sh .github/scripts/release-notes.sh .github/scripts/release-notes-smoke.sh .github/scripts/release-shape-smoke.sh .github/scripts/quickstart-live-shape-smoke.sh .github/scripts/roadmap-shipped.sh .github/scripts/roadmap-shipped-smoke.sh .github/scripts/satellites.sh .github/scripts/satellites-smoke.sh .github/scripts/docs-release.sh .github/scripts/docs-release-smoke.sh .github/scripts/ci-timing.sh .github/scripts/ci-timing-smoke.sh .github/scripts/ci-shard.sh .github/scripts/ci-shard-smoke.sh .github/scripts/ci-aggregate.sh .github/scripts/ci-aggregate-smoke.sh .github/scripts/ci-shape-smoke.sh .github/scripts/ci-maven-cache.sh .github/scripts/ci-maven-cache-smoke.sh .github/scripts/sonar-inputs.sh .github/scripts/sonar-inputs-smoke.sh .github/scripts/sonar-workflow-smoke.sh .github/scripts/connector-witnesses.sh .github/scripts/connector-witnesses-smoke.sh .github/scripts/connector-cache.sh .github/scripts/connector-cache-smoke.sh .github/scripts/connector-workflow-smoke.sh .github/scripts/one-verify.sh .github/scripts/one-verify-smoke.sh .github/scripts/sonar-cache-key.sh .github/scripts/sonar-cache-smoke.sh .github/scripts/nightly-upgrade-expiry-smoke.sh
+        run: shellcheck scripts/refresh-catalog.sh scripts/refresh-catalog-smoke.sh scripts/build-real-connectors.sh scripts/build-real-connectors-smoke.sh .github/scripts/catalog-age-days.sh .github/scripts/catalog-age-days-smoke.sh .github/scripts/diff-coverage.sh .github/scripts/diff-coverage-smoke.sh .github/scripts/translate-intake.sh .github/scripts/translate-intake-smoke.sh .github/scripts/fork-sonar-smoke.sh .github/scripts/issue-templates-smoke.sh .github/scripts/latest-release-tag.sh .github/scripts/latest-release-tag-smoke.sh .github/scripts/set-version.sh .github/scripts/set-version-smoke.sh .github/scripts/next-version.sh .github/scripts/next-version-smoke.sh .github/scripts/release-manifest.sh .github/scripts/release-manifest-smoke.sh .github/scripts/site-from-tag.sh .github/scripts/site-from-tag-smoke.sh .github/scripts/changeset-parity.sh .github/scripts/changeset-parity-smoke.sh .github/scripts/_pr-read.sh .github/scripts/_pr-read-smoke.sh .github/scripts/release-notes-read-failure-smoke.sh .github/scripts/_pr-section.sh .github/scripts/docs-impact.sh .github/scripts/checks-on-commit.sh .github/scripts/checks-on-commit-smoke.sh .github/scripts/docs-gate.sh .github/scripts/docs-gate-smoke.sh .github/scripts/release-notes.sh .github/scripts/release-notes-smoke.sh .github/scripts/release-shape-smoke.sh .github/scripts/quickstart-live-shape-smoke.sh .github/scripts/roadmap-shipped.sh .github/scripts/roadmap-shipped-smoke.sh .github/scripts/satellites.sh .github/scripts/satellites-smoke.sh .github/scripts/docs-release.sh .github/scripts/docs-release-smoke.sh .github/scripts/ci-timing.sh .github/scripts/ci-timing-smoke.sh .github/scripts/ci-shard.sh .github/scripts/ci-shard-smoke.sh .github/scripts/ci-aggregate.sh .github/scripts/ci-aggregate-smoke.sh .github/scripts/ci-shape-smoke.sh .github/scripts/ci-maven-cache.sh .github/scripts/ci-maven-cache-smoke.sh .github/scripts/sonar-inputs.sh .github/scripts/sonar-inputs-smoke.sh .github/scripts/sonar-workflow-smoke.sh .github/scripts/connector-witnesses.sh .github/scripts/connector-witnesses-smoke.sh .github/scripts/connector-cache.sh .github/scripts/connector-cache-smoke.sh .github/scripts/connector-workflow-smoke.sh .github/scripts/one-verify.sh .github/scripts/one-verify-smoke.sh .github/scripts/sonar-cache-key.sh .github/scripts/sonar-cache-smoke.sh .github/scripts/nightly-upgrade-expiry-smoke.sh
       - name: One automatic full test suite
         run: bash .github/scripts/one-verify.sh
       - name: Full test invocation cases
@@ -462,6 +510,8 @@ jobs:
         run: bash .github/scripts/ci-timing-smoke.sh
       - name: refresh driver cases
         run: bash scripts/refresh-catalog-smoke.sh
+      - name: catalog refresh publication credential case
+        run: python3 .github/scripts/catalog-refresh-push-auth-test.py
       - name: connector build cases
         run: bash scripts/build-real-connectors-smoke.sh
       - name: catalog age cases
@@ -510,7 +560,10 @@ jobs:
       - name: The documentation gate still tells "nobody answered" from "answered none"
         run: bash .github/scripts/docs-gate-smoke.sh
       - name: The release notes still assemble the way they are supposed to
-        run: bash .github/scripts/release-notes-smoke.sh
+        run: |
+          bash .github/scripts/_pr-read-smoke.sh
+          bash .github/scripts/release-notes-smoke.sh
+          bash .github/scripts/release-notes-read-failure-smoke.sh
       # The satellites are three repositories this one cannot see the inside of, so what is testable
       # here is which of them would be touched and with what ref -- and that is exactly the half whose
       # failure is silent: a satellite dropped from the list is never tagged and nothing reports it.

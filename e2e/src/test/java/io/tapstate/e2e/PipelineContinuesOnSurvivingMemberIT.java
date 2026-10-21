@@ -17,6 +17,8 @@ import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.List;
+import java.util.Optional;
+import java.util.function.Supplier;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -131,9 +133,7 @@ class PipelineContinuesOnSurvivingMemberIT {
                                 + survivor.state(PIPELINE) + " and its captures are owned by "
                                 + survivor.captureOwnersOf(PIPELINE).values());
 
-                assertThat(survivor.state(PIPELINE))
-                        .describedAs("the pipeline is running again, and nobody asked it to be")
-                        .contains(PipelineState.RUNNING);
+                assertRunningAgain(() -> survivor.state(PIPELINE));
                 String stillHere = TwoMemberCluster.NODE_A.equals(driver)
                         ? TwoMemberCluster.NODE_B
                         : TwoMemberCluster.NODE_A;
@@ -147,7 +147,8 @@ class PipelineContinuesOnSurvivingMemberIT {
                                 + "rebuild that kept going would also leave this higher, and a pipeline "
                                 + "rebuilt three times before it caught is not a recovered one")
                         .contains(generationBefore + 1);
-                TableSnapshot completedLoad = new TableSnapshot(SEEDED_ROWS, SEEDED_ROWS, 100);
+                // Landed as well as complete: the load the dead run confirmed is one its target durably holds.
+                TableSnapshot completedLoad = new TableSnapshot(SEEDED_ROWS, SEEDED_ROWS, 100, true);
                 Await.until("the replacement observation to retain the confirmed load without rereading it",
                         Duration.ofSeconds(30),
                         () -> Long.valueOf(0L).equals(survivor.snapshotRowsRead(PIPELINE).get(TABLE))
@@ -162,6 +163,13 @@ class PipelineContinuesOnSurvivingMemberIT {
                         .containsEntry(TABLE, 0L);
             }
         }
+    }
+
+    /** A rebuilt run can deliver its first row before its RUNNING observation is published. */
+    static void assertRunningAgain(Supplier<Optional<PipelineState>> state) {
+        Await.until("the pipeline is running again, and nobody asked it to be", TAKEOVER,
+                () -> state.get().filter(PipelineState.RUNNING::equals).isPresent(),
+                () -> String.valueOf(state.get()));
     }
 
     private static boolean loadCompleted(MongoClient client, String storeUri) {

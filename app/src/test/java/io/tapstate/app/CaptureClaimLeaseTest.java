@@ -20,10 +20,76 @@ import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 class CaptureClaimLeaseTest {
+
+    @Test
+    void aRetiredLeaseRefusesAttachmentsAndCannotRenewItsReleasedClaim() {
+        InMemoryWorkloadClaimStore raw = new InMemoryWorkloadClaimStore();
+        ClusterMembershipGate gate = eligibleGate();
+        CaptureOwnership ownership = new CaptureOwnership("cluster-a", new WorkloadOwner("node-a", "boot-a"),
+                gate, new ClusterWorkloadClaims(raw, gate), Duration.ofSeconds(30));
+        CaptureOwnership.Permit permit = ownership.acquire(CAPTURE);
+        AtomicInteger stopped = new AtomicInteger();
+        AtomicBoolean reserved = new AtomicBoolean();
+        CaptureClaimLease lease = new CaptureClaimLease(ownership, permit.claim(), Duration.ofHours(1),
+                stopped::incrementAndGet);
+        try {
+            lease.whileNeeded(() -> false);
+            lease.renew();
+
+            assertThat(raw.read(permit.claim().key()).orElseThrow().leased()).isFalse();
+            assertThat(lease.retain(() -> reserved.set(true))).isFalse();
+            assertThat(reserved).as("a retired tail cannot reserve a new attachment").isFalse();
+            lease.whileNeeded(() -> true);
+            lease.renew();
+            assertThat(raw.read(permit.claim().key()).orElseThrow().leased())
+                    .as("a later ownership observation cannot revive a retired lease").isFalse();
+            assertThat(stopped).hasValue(1);
+        } finally {
+            lease.close();
+        }
+    }
+
+    @Test
+    void anUnfencedTailCanReserveAttachmentsWithoutAClusterLease() {
+        CaptureClaimLease lease = CaptureClaimLease.unfenced();
+        AtomicBoolean reserved = new AtomicBoolean();
+
+        assertThat(lease.retain(() -> reserved.set(true))).isTrue();
+        assertThat(reserved).isTrue();
+        lease.close();
+    }
+
+    @Test
+    void anAttachmentThatPreventsRetirementStillGetsTheRenewalDueOnThatPass() {
+        InMemoryWorkloadClaimStore raw = new InMemoryWorkloadClaimStore();
+        ClusterMembershipGate gate = eligibleGate();
+        Duration ttl = Duration.ofSeconds(15);
+        CaptureOwnership ownership = new CaptureOwnership("cluster-a", new WorkloadOwner("node-a", "boot-a"),
+                gate, new ClusterWorkloadClaims(raw, gate), ttl);
+        CaptureOwnership.Permit permit = ownership.acquire(CAPTURE);
+        AtomicBoolean lost = new AtomicBoolean();
+        CaptureClaimLease lease = new CaptureClaimLease(ownership, permit.claim(), Duration.ofHours(1),
+                () -> lost.set(true));
+        AtomicInteger looks = new AtomicInteger();
+        // A driven attachment reserves the tail between the first look and the retirement's locked recheck.
+        lease.whileNeeded(() -> looks.incrementAndGet() > 1);
+        try {
+            raw.elapse(Duration.ofSeconds(10));
+            lease.renew();
+            raw.elapse(Duration.ofSeconds(10));
+
+            assertThat(raw.read(permit.claim().key()).orElseThrow().leased())
+                    .as("declining retirement must still renew before the next interval passes the old TTL").isTrue();
+            assertThat(lost).isFalse();
+        } finally {
+            lease.close();
+        }
+    }
 
     @Test
     void aRenewalThatNoLongerMatchesStopsTheCaptureWithoutReleasingTheNewOwner() {
@@ -43,6 +109,30 @@ class CaptureClaimLeaseTest {
 
         assertThat(lost).isTrue();
         assertThat(raw.releases).as("a fenced holder must not release a claim it no longer owns").isZero();
+    }
+
+    /**
+     * A claim is renewed from the moment it is taken, before the capture it guards is open, so it can be lost
+     * before there is anything to stop. That loss is not dropped: binding the stop answers it at once, since
+     * the capture was opened over a claim somebody else may hold now.
+     */
+    @Test
+    void aClaimLostBeforeItsCaptureIsOpenStopsTheCaptureAsSoonAsItIsBound() {
+        RefusingRenewals raw = new RefusingRenewals();
+        ClusterMembershipGate gate = eligibleGate();
+        CaptureOwnership ownership = new CaptureOwnership(
+                "cluster-a", new WorkloadOwner("node-a", "boot-a"), gate,
+                new ClusterWorkloadClaims(raw, gate), Duration.ofSeconds(30));
+        CaptureOwnership.Permit permit = ownership.acquire(CAPTURE);
+        CaptureClaimLease lease = new CaptureClaimLease(ownership, permit.claim(), Duration.ofHours(1));
+
+        lease.renew();
+        AtomicBoolean lost = new AtomicBoolean();
+        lease.onLost(() -> lost.set(true));
+        lease.close();
+
+        assertThat(lost).as("the capture opened meanwhile is stopped once there is one to stop").isTrue();
+        assertThat(raw.releases).as("and a claim this member no longer owns is not released").isZero();
     }
 
     /**

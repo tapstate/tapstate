@@ -19,11 +19,15 @@ import io.tapdata.pdk.apis.entity.WriteListResult;
 import io.tapdata.pdk.apis.functions.connector.target.WriteRecordFunction;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * A write session over one sink connector, opened once and held across batches. Each write encodes the
@@ -50,7 +54,18 @@ final class PdkSinkWriter implements SinkWriter {
     private final DdlPolicy ddl;
     private final Map<String, TargetTable> targets;
     private final PdkTargetPreparation preparation;
+    // What closing this writer does to its connector: stops and closes it, or - where the connector is shared
+    // by the writers of one sink - lets go of this writer's hold on it.
+    private final Runnable letGo;
     private final Map<String, TapTable> tableModels = new LinkedHashMap<>();
+    // Blocking connector calls must leave the shared async pool available for engine lifecycle callbacks.
+    private final ExecutorService writes = Executors.newSingleThreadExecutor(task -> {
+        Thread thread = new Thread(task, "tapstate-sink-write");
+        thread.setDaemon(true);
+        return thread;
+    });
+    private final Object lifecycle = new Object();
+    private final Set<CompletableFuture<WriteResult>> pending = new HashSet<>();
     private boolean closed;
 
     PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, WriteMode mode, DdlPolicy ddl, TargetTable target) {
@@ -72,13 +87,37 @@ final class PdkSinkWriter implements SinkWriter {
 
     PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, SinkConfig config,
             Map<String, TargetTable> targets, KeyedStateStore stateStore) {
+        this(connector, write, config, targets, stateStore, false);
+    }
+
+    /** As above, and where {@code preparedAhead}, a writer of tables prepared already, which prepares nothing. */
+    PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, SinkConfig config,
+            Map<String, TargetTable> targets, KeyedStateStore stateStore, boolean preparedAhead) {
+        this(connector, write, config, targets, stateStore, preparedAhead, null);
+    }
+
+    /**
+     * As above, over a connector other writers share, which closing this one lets go of through {@code letGo}
+     * rather than stopping; null for a connector of this writer's own.
+     */
+    PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, SinkConfig config,
+            Map<String, TargetTable> targets, KeyedStateStore stateStore, boolean preparedAhead, Runnable letGo) {
         this(connector, write, config.writeMode(), config.ddl(), targets,
-                new PdkTargetPreparation(connector.connectorId(), connector.context(), connector.functions(), config.onFullLoad(),
-                        config.fullLoad(), config.node(), stateStore));
+                new PdkTargetPreparation(connector.connectorId(), connector.context(), connector.functions(),
+                        config.onFullLoad(), config.fullLoad(), config.node(), stateStore, preparedAhead), letGo);
     }
 
     private PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, WriteMode mode, DdlPolicy ddl,
             Map<String, TargetTable> targets, PdkTargetPreparation preparation) {
+        this(connector, write, mode, ddl, targets, preparation, null);
+    }
+
+    private PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, WriteMode mode, DdlPolicy ddl,
+            Map<String, TargetTable> targets, PdkTargetPreparation preparation, Runnable letGo) {
+        this.letGo = letGo != null ? letGo : () -> {
+            connector.stopQuietly();
+            connector.close();
+        };
         this.connector = connector;
         this.write = write;
         this.mode = mode;
@@ -112,7 +151,21 @@ final class PdkSinkWriter implements SinkWriter {
 
     @Override
     public CompletionStage<WriteResult> write(List<Envelope> records) {
-        return CompletableFuture.supplyAsync(() -> deliver(records));
+        synchronized (lifecycle) {
+            if (closed) {
+                throw new IllegalStateException("write called after the sink writer was closed");
+            }
+            // A cancelled stage releases the caller's batch even while its interrupted callback unwinds.
+            List<Envelope> batch = List.copyOf(records);
+            CompletableFuture<WriteResult> result = CompletableFuture.supplyAsync(() -> deliver(batch), writes);
+            pending.add(result);
+            result.whenComplete((accepted, failure) -> {
+                synchronized (lifecycle) {
+                    pending.remove(result);
+                }
+            });
+            return result;
+        }
     }
 
     private synchronized WriteResult deliver(List<Envelope> records) {
@@ -191,11 +244,22 @@ final class PdkSinkWriter implements SinkWriter {
 
     @Override
     public void close() {
-        if (closed) {
-            return;
+        List<CompletableFuture<WriteResult>> abandoned;
+        synchronized (lifecycle) {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            abandoned = List.copyOf(pending);
         }
-        closed = true;
-        connector.stopQuietly();
-        connector.close();
+        // Completion handlers may wait for the active callback to exit, so interrupt it first.
+        writes.shutdownNow();
+        try {
+            letGo.run();
+        } finally {
+            // Release the connector before notifying handlers; a blocked call may need that release to exit.
+            // Tasks removed from the executor's queue still owe a result even when connector cleanup fails.
+            abandoned.forEach(result -> result.cancel(false));
+        }
     }
 }

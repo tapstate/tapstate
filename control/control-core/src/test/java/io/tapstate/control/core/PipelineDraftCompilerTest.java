@@ -149,6 +149,41 @@ class PipelineDraftCompilerTest {
     }
 
     @Test
+    void compilesWizardJavaScriptAndUnwindAcrossBranchAndPipelineSteps() {
+        PipelineDraft template = wizardDraft();
+        String script = "function process(record, ctx) { return record; }";
+        PipelineDraft.Root root = new PipelineDraft.Root("orders", "crm", "orders", List.of("id"),
+                List.of(new PipelineDraft.Transform("normalize", "js", Map.of("script", script))));
+        PipelineDraft draft = withWizard(template, root, List.of(),
+                List.of(new PipelineDraft.Transform("expand-items", "unwind", Map.of(
+                        "path", "items", "include_array_index", "item_index",
+                        "preserve_null_and_empty_arrays", true, "element_key", "item_id"))),
+                template.wizard().output());
+
+        PipelineResource compiled = compiler.compile(draft);
+
+        assertThat(compiled.transforms()).extracting(Step::id).containsExactly("orders__pre", "expand-items");
+        assertThat(((Step.Inline) compiled.transforms().get(0)).body()).isEqualTo(new TransformBody.Js(script));
+        assertThat(((Step.Inline) compiled.transforms().get(1)).body()).isEqualTo(
+                new TransformBody.Unwind("items", "item_index", true, "item_id", null));
+        assertThat(new CanonicalWriter().write(new DslParser().parse(new CanonicalWriter().write(compiled))))
+                .isEqualTo(new CanonicalWriter().write(compiled));
+    }
+
+    @Test
+    void rejectsIncompleteWizardJavaScriptAndUnwindBeforePublication() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Root root = template.wizard().root();
+
+        assertCompileFails(withWizard(template, root, List.of(),
+                List.of(new PipelineDraft.Transform("script", "js", Map.of("script", " "))),
+                template.wizard().output()), "script");
+        assertCompileFails(withWizard(template, root, List.of(),
+                List.of(new PipelineDraft.Transform("expand", "unwind", Map.of("path", " "))),
+                template.wizard().output()), "path");
+    }
+
+    @Test
     void compilesComputedMapValuesAsDslExpressionsInsteadOfLiterals() {
         PipelineDraft template = wizardDraft();
         PipelineDraft draft = withWizard(template, template.wizard().root(), List.of(),

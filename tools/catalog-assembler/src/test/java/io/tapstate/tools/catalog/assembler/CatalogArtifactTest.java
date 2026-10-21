@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.EnumMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -79,6 +80,14 @@ class CatalogArtifactTest {
                 .toList();
         Files.writeString(Path.of(fetchList),
                 String.join("\n", SpecPathEnumerator.specPathsToFetch(TapstateCatalog.load().all(), upstream)));
+        String enterprisePaths = System.getProperty("tapstate.catalog.upstream-paths.enterprise");
+        if (enterprisePaths != null) {
+            List<String> paths = Files.readAllLines(Path.of(enterprisePaths)).stream()
+                    .map(String::strip).filter(line -> !line.isEmpty()).toList();
+            Files.writeString(Path.of(requireProperty("tapstate.catalog.fetch-list.enterprise")),
+                    String.join("\n", SpecPathEnumerator.specPathsToFetch(
+                            TapstateCatalog.load().all(), paths, SpecRepository.ENTERPRISE)));
+        }
     }
 
     @Test
@@ -96,8 +105,31 @@ class CatalogArtifactTest {
                     "-Dtapstate.catalog.drift-pr-open must be true or false, not " + pullRequestAlreadyOpen);
         }
 
+        Map<SpecRepository, Map<String, String>> repositories = new EnumMap<>(SpecRepository.class);
+        repositories.put(SpecRepository.OSS,
+                fetchedSpecs(fetched, Path.of(requireProperty("tapstate.catalog.fetch-list"))));
+        String enterprise = System.getProperty("tapstate.catalog.fetched.enterprise");
+        if (enterprise != null) {
+            repositories.put(SpecRepository.ENTERPRISE, fetchedSpecs(Path.of(enterprise),
+                    Path.of(requireProperty("tapstate.catalog.fetch-list.enterprise"))));
+        }
+        SpecDrift.Report drift = SpecDrift.compareRepositories(TapstateCatalog.load().all(), repositories);
+        DriftTriage.Decision decision =
+                DriftTriage.decide(drift.allIds(), ageDays, pullRequestAlreadyOpen.equals("true"));
+        Files.writeString(Path.of(reportPath), String.join("\n",
+                "decision=" + decision,
+                "changed=" + String.join(" ", drift.changedIds()),
+                "vanished=" + String.join(" ", drift.vanishedIds()),
+                "new_connectors=" + String.join(" ", drift.newConnectorIds()),
+                "pr_already_open=" + pullRequestAlreadyOpen) + "\n");
+    }
+
+    private static Map<String, String> fetchedSpecs(Path fetched, Path fetchList) throws IOException {
+        if (!Files.isDirectory(fetched)) {
+            throw new IllegalStateException("fetched specifications checkout is absent: " + fetched);
+        }
         Map<String, String> fetchedByPath = new LinkedHashMap<>();
-        for (String path : Files.readAllLines(Path.of(requireProperty("tapstate.catalog.fetch-list")))) {
+        for (String path : Files.readAllLines(fetchList)) {
             String relative = path.strip();
             if (relative.isEmpty()) {
                 continue;
@@ -110,15 +142,7 @@ class CatalogArtifactTest {
             }
         }
 
-        SpecDrift.Report drift = SpecDrift.compare(TapstateCatalog.load().all(), fetchedByPath);
-        DriftTriage.Decision decision =
-                DriftTriage.decide(drift.allIds(), ageDays, pullRequestAlreadyOpen.equals("true"));
-        Files.writeString(Path.of(reportPath), String.join("\n",
-                "decision=" + decision,
-                "changed=" + String.join(" ", drift.changedIds()),
-                "vanished=" + String.join(" ", drift.vanishedIds()),
-                "new_connectors=" + String.join(" ", drift.newConnectorIds()),
-                "pr_already_open=" + pullRequestAlreadyOpen) + "\n");
+        return fetchedByPath;
     }
 
     /** A property this step cannot proceed without — absent means the caller is wired wrong. */

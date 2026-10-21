@@ -1,11 +1,13 @@
 package io.tapstate.app;
 
 import com.hazelcast.cluster.Member;
+import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.splitbrainprotection.SplitBrainProtectionFunction;
 import io.tapstate.spi.store.ClusterMembership;
 
 import java.util.Collection;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
@@ -37,6 +39,40 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
     ClusterMembershipGate(ClusterProperties properties) {
         this.profile = properties.getProfile();
         this.bootstrapMinMembers = properties.getBootstrapMinMembers();
+    }
+
+    /** A member by the stable id it joined under, or by its engine identity where it names none. */
+    static String stableIdOf(Member member) {
+        String nodeId = member.getAttribute(NODE_ID_ATTRIBUTE);
+        return nodeId != null ? nodeId : member.getUuid().toString();
+    }
+
+    /**
+     * The members of {@code member}'s cluster a run submitted now would take part on, by stable id and in order:
+     * every member that holds data, which in this product is every member - none joins as a lite member.
+     */
+    static List<String> dataMembers(HazelcastInstance member) {
+        return member.getCluster().getMembers().stream()
+                .filter(candidate -> !candidate.isLiteMember())
+                .map(ClusterMembershipGate::stableIdOf)
+                .sorted()
+                .toList();
+    }
+
+    /**
+     * {@link #dataMembers}, or none while {@code member}'s engine cannot be asked - down, or its cluster changing under
+     * the read. For the read faces, which leave out what only a running engine knows rather than failing the part of
+     * their answer the store holds; a run being planned asks {@link #dataMembers}, and fails with it.
+     */
+    static List<String> dataMembersIfReadable(HazelcastInstance member) {
+        try {
+            return dataMembers(member);
+        } catch (RuntimeException failed) {
+            if (!HazelcastLivePipelineRuns.theClusterIsChanging(failed)) {
+                throw failed;
+            }
+            return List.of();
+        }
     }
 
     @Override

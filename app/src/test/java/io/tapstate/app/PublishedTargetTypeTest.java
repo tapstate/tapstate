@@ -2,8 +2,14 @@ package io.tapstate.app;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.tapstate.core.common.NumericType;
+import io.tapstate.core.common.TapstateType;
+import io.tapstate.core.dsl.RowExpressions;
+import io.tapstate.core.model.FieldRule;
+import io.tapstate.core.model.TransformBody;
 import io.tapstate.spi.sink.TargetField;
 import io.tapstate.spi.sink.TargetTable;
+import java.math.BigDecimal;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -16,6 +22,38 @@ import org.junit.jupiter.api.Test;
  * and field attributes travel separately to the target connector's type mapping.
  */
 class PublishedTargetTypeTest {
+
+    @Test
+    void anAcceptedDecimalChoiceKeepsTheDescriptorItsTargetNeeds() {
+        String expression = "has(after.a) ? after.a : after.b";
+        Map<String, TapstateType> columns = Map.of("a", TapstateType.DECIMAL, "b", TapstateType.DECIMAL);
+        NumericType number = new NumericType(null, true, null, null,
+                new BigDecimal("-99999999.99"), new BigDecimal("99999999.99"), 10, 2);
+        NodeColumns source = shared("a", "DECIMAL NULL", "b", "DECIMAL NULL")
+                .withNumericTypes(Map.of("a", number, "b", number));
+        TargetTable base = new TargetTable("orders", List.of(
+                new TargetField("a", "decimal(10,2)", false, TapstateType.DECIMAL, number),
+                new TargetField("b", "decimal(10,2)", false, TapstateType.DECIMAL, number)));
+
+        assertThat(RowExpressions.valueAst(expression)).as("a valid row expression").isNotNull();
+        // Refusing this choice at apply is also valid; accepting it obliges the target to build it.
+        if (RowExpressions.typedValueError(expression, columns) != null) {
+            return;
+        }
+        assertThat(RowExpressions.typedValueType(expression, columns)).isEqualTo(TapstateType.DECIMAL);
+
+        NodeColumns projected = NodeColumns.of(new TransformBody.MapProjection(
+                Map.of("chosen", FieldRule.computed(expression))), Map.of("in", source), null);
+        TargetTable target = StoreBackedDagSource.publishedAs(base, projected, source);
+
+        assertThat(target.fields()).filteredOn(field -> field.name().equals("chosen"))
+                .singleElement().satisfies(field -> {
+                    assertThat(field.inferredType()).isEqualTo(TapstateType.DECIMAL);
+                    assertThat(field.numericType())
+                            .as("an accepted decimal choice needs declared precision, scale and bounds at its target")
+                            .isEqualTo(number);
+                });
+    }
 
     @Test
     void expansionPublishesParentMetadataAndTheElementsPortableTypeTogether() {

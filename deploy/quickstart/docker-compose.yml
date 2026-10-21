@@ -1,7 +1,7 @@
 # Tapstate quickstart stack: the server and its state store, ready to run without a build.
 #
-# This is a single-node local demo, not a deployment topology. The server keeps pipeline position in
-# memory, so a restart replays rather than resumes.
+# This demo runs a single member. MongoDB persists control-plane state and recovery positions.
+# Restart recovery depends on the connector, read mode and retained source history; see the online quickstart.
 #
 # The store service is deliberately defined exactly as the development-only store stack defines it,
 # down to the advertised member address. The two differ only in how the *client* addresses the set
@@ -122,7 +122,7 @@ services:
     # tree adds the build back through docker-compose.dev.yml, which only exists inside the repository.
     # The tag is pinned rather than floating, so a demo brought up months apart runs the same server
     # both times; the quickstart smoke fails the build if it drifts from the version being built.
-    image: ghcr.io/tapstate/tapstate:0.6.0
+    image: ghcr.io/tapstate/tapstate:0.7.0
     depends_on:
       mongo:
         condition: service_healthy

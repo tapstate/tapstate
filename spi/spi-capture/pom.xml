@@ -32,6 +32,14 @@
       <version>${revision}</version>
     </dependency>
 
+    <!-- The coded refusal a release answers with when the source keeps what it had (rule R2: core
+         only). -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-common</artifactId>
+      <version>${revision}</version>
+    </dependency>
+
     <dependency>
       <groupId>org.junit.jupiter</groupId>
       <artifactId>junit-jupiter</artifactId>

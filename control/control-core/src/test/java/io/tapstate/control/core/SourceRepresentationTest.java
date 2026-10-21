@@ -45,6 +45,38 @@ class SourceRepresentationTest {
     }
 
     @Test
+    void carriesHowTheSourceIsReadBothWays() {
+        // A source's execution block reaches the model and comes back out unchanged. Dropped on the way
+        // in, a saved source would lose the batch its author set; dropped on the way out, an editor would
+        // show the defaults for a source that is read otherwise.
+        SourceDraft draft = new SourceDraft(
+                "orders", null, "mysql", linkedMap("host", "mysql.internal"), "cdc", null, null, null,
+                Map.of("parallelism", 2, "batch", Map.of("maxRecords", 512)), null, List.of());
+
+        SourceResource model = representation.toModel(draft, null);
+
+        assertThat(model.execution()).isEqualTo(
+                new io.tapstate.core.model.ExecutionSpec(2, new io.tapstate.core.model.BatchSpec(512, null)));
+        SourceView view = representation.toView(model, "e".repeat(64));
+        assertThat(view.execution()).isEqualTo(linkedMap(
+                "parallelism", 2, "batch", linkedMap("maxRecords", 512, "maxWait", null)));
+    }
+
+    @Test
+    void refusesAPerMemberCountOnASourceByName() {
+        SourceDraft draft = new SourceDraft(
+                "orders", null, "mysql", linkedMap("host", "mysql.internal"), "cdc", null, null, null,
+                Map.of("local_parallelism", 2), null, List.of());
+
+        assertThatThrownBy(() -> representation.toModel(draft, null))
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST);
+                    assertThat(String.valueOf(error.args().get("reason")))
+                            .contains("local_parallelism is not a field of execution");
+                });
+    }
+
+    @Test
     void refusesATableDraftCarryingOptions() {
         SourceDraft draft = new SourceDraft(
                 "orders", null, "mysql", linkedMap("host", "mysql.internal"), "cdc",
@@ -181,6 +213,71 @@ class SourceRepresentationTest {
         assertThat(view.config()).containsOnly(Map.entry("host", "localhost"));
         assertThat(view.configuredSecrets()).containsExactly("password");
         assertThat(view.toString()).doesNotContain(SECRET);
+    }
+
+    @Test
+    void redactsAtlasUriUserInfoButRetainsConnectionLocation() {
+        String uri = "mongodb+srv://alice:pa%40ss@cluster.example/test?retryWrites=true";
+        SourceResource model = source("mongodb-atlas", Map.of("isUri", true, "uri", uri));
+
+        SourceView view = representation.toView(model, hash(model));
+
+        assertThat(view.config().get("uri"))
+                .isEqualTo("mongodb+srv://<redacted>@cluster.example/test?retryWrites=true");
+        assertThat(view.config().toString()).doesNotContain("alice", "pa%40ss");
+    }
+
+    @Test
+    void redactsOrdinaryMongoUriUserInfoAndPreservesItOnlyForTheSameLocation() {
+        String original = "mongodb://state:pa%40ss@db.example/metadata?replicaSet=rs0";
+        SourceResource existing = source("mongodb", Map.of("isUri", true, "uri", original));
+        String display = "mongodb://<redacted>@db.example/metadata?replicaSet=rs0";
+
+        SourceView view = representation.toView(existing, hash(existing));
+        assertThat(view.config()).containsEntry("uri", display);
+        assertThat(view.config().toString()).doesNotContain("state", "pa%40ss");
+
+        SourceResource kept = representation.toModel(
+                draft("mongodb", Map.of("isUri", true, "uri", display), List.of()), existing);
+        assertThat(kept.config()).containsEntry("uri", original);
+        assertThatThrownBy(() -> representation.toModel(
+                draft("mongodb", Map.of("isUri", true,
+                        "uri", "mongodb://<redacted>@other.example/metadata"), List.of()), existing))
+                .isInstanceOfSatisfying(TapstateException.class, error ->
+                        assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST));
+        assertThatThrownBy(() -> representation.toModel(
+                draft("mongodb", Map.of("isUri", true, "uri", display), List.of()), null))
+                .isInstanceOfSatisfying(TapstateException.class, error ->
+                        assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST));
+    }
+
+    @Test
+    void preservesAnUnchangedRedactedAtlasUriButRequiresFullCredentialsForAChangedLocation() {
+        String original = "mongodb+srv://alice:pa%40ss@cluster.example/test";
+        SourceResource existing = source("mongodb-atlas", Map.of("isUri", true, "uri", original));
+        String display = "mongodb+srv://<redacted>@cluster.example/test";
+
+        SourceResource kept = representation.toModel(
+                draft("mongodb-atlas", Map.of("isUri", true, "uri", display), List.of()), existing);
+        assertThat(kept.config()).containsEntry("uri", original);
+
+        assertThatThrownBy(() -> representation.toModel(
+                draft("mongodb-atlas", Map.of("isUri", true,
+                        "uri", "mongodb+srv://<redacted>@other.example/test"), List.of()), existing))
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST);
+                    assertThat(error).hasMessageNotContaining("pa%40ss");
+                });
+    }
+
+    @Test
+    void neverPersistsAUriDisplayMarkerAsANewConnection() {
+        SourceDraft draft = draft("mongodb-atlas",
+                Map.of("isUri", true, "uri", "mongodb+srv://<redacted>@cluster.example/test"), List.of());
+
+        assertThatThrownBy(() -> representation.toModel(draft, null))
+                .isInstanceOfSatisfying(TapstateException.class, error ->
+                        assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST));
     }
 
     @Test

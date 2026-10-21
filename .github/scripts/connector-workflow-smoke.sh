@@ -14,7 +14,18 @@ def check(text):
     text='\n'.join(line.split('#',1)[0] for line in text.splitlines() if not line.lstrip().startswith('#'))
     starts=list(re.finditer(r'^  ([\w-]+):\s*$',text,re.M))
     jobs={m.group(1):text[m.end():starts[i+1].start() if i+1<len(starts) else len(text)] for i,m in enumerate(starts)}
-    aggregate=jobs['real-connectors']; witness=jobs['connector-witnesses']; jars=jobs['connector-jars']
+    aggregate=jobs['real-connectors']; witness=jobs['connector-witnesses']; jars=jobs['connector-jars']; plan=jobs['connector-plan']
+    assert 'needs: connector-plan' in jars
+    assert "if: steps.plan.outputs.requires_atlas == 'true'" in plan
+    assert "jq -r '.requires_atlas_fixtures'" in plan and '.connector_deferrals' in plan
+    assert plan.index('connector-witnesses.sh plan') < plan.index('test -n "$TAPSTATE_ATLAS_TEST_URI"')
+    for name in ('TAPSTATE_ATLAS_TEST_URI', 'TAPSTATE_ATLAS_STANDARD_URI'):
+        binding = name + ': ${{ secrets.' + name + ' }}'
+        assert binding in plan and binding in witness
+        assert 'test -n "$' + name + '"' in plan
+    assert 'prepare-test-inputs.py --output "$RUNNER_TEMP/cloud-test-release"' in witness
+    assert 'echo "TAPSTATE_TEST_CLOUD_RELEASE_DIR=$RUNNER_TEMP/cloud-test-release" >> "$GITHUB_ENV"' in witness
+    assert witness.index('prepare-test-inputs.py') < witness.index('connector-witnesses.sh run --plan')
     assert 'matrix:' not in aggregate and 'if: always()' in aggregate
     assert 'needs: [connector-plan, connector-witnesses]' in aggregate
     assert 'connector-witnesses.sh verify --plan' in aggregate and 'merge-multiple: true' in aggregate
@@ -38,13 +49,22 @@ def check(text):
     assert jars.index('connector-cache.sh verify') < jars.index('name: Cache verified remote PDK dependencies')
     assert "if: steps.pdk.outputs.cache-hit != 'true'" in jars
     assert 'connector-cache.sh prepare' in jars and 'connector-cache.sh seal' in jars and 'connector-cache.sh verify' in jars
+    selected = re.findall(r'^      CONNECTOR_MODULES: (.+)$', jars, re.M)
+    assert len(selected) == 1
+    assert set(selected[0].split(',')) == {
+        'mysql=connectors/mysql-connector', 'mongodb=connectors/mongodb-connector',
+        'postgres=connectors/postgres-connector', 'oracle=connectors/oracle-connector',
+        'sqlserver=connectors/mssql-connector', 'mongodb-atlas=connectors/mongodb-atlas-connector',
+        'aws-rds-mysql=connectors/aws-rds-mysql-connector'}
+    for command in ('connector-cache.sh prepare', 'scripts/build-real-connectors.sh'):
+        assert command + ' --modules "$CONNECTOR_MODULES" --checkout ' in jars
     assert '-nsu -Dmaven.repo.local=' in jars
     assert 'repository: tapdata/tapdata-connectors-enterprise' in jars
     assert 'token: ${{ secrets.ENTERPRISE_CONNECTORS_READ_TOKEN }}' in jars
     assert 'persist-credentials: false' in jars
     assert 'mv "$GITHUB_WORKSPACE/.connector-enterprise-source" "$RUNNER_TEMP/connector-enterprise-source"' in jars
     for line in jars.splitlines():
-        if 'connector-cache.sh prepare ' in line or 'connector-cache.sh seal ' in line or 'scripts/build-real-connectors.sh --checkout ' in line:
+        if 'connector-cache.sh prepare ' in line or 'connector-cache.sh seal ' in line or 'scripts/build-real-connectors.sh --modules ' in line:
             assert '--checkout "$RUNNER_TEMP/connector-source" --checkout "$RUNNER_TEMP/connector-enterprise-source"' in line
     assert '-Dit.test=' not in text  # No second selector list can drift from source inventory.
 assert 'group: real-connectors-sharded-${{ github.ref }}' in workflow
@@ -57,14 +77,24 @@ for before,after in [
     ('connector-witnesses.sh verify --plan','true # connector-witnesses.sh verify --plan'),
     ('shard: [shard-1, shard-2, shard-3, shard-4, shard-5, shard-6, shard-7, shard-8, shard-9, shard-10]','shard: [shard-1, shard-2, shard-3]'),
     ('connector-cache.sh verify','connector-cache.sh key'),
+    ('connector-cache.sh prepare --modules "$CONNECTOR_MODULES"', 'connector-cache.sh prepare'),
+    ('scripts/build-real-connectors.sh --modules "$CONNECTOR_MODULES"', 'scripts/build-real-connectors.sh'),
+    (',mongodb-atlas=connectors/mongodb-atlas-connector,aws-rds-mysql=connectors/aws-rds-mysql-connector', ''),
     ('path: ${{ runner.temp }}/connector-m2/io/tapdata', 'path: ~/.m2/repository'),
     ('pdk-inputs-${{ runner.os }}-${{ steps.source.outputs.oss_sha }}-${{ steps.source.outputs.enterprise_sha }}-', 'pdk-inputs-${{ runner.os }}-'),
     ('-${{ steps.source.outputs.enterprise_sha }}-', '-'),
-    (' --checkout "$RUNNER_TEMP/connector-enterprise-source"', '')]:
+    (' --checkout "$RUNNER_TEMP/connector-enterprise-source"', ''),
+    ('    needs: connector-plan', '    needs: []'),
+    ("if: steps.plan.outputs.requires_atlas == 'true'", "if: false"),
+    ("jq -r '.requires_atlas_fixtures'", "jq -r 'false'"),
+    ('TAPSTATE_ATLAS_TEST_URI: ${{ secrets.TAPSTATE_ATLAS_TEST_URI }}', 'TAPSTATE_ATLAS_TEST_URI: ""'),
+    ('TAPSTATE_ATLAS_STANDARD_URI: ${{ secrets.TAPSTATE_ATLAS_STANDARD_URI }}', 'TAPSTATE_ATLAS_STANDARD_URI: ""'),
+    ('prepare-test-inputs.py --output', 'true --output'),
+    ('echo "TAPSTATE_TEST_CLOUD_RELEASE_DIR=', 'echo "UNUSED_CLOUD_RELEASE_DIR=')]:
     mutated=workflow.replace(before,after)
     assert mutated!=workflow
     try: check(mutated)
     except (AssertionError,KeyError,ValueError): pass
     else: raise AssertionError('workflow mutation survived: '+before)
-print('connector-workflow smoke: fixed check name, complete admission and 9 mutations passed')
+print('connector-workflow smoke: fixed check name, explicit artifact selection/Atlas deferral, complete active admission and 19 mutations passed')
 PY

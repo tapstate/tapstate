@@ -141,7 +141,15 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
             default -> new LinkedHashSet<>();
         };
         for (Object item; (item = inbox.peek()) != null; ) {
-            handle(ordinal, (Envelope) item, filed);
+            if (item instanceof SettledPositions settled) {
+                // Registration copies are spoken for on their assembly path. Only this lookup's own
+                // rows settle here, behind the wakes already queued for earlier rows.
+                if (ordinal == ROWS) {
+                    SettledPositions.fold(owingNothing, settled.positions());
+                }
+            } else {
+                handle(ordinal, (Envelope) item, filed);
+            }
             inbox.remove();
             if (!flush()) {
                 return;
@@ -149,6 +157,18 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
         }
         sayWhatOwesNothing();
         flush();
+    }
+
+    /** Drains queued wakes and settlements even when no further row arrives after backpressure. */
+    @Override
+    public boolean tryProcess() {
+        sayWhatOwesNothing();
+        return flush();
+    }
+
+    @Override
+    public boolean complete() {
+        return tryProcess();
     }
 
     /**
@@ -192,9 +212,11 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
     private Set<Object> filedKeysIn(Inbox inbox, List<String> fields) {
         Collection<Object> named = new LinkedHashSet<>();
         for (Object item : inbox) {
-            named.add(NestKeys.valuesOf(NestKeys.rowOf((Envelope) item), fields));
+            if (!(item instanceof SettledPositions)) {
+                named.add(NestKeys.valuesOf(NestKeys.rowOf((Envelope) item), fields, lookup.mapName()));
+            }
         }
-        return new LinkedHashSet<>(store.loadAll(named).keySet());
+        return named.isEmpty() ? new LinkedHashSet<>() : new LinkedHashSet<>(store.loadAll(named).keySet());
     }
 
     private void handle(int ordinal, Envelope event, Set<Object> filed) {
@@ -207,7 +229,7 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
             unregister(event, row);
             return;
         }
-        List<Object> key = NestKeys.valuesOf(row, lookup.partitionKey());
+        List<Object> key = NestKeys.valuesOf(row, lookup.partitionKey(), lookup.mapName());
         // Left standing as an empty row rather than taken out. A document pointing at a row that is not
         // here has to know which kind of not-here it is: one that has not arrived is worth waiting for and
         // one that has been deleted never will be, and an absent entry cannot say which. And never taken
@@ -300,8 +322,8 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
      * hand over in either order, so which one won would be a coin toss nothing reports.
      */
     private void register(Envelope event, Map<String, Object> row, Set<Object> filed) {
-        List<Object> referenced = NestKeys.valuesOf(row, lookup.referenceFields());
-        List<Object> referrer = NestKeys.valuesOf(row, lookup.referrerIdentity());
+        List<Object> referenced = NestKeys.valuesOf(row, lookup.referenceFields(), lookup.mapName());
+        List<Object> referrer = NestKeys.valuesOf(row, lookup.referrerIdentity(), lookup.mapName());
         Object bucket = NestLookup.bucketKey(referenced, NestLookup.bucketOf(referrer));
         if (NestKeys.isDeletion(event)) {
             references.remove(bucket, referrer);
@@ -385,10 +407,10 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
             // An insert points somewhere for the first time and has nothing to leave.
             return;
         }
-        List<Object> left = NestKeys.valuesOf(was, lookup.referenceFields());
-        List<Object> referrer = NestKeys.valuesOf(was, lookup.referrerIdentity());
-        if (left.equals(NestKeys.valuesOf(row, lookup.referenceFields()))
-                && referrer.equals(NestKeys.valuesOf(row, lookup.referrerIdentity()))) {
+        List<Object> left = NestKeys.valuesOf(was, lookup.referenceFields(), lookup.mapName());
+        List<Object> referrer = NestKeys.valuesOf(was, lookup.referrerIdentity(), lookup.mapName());
+        if (left.equals(NestKeys.valuesOf(row, lookup.referenceFields(), lookup.mapName()))
+                && referrer.equals(NestKeys.valuesOf(row, lookup.referrerIdentity(), lookup.mapName()))) {
             return;
         }
         references.remove(NestLookup.bucketKey(left, NestLookup.bucketOf(referrer)), referrer);

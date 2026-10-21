@@ -3,7 +3,9 @@ package io.tapstate.app;
 import com.hazelcast.function.SupplierEx;
 import io.tapstate.control.core.PipelineWriteTargets;
 import io.tapstate.core.common.TapstateType;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.Metadata;
 import io.tapstate.core.model.PipelineNode;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
@@ -29,6 +31,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * A view is written with the write mode and full-load policy it declares -- inline, or on the shared
@@ -82,6 +85,27 @@ class AViewWritesWithItsDeclaredSettingsTest {
         });
     }
 
+    @Test
+    void theStartChecksInspectTheMarkedStoreThatTheViewActuallyWrites() {
+        InMemoryStorePort store = store(new ViewBlock.Inline("lead", FromRef.literal("src"), "id", null));
+        store.artifacts().save(new SourceResource("atlas-store", new Metadata(Map.of("store", "true"), null),
+                "mongodb-atlas", Map.of("uri", "mongodb://managed-store"), null, null, null, null));
+        CapturingBinder binder = start(store);
+        assertThat(binder.settings).containsEntry("uri", "mongodb://managed-store");
+        PipelineResource pipeline = StoredArtifacts.requirePipeline(store.artifacts(), PIPE);
+        assertThat(new StoreBackedPipelineWriteTargets(store, true).of(pipeline)).singleElement()
+                .satisfies(target -> assertThat(target.connection()).isEqualTo("atlas-store"));
+    }
+
+    @Test
+    void cloudStartChecksRequireTheSameMarkedStoreAsTheRuntime() {
+        InMemoryStorePort store = store(new ViewBlock.Inline("lead", FromRef.literal("src"), "id", null));
+        PipelineResource pipeline = StoredArtifacts.requirePipeline(store.artifacts(), PIPE);
+        assertThatThrownBy(() -> new StoreBackedPipelineWriteTargets(store, true).of(pipeline))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(ActuationError.VIEW_STORE_NOT_CONFIGURED));
+    }
+
     private static CapturingBinder start(InMemoryStorePort store) {
         CapturingBinder binder = new CapturingBinder();
         new StoreBackedDagSource(store, binder).prepareStart(PIPE, "tapstate").build(null);
@@ -107,6 +131,7 @@ class AViewWritesWithItsDeclaredSettingsTest {
         WriteMode mode;
         OnFullLoad policy;
         boolean fullLoad;
+        Map<String, Object> settings;
 
         @Override
         public SupplierEx<? extends SinkWriter> bind(String connector, Map<String, Object> settings,
@@ -121,6 +146,7 @@ class AViewWritesWithItsDeclaredSettingsTest {
             this.mode = mode;
             this.policy = policy;
             this.fullLoad = fullLoad;
+            this.settings = settings;
             return new PdkSinkWriterFactory(connector, settings, mode, ddl, targets, node, policy, fullLoad);
         }
     }

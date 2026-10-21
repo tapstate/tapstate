@@ -34,10 +34,10 @@ class TargetNotEmptyCheckTest {
             kind: pipeline
             id: pl
             source: src
-            view: { id: lead, from: orders, primary_key: id }
+            view: { id: lead, from: orders, primary_key: id, execution: { parallelism: 3 } }
             serve:
               from: orders
-              sync: [ { id: out, source: warehouse }, { id: copy, source: archive } ]
+              sync: [ { id: out, source: warehouse, execution: { parallelism: 2 } }, { id: copy, source: archive } ]
             """);
 
     @AfterEach
@@ -166,6 +166,10 @@ class TargetNotEmptyCheckTest {
         assertThat(serve.sync()).extracting(element -> element.id() + "=" + element.onFullLoad())
                 .containsExactly("out=CLEAR", "copy=null");
         assertThat(((ViewBlock.Inline) cleared.view()).onFullLoad()).isEqualTo(OnFullLoad.CLEAR);
+        assertThat(((ViewBlock.Inline) cleared.view()).execution())
+                .isEqualTo(((ViewBlock.Inline) definition.view()).execution());
+        assertThat(serve.sync().getFirst().execution())
+                .isEqualTo(((ServeBlock.Inline) definition.serve()).sync().getFirst().execution());
         assertThat(cleared.sources()).isEqualTo(definition.sources());
         assertThat(cleared.transforms()).isEqualTo(definition.transforms());
     }

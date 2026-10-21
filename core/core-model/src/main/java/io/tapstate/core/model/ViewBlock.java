@@ -26,7 +26,13 @@ public sealed interface ViewBlock {
                   WriteMode writeMode,
                   @Doc(value = "Treatment of existing view rows before a new full load; resume, recovery and CDC-only never clear rows.",
                           def = "append")
-                  OnFullLoad onFullLoad) implements ViewBlock {
+                  OnFullLoad onFullLoad,
+                  @Doc("How this node runs: its target total parallelism across the cluster and its batch.")
+                  ExecutionSpec execution) implements ViewBlock {
+        public Inline(String id, FromRef from, String primaryKey, Storage storage, ExecutionSpec execution) {
+            this(id, from, primaryKey, storage, null, null, execution);
+        }
+
         public Inline {
             Objects.requireNonNull(id, "id");
             Objects.requireNonNull(from, "from");
@@ -34,7 +40,12 @@ public sealed interface ViewBlock {
 
         /** An inline view written with the default write settings: upsert, and keep rows on a full load. */
         public Inline(String id, FromRef from, String primaryKey, Storage storage) {
-            this(id, from, primaryKey, storage, null, null);
+            this(id, from, primaryKey, storage, null, null, null);
+        }
+
+        public Inline(String id, FromRef from, String primaryKey, Storage storage,
+                WriteMode writeMode, OnFullLoad onFullLoad) {
+            this(id, from, primaryKey, storage, writeMode, onFullLoad, null);
         }
     }
 

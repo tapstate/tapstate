@@ -1,10 +1,14 @@
 package io.tapstate.e2e;
 
 import com.mongodb.ConnectionString;
+import com.mongodb.MongoClientSettings;
+import com.mongodb.MongoException;
+import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.adapters.mongostore.MongoAuthStores;
+import com.mongodb.client.result.UpdateResult;
 import io.tapstate.adapters.mongostore.MongoRateHistoryStore;
 import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.spi.store.WorkloadClaimType;
@@ -35,10 +39,12 @@ import java.util.stream.StreamSupport;
  */
 final class StoreDocuments implements AutoCloseable {
 
+    private final ConnectionString connection;
     private final MongoClient client;
     private final MongoDatabase database;
 
-    private StoreDocuments(MongoClient client, MongoDatabase database) {
+    private StoreDocuments(ConnectionString connection, MongoClient client, MongoDatabase database) {
+        this.connection = connection;
         this.client = client;
         this.database = database;
     }
@@ -51,7 +57,7 @@ final class StoreDocuments implements AutoCloseable {
             throw new AssertionError("the store url names no database, so there is nothing to read: " + storeUri);
         }
         MongoClient client = MongoClients.create(connection);
-        return new StoreDocuments(client, client.getDatabase(name));
+        return new StoreDocuments(connection, client, client.getDatabase(name));
     }
 
     /** Whether {@code collection} holds a document under {@code id}. */
@@ -122,6 +128,12 @@ final class StoreDocuments implements AutoCloseable {
         return ids(MongoStorePort.SRS_META);
     }
 
+    /** The retained log's bounds, which survive removal of its already confirmed records. */
+    Document logBounds(String ringName) {
+        return database.getCollection(MongoStorePort.SRS_LOG)
+                .find(new Document("_id", "srs-log-bounds:" + ringName)).first();
+    }
+
     /** The whole chain record, for reporting what a chain actually held when an assertion about it fails. */
     Document chain(String miningChainId) {
         return database.getCollection(MongoStorePort.SRS_META)
@@ -173,6 +185,100 @@ final class StoreDocuments implements AutoCloseable {
                         .append("_id.resourceId", captureId))
                 .first();
         return claim == null ? null : claim.getDate("leaseUntil").toInstant();
+    }
+
+    /** Hands one fixture pipeline to another live member without stopping the original holder's process. */
+    void handPipelineTo(String clusterId, String pipelineId, String oldNodeId, String newNodeId) {
+        var claims = database.getCollection(MongoStorePort.WORKLOAD_CLAIMS);
+        Document session = claims.find(new Document("_id.clusterId", clusterId)
+                .append("_id.resourceType", WorkloadClaimType.NODE_SESSION.name())
+                .append("_id.resourceId", newNodeId)).first();
+        if (session == null) {
+            throw new AssertionError("the successor has no node session: " + newNodeId);
+        }
+        Document expected = new Document("_id.clusterId", clusterId)
+                .append("_id.resourceType", WorkloadClaimType.PIPELINE_ACTUATION.name())
+                .append("_id.resourceId", pipelineId).append("ownerNodeId", oldNodeId);
+        Document next = new Document("ownerNodeId", newNodeId)
+                .append("ownerBootId", session.getString("ownerBootId"))
+                .append("claimGeneration", new Document("$add", List.of("$claimGeneration", 1L)))
+                .append("leaseUntil", new Document("$dateAdd", new Document("startDate", "$$NOW")
+                        .append("unit", "second").append("amount", 120L)));
+        if (claims.updateOne(expected, List.of(new Document("$set", next))).getModifiedCount() != 1) {
+            throw new AssertionError("the fixture did not hand pipeline " + pipelineId + " to " + newNodeId);
+        }
+    }
+
+    /**
+     * Opens a transaction on a client connected as {@code applicationName}, writes one chain's record in it, and
+     * leaves it open until what this returns is closed: what a process whose store client connected under that
+     * name leaves at the store when it is killed halfway through a write to the record.
+     *
+     * <p>The store holds what an open transaction wrote for as long as it stays open, so every other write to the
+     * record waits for it meanwhile. Nothing it writes ever lands: closing it aborts it, if nobody has ended it
+     * already.
+     */
+    HeldOpen holdChainOpenAs(String miningChainId, String applicationName) {
+        MongoClient named = MongoClients.create(MongoClientSettings.builder()
+                .applyConnectionString(connection)
+                .applicationName(applicationName)
+                .build());
+        ClientSession session;
+        try {
+            session = named.startSession();
+            session.startTransaction();
+            writeInside(named, session, miningChainId);
+        } catch (RuntimeException | Error failure) {
+            named.close();
+            throw failure;
+        }
+        return new HeldOpen() {
+            @Override
+            public boolean stillHeld() {
+                try {
+                    writeInside(named, session, miningChainId);
+                    return true;
+                } catch (MongoException ended) {
+                    return false;
+                }
+            }
+
+            @Override
+            public void close() {
+                try {
+                    if (session.hasActiveTransaction()) {
+                        session.abortTransaction();
+                    }
+                } catch (RuntimeException endedAlready) {
+                    // Somebody ended it first, which is what a case holding one open is usually about.
+                } finally {
+                    session.close();
+                    named.close();
+                }
+            }
+        };
+    }
+
+    private void writeInside(MongoClient named, ClientSession session, String miningChainId) {
+        UpdateResult written = named.getDatabase(database.getName()).getCollection(MongoStorePort.SRS_META)
+                .updateOne(session, new Document("_id", miningChainId),
+                        new Document("$inc", new Document("heldOpenByACase", 1L)));
+        if (written.getMatchedCount() != 1) {
+            throw new AssertionError("there is no record of chain '" + miningChainId + "' to hold open");
+        }
+    }
+
+    /** A write left open at the store; see {@link #holdChainOpenAs}. */
+    interface HeldOpen extends AutoCloseable {
+
+        /**
+         * Whether the store is still holding it - asked by writing inside it again, which the store refuses once
+         * the transaction has been ended.
+         */
+        boolean stillHeld();
+
+        @Override
+        void close();
     }
 
     @Override

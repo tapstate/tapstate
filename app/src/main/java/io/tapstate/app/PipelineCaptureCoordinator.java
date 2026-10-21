@@ -5,6 +5,7 @@ import io.tapstate.core.lifecycle.SnapshotReading;
 import io.tapstate.spi.store.ArtifactStore;
 
 import java.util.Optional;
+import java.util.function.Predicate;
 
 /**
  * Runs a pipeline's source-side capture alongside its Jet job. When a pipeline starts, its cdc capture must
@@ -13,6 +14,10 @@ import java.util.Optional;
  * so a start fills the ring before the job reads it and a stop stops the job before the capture behind it.
  */
 interface PipelineCaptureCoordinator {
+
+    /** Keeps a shared claim only while the capture serves a pipeline driven here, preserving durable positions. */
+    default void runOnlyWhileDriving(Predicate<String> drivesPipeline) {
+    }
 
     /**
      * Starts the cdc capture for every source the pipeline reads, retaining the live handles for a later stop.
@@ -46,6 +51,15 @@ interface PipelineCaptureCoordinator {
      * position keeps that cost with it -- deliberately, because the position is the thing being kept.
      */
     void stopCapture(String pipelineId, boolean purgeState);
+
+    /**
+     * Whether a capture started for the pipeline is still open on this member: started, and not stopped since.
+     * The run it was opened for may be over all the same -- a job lost with a member ends with no stop -- so an
+     * open capture is not by itself a pipeline that is running. A coordinator that runs no capture holds none.
+     */
+    default boolean isCapturing(String pipelineId) {
+        return false;
+    }
 
     /**
      * The failure a running pipeline's capture died with, or empty while it is healthy. The load and the cdc

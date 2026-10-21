@@ -25,10 +25,13 @@ public final class PdkApiLevels {
      * Append-only: an existing base version keeps its level (renumbering would silently re-judge every
      * connector). {@code 2.0.5} / {@code 2.0.7} / {@code 2.0.8} are one level because they are API-
      * equivalent under PDK's {@code 2.0.x} backward-compatibility line. The audited
-     * {@code 2.0.9} PDK API artifact contains the same class bytes as the baseline.
+     * {@code 2.0.9} PDK API artifact contains the same class bytes as the baseline. In the audited
+     * {@code 2.0.6} artifact every public and protected member is also present in the baseline, which
+     * only adds the alter-table-TTL function, so a connector declaring it links against the baseline.
      */
     private static final Map<String, Integer> LEVELS = Map.of(
             "2.0.5", 1,
+            "2.0.6", 1,
             "2.0.7", 1,
             "2.0.8", 1,
             "2.0.9", 1);

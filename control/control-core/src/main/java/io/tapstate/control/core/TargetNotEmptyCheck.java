@@ -148,7 +148,7 @@ public final class TargetNotEmptyCheck implements StartCheck {
             List<SyncElement> sync = inline.sync().stream()
                     .map(element -> elements.contains(elementId(element))
                             ? new SyncElement(element.id(), element.source(), element.writeMode(), element.rename(),
-                                    element.ddl(), OnFullLoad.CLEAR)
+                                    element.ddl(), OnFullLoad.CLEAR, element.execution())
                             : element)
                     .toList();
             serve = new ServeBlock.Inline(inline.id(), inline.from(), sync, inline.query(), inline.push());
@@ -156,7 +156,7 @@ public final class TargetNotEmptyCheck implements StartCheck {
         ViewBlock view = definition.view();
         if (view instanceof ViewBlock.Inline inline && elements.contains(inline.id())) {
             view = new ViewBlock.Inline(inline.id(), inline.from(), inline.primaryKey(), inline.storage(),
-                    inline.writeMode(), OnFullLoad.CLEAR);
+                    inline.writeMode(), OnFullLoad.CLEAR, inline.execution());
         }
         return new PipelineResource(definition.id(), definition.metadata(), definition.sources(),
                 definition.transforms(), view, serve, definition.settings(), definition.experimental());

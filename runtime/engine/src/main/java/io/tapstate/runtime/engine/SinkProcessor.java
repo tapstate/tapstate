@@ -8,6 +8,7 @@ import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.jet.core.Watermark;
+import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.PayloadBytes;
 import io.tapstate.core.lifecycle.HistogramBounds;
@@ -17,6 +18,7 @@ import io.tapstate.core.lifecycle.Staged;
 import io.tapstate.runtime.engine.SinkFrontier.ChainEntry;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
@@ -39,16 +41,27 @@ import java.util.concurrent.CompletionException;
  * inbox, so Jet holds the upstream back until an outstanding write settles and frees a slot. A batch's
  * events are handed to the writer and never touched again, honouring the writer's ownership window.
  *
+ * <p><b>A batch holds one stream's rows, and closes on count or on time.</b> Rows taken from the inbox wait in
+ * their stream's queue, at most one batch's worth across all of them, and a stream's rows go to the writer
+ * together once they are due: enough of them for a full batch, or the oldest having waited as long as a batch
+ * waits (nothing, by default), or no room left to take in more, or the input over. The streams take turns, so a
+ * busy one does not keep a quiet one waiting for more than a batch. One stream per batch is what a writer
+ * appending rows needs - it cannot write two tables in one call and take neither back when the second fails -
+ * and what every writer's calls are then made of.
+ *
  * <p><b>Not everything that arrives is a record.</b> A vertex upstream may also send word that a chain got
  * past changes it has nothing to deliver for — absorbed where they arrived, with no record coming for them
- * ever. Those are never offered to the writer, but they take part in the frontier, and they take part
- * <em>with the batch they arrived in</em> rather than on arrival: a position may only be acked once every
- * record carrying a lower one has landed, and settling with the batch is what makes that true here without
- * anything having to work out what is still outstanding.
+ * ever. Those are never offered to the writer, but they take part in the frontier, and they take part only
+ * once every row taken in before them has landed: a position may only be acked once every record carrying a
+ * lower one has. A bound waits the same way. Each row is numbered as it is taken in, and each word and bound
+ * waits for every row numbered before it - never for the rows after it, so a stream of rows that never goes
+ * quiet does not hold the frontier back for good, and never cutting a batch short, so the wait a batch was
+ * given is the wait it gets.
  *
- * <p>The vertex runs at total parallelism one and, by default, keeps a single write in flight: one
- * {@code serve.sync} is one external target, and applying one batch to completion before the next is
- * issued is what keeps a key's change events in their arrival order. Two batches that straddle a key
+ * <p>Each processor keeps a single write in flight by default: applying one batch to completion before the
+ * next is issued is what keeps a key's change events in their arrival order - on the one processor a vertex
+ * running at total parallelism one has, and on the one writer a key is routed to where the vertex runs
+ * several. Two batches that straddle a key
  * (an insert last in one, its update first in the next) would otherwise be free to apply out of order,
  * since the writer runs them off the caller's thread with no ordering of its own — the contract hands
  * in-flight ordering to the runtime, and this is where the runtime keeps it. Raising the in-flight
@@ -64,6 +77,20 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         return Stage.SINK;
     }
 
+    /**
+     * Not cooperative where there is an ack to report to. A write that settles hands the positions it earned
+     * to the ack there and then, and the ack a pipeline is built with writes them to the durable store and
+     * waits for the store to answer - for as long as the store takes, which is as long as it goes on holding
+     * a document for a writer that stopped halfway through writing it. A cooperative processor shares its
+     * thread with every other cooperative vertex on the member, of every run, so a report waiting there stops
+     * all of them with it, and nothing fails or says why. A sink with no ack only hands rows to its writer,
+     * which writes them off this thread, so it keeps its place in the cooperative pool.
+     */
+    @Override
+    public boolean isCooperative() {
+        return sinkAck == null;
+    }
+
     // One write in flight by default: a batch is applied to completion before the next is issued, so a
     // key's events can never be applied out of their arrival order. Raising this pipelines writes and
     // is only safe for an order-independent or append-only target.
@@ -72,8 +99,19 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
 
     private final SinkWriter writer;
     private final SinkAck sinkAck;
+    // The vertex this processor writes for, and whether that vertex runs as one processor for the cluster;
+    // together with the processor's own index they name it as a writer. Null where it was built by hand
+    // outside a graph, which reports through the ack as it stands.
+    private final String writerOf;
+    private final boolean totalOne;
+    // The ack this processor reports through: the one supplied, bound to this processor as a writer once
+    // init knows its index. See init.
+    private SinkAck ack;
     private final SinkFrontier frontier;
-    private final FrontierGauge gauge;
+    private final FrontierGauge suppliedGauge;
+    // Which of the two the frontier readings go to, settled at init for the reason the delivery readings'
+    // is: the one supplied, or one that reads nothing when this processor is not running inside a job.
+    private FrontierGauge gauge;
     private final DeliveryGauge supplied;
     // Which of the two the readings actually go to, settled at init: the one supplied, or one that reads
     // nothing when this processor turns out not to be running inside a job. See init.
@@ -102,19 +140,39 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     private final int maxInFlight;
     private final int maxBatchSize;
     private final List<InFlightBatch> inFlight = new ArrayList<>();
-    // Bounds that arrived while writes were still in flight, held until they settle, one per axis. A bound
-    // proves what is still coming, never what is durable: every event it covers has been taken in by the
-    // time it arrives, but the ones sitting in an unsettled batch are not written yet. Handing it to the
-    // frontier then would let one settled batch of a fan-out stand for the whole of what its change
-    // produced.
+    // Bounds held until every row taken in before them has landed, per axis, oldest first. A bound proves
+    // what is still coming, never what is durable: every event it covers has been taken in by the time it
+    // arrives, but the ones queued or in an unsettled batch are not written yet. Handing it to the frontier
+    // then would let one settled batch of a fan-out stand for the whole of what its change produced.
     //
-    // One slot per axis rather than one in total, because a bound names the chain it is for: one chain's
-    // promise is not a newer version of another's, and a single slot lets whichever arrives second
-    // overwrite the first. The overwritten chain then waits for a strictly higher position of its own to
-    // settle, which on a chain that has gone quiet never comes -- so the position it was holding stays
-    // open for the life of the run, and on a snapshot that is a table nothing records as loaded and every
-    // resume reads again in full.
-    private final Map<Byte, Watermark> heldBounds = new LinkedHashMap<>();
+    // Per axis rather than one in total, because a bound names the chain it is for: one chain's promise is
+    // not a newer version of another's, and letting whichever arrives second overwrite the first leaves the
+    // overwritten chain waiting for a strictly higher position of its own to settle, which on a chain that
+    // has gone quiet never comes -- so the position it was holding stays open for the life of the run, and on
+    // a snapshot that is a table nothing records as loaded and every resume reads again in full. And oldest
+    // first on an axis, each waiting for its own rows only: a newer bound that replaced an older one would
+    // make it wait for the newer one's rows too, and on a chain whose rows never stop coming that is for good.
+    private final Map<Byte, ArrayDeque<Held<Watermark>>> heldBounds = new LinkedHashMap<>();
+    // Words that chains got past positions with nothing to deliver, each waiting, as a bound does, for every
+    // row taken in before it to land; the highest position per chain among words waiting for the same rows.
+    private final ArrayDeque<Held<Map<String, ChainPosition>>> heldWords = new ArrayDeque<>();
+    // Rows taken in and not yet handed to the writer, per stream, in the order the streams get their turn: a
+    // stream whose rows go leaves, and comes back at the end with its next row.
+    private final Map<String, ArrayDeque<Queued>> queued = new LinkedHashMap<>();
+    // When each queued stream's oldest row was taken in, by the clock the wait is measured against.
+    private final Map<String, Long> waitingSince = new LinkedHashMap<>();
+    private int queuedRows;
+    // The number the next row taken in gets. A word or a bound taken in waits for every row numbered below it.
+    private long nextOrder;
+    // How long a stream's oldest queued row waits for more before its rows go, and the clock it is measured
+    // against. Zero waits for nothing: rows go as soon as the writer can take them.
+    private final long maxWaitNanos;
+    private final LongSupplier nanoClock;
+    // Set once the input is over: whatever is queued goes, however few rows and however recently they came.
+    private boolean draining;
+    // Combines the bounds that arrive edge by edge, each chain over the edges that carry it; null where the
+    // engine's combination across every edge is taken instead. See tryProcessWatermark.
+    private final LevelBounds edges;
     private boolean closed;
 
     // Resolved at init from the running job, so a failed write can be recorded against this pipeline's id
@@ -150,8 +208,55 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
 
     SinkProcessor(SinkWriter writer, SinkAck sinkAck, SinkFrontier frontier,
             int maxInFlight, int maxBatchSize, FrontierGauge gauge, DeliveryGauge delivery, LongSupplier clock) {
+        this(writer, sinkAck, frontier, maxInFlight, maxBatchSize, gauge, delivery, clock, null, true);
+    }
+
+    /**
+     * A sink that reports as one writer of the vertex {@code writerOf}: the processor names itself by that
+     * vertex and its own index once it knows the index, so where several writers land one pipeline's changes
+     * each one's progress is kept apart and the slowest decides how far the pipeline has landed. A vertex
+     * running as one processor for the cluster names its one writer by index zero whichever member it runs
+     * on; the index the engine gives it depends on that member, and a writer that changed name with the
+     * member it landed on would never be the one the run expects.
+     */
+    SinkProcessor(SinkWriter writer, SinkAck sinkAck, SinkFrontier frontier,
+            int maxInFlight, int maxBatchSize, FrontierGauge gauge, DeliveryGauge delivery, LongSupplier clock,
+            String writerOf, boolean totalOne) {
+        this(writer, sinkAck, frontier, maxInFlight, maxBatchSize, gauge, delivery, clock, writerOf, totalOne,
+                null);
+    }
+
+    /**
+     * As above, combining the bounds it takes in edge by edge through {@code edges}, which knows which chains
+     * each inbound edge carries: a chain is then held down only by the edges that carry it. Null leaves the
+     * combining to the engine, which holds every chain down by every edge - right only where every edge
+     * carries every chain.
+     */
+    SinkProcessor(SinkWriter writer, SinkAck sinkAck, SinkFrontier frontier,
+            int maxInFlight, int maxBatchSize, FrontierGauge gauge, DeliveryGauge delivery, LongSupplier clock,
+            String writerOf, boolean totalOne, LevelBounds edges) {
+        this(writer, sinkAck, frontier, maxInFlight, maxBatchSize, gauge, delivery, clock, writerOf, totalOne, edges,
+                0L, System::nanoTime);
+    }
+
+    /**
+     * As above, holding a stream's rows for up to {@code maxWaitMillis} after its oldest was taken in, by
+     * {@code nanoClock}, before they go with fewer than {@code maxBatchSize} of them.
+     */
+    SinkProcessor(SinkWriter writer, SinkAck sinkAck, SinkFrontier frontier,
+            int maxInFlight, int maxBatchSize, FrontierGauge gauge, DeliveryGauge delivery, LongSupplier clock,
+            String writerOf, boolean totalOne, LevelBounds edges, long maxWaitMillis, LongSupplier nanoClock) {
+        if (maxWaitMillis < 0) {
+            throw new IllegalArgumentException("maxWaitMillis must not be negative: " + maxWaitMillis);
+        }
+        this.maxWaitNanos = maxWaitMillis * 1_000_000L;
+        this.nanoClock = Objects.requireNonNull(nanoClock, "nanoClock");
+        this.edges = edges;
+        this.writerOf = writerOf;
+        this.totalOne = totalOne;
         this.writer = Objects.requireNonNull(writer, "writer");
-        this.gauge = Objects.requireNonNull(gauge, "gauge");
+        this.suppliedGauge = Objects.requireNonNull(gauge, "gauge");
+        this.gauge = this.suppliedGauge;
         this.supplied = Objects.requireNonNull(delivery, "delivery");
         this.delivery = this.supplied;
         this.clock = Objects.requireNonNull(clock, "clock");
@@ -170,6 +275,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             }
         }
         this.sinkAck = sinkAck;
+        this.ack = sinkAck;
         this.frontier = frontier;
         this.maxInFlight = maxInFlight;
         this.maxBatchSize = maxBatchSize;
@@ -188,10 +294,20 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
      */
     public static ProcessorMetaSupplier metaSupplier(String vertexName,
             SupplierEx<? extends SinkWriter> writerFactory) {
+        return metaSupplier(vertexName, writerFactory, DEFAULT_MAX_BATCH_SIZE, 0L);
+    }
+
+    /**
+     * As above, in batches of at most {@code maxRecords} rows of one stream, each going once full or once its
+     * first row has waited {@code maxWaitMillis}.
+     */
+    static ProcessorMetaSupplier metaSupplier(String vertexName, SupplierEx<? extends SinkWriter> writerFactory,
+            int maxRecords, long maxWaitMillis) {
         Objects.requireNonNull(vertexName, "vertexName");
         Objects.requireNonNull(writerFactory, "writerFactory");
         SupplierEx<Processor> supplier = () -> new SinkProcessor(writerFactory.get(), null, null,
-                DEFAULT_MAX_IN_FLIGHT, DEFAULT_MAX_BATCH_SIZE, FrontierGauge.none(), new JetDeliveryGauge());
+                DEFAULT_MAX_IN_FLIGHT, maxRecords, FrontierGauge.none(), new JetDeliveryGauge(),
+                System::currentTimeMillis, null, true, null, maxWaitMillis, System::nanoTime);
         return ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of(supplier), vertexName);
     }
 
@@ -205,17 +321,68 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
      *
      * <p>{@code frontierFactory} settles which shape that is, and it is settled here rather than run-time:
      * how far a sink may say a chain has landed depends on whether what reaches it is one chain in order or
-     * an assembly of several, and that is a property of the graph that was compiled, not of any event.
+     * an assembly of several, and that is a property of the graph that was compiled, not of any event. The
+     * bounds are combined by the engine, across every inbound edge.
      */
     static ProcessorMetaSupplier metaSupplier(String vertexName,
             SupplierEx<? extends SinkWriter> writerFactory,
             SinkAckFactory sinkAckFactory, SupplierEx<SinkFrontier> frontierFactory) {
+        return metaSupplier(vertexName, writerFactory, sinkAckFactory, frontierFactory, null);
+    }
+
+    /**
+     * As above, with the bounds combined edge by edge by what {@code edgesFactory} makes - over the chains
+     * each inbound edge carries - where it is not null, and by the engine where it is.
+     */
+    static ProcessorMetaSupplier metaSupplier(String vertexName,
+            SupplierEx<? extends SinkWriter> writerFactory,
+            SinkAckFactory sinkAckFactory, SupplierEx<SinkFrontier> frontierFactory,
+            SupplierEx<LevelBounds> edgesFactory) {
+        return metaSupplier(vertexName, writerFactory, sinkAckFactory, frontierFactory, edgesFactory,
+                DEFAULT_MAX_BATCH_SIZE, 0L);
+    }
+
+    /** As above, batching as {@code maxRecords} and {@code maxWaitMillis} say. */
+    static ProcessorMetaSupplier metaSupplier(String vertexName,
+            SupplierEx<? extends SinkWriter> writerFactory,
+            SinkAckFactory sinkAckFactory, SupplierEx<SinkFrontier> frontierFactory,
+            SupplierEx<LevelBounds> edgesFactory, int maxRecords, long maxWaitMillis) {
         Objects.requireNonNull(vertexName, "vertexName");
         Objects.requireNonNull(writerFactory, "writerFactory");
         Objects.requireNonNull(sinkAckFactory, "sinkAckFactory");
         Objects.requireNonNull(frontierFactory, "frontierFactory");
         return ProcessorMetaSupplier.forceTotalParallelismOne(
-                new AckSinkSupplier(writerFactory, sinkAckFactory, frontierFactory), vertexName);
+                new AckSinkSupplier(writerFactory, sinkAckFactory, frontierFactory, edgesFactory, vertexName, true,
+                        maxRecords, maxWaitMillis),
+                vertexName);
+    }
+
+    /**
+     * A meta-supplier for a sink vertex that runs the same number of writers on every member, each a writer
+     * of its own: it lands whatever rows reach it and reports as the writer at its own index among all of the
+     * vertex's processors, so the run can wait on each of them. The vertex is as wide on every member as the
+     * builder sets it, and refuses an execution that starts on a member count other than the one its width
+     * was worked out for - a run on more members would have writers nobody waits on.
+     *
+     * <p>Rows reach a writer over more than one queue - from every instance of the router in front of it, and
+     * over two edges - so a later position can land before an earlier one: {@code frontierFactory} is the
+     * shape that goes by bounds, and {@code edgesFactory} combines them over the edges that carry each chain.
+     * Without an ack factory the writers land rows and report nothing.
+     */
+    static ProcessorMetaSupplier nativeMetaSupplier(String vertexName,
+            SupplierEx<? extends SinkWriter> writerFactory, SinkAckFactory sinkAckFactory,
+            SupplierEx<SinkFrontier> frontierFactory, SupplierEx<LevelBounds> edgesFactory, int plannedMembers,
+            int maxRecords, long maxWaitMillis) {
+        Objects.requireNonNull(vertexName, "vertexName");
+        Objects.requireNonNull(writerFactory, "writerFactory");
+        ProcessorSupplier supplier = sinkAckFactory == null
+                ? (ProcessorSupplier) count -> openedTogether(count, () -> new SinkProcessor(writerFactory.get(), null,
+                        null, DEFAULT_MAX_IN_FLIGHT, maxRecords, FrontierGauge.none(), new JetDeliveryGauge(),
+                        System::currentTimeMillis, null, false, null, maxWaitMillis, System::nanoTime))
+                : new AckSinkSupplier(writerFactory, sinkAckFactory,
+                        Objects.requireNonNull(frontierFactory, "frontierFactory"), edgesFactory, vertexName, false,
+                        maxRecords, maxWaitMillis);
+        return PlannedMembersGuard.of(ProcessorMetaSupplier.of(supplier), plannedMembers);
     }
 
     /**
@@ -229,6 +396,9 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         this.timer = StageTimer.of(stage(), context);
         this.pipelineId = context.jobConfig().getName();
         this.countingSince = clock.getAsLong();
+        if (sinkAck != null && writerOf != null) {
+            ack = sinkAck.forWriter(writerId(writerOf, totalOne ? 0 : context.globalProcessorIndex()));
+        }
         HazelcastInstance instance = context.hazelcastInstance();
         this.failureRegistry = instance != null ? JobFailureRegistry.of(instance) : null;
         // A gauge that writes into a job's statistics can only do so from that job's own threads, and a
@@ -239,11 +409,23 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         if (instance == null && supplied.readableOnlyOnAJobThread()) {
             this.delivery = DeliveryGauge.none();
         }
+        if (instance == null && suppliedGauge.readableOnlyOnAJobThread()) {
+            this.gauge = FrontierGauge.none();
+        }
     }
 
     /** What this stage has timed so far, for a witness driving it by hand. */
     StageTimer timing() {
         return timer;
+    }
+
+    /**
+     * The name of the writer at {@code index} of the sink vertex {@code vertex}: how a writer reports its
+     * progress, and how a run names the writers it expects progress from. One spelling in one place, because
+     * a writer and the run expecting it that spelled it differently would each wait on the other forever.
+     */
+    public static String writerId(String vertex, int index) {
+        return vertex + "#" + index;
     }
 
     @Override
@@ -258,39 +440,119 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
 
     private void processTimed(Inbox inbox) {
         reapSettled();
-        while (!inbox.isEmpty() && inFlight.size() < maxInFlight) {
-            List<Envelope> batch = new ArrayList<>();
-            List<ChainEntry> absorbed = new ArrayList<>();
-            int taken = 0;
-            while (taken < maxBatchSize && !inbox.isEmpty()) {
-                Object item = inbox.poll();
-                taken++;
-                // Word that a chain got past some changes with nothing to deliver for them. It is not a
-                // record and is never offered to the writer, but it settles with this batch rather than on
-                // arrival: it may only be acked once every record before it has landed, and riding the
-                // batch is what makes that true without anything here having to work it out.
-                if (item instanceof SettledPositions settled) {
-                    settled.positions().forEach(
-                            (chain, position) -> absorbed.add(new ChainEntry(chain, position)));
-                    continue;
+        // Taking in more is worth it only while writes are going out: with the queues full and nothing due,
+        // the rest of the inbox waits where it is.
+        do {
+            takeIn(inbox);
+        } while (writeWhatIsDue() && !inbox.isEmpty());
+        reportWaiting();
+    }
+
+    /**
+     * Takes rows from the inbox into their stream's queue, numbering each, for as long as there is room: at most
+     * one batch's worth waits here across every stream. The rest stays in the inbox, where the engine holds the
+     * upstream back until this writer has taken more.
+     *
+     * <p>Word that a chain got past changes with nothing to deliver for them is not a row and never reaches the
+     * writer. It waits for every row taken in before it to land, and is handed over then.
+     */
+    private void takeIn(Inbox inbox) {
+        while (!inbox.isEmpty() && queuedRows < maxBatchSize) {
+            Object item = inbox.poll();
+            if (item instanceof SettledPositions settled) {
+                if (frontier != null) {
+                    holdWord(settled.positions());
                 }
-                batch.add((Envelope) item);
+                continue;
             }
-            List<ChainEntry> positions = new ArrayList<>(positionsOf(batch));
-            positions.addAll(absorbed);
+            Envelope row = (Envelope) item;
+            ArrayDeque<Queued> queue = queued.get(row.src());
+            if (queue == null) {
+                queue = new ArrayDeque<>();
+                queued.put(row.src(), queue);
+                waitingSince.put(row.src(), nanoClock.getAsLong());
+            }
+            queue.add(new Queued(nextOrder++, row));
+            queuedRows++;
+        }
+        if (frontier != null) {
+            // A word taken in behind rows that have all landed already has nothing to wait for.
+            releaseHeld();
+        }
+    }
+
+    /** Holds {@code positions} until every row taken in before them has landed. */
+    private void holdWord(Map<String, ChainPosition> positions) {
+        Held<Map<String, ChainPosition>> last = heldWords.peekLast();
+        if (last != null && last.before() == nextOrder) {
+            // Waiting for the same rows as the word before it, so the two are handed over together.
+            SettledPositions.fold(last.value(), positions);
+            return;
+        }
+        Map<String, ChainPosition> highest = new LinkedHashMap<>();
+        SettledPositions.fold(highest, positions);
+        heldWords.add(new Held<>(nextOrder, highest));
+    }
+
+    /**
+     * Hands the writer the next stream's rows for as long as it can take another write: one stream at a time,
+     * taking turns, and only a stream whose rows are due. Answers whether it handed over any.
+     */
+    private boolean writeWhatIsDue() {
+        long now = nanoClock.getAsLong();
+        boolean wrote = false;
+        while (inFlight.size() < maxInFlight) {
+            String stream = nextDue(now);
+            if (stream == null) {
+                return wrote;
+            }
+            wrote = true;
+            ArrayDeque<Queued> queue = queued.remove(stream);
+            waitingSince.remove(stream);
+            List<Envelope> batch = new ArrayList<>(queue.size());
+            long firstOrder = queue.peek().order();
+            for (Queued row : queue) {
+                batch.add(row.row());
+            }
+            queuedRows -= batch.size();
             // Tallied while the rows are still here and counted only once the write settles. Holding the
             // envelopes themselves until then would keep a batch's worth of rows alive for the length of a
             // write; this keeps one number per table and operation in it instead.
-            inFlight.add(new InFlightBatch(settlementOf(batch), positions, DeliveredRows.of(batch)));
+            inFlight.add(new InFlightBatch(settlementOf(batch), positionsOf(batch), DeliveredRows.of(batch),
+                    firstOrder));
         }
-        // A saturated in-flight set leaves the rest of the inbox unread; Jet backpressures upstream
-        // until reapSettled frees a slot on a later call.
+        // A saturated in-flight set leaves the queues as they are, and once they are full the inbox too; Jet
+        // backpressures upstream until reapSettled frees a slot on a later call.
+        return wrote;
     }
 
+    /**
+     * The first stream, in turn, whose rows are due: a full batch of them, or the oldest having waited as long
+     * as a batch waits - no time at all, by default - or no room left to take in more, or the input over.
+     */
+    private String nextDue(long now) {
+        boolean full = queuedRows >= maxBatchSize;
+        for (Map.Entry<String, ArrayDeque<Queued>> stream : queued.entrySet()) {
+            if (full || draining || maxWaitNanos == 0
+                    || now - waitingSince.get(stream.getKey()) >= maxWaitNanos) {
+                return stream.getKey();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Writes out everything still queued, however few rows and however recently they came, and reports done
+     * once every write has settled. A write that settles at once lets the next go in the same call.
+     */
     @Override
     public boolean complete() {
-        reapSettled();
-        return inFlight.isEmpty();
+        draining = true;
+        do {
+            reapSettled();
+        } while (writeWhatIsDue());
+        reportWaiting();
+        return inFlight.isEmpty() && queued.isEmpty();
     }
 
     /**
@@ -305,14 +567,36 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     @Override
     public boolean tryProcess() {
         reapSettled();
+        // And hands over what has waited as long as a batch waits: nothing else would, while the inbox is idle.
+        writeWhatIsDue();
+        reportWaiting();
         return true;
     }
 
     /**
-     * Takes in a bound that arrived with no edge attached to it, and never passes it on. This variant is
-     * the one a sink wants: the engine calls it with the value combined across every input queue, which is
-     * the guarantee the frontier rests on - a queue that has said nothing still holds it down. The
-     * per-edge variant would answer with one edge's promise while data covered by it sits on another.
+     * Reports what is waiting here: the rows taken in and not yet handed to the writer, by stream, and the rows
+     * handed to it whose writes have not settled, by table.
+     */
+    private void reportWaiting() {
+        Map<String, Long> queuedByStream = new LinkedHashMap<>();
+        queued.forEach((stream, rows) -> queuedByStream.put(stream, (long) rows.size()));
+        Map<String, Long> inFlightByTable = new LinkedHashMap<>();
+        for (InFlightBatch batch : inFlight) {
+            batch.delivered().rows().forEach((table, byOp) -> inFlightByTable.merge(
+                    table, byOp.values().stream().mapToLong(Long::longValue).sum(), Long::sum));
+        }
+        delivery.waiting(queuedByStream, inFlightByTable);
+    }
+
+    /**
+     * Takes in a bound that arrived with no edge attached to it, and never passes it on. The engine calls
+     * this with the value combined across every input queue, which is the guarantee the frontier rests on
+     * - a queue that has said nothing still holds it down - wherever every edge carries every chain.
+     *
+     * <p>Where an edge carries only some of the chains, that same combination never arrives at all for a
+     * chain another edge does not carry, since that edge never says anything about it. A sink compiled with
+     * the chains each edge carries therefore takes its bounds edge by edge instead, below, and passes over
+     * this one.
      *
      * <p>Nothing is emitted from here. This is the end of the line for a bound, and anything emitted would
      * be offered to the target as a record. The engine forwards it by default, silently, which is why
@@ -320,43 +604,86 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
      */
     @Override
     public boolean tryProcessWatermark(Watermark watermark) {
-        if (frontier != null) {
-            // The newest bound on an axis subsumes any older one held for that axis, so only the newest of
-            // each is kept. Across axes nothing subsumes anything.
-            heldBounds.put(watermark.key(), watermark);
-            releaseHeldBounds();
-            reportTrailing();
+        if (frontier != null && edges == null) {
+            take(watermark);
         }
         return true;
     }
 
-    /**
-     * Hands every held bound to the frontier once nothing is in flight. That is the moment every event they
-     * cover is durable: the engine delivers a bound only after the events beneath it, and this processor
-     * takes those straight from the inbox into batches, so once no batch is in flight none of them is
-     * unwritten.
-     *
-     * <p>All of them, not the newest: they are bounds on different chains, and a chain whose bound was
-     * dropped here has no second one coming while it stays quiet.
-     */
-    private void releaseHeldBounds() {
-        if (heldBounds.isEmpty() || !inFlight.isEmpty()) {
-            return;
+    /** Holds {@code bound} until every row taken in before it has landed, then hands it over; see releaseHeld. */
+    private void take(Watermark bound) {
+        ArrayDeque<Held<Watermark>> held = heldBounds.computeIfAbsent(bound.key(), axis -> new ArrayDeque<>());
+        // The newer bound on an axis subsumes an older one waiting for the same rows. One waiting for fewer
+        // rows is kept: it goes as soon as those have landed, rather than waiting on rows taken in after it.
+        if (!held.isEmpty() && held.peekLast().before() == nextOrder) {
+            held.pollLast();
         }
-        for (Watermark bound : heldBounds.values()) {
-            frontier.bound(bound, sinkAck);
-        }
-        heldBounds.clear();
+        held.add(new Held<>(nextOrder, bound));
+        releaseHeld();
+        reportTrailing();
     }
 
     /**
-     * Takes no notice of a bound that arrived on one edge. Answering true is what lets the engine combine
-     * it with the other edges and deliver the combined value to the variant above; acting on it here would
-     * be acting on one edge's promise alone. Written out rather than left to the interface default, which
-     * is the same answer for a different reason.
+     * Hands the frontier every held word and bound whose rows have landed. The engine delivers a bound only
+     * after the events beneath it, and a word travels behind the records it must not overtake, so each covers
+     * exactly the rows taken in before it; once every one of those has landed, so has everything it speaks for.
+     *
+     * <p>Words go before bounds. For bounds, every axis with one due, and the newest due on each: they are
+     * bounds on different chains, and a chain whose bound was dropped here has no second one coming while it
+     * stays quiet.
+     */
+    private void releaseHeld() {
+        long landedBelow = firstUnlanded();
+        while (!heldWords.isEmpty() && heldWords.peek().before() <= landedBelow) {
+            List<ChainEntry> entries = new ArrayList<>();
+            heldWords.poll().value().forEach((chain, position) -> entries.add(new ChainEntry(chain, position)));
+            frontier.settled(entries, ack);
+        }
+        for (ArrayDeque<Held<Watermark>> held : heldBounds.values()) {
+            Watermark due = null;
+            while (!held.isEmpty() && held.peek().before() <= landedBelow) {
+                due = held.poll().value();
+            }
+            if (due == null) {
+                continue;
+            }
+            frontier.bound(due, ack);
+            // Every change this writer was given at or below the bound has landed, whatever the frontier made
+            // of it: a writer given none of a chain's rows says so here and holds no chain back by having
+            // nothing to write for it.
+            String chain = frontier.chainOf(due);
+            if (chain != null) {
+                ack.bounded(chain, FrontierOrders.unpack(due.timestamp()));
+            }
+        }
+    }
+
+    /** The number of the oldest row not yet landed - queued or being written - or the next number if none is. */
+    private long firstUnlanded() {
+        long first = nextOrder;
+        for (ArrayDeque<Queued> queue : queued.values()) {
+            first = Math.min(first, queue.peek().order());
+        }
+        for (InFlightBatch batch : inFlight) {
+            first = Math.min(first, batch.firstOrder());
+        }
+        return first;
+    }
+
+    /**
+     * Takes in a bound that arrived on one edge, already combined across the queues of that edge. A sink
+     * compiled with the chains each edge carries combines it here with what the other edges carrying the
+     * same chain have promised, and takes the result once every one of them has spoken - the per-edge
+     * counterpart of what the engine does across every edge, without waiting on an edge that never carries
+     * the chain. Any other sink takes no notice: answering true is what lets the engine combine it and
+     * deliver the combined value to the variant above.
      */
     @Override
     public boolean tryProcessWatermark(int ordinal, Watermark watermark) {
+        if (frontier != null && edges != null) {
+            edges.observe(ordinal, watermark.key(), watermark.timestamp())
+                    .ifPresent(combined -> take(new Watermark(combined, watermark.key())));
+        }
         return true;
     }
 
@@ -388,7 +715,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
                 throw failure;
             }
             if (frontier != null) {
-                frontier.settled(batch.positions(), sinkAck);
+                frontier.settled(batch.positions(), ack);
             }
             // Counted here and nowhere earlier: this is the first line after the write is known to have
             // succeeded, which is the boundary the count is defined at. A row counted on hand-off would be
@@ -403,7 +730,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             return true;
         });
         if (frontier != null) {
-            releaseHeldBounds();
+            releaseHeld();
             reportTrailing();
         }
     }
@@ -454,15 +781,11 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     }
 
     /**
-     * The write that settles this batch, or an already-settled one where the batch holds no record. A drain
-     * of nothing but words about chains has nothing to deliver, and handing the writer an empty list would
-     * put an empty call on an external target on every one of them - on a pointed-at stream nobody names,
-     * that is every drain of it.
+     * The write that settles this batch. A batch always holds a row: words about chains wait apart from the
+     * rows rather than riding in a batch, so an external target is never handed an empty call for one.
      */
     private CompletableFuture<WriteResult> settlementOf(List<Envelope> batch) {
-        return batch.isEmpty()
-                ? CompletableFuture.completedFuture(new WriteResult(0))
-                : writer.write(batch).toCompletableFuture();
+        return writer.write(batch).toCompletableFuture();
     }
 
     /**
@@ -485,9 +808,20 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         }
     }
 
-    /** One outstanding write, what its batch contributes to the frontier, and what it delivers. */
+    /**
+     * One outstanding write, what its batch contributes to the frontier, what it delivers, and the number of its
+     * first row - the lowest in it, since a stream's rows go in the order they were taken in.
+     */
     private record InFlightBatch(CompletableFuture<WriteResult> future, List<ChainEntry> positions,
-            DeliveredRows delivered) {
+            DeliveredRows delivered, long firstOrder) {
+    }
+
+    /** A row taken in and not yet handed to the writer, with the number it was taken in under. */
+    private record Queued(long order, Envelope row) {
+    }
+
+    /** A word or a bound held until every row numbered below {@code before} has landed. */
+    private record Held<T>(long before, T value) {
     }
 
     /**
@@ -600,13 +934,25 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         private final SupplierEx<? extends SinkWriter> writerFactory;
         private final SinkAckFactory sinkAckFactory;
         private final SupplierEx<SinkFrontier> frontierFactory;
+        private final SupplierEx<LevelBounds> edgesFactory;
+        private final String vertexName;
+        private final boolean totalOne;
+        private final int maxRecords;
+        private final long maxWaitMillis;
         private transient SinkAck sinkAck;
 
         AckSinkSupplier(SupplierEx<? extends SinkWriter> writerFactory,
-                SinkAckFactory sinkAckFactory, SupplierEx<SinkFrontier> frontierFactory) {
+                SinkAckFactory sinkAckFactory, SupplierEx<SinkFrontier> frontierFactory,
+                SupplierEx<LevelBounds> edgesFactory, String vertexName, boolean totalOne,
+                int maxRecords, long maxWaitMillis) {
             this.writerFactory = writerFactory;
             this.sinkAckFactory = sinkAckFactory;
             this.frontierFactory = frontierFactory;
+            this.edgesFactory = edgesFactory;
+            this.vertexName = vertexName;
+            this.totalOne = totalOne;
+            this.maxRecords = maxRecords;
+            this.maxWaitMillis = maxWaitMillis;
         }
 
         @Override
@@ -616,15 +962,38 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
 
         @Override
         public Collection<? extends Processor> get(int count) {
-            List<Processor> processors = new ArrayList<>(count);
-            for (int i = 0; i < count; i++) {
-                // A gauge per processor, not one shared: the handles it keeps belong to the sink that took
-                // the reading, and a shared one would have each sink's readings land under the other's.
-                processors.add(new SinkProcessor(writerFactory.get(), sinkAck, frontierFactory.get(),
-                        DEFAULT_MAX_IN_FLIGHT, DEFAULT_MAX_BATCH_SIZE, new JetFrontierGauge(),
-                        new JetDeliveryGauge()));
-            }
-            return processors;
+            // A gauge per processor, not one shared: the handles it keeps belong to the sink that took the
+            // reading, and a shared one would have each sink's readings land under the other's.
+            return openedTogether(count, () -> new SinkProcessor(writerFactory.get(), sinkAck, frontierFactory.get(),
+                    DEFAULT_MAX_IN_FLIGHT, maxRecords, new JetFrontierGauge(),
+                    new JetDeliveryGauge(), System::currentTimeMillis, vertexName, totalOne,
+                    edgesFactory == null ? null : edgesFactory.get(), maxWaitMillis, System::nanoTime));
         }
+    }
+
+    /**
+     * {@code count} processors, each with a writer of its own, made together or not at all: a writer that fails
+     * to open fails the lot, and every writer already opened for it is closed first. The engine only ever closes
+     * processors it was handed, and these never would be - so each connector one of them opened would stay open,
+     * and a retry would open as many again beside it. None of them has written anything: a processor writes only
+     * once the engine runs it.
+     */
+    private static List<Processor> openedTogether(int count, SupplierEx<SinkProcessor> processor) {
+        List<Processor> processors = new ArrayList<>(count);
+        try {
+            for (int i = 0; i < count; i++) {
+                processors.add(processor.get());
+            }
+        } catch (Throwable failure) {
+            for (Processor opened : processors) {
+                try {
+                    opened.close();
+                } catch (Exception closing) {
+                    failure.addSuppressed(closing);
+                }
+            }
+            throw failure;
+        }
+        return processors;
     }
 }

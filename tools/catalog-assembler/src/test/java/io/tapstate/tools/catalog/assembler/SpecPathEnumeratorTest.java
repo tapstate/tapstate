@@ -16,6 +16,20 @@ import static org.assertj.core.api.Assertions.assertThat;
 class SpecPathEnumeratorTest {
 
     @Test
+    void keepsEnterpriseDeletionPathsInTheirOwnFetchList() {
+        String mysql = "connectors/mysql-connector/src/main/resources/spec_mysql.json";
+        String oracle = "connectors/oracle-connector/src/main/resources/spec_oracle.json";
+        String sqlserver = "connectors/mssql-connector/src/main/resources/mssql-spec.json";
+        String db2 = "connectors/db2-connector/src/main/resources/spec_db2.json";
+        List<ConnectorCatalogEntry> snapshot = List.of(entry("mysql", mysql), entry("oracle", oracle),
+                entry("sqlserver", sqlserver), entry("db2", db2));
+
+        assertThat(SpecPathEnumerator.specPathsToFetch(snapshot, List.of(mysql))).containsExactly(mysql);
+        assertThat(SpecPathEnumerator.specPathsToFetch(snapshot, List.of(), SpecRepository.ENTERPRISE))
+                .containsExactly(db2, sqlserver, oracle);
+    }
+
+    @Test
     void enumeratesTheSpecPathOfEveryCheckedInEntryWhicheverTreeItSitsIn() {
         List<ConnectorCatalogEntry> snapshot = List.of(
                 entry("mysql", "connectors/mysql-connector/src/main/resources/spec_mysql.json"),

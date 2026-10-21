@@ -4,12 +4,17 @@ import com.hazelcast.jet.core.Processor;
 import io.tapstate.runtime.engine.StageTimer;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.Inbox;
+import com.hazelcast.jet.core.Watermark;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.Staged;
+import io.tapstate.runtime.engine.SettledPositions;
+import io.tapstate.runtime.engine.LevelBounds;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
 
@@ -31,7 +36,8 @@ import java.util.Objects;
  * publishing its row twice. So taking them in and sending what they mean are separate steps here, and
  * only the sending is retried.
  *
- * <p><b>What is offered is taken in a whole delivery at a time rather than an item at a time.</b> The
+ * <p><b>Rows are taken in a batch rather than an item at a time.</b> A settlement marker ends a batch
+ * and follows all of its output before the next batch is taken in. The
  * driver reads the fact mirror once for the keys a batch is about to ask about, which is one round
  * trip for a delivery instead of one per row; handing it one item per call would leave that read
  * asking for a single key every time, which is the same number of trips the batching exists to
@@ -47,6 +53,7 @@ public final class JoinProcessor extends AbstractProcessor implements Staged {
 
     private final JoinDriver driver;
     private final Map<Integer, String> sourceByOrdinal;
+    private final LevelBounds bounds;
 
     /**
      * @param sourceByOrdinal which source arrives on which inbound edge. It comes from whoever drew the
@@ -55,15 +62,32 @@ public final class JoinProcessor extends AbstractProcessor implements Staged {
      *                        under two aliases, and then one stream is two sources
      */
     public JoinProcessor(JoinDriver driver, Map<Integer, String> sourceByOrdinal) {
-        this.driver = Objects.requireNonNull(driver, "driver");
-        this.sourceByOrdinal = Map.copyOf(Objects.requireNonNull(sourceByOrdinal, "sourceByOrdinal"));
+        this(driver, sourceByOrdinal, null);
     }
 
-    /** Whether what is currently being offered has already been taken into the state. */
-    private boolean taken;
+    JoinProcessor(JoinDriver driver, Map<Integer, String> sourceByOrdinal, LevelBounds bounds) {
+        this.driver = Objects.requireNonNull(driver, "driver");
+        this.sourceByOrdinal = Map.copyOf(Objects.requireNonNull(sourceByOrdinal, "sourceByOrdinal"));
+        this.bounds = bounds;
+    }
 
     /**
-     * Takes in everything being offered, then sends as much of what it means as the outbox will hold.
+     * Like every other vertex that reaches the state layer, and for the same reason: every call into the
+     * join's state is a call into the cluster, and one the cluster refuses while a member joining catches up
+     * is waited out where it was made. A call that waits on a cooperative thread stops every other vertex
+     * sharing that thread rather than only this one.
+     */
+    @Override
+    public boolean isCooperative() {
+        return false;
+    }
+
+    /** How many arrivals before the next settlement marker have already been taken into the state. */
+    private int taken;
+    private final Map<String, ChainPosition> takenPositions = new LinkedHashMap<>();
+
+    /**
+     * Takes in each run of rows before a settlement marker, then sends what the outbox will hold.
      *
      * <p>The items are left where they are until all of it has gone out, which is how the substrate is
      * told there is more to do: it offers the same delivery again, and {@link #taken} is what keeps it
@@ -94,19 +118,42 @@ public final class JoinProcessor extends AbstractProcessor implements Staged {
             throw new IllegalStateException(
                     "a join vertex was given an edge on ordinal " + ordinal + ", which names no source");
         }
-        if (!taken) {
-            List<SourceChange> changes = new ArrayList<>(inbox.size());
-            // Reading rather than draining: what is not sent yet has to still be there to be offered
-            // again, and it is the sending that decides, not this.
-            for (Object item : inbox) {
-                changes.add(new SourceChange(source, (Envelope) item));
+        while (!inbox.isEmpty()) {
+            if (inbox.peek() instanceof SettledPositions) {
+                // Finish earlier recomputes before promising that a later position has settled.
+                if (!driver.drainUpdates(this::tryEmit) || !tryEmit(inbox.peek())) {
+                    return;
+                }
+                inbox.poll();
+                continue;
             }
-            driver.absorb(changes);
-            taken = true;
-        }
-        if (driver.drainUpdates(this::tryEmit)) {
-            inbox.clear();
-            taken = false;
+            if (taken == 0) {
+                List<SourceChange> changes = new ArrayList<>(inbox.size());
+                // Keep batching contiguous rows, but never absorb rows beyond a settlement marker.
+                for (Object item : inbox) {
+                    if (item instanceof SettledPositions) {
+                        break;
+                    }
+                    Envelope event = (Envelope) item;
+                    changes.add(new SourceChange(source, event));
+                    SettledPositions.fold(takenPositions, event.positions());
+                }
+                driver.absorb(changes);
+                taken = changes.size();
+            }
+            if (!driver.drainUpdates(this::tryEmit)) {
+                return;
+            }
+            // Dimensions with no referrers and unmatched inner facts still have landed in join state.
+            // Confirm the delivery only behind its entire fan-out, including any refused output.
+            if (!takenPositions.isEmpty() && !tryEmit(new SettledPositions(takenPositions))) {
+                return;
+            }
+            takenPositions.clear();
+            for (int i = 0; i < taken; i++) {
+                inbox.poll();
+            }
+            taken = 0;
         }
     }
 
@@ -127,5 +174,17 @@ public final class JoinProcessor extends AbstractProcessor implements Staged {
     @Override
     public boolean complete() {
         return driver.drainUpdates(this::tryEmit);
+    }
+
+    /** A table's bound is combined only across the inputs that carry that table. */
+    @Override
+    public boolean tryProcessWatermark(int ordinal, Watermark watermark) {
+        return bounds == null || (driver.drainUpdates(this::tryEmit)
+                && bounds.advance(ordinal, watermark, this::tryEmit));
+    }
+
+    @Override
+    public boolean tryProcessWatermark(Watermark watermark) {
+        return bounds != null || super.tryProcessWatermark(watermark);
     }
 }

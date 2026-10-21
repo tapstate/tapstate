@@ -56,6 +56,8 @@ git rev-parse -q --verify "${base}^{commit}" >/dev/null 2>&1 || {
 }
 
 here="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=.github/scripts/_pr-read.sh
+. "$here/_pr-read.sh"
 # shellcheck source=.github/scripts/_pr-section.sh
 . "$here/_pr-section.sh"
 
@@ -67,9 +69,7 @@ numbers="$(git log --format='%s' "${base}..${sha}" 2>/dev/null \
 
 news=""; fixes=""; other=""
 for n in $numbers; do
-  # A number in a subject is not always a pull request in this repository: it can be an issue, or
-  # another repository's. Asking and being refused is the answer, not a failure.
-  body="$(gh pr view "$n" --json body --jq '.body' 2>/dev/null)" || continue
+  body="$(read_pr "$n" --json body --jq '.body')" || exit 1
   [ -n "$body" ] || continue
   note="$(section_body "Release note" "###")"
   [ -n "$note" ] || continue

@@ -4,6 +4,7 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Stream;
 
 /**
  * The connectors this release officially supports — the one place that set is written down.
@@ -31,10 +32,29 @@ public final class OfficialConnectors {
      */
     public static final Map<String, List<String>> IDS_BY_DATABASE_KIND = databaseKinds();
 
-    /** The supported ids, in the order a message naming them should read. */
-    public static final List<String> IDS = IDS_BY_DATABASE_KIND.values().stream()
-            .flatMap(List::stream)
+    /**
+     * Supported ids that belong to no verified database kind: a server accepts them at registration,
+     * but no release lane exercises their database against a live instance, so they are previews
+     * rather than certified support. Kept apart from the kinds so that accepting a connector and
+     * promising its database is verified stay two separate decisions.
+     */
+    public static final List<String> PREVIEW_IDS = List.of("db2", "db2i");
+
+    /** The supported ids, in the order a message naming them should read: the kinds', then previews. */
+    public static final List<String> IDS = Stream.concat(
+            IDS_BY_DATABASE_KIND.values().stream().flatMap(List::stream), PREVIEW_IDS.stream())
             .toList();
+
+    /**
+     * The supported ids this release accepts in the source role only.
+     *
+     * <p>Being listed here is a support boundary, not a statement about the connector: its jar may well
+     * implement writes. The same sink rule applies when catalog rows are derived and when previously
+     * stored rows are read, so an earlier release's row cannot restore the write role after an upgrade.
+     * API listings read the sink off the row. The server also checks this policy by id so missing
+     * catalog metadata cannot accidentally admit an official source-only connector as a private sink.
+     */
+    public static final List<String> SOURCE_ONLY_IDS = List.of("db2", "db2i");
 
     private static Map<String, List<String>> databaseKinds() {
         Map<String, List<String>> kinds = new LinkedHashMap<>();
@@ -56,6 +76,11 @@ public final class OfficialConnectors {
     /** Whether {@code connectorId} is one this release supports. */
     public static boolean isOfficial(String connectorId) {
         return IDS.contains(connectorId);
+    }
+
+    /** Whether {@code connectorId} is supported as a source and never as a write target. */
+    public static boolean isSourceOnly(String connectorId) {
+        return SOURCE_ONLY_IDS.contains(connectorId);
     }
 
     /**

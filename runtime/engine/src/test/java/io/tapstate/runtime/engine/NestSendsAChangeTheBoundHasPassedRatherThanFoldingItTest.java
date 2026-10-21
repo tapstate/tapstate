@@ -162,6 +162,9 @@ class NestSendsAChangeTheBoundHasPassedRatherThanFoldingItTest {
         await(() -> ACKED.contains(acked(CUSTOMERS, CUSTOMER_AT)) || job.getStatus() == JobStatus.FAILED);
         await(() -> MOST_CLAIMS_IN_A_DOCUMENT.get() >= CLAIMS_SEEDED
                 || job.getStatus() == JobStatus.FAILED);
+        // The document count is observed inside write(); confirmation follows when the sink settles it.
+        await(() -> ACKED.contains(acked(CLAIMS, claimAt(CLAIMS_SEEDED - 1)))
+                || job.getStatus() == JobStatus.FAILED);
 
         assertThat(job.getStatus())
                 .describedAs("what fell was this level's own hold, with every edge still climbing; read as "
@@ -214,7 +217,8 @@ class NestSendsAChangeTheBoundHasPassedRatherThanFoldingItTest {
                 alias -> List.of(byAlias.get(alias)),
                 new NestBinding(tables::get, HeapNestStores.onHeap(), (from, released) -> { }, settings),
                 vertex -> outbound.merge(vertex, 1, Integer::sum) - 1,
-                new NestFrontier(AXES, alias -> List.of(List.of(chainOfAlias.get(alias)))));
+                new NestFrontier(AXES, alias -> List.of(List.of(chainOfAlias.get(alias)))),
+                new NodeWidth("doc", 4, 1, null));
 
         Vertex sink = dag.newVertex("sink", SinkProcessor.metaSupplier(
                 "sink",

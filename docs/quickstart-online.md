@@ -6,9 +6,10 @@ target: https://tapstate.dev/docs/quickstart-online
 
 # Quick start: the online runtime (preview)
 
-> **Preview / POC.** Tapstate's runtime is an early slice: a single-node, in-memory
-> engine that executes your `.tap.yml` resources as live pipelines. It is enough to
-> run a real end-to-end sync, but it is **not** production-hardened — see
+> **Preview / POC.** Tapstate's runtime executes your `.tap.yml` resources as live
+> pipelines. It starts as a single member by default; [cluster mode](cluster/README.md)
+> is an opt-in preview. Control-plane state and recovery positions persist in MongoDB.
+> It is enough to run a real end-to-end sync, but it is **not** production-hardened — see
 > [Limitations](#limitations) before you rely on it. The offline authoring CLI is
 > covered in the [main README](../README.md); this page is the runtime.
 >
@@ -38,7 +39,9 @@ connector is loaded through the same plugin interface.
 
 ## Connector support boundary
 
-This preview certifies the following database kinds, with certification scoped by direction:
+This preview certifies the following database kinds, with certification scoped by direction.
+The certified `mongodb-atlas` managed id belongs to the MongoDB kind and is described below rather
+than being presented as another database kind:
 
 | Database | Connector kind | Certified use |
 |---|---|---|
@@ -48,19 +51,64 @@ This preview certifies the following database kinds, with certification scoped b
 | Oracle | `oracle` | Read |
 | SQL Server | `sqlserver` | Read |
 
-A `serve.sync` element in the cloud deployment profile installs only onto MongoDB Atlas.
-On-prem deployments may write to any catalog connector marked sink-capable; private connectors
-outside the catalog remain the operator's responsibility. This deployment allowance is not a
-certification claim: this preview certifies MongoDB write support only. Applying a cloud pipeline
-whose sync names another connector is refused; reading through it is unaffected.
+`aws-rds-mysql` is available as a source-only **unverified preview**, outside the certified table.
+Its shaded PDK JAR exposes batch and stream read functions, but no real Amazon RDS for MySQL
+snapshot, binlog CDC, or restart-continuation run has been completed. It is not a write target.
+Real-service validation is tracked in [issue #529](https://github.com/tapstate/tapstate/issues/529).
 
-Reads are verified on Oracle Free 23 and SQL Server 2022, and across the other
-kinds, with snapshot and CDC inserts, updates and deletes. Decimal validation includes a persisted MySQL DECIMAL(18,4) model, large values,
+A `serve.sync` element in cloud mode installs only onto `mongodb` or `mongodb-atlas`.
+On-prem deployments may write to catalog connectors marked sink-capable, except source-only ids
+such as `aws-rds-mysql`. Private connectors outside the catalog remain the operator's responsibility.
+This deployment allowance is not a certification claim: this preview certifies MongoDB write
+support only. Applying a cloud pipeline whose sync names another connector is refused; reading
+through it is unaffected.
+
+Db2 is accepted as a source-only **preview**, outside the certified table: no release lane
+reads a live Db2 database. Snapshot, change capture of inserts, updates and deletes, and
+continuation across a server restart were verified by hand against Db2 LUW 11.5.5 in both
+change-capture modes below.
+Db2 is supported as a source only. Its connector can write, but its catalog row is not
+sink-capable, so a `serve.sync` naming a `db2` connection is refused on-prem as well as in
+the cloud profile, and so is editing a connection that a `serve.sync` already writes to onto
+`connector: db2`. The CLI's pipeline and serve wizards can still offer a Db2 connection as a
+sync target; applying the result is what refuses it. Db2 LUW reads take a
+snapshot and then capture changes; the database needs archive logging, and each captured
+table `DATA CAPTURE CHANGES`. Change capture has two modes. With `useNativeMiner: true` the
+connector reads the log in-process through IBM's db2ReadLog API. That needs the server on
+Linux x86_64, running as root at least for the first Db2 connection, and the IBM Db2 runtime
+client prepared once on that host with `db2-native-runtime-setup.sh` from the same release:
+the published jar carries the native bridge but not the runtime archive it loads. The
+published server image runs as a non-root user and is not prepared for this mode. Without
+`useNativeMiner`, the connector reads changes from a raw log server at the configured
+`rawLogServerHost` and `rawLogServerPort`; that mode is experimental and not supported for
+production use, where the native mode is the one to run.
+
+Db2 for i (IBM i, formerly AS/400) is accepted as a source-only **preview** under the id
+`db2i`, outside the certified table: no release lane reads a live IBM i system. Snapshot, journal
+capture of inserts, updates and deletes, and continuation across a server restart were verified
+by hand against IBM i 7.4.
+Db2 for i is supported as a source only. Its connector can write, but its catalog row is not
+sink-capable, so a `serve.sync` naming a `db2i` connection is refused on-prem as well as in
+the cloud profile. Reads take a snapshot through the IBM Toolbox for Java JDBC driver and then
+capture inserts, updates and deletes from the journal named by `journalLibraryName` and
+`journalName`; every captured table must be journaled to it. The connection user needs `*USE`
+authority on the data library and its files, on that journal and its attached receiver, and on
+the `DSPJRN` command; `SELECT` on the `QSYS2` catalog views `SYSSCHEMAS`, `SYSTABLES`,
+`SYSCOLUMNS`, `SYSKEYCST`, `SYSINDEXES`, `OBJECT_PRIVILEGES`, `JOURNAL_INFO` and
+`JOURNAL_RECEIVER_INFO`; and `EXECUTE` on `QSYS2.DISPLAY_JOURNAL`. Change capture carries
+neither large-object values nor DDL changes; a snapshot reads large objects in full.
+
+Reads are verified on Oracle Free 23 and SQL Server 2022, and across MySQL, PostgreSQL
+and MongoDB, with snapshot and CDC inserts, updates and deletes. Decimal validation includes a persisted MySQL DECIMAL(18,4) model, large values,
 negative fractions and CDC updates. This is not an exhaustive cross-version or
-all-data-type matrix. The default accepted set contains 16 connector ids
-across these five database kinds, including existing managed variants of MySQL,
-PostgreSQL and MongoDB. Those managed variants have not been live-verified individually.
-Other managed variants of Oracle and SQL Server are outside the default accepted set.
+all-data-type matrix. The default accepted set contains 18 connector ids: the Db2 and
+Db2 for i previews, and 16 across these five database kinds, including existing managed variants of MySQL,
+PostgreSQL and MongoDB. Except for `mongodb-atlas`, those managed variants have not been
+live-verified individually. The Atlas connector was verified with snapshot and change-stream
+reads, restart continuation, and target writes against a real Atlas deployment in both cloud
+and on-prem runtimes. This verifies the tested deployment and does not establish an exhaustive
+Atlas version or tier compatibility matrix.
+Other managed variants of Oracle, SQL Server and Db2 are outside the default accepted set.
 
 `tapstate.connectors.also-accept-ids` lets an operator accept additional connector ids
 on this server. Configuring it puts that server outside the supported configuration;
@@ -76,16 +124,36 @@ stored by an older build need schema rediscovery before automatic target creatio
 Missing or inconsistent decimal metadata is refused before writing; computed decimal
 outputs without a declared numeric domain cannot be auto-created safely.
 
-Oracle and SQL Server connector jars are published as separate assets on the floating
-`connectors-preview` release. They remain outside versioned Tapstate releases and are not
-downloaded by the three-database quickstart unless you explicitly run `register oracle` or
-`register sqlserver`. The Oracle jar bundles `ojdbc8`, `orai18n`, and `xdb` 21.5.0.0 under
+Oracle, SQL Server and Db2 connector jars are published as separate assets on the
+floating `connectors-preview` release. They remain outside versioned Tapstate releases and are
+not downloaded by the three-database quickstart unless you explicitly run `register oracle`,
+`register sqlserver` or `register db2`.
+
+The Db2 for i asset is scheduled for publication after this connector change is merged.
+Until `db2i-connector.jar` appears on that release, register an available local JAR with
+`tapstate register /path/to/db2i-connector.jar`. After publication, `tapstate register db2i`
+downloads and verifies the pinned asset automatically.
+
+The Oracle jar bundles `ojdbc8`, `orai18n`, and `xdb` 21.5.0.0 under
 the Oracle Free Use Terms; the SQL Server jar bundles Microsoft JDBC Driver 12.2.0 under
-the MIT License. Those dependency terms govern only the bundled drivers and do not change
-Tapstate's Apache-2.0 license. The Oracle and SQL Server implementations are paid connector
+the MIT License; the Db2 jar bundles IBM Data Server Driver for JDBC and SQLJ 4.25.13 under
+IBM's International Program License Agreement; the Db2 for i jar bundles IBM Toolbox for Java
+(JTOpen) 21.0.5 under the IBM Public License 1.0, with the complete license text in
+`license.html` at the JAR root. Those dependency terms govern only the bundled drivers and do not change
+Tapstate's Apache-2.0 license. The Oracle, SQL Server, Db2 and Db2 for i implementations are paid connector
 implementations; their use remains subject to the applicable Tapdata agreement. The upstream
 enterprise connector repository has no LICENSE file;
 publishing these binary assets does not relicense that source repository.
+
+The `mongodb-atlas` jar is a separate asset on the same floating release. It is not part of the
+three-database quickstart download; use `register mongodb-atlas` to install the verified bytes
+explicitly. The jar carries bundled third-party license and notice texts under `META-INF/`;
+publishing the binary does not grant a license to the upstream connector source repository.
+
+The `aws-rds-mysql` jar is also a separate, explicit-download asset on that release. Use
+`register aws-rds-mysql` only with the preview limitation above in mind; publishing and
+registering the JAR do not certify snapshot or CDC against a real Amazon RDS instance. It
+bundles MySQL Connector/J 8.0; see the in-JAR license manual and [`NOTICE`](../NOTICE).
 
 The Oracle Free 23 source example uses `autoLog: false`: the connector's automatic
 miner requests `CONTINUOUS_MINE`, which that database no longer supports. Keep
@@ -348,12 +416,17 @@ The jars are shaded and carry their own drivers on an isolated loader;
 `mysql-connector.jar` bundles Oracle MySQL Connector/J under GPL-2.0 with the Universal
 FOSS Exception (see [`NOTICE`](../NOTICE)).
 
-The same release carries Oracle and SQL Server for an explicit registration. From an
-authenticated CLI session, give `register` the published connector id instead of a local path:
+The same release carries Oracle, SQL Server, Db2, Db2 for i, MongoDB Atlas, and the unverified AWS RDS MySQL preview
+for explicit registration. From an authenticated CLI session, give `register` the published
+connector id instead of a local path:
 
 ```console
 tapstate(admin@127.0.0.1:8080)> register oracle
 tapstate(admin@127.0.0.1:8080)> register sqlserver
+tapstate(admin@127.0.0.1:8080)> register mongodb-atlas
+tapstate(admin@127.0.0.1:8080)> register aws-rds-mysql
+tapstate(admin@127.0.0.1:8080)> register db2
+tapstate(admin@127.0.0.1:8080)> register db2i
 ```
 
 The CLI downloads `<id>-connector.jar` from `connectors-preview` and uploads the bytes to
@@ -677,9 +750,15 @@ The last `metrics` form reads bounded, reset-aware history rather than the curre
 pagination, REST and MCP forms, and the difference between an empty retained window and unavailable data.
 
 - The read faces lag the write verbs: they report observed state, which converges to
-  what you asked for rather than changing with the command. Immediately after `start`
-  the first `status`/`metrics` may report no observation yet, and a `status` right
-  after `stop` can still say `running`. Use `--watch`, or retry after a second.
+  what you asked for rather than changing with the command. Immediately after `start`,
+  CLI `status` and `metrics` may report `monitor.no-observation` until the first runtime
+  observation. REST `GET /api/pipelines/{id}/status` returns `state: "NEW"` and omits
+  `observedState` during that window; `desiredState` carries the requested target. After
+  `stop`, the observed state can still be `RUNNING` until another observation arrives,
+  even though the intent is `STOPPED`. `status --watch` streams observed state changes
+  only; a known unobserved pipeline or saved draft keeps the watch open without frames,
+  while an unknown id closes with `lifecycle.unknown-pipeline`. Use `--watch`, or retry
+  after another observation arrives.
 - Under the answer, `status` prints two more lines. `moving` is how fast the pipeline moves, in rows
   per second per direction, measured between two readings of the pipeline's own observation time —
   never this machine's clock, which keeps running while a stalled publisher's reading stands still. A
@@ -715,7 +794,8 @@ pagination, REST and MCP forms, and the difference between an empty retained win
   faces differently. When nothing on the checklist matches it does **not** report
   that all is well — it prints every reading it went through and names the questions these faces
   cannot answer, so you go and look at the thing the product genuinely cannot see instead of
-  trusting a silence. `--watch` is unchanged: it streams the state only, and says nothing more.
+  trusting a silence. `--watch` streams runtime state changes only; while no observation
+  exists yet, the known pipeline's watch stays open and waits for the first one.
 - **The position it reports is `targetAckedPosition`: how far the target has confirmed writes.**
   When a connector supplies a Java-serialized token, `metrics` summarizes how many tables have
   an acknowledged position and how many distinct positions they share; it cannot infer a source
@@ -828,8 +908,10 @@ In the REPL:
 tapstate(admin@127.0.0.1:8080)> stop order_pipeline
 This clears what the pipeline accumulated:
   - what its operators had assembled, and the changes they could not assemble
+  - what its connectors had kept for a later drive
   - the position it had read and confirmed up to
   - what the shared mining chain had read, once this is the last pipeline reading it
+  - what its source connector set up on the source to read changes, such as a replication slot, once this is the last pipeline reading through it
 The run after this one has no position to carry on from.
 Your target database is not touched either way.
 Clear order_pipeline? Type yes to go ahead [no]: yes
@@ -990,12 +1072,13 @@ This runtime is a preview. Known constraints in this slice:
   publishes no host port, so the threshold is a token rather than network reach. Do
   not put data in this deployment that its own users should not see; isolating the two
   needs authentication or a second instance, and this preview has neither.
-- **Single node, in-memory.** No multi-node HA. A server restart does **not** resume
-  from a persisted offset — it replays from the source (idempotent upsert absorbs the
-  overlap). Durable resume / exactly-once are not in this preview.
-- **Preview builds.** Until the first release, the server image is assembled locally
-  and the CLI is built from source; a published image and a CLI installer remove
-  those steps.
+- **Single member by default.** This demo runs one member. [Cluster mode](cluster/README.md)
+  is an opt-in preview, with its own configuration and safety requirements.
+- **Recovery depends on the source and read mode.** MongoDB retains control-plane
+  state and recovery positions. [Restart recovery](#restart-recovery) can replay
+  unconfirmed work and requires the connector's source history to remain available.
+- **At-least-once delivery.** Retries and restarts can deliver records again;
+  idempotent upserts absorb overlap, but there is no exactly-once guarantee.
 - **A new full load cannot see what the source deleted meanwhile.** After a stop that
   clears the pipeline's state, the next run copies what the source holds then, and a
   row deleted at the source in between is not in the copy: a target that is not
@@ -1009,3 +1092,31 @@ This runtime is a preview. Known constraints in this slice:
 - **Temporary connections and machine tokens are process-scoped.** A persistent human
   session is created only by `auth login` against a named context; `connect`,
   `--connect`, `--token`, and `TAPSTATE_TOKEN` never create or update that cache.
+
+### Restart recovery
+
+A single-member process restart with the same MongoDB data re-adopts pipelines
+recorded as running. Keep the store volume and operator-state database: recovery
+positions and state are part of that data. Completed finite runs stay completed;
+failed runs require an explicit recovery action.
+
+All supported database sources use the connector capture path. The runtime passes
+the recorded position back to that connector; recovery depends on the connector
+accepting it and the required source change history still being available. There
+is no blanket guarantee of recovery after that history expires.
+
+| Read mode | Recovery of a running pipeline after a single-member restart |
+| --- | --- |
+| `snapshot_and_cdc` (default) | Skip tables whose initial load this pipeline's sinks already confirmed. Read each unconfirmed table again from the beginning, keeping its recorded snapshot generation and original pre-snapshot CDC position, then resume changes from the recorded position. There is no durable cursor within an unfinished table's snapshot. |
+| `cdc_only` | Take no initial snapshot. Reopen CDC at a saved source checkpoint or proven start anchor. The configured initial `start_from` applies only to fresh initialization. If a previously started channel has neither anchor, restart is refused with `capture.recovery-progress-unproven` and the pipeline becomes `FAILED`. |
+| `snapshot_only` | Read the selected data again for an interrupted active load. There is no CDC recovery chain or durable snapshot row cursor. |
+
+For `capture.recovery-progress-unproven`, keep the retained state for diagnosis.
+Perform a full reload, or explicitly accept a new CDC-only baseline and the missing
+interval. The runtime does not clear retained state automatically.
+
+With shared SRS enabled, capture resumes from its persisted source checkpoint and
+each pipeline source continues from its own recorded per-table progress in the
+durable change log. With SRS disabled, each source uses its own capture channel
+and saved source checkpoint. Both paths can replay unconfirmed records; delivery
+remains at-least-once.

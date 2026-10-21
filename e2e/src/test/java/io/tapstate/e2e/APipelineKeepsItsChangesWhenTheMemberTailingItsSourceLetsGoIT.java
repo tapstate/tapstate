@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.testsupport.DockerGate;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -23,9 +24,10 @@ import org.junit.jupiter.api.Test;
  * nothing, because a different pipeline was stopped somewhere else. The member still reading the capture
  * takes the tail over instead, from where the last one had got to.
  *
- * <p>Pipelines are added over the same source until one lands on the member not holding the capture; the
- * pipelines driven by the holder are then stopped with their state cleared, and a change made afterwards
- * has to reach the one left.
+ * <p>Pipelines are added over the same source until two land on the member not holding the capture. Its
+ * first joiner is stopped with its state cleared before the pipelines driven by the holder are stopped
+ * the same way. A change made afterwards has to reach the one left, and taking the tail over must not
+ * attach the stopped first joiner to the chain again.
  * The source and the targets are real Mongo: the harness's own connector replays its whole table through
  * the ring on every run, which a pipeline left without a tail would receive anyway.
  */
@@ -34,7 +36,7 @@ class APipelineKeepsItsChangesWhenTheMemberTailingItsSourceLetsGoIT {
     private static final String CONNECTOR = "mongodb";
     private static final String TABLE = "orders";
     private static final long SEEDED_ROWS = 5;
-    private static final int MOST_PIPELINES = 6;
+    private static final int MOST_PIPELINES = 12;
 
     private static final String SOURCE_ID = "let_go_src";
 
@@ -60,7 +62,8 @@ class APipelineKeepsItsChangesWhenTheMemberTailingItsSourceLetsGoIT {
             EndpointAddress source = EndpointAddress.uri(sourceUri);
             mongo.seed(source, TABLE, SeedRows.generated(SEEDED_ROWS));
 
-            try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-let-go")) {
+            try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-let-go");
+                    StoreDocuments documents = StoreDocuments.at(store)) {
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.first();
                 control.registerConnector(CONNECTOR, ConnectorJars.bytesFor(CONNECTOR));
@@ -75,11 +78,15 @@ class APipelineKeepsItsChangesWhenTheMemberTailingItsSourceLetsGoIT {
                         () -> control.captureOwnersOf(first).values().stream().findFirst());
 
                 List<String> onTheHolder = new ArrayList<>(List.of(first));
+                Map<String, String> driversByPipeline = new LinkedHashMap<>();
+                driversByPipeline.put(first, holder);
+                String firstJoiner = null;
                 for (int n = 2; n <= MOST_PIPELINES; n++) {
                     String pipeline = pipelineId(n);
                     EndpointAddress target = startPipelineInto(control, n, sourceUri);
                     String driver = Await.answered("the cluster to name the member driving " + pipeline,
                             () -> control.pipelineControllerOf(pipeline));
+                    driversByPipeline.put(pipeline, driver);
                     if (driver.equals(holder)) {
                         onTheHolder.add(pipeline);
                         continue;
@@ -87,6 +94,27 @@ class APipelineKeepsItsChangesWhenTheMemberTailingItsSourceLetsGoIT {
                     Await.until(pipeline + " to receive its load",
                             () -> mongo.count(target, TABLE) >= SEEDED_ROWS,
                             () -> "rows at its target = " + mongo.count(target, TABLE) + " of " + SEEDED_ROWS);
+                    if (firstJoiner == null) {
+                        firstJoiner = pipeline;
+                        continue;
+                    }
+
+                    String stoppedJoiner = firstJoiner;
+                    String remainingPipeline = pipeline;
+                    String stoppedConsumer = SrsConsumerId.of(stoppedJoiner, SOURCE_ID).value();
+                    String remainingConsumer = SrsConsumerId.of(remainingPipeline, SOURCE_ID).value();
+                    String chain = Await.answered("both joiners to hold cursors on the same chain",
+                            () -> documents.miningChainIds().stream()
+                                    .filter(id -> documents.consumersOf(id)
+                                            .containsAll(List.of(stoppedConsumer, remainingConsumer)))
+                                    .findFirst());
+                    control.stop(stoppedJoiner, true);
+                    Await.until(stoppedJoiner + " to stop",
+                            () -> control.state(stoppedJoiner).filter(PipelineState.STOPPED::equals).isPresent(),
+                            () -> String.valueOf(control.state(stoppedJoiner)));
+                    Await.until("the stopped first joiner's cursor to be cleared before takeover",
+                            () -> !documents.consumersOf(chain).contains(stoppedConsumer),
+                            () -> "consumers on " + chain + " = " + documents.consumersOf(chain));
 
                     // Stopped with their state cleared, which is also the stop that decides whether the
                     // chain's record goes with them: it must not, while this pipeline is still on it.
@@ -99,24 +127,33 @@ class APipelineKeepsItsChangesWhenTheMemberTailingItsSourceLetsGoIT {
                                 () -> String.valueOf(control.state(stopping)));
                     }
 
+                    Await.until("the remaining joiner's member to take the capture over", HANDOVER,
+                            () -> control.captureOwnersOf(remainingPipeline).containsValue(driver),
+                            () -> "capture owners = " + control.captureOwnersOf(remainingPipeline));
+
                     long rowsBefore = mongo.count(target, TABLE);
                     mongo.cdc(source, TABLE, CdcOp.INSERT, 1);
-                    Await.until("a change made after " + holder + " let the capture go to reach " + pipeline,
+                    Await.until("a change made after " + holder + " let the capture go to reach " + remainingPipeline,
                             HANDOVER,
                             () -> mongo.count(target, TABLE) > rowsBefore,
                             () -> "rows at its target = " + mongo.count(target, TABLE) + ", was " + rowsBefore
-                                    + "; it is " + control.state(pipeline) + " and its capture is owned by "
-                                    + control.captureOwnersOf(pipeline).values());
-                    assertThat(control.state(pipeline))
+                                    + "; it is " + control.state(remainingPipeline) + " and its capture is owned by "
+                                    + control.captureOwnersOf(remainingPipeline).values());
+                    assertThat(control.state(remainingPipeline))
                             .describedAs("it ran throughout, and nobody asked it to do anything")
                             .contains(PipelineState.RUNNING);
-                    assertThat(control.captureOwnersOf(pipeline).values())
+                    assertThat(control.captureOwnersOf(remainingPipeline).values())
                             .describedAs("its source is now tailed by the member driving it")
                             .containsOnly(driver);
+                    assertThat(documents.consumersOf(chain))
+                            .describedAs("taking the tail over must not reattach the cleared first joiner %s",
+                                    stoppedJoiner)
+                            .doesNotContain(stoppedConsumer);
                     return;
                 }
-                throw new AssertionError("no pipeline of " + MOST_PIPELINES + " landed on the member not "
-                        + "holding the capture, so this run could not ask the question");
+                throw new AssertionError("fewer than two pipelines of " + MOST_PIPELINES + " landed on the member "
+                        + "not holding the capture, so this run could not ask the question; capture holder = "
+                        + holder + "; pipeline controllers = " + driversByPipeline);
             }
         }
     }

@@ -9,6 +9,7 @@ import java.net.URLConnection;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.List;
 import java.util.Map;
 
@@ -92,6 +93,101 @@ class ConnectorClassLoaderTest {
             Class<?> shared = loader.load("net.sf.cglib.beans.BeanMap");
             assertThat(shared).isSameAs(hostBeanMap);
         }
+    }
+
+    @Test
+    void sharesTheLog4jApiFromTheHost(@TempDir Path dir) throws Exception {
+        // A connector built for the Tapdata engine logs through the log4j API and leaves it out of its jar,
+        // because that engine provides it - the Db2 for i journal reader does. Unshared, its first change
+        // read dies on NoClassDefFoundError for LogManager.
+        Path jar = SyntheticJar.compileToJar(dir, "synthetic.JournalReader",
+                "package synthetic; public class JournalReader { public String logger() {"
+                        + " return org.apache.logging.log4j.LogManager.getLogger(\"synthetic.journal\").getName(); } }");
+        try (ConnectorClassLoader loader = ConnectorClassLoader.open(List.of(jar))) {
+            assertThat(loader.load("org.apache.logging.log4j.LogManager"))
+                    .isSameAs(org.apache.logging.log4j.LogManager.class);
+            Class<?> reader = loader.load("synthetic.JournalReader");
+            Object logger = reader.getMethod("logger").invoke(reader.getDeclaredConstructor().newInstance());
+            assertThat(logger).isEqualTo("synthetic.journal");
+        }
+    }
+
+    @Test
+    void aBundledLog4jApiAndItsCallersStayInOneLoader(@TempDir Path dir) throws Exception {
+        // The nested caller needs package-private API access. Mixing its bundled API with the host
+        // facade fails at invocation, even when both classes could be looked up independently.
+        Path jar = SyntheticJar.compileToJar(dir, "org.apache.logging.log4j.LogManager", """
+                package org.apache.logging.log4j;
+                public class LogManager {
+                    static String contextName() { return "bundled-context"; }
+                    public static class BundledReader {
+                        public String read() { return LogManager.contextName(); }
+                    }
+                }
+                """);
+        try (ConnectorClassLoader loader = ConnectorClassLoader.open(List.of(jar))) {
+            Class<?> reader = loader.load("org.apache.logging.log4j.LogManager$BundledReader");
+            assertThat(reader.getMethod("read").invoke(reader.getDeclaredConstructor().newInstance()))
+                    .isEqualTo("bundled-context");
+            assertThat(loader.load("org.apache.logging.log4j.LogManager").getClassLoader())
+                    .isSameAs(reader.getClassLoader()).isNotSameAs(getClass().getClassLoader());
+        }
+    }
+
+    /**
+     * Every caller over one artifact gets the one loader, and so the one copy of each class: a connector that
+     * binds a JNI library to the loader it was loaded through finds that loader again on its next open.
+     * {@code open} still gives each caller a loader of its own.
+     */
+    @Test
+    void everyCallerOverOneArtifactSharesOneLoader(@TempDir Path dir) throws Exception {
+        Path jar = widgetJar(dir, "A");
+        ConnectorClassLoader first = ConnectorClassLoader.shared(List.of(jar));
+        ConnectorClassLoader second = ConnectorClassLoader.shared(List.of(jar));
+        assertThat(second).isSameAs(first);
+        assertThat(second.load("synthetic.Widget")).isSameAs(first.load("synthetic.Widget"));
+        try (ConnectorClassLoader own = ConnectorClassLoader.open(List.of(jar))) {
+            assertThat(own.load("synthetic.Widget")).isNotSameAs(first.load("synthetic.Widget"));
+        }
+    }
+
+    @Test
+    void sharedLoadersOverDifferentArtifactsStayIsolated(@TempDir Path dir) throws Exception {
+        Path jarA = widgetJar(dir.resolve("a"), "A");
+        Path jarB = widgetJar(dir.resolve("b"), "B");
+        Class<?> wa = ConnectorClassLoader.shared(List.of(jarA)).load("synthetic.Widget");
+        Class<?> wb = ConnectorClassLoader.shared(List.of(jarB)).load("synthetic.Widget");
+        assertThat(wa).isNotSameAs(wb);
+        assertThat(wa.getMethod("tag").invoke(wa.getDeclaredConstructor().newInstance())).isEqualTo("A");
+        assertThat(wb.getMethod("tag").invoke(wb.getDeclaredConstructor().newInstance())).isEqualTo("B");
+    }
+
+    /** One caller finishing with a shared loader must not take it from the others: its close does nothing. */
+    @Test
+    void closingASharedLoaderLeavesItToTheOtherCallers(@TempDir Path dir) throws Exception {
+        Path jar = messagesJar(dir);
+        ConnectorClassLoader shared = ConnectorClassLoader.shared(List.of(jar));
+        shared.close();
+        Class<?> widget = ConnectorClassLoader.shared(List.of(jar)).load("synthetic.Widget");
+        assertThat(widget.getClassLoader()).isSameAs(shared.load("synthetic.Widget").getClassLoader());
+        try (InputStream messages = widget.getClassLoader().getResourceAsStream(MESSAGES_ENTRY)) {
+            assertThat(messages.readAllBytes()).isEqualTo(MESSAGES);
+        }
+    }
+
+    /** A jar replaced in place is a different artifact, and gets its own classes rather than the old ones. */
+    @Test
+    void aJarReplacedInPlaceGetsALoaderOfItsOwn(@TempDir Path dir) throws Exception {
+        Path jar = dir.resolve("connector.jar");
+        Files.copy(widgetJar(dir.resolve("a"), "A"), jar);
+        Class<?> before = ConnectorClassLoader.shared(List.of(jar)).load("synthetic.Widget");
+
+        Files.copy(widgetJar(dir.resolve("b"), "a longer marker"), jar, StandardCopyOption.REPLACE_EXISTING);
+        Class<?> after = ConnectorClassLoader.shared(List.of(jar)).load("synthetic.Widget");
+
+        assertThat(after).isNotSameAs(before);
+        assertThat(after.getMethod("tag").invoke(after.getDeclaredConstructor().newInstance()))
+                .isEqualTo("a longer marker");
     }
 
     @Test

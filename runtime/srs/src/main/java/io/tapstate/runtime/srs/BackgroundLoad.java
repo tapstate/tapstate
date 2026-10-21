@@ -156,7 +156,12 @@ final class BackgroundLoad {
             readLoad();
             synchronized (this) {
                 loadOver = true;
-                if (loadLetGo && !cancelled) {
+                if (cancelled) {
+                    // Closed as the load ended: the run is over, and a tail opened now would set up on the source
+                    // what nothing is left to read through, confirm or let go of -- a replication slot, say.
+                    return;
+                }
+                if (loadLetGo) {
                     // The wake that ended the read is not the tail's to answer.
                     Thread.interrupted();
                 }

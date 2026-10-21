@@ -4,6 +4,7 @@ import io.tapstate.control.core.ControlError;
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.messages.MessageCatalog;
 import jakarta.servlet.http.HttpServletResponse;
+import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.MediaType;
 import org.springframework.http.HttpHeaders;
 import tools.jackson.databind.ObjectMapper;
@@ -35,6 +36,17 @@ final class ApiSecurityErrorWriter {
 
     void unauthenticated(HttpServletResponse response) throws IOException {
         write(response, ControlError.UNAUTHENTICATED, Map.of());
+    }
+
+    void unauthenticated(HttpServletRequest request, HttpServletResponse response) throws IOException {
+        ApiExceptionHandler.markCloudError(request, ControlError.UNAUTHENTICATED);
+        unauthenticated(response);
+    }
+
+    void forbidden(HttpServletRequest request, HttpServletResponse response, String operation, String required)
+            throws IOException {
+        ApiExceptionHandler.markCloudError(request, ControlError.FORBIDDEN);
+        forbidden(response, operation, required);
     }
 
     void forbidden(HttpServletResponse response, String operation, String required) throws IOException {

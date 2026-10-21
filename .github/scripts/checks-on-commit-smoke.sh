@@ -392,5 +392,15 @@ else
   failed=$((failed + 1))
 fi
 
+# Gate 8 must read the performance lane, not this release's dispatcher.
+if python3 "$here/release-join-perf-pending-test.py" \
+    JoinPerformanceReleaseGateTest.test_gate_waits_for_lane_after_dispatcher_succeeds; then
+  printf '  ok    %s\n' "gate 8 waits for the join performance lane"
+  passed=$((passed + 1))
+else
+  printf '  FAIL  %s\n' "gate 8 waits for the join performance lane"
+  failed=$((failed + 1))
+fi
+
 printf '\n%s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" = 0 ]

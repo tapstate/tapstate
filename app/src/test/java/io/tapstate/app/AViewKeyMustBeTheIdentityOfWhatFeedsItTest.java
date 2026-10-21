@@ -1,7 +1,13 @@
 package io.tapstate.app;
 
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
+import com.hazelcast.core.HazelcastInstance;
+import com.hazelcast.jet.config.JobConfig;
+import com.hazelcast.jet.core.DAG;
+import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
@@ -27,6 +33,7 @@ import io.tapstate.spi.store.SourceTable;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.Test;
@@ -165,6 +172,36 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
         // Discovery's primary key remains a default, not an override. The explicit customer key is
         // accepted because discovery records that its current value identifies one source row; the
         // materialized view's writer separately requires that alternate key in CDC before images.
+        InMemoryStorePort store = viewKeyedOnAnAlternateIdentity();
+
+        Assertions.assertThatCode(() -> new StoreBackedDagSource(store).dagFor(PIPELINE))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    void a_view_keyed_on_an_alternate_identity_still_prepares_its_tables_as_each_execution_starts()
+            throws Exception {
+        // That requirement wraps the view's writers, and they open only onto tables prepared for them. The
+        // tables are prepared as an execution starts where the writers say they prepare them; wrapped without
+        // saying so, nothing would prepare them and every writer would refuse to open.
+        DAG dag = new StoreBackedDagSource(viewKeyedOnAnAlternateIdentity()).dagFor(PIPELINE);
+        ProcessorMetaSupplier writers = dag.getVertex("view.order_state").getMetaSupplier();
+        HazelcastInstance member = mock(HazelcastInstance.class);
+        when(member.getUserContext()).thenReturn(new ConcurrentHashMap<>());
+        ProcessorMetaSupplier.Context starting = mock(ProcessorMetaSupplier.Context.class);
+        when(starting.hazelcastInstance()).thenReturn(member);
+        when(starting.memberCount()).thenReturn(1);
+        when(starting.jobConfig()).thenReturn(new JobConfig().setName(PIPELINE));
+
+        assertThatThrownBy(() -> writers.init(starting))
+                .as("the execution starting has the view's tables prepared - on a member that cannot load a "
+                        + "connector, which says so")
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("no connector provisioner is bound");
+    }
+
+    /** A view keyed on customer, which discovery records as unique, over orders whose primary key is id. */
+    private static InMemoryStorePort viewKeyedOnAnAlternateIdentity() {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(new SourceResource("src", null, "fake", Map.of("host", "h"), SourceMode.CDC,
                 List.of(TableRef.literal("orders")), null, null));
@@ -179,9 +216,7 @@ class AViewKeyMustBeTheIdentityOfWhatFeedsItTest {
                         List.of("id"), List.of(new SourceIndex("__t__{\"v\": 2, "
                                 + "\"key\": {\"customer\": 1}, \"name\": \"customer_unique\", "
                                 + "\"unique\": true}", List.of("customer"), true)))))));
-
-        Assertions.assertThatCode(() -> new StoreBackedDagSource(store).dagFor(PIPELINE))
-                .doesNotThrowAnyException();
+        return store;
     }
 
     @Test

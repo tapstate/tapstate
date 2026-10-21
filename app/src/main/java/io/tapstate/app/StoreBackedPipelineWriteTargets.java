@@ -2,6 +2,8 @@ package io.tapstate.app;
 
 import io.tapstate.control.core.PipelineWriteTargets;
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.runtime.engine.nest.NestSettings;
+import io.tapstate.runtime.srs.SourcePlacement;
 import io.tapstate.spi.store.StorePort;
 
 import java.util.List;
@@ -16,7 +18,13 @@ final class StoreBackedPipelineWriteTargets implements PipelineWriteTargets {
     private final StoreBackedDagSource source;
 
     StoreBackedPipelineWriteTargets(StorePort storePort) {
-        this.source = new StoreBackedDagSource(Objects.requireNonNull(storePort, "storePort"));
+        this(storePort, false);
+    }
+
+    StoreBackedPipelineWriteTargets(StorePort storePort, boolean requireMarkedStore) {
+        this.source = new StoreBackedDagSource(Objects.requireNonNull(storePort, "storePort"),
+                NestSettings.defaults(), StoreReachability.assumingReachable(),
+                SourcePlacement.anyMember(), requireMarkedStore);
     }
 
     @Override

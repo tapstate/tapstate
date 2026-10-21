@@ -124,6 +124,7 @@ public final class MongoStorePort implements StorePort {
      */
     public static final WriteConcern NEST_STATE_WRITE_CONCERN = WriteConcern.MAJORITY.withJournal(true);
 
+    private final MongoConnection connection;
     private final ArtifactStore artifacts;
     private final StateStore state;
     private final DesiredStore desired;
@@ -162,14 +163,15 @@ public final class MongoStorePort implements StorePort {
      */
     public MongoStorePort(
             MongoConnection connection, String operatorStateDatabase, Duration rateHistoryRetention) {
-        Objects.requireNonNull(connection, "connection");
+        this.connection = Objects.requireNonNull(connection, "connection");
         MongoDatabase database = connection.database();
-        this.artifacts = new MongoArtifactStore(connection.client(), SystemCollections.ARTIFACTS.on(database));
+        this.artifacts = new MongoArtifactStore(
+                connection.client(), SystemCollections.ARTIFACTS.on(database), connection.sourceConfigKeyring());
         this.state = new MongoStateStore(SystemCollections.PIPELINE_STATE.on(database));
         this.desired = new MongoDesiredStore(SystemCollections.PIPELINE_DESIRED.on(database));
         this.catalog = new MongoCatalogStore(SystemCollections.CONNECTIONS.on(database));
         this.schemas = new MongoSchemaStore(SystemCollections.SOURCE_SCHEMAS.on(database));
-        this.connectors = new MongoConnectorRegistry(SystemCollections.CONNECTOR_ARTIFACTS.bucketOn(database));
+        this.connectors = new MongoConnectorRegistry(connection.client(), database);
         this.connectorCatalog = new MongoConnectorCatalogStore(SystemCollections.CONNECTOR_CATALOG.on(database));
         this.connectorSpecs = new MongoConnectorSpecStore(SystemCollections.CONNECTOR_SPECS.on(database));
         this.connectionTestResults =
@@ -304,6 +306,11 @@ public final class MongoStorePort implements StorePort {
     @Override
     public ClusterMembershipStore clusterMembership() {
         return clusterMembership;
+    }
+
+    @Override
+    public int endTransactionsLeftOpenBy(String processId) {
+        return connection.endTransactionsLeftOpenBy(processId);
     }
 
     @Override

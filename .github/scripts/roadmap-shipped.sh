@@ -58,10 +58,14 @@ git rev-parse -q --verify "${base}^{commit}" >/dev/null 2>&1 || {
   exit 1
 }
 
+here="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=.github/scripts/_pr-read.sh
+. "$here/_pr-read.sh"
+
 # The pull requests in the range, then the execution issue each one says it is part of.
 issues=""
 for n in $(git log --format='%s' "${base}..${sha}" 2>/dev/null | grep -oE '#[0-9]+' | tr -d '#' | sort -un); do
-  body="$(gh pr view "$n" --json body --jq '.body' 2>/dev/null)" || continue
+  body="$(read_pr "$n" --json body --jq '.body')" || exit 1
   refs="$(printf '%s' "$body" | grep -oiE '(^|[^a-z])Refs[[:space:]]+#[0-9]+' | grep -oE '[0-9]+')"
   [ -n "$refs" ] || continue
   issues="${issues}${refs}
@@ -145,7 +149,11 @@ for i in $issues; do
     # The board is a list of work items, so this is passed over: out loud, because a step silent
     # about what it skipped is one nobody can check, and not red, because a red roadmap is supposed
     # to mean something needs looking at and this needs none.
-    if gh pr view "$i" --json number >/dev/null 2>&1; then
+    if ! pr="$(read_pr "$i" --json number)"; then
+      failed=1
+      continue
+    fi
+    if [ -n "$pr" ]; then
       echo "  #${i}: a pull request, not an issue -- passed over, the board holds work items"
       continue
     fi

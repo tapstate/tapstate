@@ -70,25 +70,31 @@ public enum ConnectorError implements TapstateErrorCode {
     CLASS_NOT_FOUND("connector.class-not-found", Set.of("connector", "class")),
 
     /**
+     * A connector artifact's archive or spec resource could not be read. {@code artifact} names the
+     * unreadable artifact, since introspection may fail before its connector id is known.
+     */
+    ARTIFACT_UNREADABLE("connector.artifact-unreadable", Set.of(Parameters.ARTIFACT)),
+
+    /**
      * A registered artifact carries no connector entry class — no class it contains is annotated as a
      * connector. {@code artifact} names the artifact that was scanned. Self-scan raises this before a
      * connector id is known, so it is keyed by the artifact rather than by an id.
      */
-    NO_CONNECTOR_CLASS("connector.no-connector-class", Set.of("artifact")),
+    NO_CONNECTOR_CLASS("connector.no-connector-class", Set.of(Parameters.ARTIFACT)),
 
     /**
      * A registered artifact carries more than one unrelated connector entry class, so which connector
      * it registers is ambiguous (variants that subclass a shared base are not: the most-derived wins).
      * {@code artifact} names the artifact; {@code classes} lists the competing entry classes.
      */
-    AMBIGUOUS_CONNECTOR_CLASS("connector.ambiguous-connector-class", Set.of("artifact", "classes")),
+    AMBIGUOUS_CONNECTOR_CLASS("connector.ambiguous-connector-class", Set.of(Parameters.ARTIFACT, "classes")),
 
     /**
      * A connector's {@code @TapConnectorClass} annotation names a spec resource the artifact does not
      * contain. {@code artifact} names the artifact; {@code spec} is the resource path the annotation
      * named.
      */
-    SPEC_NOT_FOUND("connector.spec-not-found", Set.of("artifact", "spec")),
+    SPEC_NOT_FOUND("connector.spec-not-found", Set.of(Parameters.ARTIFACT, "spec")),
 
     /**
      * A connector's spec resource does not yield the connector's identity — it is not valid JSON, or
@@ -96,7 +102,7 @@ public enum ConnectorError implements TapstateErrorCode {
      * refused. {@code artifact} names the artifact; {@code spec} is the spec resource path;
      * {@code detail} says what was wrong with it.
      */
-    SPEC_INVALID("connector.spec-invalid", Set.of("artifact", "spec", "detail")),
+    SPEC_INVALID("connector.spec-invalid", Set.of(Parameters.ARTIFACT, "spec", "detail")),
 
     /**
      * A connection config value cannot be converted to the type the connector's own connection form
@@ -250,7 +256,33 @@ public enum ConnectorError implements TapstateErrorCode {
      * id; {@code detail} is why it could not be read. Refusing is deliberate: starting from the present
      * instead would silently drop every change made since the position was recorded.
      */
-    POSITION_UNREADABLE("connector.position-unreadable", Set.of("connector", "detail"));
+    POSITION_UNREADABLE("connector.position-unreadable", Set.of("connector", "detail")),
+
+    /**
+     * A running change stream could not tell its connector how far the source may release its change log:
+     * the durable position could not be read back into the connector's own offset, or the connector threw
+     * when it was handed one. {@code connector} is the connector id; {@code detail} is why. Reported, never
+     * fatal: the stream keeps delivering and the position is handed over again at the next interval,
+     * because what a missed release costs is the source keeping some log a while longer, and failing the
+     * stream over that would make an outage of a delay.
+     */
+    ACKNOWLEDGE_FAILED("connector.acknowledge-failed", Set.of("connector", "detail")),
+
+    /**
+     * A connector could not let go of what it set up on its source to read changes -- a replication slot,
+     * say -- while the state it belongs to was being cleared. {@code connector} is the connector id;
+     * {@code detail} is why; {@code resources} is what its notes named on the source, for somebody to remove
+     * there by hand. Reported, never fatal: the clearing completes, because a source that cannot be reached
+     * must not leave a pipeline that can neither keep its state nor let go of it.
+     */
+    RELEASE_FAILED("connector.release-failed", Set.of("connector", "detail", "resources"));
+
+    static final class Parameters {
+        static final String ARTIFACT = "artifact";
+
+        private Parameters() {
+        }
+    }
 
     private final String code;
     private final Set<String> placeholders;

@@ -4,7 +4,6 @@ import com.hazelcast.function.FunctionEx;
 import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.Edge;
 import com.hazelcast.jet.core.Processor;
-import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.jet.core.Vertex;
 import com.hazelcast.jet.core.metrics.Metric;
@@ -13,7 +12,11 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.core.sql.JoinKey;
 import io.tapstate.core.sql.JoinPlan;
 import io.tapstate.core.sql.JoinTree;
+import io.tapstate.runtime.engine.NodeWidth;
 import io.tapstate.runtime.engine.PassthroughProcessor;
+import io.tapstate.runtime.engine.SettledPositions;
+import io.tapstate.runtime.engine.ChainAxes;
+import io.tapstate.runtime.engine.LevelBounds;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -41,6 +44,8 @@ import java.util.function.ToIntFunction;
  */
 public final class JoinDag {
 
+    private static final String SETTLED_POSITIONS_LANE = "settled-positions";
+
     private JoinDag() {
     }
 
@@ -52,12 +57,25 @@ public final class JoinDag {
      * @param dimensionRowKeyColumns each dimension source's own key columns, which distinguish rows
      *                               that share the columns the join matches on
      * @param displaced      where a dimension row lost to a key another row already held is reported
+     * @param width          how wide the node runs - one processor for the cluster, or the same number on
+     *                       every member - which both of its vertices, and every edge into them, follow
      */
     public static Vertex attach(DAG dag, JoinPlan plan, String pipelineId, String nodeId,
             List<String> factKeyColumns, Map<String, List<String>> dimensionRowKeyColumns,
             Function<String, List<Vertex>> sourceUpstream,
             ToIntFunction<Vertex> nextOutbound, JoinStoresBinding stores,
-            DimensionRowDisplacedAlert displaced) {
+            DimensionRowDisplacedAlert displaced, NodeWidth width) {
+        return attach(dag, plan, pipelineId, nodeId, factKeyColumns, dimensionRowKeyColumns, sourceUpstream,
+                nextOutbound, stores, displaced, width, null, null);
+    }
+
+    /** As above, with the source chains carried by each join input kept apart for progress bounds. */
+    public static Vertex attach(DAG dag, JoinPlan plan, String pipelineId, String nodeId,
+            List<String> factKeyColumns, Map<String, List<String>> dimensionRowKeyColumns,
+            Function<String, List<Vertex>> sourceUpstream,
+            ToIntFunction<Vertex> nextOutbound, JoinStoresBinding stores,
+            DimensionRowDisplacedAlert displaced, NodeWidth width, ChainAxes axes,
+            Function<String, List<String>> chainsOfSource) {
         Map<Integer, String> sourceByOrdinal = new LinkedHashMap<>();
         Map<String, List<String>> keyColumns = new LinkedHashMap<>();
         String factSource = plan.factSource().name();
@@ -72,9 +90,14 @@ public final class JoinDag {
             keyColumns.put(source.name(), dimensionKeyColumns(plan.from(), source.name()));
         }
 
-        Vertex vertex = dag.newVertex(nodeId, ProcessorMetaSupplier.of(new JoinVertexSupplier(
+        Map<Integer, List<String>> chainsByOrdinal = new LinkedHashMap<>();
+        if (axes != null) {
+            sourceByOrdinal.forEach((edge, source) -> chainsByOrdinal.put(edge, chainsOfSource.apply(source)));
+        }
+        Vertex vertex = width.sized(dag.newVertex(nodeId, width.metaSupplier(nodeId, new JoinVertexSupplier(
                 plan, pipelineId, nodeId, factKeyColumns, dimensionRowKeyColumns,
-                Map.copyOf(sourceByOrdinal), stores, displaced, false)));
+                Map.copyOf(sourceByOrdinal), stores, displaced, false, axes, chainsByOrdinal),
+                axes, chainsByOrdinal)));
         sourceByOrdinal.forEach((edge, source) -> {
             List<Vertex> producers = sourceUpstream.apply(source);
             if (producers == null || producers.isEmpty()) {
@@ -82,14 +105,16 @@ public final class JoinDag {
             }
             Vertex producer = producers.size() == 1 ? producers.get(0)
                     : merged(dag, vertex, source, producers, nextOutbound);
-            dag.edge(Edge.from(producer, nextOutbound.applyAsInt(producer)).to(vertex, edge)
-                    .partitioned(keyOf(keyColumns.get(source))).distributed());
+            dag.edge(width.into(Edge.from(producer, nextOutbound.applyAsInt(producer)).to(vertex, edge),
+                    nodeId, keyOf(keyColumns.get(source))));
         });
-        Vertex projection = dag.newVertex(nodeId + ":project", ProcessorMetaSupplier.of(new JoinVertexSupplier(
-                plan, pipelineId, nodeId, factKeyColumns, Map.of(), Map.of(), stores,
-                displaced, true)));
-        dag.edge(Edge.from(vertex, nextOutbound.applyAsInt(vertex)).to(projection)
-                .partitioned(item -> ((JoinUpdate) item).factKey()).distributed());
+        String projecting = nodeId + ":project";
+        Vertex projection = width.sized(dag.newVertex(projecting, width.metaSupplier(projecting,
+                new JoinVertexSupplier(plan, pipelineId, nodeId, factKeyColumns, Map.of(), Map.of(), stores,
+                        displaced, true, null, Map.of()))));
+        dag.edge(width.into(Edge.from(vertex, nextOutbound.applyAsInt(vertex)).to(projection), projecting,
+                (FunctionEx<Object, Object>) item -> item instanceof SettledPositions
+                        ? SETTLED_POSITIONS_LANE : ((JoinUpdate) item).factKey()));
         return projection;
     }
 
@@ -147,6 +172,9 @@ public final class JoinDag {
      */
     private static FunctionEx<Object, Object> keyOf(List<String> columns) {
         return item -> {
+            if (item instanceof SettledPositions) {
+                return SETTLED_POSITIONS_LANE;
+            }
             Envelope event = (Envelope) item;
             Map<String, Object> row = event.after() != null ? event.after() : event.before();
             if (row == null) {
@@ -179,6 +207,8 @@ public final class JoinDag {
         private final JoinStoresBinding binding;
         private final DimensionRowDisplacedAlert displaced;
         private final boolean projection;
+        private final ChainAxes axes;
+        private final Map<Integer, List<String>> chainsByOrdinal;
         private transient JoinStores stores;
         private transient JoinGauge gauge;
         private transient DimensionRowDisplacedAlert boundDisplaced;
@@ -186,7 +216,8 @@ public final class JoinDag {
         private JoinVertexSupplier(JoinPlan plan, String pipelineId, String stepId,
                 List<String> factKeyColumns, Map<String, List<String>> dimensionRowKeyColumns,
                 Map<Integer, String> sourceByOrdinal,
-                JoinStoresBinding binding, DimensionRowDisplacedAlert displaced, boolean projection) {
+                JoinStoresBinding binding, DimensionRowDisplacedAlert displaced, boolean projection,
+                ChainAxes axes, Map<Integer, List<String>> chainsByOrdinal) {
             this.plan = plan;
             this.pipelineId = pipelineId;
             this.stepId = stepId;
@@ -196,6 +227,8 @@ public final class JoinDag {
             this.binding = binding;
             this.displaced = displaced;
             this.projection = projection;
+            this.axes = axes;
+            this.chainsByOrdinal = Map.copyOf(chainsByOrdinal);
         }
 
         @Override
@@ -260,7 +293,8 @@ public final class JoinDag {
                         ? new JoinProjectionProcessor(new JoinProjection(plan, factKeyColumns, stepId, stores))
                         : new JoinProcessor(new JoinDriver(plan, factKeyColumns, stepId, stores,
                                 JoinDriver.DEFAULT_KEYS_PER_READ, gauge, dimensionRowKeyColumns,
-                                boundDisplaced), sourceByOrdinal));
+                                boundDisplaced), sourceByOrdinal,
+                                axes == null ? null : new LevelBounds(chainsByOrdinal, axes, LevelBounds.HOLDS_NOTHING)));
             }
             return processors;
         }

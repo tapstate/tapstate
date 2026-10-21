@@ -10,6 +10,7 @@ import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.StateStore;
 
 import java.time.Clock;
+import java.util.Collection;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -48,6 +49,11 @@ public final class PipelineConverger {
         this.rebuilds = Objects.requireNonNull(rebuilds, "rebuilds");
     }
 
+    /** Tells the rebuild admission which pipelines are still desired, so it forgets the rest. */
+    public void retain(Collection<String> pipelineIds) {
+        rebuilds.retain(pipelineIds);
+    }
+
     /** Drives the pipeline's actual state toward its current desired target, seeding it if new. */
     public ConvergeResult converge(String pipelineId) {
         Optional<DesiredState> intent = desired.read(pipelineId);
@@ -75,41 +81,11 @@ public final class PipelineConverger {
                 && actualDoc.map(CheckpointDoc::epoch).orElse(-1L).equals(stampedAt);
         boolean rebuild = reassemble && (stampedAt == null || rebuildOwed);
 
-        if (target == PipelineState.RUNNING && actual == PipelineState.RUNNING) {
-            // A pipeline believed running whose job has died converges to the observable FAILED state,
-            // rather than reporting RUNNING over a dead job. The failure cause rides out on the result so
-            // the driver can surface it. A converge-side transition, never a user verb.
-            Optional<Throwable> failure = actuator.failure(pipelineId);
-            if (failure.isPresent()) {
-                ConvergeResult driven =
-                        driveTo(pipelineId, PipelineState.FAILED, false, actualDoc.orElse(null), false);
-                return driven.checkpoint()
-                        .map(checkpoint -> ConvergeResult.failed(checkpoint, failure.get()))
-                        .orElse(driven);
-            }
-            // Nothing failed and nothing is carrying it: this process has come up to a checkpoint an
-            // earlier one wrote. The state already matches the intent, so the drive below would call
-            // this converged and actuate nothing - which is how a pipeline ends up reporting RUNNING,
-            // with no errors, over a data plane that does not exist. Put a job behind it instead.
-            //
-            // A start rather than a resume: a resume continues a job that is being held, and there is
-            // no job here to continue. The fresh run re-reads its source position from the store, which
-            // is where the previous process's progress was recorded, so this resumes the work without
-            // resuming the job. Submitting is absent-safe, and the guard is "no job is carrying it"
-            // rather than "this process did not start it", so the next tick actuates nothing.
-            if (!actuator.isCarryingAJob(pipelineId)) {
-                try {
-                    actuator.start(pipelineId);
-                } catch (TapstateException refused) {
-                    // Same refusal, third road. This one is the worst of the three to let escape: the
-                    // checkpoint already says RUNNING, so an escaping throw leaves every read face
-                    // answering healthy over a data plane that was never built, and the loop retries
-                    // for the life of the process. A store that is unreachable when a process comes up
-                    // is exactly the condition the coded refusal exists for.
-                    return failedWith(pipelineId, refused);
-                }
-                return ConvergeResult.converged(actualDoc.orElseThrow());
-            }
+        // An owed restart must reach the fenced stop/start below before checking the old run.
+        // Recording that run's failure would advance the epoch without carrying out the restart,
+        // consuming its accepted start and any clearing the user requested.
+        if (target == PipelineState.RUNNING && actual == PipelineState.RUNNING && !rebuildOwed) {
+            return convergeRunning(pipelineId, actualDoc.orElseThrow(), purgeState, rebuild);
         }
 
         if (target == PipelineState.PAUSED && actual == PipelineState.PAUSED) {
@@ -125,24 +101,7 @@ public final class PipelineConverger {
 
         if ((target == PipelineState.RUNNING || target == PipelineState.PAUSED)
                 && actual == PipelineState.FAILED && !rebuildOwed) {
-            // A run that died because the cluster changed under it is the one death this loop may answer
-            // by itself, and it is asked here rather than where the death was observed so that the
-            // failure is recorded and published first: whatever is decided next, nobody is left reading a
-            // healthy pipeline over a dead job while it is being decided. The admission bounds itself --
-            // a yes that never runs out is a restart loop wearing the word "recovery". It is asked only of
-            // a pipeline meant to run: a rebuild starts a run, which is not what a paused intent asks for.
-            if (target == PipelineState.RUNNING && rebuilds.admits(pipelineId)) {
-                return driveTo(pipelineId, target, false, actualDoc.orElse(null), false, true, false);
-            }
-            // Otherwise a failed run stays failed: re-driving it toward RUNNING would restart the dead job
-            // on every tick, and toward PAUSED would try every tick to hold a job that is gone, be refused,
-            // and fail the pipeline over again. The user recovers by stopping it then starting a fresh
-            // run -- which arrives as the one instruction above, and that is let through: it is somebody
-            // saying so once, which is the whole difference from this loop noticing the same death every
-            // second.
-            // actual is FAILED only when the checkpoint was read and parsed, so
-            // the doc is necessarily present; orElseThrow makes that invariant explicit and fail-loud.
-            return ConvergeResult.converged(actualDoc.orElseThrow());
+            return convergeFailed(pipelineId, target, actualDoc.orElseThrow());
         }
 
         if (target == PipelineState.RUNNING && actual == PipelineState.COMPLETED && !rebuildOwed) {
@@ -155,6 +114,63 @@ public final class PipelineConverger {
         }
 
         return driveTo(pipelineId, target, true, actualDoc.orElse(null), purgeState, rebuild, rebuildOwed);
+    }
+
+    private ConvergeResult convergeRunning(
+            String pipelineId, CheckpointDoc current, boolean purgeState, boolean rebuild) {
+        // A pipeline believed running whose job has died converges to the observable FAILED state,
+        // rather than reporting RUNNING over a dead job. The failure cause rides out on the result so
+        // the driver can surface it. A converge-side transition, never a user verb.
+        Optional<Throwable> failure = actuator.failure(pipelineId);
+        if (failure.isPresent()) {
+            ConvergeResult driven = driveTo(pipelineId, PipelineState.FAILED, false, current, false);
+            return driven.checkpoint()
+                    .map(checkpoint -> ConvergeResult.failed(checkpoint, failure.get()))
+                    .orElse(driven);
+        }
+        // Nothing failed and nothing is carrying it: this process has come up to a checkpoint an
+        // earlier one wrote. The state already matches the intent, so the drive below would call
+        // this converged and actuate nothing - which is how a pipeline ends up reporting RUNNING,
+        // with no errors, over a data plane that does not exist. Put a job behind it instead.
+        //
+        // A start rather than a resume: a resume continues a job that is being held, and there is
+        // no job here to continue. The fresh run re-reads its source position from the store, which
+        // is where the previous process's progress was recorded, so this resumes the work without
+        // resuming the job. Submitting is absent-safe, and the guard is "no job is carrying it"
+        // rather than "this process did not start it", so the next tick actuates nothing.
+        if (!actuator.isCarryingAJob(pipelineId)) {
+            try {
+                actuator.start(pipelineId);
+            } catch (TapstateException refused) {
+                // Same refusal, third road. This one is the worst of the three to let escape: the
+                // checkpoint already says RUNNING, so an escaping throw leaves every read face
+                // answering healthy over a data plane that was never built, and the loop retries
+                // for the life of the process. A store that is unreachable when a process comes up
+                // is exactly the condition the coded refusal exists for.
+                return failedWith(pipelineId, refused);
+            }
+            return ConvergeResult.converged(current);
+        }
+        return driveTo(pipelineId, PipelineState.RUNNING, true, current, purgeState, rebuild, false);
+    }
+
+    private ConvergeResult convergeFailed(String pipelineId, PipelineState target, CheckpointDoc current) {
+        // A run that died because the cluster changed under it is the one death this loop may answer
+        // by itself, and it is asked here rather than where the death was observed so that the
+        // failure is recorded and published first: whatever is decided next, nobody is left reading a
+        // healthy pipeline over a dead job while it is being decided. The admission bounds itself --
+        // a yes that never runs out is a restart loop wearing the word "recovery". It is asked only of
+        // a pipeline meant to run: a rebuild starts a run, which is not what a paused intent asks for.
+        if (target == PipelineState.RUNNING && rebuilds.admits(pipelineId)) {
+            return driveTo(pipelineId, target, false, current, false, true, false);
+        }
+        // Otherwise a failed run stays failed: re-driving it toward RUNNING would restart the dead job
+        // on every tick, and toward PAUSED would try every tick to hold a job that is gone, be refused,
+        // and fail the pipeline over again. The user recovers by stopping it then starting a fresh
+        // run -- which arrives as the one instruction above, and that is let through: it is somebody
+        // saying so once, which is the whole difference from this loop noticing the same death every
+        // second.
+        return ConvergeResult.converged(current);
     }
 
     /**
