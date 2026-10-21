@@ -54,7 +54,7 @@ public final class ValidationRootCheck {
             Objects.requireNonNull(scope, "scope");
             if (fieldPath == null || fieldPath.size() > 64) throw ValidationError.invalid("rootCheck.path");
             for (Object segment : fieldPath) {
-                if (segment instanceof String text) ValidationError.identifier(text, "rootCheck.path");
+                if (segment instanceof String text) ValidationError.fieldName(text, "rootCheck.path");
                 else if (!(segment instanceof Integer ordinal) || ordinal < 0) {
                     throw ValidationError.invalid("rootCheck.path");
                 }
@@ -361,6 +361,10 @@ public final class ValidationRootCheck {
                     || extra != (participation == Participation.SHOULD_NOT_EXIST && targetPresence == TargetPresence.PRESENT)) {
                 throw ValidationError.invalid("rootCheck.presenceFinding");
             }
+        }
+
+        Builder requireSampleRead(Side side, SampledSide sample) {
+            return mutate(() -> sampleRead(Objects.requireNonNull(side, "side"), Objects.requireNonNull(sample, "sample")));
         }
 
         private void sampleRead(Side side, SampledSide sample) {

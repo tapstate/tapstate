@@ -237,6 +237,22 @@ class ValidationRootCheckTest {
                 Optional.empty(), Optional.of(sample))).isInstanceOf(TapstateException.class);
     }
 
+    @Test void emptyAndWhitespaceJsonMemberNamesRemainReportableDataPaths() {
+        var builder = basic(SHOULD_EXIST, TargetPresence.PRESENT);
+        complete(builder);
+        var limits = new ValidationValues.Limits(4096, 30, 8);
+        var source = ValidationValues.ownRow(Map.of("body", Map.of("", 1, "  ", 2)), limits);
+        var target = ValidationValues.ownRow(Map.of("body", Map.of("", 9, "  ", 8)), limits);
+        ValidationValueComparison.visitDifferences(source, target, String::equals,
+                new ValidationValueComparison.TraversalLimits(limits, 10000), difference ->
+                        builder.finding(new Finding(Kind.TARGET_VALUE, new Location(root(), difference.path()))));
+        var result = builder.finish();
+        assertThat(result.counts()).containsEntry(Kind.TARGET_VALUE, 2L);
+        assertThat(result.findings().keySet()).extracting(finding -> finding.location().fieldPath())
+                .containsExactlyInAnyOrder(List.of("body", ""), List.of("body", "  "));
+        assertThatThrownBy(() -> new ValidationRoot(" ", "output", key(1), List.of())).isInstanceOf(TapstateException.class);
+    }
+
     private static SampledSide sampled(ValidationValues.Row row, String readId) {
         return new SampledSide(new ValidationPhysicalIdentity("connection", "database", null, "table",
                 List.of(List.of("physical_id")), key(999)), row, readId);

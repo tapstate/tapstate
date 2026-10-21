@@ -41,9 +41,12 @@ public enum ValidationError implements TapstateErrorCode {
     }
 
     static String identifier(String value, String field) {
-        if (value == null || value.isBlank() || value.length() > 512) {
-            throw invalid(field);
-        }
+        if (value == null || value.isBlank()) throw invalid(field);
+        return fieldName(value, field);
+    }
+
+    static String fieldName(String value, String field) {
+        if (value == null || value.length() > 512) throw invalid(field);
         for (int i = 0; i < value.length(); i++) {
             char c = value.charAt(i);
             if (Character.isHighSurrogate(c)) {
