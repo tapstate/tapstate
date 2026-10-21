@@ -1008,7 +1008,49 @@ def event_inputs(args):
     write(Path(args.output), value)
 
 
-def reconcile_pr_identity(run, event, commit, repository, number, head, branch):
+def event_planner_binding(run, event, attempts):
+    """Bind a retained capture to the latest actual successful planner producer."""
+    current, producer = run['run_attempt'], event['run_attempt']
+    require(type(current) is int and type(producer) is int and 1 <= producer <= current <= 100,
+            'event capture differs from current run/attempt')
+    require(event['repository'] == run['repository']['full_name'] and event['event'] == run['event']
+            and type(event['run_id']) is int and event['run_id'] == run['id'],
+            'event capture differs from current run/attempt')
+    if current == 1:
+        return {'run_attempt': current, 'event_producer_attempt': producer}
+    workflow = event_workflow_source(event, event['repository'])
+    require(workflow['snapshot'] == 'captured' and workflow['job'] == 'shard-plan'
+            and workflow['workflow_path'] == run['path'], 'retained planner workflow is unproven')
+    require(len(attempts) == current, 'retained planner attempt history is incomplete')
+    planners, seen_jobs = [], set()
+    for number, observed in enumerate(attempts, 1):
+        previous, jobs = observed['run'], observed['jobs']
+        require(type(previous.get('run_attempt')) is int and previous['run_attempt'] == number
+                and previous.get('status') == 'completed'
+                and previous.get('repository', {}).get('full_name') == run['repository']['full_name']
+                and all(previous.get(key) == run.get(key) for key in
+                        ('id', 'event', 'head_sha', 'head_branch', 'path')),
+                'retained planner attempt scope differs')
+        require(isinstance(jobs, list), 'retained planner jobs are invalid')
+        candidates = []
+        for job in jobs:
+            require(type(job.get('id')) is int and job['id'] not in seen_jobs
+                    and type(job.get('run_id')) is int and job['run_id'] == run['id']
+                    and type(job.get('run_attempt')) is int and job['run_attempt'] == number
+                    and job.get('head_sha') == run['head_sha'] and job.get('status') == 'completed',
+                    'retained planner job scope differs')
+            seen_jobs.add(job['id'])
+            if job.get('name') == 'shard-plan' and job.get('conclusion') != 'skipped':
+                candidates.append(job)
+        require(len(candidates) <= 1, 'retained planner producer is ambiguous')
+        if candidates:
+            planners.append(candidates[0])
+    require(planners and planners[-1]['run_attempt'] == producer
+            and planners[-1]['conclusion'] == 'success', 'retained planner is not the latest successful producer')
+    return {'run_attempt': current, 'event_producer_attempt': producer, 'planner_job_id': planners[-1]['id']}
+
+
+def reconcile_pr_event_identity(run, event, commit, repository, number, head, branch):
     # This binds identities, not full execution, group equivalence or performance.
     sha(head, 'expected head')
     require(type(number) is int and number > 0 and branch, 'explicit PR scope is required')
@@ -1018,7 +1060,7 @@ def reconcile_pr_identity(run, event, commit, repository, number, head, branch):
     require(run['repository']['full_name'] == event['repository'] == repository, 'PR repository differs')
     require(type(run['id']) is int and run['id'] == event['run_id'], 'PR run ID differs')
     require(type(run['run_attempt']) is int and type(event['run_attempt']) is int
-            and run['run_attempt'] == event['run_attempt'] == 1, 'PR first-attempt identity requires attempt 1')
+            and 1 <= event['run_attempt'] <= run['run_attempt'] <= 100, 'invalid PR event producer attempt')
     require(run['status'] == 'completed', 'PR run is not complete')
     require(run['path'] == '.github/workflows/ci.yml', 'unexpected PR workflow')
     workflow = event_workflow_source(event, repository)
@@ -1048,11 +1090,20 @@ def reconcile_pr_identity(run, event, commit, repository, number, head, branch):
     for association in associations:
         require(association['number'] == number and association['head']['sha'] == head
                 and association['base']['sha'] == base, 'run PR association differs from original event')
-    return dict(schema=1, repository=repository, run_id=run['id'], run_attempt=1, pull_request=number,
+    return dict(schema=1, repository=repository, run_id=run['id'], run_attempt=run['run_attempt'],
+                event_producer_attempt=event['run_attempt'], pull_request=number,
                 head_sha=head, base_sha=base, checkout_sha=checkout, checkout_tree=event['checkout_tree'],
                 conclusion=run['conclusion'], workflow_source=workflow, pr_event_identity_consistent=True,
-                first_attempt_identity_consistent=True, first_complete_pr_sample_proven=False,
+                first_attempt_identity_consistent=run['run_attempt'] == event['run_attempt'] == 1,
+                first_complete_pr_sample_proven=False,
                 group_equivalence_proven=False)
+
+
+def reconcile_pr_identity(run, event, commit, repository, number, head, branch):
+    # The qualification entry point remains strictly first-attempt-only.
+    require(type(run['run_attempt']) is int and type(event['run_attempt']) is int
+            and run['run_attempt'] == event['run_attempt'] == 1, 'PR first-attempt identity requires attempt 1')
+    return reconcile_pr_event_identity(run, event, commit, repository, number, head, branch)
 
 
 def pr_identity(args):
@@ -1155,7 +1206,7 @@ def collect(args):
     require(run['status'] == 'completed', 'run is not complete; collect after completion')
     directory.mkdir(parents=True)
     write(directory / 'run.json', run)
-    gaps, jobs_all = [], []
+    gaps, jobs_all, attempts = [], [], []
     external_start = time.monotonic_ns()
     for attempt in range(1, run['run_attempt'] + 1):
         target = directory / f'attempt-{attempt}'
@@ -1166,6 +1217,7 @@ def collect(args):
         require(all(j.get('run_id') == args.run and j.get('run_attempt') == attempt for j in jobs),
                 'jobs do not belong to this run and attempt')
         jobs_all.extend(jobs)
+        attempts.append({'run': attempt_run, 'jobs': jobs})
         try:
             logs = command(['gh', 'api', f'{prefix}/actions/runs/{args.run}/attempts/{attempt}/logs'], binary=True)
             (target / 'logs.zip').write_bytes(logs)
@@ -1212,9 +1264,7 @@ def collect(args):
         event = event_records[0]
         write(directory / 'event-inputs.json', event)
         try:
-            require(event['repository'] == args.repo and event['event'] == run['event']
-                    and event['run_id'] == args.run and event['run_attempt'] == run['run_attempt'],
-                    'event capture differs from current run/attempt')
+            event_planner_binding(run, event, attempts)
             candidate_sha = sha(event['checkout_sha'], 'captured checkout')
             commit = api(f'{prefix}/git/commits/{candidate_sha}')
             write(directory / 'checkout-commit.json', commit)
@@ -1227,7 +1277,7 @@ def collect(args):
             if run['event'] == 'pull_request':
                 scope = [getattr(args, name, None) for name in ('pr', 'head', 'branch')]
                 require(all(scope), 'explicit --pr/--head/--branch scope is required for PR identity')
-                identity = reconcile_pr_identity(run, event, commit, args.repo, *scope)
+                identity = reconcile_pr_event_identity(run, event, commit, args.repo, *scope)
                 write(directory / 'pr-identity.json', identity)
                 pr_identity_verified = True
                 if event.get('repository_default_branch', {}).get('snapshot') == 'captured':

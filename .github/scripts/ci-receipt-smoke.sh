@@ -695,6 +695,65 @@ with tempfile.TemporaryDirectory(prefix='ci-receipt-', dir='/var/tmp') as tmp:
               and (archived/'checkout-source.tar').is_file(),'collector archives both PR head and actual merge checkout')
         check(result['pr_event_identity_verified'] and not result['first_complete_pr_sample_proven'],
               'collector joins explicit PR scope without claiming full first-attempt acceptance')
+        # Successful planners and workers survive a failed-jobs-only retry.
+        first_run=copy.deepcopy(collected_run)
+        collected_run=dict(first_run,run_attempt=2)
+        retained_event=copy.deepcopy(workflow_capture)
+        retained_event['workflow_source']['job']='shard-plan'
+        def event_zip(value):
+            output=io.BytesIO()
+            with zipfile.ZipFile(output,'w') as archive:
+                archive.writestr('ci-event-inputs.json',json.dumps(value))
+                archive.writestr('shards.json',json.dumps(dict(source_sha=merge,shards=[{'id':'rest'}])))
+            return output
+        archive_bytes=event_zip(retained_event)
+        def job(identity,name,attempt,conclusion='success'):
+            return dict(id=identity,run_id=100,run_attempt=attempt,head_sha=head,name=name,
+                        status='completed',conclusion=conclusion,
+                        started_at='2026-10-14T03:00:00Z',completed_at='2026-10-14T03:00:01Z')
+        attempt_jobs={1:[job(1,'shard-plan',1),job(2,'test-shards (engine)',1),job(3,'test-shards (rest)',1,'failure')],
+                      2:[job(4,'test-shards (rest)',2)]}
+        def retry_api(endpoint):
+            for attempt in (1,2):
+                if '/attempts/'+str(attempt)+'/jobs?' in endpoint:
+                    values=attempt_jobs[attempt];return dict(total_count=len(values),jobs=values)
+                if endpoint.endswith('/attempts/'+str(attempt)):
+                    return dict(first_run,run_attempt=attempt)
+            return collector_api(endpoint)
+        m.api=retry_api
+        retry=copy.copy(scoped);retry.archive_root=str(root/'retained-planner')
+        check(m.collect(retry)==2,'partial fixture stays incomplete despite valid retained planner')
+        directory=root/'retained-planner/run-100/attempt-2'
+        receipt=json.loads((directory/'receipt.json').read_text())
+        check(receipt['checkout_sha']==merge and (directory/'checkout-source.tar').is_file()
+              and receipt['pr_event_identity_verified'],'retained planner preserves independent checkout binding')
+        identity=json.loads((directory/'pr-identity.json').read_text())
+        check(receipt['run_attempt']==identity['run_attempt']==2
+              and json.loads((directory/'event-inputs.json').read_text())['run_attempt']==1
+              and not receipt['first_attempt'] and not identity['first_attempt_identity_consistent']
+              and not receipt['first_complete_pr_sample_proven'],
+              'retry retains producer attempt and never earns first-attempt credit')
+        pristine_jobs=copy.deepcopy(attempt_jobs)
+        for label in ('future','failed','duplicate','missing','newer-failed','foreign-run','foreign-head','foreign-attempt'):
+            candidate=copy.deepcopy(retained_event);attempt_jobs=copy.deepcopy(pristine_jobs)
+            if label=='future':candidate['run_attempt']=3
+            if label=='failed':attempt_jobs[1][0]['conclusion']='failure'
+            if label=='duplicate':attempt_jobs[1].append(job(5,'shard-plan',1))
+            if label=='missing':attempt_jobs[1]=attempt_jobs[1][1:]
+            if label=='newer-failed':attempt_jobs[2].append(job(5,'shard-plan',2,'failure'))
+            if label=='foreign-run':attempt_jobs[1][0]['run_id']=101
+            if label=='foreign-head':attempt_jobs[1][0]['head_sha']='f'*40
+            if label=='foreign-attempt':candidate['run_id']=101
+            archive_bytes=event_zip(candidate);retry.archive_root=str(root/('retry-'+label))
+            try:result=m.collect(retry)
+            except ValueError:
+                check(label=='foreign-run','only foreign run pages reject before the final receipt');continue
+            directory=root/('retry-'+label)/'run-100/attempt-2'
+            receipt=json.loads((directory/'receipt.json').read_text())
+            check(result==2 and receipt['checkout_sha'] is None and not receipt['pr_event_identity_verified']
+                  and not (directory/'checkout-source.tar').exists(),label+' retained planner cannot prove checkout')
+        collected_run=first_run;m.api=collector_api;attempt_jobs=pristine_jobs
+        archive_bytes=event_zip(captured)
         original_artifact_bytes=archive_bytes
         archive_bytes=io.BytesIO()
         with zipfile.ZipFile(archive_bytes,'w') as archive:

@@ -66,8 +66,8 @@ with tempfile.TemporaryDirectory(prefix='ci-source-projection-') as temporary:
   return seal()
  def seal():
   directory=evidence/'run'
-  files={p.name:{'size':p.stat().st_size,'sha256':g.checksum(p.read_bytes())}
-         for p in directory.iterdir() if p.name!='receipt.json'}
+  files={p.relative_to(directory).as_posix():{'size':p.stat().st_size,'sha256':g.checksum(p.read_bytes())}
+         for p in directory.rglob('*') if p.is_file() and p.name!='receipt.json'}
   receipt={'archive_root':str(directory),'repository':'example/project','run_id':42,'run_attempt':1,
            'event':'pull_request','source_sha':anchor,'archive_complete':True,'gaps':[],
            'purpose':'source-readback fixture only; not full workflow evidence','checkout_sha':merge,'files':files}
@@ -216,8 +216,52 @@ with tempfile.TemporaryDirectory(prefix='ci-source-projection-') as temporary:
  receipt=json.loads((evidence/'run/receipt.json').read_text());receipt['run_attempt']=2
  ref=seal();sealed=json.loads((evidence/'run/receipt.json').read_text());sealed['run_attempt']=2
  value['archive']=save('run/receipt.json',sealed)
- later=project(value);check('first_attempt' in later['unverified_components'] and later['first_complete_PR_sample'] is False,
-                         'later attempts remain diagnostic source readback, never first samples')
+ rejected(lambda:project(value),'mandatory source archive input missing: attempt-1/run.json')
+ # Keep the event at planner attempt 1 while current/API/receipt remain attempt 2.
+ event['run_attempt']=1
+ event['workflow_source']={'snapshot':'captured','workflow_path':'.github/workflows/ci.yml',
+   'workflow_ref':'example/project/.github/workflows/ci.yml@refs/pull/7/merge',
+   'workflow_sha':merge,'job':'shard-plan','source_bytes_verified':False}
+ save('run/event-inputs.json',event)
+ def retry_pages():
+  for attempt in (1,2):
+   previous=dict(run,run_attempt=attempt,status='completed',path='.github/workflows/ci.yml')
+   save('run/attempt-'+str(attempt)+'/run.json',previous)
+   jobs=([{'id':1,'run_id':42,'run_attempt':1,'head_sha':anchor,'name':'shard-plan',
+           'status':'completed','conclusion':'success'}] if attempt==1 else [])
+   save('run/attempt-'+str(attempt)+'/jobs-1.json',{'total_count':len(jobs),'jobs':jobs})
+ def seal_retry():
+  seal();record=json.loads((evidence/'run/receipt.json').read_text());record['run_attempt']=2
+  return save('run/receipt.json',record)
+ run.update(status='completed',path='.github/workflows/ci.yml');save('run/run.json',run)
+ retry_pages();value['archive']=seal_retry()
+ retained=project(value)
+ check(retained['archived_source_readback_verified'] and 'first_attempt' in retained['unverified_components'],
+       'PR retry reads back the retained planner without first-sample credit')
+ # A newly rerun planner is also valid, with its own actual successful job.
+ event['run_attempt']=2;save('run/event-inputs.json',event)
+ save('run/attempt-2/jobs-1.json',{'total_count':1,'jobs':[{'id':2,'run_id':42,'run_attempt':2,
+   'head_sha':anchor,'name':'shard-plan','status':'completed','conclusion':'success'}]})
+ value['archive']=seal_retry();check(project(value)['first_complete_PR_sample'] is False,
+                                   'rerun planner still cannot become a first PR sample')
+ event['run_attempt']=1;save('run/event-inputs.json',event)
+ for label in ('missing','duplicate','failed','newer','future','foreign-head','foreign-run'):
+  retry_pages();candidate=copy.deepcopy(event)
+  name='run/attempt-1/jobs-1.json';page=json.loads((evidence/name).read_text())
+  if label=='missing':(evidence/name).unlink()
+  if label=='duplicate':page['jobs'].append(dict(page['jobs'][0],id=9));page['total_count']=2
+  if label=='failed':page['jobs'][0]['conclusion']='failure'
+  if label=='newer':save('run/attempt-2/jobs-1.json',{'total_count':1,'jobs':[dict(page['jobs'][0],id=9,run_attempt=2)]})
+  if label=='future':candidate['run_attempt']=3
+  if label=='foreign-head':page['jobs'][0]['head_sha']='f'*40
+  if label=='foreign-run':candidate['run_id']=43
+  if label!='missing':save(name,page)
+  save('run/event-inputs.json',candidate);value['archive']=seal_retry()
+  try:project(value)
+  except (ValueError,KeyError):check(True,'retry rejects '+label)
+  else:raise AssertionError('retained planner mutation escaped: '+label)
+ for path in (evidence/'run').glob('attempt-*/*'):path.unlink()
+ for path in (evidence/'run').glob('attempt-*'):path.rmdir()
  request['archive']=archive()
  value=copy.deepcopy(request);value['scope']['event']='workflow_dispatch';value['scope'].pop('pr');value['scope'].pop('base_sha')
  run=json.loads((evidence/'run/run.json').read_text());run['event']='workflow_dispatch';save('run/run.json',run)
@@ -228,6 +272,22 @@ with tempfile.TemporaryDirectory(prefix='ci-source-projection-') as temporary:
  value['archive']=save('run/receipt.json',sealed)
  dispatched=project(value);check('pull_request_event' in dispatched['unverified_components'] and dispatched['first_complete_PR_sample'] is False,
                               'dispatch source readback cannot become a PR first sample')
+ original_dispatch=copy.deepcopy(event);original_run=copy.deepcopy(run)
+ run.update(run_attempt=2,status='completed',path='.github/workflows/ci.yml');save('run/run.json',run)
+ event['workflow_source']={'snapshot':'captured','workflow_path':'.github/workflows/ci.yml',
+   'workflow_ref':'example/project/.github/workflows/ci.yml@refs/heads/ws/fixture',
+   'workflow_sha':anchor,'job':'shard-plan','source_bytes_verified':False}
+ save('run/event-inputs.json',event);retry_pages()
+ value['scope']['run_attempt']=2
+ value['archive']=seal_retry();record=json.loads((evidence/'run/receipt.json').read_text())
+ record.update(event='workflow_dispatch',checkout_sha=anchor);value['archive']=save('run/receipt.json',record)
+ check(project(value)['archived_source_readback_verified'], 'dispatch retry retains its independently proven planner')
+ for path in (evidence/'run').glob('attempt-*/*'):path.unlink()
+ for path in (evidence/'run').glob('attempt-*'):path.rmdir()
+ event=original_dispatch;run=original_run;save('run/event-inputs.json',event);save('run/run.json',run)
+ value['scope']['run_attempt']=1
+ seal();sealed=json.loads((evidence/'run/receipt.json').read_text());sealed.update(event='workflow_dispatch',checkout_sha=anchor)
+ value['archive']=save('run/receipt.json',sealed)
  sealed['checkout_sha']='a'*40;value['archive']=save('run/receipt.json',sealed)
  try:project(value)
  except ValueError as error:

@@ -28,9 +28,9 @@ on:
 
   workflow_dispatch:
 
-# Apply the Docker API setting to Maven and every forked test JVM.
+# Pass the Docker API setting through Maven without changing child CLI output.
 env:
-  JAVA_TOOL_OPTIONS: "-Dapi.version=1.44"
+  MAVEN_ARGS: "-Dapi.version=1.44"
 
 permissions:
   contents: read

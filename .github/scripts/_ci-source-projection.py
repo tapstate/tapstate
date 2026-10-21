@@ -147,6 +147,27 @@ def project(refs, root, request):
         require(files == variants.tree_files(root, tree_sha), 'archived source path/mode/blob map differs')
         return files
 
+    def planner_binding(event):
+        attempts = []
+        if run['run_attempt'] > 1:
+            for number in range(1, run['run_attempt'] + 1):
+                prefix = f'attempt-{number}/'
+                previous = groups.json_bytes(raw(prefix + 'run.json'))
+                pages = sorted((name for name in archive['files'] if re.fullmatch(
+                    re.escape(prefix) + r'jobs-[0-9]+\.json', name)),
+                    key=lambda name: int(name.rsplit('-', 1)[1].split('.')[0]))
+                require(pages and pages == [prefix + f'jobs-{i}.json' for i in range(1, len(pages) + 1)],
+                        'retained planner job pages are incomplete')
+                jobs, total = [], None
+                for name in pages:
+                    page = groups.json_bytes(raw(name))
+                    require(type(page.get('total_count')) is int and isinstance(page.get('jobs'), list)
+                            and (total is None or total == page['total_count']), 'retained planner job count differs')
+                    total = page['total_count']; jobs.extend(page['jobs'])
+                require(len(jobs) == total, 'retained planner job count differs')
+                attempts.append({'run': previous, 'jobs': jobs})
+        return groups.receipt.event_planner_binding(run, event, attempts)
+
     tree = recipe['variant_trees'][scope['variant']]
     files = source('commit.json', 'source.tar', scope['head_sha'], tree)
     owned = set(recipe['owned_paths'])
@@ -158,8 +179,9 @@ def project(refs, root, request):
         require(isinstance(event, dict), 'invalid checkout event source')
         require(event.get('repository') == scope['repository'] and event.get('event') == scope['event']
                 and type(event.get('run_id')) is int and event['run_id'] == scope['run_id']
-                and type(event.get('run_attempt')) is int and event['run_attempt'] == scope['run_attempt'],
+                and type(event.get('run_attempt')) is int and 1 <= event['run_attempt'] <= scope['run_attempt'],
                 'checkout event source differs')
+        planner_binding(event)
         checkout_sha = groups.receipt.sha(event['checkout_sha'], 'source checkout')
         if archive.get('checkout_sha') is None:
             missing.append('receipt_checkout_binding')
@@ -192,8 +214,9 @@ def project(refs, root, request):
             require(isinstance(event, dict) and event.get('repository') == scope['repository']
                     and event.get('event') == scope['event'] and type(event.get('run_id')) is int
                     and event['run_id'] == scope['run_id'] and type(event.get('run_attempt')) is int
-                    and event['run_attempt'] == scope['run_attempt'] and event.get('checkout_sha') == scope['head_sha']
+                    and 1 <= event['run_attempt'] <= scope['run_attempt'] and event.get('checkout_sha') == scope['head_sha']
                     and event.get('checkout_tree') == tree, 'dispatch checkout event differs')
+            planner_binding(event)
             parents = variants.text(root, 'rev-list', '--parents', '-n', '1', scope['head_sha']).split()[1:]
             require(event.get('checkout_parents') == parents, 'dispatch checkout parents differ')
         else:
