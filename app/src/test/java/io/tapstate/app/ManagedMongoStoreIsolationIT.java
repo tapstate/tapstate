@@ -28,6 +28,7 @@ import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -75,6 +76,34 @@ class ManagedMongoStoreIsolationIT {
     @Container
     private static final GenericContainer<?> MONGO = mongo();
     @TempDir Path work;
+    private final List<String> ownedDatabases = new ArrayList<>();
+
+    private String ownedMetadataDatabase(String metadata) {
+        ownedDatabases.addAll(List.of(metadata, metadata + "_operator", metadata + "_views"));
+        return metadata;
+    }
+
+    @AfterEach
+    void releaseThisInvocationsDatabases() {
+        if (ownedDatabases.isEmpty()) return;
+        // Retain data through every restart assertion in this invocation, then release only its
+        // exact databases. The class-scoped container must not accumulate another full connector
+        // release for each later permission case.
+        try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
+            long connectorBytes = 0;
+            for (String database : ownedDatabases) {
+                for (Document artifact : admin.getDatabase(database).getCollection("connector_artifacts.files")
+                        .find().projection(new Document("length", 1))) {
+                    connectorBytes += artifact.get("length", Number.class).longValue();
+                }
+                admin.getDatabase(database).drop();
+            }
+            assertThat(admin.listDatabaseNames().into(new ArrayList<>()))
+                    .doesNotContainAnyElementsOf(ownedDatabases);
+            System.out.printf("Managed store fixture released %d databases and %d connector bytes%n",
+                    ownedDatabases.size(), connectorBytes);
+        }
+    }
 
     private static GenericContainer<?> mongo() {
         byte[] key = new byte[64];
@@ -114,8 +143,8 @@ class ManagedMongoStoreIsolationIT {
     @Test
     void twoClusterUsersCanUseOnlyTheirOwnThreeDatabasesAndRecoverAfterRestart() throws Exception {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
-        String a = "isolation_a_" + suffix;
-        String b = "isolation_b_" + suffix;
+        String a = ownedMetadataDatabase("isolation_a_" + suffix);
+        String b = ownedMetadataDatabase("isolation_b_" + suffix);
         String userA = "user_a_" + suffix;
         String userB = "user_b_" + suffix;
         try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
@@ -248,7 +277,7 @@ class ManagedMongoStoreIsolationIT {
     @Test
     void changingHistoryRetentionNeedsOnlyTheHistoryCollectionsAlterPrivilege() {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
-        String metadata = "isolation_ttl_" + suffix;
+        String metadata = ownedMetadataDatabase("isolation_ttl_" + suffix);
         String user = "user_ttl_" + suffix;
         long originalSeconds = Duration.ofDays(15).toSeconds();
         long changedSeconds = Duration.ofDays(7).toSeconds();
@@ -331,7 +360,7 @@ class ManagedMongoStoreIsolationIT {
     @Test
     void missingMigrationIndexPrivilegeIsCodedWithoutTheDriverMessageOrCause() {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
-        String metadata = "isolation_migration_" + suffix;
+        String metadata = ownedMetadataDatabase("isolation_migration_" + suffix);
         String user = "user_migration_" + suffix;
         String role = "without_create_index_" + suffix;
         try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
@@ -407,7 +436,7 @@ class ManagedMongoStoreIsolationIT {
     @Test
     void changingCloudMetadataCredentialsDoesNotCreateOrRenewAViewsSource() {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
-        String metadata = "isolation_renewed_" + suffix;
+        String metadata = ownedMetadataDatabase("isolation_renewed_" + suffix);
         String user = "user_renewed_" + suffix;
         String renewedPassword = "controlled-renewed-mongo-password";
         SourceResource authored = new SourceResource("views",
@@ -466,7 +495,7 @@ class ManagedMongoStoreIsolationIT {
     @EnumSource(Missing.class)
     void readableButUnwritableDerivedDatabaseCannotReportReady(Missing readOnly) {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
-        String metadata = "isolation_readonly_" + suffix;
+        String metadata = ownedMetadataDatabase("isolation_readonly_" + suffix);
         String denied = metadata + (readOnly == Missing.OPERATOR ? "_operator" : "_views");
         String other = metadata + (readOnly == Missing.OPERATOR ? "_views" : "_operator");
         String user = "user_readonly_" + suffix;
@@ -510,7 +539,7 @@ class ManagedMongoStoreIsolationIT {
     @EnumSource(Missing.class)
     void missingDerivedDatabaseRightsCannotReportReady(Missing missing) {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
-        String metadata = "isolation_missing_" + suffix;
+        String metadata = ownedMetadataDatabase("isolation_missing_" + suffix);
         String denied = metadata + (missing == Missing.OPERATOR ? "_operator" : "_views");
         String allowed = metadata + (missing == Missing.OPERATOR ? "_views" : "_operator");
         String user = "user_missing_" + suffix;
