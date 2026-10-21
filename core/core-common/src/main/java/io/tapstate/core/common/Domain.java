@@ -98,7 +98,9 @@ public enum Domain {
     // would move a chain still being read, one that changed a reading rather than the resume point, and
     // one that asks for no move at all. Distinct from CAPTURE, which owns what goes wrong when a run
     // consumes a start point, and from MONITOR, which reports a run without ever setting anything
-    POSITION;
+    POSITION,
+    // Independent data validation, including identity and execution-contract refusals.
+    VALIDATION;
 
 
     /**
