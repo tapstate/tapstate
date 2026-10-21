@@ -405,8 +405,13 @@ class AuthTest {
     }
 
     @Test
-    void theControlFaceUsesTwoStatelessSecurityChainsInsteadOfTheLegacyInterceptor() {
-        assertThat(context.getBeansOfType(SecurityFilterChain.class)).hasSize(2);
+    void theControlFaceKeepsInstallationTrafficSeparateFromPublicSecurityChains() {
+        assertThat(context.getBeansOfType(SecurityFilterChain.class)).containsOnlyKeys(
+                "installationSecurityFilterChain", "apiSecurityFilterChain", "rootSecurityFilterChain");
+        var publicRequest = new org.springframework.mock.web.MockHttpServletRequest("POST", "/api/storage/setup/commit");
+        publicRequest.setLocalAddr("127.0.0.1");
+        publicRequest.addHeader("X-Forwarded-For", "127.0.0.1");
+        assertThat(context.getBean("installationSecurityFilterChain", SecurityFilterChain.class).matches(publicRequest)).isFalse();
     }
 
     @Test

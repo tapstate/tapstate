@@ -418,15 +418,19 @@ final class StorageRoot implements AutoCloseable {
         var pending = formalRecovery ? configuration.recoveryCommands().guardedBy(active).current(preparation.orElseThrow().authScope())
                 : Optional.<StorageRecoveryCommands.Plan>empty();
         var actions = new ArrayList<>(List.of("storage.status", "storage.setup.status"));
-        if (!runtime.cleanupRequired() && mode() == StorageBinding.Mode.CLOUD) {
+        if (caller.cacheScope().isPresent()) {
+            actions.addAll(List.of("configuration.export", "configuration.import.status"));
+            if (admitted) actions.addAll(List.of("configuration.import.preflight", "configuration.import.commit"));
+        }
+        if (!runtime.cleanupRequired()) {
             if (formalRecovery) {
                 actions.add("storage.recovery.status");
-                if (!admitted) {
+                if (!admitted && mode() == StorageBinding.Mode.CLOUD && status.phase() != StorageSetupStateStore.Phase.COMPLETE) {
                     actions.add("storage.recovery.plan");
                     if (pending.filter(plan -> plan.originalScope().equals(preparation.orElseThrow().authScope())).isPresent())
                         actions.add("storage.recovery.confirm");
                 }
-            } else if (status.phase() != StorageSetupStateStore.Phase.COMPLETE) {
+            } else if (mode() == StorageBinding.Mode.CLOUD && status.phase() != StorageSetupStateStore.Phase.COMPLETE) {
                 actions.add("storage.test"); actions.add("storage.setup.commit");
             }
         }

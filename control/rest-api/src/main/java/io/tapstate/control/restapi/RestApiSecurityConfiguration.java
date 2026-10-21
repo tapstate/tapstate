@@ -123,7 +123,7 @@ class RestApiSecurityConfiguration {
                         .requestMatchers("/healthz", "/version", AuthWire.DISCOVERY_PATH, AuthWire.LOGIN_PATH,
                                 AuthWire.SESSION_PATH, AuthWire.LOGOUT_PATH, CloudAuthController.EXCHANGE_PATH,
                                 CloudAuthController.INVALIDATE_PATH, "/auth/bootstrap", "/connector-icons/*",
-                                "/index.html", "/assets/**", "/error").permitAll()
+                                "/auth/storage-entry", "/index.html", "/assets/**", "/error").permitAll()
                         .requestMatchers(SpaNavigationRequest::matches).permitAll()
                         .anyRequest().denyAll());
         return http.build();

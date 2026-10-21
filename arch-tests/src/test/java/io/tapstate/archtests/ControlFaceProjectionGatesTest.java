@@ -83,7 +83,7 @@ class ControlFaceProjectionGatesTest {
 
     @Test void storageRoutesMatchTheSharedClientAndCanonicalRegistry() {
         var ids = io.tapstate.control.client.StorageControlClient.OPERATIONS;
-        assertThat(ids).hasSize(10);
+        assertThat(ids).contains("configuration.export").hasSize(11);
         for (var id : ids) {
             var methods = restApi.stream().flatMap(type -> type.getMethods().stream()).filter(method -> method.isAnnotatedWith(Verb.class)
                     && method.getAnnotationOfType(Verb.class).value().equals(id)).toList();

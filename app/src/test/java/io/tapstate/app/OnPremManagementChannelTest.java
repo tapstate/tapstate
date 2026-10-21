@@ -20,9 +20,14 @@ class OnPremManagementChannelTest {
 
     @Test void onlyTheDedicatedConnectorAndCurrentCapabilityCanUseTheInstallationSurface() throws Exception {
         var files = InstallationFiles.initialize(temporary.resolve("installation"));
+        var web = java.nio.file.Files.createDirectories(temporary.resolve("web"));
+        java.nio.file.Files.createDirectories(web.resolve("assets"));
+        java.nio.file.Files.writeString(web.resolve("index.html"), "<!doctype html><title>Storage setup</title><div id=\"root\"></div>");
+        java.nio.file.Files.writeString(web.resolve("assets/setup.js"), "document.title = 'Storage setup';");
         var issued = InstallationCommand.authorize(files, new MongoProperties(), Clock.systemUTC());
         try (var application = new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated()).run(
                 "--server.address=127.0.0.1", "--server.port=0", "--logging.level.root=ERROR",
+                "--spring.web.resources.static-locations=" + web.toUri(),
                 "--tapstate.installation.directory=" + files.directory(), "--tapstate.control.auth.jwt-secret=installation-test-signing-key",
                 "--tapstate.connectors.seed-dir=" + temporary.resolve("no-seeds"))) {
             int publicPort = ((WebServerApplicationContext)application).getWebServer().getPort();
@@ -32,6 +37,18 @@ class OnPremManagementChannelTest {
             assertThat(application.getBean(StorageRoot.class).phase()).isEqualTo(StorageRoot.Phase.CONFIGURATION_REQUIRED);
             assertThat(application.getBean(StorageRoot.class).runtime().business()).isEmpty();
             try (var http = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NEVER).build()) {
+                var entry = http.send(HttpRequest.newBuilder(URI.create(publicUrl + "/auth/storage-entry")).GET().build(), HttpResponse.BodyHandlers.ofString());
+                assertThat(entry.statusCode()).isEqualTo(200);
+                assertThat((Map<?,?>)JsonReader.parse(entry.body())).isEqualTo(Map.of("mode", "OP", "entry", "SETUP_REQUIRED", "management", false));
+                var managedEntry = http.send(HttpRequest.newBuilder(URI.create(management + "/auth/storage-entry")).GET().build(), HttpResponse.BodyHandlers.ofString());
+                assertThat(managedEntry.statusCode()).isEqualTo(200);
+                assertThat((Map<?,?>)JsonReader.parse(managedEntry.body())).isEqualTo(Map.of("mode", "OP", "entry", "SETUP_REQUIRED", "management", true));
+                var page = http.send(HttpRequest.newBuilder(URI.create(management + "/installation")).header("Accept", "text/html").GET().build(), HttpResponse.BodyHandlers.ofString());
+                assertThat(page.statusCode()).withFailMessage(page.body()).isEqualTo(200);
+                assertThat(page.body()).contains("id=\"root\"").doesNotContain(issued.token());
+                assertThat(http.send(HttpRequest.newBuilder(URI.create(management + "/assets/setup.js")).GET().build(), HttpResponse.BodyHandlers.ofString()).statusCode()).isEqualTo(200);
+                assertThat(http.send(HttpRequest.newBuilder(URI.create(management + "/api/sources")).GET().build(), HttpResponse.BodyHandlers.ofString()).statusCode()).isEqualTo(403);
+                assertThat(http.send(HttpRequest.newBuilder(URI.create(management + "/auth/storage-entry")).header("Origin", "https://unrelated.example").GET().build(), HttpResponse.BodyHandlers.ofString()).statusCode()).isEqualTo(403);
                 assertThat(post(http, publicUrl + "/api/storage/status", issued, "{}").statusCode()).isIn(401, 403, 503);
                 assertThat(post(http, publicUrl + "/installation/first-admin", issued, "{\"username\":\"admin\",\"password\":\"password\"}").statusCode()).isIn(401, 403);
                 assertPublicReverseProxyCannotGrantManagement(http, publicUrl, issued);

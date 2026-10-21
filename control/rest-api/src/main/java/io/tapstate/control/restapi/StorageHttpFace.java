@@ -17,7 +17,7 @@ import java.util.Map;
 @ConditionalOnWebApplication(type = ConditionalOnWebApplication.Type.SERVLET)
 @Import({RestApiConfiguration.class, RestApiSecurityConfiguration.class, HealthController.class,
         VersionController.class, IssuerDiscoveryController.class, AuthController.class, CloudAuthController.class,
-        CurrentUserController.class, ClusterContextController.class, StorageControlController.class, InstallationController.class, ApiExceptionHandler.class})
+        CurrentUserController.class, ClusterContextController.class, StorageControlController.class, StorageEntryController.class, InstallationController.class, ApiExceptionHandler.class})
 public class StorageHttpFace {
     @Bean
     org.springframework.boot.jackson.autoconfigure.JsonMapperBuilderCustomizer sourceJsonContract() {

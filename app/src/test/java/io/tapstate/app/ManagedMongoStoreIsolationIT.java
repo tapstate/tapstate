@@ -230,6 +230,8 @@ class ManagedMongoStoreIsolationIT {
                 var committed = management.post().uri("/api/storage/setup/commit").body(Map.of("operationId", setup.scope().operationId(),
                         "generation", setup.scope().generation(), "candidate", candidate, "testStamps", stamps)).retrieve().body(Map.class);
                 assertThat(committed.get("setupPhase")).isEqualTo("COMPLETE");
+                assertThat(process.publicClient().get().uri("/auth/storage-entry").retrieve().body(Map.class))
+                        .containsExactlyInAnyOrderEntriesOf(Map.of("mode", "OP", "entry", "RESTART_REQUIRED", "management", false));
                 assertThat(files.stage().handoff()).isEqualTo(InstallationFiles.Handoff.RESTART_REQUIRED);
                 assertThat(files.capability()).isEmpty();
                 assertThat(files.configurationUri()).contains(uri(user, configDb));
@@ -241,16 +243,23 @@ class ManagedMongoStoreIsolationIT {
             try (var process = installationProcess(files, setupSeeds, "restarted")) {
                 assertThat(process.process.pid()).isNotEqualTo(initialPid);
                 assertThat(files.stage().handoff()).isEqualTo(InstallationFiles.Handoff.RESTARTED);
+                assertThat(process.publicClient().get().uri("/auth/storage-entry").retrieve().body(Map.class))
+                        .containsExactlyInAnyOrderEntriesOf(Map.of("mode", "OP", "entry", "FIRST_ADMIN_REQUIRED", "management", false));
                 var firstAdmin = InstallationCommand.authorize(files, new MongoProperties(), java.time.Clock.systemUTC());
                 assertThat(firstAdmin.purpose()).isEqualTo(io.tapstate.spi.store.StorageSetupStateStore.Purpose.FIRST_ADMIN);
                 var created = process.management(files, firstAdmin.token()).post().uri("/installation/first-admin")
                         .body(Map.of("username", "admin", "password", "op-installation-password")).retrieve().body(Map.class);
                 assertThat(created.get("phase")).isEqualTo("COMPLETE");
+                assertThat(process.publicClient().get().uri("/auth/storage-entry").retrieve().body(Map.class))
+                        .containsExactlyInAnyOrderEntriesOf(Map.of("mode", "OP", "entry", "LOGIN", "management", false));
                 assertThat(files.capability()).isEmpty();
                 var publicClient = process.publicClient();
                 var login = publicClient.post().uri("/auth/login").body(Map.of("username", "admin", "password", "op-installation-password", "createSession", true))
                         .retrieve().body(io.tapstate.control.restapi.LoginResponse.class);
                 var client = publicClient.mutate().defaultHeader("Authorization", "Bearer " + login.token()).build();
+                var admitted = client.post().uri("/api/storage/status").body(Map.of()).retrieve().body(Map.class);
+                assertThat(((List<?>)admitted.get("allowedActions")).containsAll(List.of("configuration.export", "configuration.import.preflight",
+                        "configuration.import.commit", "configuration.import.status"))).isTrue();
                 Map<String,Object> settings = Map.of("isUri", true, "uri", uri(user, sourceDb));
                 client.post().uri("/api/sources").body(Map.of("id", "input", "connector", "mongodb", "config", settings,
                         "mode", "snapshot", "tables", List.of(Map.of("type", "literal", "name", "orders")))).retrieve().toBodilessEntity();

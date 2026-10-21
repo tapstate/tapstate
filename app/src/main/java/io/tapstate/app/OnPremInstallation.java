@@ -80,7 +80,8 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
     }
     @Override public boolean isManagementRequest(HttpServletRequest request) { return request.getAttribute(CONNECTOR_ATTRIBUTE) == connectorIdentity; }
     @Override public void requireManagementRequest(HttpServletRequest request) {
-        if (closed || connector == null || !isManagementRequest(request) || request.getDispatcherType() != jakarta.servlet.DispatcherType.REQUEST
+        boolean shellForward = request.getDispatcherType() == jakarta.servlet.DispatcherType.FORWARD && "/index.html".equals(request.getRequestURI());
+        if (closed || connector == null || !isManagementRequest(request) || request.getDispatcherType() != jakarta.servlet.DispatcherType.REQUEST && !shellForward
                 || request.getLocalPort() != connector.getLocalPort() || !"127.0.0.1".equals(request.getLocalAddr())) throw InstallationFiles.refused();
         String host = "127.0.0.1:" + connector.getLocalPort();
         if (!host.equals(request.getHeader("Host")) || request.getHeader("Origin") != null && !("http://" + host).equals(request.getHeader("Origin"))
@@ -88,8 +89,10 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
         if (request.getHeader("Forwarded") != null || request.getHeader("X-Forwarded-For") != null || request.getHeader("X-Forwarded-Host") != null) throw InstallationFiles.refused();
         String path = request.getRequestURI();
         boolean write = "POST".equals(request.getMethod()) && (STORAGE_PATHS.contains(path) || path.equals("/installation/first-admin"));
-        boolean probe = "GET".equals(request.getMethod()) && path.equals("/healthz");
-        if (!write && !probe) throw InstallationFiles.refused();
+        boolean read = Set.of("GET", "HEAD").contains(request.getMethod()) && (path.equals("/healthz")
+                || path.equals("/auth/storage-entry") || path.equals("/index.html") || path.equals("/installation")
+                || path.equals("/") || path.startsWith("/assets/"));
+        if (!write && !read) throw InstallationFiles.refused();
     }
     @Override public StorageControlAccess caller(HttpServletRequest request) {
         var permission = permission(request);

@@ -79,6 +79,35 @@ class StorageRootConfiguration {
             return installation != null && (caller.cacheScope().isEmpty() || caller.initialInstallationRecovery()) ? installation.snapshot(caller, active) : root.snapshot(caller, active);
         };
     }
+    @Bean io.tapstate.control.restapi.StorageEntryStatus storageEntryStatus(StorageRoot root, ObjectProvider<OnPremInstallation> installations) {
+        return () -> {
+            var entry = io.tapstate.control.restapi.StorageEntryStatus.Entry.UNAVAILABLE;
+            try {
+                var phase = root.phase();
+                var installation = installations.getIfAvailable();
+                if (phase == StorageRoot.Phase.CONFIGURATION_REQUIRED) {
+                    if (installation != null && installation.files().stage().handoff() == InstallationFiles.Handoff.LOCAL)
+                        entry = io.tapstate.control.restapi.StorageEntryStatus.Entry.SETUP_REQUIRED;
+                } else if (phase != StorageRoot.Phase.CONFIGURATION_UNAVAILABLE && phase != StorageRoot.Phase.CACHE_UNAVAILABLE) {
+                    var configuration = root.runtime().requireConfiguration();
+                    var state = configuration.setupStates().load();
+                    if (state.phase() != StorageSetupStateStore.Phase.COMPLETE) {
+                        entry = io.tapstate.control.restapi.StorageEntryStatus.Entry.SETUP_REQUIRED;
+                    } else if (installation != null && !installation.normalStartupAllowed()) {
+                        entry = io.tapstate.control.restapi.StorageEntryStatus.Entry.RESTART_REQUIRED;
+                    } else if (phase == StorageRoot.Phase.AUTH_READY || phase == StorageRoot.Phase.BUSINESS_READY) {
+                        entry = io.tapstate.control.restapi.StorageEntryStatus.Entry.LOGIN;
+                        if (installation != null && configuration.firstAdmin().load().orElseThrow(StorageRuntime::unavailable).phase() == FirstAdminStore.Phase.PENDING)
+                            entry = phase == StorageRoot.Phase.BUSINESS_READY ? io.tapstate.control.restapi.StorageEntryStatus.Entry.FIRST_ADMIN_REQUIRED
+                                    : io.tapstate.control.restapi.StorageEntryStatus.Entry.UNAVAILABLE;
+                    }
+                }
+            } catch (io.tapstate.core.common.TapstateException unavailable) {
+                entry = io.tapstate.control.restapi.StorageEntryStatus.Entry.UNAVAILABLE;
+            }
+            return new io.tapstate.control.restapi.StorageEntryStatus.Summary(root.mode().name(), entry);
+        };
+    }
     @Bean @org.springframework.context.annotation.Lazy
     InstalledConnectorTests installedConnectorTests(ConnectorPluginProperties properties, Clock clock) {
         return new InstalledConnectorTests(properties, clock);
