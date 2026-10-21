@@ -6,6 +6,8 @@ import io.tapstate.spi.store.ValidationRowCursor;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.LinkedHashSet;
+import java.util.LinkedHashMap;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -30,10 +32,38 @@ public final class ValidationRootReader {
         }
     }
 
-    /** Known source data issues explain uncertain participation; execution failures must be thrown. */
-    public record Source(ValidationRelationReader.Evaluation row, List<Finding> uncertainty) {
+    /**
+     * A known source problem and the final content scopes it prevents comparing. An empty scope list
+     * retains the diagnosis after explicit rules remove/replace that contribution; it hides no target field.
+     */
+    public record SourceIssue(Finding finding, Optional<SampledSide> sample, List<Location> affected) {
+        public SourceIssue {
+            Objects.requireNonNull(finding, "finding"); Objects.requireNonNull(sample, "sample");
+            if (!finding.kind().sourceProblem() || affected == null || affected.size() > 256)
+                throw invalid("rootRead.sourceIssue");
+            affected = List.copyOf(affected);
+        }
+    }
+
+    /** Only completed independent source reads; partial query results and execution failures never enter here. */
+    public record SourceEvidence(ValidationObservation observation, List<ValidationCheckEvent.ReadBoundary> reads, List<SourceIssue> issues) {
+        public SourceEvidence {
+            if (reads == null || reads.size() > 256 || issues == null || issues.size() > 256
+                    || observation == null && (!reads.isEmpty() || !issues.isEmpty()))
+                throw invalid("rootRead.sourceEvidence");
+            reads = List.copyOf(reads); issues = List.copyOf(issues);
+        }
+        public static SourceEvidence empty() { return new SourceEvidence(null, List.of(), List.of()); }
+    }
+
+    /** Known source data issues may survive a definite predicate; uncertainty specifically prevents participation. */
+    public record Source(ValidationRelationReader.Evaluation row, List<Finding> uncertainty, SourceEvidence evidence) {
+        public Source(ValidationRelationReader.Evaluation row, List<Finding> uncertainty) {
+            this(row, uncertainty, SourceEvidence.empty());
+        }
         public Source {
             Objects.requireNonNull(row, "row");
+            Objects.requireNonNull(evidence, "evidence");
             if (uncertainty == null || uncertainty.size() > 256
                     || (row.disposition() == ValidationRelationRows.Disposition.INDETERMINATE) != !uncertainty.isEmpty()
                     || uncertainty.stream().anyMatch(cause -> cause == null || !cause.kind().sourceProblem())) {
@@ -51,15 +81,20 @@ public final class ValidationRootReader {
         }
     }
 
+    /** Content evidence retains deduplicated metadata only; raw diagnostic samples belong to the bounded root report. */
     public record Pair(ValidationRelationRows.Sample source, ValidationCheckEvent.ReadBoundary sourceRead,
-                       ValidationRelationRows.Sample target, ValidationCheckEvent.ReadBoundary targetRead) {
+                       ValidationRelationRows.Sample target, ValidationCheckEvent.ReadBoundary targetRead,
+                       SourceEvidence sourceEvidence) {
         public Optional<SampledSide> sourceSample() { return sample(source, sourceRead); }
         public Optional<SampledSide> targetSample() { return sample(target, targetRead); }
     }
 
     @FunctionalInterface
     public interface ContentCheck {
-        /** Complete every admitted content/descendant obligation, or record its explicit blocking scope. */
+        /**
+         * Complete every admitted content/descendant obligation, or record its blocking scope.
+         * Source evidence's affected scopes must not be compared using invented partial values.
+         */
         void check(Pair pair, Builder root);
     }
 
@@ -81,13 +116,26 @@ public final class ValidationRootReader {
             var whole = new Location(observation.root(), List.of());
             // References to already-budgeted finding metadata; bounded by the result's finding cap.
             var uncertainty = new LinkedHashSet<Finding>();
+            var retainedSource = new SourceEvidence[] { null };
+            var contentBlocked = new boolean[] { false };
             requireAuthorized.run();
             var source = ValidationRelationReader.read(observation, sourceQuery.readId(), sourceQuery.contractVersion(),
                     sourceQuery.open().get(), readLimits, clock, requireAuthorized, original -> {
                         var classified = Objects.requireNonNull(sourceRule.apply(original), "source classification");
                         var diagnostic = classified.row().physical().map(identity -> new SampledSide(identity, original, sourceQuery.readId()));
+                        if (classified.evidence().observation() != null && !observation.equals(classified.evidence().observation()))
+                            throw invalid("rootRead.sourceEvidenceObservation");
+                        var recordedHere = new LinkedHashSet<Finding>();
+                        for (var read : classified.evidence().reads()) root.read(Side.SOURCE, read);
+                        for (var issue : classified.evidence().issues()) {
+                            root.sourceFinding(issue.finding(), issue.sample());
+                            for (var affected : issue.affected()) blockContent(root, affected, issue.finding());
+                            recordedHere.add(issue.finding()); contentBlocked[0] |= !issue.affected().isEmpty();
+                        }
+                        if (classified.row().disposition() == ValidationRelationRows.Disposition.INCLUDED && retainedSource[0] == null)
+                            retainedSource[0] = contentEvidence(classified.evidence());
                         for (Finding cause : classified.uncertainty()) {
-                            root.sourceFinding(cause, diagnostic);
+                            if (!recordedHere.contains(cause)) root.sourceFinding(cause, diagnostic);
                             blockContent(root, whole, cause);
                             uncertainty.add(cause);
                         }
@@ -135,17 +183,33 @@ public final class ValidationRootReader {
             if (shouldExist && exists) {
                 if (!target.atLeastTwo()) {
                     requireAuthorized.run();
-                    content.check(new Pair(source.unique().orElseThrow(), source.read(), target.unique().orElseThrow(), target.read()), root);
+                    content.check(new Pair(source.unique().orElseThrow(), source.read(), target.unique().orElseThrow(), target.read(),
+                            Objects.requireNonNull(retainedSource[0], "unique source evidence")), root);
                 }
                 root.checked(Check.STRUCTURE);
                 if (method == ValidationMethod.FULL_COLUMN) root.checked(Check.VALUES);
-            } else {
+            } else if (!contentBlocked[0]) {
                 root.notApplicable(Check.STRUCTURE);
                 if (method == ValidationMethod.FULL_COLUMN) root.notApplicable(Check.VALUES);
             }
             requireAuthorized.run();
             return root.finish();
         }
+    }
+
+    private static SourceEvidence contentEvidence(SourceEvidence source) {
+        // Import into RootCheck first: its hard finding/scope/read limits bound this metadata. Never
+        // retain the caller's diagnostic rows here, including samples the root report has dropped.
+        var byFinding = new LinkedHashMap<Finding, LinkedHashSet<Location>>();
+        for (var issue : source.issues()) byFinding.computeIfAbsent(issue.finding(), ignored -> new LinkedHashSet<>()).addAll(issue.affected());
+        var compact = new ArrayList<SourceIssue>();
+        for (var entry : byFinding.entrySet()) {
+            var affected = new ArrayList<>(entry.getValue());
+            if (affected.isEmpty()) compact.add(new SourceIssue(entry.getKey(), Optional.empty(), List.of()));
+            for (int from = 0; from < affected.size(); from += 256)
+                compact.add(new SourceIssue(entry.getKey(), Optional.empty(), affected.subList(from, Math.min(from + 256, affected.size()))));
+        }
+        return new SourceEvidence(source.observation(), new ArrayList<>(new LinkedHashSet<>(source.reads())), compact);
     }
 
     private static void blockContent(Builder root, Location location, Finding cause) {
