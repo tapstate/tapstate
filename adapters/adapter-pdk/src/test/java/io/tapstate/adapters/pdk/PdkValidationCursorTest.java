@@ -332,6 +332,69 @@ class PdkValidationCursorTest {
         }
     }
 
+    @Test void workerExitDoesNotFollowCancellationUntilAnIgnoringQueryReallyReturns() throws Exception {
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var releasedReservations = new AtomicInteger();
+        try (var io = Executors.newSingleThreadExecutor();
+             var cursor = new PdkValidationCursor("table", consumer -> {
+                 entered.countDown();
+                 while (true) {
+                     try { if (!release.await(3, TimeUnit.SECONDS)) throw new AssertionError("fixture timed out"); break; }
+                     catch (InterruptedException ignored) { }
+                 }
+             }, row -> ValidationValues.ownRow(row, LIMITS), () -> {}, () -> {}, io, 1, LIMITS)) {
+            try {
+                cursor.workersExited().whenComplete((ignored, error) -> releasedReservations.incrementAndGet());
+                assertThat(entered.await(3, TimeUnit.SECONDS)).isTrue();
+                cursor.close();
+                assertThat(cursor.workersExited().toCompletableFuture().isDone()).isFalse();
+                assertThat(releasedReservations).hasValue(0);
+                release.countDown(); io.submit(() -> {}).get(3, TimeUnit.SECONDS);
+                assertThatThrownBy(() -> cursor.workersExited().toCompletableFuture().get(3, TimeUnit.SECONDS))
+                        .isInstanceOfSatisfying(java.util.concurrent.ExecutionException.class, error ->
+                                assertThat(error.getCause()).isInstanceOfSatisfying(TapstateException.class,
+                                        cause -> assertThat(cause.code()).isEqualTo(ValidationError.READ_CANCELLED)));
+                assertThat(releasedReservations).hasValue(1);
+            } finally { release.countDown(); }
+        }
+    }
+
+    @Test void preStartCancellationProvesNoQueryCanStartButNeverPretendsSuccessfulEof() throws Exception {
+        var occupied = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var queries = new AtomicInteger();
+        try (var io = Executors.newSingleThreadExecutor()) {
+            io.execute(() -> {
+                occupied.countDown();
+                try { release.await(); } catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
+            });
+            assertThat(occupied.await(3, TimeUnit.SECONDS)).isTrue();
+            try (var cursor = new PdkValidationCursor("table", consumer -> queries.incrementAndGet(),
+                    row -> ValidationValues.ownRow(row, LIMITS), () -> {}, () -> {}, io, 1, LIMITS)) {
+                cursor.close();
+                assertThat(cursor.workersExited().toCompletableFuture().get(3, TimeUnit.SECONDS)).isNull();
+                assertThatThrownBy(cursor::next).isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(ValidationError.READ_CANCELLED));
+                release.countDown(); io.submit(() -> {}).get(3, TimeUnit.SECONDS);
+                assertThat(queries).hasValue(0);
+            } finally { release.countDown(); }
+        } finally { release.countDown(); }
+    }
+
+    @Test void closingAfterNormalEofDoesNotTurnActualWorkerExitIntoAReadFailure() throws Exception {
+        try (var io = Executors.newSingleThreadExecutor()) {
+            for (int i = 0; i < 50; i++) {
+                try (var cursor = new PdkValidationCursor("table", consumer -> {}, row -> ValidationValues.ownRow(row, LIMITS),
+                        () -> {}, () -> {}, io, 1, LIMITS)) {
+                    assertThat(cursor.next()).isEmpty();
+                    cursor.close();
+                    assertThat(cursor.workersExited().toCompletableFuture().get(3, TimeUnit.SECONDS)).isNull();
+                }
+            }
+        }
+    }
+
     @SafeVarargs private static FilterResults result(Map<String, Object>... rows) {
         FilterResults result = new FilterResults();
         result.setResults(List.of(rows));

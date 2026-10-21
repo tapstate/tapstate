@@ -5,13 +5,13 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.validation.ValidationError;
 import io.tapstate.core.validation.ValidationFailureLatch;
 import io.tapstate.core.validation.ValidationValues;
-import io.tapstate.spi.store.ValidationRowCursor;
+import io.tapstate.spi.store.ValidationReadHandle;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Future;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
@@ -23,7 +23,7 @@ import java.util.function.Consumer;
  * connector, loader context, an admitted blocking-I/O executor and a driver-materialization reservation
  * before opening this bridge. This queue bounds decoded rows only; it grants none of those resources.
  */
-final class PdkValidationCursor implements ValidationRowCursor {
+final class PdkValidationCursor implements ValidationReadHandle {
     @FunctionalInterface interface QueryCall { void run(Consumer<FilterResults> consumer) throws Throwable; }
     @FunctionalInterface interface Decoder { ValidationValues.Row decode(Map<String, Object> row); }
 
@@ -41,7 +41,7 @@ final class PdkValidationCursor implements ValidationRowCursor {
     private final ValidationFailureLatch failure = new ValidationFailureLatch();
     private volatile boolean invocationOpen;
     private volatile boolean done;
-    private volatile Future<?> worker;
+    private final PdkValidationActivityTask worker;
     private long ordinal;
 
     PdkValidationCursor(String table, QueryCall query, Decoder decoder, Runnable requireAuthorized,
@@ -59,12 +59,14 @@ final class PdkValidationCursor implements ValidationRowCursor {
         }
         this.rows = new ArrayBlockingQueue<>(maxInFlightRows);
         this.slots = new Semaphore(maxInFlightRows);
+        worker = new PdkValidationActivityTask(() -> { produce(); return null; });
         try {
             requireAuthorized.run();
-            worker = executor.submit(this::produce);
+            executor.execute(worker);
             if (closed.get()) worker.cancel(true);
         } catch (RuntimeException | Error rejected) {
             closed.set(true);
+            worker.cancel(true);
             Throwable primary = rejected instanceof RejectedExecutionException
                     ? new TapstateException(ValidationError.READ_FAILED, Map.of("table", table), rejected) : rejected;
             failure.record(primary);
@@ -78,6 +80,7 @@ final class PdkValidationCursor implements ValidationRowCursor {
     }
 
     private void produce() {
+        Throwable finishedFailure;
         try {
             checkActive();
             synchronized (invocationLock) { invocationOpen = true; }
@@ -91,8 +94,11 @@ final class PdkValidationCursor implements ValidationRowCursor {
             recordFailure(stopped);
         } finally {
             synchronized (invocationLock) { invocationOpen = false; }
+            // Capture before publishing EOF: a later normal consumer close is not a query failure.
+            finishedFailure = failure.get();
             done = true;
         }
+        throwFailure(finishedFailure);
     }
 
     private void accept(FilterResults result) {
@@ -201,8 +207,9 @@ final class PdkValidationCursor implements ValidationRowCursor {
         failure.record(error);
     }
 
-    private void throwFailure() {
-        Throwable failed = failure.get();
+    private void throwFailure() { throwFailure(failure.get()); }
+
+    private void throwFailure(Throwable failed) {
         if (failed instanceof RuntimeException runtime) throw runtime;
         if (failed instanceof Error error) throw error;
         if (failed != null) throw new TapstateException(ValidationError.READ_FAILED, Map.of("table", table), failed);
@@ -215,6 +222,8 @@ final class PdkValidationCursor implements ValidationRowCursor {
     private TapstateException cancelled() {
         return new TapstateException(ValidationError.READ_CANCELLED, Map.of("table", table), null);
     }
+
+    @Override public CompletionStage<Void> workersExited() { return worker.exited(); }
 
     int availableRowSlots() { return slots.availablePermits(); }
 

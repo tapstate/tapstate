@@ -32,6 +32,7 @@ import io.tapstate.core.validation.ValidationValues;
 import io.tapstate.runtime.engine.validation.ValidationOrderedGroups;
 import io.tapstate.runtime.engine.validation.ValidationOrderedMerge;
 import io.tapstate.spi.store.ValidationRowCursor;
+import io.tapstate.spi.store.ValidationReadHandle;
 import io.tapstate.testsupport.RequiresDocker;
 import java.math.BigDecimal;
 import java.math.BigInteger;
@@ -282,16 +283,23 @@ class ValidationJdbcMongoReadIT {
 
     private static ValidationRootCheck rootRead(String kind, ConnectorRef sourceRef, Map<String, Object> sourceSettings,
             ConnectorRef targetRef, Map<String, Object> targetSettings, String sourceTable, String targetTable, long id,
-            ValidationStaticMap projection, Optional<ValidationPredicate> predicate, ExecutorService queryIo, ExecutorService decodeIo) {
+            ValidationStaticMap projection, Optional<ValidationPredicate> predicate, ExecutorService queryIo, ExecutorService decodeIo) throws Exception {
         var logical = new ValidationKey(List.of(ValidationKey.Part.number(id)));
         var observation = new ValidationObservation(new ValidationRunIdentity(new ValidationOwner("cluster", "pipeline", "node", "boot", 1, 1, 0),
                 "task", "native-roots-" + kind, ValidationMode.FULL, "fixed-projection", 1, "rules"),
                 new ValidationRoot("mapping", "output", logical, List.of()), 1);
         var generated = ValidationFieldCheck.generatedId(observation.run(), "mapping", "output", true, false, false,
                 value -> value instanceof ValidationValues.Typed typed && typed.logicalType().equals("text") && typed.value() instanceof String);
-        return ValidationRootReader.read(observation, ValidationMethod.FULL_COLUMN,
-                new ValidationRootReader.Query("source", "native-root-v1", () -> rootLookup(kind, sourceRef, sourceSettings, sourceTable, "source_key", logical, queryIo, decodeIo)),
-                new ValidationRootReader.Query("target", "native-root-v1", () -> rootLookup("mongodb", targetRef, targetSettings, targetTable, "target_key", logical, queryIo, decodeIo)),
+        var handles = new ArrayList<ValidationReadHandle>();
+        var checked = ValidationRootReader.read(observation, ValidationMethod.FULL_COLUMN,
+                new ValidationRootReader.Query("source", "native-root-v1", () -> {
+                    var handle = rootLookup(kind, sourceRef, sourceSettings, sourceTable, "source_key", logical, queryIo, decodeIo);
+                    handles.add(handle); return handle;
+                }),
+                new ValidationRootReader.Query("target", "native-root-v1", () -> {
+                    var handle = rootLookup("mongodb", targetRef, targetSettings, targetTable, "target_key", logical, queryIo, decodeIo);
+                    handles.add(handle); return handle;
+                }),
                 new ValidationRelationRows.Limits(65536, LIMITS), new ValidationRootCheck.Limits(1024 * 1024, 100, 100, 20, 4),
                 Clock.systemUTC(), () -> {}, original -> {
                     var working = projection.apply(original);
@@ -310,9 +318,11 @@ class ValidationJdbcMongoReadIT {
                             new ValidationPhysicalIdentity(actual.sourceId(), DATABASE, null, targetTable, actual.keyFields(), actual.actualKey()));
                 }, (pair, root) -> ValidationFieldCheck.check(observation, List.of(), pair.source().working(), pair.target().working(),
                         pair.sourceSample(), pair.targetSample(), generated, String::equals, new ValidationValueComparison.TraversalLimits(LIMITS, 10000), root));
+        for (var handle : handles) assertThat(handle.workersExited().toCompletableFuture().get(5, java.util.concurrent.TimeUnit.SECONDS)).isNull();
+        return checked;
     }
 
-    private static ValidationRowCursor rootLookup(String kind, ConnectorRef artifact, Map<String, Object> settings, String table,
+    private static ValidationReadHandle rootLookup(String kind, ConnectorRef artifact, Map<String, Object> settings, String table,
             String keyField, ValidationKey logical, ExecutorService queryIo, ExecutorService decodeIo) {
         var binding = new ValidationKeyBinding("root", List.of(new ValidationKeyBinding.Component(List.of(keyField),
                 ValidationKey.Kind.EXACT_NUMBER, Set.of("exact-number"))), Set.of(), LIMITS);

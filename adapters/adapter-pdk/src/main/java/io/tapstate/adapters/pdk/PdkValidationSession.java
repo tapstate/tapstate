@@ -12,7 +12,7 @@ import io.tapstate.core.validation.ValidationKey;
 import io.tapstate.core.validation.ValidationKeyBinding;
 import io.tapstate.core.validation.ValidationFailureLatch;
 import io.tapstate.core.validation.ValidationValues;
-import io.tapstate.spi.store.ValidationRowCursor;
+import io.tapstate.spi.store.ValidationReadHandle;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -20,7 +20,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.FutureTask;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -127,11 +128,15 @@ final class PdkValidationSession {
     private final Runnable requireAuthorized;
     private final AtomicBoolean cancelled = new AtomicBoolean();
     private final ValidationFailureLatch failure = new ValidationFailureLatch();
-    private final AtomicReference<FutureTask<Void>> delivery = new AtomicReference<>();
+    private final AtomicReference<PdkValidationActivityTask> delivery = new AtomicReference<>();
     private final Object callbackLock = new Object();
     private boolean queryOpen;
     private final Object stopLock = new Object();
     private volatile PdkConnector connector;
+    private final Object activityLock = new Object();
+    private final CompletableFuture<Void> workersExited = new CompletableFuture<>();
+    private boolean queryExited;
+    private int decoding;
     private PdkValidationCursor.Decoder decoder;
 
     private PdkValidationSession(String connectorId, ConnectorRef artifact, Map<String, Object> settings,
@@ -150,24 +155,53 @@ final class PdkValidationSession {
         if (connectorId.isBlank() || codecBinding.isBlank()) throw new IllegalArgumentException("missing reader identity");
     }
 
-    static ValidationRowCursor scan(String connectorId, ConnectorRef artifact, Map<String, Object> settings,
+    static ValidationReadHandle scan(String connectorId, ConnectorRef artifact, Map<String, Object> settings,
             String codecBinding, Scan scan, ReadAdmission admission, Runnable requireAuthorized,
             ExecutorService io, ExecutorService decodeIo, int maxInFlightRows, ValidationValues.Limits rowLimits) {
         if (io == decodeIo) throw new IllegalArgumentException("query and decoding require distinct executors");
         var session = new PdkValidationSession(connectorId, artifact, settings, codecBinding, scan,
                 admission, null, requireAuthorized, decodeIo);
-        return new PdkValidationCursor(scan.table(), session::read, row -> session.decoder.decode(session.project(row)),
-                session::checkActive, session::cancel, io, maxInFlightRows, rowLimits);
+        return session.open(io, maxInFlightRows, rowLimits);
     }
 
-    static ValidationRowCursor lookup(String connectorId, ConnectorRef artifact, Map<String, Object> settings,
+    static ValidationReadHandle lookup(String connectorId, ConnectorRef artifact, Map<String, Object> settings,
             String codecBinding, Lookup lookup, ReadAdmission admission, MatchEncoding encoding, Runnable requireAuthorized,
             ExecutorService io, ExecutorService decodeIo, int maxInFlightRows, ValidationValues.Limits rowLimits) {
         if (io == decodeIo) throw new IllegalArgumentException("query and decoding require distinct executors");
         var session = new PdkValidationSession(connectorId, artifact, settings, codecBinding, lookup,
                 admission, Objects.requireNonNull(encoding, "encoding"), requireAuthorized, decodeIo);
-        return new PdkValidationCursor(lookup.table(), session::read, row -> session.decoder.decode(session.project(row)),
-                session::checkActive, session::cancel, io, maxInFlightRows, rowLimits);
+        return session.open(io, maxInFlightRows, rowLimits);
+    }
+
+    private ValidationReadHandle open(ExecutorService io, int maxInFlightRows, ValidationValues.Limits rowLimits) {
+        var cursor = new PdkValidationCursor(scan.table(), this::read, row -> decoder.decode(project(row)),
+                this::checkActive, this::cancel, io, maxInFlightRows, rowLimits);
+        cursor.workersExited().whenComplete((ignored, error) -> activityExited(true, error));
+        return new ValidationReadHandle() {
+            @Override public java.util.Optional<Row> next() { return cursor.next(); }
+            @Override public void close() { cursor.close(); }
+            @Override public CompletionStage<Void> workersExited() { return workersExited.minimalCompletionStage(); }
+        };
+    }
+
+    private void activityExited(boolean query, Throwable error) {
+        if (error != null) {
+            while (error instanceof java.util.concurrent.CompletionException && error.getCause() != null) error = error.getCause();
+            failure.record(error);
+            ValidationFailureLatch.addContext(failure.get(), error);
+        }
+        boolean complete;
+        synchronized (activityLock) {
+            if (query) queryExited = true;
+            else decoding--;
+            complete = queryExited && decoding == 0;
+        }
+        // Completion callbacks run outside internal locks and retain fatal errors after cancellation.
+        if (complete) {
+            Throwable primary = failure.get();
+            if (primary == null) workersExited.complete(null);
+            else workersExited.completeExceptionally(primary);
+        }
     }
 
     private void read(Consumer<FilterResults> rows) throws Throwable {
@@ -256,7 +290,7 @@ final class PdkValidationSession {
     }
 
     private void deliver(PdkConnector opened, Consumer<FilterResults> consumer, FilterResults result) {
-        FutureTask<Void> task = new FutureTask<>(() -> {
+        PdkValidationActivityTask task = new PdkValidationActivityTask(() -> {
             try {
                 return opened.underLoader(() -> {
                     checkActive();
@@ -266,15 +300,26 @@ final class PdkValidationSession {
             } catch (RuntimeException | Error failure) { throw failure; }
             catch (Throwable failure) { throw readFailed(failure); }
         });
+        boolean tracked = false;
         try {
             synchronized (callbackLock) {
                 checkActive();
-                if (!queryOpen || !delivery.compareAndSet(null, task)) throw protocol();
+                if (!queryOpen || delivery.get() != null) throw protocol();
+                synchronized (activityLock) {
+                    if (queryExited || decoding != 0) throw protocol();
+                    decoding++;
+                }
+                tracked = true;
+                delivery.set(task);
             }
+            var trackedExit = task.exited().whenComplete((ignored, error) -> activityExited(false, error));
             // A callback retains its driver batch until decoding has completed. Concurrent callbacks
             // are refused before submitting, so this bridge never builds a queue of raw batches.
             decodeIo.execute(task);
             task.get();
+            // FutureTask publishes its value before run() finishes. Do not admit the next raw batch
+            // until this decode body has exited and its activity registration has been retired.
+            trackedExit.toCompletableFuture().get();
         } catch (RejectedExecutionException rejected) {
             task.cancel(true);
             var failure = readFailed(rejected);
@@ -300,7 +345,10 @@ final class PdkValidationSession {
             task.cancel(true);
             failure.record(failed);
             throw failed;
-        } finally { delivery.compareAndSet(task, null); }
+        } finally {
+            if (!tracked) task.cancel(true);
+            delivery.compareAndSet(task, null);
+        }
     }
 
     private TapstateException readFailed(Throwable cause) {
@@ -412,7 +460,7 @@ final class PdkValidationSession {
 
     private void cancel() {
         if (!cancelled.compareAndSet(false, true)) return;
-        FutureTask<Void> pending = delivery.get();
+        PdkValidationActivityTask pending = delivery.get();
         if (pending != null) pending.cancel(true);
         synchronized (stopLock) {
             PdkConnector opened = connector;

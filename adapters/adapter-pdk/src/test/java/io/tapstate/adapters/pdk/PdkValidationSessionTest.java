@@ -6,6 +6,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.validation.ValidationError;
 import io.tapstate.core.validation.ValidationValues;
 import io.tapstate.spi.store.ValidationRowCursor;
+import io.tapstate.spi.store.ValidationReadHandle;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
@@ -102,6 +103,8 @@ class PdkValidationSessionTest {
                                 try { consumer.accept(result); } catch (RuntimeException ignored) {}
                                 if (mode(c).equals("swallow-then-throw")) throw new Exception("later query failure");
                                 if (mode(c).equals("swallow-then-fatal")) throw new AssertionError("fatal after callback");
+                            } else if (mode(c).equals("many-batches")) {
+                                for (int i = 0; i < 64; i++) consumer.accept(result);
                             } else consumer.accept(result);
                             if (mode(c).equals("block-query"))
                                 ((CountDownLatch) c.getConnectionConfig().get("release")).await();
@@ -337,6 +340,65 @@ class PdkValidationSessionTest {
                 assertCode(cursor, ValidationError.READ_CANCELLED);
                 assertThat(probe.stops.get()).isGreaterThanOrEqualTo(1);
             } finally { released.countDown(); }
+        }
+    }
+
+    @Test void workerExitWaitsForAnInterruptIgnoringDecoderAndRetainsItsLateFatalError() throws Exception {
+        for (boolean fatal : List.of(false, true)) {
+            var probe = new Probe("late-decode", "normal");
+            var entered = new CountDownLatch(1);
+            var release = new CountDownLatch(1);
+            var releasedReservations = new AtomicInteger();
+            var late = new AssertionError("late decoder failure");
+            try (var io = Executors.newSingleThreadExecutor();
+                 var cursor = (ValidationReadHandle)scan(probe, io, (model, codecs) -> row -> {
+                     entered.countDown(); uninterruptibly(release);
+                     if (fatal) throw late;
+                     return ValidationValues.ownRow(Map.of("id", 7), LIMITS);
+                 }, () -> {})) {
+                try {
+                    cursor.workersExited().whenComplete((ignored, error) -> releasedReservations.incrementAndGet());
+                    assertThat(entered.await(3, TimeUnit.SECONDS)).isTrue();
+                    cursor.close();
+                    io.submit(() -> {}).get(3, TimeUnit.SECONDS);
+                    assertThat(cursor.workersExited().toCompletableFuture().isDone()).isFalse();
+                    assertThat(releasedReservations).hasValue(0);
+                    var detached = cursor.workersExited().toCompletableFuture();
+                    detached.complete(null);
+                    assertThat(cursor.workersExited().toCompletableFuture().isDone()).isFalse();
+                    release.countDown(); decodeIo.submit(() -> {}).get(3, TimeUnit.SECONDS);
+                    assertThatThrownBy(() -> cursor.workersExited().toCompletableFuture().get(3, TimeUnit.SECONDS))
+                            .isInstanceOfSatisfying(java.util.concurrent.ExecutionException.class, error -> {
+                                if (fatal) assertThat(error.getCause()).isSameAs(late);
+                                else assertThat(error.getCause()).isInstanceOfSatisfying(TapstateException.class,
+                                        stopped -> assertThat(stopped.code()).isEqualTo(ValidationError.READ_CANCELLED));
+                            });
+                    assertThat(releasedReservations).hasValue(1);
+                    if (fatal) assertThatThrownBy(cursor::next).isSameAs(late);
+                } finally { release.countDown(); }
+            }
+        }
+    }
+
+    @Test void serialBatchesRetireTheirDecodeActivityBeforeAdmittingTheNextBatch() throws Exception {
+        var probe = new Probe("batches", "many-batches");
+        try (var io = Executors.newSingleThreadExecutor(); var cursor = (ValidationReadHandle)scan(probe, io)) {
+            int rows = 0;
+            while (true) {
+                var next = cursor.next();
+                if (next.isEmpty()) break;
+                try (var row = next.orElseThrow()) { assertThat(row.ordinal()).isEqualTo(rows++); }
+            }
+            assertThat(rows).isEqualTo(64);
+            cursor.close();
+            assertThat(cursor.workersExited().toCompletableFuture().get(3, TimeUnit.SECONDS)).isNull();
+        }
+    }
+
+    private static void uninterruptibly(CountDownLatch latch) {
+        while (true) {
+            try { if (!latch.await(3, TimeUnit.SECONDS)) throw new AssertionError("fixture timed out"); return; }
+            catch (InterruptedException ignored) { }
         }
     }
 
