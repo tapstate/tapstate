@@ -3,6 +3,7 @@ package io.tapstate.adapters.pdk;
 import io.tapdata.pdk.apis.entity.FilterResults;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.validation.ValidationError;
+import io.tapstate.core.validation.ValidationFailureLatch;
 import io.tapstate.core.validation.ValidationValues;
 import io.tapstate.spi.store.ValidationRowCursor;
 import java.util.Map;
@@ -15,7 +16,6 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 /**
@@ -38,7 +38,7 @@ final class PdkValidationCursor implements ValidationRowCursor {
     private final AtomicBoolean closed = new AtomicBoolean();
     private final AtomicBoolean callbackActive = new AtomicBoolean();
     private final Object invocationLock = new Object();
-    private final AtomicReference<Throwable> failure = new AtomicReference<>();
+    private final ValidationFailureLatch failure = new ValidationFailureLatch();
     private volatile boolean invocationOpen;
     private volatile boolean done;
     private volatile Future<?> worker;
@@ -63,13 +63,17 @@ final class PdkValidationCursor implements ValidationRowCursor {
             requireAuthorized.run();
             worker = executor.submit(this::produce);
             if (closed.get()) worker.cancel(true);
-        } catch (RuntimeException rejected) {
+        } catch (RuntimeException | Error rejected) {
             closed.set(true);
-            RuntimeException primary = rejected instanceof RejectedExecutionException
+            Throwable primary = rejected instanceof RejectedExecutionException
                     ? new TapstateException(ValidationError.READ_FAILED, Map.of("table", table), rejected) : rejected;
+            failure.record(primary);
             try { cancelQuery.run(); }
-            catch (RuntimeException cleanup) { if (cleanup != primary) primary.addSuppressed(cleanup); }
-            throw primary;
+            catch (RuntimeException | Error cleanup) {
+                failure.record(cleanup);
+                ValidationFailureLatch.addContext(failure.get(), cleanup);
+            }
+            throwFailure();
         }
     }
 
@@ -194,7 +198,7 @@ final class PdkValidationCursor implements ValidationRowCursor {
     }
 
     private void recordFailure(Throwable error) {
-        failure.compareAndSet(null, error);
+        failure.record(error);
     }
 
     private void throwFailure() {
@@ -216,14 +220,15 @@ final class PdkValidationCursor implements ValidationRowCursor {
 
     @Override public void close() {
         if (!closed.compareAndSet(false, true)) return;
-        boolean cancellationFirst = failure.compareAndSet(null, cancelled());
+        boolean cancellationFirst = failure.record(cancelled());
         if (worker != null) worker.cancel(true);
         BorrowedRow queued;
         while ((queued = rows.poll()) != null) queued.close();
         try { cancelQuery.run(); }
         catch (RuntimeException | Error cleanup) {
-            Throwable primary = failure.get();
-            if (primary != cleanup) primary.addSuppressed(cleanup);
+            failure.record(cleanup);
+            ValidationFailureLatch.addContext(failure.get(), cleanup);
+            if (cleanup instanceof Error) throwFailure();
             if (cancellationFirst) throw cleanup;
         }
     }

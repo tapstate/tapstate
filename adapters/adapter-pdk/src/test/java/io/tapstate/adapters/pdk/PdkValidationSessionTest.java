@@ -87,9 +87,10 @@ class PdkValidationSessionTest {
                             result.setResults(List.of(Map.of("id", 7)));
                             if (mode(c).equals("callback-thread")) {
                                 java.util.concurrent.CompletableFuture.runAsync(() -> consumer.accept(result)).get();
-                            } else if ((mode(c).equals("swallow-callback") || mode(c).equals("swallow-then-throw"))) {
+                            } else if ((mode(c).equals("swallow-callback") || mode(c).equals("swallow-then-throw") || mode(c).equals("swallow-then-fatal"))) {
                                 try { consumer.accept(result); } catch (RuntimeException ignored) {}
                                 if (mode(c).equals("swallow-then-throw")) throw new Exception("later query failure");
+                                if (mode(c).equals("swallow-then-fatal")) throw new AssertionError("fatal after callback");
                             } else consumer.accept(result);
                             if (mode(c).equals("block-query"))
                                 ((CountDownLatch) c.getConnectionConfig().get("release")).await();
@@ -224,6 +225,19 @@ class PdkValidationSessionTest {
                 assertThat(failure.getCause()).isInstanceOf(java.util.concurrent.RejectedExecutionException.class);
                 assertThat(failure.getSuppressed()).hasSize(1);
                 assertThat(failure.getSuppressed()[0].getCause()).hasMessage("later query failure");
+            });
+        }
+    }
+
+    @Test void ordinaryFailureCannotHideALaterFatalError() throws Exception {
+        decodeIo.shutdownNow();
+        var probe = new Probe("fatal", "swallow-then-fatal");
+        try (var io = Executors.newSingleThreadExecutor(); var cursor = scan(probe, io)) {
+            io.submit(() -> { }).get(3, TimeUnit.SECONDS);
+            assertThatThrownBy(cursor::next).isInstanceOfSatisfying(AssertionError.class, fatal -> {
+                assertThat(fatal).hasMessage("fatal after callback");
+                assertThat(fatal.getSuppressed()).isNotEmpty();
+                assertThat(fatal.getSuppressed()[0].getCause()).isInstanceOf(java.util.concurrent.RejectedExecutionException.class);
             });
         }
     }

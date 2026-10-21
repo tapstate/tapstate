@@ -100,6 +100,42 @@ class PdkValidationCursorTest {
         }
     }
 
+    @Test void ordinaryFailureCannotHideALaterFatalError() throws Exception {
+        var fatal = new AssertionError("fatal after invalid row");
+        try (var worker = Executors.newSingleThreadExecutor();
+             var cursor = new PdkValidationCursor("table", consumer -> {
+                 try { consumer.accept(new FilterResults()); } catch (TapstateException swallowed) { }
+                 throw fatal;
+             }, row -> ValidationValues.ownRow(row, LIMITS), () -> { }, () -> { }, worker, 1, LIMITS)) {
+            worker.submit(() -> { }).get(3, TimeUnit.SECONDS);
+            assertThatThrownBy(cursor::next).isSameAs(fatal);
+            assertThat(fatal.getSuppressed()).hasSize(1);
+            assertThat(((TapstateException)fatal.getSuppressed()[0]).code()).isEqualTo(ValidationError.READ_PROTOCOL_VIOLATION);
+        }
+    }
+
+    @Test void fatalAdmissionStillCancelsOnlyItsOwnedQueryResource() {
+        var fatal = new AssertionError("fatal admission");
+        var cleaned = new AtomicInteger();
+        try (var worker = Executors.newSingleThreadExecutor()) {
+            assertThatThrownBy(() -> new PdkValidationCursor("table", sink -> { },
+                    row -> ValidationValues.ownRow(row, LIMITS), () -> { throw fatal; },
+                    cleaned::incrementAndGet, worker, 1, LIMITS)).isSameAs(fatal);
+            assertThat(cleaned).hasValue(1);
+        }
+    }
+
+    @Test void fatalAdmissionCleanupEscapesWithTheEarlierRefusalAsContext() {
+        var refusal = denied();
+        var fatal = new AssertionError("fatal admission cleanup");
+        try (var worker = Executors.newSingleThreadExecutor()) {
+            assertThatThrownBy(() -> new PdkValidationCursor("table", sink -> { },
+                    row -> ValidationValues.ownRow(row, LIMITS), () -> { throw refusal; },
+                    () -> { throw fatal; }, worker, 1, LIMITS)).isSameAs(fatal);
+            assertThat(fatal.getSuppressed()).containsExactly(refusal);
+        }
+    }
+
     @Test void nullResultPayloadIsAProtocolViolationRatherThanAnEmptyTable() {
         try (var worker = Executors.newSingleThreadExecutor();
              var cursor = new PdkValidationCursor("table", consumer -> consumer.accept(new FilterResults()),

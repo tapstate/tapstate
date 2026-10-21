@@ -2,6 +2,7 @@ package io.tapstate.runtime.engine.validation;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.validation.ValidationError;
+import io.tapstate.core.validation.ValidationFailureLatch;
 import io.tapstate.core.validation.ValidationKey;
 import io.tapstate.core.validation.ValidationPhysicalIdentity;
 import io.tapstate.core.validation.ValidationValues;
@@ -43,7 +44,7 @@ public final class ValidationOrderedGroups implements AutoCloseable {
     private volatile ValidationKey previous;
     private long expectedOrdinal;
     private boolean eof;
-    private Throwable failure;
+    private final ValidationFailureLatch failure = new ValidationFailureLatch();
 
     public ValidationOrderedGroups(String readId, ValidationRowCursor input,
             Function<ValidationValues.Row, Key> project, long maxSampleBytes) {
@@ -87,7 +88,7 @@ public final class ValidationOrderedGroups implements AutoCloseable {
             }
             return Optional.of(group);
         } catch (RuntimeException | Error stopped) {
-            if (failure == null) failure = stopped;
+            failure.record(stopped);
             // close may have won while projection was in flight; discard ownership published late.
             lookahead = null;
             previous = null;
@@ -95,7 +96,8 @@ public final class ValidationOrderedGroups implements AutoCloseable {
             if (leased != null) leased.close();
             try { close(); }
             catch (RuntimeException | Error cleanup) {
-                if (cleanup != failure) failure.addSuppressed(cleanup);
+                failure.record(cleanup);
+                ValidationFailureLatch.addContext(failure.get(), cleanup);
             }
             throwFailure();
             throw stopped;
@@ -110,7 +112,8 @@ public final class ValidationOrderedGroups implements AutoCloseable {
             eof = true;
             return null;
         }
-        try (var row = delivered.orElseThrow()) {
+        var row = delivered.orElseThrow();
+        try {
             checkActive();
             if (expectedOrdinal == Long.MAX_VALUE || row.ordinal() != expectedOrdinal++) throw protocol();
             ValidationValues.Row values = Objects.requireNonNull(row.values(), "row values");
@@ -120,6 +123,18 @@ public final class ValidationOrderedGroups implements AutoCloseable {
             if (prior != null && prior.compareTo(key.comparison()) > 0) throw protocol();
             previous = key.comparison();
             return new Sample(key, values);
+        } catch (RuntimeException | Error reported) {
+            failure.record(reported);
+            throw reported;
+        } finally {
+            // Automatic resource cleanup would suppress a cleanup Error beneath an ordinary body
+            // failure. Keep the shared failure precedence at this external row-lease boundary too.
+            try { row.close(); }
+            catch (RuntimeException | Error cleanup) {
+                failure.record(cleanup);
+                ValidationFailureLatch.addContext(failure.get(), cleanup);
+                throwFailure();
+            }
         }
     }
 
@@ -129,8 +144,9 @@ public final class ValidationOrderedGroups implements AutoCloseable {
     }
 
     private void throwFailure() {
-        if (failure instanceof RuntimeException runtime) throw runtime;
-        if (failure instanceof Error error) throw error;
+        Throwable first = failure.get();
+        if (first instanceof RuntimeException runtime) throw runtime;
+        if (first instanceof Error error) throw error;
     }
 
     private TapstateException protocol() {
@@ -147,7 +163,12 @@ public final class ValidationOrderedGroups implements AutoCloseable {
         if (group != null) group.close();
         lookahead = null;
         previous = null;
-        input.close();
+        try { input.close(); }
+        catch (RuntimeException | Error cleanup) {
+            failure.record(cleanup);
+            ValidationFailureLatch.addContext(failure.get(), cleanup);
+            throwFailure();
+        }
     }
 
     /** Only the first sample is retained; multiplicity covers the entire group, including all batches. */

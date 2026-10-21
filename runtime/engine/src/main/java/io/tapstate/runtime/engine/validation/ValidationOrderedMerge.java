@@ -3,6 +3,7 @@ package io.tapstate.runtime.engine.validation;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.validation.ValidationCheckEvent;
 import io.tapstate.core.validation.ValidationError;
+import io.tapstate.core.validation.ValidationFailureLatch;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -24,7 +25,7 @@ public final class ValidationOrderedMerge implements AutoCloseable {
     private Pair outstanding;
     private boolean sourceEof;
     private boolean targetEof;
-    private Throwable failure;
+    private final ValidationFailureLatch failure = new ValidationFailureLatch();
 
     public ValidationOrderedMerge(ValidationOrderedGroups source, ValidationOrderedGroups target) {
         this.source = Objects.requireNonNull(source, "source");
@@ -55,10 +56,11 @@ public final class ValidationOrderedMerge implements AutoCloseable {
                 return Optional.of(pair);
             }
         } catch (RuntimeException | Error stopped) {
-            if (failure == null) failure = stopped;
+            failure.record(stopped);
             try { close(); }
             catch (RuntimeException | Error cleanup) {
-                if (cleanup != failure) failure.addSuppressed(cleanup);
+                failure.record(cleanup);
+                ValidationFailureLatch.addContext(failure.get(), cleanup);
             }
             throwFailure();
             throw stopped;
@@ -97,8 +99,9 @@ public final class ValidationOrderedMerge implements AutoCloseable {
     }
 
     private void throwFailure() {
-        if (failure instanceof RuntimeException runtime) throw runtime;
-        if (failure instanceof Error error) throw error;
+        Throwable first = failure.get();
+        if (first instanceof RuntimeException runtime) throw runtime;
+        if (first instanceof Error error) throw error;
     }
 
     @Override public void close() {
@@ -112,13 +115,20 @@ public final class ValidationOrderedMerge implements AutoCloseable {
             targetPending = null;
         }
         if (leased != null) leased.close();
+        boolean cleanupFailed = false;
         try { source.close(); }
-        catch (RuntimeException | Error first) {
-            try { target.close(); }
-            catch (RuntimeException | Error second) { if (first != second) first.addSuppressed(second); }
-            throw first;
+        catch (RuntimeException | Error problem) {
+            cleanupFailed = true;
+            failure.record(problem);
+            ValidationFailureLatch.addContext(failure.get(), problem);
         }
-        target.close();
+        try { target.close(); }
+        catch (RuntimeException | Error problem) {
+            cleanupFailed = true;
+            failure.record(problem);
+            ValidationFailureLatch.addContext(failure.get(), problem);
+        }
+        if (cleanupFailed) throwFailure();
     }
 
     public static final class Pair implements AutoCloseable {

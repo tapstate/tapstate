@@ -6,6 +6,7 @@ import io.tapdata.pdk.apis.entity.SortOn;
 import io.tapdata.pdk.apis.entity.TapAdvanceFilter;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.validation.ValidationError;
+import io.tapstate.core.validation.ValidationFailureLatch;
 import io.tapstate.core.validation.ValidationValues;
 import io.tapstate.spi.store.ValidationRowCursor;
 import java.util.Collections;
@@ -60,7 +61,7 @@ final class PdkValidationSession {
     private final ExecutorService decodeIo;
     private final Runnable requireAuthorized;
     private final AtomicBoolean cancelled = new AtomicBoolean();
-    private final AtomicReference<Throwable> failure = new AtomicReference<>();
+    private final ValidationFailureLatch failure = new ValidationFailureLatch();
     private final AtomicReference<FutureTask<Void>> delivery = new AtomicReference<>();
     private final Object callbackLock = new Object();
     private boolean queryOpen;
@@ -123,22 +124,25 @@ final class PdkValidationSession {
                 } finally {
                     synchronized (callbackLock) {
                         queryOpen = false;
-                        if (delivery.get() != null) failure.compareAndSet(null, protocol());
+                        if (delivery.get() != null) failure.record(protocol());
                     }
                 }
                 checkAlive(opened);
                 return null;
             });
         } catch (Throwable reported) {
-            failure.compareAndSet(null, reported);
+            failure.record(reported);
             primary = failure.get();
-            if (primary != reported && reported.getCause() != primary) primary.addSuppressed(reported);
+            ValidationFailureLatch.addContext(primary, reported);
             throw primary;
         } finally {
             try { finish(); }
             catch (Throwable cleanup) {
-                if (primary == null) throw cleanup;
-                if (primary != cleanup) primary.addSuppressed(cleanup);
+                failure.record(cleanup);
+                Throwable dominant = failure.get();
+                ValidationFailureLatch.addContext(dominant, primary);
+                ValidationFailureLatch.addContext(dominant, cleanup);
+                if (primary == null || dominant instanceof Error) throw dominant;
             }
         }
     }
@@ -166,27 +170,27 @@ final class PdkValidationSession {
         } catch (RejectedExecutionException rejected) {
             task.cancel(true);
             var failure = readFailed(rejected);
-            this.failure.compareAndSet(null, failure);
+            this.failure.record(failure);
             throw failure;
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             task.cancel(true);
             var failure = new TapstateException(ValidationError.READ_CANCELLED, Map.of("table", scan.table()), interrupted);
-            this.failure.compareAndSet(null, failure);
+            this.failure.record(failure);
             throw failure;
         } catch (ExecutionException failed) {
             Throwable cause = failed.getCause();
-            failure.compareAndSet(null, cause);
+            failure.record(cause);
             if (cause instanceof RuntimeException runtime) throw runtime;
             if (cause instanceof Error error) throw error;
             throw readFailed(cause);
         } catch (CancellationException stopped) {
             var failure = new TapstateException(ValidationError.READ_CANCELLED, Map.of("table", scan.table()), stopped);
-            this.failure.compareAndSet(null, failure);
+            this.failure.record(failure);
             throw failure;
         } catch (RuntimeException | Error failed) {
             task.cancel(true);
-            failure.compareAndSet(null, failed);
+            failure.record(failed);
             throw failed;
         } finally { delivery.compareAndSet(task, null); }
     }
@@ -224,7 +228,7 @@ final class PdkValidationSession {
                     model = table;
                 }
             } catch (TapstateException invalid) {
-                failure.compareAndSet(null, invalid);
+                failure.record(invalid);
                 throw invalid;
             }
         }
@@ -240,11 +244,11 @@ final class PdkValidationSession {
     private <T> T invoke(PdkConnector.Action<T> operation) throws Throwable {
         try { return operation.run(); }
         catch (TapstateException | Error reported) {
-            failure.compareAndSet(null, reported);
+            failure.record(reported);
             throw reported;
         } catch (Throwable reported) {
             var coded = readFailed(reported);
-            failure.compareAndSet(null, coded);
+            failure.record(coded);
             throw coded;
         }
     }
@@ -263,7 +267,7 @@ final class PdkValidationSession {
                     Map.of("table", scan.table()), null);
             requireAuthorized.run();
         } catch (RuntimeException | Error reported) {
-            failure.compareAndSet(null, reported);
+            failure.record(reported);
             throwFailure();
         }
     }

@@ -289,6 +289,54 @@ class ValidationOrderedMergeTest {
         }
     }
 
+    @Test void fatalGroupCleanupCannotHideBehindAnEarlierReadFailure() {
+        var source = rows("source_key", 1);
+        source.failAt = 0;
+        source.readFailure = new TapstateException(ValidationError.READ_FAILED, Map.of("table", "source"), null);
+        var fatal = new AssertionError("fatal group cleanup");
+        source.closeFailure = fatal;
+        try (var groups = groups(source)) {
+            assertThatThrownBy(groups::next).isSameAs(fatal);
+            assertThat(fatal.getSuppressed()).contains(source.readFailure);
+        }
+    }
+
+    @Test void fatalMergeCleanupCannotHideBehindAnEarlierReadFailure() {
+        var source = rows("source_key", 1);
+        var target = rows("target_key", 1);
+        source.failAt = 0;
+        source.readFailure = new TapstateException(ValidationError.READ_FAILED, Map.of("table", "source"), null);
+        var fatal = new AssertionError("fatal target cleanup");
+        target.closeFailure = fatal;
+        try (var merge = merge(source, target)) {
+            assertThatThrownBy(merge::next).isSameAs(fatal);
+            assertThat(fatal.getSuppressed()).contains(source.readFailure);
+        }
+    }
+
+    @Test void fatalSecondInputCleanupEscapesInsteadOfTheOrdinaryFirstCleanup() {
+        var source = rows("source_key");
+        var target = rows("target_key");
+        source.closeFailure = new IllegalStateException("source cleanup failed");
+        var fatal = new AssertionError("fatal second cleanup");
+        target.closeFailure = fatal;
+        var merge = merge(source, target);
+        assertThatThrownBy(merge::close).isSameAs(fatal);
+        assertThat(fatal.getSuppressed()).contains(source.closeFailure);
+    }
+
+    @Test void fatalRowLeaseCloseCannotBeSuppressedUnderAProjectionFailure() {
+        var source = rows("source_key", 1);
+        var original = new TapstateException(ValidationError.INCOMPATIBLE_KEY, Map.of("component", 0), null);
+        var fatal = new AssertionError("fatal row lease close");
+        source.rowCloseFailure = fatal;
+        try (var groups = new ValidationOrderedGroups("source", source, row -> { throw original; }, LIMITS.bytes())) {
+            assertThatThrownBy(groups::next).isSameAs(fatal);
+            assertThat(fatal.getSuppressed()).containsExactly(original);
+            assertThat(source.borrowed).hasValue(0);
+        }
+    }
+
     private static ValidationOrderedMerge merge(Rows source, Rows target) {
         return new ValidationOrderedMerge(groups(source), groups(target));
     }
@@ -329,7 +377,8 @@ class ValidationOrderedMergeTest {
         private int ordinalDeltaAfterFirst;
         private long failAt = -1;
         private RuntimeException readFailure;
-        private RuntimeException closeFailure;
+        private Throwable closeFailure;
+        private Error rowCloseFailure;
 
         private Rows(String field, long count, LongFunction<Map<String, Object>> values) {
             this.field = field;
@@ -349,13 +398,20 @@ class ValidationOrderedMergeTest {
                 private boolean released;
                 @Override public long ordinal() { return ordinal + (ordinal == 0 ? 0 : ordinalDeltaAfterFirst); }
                 @Override public ValidationValues.Row values() { return row; }
-                @Override public void close() { if (!released) { released = true; borrowed.decrementAndGet(); } }
+                @Override public void close() {
+                    if (!released) {
+                        released = true;
+                        borrowed.decrementAndGet();
+                        if (rowCloseFailure != null) throw rowCloseFailure;
+                    }
+                }
             });
         }
 
         @Override public void close() {
             closed = true;
-            if (closeFailure != null) throw closeFailure;
+            if (closeFailure instanceof RuntimeException runtime) throw runtime;
+            if (closeFailure instanceof Error error) throw error;
         }
     }
 }
