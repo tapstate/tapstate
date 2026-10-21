@@ -827,6 +827,14 @@ class ManagedMongoStoreIsolationIT {
                 }
                 assertThat(admin.getDatabase(cacheDb).getCollection("pipeline_state").countDocuments()).isZero();
                 assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims").countDocuments()).isOne();
+                var businessOwner=(NativeBusinessContext)root.runtime().business().orElseThrow();
+                var child=(org.springframework.context.ConfigurableApplicationContext)org.springframework.test.util.ReflectionTestUtils.getField(businessOwner,"context");
+                var catalog=child.getBean(io.tapstate.control.core.PipelineCatalogService.class);
+                for(String id:List.of("a","b")) {
+                    var item=catalog.find(id).orElseThrow();
+                    assertThat(item.status().displayState()).isEqualTo(io.tapstate.control.core.PipelineCatalogItem.UiState.RECOVERY_REQUIRED);
+                    assertThat(item.status().observedState()).isNull();
+                }
                 var recoveryService=application.getBean(io.tapstate.control.core.StorageRecoveryService.class);
                 var delegate=(io.tapstate.control.core.StorageRecoveryService.Inspector)org.springframework.test.util.ReflectionTestUtils.getField(recoveryService,"inspector");
                 org.springframework.test.util.ReflectionTestUtils.setField(recoveryService,"inspector",new io.tapstate.control.core.StorageRecoveryService.Inspector() {
@@ -851,10 +859,12 @@ class ManagedMongoStoreIsolationIT {
                     assertThat(post.apply("/api/storage/recovery/status",Map.of("operationId",full.get("operationId"))).get("phase")).isEqualTo("COMPLETE");
                     var business=(NativeBusinessContext)root.runtime().business().orElseThrow();
                     assertThat(io.tapstate.core.lifecycle.StateJson.parse(business.statusStore().state().read("a").orElseThrow().stateJson())).isEqualTo(io.tapstate.core.lifecycle.PipelineState.COMPLETED);
+                    assertThat(catalog.find("a").orElseThrow().status().displayState()).isEqualTo(io.tapstate.control.core.PipelineCatalogItem.UiState.COMPLETED);
                 });
                 var rows=admin.getDatabase(masterDb).getCollection("orders").find().sort(new Document("_id",1)).into(new ArrayList<>());
                 assertThat(rows).containsExactly(new Document("_id",1L).append("value","first"),new Document("_id",2L).append("value","second"));
                 assertThat(root.runtime().requireConfiguration().intents().load("b").orElseThrow().desired().targetState()).isEqualTo(io.tapstate.core.lifecycle.PipelineState.STOPPED);
+                assertThat(catalog.find("b").orElseThrow().status().displayState()).isEqualTo(io.tapstate.control.core.PipelineCatalogItem.UiState.RECOVERY_REQUIRED);
                 assertThat(root.runtime().requireConfiguration().preparations().read("b").orElseThrow().phase()).isEqualTo(PipelinePreparation.Phase.UNASSIGNED);
                 assertThatThrownBy(() -> post.apply("/api/pipelines/b:start",Map.of())).isInstanceOf(org.springframework.web.client.RestClientResponseException.class);
                 admin.getDatabase(masterDb).getCollection("orders").insertOne(new Document("_id",100).append("value","after-completion"));

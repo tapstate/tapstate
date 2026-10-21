@@ -69,6 +69,20 @@ final class ThreeLayerStorePort implements StorePort {
         return configuration.preparations().read(pipeline).orElseThrow(ThreeLayerStorePort::refused).phase()
                 == PipelinePreparation.Phase.UNASSIGNED;
     }
+    @Override public boolean pipelineRecoveryRequired(String pipeline) {
+        active();var summary=configuration.cacheRecoveries().read(pipeline);
+        if(summary.isEmpty())return false;
+        var original=scope(pipeline);if(!summary.orElseThrow().targetScope().equals(original))throw refused();
+        if(configuration.preparations().read(pipeline).orElseThrow(ThreeLayerStorePort::refused).phase()!=PipelinePreparation.Phase.COMPLETE)return true;
+        var pending=configuration.recoveryCommands().current(bound.preparation().authScope());
+        return pending.filter(plan -> plan.originalScope().equals(bound.preparation().authScope())
+                && plan.phase()!=StorageRecoveryCommands.Phase.COMPLETE
+                && plan.manifest().selection().extent()==StorageRecoveryCommands.Extent.PIPELINE
+                && plan.manifest().selection().pipelineIds().contains(pipeline)).isPresent()
+                && configuration.intents().load(pipeline).filter(intent -> !intent.deleted() && intent.scope().equals(original)
+                        && intent.desired().targetState()==PipelineState.STOPPED).isPresent();
+    }
+
     @Override public ArtifactStore artifacts() { active(); return configuration.artifacts(); }
     @Override public CatalogStore catalog() { active(); return configuration.catalog(); }
     @Override public PipelineLayoutStore layouts() { active(); return configuration.layouts(); }
@@ -116,7 +130,10 @@ final class ThreeLayerStorePort implements StorePort {
         return new ObservationStore() {
             @Override public Optional<Observation> read(String pipeline) {
                 var original = scope(pipeline);
-                return unprepared(pipeline) ? Optional.empty() : bound.cache().pipelineObservations(original).read(pipeline);
+                var preparation=configuration.preparations().read(pipeline).orElseThrow(ThreeLayerStorePort::refused);
+                if(preparation.phase()!=PipelinePreparation.Phase.COMPLETE)return Optional.empty();
+                if(!original.equals(preparation.scope()))throw refused();
+                return bound.cache().pipelineObservations(original).read(pipeline);
             }
             @Override public void save(Observation observation) { throw refused(); }
             @Override public void delete(String pipeline) { throw refused(); }

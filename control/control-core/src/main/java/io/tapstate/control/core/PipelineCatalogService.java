@@ -29,12 +29,18 @@ public final class PipelineCatalogService {
     private final PipelineDraftService drafts;
     private final DesiredStore desired;
     private final PipelineObservationQueryService observations;
+    private final java.util.function.Predicate<String> recoveryRequired;
 
     public PipelineCatalogService(
             ArtifactQueryService artifacts,
             PipelineDraftService drafts,
             DesiredStore desired,
             PipelineObservationQueryService observations) {
+        this(artifacts,drafts,desired,observations,ignored -> false);
+    }
+    public PipelineCatalogService(ArtifactQueryService artifacts,PipelineDraftService drafts,DesiredStore desired,
+            PipelineObservationQueryService observations,java.util.function.Predicate<String> recoveryRequired) {
+        this.recoveryRequired=Objects.requireNonNull(recoveryRequired);
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
         this.drafts = Objects.requireNonNull(drafts, "drafts");
         this.desired = Objects.requireNonNull(desired, "desired");
@@ -93,6 +99,7 @@ public final class PipelineCatalogService {
     }
 
     private PipelineCatalogItem toItem(String id, PipelineDraftSummary draft, ArtifactSummary artifact) {
+        boolean needsRecovery=artifact!=null && recoveryRequired.test(id);
         PipelineStatus observation = observations.findStatus(id).orElse(null);
         PipelineState observed = observation == null ? null : observation.state();
         PipelineState target;
@@ -106,7 +113,10 @@ public final class PipelineCatalogService {
             target = null;
         }
         boolean hasArtifact = artifact != null;
-        PipelineCatalogItem.DisplayState state = displayState(target, observed);
+        boolean recoveryAtRest=needsRecovery && (observed==null || observed==PipelineState.NEW || observed==PipelineState.STOPPED);
+        PipelineCatalogItem.DisplayState state = recoveryAtRest
+                ? observed==null?PipelineCatalogItem.DisplayState.UNAVAILABLE:PipelineCatalogItem.DisplayState.valueOf(observed.name())
+                : displayState(target, observed);
 
         String description = draft != null ? draft.description() : descriptionOf(artifact);
         String mode = draft == null ? null : draft.mode().name().toLowerCase(java.util.Locale.ROOT);
@@ -123,7 +133,7 @@ public final class PipelineCatalogService {
                 hasArtifact,
                 new PipelineCatalogItem.Status(
                         state,
-                        hasArtifact ? PipelineCatalogItem.UiState.valueOf(state.name()) : PipelineCatalogItem.UiState.DRAFT,
+                        recoveryAtRest?PipelineCatalogItem.UiState.RECOVERY_REQUIRED:hasArtifact ? PipelineCatalogItem.UiState.valueOf(state.name()) : PipelineCatalogItem.UiState.DRAFT,
                         target,
                         observed,
                         observation == null ? null : observation.failure(),
