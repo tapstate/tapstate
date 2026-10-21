@@ -88,6 +88,50 @@ class ValidationMongoOrderedReadIT {
         }
     }
 
+    @Test @Timeout(60)
+    void supplementaryTextKeysFollowTheDatabaseBinaryOrderWithoutFalseReverseDetection() throws Exception {
+        String configured = System.getProperty("tapstate.pdk.it.mongodb-jar");
+        assumeTrue(configured != null && !configured.isBlank(), "a real MongoDB connector jar is required");
+        var paths = List.of(Path.of(configured));
+        var artifact = new ConnectorIntrospector().introspect(paths);
+        var ref = new ConnectorRef(paths, artifact.className(), artifact.pdkApiVersion(), null, artifact.spec());
+        String highBmp = String.valueOf((char)0xE000);
+        String supplementary = new String(Character.toChars(0x10000));
+        try (var mongo = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))) {
+            mongo.start();
+            String uri = mongo.getReplicaSetUrl(DATABASE);
+            try (var observer = MongoClients.create(uri)) {
+                var collection = observer.getDatabase(DATABASE).getCollection("unicode_keys");
+                collection.insertMany(List.of(new Document("name", supplementary), new Document("name", highBmp)));
+                assertThat(collection.find().sort(new Document("name", 1)).map(row -> row.getString("name"))
+                        .into(new ArrayList<>())).containsExactly(highBmp, supplementary);
+            }
+            var observed = new ArrayList<String>();
+            try (var queryIo = Executors.newSingleThreadExecutor(); var decodeIo = Executors.newSingleThreadExecutor();
+                 var cursor = PdkValidationSession.scan("mongodb", ref, Map.of("uri", uri, "database", DATABASE, "isUri", true),
+                         "fixture-artifact", new PdkValidationSession.Scan("unicode_keys", List.of("name"), List.of("name"), 2),
+                         (model, codecs) -> new PdkValidationRows(model, codecs,
+                                 path -> PdkValidationRows.Rule.of(PdkValidationRows.Shape.TEXT), LIMITS),
+                         () -> { }, queryIo, decodeIo, 1, LIMITS);
+                 var groups = new ValidationOrderedGroups("unicode", cursor, row -> {
+                     String text = (String)((ValidationValues.Typed)row.fields().get("name")).value();
+                     var key = new ValidationKey(List.of(ValidationKey.Part.text(text)));
+                     return new ValidationOrderedGroups.Key(key, new ValidationPhysicalIdentity("unicode-source",
+                             DATABASE, null, "unicode_keys", List.of(List.of("name")), key));
+                 }, LIMITS.bytes())) {
+                while (true) {
+                    var next = groups.next();
+                    if (next.isEmpty()) break;
+                    try (var group = next.orElseThrow()) {
+                        assertThat(group.occurrences()).isEqualTo(1);
+                        observed.add((String)((ValidationValues.Typed)group.sampleValues().fields().get("name")).value());
+                    }
+                }
+            }
+            assertThat(observed).containsExactly(highBmp, supplementary);
+        }
+    }
+
     private static List<Document> rows(String key, List<Long> keys) {
         return keys.stream().map(value -> new Document(key, value)
                 // An unrelated lossy codec lane must not become a prerequisite for comparing keys.

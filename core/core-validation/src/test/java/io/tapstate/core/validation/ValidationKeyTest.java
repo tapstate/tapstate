@@ -47,6 +47,23 @@ class ValidationKeyTest {
                         e -> assertThat(e.code()).isEqualTo(ValidationError.INCOMPATIBLE_KEY));
     }
 
+    @Test void textOrderUsesUnicodeCodePointsRatherThanUtf16CodeUnits() {
+        String highBmp = String.valueOf((char)0xE000);
+        String supplementary = new String(Character.toChars(0x10000));
+        assertThat(key(text(highBmp)).compareTo(key(text(supplementary)))).isNegative();
+        assertThat(key(text("x" + supplementary)).compareTo(key(text("x" + highBmp)))).isPositive();
+        assertThat(key(text(supplementary)).compareTo(key(text(supplementary + "a")))).isNegative();
+        assertThat(key(text(supplementary))).isEqualTo(key(text(new String(supplementary))));
+    }
+
+    @Test void malformedTextCannotBeUsedAsAPhysicalKey() {
+        for (String malformed : List.of(String.valueOf((char)0xD800), String.valueOf((char)0xDC00),
+                String.valueOf((char)0xD800) + "a")) {
+            assertThatThrownBy(() -> text(malformed)).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(ValidationError.INVALID_CONTRACT));
+        }
+    }
+
     @Test void comparesAllDomainsBeforeReturningAnEarlierComponentOrder() {
         assertThatThrownBy(() -> key(number(1), text("a")).compareTo(key(number(2), number(3))))
                 .isInstanceOfSatisfying(TapstateException.class,

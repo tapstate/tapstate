@@ -106,6 +106,12 @@ public record ValidationKey(List<Part> parts) implements Comparable<ValidationKe
             Objects.requireNonNull(value, "value");
             long bytes = 48L + 2L * value.length();
             checkSize(bytes);
+            for (int i = 0; i < value.length(); i++) {
+                char next = value.charAt(i);
+                if (Character.isHighSurrogate(next)) {
+                    if (++i == value.length() || !Character.isLowSurrogate(value.charAt(i))) throw ValidationError.invalid("key.text");
+                } else if (Character.isLowSurrogate(next)) throw ValidationError.invalid("key.text");
+            }
             return new Part(Kind.TEXT, value, -1, bytes);
         }
 
@@ -140,7 +146,7 @@ public record ValidationKey(List<Part> parts) implements Comparable<ValidationKe
         private int compareValue(Part other) {
             return switch (kind) {
                 case EXACT_NUMBER -> ((BigDecimal) value).compareTo((BigDecimal) other.value);
-                case TEXT -> ((String) value).compareTo((String) other.value);
+                case TEXT -> compareText((String) value, (String) other.value);
                 case BOOLEAN -> Boolean.compare((Boolean) value, (Boolean) other.value);
                 case BINARY -> Arrays.compareUnsigned((byte[]) value, (byte[]) other.value);
                 case DATE -> ((LocalDate) value).compareTo((LocalDate) other.value);
@@ -148,6 +154,17 @@ public record ValidationKey(List<Part> parts) implements Comparable<ValidationKe
                 case LOCAL_DATE_TIME -> ((LocalDateTime) value).compareTo((LocalDateTime) other.value);
                 case INSTANT -> ((Instant) value).compareTo((Instant) other.value);
             };
+        }
+
+        /** Unicode scalar ordering matches binary UTF-8 order for admitted well-formed text. */
+        private static int compareText(String left, String right) {
+            int a = 0, b = 0;
+            while (a < left.length() && b < right.length()) {
+                int x = left.codePointAt(a), y = right.codePointAt(b);
+                if (x != y) return Integer.compare(x, y);
+                a += Character.charCount(x); b += Character.charCount(y);
+            }
+            return Integer.compare(left.length() - a, right.length() - b);
         }
 
         @Override public boolean equals(Object other) {
