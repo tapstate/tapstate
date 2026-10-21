@@ -35,6 +35,8 @@ actuation.view-storage-tier-unsupported
 actuation.view-store-is-a-capture-source
 actuation.view-store-not-configured
 actuation.view-store-unreachable
+alert.invalid-configuration
+alert.stale-action
 artifact.in-use
 artifact.not-found
 artifact.pipeline-not-stopped

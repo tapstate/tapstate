@@ -1063,3 +1063,10 @@ cli.auth-issuer-mismatch:
 actuation.unwind-parent-key-unresolved:
   message: "Cannot bind the parent key for step `{step}` and stream `{stream}`: {reason}."
   solution: "Discover a source primary key and keep its column names consistent across merged branches feeding unwind."
+
+alert.invalid-configuration:
+  message: "Alert field `{field}` is invalid: {reason}."
+  solution: "Use the supported field type, bounds and trusted identity binding."
+alert.stale-action:
+  message: "The alert action `{action}` does not match the current episode or evaluation generation."
+  solution: "Read the current alert and act on its exact identity."

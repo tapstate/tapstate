@@ -15,6 +15,8 @@ import java.util.TreeSet;
  */
 public enum Domain {
     DSL,
+    // Alert configuration and action refusals, separate from resource alarm severity.
+    ALERT,
     CLI,
     CORE,
     CATALOG,
