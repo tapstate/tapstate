@@ -337,5 +337,6 @@ validation.illegal-transition
 validation.incompatible-key
 validation.invalid-contract
 validation.key-limit-exceeded
+validation.owner-not-authorized
 validation.value-limit-exceeded
 validation.value-type-unsupported

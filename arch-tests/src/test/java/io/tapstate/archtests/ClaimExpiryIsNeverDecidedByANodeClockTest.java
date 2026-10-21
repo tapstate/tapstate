@@ -45,6 +45,7 @@ class ClaimExpiryIsNeverDecidedByANodeClockTest {
             "io.tapstate.app.CaptureOwnership",
             "io.tapstate.app.CaptureClaimLease",
             "io.tapstate.app.NodeSessionLease",
+            "io.tapstate.app.ValidationOwnerLease",
             "io.tapstate.app.ClusterWorkloadClaims",
             "io.tapstate.adapters.mongostore.MongoWorkloadClaimStore");
 

@@ -7,6 +7,8 @@ import com.mongodb.client.MongoClients;
 import com.mongodb.event.CommandListener;
 import com.mongodb.event.CommandStartedEvent;
 import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.WorkloadClaimFence;
+import io.tapstate.spi.store.ValidationClaims;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimReading;
@@ -41,6 +43,42 @@ class WorkloadClaimStoreIT {
     @Container
     private static final MongoDBContainer REPLICA_SET =
             new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
+
+    @Test
+    void validationOwnershipIsIndependentAndStaleAFencesCannotMatchB() {
+        withStore((store, collection) -> {
+            var key = ValidationClaims.key("cluster-a", "orders");
+            var ownerA = new WorkloadOwner("node-a", "boot-a");
+            var ownerB = new WorkloadOwner("node-b", "boot-b");
+            var production = store.acquire(new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION,
+                    "orders"), ownerA, 7, TTL).claim();
+            var acquiredA = store.acquire(key, ownerA, 7, TTL).claim();
+            var a = store.advanceExecution(acquiredA, 7, Set.of("node-a")).orElseThrow();
+            assertThat(store.acquire(key, ownerB, 7, TTL).acquired()).isFalse();
+            assertThat(collection.countDocuments(WorkloadClaimDocuments.live(WorkloadClaimFence.from(a)))).isEqualTo(1);
+
+            // Expire only this isolated fixture's validation lease, without waiting on a wall clock.
+            assertThat(collection.updateOne(WorkloadClaimDocuments.live(WorkloadClaimFence.from(a)),
+                    new org.bson.Document("$set", new org.bson.Document("leaseUntil", new java.util.Date(0))))
+                    .getModifiedCount()).isEqualTo(1);
+            var acquiredB = store.acquire(key, ownerB, 7, TTL);
+            assertThat(acquiredB.acquired()).isTrue();
+            var b = store.advanceExecution(acquiredB.claim(), 7, Set.of("node-b")).orElseThrow();
+
+            assertThat(b.claimGeneration()).isGreaterThan(a.claimGeneration());
+            assertThat(b.executionGeneration()).isGreaterThan(a.executionGeneration());
+            assertThat(store.renew(a, TTL)).isEmpty();
+            assertThat(store.release(a)).isFalse();
+            assertThat(store.advanceExecution(a, 7, Set.of("node-a"))).isEmpty();
+            assertThat(collection.countDocuments(WorkloadClaimDocuments.live(WorkloadClaimFence.from(a)))).isZero();
+            assertThat(collection.countDocuments(WorkloadClaimDocuments.live(ValidationClaims.fence(
+                    ValidationClaims.owner("orders", b))))).isEqualTo(1);
+            assertThat(store.read(key).orElseThrow().claim()).isEqualTo(b);
+            assertThat(store.read(key).orElseThrow().claim().key().type()).isEqualTo(WorkloadClaimType.VALIDATION);
+            assertThat(store.read(production.key()).orElseThrow().leased()).isTrue();
+            assertThat(collection.countDocuments()).isEqualTo(2);
+        });
+    }
 
     @Test
     void concurrentBootsForOneStableNodeProduceOneClaimHolder() throws Exception {

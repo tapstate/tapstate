@@ -13,7 +13,8 @@ public enum ValidationError implements TapstateErrorCode {
     INCOMPATIBLE_KEY("validation.incompatible-key", Set.of("component")),
     ILLEGAL_TRANSITION("validation.illegal-transition", Set.of("from", "to", "mode")),
     VALUE_LIMIT_EXCEEDED("validation.value-limit-exceeded", Set.of("limit")),
-    VALUE_TYPE_UNSUPPORTED("validation.value-type-unsupported", Set.of("type"));
+    VALUE_TYPE_UNSUPPORTED("validation.value-type-unsupported", Set.of("type")),
+    OWNER_NOT_AUTHORIZED("validation.owner-not-authorized", Set.of("pipeline"));
 
     private final String code;
     private final Set<String> placeholders;

@@ -46,6 +46,11 @@
   </dependencyManagement>
 
   <dependencies>
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-validation</artifactId>
+      <version>${revision}</version>
+    </dependency>
     <!-- Shared test scaffolding: the Docker gate these suites are held to. A test-jar in test
          scope - nothing from it reaches the shipped artifact. -->
     <dependency>

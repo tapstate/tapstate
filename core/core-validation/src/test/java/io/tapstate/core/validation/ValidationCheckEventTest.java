@@ -59,7 +59,7 @@ class ValidationCheckEventTest {
 
     private static ValidationObservation observation() {
         return new ValidationObservation(new ValidationRunIdentity(
-                new ValidationOwner("cluster", "pipeline", "node", "boot", 1, 1),
+                new ValidationOwner("cluster", "pipeline", "node", "boot", 1, 1, 0),
                 "task", "run", ValidationMode.FULL, "spec", 1, "rules-v1"),
                 new ValidationRoot("mapping", "output", key(), List.of()), 1);
     }

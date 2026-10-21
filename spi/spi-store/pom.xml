@@ -17,6 +17,11 @@
     core ring; zero third-party (rule R2: the port depends on the core ring only).</description>
 
   <dependencies>
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-validation</artifactId>
+      <version>${revision}</version>
+    </dependency>
     <!-- The resource model is the currency of the artifact truth layer (rule R2: core only). -->
     <dependency>
       <groupId>io.tapstate</groupId>

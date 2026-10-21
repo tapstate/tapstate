@@ -8,7 +8,7 @@ class ValidationIdentityTest {
     private static ValidationRunIdentity run(String runId, String boot, long generation,
                                               ValidationMode mode, String spec, long keyRevision) {
         return new ValidationRunIdentity(new ValidationOwner("cluster", "pipeline", "node", boot,
-                generation, 7), "task", runId, mode, spec, keyRevision, "rules-v1");
+                generation, 7, 0), "task", runId, mode, spec, keyRevision, "rules-v1");
     }
 
     @Test void slotIgnoresMethodRevisionAndOwnerButSeparatesModes() {

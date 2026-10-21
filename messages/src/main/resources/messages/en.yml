@@ -8,6 +8,9 @@
 #
 # Values are double-quoted single-line scalars; colons, apostrophes and backticks inside the quotes
 # are fine. Keep literal double-quotes out of values (use backticks for inline code).
+validation.owner-not-authorized:
+  message: "The validation owner for Pipeline {pipeline} is no longer authorized."
+  solution: "The old validation run must end. Start a new run after the owner has been safely retired."
 validation.value-limit-exceeded:
   message: "Validation read facts exceed their {limit} budget."
   solution: "Inspect the affected value or root size; validation cannot truncate facts to continue."
