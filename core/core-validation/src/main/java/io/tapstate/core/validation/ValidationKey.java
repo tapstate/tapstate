@@ -33,6 +33,13 @@ public record ValidationKey(List<Part> parts) implements Comparable<ValidationKe
         parts = List.copyOf(parts);
     }
 
+    /** Conservative owned-key charge, available without exposing or copying binary components. */
+    public long retainedBytes() {
+        long bytes = 32L + 8L * parts.size();
+        for (Part part : parts) bytes += part.retainedBytes;
+        return bytes;
+    }
+
     @Override public int compareTo(ValidationKey other) {
         Objects.requireNonNull(other, "other");
         if (parts.size() != other.parts.size()) throw incompatible(-1);
