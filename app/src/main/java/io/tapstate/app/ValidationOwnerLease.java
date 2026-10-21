@@ -2,6 +2,7 @@ package io.tapstate.app;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.validation.ValidationError;
+import io.tapstate.core.validation.ValidationFailureLatch;
 import io.tapstate.core.validation.ValidationOwner;
 import io.tapstate.spi.store.ValidationClaims;
 import io.tapstate.spi.store.WorkloadClaim;
@@ -94,9 +95,8 @@ final class ValidationOwnerLease implements AutoCloseable {
             nodeLive = nodeAuthorized.getAsBoolean();
         } catch (TapstateException unknown) {
             nodeLive = false;
-        } catch (RuntimeException defect) {
-            lose(LossReason.NODE_NOT_AUTHORIZED);
-            throw defect;
+        } catch (RuntimeException | Error defect) {
+            throw loseAfterFailure(LossReason.NODE_NOT_AUTHORIZED, defect);
         }
         if (!nodeLive) {
             lose(LossReason.NODE_NOT_AUTHORIZED);
@@ -134,9 +134,8 @@ final class ValidationOwnerLease implements AutoCloseable {
             } catch (TapstateException unavailable) {
                 lose(LossReason.RENEW_FAILED);
                 return;
-            } catch (RuntimeException defect) {
-                lose(LossReason.RENEW_FAILED);
-                throw defect;
+            } catch (RuntimeException | Error defect) {
+                throw loseAfterFailure(LossReason.RENEW_FAILED, defect);
             }
             if (!authorized()) return;
             if (answer.isEmpty() || !WorkloadClaimFence.from(answer.get()).equals(fence)) {
@@ -149,11 +148,7 @@ final class ValidationOwnerLease implements AutoCloseable {
                     return;
                 }
             } catch (TapstateException invalidContext) {
-                try { lose(LossReason.RENEW_REFUSED); }
-                catch (RuntimeException cleanupFailure) {
-                    if (cleanupFailure != invalidContext) invalidContext.addSuppressed(cleanupFailure);
-                }
-                throw invalidContext;
+                throw loseAfterFailure(LossReason.RENEW_REFUSED, invalidContext);
             }
             boolean lapsed;
             synchronized (lock) {
@@ -190,10 +185,8 @@ final class ValidationOwnerLease implements AutoCloseable {
                 deadlineTask = deadlines.scheduleWithFixedDelay(this::checkDeadline, deadlineNanos,
                         deadlineNanos, TimeUnit.NANOSECONDS);
             }
-        } catch (RuntimeException setupFailure) {
-            try { lose(LossReason.SCHEDULING_FAILED); }
-            catch (RuntimeException cleanupFailure) { setupFailure.addSuppressed(cleanupFailure); }
-            throw setupFailure;
+        } catch (RuntimeException | Error setupFailure) {
+            throw loseAfterFailure(LossReason.SCHEDULING_FAILED, setupFailure);
         }
     }
 
@@ -210,19 +203,34 @@ final class ValidationOwnerLease implements AutoCloseable {
         lost.accept(reason);
     }
 
+    private RuntimeException loseAfterFailure(LossReason reason, Throwable primary) {
+        var failure = new ValidationFailureLatch();
+        failure.record(primary);
+        try { lose(reason); }
+        catch (RuntimeException | Error cleanup) {
+            failure.record(cleanup);
+            ValidationFailureLatch.addContext(failure.get(), cleanup);
+        }
+        Throwable dominant = failure.get();
+        if (dominant instanceof Error fatal) throw fatal;
+        return (RuntimeException) dominant;
+    }
+
     /** Releasing an old exact tenure cannot release a successor, even after a late response. */
     @Override public void close() {
-        RuntimeException failure = null;
+        var failure = new ValidationFailureLatch();
         try { lose(LossReason.CLOSED); }
-        catch (RuntimeException cleanupFailure) { failure = cleanupFailure; }
+        catch (RuntimeException | Error cleanupFailure) { failure.record(cleanupFailure); }
         if (releaseAttempted.compareAndSet(false, true)) {
             try { release.accept(original); }
-            catch (RuntimeException releaseFailure) {
-                if (failure == null) failure = releaseFailure;
-                else failure.addSuppressed(releaseFailure);
+            catch (RuntimeException | Error releaseFailure) {
+                failure.record(releaseFailure);
+                ValidationFailureLatch.addContext(failure.get(), releaseFailure);
             }
         }
-        if (failure != null) throw failure;
+        Throwable dominant = failure.get();
+        if (dominant instanceof Error fatal) throw fatal;
+        if (dominant != null) throw (RuntimeException) dominant;
     }
 
     private static long positiveNanos(Duration duration) {

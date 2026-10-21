@@ -230,6 +230,79 @@ class ValidationOwnerLeaseTest {
         }
     }
 
+    @Test void fatalNodeGuardFailurePermanentlyRevokesTheLease() {
+        var store = new InMemoryWorkloadClaimStore();
+        var a = acquire(store, A);
+        var first = new AtomicBoolean(true);
+        var fatal = new AssertionError("fatal node guard");
+        var stopped = new AtomicInteger();
+        try (var lease = new ValidationOwnerLease("orders", a, 0, TTL, () -> 0,
+                () -> { if (first.getAndSet(false)) throw fatal; return true; },
+                claim -> store.renew(claim, TTL), store::release, reason -> stopped.incrementAndGet())) {
+            assertThatThrownBy(lease::authorized).isSameAs(fatal);
+            assertThat(lease.authorized()).isFalse();
+            assertThat(stopped).hasValue(1);
+        }
+    }
+
+    @Test void fatalRenewalFailurePermanentlyRevokesTheLease() {
+        var store = new InMemoryWorkloadClaimStore();
+        var a = acquire(store, A);
+        var fatal = new AssertionError("fatal renewal");
+        var stopped = new AtomicInteger();
+        try (var lease = new ValidationOwnerLease("orders", a, 0, TTL, () -> 0, () -> true,
+                claim -> { throw fatal; }, store::release, reason -> stopped.incrementAndGet())) {
+            assertThatThrownBy(lease::renew).isSameAs(fatal);
+            assertThat(lease.authorized()).isFalse();
+            assertThat(stopped).hasValue(1);
+        }
+    }
+
+    @Test void aNodeGuardDefectKeepsItsCauseWhenCancellationAlsoFails() {
+        var store = new InMemoryWorkloadClaimStore();
+        var a = acquire(store, A);
+        var defect = new IllegalStateException("node guard failed first");
+        var cleanup = new IllegalStateException("later cancellation failure");
+        try (var lease = new ValidationOwnerLease("orders", a, 0, TTL, () -> 0,
+                () -> { throw defect; }, claim -> store.renew(claim, TTL), store::release, reason -> { throw cleanup; })) {
+            assertThatThrownBy(lease::authorized).isSameAs(defect);
+            assertThat(defect.getSuppressed()).containsExactly(cleanup);
+            assertThat(lease.authorized()).isFalse();
+        }
+    }
+
+    @Test void fatalCancellationStillAttemptsOneExactClaimRelease() {
+        var store = new InMemoryWorkloadClaimStore();
+        var a = acquire(store, A);
+        var fatal = new AssertionError("fatal cancellation");
+        var releases = new AtomicInteger();
+        var lease = new ValidationOwnerLease("orders", a, 0, TTL, () -> 0, () -> true,
+                claim -> store.renew(claim, TTL), claim -> { releases.incrementAndGet(); store.release(claim); },
+                reason -> { throw fatal; });
+        assertThatThrownBy(lease::close).isSameAs(fatal);
+        assertThat(releases).hasValue(1);
+        var b = acquire(store, B);
+        lease.close();
+        assertThat(releases).hasValue(1);
+        assertThat(store.read(KEY).orElseThrow().claim()).isEqualTo(b);
+    }
+
+    @Test void fatalReleaseKeepsTheEarlierCancellationDiagnosis() {
+        var store = new InMemoryWorkloadClaimStore();
+        var a = acquire(store, A);
+        var ordinary = new IllegalStateException("ordinary cancellation failure");
+        var fatal = new AssertionError("fatal release");
+        var attempts = new AtomicInteger();
+        var lease = new ValidationOwnerLease("orders", a, 0, TTL, () -> 0, () -> true,
+                claim -> store.renew(claim, TTL), claim -> { attempts.incrementAndGet(); throw fatal; },
+                reason -> { throw ordinary; });
+        assertThatThrownBy(lease::close).isSameAs(fatal);
+        assertThat(fatal.getSuppressed()).containsExactly(ordinary);
+        assertThat(lease.authorized()).isFalse();
+        lease.close();
+        assertThat(attempts).hasValue(1);
+    }
+
     @Test void monotonicClockWrapDoesNotExtendAuthorization() {
         var store = new InMemoryWorkloadClaimStore();
         var a = acquire(store, A);
