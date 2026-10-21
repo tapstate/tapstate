@@ -12,6 +12,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.function.BiPredicate;
+import java.util.function.Consumer;
+import io.tapstate.core.common.TapstateException;
 
 /**
  * Exact structural comparison of already owned portable facts. Codec bindings and native names are
@@ -43,6 +45,143 @@ public final class ValidationValueComparison {
         Objects.requireNonNull(target, "target");
         Objects.requireNonNull(compatible, "compatible");
         return Optional.ofNullable(compare(source.fields(), target.fields(), compatible, new ArrayList<>()));
+    }
+
+    /** Bounds local traversal; callers separately reserve reader, retained-result and callback work. */
+    public record TraversalLimits(ValidationValues.Limits row, long operations) {
+        public TraversalLimits {
+            Objects.requireNonNull(row, "row");
+            if (operations < 1 || operations > 64L * 1024 * 1024) throw ValidationError.invalid("comparison.operations");
+        }
+    }
+
+    /**
+     * Visits every independently comparable field, without accumulating differences. A missing or
+     * incompatible parent is one structural conclusion; its unavailable subtree is not fabricated.
+     * Normal return is a completed traversal. Budget and callback failures propagate unchanged.
+     * Ordinary arrays remain ordered; declared Nest arrays require their separate member matcher.
+     */
+    public static long visitDifferences(ValidationValues.Row source, ValidationValues.Row target,
+                                       BiPredicate<String, String> compatible, TraversalLimits limits,
+                                       Consumer<Difference> consumer) {
+        Objects.requireNonNull(source, "source");
+        Objects.requireNonNull(target, "target");
+        Objects.requireNonNull(compatible, "compatible");
+        Objects.requireNonNull(limits, "limits");
+        Objects.requireNonNull(consumer, "consumer");
+        for (ValidationValues.Row row : List.of(source, target)) {
+            if (row.accountedBytes() > limits.row().bytes() || row.nodes() > limits.row().nodes()
+                    || row.depth() > limits.row().depth()) throw comparisonLimit("row");
+        }
+        Walker walker = new Walker(compatible, limits.operations(), consumer);
+        walker.walk(source.fields(), target.fields(), new ArrayList<>());
+        return walker.differences;
+    }
+
+    private static final class Walker {
+        private final BiPredicate<String, String> compatible;
+        private final Consumer<Difference> consumer;
+        private long remaining;
+        private long differences;
+        private Walker(BiPredicate<String, String> compatible, long operations, Consumer<Difference> consumer) {
+            this.compatible = compatible;
+            this.remaining = operations;
+            this.consumer = consumer;
+        }
+        private void work(long amount) {
+            if (amount > remaining) throw comparisonLimit("operations");
+            remaining -= amount;
+        }
+        private void emit(Kind kind, List<Object> path) {
+            work(1L + path.size());
+            consumer.accept(difference(kind, path));
+            differences++;
+        }
+        private boolean nullValue(Object value) {
+            while (value instanceof ValidationValues.Typed typed) {
+                work(1);
+                value = typed.value();
+            }
+            return value == null;
+        }
+        private void walk(Object source, Object target, List<Object> path) {
+            work(1);
+            boolean sourceNull = nullValue(source);
+            boolean targetNull = nullValue(target);
+            if (sourceNull || targetNull) {
+                if (sourceNull != targetNull) emit(Kind.VALUE, path);
+                return;
+            }
+            String sourceType = logicalType(source);
+            String targetType = logicalType(target);
+            work((long) sourceType.length() + targetType.length());
+            if (!sourceType.equals(targetType) && !compatible.test(sourceType, targetType)) {
+                emit(Kind.LOGICAL_TYPE, path);
+                return;
+            }
+            if (source instanceof ValidationValues.Typed || target instanceof ValidationValues.Typed) {
+                walk(source instanceof ValidationValues.Typed typed ? typed.value() : source,
+                        target instanceof ValidationValues.Typed typed ? typed.value() : target, path);
+                return;
+            }
+            if (source instanceof Map<?, ?> left && target instanceof Map<?, ?> right) {
+                for (var field : left.entrySet()) {
+                    work(1L + ((String) field.getKey()).length());
+                    path.add(field.getKey());
+                    try {
+                        if (!right.containsKey(field.getKey())) emit(Kind.MISSING_TARGET, path);
+                        else walk(field.getValue(), right.get(field.getKey()), path);
+                    } finally { path.removeLast(); }
+                }
+                for (Object name : right.keySet()) {
+                    work(1L + ((String) name).length());
+                    if (!left.containsKey(name)) {
+                        path.add(name);
+                        try { emit(Kind.MISSING_SOURCE, path); }
+                        finally { path.removeLast(); }
+                    }
+                }
+                return;
+            }
+            if (source instanceof List<?> left && target instanceof List<?> right) {
+                int total = Math.max(left.size(), right.size());
+                for (int i = 0; i < total; i++) {
+                    work(1);
+                    path.add(i);
+                    try {
+                        if (i >= left.size()) emit(Kind.MISSING_SOURCE, path);
+                        else if (i >= right.size()) emit(Kind.MISSING_TARGET, path);
+                        else walk(left.get(i), right.get(i), path);
+                    } finally { path.removeLast(); }
+                }
+                return;
+            }
+            if (source instanceof Number left && target instanceof Number right) {
+                work(numberWork(left) + numberWork(right));
+                if (!numericEquals(left, right)) emit(Kind.VALUE, path);
+                return;
+            }
+            if (source instanceof ValidationValues.Binary left && target instanceof ValidationValues.Binary right) {
+                work(1L + Math.max(left.length(), right.length()));
+                if (!left.sameContent(right)) emit(Kind.VALUE, path);
+                return;
+            }
+            if (!representation(source).equals(representation(target))) {
+                emit(Kind.LOGICAL_TYPE, path);
+                return;
+            }
+            if (source instanceof String left && target instanceof String right) work(1L + Math.max(left.length(), right.length()));
+            if (!source.equals(target)) emit(Kind.VALUE, path);
+        }
+        private static long numberWork(Number number) {
+            if (number instanceof BigInteger integer) return 1L + integer.bitLength();
+            if (number instanceof BigDecimal decimal) return 1L + decimal.unscaledValue().bitLength();
+            return 64;
+        }
+    }
+
+    private static TapstateException comparisonLimit(String dimension) {
+        return new TapstateException(ValidationError.VALUE_LIMIT_EXCEEDED, Map.of("limit", "comparison." + dimension), null);
     }
 
     private static Difference compare(Object source, Object target, BiPredicate<String, String> compatible,
