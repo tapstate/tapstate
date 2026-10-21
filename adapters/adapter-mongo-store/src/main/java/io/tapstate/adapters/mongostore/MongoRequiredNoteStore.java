@@ -39,6 +39,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
             .readConcern(ReadConcern.SNAPSHOT).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
     private static final String ALL_KEYS = "cleared";
     private final MongoClient client;
+    private final MongoDatabase database;
     private final MongoCollection<Document> scopes;
     private final MongoCollection<Document> notes;
     private final MongoCollection<Document> migrations;
@@ -49,7 +50,9 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     private final SourceConfigCipherProvider ciphers;
     private final Runnable requireActive;
     private final Retirement retirement;
-    private record Retirement(RequiredNoteScope scope, String operationId) {}
+    private record Retirement(RequiredNoteScope scope, String operationId, MongoCacheRecoveryStore.Permission recovery) {
+        Retirement(RequiredNoteScope scope, String operationId) { this(scope, operationId, null); }
+    }
 
     public MongoRequiredNoteStore(MongoClient client, MongoDatabase database, SourceConfigCipher cipher) {
         this(client, database, SourceConfigCipherProvider.fixed(Objects.requireNonNull(cipher, "cipher")));
@@ -57,7 +60,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
 
     MongoRequiredNoteStore(MongoClient client, MongoDatabase database, SourceConfigCipherProvider ciphers) {
         this.client = Objects.requireNonNull(client, "client");
-        Objects.requireNonNull(database, "database");
+        this.database = Objects.requireNonNull(database, "database");
         this.scopes = durable(SystemCollections.PDK_NOTE_SCOPES.on(database));
         this.notes = durable(SystemCollections.PDK_NOTES.on(database));
         this.migrations = durable(SystemCollections.PDK_NOTE_MIGRATIONS.on(database));
@@ -77,6 +80,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     private MongoRequiredNoteStore(MongoRequiredNoteStore original, Runnable additionalGuard, Retirement retirement) {
         this.retirement = retirement;
         this.client = original.client;
+        this.database = original.database;
         this.scopes = original.scopes;
         this.notes = original.notes;
         this.migrations = original.migrations;
@@ -146,8 +150,11 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
 
     /** Authoring reserves new identities inside its existing configuration transaction. */
     RequiredNoteScope initialize(ClientSession session, RequiredNoteOwner owner) {
+        return initialize(session,owner,false);
+    }
+    private RequiredNoteScope initialize(ClientSession session,RequiredNoteOwner owner,boolean authoringOnly) {
         cipherForWrite(session);
-        checkOwner(session, owner, true);
+        checkOwner(session, owner, true,authoringOnly);
         Document existing = scopes.find(session, byScope(owner)).first();
         if (existing == null) {
             refuseRetainedFacts(session, owner);
@@ -157,6 +164,15 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
             scopes.insertOne(session, existing);
         }
         return scopeOf(owner, existing);
+    }
+
+    /** CONFIG authoring may preserve or reserve a name, but this method never exposes its old values or origin. */
+    void reserveAuthoring(ClientSession session,RequiredNoteOwner owner,boolean known) {
+        requireOrdinary();
+        if(known) {
+            checkOwner(session,owner,false,true);
+            scopeOf(owner,scopes.find(session,byScope(owner)).first());
+        } else initialize(session,owner,true);
     }
 
     private void refuseRetainedFacts(ClientSession session, RequiredNoteOwner owner) {
@@ -448,10 +464,52 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     }
     @Override public List<io.tapstate.spi.store.RequiredNoteContext> privateContexts(io.tapstate.spi.store.PipelineIntentScope original,String operationId) {
         var tokens=privateTokens(original,operationId);
+        return privateContexts(tokens.stream().map(token -> new Retirement(token,operationId)).toList());
+    }
+    @Override public List<io.tapstate.spi.store.RequiredNoteContext> privateContexts(io.tapstate.spi.store.CacheRecoveryStore.FullPreparation confirmation) {
+        requireOrdinary();
+        var permission = recoveryPermission(confirmation);
+        var tokens = withOriginIndexes(() -> withCarryIndexes(() -> transaction(session -> {
+            permission.require(session,client,database);
+            var original = permission.recovery().previousScope();
+            if (original == null) {
+                requireEmptyAuthoringReservations(session,permission.recovery().targetScope());
+                return List.<RequiredNoteScope>of();
+            }
+            return retirementScopes(session,original,permission.operationId());
+        })));
+        return privateContexts(tokens.stream().map(token -> new Retirement(token,permission.operationId(),permission)).toList());
+    }
+    private void requireEmptyAuthoringReservations(ClientSession session,io.tapstate.spi.store.PipelineIntentScope target) {
+        // Authoring reserves logical namespaces before any execution. Validate only empty reservations;
+        // the target owner is used for shape checks and never returned as an invented predecessor.
+        try(var rows=scopes.find(session,new Document("_id.bindingVersion",target.bindingVersion())
+                .append("ownerKind","PIPELINE").append("ownerId",target.pipelineId())).iterator()) {
+            while(rows.hasNext()) {
+                var metadata=rows.next();
+                if(!(metadata.get("_id") instanceof Document id) || !(id.get("namespace") instanceof String namespace))throw unavailable();
+                RequiredNoteOwner owner;
+                try {owner=new RequiredNoteOwner(target.bindingVersion(),namespace,RequiredNoteOwner.Kind.PIPELINE,target.pipelineId(),target.stateGeneration());}
+                catch(IllegalArgumentException corrupt){throw unavailable();}
+                checkBinding(session,owner);var token=scopeOf(owner,metadata);
+                if(token.generation()!=1 || !Long.valueOf(0).equals(metadata.get("originGeneration")) || metadata.containsKey("lastRetirement")
+                        || !Long.valueOf(0).equals(metadata.get("incomingCarries")) || !Long.valueOf(0).equals(metadata.get("outgoingCarries")))throw unavailable();
+                refuseRetainedFacts(session,owner);
+            }
+        }
+        var namespace=java.util.regex.Pattern.compile("^pdk\\.state\\."+java.util.regex.Pattern.quote(target.pipelineId())+"\\.");
+        var filter=new Document("_id.bindingVersion",target.bindingVersion()).append("_id.namespace",namespace);
+        for(var table:List.of(notes,origins,migrations))if(table.find(session,filter).projection(new Document("_id",1)).first()!=null)throw unavailable();
+        if(carryRows.find(session,new Document("$or",List.of(
+                new Document("_id.sourceBindingVersion",target.bindingVersion()).append("_id.sourceNamespace",namespace),
+                new Document("_id.sharedBindingVersion",target.bindingVersion()).append("_id.sharedNamespace",namespace))))
+                .projection(new Document("_id",1)).first()!=null)throw unavailable();
+    }
+    private List<io.tapstate.spi.store.RequiredNoteContext> privateContexts(List<Retirement> tokens) {
         return withOriginIndexes(() -> withCarryIndexes(() -> transaction(session -> {
             var result=new ArrayList<io.tapstate.spi.store.RequiredNoteContext>();
-            for(var token:tokens) {
-                var fixed=new Retirement(token,operationId);checkRetiringOwner(session,fixed,false);
+            for(var fixed:tokens) {
+                var token=fixed.scope();checkRetiringOwner(session,fixed,false);
                 var metadata=scopes.find(session,byScope(token.owner())).first();
                 if(retiredResult(fixed,metadata)!=null){result.add(new io.tapstate.spi.store.RequiredNoteContext(token,java.util.Optional.empty(),true));continue;}
                 metadata=verifyPhysicalScope(session,token,false);var origin=retainedOrigin(session,token,metadata);
@@ -519,7 +577,19 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     public RequiredNoteRetirement retirement(RequiredNoteScope original, String operationId) {
         requireOrdinary(); Objects.requireNonNull(original, "original");
         if (original.owner().kind() != RequiredNoteOwner.Kind.PIPELINE || operationId == null || operationId.isBlank()) throw unavailable();
-        var fixed = new Retirement(original, operationId);
+        return retirement(new Retirement(original, operationId));
+    }
+    @Override public RequiredNoteRetirement retirement(RequiredNoteScope original, io.tapstate.spi.store.CacheRecoveryStore.FullPreparation confirmation) {
+        requireOrdinary();Objects.requireNonNull(original,"original");
+        var permission=recoveryPermission(confirmation);
+        return retirement(new Retirement(original,permission.operationId(),permission));
+    }
+    private MongoCacheRecoveryStore.Permission recoveryPermission(io.tapstate.spi.store.CacheRecoveryStore.FullPreparation confirmation) {
+        if (!(confirmation instanceof MongoCacheRecoveryStore.Permission permission)) throw unavailable();
+        return permission;
+    }
+    private RequiredNoteRetirement retirement(Retirement fixed) {
+        var original=fixed.scope();var operationId=fixed.operationId();
         var view = new MongoRequiredNoteStore(this, () -> {}, fixed);
         withOriginIndexes(() -> withCarryIndexes(() -> transaction(session -> {
             checkRetiringOwner(session, fixed, false);
@@ -538,8 +608,10 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
             @Override public String operationId() { return operationId; }
             @Override public RequiredNoteStore notes() { return view; }
             @Override public java.util.Optional<RequiredNoteOrigin> origin() {
-                return view.withOriginIndexes(() -> view.transaction(session -> java.util.Optional.ofNullable(
-                        view.retainedOrigin(session, original, view.verifyPhysicalScope(session, original, false)))));
+                return view.withOriginIndexes(() -> view.transaction(session -> {
+                    view.checkRetiringOwner(session,fixed,false);
+                    return java.util.Optional.ofNullable(view.retainedOrigin(session, original, view.verifyPhysicalScope(session, original, false)));
+                }));
             }
             @Override public RequiredNoteScope completeAfterVerifiedRelease() { return completePrivate(fixed); }
         };
@@ -598,12 +670,19 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         var owner = fixed.scope().owner(); checkBinding(session, owner);
         Document operator = operators.find(session, new Document("_id", owner.ownerId())).first();
         PipelineStateMapping mapping = MongoPipelineStateMappings.decode(owner.ownerId(), operator);
-        if (mapping.stateGeneration() != owner.stateGeneration()
+        if (fixed.recovery()!=null) {
+            var permission=fixed.recovery();permission.require(session,client,database);
+            var previous=permission.recovery().previousScope();
+            if (previous==null || owner.kind()!=RequiredNoteOwner.Kind.PIPELINE || !owner.ownerId().equals(previous.pipelineId())
+                    || owner.bindingVersion()!=previous.bindingVersion() || owner.stateGeneration()!=previous.stateGeneration()
+                    || !permission.operationId().equals(fixed.operationId())) throw unavailable();
+            if (write) permission.fence(session,client,database);
+        } else if (mapping.stateGeneration() != owner.stateGeneration()
                 || (mapping.phase() != PipelineStateMapping.Phase.REBUILDING && mapping.phase() != PipelineStateMapping.Phase.RETIRING)
                 || !fixed.operationId().equals(mapping.operationId())) throw unavailable();
         if (write) {
             long fence = operator.getLong("noteWriteFence"); if (fence >= Long.MAX_VALUE - 1) throw unreadable("noteWriteFence");
-            if (operators.updateOne(session, new Document("_id", owner.ownerId()).append("stateGeneration", owner.stateGeneration())
+            if (operators.updateOne(session, new Document("_id", owner.ownerId()).append("stateGeneration", mapping.stateGeneration())
                             .append("phase", mapping.phase().name()).append("operationId", fixed.operationId()).append("noteWriteFence", fence),
                     new Document("$inc", new Document("noteWriteFence", 1L))).getMatchedCount() != 1) throw unavailable();
         }
@@ -811,6 +890,9 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     }
 
     private void checkOwner(ClientSession session, RequiredNoteOwner owner, boolean write) {
+        checkOwner(session,owner,write,false);
+    }
+    private void checkOwner(ClientSession session, RequiredNoteOwner owner, boolean write,boolean authoringOnly) {
         checkBinding(session, owner);
         if (retirement != null) {
             if (owner.kind() != RequiredNoteOwner.Kind.GLOBAL && !retirement.scope().owner().equals(owner)) throw unavailable();
@@ -829,6 +911,10 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
             if (mapping.phase() != PipelineStateMapping.Phase.ACTIVE || mapping.stateGeneration() != owner.stateGeneration()) {
                 throw unavailable();
             }
+            var recovery=MongoCacheRecoveryFacts.read(operator);
+            if (!authoringOnly && recovery.isPresent() && MongoPipelinePreparationFacts.decode(owner.ownerId(),operator,
+                    recovery.orElseThrow().targetScope().clusterId()).phase()!=io.tapstate.spi.store.PipelinePreparation.Phase.COMPLETE)
+                throw unavailable();
             if (write) {
                 Document filter = new Document("_id", owner.ownerId()).append("stateGeneration", owner.stateGeneration())
                         .append("phase", "ACTIVE").append("noteWriteFence", operator.getLong("noteWriteFence"));

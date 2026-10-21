@@ -167,21 +167,27 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     public AuthoringModels authoringModels(io.tapstate.spi.store.PipelineIntentScope scope) {
         requireOpen();
         var previous = ((MongoPipelineStatePreparations) preparations()).authoringPredecessor(scope);
-        return new AuthoringModels(this, scope, previous);
+        var recovery=cacheRecoveries().read(scope.pipelineId());
+        if(recovery.isPresent() && !recovery.orElseThrow().targetScope().equals(scope))throw MongoCachePipelineAccess.fenced();
+        return new AuthoringModels(this, scope, previous,recovery);
     }
     public static final class AuthoringModels {
         private final MongoConfigurationDomain owner;
         private final io.tapstate.spi.store.PipelineIntentScope scope;
         private final java.util.Optional<io.tapstate.spi.store.PipelineRetirementResult> predecessor;
+        private final java.util.Optional<io.tapstate.spi.store.PipelineCacheRecovery> recovery;
         private AuthoringModels(MongoConfigurationDomain owner, io.tapstate.spi.store.PipelineIntentScope scope,
-                java.util.Optional<io.tapstate.spi.store.PipelineRetirementResult> predecessor) {
-            this.owner = owner; this.scope = scope; this.predecessor = predecessor;
+                java.util.Optional<io.tapstate.spi.store.PipelineRetirementResult> predecessor,
+                java.util.Optional<io.tapstate.spi.store.PipelineCacheRecovery> recovery) {
+            this.owner = owner; this.scope = scope; this.predecessor = predecessor;this.recovery=recovery;
         }
         public io.tapstate.spi.store.PipelineIntentScope scope() { return scope; }
         java.util.Optional<io.tapstate.spi.store.PipelineRetirementResult> predecessor() { return predecessor; }
+        java.util.Optional<io.tapstate.spi.store.PipelineCacheRecovery> recovery() {return recovery;}
         void requireActive() {
             owner.requireOpen();
-            if (!predecessor.equals(((MongoPipelineStatePreparations) owner.preparations()).authoringPredecessor(scope)))
+            if (!predecessor.equals(((MongoPipelineStatePreparations) owner.preparations()).authoringPredecessor(scope))
+                    || !recovery.equals(owner.cacheRecoveries().read(scope.pipelineId())))
                 throw MongoCachePipelineAccess.fenced();
         }
         @Override public String toString() { return "AuthoringModels[original]"; }
@@ -202,6 +208,10 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     public io.tapstate.spi.store.StorageRecoveryCommands recoveryCommands() {
         requireOpen();
         return new MongoStorageRecoveryCommands(connection.client(), connection.database(), bindings, artifacts, this::requireOpen);
+    }
+    public io.tapstate.spi.store.CacheRecoveryStore cacheRecoveries() {
+        requireOpen();
+        return new MongoCacheRecoveryStore(connection.client(), connection.database(), bindings, artifacts, clusterId, this::requireOpen);
     }
 
     public void requireOriginalInitialPreparation(io.tapstate.spi.store.CachePreparation original) {
@@ -287,6 +297,19 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                 });
             }
         });
+    }
+
+    /** Prepares only the business domain after atomic all-stopped publication and caller-proven old-writer isolation. */
+    public void prepareStoppedRecovery(MongoCacheDomain cache, io.tapstate.spi.store.StorageRecoveryCommands.Plan running,
+            Runnable localIsolationGuard) {
+        requireOpen();localIsolationGuard.run();
+        var recoveries=(MongoCacheRecoveryStore)cacheRecoveries();
+        recoveries.requireStopped(running);
+        cache.requireRecoveryTarget(bindings.load().orElseThrow(MongoCachePipelineAccess::fenced));
+        // CONFIG validation stays outside CACHE transactions; their callbacks only check this local lifecycle.
+        cache.prepareConfirmedInitialBusiness(new io.tapstate.spi.store.CachePreparation(running.operationId(),running.originalScope()),
+                () -> {requireOpen();localIsolationGuard.run();});
+        recoveries.requireStopped(running);localIsolationGuard.run();requireOpen();
     }
 
     /** Only the exact current confirmed runtime operation can authorize an initial business birth. */

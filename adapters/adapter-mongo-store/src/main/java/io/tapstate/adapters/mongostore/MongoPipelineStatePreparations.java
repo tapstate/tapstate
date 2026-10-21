@@ -34,6 +34,7 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
     private static final TransactionOptions TRANSACTION = TransactionOptions.builder().readConcern(ReadConcern.SNAPSHOT)
             .writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
     private final MongoClient client;
+    private final MongoDatabase database;
     private final MongoCollection<Document> mappings;
     private final MongoCollection<Document> pipelines;
     private final String clusterId;
@@ -43,6 +44,7 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
 
     MongoPipelineStatePreparations(MongoClient client, MongoDatabase database, String clusterId,
             MongoStorageBindingStore bindings, MongoConfigurationArtifactStore artifacts, Runnable requireActive) {
+        this.database = Objects.requireNonNull(database, "database");
         this.client = Objects.requireNonNull(client, "client"); this.clusterId = Objects.requireNonNull(clusterId, "clusterId");
         this.artifacts = Objects.requireNonNull(artifacts,"artifacts");
         if (!artifacts.belongsTo(client,database.getName())) throw new IllegalArgumentException("preparation resources must share the original CONFIG client");
@@ -73,37 +75,55 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
     }
 
     @Override public FirstPipelineCreationResult issueFirstCreate(PipelineIntentScope scope, WorkloadClaimFence originalNode) {
-        return issue(scope,originalNode,null);
+        return issue(scope,originalNode,null,null,() -> {});
     }
     @Override public FirstPipelineCreationResult issueFirstCreate(PipelineIntentScope scope, WorkloadClaimFence originalNode,PipelinePreparationInputs inputs) {
-        return issue(scope,originalNode,Objects.requireNonNull(inputs,"inputs"));
+        return issue(scope,originalNode,Objects.requireNonNull(inputs,"inputs"),null,() -> {});
     }
-    private FirstPipelineCreationResult issue(PipelineIntentScope scope,WorkloadClaimFence originalNode,PipelinePreparationInputs requested) {
+    @Override public FirstPipelineCreationResult issueRecoveredFirstCreate(PipelineIntentScope scope,WorkloadClaimFence originalNode,
+            PipelinePreparationInputs inputs,io.tapstate.spi.store.CacheRecoveryStore.FullPreparation confirmation,Runnable verifyPredecessor) {
+        if (!(confirmation instanceof MongoCacheRecoveryStore.Permission permission) || !scope.equals(permission.recovery().targetScope())) throw fenced();
+        return issue(scope, originalNode, Objects.requireNonNull(inputs,"inputs"), permission, Objects.requireNonNull(verifyPredecessor,"verifyPredecessor"));
+    }
+    private FirstPipelineCreationResult issue(PipelineIntentScope scope,WorkloadClaimFence originalNode,PipelinePreparationInputs requested,
+            MongoCacheRecoveryStore.Permission recovery,Runnable verifyPredecessor) {
         Objects.requireNonNull(scope, "scope"); Objects.requireNonNull(originalNode, "originalNode");
         if (originalNode.key().type() != WorkloadClaimType.NODE_SESSION || !clusterId.equals(originalNode.key().clusterId())
                 || !originalNode.key().resourceId().equals(originalNode.owner().nodeId())) throw fenced();
         String preparationId = UUID.randomUUID().toString();
         Issuance result = transaction(session -> {
             Document row = requireCurrent(session, scope);
+            if (recovery != null) recovery.require(session,client,database);
             PipelinePreparation previous = MongoPipelinePreparationFacts.decode(scope.pipelineId(), row, clusterId);
             if (previous.phase() != PipelinePreparation.Phase.UNASSIGNED) {
                 if (!scope.equals(previous.scope())) throw fenced();
-                return new Issuance(previous, false, null,Optional.empty());
+                return new Issuance(previous, false, null,Optional.empty(),Optional.empty());
             }
+            var summary = MongoCacheRecoveryFacts.read(row);
+            if (summary.isPresent() && recovery == null) throw new TapstateException(IoError.PIPELINE_STATE_REBUILD_REQUIRED,Map.of("pipeline",scope.pipelineId()),null);
+            if (recovery != null && !summary.filter(recovery.recovery()::equals).isPresent()) throw fenced();
+            if (recovery != null) recovery.fence(session, client, database);
             var fixed = verifyInputs(session,scope,requested);
             var issued = new PipelinePreparation(scope.pipelineId(), scope.stateGeneration(), PipelinePreparation.Phase.ISSUED,
                     scope, preparationId, originalNode);
             Optional<io.tapstate.spi.store.PipelineRetirementResult> retired=Optional.empty();
-            if(row.containsKey("retirement")) {
+            if (recovery != null) {
+                if (!scope.equals(recovery.recovery().targetScope())) throw fenced();
+            } else if(row.containsKey("retirement")) {
                 var completedRetirement=MongoPipelineRetirementFacts.read(row).completed();
                 if(completedRetirement.scope().stateGeneration()+1!=scope.stateGeneration())throw fenced();retired=Optional.of(completedRetirement);
             } else if(scope.stateGeneration()!=1)throw fenced();
             replaceAnnex(session, scope, row, issued);
-            return new Issuance(issued, true, fixed,retired);
+            return new Issuance(issued, true, fixed,retired,summary);
         });
         // The grant is constructed only after withTransaction has confirmed its commit.
         requireActive.run();
-        return result.won() ? new FirstPipelineCreationResult.Issued(new Creation(result.preparation(), result.inputs(), result.retirement(),requireActive))
+        if (result.won() && recovery != null) {
+            // Only the committed winner checks/releases original resources, outside every database transaction.
+            // Losing this invocation before CACHE preparation retains ISSUED and never reconstructs a grant.
+            verifyPredecessor.run(); requireActive.run(); recovery.requireActive();
+        }
+        return result.won() ? new FirstPipelineCreationResult.Issued(new Creation(result.preparation(), result.inputs(), result.retirement(),result.recovery(),requireActive))
                 : new FirstPipelineCreationResult.AlreadyIssued(result.preparation());
     }
 
@@ -115,6 +135,7 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
         return transaction(session -> {
             Document row = requireCurrent(session, scope);
             if (MongoPipelinePreparationFacts.decode(scope.pipelineId(), row, clusterId).phase() != PipelinePreparation.Phase.UNASSIGNED) throw fenced();
+            if (MongoCacheRecoveryFacts.read(row).filter(value -> value.targetScope().equals(scope)).isPresent()) return Optional.empty();
             if (!row.containsKey("retirement")) {
                 if (scope.stateGeneration() != 1) throw fenced();
                 return Optional.empty();
@@ -275,8 +296,12 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
     static Optional<io.tapstate.spi.store.PipelineRetirementResult> retirement(FirstPipelineCreation original) {
         if(!(original instanceof Creation creation))throw fenced();return creation.retirement;
     }
+    static Optional<io.tapstate.spi.store.PipelineCacheRecovery> cacheRecovery(FirstPipelineCreation original) {
+        if (!(original instanceof Creation creation)) throw fenced(); return creation.recovery;
+    }
 
-    private record Issuance(PipelinePreparation preparation,boolean won,PipelinePreparationInputs inputs,Optional<io.tapstate.spi.store.PipelineRetirementResult> retirement) {}
+    private record Issuance(PipelinePreparation preparation,boolean won,PipelinePreparationInputs inputs,Optional<io.tapstate.spi.store.PipelineRetirementResult> retirement,
+            Optional<io.tapstate.spi.store.PipelineCacheRecovery> recovery) {}
 
     /** The implementation is neither a persistent DTO nor serializable. */
     private static final class Creation implements FirstPipelineCreation {
@@ -284,9 +309,12 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
         private final Runnable originalActive;
         private final PipelinePreparationInputs inputs;
         private final Optional<io.tapstate.spi.store.PipelineRetirementResult> retirement;
+        private final Optional<io.tapstate.spi.store.PipelineCacheRecovery> recovery;
         private final AtomicBoolean consumed = new AtomicBoolean();
-        private Creation(PipelinePreparation preparation,PipelinePreparationInputs inputs,Optional<io.tapstate.spi.store.PipelineRetirementResult> retirement,Runnable originalActive) {
+        private Creation(PipelinePreparation preparation,PipelinePreparationInputs inputs,Optional<io.tapstate.spi.store.PipelineRetirementResult> retirement,
+                Optional<io.tapstate.spi.store.PipelineCacheRecovery> recovery,Runnable originalActive) {
             this.retirement=retirement;
+            this.recovery=recovery;
             this.preparation = preparation; this.inputs = Objects.requireNonNull(inputs,"inputs"); this.originalActive = originalActive;
         }
         @Override public PipelinePreparation preparation() { return preparation; }

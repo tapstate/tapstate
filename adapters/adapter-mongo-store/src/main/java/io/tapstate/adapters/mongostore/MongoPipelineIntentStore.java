@@ -73,6 +73,21 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
     Optional<PipelineIntentSnapshot> loadInTransaction(ClientSession session, String pipelineId) {
         return Optional.ofNullable(intents.find(session, new Document("_id", pipelineId)).first()).map(row -> decodeCurrent(session, row));
     }
+    Optional<PipelineIntentSnapshot> loadRetainedInTransaction(ClientSession session, String pipelineId) {
+        return Optional.ofNullable(intents.find(session, new Document("_id", pipelineId)).first()).map(this::decode);
+    }
+    void rebindStopped(ClientSession session, io.tapstate.spi.store.PipelineCacheRecovery recovery, String pipelineHash) {
+        var target = recovery.targetScope();
+        var previous = loadRetainedInTransaction(session, target.pipelineId());
+        if (previous.filter(PipelineIntentSnapshot::deleted).isPresent() || pipelineHash == null || !pipelineHash.matches("[0-9a-f]{64}")) throw fenced();
+        long revision = previous.map(PipelineIntentSnapshot::intentRevision).orElse(0L);
+        if (revision >= Long.MAX_VALUE - 1) throw fenced();
+        var stopped = header(target, revision + 1, false).append("targetState", PipelineState.STOPPED.name())
+                .append("revision", pipelineHash).append("purgeState", false).append("assemblyRevision", null)
+                .append("reassemble", false).append("rebuiltAtStateEpoch", null);
+        if (previous.isEmpty()) intents.insertOne(session, stopped);
+        else if (intents.replaceOne(session, new Document("_id", target.pipelineId()).append("intentRevision", revision), stopped).getMatchedCount() != 1) throw fenced();
+    }
     @Override public Optional<PipelineIntentSnapshot> loadForActuation(String pipelineId) {
         requireId(pipelineId);
         return transaction(session -> {

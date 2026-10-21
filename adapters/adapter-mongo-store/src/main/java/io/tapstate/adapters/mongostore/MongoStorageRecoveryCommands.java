@@ -111,7 +111,13 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands {
     private Plan transition(Plan original, Phase from, Phase to, boolean requireRevision) {
         return transitionResult(original, from, to, requireRevision).plan();
     }
+    Plan startStoppedCluster(Plan confirmed, MongoCacheRecoveryStore scopes) {
+        return transitionResult(confirmed, Phase.CONFIRMED, Phase.RUNNING, true, scopes).plan();
+    }
     private Transition transitionResult(Plan original, Phase from, Phase to, boolean requireRevision) {
+        return transitionResult(original, from, to, requireRevision, null);
+    }
+    private Transition transitionResult(Plan original, Phase from, Phase to, boolean requireRevision, MongoCacheRecoveryStore stoppedScopes) {
         Objects.requireNonNull(original, "original");
         return transaction(session -> {
             Document root = root(session, original.originalScope());
@@ -124,6 +130,7 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands {
             requireManifest(session, original.manifest());
             ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database));
             Plan result = new Plan(current.operationId(), current.previousOperationId(), current.originalScope(), current.manifest(), current.planHash(), current.controlRevision(), to);
+            if (stoppedScopes != null) stoppedScopes.publishInTransaction(session, result);
             save(session, root, result);
             return new Transition(result, true);
         });
@@ -148,7 +155,7 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands {
                 && setup != null && "STORAGE_BOUND".equals(setup.get("phase")))
             MongoInitialOpRecovery.requireManifest(client, session, database, bindings, artifacts, scope, manifest, false);
     }
-    private void requireManifest(ClientSession session, Manifest manifest) {
+    void requireManifest(ClientSession session, Manifest manifest) {
         var found = new TreeMap<String,Resource>();
         for (var entry : manifest.definitionHashes().entrySet()) {
             Resource resource = artifacts.getInTransaction(session, entry.getKey()).orElseThrow(MongoStorageRecoveryCommands::refused);

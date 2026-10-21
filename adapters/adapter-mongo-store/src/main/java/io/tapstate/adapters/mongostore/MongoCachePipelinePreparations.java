@@ -62,10 +62,13 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
         for (var channel : inputs.directChannels()) if (!channel.context().scope().equals(preparation.scope())) throw rebuild(preparation.scope());
         requireIssued(preparation); positive(ttl); requireScope(preparation.scope());
         var retirement=MongoPipelineStatePreparations.retirement(original);
+        var recovery=MongoPipelineStatePreparations.cacheRecovery(original);
         return transaction(preparation.scope(), true, original::requireActive, session -> {
             WorkloadClaimFence node = preparation.issuerNode();
             Date serverNow = proveNode(session, node);
-            if(retirement.isPresent()) {
+            if (recovery.isPresent()) {
+                if (!recovery.orElseThrow().targetScope().equals(preparation.scope())) throw rebuild(preparation.scope());
+            } else if(retirement.isPresent()) {
                 var result=retirement.orElseThrow();
                 if(result.scope().stateGeneration()+1!=preparation.scope().stateGeneration() || !result.scope().pipelineId().equals(preparation.pipelineId()))throw rebuild(preparation.scope());
                 if(MongoPipelineRetirementFacts.sameBusiness(result.scope(),preparation.scope()) && result.cache().isPresent())

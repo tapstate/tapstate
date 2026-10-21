@@ -131,6 +131,7 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
                             .append("noteWriteFence", writeFence),
                     new Document("$set", new Document("stateGeneration", target.stateGeneration()).append("phase", "ACTIVE")
                             .append("cachePreparation", MongoPipelinePreparationFacts.encode(result)).append("stateRebuild", annex))
+                            .append("$unset", new Document("cacheRecovery", ""))
                             .append("$inc", new Document("noteWriteFence", 1L))).getMatchedCount() != 1)
                 throw new IllegalStateException("original rebuild changed within one CONFIG snapshot");
             return result;

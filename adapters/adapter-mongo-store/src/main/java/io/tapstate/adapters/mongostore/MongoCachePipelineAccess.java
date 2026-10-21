@@ -32,6 +32,7 @@ final class MongoCachePipelineAccess {
     private final boolean unpreparedModels;
     private final WorkloadClaimFence originalNode;
     private final java.util.Optional<io.tapstate.spi.store.PipelineRetirementResult> authoringPredecessor;
+    private final MongoConfigurationDomain.AuthoringModels authoringModels;
     final java.time.Duration rateRetention;
     final io.tapstate.spi.store.OperatorDatabaseBinding operatorDatabases;
 
@@ -48,13 +49,14 @@ final class MongoCachePipelineAccess {
     MongoCachePipelineAccess(MongoClient client, MongoDatabase database, PipelineIntentScope scope,
             WorkloadClaimFence original, Runnable requireActive, java.time.Duration rateRetention,
             io.tapstate.spi.store.OperatorDatabaseBinding operatorDatabases) {
-        this(client, database, scope, original, requireActive, rateRetention, operatorDatabases, false, null, java.util.Optional.empty());
+        this(client, database, scope, original, requireActive, rateRetention, operatorDatabases, false, null, java.util.Optional.empty(),null);
     }
     private MongoCachePipelineAccess(MongoClient client, MongoDatabase database, PipelineIntentScope scope,
             WorkloadClaimFence original, Runnable requireActive, java.time.Duration rateRetention,
             io.tapstate.spi.store.OperatorDatabaseBinding operatorDatabases, boolean unpreparedModels, WorkloadClaimFence originalNode,
-            java.util.Optional<io.tapstate.spi.store.PipelineRetirementResult> authoringPredecessor) {
+            java.util.Optional<io.tapstate.spi.store.PipelineRetirementResult> authoringPredecessor,MongoConfigurationDomain.AuthoringModels authoringModels) {
         this.unpreparedModels = unpreparedModels; this.originalNode = originalNode;
+        this.authoringModels=authoringModels;
         this.authoringPredecessor = Objects.requireNonNull(authoringPredecessor);
         this.operatorDatabases = operatorDatabases;
         this.rateRetention = MongoCacheMetadataStructure.requireRetention(rateRetention);
@@ -66,12 +68,12 @@ final class MongoCachePipelineAccess {
     }
     static MongoCachePipelineAccess unpreparedModels(MongoClient client, MongoDatabase database, PipelineIntentScope scope,
             WorkloadClaimFence node, Runnable active, java.time.Duration retention) {
-        return new MongoCachePipelineAccess(client, database, scope, null, active, retention, null, true, node, java.util.Optional.empty());
+        return new MongoCachePipelineAccess(client, database, scope, null, active, retention, null, true, node, java.util.Optional.empty(),null);
     }
     static MongoCachePipelineAccess unpreparedModels(MongoClient client, MongoDatabase database, MongoConfigurationDomain.AuthoringModels original,
             WorkloadClaimFence node, Runnable active, java.time.Duration retention) {
         return new MongoCachePipelineAccess(client, database, original.scope(), null,
-                () -> { original.requireActive(); active.run(); }, retention, null, true, node, original.predecessor());
+                active, retention, null, true, node, original.predecessor(),original);
     }
     void requireModelPin() { if (unpreparedModels) throw fenced(); }
 
@@ -107,6 +109,7 @@ final class MongoCachePipelineAccess {
     }
 
     <T> T metadataTransaction(SystemCollections table, MongoDatabase target, boolean mutation, Function<ClientSession, T> action) {
+        if(authoringModels!=null)authoringModels.requireActive();
         T result = transaction(session -> {
             if (unpreparedModels) {
                 if (table != SystemCollections.CACHE_DERIVED_SCHEMAS || !database.getName().equals(target.getName())) throw fenced();
@@ -129,6 +132,7 @@ final class MongoCachePipelineAccess {
             if (mutation) { proveClaim(session); updateState(session, current, new Document(), false); }
             return action.apply(session);
         });
+        if(authoringModels!=null)authoringModels.requireActive();
         requireActive.run(); return result;
     }
     private void requireUnpreparedModels(ClientSession session) {
@@ -137,6 +141,7 @@ final class MongoCachePipelineAccess {
                 new Document("_id", MongoWorkloadClaimStore.id(key))).first();
         var state = SystemCollections.CACHE_PIPELINE_STATE.on(database).find(session, new Document("_id", scope.pipelineId())).first();
         if (claim == null && state == null) {
+            if(authoringModels!=null && authoringModels.recovery().filter(value -> value.targetScope().equals(scope)).isPresent())return;
             if (scope.stateGeneration() == 1 && authoringPredecessor.isEmpty()) return;
             var previous = authoringPredecessor.orElseThrow(MongoCachePipelineAccess::fenced);
             if (previous.scope().stateGeneration() + 1 != scope.stateGeneration()) throw fenced();

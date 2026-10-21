@@ -249,11 +249,11 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
             var mapping = MongoPipelineStateMappings.decode(entry.getKey(),
                     mappings.find(session, new Document("_id", entry.getKey())).first());
             for (var node : prior) {
-                notes.open(session, RequiredNoteOwner.forNode(binding, node.node(), node.purpose(), mapping.stateGeneration()));
+                notes.reserveAuthoring(session, RequiredNoteOwner.forNode(binding, node.node(), node.purpose(), mapping.stateGeneration()),true);
             }
             for (var node : current) {
                 if (prior.contains(node)) continue;
-                notes.initialize(session, RequiredNoteOwner.forNode(binding, node.node(), node.purpose(), mapping.stateGeneration()));
+                notes.reserveAuthoring(session, RequiredNoteOwner.forNode(binding, node.node(), node.purpose(), mapping.stateGeneration()),false);
             }
         }
     }

@@ -55,6 +55,16 @@ public interface RequiredNoteStore {
         throw new io.tapstate.core.common.TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE, java.util.Map.of(), null);
     }
 
+    /** Inspects retained private contexts through the exact confirmed replacement scope. */
+    default List<RequiredNoteContext> privateContexts(CacheRecoveryStore.FullPreparation confirmation) {
+        throw new io.tapstate.core.common.TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE, java.util.Map.of(), null);
+    }
+
+    /** Grants release of one original private token through that same recovery confirmation. */
+    default RequiredNoteRetirement retirement(RequiredNoteScope original, CacheRecoveryStore.FullPreparation confirmation) {
+        throw new io.tapstate.core.common.TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE, java.util.Map.of(), null);
+    }
+
     /** Null bytes delete logically; a shared removal may atomically block carry from earlier private notes. */
     boolean compareAndSet(RequiredNoteScope scope, String key, long expectedRevision, byte[] bytes,
             boolean blockEarlierValue);
