@@ -6,6 +6,7 @@ from collections import Counter
 import fnmatch
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -212,7 +213,15 @@ def run_shard(args, root, plan):
     if examples:
         command += ['-Dtapstate.e2e.published-examples=' + ','.join(examples),
                     '-DforkCount=1', '-DreuseForks=true', '-Djunit.jupiter.execution.parallel.enabled=false']
-    subprocess.run(command, cwd=root, check=True)
+    env = dict(os.environ)
+    runner_temp = env.get('RUNNER_TEMP')
+    if runner_temp:
+        java_tmp = Path(runner_temp).resolve() / 'tapstate-java-tmp'
+        java_tmp.mkdir(parents=True, exist_ok=True)
+        java_option = '-Djava.io.tmpdir=' + str(java_tmp)
+        env['JAVA_TOOL_OPTIONS'] = ' '.join(value for value in
+                                           (env.get('JAVA_TOOL_OPTIONS', '').strip(), java_option) if value)
+    subprocess.run(command, cwd=root, check=True, env=env)
 
 
 def reports(root, shard):

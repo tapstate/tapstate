@@ -14,9 +14,10 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
 
 import java.io.IOException;
+import java.nio.file.FileSystemException;
+import java.nio.file.Files;
 import java.nio.file.StandardOpenOption;
 import java.util.jar.JarFile;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -70,7 +71,7 @@ class CloudConnectorSeedReadinessIT {
     void aCorruptCloudJarRefusesReadyWithoutWeakeningTheOtherLockedInputs() throws Exception {
         Path seeds = copyRelease();
         Path atlas = seeds.resolve("mongodb-atlas-connector.jar");
-        // Break only the owned hard link, then create the damaged file. Never modify the shared input.
+        // Replace only the private fixture file. Never modify the shared input.
         Files.delete(atlas);
         Files.write(atlas, new byte[] {0x13, 0x37});
         refusesReady(database("corrupt"), seeds);
@@ -177,10 +178,22 @@ class CloudConnectorSeedReadinessIT {
                 if (Files.isDirectory(input)) {
                     Files.createDirectories(destination);
                 } else {
-                    Files.createLink(destination, input);
+                    linkOrCopy(input, destination);
                 }
             }
         }
         return root.resolve("connectors");
+    }
+
+    private static void linkOrCopy(Path input, Path destination) throws IOException {
+        if (!Files.getFileStore(input).equals(Files.getFileStore(destination.getParent()))) {
+            Files.copy(input, destination);
+            return;
+        }
+        try {
+            Files.createLink(destination, input);
+        } catch (FileSystemException | UnsupportedOperationException unsupported) {
+            Files.copy(input, destination);
+        }
     }
 }
