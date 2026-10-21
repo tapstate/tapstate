@@ -79,7 +79,7 @@ class ValidationLinearRulesTest {
                   - { id: script, from: src.orders, type: js, script: "return event;" }
                 serve: { from: script, sync: [{ id: output, source: target }] }
                 """))
-                .isInstanceOf(TapstateException.class).hasMessageContaining("linear.js");
+                .isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.args()).containsEntry("rule", "js"));
     }
 
     @Test

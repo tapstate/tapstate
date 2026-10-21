@@ -3,6 +3,7 @@ package io.tapstate.app;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.ValidationDeclarations;
 import io.tapstate.core.dsl.ValidationPredicateCompiler;
+import io.tapstate.core.dsl.ValidationStaticRestrictions;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.validation.ValidationError;
@@ -73,6 +74,18 @@ public final class ValidationLinearRules {
             throw unsupported(declarations.output().id(), "from", "linear.single-resolved-route-required");
         List<Step.Inline> steps = declarations.routes().getFirst().steps();
         if (steps.size() > limits.maxSteps()) throw limit("steps");
+        var restrictions = ValidationStaticRestrictions.inspect(declarations, ValidationStaticRestrictions.Limits.defaults());
+        for (var reason : restrictions.reasons()) {
+            if (reason.kind() == ValidationStaticRestrictions.Kind.UNSUPPORTED) {
+                String rule = switch (reason.rule()) {
+                    case JAVASCRIPT -> "js";
+                    case JOIN -> "join";
+                    case COMPUTED_MAP -> "map.computed";
+                    case UNRESOLVED_REFERENCE -> throw new IllegalStateException("an unresolved reference is not an operator restriction");
+                };
+                throw unsupported(reason.node(), reason.fieldPath().getLast(), rule);
+            }
+        }
         long bytes = 256L;
         if (bytes > limits.programBytes()) throw limit("programBytes");
         var operations = new ArrayList<Operation>();
