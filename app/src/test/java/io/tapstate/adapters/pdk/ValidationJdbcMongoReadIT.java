@@ -2,6 +2,24 @@ package io.tapstate.adapters.pdk;
 
 import com.mongodb.client.MongoClients;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.dsl.ValidationPredicateCompiler;
+import io.tapstate.core.model.FieldRule;
+import io.tapstate.core.model.TransformBody;
+import io.tapstate.core.validation.ValidationMethod;
+import io.tapstate.core.validation.ValidationMode;
+import io.tapstate.core.validation.ValidationNestSingleSource;
+import io.tapstate.core.validation.ValidationObservation;
+import io.tapstate.core.validation.ValidationOwner;
+import io.tapstate.core.validation.ValidationPredicate;
+import io.tapstate.core.validation.ValidationRelationRows;
+import io.tapstate.core.validation.ValidationRoot;
+import io.tapstate.core.validation.ValidationRootCheck;
+import io.tapstate.core.validation.ValidationRunIdentity;
+import io.tapstate.core.validation.ValidationCheckEvent;
+import io.tapstate.runtime.engine.validation.ValidationRelationReader;
+import io.tapstate.runtime.engine.validation.ValidationStaticMap;
+import java.time.Clock;
+import java.util.Optional;
 import io.tapstate.core.validation.ValidationError;
 import io.tapstate.core.validation.ValidationKey;
 import io.tapstate.core.validation.ValidationKeyBinding;
@@ -205,6 +223,7 @@ class ValidationJdbcMongoReadIT {
             Map<String, Object> settings = source ? sourceSettings : Map.of("uri", uri, "database", DATABASE, "isUri", true);
             assertThat(lookupIds(connector, artifact, settings, EXACT)).containsExactlyInAnyOrder(1L, 2L, 3L);
             assertThat(lookupIds(connector, artifact, settings, EXACT - 1)).containsExactly(4L);
+            assertThat(lookupIds(connector, artifact, settings, EXACT + 1)).containsExactly(7L);
             assertThat(lookupIds(connector, artifact, settings, EXACT + 10)).isEmpty();
         }
         assertThat(sql(jdbc, mysql, "SELECT COUNT(*) FROM lookup_records;").trim()).isEqualTo("7");
@@ -217,19 +236,51 @@ class ValidationJdbcMongoReadIT {
         var logical = new ValidationKey(List.of(ValidationKey.Part.number(amount), ValidationKey.Part.text(" O'Brien ")));
         var lookup = new PdkValidationSession.Lookup("lookup_records", List.of(), List.of("record_key", "amount", "label"), 2, binding, logical);
         var ids = new ArrayList<Long>();
+        var projection = ValidationStaticMap.compile("price", new TransformBody.MapProjection(
+                Map.of("price", FieldRule.rename("amount"))), LIMITS);
+        var predicate = ValidationPredicateCompiler.compile("eligible", "after.price >= 9007199254740993",
+                new ValidationPredicate.Limits(LIMITS, 2000, false));
+        var observation = new ValidationObservation(new ValidationRunIdentity(new ValidationOwner("cluster", "pipeline", "node", "boot", 1, 1, 0),
+                "task", "run", ValidationMode.FULL, "spec", 1, "rules"),
+                new ValidationRoot("mapping", "output", new ValidationKey(List.of(ValidationKey.Part.number(102))), List.of()), 1);
         try (var queryIo = Executors.newSingleThreadExecutor(); var decodeIo = Executors.newSingleThreadExecutor();
              var cursor = PdkValidationSession.lookup(kind, artifact, settings, "retained-" + kind + "-artifact", lookup,
                      (model, codecs) -> new PdkValidationRows(model, codecs, path ->
                              PdkValidationRows.Rule.of(path.equals(List.of("label")) ? PdkValidationRows.Shape.TEXT : PdkValidationRows.Shape.EXACT_NUMBER), LIMITS),
                      (model, codecs, key) -> Map.of("amount", key.parts().get(0).value(), "label", key.parts().get(1).value()),
                      () -> {}, queryIo, decodeIo, 1, LIMITS)) {
-            while (true) {
-                var next = cursor.next();
-                if (next.isEmpty()) break;
-                try (var row = next.orElseThrow()) {
-                    ids.add(((Number) value(row.values().fields().get("record_key"))).longValue());
-                    assertThat(value(row.values().fields().get("label"))).isEqualTo(" O'Brien ");
-                }
+            var relation = ValidationRelationReader.read(observation, "relation", "native-lookup-v1", cursor,
+                    new ValidationRelationRows.Limits(32768, LIMITS), Clock.systemUTC(), () -> {}, original -> {
+                        long id = ((Number) value(original.fields().get("record_key"))).longValue();
+                        ids.add(id);
+                        assertThat(value(original.fields().get("label"))).isEqualTo(" O'Brien ");
+                        var working = projection.apply(original);
+                        var participation = predicate.evaluate(working);
+                        assertThat(participation.problem()).isNull();
+                        var physical = new ValidationPhysicalIdentity(kind, DATABASE, kind.equals("postgres") ? "public" : null,
+                                "lookup_records", List.of(List.of("record_key")), new ValidationKey(List.of(ValidationKey.Part.number(id))));
+                        return new ValidationRelationReader.Evaluation(participation.matches() ? ValidationRelationRows.Disposition.INCLUDED
+                                : ValidationRelationRows.Disposition.EXCLUDED, working, Optional.of(physical));
+                    });
+            long included = amount >= EXACT ? ids.size() : 0;
+            assertThat(relation.included()).isEqualTo(included);
+            assertThat(relation.excluded()).isEqualTo(ids.size() - included);
+            assertThat(relation.indeterminate()).isZero();
+            assertThat(relation.includedSamples()).hasSize((int) Math.min(included, 2));
+            relation.includedSamples().forEach(sample -> {
+                assertThat(sample.original().fields()).containsKey("amount").doesNotContainKey("price");
+                assertThat(sample.working().fields()).containsKey("price").doesNotContainKey("amount");
+                assertThat(sample.physical().orElseThrow().table()).isEqualTo("lookup_records");
+            });
+            try (var root = ValidationRootCheck.builder(observation, ValidationMethod.FULL_COLUMN,
+                    ValidationCheckEvent.Participation.SHOULD_EXIST, ValidationRootCheck.TargetPresence.PRESENT,
+                    new ValidationRootCheck.Limits(1024 * 1024, 100, 100, 20, 4))) {
+                var location = new ValidationRootCheck.Location(observation.root(), List.of("child"));
+                var checked = ValidationNestSingleSource.check(relation, ValidationNestSingleSource.Relation.GATHER,
+                        Optional.empty(), location, List.of(location), List.of(), root);
+                assertThat(checked.state()).isEqualTo(included == 0 ? ValidationNestSingleSource.State.EMPTY
+                        : included == 1 ? ValidationNestSingleSource.State.UNIQUE : ValidationNestSingleSource.State.BLOCKED);
+                // Target content and the full root are outside this source-query fixture.
             }
         }
         return ids;
