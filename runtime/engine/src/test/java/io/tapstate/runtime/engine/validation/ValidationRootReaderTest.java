@@ -196,7 +196,7 @@ class ValidationRootReaderTest {
         for (boolean participates : List.of(false, true)) {
             var source = new Cursor(List.of(row(Map.of("id", 7))));
             var child = new Cursor(List.of(row(Map.of("id", 7, "raw_child", "kept"))));
-            var target = new Cursor(List.of(row(Map.of("id", 7))));
+            var target = new Cursor(List.of(row(Map.of("id", 7, "items", List.of(Map.of("unproved", true))))));
             var cause = new Finding(Kind.SOURCE_FIELD_MISSING, new Location(observation().root(), List.of("items", "eligible")));
             var array = new Location(observation().root(), List.of("items"));
             ValidationPredicate.Expr uncertain = new ValidationPredicate.Present(List.of("items"));
@@ -216,8 +216,11 @@ class ValidationRootReaderTest {
             }, (pair, root) -> {
                 contents.incrementAndGet();
                 assertThat(pair.sourceEvidence().issues()).singleElement().satisfies(issue -> assertThat(issue.affected()).containsExactly(array));
-                // Only the independent scalar is compared; the unresolved array remains blocked.
-                assertThat(pair.source().working().fields().get("id")).isEqualTo(pair.target().working().fields().get("id"));
+                var masks = pair.sourceEvidence().issues().stream().flatMap(issue -> issue.affected().stream()).map(Location::fieldPath).toList();
+                var checked = ValidationFieldCheck.checkPartial(observation(), List.of(), pair.source().working(), pair.target().working(),
+                        pair.sourceSample(), pair.targetSample(), Optional.empty(), String::equals,
+                        new ValidationValueComparison.TraversalLimits(ROW, 10000), masks, root);
+                assertThat(checked.differences()).isZero();
             });
             assertThat(child.closed).isTrue(); assertThat(child.rowsClosed).isEqualTo(1);
             assertThat(contents).hasValue(participates ? 1 : 0);

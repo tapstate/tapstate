@@ -11,9 +11,9 @@ import java.util.function.Predicate;
 import static io.tapstate.core.validation.ValidationRootCheck.*;
 
 /**
- * Compares a fully defined current field view and records every independent mismatch in its root.
- * The compiled caller checks delegated Nest scopes separately and never supplies unresolved source
- * fields as missing values. This helper does not complete root obligations or authorize publication.
+ * Compares current field views and records every independent mismatch in their root. Partial views
+ * require recorded source blocks for every unavailable path. The compiled caller checks delegated
+ * Nest scopes separately and never supplies unresolved source fields as known missing values. This helper does not complete root obligations or authorize publication.
  */
 public final class ValidationFieldCheck {
     /** Fixed-model eligibility for the physical output document only; never a general ignore-field rule. */
@@ -52,6 +52,26 @@ public final class ValidationFieldCheck {
             ValidationValues.Row target, Optional<SampledSide> sourceSample, Optional<SampledSide> targetSample,
             Optional<GeneratedId> generatedId, BiPredicate<String, String> compatible,
             ValidationValueComparison.TraversalLimits limits, Builder root) {
+        return checkView(parent, path, source, target, sourceSample, targetSample, generatedId, compatible, limits, List.of(), root);
+    }
+
+    /**
+     * Paths are relative to this source working row, including ordinary-array ordinals. Each needs
+     * an existing source block for both structure and values at the exact enclosing observation and
+     * field path. Known parent shape and siblings remain comparable. Reserve one extra row-sized
+     * mask-metadata allocation; masks and their traversal checks have hard byte/operation limits.
+     */
+    public static Result checkPartial(ValidationObservation parent, List<Object> path, ValidationValues.Row source,
+            ValidationValues.Row target, Optional<SampledSide> sourceSample, Optional<SampledSide> targetSample,
+            Optional<GeneratedId> generatedId, BiPredicate<String, String> compatible,
+            ValidationValueComparison.TraversalLimits limits, List<List<Object>> unavailablePaths, Builder root) {
+        return checkView(parent, path, source, target, sourceSample, targetSample, generatedId, compatible, limits, unavailablePaths, root);
+    }
+
+    private static Result checkView(ValidationObservation parent, List<Object> path, ValidationValues.Row source,
+            ValidationValues.Row target, Optional<SampledSide> sourceSample, Optional<SampledSide> targetSample,
+            Optional<GeneratedId> generatedId, BiPredicate<String, String> compatible,
+            ValidationValueComparison.TraversalLimits limits, List<List<Object>> unavailablePaths, Builder root) {
         Objects.requireNonNull(root, "root");
         try {
             Objects.requireNonNull(parent, "parent");
@@ -65,6 +85,7 @@ public final class ValidationFieldCheck {
             Location location = new Location(parent.root(), path);
             List<Object> fieldPath = location.fieldPath();
             requireScope(parent, root);
+            var unavailable = unavailable(parent, fieldPath, unavailablePaths, limits.row().bytes(), root);
             sourceSample.ifPresent(sample -> root.requireSampleRead(Side.SOURCE, sample));
             targetSample.ifPresent(sample -> root.requireSampleRead(Side.TARGET, sample));
             bounded(source, limits.row()); bounded(target, limits.row());
@@ -73,7 +94,8 @@ public final class ValidationFieldCheck {
                     || !generatedId.orElseThrow().outputId.equals(parent.root().outputId()))) {
                 throw ValidationError.invalid("fieldCheck.generatedIdScope");
             }
-            boolean exempt = generatedId.isPresent() && !source.fields().containsKey("_id");
+            boolean exempt = generatedId.isPresent() && !source.fields().containsKey("_id")
+                    && unavailable.stream().noneMatch(mask -> mask.isEmpty() || mask.equals(List.of("_id")));
             long requiredDifferences = 0;
             ValidationValues.Row comparedTarget = target;
             if (exempt) {
@@ -91,7 +113,7 @@ public final class ValidationFieldCheck {
                     comparedTarget = ValidationValues.ownRow(fields, limits.row());
                 }
             }
-            long differences = ValidationValueComparison.visitDifferences(source, comparedTarget, compatible, limits, difference -> {
+            long differences = ValidationValueComparison.visitKnownDifferences(source, comparedTarget, compatible, limits, unavailable, difference -> {
                 var field = new ArrayList<Object>(fieldPath); field.addAll(difference.path());
                 Kind kind = switch (difference.kind()) {
                     case VALUE -> Kind.TARGET_VALUE;
@@ -106,6 +128,26 @@ public final class ValidationFieldCheck {
             root.close();
             throw failure;
         }
+    }
+
+    private static List<List<Object>> unavailable(ValidationObservation parent, List<Object> base, List<List<Object>> paths,
+            long maxBytes, Builder root) {
+        if (paths == null || paths.size() > 256) throw ValidationError.invalid("fieldCheck.unavailablePaths");
+        long bytes = 64;
+        var masks = new ArrayList<List<Object>>(paths.size());
+        for (var path : paths) {
+            if (path == null || path.size() > 64 - base.size() || !path.isEmpty() && !(path.getFirst() instanceof String))
+                throw ValidationError.invalid("fieldCheck.unavailablePaths");
+            bytes += 64L + 16L * path.size();
+            for (Object segment : path) bytes += segment instanceof String text ? 48L + 2L * text.length() : 32L;
+            if (bytes > maxBytes) throw new io.tapstate.core.common.TapstateException(ValidationError.VALUE_LIMIT_EXCEEDED,
+                    java.util.Map.of("limit", "fieldCheck.unavailablePaths"), null);
+            var complete = new ArrayList<Object>(base); complete.addAll(path);
+            var location = new Location(parent.root(), complete);
+            root.requireBlocked(Check.STRUCTURE, location).requireBlocked(Check.VALUES, location);
+            masks.add(List.copyOf(path));
+        }
+        return List.copyOf(masks);
     }
 
     private static void record(Builder root, Kind kind, Location location, Optional<SampledSide> source, Optional<SampledSide> target) {

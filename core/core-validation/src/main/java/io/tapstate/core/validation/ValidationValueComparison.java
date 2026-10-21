@@ -64,6 +64,13 @@ public final class ValidationValueComparison {
     public static long visitDifferences(ValidationValues.Row source, ValidationValues.Row target,
                                        BiPredicate<String, String> compatible, TraversalLimits limits,
                                        Consumer<Difference> consumer) {
+        return visitKnownDifferences(source, target, compatible, limits, List.of(), consumer);
+    }
+
+    /** Package boundary: the field checker first requires recorded source blocks for every path. */
+    static long visitKnownDifferences(ValidationValues.Row source, ValidationValues.Row target,
+            BiPredicate<String, String> compatible, TraversalLimits limits, List<List<Object>> unavailable,
+            Consumer<Difference> consumer) {
         Objects.requireNonNull(source, "source");
         Objects.requireNonNull(target, "target");
         Objects.requireNonNull(compatible, "compatible");
@@ -73,7 +80,7 @@ public final class ValidationValueComparison {
             if (row.accountedBytes() > limits.row().bytes() || row.nodes() > limits.row().nodes()
                     || row.depth() > limits.row().depth()) throw comparisonLimit("row");
         }
-        Walker walker = new Walker(compatible, limits.operations(), consumer);
+        Walker walker = new Walker(compatible, limits.operations(), unavailable, consumer);
         walker.walk(source.fields(), target.fields(), new ArrayList<>());
         return walker.differences;
     }
@@ -81,10 +88,12 @@ public final class ValidationValueComparison {
     private static final class Walker {
         private final BiPredicate<String, String> compatible;
         private final Consumer<Difference> consumer;
+        private final List<List<Object>> unavailable;
         private long remaining;
         private long differences;
-        private Walker(BiPredicate<String, String> compatible, long operations, Consumer<Difference> consumer) {
+        private Walker(BiPredicate<String, String> compatible, long operations, List<List<Object>> unavailable, Consumer<Difference> consumer) {
             this.compatible = compatible;
+            this.unavailable = unavailable;
             this.remaining = operations;
             this.consumer = consumer;
         }
@@ -93,6 +102,7 @@ public final class ValidationValueComparison {
             remaining -= amount;
         }
         private void emit(Kind kind, List<Object> path) {
+            if (unavailable(path)) return;
             work(1L + path.size());
             consumer.accept(difference(kind, path));
             differences++;
@@ -106,6 +116,7 @@ public final class ValidationValueComparison {
         }
         private void walk(Object source, Object target, List<Object> path) {
             work(1);
+            if (unavailable(path)) return;
             boolean sourceNull = nullValue(source);
             boolean targetNull = nullValue(target);
             if (sourceNull || targetNull) {
@@ -172,6 +183,21 @@ public final class ValidationValueComparison {
             }
             if (source instanceof String left && target instanceof String right) work(1L + Math.max(left.length(), right.length()));
             if (!source.equals(target)) emit(Kind.VALUE, path);
+        }
+        private boolean unavailable(List<Object> path) {
+            for (var blocked : unavailable) {
+                work(1);
+                if (blocked.size() > path.size()) continue;
+                boolean prefix = true;
+                for (int i = 0; i < blocked.size(); i++) {
+                    Object expected = blocked.get(i); Object actual = path.get(i);
+                    work(1L + (expected instanceof String left && actual instanceof String right
+                            ? Math.min(left.length(), right.length()) : 0));
+                    if (!expected.equals(actual)) { prefix = false; break; }
+                }
+                if (prefix) return true;
+            }
+            return false;
         }
         private static long numberWork(Number number) {
             if (number instanceof BigInteger integer) return 1L + integer.bitLength();
