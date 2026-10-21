@@ -19,7 +19,7 @@ import io.tapstate.core.validation.ValidationCheckEvent;
 import io.tapstate.runtime.engine.validation.ValidationRelationReader;
 import io.tapstate.runtime.engine.validation.ValidationRootReader;
 import io.tapstate.runtime.engine.validation.ValidationStaticMap;
-import io.tapstate.runtime.engine.validation.ValidationScopedRead;
+import io.tapstate.runtime.engine.validation.ValidationReadScope;
 import java.time.Clock;
 import java.util.Optional;
 import io.tapstate.core.validation.ValidationError;
@@ -292,19 +292,22 @@ class ValidationJdbcMongoReadIT {
         var generated = ValidationFieldCheck.generatedId(observation.run(), "mapping", "output", true, false, false,
                 value -> value instanceof ValidationValues.Typed typed && typed.logicalType().equals("text") && typed.value() instanceof String);
         var handles = new ArrayList<ValidationReadHandle>();
+        try (var cleanup = new java.util.concurrent.ThreadPoolExecutor(1, 1, 0, java.util.concurrent.TimeUnit.SECONDS,
+                new java.util.concurrent.ArrayBlockingQueue<>(2), new java.util.concurrent.ThreadPoolExecutor.AbortPolicy());
+                var scope = new ValidationReadScope(observation, cleanup, () -> {}, 2)) {
         var checked = ValidationRootReader.read(observation, ValidationMethod.FULL_COLUMN,
                 new ValidationRootReader.Query("source", "native-root-v1", () -> {
-                    var handle = new ValidationScopedRead(observation,
-                            rootLookup(kind, sourceRef, sourceSettings, sourceTable, "source_key", logical, queryIo, decodeIo));
+                    var handle = scope.open(sourceTable, guard ->
+                            rootLookup(kind, sourceRef, sourceSettings, sourceTable, "source_key", logical, queryIo, decodeIo, guard));
                     handles.add(handle); return handle;
                 }),
                 new ValidationRootReader.Query("target", "native-root-v1", () -> {
-                    var handle = new ValidationScopedRead(observation,
-                            rootLookup("mongodb", targetRef, targetSettings, targetTable, "target_key", logical, queryIo, decodeIo));
+                    var handle = scope.open(targetTable, guard ->
+                            rootLookup("mongodb", targetRef, targetSettings, targetTable, "target_key", logical, queryIo, decodeIo, guard));
                     handles.add(handle); return handle;
                 }),
                 new ValidationRelationRows.Limits(65536, LIMITS), new ValidationRootCheck.Limits(1024 * 1024, 100, 100, 20, 4),
-                Clock.systemUTC(), () -> {}, original -> {
+                Clock.systemUTC(), scope::requireActive, original -> {
                     var working = projection.apply(original);
                     var evaluated = predicate.map(rule -> rule.evaluate(working)).orElse(new ValidationPredicate.Result(true, null));
                     var disposition = evaluated.problem() != null ? ValidationRelationRows.Disposition.INDETERMINATE
@@ -325,11 +328,14 @@ class ValidationJdbcMongoReadIT {
             assertThat(handle.workersExited().toCompletableFuture().get(5, java.util.concurrent.TimeUnit.SECONDS)).isNull();
             assertThat(handle.rowsReleased().toCompletableFuture().get(5, java.util.concurrent.TimeUnit.SECONDS)).isNull();
         }
+        scope.close();
+        assertThat(scope.drained().toCompletableFuture().get(5, java.util.concurrent.TimeUnit.SECONDS)).isNull();
         return checked;
+        }
     }
 
     private static ValidationReadHandle rootLookup(String kind, ConnectorRef artifact, Map<String, Object> settings, String table,
-            String keyField, ValidationKey logical, ExecutorService queryIo, ExecutorService decodeIo) {
+            String keyField, ValidationKey logical, ExecutorService queryIo, ExecutorService decodeIo, Runnable requireActive) {
         var binding = new ValidationKeyBinding("root", List.of(new ValidationKeyBinding.Component(List.of(keyField),
                 ValidationKey.Kind.EXACT_NUMBER, Set.of("exact-number"))), Set.of(), LIMITS);
         return PdkValidationSession.lookup(kind, artifact, settings, "retained-" + kind + "-artifact",
@@ -341,7 +347,7 @@ class ValidationJdbcMongoReadIT {
                     if (path.equals(List.of("body"))) return PdkValidationRows.Rule.of(PdkValidationRows.Shape.JSON);
                     return PdkValidationRows.Rule.AUTO;
                 }, LIMITS), (model, codecs, key) -> Map.of(keyField, key.parts().getFirst().value()),
-                () -> {}, queryIo, decodeIo, 1, LIMITS);
+                requireActive, queryIo, decodeIo, 1, LIMITS);
     }
 
     private static void verifyLookups(GenericContainer<?> jdbc, boolean mysql, String kind, ConnectorRef sourceRef,
