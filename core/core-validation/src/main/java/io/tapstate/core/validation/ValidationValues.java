@@ -55,6 +55,9 @@ public final class ValidationValues {
         public int subtype() { return subtype; }
         public byte[] bytes() { return bytes.clone(); }
         public int length() { return bytes.length; }
+        boolean sameContent(Binary other) {
+            return subtype == other.subtype && java.util.Arrays.equals(bytes, other.bytes);
+        }
         @Override public String toString() { return "Binary[subtype=" + subtype + ", length=" + bytes.length + "]"; }
     }
 

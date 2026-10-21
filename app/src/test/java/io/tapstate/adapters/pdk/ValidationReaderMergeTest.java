@@ -4,6 +4,7 @@ import io.tapdata.entity.schema.type.TapNumber;
 import io.tapstate.core.validation.ValidationKey;
 import io.tapstate.core.validation.ValidationPhysicalIdentity;
 import io.tapstate.core.validation.ValidationValues;
+import io.tapstate.core.validation.ValidationValueComparison;
 import io.tapstate.runtime.engine.validation.ValidationOrderedGroups;
 import io.tapstate.runtime.engine.validation.ValidationOrderedMerge;
 import java.nio.file.Path;
@@ -47,8 +48,10 @@ class ValidationReaderMergeTest {
                                 throw new IllegalStateException("bounded preview is not a full read");
                             for (int start = 0; start < ids.size(); start += 3) {
                                 List<Map<String,Object>> batch = new ArrayList<>();
-                                for (int i = start; i < Math.min(start + 3, ids.size()); i++)
-                                    batch.add(Map.of(key, ids.get(i)));
+                                for (int i = start; i < Math.min(start + 3, ids.size()); i++) {
+                                    long amount = key.equals("target_id") && ids.get(i) == 5L ? 100L : 120L;
+                                    batch.add(Map.of(key, ids.get(i), "amount", amount));
+                                }
                                 FilterResults results = new FilterResults(); results.setResults(batch);
                                 consumer.accept(results);
                             }
@@ -63,6 +66,7 @@ class ValidationReaderMergeTest {
                         TapTable table = new TapTable(names.get(0));
                         table.add(new TapField(c.getConnectionConfig().getString("key"), "long")
                             .tapType(new TapNumber().fixed(true).bit(64)));
+                        table.add(new TapField("amount", "long").tapType(new TapNumber().fixed(true).bit(64)));
                         consumer.accept(List.of(table));
                     }
                     public ConnectionOptions connectionTest(TapConnectionContext c, Consumer<TestItem> s) {
@@ -76,17 +80,18 @@ class ValidationReaderMergeTest {
         var sourceStops = new AtomicInteger();
         var targetStops = new AtomicInteger();
         var facts = new ArrayList<String>();
+        var valueChecks = new ArrayList<String>();
         // Each live read holds a query slot and a separately admitted decode slot for its duration.
         try (var queryIo = Executors.newFixedThreadPool(2); var decodeIo = Executors.newFixedThreadPool(2);
              var source = PdkValidationSession.scan("fixture", artifact,
-                     Map.of("key", "source_id", "ids", List.of(1L, 3L, 3L, 7L), "stops", sourceStops),
+                     Map.of("key", "source_id", "ids", List.of(1L, 3L, 3L, 5L, 6L, 7L), "stops", sourceStops),
                      "fixed-artifact", new PdkValidationSession.Scan("orders", List.of("source_id"), 2),
                      (model, codecs) -> {
                          assertThat(model.getNameFieldMap().get("source_id").getTapType()).isInstanceOf(TapNumber.class);
                          return row -> ValidationValues.ownRow(row, limits);
                      }, () -> { }, queryIo, decodeIo, 1, limits);
              var target = PdkValidationSession.scan("fixture", artifact,
-                     Map.of("key", "target_id", "ids", List.of(2L, 3L, 8L), "stops", targetStops),
+                     Map.of("key", "target_id", "ids", List.of(2L, 3L, 5L, 6L, 8L), "stops", targetStops),
                      "fixed-artifact", new PdkValidationSession.Scan("orders_v2", List.of("target_id"), 2),
                      (model, codecs) -> row -> ValidationValues.ownRow(row, limits), () -> { },
                      queryIo, decodeIo, 1, limits);
@@ -101,11 +106,24 @@ class ValidationReaderMergeTest {
                             + ":" + pair.target().map(group -> group.occurrences()).orElse(0L));
                     pair.source().ifPresent(group -> assertThat(group.key().physical().table()).isEqualTo("orders"));
                     pair.target().ifPresent(group -> assertThat(group.key().physical().table()).isEqualTo("orders_v2"));
+                    if (pair.source().isPresent() && pair.target().isPresent()
+                            && pair.source().orElseThrow().occurrences() == 1 && pair.target().orElseThrow().occurrences() == 1) {
+                        var left = pair.source().orElseThrow().sampleValues().fields();
+                        var right = pair.target().orElseThrow().sampleValues().fields();
+                        // Physical key mapping was checked separately; this controlled fixture has one
+                        // common payload field. Model conformance and general mapping are not inferred.
+                        var compared = ValidationValueComparison.compare(
+                                ValidationValues.ownRow(Map.of("amount", left.get("amount")), limits),
+                                ValidationValues.ownRow(Map.of("amount", right.get("amount")), limits));
+                        valueChecks.add(left.get("source_id") + ":" + compared.map(diff -> diff.kind().toString()).orElse("EQUAL"));
+                        compared.ifPresent(diff -> assertThat(diff.path()).containsExactly("amount"));
+                    }
                 }
             }
         }
-        assertThat(facts).containsExactly("SOURCE_ONLY:1:0", "TARGET_ONLY:0:1", "MATCHED:2:1",
+        assertThat(facts).containsExactly("SOURCE_ONLY:1:0", "TARGET_ONLY:0:1", "MATCHED:2:1", "MATCHED:1:1", "MATCHED:1:1",
                 "SOURCE_ONLY:1:0", "TARGET_ONLY:0:1");
+        assertThat(valueChecks).containsExactly("5:VALUE", "6:EQUAL");
         assertThat(sourceStops).hasValue(1);
         assertThat(targetStops).hasValue(1);
     }
