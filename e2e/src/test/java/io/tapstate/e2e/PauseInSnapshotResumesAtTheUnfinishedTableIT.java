@@ -150,12 +150,16 @@ class PauseInSnapshotResumesAtTheUnfinishedTableIT {
 
             // A durable synchronisation point rather than a sleep: the record itself is what says the two
             // tables are confirmed, and it is the only thing this test carries across the restart.
-            awaitCompleted(storeUri, Set.of(FIRST, SECOND));
+            long confirmationDeadline = System.nanoTime() + TIMEOUT.toNanos();
+            awaitCompleted(storeUri, Set.of(FIRST, SECOND), confirmationDeadline);
             assertThat(completedTables(storeUri))
                     .as("the third table is in no selection that has run, so nothing has confirmed it")
                     .doesNotContain(OWED);
 
-            confirmingRunReads = control.snapshotRowsRead(PIPELINE);
+            // Durable completion can precede its sampled metrics. Share the original bound and take the
+            // accepted sample before stopping; the original exact row-count assertions remain below.
+            confirmingRunReads = control.awaitSnapshotRowsRead(PIPELINE, Set.of(FIRST, SECOND),
+                    Duration.ofNanos(Math.max(0L, confirmationDeadline - System.nanoTime())));
 
             // Stopped without clearing: the pipeline has to be at rest before its selection can be widened,
             // and what it confirmed has to survive that. A clearing stop would give its record back and the
@@ -211,8 +215,7 @@ class PauseInSnapshotResumesAtTheUnfinishedTableIT {
     }
 
     /** Waits until the chain record names every table a sink is expected to have confirmed. */
-    private static void awaitCompleted(String storeUri, Set<String> expected) {
-        long deadline = System.nanoTime() + TIMEOUT.toNanos();
+    private static void awaitCompleted(String storeUri, Set<String> expected, long deadline) {
         List<String> last = List.of();
         while (System.nanoTime() - deadline < 0) {
             last = completedTables(storeUri);
@@ -225,9 +228,9 @@ class PauseInSnapshotResumesAtTheUnfinishedTableIT {
     }
 
     /**
-     * The later run's per-table read counts, once they stop moving. The map is published whole once the
-     * bounded round finishes, never part way through, so the wait is for the run to exist rather than for
-     * the reading to complete.
+     * The later run's per-table read counts, once they stop moving. Tables reach the sampled observation
+     * individually after their bounded reads finish; keep the original quiet window before taking the
+     * sample whose exact selected-table counts are asserted by the caller.
      */
     private static Map<String, Long> awaitSettledReads(ControlPlane control) {
         long deadline = System.nanoTime() + TIMEOUT.toNanos();

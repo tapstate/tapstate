@@ -1890,7 +1890,8 @@ final class ControlPlane {
      * <p>The per-run counter is read from the metrics face. The snapshot face reports completed load
      * progress across replacement runs, so it cannot say whether the live run read a table again. A
      * resumed run that skips a table reports zero here while the target still holds its earlier rows.
-     * Every selected table appears while its run is live; a missing key is a broken reading.
+     * Tables arrive individually after their bounded reads finish. This sampled observation can lag a
+     * sink's durable completion record, so callers needing several tables must wait for all of them.
      */
     Map<String, Long> snapshotRowsRead(String pipelineId) {
         HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/metrics"));
@@ -1914,6 +1915,17 @@ final class ControlPlane {
             }
         }
         return read;
+    }
+
+    /** The accepted sample itself, after every selected table has reached the metrics face. */
+    Map<String, Long> awaitSnapshotRowsRead(String pipelineId, Set<String> tables, Duration bound) {
+        AtomicReference<Map<String, Long>> observed = new AtomicReference<>(Map.of());
+        Await.until("snapshot read metrics for every selected table " + tables, bound, () -> {
+            Map<String, Long> sample = snapshotRowsRead(pipelineId);
+            observed.set(sample);
+            return sample.keySet().containsAll(tables);
+        }, () -> observed.get().toString());
+        return observed.get();
     }
 
     /**
