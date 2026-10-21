@@ -17,6 +17,7 @@ import io.tapstate.core.validation.ValidationRootCheck;
 import io.tapstate.core.validation.ValidationRunIdentity;
 import io.tapstate.core.validation.ValidationCheckEvent;
 import io.tapstate.runtime.engine.validation.ValidationRelationReader;
+import io.tapstate.runtime.engine.validation.ValidationRootReader;
 import io.tapstate.runtime.engine.validation.ValidationStaticMap;
 import java.time.Clock;
 import java.util.Optional;
@@ -202,6 +203,7 @@ class ValidationJdbcMongoReadIT {
             assertThat(checks).containsExactly("1:EQUAL", "2:[amount]:VALUE", "4:EQUAL", "5:[label]:VALUE");
             assertThat(fullChecks).containsExactly("1:EQUAL", "2:{TARGET_VALUE=1}", "4:{TARGET_EXTRA=1}", "5:{TARGET_VALUE=1}");
             verifyLookups(jdbc, mysql, kind, sourceRef, sourceSettings, targetRef, uri);
+            verifyRootReads(jdbc, mysql, kind, sourceRef, sourceSettings, targetRef, uri, projection);
             // These are fresh read-only sessions; no CDC slot or source mutation was needed.
             assertThat(sql(jdbc, mysql, "SELECT COUNT(*) FROM source_records;").trim()).isEqualTo("5");
             if (!mysql) {
@@ -235,6 +237,95 @@ class ValidationJdbcMongoReadIT {
                 }
             }
         }
+    }
+
+    private static void verifyRootReads(GenericContainer<?> jdbc, boolean mysql, String kind, ConnectorRef sourceRef,
+            Map<String, Object> sourceSettings, ConnectorRef targetRef, String uri, ValidationStaticMap projection) throws Exception {
+        var targetSettings = Map.<String, Object>of("uri", uri, "database", DATABASE, "isUri", true);
+        try (var queryIo = Executors.newSingleThreadExecutor(); var decodeIo = Executors.newSingleThreadExecutor()) {
+            var actual = new ArrayList<String>();
+            for (long id = 1; id <= 6; id++) {
+                var result = rootRead(kind, sourceRef, sourceSettings, targetRef, targetSettings, "source_records", "target_records", id,
+                        projection, Optional.empty(), queryIo, decodeIo);
+                actual.add(id + ":" + (result.observedAgreement() ? "EQUAL" : result.counts()));
+                assertThat(result.reads()).hasSize(2);
+            }
+            assertThat(actual).containsExactly("1:EQUAL", "2:{TARGET_VALUE=1}", "3:{TARGET_MISSING=1}",
+                    "4:{TARGET_EXTRA=1}", "5:{TARGET_VALUE=1}", "6:{TARGET_EXTRA=1}");
+        }
+        sql(jdbc, mysql, "CREATE TABLE root_check_records (source_key BIGINT NOT NULL, amount DECIMAL(30,0));"
+                + "INSERT INTO root_check_records VALUES (7," + (EXACT - 1) + "),(7," + EXACT + "),"
+                + "(8," + EXACT + "),(8," + EXACT + "),(9,NULL),(10," + EXACT + "),(11," + (EXACT - 1) + ");");
+        try (var observer = MongoClients.create(uri)) {
+            observer.getDatabase(DATABASE).getCollection("root_check_records").insertMany(
+                    List.of(7L, 8L, 9L, 10L, 10L, 11L).stream().map(id -> new Document("target_key", id).append("price", EXACT)).toList());
+        }
+        var mapped = ValidationStaticMap.compile("eligible-root", new TransformBody.MapProjection(
+                Map.of("target_key", FieldRule.rename("source_key"), "price", FieldRule.rename("amount"))), LIMITS);
+        var predicate = ValidationPredicateCompiler.compile("eligible", "after.price >= 9007199254740993",
+                new ValidationPredicate.Limits(LIMITS, 2000, false));
+        try (var queryIo = Executors.newSingleThreadExecutor(); var decodeIo = Executors.newSingleThreadExecutor()) {
+            var actual = new ArrayList<String>();
+            for (long id = 7; id <= 11; id++) {
+                var result = rootRead(kind, sourceRef, sourceSettings, targetRef, targetSettings, "root_check_records", "root_check_records", id,
+                        mapped, Optional.of(predicate), queryIo, decodeIo);
+                actual.add(id + ":" + (result.observedAgreement() ? "EQUAL" : result.counts()));
+                if (id == 8 || id == 9) {
+                    assertThat(result.targetPresence()).isEqualTo(ValidationRootCheck.TargetPresence.NOT_READ);
+                    assertThat(result.reads()).singleElement().satisfies(read -> assertThat(read.side()).isEqualTo(ValidationRootCheck.Side.SOURCE));
+                }
+            }
+            assertThat(actual).containsExactly("7:EQUAL", "8:{SOURCE_DUPLICATE=1}", "9:{SOURCE_FIELD_INVALID=1}",
+                    "10:{TARGET_DUPLICATE=1}", "11:{TARGET_EXTRA=1}");
+        }
+    }
+
+    private static ValidationRootCheck rootRead(String kind, ConnectorRef sourceRef, Map<String, Object> sourceSettings,
+            ConnectorRef targetRef, Map<String, Object> targetSettings, String sourceTable, String targetTable, long id,
+            ValidationStaticMap projection, Optional<ValidationPredicate> predicate, ExecutorService queryIo, ExecutorService decodeIo) {
+        var logical = new ValidationKey(List.of(ValidationKey.Part.number(id)));
+        var observation = new ValidationObservation(new ValidationRunIdentity(new ValidationOwner("cluster", "pipeline", "node", "boot", 1, 1, 0),
+                "task", "native-roots-" + kind, ValidationMode.FULL, "fixed-projection", 1, "rules"),
+                new ValidationRoot("mapping", "output", logical, List.of()), 1);
+        var generated = ValidationFieldCheck.generatedId(observation.run(), "mapping", "output", true, false, false,
+                value -> value instanceof ValidationValues.Typed typed && typed.logicalType().equals("text") && typed.value() instanceof String);
+        return ValidationRootReader.read(observation, ValidationMethod.FULL_COLUMN,
+                new ValidationRootReader.Query("source", "native-root-v1", () -> rootLookup(kind, sourceRef, sourceSettings, sourceTable, "source_key", logical, queryIo, decodeIo)),
+                new ValidationRootReader.Query("target", "native-root-v1", () -> rootLookup("mongodb", targetRef, targetSettings, targetTable, "target_key", logical, queryIo, decodeIo)),
+                new ValidationRelationRows.Limits(65536, LIMITS), new ValidationRootCheck.Limits(1024 * 1024, 100, 100, 20, 4),
+                Clock.systemUTC(), () -> {}, original -> {
+                    var working = projection.apply(original);
+                    var evaluated = predicate.map(rule -> rule.evaluate(working)).orElse(new ValidationPredicate.Result(true, null));
+                    var disposition = evaluated.problem() != null ? ValidationRelationRows.Disposition.INDETERMINATE
+                            : evaluated.matches() ? ValidationRelationRows.Disposition.INCLUDED : ValidationRelationRows.Disposition.EXCLUDED;
+                    var actual = key(original, "source_key", kind).physical();
+                    var physical = new ValidationPhysicalIdentity(actual.sourceId(), DATABASE, actual.schema(), sourceTable, actual.keyFields(), actual.actualKey());
+                    var issues = evaluated.problem() == null ? List.<ValidationRootCheck.Finding>of() : List.of(new ValidationRootCheck.Finding(
+                            evaluated.problem().kind() == ValidationPredicate.ProblemKind.MISSING_FIELD ? ValidationRootCheck.Kind.SOURCE_FIELD_MISSING
+                                    : ValidationRootCheck.Kind.SOURCE_FIELD_INVALID, new ValidationRootCheck.Location(observation.root(), evaluated.problem().path())));
+                    return new ValidationRootReader.Source(new ValidationRelationReader.Evaluation(disposition, working, Optional.of(physical)), issues);
+                }, original -> {
+                    var actual = key(original, "target_key", "mongodb").physical();
+                    return new ValidationRootReader.Target(original,
+                            new ValidationPhysicalIdentity(actual.sourceId(), DATABASE, null, targetTable, actual.keyFields(), actual.actualKey()));
+                }, (pair, root) -> ValidationFieldCheck.check(observation, List.of(), pair.source().working(), pair.target().working(),
+                        pair.sourceSample(), pair.targetSample(), generated, String::equals, new ValidationValueComparison.TraversalLimits(LIMITS, 10000), root));
+    }
+
+    private static ValidationRowCursor rootLookup(String kind, ConnectorRef artifact, Map<String, Object> settings, String table,
+            String keyField, ValidationKey logical, ExecutorService queryIo, ExecutorService decodeIo) {
+        var binding = new ValidationKeyBinding("root", List.of(new ValidationKeyBinding.Component(List.of(keyField),
+                ValidationKey.Kind.EXACT_NUMBER, Set.of("exact-number"))), Set.of(), LIMITS);
+        return PdkValidationSession.lookup(kind, artifact, settings, "retained-" + kind + "-artifact",
+                new PdkValidationSession.Lookup(table, List.of(), List.of(), 2, binding, logical),
+                (model, codecs) -> new PdkValidationRows(model, codecs, path -> {
+                    if (path.size() == 1 && List.of(keyField, "amount", "price", "fractional").contains(path.getFirst()))
+                        return PdkValidationRows.Rule.of(PdkValidationRows.Shape.EXACT_NUMBER);
+                    if (path.equals(List.of("local_time"))) return PdkValidationRows.Rule.of(PdkValidationRows.Shape.LOCAL_DATE_TIME);
+                    if (path.equals(List.of("body"))) return PdkValidationRows.Rule.of(PdkValidationRows.Shape.JSON);
+                    return PdkValidationRows.Rule.AUTO;
+                }, LIMITS), (model, codecs, key) -> Map.of(keyField, key.parts().getFirst().value()),
+                () -> {}, queryIo, decodeIo, 1, LIMITS);
     }
 
     private static void verifyLookups(GenericContainer<?> jdbc, boolean mysql, String kind, ConnectorRef sourceRef,

@@ -203,6 +203,7 @@ public final class ValidationRootCheck {
         private final Set<Skipped> skipped = new LinkedHashSet<>();
         private final Map<ReadKey, Read> reads = new LinkedHashMap<>();
         private final List<Sample> samples = new ArrayList<>();
+        private final Set<String> pendingSourceReads = new LinkedHashSet<>();
         private final ValidationFailureLatch failure = new ValidationFailureLatch();
         private long bytes;
         private boolean samplesTruncated;
@@ -232,7 +233,7 @@ public final class ValidationRootCheck {
             return mutate(() -> {
                 Objects.requireNonNull(participation, "participation");
                 Objects.requireNonNull(targetPresence, "targetPresence");
-                if (!outcomePending || reads.values().stream().noneMatch(read -> read.side() == Side.SOURCE)
+                if (!outcomePending || !pendingSourceReads.isEmpty() || reads.values().stream().noneMatch(read -> read.side() == Side.SOURCE)
                         || targetPresence == TargetPresence.NOT_READ && participation != Participation.UNKNOWN) {
                     throw ValidationError.invalid("rootCheck.outcome");
                 }
@@ -273,20 +274,43 @@ public final class ValidationRootCheck {
                 if (reads.size() == limits.reads()) throw limit("reads");
                 charge(256L + textBytes(boundary.readId()) + textBytes(boundary.contractVersion()));
                 reads.put(key, read);
+                if (side == Side.SOURCE) pendingSourceReads.remove(boundary.readId());
             });
         }
 
         /** Each call records one observed finding, not one confirmed root or one duplicate row. */
         public Builder finding(Finding finding, Optional<SampledSide> source, Optional<SampledSide> target) {
+            return addFinding(finding, source, target, false);
+        }
+
+        /**
+         * Retains a source issue during an unfinished read. Only source-only staging accepts it;
+         * every referenced read must subsequently complete before the outcome can be bound, even
+         * when the diagnostic sample is dropped. Cancellation or read failure must close staging.
+         */
+        public Builder sourceFinding(Finding finding, Optional<SampledSide> source) {
+            return addFinding(finding, source, Optional.empty(), true);
+        }
+
+        private Builder addFinding(Finding finding, Optional<SampledSide> source, Optional<SampledSide> target, boolean pendingRead) {
             return mutate(() -> {
                 Objects.requireNonNull(finding, "finding");
                 Objects.requireNonNull(source, "source");
                 Objects.requireNonNull(target, "target");
-                if (outcomePending && (!finding.kind().sourceProblem() || target.isPresent())) {
+                if (pendingRead && (!outcomePending || !finding.kind().sourceProblem())
+                        || outcomePending && (!finding.kind().sourceProblem() || target.isPresent())) {
                     throw ValidationError.invalid("rootCheck.sourceOnly");
                 }
                 sameRoot(finding.location());
-                source.ifPresent(side -> sampleRead(Side.SOURCE, side));
+                source.ifPresent(side -> {
+                    if (pendingRead && !reads.containsKey(new ReadKey(Side.SOURCE, side.readId()))) {
+                        if (!pendingSourceReads.contains(side.readId())) {
+                            if (pendingSourceReads.size() == limits.reads()) throw limit("reads");
+                            charge(64L + textBytes(side.readId()));
+                            pendingSourceReads.add(side.readId());
+                        }
+                    } else sampleRead(Side.SOURCE, side);
+                });
                 target.ifPresent(side -> sampleRead(Side.TARGET, side));
                 if (method == ValidationMethod.UNIQUE_KEY && finding.kind().valueCheck()) {
                     throw ValidationError.invalid("rootCheck.method");
@@ -440,7 +464,7 @@ public final class ValidationRootCheck {
         private void fail(Throwable cause) { failure.record(cause); close(); }
         @Override public void close() {
             closed = true;
-            checks.clear(); findings.clear(); counts.clear(); blocked.clear(); skipped.clear(); reads.clear(); samples.clear();
+            checks.clear(); findings.clear(); counts.clear(); blocked.clear(); skipped.clear(); reads.clear(); samples.clear(); pendingSourceReads.clear();
         }
         private record ReadKey(Side side, String id) {}
     }
