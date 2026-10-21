@@ -106,8 +106,13 @@ jobs:
         env:
           SHARD: ${{ matrix.shard }}
           # The pinned client otherwise selects an API version current runners reject.
-          MAVEN_ARGS: -Dapi.version=1.44
-        run: .github/scripts/ci-shard.sh run --plan "$RUNNER_TEMP/shards.json" --shard "$SHARD" --repo-local "$RUNNER_TEMP/m2"
+          # Cloud fixtures must share the release-input filesystem for hard links and space.
+          MAVEN_ARGS: >-
+            -Dapi.version=1.44
+            -Dtapstate.it.jvmArgs=-Djava.io.tmpdir=${{ runner.temp }}/test-tmp
+        run: |
+          mkdir -p "$RUNNER_TEMP/test-tmp"
+          .github/scripts/ci-shard.sh run --plan "$RUNNER_TEMP/shards.json" --shard "$SHARD" --repo-local "$RUNNER_TEMP/m2"
       - name: Preserve downloaded dependencies
         if: always()
         run: .github/scripts/ci-maven-cache.sh collect "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
