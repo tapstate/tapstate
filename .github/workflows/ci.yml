@@ -28,10 +28,6 @@ on:
 
   workflow_dispatch:
 
-# Pass the Docker API setting through Maven without changing child CLI output.
-env:
-  MAVEN_ARGS: "-Dapi.version=1.44"
-
 permissions:
   contents: read
   pull-requests: write
@@ -135,6 +131,7 @@ jobs:
           .github/scripts/ci-evidence.sh export-hashes --input "$RUNNER_TEMP/resolved-inventory.json" --output "$RUNNER_TEMP/ci-inputs/expected-case-hashes.json"
       - name: Execute exactly this shard
         env:
+          MAVEN_ARGS: "-Dapi.version=1.44"
           SHARD: ${{ matrix.shard }}
           GH_TOKEN: ${{ github.token }}
         run: .github/scripts/ci-pr-work.sh --root . --event-inputs "$RUNNER_TEMP/ci-event-inputs.json" --output "$RUNNER_TEMP/ci-inputs/pr-work-verify.json" --phase verify -- .github/scripts/ci-shard.sh run --plan "$RUNNER_TEMP/shards.json" --shard "$SHARD" --repo-local "$RUNNER_TEMP/m2" --case-evidence --build-inputs "$RUNNER_TEMP/ci-inputs/build-inputs.json" --class-gate-dir "$RUNNER_TEMP/ci-inputs/class-gates" --runtime-class-dir "$RUNNER_TEMP/ci-runtime-bytecode"

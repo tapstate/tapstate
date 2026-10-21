@@ -30,8 +30,13 @@ def jobs(text):
 
 
 def check(workflows, contexts, inputs):
-    assert re.search(r'^env:\n  MAVEN_ARGS: "-Dapi\.version=1\.44"\n', workflows['ci.yml'], re.M), \
-        'hosted Docker API compatibility must reach every Maven and fork JVM'
+    assert not re.search(r'^(?: {2}| {6})MAVEN_ARGS:', workflows['ci.yml'], re.M), \
+        'Docker API configuration must not enter unrelated job or connector environments'
+    execute = re.search(r'(?ms)^      - name: Execute exactly this shard\n(.*?)(?=^      - |\Z)', workflows['ci.yml'])
+    assert execute and re.search(r'^        env:\n          MAVEN_ARGS: "-Dapi\.version=1\.44"\n', execute[1], re.M), \
+        'Docker API configuration must reach only the selected Maven verify and its test forks'
+    assert workflows['ci.yml'].count('MAVEN_ARGS:') == 1 and 'JAVA_TOOL_OPTIONS:' not in workflows['ci.yml'], \
+        'Docker API configuration must not leak into other steps or JVM child output'
     ci = jobs(workflows['ci.yml'])
     plan = ci.get('shard-plan', '')
     assert 'ci-receipt.sh event-inputs' in plan and '${{ runner.temp }}/ci-event-inputs.json' in plan, \
@@ -180,8 +185,10 @@ assert contexts, 'required context list is empty'
 check(workflows, contexts, inputs)
 mutations = 0
 for original, replacement in [
-    ('  MAVEN_ARGS: "-Dapi.version=1.44"', ''),
-    ('  MAVEN_ARGS: "-Dapi.version=1.44"', '  MAVEN_ARGS: "-Dapi.version=1.32"'),
+    ('          MAVEN_ARGS: "-Dapi.version=1.44"', ''),
+    ('          MAVEN_ARGS: "-Dapi.version=1.44"', '          MAVEN_ARGS: "-Dapi.version=1.32"'),
+    ('          MAVEN_ARGS: "-Dapi.version=1.44"', '    env:\n      MAVEN_ARGS: "-Dapi.version=1.44"'),
+    ('permissions:\n', 'env:\n  MAVEN_ARGS: "-Dapi.version=1.44"\npermissions:\n'),
     ('ci-receipt.sh event-inputs', 'echo event-capture-removed'),
     ('${{ runner.temp }}/ci-event-inputs.json', '${{ runner.temp }}/missing-event.json'),
     ('matrix: ${{ steps.plan.outputs.matrix }}', 'matrix: wrong-output'),

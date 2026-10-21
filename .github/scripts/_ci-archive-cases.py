@@ -220,7 +220,8 @@ def project(refs, root, request, include_test_observations=False):
             require(Counter(g.canonical(r) for r in producer_known) == Counter(g.canonical(r) for r in derived['cases']),
                     'producer static case identities/skip policy differ from source')
             prepared = members['build-inputs.json']
-            binding = {'run_id': readback['scope']['run_id'], 'run_attempt': readback['scope']['run_attempt'], 'source_sha': checkout}
+            binding = {'run_id': readback['scope']['run_id'],
+                       'run_attempt': readback['worker_producers'][name]['run_attempt'], 'source_sha': checkout}
             require(type(actual.get('schema')) is int and actual['schema'] == 1 and actual.get('type') == 'observed-case-hashes'
                     and g.origin(actual.get('input_binding')) == binding
                     and actual.get('inputs_sha256') == g.checksum(prepared)

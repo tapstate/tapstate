@@ -361,6 +361,15 @@ def project(refs, root, request):
             == {'ci-inputs-' + n for n in worker_names | {'build'}}, 'input artifact shard set differs')
     require({n for n in archive.artifacts if n.startswith('ci-test-results-')}
             == {'ci-test-results-' + n for n in worker_names}, 'result artifact shard set differs')
+    if scope['run_attempt'] > 1:
+        run = archive.json('run.json')
+        attempts = g.receipt.archived_attempt_history(run, archive.receipt['files'], archive.raw, g.json_bytes)
+        producers = g.receipt.selected_worker_producers(run, attempts, [worker['id'] for worker in plan['shards']])
+    else:
+        producers = {worker['id']: {'run_attempt': 1, 'job_id': None, 'latest_job_proven': False}
+                     for worker in plan['shards']}
+    producer_scopes = {name: {**scope, 'run_attempt': value['run_attempt']} for name, value in producers.items()}
+    producer_scopes['build'] = scope
     pre, post, raw, results = {}, {}, {}, {}
     provider_members, result_payloads = {}, {}
     for name in ['build', *[w['id'] for w in plan['shards']]]:
@@ -368,13 +377,13 @@ def project(refs, root, request):
         if name != 'build':
             provider_members[name] = inputs
         raw[name] = inputs['build-inputs.json']
-        pre[name] = snapshot(g.json_bytes(raw[name]), scope, checkout, tree, sources, 'pre-test-after-install', poms)
+        pre[name] = snapshot(g.json_bytes(raw[name]), producer_scopes[name], checkout, tree, sources, 'pre-test-after-install', poms)
         g.receipt.input_runner_context(pre[name], name, scope['repository'])
         g.receipt.maven_observation_fact(pre[name], name, scope['repository'])
         if 'resolved_maven_artifacts' in pre[name]:
             maven_artifacts.validate(pre[name]['resolved_maven_artifacts'], pre[name], lambda path: poms[path])
         if name != 'build':
-            post[name] = snapshot(g.json_bytes(inputs['post-test-inputs.json']), scope, checkout, tree, sources,
+            post[name] = snapshot(g.json_bytes(inputs['post-test-inputs.json']), producer_scopes[name], checkout, tree, sources,
                                   'post-test-before-pack', poms)
             g.receipt.input_runner_context(post[name], name, scope['repository'])
             g.receipt.maven_observation_fact(post[name], name, scope['repository'])
@@ -401,10 +410,11 @@ def project(refs, root, request):
     for worker in plan['shards']:
         name = worker['id']
         result_payloads[name] = archive.artifact('ci-test-results-' + name)
-        results[name] = result_read(result_payloads[name], worker, plan, binding, raw[name], post[name])
+        worker_binding = {**binding, 'run_attempt': producers[name]['run_attempt']}
+        results[name] = result_read(result_payloads[name], worker, plan, worker_binding, raw[name], post[name])
     test_jar_facts = test_jar_readback(plan, pre, post, results, poms)
     provider = g.module('provider_archive_readback', '_ci-provider-readback.py').project(
-        archive, plan, pre, post, provider_members, result_payloads, sources, archive.raw('checkout-source.tar'), zip_read)
+        archive, plan, pre, post, provider_members, result_payloads, sources, archive.raw('checkout-source.tar'), zip_read, producers)
     aggregate = archive.artifact('ci-aggregate')
     # The aggregate is retained in the readback chain, but merged report semantics
     # and complete provider identities still require their dedicated comparator.
@@ -431,7 +441,8 @@ def project(refs, root, request):
             'resolved_test_classpaths': dependency, 'resolved_classpath_digest': g.checksum(g.canonical(dependency)),
             'observed_toolchain': observed['toolchain'], 'plan': plan,
             'independent_input_replay': equality, 'input_member_hashes': input_hashes,
-            'results': results, 'aggregate_member_count': len(aggregate), 'artifact_members': archive.members,
+            'results': results, 'worker_producers': producers,
+            'aggregate_member_count': len(aggregate), 'artifact_members': archive.members,
             'archived_input_members_verified': True, 'whole_build_provenance_complete': False,
             'whole_input_projection_verified': False, 'first_complete_PR_sample': False, 'performance_accepted': False,
             'unverified_components': sorted(missing), 'input_files': refs.finish()}

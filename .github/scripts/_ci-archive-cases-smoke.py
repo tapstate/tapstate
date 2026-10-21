@@ -222,7 +222,7 @@ def controls(f):
     print('CI archive case controls passed: ' + str(count))
 
 
-def two_worker_controls(f):
+def two_worker_controls(f, verify=True):
     data = f['root'] / 'two-worker-producer'
     data.mkdir()
     source_path = data / 'source.json'
@@ -247,7 +247,8 @@ def two_worker_controls(f):
             m.data_file(target, path, raw if isinstance(raw, bytes) else fixture.encode(raw))
         input_path = m.data_file(target, 'inputs.json', prepared)
         binding_path = m.data_file(target, 'binding.json', fixture.encode(
-            {'source_sha': f['merge'], 'run_id': 42, 'attempt': 1}))
+            {'source_sha': f['merge'], 'run_id': int(members['build-inputs.json']['run_id']),
+             'attempt': int(members['build-inputs.json']['run_attempt'])}))
         gates = target / 'gates'
         gates.mkdir()
         obs_path, hashes_path = target / 'observations.json', target / 'hashes.json'
@@ -264,6 +265,8 @@ def two_worker_controls(f):
     f['reseal']()
     request = {'schema': 1, 'type': 'archive-cases-request',
                'archive_inputs': f['save']('two-worker-request.json', f['request'])}
+    if not verify:
+        return request
     answer = m.project(g.References(f['evidence']), f['work'], request, include_test_observations=True)
     check(answer['all_source_cases_statically_parsed'] and len(answer['workers']) == 2,
           'same source and different worker capture metadata are valid')

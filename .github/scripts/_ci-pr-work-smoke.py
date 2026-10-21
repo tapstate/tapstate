@@ -127,7 +127,7 @@ with tempfile.TemporaryDirectory(prefix='ci-pr-work-') as temporary:
     original_query = w.query
     for values, state in [([{'head_sha': head, 'base_sha': base}] * 2, 'current'),
                           ([{'head_sha': 'f'*40, 'base_sha': base}] * 2, 'obsolete'),
-                          ([{'head_sha': head, 'base_sha': 'f'*40}] * 2, 'obsolete'),
+                          ([{'head_sha': head, 'base_sha': 'f'*40}] * 2, 'current'),
                           ([{'head_sha': head, 'base_sha': base}, {'head_sha': 'f'*40, 'base_sha': base}], 'unknown')]:
         iterator = iter(values)
         w.query = lambda _: next(iterator)
@@ -162,6 +162,19 @@ with tempfile.TemporaryDirectory(prefix='ci-pr-work-') as temporary:
         w.probe = lambda _: {'state': 'unknown'}
         check(w.supervise(argv, repo, expected, root / 'unknown.json', 'prepare', interval=0.02) == 0
               and marker.read_text() == 'ran', 'unknown API state never terminates work')
+        # Observe a base-only advance while a real owned command is active.
+        base_started, base_observed = root/'base-started', root/'base-observed'
+        def base_while_running(_):
+            if base_started.exists():
+                base_observed.touch()
+                return {'head_sha':head,'base_sha':'f'*40}
+            return {'head_sha':head,'base_sha':base}
+        w.query=base_while_running;w.probe=original_probe
+        code='from pathlib import Path; import sys,time; a,b=map(Path,sys.argv[1:]); a.touch(); deadline=time.monotonic()+5\nwhile not b.exists() and time.monotonic()<deadline: time.sleep(0.01)\nassert b.exists()'
+        check(w.supervise([sys.executable,'-c',code,str(base_started),str(base_observed)],repo,expected,
+                          root/'base-during.json','verify',interval=0.01)==0 and base_observed.exists(),
+              'a base-only update preserves an already running current-head command')
+        w.query=original_query
         w.probe = lambda _: {'state': 'current'}
         check(w.supervise([sys.executable, '-c', 'raise SystemExit(23)'], repo, expected,
                            root / 'failed.json', 'verify', interval=0.02) == 23, 'original command failure is preserved')
@@ -415,7 +428,7 @@ time.sleep(30)
     for name, data, extra, expected_exit in [
         ('current', live(), {}, 0),
         ('obsolete', live(head_sha='f'*40), {}, w.OBSOLETE),
-        ('base-advanced', live(base_sha='f'*40), {}, w.OBSOLETE),
+        ('base-advanced', live(base_sha='f'*40), {}, 0),
         ('unavailable', live(), {'FAKE_API_FAIL': 'true'}, 0),
         ('malformed', {'private_body': 'must-not-leak'}, {}, 0),
     ]:

@@ -407,7 +407,7 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
         archive_extra_files = {}
 
         def archive():
-            values = {'run.json': {'id': run_id, 'run_attempt': 1, 'head_sha': anchor, 'head_branch': scope['branch'],
+            values = {'run.json': {'id': run_id, 'run_attempt': scope['run_attempt'], 'head_sha': anchor, 'head_branch': scope['branch'],
                                   'event': scope['event'], 'repository': {'full_name': scope['repository']},
                                   'pull_requests': ([{'number': 7, 'head': {'sha': anchor}, 'base': {'sha': base}}]
                                                     if event_name == 'pull_request' else [])},
@@ -440,7 +440,7 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
             files = {p.relative_to(directory).as_posix(): {'size': p.stat().st_size, 'sha256': g.checksum(p.read_bytes())}
                      for p in directory.rglob('*') if p.is_file() and p.name != 'receipt.json'}
             return save('run/receipt.json', {'schema': 1, 'archive_root': str(directory), 'repository': scope['repository'],
-                        'run_id': run_id, 'run_attempt': 1, 'event': scope['event'], 'source_sha': anchor,
+                        'run_id': run_id, 'run_attempt': scope['run_attempt'], 'event': scope['event'], 'source_sha': anchor,
                         'checkout_sha': merge, 'archive_complete': True, 'gaps': [],
                         'purpose': 'offline archive protocol fixture, not CI success or producer proof', 'files': files})
 

@@ -1008,6 +1008,58 @@ def event_inputs(args):
     write(Path(args.output), value)
 
 
+def archived_attempt_history(run, files, raw, parse_json):
+    """Read complete original attempt runs and paginated job records from bound bytes."""
+    current = run['run_attempt']
+    require(type(current) is int and 1 <= current <= 100, 'invalid archived attempt count')
+    attempts, seen = [], set()
+    for number in range(1, current + 1):
+        prefix = f'attempt-{number}/'
+        previous = parse_json(raw(prefix + 'run.json'))
+        require(type(previous.get('run_attempt')) is int and previous['run_attempt'] == number
+                and previous.get('status') == 'completed'
+                and previous.get('repository', {}).get('full_name') == run['repository']['full_name']
+                and all(previous.get(key) == run.get(key) for key in
+                        ('id', 'event', 'head_sha', 'head_branch', 'path')), 'archived producer attempt scope differs')
+        names = sorted((name for name in files if re.fullmatch(re.escape(prefix) + r'jobs-[0-9]+\.json', name)),
+                       key=lambda name: int(name.rsplit('-', 1)[1].split('.')[0]))
+        require(names and names == [prefix + f'jobs-{i}.json' for i in range(1, len(names) + 1)],
+                'archived producer job pages are incomplete')
+        jobs, total = [], None
+        for name in names:
+            page = parse_json(raw(name))
+            require(type(page.get('total_count')) is int and isinstance(page.get('jobs'), list)
+                    and (total is None or total == page['total_count']), 'archived producer job count differs')
+            total = page['total_count']; jobs.extend(page['jobs'])
+        require(len(jobs) == total, 'archived producer job count differs')
+        for job in jobs:
+            require(type(job.get('id')) is int and job['id'] > 0 and job['id'] not in seen
+                    and type(job.get('run_id')) is int and job['run_id'] == run['id']
+                    and type(job.get('run_attempt')) is int and job['run_attempt'] == number
+                    and job.get('head_sha') == run['head_sha'] and job.get('status') == 'completed',
+                    'archived producer job scope differs')
+            seen.add(job['id'])
+        attempts.append({'run': previous, 'jobs': jobs})
+    return attempts
+
+
+def selected_worker_producers(run, attempts, workers):
+    """Select the latest actual job for every worker, never an older successful fallback."""
+    require(len(attempts) == run['run_attempt'], 'worker producer history is incomplete')
+    found = {}
+    for observed in attempts:
+        for worker in workers:
+            jobs = [job for job in observed['jobs'] if job.get('name') == f'test-shards ({worker})'
+                    and job.get('conclusion') != 'skipped']
+            require(len(jobs) <= 1, 'worker producer job is ambiguous: ' + worker)
+            if jobs:
+                found[worker] = jobs[0]
+    require(set(found) == set(workers), 'worker producer job is missing')
+    require(all(job['conclusion'] == 'success' for job in found.values()), 'latest worker producer did not succeed')
+    return {name: {'run_attempt': job['run_attempt'], 'job_id': job['id'], 'latest_job_proven': True}
+            for name, job in found.items()}
+
+
 def event_planner_binding(run, event, attempts):
     """Bind a retained capture to the latest actual successful planner producer."""
     current, producer = run['run_attempt'], event['run_attempt']

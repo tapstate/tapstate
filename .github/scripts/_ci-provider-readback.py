@@ -63,8 +63,10 @@ class Source:
         self.archive.close()
 
 
-def jobs(archive):
-    prefix = 'attempt-' + str(archive.scope['run_attempt']) + '/'
+def jobs(archive, producer_attempt=None):
+    attempt = archive.scope['run_attempt'] if producer_attempt is None else producer_attempt
+    require(type(attempt) is int and 1 <= attempt <= archive.scope['run_attempt'], 'invalid provider producer attempt')
+    prefix = 'attempt-' + str(attempt) + '/'
     pages = sorted((name for name in archive.receipt['files'] if re.fullmatch(re.escape(prefix)+r'jobs-[1-9][0-9]*\.json', name)),
                    key=lambda name: int(name.rsplit('-', 1)[1].split('.')[0]))
     require(pages and pages == [prefix+'jobs-'+str(i)+'.json' for i in range(1,len(pages)+1)], 'provider step job pages missing')
@@ -79,7 +81,7 @@ def jobs(archive):
     for row in found:
         require(type(row.get('id')) is int and row['id'] > 0 and type(row.get('run_id')) is int
                 and row['run_id'] == archive.scope['run_id'] and type(row.get('run_attempt')) is int
-                and row['run_attempt'] == archive.scope['run_attempt'] and row.get('status') == 'completed', 'foreign or unfinished provider job')
+                and row['run_attempt'] == attempt and row.get('status') == 'completed', 'foreign or unfinished provider job')
     return found, prefix
 
 
@@ -199,7 +201,9 @@ def read_capture(archive, worker, members, before, after, source, source_hashes,
             'provider capture claims unsupported completeness or projection')
     binding = value['binding']
     require(set(binding)=={'source_sha','source_tree','run_id','run_attempt','event'}
-            and g.origin(binding)=={'run_id':archive.scope['run_id'],'run_attempt':archive.scope['run_attempt'],'source_sha':before['source_sha']}
+            and g.origin(binding)==g.origin(before)==g.origin(after)
+            and g.origin(binding)['run_id']==archive.scope['run_id']
+            and 1 <= g.origin(binding)['run_attempt'] <= archive.scope['run_attempt']
             and binding['source_tree']==before['source_tree']
             and binding['event']==before['event']==archive.scope['event']
             and binding['event'] in ('pull_request','workflow_dispatch')
@@ -357,7 +361,7 @@ def workflow_recipe(text, capture=True):
     return commands == wanted and any(step[1] == EXECUTE and step.start() > selected[0].start() for step in steps)
 
 
-def project(archive, plan, pre, post, input_members, payloads, source_hashes, source_raw, zip_reader):
+def project(archive, plan, pre, post, input_members, payloads, source_hashes, source_raw, zip_reader, producers=None):
     with_source=Source(source_raw,source_hashes)
     try:
         workflow=with_source.read('.github/workflows/ci.yml').decode()
@@ -369,10 +373,21 @@ def project(archive, plan, pre, post, input_members, payloads, source_hashes, so
         workers={worker['id'] for worker in plan['shards']}
         require(required and set(present)==workers,'provider receipt set differs from original workflow/worker set')
         inventory, original_sha = original_inventory(source_raw,plan['source_sha'])
-        all_jobs,prefix=jobs(archive)
-        log_files,_=zip_reader(archive.raw(prefix+'logs.zip'))
-        return {name:read_capture(archive,name,input_members[name],pre[name],post[name],with_source,source_hashes,payloads,all_jobs,log_files,inventory,original_sha)
-                for name in sorted(workers)}
+        cache, result = {}, {}
+        for name in sorted(workers):
+            attempt = (producers[name]['run_attempt'] if producers is not None else archive.scope['run_attempt'])
+            require(g.origin(pre[name])['run_attempt'] == attempt, 'provider input producer differs')
+            if attempt not in cache:
+                all_jobs, prefix = jobs(archive, attempt)
+                log_files, unused = zip_reader(archive.raw(prefix+'logs.zip'))
+                cache[attempt] = all_jobs, log_files
+            all_jobs, log_files = cache[attempt]
+            if producers is not None and producers[name]['latest_job_proven']:
+                require(any(job['id'] == producers[name]['job_id'] and job['name'] == f'test-shards ({name})'
+                            for job in all_jobs), 'provider selected producer job differs')
+            result[name] = read_capture(archive,name,input_members[name],pre[name],post[name],with_source,
+                                       source_hashes,payloads,all_jobs,log_files,inventory,original_sha)
+        return result
     finally:
         with_source.close()
 

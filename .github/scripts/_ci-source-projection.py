@@ -148,24 +148,8 @@ def project(refs, root, request):
         return files
 
     def planner_binding(event):
-        attempts = []
-        if run['run_attempt'] > 1:
-            for number in range(1, run['run_attempt'] + 1):
-                prefix = f'attempt-{number}/'
-                previous = groups.json_bytes(raw(prefix + 'run.json'))
-                pages = sorted((name for name in archive['files'] if re.fullmatch(
-                    re.escape(prefix) + r'jobs-[0-9]+\.json', name)),
-                    key=lambda name: int(name.rsplit('-', 1)[1].split('.')[0]))
-                require(pages and pages == [prefix + f'jobs-{i}.json' for i in range(1, len(pages) + 1)],
-                        'retained planner job pages are incomplete')
-                jobs, total = [], None
-                for name in pages:
-                    page = groups.json_bytes(raw(name))
-                    require(type(page.get('total_count')) is int and isinstance(page.get('jobs'), list)
-                            and (total is None or total == page['total_count']), 'retained planner job count differs')
-                    total = page['total_count']; jobs.extend(page['jobs'])
-                require(len(jobs) == total, 'retained planner job count differs')
-                attempts.append({'run': previous, 'jobs': jobs})
+        attempts = (groups.receipt.archived_attempt_history(run, archive['files'], raw, groups.json_bytes)
+                    if run['run_attempt'] > 1 else [])
         return groups.receipt.event_planner_binding(run, event, attempts)
 
     tree = recipe['variant_trees'][scope['variant']]

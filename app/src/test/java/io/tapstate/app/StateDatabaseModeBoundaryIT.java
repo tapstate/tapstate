@@ -143,7 +143,8 @@ class StateDatabaseModeBoundaryIT {
                     "--tapstate.cloud.atlas-uri=" + MONGO.getReplicaSetUrl(database),
                     "--tapstate.cloud.cluster-id=state-mode-cluster"));
         }
-        context = new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated())
+        context = new SpringApplicationBuilder(Bootstrap.class)
+                .initializers(CloudConnectorTestInputs::reportCapabilityFailures).environment(CloudFixtureEnvironment.isolated())
                 .run(args.toArray(String[]::new));
     }
 

@@ -73,7 +73,8 @@ def probe(expected):
         first, second = query(expected), query(expected)
         if first != second:
             return {'state': 'unknown', 'reason': 'PR changed during readback'}
-        same = all(first[k] == expected[k] for k in ('head_sha', 'base_sha'))
+        # Base updates do not schedule replacement PR work; only a new head supersedes it.
+        same = first['head_sha'] == expected['head_sha']
         return {'state': 'current' if same else 'obsolete', **first}
     except (ValueError, OSError, KeyError, TypeError, json.JSONDecodeError, subprocess.TimeoutExpired):
         # Unknown state never authorizes terminating work. Do not echo API bodies or credentials.
