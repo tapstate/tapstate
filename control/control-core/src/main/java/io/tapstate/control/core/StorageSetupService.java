@@ -51,6 +51,10 @@ public final class StorageSetupService {
         SourceResource definition(StorageBinding.Connection master, String sourceId);
         void test(StorageBinding.Connection master, SourceResource source, ConnectorIdentity original);
     }
+    /** The installation owner hands CONFIG over only after the original three layer proofs pass. */
+    public interface ConfigurationPreparation {
+        void prepare(StorageSetupScope expected, Candidate tested, Runnable requireCurrent);
+    }
     public record TestResult(Layer layer, String testStamp, Instant expiresAt, List<String> checks) {
         public TestResult { checks = List.copyOf(checks); }
     }
@@ -73,6 +77,7 @@ public final class StorageSetupService {
     private final EnumMap<Layer,Tested> tests = new EnumMap<>(Layer.class);
     private StorageBindingCommit pending;
     private final java.util.function.Function<Supplier<Status>,Status> commitOwner;
+    private final ConfigurationPreparation configurationPreparation;
 
     public StorageSetupService(StorageBinding.Mode mode, StorageBindingStore bindings, StorageSetupStateStore states,
             StorageConnectionProbe probe, DefaultTarget target, Supplier<Optional<StorageBinding.Connection>> configuration,
@@ -91,6 +96,14 @@ public final class StorageSetupService {
             StorageConnectionProbe probe, DefaultTarget target, Supplier<Optional<StorageBinding.Connection>> configuration,
             AuditGate audit, Clock clock, Runnable operationActive,
             java.util.function.Consumer<StorageBindingCommit> continuation, java.util.function.Function<Supplier<Status>,Status> commitOwner) {
+        this(mode, bindings, states, probe, target, configuration, audit, clock, operationActive, continuation, commitOwner,
+                (expected, tested, active) -> {});
+    }
+
+    public StorageSetupService(StorageBinding.Mode mode, StorageBindingStore bindings, StorageSetupStateStore states,
+            StorageConnectionProbe probe, DefaultTarget target, Supplier<Optional<StorageBinding.Connection>> configuration,
+            AuditGate audit, Clock clock, Runnable operationActive, java.util.function.Consumer<StorageBindingCommit> continuation,
+            java.util.function.Function<Supplier<Status>,Status> commitOwner, ConfigurationPreparation configurationPreparation) {
         this.mode = Objects.requireNonNull(mode, "mode"); this.bindings = Objects.requireNonNull(bindings, "bindings");
         this.states = Objects.requireNonNull(states, "states"); this.probe = Objects.requireNonNull(probe, "probe");
         this.target = Objects.requireNonNull(target, "target"); this.configuration = Objects.requireNonNull(configuration, "configuration");
@@ -98,6 +111,7 @@ public final class StorageSetupService {
         this.operationActive = Objects.requireNonNull(operationActive, "operationActive");
         this.continuation = Objects.requireNonNull(continuation, "continuation");
         this.commitOwner = Objects.requireNonNull(commitOwner, "commitOwner");
+        this.configurationPreparation = Objects.requireNonNull(configurationPreparation, "configurationPreparation");
     }
 
     /** The caller guard is established by the server's existing Cloud identity or OP management capability. */
@@ -131,6 +145,13 @@ public final class StorageSetupService {
     private Status commitOwned(String subject, StorageSetupScope expected, Runnable active, Candidate candidate, Map<Layer,String> stamps) {
         active.run();
         Prepared prepared = prepare(candidate);
+        if (mode == StorageBinding.Mode.OP && states.load().phase() == StorageSetupStateStore.Phase.LOCAL_SETUP) {
+            requireSetup(expected, active);
+            requireTests(expected, prepared, stamps);
+            for (Layer layer : Layer.values()) probe.test(prepared.candidate().connection(layer));
+            requireSetup(expected, active);
+            configurationPreparation.prepare(expected, prepared.candidate(), active);
+        }
         requireInstalledConfiguration(prepared.candidate().configuration());
         var guarded = bindings.guardedBy(active);
         Optional<StorageBinding> previous = guarded.load();
@@ -192,7 +213,7 @@ public final class StorageSetupService {
         } else {
             if (input.configuration() == null) throw conflict();
             config = probe.normalize(input.configuration());
-            if (installed.isPresent() && !config.equals(installed.get())) throw conflict();
+            if (installed.isPresent() && !sameConfigurationEndpoint(config, installed.get())) throw conflict();
         }
         Candidate normalized = new Candidate(config, probe.normalize(input.cache()), probe.normalize(input.master()));
         if (java.util.stream.Stream.of(normalized.configuration(), normalized.cache(), normalized.master())
@@ -215,7 +236,7 @@ public final class StorageSetupService {
 
     private void requireInstalledConfiguration(StorageBinding.Connection expected) {
         var installed = configuration.get().map(probe::normalize).orElseThrow(StorageSetupService::unavailable);
-        if (!expected.equals(installed)) throw conflict();
+        if (!sameConfigurationEndpoint(expected, installed)) throw conflict();
         if (states.load().phase() == StorageSetupStateStore.Phase.LOCAL_SETUP) throw unavailable();
     }
     private static TapstateException unavailable() {
@@ -238,6 +259,11 @@ public final class StorageSetupService {
     }
     private static boolean sameOperation(StorageSetupScope a, StorageSetupScope b) {
         return a.clusterId().equals(b.clusterId()) && a.installationId().equals(b.installationId()) && a.operationId().equals(b.operationId());
+    }
+    private static boolean sameConfigurationEndpoint(StorageBinding.Connection a, StorageBinding.Connection b) {
+        // The owner file retains the normalized driver URI and trust input. Its local policy tag is
+        // not a second persisted connection setting; both inputs already passed their own policy.
+        return a.uri().equals(b.uri()) && a.database().equals(b.database()) && Objects.equals(a.caPem(), b.caPem());
     }
     private static TapstateException conflict() { return new TapstateException(ControlError.STORAGE_SCOPE_CONFLICT, Map.of(), null); }
     private static TapstateException testsRequired() { return new TapstateException(ControlError.STORAGE_TEST_REQUIRED, Map.of(), null); }

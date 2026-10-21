@@ -45,6 +45,30 @@ class RestApiSecurityConfiguration {
         return new ProviderManager(List.of(new TapstateCredentialAuthenticationProvider(credentials)));
     }
 
+    @Bean @Order(0)
+    SecurityFilterChain installationSecurityFilterChain(HttpSecurity http, ObjectProvider<InstallationHttpAccess> installations,
+            ApiSecurityErrorWriter errors) throws Exception {
+        http.securityMatcher(request -> {
+                    var installation = installations.getIfAvailable();
+                    return installation != null && installation.isManagementRequest(request);
+                })
+                .csrf(AbstractHttpConfigurer::disable).formLogin(AbstractHttpConfigurer::disable)
+                .httpBasic(AbstractHttpConfigurer::disable).logout(AbstractHttpConfigurer::disable)
+                .requestCache(AbstractHttpConfigurer::disable)
+                .sessionManagement(sessions -> sessions.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                .addFilterAfter(new org.springframework.web.filter.OncePerRequestFilter() {
+                    @Override protected void doFilterInternal(jakarta.servlet.http.HttpServletRequest request,
+                            jakarta.servlet.http.HttpServletResponse response, jakarta.servlet.FilterChain chain)
+                            throws jakarta.servlet.ServletException, java.io.IOException {
+                        try { installations.getObject().requireManagementRequest(request); }
+                        catch (io.tapstate.core.common.TapstateException refused) { errors.write(response, refused.code(), refused.args()); return; }
+                        chain.doFilter(request, response);
+                    }
+                }, SecurityContextHolderFilter.class)
+                .authorizeHttpRequests(authorize -> authorize.anyRequest().permitAll());
+        return http.build();
+    }
+
     @Bean
     @Order(1)
     SecurityFilterChain apiSecurityFilterChain(

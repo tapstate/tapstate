@@ -59,6 +59,10 @@ public class Bootstrap {
             System.exit(MigrateCommand.run(args, System.out, System.err));
             return;
         }
+        if (InstallationCommand.isRequested(args)) {
+            System.exit(InstallationCommand.run(args, System.out, System.err));
+            return;
+        }
         SpringApplication app = new SpringApplication(Bootstrap.class);
         // The server owns process termination. Spring's own shutdown hook would close the context on
         // SIGTERM but leave the JVM to exit with the signal's default disposition (128+15 = 143);

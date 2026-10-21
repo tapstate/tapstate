@@ -72,6 +72,286 @@ import static org.assertj.core.api.Assertions.catchThrowable;
 @RequiresDocker
 class ManagedMongoStoreIsolationIT {
     enum Missing { OPERATOR, VIEWS }
+
+    @Test void opInstallationRestartsCreatesItsFirstAdministratorAndCopiesRealSourceValues() throws Exception {
+        String suffix = UUID.randomUUID().toString().replace("-", "");
+        String configDb = "op_config_" + suffix, cacheDb = "op_cache_" + suffix, masterDb = "op_master_" + suffix, sourceDb = "op_source_" + suffix;
+        String user = "op_" + suffix;
+        var files = InstallationFiles.initialize(work.resolve("op-installation"));
+        var setup = InstallationCommand.authorize(files, new MongoProperties(), java.time.Clock.systemUTC());
+        Path setupSeeds = Files.createDirectory(work.resolve("op-setup-seeds"));
+        Files.copy(CloudConnectorTestInputs.seedDirectory().resolve("mongodb-connector.jar"), setupSeeds.resolve("mongodb-connector.jar"));
+        try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
+            createUser(admin, user, List.of(configDb, cacheDb, masterDb, sourceDb));
+            var source = admin.getDatabase(sourceDb).getCollection("orders");
+            source.insertMany(List.of(new Document("_id", 1).append("name", "first").append("quantity", 7),
+                    new Document("_id", 2).append("name", "second").append("quantity", 19)));
+            long initialPid;
+            try (var process = installationProcess(files, setupSeeds, "first")) {
+                initialPid = process.process.pid();
+                var management = process.management(files, setup.token());
+                Map<String,Object> candidate = Map.of("configuration", Map.of("kind", "MONGODB", "uri", uri(user, configDb), "database", configDb),
+                        "cache", Map.of("kind", "MONGODB", "uri", uri(user, cacheDb), "database", cacheDb),
+                        "master", Map.of("kind", "MONGODB", "uri", uri(user, masterDb), "database", masterDb));
+                var stamps = new java.util.LinkedHashMap<String,Object>();
+                for (var layer : io.tapstate.control.core.StorageSetupService.Layer.values()) {
+                    var tested = management.post().uri("/api/storage/test").body(Map.of("operationId", setup.scope().operationId(),
+                            "generation", setup.scope().generation(), "candidate", candidate, "layer", layer.name())).retrieve().body(Map.class);
+                    stamps.put(layer.name(), tested.get("testStamp"));
+                }
+                assertThat(files.configurationUri()).isEmpty();
+                var committed = management.post().uri("/api/storage/setup/commit").body(Map.of("operationId", setup.scope().operationId(),
+                        "generation", setup.scope().generation(), "candidate", candidate, "testStamps", stamps)).retrieve().body(Map.class);
+                assertThat(committed.get("setupPhase")).isEqualTo("COMPLETE");
+                assertThat(files.stage().handoff()).isEqualTo(InstallationFiles.Handoff.RESTART_REQUIRED);
+                assertThat(files.capability()).isEmpty();
+                assertThat(files.configurationUri()).contains(uri(user, configDb));
+                assertThat(admin.getDatabase(configDb).getCollection("users").countDocuments()).isZero();
+                assertThat(admin.getDatabase(configDb).getCollection("sources").countDocuments()).isOne();
+                assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims").countDocuments()).isZero();
+            }
+            String key = admin.getDatabase(configDb).getCollection("cluster_keys").find().first().getString("keyId");
+            try (var process = installationProcess(files, setupSeeds, "restarted")) {
+                assertThat(process.process.pid()).isNotEqualTo(initialPid);
+                assertThat(files.stage().handoff()).isEqualTo(InstallationFiles.Handoff.RESTARTED);
+                var firstAdmin = InstallationCommand.authorize(files, new MongoProperties(), java.time.Clock.systemUTC());
+                assertThat(firstAdmin.purpose()).isEqualTo(io.tapstate.spi.store.StorageSetupStateStore.Purpose.FIRST_ADMIN);
+                var created = process.management(files, firstAdmin.token()).post().uri("/installation/first-admin")
+                        .body(Map.of("username", "admin", "password", "op-installation-password")).retrieve().body(Map.class);
+                assertThat(created.get("phase")).isEqualTo("COMPLETE");
+                assertThat(files.capability()).isEmpty();
+                var publicClient = process.publicClient();
+                var login = publicClient.post().uri("/auth/login").body(Map.of("username", "admin", "password", "op-installation-password", "createSession", true))
+                        .retrieve().body(io.tapstate.control.restapi.LoginResponse.class);
+                var client = publicClient.mutate().defaultHeader("Authorization", "Bearer " + login.token()).build();
+                Map<String,Object> settings = Map.of("isUri", true, "uri", uri(user, sourceDb));
+                client.post().uri("/api/sources").body(Map.of("id", "input", "connector", "mongodb", "config", settings,
+                        "mode", "snapshot", "tables", List.of(Map.of("type", "literal", "name", "orders")))).retrieve().toBodilessEntity();
+                var test = client.post().uri("/api/connections:test").body(Map.of("id", "input", "connectorId", "mongodb", "settings", settings)).retrieve().body(Map.class);
+                assertThat(test.get("outcome")).isEqualTo("PASSED");
+                client.post().uri("/api/connections:discover-schema").body(Map.of("id", "input", "connectorId", "mongodb", "settings", settings))
+                        .retrieve().toBodilessEntity();
+                client.post().uri("/api/pipelines").body(Map.of("id", "first_copy", "sources", List.of(Map.of("id", "input", "srs", false)),
+                        "settings", Map.of("readMode", "snapshot_only"), "serve", Map.of("id", "output", "from", "/.*/",
+                                "sync", List.of(Map.of("id", "copy", "source", "views", "onFullLoad", "clear"))))).retrieve().toBodilessEntity();
+                client.post().uri("/api/pipelines/first_copy:start").retrieve().toBodilessEntity();
+                var target = admin.getDatabase(masterDb).getCollection("orders");
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(60)).untilAsserted(() -> {
+                    assertThat(target.countDocuments()).isEqualTo(2);
+                    var first = target.find(new Document("_id", 1)).first(); var second = target.find(new Document("_id", 2)).first();
+                    assertThat(first.getString("name")).isEqualTo("first"); assertThat(((Number)first.get("quantity")).longValue()).isEqualTo(7);
+                    assertThat(second.getString("name")).isEqualTo("second"); assertThat(((Number)second.get("quantity")).longValue()).isEqualTo(19);
+                });
+                publicClient.post().uri("/auth/logout").header("Authorization", "TapstateSession " + login.sessionToken()).retrieve().toBodilessEntity();
+                var fresh = publicClient.post().uri("/auth/login").body(Map.of("username", "admin", "password", "op-installation-password", "createSession", true))
+                        .retrieve().body(io.tapstate.control.restapi.LoginResponse.class);
+                assertThat(fresh.sessionToken()).isNotEqualTo(login.sessionToken());
+                assertThat(publicClient.get().uri("/api/pipelines/first_copy").header("Authorization", "Bearer " + fresh.token()).retrieve().body(String.class)).contains("first_copy");
+                assertThat(admin.getDatabase(configDb).getCollection("cluster_keys").find().first().getString("keyId")).isEqualTo(key);
+                assertThat(admin.getDatabase(configDb).getCollection("users").countDocuments()).isOne();
+                assertThat(admin.getDatabase(cacheDb).getCollection("users").countDocuments()).isZero();
+                assertThat(admin.getDatabase(configDb).getCollection("op_sessions").countDocuments()).isZero();
+                assertThat(admin.getDatabase(cacheDb).getCollection("op_sessions").countDocuments()).isPositive();
+                assertThatThrownBy(() -> InstallationCommand.authorize(files, new MongoProperties(), java.time.Clock.systemUTC())).isInstanceOf(TapstateException.class);
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"intent", "uri", "configuration", "birth", "complete"})
+    void opRetainedInstallationBoundariesResumeTheOriginalOperation(String boundary) throws Exception {
+        String suffix = UUID.randomUUID().toString().replace("-", "");
+        String config = "resume_config_" + suffix, cache = "resume_cache_" + suffix, master = "resume_master_" + suffix, user = "resume_" + suffix;
+        var files = InstallationFiles.initialize(work.resolve("resume-installation"));
+        var original = InstallationCommand.authorize(files, new MongoProperties(), java.time.Clock.systemUTC());
+        Path seeds = Files.createDirectory(work.resolve("resume-seeds"));
+        Files.copy(CloudConnectorTestInputs.seedDirectory().resolve("mongodb-connector.jar"), seeds.resolve("mongodb-connector.jar"));
+        try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
+            createUser(admin, user, List.of(config, cache, master));
+            seedOpBoundary(files, user, config, cache, master, boundary);
+            String oldKey = admin.getDatabase(config).getCollection("cluster_keys").find().first() == null ? null
+                    : admin.getDatabase(config).getCollection("cluster_keys").find().first().getString("keyId");
+            try (var process = installationProcess(files, seeds, "resume-" + boundary)) {
+                if (List.of("intent", "uri", "configuration").contains(boundary)) {
+                    var renewed = InstallationCommand.authorize(files, new MongoProperties(), java.time.Clock.systemUTC());
+                    assertThat(renewed.scope().operationId()).isEqualTo(original.scope().operationId());
+                    assertThat(renewed.scope().generation()).isGreaterThan(original.scope().generation());
+                    var management = process.management(files, renewed.token());
+                    var status = management.post().uri("/api/storage/status").body(Map.of()).retrieve().body(Map.class);
+                    assertThat(((List<?>)status.get("allowedActions")).containsAll(List.of("storage.test", "storage.setup.commit"))).isTrue();
+                    var candidate = Map.of("configuration", Map.of("kind", "MONGODB", "uri", uri(user, config), "database", config),
+                            "cache", Map.of("kind", "MONGODB", "uri", uri(user, cache), "database", cache),
+                            "master", Map.of("kind", "MONGODB", "uri", uri(user, master), "database", master));
+                    var stamps = new java.util.LinkedHashMap<String,Object>();
+                    for (var layer : io.tapstate.control.core.StorageSetupService.Layer.values()) {
+                        var tested = management.post().uri("/api/storage/test").body(Map.of("operationId", renewed.scope().operationId(), "generation", renewed.scope().generation(),
+                                "candidate", candidate, "layer", layer.name())).retrieve().body(Map.class);
+                        stamps.put(layer.name(), tested.get("testStamp"));
+                    }
+                    management.post().uri("/api/storage/setup/commit").body(Map.of("operationId", renewed.scope().operationId(), "generation", renewed.scope().generation(),
+                            "candidate", candidate, "testStamps", stamps)).retrieve().toBodilessEntity();
+                }
+                assertThat(files.stage().scope().operationId()).isEqualTo(original.scope().operationId());
+                assertThat(files.stage().handoff()).isEqualTo(boundary.equals("complete") ? InstallationFiles.Handoff.RESTARTED : InstallationFiles.Handoff.RESTART_REQUIRED);
+                var database = admin.getDatabase(config);
+                assertThat(database.getCollection("storage_setup").find().first().getString("phase")).isEqualTo("COMPLETE");
+                assertThat(database.getCollection("storage_binding").countDocuments()).isOne();
+                assertThat(database.getCollection("sources").countDocuments()).isOne();
+                assertThat(database.getCollection("users").countDocuments()).isZero();
+                if (oldKey != null) assertThat(database.getCollection("cluster_keys").find().first().getString("keyId")).isEqualTo(oldKey);
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void firstAdministratorTransactionHasOneWinnerAcrossIndependentProcesses(boolean sameUsername) throws Exception {
+        String suffix = UUID.randomUUID().toString().replace("-", "");
+        String config = "race_config_" + suffix, cache = "race_cache_" + suffix, master = "race_master_" + suffix, user = "race_" + suffix;
+        var files = InstallationFiles.initialize(work.resolve("admin-race"));
+        try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
+            createUser(admin, user, List.of(config, cache, master)); seedOpBoundary(files, user, config, cache, master, "complete");
+            var children = new ArrayList<Process>(); var outputs = new ArrayList<Path>();
+            try {
+                for (int i = 0; i < 2; i++) {
+                    var output = work.resolve("admin-race-" + i + ".log"); outputs.add(output);
+                    children.add(new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(), "-Xmx128m", "-cp",
+                            System.getProperty("surefire.test.class.path", System.getProperty("java.class.path")), FirstAdministratorTransactionProcess.class.getName(), files.directory().toString())
+                            .redirectErrorStream(true).redirectOutput(output.toFile()).start());
+                }
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(20)).until(() -> outputs.stream().allMatch(output -> {
+                    try { return Files.readString(output).contains("ADMIN_TRANSACTION_READY"); } catch (java.io.IOException invalid) { return false; }
+                }));
+                for (int i = 0; i < 2; i++) {
+                    var process = children.get(i);
+                    process.getOutputStream().write(io.tapstate.core.common.JsonWriter.write(Map.of("username", i == 0 || sameUsername ? "first" : "second", "password", "password-" + i)).getBytes(StandardCharsets.UTF_8));
+                    process.getOutputStream().close();
+                }
+                for (var child : children) assertThat(child.waitFor(20, TimeUnit.SECONDS)).isTrue();
+                var results = new ArrayList<String>(); for (Path output : outputs) results.add(Files.readString(output));
+                assertThat(results.stream().filter(value -> value.contains("ADMIN_TRANSACTION_COMMITTED")).count()).isOne();
+                assertThat(results.stream().filter(value -> value.contains("ADMIN_TRANSACTION_REFUSED")).count()).isOne();
+                var database = admin.getDatabase(config);
+                assertThat(database.getCollection("users").countDocuments()).isOne();
+                var receipt = database.getCollection("op_bootstrap").find().first();
+                assertThat(receipt.getString("phase")).isEqualTo("COMPLETE");
+                assertThat(database.getCollection("users").find(new Document("_id", receipt.getString("username"))).first()).isNotNull();
+            } finally {
+                for (var child : children) if (child.isAlive()) { child.destroy(); if (!child.waitFor(5, TimeUnit.SECONDS)) child.destroyForcibly().waitFor(5, TimeUnit.SECONDS); }
+            }
+        }
+    }
+
+    @Test void firstAdminAuditFailureAndLostHttpResponseNeverOverwriteOrReopenTheAdministrator() throws Exception {
+        String suffix = UUID.randomUUID().toString().replace("-", "");
+        String config = "audit_config_" + suffix, cache = "audit_cache_" + suffix, master = "audit_master_" + suffix, user = "audit_" + suffix;
+        var files = InstallationFiles.initialize(work.resolve("admin-response-loss"));
+        Path seeds = Files.createDirectory(work.resolve("admin-response-seeds"));
+        Files.copy(CloudConnectorTestInputs.seedDirectory().resolve("mongodb-connector.jar"), seeds.resolve("mongodb-connector.jar"));
+        try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
+            createUser(admin, user, List.of(config, cache, master)); seedOpBoundary(files, user, config, cache, master, "complete");
+            try (var process = installationProcess(files, seeds, "admin-response")) {
+                var issued = InstallationCommand.authorize(files, new MongoProperties(), java.time.Clock.systemUTC());
+                var database = admin.getDatabase(config);
+                if (!database.listCollectionNames().into(new ArrayList<>()).contains("audit")) database.createCollection("audit");
+                database.runCommand(new Document("collMod", "audit").append("validator", new Document("$expr", new Document("$eq", List.of(1, 0)))).append("validationLevel", "strict"));
+                var management = process.management(files, issued.token());
+                assertThatThrownBy(() -> management.post().uri("/installation/first-admin").body(Map.of("username", "admin", "password", "original-admin-password"))
+                        .retrieve().toBodilessEntity()).isInstanceOfSatisfying(org.springframework.web.client.RestClientResponseException.class,
+                                failure -> assertThat(failure.getResponseBodyAsString()).contains("control.audit-blocked"));
+                assertThat(database.getCollection("users").countDocuments()).isZero();
+                assertThat(database.getCollection("op_bootstrap").find().first().getString("phase")).isEqualTo("PENDING");
+                assertThat(database.getCollection("audit").countDocuments()).isZero();
+                database.runCommand(new Document("collMod", "audit").append("validator", new Document()));
+                var address = java.net.URI.create(files.stage().managementUrl());
+                byte[] body = io.tapstate.core.common.JsonWriter.write(Map.of("username", "admin", "password", "original-admin-password")).getBytes(StandardCharsets.UTF_8);
+                try (var socket = new java.net.Socket("127.0.0.1", address.getPort())) {
+                    String headers = "POST /installation/first-admin HTTP/1.1\r\nHost: 127.0.0.1:" + address.getPort()
+                            + "\r\nOrigin: " + address + "\r\nContent-Type: application/json\r\nContent-Length: " + body.length
+                            + "\r\n" + OnPremInstallation.CAPABILITY_HEADER + ": " + issued.token() + "\r\nConnection: close\r\n\r\n";
+                    socket.getOutputStream().write(headers.getBytes(StandardCharsets.US_ASCII)); socket.getOutputStream().write(body);
+                    socket.getOutputStream().flush(); socket.shutdownOutput();
+                    // The caller deliberately receives no response; the native transaction must be reconciled.
+                }
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(20)).until(() -> database.getCollection("users").countDocuments() == 1);
+                var saved = database.getCollection("users").find().first();
+                assertThat(new BCryptPasswordHasher().matches("original-admin-password", saved.getString("passwordHash"))).isTrue();
+                assertThat(database.getCollection("op_bootstrap").find().first().getString("phase")).isEqualTo("COMPLETE");
+                assertThat(database.getCollection("audit").countDocuments()).isOne();
+                assertThatThrownBy(() -> management.post().uri("/installation/first-admin").body(Map.of("username", "admin", "password", "replacement-password"))
+                        .retrieve().toBodilessEntity()).isInstanceOf(org.springframework.web.client.RestClientResponseException.class);
+                assertThat(database.getCollection("users").find().first()).isEqualTo(saved);
+                assertThat(process.publicClient().post().uri("/auth/login").body(Map.of("username", "admin", "password", "original-admin-password", "createSession", true))
+                        .retrieve().body(io.tapstate.control.restapi.LoginResponse.class).token()).isNotBlank();
+                assertThatThrownBy(() -> InstallationCommand.authorize(files, new MongoProperties(), java.time.Clock.systemUTC())).isInstanceOf(TapstateException.class);
+                database.getCollection("users").deleteMany(new Document());
+                assertThatThrownBy(() -> InstallationCommand.authorize(files, new MongoProperties(), java.time.Clock.systemUTC())).isInstanceOf(TapstateException.class);
+                assertThatThrownBy(() -> management.post().uri("/installation/first-admin").body(Map.of("username", "new", "password", "replacement-password"))
+                        .retrieve().toBodilessEntity()).isInstanceOf(org.springframework.web.client.RestClientResponseException.class);
+                assertThat(database.getCollection("users").countDocuments()).isZero();
+                assertThat(database.getCollection("op_bootstrap").find().first().getString("phase")).isEqualTo("COMPLETE");
+            }
+        }
+    }
+
+    private static void seedOpBoundary(InstallationFiles files, String user, String config, String cache, String master, String boundary) {
+        var endpoint = new io.tapstate.spi.store.StorageBinding.Connection(io.tapstate.spi.store.StorageBinding.Connection.Kind.MONGODB, uri(user, config), config, null);
+        var scope = files.stage().scope(); String hash = OnPremInstallation.configurationHash(endpoint);
+        files.saveStage(files.stage().withHandoff(InstallationFiles.Handoff.INTENT, hash));
+        if (boundary.equals("intent")) return;
+        files.saveConnection(endpoint.uri(), null); files.saveStage(files.stage().withHandoff(InstallationFiles.Handoff.URI_WRITTEN, hash));
+        if (boundary.equals("uri")) return;
+        files.saveStage(files.stage().withHandoff(InstallationFiles.Handoff.CREATE_STARTED, hash));
+        try (var configuration = io.tapstate.adapters.mongostore.MongoConfigurationBootstrap.prepare(OnPremInstallation.settings(files, new MongoProperties()),
+                scope.clusterId(), scope.installationId(), scope.operationId(), scope.generation())) {
+            if (boundary.equals("configuration")) return;
+            files.saveStage(files.stage().withHandoff(InstallationFiles.Handoff.CONFIGURED, hash));
+            var connection = new io.tapstate.spi.store.StorageBinding.Connection(io.tapstate.spi.store.StorageBinding.Connection.Kind.MONGODB, uri(user, cache), cache, null);
+            var target = new SourceResource("views", null, "mongodb", Map.of("isUri", true, "uri", uri(user, master)), null, null, null, null);
+            var committed = configuration.bindings().commitWithFirstCache(scope, io.tapstate.spi.store.StorageBinding.Mode.OP, connection, target);
+            try (var cached = io.tapstate.adapters.mongostore.MongoCacheDomain.connect(connection, Duration.ofSeconds(5), "retained-op-boundary")) {
+                cached.prepareFirstAuth(committed.firstCreation().orElseThrow());
+                if (boundary.equals("birth")) return;
+                cached.prepareInitialBusiness(committed.preparation(), () -> {});
+            }
+            configuration.bindings().complete(scope);
+        }
+    }
+
+    private InstallationProcess installationProcess(InstallationFiles files, Path setupSeeds, String name) throws Exception {
+        Path output = work.resolve("installation-" + name + ".log");
+        String classpath = System.getProperty("surefire.test.class.path", System.getProperty("java.class.path"));
+        var process = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(), "-Xmx768m",
+                "--add-opens=java.base/java.lang=ALL-UNNAMED", "-cp", classpath, OnPremInstallationProcess.class.getName(),
+                files.directory().toString(), work.resolve("op-plugins").toString(), CloudConnectorTestInputs.seedDirectory().toString(), setupSeeds.toString())
+                .redirectErrorStream(true).redirectOutput(output.toFile()).start();
+        var result = new InstallationProcess(process, output);
+        try {
+            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(90)).until(() -> {
+                if (!process.isAlive()) throw new AssertionError("installation child exited: " + Files.readString(output).replace(PASSWORD, "<redacted>"));
+                return Files.readString(output).contains("INSTALLATION_READY ");
+            });
+            return result;
+        } catch (RuntimeException | Error failure) { result.close(); throw failure; }
+    }
+    private static final class InstallationProcess implements AutoCloseable {
+        final Process process; final Path output;
+        InstallationProcess(Process process, Path output) { this.process = process; this.output = output; }
+        org.springframework.web.client.RestClient management(InstallationFiles files, String capability) {
+            String base = files.stage().managementUrl();
+            return org.springframework.web.client.RestClient.builder().baseUrl(base).defaultHeader("Origin", base)
+                    .defaultHeader(OnPremInstallation.CAPABILITY_HEADER, capability).build();
+        }
+        org.springframework.web.client.RestClient publicClient() throws Exception {
+            var line = Files.readAllLines(output).stream().filter(value -> value.startsWith("INSTALLATION_READY ")).findFirst().orElseThrow();
+            return org.springframework.web.client.RestClient.builder().baseUrl("http://127.0.0.1:" + line.split(" ")[1]).build();
+        }
+        @Override public void close() throws Exception {
+            process.getOutputStream().close();
+            if (!process.waitFor(30, TimeUnit.SECONDS)) { process.destroy(); if (!process.waitFor(10, TimeUnit.SECONDS)) process.destroyForcibly().waitFor(10, TimeUnit.SECONDS); }
+            assertThat(process.isAlive()).isFalse();
+        }
+    }
     private static final String PASSWORD = "controlled-mongo-permissions-password";
     private static final String REPLICA_SET = "permissions-rs";
     private static final TestTrust TLS = TestTrust.create();

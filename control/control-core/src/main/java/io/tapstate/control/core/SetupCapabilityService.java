@@ -94,6 +94,7 @@ public final class SetupCapabilityService {
             if (current != captured || !captured.issued().expiresAt().isAfter(clock.instant())) throw refused();
             if (purpose == StorageSetupStateStore.Purpose.FIRST_ADMIN) requireFirstAdminReadiness.run();
             states.requireCurrent(expected, purpose);
+            if (current != captured || !captured.issued().expiresAt().isAfter(clock.instant())) throw refused();
         };
         active.run();
         return new Permission(expected, purpose, active);

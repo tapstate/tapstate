@@ -97,4 +97,17 @@ class SetupCapabilityServiceTest {
         time.now = issued.expiresAt();
         assertThatThrownBy(() -> restarted.restore(issued)).isInstanceOf(TapstateException.class);
     }
+
+    @Test void aSlowFirstAdminReadinessCheckCannotExtendTheCapabilityDeadline() {
+        var states = new States(); var time = new Time();
+        states.status = new StorageSetupStateStore.Status(ORIGINAL, StorageSetupStateStore.Phase.COMPLETE, 1);
+        var slow = new java.util.concurrent.atomic.AtomicBoolean();
+        var service = new SetupCapabilityService(states, time, () -> {}, () -> {}, () -> {
+            if (slow.get()) time.now = time.now.plus(SetupCapabilityService.LIFETIME);
+        });
+        var issued = service.issue(ORIGINAL, StorageSetupStateStore.Purpose.FIRST_ADMIN);
+        var request = service.authorize(issued.token(), issued.scope(), issued.purpose());
+        slow.set(true);
+        assertThatThrownBy(request::run).isInstanceOf(TapstateException.class);
+    }
 }

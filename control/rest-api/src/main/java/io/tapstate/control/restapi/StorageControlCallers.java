@@ -15,6 +15,17 @@ import org.springframework.security.core.context.SecurityContextHolder;
 public final class StorageControlCallers {
     private StorageControlCallers() {}
 
+    public static StorageControlCaller withInstallation(StorageControlCaller ordinary,
+            java.util.function.Supplier<InstallationHttpAccess> installations) {
+        return () -> {
+            var attributes = org.springframework.web.context.request.RequestContextHolder.getRequestAttributes();
+            var installation = installations.get();
+            if (installation != null && attributes instanceof org.springframework.web.context.request.ServletRequestAttributes servlet
+                    && installation.isManagementRequest(servlet.getRequest())) return installation.caller(servlet.getRequest());
+            return ordinary.current();
+        };
+    }
+
     public static StorageControlCaller ordinary(BiFunction<TapstatePrincipal, CredentialAuthentication, StorageControlAccess> access) {
         Objects.requireNonNull(access, "access");
         return () -> {

@@ -15,7 +15,7 @@ final class StorageRoot implements AutoCloseable {
     private final CloudRuntimeSettings cloud;
     private volatile StorageRuntime runtime;
     private volatile StorageAuthentication authentication;
-    private final Optional<StorageBinding.Connection> endpoint;
+    private volatile Optional<StorageBinding.Connection> endpoint;
     private final java.util.function.Supplier<MongoConfigurationDomain> configurationLoader;
     private final Function<MongoConfigurationDomain, StorageRuntime> runtimes;
     private final Function<MongoConfigurationDomain, StorageAuthentication> authentications;
@@ -102,12 +102,36 @@ final class StorageRoot implements AutoCloseable {
         requireOpen(); return action.get();
     }
 
+    /** Transfers the original installer-owned CONFIG client; the installer retains no second runtime. */
+    synchronized void installOnPremConfiguration(MongoConfigurationDomain candidate, StorageBinding.Connection connection) {
+        requireOpen();
+        if (cloud.cloud() || runtime.configuration().isPresent() || runtime.cleanupRequired()) throw StorageRuntime.unavailable();
+        var nextRuntime = runtimes.apply(candidate);
+        var nextAuthentication = authentications.apply(candidate);
+        authentication.close(); runtime.close();
+        endpoint = Optional.of(connection); runtime = nextRuntime; authentication = nextAuthentication; phase = Phase.SETUP_REQUIRED;
+    }
+
     /** Continues only the original committed setup. No request owns or closes the retained CACHE client. */
     synchronized void continueCloudSetup(StorageBindingCommit committed, StorageSetupService.DefaultTarget target,
             Function<StorageRuntime.Bound, ? extends StorageRuntime.Business> assembly) {
         requireOpen();
         if (!cloud.cloud() || committed.binding().mode() != StorageBinding.Mode.CLOUD || runtime.cleanupRequired())
             throw StorageRuntime.unavailable();
+        var original = prepareInitialSetup(committed, target);
+        authentication.install(original); phase = Phase.AUTH_READY;
+        runtime.startBusiness(original, assembly); phase = Phase.BUSINESS_READY;
+    }
+
+    /** OP prepares its original storage but keeps authentication and business behind a controlled restart. */
+    synchronized void continueOnPremSetup(StorageBindingCommit committed, StorageSetupService.DefaultTarget target) {
+        requireOpen();
+        if (cloud.cloud() || committed.binding().mode() != StorageBinding.Mode.OP || runtime.cleanupRequired()) throw StorageRuntime.unavailable();
+        prepareInitialSetup(committed, target);
+        phase = Phase.SETUP_REQUIRED;
+    }
+
+    private StorageRuntime.Bound prepareInitialSetup(StorageBindingCommit committed, StorageSetupService.DefaultTarget target) {
         setupInvocation = committed;
         var original = runtime.loadBound().orElseThrow(StorageRuntime::unavailable);
         Runnable active = () -> {
@@ -126,9 +150,12 @@ final class StorageRoot implements AutoCloseable {
             // Reload the saved encrypted definition and its trust material; a probe's live client is never adopted.
             var source = configuration.artifacts().get(committed.binding().defaultSourceId())
                     .filter(SourceResource.class::isInstance).map(SourceResource.class::cast).orElseThrow(StorageRuntime::unavailable);
-            if (!source.connector().equals("mongodb-atlas") || !(source.config().get("uri") instanceof String uri))
+            if (!(source.config().get("uri") instanceof String uri)
+                    || !Set.of("mongodb", "mongodb-atlas").contains(source.connector())
+                    || cloud.cloud() && !source.connector().equals("mongodb-atlas"))
                 throw StorageRuntime.unavailable();
-            var master = new StorageBinding.Connection(StorageBinding.Connection.Kind.ATLAS, uri, MongoDatabaseNames.fromUri(uri),
+            var master = new StorageBinding.Connection(source.connector().equals("mongodb-atlas")
+                    ? StorageBinding.Connection.Kind.ATLAS : StorageBinding.Connection.Kind.MONGODB, uri, MongoDatabaseNames.fromUri(uri),
                     source.config().get(StorageSetupService.CA_BUNDLE_FIELD) instanceof String ca ? ca : null);
             target.test(master, source, target.identity(master)); active.run();
             if (committed.firstCreation().isPresent() && attemptedCreation != committed.firstCreation().orElseThrow()) {
@@ -138,11 +165,14 @@ final class StorageRoot implements AutoCloseable {
             original.verifyAuthentication();
             original.cache().prepareInitialBusiness(committed.preparation(), active);
             original.verifyBusiness(); active.run();
-            configuration.bindings().guardedBy(active).complete(committed.binding().setup());
+            var currentSetup = configuration.setupStates().load().scope();
+            if (!currentSetup.clusterId().equals(committed.binding().setup().clusterId())
+                    || !currentSetup.installationId().equals(committed.binding().setup().installationId())
+                    || !currentSetup.operationId().equals(committed.binding().setup().operationId())) throw StorageRuntime.unavailable();
+            configuration.bindings().guardedBy(active).complete(currentSetup);
         }
         active.run();
-        authentication.install(original); phase = Phase.AUTH_READY;
-        runtime.startBusiness(original, assembly); phase = Phase.BUSINESS_READY;
+        return original;
     }
 
     /** Explicit startup/operation continuation only. Status reads never connect or initialize a cache. */

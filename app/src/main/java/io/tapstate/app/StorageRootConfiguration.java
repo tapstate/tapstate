@@ -34,7 +34,21 @@ class StorageRootConfiguration {
     }
     @Bean(destroyMethod = "close") StorageRoot storageRoot(MongoProperties mongo, CloudRuntimeSettings cloud,
             ObjectProvider<CloudSdkBridge> bridge, BootId boot, MetricsHistoryProperties history,
-            TokenSecrets secrets, Clock clock, ControlPlaneConfiguration.SigningSecret signing) {
+            TokenSecrets secrets, Clock clock, ControlPlaneConfiguration.SigningSecret signing,
+            ObjectProvider<InstallationFiles> installationFiles, Environment environment) {
+        var files = installationFiles.getIfAvailable();
+        if (files != null) {
+            if (cloud.cloud() || !mongo.isEnabled()) throw InstallationFiles.refused();
+            var uri = files.configurationUri();
+            String explicit = environment.getProperty("tapstate.store.mongo.uri");
+            if (explicit != null && !explicit.isBlank() && !uri.filter(explicit::equals).isPresent()) throw InstallationFiles.refused();
+            mongo.setUri(uri.orElse(null));
+            mongo.setTlsCaFile(files.configurationCa().isPresent() ? files.caFile().toString() : null);
+            var stage = files.stage();
+            if (stage.handoff().ordinal() >= InstallationFiles.Handoff.URI_WRITTEN.ordinal() && uri.isEmpty()) throw InstallationFiles.refused();
+            if (stage.configurationHash() != null && uri.isPresent()
+                    && !stage.configurationHash().equals(OnPremInstallation.configurationHash(OnPremInstallation.connection(files)))) throw InstallationFiles.refused();
+        }
         return new StorageRoot(mongo, cloud, bridge.getIfAvailable(), boot, history, secrets, clock, signing.bytes());
     }
     @Bean AuthenticationMode authenticationMode(CloudRuntimeSettings cloud) {
@@ -52,11 +66,16 @@ class StorageRootConfiguration {
             @Override public ClusterIdentity createIfAbsent(ClusterIdentity identity) { throw StorageRuntime.unavailable(); }
         });
     }
-    @Bean StorageControlCaller storageControlCaller(StorageRoot root) {
-        return StorageControlCallers.ordinary((principal, original) -> StorageControlAccess.ordinary(root.mode(),
-                () -> root.runtime().requireConfiguration().setupStates().load().scope(), principal, original));
+    @Bean StorageControlCaller storageControlCaller(StorageRoot root, ObjectProvider<OnPremInstallation> installations) {
+        return StorageControlCallers.withInstallation(StorageControlCallers.ordinary((principal, original) -> StorageControlAccess.ordinary(root.mode(),
+                () -> root.runtime().requireConfiguration().setupStates().load().scope(), principal, original)), installations::getIfAvailable);
     }
-    @Bean StorageControlDispatcher.Snapshots storageSnapshots(StorageRoot root) { return root::snapshot; }
+    @Bean StorageControlDispatcher.Snapshots storageSnapshots(StorageRoot root, ObjectProvider<OnPremInstallation> installations) {
+        return (caller, active) -> {
+            var installation = installations.getIfAvailable();
+            return installation != null && caller.cacheScope().isEmpty() ? installation.snapshot(caller, active) : root.snapshot(caller, active);
+        };
+    }
     @Bean @org.springframework.context.annotation.Lazy
     InstalledConnectorTests installedConnectorTests(ConnectorPluginProperties properties, Clock clock) {
         return new InstalledConnectorTests(properties, clock);
@@ -78,7 +97,9 @@ class StorageRootConfiguration {
     StorageRecoveryService storageRecoveryService(StorageRoot root, Clock clock) { return root.recoveryService(clock); }
     @Bean @org.springframework.context.annotation.Lazy
     StorageSetupService storageSetupService(StorageRoot root, ObjectProvider<InstalledConnectorTests> connectors,
-            MongoProperties mongo, Clock clock, ObjectProvider<StorageBusinessFactory> factories) {
+            MongoProperties mongo, Clock clock, ObjectProvider<StorageBusinessFactory> factories, ObjectProvider<OnPremInstallation> installations) {
+        var installation = installations.getIfAvailable();
+        if (installation != null) return installation.setups();
         var configuration = root.runtime().requireConfiguration();
         StorageSetupService.DefaultTarget target = new StorageSetupService.DefaultTarget() {
             @Override public StorageSetupService.ConnectorIdentity identity(StorageBinding.Connection master) {
@@ -115,11 +136,23 @@ class StorageRootConfiguration {
         return StorageControlDispatcher.staged(operations, setups::getIfAvailable, recoveries::getIfAvailable, imports::getIfAvailable, snapshots);
     }
     @Bean ApplicationRunner loadRetainedStorage(StorageRoot root, ObjectProvider<StorageBusinessFactory> factories,
-            ObjectProvider<StorageSetupService.DefaultTarget> targets) {
-        return arguments -> root.loadExisting(original -> {
+            ObjectProvider<StorageSetupService.DefaultTarget> targets, ObjectProvider<OnPremInstallation> installations) {
+        return arguments -> {
+            var installation = installations.getIfAvailable();
+            if (installation != null) {
+                try { installation.resumePreparation(); }
+                catch (io.tapstate.core.common.TapstateException unavailable) { return; }
+                if (!installation.normalStartupAllowed()) return;
+            }
+            root.loadExisting(original -> {
             var factory = factories.getIfAvailable();
             if (factory == null) throw StorageRuntime.unavailable();
             return factory.create(original);
         }, targets::getObject);
+            if (installation != null) {
+                try { installation.afterNormalStartup(); }
+                catch (io.tapstate.core.common.TapstateException unavailable) { /* Keep diagnostics available without reopening installation. */ }
+            }
+        };
     }
 }
