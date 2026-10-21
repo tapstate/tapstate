@@ -131,6 +131,8 @@ public record ValidationKey(List<Part> parts) implements Comparable<ValidationKe
         }
         public static Part instant(Instant value) { return new Part(Kind.INSTANT, value, -1, 48); }
 
+        /** Conservative component charge without copying an owned binary payload. */
+        public long retainedBytes() { return retainedBytes; }
         public Kind kind() { return kind; }
         public int binarySubtype() { return binarySubtype; }
         public Object value() { return value instanceof byte[] bytes ? bytes.clone() : value; }

@@ -2,6 +2,7 @@ package io.tapstate.adapters.pdk;
 
 import io.tapdata.entity.schema.type.TapNumber;
 import io.tapstate.core.validation.ValidationKey;
+import io.tapstate.core.validation.ValidationKeyBinding;
 import io.tapstate.core.validation.ValidationPhysicalIdentity;
 import io.tapstate.core.validation.ValidationValues;
 import io.tapstate.core.validation.ValidationValueComparison;
@@ -11,6 +12,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
@@ -77,6 +79,8 @@ class ValidationReaderMergeTest {
                 """);
         var artifact = new ConnectorRef(List.of(path), "synthetic.OrderedValidationRead", "2.0.8", null);
         var limits = new ValidationValues.Limits(4096, 50, 8);
+        var sourceBinding = keyBinding("source_id", limits);
+        var targetBinding = keyBinding("target_id", limits);
         var sourceStops = new AtomicInteger();
         var targetStops = new AtomicInteger();
         var facts = new ArrayList<String>();
@@ -96,8 +100,8 @@ class ValidationReaderMergeTest {
                      (model, codecs) -> new PdkValidationRows(model, codecs, pathRule -> PdkValidationRows.Rule.AUTO, limits), () -> { },
                      queryIo, decodeIo, 1, limits);
              var merge = new ValidationOrderedMerge(
-                     new ValidationOrderedGroups("source", source, row -> key(row, "source_id", "orders"), limits.bytes()),
-                     new ValidationOrderedGroups("target", target, row -> key(row, "target_id", "orders_v2"), limits.bytes()))) {
+                     new ValidationOrderedGroups("source", source, row -> key(row, sourceBinding, "source_id", "orders"), limits.bytes()),
+                     new ValidationOrderedGroups("target", target, row -> key(row, targetBinding, "target_id", "orders_v2"), limits.bytes()))) {
             while (true) {
                 var next = merge.next();
                 if (next.isEmpty()) break;
@@ -128,8 +132,15 @@ class ValidationReaderMergeTest {
         assertThat(targetStops).hasValue(1);
     }
 
-    private static ValidationOrderedGroups.Key key(ValidationValues.Row row, String field, String table) {
-        var key = new ValidationKey(List.of(ValidationKey.Part.number((Long)((ValidationValues.Typed)row.fields().get(field)).value())));
+    private static ValidationKeyBinding keyBinding(String field, ValidationValues.Limits limits) {
+        return new ValidationKeyBinding(field, List.of(new ValidationKeyBinding.Component(List.of(field),
+                ValidationKey.Kind.EXACT_NUMBER, Set.of("exact-number"))), Set.of(), limits);
+    }
+
+    private static ValidationOrderedGroups.Key key(ValidationValues.Row row, ValidationKeyBinding binding, String field, String table) {
+        var result = binding.read(row);
+        assertThat(result).isInstanceOf(ValidationKeyBinding.Bound.class);
+        var key = ((ValidationKeyBinding.Bound) result).key();
         return new ValidationOrderedGroups.Key(key, new ValidationPhysicalIdentity(field + "-connection",
                 "database", null, table, List.of(List.of(field)), key));
     }
