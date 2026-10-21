@@ -12,6 +12,7 @@ import io.tapstate.spi.store.ArtifactBatchWrite;
 import io.tapstate.spi.store.ArtifactMutation;
 import io.tapstate.spi.store.ArtifactWrite;
 import io.tapstate.spi.store.RegistrationSource;
+import io.tapstate.spi.store.SrsLogBounds;
 import io.tapstate.spi.store.SrsLogRecord;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
@@ -109,7 +110,11 @@ class ManagedAtlasMetadataIT {
 
                     MongoDatabase metadata = reopened.database();
                     assertThat(metadata.getCollection(MongoStorePort.ARTIFACTS).countDocuments()).isEqualTo(2);
-                    assertThat(metadata.getCollection(MongoStorePort.SRS_LOG).countDocuments()).isEqualTo(1);
+                    // The ring keeps its durable high-water mark beside its one change row.
+                    assertThat(metadata.getCollection(MongoStorePort.SRS_LOG)
+                            .countDocuments(new Document("_id.ring", "metadata-probe-ring"))).isEqualTo(1);
+                    assertThat(port.srsLog().bounds("metadata-probe-ring")).isEqualTo(new SrsLogBounds(1L, -1L));
+                    assertThat(metadata.getCollection(MongoStorePort.SRS_LOG).countDocuments()).isEqualTo(2);
                     assertThat(metadata.getCollection(MongoStorePort.PIPELINE_RATE_HISTORY).countDocuments())
                             .isEqualTo(1);
                     assertThat(metadata.getCollection(MongoStorePort.CONNECTOR_ARTIFACTS + ".files")

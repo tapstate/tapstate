@@ -300,6 +300,8 @@ class SessionResumePtyIT {
     private static ProcessBuilder process(List<String> command, Path workspace) {
         ProcessBuilder builder = new ProcessBuilder(command);
         builder.environment().remove("TAPSTATE_PASSWORD");
+        // Keep the CLI's stderr observable without inherited JVM launcher banners.
+        builder.environment().keySet().removeAll(List.of("JDK_JAVA_OPTIONS", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS"));
         builder.environment().put("TAPSTATE_WORKDIR", workspace.toString());
         return builder;
     }
@@ -308,6 +310,7 @@ class SessionResumePtyIT {
         String classpath = System.getProperty("surefire.test.class.path", System.getProperty("java.class.path"));
         List<String> command = new ArrayList<>(List.of(
                 Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                "-Xmx384m", "-XX:ActiveProcessorCount=2",
                 "-Duser.home=" + home,
                 "-cp", classpath,
                 Cli.class.getName()));

@@ -220,11 +220,13 @@ final class ClusterRebuildAdmission implements RebuildAdmission {
      */
     static boolean isMembershipChangedBeforeStart(Throwable failure) {
         String code = EngineError.MEMBERSHIP_CHANGED_BEFORE_START.code();
+        String cohortCode = EngineError.EXECUTION_COHORT_CHANGED_BEFORE_START.code();
         for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
-            if (cause instanceof TapstateException coded && coded.code() == EngineError.MEMBERSHIP_CHANGED_BEFORE_START) {
+            if (cause instanceof TapstateException coded && (coded.code() == EngineError.MEMBERSHIP_CHANGED_BEFORE_START
+                    || coded.code() == EngineError.EXECUTION_COHORT_CHANGED_BEFORE_START)) {
                 return true;
             }
-            if (cause.getMessage() != null && cause.getMessage().contains(code)) {
+            if (cause.getMessage() != null && (cause.getMessage().contains(code) || cause.getMessage().contains(cohortCode))) {
                 return true;
             }
         }

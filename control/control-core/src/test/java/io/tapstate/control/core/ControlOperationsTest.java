@@ -11,6 +11,16 @@ class ControlOperationsTest {
     private final OperationRegistry registry = ControlOperations.registry();
 
     @Test
+    void clusterOperationsRegisterOnlyUnauditedReads() {
+        assertThat(registry.ids().stream().filter(id -> id.startsWith("cluster.")))
+                .containsExactlyInAnyOrder("cluster.members", "cluster.status", "cluster.context");
+        for (String id : List.of("cluster.members", "cluster.status", "cluster.context")) {
+            assertThat(registry.resolve(id).scope()).as(id).isEqualTo(Scope.READ);
+            assertThat(registry.resolve(id).audited()).as(id).isFalse();
+        }
+    }
+
+    @Test
     void registersExactlyTheL1OperationSet() {
         assertThat(registry.ids())
                 .containsExactlyInAnyOrder(
@@ -43,6 +53,7 @@ class ControlOperationsTest {
                         "data-browser.find",
                         "data-browser.stats",
                         "cluster.members",
+                        "cluster.status",
                         "cluster.context",
                         "pipeline.list",
                         "pipeline.catalog",
@@ -128,6 +139,7 @@ class ControlOperationsTest {
         // cluster.members reads live topology; it is authenticated like every registry operation, but
         // needs no write or admin privilege.
         assertThat(registry.resolve("cluster.members").scope()).isEqualTo(Scope.READ);
+        assertThat(registry.resolve("cluster.status").scope()).isEqualTo(Scope.READ);
         // The layout update replaces editor metadata, while the lifecycle verbs write desired state.
         for (String id : List.of(
                 "pipeline.layout.update", "pipeline.create", "pipeline.update", "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume")) {
@@ -190,6 +202,7 @@ class ControlOperationsTest {
                 "data-browser.find",
                 "data-browser.stats",
                 "cluster.members",
+                "cluster.status",
                 "user.list",
                 "token.list",
                 "pipeline.list",
@@ -211,7 +224,7 @@ class ControlOperationsTest {
     void theRegistryOpensEveryUsableOperationOnCliAndKeepsTheRevealReservationClosed() {
         // The cluster context is REST-only. The reveal reservation stays unpublished until its
         // dedicated authorizer exists.
-        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(66);
+        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(67);
         assertThat(registry.all()).filteredOn(op -> !"source.reveal-config".equals(op.id())
                 && !"cluster.context".equals(op.id())).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));

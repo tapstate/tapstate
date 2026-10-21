@@ -13,6 +13,9 @@ import io.tapstate.spi.store.SrsMetaStore;
 import io.tapstate.spi.store.StorePort;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.ClusterMembershipStore;
+import io.tapstate.spi.store.ClusterProfileStore;
+import io.tapstate.spi.store.ClusterCapacityStore;
+import io.tapstate.spi.store.ClusterRecoveryStore;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
@@ -29,7 +32,7 @@ import org.springframework.context.annotation.Import;
  * substrate check, say — turns it off and starts without one.
  */
 @Configuration
-@EnableConfigurationProperties({MongoProperties.class, MetricsHistoryProperties.class})
+@EnableConfigurationProperties({MongoProperties.class, MetricsHistoryProperties.class, ClusterProperties.class})
 @Import({ClusterMembershipConfiguration.class, CloudRuntimeConfiguration.class})
 class StoreConfiguration {
 
@@ -67,12 +70,30 @@ class StoreConfiguration {
     @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
     StorePort storePort(
             MongoConnection storeConnection, MongoProperties mongo, MetricsHistoryProperties history,
-            CloudRuntimeSettings cloud) {
+            ClusterProperties cluster, CloudRuntimeSettings cloud) {
         // The one configured bound among the stores: how long a movement sample is kept. Written onto
         // the history's expiring index as the port comes up, so a changed retention is a changed index.
         return new MongoStorePort(
-                storeConnection, cloud.operatorStateDatabase(mongo.getOperatorStateDatabase()),
-                history.getRetention());
+                storeConnection, cloud.operatorStateDatabase(mongo.getOperatorStateDatabase()), history.getRetention(),
+                cluster.getProfile() != ClusterProperties.Profile.SINGLE);
+    }
+
+    @Bean
+    @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
+    ClusterProfileStore clusterProfileStore(StorePort storePort) {
+        return storePort.clusterProfiles();
+    }
+
+    @Bean
+    @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
+    ClusterCapacityStore clusterCapacityStore(StorePort storePort) {
+        return storePort.clusterCapacity();
+    }
+
+    @Bean
+    @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
+    ClusterRecoveryStore clusterRecoveryStore(StorePort storePort) {
+        return storePort.clusterRecovery();
     }
 
     /** The process-local keyring view used by Source storage and the clustered node-session lease. */

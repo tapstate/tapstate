@@ -206,6 +206,10 @@ public enum NestError implements TapstateErrorCode {
     MIGRATION_PARKING_LIMIT_EXCEEDED(
             "nest.migration-parking-limit-exceeded", Set.of("address", "changes", "limit")),
 
+    /** Running: a parked handover no longer supplies a piece its identifying entry promised. */
+    MIGRATION_HANDOVER_UNAVAILABLE(
+            "nest.migration-handover-unavailable", Set.of("address", "piece")),
+
     /**
      * Running: an event can never be placed in a document, because the row it hangs from is known to be
      * gone, and has gone to the dead-letter channel instead. The pipeline keeps running, which is why this

@@ -60,6 +60,7 @@ class ASlowerSinkHoldsTheResumePositionIT {
         Path fastTarget = Files.createDirectory(temporary.resolve("fast-target"));
         Path heldTarget = Files.createDirectory(temporary.resolve("held-target"));
         Path signals = Files.createDirectory(temporary.resolve("held-write"));
+        Path readerEntries = Files.createDirectory(temporary.resolve("reader-entries"));
         EndpointAddress sourceAddress = EndpointAddress.uri(source.toString());
         EndpointAddress fastAddress = EndpointAddress.uri(fastTarget.toString());
         EndpointAddress heldAddress = EndpointAddress.uri(heldTarget.toString());
@@ -73,7 +74,7 @@ class ASlowerSinkHoldsTheResumePositionIT {
             control.bootstrapAndLogin("e2e", "e2e-password");
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID,
                     Files.readAllBytes(E2eConnectorJar.buildInto(temporary)));
-            control.apply(workspace(source, fastTarget, heldTarget, signals));
+            control.apply(workspace(source, fastTarget, heldTarget, signals, readerEntries));
             control.discoverSchema(SOURCE, E2eConnectorJar.CONNECTOR_ID, Map.of("uri", source.toString()));
             control.lifecycle(PIPELINE, LifecycleVerb.START);
 
@@ -83,9 +84,10 @@ class ASlowerSinkHoldsTheResumePositionIT {
                 }
                 return Optional.of(documents.miningChainIds().iterator().next());
             });
-            Await.until("the pipeline's initial shared resume position", TIMEOUT,
-                    () -> hasAggregateRingDone(documents, chain),
-                    () -> String.valueOf(documents.consumerOffset(chain, SrsConsumerId.of(PIPELINE, SOURCE).value())));
+            Await.until("the physical reader and the pipeline's initial shared resume position", TIMEOUT,
+                    () -> readerStarted(readerEntries) && hasAggregateRingDone(documents, chain),
+                    () -> "reader entries=" + directoryEntries(readerEntries) + ", consumer="
+                            + documents.consumerOffset(chain, SrsConsumerId.of(PIPELINE, SOURCE).value()));
             Progress initial = progress(documents, chain);
 
             try {
@@ -141,16 +143,63 @@ class ASlowerSinkHoldsTheResumePositionIT {
                         },
                         () -> progress(documents, chain).toString());
                 assertThat(control.state(PIPELINE)).contains(PipelineState.RUNNING);
+            } catch (AssertionError failure) {
+                try {
+                    Path retained = retainReaderEntries(readerEntries, source, fastTarget, heldTarget, signals, server);
+                    throw new AssertionError(failure.getMessage() + "; reader-entry diagnostics retained at " + retained, failure);
+                } catch (java.io.IOException | RuntimeException unavailable) {
+                    failure.addSuppressed(unavailable);
+                    throw failure;
+                }
             } finally {
                 Files.writeString(signals.resolve("release"), "");
             }
         }
     }
 
+    private static Path retainReaderEntries(Path entries, Path source, Path fastTarget,
+            Path heldTarget, Path signals, ServerHandle server) throws java.io.IOException {
+        Path retained = Path.of(System.getProperty("tapstate.e2e.build-directory", "target"))
+                .resolve("failure-scenes").resolve("two-sink-reader-entry").resolve(java.util.UUID.randomUUID().toString());
+        Files.createDirectories(retained);
+        try (var files = Files.list(entries)) {
+            for (Path entry : files.filter(Files::isRegularFile).sorted().toList()) {
+                Files.copy(entry, retained.resolve(entry.getFileName()));
+            }
+        }
+        for (var named : Map.of("source", source, "fast-target", fastTarget, "held-target", heldTarget).entrySet()) {
+            Path table = named.getValue().resolve(TABLE + ".csv");
+            if (Files.exists(table)) { Files.copy(table, retained.resolve(named.getKey() + ".csv")); }
+        }
+        Files.writeString(retained.resolve("signals.txt"), directoryEntries(signals).toString());
+        if (server instanceof RealProcessServer process) {
+            Files.copy(process.output(), retained.resolve("server.log"));
+        }
+        return retained;
+    }
+
     private static boolean oneWriterIsAhead(Progress progress, long initial) {
         return progress.writerAt(HELD_WRITER, initial) == initial
                 && progress.writerAt(FAST_WRITER, initial) > initial
                 && progress.aggregateRingDone() == initial;
+    }
+
+    private static boolean readerStarted(Path directory) {
+        try (var entries = Files.list(directory)) {
+            for (Path ledger : entries.filter(Files::isRegularFile)
+                    .filter(path -> path.getFileName().toString().startsWith("positions-")
+                            && path.getFileName().toString().endsWith(".tsv")).toList()) {
+                for (String line : Files.readAllLines(ledger)) {
+                    String[] fields = line.split("\t", 5);
+                    if (fields.length == 5 && "START".equals(fields[1]) && TABLE.equals(fields[2])) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        } catch (java.io.IOException failure) {
+            throw new java.io.UncheckedIOException(failure);
+        }
     }
 
     private static boolean hasAggregateRingDone(StoreDocuments documents, String chain) {
@@ -200,17 +249,17 @@ class ASlowerSinkHoldsTheResumePositionIT {
     }
 
     private static Map<String, String> workspace(
-            Path source, Path fastTarget, Path heldTarget, Path signals) {
+            Path source, Path fastTarget, Path heldTarget, Path signals, Path readerEntries) {
         Map<String, String> resources = new LinkedHashMap<>();
         resources.put(SOURCE + ".tap.yml", """
                 version: tapstate/v1
                 kind: source
                 id: %s
                 connector: %s
-                config: { uri: "%s" }
+                config: { uri: "%s", read_witness: "%s" }
                 mode: cdc
                 tables: [ %s ]
-                """.formatted(SOURCE, E2eConnectorJar.CONNECTOR_ID, source, TABLE));
+                """.formatted(SOURCE, E2eConnectorJar.CONNECTOR_ID, source, readerEntries, TABLE));
         resources.put(FAST_TARGET + ".tap.yml", """
                 version: tapstate/v1
                 kind: source

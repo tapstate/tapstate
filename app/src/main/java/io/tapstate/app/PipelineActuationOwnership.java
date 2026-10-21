@@ -1,8 +1,10 @@
 package io.tapstate.app;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimType;
@@ -136,6 +138,8 @@ final class PipelineActuationOwnership {
         return new PipelineActuationOwnership();
     }
 
+    boolean isFenced() { return fenced; }
+
     PipelineActuationOwnership(
             String clusterId,
             WorkloadOwner owner,
@@ -235,6 +239,16 @@ final class PipelineActuationOwnership {
     }
 
     synchronized Execution beginExecution(String pipelineId) {
+        return beginExecution(pipelineId, claims == null ? null : claims::advanceExecution);
+    }
+
+    @FunctionalInterface
+    interface ExecutionAdvance {
+        Optional<WorkloadClaim> advance(WorkloadClaim expected, long topologyRevision, Set<String> members);
+    }
+
+    /** Reuses the real issuer through a transaction which also records capacity or recovery receipts. */
+    synchronized Execution beginExecution(String pipelineId, ExecutionAdvance advance) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         if (closing) {
             return Execution.refused();
@@ -248,16 +262,19 @@ final class PipelineActuationOwnership {
         }
         ClusterMembership planned = membership.committed();
         Set<String> runMembers = planned == null ? Set.of() : plannedOver(planned);
+        WorkloadClaim expected = state.claim;
         Optional<WorkloadClaim> advanced;
         try {
-            // At the claim's own topology revision, which is the committed one: a revision change refuses
-            // the renew above, so a claim still held is a claim granted under the current topology.
-            advanced = claims.advanceExecution(state.claim, state.claim.topologyRevision(), runMembers);
+            // The allocation is fenced under the acquisition revision carried by the exact owning claim.
+            advanced = Objects.requireNonNull(advance, "advance")
+                    .advance(expected, expected.topologyRevision(), runMembers);
         } catch (RuntimeException unreachable) {
-            advanced = Optional.empty();
+            state.claim = null;
+            return Execution.refused();
         }
         if (advanced.isEmpty()) {
-            state.claim = null;
+            // A deferred allocation cannot submit, but may retain the exact live claim for renewal.
+            if (!stillOwns(expected)) { state.claim = null; }
             return Execution.refused();
         }
         state.claim = advanced.get();
@@ -273,8 +290,24 @@ final class PipelineActuationOwnership {
         // submitted because a member went away, into a cluster that is still settling from it. Clearing
         // the moment here would make the very next death of this run read as the pipeline's own.
         return new Execution(true, new ExecutionFence(
-                pipelineId, state.claim.claimGeneration(), state.claim.executionGeneration()),
+                pipelineId, state.claim.claimGeneration(), state.claim.executionGeneration(),
+                state.claim.profileGeneration()),
                 state.claim.topologyRevision());
+    }
+
+    private boolean stillOwns(WorkloadClaim expected) {
+        try {
+            return claims.read(expected.key()).filter(WorkloadClaimReading::leased)
+                    .map(WorkloadClaimReading::claim)
+                    .filter(actual -> actual.key().equals(expected.key()) && actual.owner().equals(expected.owner())
+                            && actual.claimGeneration() == expected.claimGeneration()
+                            && actual.executionGeneration() == expected.executionGeneration()
+                            && actual.profileGeneration() == expected.profileGeneration()
+                            && actual.topologyRevision() == expected.topologyRevision())
+                    .isPresent();
+        } catch (TapstateException unavailable) {
+            return false;
+        }
     }
 
     /**
@@ -421,10 +454,9 @@ final class PipelineActuationOwnership {
      * A run submitted over a claim this member no longer holds dies at its first write, and the member that
      * holds the pipeline then reads that death as the pipeline's.
      *
-     * <p>Read rather than renewed: what is asked is who holds the run's generations now, and a renewal is
-     * also refused for a claim granted under a topology revision a member joining has since moved, which
-     * the same owner takes again on its next pass under the same generations. True on a single node, where
-     * nothing is fenced.
+     * <p>Read rather than renewed: this proves the run's generations independently of a topology-only
+     * lease refresh. The renewer refreshes acquisition topology while that same authority remains live.
+     * True on a single node, where nothing is fenced.
      */
     boolean proveExecution(ExecutionFence fence) {
         if (!fenced || fence == null) {
@@ -446,8 +478,54 @@ final class PipelineActuationOwnership {
         return reading.filter(WorkloadClaimReading::leased)
                 .map(WorkloadClaimReading::claim)
                 .filter(claim -> claim.claimGeneration() == fence.claimGeneration()
-                        && claim.executionGeneration() == fence.executionGeneration())
+                        && claim.executionGeneration() == fence.executionGeneration()
+                        && claim.profileGeneration() == fence.profileGeneration())
                 .isPresent();
+    }
+
+    /** A captured local claim is an expectation only; the store still validates every transaction. */
+    synchronized Optional<WorkloadClaim> currentClaim(String pipelineId) {
+        Held current = held.get(pipelineId);
+        return current == null ? Optional.empty() : Optional.ofNullable(current.claim);
+    }
+
+    /** Validates the current owning claim before pre-allocation validation or pending teardown. */
+    synchronized boolean mayStart(String pipelineId) {
+        if (closing) {
+            return false;
+        }
+        if (!fenced) {
+            return true;
+        }
+        WorkloadClaim expected = currentClaim(pipelineId).orElse(null);
+        if (expected == null) {
+            return false;
+        }
+        return claims.read(expected.key()).filter(WorkloadClaimReading::leased)
+                .map(WorkloadClaimReading::claim)
+                .filter(actual -> actual.owner().equals(expected.owner())
+                        && actual.claimGeneration() == expected.claimGeneration()
+                        && actual.executionGeneration() == expected.executionGeneration()
+                        && actual.profileGeneration() == expected.profileGeneration()).isPresent();
+    }
+
+    /** Retires only the stopped execution captured before cleanup, never a subsequently admitted run. */
+    synchronized boolean retireStoppedExecution(WorkloadClaim expected) {
+        if (!fenced || expected == null) {
+            return true;
+        }
+        Held current = held.get(expected.key().resourceId());
+        if (current == null || current.claim == null
+                || current.claim.claimGeneration() != expected.claimGeneration()
+                || current.claim.executionGeneration() != expected.executionGeneration()
+                || current.claim.profileGeneration() != expected.profileGeneration()) {
+            return false;
+        }
+        boolean released = claims.release(expected);
+        if (released) {
+            current.claim = null;
+        }
+        return released;
     }
 
     /** Whether a local capture still serves a pipeline this member holds; never acquires or renews a claim. */
@@ -539,6 +617,16 @@ final class PipelineActuationOwnership {
         state.claim = recorded.get();
     }
 
+    /** A specifically diagnosed failure keeps its classification before unrelated membership movement. */
+    synchronized void recordClassifiedFailure(String pipelineId, boolean topologyFailure) {
+        if (!fenced || closing) { return; }
+        Held state = held.get(pipelineId);
+        if (state == null || state.claim == null || state.claim.executionGeneration() < 1
+                || state.claim.contextExecutionGeneration() != state.claim.executionGeneration()
+                || state.claim.failureClaimGeneration() != 0) { return; }
+        state.claim = claims.recordExecutionFailure(state.claim, topologyFailure).orElse(null);
+    }
+
     /** A shutting-down member must leave its dying run unclassified for the next holder to recover. */
     @EventListener(ContextClosedEvent.class)
     synchronized void stopForShutdown() {
@@ -628,7 +716,10 @@ final class PipelineActuationOwnership {
     private Permit renew(Held state, long now) {
         Optional<WorkloadClaim> renewed;
         try {
-            renewed = claims.renew(state.claim, ttl);
+            ClusterMembership current = membership.committed();
+            renewed = current != null && current.revision() != state.claim.topologyRevision()
+                    ? refreshAcquisitionTopology(state.claim, current.revision())
+                    : claims.renew(state.claim, ttl);
         } catch (RuntimeException unreachable) {
             // The coordination store is the only thing that can say this member still owns the pipeline,
             // and it did not answer. Unproved is the same as lost here: the alternative is to keep driving
@@ -643,6 +734,34 @@ final class PipelineActuationOwnership {
         }
         state.claim = renewed.get();
         return new Permit(true, state.claim);
+    }
+
+    /** Refreshes acquisition topology only while the original authority and execution remain proved. */
+    private Optional<WorkloadClaim> refreshAcquisitionTopology(WorkloadClaim expected, long topologyRevision) {
+        WorkloadClaimFence authority = WorkloadClaimFence.from(expected);
+        return claims.read(expected.key()).filter(WorkloadClaimReading::leased)
+                .map(WorkloadClaimReading::claim)
+                .filter(current -> authority.sameAuthorityAs(WorkloadClaimFence.from(current))
+                        && sameFrozenExecution(expected, current))
+                .flatMap(current -> claims.acquire(expected.key(), expected.owner(), topologyRevision, ttl))
+                .filter(WorkloadClaimAttempt::acquired)
+                .map(WorkloadClaimAttempt::claim)
+                .filter(refreshed -> refreshed.topologyRevision() == topologyRevision
+                        && authority.sameAuthorityAs(WorkloadClaimFence.from(refreshed))
+                        && sameFrozenExecution(expected, refreshed));
+    }
+
+    private static boolean sameFrozenExecution(WorkloadClaim expected, WorkloadClaim actual) {
+        return expected.contextExecutionGeneration() == actual.contextExecutionGeneration()
+                && expected.executionClaimGeneration() == actual.executionClaimGeneration()
+                && expected.executionNodeIds().equals(actual.executionNodeIds())
+                && expected.executionMembers().equals(actual.executionMembers())
+                && Objects.equals(expected.executionProfile(), actual.executionProfile())
+                && Objects.equals(expected.executionTopologyRevision(), actual.executionTopologyRevision())
+                && Objects.equals(expected.executionIncarnation(), actual.executionIncarnation())
+                && Objects.equals(expected.executionRevision(), actual.executionRevision())
+                && expected.failureClaimGeneration() == actual.failureClaimGeneration()
+                && expected.failureAfterMemberLoss() == actual.failureAfterMemberLoss();
     }
 
     private Permit acquire(String pipelineId, Held state, long now) {

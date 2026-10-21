@@ -85,7 +85,9 @@ final class SharedPostgres {
                             "-c", "fsync=off",
                             "-c", "wal_level=logical",
                             "-c", "max_wal_senders=32",
-                            "-c", "max_replication_slots=32");
+                            // Stopped streams keep their slots, so this ceiling is sized for every slot a
+                            // complete pass leaves behind; one complete pass already needs more than 32.
+                            "-c", "max_replication_slots=64");
             starting.start();
             container = starting;
         }

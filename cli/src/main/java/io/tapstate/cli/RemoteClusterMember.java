@@ -12,5 +12,14 @@ package io.tapstate.cli;
  * @param state      what the member is to the cluster, in the server's own words
  */
 record RemoteClusterMember(
-        String nodeId, String memberUuid, String bootId, String hzAddress, String controlUrl, String state) {
+        String nodeId, String memberUuid, String bootId, String hzAddress, String controlUrl, String state,
+        Long profileGeneration, String profileHash, String sessionBootId, String sessionLeaseUntil,
+        Long sessionLeaseRemainingMillis, Boolean sessionLeased, Boolean joined, String joinedAt, Boolean live,
+        String joinedMemberUuid, String joinedMemberAddress) {
+
+    RemoteClusterMember(String nodeId, String memberUuid, String bootId, String hzAddress,
+            String controlUrl, String state) {
+        this(nodeId, memberUuid, bootId, hzAddress, controlUrl, state,
+                null, null, null, null, null, null, null, null, null, null, null);
+    }
 }

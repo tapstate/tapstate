@@ -16,6 +16,9 @@ import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.SnapshotOnlyCapture;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.ConsumerOffset;
+import io.tapstate.spi.store.CaptureResumeWitness;
+import io.tapstate.spi.store.ConsumerProgressKind;
+import io.tapstate.core.model.ReadMode;
 import io.tapstate.spi.store.SchemaVersion;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
@@ -63,6 +66,24 @@ class SnapshotPhaseTest {
 
     private static Envelope row(String src, int id) {
         return Envelope.read(id, src, Map.of("id", id), Map.of());
+    }
+
+    @Test
+    void aFrozenSnapshotRequestCannotAdoptLaterConsumerCompletionOrAReplacedSeam() {
+        var frozen = new CaptureResumeWitness("source", "mysql", "chain", PIPE, ReadMode.SNAPSHOT_AND_CDC,
+                true, List.of("orders"), true, 2, new ChainPosition(new SourceOrder(2, 20), "old-root"),
+                true, true, List.of(), "original-own-seam", 1, ConsumerProgressKind.SRS, null, Map.of());
+        ConsumerOffset changed = new ConsumerOffset(PIPE, Map.of(), null, List.of("orders"), "later-seam", 8);
+        RecordingMeta later = new RecordingMeta(new ArrayList<>(), new SrsMeta("chain",
+                new ChainPosition(new SourceOrder(9, 30), "later-root"), List.of(changed), List.of(), null));
+        FakePort port = new FakePort(new FakeBatch(List.of(row(1)), "new-sampled-seam"));
+        List<Envelope> read = new ArrayList<>();
+        try (SnapshotPhase.Load load = SnapshotPhase.open(port, config(), "chain", PIPE, List.of("orders"), 9, later, frozen)) {
+            assertThat(load.tailSeam()).isEqualTo("original-own-seam");
+            assertThat(load.read(read::add, table -> { })).isEqualTo(1);
+        }
+        assertThat(read).singleElement().satisfies(event -> assertThat(event.position().order()).isEqualTo(SourceOrder.snapshotRow(1)));
+        assertThat(later.pinnedEpoch).isEqualTo(1);
     }
 
     @Test

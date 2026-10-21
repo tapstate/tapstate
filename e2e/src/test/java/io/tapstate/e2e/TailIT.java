@@ -11,6 +11,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -24,7 +25,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * both commands still appear to work - a {@code tail} built by polling one row would look right until
  * somebody changed a different one.
  *
- * <p>So the row that changes is deliberately not the one {@code watch} would be holding. That makes
+ * <p>So the row appended is deliberately not the one {@code watch} would be holding. That makes
  * the two commands answer differently about the same event, which is the only way to show from outside
  * that the difference is real rather than a difference in what the help text says.
  *
@@ -44,9 +45,9 @@ class TailIT {
     private static final String SOURCE_ID = "src_rows";
     private static final String COLLECTION = "orders";
 
-    /** How many rows are there to change; the one changed is deliberately not the first. */
+    /** The seeded rows remain in order; later CDC inserts have strictly greater row positions. */
     private static final int SEEDED_ROWS = 5;
-    private static final int CHANGED_ROW = 4;
+    private final Map<Integer, String> sourceRows = new LinkedHashMap<>();
 
     /**
      * The host's ceiling on live connector instances. Named here rather than read from the product: a
@@ -106,14 +107,14 @@ class TailIT {
             try (CliProcess tail = CliProcess.onAPipe(Map.of("TAPSTATE_PASSWORD", PASSWORD),
                     "-c", server.baseUrl().toString(), "-u", USER,
                     "tail", SOURCE_ID + "." + COLLECTION)) {
-                awaitFollowing(control);
-                change(CHANGED_ROW);
-                tail.awaitOutput(seen -> seen.contains(marker(CHANGED_ROW)), TIMEOUT,
-                        "the change to row " + CHANGED_ROW + " to reach a tail of the whole collection");
+                awaitFollowing(() -> tail.output().contains("waking-"));
+                int appended = appendChangedRow();
+                tail.awaitOutput(seen -> seen.contains(marker(appended)), TIMEOUT,
+                        "the appended row " + appended + " to reach this tail of the whole collection");
             }
 
-            // (2) The control group, and the reason (1) says anything. The same event, watched by the
-            // other command holding a different row, must not show up - otherwise "tail follows the
+            // (2) The control group, and the reason (1) says anything. A new row in the same collection,
+            // watched by the other command holding its first row, must not show up - otherwise "tail follows the
             // whole collection" is a sentence about a command that behaves identically to its
             // neighbour. On a terminal because watch refuses a pipe, which is its own case.
             // No filter: unasked, watch holds the first row the database hands back, which for this
@@ -130,7 +131,7 @@ class TailIT {
                         .as("the first frame this command draws")
                         .doesNotContainPattern(CURSOR_UP);
 
-                change(CHANGED_ROW);
+                int notHeld = appendChangedRow();
                 // Then change the row it *is* holding. Its arrival is what makes the absence above a
                 // fact rather than a wait: the two changes are ordered, so once the second has been
                 // drawn the first has already been seen and not drawn.
@@ -140,7 +141,7 @@ class TailIT {
                         "watch to redraw the row it is holding after that row changed");
                 assertThat(shown)
                         .as("what watch drew while a row it was not holding changed")
-                        .doesNotContain(marker(CHANGED_ROW));
+                        .doesNotContain(marker(notHeld));
                 // It redrew rather than appended. This is the one place that says so on the lane every
                 // change runs through: the witness that drives this command against a pipeline needs real
                 // connector jars, so on an ordinary run it does not execute at all - and the bytes being
@@ -174,55 +175,54 @@ class TailIT {
             // Not merely accepted - actually working. A follow that opened and then sat deaf would
             // pass an "it was not refused" assertion while holding nothing anybody could use.
             try (ControlPlane.Follow afterwards = control.follow(SOURCE_ID, COLLECTION, null)) {
-                change(2);
-                afterwards.awaitFrame(frame -> true, TIMEOUT,
-                        "a change on a follow opened after every earlier one was closed");
+                awaitFollowing(() -> !afterwards.frames().isEmpty());
+                int appended = appendChangedRow();
+                afterwards.awaitFrame(frame -> frame.toString().contains(marker(appended)), TIMEOUT,
+                        "a new row on this follow after every earlier one was closed");
             }
         }
     }
 
-    /**
-     * Waits until the follow behind the command is actually running, by changing a row it is not being
-     * asked about and watching that arrive.
-     *
-     * <p>Without this the change under test could be made before the stream started, and the case would
-     * fail reporting that a tail does not report changes - which would be a true sentence about a
-     * product that works. The row used is the first one, and the assertion below is about the fourth.
-     */
-    private void awaitFollowing(ControlPlane control) {
+    /** Proves this reader has delivered a new row after its sampled PRESENT position. */
+    private void awaitFollowing(java.util.function.BooleanSupplier delivered) {
         long deadline = System.nanoTime() + TIMEOUT.toNanos();
-        try (ControlPlane.Follow probe = control.follow(SOURCE_ID, COLLECTION, null)) {
-            int nudge = 0;
-            while (System.nanoTime() - deadline < 0) {
-                change(1, "waking-" + nudge++);
-                if (!probe.frames().isEmpty()) {
-                    return;
-                }
-                sleep();
-            }
+        int nudge = 0;
+        while (System.nanoTime() - deadline < 0) {
+            append("waking-" + nudge++);
+            if (delivered.getAsBoolean()) { return; }
+            sleep();
         }
-        throw new AssertionError("no change reached a follow within " + TIMEOUT
-                + ", so nothing here could tell a stream that had not started from one with nothing to say");
+        throw new AssertionError("no new row reached this follow within " + TIMEOUT
+                + ", so it has not proved actual delivery");
     }
 
     private void seed(int rows) {
-        StringBuilder csv = new StringBuilder("id,note\n");
-        for (int row = 1; row <= rows; row++) {
-            csv.append(row).append(',').append("row-").append(row).append('\n');
-        }
-        write(csv.toString());
+        sourceRows.clear();
+        for (int row = 1; row <= rows; row++) { sourceRows.put(row, "row-" + row); }
+        publishRows();
     }
 
-    /** Rewrites the collection with one row carrying a value nothing else in it has. */
-    private void change(int row) {
-        change(row, marker(row));
-    }
-
+    /** Query-based watch can see an edit; the fixture's CDC stream carries only new row positions. */
     private void change(int row, String note) {
+        sourceRows.put(row, note);
+        publishRows();
+    }
+
+    private int append(String note) {
+        int row = sourceRows.keySet().stream().mapToInt(Integer::intValue).max().orElse(0) + 1;
+        sourceRows.put(row, note);
+        publishRows();
+        return row;
+    }
+
+    private int appendChangedRow() {
+        int row = sourceRows.keySet().stream().mapToInt(Integer::intValue).max().orElse(0) + 1;
+        return append(marker(row));
+    }
+
+    private void publishRows() {
         StringBuilder csv = new StringBuilder("id,note\n");
-        for (int each = 1; each <= SEEDED_ROWS; each++) {
-            csv.append(each).append(',').append(each == row ? note : "row-" + each).append('\n');
-        }
+        sourceRows.forEach((row, note) -> csv.append(row).append(',').append(note).append('\n'));
         write(csv.toString());
     }
 

@@ -58,7 +58,7 @@ public final class MigrationRunner {
                     new V4DiscardInventedPositions(), new V5SplitSourceSchemas(), new V6SplitDerivedSchemas(),
                     new V7RepairBlankPipelines(), new V8DiscardViewSchemaPolicies(),
                     new V9RateHistoryIndexes(), new V10SrsConsumerOffsetIndexes(),
-                    new V11RateHistoryKeysetIndex(), new V12EncryptSourceConfigs());
+                    new V11RateHistoryKeysetIndex(), new V12EncryptSourceConfigs(), new V13ClusterExecutionProfiles());
 
     /**
      * The highest version this build knows. A store above it is one this build must not open: it was

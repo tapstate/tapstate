@@ -229,6 +229,9 @@ final class Repl {
     /** The connection state, carried across read-loop iterations (offline until {@code connect}). */
     private final Session session = new Session();
 
+    /** The verified issuer of this connection, retained across endpoint moves and credential renewal. */
+    private String boundIssuer;
+
     /** The launch-scoped machine bearer, retained only in this process until logout or exit. */
     private String machineToken;
 
@@ -843,8 +846,7 @@ final class Repl {
         if (words.get(0).equals("apply")) {
             return applyOnline(words);
         }
-        // The two streaming sugars ride the read verbs over the websocket channel: `status --watch` and
-        // `logs --follow`. They are the only dash-options a connected verb accepts, and only on their verb.
+        // Streaming forms ride the existing websocket channel and keep their text-only option parsing.
         if (words.get(0).equals("status") && words.contains("--watch")) {
             return statusWatch(words);
         }
@@ -880,6 +882,10 @@ final class Repl {
         // success.
         if (words.get(0).equals("status")) {
             return statusOnline(words);
+        }
+        // Explanation reads share the existing output formats and parse them beside their pipeline id.
+        if (words.get(0).equals("explain")) {
+            return explainOnline(words);
         }
         // Current metrics is positional, while the history form carries a bounded range and selectors.
         // Parse both here so the generic connected-verb guard does not reject the history options.
@@ -2892,7 +2898,7 @@ final class Repl {
     }
 
     /**
-     * {@code cluster [-o text|json|yaml]} — lists the cluster's members: each one's stable node id, the
+     * {@code cluster [members|status] [-o text|json|yaml]} — lists the cluster's members: each one's stable node id, the
      * runtime identity of this boot of it, where members reach it, where a client reaches its control
      * face, and what it is to the cluster. Takes no operand; an unknown option is a benign usage line; a
      * coded refusal renders its code and message.
@@ -2901,12 +2907,19 @@ final class Repl {
      * change what is printed — the point of asking a cluster rather than a node.
      */
     private int clusterOnline(List<String> words) {
-        OutputFormat format = parseFormatOnly("cluster", words);
+        boolean status = words.size() > 1 && words.get(1).equals("status");
+        boolean explicit = status || (words.size() > 1 && words.get(1).equals("members"));
+        List<String> options = new ArrayList<>(words);
+        if (explicit) {
+            options.remove(1);
+        }
+        OutputFormat format = parseFormatOnly(explicit ? "cluster " + words.get(1) : "cluster", options);
         if (format == null) {
             return Cli.EXIT_USAGE;
         }
         ClusterMembersOutcome outcome = withFailover(
-                () -> controlPlane.clusterMembers(session.landingNode(), session.credential()),
+                () -> status ? controlPlane.clusterStatus(session.landingNode(), session.credential())
+                        : controlPlane.clusterMembers(session.landingNode(), session.credential()),
                 o -> o instanceof ClusterMembersOutcome.Unreachable);
         return switch (outcome) {
             case ClusterMembersOutcome.Listed listed -> {
@@ -2923,18 +2936,30 @@ final class Repl {
         PrintWriter out = commandLine.getOut();
         switch (format) {
             case TEXT -> {
+                StringBuilder identity = new StringBuilder();
+                appendFact(identity, "cluster", listed.clusterId());
+                appendFact(identity, "topology", listed.topologyRevision());
+                printFacts(out, identity);
+                StringBuilder profile = new StringBuilder();
+                appendFact(profile, "profile", listed.profileGeneration());
+                appendFact(profile, "hash", listed.profileHash());
+                printFacts(out, profile);
+                RecoveryText.cluster(out, listed.recovery());
                 if (listed.members().isEmpty()) {
                     out.println("no members");
                 } else {
                     for (RemoteClusterMember member : listed.members()) {
                         out.println(memberHeadline(member));
+                        renderMemberFacts(out, member, listed.profileHash());
                     }
                 }
                 for (RemotePipeline pipeline : listed.pipelines()) {
                     out.println();
-                    out.println(pipelineHeadline(pipeline, listed.members().size()));
+                    out.println(pipelineHeadline(pipeline, participatingLiveMembers(pipeline, listed.members())));
+                    renderClaimFacts(out, pipeline.controllerClaim());
                     for (RemoteVertex vertex : pipeline.vertices()) {
                         out.println("  " + cell(vertex.name()) + "  " + where(vertex) + backlogOf(vertex));
+                        for (RemoteProcessor processor : vertex.processors()) { renderProcessorContext(out, processor); }
                     }
                 }
             }
@@ -2949,6 +2974,68 @@ final class Repl {
         return cell(member.nodeId()) + "  " + cell(member.state()) + "  " + cell(member.controlUrl());
     }
 
+    private static void renderMemberFacts(PrintWriter out, RemoteClusterMember member, String clusterProfileHash) {
+        StringBuilder runtime = new StringBuilder();
+        appendFact(runtime, "boot", member.bootId());
+        appendFact(runtime, "member", member.memberUuid());
+        appendFact(runtime, "address", member.hzAddress());
+        appendFact(runtime, "live", member.live());
+        printFacts(out, runtime);
+        StringBuilder profile = new StringBuilder();
+        appendFact(profile, "profile", member.profileGeneration());
+        if (!Objects.equals(member.profileHash(), clusterProfileHash)) {
+            appendFact(profile, "hash", member.profileHash());
+        }
+        printFacts(out, profile);
+        StringBuilder session = new StringBuilder();
+        appendFact(session, "session boot", member.sessionBootId());
+        appendFact(session, "leased", member.sessionLeased());
+        appendFact(session, "remaining ms", member.sessionLeaseRemainingMillis());
+        appendFact(session, "until", member.sessionLeaseUntil());
+        printFacts(out, session);
+        StringBuilder join = new StringBuilder();
+        appendFact(join, "join observed", member.joined());
+        appendFact(join, "at", member.joinedAt());
+        if (!Objects.equals(member.memberUuid(), member.joinedMemberUuid())) {
+            appendFact(join, "joined member", member.joinedMemberUuid());
+        }
+        if (!Objects.equals(member.hzAddress(), member.joinedMemberAddress())) {
+            appendFact(join, "joined address", member.joinedMemberAddress());
+        }
+        printFacts(out, join);
+    }
+
+    private static void appendFact(StringBuilder line, String label, Object value) {
+        if (value != null) {
+            line.append("  ").append(label).append(' ').append(value);
+        }
+    }
+
+    private static void printFacts(PrintWriter out, StringBuilder line) {
+        if (!line.isEmpty()) {
+            out.println(line);
+        }
+    }
+
+    /** Expected measurement sources use only supplied live identities and the run's participation exclusions. */
+    private static java.util.Set<String> participatingLiveMembers(
+            RemotePipeline pipeline, List<RemoteClusterMember> members) {
+        java.util.Set<String> participating = new java.util.HashSet<>();
+        for (RemoteClusterMember member : members) {
+            if (Boolean.FALSE.equals(member.live())
+                    || (member.nodeId() != null && pipeline.awaitingRebalance().contains(member.nodeId()))
+                    || "LOST".equals(member.state()) || "INCOMPATIBLE".equals(member.state())
+                    || "JOINING".equals(member.state())) {
+                continue;
+            }
+            if (member.live() == null || member.memberUuid() == null || !"ACTIVE".equals(member.state())) {
+                return null;
+            }
+            participating.add(member.memberUuid());
+        }
+        return participating;
+    }
+
     /** The topology as an ordered tree for the machine surfaces, omitting what the server did not say. */
     private static Map<String, Object> clusterMap(ClusterMembersOutcome.Listed listed) {
         List<Object> rows = new ArrayList<>();
@@ -2960,6 +3047,17 @@ final class Repl {
             putIfPresent(row, "hzAddress", member.hzAddress());
             putIfPresent(row, "controlUrl", member.controlUrl());
             putIfPresent(row, "state", member.state());
+            putIfPresent(row, "profileGeneration", member.profileGeneration());
+            putIfPresent(row, "profileHash", member.profileHash());
+            putIfPresent(row, "sessionBootId", member.sessionBootId());
+            putIfPresent(row, "sessionLeaseUntil", member.sessionLeaseUntil());
+            putIfPresent(row, "sessionLeaseRemainingMillis", member.sessionLeaseRemainingMillis());
+            putIfPresent(row, "sessionLeased", member.sessionLeased());
+            putIfPresent(row, "joined", member.joined());
+            putIfPresent(row, "joinedAt", member.joinedAt());
+            putIfPresent(row, "live", member.live());
+            putIfPresent(row, "joinedMemberUuid", member.joinedMemberUuid());
+            putIfPresent(row, "joinedMemberAddress", member.joinedMemberAddress());
             rows.add(row);
         }
         List<Object> pipelines = new ArrayList<>();
@@ -2968,12 +3066,15 @@ final class Repl {
         }
         Map<String, Object> map = new LinkedHashMap<>();
         putIfPresent(map, "clusterId", listed.clusterId());
+        putIfPresent(map, "profileGeneration", listed.profileGeneration());
+        putIfPresent(map, "profileHash", listed.profileHash());
         // Absent rather than zero: nothing committed is not a cluster at revision zero.
         if (listed.topologyRevision() != null) {
             map.put("topologyRevision", listed.topologyRevision());
         }
         map.put("members", rows);
         map.put("pipelines", pipelines);
+        putIfPresent(map, "recovery", RecoveryWire.tree(listed.recovery()));
         return map;
     }
 
@@ -2981,12 +3082,11 @@ final class Repl {
      * The human line for one pipeline: who owns it, at which generations, and whether the placement
      * below it is the whole picture.
      *
-     * <p>The count of members the readings came from is printed only when it is short of the cluster,
-     * because that is the one case where the vertex lines below mean less than they appear to: for the
-     * first seconds of a run the engine has reported from some members and not others, and a narrower
-     * answer then is being assembled rather than being true.
+     * <p>Measurement coverage is compared by engine identity with the supplied live participants, not
+     * with registry history or newly joined members awaiting rebalance. Unknown membership proof leaves
+     * coverage unknown; a departed member's reading cannot stand in for a live member that did not report.
      */
-    private static String pipelineHeadline(RemotePipeline pipeline, int members) {
+    private static String pipelineHeadline(RemotePipeline pipeline, java.util.Set<String> members) {
         StringBuilder line = new StringBuilder(cell(pipeline.pipelineId()));
         RemoteClaim claim = pipeline.controllerClaim();
         if (claim == null) {
@@ -3008,9 +3108,15 @@ final class Repl {
         }
         if (pipeline.vertices().isEmpty()) {
             line.append("  (not running)");
-        } else if (pipeline.measuredFrom().size() < members) {
+        } else if (members == null) {
             line.append("  (measured from ").append(pipeline.measuredFrom().size())
-                    .append(" of ").append(members).append(" members)");
+                    .append(" members; membership coverage unknown)");
+        } else if (members.isEmpty()) {
+            line.append("  (no live participating members)");
+        } else if (!pipeline.measuredFrom().containsAll(members)) {
+            long measured = members.stream().filter(pipeline.measuredFrom()::contains).count();
+            line.append("  (measured from ").append(measured)
+                    .append(" of ").append(members.size()).append(" members)");
         }
         return line.toString();
     }
@@ -3071,6 +3177,7 @@ final class Repl {
                 putIfPresent(one, "localIndex", processor.localIndex());
                 putIfPresent(one, "memberUuid", processor.memberUuid());
                 putIfPresent(one, "nodeId", processor.nodeId());
+                putIfPresent(one, "context", RecoveryWire.tree(processor.context()));
                 putIfPresent(one, "backlog", processor.backlog());
                 if (!processor.frontierGaps().isEmpty()) {
                     one.put("frontierGaps", new java.util.TreeMap<>(processor.frontierGaps()));
@@ -3100,8 +3207,69 @@ final class Repl {
         putIfPresent(row, "ownerBootId", claim.ownerBootId());
         putIfPresent(row, "claimGeneration", claim.claimGeneration());
         putIfPresent(row, "executionGeneration", claim.executionGeneration());
+        putIfPresent(row, "topologyRevision", claim.topologyRevision());
         putIfPresent(row, "leased", claim.leased());
+        putIfPresent(row, "leaseUntil", claim.leaseUntil());
+        putIfPresent(row, "leaseRemainingMillis", claim.leaseRemainingMillis());
+        putIfPresent(row, "profileGeneration", claim.profileGeneration());
+        putIfPresent(row, "contextExecutionGeneration", claim.contextExecutionGeneration());
+        putIfPresent(row, "executionClaimGeneration", claim.executionClaimGeneration());
+        putIfPresent(row, "executionIncarnation", claim.executionIncarnation());
+        putIfPresent(row, "executionRevision", claim.executionRevision());
+        putIfPresent(row, "executionTopologyRevision", claim.executionTopologyRevision());
+        putIfPresent(row, "executionProfileGeneration", claim.executionProfileGeneration());
+        putIfPresent(row, "executionProfileHash", claim.executionProfileHash());
+        putIfPresent(row, "executionMembers", RecoveryWire.tree(claim.executionMembers()));
+        putIfPresent(row, "failureClaimGeneration", claim.failureClaimGeneration());
+        putIfPresent(row, "failureAfterMemberLoss", claim.failureAfterMemberLoss());
+        putIfPresent(row, "executionContextCurrent", claim.executionContextCurrent());
         return row;
+    }
+
+    private static void renderClaimFacts(PrintWriter out, RemoteClaim claim) {
+        if (claim == null) { return; }
+        StringBuilder lease = new StringBuilder();
+        appendFact(lease, "topology", claim.topologyRevision());
+        appendFact(lease, "profile", claim.profileGeneration());
+        appendFact(lease, "leased", claim.leased());
+        appendFact(lease, "remaining ms", claim.leaseRemainingMillis());
+        appendFact(lease, "until", claim.leaseUntil());
+        printFacts(out, lease);
+        StringBuilder context = new StringBuilder();
+        appendFact(context, "context execution", claim.contextExecutionGeneration());
+        appendFact(context, "execution claim", claim.executionClaimGeneration());
+        appendFact(context, "execution incarnation", claim.executionIncarnation());
+        appendFact(context, "execution revision", claim.executionRevision());
+        appendFact(context, "execution topology", claim.executionTopologyRevision());
+        appendFact(context, "execution profile", claim.executionProfileGeneration());
+        appendFact(context, "execution profile hash", claim.executionProfileHash());
+        appendFact(context, "execution context current", claim.executionContextCurrent());
+        printFacts(out, context);
+        StringBuilder cohort = new StringBuilder();
+        appendFact(cohort, "execution members", RecoveryWire.tree(claim.executionMembers()));
+        appendFact(cohort, "failure claim", claim.failureClaimGeneration());
+        appendFact(cohort, "failure after member loss", claim.failureAfterMemberLoss());
+        printFacts(out, cohort);
+    }
+
+    private static void renderProcessorContext(PrintWriter out, RemoteProcessor processor) {
+        if (processor.context() == null) { return; }
+        RemoteProcessorContext context = processor.context();
+        StringBuilder line = new StringBuilder();
+        appendFact(line, "processor", processor.index());
+        appendFact(line, "local", processor.localIndex());
+        appendFact(line, "job", context.jobId());
+        appendFact(line, "runtime execution", context.runtimeExecutionId());
+        appendFact(line, "claim", context.claimGeneration());
+        appendFact(line, "execution", context.executionGeneration());
+        appendFact(line, "profile", context.profileGeneration());
+        appendFact(line, "node", context.nodeId());
+        appendFact(line, "boot", context.bootId());
+        appendFact(line, "member", context.memberUuid());
+        appendFact(line, "native global", context.globalProcessorIndex());
+        appendFact(line, "native local", context.localProcessorIndex());
+        appendFact(line, "initialized", context.initializedAt());
+        printFacts(out, line);
     }
 
     /**
@@ -3571,11 +3739,32 @@ final class Repl {
      * working.
      */
     private int statusOnline(List<String> words) {
-        String id = streamTargetId(words, "--rate");
-        if (id == null) {
+        IdAndFormat target = parseIdAndFormat("status", words.stream().filter(word -> !word.equals("--rate")).toList());
+        if (target == null) {
             return Cli.EXIT_USAGE;
         }
+        String id = target.id();
         boolean waitForRate = words.contains("--rate");
+        if (target.format() != OutputFormat.TEXT) {
+            if (waitForRate) {
+                commandLine.getErr().println("status: --rate requires text output");
+                commandLine.getErr().flush();
+                return Cli.EXIT_USAGE;
+            }
+            StatusOutcome status = readStatus(id);
+            return switch (status) {
+                case StatusOutcome.Found found -> {
+                    renderReadDocument(ReadViewDocuments.status(found), target.format());
+                    yield Cli.EXIT_OK;
+                }
+                case StatusOutcome.NoObservation unobserved -> {
+                    renderReadDocument(ReadViewDocuments.status(unobserved, id), target.format());
+                    yield Cli.EXIT_OK;
+                }
+                case StatusOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+                case StatusOutcome.Unreachable ignored -> reportRequestFailed();
+            };
+        }
         ExplainOutcome outcome = readExplanation(id);
         PrintWriter out = commandLine.getOut();
         return switch (outcome) {
@@ -3817,22 +4006,33 @@ final class Repl {
     }
 
     private int explainOnline(List<String> words) {
-        String id = readTargetId(words);
-        if (id == null) {
+        IdAndFormat target = parseIdAndFormat("explain", words);
+        if (target == null) {
             return Cli.EXIT_USAGE;
         }
+        String id = target.id();
         ExplainOutcome outcome = readExplanation(id);
         PrintWriter out = commandLine.getOut();
         return switch (outcome) {
             case ExplainOutcome.Found found -> {
-                out.println(found.pipelineId() + "  " + found.state().toLowerCase(Locale.ROOT));
-                renderExplanation(out, found);
+                if (target.format() == OutputFormat.TEXT) {
+                    out.println(found.pipelineId() + "  " + found.state().toLowerCase(Locale.ROOT));
+                    renderExplanation(out, found);
+                } else {
+                    renderReadDocument(ReadViewDocuments.explanation(found), target.format());
+                }
                 out.flush();
                 yield Cli.EXIT_OK;
             }
             case ExplainOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
             case ExplainOutcome.Unreachable ignored -> reportRequestFailed();
         };
+    }
+
+    private void renderReadDocument(Map<String, Object> document, OutputFormat format) {
+        PrintWriter out = commandLine.getOut();
+        out.println(format == OutputFormat.JSON ? JsonOut.write(document) : YamlOut.write(document));
+        out.flush();
     }
 
     /**
@@ -5222,6 +5422,7 @@ final class Repl {
             out.println("  awaiting   " + String.join(", ", answer.awaitingRebalance())
                     + " -- joined after this run was planned; given no part of it until a rebalance");
         }
+        RecoveryText.pipeline(out, answer.recovery());
     }
 
     /**
@@ -5461,6 +5662,7 @@ final class Repl {
                 // server that does not answer is reported as not answering rather than as agreeing.
                 String serverVersion = controlPlane.serverVersion(seed);
                 session.connect(seeds, seed, serverVersion);
+                boundIssuer = null;
                 confirm("connected to " + hostPort(seed) + " (" + session.versions() + ")");
                 if (serverVersion != null && !serverVersion.equals(Cli.VERSION_NUMBER)) {
                     renderWarning(CliError.VERSION_MISMATCH.code(),
@@ -5517,6 +5719,7 @@ final class Repl {
         PrintWriter out = commandLine.getOut();
         if (session.isConnected()) {
             session.disconnect();
+            boundIssuer = null;
             out.println("disconnected");
         } else {
             out.println("not connected");
@@ -5653,6 +5856,7 @@ final class Repl {
      * better informed and is not a step it depends on.
      */
     private void adoptAdvertisedMembers(String issuer) {
+        boundIssuer = issuer;
         // Once per connection. A cached session is re-activated before every API call, so asking here
         // each time would put a second round trip in front of every command this CLI runs.
         if (session.membersDiscovered()
@@ -5695,6 +5899,10 @@ final class Repl {
      * session returns to offline; an offline session is a no-op. This is the seam a connected verb
      * invokes on a request failure — L1's single-node member set exercises the same path (it is not
      * omitted for one node). Returns whether a landing node was kept.
+     *
+     * <p>A candidate can have been unreachable during initial discovery, or its address can have been
+     * reassigned since. Health proves neither identity, so a connection whose issuer is known verifies
+     * it again anonymously before moving the credential to any candidate.
      */
     boolean failover() {
         if (!session.isConnected()) {
@@ -5702,6 +5910,14 @@ final class Repl {
         }
         for (URI member : session.members()) {
             if (controlPlane.isHealthy(member)) {
+                if (boundIssuer != null) {
+                    try {
+                        new IssuerBinding(controlPlane).verify(List.of(member), boundIssuer);
+                    } catch (io.tapstate.core.common.TapstateException refusal) {
+                        printDiagnostic(commandLine.getErr(), refusal.code(), refusal.args());
+                        continue;
+                    }
+                }
                 session.reland(member);
                 PrintWriter out = commandLine.getOut();
                 out.println("reconnected to " + hostPort(member));

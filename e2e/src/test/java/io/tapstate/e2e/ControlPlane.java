@@ -1,12 +1,19 @@
 package io.tapstate.e2e;
 
 import io.tapstate.control.core.ClusterError;
+import io.tapstate.control.core.ClusterPipelineRecoveryView;
+import io.tapstate.control.core.ClusterRecoveryItemView;
+import io.tapstate.control.core.ClusterRecoveryView;
+import io.tapstate.control.core.ClusterTopologyView;
 import io.tapstate.control.core.MonitorError;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.TableSnapshot;
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -49,6 +56,8 @@ final class ControlPlane {
 
     private static final Duration TIMEOUT = Duration.ofSeconds(20);
 
+    private static final ObjectMapper TYPED_JSON = new ObjectMapper();
+
     /** How often a caller waiting on a pushed change looks again; a follow is told, never asked. */
     private static final Duration POLL = Duration.ofMillis(100);
 
@@ -85,6 +94,8 @@ final class ControlPlane {
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(TIMEOUT).build();
 
     private String credential;
+    private int healthAttempts;
+    private volatile String healthObservation = "no completed health request";
     private boolean cloudCookie;
 
     ControlPlane(URI baseUrl) {
@@ -93,13 +104,31 @@ final class ControlPlane {
 
     /** Whether the product answers its health probe; the readiness signal a launcher waits on. */
     boolean healthy() {
+        int attempt = ++healthAttempts;
+        long started = System.nanoTime();
         try {
             HttpResponse<String> response = send(get("/healthz"));
+            String body = response.body();
+            String excerpt = body.length() <= 128 ? body : body.substring(0, 128);
+            healthObservation = "attempt " + attempt + " at " + response.uri() + " after "
+                    + Duration.ofNanos(System.nanoTime() - started) + ": HTTP " + response.statusCode()
+                    + ", bodyLength=" + body.length() + ", body=" + TYPED_JSON.valueToTree(excerpt);
             return response.statusCode() == 200 && "ok".equals(response.body());
         } catch (UncheckedIOException e) {
+            List<String> causes = new ArrayList<>();
+            for (Throwable cause = e; cause != null && causes.size() < 5; cause = cause.getCause()) {
+                String message = String.valueOf(cause.getMessage());
+                if (message.length() > 128) { message = message.substring(0, 128); }
+                causes.add(cause.getClass().getName() + ": " + TYPED_JSON.valueToTree(message));
+            }
+            healthObservation = "attempt " + attempt + " at " + baseUrl.resolve("/healthz") + " after "
+                    + Duration.ofNanos(System.nanoTime() - started) + ": " + String.join(" <- ", causes);
             return false;
         }
     }
+
+    /** The last completed existing probe, without making another request or changing readiness. */
+    String healthObservation() { return healthObservation; }
 
     /**
      * The version the running server says it is, read the way a client reads it: unauthenticated,
@@ -352,13 +381,11 @@ final class ControlPlane {
     }
 
     /**
-     * The node ids this member says are in its cluster, in order.
+     * The stable ids of native members this answering node observes live, in sorted order.
      *
-     * <p>Asked of one member rather than of the cluster, because that is the property worth having: each
-     * of them answers out of the committed membership rather than out of what it happens to have seen,
-     * so two members that have found each other answer the same list and two that have not answer two
-     * lists of one. Sorted, so that comparing two members' answers compares what they hold rather than
-     * the order they happened to write it in.
+     * <p>The topology also retains admitted registry rows for departed and reserved boots. Their presence
+     * in the response does not make them native members; admission state and lease status likewise do not
+     * decide whether a member is visible in this node's native view.
      */
     List<String> clusterMemberNodeIds() {
         HttpResponse<String> response = send(authedGet("/api/cluster/members"));
@@ -441,7 +468,10 @@ final class ControlPlane {
         }
         List<String> nodeIds = new ArrayList<>();
         for (Object member : members) {
-            if (member instanceof Map<?, ?> one && one.get("nodeId") instanceof String nodeId) {
+            if (!(member instanceof Map<?, ?> one) || !(one.get("live") instanceof Boolean live)) {
+                throw new AssertionError("the cluster member carried no native liveness fact: " + member);
+            }
+            if (live && one.get("nodeId") instanceof String nodeId) {
                 nodeIds.add(nodeId);
             }
         }
@@ -473,6 +503,80 @@ final class ControlPlane {
             }
         }
         return facts;
+    }
+
+    /** The exact core projection, preserving absent facts and read diagnostics from this endpoint. */
+    ClusterTopologyView clusterStatus() {
+        HttpResponse<String> response = send(authedGet("/api/cluster/status"));
+        expect(response, 200, "read the typed cluster status");
+        return typed(response.body(), ClusterTopologyView.class);
+    }
+
+    /** A bounded poll may wait for the product's explicit temporary membership refusal. */
+    Optional<ClusterTopologyView> clusterStatusIfAnswered() {
+        HttpResponse<String> response = send(authedGet("/api/cluster/status"));
+        return interpretClusterStatus(response.statusCode(), response.body());
+    }
+
+    static Optional<ClusterTopologyView> interpretClusterStatus(int status, String body) {
+        if (status == 503 && ClusterError.MEMBERSHIP_UNREADABLE.code().equals(codeOf(body))) {
+            return Optional.empty();
+        }
+        if (status != 200) {
+            throw new AssertionError("could not read the typed cluster status: expected HTTP 200, got "
+                    + status + " - " + body);
+        }
+        return Optional.of(typed(body, ClusterTopologyView.class));
+    }
+
+    /** Uses the same authenticated read transport with an explicit case-scoped request bound. */
+    ClusterTopologyView clusterStatus(Duration bound) {
+        HttpRequest request = authenticate(HttpRequest.newBuilder(baseUrl.resolve("/api/cluster/status"))
+                .timeout(bound).GET()).build();
+        HttpResponse<String> response = send(request);
+        expect(response, 200, "read the typed cluster status within its bound");
+        return typed(response.body(), ClusterTopologyView.class);
+    }
+
+    ClusterRecoveryView clusterRecovery(Duration bound) {
+        ClusterRecoveryView recovery = clusterStatus(bound).recovery();
+        if (recovery == null) throw new AssertionError("cluster status omitted its recovery projection");
+        return recovery;
+    }
+
+    /** The core queue/profile/capacity projection, without deriving a recovery state in the harness. */
+    ClusterRecoveryView clusterRecovery() {
+        ClusterRecoveryView recovery = clusterStatus().recovery();
+        if (recovery == null) throw new AssertionError("cluster status omitted its recovery projection");
+        return recovery;
+    }
+
+    /** The installed profile exactly as projected; null retains an unavailable/absent server reading. */
+    ClusterRecoveryItemView.Profile clusterProfile() {
+        return clusterRecovery().currentProfile();
+    }
+
+    /** The pipeline's recovery field, decoded as its core DTO from the existing lifecycle status face. */
+    ClusterPipelineRecoveryView pipelineRecovery(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + urlSegment(pipelineId) + "/status"));
+        expect(response, 200, "read the recovery of " + pipelineId);
+        try {
+            JsonNode recovery = TYPED_JSON.readTree(response.body()).get("recovery");
+            if (recovery == null || recovery.isNull()) {
+                throw new AssertionError("pipeline status omitted its recovery projection: " + response.body());
+            }
+            return TYPED_JSON.treeToValue(recovery, ClusterPipelineRecoveryView.class);
+        } catch (JacksonException invalid) {
+            throw new AssertionError("pipeline recovery differs from its core DTO: " + response.body(), invalid);
+        }
+    }
+
+    private static <T> T typed(String body, Class<T> type) {
+        try {
+            return TYPED_JSON.readValue(body, type);
+        } catch (JacksonException invalid) {
+            throw new AssertionError("response differs from " + type.getSimpleName() + ": " + body, invalid);
+        }
     }
 
     private static String asText(Object value) {

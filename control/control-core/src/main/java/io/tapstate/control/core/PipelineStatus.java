@@ -25,13 +25,18 @@ import java.util.Objects;
  * of it until it is rebalanced. Empty where every member is planned for, or where there is no plan.
  */
 public record PipelineStatus(String pipelineId, PipelineState state, ObservationFailure failure,
-        Instant observedAt, ExecutionPlan plan, List<String> awaitingRebalance) {
+        Instant observedAt, ExecutionPlan plan, List<String> awaitingRebalance, ClusterPipelineRecoveryView recovery) {
 
     public PipelineStatus {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(state, "state");
         // Absent reads as none: the wire omits an empty list, and a status read back from it names nobody.
         awaitingRebalance = awaitingRebalance == null ? List.of() : List.copyOf(awaitingRebalance);
+    }
+
+    public PipelineStatus(String pipelineId, PipelineState state, ObservationFailure failure, Instant observedAt,
+            ExecutionPlan plan, List<String> awaitingRebalance) {
+        this(pipelineId, state, failure, observedAt, plan, awaitingRebalance, null);
     }
 
     /** A status whose plan, if any, was worked out for every member of the cluster. */

@@ -92,11 +92,11 @@ class HttpControlPlaneClientTest {
             assertThat(listed.pipelines()).hasSize(1);
             RemotePipeline pipeline = listed.pipelines().get(0);
             assertThat(pipeline.controllerClaim())
-                    .isEqualTo(new RemoteClaim("orders", "node-b", "boot-b", 3L, 7L, true));
+                    .isEqualTo(new RemoteClaim("orders", "node-b", "boot-b", 3L, 7L, 4L, true));
             assertThat(pipeline.captureClaims())
                     .as("a capture's ownership is its own, with its own generations and its own lease")
                     .containsExactly(
-                            new RemoteClaim("capture-f00d", "node-a", "boot-a", 1L, 1L, false));
+                            new RemoteClaim("capture-f00d", "node-a", "boot-a", 1L, 1L, 4L, false));
             assertThat(pipeline.measuredAt())
                     .as("read as a time, so a server that sent a number instead would be caught here "
                             + "rather than by a reader wondering why a placement has no moment")
@@ -118,6 +118,181 @@ class HttpControlPlaneClientTest {
                             new RemoteProcessor(0, "uuid-a", "node-a"),
                             new RemoteProcessor(1, 0, "uuid-b", "node-b", 12L, Map.of("shop", 40L),
                                     Map.of("shop", 1200L), Map.of("shop.orders", 30L), Map.of("orders", 512L)));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void bothClusterReadsDecodeTheSharedProfileAndSessionWireWithoutInventingUnknowns() throws Exception {
+        String body;
+        try (var golden = getClass().getResourceAsStream("/golden/cluster/topology-profile.golden.json")) {
+            assertThat(golden).isNotNull();
+            body = new String(golden.readAllBytes(), StandardCharsets.UTF_8);
+        }
+        String hash = "7cfff7ba047061b5cdffe86fa6d643c0c803ac007a190419d922cf98afa8303e";
+        for (String path : List.of("/api/cluster/members", "/api/cluster/status")) {
+            HttpServer server = serverReplying(path, 200, body);
+            try {
+                HttpControlPlaneClient client = new HttpControlPlaneClient();
+                ClusterMembersOutcome result = path.endsWith("status")
+                        ? client.clusterStatus(baseOf(server), "token") : client.clusterMembers(baseOf(server), "token");
+                assertThat(result).isInstanceOf(ClusterMembersOutcome.Listed.class);
+                ClusterMembersOutcome.Listed listed = (ClusterMembersOutcome.Listed) result;
+                assertThat(listed.profileGeneration()).isEqualTo(2L);
+                assertThat(listed.profileHash()).isEqualTo(hash);
+                assertThat(listed.members()).containsExactly(
+                        new RemoteClusterMember("node-a", "8b0a1e6e-0000-4000-8000-00000000000a", "boot-a1",
+                                "[127.0.0.1]:5701", "https://node-a.example:8443", "ACTIVE", 2L, hash,
+                                "boot-a1", "2026-09-19T08:30:21Z", 21_000L, true, true, "2026-09-19T08:29:00Z", true,
+                                "8b0a1e6e-0000-4000-8000-00000000000a", "[127.0.0.1]:5701"),
+                        new RemoteClusterMember("node-b", "8b0a1e6e-0000-4000-8000-00000000000b", "boot-b1",
+                                "[127.0.0.1]:5702", "https://node-b.example:8443", "ACTIVE", 2L, hash,
+                                "boot-b1", "2026-09-19T08:30:28Z", 28_000L, true, true, "2026-09-19T08:29:00Z", true,
+                                "8b0a1e6e-0000-4000-8000-00000000000b", "[127.0.0.1]:5702"),
+                        new RemoteClusterMember("node-c", "uuid-c", "boot-c1", "[127.0.0.1]:5703",
+                                "https://node-c.example:8443", "LOST", 2L, hash, "boot-c1",
+                                "2026-09-19T08:29:53Z", -7_000L, false, true, "2026-09-19T08:29:00Z", false,
+                                "uuid-c", "[127.0.0.1]:5703"),
+                        new RemoteClusterMember("node-d", null, "boot-d1", null, "https://node-d.example:8443",
+                                "JOINING", 2L, hash, "boot-d1", "2026-09-19T08:30:15Z", 15_000L,
+                                true, false, null, false, null, null));
+                assertThat(listed.pipelines().getFirst().vertices()).extracting(RemoteVertex::effective)
+                        .containsExactly(1, 2);
+                assertThat(listed.pipelines().getFirst().awaitingRebalance()).isEmpty();
+            } finally {
+                server.stop(0);
+            }
+        }
+    }
+
+    @Test
+    void recoveryClaimsAndNativeContextKeepTheirSeparateDurableIdentities() throws Exception {
+        for (String path : List.of("/api/cluster/members", "/api/cluster/status")) {
+            HttpServer server = serverReplying(path, 200, JsonOut.compact(RecoveryFixtures.topology()));
+            try {
+                HttpControlPlaneClient client = new HttpControlPlaneClient();
+                ClusterMembersOutcome outcome = path.endsWith("status")
+                        ? client.clusterStatus(baseOf(server), "token") : client.clusterMembers(baseOf(server), "token");
+                assertThat(outcome).isInstanceOf(ClusterMembersOutcome.Listed.class);
+                var found = (ClusterMembersOutcome.Listed) outcome;
+                assertThat(JsonReader.parse(JsonOut.compact(RecoveryWire.tree(found.recovery())))).isEqualTo(RecoveryFixtures.clusterRecovery());
+                assertThat(found.recovery().quorumReady()).isNull();
+                assertThat(found.recovery().capacity().occupiedByNode()).isNull();
+                var pipeline = found.pipelines().getFirst();
+                assertThat(pipeline.controllerClaim().executionContextCurrent()).isFalse();
+                assertThat(pipeline.controllerClaim().executionGeneration()).isEqualTo(22);
+                assertThat(pipeline.controllerClaim().contextExecutionGeneration()).isEqualTo(21);
+                assertThat(pipeline.controllerClaim().executionMembers()).containsExactly(new RemoteClaim.Member("node-b", "boot-b1", "uuid-b1"));
+                var processors = pipeline.vertices().getFirst().processors();
+                assertThat(processors.getFirst().localIndex()).isNull();
+                assertThat(processors.getFirst().context()).isNull();
+                assertThat(JsonReader.parse(JsonOut.compact(RecoveryWire.tree(processors.getLast().context()))))
+                        .isEqualTo(RecoveryFixtures.processorContext());
+                assertThat(found.recovery().items().getFirst().successor().failureNote().diagnostic().params())
+                        .containsEntry("requested", "resume-12");
+                assertThat(found.recovery().items().getFirst().originalPositions().get("crm").token()).isEqualTo("resume-7");
+            } finally {
+                server.stop(0);
+            }
+        }
+    }
+
+    @Test
+    void statusAndExplanationCarryTheSameAttemptFactsAndOriginalCodedArguments() throws Exception {
+        HttpServer statusServer = serverReplying("/api/pipelines/orders/status", 200, JsonOut.compact(RecoveryFixtures.status()));
+        HttpServer explainServer = serverReplying("/api/pipelines/orders/explain", 200, JsonOut.compact(RecoveryFixtures.explanation()));
+        try {
+            var client = new HttpControlPlaneClient();
+            StatusOutcome status = client.status(baseOf(statusServer), "token", "orders");
+            ExplainOutcome explanation = client.explain(baseOf(explainServer), "token", "orders");
+            assertThat(status).isInstanceOf(StatusOutcome.Found.class);
+            assertThat(explanation).isInstanceOf(ExplainOutcome.Found.class);
+            assertThat(JsonReader.parse(JsonOut.compact(ReadViewDocuments.status((StatusOutcome.Found) status))))
+                    .isEqualTo(RecoveryFixtures.status());
+            assertThat(JsonReader.parse(JsonOut.compact(ReadViewDocuments.explanation((ExplainOutcome.Found) explanation))))
+                    .isEqualTo(RecoveryFixtures.explanation());
+        } finally {
+            statusServer.stop(0);
+            explainServer.stop(0);
+        }
+    }
+
+    @Test
+    void machineDocumentsKeepTheFrozenPlanAndReplacementAfterHttpDecoding() throws Exception {
+        String plan = """
+                {"claimGeneration":8,"executionGeneration":22,"topologyRevision":3,
+                 "members":["node-a","node-b"],
+                 "nodes":[
+                  {"node":"orders_sink","requested":4,"requestedOrigin":"node-default","scope":"native",
+                   "memberCount":2,"computedLocal":4,"effective":8,"reasons":["full-member-width"],
+                   "batch":{"maxRecords":25,"maxWaitMillis":200},
+                   "resources":{"writers":8,"connectorMode":"PER_WRITER","connectorInstances":8,
+                    "bufferedRecords":200,"edgeQueueRecords":128},
+                   "change":{"previousEffective":4,"causes":["member-set-changed"]}},
+                  {"node":"orders_source","requested":1,"requestedOrigin":"explicit","scope":"cluster",
+                   "memberCount":2,"effective":1,"reasons":["shared-reader"],
+                   "batch":{"maxRecords":10,"maxWaitMillis":100}}],
+                 "plannedAt":"2026-10-10T12:00:00Z",
+                 "replaces":{"executionGeneration":21,"members":["node-a"],
+                  "plannedAt":"2026-10-10T11:00:00Z"}}
+                """;
+        for (boolean status : List.of(true, false)) {
+            String path = "/api/pipelines/orders/" + (status ? "status" : "explain");
+            String document = status ? "{\"pipelineId\":\"orders\",\"state\":\"RUNNING\",\"plan\":" + plan + "}"
+                    : "{\"pipelineId\":\"orders\",\"state\":\"RUNNING\",\"kind\":\"NO_MATCH\","
+                      + "\"message\":\"No diagnostic rule matched.\",\"freshness\":\"UNKNOWN\","
+                      + "\"evidence\":[],\"cannotSay\":[],\"next\":null,\"plan\":" + plan + "}";
+            HttpServer server = serverReplying(path, 200, document);
+            try {
+                HttpControlPlaneClient client = new HttpControlPlaneClient();
+                Map<String, Object> rendered;
+                if (status) {
+                    var outcome = client.status(baseOf(server), "token", "orders");
+                    assertThat(outcome).isInstanceOf(StatusOutcome.Found.class);
+                    rendered = ReadViewDocuments.status((StatusOutcome.Found) outcome);
+                } else {
+                    var outcome = client.explain(baseOf(server), "token", "orders");
+                    assertThat(outcome).isInstanceOf(ExplainOutcome.Found.class);
+                    rendered = ReadViewDocuments.explanation((ExplainOutcome.Found) outcome);
+                }
+                assertThat(JsonReader.parse(JsonOut.compact(rendered))).isEqualTo(JsonReader.parse(document));
+            } finally {
+                server.stop(0);
+            }
+        }
+    }
+
+    @Test
+    void malformedRecoveryDoesNotDecodeAsAHealthyEmptyQueue() throws Exception {
+        Map<String, Object> malformed = new java.util.LinkedHashMap<>(RecoveryFixtures.explanation());
+        malformed.put("recovery", Map.of("recoveryState", "RECOVERED", "causes", List.of(), "items", "wrong-type"));
+        HttpServer server = serverReplying("/api/pipelines/orders/explain", 200, JsonOut.compact(malformed));
+        try {
+            assertThat(new HttpControlPlaneClient().explain(baseOf(server), "token", "orders"))
+                    .isInstanceOf(ExplainOutcome.Unreachable.class);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void anUnavailableQueueKeepsItsUnknownStateAndOriginalReadDiagnostic() throws Exception {
+        Map<String, Object> unknown = new java.util.LinkedHashMap<>(RecoveryFixtures.clusterRecovery());
+        unknown.put("recoveryState", null);
+        unknown.put("items", List.of());
+        unknown.put("causes", List.of());
+        unknown.put("queueUnavailable", Map.of("code", "io.document-unreadable",
+                "params", Map.of("id", "orders", "field", "targetProfile")));
+        HttpServer server = serverReplying("/api/cluster/status", 200,
+                JsonOut.compact(Map.of("clusterId", "cluster-a", "members", List.of(), "pipelines", List.of(), "recovery", unknown)));
+        try {
+            var outcome = new HttpControlPlaneClient().clusterStatus(baseOf(server), "token");
+            assertThat(outcome).isInstanceOf(ClusterMembersOutcome.Listed.class);
+            var view = ((ClusterMembersOutcome.Listed) outcome).recovery();
+            assertThat(view.recoveryState()).isNull();
+            assertThat(view.queueUnavailable().code()).isEqualTo("io.document-unreadable");
+            assertThat(JsonReader.parse(JsonOut.compact(RecoveryWire.tree(view)))).isEqualTo(unknown);
         } finally {
             server.stop(0);
         }
@@ -1682,9 +1857,60 @@ class HttpControlPlaneClientTest {
                 new AtomicReference<>());
         try {
             assertThat(new HttpControlPlaneClient().status(baseOf(server), "tok", "pl1"))
-                    .isEqualTo(new StatusOutcome.NoObservation());
+                    .isEqualTo(new StatusOutcome.NoObservation("pl1", "NEW", "STARTING", "RUNNING", true, null));
         } finally {
             server.stop(0);
+        }
+    }
+
+    @Test
+    void aggregateStatusKeepsRecoveryBeforeTheFirstRuntimeObservation() throws Exception {
+        Map<String, Object> body = Map.of("pipelineId", "orders", "state", "NEW", "displayState", "STARTING",
+                "desiredState", "RUNNING", "hasArtifact", true, "recovery", RecoveryFixtures.pipelineRecovery());
+        HttpServer server = apiServer("/api/pipelines/orders/status", 200,
+                io.tapstate.core.common.JsonWriter.write(body), new AtomicReference<>());
+        try {
+            assertThat(new HttpControlPlaneClient().status(baseOf(server), "tok", "orders"))
+                    .isInstanceOfSatisfying(StatusOutcome.NoObservation.class, reading -> {
+                        assertThat(reading.pipelineId()).isEqualTo("orders");
+                        assertThat(reading.state()).isEqualTo("NEW");
+                        assertThat(reading.desiredState()).isEqualTo("RUNNING");
+                        assertThat(JsonReader.parse(io.tapstate.core.common.JsonWriter.write(
+                                RecoveryWire.tree(reading.recovery())))).isEqualTo(RecoveryFixtures.pipelineRecovery());
+                    });
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void unobservedStatusAllowsAbsentOrNullOptionalMetadata() throws Exception {
+        for (String body : List.of(
+                "{\"pipelineId\":\"pl1\",\"state\":\"NEW\",\"observedState\":null}",
+                "{\"pipelineId\":\"pl1\",\"state\":\"NEW\",\"displayState\":null,"
+                        + "\"desiredState\":null,\"hasArtifact\":null,\"recovery\":null}")) {
+            HttpServer server = apiServer("/api/pipelines/pl1/status", 200, body, new AtomicReference<>());
+            try {
+                assertThat(new HttpControlPlaneClient().status(baseOf(server), "tok", "pl1"))
+                        .isEqualTo(new StatusOutcome.NoObservation("pl1", "NEW", null, null, null, null));
+            } finally {
+                server.stop(0);
+            }
+        }
+    }
+
+    @Test
+    void malformedRecoveryInAnUnobservedStatusIsNotAcceptedAsAValidRead() throws Exception {
+        for (String recovery : List.of("\"invalid\"", "[]", "{\"items\":12}")) {
+            String body = "{\"pipelineId\":\"pl1\",\"state\":\"NEW\",\"observedState\":null,\"recovery\":"
+                    + recovery + "}";
+            HttpServer server = apiServer("/api/pipelines/pl1/status", 200, body, new AtomicReference<>());
+            try {
+                assertThat(new HttpControlPlaneClient().status(baseOf(server), "tok", "pl1"))
+                        .isInstanceOf(StatusOutcome.Unreachable.class);
+            } finally {
+                server.stop(0);
+            }
         }
     }
 
@@ -1713,7 +1939,8 @@ class HttpControlPlaneClientTest {
             StatusOutcome outcome = new HttpControlPlaneClient().status(baseOf(server), "tok-abc", "pl1");
 
             assertThat(outcome).isEqualTo(new StatusOutcome.Found("pl1", "FAILED", "engine.job-failed",
-                    "Pipeline pl1 stopped because its job failed: sink refused."));
+                    "Pipeline pl1 stopped because its job failed: sink refused.", null, null, null,
+                    Map.of("cause", "sink refused"), null, List.of()));
         } finally {
             server.stop(0);
         }

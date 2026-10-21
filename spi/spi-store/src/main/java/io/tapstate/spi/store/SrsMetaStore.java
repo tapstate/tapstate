@@ -25,6 +25,63 @@ import java.util.Optional;
  */
 public interface SrsMetaStore {
 
+    default CaptureResumeWitness resumeWitness(String sourceId, String connectorId, String chain,
+            String consumerId, io.tapstate.core.model.ReadMode mode, boolean shared, List<String> tables) {
+        return CaptureResumeWitness.from(sourceId, connectorId, chain, consumerId, mode, shared, tables, read(chain));
+    }
+
+    /** Records the exact pre-open facts under the pipeline's real successor claim, never a read-time UUID. */
+    default boolean prepareCaptureResume(WorkloadClaimFence pipelineClaim, CaptureResumeWitness witness,
+            ClusterRecoveryPosition requestedPosition) {
+        return false;
+    }
+
+    default boolean prepareCaptureResume(WorkloadClaimFence pipelineClaim, CaptureResumeWitness witness,
+            ClusterRecoveryPosition requestedPosition, java.util.Set<String> requiredSourceIds) {
+        return false;
+    }
+
+    default boolean prepareCaptureResume(WorkloadClaimFence pipelineClaim, CaptureResumeWitness witness,
+            ClusterRecoveryPosition requestedPosition, java.util.Set<String> requiredSourceIds, String retention) {
+        return false;
+    }
+
+    default Optional<CaptureReadAttempt> beginCaptureReadAttempt(String chain, long epoch, List<String> tables,
+            CaptureReadAttempt.Kind kind, String requestedToken, java.time.Instant requestedInstant,
+            WorkloadClaimFence captureClaim) {
+        return Optional.empty();
+    }
+
+    /** Binds the actual physical reader, before open; attachments consume that reader's shared proof. */
+    default boolean bindCaptureReadAttempt(WorkloadClaimFence pipelineClaim, CaptureResumeWitness witness,
+            CaptureReadAttempt attempt, boolean sharedAttachment) { return false; }
+
+    default boolean recordCaptureAnchor(CaptureReadAttempt attempt, String anchor) { return false; }
+    default boolean recordCaptureFirstDelivery(CaptureReadAttempt attempt) { return false; }
+    default boolean recordCaptureReadFailure(CaptureReadAttempt attempt, String code) { return false; }
+    default boolean recordCaptureReadFailure(CaptureReadAttempt attempt, String code,
+            Map<String, Object> params, String disposition) { return recordCaptureReadFailure(attempt, code); }
+    default Optional<CaptureReadState> captureReadState(String chain) { return Optional.empty(); }
+
+    /** Records actual validated registration, after recovery validation and before source open. */
+    default boolean recordCaptureAttachment(WorkloadClaimFence pipelineClaim, CaptureResumeWitness witness,
+            long chainEpoch) { return false; }
+
+    /** A bounded load proves actual delivery or successful empty completion, without claiming its tail. */
+    default boolean recordSnapshotStartup(WorkloadClaimFence pipelineClaim, CaptureResumeWitness witness) { return false; }
+
+    default Optional<CaptureStartupProof> captureStartupProof(WorkloadClaimFence pipelineClaim,
+            CaptureResumeWitness witness) { return Optional.empty(); }
+
+    default Optional<CaptureStartupFailure> captureStartupFailure(WorkloadClaimFence pipelineClaim,
+            CaptureResumeWitness witness) { return Optional.empty(); }
+
+    default Optional<CaptureResumePreparation> captureResumePreparation(WorkloadClaimFence pipelineClaim,
+            String chain, String consumerId) { return Optional.empty(); }
+
+    /** Exact prepared sources survive loss of the controller that opened them. */
+    default List<CaptureResumePreparation> captureResumePreparations(WorkloadClaimFence pipelineClaim) { return List.of(); }
+
     /** Records a requested table union for one physical capture without broadening any consumer. */
     default void requestCaptureTables(String miningChainId, List<String> tables) {
     }
@@ -107,6 +164,17 @@ public interface SrsMetaStore {
      */
     default List<ConsumerOffset> consumerOffsets(String miningChainId) {
         return read(miningChainId).map(SrsMeta::consumerOffsets).orElse(List.of());
+    }
+
+    /** Active flow-control consumers; raw cursor evidence remains available through {@link #consumerOffsets}. */
+    default List<ConsumerOffset> activeConsumerOffsets(String miningChainId) {
+        return ConsumerOffset.activeForFlow(consumerOffsets(miningChainId),
+                legacy -> legacyReadCursorOnly(miningChainId, legacy));
+    }
+
+    /** Proves the exact raw legacy record has no sink/writer state hidden by its value projection. */
+    default boolean legacyReadCursorOnly(String miningChainId, ConsumerOffset expected) {
+        return false;
     }
 
     /**

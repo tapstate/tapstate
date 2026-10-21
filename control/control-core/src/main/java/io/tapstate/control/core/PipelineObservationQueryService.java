@@ -38,6 +38,7 @@ public final class PipelineObservationQueryService {
     private final ObservationStore observations;
     private final ExecutionPlans plans;
     private final Supplier<List<String>> members;
+    private final ClusterRecoveryQueries recovery;
 
     public PipelineObservationQueryService(ArtifactQueryService artifacts, ObservationStore observations) {
         this(artifacts, observations, ExecutionPlans.NONE);
@@ -55,10 +56,16 @@ public final class PipelineObservationQueryService {
      */
     public PipelineObservationQueryService(ArtifactQueryService artifacts, ObservationStore observations,
             ExecutionPlans plans, Supplier<List<String>> members) {
+        this(artifacts, observations, plans, members, ClusterRecoveryQueries.NONE);
+    }
+
+    public PipelineObservationQueryService(ArtifactQueryService artifacts, ObservationStore observations,
+            ExecutionPlans plans, Supplier<List<String>> members, ClusterRecoveryQueries recovery) {
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
         this.observations = Objects.requireNonNull(observations, "observations");
         this.plans = Objects.requireNonNull(plans, "plans");
         this.members = Objects.requireNonNull(members, "members");
+        this.recovery = Objects.requireNonNull(recovery, "recovery");
     }
 
     /**
@@ -77,7 +84,7 @@ public final class PipelineObservationQueryService {
     public PipelineStatus lifecycleStatus(String pipelineId) {
         Observation observation = require(pipelineId);
         return new PipelineStatus(observation.pipelineId(), observation.state(), observation.failure(),
-                observation.observedAt());
+                observation.observedAt(), null, List.of(), recovery.pipeline(pipelineId));
     }
 
     /** Returns the latest status when an observation exists, without turning an unobserved pipeline into an error. */
@@ -107,10 +114,16 @@ public final class PipelineObservationQueryService {
                 status.observedAt()), item.id()));
     }
 
+    /** The durable recovery reading, including before the first runtime observation is published. */
+    public ClusterPipelineRecoveryView recovery(String pipelineId) {
+        Objects.requireNonNull(pipelineId, PIPELINE_ID_ARGUMENT);
+        return recovery.pipeline(pipelineId);
+    }
+
     private PipelineStatus withCurrentPlan(PipelineStatus status, String pipelineId) {
         ExecutionPlan plan = plans.current(List.of(pipelineId)).get(pipelineId);
         return new PipelineStatus(status.pipelineId(), status.state(), status.failure(), status.observedAt(), plan,
-                plan == null ? List.of() : plan.notPlannedFor(members.get()));
+                plan == null ? List.of() : plan.notPlannedFor(members.get()), recovery.pipeline(pipelineId));
     }
 
     /**

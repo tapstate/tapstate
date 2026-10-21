@@ -32,4 +32,5 @@ record RemotePipeline(
         awaitingRebalance = List.copyOf(awaitingRebalance);
         vertices = List.copyOf(vertices);
     }
+
 }

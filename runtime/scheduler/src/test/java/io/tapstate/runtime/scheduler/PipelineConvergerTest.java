@@ -48,6 +48,27 @@ class PipelineConvergerTest {
             new PipelineConverger(desired, state, actuator, Clock.fixed(T0, ZoneOffset.UTC));
 
     @Test
+    void aCodedMissingJobAdmissionRefusalBecomesTheObservablePipelineFailure() {
+        actuator.carryingNothing();
+        desired.save(new DesiredState("p1", RUNNING, REV));
+        state.create("p1", StateJson.of(RUNNING), T0);
+        TapstateException refused = new TapstateException(LifecycleError.CLUSTER_CAPACITY_UNPROVEN,
+                Map.of("pipeline", "p1", "reason", "submitted execution history is unknown"), null);
+        RebuildAdmission admission = new RebuildAdmission() {
+            @Override public boolean admits(String pipelineId) { return false; }
+            @Override public boolean admitsMissingJob(String pipelineId) { throw refused; }
+        };
+        PipelineConverger guarded = new PipelineConverger(desired, state, actuator, Clock.fixed(T0, ZoneOffset.UTC), admission);
+
+        ConvergeResult result = guarded.converge("p1");
+
+        assertThat(result.failure()).contains(refused);
+        assertThat(result.checkpoint().orElseThrow().stateJson()).isEqualTo(StateJson.of(FAILED));
+        assertThat(state.read("p1").orElseThrow().epoch()).isEqualTo(1);
+        assertThat(actuator.calls()).containsExactly("stop:p1:keep");
+    }
+
+    @Test
     @DisplayName("with no desired intent there is nothing to converge and no checkpoint is written")
     void noDesiredIsANoOp() {
         ConvergeResult result = converger.converge("p1");
@@ -453,6 +474,20 @@ class PipelineConvergerTest {
                 .containsExactly("start:p1");
     }
 
+    @Test
+    void aSuccessfullyCompletedNativeRunIsRecordedAndNeverAutomaticallyReplayed() {
+        converge(RUNNING);
+        actuator.reset();
+        actuator.completedSuccessfully();
+
+        converger.converge("p1");
+        assertThat(state.read("p1").orElseThrow().stateJson()).isEqualTo(StateJson.of(COMPLETED));
+        assertThat(actuator.calls()).containsExactly("stop:p1:keep");
+        actuator.reset();
+        converger.converge("p1");
+        assertThat(actuator.calls()).isEmpty();
+    }
+
     /**
      * The restart road reaches the same refusal as the CAS road, and it used to escape here. A store
      * that is unreachable when a process comes up is exactly the condition this refusal exists for --
@@ -757,6 +792,37 @@ class PipelineConvergerTest {
     private void converge(io.tapstate.core.lifecycle.PipelineState target) {
         desired.save(new DesiredState("p1", target, REV));
         converger.converge("p1");
+    }
+
+    @Test
+    void aMissingJobWaitsForTheSameRecoveryPermitBeforeStartingAgain() {
+        converge(RUNNING);
+        actuator.carryingNothing();
+        actuator.reset();
+        long epoch = state.read("p1").orElseThrow().epoch();
+        AtomicBoolean permit = new AtomicBoolean();
+        RebuildAdmission admission = new RebuildAdmission() {
+            @Override
+            public boolean admits(String pipelineId) {
+                return permit.get();
+            }
+
+            @Override
+            public boolean admitsMissingJob(String pipelineId) {
+                return permit.get();
+            }
+        };
+        PipelineConverger queued = new PipelineConverger(desired, state, actuator,
+                Clock.fixed(T0, ZoneOffset.UTC), admission);
+
+        queued.converge("p1");
+        assertThat(actuator.calls()).isEmpty();
+        assertThat(state.read("p1").orElseThrow().epoch()).isEqualTo(epoch);
+        permit.set(true);
+        queued.converge("p1");
+        assertThat(actuator.calls()).containsExactly("start:p1");
+        queued.converge("p1");
+        assertThat(actuator.calls()).containsExactly("start:p1");
     }
 
     private void convergeStopping(boolean purgeState) {

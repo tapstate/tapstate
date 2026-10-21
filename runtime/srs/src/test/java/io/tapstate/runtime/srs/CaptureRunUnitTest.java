@@ -1668,6 +1668,12 @@ class CaptureRunUnitTest {
      * wiring without a store backend.
      */
     static class InMemoryMeta implements SrsMetaStore {
+        @Override
+        public boolean legacyReadCursorOnly(String chain, ConsumerOffset expected) {
+            return expected.legacyReadCursorOnly() && read(chain).flatMap(meta -> meta.consumerOffset(expected.pipelineId()))
+                    .filter(expected::equals).isPresent();
+        }
+
         /** Per chain and pipeline, how far each table's ring is done with -- kept once, never raised here. */
         final Map<String, Map<String, Long>> ringDone = new LinkedHashMap<>();
         private volatile String pausedPipeline;
@@ -2215,6 +2221,120 @@ class CaptureRunUnitTest {
         } finally {
             member.shutdown();
         }
+    }
+
+    @Test
+    void aSingleSourceCursorOnlyUpgradeStillOwesItsSnapshotAndKeepsTheOldEvidence() {
+        InMemoryMeta meta = new InMemoryMeta();
+        CaptureRunSpec selected = spec(ReadMode.SNAPSHOT_AND_CDC, true, "cursor-only-upgrade")
+                .withConsumerId(SrsConsumerId.of("pipe-1", "src-1").value()).withPipelineSourceCount(1);
+        String chain = selected.miningChainId().value();
+        meta.create(chain, null);
+        meta.openEpoch(chain);
+        meta.advanceConsumerReadSeq(chain, selected.pipelineId(), "orders", 1);
+        ConsumerOffset legacy = meta.read(chain).orElseThrow().consumerOffset(selected.pipelineId()).orElseThrow();
+        FakeSource source = new FakeSource(List.of(row(1)), List.of(), "actual-upgrade-snapshot-seam");
+        List<Envelope> rows = new ArrayList<>();
+        HazelcastInstance member = emptyDurableMember();
+        try {
+            CaptureRunUnit unit = new CaptureRunUnit(source, new SrsCoordinator(meta), meta, member);
+            org.assertj.core.api.Assertions.assertThatCode(() -> {
+                try (CaptureRun run = unit.start(selected, rows::add)) {
+                    assertThat(rows).hasSize(1);
+                    assertThat(source.cdcStart).isEqualTo(CaptureStart.resume(new SourcePosition("actual-upgrade-snapshot-seam")));
+                    assertThat(meta.read(chain).orElseThrow().consumerOffset(selected.pipelineId())).contains(legacy);
+                    assertThat(meta.activeConsumerOffsets(chain)).noneMatch(offset -> offset.pipelineId().equals(selected.pipelineId()));
+                }
+            }).doesNotThrowAnyException();
+        } finally { member.shutdown(); }
+    }
+
+    @Test
+    void anUpgradeNeverUsesCursorOnlyAsPermissionForAnAmbiguousOrPositionedStart() {
+        for (String reason : List.of("unknown-topology", "multiple-sources", "cdc-only", "different-table",
+                "source-position", "sink-ack", "snapshot-complete", "legacy-seam", "hidden-writer", "different-scoped-source")) {
+            InMemoryMeta meta = reason.equals("hidden-writer") ? new InMemoryMeta() {
+                @Override public boolean legacyReadCursorOnly(String chain, ConsumerOffset expected) { return false; }
+            } : new InMemoryMeta();
+            CaptureRunSpec selected = spec(reason.equals("cdc-only") ? ReadMode.CDC_ONLY : ReadMode.SNAPSHOT_AND_CDC,
+                    true, "upgrade-refuses-" + reason).withConsumerId(SrsConsumerId.of("pipe-1", "src-1").value())
+                    .withPipelineSourceCount(reason.equals("unknown-topology") ? 0 : reason.equals("multiple-sources") ? 2 : 1);
+            String chain = selected.miningChainId().value();
+            meta.create(chain, null);
+            meta.openEpoch(chain);
+            ConsumerOffset legacy = new ConsumerOffset(selected.pipelineId(),
+                    Map.of(reason.equals("different-table") ? "customers" : "orders", 1L),
+                    reason.equals("sink-ack") ? new ChainPosition(new SourceOrder(1, 1), "confirmed-native") : null,
+                    reason.equals("snapshot-complete") ? List.of("orders") : List.of(),
+                    reason.equals("legacy-seam") ? "real-legacy-seam" : null, reason.equals("legacy-seam") ? 1 : 0);
+            meta.upsertConsumerOffset(chain, legacy);
+            if (reason.equals("source-position")) meta.advanceSourceReadOffset(chain,
+                    new ChainPosition(new SourceOrder(1, 2), "retained-source-position"));
+            if (reason.equals("different-scoped-source")) meta.upsertConsumerOffset(chain, new ConsumerOffset(
+                    SrsConsumerId.of(selected.pipelineId(), "another-source").value(), Map.of("orders", 1L), null,
+                    List.of(), "other-scoped-seam", 2, Map.of(), ConsumerProgressKind.SRS));
+            SrsMeta before = meta.read(chain).orElseThrow();
+            FakeSource source = new FakeSource(List.of(row(1)), List.of());
+            List<Envelope> handedOff = new ArrayList<>();
+            TapstateException failed = catchThrowableOfType(() -> runUnit(source, meta).start(selected, handedOff::add),
+                    TapstateException.class);
+            assertThat(failed.code()).as(reason).isEqualTo(CaptureError.RECOVERY_PROGRESS_UNPROVEN);
+            assertThat(source.cdcStarted).as(reason).isFalse();
+            assertThat(handedOff).as(reason).isEmpty();
+            assertThat(meta.read(chain)).as(reason).contains(before);
+        }
+    }
+
+    @Test
+    void anUnprovenLegacyRecordCannotBypassTheUpgradeGuard() {
+        HazelcastInstance member = emptyDurableMember();
+        try {
+            for (Map<String, Long> sequences : List.of(Map.of("orders", -1L), Map.of("orders", -2L), Map.<String, Long>of())) {
+                InMemoryMeta meta = new InMemoryMeta() {
+                    @Override public boolean legacyReadCursorOnly(String chain, ConsumerOffset expected) { return false; }
+                };
+                CaptureRunSpec selected = spec(ReadMode.SNAPSHOT_AND_CDC, true, "unproven-legacy-" + sequences)
+                        .withConsumerId(SrsConsumerId.of("pipe-1", "src-1").value()).withPipelineSourceCount(1);
+                String chain = selected.miningChainId().value();
+                meta.create(chain, null);
+                meta.upsertConsumerOffset(chain, new ConsumerOffset(selected.pipelineId(), sequences, null));
+                SrsMeta before = meta.read(chain).orElseThrow();
+                FakeSource source = new FakeSource(List.of(row(1)), List.of());
+                CaptureRunUnit unit = new CaptureRunUnit(source, new SrsCoordinator(meta), meta, member);
+                assertThatThrownBy(() -> {
+                    try (CaptureRun run = unit.start(selected, event -> { })) { }
+                }).isInstanceOfSatisfying(TapstateException.class, failure ->
+                        assertThat(failure.code()).isEqualTo(CaptureError.RECOVERY_PROGRESS_UNPROVEN));
+                assertThat(source.cdcStarted).isFalse();
+                assertThat(meta.read(chain)).contains(before);
+            }
+        } finally { member.shutdown(); }
+    }
+
+    @Test
+    void aLegacyCursorLeavesFlowOnlyAfterOneMatchingScopedSeamAndNeverHidesRealProgress() {
+        ConsumerOffset old = new ConsumerOffset("p", Map.of("orders", 1L), null);
+        String consumer = SrsConsumerId.of("p", "source").value();
+        ConsumerOffset started = new ConsumerOffset(consumer, Map.of("orders", 50L), null,
+                List.of(), "real-scoped-seam", 2, Map.of(), ConsumerProgressKind.SRS);
+        InMemoryMeta meta = new InMemoryMeta();
+        meta.create("upgrade-flow", null);
+        meta.upsertConsumerOffset("upgrade-flow", old);
+        meta.upsertConsumerOffset("upgrade-flow", new ConsumerOffset(consumer, Map.of("orders", 50L), null));
+        assertThat(meta.activeConsumerOffsets("upgrade-flow")).hasSize(2);
+        meta.upsertConsumerOffset("upgrade-flow", started);
+        assertThat(meta.activeConsumerOffsets("upgrade-flow")).containsExactly(started);
+        assertThat(CdcPhase.headroomBound(meta.activeConsumerOffsets("upgrade-flow"), "orders")).isEqualTo(50);
+        assertThat(meta.consumerOffsets("upgrade-flow")).containsExactlyInAnyOrder(old, started);
+        ConsumerOffset another = new ConsumerOffset(SrsConsumerId.of("p", "other").value(), Map.of("orders", 50L), null,
+                List.of(), "another-seam", 2, Map.of(), ConsumerProgressKind.SRS);
+        meta.upsertConsumerOffset("upgrade-flow", another);
+        assertThat(meta.activeConsumerOffsets("upgrade-flow")).hasSize(3);
+        meta.detachConsumer("upgrade-flow", another.pipelineId());
+        ConsumerOffset confirmed = new ConsumerOffset("p", Map.of("orders", 1L),
+                new ChainPosition(new SourceOrder(1, 1), "actual-old-position"));
+        meta.upsertConsumerOffset("upgrade-flow", confirmed);
+        assertThat(meta.activeConsumerOffsets("upgrade-flow")).containsExactlyInAnyOrder(confirmed, started);
     }
 
     @Test

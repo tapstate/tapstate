@@ -27,9 +27,10 @@ import java.util.function.Predicate;
  *
  * <p><b>Holding something only ever lowers the answer.</b> An instance with nothing held passes on what
  * its edges promised, which is what stops an idle instance from pinning the frontier at the last change
- * it happened to see. An instance holding a change answers with the value immediately beneath it: the
- * packing is dense, so that is the exact predecessor rather than an approximation, and it needs no token
- * because a bound in flight is never written down.
+ * it happened to see. An instance holding an incremental change answers with the value immediately beneath
+ * it. A snapshot begins at its generation's lowest position, so its encoded predecessor is the preceding
+ * generation's ceiling rather than a consumed ring sequence. While that snapshot is held, the level keeps
+ * its last safe promise and still forwards lower upstream bounds; release can advance it again.
  *
  * <p><b>The answer climbs strictly or is not sent.</b> Repeating a bound is fatal - the engine tears the
  * job down on a bound that fails to climb - so an unchanged answer is silence. An answer that has fallen
@@ -198,6 +199,12 @@ public final class LevelBounds {
             }
         }
         if (lowest < 0) {
+            return OptionalLong.empty();
+        }
+        if (holding != null && holding.seq() == SourceOrder.SNAPSHOT_SEQ
+                && lowest == FrontierOrders.pack(chain, holding) - 1) {
+            // The preceding generation's encoding ceiling is not a consumed ring sequence.
+            // Keep the last promise until the held snapshot can be covered by a real bound.
             return OptionalLong.empty();
         }
         sent.put(chain, lowest);

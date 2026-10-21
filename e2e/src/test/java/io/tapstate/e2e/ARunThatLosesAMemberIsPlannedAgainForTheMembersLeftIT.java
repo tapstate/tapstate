@@ -103,12 +103,14 @@ class ARunThatLosesAMemberIsPlannedAgainForTheMembersLeftIT {
                 long generation = survivor.executionGenerationOf(PIPELINE).orElseThrow();
                 cluster.processCarrying(victim).kill();
 
-                // Nothing is asked of the product from here until the assertions below.
+                // Only the post-kill change and observations follow; no lifecycle request drives the recovery.
                 long rowsAtTheKill = files.count(targetAddress, TABLE);
                 files.cdc(sourceAddress, TABLE, CdcOp.INSERT, 1);
-                Await.until("a change made after the kill to reach the target, which only a replaced run can carry",
+                Await.until("a change made after the kill to reach the target, which only a replaced run can carry, "
+                                + "with published RUNNING",
                         TAKEOVER,
-                        () -> files.count(targetAddress, TABLE) > rowsAtTheKill,
+                        () -> files.count(targetAddress, TABLE) > rowsAtTheKill
+                                && survivor.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent(),
                         () -> "rows at the target = " + files.count(targetAddress, TABLE) + ", was " + rowsAtTheKill
                                 + " when " + victim + " was killed; the pipeline is " + survivor.state(PIPELINE));
 

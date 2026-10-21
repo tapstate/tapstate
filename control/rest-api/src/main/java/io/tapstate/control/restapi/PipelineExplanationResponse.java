@@ -2,6 +2,7 @@ package io.tapstate.control.restapi;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 import io.tapstate.control.core.PipelineExplanation;
+import io.tapstate.control.core.ClusterPipelineRecoveryView;
 
 import java.util.List;
 import java.util.Map;
@@ -26,7 +27,8 @@ record PipelineExplanationResponse(
         @JsonInclude(JsonInclude.Include.ALWAYS) Next next,
         Pending pending,
         ExecutionPlanResponse plan,
-        List<String> awaitingRebalance) {
+        List<String> awaitingRebalance,
+        ClusterPipelineRecoveryView recovery) {
 
     record Evidence(String source, String field,
             @JsonInclude(JsonInclude.Include.ALWAYS) Object value) {
@@ -57,7 +59,7 @@ record PipelineExplanationResponse(
                 explanation.pending() == null ? null
                         : new Pending(explanation.pending().reason().name()),
                 ExecutionPlanResponse.of(explanation.plan()),
-                explanation.awaitingRebalance().isEmpty() ? null : explanation.awaitingRebalance());
+                explanation.awaitingRebalance().isEmpty() ? null : explanation.awaitingRebalance(), explanation.recovery());
     }
 
     private static Evidence evidence(PipelineExplanation.Evidence evidence) {

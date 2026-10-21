@@ -121,13 +121,14 @@ class AMemberLostWhileATableLoadsReplaysOnlyTheLoadThatHadNotLandedIT {
                 cluster.processCarrying(victim).kill();
                 holds.releaseAfter(LOADING, HELD);
 
-                // Nothing is asked of the product from here until the assertions below, bar the changes made after.
+                // Only post-kill changes and observations follow; no lifecycle request drives the recovery.
                 files.cdc(landedAddress, LANDED, CdcOp.INSERT, 1);
                 files.cdc(loadingAddress, LOADING, CdcOp.INSERT, 1);
-                Await.until("every row of both tables, and a change of each made after the kill, to arrive",
+                Await.until("every row of both tables and their post-kill changes to arrive with published RUNNING",
                         TAKEOVER,
                         () -> files.count(targetAddress, LANDED) == LANDED_ROWS + 1
-                                && files.count(targetAddress, LOADING) == LOADING_ROWS + 1,
+                                && files.count(targetAddress, LOADING) == LOADING_ROWS + 1
+                                && survivor.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent(),
                         () -> "rows at the target: " + LANDED + " " + files.count(targetAddress, LANDED) + ", "
                                 + LOADING + " " + files.count(targetAddress, LOADING) + "; the pipeline is "
                                 + survivor.state(PIPELINE));

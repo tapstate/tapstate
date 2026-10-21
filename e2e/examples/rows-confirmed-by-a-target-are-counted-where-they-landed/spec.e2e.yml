@@ -25,8 +25,9 @@
 # cdc_only, and that is load-bearing rather than incidental. The total is read off the live job, so a
 # bounded read takes it away with the job the moment it completes: the number is gone exactly when it
 # has finished being interesting. A tailing pipeline keeps its job, and so keeps answering. The
-# arrivals are one per row either way here - this connector's tail remembers how far it has read within
-# a run - so three seeded rows cross three times, not three plus a replay.
+# direct stream explicitly starts at the source's earliest retained position. Its three seeded rows
+# arrive as CDC inserts and are each confirmed once; later accepted callback checkpoints prevent them
+# from being mined again while the next two inserts bring the confirmed total to five.
 name: rows-confirmed-by-a-target-are-counted-where-they-landed
 setup:
   connectors: [e2e_file]

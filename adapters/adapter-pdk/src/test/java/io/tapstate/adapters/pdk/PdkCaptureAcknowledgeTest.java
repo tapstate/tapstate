@@ -18,6 +18,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -304,6 +305,36 @@ class PdkCaptureAcknowledgeTest {
         assertThatCode(() -> sub.acknowledge(durable))
                 .as("acknowledging a closed subscription does nothing, and says nothing")
                 .doesNotThrowAnyException();
+    }
+
+    @Test
+    void aCompletedNativeHandoverStillReturnsNormallyWhenCloseWakesItsListener(@TempDir Path dir)
+            throws Exception {
+        CountDownLatch delivered = new CountDownLatch(1);
+        CountDownLatch parked = new CountDownLatch(1);
+        List<Delivery> accepted = new CopyOnWriteArrayList<>();
+        List<Throwable> failures = new CopyOnWriteArrayList<>();
+        CaptureListener listener = new CaptureListener() {
+            @Override public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
+                accepted.add(new Delivery(events, position));
+                delivered.countDown();
+                try { parked.await(); }
+                catch (InterruptedException closed) { Thread.currentThread().interrupt(); }
+            }
+            @Override public void onError(Throwable error) { failures.add(error); }
+        };
+        try (Subscription sub = open(Synthetic.acknowledgingSource(dir, channel.key), "AcknowledgingSource", listener)) {
+            channel.orders.add("rows");
+            assertThat(delivered.await(AWAIT_SECONDS, TimeUnit.SECONDS)).isTrue();
+            sub.close();
+        } finally { parked.countDown(); }
+        assertThat(accepted).singleElement().satisfies(batch -> {
+            assertThat(batch.events()).hasSize(1);
+            assertThat(batch.position()).contains(new SourcePosition(ConnectorOffsetCodec.toToken("demo", channel.named.getFirst())));
+        });
+        assertThat(channel.handedOver).as("the SDK sees the completed callback return normally").hasSize(1);
+        assertThat(channel.deliveredOn).as("a delivery after close is attempted but rejected at entry").hasSize(2);
+        assertThat(failures).isEmpty();
     }
 
     // ---- harness -----------------------------------------------------------------------------------------

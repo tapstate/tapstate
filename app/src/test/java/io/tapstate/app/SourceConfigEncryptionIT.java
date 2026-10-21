@@ -47,7 +47,8 @@ class SourceConfigEncryptionIT {
             "mongodb", "mongodb-atlas", "mysql", "oracle", "aws-rds-mysql", "unregistered");
 
     @Container
-    private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
+    private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
+            .withCommand("--replSet", "docker-rs", "--wiredTigerCacheSizeGB", "1.0");
 
     @TempDir Path work;
 

@@ -84,7 +84,8 @@ class ManagedMongoStoreIsolationIT {
                 .withEnv("MONGO_INITDB_ROOT_USERNAME", "root")
                 .withEnv("MONGO_INITDB_ROOT_PASSWORD", PASSWORD)
                 .withCopyToContainer(Transferable.of(Base64.getEncoder().encode(key), 0400), "/data/configdb/member.key")
-                .withCommand("--replSet", REPLICA_SET, "--keyFile", "/data/configdb/member.key", "--bind_ip_all")
+                .withCommand("--replSet", REPLICA_SET, "--keyFile", "/data/configdb/member.key", "--bind_ip_all",
+                        "--wiredTigerCacheSizeGB", "1.0")
                 // The image opens a temporary unauthenticated server while creating its administrator.
                 .waitingFor(new WaitAllStrategy()
                         .withStrategy(Wait.forLogMessage(".*MongoDB init process complete; ready for start up.*", 1))

@@ -101,6 +101,11 @@ enum BootError implements TapstateErrorCode {
 
     /** Another live boot already holds this stable node id. */
     NODE_ID_IN_USE("boot.node-id-in-use", Set.of("nodeId")),
+    EXECUTION_PROFILE_INCOMPATIBLE("boot.execution-profile-incompatible", Set.of("proposed", "active")),
+    EXECUTION_PROFILE_INVALID("boot.execution-profile-invalid", Set.of("detail")),
+    PROFILE_AUTHORIZATION_PENDING("boot.profile-authorization-pending", Set.of()),
+    PROFILE_SESSION_LOST("boot.profile-session-lost", Set.of()),
+    LEGACY_CLUSTER_ACTIVE("boot.legacy-cluster-active", Set.of()),
 
     /** A development-only embedded Web artifact needs explicit runtime confirmation. */
     WEB_DEVELOPMENT_CONFIRMATION_REQUIRED("boot.web-development-confirmation-required", Set.of()),

@@ -59,6 +59,19 @@ public interface StorePort {
         throw new UnsupportedOperationException("this store is not cluster-capable");
     }
 
+    /** Immutable profile admission and the stable node registry, using the same owner-session leases. */
+    default ClusterProfileStore clusterProfiles() {
+        throw new UnsupportedOperationException("this store is not cluster-profile-capable");
+    }
+
+    default ClusterCapacityStore clusterCapacity() {
+        throw new UnsupportedOperationException("shared cluster capacity is not configured");
+    }
+
+    default ClusterRecoveryStore clusterRecovery() {
+        throw new UnsupportedOperationException("durable cluster recovery is not configured");
+    }
+
     /** The majority-committed ACTIVE membership and monotonic topology revision. */
     default ClusterMembershipStore clusterMembership() {
         throw new UnsupportedOperationException("this store is not cluster-capable");

@@ -1,5 +1,10 @@
 package io.tapstate.cli;
 
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
 /**
  * The outcome of a remote pipeline status read ({@code GET /api/pipelines/{id}/status}). Either the read
  * found the pipeline's latest observed lifecycle state, the known pipeline has not published an observation,
@@ -28,7 +33,23 @@ sealed interface StatusOutcome {
      *                          its own
      */
     record Found(String pipelineId, String state, String failureCode, String failureMessage,
-            Long observedAgeMillis) implements StatusOutcome {
+            Long observedAgeMillis, RemoteRecovery.Pipeline recovery, String observedAt,
+            Map<String, Object> failureParams, ExplainOutcome.Plan plan, List<String> awaitingRebalance)
+            implements StatusOutcome {
+
+        public Found {
+            failureParams = failureParams == null ? Map.of() : Collections.unmodifiableMap(new LinkedHashMap<>(failureParams));
+            awaitingRebalance = awaitingRebalance == null ? List.of() : List.copyOf(awaitingRebalance);
+        }
+
+        Found(String pipelineId, String state, String failureCode, String failureMessage,
+                Long observedAgeMillis, RemoteRecovery.Pipeline recovery) {
+            this(pipelineId, state, failureCode, failureMessage, observedAgeMillis, recovery, null, Map.of(), null, List.of());
+        }
+
+        Found(String pipelineId, String state, String failureCode, String failureMessage, Long observedAgeMillis) {
+            this(pipelineId, state, failureCode, failureMessage, observedAgeMillis, null);
+        }
 
         /** A reading from a server that did not say how old it is — the shape before the time was carried. */
         Found(String pipelineId, String state, String failureCode, String failureMessage) {
@@ -45,8 +66,15 @@ sealed interface StatusOutcome {
     record Rejected(String code, String message) implements StatusOutcome {
     }
 
-    /** A current aggregate status response identified a known pipeline with no runtime observation yet. */
-    record NoObservation() implements StatusOutcome {
+    /**
+     * A known pipeline before its first runtime observation. State is the server's placeholder, never
+     * an observed state for lifecycle decisions; recovery and catalog intent remain independently readable.
+     */
+    record NoObservation(String pipelineId, String state, String displayState, String desiredState,
+            Boolean hasArtifact, RemoteRecovery.Pipeline recovery) implements StatusOutcome {
+        NoObservation() {
+            this(null, null, null, null, null, null);
+        }
     }
 
     /** The server could not be reached (connection refused, timeout, or a malformed target). */

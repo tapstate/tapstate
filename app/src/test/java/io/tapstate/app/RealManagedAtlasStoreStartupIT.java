@@ -138,7 +138,10 @@ class RealManagedAtlasStoreStartupIT {
 
     private static ConfigurableApplicationContext start(String metadataUri, String cluster, Path plugins,
             Path seedDirectory, String retention, AtomicInteger ready) {
-        return new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated())
+        CloudStartupDerivationWitness witness = CloudStartupDerivationWitness.realManagedStartupInitializer();
+        try (var observation = witness.observeClientCreation()) {
+            return new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated())
+                .initializers(witness, CloudSeedOutcomeWitness.initializer())
                 .listeners((ApplicationListener<ApplicationReadyEvent>) event -> ready.incrementAndGet())
                 .run("--server.address=127.0.0.1", "--server.port=0", "--tapstate.hz.member-port=0",
                         "--tapstate.hz.jet.cooperative-thread-count=2", "--logging.level.root=ERROR",
@@ -150,6 +153,7 @@ class RealManagedAtlasStoreStartupIT {
                         "--tapstate.store.mongo.server-selection-timeout=20s",
                         "--tapstate.connectors.plugins-dir=" + plugins, "--tapstate.connectors.seed-dir=" + seedDirectory,
                         "--tapstate.metrics.history.retention=" + retention);
+        }
     }
 
     private static StorePort readyStore(ConfigurableApplicationContext context, AtomicInteger ready, String operator) {

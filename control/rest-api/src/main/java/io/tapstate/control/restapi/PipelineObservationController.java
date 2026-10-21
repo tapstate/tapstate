@@ -37,7 +37,7 @@ class PipelineObservationController {
             PipelineCatalogItem pipeline = item.orElseThrow();
             return observations.findStatusWithPlan(pipeline)
                     .map(status -> PipelineStatusResponse.of(pipeline, catalog, status))
-                    .orElseGet(() -> PipelineStatusResponse.of(pipeline, catalog));
+                    .orElseGet(() -> PipelineStatusResponse.of(pipeline, catalog, observations.recovery(id)));
         }
         return PipelineStatusResponse.of(observations.status(id), catalog);
     }

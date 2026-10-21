@@ -3,6 +3,10 @@ package io.tapstate.e2e;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.mongodb.client.MongoClient;
+import com.mongodb.ConnectionString;
+import com.mongodb.MongoClientSettings;
+import io.tapstate.core.common.JsonWriter;
+import org.bson.BsonTimestamp;
 import com.mongodb.client.MongoClients;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
@@ -79,10 +83,15 @@ class ACdcOnlyPipelineDoesNotBorrowAnotherPipelinesSnapshotSeamIT {
         String targetUri = SharedMongo.replicaSetUrl("cdc_own_start_target_" + suffix);
         Path witness = temporary.resolve("mongo-writes");
         Path tail = temporary.resolve("mongo-writes.tail");
-        byte[] connector = ObservedMongoConnectorJar.build(ConnectorJars.bytesFor("mongodb"), witness);
+        Path present = temporary.resolve("mongo-present.tsv");
+        byte[] connector = ObservedMongoConnectorJar.build(
+                ConnectorJars.bytesFor("mongodb"), witness, null, clearState ? present : null);
+        MongoBeforeInsertWitness beforeInsert = new MongoBeforeInsertWitness();
         String storeUri = SharedMongo.replicaSetUrl("cdc_own_start_store_" + suffix);
 
-        try (MongoClient source = MongoClients.create(sourceUri);
+        try (MongoClient source = clearState ? MongoClients.create(MongoClientSettings.builder()
+                        .applyConnectionString(new ConnectionString(sourceUri))
+                        .addCommandListener(beforeInsert).build()) : MongoClients.create(sourceUri);
                 MongoEndpoints mongo = new MongoEndpoints();
                 ServerHandle server = tier.launch(storeUri);
                 StoreDocuments documents = StoreDocuments.at(storeUri)) {
@@ -139,7 +148,7 @@ class ACdcOnlyPipelineDoesNotBorrowAnotherPipelinesSnapshotSeamIT {
                 Await.until("clearing the sole consumer to remove its actual mining-chain record", TIMEOUT,
                         () -> documents.chain(chain) == null,
                         () -> String.valueOf(documents.chain(chain)));
-                seed(source, sourceDatabase, SECOND_COLLECTION, BEFORE_START);
+                beforeInsert.capture(() -> seed(source, sourceDatabase, SECOND_COLLECTION, BEFORE_START));
             } else {
                 assertThat(documents.chain(chain)).as("keeping state retains the shared checkpoint").isNotNull();
                 assertThat(ownerConsumer(documents, chain)).as("keeping state retains the source's own consumer")
@@ -147,6 +156,7 @@ class ACdcOnlyPipelineDoesNotBorrowAnotherPipelinesSnapshotSeamIT {
                 insert(source, sourceDatabase, SECOND_COLLECTION, 2, BEFORE_START);
                 insert(source, sourceDatabase, FIRST_COLLECTION, 3, WHILE_STOPPED);
             }
+            int presentBaseline = clearState ? tailLines(present).size() : 0;
             control.apply(workspace(
                     SECOND_SOURCE, SECOND_TARGET, SECOND_PIPELINE, SECOND_COLLECTION,
                     "cdc_only", sourceUri, targetUri));
@@ -157,6 +167,12 @@ class ACdcOnlyPipelineDoesNotBorrowAnotherPipelinesSnapshotSeamIT {
             Await.until("the CDC-only pipeline's tail to open", TIMEOUT,
                     () -> tailLines(tail).size() == 3 && tailLines(tail).getLast().startsWith("START "),
                     () -> tailLines(tail).toString());
+
+            if (clearState) {
+                List<String> presentEvents = tailLines(present);
+                printPresentBoundary(beforeInsert.operationTime(),
+                        presentEvents.subList(presentBaseline, presentEvents.size()));
+            }
 
             insert(source, sourceDatabase, SECOND_COLLECTION, clearState ? 2 : 3, AFTER_START);
             Await.until("the change written after the CDC-only start to reach the target", TIMEOUT,
@@ -186,6 +202,32 @@ class ACdcOnlyPipelineDoesNotBorrowAnotherPipelinesSnapshotSeamIT {
             }
             assertThat(control.errorCount(SECOND_PIPELINE)).contains(0L);
         }
+    }
+
+    private static void printPresentBoundary(BsonTimestamp before, List<String> events) {
+        Map<String, Object> safe = new LinkedHashMap<>();
+        safe.put("before_operation_time_available", before != null);
+        if (before != null) {
+            safe.put("before_seconds", Integer.toUnsignedLong(before.getTime()));
+            safe.put("before_increment", Integer.toUnsignedLong(before.getInc()));
+        }
+        List<Long> resolved = events.stream().filter(line -> line.matches("RESOLVE\\ttrue\\t[0-9]+"))
+                .map(line -> Long.parseLong(line.substring("RESOLVE\ttrue\t".length()))).toList();
+        List<Long> entered = events.stream().filter(line -> line.matches("STREAM\\t[0-9]+"))
+                .map(line -> Long.parseLong(line.substring("STREAM\t".length()))).toList();
+        safe.put("resolved_count", resolved.size());
+        safe.put("stream_count", entered.size());
+        if (resolved.size() == 1 && entered.size() == 1) {
+            long boundary = resolved.getFirst();
+            safe.put("resolved_seconds", boundary);
+            safe.put("stream_seconds", entered.getFirst());
+            safe.put("same_resolved_stream_seconds", boundary == entered.getFirst());
+            if (before != null) {
+                safe.put("before_at_or_after_resolved_boundary",
+                        Integer.toUnsignedLong(before.getTime()) >= boundary);
+            }
+        }
+        System.out.println("MONGO_PRESENT_BOUNDARY " + JsonWriter.write(safe));
     }
 
     private record Checkpoint(String token, long epoch, long sequence) { }

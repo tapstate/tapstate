@@ -9,6 +9,8 @@ import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
+import io.tapstate.spi.store.ClusterProfileStore;
+import io.tapstate.spi.store.ExecutionProfile;
 
 import java.net.InetAddress;
 import java.net.URI;
@@ -79,7 +81,8 @@ final class ClusterMemberPreflight {
         if (cluster.getWorkloadClaimRenewInterval() == null
                 || cluster.getWorkloadClaimRenewInterval().isNegative()
                 || cluster.getWorkloadClaimRenewInterval().isZero()
-                || cluster.getWorkloadClaimRenewInterval().compareTo(cluster.getWorkloadClaimTtl()) >= 0) {
+                || cluster.getWorkloadClaimRenewInterval().compareTo(cluster.getWorkloadClaimTtl()) >= 0
+                || cluster.getWorkloadClaimRenewInterval().compareTo(cluster.getNodeSessionTtl()) >= 0) {
             throw new TapstateException(BootError.WORKLOAD_CLAIM_RENEW_INTERVAL_INVALID, Map.of(), null);
         }
         if (cluster.getMembershipReconcileInterval() == null
@@ -150,6 +153,31 @@ final class ClusterMemberPreflight {
             throw new TapstateException(BootError.NODE_ID_IN_USE, Map.of("nodeId", identity.nodeId()), null);
         }
         return new Identity(identity.clusterId(), identity.nodeId(), identity.controlUrl(), attempt.claim());
+    }
+
+    static Identity reserve(Identity identity, ClusterProperties cluster, ClusterIdentityStore identities,
+            ClusterProfileStore profiles, ExecutionProfile proposed, String bootId) {
+        if (identities == null || profiles == null) {
+            throw new TapstateException(BootError.COORDINATION_STORE_REQUIRED, Map.of(), null);
+        }
+        ClusterIdentity stored = identities.createIfAbsent(new ClusterIdentity(identity.clusterId()));
+        if (!stored.clusterId().equals(identity.clusterId())) {
+            throw new TapstateException(BootError.CLUSTER_ID_MISMATCH,
+                    Map.of("configured", identity.clusterId(), "stored", stored.clusterId()), null);
+        }
+        var outcome = profiles.reserve(identity.clusterId(), new WorkloadOwner(identity.nodeId(), bootId),
+                identity.controlUrl(), proposed, cluster.getNodeSessionTtl());
+        return switch (outcome.outcome()) {
+            case ACQUIRED -> new Identity(identity.clusterId(), identity.nodeId(), identity.controlUrl(),
+                    outcome.node().registration().nodeSession());
+            case NODE_IN_USE -> throw new TapstateException(BootError.NODE_ID_IN_USE,
+                    Map.of("nodeId", identity.nodeId()), null);
+            case INCOMPATIBLE -> throw new TapstateException(BootError.EXECUTION_PROFILE_INCOMPATIBLE,
+                    Map.of("proposed", proposed.hash(), "active", outcome.profile().profile().hash()), null);
+            case LEGACY_LEASES_ACTIVE -> throw new TapstateException(BootError.LEGACY_CLUSTER_ACTIVE, Map.of(), null);
+            case AUTHORIZATION_HORIZON_ACTIVE -> throw new TapstateException(BootError.PROFILE_AUTHORIZATION_PENDING,
+                    Map.of(), null);
+        };
     }
 
     private static String required(String value, BootError error) {

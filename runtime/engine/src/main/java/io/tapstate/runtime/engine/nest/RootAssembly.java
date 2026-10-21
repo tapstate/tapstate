@@ -9,12 +9,14 @@ import io.tapstate.runtime.engine.ReplayFloor;
 import java.io.Serializable;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.ArrayDeque;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -393,6 +395,118 @@ public final class RootAssembly implements Serializable {
         return beneath;
     }
 
+    /** A pure handover view, consumed by the parking writer before anything is detached. */
+    Iterable<NestElement> subtreeForHandover(ElementRef from) {
+        Objects.requireNonNull(from, "from");
+        ElementNode leaving = nodeAt(from);
+        return leaving == null ? List.of() : () -> new ForestRows(leaving.children(), from.pathId(),
+                identityOf(from.pathId(), leaving));
+    }
+
+    /** The same pure view for a whole document, including subtrees waiting for an ancestor. */
+    Iterable<NestElement> everythingForHandover() {
+        return () -> new Iterator<>() {
+            private final Iterator<NestElement> attached = new ForestRows(children, List.of(), null);
+            private final Iterator<List<Pending>> buckets = waiting.values().iterator();
+            private Iterator<Pending> pending = Collections.emptyIterator();
+            private Iterator<NestElement> beneath = Collections.emptyIterator();
+
+            @Override public boolean hasNext() {
+                if (attached.hasNext() || beneath.hasNext()) return true;
+                while (!pending.hasNext() && buckets.hasNext()) pending = buckets.next().iterator();
+                return pending.hasNext();
+            }
+
+            @Override public NestElement next() {
+                if (attached.hasNext()) return attached.next();
+                if (beneath.hasNext()) return beneath.next();
+                if (!hasNext()) throw new NoSuchElementException();
+                Pending next = pending.next();
+                NestElement held = next.held();
+                if (next.node() != null) {
+                    beneath = new ForestRows(next.node().children(), held.ref().pathId(), held.ref().identity());
+                }
+                return new NestElement(held.ref(), held.fields(), held.order(), Map.of());
+            }
+        };
+    }
+
+    /** One produced row at a time, retaining only traversal cursors rather than an expanded subtree. */
+    private final class ForestRows implements Iterator<NestElement> {
+        private final ArrayDeque<ForestCursor> levels = new ArrayDeque<>();
+        private NestElement ready;
+
+        private ForestRows(Map<String, Map<List<Object>, ElementNode>> nodes,
+                List<String> path, Object parentIdentity) {
+            levels.push(new ForestCursor(nodes, path, parentIdentity));
+        }
+
+        @Override public boolean hasNext() {
+            while (ready == null && !levels.isEmpty()) {
+                ForestCursor level = levels.peek();
+                RowToHand row = level.nextRow();
+                if (row == null) {
+                    if (!level.descending) level.descend();
+                    else levels.pop();
+                    continue;
+                }
+                Object identity = identityOf(row.path(), row.node());
+                if (level.descending) {
+                    levels.push(new ForestCursor(row.node().children(), row.path(), identity));
+                } else {
+                    ready = new NestElement(new ElementRef(row.path(), level.parentIdentity, row.key(), identity),
+                            row.node().fields(), row.node().order(), Map.of());
+                }
+            }
+            return ready != null;
+        }
+
+        @Override public NestElement next() {
+            if (!hasNext()) throw new NoSuchElementException();
+            NestElement row = ready;
+            ready = null;
+            return row;
+        }
+    }
+
+    private record RowToHand(List<String> path, List<Object> key, ElementNode node) { }
+
+    /** Each level first emits its direct children, then visits their subtrees in that same order. */
+    private static final class ForestCursor {
+        private final Map<String, Map<List<Object>, ElementNode>> nodes;
+        private final List<String> parentPath;
+        private final Object parentIdentity;
+        private Iterator<Map.Entry<String, Map<List<Object>, ElementNode>>> embeds;
+        private Iterator<Map.Entry<List<Object>, ElementNode>> elements = Collections.emptyIterator();
+        private List<String> path;
+        private boolean descending;
+
+        private ForestCursor(Map<String, Map<List<Object>, ElementNode>> nodes,
+                List<String> parentPath, Object parentIdentity) {
+            this.nodes = nodes;
+            this.parentPath = parentPath;
+            this.parentIdentity = parentIdentity;
+            embeds = nodes.entrySet().iterator();
+        }
+
+        private RowToHand nextRow() {
+            while (!elements.hasNext() && embeds.hasNext()) {
+                Map.Entry<String, Map<List<Object>, ElementNode>> embed = embeds.next();
+                path = deeper(parentPath, embed.getKey());
+                elements = embed.getValue().entrySet().iterator();
+            }
+            if (!elements.hasNext()) return null;
+            Map.Entry<List<Object>, ElementNode> row = elements.next();
+            return new RowToHand(path, row.getKey(), row.getValue());
+        }
+
+        private void descend() {
+            descending = true;
+            embeds = nodes.entrySet().iterator();
+            elements = Collections.emptyIterator();
+        }
+    }
+
     public List<NestElement> detachSubtree(ElementRef from) {
         Objects.requireNonNull(from, "from");
         Map<List<Object>, ElementNode> slot = slotFor(from);
@@ -401,9 +515,17 @@ public final class RootAssembly implements Serializable {
             return List.of();
         }
         List<NestElement> handedOver = subtreeAt(from);
+        forgetSubtree(from);
+        return handedOver;
+    }
+
+    /** Removes a subtree after its pure handover view has been fully published. */
+    void forgetSubtree(ElementRef from) {
+        Map<List<Object>, ElementNode> slot = slotFor(from);
+        ElementNode leaving = slot == null ? null : slot.get(from.elementKey());
+        if (leaving == null) return;
         slot.remove(from.elementKey());
         forgetNames(leaving, from.pathId());
-        return handedOver;
     }
 
     /** The elements one embed of one parent holds, or null where nothing addresses that place yet. */
@@ -452,11 +574,16 @@ public final class RootAssembly implements Serializable {
                 }
             }
         }
+        forgetEverything();
+        return handedOver;
+    }
+
+    /** Clears a donor only after every row in its pure handover view has landed in parking. */
+    void forgetEverything() {
         children.clear();
         byIdentity.clear();
         waiting.clear();
         heldElements.clear();
-        return handedOver;
     }
 
     /**

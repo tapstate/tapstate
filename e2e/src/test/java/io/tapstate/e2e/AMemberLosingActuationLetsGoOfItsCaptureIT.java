@@ -57,9 +57,7 @@ class AMemberLosingActuationLetsGoOfItsCaptureIT {
                 Await.until("the original pipeline to deliver its load", BOUND,
                         () -> mongo.count(target, TABLE) == 2,
                         () -> "target rows=" + mongo.count(target, TABLE) + ", state=" + control.state(PIPELINE));
-                Await.until("the target to confirm the original load", BOUND,
-                        () -> control.snapshotTable(PIPELINE, TABLE).filter(TableSnapshot::landed).isPresent(),
-                        () -> "snapshot=" + control.snapshotTable(PIPELINE, TABLE));
+                awaitOriginalSnapshot(control);
                 Map<String, String> captures = control.captureOwnersOf(PIPELINE);
                 assertThat(captures).hasSize(1);
                 String captureId = captures.keySet().iterator().next();
@@ -76,8 +74,7 @@ class AMemberLosingActuationLetsGoOfItsCaptureIT {
                 WorkloadClaimKey actuation = new WorkloadClaimKey(
                         control.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, PIPELINE);
 
-                documents.handPipelineTo(control.clusterId(), PIPELINE, oldNode, successor);
-                Instant handedOffLease = store.workloadClaims().read(actuation).orElseThrow().claim().leaseUntil();
+                Instant handedOffLease = documents.handPipelineTo(control.clusterId(), PIPELINE, oldNode, successor);
                 Await.until("the other member to hold actuation", BOUND,
                         () -> control.pipelineControllerOf(PIPELINE).filter(successor::equals).isPresent(),
                         () -> "controller=" + control.pipelineControllerOf(PIPELINE));
@@ -104,10 +101,15 @@ class AMemberLosingActuationLetsGoOfItsCaptureIT {
                         () -> "capture=" + store.workloadClaims().read(capture));
                 assertThat(cluster.processCarrying(oldNode).isAlive()).isTrue();
 
+                long originalExecution = store.workloadClaims().read(actuation).orElseThrow().claim().executionGeneration();
                 control.lifecycle(PIPELINE, LifecycleVerb.START);
                 Await.until("the restarted pipeline to run", BOUND,
                         () -> control.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent(),
                         () -> "state=" + control.state(PIPELINE));
+                Await.until("the restart to allocate a new execution", BOUND,
+                        () -> store.workloadClaims().read(actuation)
+                                .filter(reading -> reading.claim().executionGeneration() > originalExecution).isPresent(),
+                        () -> "actuation=" + store.workloadClaims().read(actuation));
                 long before = mongo.count(target, TABLE);
                 mongo.cdc(source, TABLE, CdcOp.INSERT, 1);
                 Await.until("a change to reach the restarted pipeline", BOUND,
@@ -117,6 +119,15 @@ class AMemberLosingActuationLetsGoOfItsCaptureIT {
                 control.stop(PIPELINE, false);
             }
         }
+    }
+
+    static void awaitOriginalSnapshot(ControlPlane control) {
+        Await.until("the target to confirm the original load", BOUND,
+                () -> {
+                    TableSnapshot snapshot = control.snapshotTables(PIPELINE).get(TABLE);
+                    return snapshot != null && snapshot.landed();
+                },
+                () -> "snapshot=" + control.snapshotTables(PIPELINE));
     }
 
     private static Map<String, String> resources(String sourceUri, String targetUri) {

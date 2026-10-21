@@ -2,10 +2,13 @@ package io.tapstate.app;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.ExecutionPlan;
+import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.NodeParallelism;
 import io.tapstate.core.model.BatchSpec;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
+import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.PendingPipelineResume;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -40,8 +43,8 @@ import java.util.concurrent.ConcurrentHashMap;
  *       here would have the state dropped by the next start of a pipeline nobody asked to clear.</li>
  *   <li>{@code pause} / {@code resume} are engine-only once the initial load has reached the target: the
  *       capture keeps running while a pipeline is paused, held back by the ring's headroom backpressure,
- *       and a resume replays the buffered ring. A load still undelivered is the one case that cannot be
- *       resumed in place, and it rebuilds instead.</li>
+ *       and a resume replays the buffered ring. An undelivered load or changed native member cohort
+ *       requires an ordinary rebuild that keeps positions.</li>
  * </ul>
  */
 final class EngineLifecycleActuator implements LifecycleActuator {
@@ -64,6 +67,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     private final ExecutionPlanRecorder plans;
     private final Clock clock;
     private final ConnectorReadiness connectors;
+    private final PipelineExecutionAdmission admission;
     private final Map<String, Long> waitingForCapture = new ConcurrentHashMap<>();
 
     EngineLifecycleActuator(Engine engine, DagSource dagSource, PipelineCaptureCoordinator captureCoordinator,
@@ -91,6 +95,13 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     EngineLifecycleActuator(Engine engine, DagSource dagSource, PipelineCaptureCoordinator captureCoordinator,
             NestStateTeardown stateTeardown, PipelineActuationOwnership actuation, ExecutionPlanRecorder plans,
             Clock clock, ConnectorReadiness connectors) {
+        this(engine, dagSource, captureCoordinator, stateTeardown, actuation, plans, clock, connectors,
+                PipelineExecutionAdmission.NONE);
+    }
+
+    EngineLifecycleActuator(Engine engine, DagSource dagSource, PipelineCaptureCoordinator captureCoordinator,
+            NestStateTeardown stateTeardown, PipelineActuationOwnership actuation, ExecutionPlanRecorder plans,
+            Clock clock, ConnectorReadiness connectors, PipelineExecutionAdmission admission) {
         this.engine = Objects.requireNonNull(engine, "engine");
         this.dagSource = Objects.requireNonNull(dagSource, "dagSource");
         this.captureCoordinator = Objects.requireNonNull(captureCoordinator, "captureCoordinator");
@@ -99,6 +110,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         this.plans = Objects.requireNonNull(plans, "plans");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.connectors = Objects.requireNonNull(connectors, "connectors");
+        this.admission = Objects.requireNonNull(admission, "admission");
         captureCoordinator.runOnlyWhileDriving(actuation::isDriving);
     }
 
@@ -110,31 +122,36 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         // below would otherwise run up to the member and be thrown back uncoded, a capture left reading for
         // a job that cannot exist.
         DagSource.StartPreparation prepared;
+        DagSource.PlannedStart planned;
         Set<String> sharedConnectors;
         try {
             engine.refuseIfLost(pipelineId);
+            // A preceding stop can retire this member's control claim. Re-entry uses the same
+            // qualified ownership port; a cooldown or another holder leaves the accepted start pending.
+            if (actuation.isFenced() && actuation.currentClaim(pipelineId).isEmpty()
+                    && !actuation.permit(pipelineId).granted()) { return; }
             prepared = dagSource.prepareStart(pipelineId, stateTeardown.defaultDatabase());
             // Every member the run would take part on loads the connectors its sinks open, asked before the run
             // is fenced or anything is opened: a member that finds out only as its sink opens fails a run that
             // is already reading, and its reason stays on that member.
-            sharedConnectors = connectors.requireEveryMemberCanLoad(
-                    pipelineId, Set.copyOf(prepared.sinkConnectors().values()));
+            Set<String> requiredConnectors = new java.util.LinkedHashSet<>(prepared.sinkConnectors().values());
+            prepared.artifactSnapshot().ifPresent(snapshot -> StoredArtifacts.requirePipeline(snapshot, pipelineId)
+                    .sourceIds().forEach(source -> requiredConnectors.add(StoredArtifacts.requireSource(snapshot, source).connector())));
+            sharedConnectors = connectors.requireEveryMemberCanLoad(pipelineId, Set.copyOf(requiredConnectors));
+            planned = prepared.plan();
         } catch (TapstateException refused) {
-            // Refused before this start took a run, so the claim still names the run before it. Judged by that
-            // run, the failure this refusal records would read as its death - and right after a member left,
-            // as the departure again, spending the rebuilds meant for it on a refusal nobody leaving caused.
-            actuation.startRefusedBeforeItsRun(pipelineId);
+            recordStartRefusal(pipelineId, refused);
             throw refused;
         }
-        // The run's own generation, taken before the first side effect for the same reason: a run this
-        // member cannot fence is one nothing could later stop from writing, so it must not be half built.
-        // Nothing is recorded as failed here -- the pipeline is fine, this member is not its driver any
-        // more (or cannot prove it is), and the member that is will put a run behind it.
-        PipelineActuationOwnership.Execution execution = actuation.beginExecution(pipelineId);
-        if (!execution.allowed()) {
-            LOG.warn("Not starting pipeline {} on this member: its run could not be fenced to a new "
-                    + "execution generation", pipelineId);
-            return;
+        // Reserve the frozen demand before teardown or allocation. A refusal here opens no source and
+        // spends no generation; a live owning claim still guards pending teardown and validation.
+        try {
+            if (!admission.prepare(pipelineId, planned, actuation) || !actuation.mayStart(pipelineId)) {
+                return;
+            }
+        } catch (TapstateException refused) {
+            recordStartRefusal(pipelineId, refused);
+            throw refused;
         }
         // Before anything reads it: a drop the last stop noted but did not finish is finished here, so this
         // run never starts onto a half-dropped state. A start with nothing noted drops nothing, which is
@@ -151,59 +168,99 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         // snapshot, so an apply cannot move one without the others. Said after the drop above, which is the
         // one thing entitled to clear what earlier runs said.
         stateTeardown.willKeepStateAt(pipelineId, prepared.stateLocations());
-        // The run is worked out before its capture opens - how wide each node runs among the members, and every
-        // shape it records - so a start refused here, for a width it cannot honour or anything else found on the
-        // way, has opened no source connector and left the pipeline on no mining chain. A consumer left there
-        // holds back every other pipeline reading the same table on that chain. Worked out after placement and
-        // teardown, from the same frozen artifacts, so any shape record it writes stays named if it refuses.
-        DagSource.PlannedStart planned = prepared.plan();
-        // A capture still open here while no job carries the pipeline was left by a run that ended with no stop:
-        // a job lost with a member, which this member can replace before it can see that job fail. That run's
-        // sources had begun taking the load the capture handed them, and a source of this run cannot vouch for a
-        // load another run began, so the table would never land in this run. Closed first, keeping the pipeline's
-        // position, the capture opens a load for this run. A second start over a running job leaves it alone.
-        if (captureCoordinator.isCapturing(pipelineId) && !engine.hasLiveJob(pipelineId)) {
-            captureCoordinator.stopCapture(pipelineId, false);
+        try {
+            planned.activate();
+        } catch (TapstateException refused) {
+            recordStartRefusal(pipelineId, refused);
+            throw refused;
+        }
+        PipelineActuationOwnership.Execution execution;
+        try { execution = admission.begin(pipelineId, planned, actuation); }
+        catch (TapstateException refused) {
+            recordStartRefusal(pipelineId, refused);
+            throw refused;
+        }
+        if (!execution.allowed()) {
+            LOG.warn("Not starting pipeline {} on this member: its admitted run could not be fenced", pipelineId);
+            return;
         }
         try {
-            prepared.artifactSnapshot().ifPresentOrElse(
-                    snapshot -> captureCoordinator.startCapture(pipelineId, snapshot),
-                    () -> captureCoordinator.startCapture(pipelineId));
-        } catch (RingNotOpenYet notYet) {
-            // Nothing was opened, so nothing is submitted: the pipeline reads as started and carries no job,
-            // which is exactly what the next pass starts again. Not recorded as failed -- a capture it reads is
-            // being opened on another member, and how long that may take is bounded where it is decided.
-            waitingForCapture.put(pipelineId,
-                    execution.fence() == null ? 0L : execution.fence().executionGeneration());
-            return;
+            // A capture still open here while no job carries the pipeline was left by a run that ended with no stop:
+            // a job lost with a member, which this member can replace before it can see that job fail. That run's
+            // sources had begun taking the load the capture handed them, and a source of this run cannot vouch for a
+            // load another run began, so the table would never land in this run. Closed first, keeping the pipeline's
+            // position, the capture opens a load for this run. A second start over a running job leaves it alone.
+            if (captureCoordinator.isCapturing(pipelineId) && !engine.hasLiveJob(pipelineId)) {
+                captureCoordinator.stopCapture(pipelineId, false);
+            }
+            try {
+                prepared.artifactSnapshot().ifPresentOrElse(
+                        snapshot -> {
+                            if (execution.fence() != null && execution.fence().profileGeneration() > 0) {
+                                WorkloadClaim claim = actuation.currentClaim(pipelineId).orElseThrow();
+                                captureCoordinator.startCapture(pipelineId, snapshot, planned.sourceModels().orElseThrow(),
+                                        io.tapstate.spi.store.WorkloadClaimFence.from(claim));
+                            } else { captureCoordinator.startCapture(pipelineId, snapshot); }
+                        },
+                        () -> captureCoordinator.startCapture(pipelineId));
+            } catch (RingNotOpenYet notYet) {
+                // Nothing was opened, so nothing is submitted: the pipeline reads as started and carries no job,
+                // which is exactly what the next pass starts again. Not recorded as failed -- a capture it reads is
+                // being opened on another member, and how long that may take is bounded where it is decided.
+                waitingForCapture.put(pipelineId,
+                        execution.fence() == null ? 0L : execution.fence().executionGeneration());
+                return;
+            }
+            // Capture opens the SRS generation that source vertices compile into the DAG, so the topology is built
+            // only now, from the plan worked out above.
+            DagSource.StartPlan plan = planned.build(execution.fence());
+            admission.guard(pipelineId, execution, plan.dag());
+            // Proved once more, against the store, before anything is recorded or submitted. Everything above can
+            // take longer than a lease, and the renewer keeping the claim alive through it can still lose it: the
+            // store out of reach, the process paused, another member taking the pipeline over. A run submitted over
+            // a claim this member no longer holds dies at its first write, and whoever holds the pipeline then reads
+            // that death as the pipeline's. Not recorded as failed, for the reason a start refused its generation
+            // is not: the member that holds the pipeline puts a run behind it, over a capture this start closes
+            // again keeping its position.
+            if (!actuation.proveExecution(execution.fence())) {
+                LOG.warn("Not submitting pipeline {} on this member: the claim its run was taken under could not "
+                        + "be proved once the start was ready to submit it", pipelineId);
+                captureCoordinator.stopCapture(pipelineId, false);
+                return;
+            }
+            // Written down before the run is submitted, so a reader never finds a run executing on a plan nobody
+            // recorded; a run that goes on to fail keeps its plan until the next start replaces it or a stop lets go.
+            // Compared with the plan of the run before - lost to a failed member, a stop or a restart - so a node
+            // whose width moved says what it was and which of its inputs moved it.
+            plans.record(planOf(pipelineId, execution, plan.planned(), clock.instant(), prepared.sinkConnectors(),
+                    sharedConnectors).replacing(plans.last(pipelineId)));
+            // The capacity travels with the submission because the maps are made by the job: what a state map
+            // holds is fixed as it is created, so a number applied after the job started would be accepted and
+            // change nothing.
+            if (execution.fence() != null && execution.fence().profileGeneration() > 0) {
+                String nativeJobId = engine.submitFenced(pipelineId, plan.dag(), capacity.mapDatabases(), capacity.settings(),
+                        execution.fence().claimGeneration(), execution.fence().executionGeneration(),
+                        execution.fence().profileGeneration());
+                waitingForCapture.remove(pipelineId);
+                admission.submitted(pipelineId, execution, nativeJobId);
+            } else {
+                engine.submit(pipelineId, plan.dag(), capacity.mapDatabases(), capacity.settings());
+                waitingForCapture.remove(pipelineId);
+            }
+        } catch (TapstateException failed) {
+            admission.failedAfterAllocation(pipelineId, execution, failed);
+            throw failed;
         }
-        // Capture opens the SRS generation that source vertices compile into the DAG, so the topology is built
-        // only now, from the plan worked out above.
-        DagSource.StartPlan plan = planned.build(execution.fence());
-        // Proved once more, against the store, before anything is recorded or submitted. Everything above can
-        // take longer than a lease, and the renewer keeping the claim alive through it can still lose it: the
-        // store out of reach, the process paused, another member taking the pipeline over. A run submitted over
-        // a claim this member no longer holds dies at its first write, and whoever holds the pipeline then reads
-        // that death as the pipeline's. Not recorded as failed, for the reason a start refused its generation
-        // is not: the member that holds the pipeline puts a run behind it, over a capture this start closes
-        // again keeping its position.
-        if (!actuation.proveExecution(execution.fence())) {
-            LOG.warn("Not submitting pipeline {} on this member: the claim its run was taken under could not "
-                    + "be proved once the start was ready to submit it", pipelineId);
-            captureCoordinator.stopCapture(pipelineId, false);
-            return;
+    }
+
+    private void recordStartRefusal(String pipelineId, TapstateException refusal) {
+        Optional<PipelineActuationOwnership.Execution> pending = admission.pendingExecution(pipelineId);
+        if (pending.isPresent()) {
+            admission.failedAfterAllocation(pipelineId, pending.orElseThrow(), refusal);
+        } else {
+            actuation.startRefusedBeforeItsRun(pipelineId);
+            admission.refused(pipelineId, refusal);
         }
-        // Written down before the run is submitted, so a reader never finds a run executing on a plan nobody
-        // recorded; a run that goes on to fail keeps its plan until the next start replaces it or a stop lets go.
-        // Compared with the plan of the run before - lost to a failed member, a stop or a restart - so a node
-        // whose width moved says what it was and which of its inputs moved it.
-        plans.record(planOf(pipelineId, execution, plan.planned(), clock.instant(), prepared.sinkConnectors(),
-                sharedConnectors).replacing(plans.last(pipelineId)));
-        // The capacity travels with the submission because the maps are made by the job: what a state map
-        // holds is fixed as it is created, so a number applied after the job started would be accepted and
-        // change nothing.
-        engine.submit(pipelineId, plan.dag(), capacity.mapDatabases(), capacity.settings());
-        waitingForCapture.remove(pipelineId);
     }
 
     @Override
@@ -229,16 +286,65 @@ final class EngineLifecycleActuator implements LifecycleActuator {
      */
     @Override
     public void resume(String pipelineId) {
+        Optional<PendingPipelineResume> pending = admission.pendingResume(pipelineId);
+        if (pending.isPresent()) {
+            PendingPipelineResume receipt = pending.orElseThrow();
+            switch (admission.resumeDisposition(receipt, captureCoordinator.loadDelivered(pipelineId))) {
+                case WAIT -> { return; }
+                case HELD -> {
+                    WorkloadClaim original = receipt.originalClaim();
+                    waitingForCapture.remove(pipelineId);
+                    engine.resume(pipelineId, receipt.originalNativeJobId(), original.claimGeneration(),
+                            original.executionGeneration(), original.profileGeneration(), receipt.originalRuntimeExecutionId());
+                    return;
+                }
+                case RECOMPILE -> {
+                    if (!stopResumeExecution(pipelineId, receipt)) { return; }
+                }
+                case START -> { }
+            }
+            // Stopping can release PIPE ownership. Re-entry is the existing store-qualified permit,
+            // and the linked ordinary reservation waits for the original authorization horizon.
+            if (actuation.permit(pipelineId).granted()) { start(pipelineId); }
+            return;
+        }
         if (!captureCoordinator.loadDelivered(pipelineId)) {
             stop(pipelineId, false);
             start(pipelineId);
             return;
         }
+        waitingForCapture.remove(pipelineId);
         engine.resume(pipelineId);
+    }
+
+    @Override public Optional<PendingPipelineResume> prepareResume(
+            String pipelineId, DesiredState intent, long acceptedStateEpoch) {
+        return admission.prepareResume(pipelineId, intent, acceptedStateEpoch);
+    }
+
+    @Override public boolean acceptsPendingResume(PendingPipelineResume receipt) {
+        return admission.acceptsPendingResume(receipt);
+    }
+
+    @Override public boolean resumeCompleted(PendingPipelineResume receipt) {
+        return admission.resumeCompleted(receipt);
+    }
+
+    private boolean stopResumeExecution(String pipelineId, PendingPipelineResume receipt) {
+        waitingForCapture.remove(pipelineId);
+        WorkloadClaim original = receipt.originalClaim();
+        boolean over = engine.cancelAndAwaitTerminal(pipelineId, receipt.originalNativeJobId(), original.claimGeneration(),
+                original.executionGeneration(), original.profileGeneration(), JOB_TEARDOWN_BUDGET);
+        if (!over) { return false; }
+        if (!engine.isLost()) { plans.forget(pipelineId); }
+        captureCoordinator.stopCapture(pipelineId, false);
+        admission.stopped(pipelineId, original, true);
+        return true;
     }
 
     @Override
     public void stop(String pipelineId, boolean purgeState) {
+        WorkloadClaim stoppedClaim = actuation.currentClaim(pipelineId).orElse(null);
         waitingForCapture.remove(pipelineId);
         engine.cancel(pipelineId);
         if (!engine.isLost()) {
@@ -258,6 +364,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         }
         boolean jobOver = engine.awaitTerminal(pipelineId, JOB_TEARDOWN_BUDGET);
         captureCoordinator.stopCapture(pipelineId, purgeState);
+        admission.stopped(pipelineId, stoppedClaim, jobOver);
         if (purgeState && jobOver && !engine.isLost()) {
             // Only once nothing is left to write into it. A processor still winding down writes state as it
             // closes, and a drop racing that leaves entries behind with the note already gone.
@@ -276,10 +383,12 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         // A deferred start submitted no job of its own. Ignore the previous terminal job only while the
         // claim still carries that start's execution: another holder's replacement run can fail normally.
         // Capture failures and a lost engine still surface.
+        WorkloadClaim current = actuation.currentClaim(pipelineId).orElse(null);
         Long waitingGeneration = waitingForCapture.get(pipelineId);
         if (waitingGeneration != null && waitingGeneration == actuation.heldExecutionGeneration(pipelineId)
                 && !engine.isLost()) {
-            return captureCoordinator.captureFailure(pipelineId);
+            return PipelineFailures.captureCurrent(pipelineId, current, actuation.isFenced(), captureCoordinator)
+                    .or(() -> admission.inheritedFailure(pipelineId, current));
         }
         if (waitingGeneration != null) {
             waitingForCapture.remove(pipelineId, waitingGeneration);
@@ -287,7 +396,8 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         // A pipeline fails two ways the converge loop must see as one: the Jet job itself dies (engine), or the
         // cdc capture feeding its ring dies while the job keeps running over a ring gone quiet (coordinator).
         // Either surfaces here so the converge side drives the pipeline into the observable FAILED state.
-        return engine.failureOf(pipelineId).or(() -> captureCoordinator.captureFailure(pipelineId));
+        return PipelineFailures.current(pipelineId, current, actuation.isFenced(), engine, captureCoordinator)
+                .or(() -> admission.inheritedFailure(pipelineId, current));
     }
 
     @Override
@@ -302,7 +412,11 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         // The job side alone. A capture that died while the job runs is a failure, reported above; what
         // is asked here is whether anything is running this pipeline at all, and a process that has just
         // come up to a checkpoint an earlier one wrote answers no.
-        return engine.hasLiveJob(pipelineId);
+        return engine.hasLiveJob(pipelineId) || engine.hasCompleted(pipelineId);
+    }
+
+    @Override public boolean hasCompleted(String pipelineId) {
+        return engine.hasCompleted(pipelineId) && admission.mayComplete(pipelineId);
     }
 
     /** As below, for a run none of whose sinks opens a connector named here. */

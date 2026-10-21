@@ -66,6 +66,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -1570,6 +1571,26 @@ class StoreBackedPipelineCaptureCoordinatorTest {
     }
 
     @Test
+    void aNewExecutionCannotInheritAnOlderLocalCaptureFailure() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(pipeline("p", "orders_src"));
+        CaptureHealth health = new CaptureHealth();
+        CaptureStarter starter = (spec, handoff) -> new CaptureRun(
+                Optional.empty(), false, 0L, Optional.empty(), Optional.empty(), health);
+        var coordinator = new StoreBackedPipelineCaptureCoordinator(artifactsOnly(artifacts), starter,
+                new SrsCoordinator(new InMemorySrsMetaStore()), new SnapshotBuffer());
+        coordinator.startCapture("p");
+        RuntimeException oldFailure = new RuntimeException("old reader failed");
+        health.fail(oldFailure);
+        assertThat(coordinator.captureFailure("p")).containsSame(oldFailure);
+        var newExecution = new io.tapstate.spi.store.WorkloadClaimFence(
+                new io.tapstate.spi.store.WorkloadClaimKey("east", io.tapstate.spi.store.WorkloadClaimType.PIPELINE_ACTUATION, "p"),
+                new io.tapstate.spi.store.WorkloadOwner("node", "boot"), 2, 3, 1, 1);
+        assertThat(coordinator.captureFailure("p", newExecution)).isEmpty();
+    }
+
+    @Test
     void captureFailureSurfacesAFailedRunPastAHealthyEarlierRun() {
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         artifacts.save(cdcSource("src_a", "orders", null));
@@ -1839,6 +1860,59 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         coordinator.stopCapture("p", false);
 
         assertThat(coordinator.loadDelivered("p")).isTrue();
+    }
+
+    @Test
+    void aLegacyUnprofiledFenceDoesNotAcquireSourceProofStartupPrerequisites() {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", null));
+        artifacts.save(pipeline("p", "orders_src"));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        java.util.concurrent.atomic.AtomicReference<CaptureRunSpec> started = new java.util.concurrent.atomic.AtomicReference<>();
+        CaptureStarter starter = (spec, handoff) -> {
+            started.set(spec);
+            return new CaptureRun(Optional.empty(), false, 0L, Optional.empty(), Optional.empty(), new CaptureHealth());
+        };
+        StoreBackedPipelineCaptureCoordinator coordinator = new StoreBackedPipelineCaptureCoordinator(store, starter,
+                new SrsCoordinator(store.meta()), new SnapshotBuffer());
+        var legacy = new io.tapstate.spi.store.WorkloadClaimFence(new io.tapstate.spi.store.WorkloadClaimKey("east",
+                io.tapstate.spi.store.WorkloadClaimType.PIPELINE_ACTUATION, "p"),
+                new io.tapstate.spi.store.WorkloadOwner("node", "boot"), 1, 1, 1);
+        coordinator.startCapture("p", artifacts, legacy);
+        assertThat(started.get().resumeWitness()).isNull();
+        assertThat(coordinator.isCapturing("p")).isTrue();
+        coordinator.stopCapture("p", false);
+    }
+
+    @Test
+    void originalResumeDiagnosticsNameTheActualCaptureWithoutOpeningOrAdvancingIt() throws Exception {
+        InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
+        artifacts.save(cdcSource("orders_src", "orders", "physical-source"));
+        artifacts.save(pipeline("p", "orders_src"));
+        InMemoryStorePort store = new InMemoryStorePort(artifacts);
+        String chain = MiningChainId.ofKey("physical-source").value();
+        store.meta().create(chain, "2h");
+        long epoch = store.meta().openEpoch(chain);
+        store.meta().advanceCaptureCheckpoint(chain, new ChainPosition(new SourceOrder(epoch, 7), "retained"));
+        var before = store.meta().read(chain).orElseThrow();
+        CaptureStarter unopened = (spec, handoff) -> { throw new AssertionError("diagnostics must not open a source"); };
+        var coordinator = new StoreBackedPipelineCaptureCoordinator(store, unopened, new SrsCoordinator(store.meta()), new SnapshotBuffer());
+        HazelcastInstance member = mock(HazelcastInstance.class);
+        when(member.getUserContext()).thenReturn(new ConcurrentHashMap<>());
+        var runtime = new ClusterRecoveryRuntime(store, null, coordinator, null, null, null, null, member,
+                new ClusterProperties(), new io.tapstate.core.lifecycle.ClusterCapacityLimits(8, 4, 4, 2, 1024, 1024),
+                "default", Duration.ofSeconds(1));
+        var method = ClusterRecoveryRuntime.class.getDeclaredMethod("positions", String.class);
+        method.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        Map<String, io.tapstate.spi.store.ClusterRecoveryPosition> positions =
+                (Map<String, io.tapstate.spi.store.ClusterRecoveryPosition>) method.invoke(runtime, "p");
+        String actualCapture = io.tapstate.runtime.srs.CaptureId.of(new CaptureConfig("mysql", Map.of("host", "h"),
+                List.of("orders")), "physical-source").value();
+        assertThat(positions.get("orders_src").captureId()).isEqualTo(actualCapture);
+        assertThat(positions.get("orders_src").position().token()).isEqualTo("retained");
+        assertThat(store.meta().read(chain)).contains(before);
+        assertThat(coordinator.isCapturing("p")).isFalse();
     }
 
     // ---- fixtures --------------------------------------------------------------------------------

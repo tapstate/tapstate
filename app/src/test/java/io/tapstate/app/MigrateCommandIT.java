@@ -71,7 +71,8 @@ class MigrateCommandIT {
                 .contains("V9RateHistoryIndexes")
                 .contains("V10SrsConsumerOffsetIndexes")
                 .contains("V11RateHistoryKeysetIndex")
-                .contains("V12EncryptSourceConfigs");
+                .contains("V12EncryptSourceConfigs")
+                .contains("V13ClusterExecutionProfiles");
         assertThat(collectionNames(database))
                 .as("the command is read-only; it must not bring the store part way forward while "
                         + "reporting on it")

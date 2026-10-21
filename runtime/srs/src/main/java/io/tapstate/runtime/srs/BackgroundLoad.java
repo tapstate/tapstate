@@ -156,6 +156,9 @@ final class BackgroundLoad {
             readLoad();
             synchronized (this) {
                 loadOver = true;
+                if (!cancelled && !loadLetGo) {
+                    health.snapshotCompleted();
+                }
                 if (cancelled) {
                     // Closed as the load ended: the run is over, and a tail opened now would set up on the source
                     // what nothing is left to read through, confirm or let go of -- a replication slot, say.
@@ -215,6 +218,7 @@ final class BackgroundLoad {
         // Handed over first and counted after: the hand-off may wait for room and be abandoned while it
         // waits, and a row that never went anywhere is not one this run passed on.
         handoff.accept(row);
+        health.snapshotDelivered();
         rowsByTable.merge(row.src(), 1L, Long::sum);
         rows.incrementAndGet();
         health.received(row);

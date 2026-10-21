@@ -2,6 +2,7 @@ package io.tapstate.control.core;
 
 import io.tapstate.core.lifecycle.ExecutionPlans;
 import io.tapstate.core.lifecycle.ExecutionPlan;
+import io.tapstate.core.lifecycle.ProcessorRuntimeContext;
 import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimKey;
@@ -93,6 +94,8 @@ public final class ClusterPipelineTopologyService {
                 nodeIdByMemberUuid.put(member.memberUuid(), member.nodeId());
             }
         }
+        Set<String> currentMemberUuids = members.stream().map(ClusterMemberView::memberUuid)
+                .filter(Objects::nonNull).collect(java.util.stream.Collectors.toUnmodifiableSet());
         Map<String, LivePipelineRun> runById = new HashMap<>();
         for (LivePipelineRun run : runs.runs()) {
             runById.put(run.pipelineId(), run);
@@ -109,15 +112,18 @@ public final class ClusterPipelineTopologyService {
         for (String pipelineId : pipelineIds) {
             LivePipelineRun run = runById.get(pipelineId);
             ClusterClaimView controller = claimOver(readings, WorkloadClaimType.PIPELINE_ACTUATION, pipelineId);
+            Map<ProcessorSlot, ProcessorRuntimeContext> nativeSlots = run == null ? Map.of()
+                    : nativeSlots(run, members, controller);
             views.add(new ClusterPipelineView(
                     pipelineId,
                     controller,
                     captureClaims(readings, captureIds.getOrDefault(pipelineId, Set.of())),
                     run == null ? null : run.measuredAt(),
                     run == null ? List.of() : List.copyOf(new TreeSet<>(run.measuredFrom())),
-                    run == null ? List.of() : awaitingRebalance(run, members),
+                    run == null ? List.of() : awaitingRebalance(run, members, currentMemberUuids, nativeSlots),
                     run == null ? List.of()
-                            : vertices(run, nodeIdByMemberUuid, plannedNodes(planById.get(pipelineId), controller))));
+                            : vertices(run, nodeIdByMemberUuid, currentMemberUuids, nativeSlots,
+                                    plannedNodes(planById.get(pipelineId), controller, run.processorContexts()))));
         }
         return views;
     }
@@ -127,11 +133,15 @@ public final class ClusterPipelineTopologyService {
      * plan. One written for an earlier execution than the claim now names says nothing about the run executing:
      * its widths were worked out for another run, and reporting them would put an old answer beside a new run.
      */
-    private static Map<String, ExecutionPlan.Node> plannedNodes(ExecutionPlan plan, ClusterClaimView controller) {
+    private static Map<String, ExecutionPlan.Node> plannedNodes(ExecutionPlan plan, ClusterClaimView controller,
+            List<ProcessorRuntimeContext> contexts) {
         if (plan == null) {
             return Map.of();
         }
         if (controller != null && !Objects.equals(plan.executionGeneration(), controller.executionGeneration())) {
+            return Map.of();
+        }
+        if (contexts.stream().anyMatch(context -> !Objects.equals(plan.executionGeneration(), context.executionGeneration()))) {
             return Map.of();
         }
         Map<String, ExecutionPlan.Node> byVertex = new HashMap<>();
@@ -156,7 +166,8 @@ public final class ClusterPipelineTopologyService {
      * work because it is not yet entitled to any, which is a different thing and the member half says it.
      */
     private static List<String> awaitingRebalance(
-            LivePipelineRun run, List<ClusterMemberView> members) {
+            LivePipelineRun run, List<ClusterMemberView> members, Set<String> currentMemberUuids,
+            Map<ProcessorSlot, ProcessorRuntimeContext> nativeSlots) {
         if (run.measuredAt() == null) {
             return List.of();
         }
@@ -164,6 +175,8 @@ public final class ClusterPipelineTopologyService {
         for (LivePipelineVertex vertex : run.vertices()) {
             for (LivePipelineProcessor processor : vertex.processors()) {
                 carrying.add(processor.memberUuid());
+                ProcessorRuntimeContext context = contextFor(run, vertex.name(), processor, currentMemberUuids, nativeSlots);
+                if (context != null) { carrying.add(context.memberUuid()); }
             }
         }
         List<String> awaiting = new ArrayList<>();
@@ -253,32 +266,122 @@ public final class ClusterPipelineTopologyService {
                 claim.claimGeneration(),
                 claim.executionGeneration(),
                 claim.topologyRevision(),
-                reading.leased());
+                reading.leased(), claim.leaseUntil(), reading.leaseRemaining().toMillis(),
+                claim.profileGeneration() == 0 ? null : claim.profileGeneration(),
+                claim.contextExecutionGeneration() == 0 ? null : claim.contextExecutionGeneration(),
+                claim.executionClaimGeneration() == 0 ? null : claim.executionClaimGeneration(),
+                claim.executionIncarnation(), claim.executionRevision(), claim.executionTopologyRevision(),
+                claim.executionProfile() == null ? null : claim.executionProfile().generation(),
+                claim.executionProfile() == null ? null : claim.executionProfile().profile().hash(),
+                claim.executionMembers().values().stream().sorted(java.util.Comparator.comparing(io.tapstate.spi.store.ClusterExecutionMember::nodeId))
+                        .map(value -> new ClusterClaimView.Member(value.nodeId(), value.bootId(), value.memberUuid())).toList(),
+                claim.failureClaimGeneration() == 0 ? null : claim.failureClaimGeneration(),
+                claim.failureClaimGeneration() == 0 ? null : claim.failureAfterMemberLoss(),
+                claim.contextExecutionGeneration() == 0 ? null : claim.contextExecutionGeneration() == claim.executionGeneration());
+    }
+
+    private record ProcessorSlot(String vertex, int index) { }
+
+    /** A changed metric identity can be joined only through the current execution's unique initialized slot. */
+    private static Map<ProcessorSlot, ProcessorRuntimeContext> nativeSlots(LivePipelineRun run,
+            List<ClusterMemberView> members, ClusterClaimView controller) {
+        LivePipelineRun.NativeExecution scope = run.nativeExecution();
+        if (scope == null || !scope.measuredExecutionId().equals(run.executionId()) || controller == null
+                || !Boolean.TRUE.equals(controller.executionContextCurrent())
+                || !Objects.equals(controller.contextExecutionGeneration(), scope.executionGeneration())
+                || !Objects.equals(controller.executionClaimGeneration(), scope.claimGeneration())
+                || !Objects.equals(controller.executionProfileGeneration(), scope.profileGeneration())
+                || !Objects.equals(controller.profileGeneration(), scope.profileGeneration())
+                || controller.executionProfileHash() == null || controller.executionMembers().isEmpty()) {
+            return Map.of();
+        }
+        Map<String, ClusterClaimView.Member> cohort = new HashMap<>();
+        Set<String> cohortUuids = new HashSet<>();
+        for (ClusterClaimView.Member member : controller.executionMembers()) {
+            if (cohort.putIfAbsent(member.nodeId(), member) != null || !cohortUuids.add(member.memberUuid())) {
+                return Map.of();
+            }
+        }
+        Set<ProcessorSlot> measured = new HashSet<>();
+        for (LivePipelineVertex vertex : run.vertices()) {
+            for (LivePipelineProcessor processor : vertex.processors()) {
+                if (!measured.add(new ProcessorSlot(vertex.name(), processor.index()))) { return Map.of(); }
+            }
+        }
+        Map<ProcessorSlot, ProcessorRuntimeContext> slots = new HashMap<>();
+        for (ProcessorRuntimeContext context : run.processorContexts()) {
+            ClusterClaimView.Member original = cohort.get(context.nodeId());
+            if (!run.pipelineId().equals(context.pipelineId()) || !scope.matches(context)
+                    || context.memberCount() != cohort.size() || original == null
+                    || !original.bootId().equals(context.bootId()) || !original.memberUuid().equals(context.memberUuid())) {
+                return Map.of();
+            }
+            List<ClusterMemberView> current = members.stream().filter(member ->
+                    Objects.equals(member.nodeId(), context.nodeId())).toList();
+            if (current.size() != 1 || !currentMember(current.get(0), context, controller.executionProfileHash())) {
+                return Map.of();
+            }
+            if (slots.putIfAbsent(new ProcessorSlot(context.vertex(), context.globalProcessorIndex()), context) != null) {
+                return Map.of();
+            }
+        }
+        return Map.copyOf(slots);
+    }
+
+    private static boolean currentMember(ClusterMemberView member, ProcessorRuntimeContext context, String profileHash) {
+        return member.state() == ClusterMemberState.ACTIVE && Boolean.TRUE.equals(member.live())
+                && Boolean.TRUE.equals(member.sessionLeased()) && Boolean.TRUE.equals(member.joined())
+                && Objects.equals(member.profileGeneration(), context.profileGeneration())
+                && Objects.equals(member.profileHash(), profileHash)
+                && Objects.equals(member.bootId(), context.bootId())
+                && Objects.equals(member.sessionBootId(), context.bootId())
+                && Objects.equals(member.memberUuid(), context.memberUuid())
+                && Objects.equals(member.joinedMemberUuid(), context.memberUuid())
+                && Objects.equals(member.hzAddress(), context.memberAddress())
+                && Objects.equals(member.joinedMemberAddress(), context.memberAddress());
+    }
+
+    private static ProcessorRuntimeContext contextFor(LivePipelineRun run, String vertex,
+            LivePipelineProcessor processor, Set<String> currentMemberUuids,
+            Map<ProcessorSlot, ProcessorRuntimeContext> nativeSlots) {
+        if (run.nativeExecution() == null) {
+            List<ProcessorRuntimeContext> direct = run.processorContexts().stream().filter(context ->
+                    context.vertex().equals(vertex) && context.globalProcessorIndex() == processor.index()
+                            && context.memberUuid().equals(processor.memberUuid())).toList();
+            return direct.size() == 1 ? direct.get(0) : null;
+        }
+        ProcessorRuntimeContext context = nativeSlots.get(new ProcessorSlot(vertex, processor.index()));
+        if (context == null || processor.memberUuid() == null || processor.memberUuid().isBlank()
+                || (!context.memberUuid().equals(processor.memberUuid())
+                        && currentMemberUuids.contains(processor.memberUuid()))) {
+            return null;
+        }
+        return context;
     }
 
     private static List<ClusterVertexView> vertices(
-            LivePipelineRun run, Map<String, String> nodeIdByMemberUuid, Map<String, ExecutionPlan.Node> planned) {
+            LivePipelineRun run, Map<String, String> nodeIdByMemberUuid, Set<String> currentMemberUuids,
+            Map<ProcessorSlot, ProcessorRuntimeContext> nativeSlots, Map<String, ExecutionPlan.Node> planned) {
         List<ClusterVertexView> views = new ArrayList<>();
         for (LivePipelineVertex vertex : run.vertices()) {
             List<LivePipelineProcessor> working = vertex.processors().stream()
                     .filter(LivePipelineProcessor::working)
                     .sorted((left, right) -> Integer.compare(left.index(), right.index()))
                     .toList();
-            // A processor's index on its member is its place among the vertex's processors there, in the
-            // cluster-wide order: the engine numbers each member's processors of a vertex in one run.
-            Map<String, Integer> nextOnMember = new HashMap<>();
             List<ClusterProcessorView> processors = new ArrayList<>();
             for (LivePipelineProcessor processor : working) {
+                ProcessorRuntimeContext context = contextFor(run, vertex.name(), processor,
+                        currentMemberUuids, nativeSlots);
                 processors.add(new ClusterProcessorView(
                         processor.index(),
-                        nextOnMember.merge(String.valueOf(processor.memberUuid()), 1, Integer::sum) - 1,
+                        context == null ? null : context.localProcessorIndex(),
                         processor.memberUuid(),
-                        nodeIdByMemberUuid.get(processor.memberUuid()),
+                        context == null ? nodeIdByMemberUuid.get(processor.memberUuid()) : context.nodeId(),
                         processor.backlog(),
                         processor.frontierGaps(),
                         processor.frontierStalledMillis(),
                         processor.queuedByStream(),
-                        processor.inFlightByTable()));
+                        processor.inFlightByTable(), context));
             }
             // What the plan says of the vertex's node, where the vertex runs at its node's width: a vertex the plan
             // does not name - one gathering several producers into one, or any vertex of a run with no plan
