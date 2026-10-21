@@ -128,6 +128,13 @@ public final class ValidationNestArrayMembers implements AutoCloseable {
         for (String segment : path) charge(textBytes(segment));
     }
 
+    void requireRequest(ValidationObservation parent, List<String> arrayPath) {
+        mutate(() -> {
+            sameObservation(parent);
+            if (!path.equals(arrayPath)) throw ValidationError.invalid("nestMembers.arrayPath");
+        });
+    }
+
     /** The caller may interleave sides; order does not change membership or overwrite duplicates. */
     public void add(Side side, ValidationObservation request, Member member) {
         mutate(() -> {
