@@ -155,6 +155,13 @@ public final class ValidationNestLookupBinding {
         return problems.isEmpty() ? new Ready(new ValidationKey(parts)) : new Invalid(problems);
     }
 
+    /** The parent uses its own admitted row budget, independently of any child reader's limit. */
+    ValidationReferenceFields.Complete requireReferenceFields(ValidationValues.Row workingParent) {
+        if (relation.direction() != ValidationNestRelations.Direction.REFERENCE) throw invalid("nestLookup.referenceDirection");
+        if (reference.read(workingParent) instanceof ValidationReferenceFields.Complete complete) return complete;
+        throw invalid("nestLookup.referenceNotReady");
+    }
+
     private static TapstateException invalid(String field) {
         return new TapstateException(ValidationError.INVALID_CONTRACT, Map.of("field", field), null);
     }
