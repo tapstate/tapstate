@@ -28,20 +28,20 @@ public enum StartCheckCode implements TapstateErrorCode {
     TARGET_EMPTY("start-check.target-empty", Set.of(Parameters.TARGET, Parameters.CONNECTION)),
 
     /** A new full load into a non-empty target this pipeline is set to clear first. */
-    TARGET_SET_TO_CLEAR("start-check.target-set-to-clear", Set.of(Parameters.TARGET, Parameters.CONNECTION, "holding")),
+    TARGET_SET_TO_CLEAR("start-check.target-set-to-clear", Set.of(Parameters.TARGET, Parameters.CONNECTION, Parameters.HOLDING)),
 
     /** A new full load into a non-empty target, kept as it is: the question the first check asks. */
-    TARGET_NOT_EMPTY("start-check.target-not-empty", Set.of(Parameters.TARGET, Parameters.CONNECTION, "holding")),
+    TARGET_NOT_EMPTY("start-check.target-not-empty", Set.of(Parameters.TARGET, Parameters.CONNECTION, Parameters.HOLDING)),
 
     /**
      * The same question about a target whose element comes from a shared definition, which the start
      * offers no way to change: {@code definition} names where to change it instead.
      */
     TARGET_NOT_EMPTY_SHARED(
-            "start-check.target-not-empty-shared", Set.of(Parameters.TARGET, Parameters.CONNECTION, "holding", "definition")),
+            "start-check.target-not-empty-shared", Set.of(Parameters.TARGET, Parameters.CONNECTION, Parameters.HOLDING, "definition")),
 
     /** A new full load into a non-empty target whose policy refuses one. */
-    TARGET_NOT_EMPTY_REFUSED("start-check.target-not-empty-refused", Set.of(Parameters.TARGET, Parameters.CONNECTION, "holding")),
+    TARGET_NOT_EMPTY_REFUSED("start-check.target-not-empty-refused", Set.of(Parameters.TARGET, Parameters.CONNECTION, Parameters.HOLDING)),
 
     /** Whether a target holds rows could not be found out: {@code reason} says why. */
     TARGET_ROWS_UNKNOWN("start-check.target-rows-unknown", Set.of(Parameters.TARGET, Parameters.CONNECTION, Parameters.REASON)),
@@ -56,6 +56,7 @@ public enum StartCheckCode implements TapstateErrorCode {
     KEEP_EXISTING_ROWS("start-check.keep-existing-rows", Set.of(Parameters.TARGET));
 
     private static final class Parameters {
+        static final String HOLDING = "holding";
         static final String CONNECTION = "connection";
         static final String TARGET = "target";
         static final String REASON = "reason";

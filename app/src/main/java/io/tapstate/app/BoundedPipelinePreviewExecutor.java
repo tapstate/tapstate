@@ -264,7 +264,7 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
             Throwable observed = null;
             if (!(problem instanceof InterruptedException) || !cancelled.get()) {
                 observed = problem;
-                if (!(problem instanceof TapstateException)) {
+                if (!(problem instanceof TapstateException) && LOG.isWarnEnabled()) {
                     LOG.warn("Preview run {} failed unexpectedly (exception types: {})",
                             request.runId(), exceptionTypes(problem));
                 }

@@ -131,7 +131,7 @@ public enum ConnectorError implements TapstateErrorCode {
      * deadline, so its worker and connector were stopped instead of holding the reconciliation loop.
      * {@code connector} is the Oracle connector id; {@code timeout} is how long preflight was given.
      */
-    LOGMINER_PREFLIGHT_TIMEOUT("connector.logminer-preflight-timeout", Set.of(Parameters.CONNECTOR, "timeout")),
+    LOGMINER_PREFLIGHT_TIMEOUT("connector.logminer-preflight-timeout", Set.of(Parameters.CONNECTOR, Parameters.TIMEOUT)),
 
     /**
      * The connector requires a newer PDK API level than the bridge provides, so it is refused rather
@@ -215,7 +215,7 @@ public enum ConnectorError implements TapstateErrorCode {
      * {@code timeout} is how long the read waited. A caller that sees this repeatedly is contending
      * with other reads of the same connection, not with a broken one.
      */
-    INSTANCES_BUSY("connector.instances-busy", Set.of(Parameters.CONNECTOR, "timeout")),
+    INSTANCES_BUSY("connector.instances-busy", Set.of(Parameters.CONNECTOR, Parameters.TIMEOUT)),
 
     /**
      * The host already holds as many live connector instances as it allows and every one of them is
@@ -230,7 +230,7 @@ public enum ConnectorError implements TapstateErrorCode {
      * connector id; {@code timeout} is how long it was given. The instance it ran on is closed rather
      * than reused, because the abandoned read is still inside it.
      */
-    READ_TIMEOUT("connector.read-timeout", Set.of(Parameters.CONNECTOR, "timeout")),
+    READ_TIMEOUT("connector.read-timeout", Set.of(Parameters.CONNECTOR, Parameters.TIMEOUT)),
 
     /**
      * A connector asked to keep a value whose type this build has no encoding for. Refused where it is
@@ -282,6 +282,7 @@ public enum ConnectorError implements TapstateErrorCode {
     RELEASE_FAILED("connector.release-failed", Set.of(Parameters.CONNECTOR, Parameters.DETAIL, "resources"));
 
     static final class Parameters {
+        static final String TIMEOUT = "timeout";
         static final String CONNECTOR = "connector";
         static final String DETAIL = "detail";
         static final String ARTIFACT = "artifact";
