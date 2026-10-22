@@ -8,6 +8,9 @@
 #
 # Values are double-quoted single-line scalars; colons, apostrophes and backticks inside the quotes
 # are fine. Keep literal double-quotes out of values (use backticks for inline code).
+core.row-map-key-unsupported:
+  message: "Row object at `{path}` contains an unsupported map key of type `{keyType}`."
+  solution: "Use non-null string map keys at every nesting level. The row was refused without coercing its keys."
 cluster.membership-unreadable:
   message: "This member cannot read who is in the cluster right now."
   solution: "Its engine cannot answer for the cluster yet, which is what a member looks like while it is starting, while it is stopping, while the cluster is putting itself back together after a partition healed, and while it settles after another member has left. Ask another member, or read again in a moment."

@@ -1,6 +1,7 @@
 package io.tapstate.adapters.pdk;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.event.RowMapKeys;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.spi.capture.BoundedSnapshotQueryPort;
 import io.tapstate.spi.capture.BoundedQueryCancellation;
@@ -356,8 +357,12 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
                                         "detail", "bounded preview sample exceeds its byte limit"), null));
                         return;
                     }
+                    RowMapKeys.validate(envelope.after());
                     bytesUsed[0] += rowBytes;
                     rows.values.add(envelope);
+                } catch (TapstateException failure) {
+                    reported.compareAndSet(null, failure);
+                    return;
                 } catch (RuntimeException failure) {
                     reported.compareAndSet(null, new IllegalArgumentException(
                             "connector row could not be decoded for preview table " + request.table().name(), failure));
@@ -402,12 +407,9 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
             throw new IllegalArgumentException("connector returned a null row");
         }
         Map<String, Object> copy = new LinkedHashMap<>();
-        row.forEach((name, value) -> {
-            if (name == null) {
-                throw new IllegalArgumentException("connector returned a row with a null field name");
-            }
-            copy.put(name, value);
-        });
+        for (Map.Entry<?, ?> entry : row.entrySet()) {
+            copy.put(RowMapKeys.requireString(entry.getKey(), "$"), entry.getValue());
+        }
         return copy;
     }
 
