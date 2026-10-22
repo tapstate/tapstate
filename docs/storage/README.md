@@ -178,7 +178,11 @@ to initialize a replacement database manually.
 1. Sign in through the existing Cloud console and open this Cluster. Cloud manages its users;
    there is no local account or first-administrator installation step.
 2. In **Set up cluster storage**, enter the Atlas URI, Durable cache name and Application data
-   name. Test Configuration, Durable cache and Application data separately.
+   name. The URI is hidden by default; use its show/hide button when needed. Test Durable cache
+   and Application data. The platform Configuration check is included automatically with the
+   first database test and needs no separate click. OP still tests all three user-selected layers.
+   Status icons retain readable labels: green means passed, red means failed, and an expired
+   check must run again before saving.
 3. Save once all tests pass. A successful setup retains one default target, `atlas-store`.
    Its application database is separate from the cache; ordinary Source labels do not create a
    managed target.
