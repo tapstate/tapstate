@@ -710,6 +710,21 @@ public final class ObservationPublisher {
         Objects.requireNonNull(pipelineId, "pipelineId");
         return state.read(pipelineId).map(checkpoint -> {
             PipelineState actual = StateJson.parse(checkpoint.stateJson());
+            if (actual == PipelineState.COMPLETED) {
+                Optional<Observation> previous = observations.read(pipelineId);
+                if (previous.isPresent()) {
+                    Observation last = previous.get();
+                    List<MetricFact> retained = last.facts().stream()
+                            .filter(fact -> !fact.name().equals(RECONCILE_STREAK_METRIC)).toList();
+                    Map<String, Long> retainedMetrics = new LinkedHashMap<>(last.metrics());
+                    retainedMetrics.remove(RECONCILE_STREAK_FLAT);
+                    Observation terminal = new Observation(pipelineId, actual,
+                            retainedMetrics, last.snapshot(),
+                            last.positions(), null, observedNow(), retained);
+                    observations.save(terminal);
+                    return terminal;
+                }
+            }
             ObservationFailure carried = failure;
             if (carried == null && actual == PipelineState.FAILED) {
                 carried = observations.read(pipelineId).map(Observation::failure).orElse(null);
@@ -768,21 +783,38 @@ public final class ObservationPublisher {
      * told apart from "still converging". The consecutive-failure count rides out as errorCount; the last
      * observed lifecycle state, coded failure and source positions are all preserved as they last stood, since
      * a reconcile that could not run witnessed no transition in any of them — a pass that never ran did not
-     * just recover either. The snapshot dataset is left unavailable: this path has no capture-side source to
-     * read it from, unlike positions and failure which are simply carried forward from the last observation.
+     * just recover either. Unconfirmed snapshot progress is left unavailable; a fully confirmed load is a
+     * retained fact, especially once completion has released the capture that could report it again.
      */
     public void publishReconcileFailure(String pipelineId, long consecutiveFailures) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Observation previous = observations.read(pipelineId).orElse(null);
         PipelineState lastState = previous != null ? previous.state() : PipelineState.NEW;
+        try {
+            if (state.read(pipelineId).map(checkpoint -> StateJson.parse(checkpoint.stateJson()))
+                    .filter(PipelineState.COMPLETED::equals).isPresent()) {
+                lastState = PipelineState.COMPLETED;
+            }
+        } catch (RuntimeException unavailable) {
+            // This path must still report when the state store itself is what the pass could not read.
+        }
         Map<String, String> lastPositions = previous != null ? previous.positions() : Map.of();
         ObservationFailure lastFailure = previous != null ? previous.failure() : null;
         Instant at = observedNow();
-        List<MetricFact> measured = List.of(
-                readAt(pipelineId, RECONCILE_STREAK_METRIC, "{pass}", at, consecutiveFailures));
+        boolean confirmed = previous != null && !previous.snapshot().isEmpty()
+                && previous.snapshot().values().stream().allMatch(TableSnapshot::landed);
+        // A completed load is a confirmed fact, even if releasing its runtime failed. Losing it here
+        // would make the next successful publication preserve an empty load after capture was released.
+        boolean keepLoad = previous != null && (lastState == PipelineState.COMPLETED || confirmed);
+        List<MetricFact> measured = new ArrayList<>();
+        if (keepLoad) {
+            previous.facts().stream().filter(fact -> !fact.name().equals(RECONCILE_STREAK_METRIC))
+                    .forEach(measured::add);
+        }
+        measured.add(readAt(pipelineId, RECONCILE_STREAK_METRIC, "{pass}", at, consecutiveFailures));
         observations.save(new Observation(pipelineId, lastState,
                 FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(),
-                null, lastPositions, lastFailure, at, measured));
+                keepLoad ? previous.snapshot() : null, lastPositions, lastFailure, at, measured));
     }
 
     /**

@@ -58,8 +58,11 @@ class AMemberLosingActuationLetsGoOfItsCaptureIT {
                         () -> mongo.count(target, TABLE) == 2,
                         () -> "target rows=" + mongo.count(target, TABLE) + ", state=" + control.state(PIPELINE));
                 Await.until("the target to confirm the original load", BOUND,
-                        () -> control.snapshotTable(PIPELINE, TABLE).filter(TableSnapshot::landed).isPresent(),
-                        () -> "snapshot=" + control.snapshotTable(PIPELINE, TABLE));
+                        () -> {
+                            TableSnapshot snapshot = control.snapshotTables(PIPELINE).get(TABLE);
+                            return snapshot != null && snapshot.landed();
+                        },
+                        () -> "snapshot=" + control.snapshotTables(PIPELINE));
                 Map<String, String> captures = control.captureOwnersOf(PIPELINE);
                 assertThat(captures).hasSize(1);
                 String captureId = captures.keySet().iterator().next();
@@ -104,7 +107,8 @@ class AMemberLosingActuationLetsGoOfItsCaptureIT {
                         () -> "capture=" + store.workloadClaims().read(capture));
                 assertThat(cluster.processCarrying(oldNode).isAlive()).isTrue();
 
-                control.lifecycle(PIPELINE, LifecycleVerb.START);
+                // Purging capture state requires a full load; retain the target rows from the first run.
+                control.startAnswering(PIPELINE, "target-not-empty", "keep");
                 Await.until("the restarted pipeline to run", BOUND,
                         () -> control.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent(),
                         () -> "state=" + control.state(PIPELINE));

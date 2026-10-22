@@ -31,7 +31,9 @@ public final class LifecycleMachine {
         LEGAL_FROM.put(LifecycleVerb.RESUME, EnumSet.of(PipelineState.PAUSED));
         // STOP is legal from FAILED so a failed run can be cleared to STOPPED and started fresh from there;
         // START is not legal directly from FAILED — recovery is a deliberate stop, then a start.
-        LEGAL_FROM.put(LifecycleVerb.STOP, EnumSet.of(PipelineState.RUNNING, PipelineState.PAUSED, PipelineState.FAILED));
+        // A completed run may also be explicitly stopped to preserve or clear its retained state.
+        LEGAL_FROM.put(LifecycleVerb.STOP, EnumSet.of(
+                PipelineState.RUNNING, PipelineState.PAUSED, PipelineState.FAILED, PipelineState.COMPLETED));
 
         TARGET.put(LifecycleVerb.START, PipelineState.RUNNING);
         TARGET.put(LifecycleVerb.PAUSE, PipelineState.PAUSED);

@@ -4,6 +4,7 @@ import io.tapstate.core.lifecycle.MetricAttributes;
 import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
 import io.tapstate.core.lifecycle.Observation;
+import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.spi.store.RateHistoryStore;
 
@@ -31,7 +32,8 @@ import java.util.concurrent.ConcurrentHashMap;
  * <p>An observation with nothing to draw a line from is not sampled. A pipeline with no live job publishes
  * no counters, and a history of empty documents, one a minute for fifteen days per stopped pipeline, would
  * be the cost of a stop that nobody reads back. The samples that pipeline took while running stay where
- * they are: stopping is not what removes a history, deleting the pipeline is.
+ * they are: stopping is not what removes a history, deleting the pipeline is. A completed pipeline retains
+ * its final metrics for display, but later state publications are not new measurements of those metrics.
  */
 public final class RateSampler {
 
@@ -81,6 +83,9 @@ public final class RateSampler {
 
     /** The sample {@code observation} yields, or {@code null} when it carries nothing to draw a line from. */
     static RateSample sampleOf(Observation observation) {
+        if (observation.state() == PipelineState.COMPLETED) {
+            return null;
+        }
         Map<String, Long> counters = new LinkedHashMap<>();
         Map<String, Long> lag = new LinkedHashMap<>();
         observation.metrics().forEach((key, value) -> {

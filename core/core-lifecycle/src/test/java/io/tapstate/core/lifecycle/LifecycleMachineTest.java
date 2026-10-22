@@ -48,10 +48,11 @@ class LifecycleMachineTest {
     }
 
     @Test
-    @DisplayName("stop clears state from either running or paused")
-    void stopFromRunningOrPaused() {
+    @DisplayName("stop accepts running, paused, and naturally completed runs")
+    void stopFromRunningPausedOrCompleted() {
         assertThat(LifecycleMachine.transition(RUNNING, STOP)).isEqualTo(STOPPED);
         assertThat(LifecycleMachine.transition(PAUSED, STOP)).isEqualTo(STOPPED);
+        assertThat(LifecycleMachine.transition(COMPLETED, STOP)).isEqualTo(STOPPED);
     }
 
     @Test
@@ -109,7 +110,7 @@ class LifecycleMachineTest {
         assertThat(LifecycleMachine.legalVerbs(RUNNING)).isEqualTo(EnumSet.of(PAUSE, STOP));
         assertThat(LifecycleMachine.legalVerbs(PAUSED)).isEqualTo(EnumSet.of(RESUME, STOP));
         assertThat(LifecycleMachine.legalVerbs(STOPPED)).isEqualTo(EnumSet.of(START));
-        assertThat(LifecycleMachine.legalVerbs(COMPLETED)).isEqualTo(EnumSet.of(START));
+        assertThat(LifecycleMachine.legalVerbs(COMPLETED)).isEqualTo(EnumSet.of(START, STOP));
         assertThat(LifecycleMachine.legalVerbs(FAILED)).isEqualTo(EnumSet.of(STOP));
     }
 

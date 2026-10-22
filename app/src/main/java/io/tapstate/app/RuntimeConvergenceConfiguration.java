@@ -58,9 +58,10 @@ class RuntimeConvergenceConfiguration {
     @Bean
     PipelineConverger pipelineConverger(
             StorePort storePort, LifecycleActuator lifecycleActuator, Clock clock,
-            RebuildAdmission rebuildAdmission) {
+            RebuildAdmission rebuildAdmission, ObservationPublisher observationPublisher) {
         return new PipelineConverger(
-                storePort.desired(), storePort.state(), lifecycleActuator, clock, rebuildAdmission);
+                storePort.desired(), storePort.state(), lifecycleActuator, clock, rebuildAdmission,
+                observationPublisher::publish);
     }
 
     @Bean
