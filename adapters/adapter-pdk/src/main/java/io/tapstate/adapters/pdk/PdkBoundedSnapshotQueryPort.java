@@ -106,6 +106,7 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
             cancellation.throwIfCancelled();
             ensureBeforeDeadline(request);
             TapTable table = discover(connector, request);
+            PdkRowSchema schema = PdkRowSchema.of(table);
             List<Envelope> rows = new ArrayList<>(Math.min(request.limit(), 1024));
             int[] queryCount = {0};
             boolean[] hasMore = {false};
@@ -113,7 +114,7 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
 
             if (request.selection() instanceof BoundedSnapshotQueryRequest.AllRows) {
                 List<Envelope> found = queryOnce(
-                        connector, query, table, request, Map.of(), request.limit(), queryCount, bytesUsed,
+                        connector, query, table, schema, request, Map.of(), request.limit(), queryCount, bytesUsed,
                         cancellation);
                 if (found.size() > request.limit()) {
                     rows.addAll(found.subList(0, request.limit()));
@@ -131,7 +132,7 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
                         break;
                     }
                     List<Envelope> found = queryOnce(
-                            connector, query, table, request, tuple, remaining, queryCount, bytesUsed,
+                            connector, query, table, schema, request, tuple, remaining, queryCount, bytesUsed,
                             cancellation);
                     if (found.size() > remaining) {
                         rows.addAll(found.subList(0, remaining));
@@ -255,6 +256,7 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
             PdkConnector connector,
             QueryByAdvanceFilterFunction query,
             TapTable table,
+            PdkRowSchema schema,
             BoundedSnapshotQueryRequest request,
             Map<String, Object> tuple,
             int remaining,
@@ -282,7 +284,7 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
         try {
             connector.underLoader(() -> {
                 query.query(connector.context(), filter, table, results -> collect(
-                        connector, request, table, queryLimit, results, rows, reported, bytesUsed, cancellation));
+                        connector, request, table, schema, queryLimit, results, rows, reported, bytesUsed, cancellation));
                 return null;
             });
         } catch (Throwable failure) {
@@ -307,6 +309,7 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
             PdkConnector connector,
             BoundedSnapshotQueryRequest request,
             TapTable table,
+            PdkRowSchema schema,
             int cap,
             FilterResults result,
             QueryRows rows,
@@ -343,7 +346,7 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
                 try {
                     Map<String, Object> copy = stringKeyed(sourceRow);
                     TapEvent event = TapInsertRecordEvent.create().table(table.getId()).after(copy);
-                    Envelope envelope = TapEventCodec.decodeSnapshotRow(event, connector.codecs(), PdkRowSchema.of(table));
+                    Envelope envelope = TapEventCodec.decodeSnapshotRow(event, connector.conversions(), schema);
                     long remainingBytes = request.maxBytes() - bytesUsed[0];
                     // Byte accounting renders PDK temporal values without changing the typed row.
                     long rowBytes = PdkPreviewJsonValues.encodedSize(envelope.after(), remainingBytes);
@@ -388,13 +391,11 @@ public final class PdkBoundedSnapshotQueryPort implements BoundedSnapshotQueryPo
         if (tuple.isEmpty()) {
             return DataMap.create();
         }
-        TapEvent encoded = TapEventCodec.encode(Envelope.read(0, table.getId(), tuple, null), connector.codecs());
+        TapEvent encoded = TapEventCodec.encode(Envelope.read(0, table.getId(), tuple, null), connector.conversions());
         @SuppressWarnings("unchecked")
         Map<String, Object> values = ((TapInsertRecordEvent) encoded).getAfter();
         return DataMap.create(new LinkedHashMap<>(values));
     }
-
-
 
     private static Map<String, Object> stringKeyed(Map<String, Object> row) {
         if (row == null) {

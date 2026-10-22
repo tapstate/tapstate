@@ -33,26 +33,47 @@ final class PdkValueConversions {
             Map.entry("TapXmlValue", TapXmlValue::new), Map.entry("TapRawValue", TapRawValue::new),
             Map.entry("TapInputStreamValue", TapInputStreamValue::new));
 
-    private PdkValueConversions() { }
+    private static final Map<Class<?>, String> VALUE_KINDS = valueKinds();
+    private static final Map<Class<?>, String> TYPE_KINDS = typeKinds();
+    private static final ClassValue<String> CANONICAL_KINDS = new ClassValue<>() {
+        @Override
+        protected String computeValue(Class<?> type) {
+            for (Class<?> base = type; base != null; base = base.getSuperclass()) {
+                String kind = VALUE_KINDS.get(base);
+                if (kind != null) return kind;
+            }
+            return "";
+        }
+    };
+    private final TapCodecsRegistry codecs;
+    private final PdkConversionManager source;
+    private final PdkConversionManager target;
+
+    PdkValueConversions(TapCodecsRegistry codecs) {
+        this.codecs = java.util.Objects.requireNonNull(codecs, "codecs");
+        source = new PdkConversionManager(codecs);
+        target = new PdkConversionManager(new RetainingTargetCodecs(codecs));
+    }
+
+    TapCodecsRegistry codecs() {
+        return codecs;
+    }
 
     /** An absent row image stays absent rather than becoming an empty document. */
-    static Optional<Map<String, Object>> read(Map<String, Object> row, TapCodecsRegistry codecs,
-            Map<String, TapField> fields, BiFunction<Object, String, String> origin,
+    Optional<Map<String, Object>> read(Map<String, Object> row, PdkRowSchema schema, BiFunction<Object, String, String> origin,
             BinaryOperator<Object> compatibility) {
         if (row == null) {
             return Optional.empty();
         }
-        Map<String, Object> converted = copyRow(row);
-        new TapCodecsFilterManager(codecs).transformToTapValueMap(converted, fields);
-        Map<String, Object> result = new LinkedHashMap<>(converted.size());
-        ReadContext context = new ReadContext(fields, origin, compatibility);
-        converted.forEach((key, value) -> result.put(key,
-                carry(value, row.get(key), key, key, context)));
-        return Optional.of(result);
+        PdkSourceRow converted = new PdkSourceRow(row);
+        source.transformToTapValueMap(converted, schema.fields());
+        ReadContext context = new ReadContext(schema, origin, compatibility, converted);
+        converted.replaceAll((key, value) -> carry(value, row.get(key), key, key, context));
+        return Optional.of(converted);
     }
 
-    private record ReadContext(Map<String, TapField> fields, BiFunction<Object, String, String> origin,
-            BinaryOperator<Object> compatibility) { }
+    private record ReadContext(PdkRowSchema schema, BiFunction<Object, String, String> origin,
+            BinaryOperator<Object> compatibility, PdkSourceRow originals) { }
 
     private static Object carry(Object value, Object original, String path, String schemaPath, ReadContext context) {
         if (value instanceof TapValue<?, ?> tap) {
@@ -69,9 +90,11 @@ final class PdkValueConversions {
 
     private static Object carryTapValue(TapValue<?, ?> tap, Object original, String path,
             String schemaPath, ReadContext context) {
+        original = context.originals().original(tap, original);
         Object payload = tap.getValue();
         if (payload == null) {
-            return null;
+            Object fallback = original instanceof TapValue<?, ?> previous ? previous.getOriginValue() : original;
+            return fallback == null ? null : carry(fallback, fallback, path, schemaPath, context);
         }
         if (original != null) {
             payload = context.compatibility().apply(original, payload);
@@ -79,14 +102,12 @@ final class PdkValueConversions {
         Object originalPayload = original instanceof TapValue<?, ?> previous ? previous.getValue() : original;
         String temporal = payload instanceof DateTime time ? describeTime(time) : null;
         Object portable = portablePayload(payload, originalPayload, path, schemaPath, context);
-        String kind = tap.getClass().getSimpleName();
-        if (!VALUES.containsKey(kind)) {
-            throw new IllegalArgumentException("unsupported PDK value kind: " + kind);
-        }
+        String kind = CANONICAL_KINDS.get(tap.getClass());
+        if (kind.isEmpty()) kind = TYPE_KINDS.get(tap.tapTypeClass());
         // The PDK flattens array indexes when finding fields. An element must not inherit
         // the container's declared database type when the schema cannot name the element.
         TapField field = positionalElement(schemaPath) ? null
-                : context.fields().get(TapCodecsFilterManager.fieldName(schemaPath));
+                : context.schema().fields().get(TapCodecsFilterManager.fieldName(schemaPath));
         boolean matches = field != null && tap.tapTypeClass().isInstance(field.getTapType());
         var type = tap.getTapType();
         if (type == null && matches) {
@@ -96,7 +117,7 @@ final class PdkValueConversions {
         }
         String declared = declaredType(tap, matches ? field : null, original, path, context);
         return new ConvertedValue(portable, declared, kind,
-                type == null ? null : parser().toJson(type), temporal);
+                context.schema().description(type), temporal);
     }
 
     private static Object portablePayload(Object payload, Object original, String path,
@@ -112,6 +133,9 @@ final class PdkValueConversions {
 
     private static String declaredType(TapValue<?, ?> tap, TapField field, Object original,
             String path, ReadContext context) {
+        if (!context.originals().wasConverted(tap) && tap.getOriginType() != null) {
+            return tap.getOriginType();
+        }
         if (path != null && tap.getOriginType() != null) {
             return tap.getOriginType();
         }
@@ -121,27 +145,23 @@ final class PdkValueConversions {
         return original == null ? null : context.origin().apply(original, path);
     }
 
-    private static Map<String, Object> carryMap(Map<?, ?> map, Object original, String path,
+    private static Map<?, ?> carryMap(Map<?, ?> map, Object original, String path,
             String schemaPath, ReadContext context) {
-        Map<String, Object> result = new LinkedHashMap<>();
         Map<?, ?> source = original instanceof Map<?, ?> raw ? raw : Map.of();
-        map.forEach((key, element) -> result.put((String) key,
-                carry(element, source.get(key), path == null ? null : path + "." + key,
-                        schemaPath + "." + key, context)));
-        return result;
+        Map<?, ?> result = PdkContainerValues.map(map, (key, index, element) -> carry(element, source.get(key),
+                path == null || !(key instanceof String) ? null : path + "." + key,
+                PdkContainerValues.childPath(schemaPath, key, index), context));
+        // Driver container classes are needed by source codecs, but cannot cross loader boundaries.
+        return result.getClass().getClassLoader() == null ? result : new LinkedHashMap<>(result);
     }
 
-    private static List<Object> carryList(Collection<?> collection, Object original,
+    private static Collection<?> carryList(Collection<?> collection, Object original,
             String schemaPath, ReadContext context) {
         List<?> source = original instanceof List<?> raw ? raw : List.of();
-        List<Object> result = new ArrayList<>(collection.size());
-        int index = 0;
-        for (Object element : collection) {
-            result.add(carry(element, index < source.size() ? source.get(index) : null,
-                    null, schemaPath + ".#" + index, context));
-            index++;
-        }
-        return result;
+        Collection<?> result = PdkContainerValues.collection(collection, (key, index, element) ->
+                carry(element, index < source.size() ? source.get(index) : null,
+                        null, schemaPath + ".#" + index, context));
+        return result.getClass().getClassLoader() == null ? result : new ArrayList<>(result);
     }
 
     private static Object portableScalar(Object value) {
@@ -164,14 +184,14 @@ final class PdkValueConversions {
     }
 
     /** Preserve the distinction between an absent image and a present, empty document. */
-    static Optional<Map<String, Object>> write(Map<String, Object> row, TapCodecsRegistry codecs,
+    Optional<Map<String, Object>> write(Map<String, Object> row,
             java.util.function.Function<ConvertedValue, Object> legacy) {
         if (row == null) {
             return Optional.empty();
         }
         Map<String, Object> restored = new LinkedHashMap<>(row.size());
         row.forEach((key, value) -> restored.put(key, restore(value, legacy)));
-        new TapCodecsFilterManager(new RetainingTargetCodecs(codecs)).transformFromTapValueMap(restored);
+        target.transformFromTapValueMap(restored);
         return Optional.of(restored);
     }
 
@@ -226,7 +246,9 @@ final class PdkValueConversions {
         }
         Supplier<TapValue<?, ?>> factory = VALUES.get(carrier.valueKind());
         if (factory == null) {
-            throw new IllegalArgumentException("unsupported stored PDK value kind: " + carrier.valueKind());
+            // A newer producer may know a kind this runtime does not. Keep the portable payload
+            // usable without loading source-side classes or guessing a target driver type.
+            return restore(carrier.value(), legacy);
         }
         TapValue tap = factory.get();
         // A compatibility correction can preserve an exact numeric value wider than the PDK box.
@@ -260,11 +282,14 @@ final class PdkValueConversions {
         return payload;
     }
 
+    @SuppressWarnings({"rawtypes", "unchecked"})
     private static Map<String, Object> restoreMap(Map<?, ?> map,
             java.util.function.Function<ConvertedValue, Object> legacy) {
-        Map<String, Object> result = new LinkedHashMap<>(map.size());
-        map.forEach((key, value) -> result.put((String) key, restore(value, legacy)));
-        return result;
+        Map<Object, Object> result = new LinkedHashMap<>(map.size());
+        map.forEach((key, value) -> result.put(key, restore(value, legacy)));
+        // TapMapValue's generic signature is narrower than portable nested maps. The host's
+        // iterator retains these key objects without casting or changing their representation.
+        return (Map) result;
     }
 
     private static List<Object> restoreList(Collection<?> collection,
@@ -274,24 +299,16 @@ final class PdkValueConversions {
         return result;
     }
 
-    private static Map<String, Object> copyRow(Map<String, Object> row) {
-        Map<String, Object> copy = new LinkedHashMap<>(row.size());
-        row.forEach((key, value) -> copy.put(key, copyValue(value)));
-        return copy;
+    private static Map<Class<?>, String> valueKinds() {
+        Map<Class<?>, String> result = new LinkedHashMap<>();
+        VALUES.forEach((kind, factory) -> result.put(factory.get().getClass(), kind));
+        return Map.copyOf(result);
     }
 
-    private static Object copyValue(Object value) {
-        if (value instanceof Map<?, ?> map) {
-            Map<String, Object> copy = new LinkedHashMap<>(map.size());
-            map.forEach((key, element) -> copy.put((String) key, copyValue(element)));
-            return copy;
-        }
-        if (value instanceof Collection<?> collection) {
-            List<Object> copy = new ArrayList<>(collection.size());
-            collection.forEach(element -> copy.add(copyValue(element)));
-            return copy;
-        }
-        return value;
+    private static Map<Class<?>, String> typeKinds() {
+        Map<Class<?>, String> result = new LinkedHashMap<>();
+        VALUES.forEach((kind, factory) -> result.put(factory.get().tapTypeClass(), kind));
+        return Map.copyOf(result);
     }
 
     private static JsonParser parser() {
@@ -337,10 +354,11 @@ final class PdkValueConversions {
             }
         } else {
             var constructor = TIME_ORIGINS.get(((Number) state.get("origin")).intValue());
-            if (constructor == null) {
-                throw new IllegalArgumentException("unsupported temporal origin representation");
-            }
-            result = constructor.apply(((Number) state.get("fraction")).intValue());
+            int fraction = ((Number) state.get("fraction")).intValue();
+            // Unknown origin representations still have an exact portable clock. Use a known
+            // fractional representation rather than ask the PDK to reconstruct an unknown driver.
+            result = constructor == null ? new DateTime(java.math.BigDecimal.ZERO, fraction)
+                    : constructor.apply(fraction);
             result.setSeconds(((Number) state.get("seconds")).longValue());
             result.setNano(((Number) state.get("nano")).intValue());
         }

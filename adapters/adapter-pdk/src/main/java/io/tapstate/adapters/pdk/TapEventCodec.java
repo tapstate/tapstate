@@ -96,14 +96,19 @@ public final class TapEventCodec {
      */
     public static Envelope decodeChange(
             TapEvent event, TapCodecsRegistry codecs, Map<String, String> columnTypes) {
+        Objects.requireNonNull(columnTypes, "columnTypes");
         return decodeChange(event, codecs, PdkRowSchema.declared(columnTypes));
     }
 
     static Envelope decodeChange(TapEvent event, TapCodecsRegistry codecs, PdkRowSchema schema) {
-        Objects.requireNonNull(codecs, "codecs");
+        return decodeChange(event, new PdkValueConversions(codecs), schema);
+    }
+
+    static Envelope decodeChange(TapEvent event, PdkValueConversions conversions, PdkRowSchema schema) {
+        TapCodecsRegistry codecs = conversions.codecs();
         Objects.requireNonNull(schema, "schema");
         if (event instanceof TapInsertRecordEvent insert) {
-            return Envelope.insert(ts(insert), src(insert), row(insert.getAfter(), codecs, schema), null);
+            return Envelope.insert(ts(insert), src(insert), row(insert.getAfter(), conversions, schema), null);
         }
         if (event instanceof TapUpdateRecordEvent update) {
             // One reading over both images, because they are two halves of one row. Taken per image, an
@@ -122,12 +127,12 @@ public final class TapEventCodec {
             SchemaNames names =
                     SchemaNames.read(codecs, schema.declared(), update.getBefore(), update.getAfter());
             return Envelope.update(ts(update), src(update),
-                    PdkValueConversions.read(update.getBefore(), codecs, schema.fields(), names::of, TapEventCodec::portable).orElse(null),
-                    PdkValueConversions.read(update.getAfter(), codecs, schema.fields(), names::of, TapEventCodec::portable).orElse(null),
+                    conversions.read(update.getBefore(), schema, names::of, TapEventCodec::portable).orElse(null),
+                    conversions.read(update.getAfter(), schema, names::of, TapEventCodec::portable).orElse(null),
                     null);
         }
         if (event instanceof TapDeleteRecordEvent delete) {
-            return Envelope.delete(ts(delete), src(delete), row(delete.getBefore(), codecs, schema), null);
+            return Envelope.delete(ts(delete), src(delete), row(delete.getBefore(), conversions, schema), null);
         }
         if (event instanceof TapDDLEvent ddl) {
             return Envelope.ddl(ts(ddl), src(ddl), ddlSchema(ddl));
@@ -142,14 +147,18 @@ public final class TapEventCodec {
      */
     public static Envelope decodeSnapshotRow(
             TapEvent event, TapCodecsRegistry codecs, Map<String, String> columnTypes) {
+        Objects.requireNonNull(columnTypes, "columnTypes");
         return decodeSnapshotRow(event, codecs, PdkRowSchema.declared(columnTypes));
     }
 
     static Envelope decodeSnapshotRow(TapEvent event, TapCodecsRegistry codecs, PdkRowSchema schema) {
-        Objects.requireNonNull(codecs, "codecs");
+        return decodeSnapshotRow(event, new PdkValueConversions(codecs), schema);
+    }
+
+    static Envelope decodeSnapshotRow(TapEvent event, PdkValueConversions conversions, PdkRowSchema schema) {
         Objects.requireNonNull(schema, "schema");
         if (event instanceof TapInsertRecordEvent read) {
-            return Envelope.read(ts(read), src(read), row(read.getAfter(), codecs, schema), null);
+            return Envelope.read(ts(read), src(read), row(read.getAfter(), conversions, schema), null);
         }
         throw new IllegalArgumentException(
                 "snapshot rows are insert-shaped; got: " + event.getClass().getName());
@@ -163,9 +172,9 @@ public final class TapEventCodec {
      * conversion; integer widths are normalized without routing exact numbers through doubles.
      */
     private static Map<String, Object> row(
-            Map<String, Object> row, TapCodecsRegistry codecs, PdkRowSchema schema) {
-        SchemaNames names = SchemaNames.read(codecs, schema.declared(), row, null);
-        return PdkValueConversions.read(row, codecs, schema.fields(), names::of, TapEventCodec::portable).orElse(null);
+            Map<String, Object> row, PdkValueConversions conversions, PdkRowSchema schema) {
+        SchemaNames names = SchemaNames.read(conversions.codecs(), schema.declared(), row, null);
+        return conversions.read(row, schema, names::of, TapEventCodec::portable).orElse(null);
     }
 
     /**
@@ -180,11 +189,11 @@ public final class TapEventCodec {
      * sink would rebuild, and a read rebuilds nothing.
      */
     static Map<String, Object> connectorConverted(Map<String, Object> row, TapCodecsRegistry codecs) {
-        return walk(row, codecs, SchemaNames.NONE, false);
+        return walk(row, codecs, SchemaNames.NONE);
     }
 
     private static Map<String, Object> walk(Map<String, Object> row, TapCodecsRegistry codecs,
-            SchemaNames names, boolean toNamespaceWidths) {
+            SchemaNames names) {
         if (row == null) {
             return null;
         }
@@ -192,7 +201,7 @@ public final class TapEventCodec {
         boolean changed = false;
         for (Map.Entry<String, Object> column : row.entrySet()) {
             Object value =
-                    converted(column.getValue(), codecs, names, column.getKey(), toNamespaceWidths);
+                    converted(column.getValue(), codecs, names, column.getKey());
             changed |= value != column.getValue();
             out.put(column.getKey(), value);
         }
@@ -213,7 +222,7 @@ public final class TapEventCodec {
      * {@link SchemaNames}.
      */
     private static Object converted(Object value, TapCodecsRegistry codecs,
-            SchemaNames names, String path, boolean toNamespaceWidths) {
+            SchemaNames names, String path) {
         // The one reading of the registry this value takes. Its own class settles two questions - is
         // there a conversion to take, and has the type reading anything to say where the schema names
         // no place - and both are settled from this answer rather than each asking the registry again.
@@ -226,20 +235,6 @@ public final class TapEventCodec {
                 return registered;
             }
         }
-        if (toNamespaceWidths) {
-            if (value instanceof ZonedDateTime zonedDateTime) {
-                return Date.from(zonedDateTime.toInstant());
-            }
-            if (value instanceof Integer || value instanceof Short || value instanceof Byte) {
-                return ((Number) value).longValue();
-            }
-            if (value instanceof Float f) {
-                return f.doubleValue();
-            }
-            if (value instanceof BigInteger big && big.bitLength() < Long.SIZE) {
-                return big.longValue();
-            }
-        }
         if (value instanceof Map<?, ?> map) {
             Map<Object, Object> converted = new LinkedHashMap<>(map.size());
             boolean changed = false;
@@ -248,7 +243,7 @@ public final class TapEventCodec {
                 // lookup is keyed by. Beneath an array the path is already gone and stays gone all the
                 // way down, because nothing under an element has a place the schema could name either.
                 Object element = converted(entry.getValue(), codecs, names,
-                        path == null ? null : path + "." + entry.getKey(), toNamespaceWidths);
+                        path == null ? null : path + "." + entry.getKey());
                 changed |= element != entry.getValue();
                 converted.put(entry.getKey(), element);
             }
@@ -261,7 +256,7 @@ public final class TapEventCodec {
                 // An element has no place of its own to look up — the schema names the array and
                 // stops — so the path ends here. Deliberately not the array's own name: that would
                 // rebuild every element as whatever the array is declared to be, and succeed.
-                Object next = converted(element, codecs, names, null, toNamespaceWidths);
+                Object next = converted(element, codecs, names, null);
                 changed |= next != element;
                 converted.add(next);
             }
@@ -545,17 +540,20 @@ public final class TapEventCodec {
      * place, which the envelope's own unmodifiable maps would reject.
      */
     public static TapEvent encode(Envelope env, TapCodecsRegistry codecs) {
-        Objects.requireNonNull(codecs, "codecs");
+        return encode(env, new PdkValueConversions(codecs));
+    }
+
+    static TapEvent encode(Envelope env, PdkValueConversions conversions) {
         return switch (env.op()) {
             case INSERT, READ -> TapInsertRecordEvent.create()
-                    .table(env.src()).referenceTime(env.ts()).after(mutable(env.after(), codecs))
+                    .table(env.src()).referenceTime(env.ts()).after(mutable(env.after(), conversions))
                     .removedFields(dropped(env));
             case UPDATE -> TapUpdateRecordEvent.create()
                     .table(env.src()).referenceTime(env.ts())
-                    .before(mutable(env.before(), codecs)).after(mutable(env.after(), codecs))
+                    .before(mutable(env.before(), conversions)).after(mutable(env.after(), conversions))
                     .removedFields(dropped(env));
             case DELETE -> TapDeleteRecordEvent.create()
-                    .table(env.src()).referenceTime(env.ts()).before(mutable(env.before(), codecs));
+                    .table(env.src()).referenceTime(env.ts()).before(mutable(env.before(), conversions));
             case DDL -> encodeDdl(env);
         };
     }
@@ -564,8 +562,8 @@ public final class TapEventCodec {
      * A fresh mutable copy PDK can write through in place, or {@code null} when the map is absent, with
      * every carried value put back the way the target wants it.
      */
-    private static Map<String, Object> mutable(Map<String, Object> map, TapCodecsRegistry codecs) {
-        return PdkValueConversions.write(map, codecs, carrier -> restored(carrier, codecs)).orElse(null);
+    private static Map<String, Object> mutable(Map<String, Object> map, PdkValueConversions conversions) {
+        return conversions.write(map, carrier -> restored(carrier, conversions.codecs())).orElse(null);
     }
 
     /**

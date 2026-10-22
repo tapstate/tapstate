@@ -772,7 +772,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
 
     private static PdkRowSchema declaredTypes(Map<String, PdkRowSchema> tables, TapEvent event) {
         String tableId = event instanceof TapBaseEvent based ? based.getTableId() : null;
-        return tables.getOrDefault(tableId, PdkRowSchema.declared(Map.of()));
+        return tables.getOrDefault(tableId, PdkRowSchema.EMPTY);
     }
 
     /** Indexes discovered tables by id, keeping discovery order. */
@@ -943,7 +943,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
         }
         List<Envelope> decoded = new ArrayList<>(changes.size());
         for (TapEvent change : changes) {
-            decoded.add(TapEventCodec.decodeChange(change, connector.codecs(), declaredTypes(declared, change)));
+            decoded.add(TapEventCodec.decodeChange(change, connector.conversions(), declaredTypes(declared, change)));
         }
         listener.onBatch(decoded, position(connector, offset));
     }
@@ -1205,7 +1205,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
         try {
             for (TapEvent event : raw) {
                 rows.add(TapEventCodec.decodeSnapshotRow(
-                        event, connector.codecs(), declaredTypes(declared, event)));
+                        event, connector.conversions(), declaredTypes(declared, event)));
             }
         } catch (RuntimeException e) {
             throw new TapstateException(ConnectorError.PROJECTION_FAILED,
