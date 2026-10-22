@@ -13,6 +13,7 @@ import com.hazelcast.jet.core.metrics.MetricNames;
 import com.hazelcast.jet.core.metrics.MetricTags;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.HistogramBounds;
+import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.HistogramValue;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.StageReading;
@@ -605,6 +606,12 @@ public final class Engine {
     public Map<String, Map<String, Long>> recordsDelivered(String pipelineId) {
         Job job = liveJob(pipelineId);
         return job == null ? Map.of() : deliveredRowsIn(job.getMetrics());
+    }
+
+    /** This job's own source-input counters, never a shared physical capture's account. */
+    public CaptureReading capturedRows(String pipelineId) {
+        Job job = liveJob(pipelineId);
+        return job == null ? CaptureReading.NONE : SourceArrivals.reading(job.getMetrics());
     }
 
     /**

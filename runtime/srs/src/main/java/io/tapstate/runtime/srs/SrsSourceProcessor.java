@@ -1,6 +1,7 @@
 package io.tapstate.runtime.srs;
 
 import io.tapstate.runtime.engine.StageTimer;
+import io.tapstate.runtime.engine.SourceArrivals;
 import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.Processor;
@@ -142,6 +143,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
 
     // Times each read of the ring that produced something, which is this stage's unit of work.
     private StageTimer timer = StageTimer.none(Stage.SOURCE);
+    private SourceArrivals arrivals = SourceArrivals.of(null);
 
     @Override
     public void holdChangesUntil(List<AwaitedLoad> awaited, LoadLandings landings) {
@@ -152,6 +154,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     @Override
     protected void init(Context context) {
         this.timer = StageTimer.of(stage(), context);
+        this.arrivals = SourceArrivals.of(context);
         // Take what the capture side has already buffered for this ring before opening the ring reader, so
         // the source emits every snapshot row (op r, no source position) ahead of the first cdc change -- the
         // ordering that keeps a stale snapshot from landing at the sink after a newer change of the same key.
@@ -254,7 +257,9 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
                 reader.fill((item, seq) -> {
                     modelVerifier.verify(item,seq);
                     SourceOrder order = orderOf(item, seq);
-                    pending.add(SrsProjection.toEnvelope(item, src, order));
+                    Envelope row = SrsProjection.toEnvelope(item, src, order);
+                    arrivals.received(src, row);
+                    pending.add(row);
                     read = order;
                 }, readBatch);
                 refused = false;
@@ -374,6 +379,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             awaitingSnapshot = !buffered.snapshotState(pipelineId, ringName).handedOver();
         }
         for (Envelope row : rows) {
+            arrivals.received(src, row);
             if (holding && (!held.isEmpty() || !isLoadRow(row))) {
                 held.add(row);
             } else {

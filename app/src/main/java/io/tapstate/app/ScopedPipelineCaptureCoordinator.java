@@ -3,6 +3,7 @@ package io.tapstate.app;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.Op;
 import io.tapstate.core.lifecycle.*;
 import io.tapstate.core.model.*;
 import io.tapstate.runtime.srs.*;
@@ -144,23 +145,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                 return cursor.snapshotCompletedTables().containsAll(source.selected.tables());
             }); }
         @Override public SnapshotReading snapshotProgress(String pipeline) { requireId(pipeline); var held=current(); return held==null?SnapshotReading.NONE:snapshotReading(held); }
-        @Override public SnapshotReading runSnapshotProgress(String pipeline) { return snapshotProgress(pipeline); }
-        @Override public CaptureReading capturedRows(String pipeline) {
-            requireId(pipeline); var held=current(); if(held==null)return CaptureReading.NONE; var rows=new LinkedHashMap<String,Map<String,Long>>(); var bytes=new LinkedHashMap<String,Long>();
-            for(var source:held.sources.values()) {
-                var health=new ArrayList<CaptureHealth>();
-                if(source.run!=null)health.add(source.run.health());
-                if(source.shared && source.owner!=null && source.owner.physical!=null && source.owner.physical.tail!=null)health.add(source.owner.physical.tail.health());
-                for(var current:health) {
-                    current.receivedRows().forEach((table,counts) -> {
-                        var merged=rows.computeIfAbsent(held.label(source.id,table),ignored -> new LinkedHashMap<>());
-                        counts.forEach((operation,count) -> merged.merge(operation,count,Long::sum));
-                    });
-                    current.receivedBytes().forEach((table,count) -> bytes.merge(held.label(source.id,table),count,Long::sum));
-                }
-            }
-            return new CaptureReading(rows,bytes,held.began);
-        }
+        @Override public SnapshotReading runSnapshotProgress(String pipeline) { requireId(pipeline); var held=current(); return held==null?SnapshotReading.NONE:runSnapshotReading(held); }
         private Session current() { synchronized(ScopedPipelineCaptureCoordinator.this) { return sessions.get(original); } }
         private Session session() { var session=current(); if(session==null || session.bindings==null)throw refused(); return session; }
         private void requireId(String pipeline) { if(!original.pipelineId().equals(pipeline))throw refused(); }
@@ -281,7 +266,8 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                 CaptureHandoff output=new CaptureHandoff() {
                     @Override public void accept(Envelope row) {
                         guard.run(); if(!source.selected.tables().contains(row.src()))throw refused();
-                        originalHandoffs.get(row.src()).accept(row); source.rows.merge(row.src(),1L,Long::sum);
+                        originalHandoffs.get(row.src()).accept(row);
+                        if(row.op()==Op.READ)source.rows.merge(row.src(),1L,Long::sum);
                     }
                     @Override public void loaded(String table) {
                         guard.run(); if(!session.snapshot || !source.selected.tables().contains(table))throw refused();
@@ -368,7 +354,14 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             var count=state.count(source.id,table,source.snapshotEpoch);
             if(count.isPresent())result.put(session.label(source.id,table),new TableSnapshot(count.getAsLong(),null,null,false));
         }
-        return new SnapshotReading(result,session.began);
+        requireSession(session); return new SnapshotReading(result,session.began);
+    }
+    private SnapshotReading runSnapshotReading(Session session) {
+        requireSession(session); if(!session.snapshot)return SnapshotReading.NONE;
+        var result=new LinkedHashMap<String,TableSnapshot>();
+        for(var source:session.sources.values())for(String table:source.selected.tables())
+            result.put(session.label(source.id,table),new TableSnapshot(source.rows.getOrDefault(table,0L),null,null,false));
+        requireSession(session); return new SnapshotReading(result,session.began);
     }
     private final class Physical {
         final AtomicBoolean live=new AtomicBoolean(true);final Owner owner;NativeSrsCaptureRunUnit.Tail tail;final Runnable guard=this::require;

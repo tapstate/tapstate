@@ -333,7 +333,11 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             return new PipelineConverger(owner.port.desired(), owner.port.state(), actuator, clock, admission);
         }
         @Bean ObservationPublisher observationPublisher(NativeBusinessContext owner, Engine engine, PipelineCaptureCoordinator captures) {
-            return new RuntimeConvergenceConfiguration().observationPublisher(owner.port, engine, captures);
+            var readings = new RunBoundCaptureReadings(captures, pipeline -> engine.captureRun(pipeline).map(run -> {
+                if (!(run.operatorManifest().executionIdentity() instanceof ExecutionFence original)) throw ThreeLayerStorePort.refused();
+                return original;
+            }), engine::capturedRows);
+            return new RuntimeConvergenceConfiguration().observationPublisher(owner.port, engine, readings);
         }
         @Bean RateSampler rateSampler(NativeBusinessContext owner, MetricsHistoryProperties history) {
             return new RateSampler(owner.port.rateHistory(), history.getSampleInterval());

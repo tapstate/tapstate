@@ -59,6 +59,19 @@ class ScopedPipelineCaptureCoordinatorTest {
             assertThat(run.capturedRows("flow")).isEqualTo(CaptureReading.NONE);
         }
     }
+
+    @Test void currentRunCountsDoNotAdoptTheRetainedSnapshotTotal() throws Exception {
+        try(var f=new Fixture()) {
+            var run=f.coordinator.forRun(SCOPE,PIPELINE,ORIGINAL); run.startCapture("flow",f.snapshot(),f.models());
+            verify(f.snapshots,timeout(3000)).recordCount("input","orders",1,1);
+            long deadline=System.nanoTime()+Duration.ofSeconds(3).toNanos();
+            while(run.snapshotProgress("flow").byTable().isEmpty() && System.nanoTime()<deadline)Thread.sleep(5);
+            assertThat(run.snapshotProgress("flow").byTable()).containsKey("orders");
+            when(f.snapshots.count("input","orders",1)).thenReturn(OptionalLong.of(20));
+            assertThat(run.runSnapshotProgress("flow").byTable().get("orders").rowsDone()).isOne();
+            assertThat(run.snapshotProgress("flow").byTable().get("orders").rowsDone()).isEqualTo(20);
+        }
+    }
     @Test void twoSourceNodesSharingOneCaptureKeepSeparatePrivateRowsAndOneLease() throws Exception {
         try(var f=new Fixture(List.of("left","right"))) {
             var run=f.coordinator.forRun(SCOPE,PIPELINE,ORIGINAL); run.startCapture("flow",f.snapshot(),f.models()); var bindings=run.captureBindings();
