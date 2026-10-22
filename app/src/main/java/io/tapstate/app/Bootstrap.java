@@ -34,12 +34,14 @@ import java.util.List;
 @SpringBootApplication
 public class Bootstrap {
 
+    private static final ServerTimeZone TIME_ZONE = ServerTimeZone.initialize();
     private static final Logger LOG = LoggerFactory.getLogger(Bootstrap.class);
 
     /** Exit code when a coded diagnostic was reported (matches the CLI's convention). */
     private static final int EXIT_CODED_DIAGNOSTIC = 1;
 
     public static void main(String[] args) {
+        LOG.info("Server time zone: {} ({})", TIME_ZONE.id(), TIME_ZONE.source());
         try {
             RoleArguments.parse(args);
         } catch (TapstateException e) {

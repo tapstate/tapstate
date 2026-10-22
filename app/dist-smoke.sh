@@ -163,10 +163,12 @@ if [[ -z "$BOOT_JAR" || ! -f "$BOOT_JAR" ]]; then
   FAIL=$((FAIL + 1))
 else
   set +e
-  serve_then_term 90 "$WORK/boot-all.txt" "$JAVA" -jar "$BOOT_JAR" --role=all --tapstate.store.mongo.enabled=false --tapstate.log.dir="$WORK/logs-boot"; RC=$?
+  serve_then_term 90 "$WORK/boot-all.txt" env -u JAVA_TOOL_OPTIONS -u JDK_JAVA_OPTIONS -u _JAVA_OPTIONS TZ=Etc/UTC \
+    "$JAVA" -jar "$BOOT_JAR" --role=all --tapstate.store.mongo.enabled=false --tapstate.log.dir="$WORK/logs-boot"; RC=$?
   set -e
   check     "stays up; SIGTERM exits 0 (orderly stop → forced exit 0)" test "$RC" -eq 0
   check     "logged 'Started Bootstrap'"      grep -q "Started Bootstrap" "$WORK/boot-all.txt"
+  check     "server defaults to canonical UTC despite the host alias" grep -qF "Server time zone: UTC (default)" "$WORK/boot-all.txt"
   # The embedded member left in an orderly fashion under SIGTERM (shutdown hooks ran), rather than
   # the process being torn down mid-flight.
   check     "member shut down cleanly on SIGTERM" grep -q "is SHUTDOWN" "$WORK/boot-all.txt"
@@ -208,10 +210,13 @@ else
   check     "lib/ holds the server jar"       bash -c 'ls "$1"/lib/*.jar >/dev/null 2>&1' _ "$ROOT"
   if [[ -x "$ROOT/bin/tapstate-server" ]]; then
     set +e
-    serve_then_term 90 "$WORK/dist-all.txt" "$ROOT/bin/tapstate-server" --role=all --tapstate.store.mongo.enabled=false --tapstate.log.dir="$WORK/logs-dist"; RC=$?
+    serve_then_term 90 "$WORK/dist-all.txt" env -u JDK_JAVA_OPTIONS -u _JAVA_OPTIONS TZ=Etc/UTC \
+      JAVA_TOOL_OPTIONS=-Duser.timezone=Asia/Tokyo "$ROOT/bin/tapstate-server" \
+      --role=all --tapstate.store.mongo.enabled=false --tapstate.log.dir="$WORK/logs-dist"; RC=$?
     set -e
     check   "launcher stays up; SIGTERM exits 0" test "$RC" -eq 0
     check   "launcher logged 'Started Bootstrap'" grep -q "Started Bootstrap" "$WORK/dist-all.txt"
+    check   "launcher preserves an explicit JVM timezone" grep -qF "Server time zone: Asia/Tokyo (JVM option)" "$WORK/dist-all.txt"
     # Exit 0 alone cannot distinguish an orderly hooked exit from the launcher wrapper being killed
     # with the JVM orphaned (e.g. a launcher edit dropping `exec`, which would surface as the
     # wrapper's own non-zero signal disposition): the member's own SHUTDOWN line is the discriminator.

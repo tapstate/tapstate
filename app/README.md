@@ -5,6 +5,25 @@ only module permitted to depend on the adapters ring: the assembly root is where
 are bound into the runtime. It runs on the JVM (Spring Boot), packaged as a fat-jar and a `tar.gz`
 distribution (`bin/` launcher + `conf/` external config + `lib/` jar).
 
+## Server timezone
+
+The server defaults to the canonical `UTC` timezone before initializing logging, Spring or
+connectors. The same bootstrap applies to direct JAR launches, the distribution launcher, and
+on-premises or Cloud containers. The host's timezone does not select the server default.
+
+An explicit JVM `-Duser.timezone=...` option takes precedence, including one supplied through
+`JAVA_TOOL_OPTIONS` or `JDK_JAVA_OPTIONS`. For example:
+
+```sh
+java -Duser.timezone=Asia/Tokyo -jar app-0.7.0-boot.jar
+JAVA_TOOL_OPTIONS=-Duser.timezone=Asia/Tokyo bin/tapstate-server
+```
+
+An empty timezone option uses the server default. Startup logs report the effective timezone and
+whether it came from a JVM option or the default. Source-specific timezone settings retain their
+connector-defined meaning; this default does not change connector parameters. The separate CLI
+client continues to use local time for its local displays.
+
 ## Operational logging
 
 The server has two, deliberately separate, ways of saying something went wrong:
