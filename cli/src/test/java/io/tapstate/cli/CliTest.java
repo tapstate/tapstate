@@ -705,9 +705,12 @@ class CliTest {
         // the grammar is the half of the answer a description cannot carry: `schema` taking an optional
         // table, `status` taking --watch, and which verbs accept -o at all were discoverable only by
         // typing the verb wrong and reading the complaint
+        // read as words rather than as lines: a grammar or a summary longer than the help width wraps, and
+        // where it breaks is the renderer's choice, not part of what the help says
         Run r = run(verb, "--help");
-        assertThat(r.out()).contains(Cli.VERB_HELP.get(verb).operands());
-        assertThat(r.out()).contains(Cli.VERB_HELP.get(verb).summary());
+        String words = r.out().replaceAll("\\s+", " ");
+        assertThat(words).contains(Cli.VERB_HELP.get(verb).operands());
+        assertThat(words).contains(Cli.VERB_HELP.get(verb).summary());
     }
 
     @ParameterizedTest

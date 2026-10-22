@@ -169,6 +169,40 @@ enum CliError implements TapstateErrorCode {
      */
     IF_MATCH_NEEDS_ONE_RESOURCE("cli.if-match-needs-one-resource", Set.of("count")),
 
+    /**
+     * A start whose start checks ask questions, where nothing answered them and there is no terminal to ask
+     * at: {@code count} questions are open, {@code commands} are the command lines that answer them. Refused
+     * rather than answered by default, because every default here keeps rows or deletes them.
+     */
+    START_NEEDS_AN_ANSWER("cli.start-needs-an-answer", Set.of("pipeline", "count", "commands")),
+
+    /**
+     * An option that only start checks can honour, sent to a server that runs none: {@code option} is the
+     * option. Refused before anything is started, since the server would take the start and drop the option.
+     */
+    START_CHECKS_UNSUPPORTED("cli.start-checks-unsupported", Set.of("option")),
+
+    /** A server started {@code pipeline} without running start checks; it is likely older than this client. */
+    START_CHECKS_NOT_RUN("cli.start-checks-not-run", Set.of("pipeline"), Severity.WARNING),
+
+    /** A {@code --decide} that is not {@code <check>[/<subject>]=<action>}: {@code decide} is what was given. */
+    DECIDE_MALFORMED("cli.decide-malformed", Set.of("decide")),
+
+    /**
+     * A {@code --decide} naming an answer some of its questions do not offer: {@code findings} are those
+     * questions, which have to be answered one by one instead.
+     */
+    DECIDE_NOT_OFFERED("cli.decide-not-offered", Set.of("decide", "findings")),
+
+    /** A {@code --decide} answering a start check that refuses the start, which no answer changes. */
+    DECIDE_ON_A_REFUSAL("cli.decide-on-a-refusal", Set.of("decide")),
+
+    /**
+     * A start that was sent and got no answer in time. It may have gone ahead, so it is neither sent again
+     * nor sent to another member: a person checks first.
+     */
+    START_MAY_HAVE_GONE_AHEAD("cli.start-may-have-gone-ahead", Set.of("pipeline", "server")),
+
     /** The context configuration is not a valid, unambiguous versioned document. */
     CONTEXT_CONFIG_INVALID("cli.context-config-invalid", Set.of("path", Names.REASON)),
 

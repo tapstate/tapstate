@@ -5,8 +5,8 @@
 # separate workflow (no-agent-footprint.yml).
 # Specifications (e2e/*IT) run here against real containers: this runner has a Docker daemon, and
 # the e2e module fails rather than skips when one is missing, so a green build here means they ran.
-# On a developer machine they skip instead — and note Docker 29 rejects the API version the client
-# negotiates by default, so running them locally needs -Dapi.version=1.44.
+# On a developer machine they skip instead. Docker 29 rejects the client's default API version;
+# the test steps pass API 1.44 explicitly, as local verification can with -Dapi.version=1.44.
 # Deliberately excluded for now: native-image build (pinned to local darwin-arm64 until D5) and the
 # connector catalog *refresh* - regenerating it needs a connectors checkout and built connector jars.
 # The catalog's own consistency gates are PDK-free and run in the build above; the shell that drives
@@ -102,6 +102,12 @@ jobs:
             python3 deploy/cloud/prepare-test-inputs.py --output "$RUNNER_TEMP/cloud-test-release"
             echo "TAPSTATE_TEST_CLOUD_RELEASE_DIR=$RUNNER_TEMP/cloud-test-release" >> "$GITHUB_ENV"
           fi
+      - name: Record storage before the test shard
+        run: |
+          df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP" /tmp
+          if ! docker system df; then
+            echo '::warning::Docker storage could not be observed before the test shard.'
+          fi
       - name: Execute exactly this shard
         env:
           SHARD: ${{ matrix.shard }}
@@ -113,6 +119,16 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/test-tmp"
           .github/scripts/ci-shard.sh run --plan "$RUNNER_TEMP/shards.json" --shard "$SHARD" --repo-local "$RUNNER_TEMP/m2"
+      - name: Record storage after the test shard
+        if: always()
+        run: |
+          df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP" /tmp
+          if ! docker system df; then
+            echo '::warning::Docker storage could not be observed after the test shard.'
+          fi
+          if ! du -sh "$RUNNER_TEMP/m2" "$GITHUB_WORKSPACE" /tmp; then
+            echo '::warning::Some test storage could not be measured.'
+          fi
       - name: Preserve downloaded dependencies
         if: always()
         run: .github/scripts/ci-maven-cache.sh collect "$HOME/.m2/repository" "$RUNNER_TEMP/m2"

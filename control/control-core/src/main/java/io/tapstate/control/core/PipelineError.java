@@ -12,7 +12,9 @@ public enum PipelineError implements TapstateErrorCode {
     NOT_FOUND("pipeline.not-found", Set.of("id")),
     ID_MISMATCH("pipeline.id-mismatch", Set.of("pathId", "bodyId")),
     PRECONDITION_REQUIRED("pipeline.precondition-required", Set.of("id")),
-    VERSION_CONFLICT("pipeline.version-conflict", Set.of("id"));
+    VERSION_CONFLICT("pipeline.version-conflict", Set.of("id")),
+    START_CHANGE_NOT_APPLIED("pipeline.start-change-not-applied", Set.of("id")),
+    DEFINITION_CHANGE_UNAVAILABLE("pipeline.definition-change-unavailable", Set.of("id"));
 
     private final String code;
     private final Set<String> placeholders;

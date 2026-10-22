@@ -470,6 +470,8 @@ public final class PipelineRepresentation {
             value.put("from", fromRefValue(inline.from()));
             value.put("primaryKey", inline.primaryKey());
             value.put("storage", storageValue(inline.storage()));
+            value.put("writeMode", inline.writeMode() == null ? null : inline.writeMode().name());
+            value.put("onFullLoad", inline.onFullLoad() == null ? null : inline.onFullLoad().name());
             value.put("execution", executionValue(inline.execution()));
         }
         return Collections.unmodifiableMap(value);
@@ -658,6 +660,10 @@ public final class PipelineRepresentation {
                 from,
                 textOrNull(value(value, "primary_key", "primaryKey"), path + ".primary_key"),
                 storage(objectOrNull(value.get("storage"), path + ".storage")),
+                enumValue(value(value, "write_mode", "writeMode"), WriteMode.values(), WriteMode::yaml,
+                        path + ".writeMode"),
+                enumValue(value(value, "on_full_load", "onFullLoad"), OnFullLoad.values(), OnFullLoad::yaml,
+                        path + ".onFullLoad"),
                 execution(value.get("execution"), path + ".execution"));
     }
 
