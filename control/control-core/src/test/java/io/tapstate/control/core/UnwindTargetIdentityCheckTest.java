@@ -90,7 +90,7 @@ class UnwindTargetIdentityCheckTest {
     }
 
     private static PipelineTargetIdentities.Assessment assessment(String status) {
-        return new PipelineTargetIdentities.Assessment("out", "warehouse", "orders", status,
+        return new PipelineTargetIdentities.Assessment("out", "orders", "warehouse", "orders", status,
                 status.equals("automatic") ? "generated-target-identity" : "field-collision",
                 "_id", "_unwind_source_id", List.of("_unwind_source_id", "TAG_NO"));
     }

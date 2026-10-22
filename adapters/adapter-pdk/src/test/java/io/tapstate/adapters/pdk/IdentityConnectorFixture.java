@@ -6,10 +6,10 @@ import java.util.List;
 import java.util.Map;
 
 /** Minimal PDK metadata contract; native index semantics are verified separately against databases. */
-final class IdentityConnectorFixture {
+public final class IdentityConnectorFixture {
     private IdentityConnectorFixture() { }
 
-    static ConnectorRef ref(Path directory) {
+    public static ConnectorRef ref(Path directory) {
         Path jar = SyntheticJar.compileToJar(directory, "synthetic.IdentityConnector", """
                 package synthetic;
                 import io.tapdata.pdk.apis.TapConnector;

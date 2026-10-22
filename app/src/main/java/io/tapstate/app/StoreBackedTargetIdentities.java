@@ -80,7 +80,7 @@ final class StoreBackedTargetIdentities implements PipelineTargetIdentities {
                     DdlPolicy.FAIL, target, null, OnFullLoad.valueOf(coordinate.onFullLoad().name()), fullLoad);
             TargetIdentityPlan plan = new PdkTargetIdentityPlanner(connectors)
                     .assess(config, Map.of(target.name(), target)).get(target.name());
-            Assessment assessment = new Assessment(coordinate.element(), coordinate.connection(), coordinate.table(),
+            Assessment assessment = new Assessment(coordinate.element(), stream, coordinate.connection(), coordinate.table(),
                     plan.status(), plan.reason(), plan.sourceField(), plan.preservedField(), plan.writeKey());
             results.add(new Resolved(assessment, stream, plan));
         });
@@ -100,7 +100,7 @@ final class StoreBackedTargetIdentities implements PipelineTargetIdentities {
             var result = results.get(i);
             var assessment = result.assessment();
             var plan = byConnection.get(assessment.connection()).get(Integer.toString(i));
-            reconciled.add(new Resolved(new Assessment(assessment.element(), assessment.connection(), assessment.table(),
+            reconciled.add(new Resolved(new Assessment(assessment.element(), result.stream(), assessment.connection(), assessment.table(),
                     plan.status(), plan.reason(), plan.sourceField(), plan.preservedField(), plan.writeKey()), result.stream(), plan));
         }
         return List.copyOf(reconciled);

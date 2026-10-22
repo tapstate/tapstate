@@ -1,6 +1,8 @@
 package io.tapstate.control.core;
 
 import io.tapstate.spi.store.StartLoad;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -42,9 +44,17 @@ public final class UnwindTargetIdentityCheck implements StartCheck {
         };
     }
 
+    private static String subjectId(PipelineTargetIdentities.Assessment assessment) {
+        // Identifiers may contain the separator; encode each coordinate without changing its label.
+        return List.of(assessment.connection(), assessment.table(), assessment.element(), assessment.stream())
+                .stream().map(part -> URLEncoder.encode(part, StandardCharsets.UTF_8))
+                .collect(java.util.stream.Collectors.joining("/"));
+    }
+
     private StartFinding finding(PipelineTargetIdentities.Assessment assessment) {
         Map<String, Object> params = new LinkedHashMap<>();
         params.put("target", assessment.table());
+        params.put("stream", assessment.stream());
         params.put("connection", assessment.connection());
         params.put("field", assessment.sourceField() == null ? "" : assessment.sourceField());
         params.put("preserved", assessment.preservedField() == null ? "" : assessment.preservedField());
@@ -54,8 +64,8 @@ public final class UnwindTargetIdentityCheck implements StartCheck {
         boolean automatic = "automatic".equals(assessment.status());
         boolean compatible = "not-required".equals(assessment.status());
         return new StartFinding(CHECK_ID, new StartFinding.Subject(StartFinding.Subject.TARGET,
-                assessment.connection() + "/" + assessment.table() + "/" + assessment.element(),
-                assessment.element(), assessment.table() + " on " + assessment.connection()),
+                subjectId(assessment),
+                assessment.element(), assessment.table() + " on " + assessment.connection() + " from " + assessment.stream()),
                 automatic || compatible ? StartFinding.Behavior.PASS : StartFinding.Behavior.BLOCK,
                 StartFinding.Evaluation.COMPLETE,
                 identityCode(assessment.status()),

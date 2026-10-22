@@ -164,6 +164,9 @@ Different source streams may keep different settings when they reach independent
 targets, or when their target needs no automatic separation. If branches reaching
 one target actually require automatic separation, the chosen name and complete
 matching key must agree; otherwise the target panel reports **Action required**.
+START identifies each contributing source stream in its diagnostics, including
+multiple streams routed through the same sync element. A conflicting mapping
+blocks the start before desired state or an audit operation is written.
 Resolve that target's conflicting settings or send the streams to separate targets.
 An unused difference never adds fields or blocks an ordinary compatible target.
 

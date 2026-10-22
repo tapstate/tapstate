@@ -11,8 +11,12 @@ public interface PipelineTargetIdentities {
 
     List<Assessment> assess(PipelineResource definition, boolean fullLoad);
 
-    record Assessment(String element, String connection, String table, String status, String reason,
+    /** One contributing stream retains its identity even when several streams share a sink and table. */
+    record Assessment(String element, String stream, String connection, String table, String status, String reason,
             String sourceField, String preservedField, List<String> writeKey) {
-        public Assessment { writeKey = List.copyOf(writeKey); }
+        public Assessment {
+            java.util.Objects.requireNonNull(stream, "stream");
+            writeKey = List.copyOf(writeKey);
+        }
     }
 }

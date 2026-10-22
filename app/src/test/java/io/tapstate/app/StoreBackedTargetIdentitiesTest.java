@@ -61,14 +61,14 @@ class StoreBackedTargetIdentitiesTest {
         var plan = new io.tapstate.adapters.pdk.TargetIdentityPlan("automatic", "generated-target-identity",
                 target, "_id", "original_id", key);
         var assessment = new io.tapstate.control.core.PipelineTargetIdentities.Assessment(
-                "out", "target", "orders", plan.status(), plan.reason(), plan.sourceField(), plan.preservedField(), key);
+                "out", "expanded", "target", "orders", plan.status(), plan.reason(), plan.sourceField(), plan.preservedField(), key);
         var payload = StoreBackedTargetIdentities.payload(new StoreBackedTargetIdentities.Resolved(assessment, "expanded", plan));
         assertThat(payload).containsEntry("generatedFields", java.util.List.of("_id"))
                 .containsEntry("preservedField", "original_id").containsEntry("writeKey", key)
                 .containsEntry("stream", "expanded").doesNotContainKey("documents");
         var unchanged = new io.tapstate.adapters.pdk.TargetIdentityPlan("not-required", "compatible-key", target, null, null, key);
         assertThat(StoreBackedTargetIdentities.payload(new StoreBackedTargetIdentities.Resolved(
-                new io.tapstate.control.core.PipelineTargetIdentities.Assessment("out", "target", "orders",
+                new io.tapstate.control.core.PipelineTargetIdentities.Assessment("out", "expanded", "target", "orders",
                         unchanged.status(), unchanged.reason(), null, null, key), "expanded", unchanged)))
                 .containsEntry("generatedFields", java.util.List.of());
     }
@@ -92,7 +92,7 @@ class StoreBackedTargetIdentitiesTest {
         var plan = new io.tapstate.adapters.pdk.TargetIdentityPlan("automatic", "generated-target-identity", target,
                 "_id", preserved, java.util.List.of(preserved, "position"));
         return new StoreBackedTargetIdentities.Resolved(new io.tapstate.control.core.PipelineTargetIdentities.Assessment(
-                element, connection, table, plan.status(), plan.reason(), plan.sourceField(), preserved, plan.writeKey()), element, plan);
+                element, element, connection, table, plan.status(), plan.reason(), plan.sourceField(), preserved, plan.writeKey()), element, plan);
     }
 
     private void source() {
