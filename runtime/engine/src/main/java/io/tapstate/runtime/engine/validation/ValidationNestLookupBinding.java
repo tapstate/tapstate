@@ -20,7 +20,7 @@ import java.util.Set;
  * encoding, model versions, indexing and complete-query/resource admission remain separate.
  */
 public final class ValidationNestLookupBinding {
-    public sealed interface Result permits Ready, NoReference, Invalid {}
+    public sealed interface Result permits Ready, NoReference, Invalid, Unresolved {}
     public record Ready(ValidationKey key) implements Result {
         public Ready { Objects.requireNonNull(key, "key"); }
     }
@@ -32,17 +32,31 @@ public final class ValidationNestLookupBinding {
         }
     }
 
+    /**
+     * Unknown projected components are not missing/NULL keys. Preserve independently proven presence
+     * problems, but do not build a query. The caller retains the original source causes and masks.
+     */
+    public record Unresolved(List<String> fields, List<ValidationKeyBinding.Problem> knownProblems) implements Result {
+        public Unresolved {
+            if (fields == null || fields.isEmpty() || fields.size() > 32 || knownProblems == null || knownProblems.size() > 32)
+                throw invalid("nestLookup.unresolved");
+            for (String field : fields) ValidationError.fieldName(field, "nestLookup.unresolvedField");
+            fields = List.copyOf(fields); knownProblems = List.copyOf(knownProblems);
+        }
+    }
+
     private final ValidationNestRelations.Relation relation;
     private final ValidationKeyBinding physical;
     private final List<ValidationKeyBinding> parentComponents;
     private final ValidationReferenceFields reference;
+    private final ValidationValues.Limits rowLimits;
 
     public ValidationNestLookupBinding(String node, ValidationNestRelations.Relation relation,
             List<ValidationKeyBinding.Component> parentComponents, ValidationKeyBinding physical, ValidationValues.Limits rowLimits) {
         this.relation = Objects.requireNonNull(relation, "relation");
         this.physical = Objects.requireNonNull(physical, "physical");
         Objects.requireNonNull(parentComponents, "parentComponents");
-        Objects.requireNonNull(rowLimits, "rowLimits");
+        this.rowLimits = Objects.requireNonNull(rowLimits, "rowLimits");
         if (relation.join().isEmpty() || relation.join().size() > 32 || parentComponents.size() != relation.join().size()
                 || physical.components().size() != relation.join().size()) throw invalid("nestLookup.arity");
         var bindings = new ArrayList<ValidationKeyBinding>();
@@ -61,6 +75,51 @@ public final class ValidationNestLookupBinding {
     }
 
     public ValidationKeyBinding physical() { return physical; }
+
+    /**
+     * Uses the projection's knowledge before inspecting reference values. An explicit static assignment
+     * can establish a field within a whole-unknown row; a specific unknown descendant still blocks a
+     * scalar lookup component. Literal dotted column names remain distinct from nested paths.
+     */
+    public Result prepare(ValidationStaticMap.Projection parent) {
+        Objects.requireNonNull(parent, "parent");
+        var row = parent.row();
+        if (row.accountedBytes() > rowLimits.bytes() || row.nodes() > rowLimits.nodes() || row.depth() > rowLimits.depth()) {
+            throw new TapstateException(ValidationError.VALUE_LIMIT_EXCEEDED, Map.of("limit", "nestLookup.row"), null);
+        }
+        var unavailable = new LinkedHashSet<String>();
+        for (var join : relation.join()) {
+            String field = join.parent();
+            for (var path : parent.unavailablePaths()) {
+                if (path.isEmpty() ? !parent.definedFields().contains(field) : path.getFirst().equals(field)) {
+                    unavailable.add(field); break;
+                }
+            }
+        }
+        if (unavailable.isEmpty()) return prepare(row);
+        var problems = new ArrayList<ValidationKeyBinding.Problem>();
+        long keyBytes = 32;
+        for (int i = 0; i < parentComponents.size(); i++) {
+            String field = relation.join().get(i).parent();
+            if (unavailable.contains(field)) continue;
+            if (relation.direction() == ValidationNestRelations.Direction.REFERENCE) {
+                // A missing component is definite even if another component later proves NULL. A
+                // type error is not: an unresolved component may instead make this no-reference.
+                if (!row.fields().containsKey(field)) problems.add(new ValidationKeyBinding.Problem(i,
+                        List.of(field), ValidationKeyBinding.ProblemKind.MISSING_FIELD));
+            } else {
+                var bound = parentComponents.get(i).read(row);
+                if (bound instanceof ValidationKeyBinding.Invalid bad) {
+                    for (var problem : bad.problems()) problems.add(new ValidationKeyBinding.Problem(i, problem.path(), problem.kind()));
+                } else {
+                    keyBytes += ((ValidationKeyBinding.Bound) bound).key().parts().getFirst().retainedBytes();
+                    if (keyBytes > ValidationKey.MAX_KEY_BYTES) throw new TapstateException(ValidationError.KEY_LIMIT_EXCEEDED,
+                            Map.of("limit", "keyBytes"), null);
+                }
+            }
+        }
+        return new Unresolved(new ArrayList<>(unavailable), problems);
+    }
 
     /** Missing takes precedence over NULL for references; gathering never issues a NULL key query. */
     public Result prepare(ValidationValues.Row workingParent) {
