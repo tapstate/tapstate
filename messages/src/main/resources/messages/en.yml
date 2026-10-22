@@ -533,7 +533,7 @@ store.tls-ca-unreadable:
   solution: "Check the path points at a readable PEM certificate for the store's TLS chain."
 store.storage-connection-unsupported:
   message: "The storage connection uses unsupported database, authentication or TLS settings."
-  solution: "Use an explicit valid database, verified server TLS and a separate CA bundle. Atlas requires a username and password with SCRAM-SHA-256 and authSource=admin. Client keys and disabled certificate verification are not supported."
+  solution: "Use an explicit valid database, verified server TLS and a separate CA bundle. Atlas requires a username and password with authSource=admin. Omit the mechanism to negotiate SCRAM, or specify supported SCRAM-SHA-256 or SCRAM-SHA-1 credentials. Client keys and disabled certificate verification are not supported."
 store.tls-trust-invalid:
   message: "The storage TLS trust bundle is invalid."
   solution: "Provide a PEM certificate bundle of at most 64 KiB without private keys. Check the server chain and hostname; do not disable verification."

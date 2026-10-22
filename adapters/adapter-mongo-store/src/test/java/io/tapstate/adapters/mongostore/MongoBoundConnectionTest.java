@@ -35,10 +35,10 @@ class MongoBoundConnectionTest {
     }
 
     @Test
-    void aUsersAtlasCredentialIsPinnedToScramSha256WithoutDroppingItsAuthSource() {
+    void aUsersAtlasCredentialNegotiatesScramWithoutDroppingItsAuthSource() {
         String uri = "mongodb://user:password@localhost/uri_auth?tls=true&authSource=admin";
         var settings = settings(uri, StorageBinding.Connection.Kind.ATLAS, null);
-        assertThat(settings.getCredential().getAuthenticationMechanism()).isEqualTo(AuthenticationMechanism.SCRAM_SHA_256);
+        assertThat(settings.getCredential().getAuthenticationMechanism()).isNull();
         assertThat(settings.getCredential().getSource()).isEqualTo("admin");
         assertThat(settings.getCredential().getUserName()).isEqualTo("user");
     }
@@ -57,15 +57,23 @@ class MongoBoundConnectionTest {
     }
 
     @Test
-    void aUsersAtlasSrvConnectionKeepsAdminTxtAndPinsSha256() {
+    void aUsersAtlasSrvConnectionKeepsAdminTxtAndNegotiatesScram() {
         String uri = "mongodb+srv://user:password@cluster.example.net/uri_auth";
         ConnectionString parsed = new ConnectionString(uri, (name, type) -> List.of("authSource=admin"));
         try (var connection = cache(uri, StorageBinding.Connection.Kind.ATLAS, null)) {
             var settings = connection.buildClientSettings(parsed);
             assertThat(settings.getSslSettings().isEnabled()).isTrue();
             assertThat(settings.getCredential().getSource()).isEqualTo("admin");
-            assertThat(settings.getCredential().getAuthenticationMechanism()).isEqualTo(AuthenticationMechanism.SCRAM_SHA_256);
+            assertThat(settings.getCredential().getAuthenticationMechanism()).isNull();
         }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"SCRAM-SHA-1", "SCRAM-SHA-256"})
+    void explicitScramChoicesRemainExplicit(String mechanism) {
+        var settings = settings("mongodb://user:password@localhost/cache?tls=true&authSource=admin&authMechanism=" + mechanism,
+                StorageBinding.Connection.Kind.ATLAS, null);
+        assertThat(settings.getCredential().getAuthenticationMechanism().getMechanismName()).isEqualTo(mechanism);
     }
 
     @Test
@@ -132,9 +140,9 @@ class MongoBoundConnectionTest {
     @ParameterizedTest
     @ValueSource(strings = {"mongodb://user:password@localhost/cache?tls=false",
             "mongodb://localhost/cache?tls=true",
-            "mongodb://user:password@localhost/cache?tls=true&authMechanism=SCRAM-SHA-1",
+            "mongodb://user:password@localhost/cache?tls=true&authMechanism=PLAIN",
             "mongodb://user:password@localhost/cache?tls=true&authSource=not_admin"})
-    void aUsersAtlasConnectionCannotUsePlaintextMissingCredentialsOrSha1(String uri) {
+    void aUsersAtlasConnectionCannotUsePlaintextMissingCredentialsOrNonScram(String uri) {
         assertThatThrownBy(() -> settings(uri, StorageBinding.Connection.Kind.ATLAS, null))
                 .isInstanceOfSatisfying(TapstateException.class,
                         error -> assertThat(error.code()).isEqualTo(StoreError.STORAGE_CONNECTION_UNSUPPORTED));

@@ -67,8 +67,11 @@ User-supplied Atlas storage requires all of the following:
 - The actual outbound IP of every participating Cluster member in the Atlas access list.
   A browser's IP is insufficient. Ask the deployment owner for the exact egress addresses;
   do not open the access list to the whole internet as a diagnostic shortcut.
-- TLS and username/password authentication with `SCRAM-SHA-256`, `authSource=admin`.
-  Explicitly conflicting mechanisms or disabled TLS are rejected; there is no SHA-1 fallback.
+- TLS and username/password authentication with `authSource=admin`.
+  When the URI omits an authentication mechanism, the MongoDB driver negotiates the user's
+  advertised SCRAM support, preferring `SCRAM-SHA-256` and accepting `SCRAM-SHA-1` accounts.
+  Explicit `SCRAM-SHA-256` and `SCRAM-SHA-1` choices are preserved. An authentication failure
+  does not trigger a retry with another mechanism. Other mechanisms and disabled TLS are rejected.
 - Permissions on the selected databases, checked from the running Cluster.
 
 Other Atlas authentication methods, VPC Peering and Private Endpoint are outside this scope.

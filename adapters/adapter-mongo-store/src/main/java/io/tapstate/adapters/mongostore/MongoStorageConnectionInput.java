@@ -27,11 +27,10 @@ public final class MongoStorageConnectionInput {
             if (input.kind() == StorageBinding.Connection.Kind.ATLAS) {
                 if (options.containsKey("authsource") && !"admin".equals(options.get("authsource"))) throw refused();
                 if (options.containsKey("authmechanism")
-                        && !"SCRAM-SHA-256".equals(options.get("authmechanism"))) throw refused();
+                        && !java.util.Set.of("SCRAM-SHA-256", "SCRAM-SHA-1").contains(options.get("authmechanism"))) throw refused();
                 if ((options.containsKey("tls") && !"true".equalsIgnoreCase(options.get("tls")))
                         || (options.containsKey("ssl") && !"true".equalsIgnoreCase(options.get("ssl")))) throw refused();
                 if (!options.containsKey("authsource")) uri = append(uri, "authSource=admin");
-                if (!options.containsKey("authmechanism")) uri = append(uri, "authMechanism=SCRAM-SHA-256");
                 if (!options.containsKey("tls") && !options.containsKey("ssl")) uri = append(uri, "tls=true");
             }
             StorageBinding.Connection normalized = new StorageBinding.Connection(input.kind(), uri, input.database(), input.caPem());
@@ -41,7 +40,9 @@ public final class MongoStorageConnectionInput {
                 connection.buildClientSettings(parsed);
                 if (input.kind() == StorageBinding.Connection.Kind.ATLAS
                         && (parsed.getUsername() == null || parsed.getPassword() == null
-                        || parsed.getCredential().getAuthenticationMechanism() != AuthenticationMechanism.SCRAM_SHA_256)) throw refused();
+                        || (parsed.getCredential().getAuthenticationMechanism() != null
+                        && parsed.getCredential().getAuthenticationMechanism() != AuthenticationMechanism.SCRAM_SHA_256
+                        && parsed.getCredential().getAuthenticationMechanism() != AuthenticationMechanism.SCRAM_SHA_1))) throw refused();
             }
             return normalized;
         } catch (IllegalArgumentException invalid) {

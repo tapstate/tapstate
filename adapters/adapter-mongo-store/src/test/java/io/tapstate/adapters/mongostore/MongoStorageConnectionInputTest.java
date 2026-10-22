@@ -15,15 +15,25 @@ class MongoStorageConnectionInputTest {
         assertThat(MongoStorageConnectionInput.databaseUri(normalized)).isEqualTo(
                 "mongodb://alice:pa%40ss@host1:27017,host2:27017/selected?replicaSet=rs&tls=true&authSource=original");
     }
-    @Test void atlasRequiresTlsAndNormalizesSha256WithAdminAuthentication() {
+    @Test void atlasRequiresTlsAndKeepsNegotiatedScramWithAdminAuthentication() {
         var normalized = MongoStorageConnectionInput.normalize(input(
                 "mongodb://alice:secret@atlas.example/some_database", StorageBinding.Connection.Kind.ATLAS));
         assertThat(MongoStorageConnectionInput.databaseUri(normalized)).isEqualTo(
-                "mongodb://alice:secret@atlas.example/selected?authSource=admin&authMechanism=SCRAM-SHA-256&tls=true");
+                "mongodb://alice:secret@atlas.example/selected?authSource=admin&tls=true");
+    }
+    @Test void explicitScramMechanismsSurviveNormalizationAndDatabaseRewrite() {
+        for (String mechanism : new String[]{"SCRAM-SHA-1", "SCRAM-SHA-256"}) {
+            var normalized = MongoStorageConnectionInput.normalize(input(
+                    "mongodb://alice:secret@atlas.example/original?authMechanism=" + mechanism, StorageBinding.Connection.Kind.ATLAS));
+            var parsed = new com.mongodb.ConnectionString(MongoStorageConnectionInput.databaseUri(normalized));
+            assertThat(parsed.getCredential().getAuthenticationMechanism().getMechanismName()).isEqualTo(mechanism);
+            assertThat(parsed.getCredential().getSource()).isEqualTo("admin");
+            assertThat(parsed.getSslEnabled()).isTrue();
+        }
     }
     @Test void rejectsDuplicateConflictingInsecureAndClientCertificateOptionsWithoutEchoingSecrets() {
         for (String option : new String[]{"tls=true&TLS=true", "ssl=true&tls=false", "tls=false", "authSource=other",
-                "authMechanism=SCRAM-SHA-1", "tlsAllowInvalidHostnames=true", "tlsAllowInvalidCertificates=true",
+                "authMechanism=PLAIN", "tlsAllowInvalidHostnames=true", "tlsAllowInvalidCertificates=true",
                 "tlsInsecure=true", "tlsCertificateKeyFile=secret", "tlsCAFile=secret"}) {
             assertThatThrownBy(() -> MongoStorageConnectionInput.normalize(input(
                     "mongodb://alice:sentinel-secret@host/original?" + option, StorageBinding.Connection.Kind.ATLAS)))

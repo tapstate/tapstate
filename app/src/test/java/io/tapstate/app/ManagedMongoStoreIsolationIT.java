@@ -732,6 +732,76 @@ class ManagedMongoStoreIsolationIT {
         }
     }
 
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void atlasPasswordAuthenticationNegotiatesAvailableScramAndPrefersSha256(boolean sha256Available) {
+        String database = "scram_choice_" + UUID.randomUUID().toString().substring(0, 8);
+        String user = "scram_user_" + database;
+        try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
+            admin.getDatabase("admin").runCommand(new Document("createUser", user).append("pwd", PASSWORD)
+                    .append("roles", List.of(new Document("role", "readWrite").append("db", database)))
+                    .append("mechanisms", sha256Available ? List.of("SCRAM-SHA-1", "SCRAM-SHA-256") : List.of("SCRAM-SHA-1")));
+            var probe = new io.tapstate.adapters.mongostore.MongoStorageConnectionProbe(Duration.ofSeconds(5));
+            var input = probe.normalize(new StorageBinding.Connection(StorageBinding.Connection.Kind.ATLAS,
+                    uri(user, database) + "&tls=true", database, TLS.ca()));
+            assertThat(new com.mongodb.ConnectionString(input.uri()).getCredential().getAuthenticationMechanism()).isNull();
+            var before = scramSuccesses(admin);
+            probe.test(input);
+            var after = scramSuccesses(admin);
+            String expected = sha256Available ? "SCRAM-SHA-256" : "SCRAM-SHA-1";
+            String other = sha256Available ? "SCRAM-SHA-1" : "SCRAM-SHA-256";
+            assertThat(after.get(expected)).isGreaterThan(before.get(expected));
+            assertThat(after.get(other)).isEqualTo(before.get(other));
+            // An explicit choice is binding; an authentication failure must not start a weaker retry.
+            long sha1Attempts = scramCounts(admin, "received").get("SCRAM-SHA-1");
+            var invalid = probe.normalize(new StorageBinding.Connection(StorageBinding.Connection.Kind.ATLAS,
+                    uri(user, database, "wrong-scram-sentinel") + "&tls=true&authMechanism=SCRAM-SHA-256", database, TLS.ca()));
+            assertThatThrownBy(() -> probe.test(invalid)).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(sha256Available ? IoError.STORE_UNAUTHORIZED : StoreError.STORAGE_CONNECTION_UNSUPPORTED));
+            assertThat(scramSuccesses(admin).get("SCRAM-SHA-1")).isEqualTo(after.get("SCRAM-SHA-1"));
+            assertThat(scramCounts(admin, "received").get("SCRAM-SHA-1")).isEqualTo(sha1Attempts);
+        }
+    }
+
+    private static Map<String, Long> scramSuccesses(MongoClient admin) {
+        return scramCounts(admin, "successful");
+    }
+
+    private static Map<String, Long> scramCounts(MongoClient admin, String counter) {
+        var mechanisms = admin.getDatabase("admin").runCommand(new Document("serverStatus", 1))
+                .get("security", Document.class).get("authentication", Document.class).get("mechanisms", Document.class);
+        var counts = new java.util.HashMap<String, Long>();
+        for (String name : List.of("SCRAM-SHA-1", "SCRAM-SHA-256")) {
+            counts.put(name, ((Number) mechanisms.get(name, Document.class).get("authenticate", Document.class).get(counter)).longValue());
+        }
+        return counts;
+    }
+
+    @Test
+    void anAtlasSaslRejectionIsDiagnosedAsAuthenticationInsteadOfNetworkFailure() {
+        String database = "atlas_auth_" + UUID.randomUUID().toString().substring(0, 8);
+        String user = "atlas_auth_user_" + database;
+        try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
+            createUser(admin, user, List.of(database));
+            admin.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand")
+                    .append("mode", new Document("times", 20)).append("data", new Document("failCommands", List.of("saslStart", "saslContinue"))
+                            .append("errorCode", 8000).append("appName", "storage-atlas-auth-rejection")));
+            try {
+                var probe = new io.tapstate.adapters.mongostore.MongoStorageConnectionProbe(Duration.ofSeconds(5));
+                var input = probe.normalize(new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,
+                        uri(user, database) + "&authMechanism=SCRAM-SHA-256&appName=storage-atlas-auth-rejection", database, null));
+                assertThatThrownBy(() -> probe.test(input)).isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(IoError.STORE_UNAUTHORIZED);
+                    assertThat(failure.args()).isEmpty();
+                    assertThat(failure.getCause()).isNull();
+                    assertThat(failure.getMessage()).doesNotContain(user, PASSWORD, "mongodb://");
+                });
+            } finally {
+                admin.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
+            }
+        }
+    }
+
     @Test
     void unboundCloudRootNeedsOnlyConfigAndDoesNotBuildRuntimeOrConnectorTestsForStatus() {
         String suffix = UUID.randomUUID().toString().replace("-", "");

@@ -275,11 +275,12 @@ public final class MongoConnection implements AutoCloseable {
             if (opened != null) {
                 opened.close();
             }
-            // Only an explicit server authentication rejection proves bad credentials. The driver also
-            // wraps socket failures during SASL in MongoSecurityException; those remain connectivity failures.
-            boolean authenticationRejected = e instanceof com.mongodb.MongoSecurityException
-                    && e.getCause() instanceof com.mongodb.MongoCommandException command && command.getErrorCode() == 18;
-            var failure = authenticationRejected ? StoreIo.coded(e)
+            // Classify explicit server authentication results. The driver also wraps SASL socket failures
+            // in MongoSecurityException; those remain connectivity failures.
+            var authenticationFailure = e instanceof com.mongodb.MongoSecurityException
+                    && e.getCause() instanceof com.mongodb.MongoCommandException command ? command : null;
+            var failure = authenticationFailure != null && authenticationFailure.getErrorCode() == 334 ? unsupportedStorage()
+                    : authenticationFailure != null && (authenticationFailure.getErrorCode() == 18 || authenticationFailure.getErrorCode() == 8000) ? StoreIo.coded(e)
                     : new TapstateException(StoreError.UNREACHABLE, Map.of("target", target), null);
             // Driver messages and causes can contain credentials. Log only bounded type and numeric metadata.
             Throwable cause = e.getCause();
@@ -415,9 +416,10 @@ public final class MongoConnection implements AutoCloseable {
             var credential = connectionString.getCredential();
             if (credential == null || credential.getPassword() == null || !"admin".equals(credential.getSource())
                     || (credential.getAuthenticationMechanism() != null
-                    && credential.getAuthenticationMechanism() != AuthenticationMechanism.SCRAM_SHA_256)) throw unsupportedStorage();
-            builder.credential(credential.getAuthenticationMechanism() == null
-                    ? credential.withMechanism(AuthenticationMechanism.SCRAM_SHA_256) : credential);
+                    && credential.getAuthenticationMechanism() != AuthenticationMechanism.SCRAM_SHA_256
+                    && credential.getAuthenticationMechanism() != AuthenticationMechanism.SCRAM_SHA_1)) throw unsupportedStorage();
+            // Preserve an explicit mechanism. Otherwise let the driver negotiate from server-advertised SCRAM support.
+            builder.credential(credential);
         }
         if (useTls && caPem != null) {
             builder.applyToSslSettings(b -> b.context(buildPemSslContext(caPem)));
