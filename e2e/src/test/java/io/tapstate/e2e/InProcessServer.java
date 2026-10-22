@@ -42,6 +42,11 @@ final class InProcessServer implements ServerHandle {
         return start(storeUri, SharedMongo.OPERATOR_STATE_DATABASE);
     }
 
+    static InProcessServer startPrepared(PreparedNativeStore storage) {
+        return start(storage.configurationUri(), null, List.of("--tapstate.cluster.id=" + storage.clusterId(),
+                "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2"));
+    }
+
     /** Boots the assembly with an explicit operator-state database. */
     static InProcessServer start(String storeUri, String operatorStateDatabase) {
         return start(storeUri, operatorStateDatabase, List.of());
@@ -74,17 +79,18 @@ final class InProcessServer implements ServerHandle {
         java.util.ArrayList<String> arguments = new java.util.ArrayList<>(List.of(
                 "--server.address=127.0.0.1", "--server.port=0"));
         arguments.addAll(additionalArguments);
-        return new SpringApplicationBuilder(Bootstrap.class)
-                .properties(
+        var defaults = new java.util.ArrayList<>(List.of(
                         "tapstate.store.mongo.enabled=true",
                         "tapstate.store.mongo.uri=" + storeUri,
-                        ServerHandle.OPERATOR_STATE_DATABASE_SETTING + "=" + operatorStateDatabase,
                         // The container speaks plaintext; store TLS is opt-in, so no flag is needed.
                         "tapstate.store.mongo.server-selection-timeout=5s",
                         // This tier's working directory is the harness's own module, and the setting's
                         // default is relative to it.
                         ServerHandle.PLUGINS_DIRECTORY_SETTING + "=" + stagingDirectory,
-                        ServerHandle.ALSO_ACCEPT_IDS_SETTING + "=" + E2eConnectorJar.CONNECTOR_ID)
+                        ServerHandle.ALSO_ACCEPT_IDS_SETTING + "=" + E2eConnectorJar.CONNECTOR_ID));
+        if (operatorStateDatabase != null) defaults.add(ServerHandle.OPERATOR_STATE_DATABASE_SETTING + "=" + operatorStateDatabase);
+        return new SpringApplicationBuilder(Bootstrap.class)
+                .properties(defaults.toArray(String[]::new))
                 // Port zero, then read back what was granted: a hard-coded port turns a busy machine
                 // into a flaky suite. Both are command-line arguments rather than default properties
                 // because the product's application configuration publishes 8080 as its default, and a

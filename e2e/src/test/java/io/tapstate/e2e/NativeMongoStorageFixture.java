@@ -18,6 +18,11 @@ final class NativeMongoStorageFixture {
     private NativeMongoStorageFixture() {}
 
     static void prepare(String configUri, StorageBinding.Connection cacheBinding, String targetUri, String cluster) {
+        prepare(configUri, cacheBinding, targetUri, cluster, USER, PASSWORD);
+    }
+
+    static void prepare(String configUri, StorageBinding.Connection cacheBinding, String targetUri, String cluster,
+            String username, String password) {
         var scope = new StorageSetupScope(cluster, "installation", "setup", 1);
         try (var configuration = MongoConfigurationBootstrap.prepare(
                 new MongoConnectionSettings(configUri, null, Duration.ofSeconds(5)), cluster, "installation", "setup", 1)) {
@@ -29,7 +34,7 @@ final class NativeMongoStorageFixture {
             }
             configuration.bindings().complete(scope);
             configuration.firstAdmin().create(configuration.firstAdmin().load().orElseThrow().scope(),
-                    new User(USER, new BCryptPasswordHasher().hash(PASSWORD), "admin"));
+                    new User(username, new BCryptPasswordHasher().hash(password), "admin"));
         }
     }
 }

@@ -154,6 +154,13 @@ final class ControlPlane {
         cloudCookie = false;
     }
 
+    /** Reads admission through the same native snapshot used by the application. */
+    Map<?, ?> storageStatus() {
+        var response = send(authed("/api/storage/status", "{}"));
+        expect(response, 200, "read native storage admission");
+        return (Map<?, ?>) JsonReader.parse(response.body());
+    }
+
     /** Redeems one code once; the real SDK and server create the local session. */
     String exchangeCloudCode(String code) {
         HttpResponse<String> response = send(get("/auth/exchange?code=" + urlSegment(code)));
@@ -2252,7 +2259,7 @@ final class ControlPlane {
      */
     private HttpRequest authedDelete(String id, String expectedContentHash) {
         HttpRequest.Builder builder = authenticate(HttpRequest.newBuilder(baseUrl.resolve("/api/artifacts/" + urlSegment(id)))
-                .timeout(TIMEOUT)
+                .timeout(io.tapstate.control.client.HttpControlClient.DEFAULT_HEAVY_TIMEOUT)
                 .DELETE());
         if (expectedContentHash != null) {
             builder.header("If-Match", "\"" + expectedContentHash + "\"");
