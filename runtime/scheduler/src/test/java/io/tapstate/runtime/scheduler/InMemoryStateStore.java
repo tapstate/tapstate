@@ -1,5 +1,7 @@
 package io.tapstate.runtime.scheduler;
 
+import io.tapstate.spi.store.WorkloadClaimFence;
+
 import io.tapstate.core.lifecycle.CasOutcome;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.EpochCas;
@@ -27,6 +29,7 @@ final class InMemoryStateStore implements StateStore {
     private final Map<String, CheckpointDoc> docs = new HashMap<>();
     private Runnable beforeSwap = () -> {};
     private int swapAttempts = 0;
+    WorkloadClaimFence liveFence;
 
     @Override
     public Optional<CheckpointDoc> read(String pipelineId) {
@@ -46,6 +49,15 @@ final class InMemoryStateStore implements StateStore {
         swapAttempts++;
         beforeSwap.run();
         return applySwap(pipelineId, expectedEpoch, nextStateJson, touchTime);
+    }
+
+    @Override
+    public CasOutcome compareAndSwap(String pipelineId, long expectedEpoch, String nextStateJson,
+            Instant touchTime, WorkloadClaimFence fence) {
+        swapAttempts++;
+        beforeSwap.run();
+        return fence.equals(liveFence) ? applySwap(pipelineId, expectedEpoch, nextStateJson, touchTime)
+                : new CasOutcome.Fenced(docs.get(pipelineId).epoch());
     }
 
     /** Applies the fence without running the {@code beforeSwap} hook — the seam a competitor writes through. */

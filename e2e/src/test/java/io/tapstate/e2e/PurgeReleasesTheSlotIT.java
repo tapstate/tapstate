@@ -115,12 +115,12 @@ class PurgeReleasesTheSlotIT {
             awaitNoSlot(source, "clearing the last pipeline on the chain to drop its slot");
 
             // ---- clearing and starting again, as restart --rerun does -------------------------------
-            start(control, p);
+            startKeepingTarget(control, p);
             carry(source, target, ORDERS, 3);
             String before = PostgresSlots.only(source).name();
             control.stop(p, true);
             awaitState(control, p, PipelineState.STOPPED);
-            start(control, p);
+            startKeepingTarget(control, p);
             carry(source, target, ORDERS, 4);
             List<String> after = PostgresSlots.names(source);
             assertThat(after).as("the rerun reads through exactly one slot").hasSize(1);
@@ -136,6 +136,12 @@ class PurgeReleasesTheSlotIT {
     /** Starts {@code pipeline} and waits until it runs and its source is being read through a slot. */
     private static void start(ControlPlane control, String pipeline) {
         control.lifecycle(pipeline, LifecycleVerb.START);
+        awaitState(control, pipeline, PipelineState.RUNNING);
+    }
+
+    /** A new full load after purge intentionally keeps the target rows from the preceding run. */
+    private static void startKeepingTarget(ControlPlane control, String pipeline) {
+        control.startAnswering(pipeline, "target-not-empty", "keep");
         awaitState(control, pipeline, PipelineState.RUNNING);
     }
 

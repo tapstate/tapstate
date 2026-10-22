@@ -705,7 +705,7 @@ class ControlPlaneConfiguration {
     PipelineLifecycleService pipelineLifecycleService(
             ArtifactQueryService artifactQueryService, StorePort storePort, AuditGate auditGate) {
         return new PipelineLifecycleService(artifactQueryService, storePort.desired(), auditGate,
-                pipelineId -> storePort.state().read(pipelineId).map(CheckpointDoc::epoch));
+                storePort.state()::read);
     }
 
     @Bean

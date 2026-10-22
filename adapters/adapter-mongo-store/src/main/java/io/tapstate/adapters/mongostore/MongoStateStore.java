@@ -4,6 +4,8 @@ import com.mongodb.ErrorCategory;
 import com.mongodb.MongoException;
 import com.mongodb.MongoWriteException;
 import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.ClientSession;
 import com.mongodb.client.model.FindOneAndUpdateOptions;
 import com.mongodb.client.model.ReturnDocument;
 import io.tapstate.core.common.TapstateException;
@@ -11,6 +13,8 @@ import io.tapstate.core.lifecycle.CasOutcome;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.StateStore;
+import io.tapstate.spi.store.WorkloadClaimFence;
+import io.tapstate.spi.store.WorkloadClaimType;
 import org.bson.Document;
 
 import java.time.Instant;
@@ -39,9 +43,18 @@ public final class MongoStateStore implements StateStore {
             new FindOneAndUpdateOptions().returnDocument(ReturnDocument.AFTER);
 
     private final MongoCollection<Document> collection;
+    private final MongoClient client;
+    private final MongoCollection<Document> workloadClaims;
 
     public MongoStateStore(MongoCollection<Document> collection) {
+        this(null, collection, null);
+    }
+
+    public MongoStateStore(MongoClient client, MongoCollection<Document> collection,
+            MongoCollection<Document> workloadClaims) {
         this.collection = Objects.requireNonNull(collection, "collection");
+        this.client = client;
+        this.workloadClaims = workloadClaims;
     }
 
     @Override
@@ -100,6 +113,45 @@ public final class MongoStateStore implements StateStore {
                     "compareAndSwap on an unseeded pipeline: " + pipelineId + " (create must seed it first)");
         }
         return new CasOutcome.Fenced(toCheckpoint(current).epoch());
+    }
+
+    @Override
+    public CasOutcome compareAndSwap(String pipelineId, long expectedEpoch, String nextStateJson,
+            Instant touchTime, WorkloadClaimFence fence) {
+        Objects.requireNonNull(fence, "fence");
+        Objects.requireNonNull(nextStateJson, "nextStateJson");
+        Objects.requireNonNull(touchTime, "touchTime");
+        if (!pipelineId.equals(fence.key().resourceId()) || fence.key().type() != WorkloadClaimType.PIPELINE_ACTUATION) {
+            throw new IllegalArgumentException("a checkpoint transition requires this pipeline's actuation fence");
+        }
+        if (client == null || workloadClaims == null) {
+            throw new IllegalStateException("workload-fenced checkpoints require the store's shared Mongo client");
+        }
+        return StoreIo.call(() -> {
+            try (ClientSession session = client.startSession()) {
+                return session.withTransaction(() -> {
+                    // Reuse the existing fence-proof counter. A write makes a takeover conflict with
+                    // this transaction; a read of the claim alone would only prove an old snapshot.
+                    boolean owned = workloadClaims.updateOne(session, WorkloadClaimDocuments.live(fence),
+                            new Document("$inc", new Document("fencedSinkEffects", 1L))).getMatchedCount() == 1;
+                    if (owned) {
+                        Document applied = collection.findOneAndUpdate(session,
+                                new Document("_id", pipelineId).append("epoch", expectedEpoch),
+                                new Document("$set", new Document("stateJson", nextStateJson)
+                                        .append("touchMillis", touchTime.toEpochMilli()))
+                                        .append("$inc", new Document("epoch", 1L)), RETURN_AFTER);
+                        if (applied != null) {
+                            return new CasOutcome.Applied(toCheckpoint(applied));
+                        }
+                    }
+                    Document current = collection.find(session, new Document("_id", pipelineId)).first();
+                    if (current == null) {
+                        throw new IllegalStateException("compareAndSwap on an unseeded pipeline: " + pipelineId);
+                    }
+                    return new CasOutcome.Fenced(toCheckpoint(current).epoch());
+                });
+            }
+        });
     }
 
     @Override

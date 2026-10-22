@@ -526,6 +526,26 @@ class ObservationPublisherTest {
     }
 
     @Test
+    void completedObservationRetainsItsFinalConfirmedLoadAfterCaptureIsReleased() {
+        state.seed("orders", PipelineState.RUNNING);
+        ObservationPublisher running = new ObservationPublisher(state, observations,
+                id -> OptionalLong.empty(), id -> Map.of(),
+                id -> new SnapshotReading(Map.of("orders", new TableSnapshot(3, 3L, 100, true)), T0));
+        Observation last = running.publish("orders").orElseThrow();
+        state.seed("orders", PipelineState.COMPLETED);
+
+        Observation completed = publisher.publish("orders").orElseThrow();
+        assertThat(completed.snapshot()).isEqualTo(last.snapshot());
+        assertThat(completed.facts()).isEqualTo(last.facts());
+        assertThat(completed.state()).isEqualTo(PipelineState.COMPLETED);
+        assertThat(new ObservationPublisher(state, observations).publish("orders").orElseThrow().snapshot())
+                .isEqualTo(last.snapshot());
+
+        state.seed("orders", PipelineState.STOPPED);
+        assertThat(publisher.publish("orders").orElseThrow().snapshot()).isEmpty();
+    }
+
+    @Test
     void publishCarriesTheCodedFailureOfAJobThatDied() {
         state.seed("orders", PipelineState.FAILED);
 

@@ -6,15 +6,27 @@ import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.RateSample;
+import io.tapstate.core.lifecycle.FrontierStallPressure;
+import io.tapstate.core.lifecycle.NestColdLayerPressure;
+import io.tapstate.core.lifecycle.SnapshotReading;
+import io.tapstate.core.lifecycle.StateJson;
+import io.tapstate.core.lifecycle.TableSnapshot;
+import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.RateHistoryStore;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.time.Clock;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.OptionalLong;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -165,5 +177,73 @@ class RateSamplerTest {
         sampler.offer(moving(T0.plusSeconds(1), 101L));
 
         assertThat(history.appended).hasSize(2);
+    }
+
+    @Test
+    void completedPublicationsRetainTheLoadWithoutGrowingHistoryAndANewRunIsSampled() {
+        InMemoryStateStore state = new InMemoryStateStore();
+        state.create("orders", StateJson.of(PipelineState.RUNNING), T0);
+        AtomicReference<Observation> stored = new AtomicReference<>();
+        ObservationStore observations = new ObservationStore() {
+            @Override
+            public void save(Observation observation) {
+                stored.set(observation);
+            }
+
+            @Override
+            public Optional<Observation> read(String pipelineId) {
+                return Optional.ofNullable(stored.get());
+            }
+
+            @Override
+            public void delete(String pipelineId) {
+                throw new AssertionError("completion must retain the final observation");
+            }
+        };
+        AtomicLong liveRows = new AtomicLong(3);
+        RecordingHistory history = new RecordingHistory();
+        RateSampler sampler = new RateSampler(history, Duration.ofMinutes(1));
+        Observation last = publishAt(state, observations, liveRows, T0);
+        sampler.offer(last);
+        state.compareAndSwap("orders", 0, StateJson.of(PipelineState.COMPLETED), T0.plusSeconds(1));
+        liveRows.set(-1);
+
+        for (int minute = 1; minute <= 3; minute++) {
+            Instant now = T0.plusSeconds(60L * minute);
+            Observation completed = publishAt(state, observations, liveRows, now);
+            sampler.offer(completed);
+            // A replacement publisher/sampler cannot mistake the retained values for a fresh reading.
+            new RateSampler(history, Duration.ofMinutes(1)).offer(completed);
+            assertThat(completed.state()).isEqualTo(PipelineState.COMPLETED);
+            assertThat(completed.snapshot()).containsEntry("orders", new TableSnapshot(3, 3L, 100, true));
+            assertThat(completed.metrics()).isEqualTo(last.metrics());
+            assertThat(completed.facts()).isEqualTo(last.facts());
+            assertThat(completed.facts()).flatExtracting(MetricFact::points)
+                    .allSatisfy(point -> assertThat(point.observedAt()).isEqualTo(T0));
+            // Observation time is the state publisher's heartbeat, not a new metric measurement.
+            assertThat(completed.observedAt()).isEqualTo(now);
+        }
+        assertThat(history.appended).as("only the live measurement belongs in history").hasSize(1);
+
+        state.compareAndSwap("orders", 1, StateJson.of(PipelineState.RUNNING), T0.plusSeconds(240));
+        liveRows.set(4);
+        sampler.offer(publishAt(state, observations, liveRows, T0.plusSeconds(240)));
+        assertThat(history.appended).extracting(RateSample::observedAt)
+                .containsExactly(T0, T0.plusSeconds(240));
+        assertThat(history.appended.getLast().counters()).containsEntry("recordCount", 4L);
+    }
+
+    private static Observation publishAt(InMemoryStateStore state, ObservationStore observations,
+            AtomicLong liveRows, Instant at) {
+        ObservationPublisher publisher = new ObservationPublisher(state, observations,
+                id -> liveRows.get() < 0 ? OptionalLong.empty() : OptionalLong.of(liveRows.get()),
+                id -> Map.of(),
+                id -> liveRows.get() < 0 ? SnapshotReading.NONE : new SnapshotReading(
+                        Map.of("orders", new TableSnapshot(liveRows.get(), liveRows.get(), 100, true)), T0),
+                id -> Map.of(), id -> Map.of(),
+                new NestColdLayerWatch(NestColdLayerPressure.DEFAULT, NestColdLayerAlert.NONE),
+                id -> Map.of(), new FrontierStallWatch(FrontierStallPressure.DEFAULT, FrontierStallAlert.NONE),
+                id -> Map.of(), id -> Map.of(), id -> Map.of(), Clock.fixed(at, ZoneOffset.UTC));
+        return publisher.publish("orders").orElseThrow();
     }
 }

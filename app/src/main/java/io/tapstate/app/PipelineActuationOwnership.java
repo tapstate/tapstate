@@ -1,5 +1,7 @@
 package io.tapstate.app;
 
+import io.tapstate.spi.store.WorkloadClaimFence;
+
 import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
@@ -480,6 +482,18 @@ final class PipelineActuationOwnership {
     synchronized long heldExecutionGeneration(String pipelineId) {
         Held state = fenced ? held.get(pipelineId) : null;
         return state == null || state.claim == null ? 0 : state.claim.executionGeneration();
+    }
+
+    /** A store-side proof for the named run, never substituting a replacement's generations. */
+    synchronized WorkloadClaimFence completionFence(ExecutionFence run) {
+        if (run == null) {
+            return null;
+        }
+        Held current = held.get(run.pipelineId());
+        long topology = current == null || current.claim == null ? 0L : current.claim.topologyRevision();
+        return new WorkloadClaimFence(
+                new WorkloadClaimKey(clusterId, WorkloadClaimType.PIPELINE_ACTUATION, run.pipelineId()),
+                owner, run.claimGeneration(), run.executionGeneration(), topology);
     }
 
     /** Records FAILED once member loss is visible or a post-detection view confirms none. */
