@@ -667,4 +667,8 @@ jobs:
           java-version: "21"
           cache: maven
       - name: image smoke (builds the boot jar + image, then runs the black-box checks)
-        run: bash deploy/docker/image-smoke.sh --build
+        env:
+          TAPSTATE_TEST_CLOUD_RELEASE_DIR: ${{ runner.temp }}/image-test-release
+        run: |
+          python3 deploy/cloud/prepare-test-inputs.py --output "$TAPSTATE_TEST_CLOUD_RELEASE_DIR"
+          bash deploy/docker/image-smoke.sh --build
