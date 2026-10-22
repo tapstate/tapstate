@@ -240,7 +240,7 @@ final class PdkSinkWriter implements SinkWriter {
     }
 
     private TapRecordEvent encode(Envelope env) {
-        return (TapRecordEvent) TapEventCodec.encode(env, connector.codecs());
+        return (TapRecordEvent) TapEventCodec.encode(env, connector.conversions());
     }
 
     /** Reforge a row envelope into an insert (append mode): the row's payload becomes an inserted row. */
