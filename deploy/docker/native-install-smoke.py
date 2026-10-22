@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import subprocess
 import time
+import uuid
 
 DIRECTORY = "/var/lib/tapstate/installation"
 JAR = "/opt/tapstate/tapstate.jar"
@@ -39,15 +40,30 @@ def prepare(args):
 
 
 def owned_container(*args, body=None):
-    identity = command("docker", "create", *args).decode().strip()
-    if not re.fullmatch(r"[0-9a-f]{64}", identity):
-        raise RuntimeError("Docker did not return an exact created container identity")
+    owner = uuid.uuid4().hex
+    name = "tapstate-native-install-" + owner
+    label = "io.tapstate.native-install-smoke.owner"
     try:
+        identity = command("docker", "create", "--name", name, "--label", label + "=" + owner, *args).decode().strip()
+        if not re.fullmatch(r"[0-9a-f]{64}", identity):
+            raise RuntimeError("Docker did not return an exact created container identity")
         flags = ("--attach", "--interactive") if body is not None else ("--attach",)
         command("docker", "start", *flags, identity, body=body)
     finally:
-        # A CLI timeout must not leave its container running with this fixture's volume mounted.
-        command("docker", "rm", "--force", "--volumes", identity)
+        # The preassigned name also finds a create whose successful response was lost.
+        try:
+            result = subprocess.run(["docker", "inspect", "-f",
+                    '{{index .Config.Labels "' + label + '"}} {{.Id}}', name],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            raise RuntimeError("could not verify smoke helper cleanup; inspect " + name) from None
+        fields = result.stdout.decode().strip().split()
+        if result.returncode == 0 and len(fields) == 2 and fields[0] == owner and re.fullmatch(r"[0-9a-f]{64}", fields[1]):
+            command("docker", "rm", "--force", "--volumes", fields[1])
+        elif result.returncode == 0:
+            raise RuntimeError("refusing to remove an unowned smoke helper container")
+        else:
+            raise RuntimeError("could not verify smoke helper cleanup; inspect " + name)
 
 
 def document(server, filename):

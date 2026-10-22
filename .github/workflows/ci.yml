@@ -455,6 +455,7 @@ jobs:
         run: |
           bash deploy/docker/image-smoke-test.sh
           bash deploy/docker/image-smoke-fixture-test.sh
+          PYTHONDONTWRITEBYTECODE=1 python3 deploy/docker/native-install-smoke-test.py
       - name: Web asset packaging cases
         run: bash scripts/prepare-web-assets-smoke.sh
       - name: Web release provenance cases
