@@ -178,6 +178,7 @@ class MongoCacheConnectorRegistryIT {
         withFixture(f -> {
             byte[] large = new byte[17 * 1024 * 1024]; Arrays.fill(large, (byte) 37);
             var chunks = new AtomicInteger(); var files = new AtomicInteger(); var publication = new AtomicInteger();
+            var largestReadBatch = new AtomicInteger();
             var listener = new CommandListener() {
                 @Override public void commandStarted(CommandStartedEvent e) {
                     if (inserts(e, "connector_artifacts.chunks")) {
@@ -190,11 +191,19 @@ class MongoCacheConnectorRegistryIT {
                         assertThat(e.getCommand().getBoolean("autocommit").getValue()).isFalse(); publication.incrementAndGet();
                     }
                 }
+                @Override public void commandSucceeded(CommandSucceededEvent e) {
+                    var cursor = e.getResponse().getDocument("cursor", new org.bson.BsonDocument());
+                    if (cursor.getString("ns", new org.bson.BsonString("")).getValue().endsWith(".connector_artifacts.chunks")) {
+                        var batch = cursor.getArray("firstBatch", cursor.getArray("nextBatch", new org.bson.BsonArray()));
+                        largestReadBatch.accumulateAndGet(batch.size(), Math::max);
+                    }
+                }
             };
             try (var observed = client(listener)) {
                 var result = f.registry(observed, ACTIVE).register("large", "1", RegistrationSource.REGISTER, large);
-                assertThat(result.newlyRegistered()).isTrue(); assertThat(f.registry().artifact(result.registration().contentHash())).contains(large);
+                assertThat(result.newlyRegistered()).isTrue(); assertThat(f.registry(observed, ACTIVE).artifact(result.registration().contentHash())).contains(large);
                 assertThat(chunks.get()).isGreaterThan(1); assertThat(files).hasValue(1); assertThat(publication).hasValue(1);
+                assertThat(largestReadBatch.get()).as("wire responses retain a bounded set of chunks").isBetween(1, 8);
                 assertThat(f.admissions()).isEqualTo(1);
             }
         });

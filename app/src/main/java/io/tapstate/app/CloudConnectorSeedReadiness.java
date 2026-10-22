@@ -42,6 +42,7 @@ import java.util.jar.Manifest;
 
 /** Verifies the immutable Cloud seed release before registration and refuses incomplete startup. */
 final class CloudConnectorSeedReadiness {
+    private static final org.slf4j.Logger LOG = org.slf4j.LoggerFactory.getLogger(CloudConnectorSeedReadiness.class);
 
     static final String LOCK_RESOURCE = "/META-INF/tapstate/connectors.lock.json";
     private static final List<String> IDS = List.of(
@@ -199,6 +200,9 @@ final class CloudConnectorSeedReadiness {
         try {
             present = registry.copyArtifactTo(artifact.sha256(), check);
         } catch (IOException | UncheckedIOException | TapstateException failure) {
+            LOG.warn("Stored connector verification failed [connector={}, error_code={}, exception_type={}].", artifact.id(),
+                    failure instanceof TapstateException coded ? coded.code().code() : BootError.CLOUD_CONNECTORS_INVALID.code(),
+                    failure.getClass().getSimpleName());
             throw invalid(artifact.id(), check.overflow ? "stored-artifact-mismatched" : "registered-artifact-unavailable");
         }
         if (required && !present) {

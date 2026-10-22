@@ -47,6 +47,7 @@ final class MongoCacheConnectorRegistry implements ConnectorRegistry {
     private static final String STAGED = "STAGED";
     private static final String PUBLISHED = "PUBLISHED";
     private static final int CHUNK_SIZE = 255 * 1024;
+    private static final int DOWNLOAD_BATCH_SIZE = 8;
     private static final Set<String> FILE_FIELDS = Set.of("_id", "length", "chunkSize", "uploadDate", "filename", "metadata");
     private static final Set<String> PUBLISHED_METADATA = Set.of("cacheScope", "publication", "contentHash", "connectorId", "pdkApiVersion", "source");
     private static final TransactionOptions TRANSACTION = TransactionOptions.builder().readConcern(ReadConcern.SNAPSHOT)
@@ -189,7 +190,7 @@ final class MongoCacheConnectorRegistry implements ConnectorRegistry {
     private void copyArtifact(Stored original, String contentHash, OutputStream target) throws IOException {
         try {
             active();
-            try (var stream = bucket.openDownloadStream(original.id())) {
+            try (var stream = bucket.openDownloadStream(original.id()).batchSize(DOWNLOAD_BATCH_SIZE)) {
                 ArtifactStreams.copyVerified(stream, guarded(target), contentHash, original.length());
             }
             active();
