@@ -149,7 +149,7 @@ public final class ValidationNestArrayMembers implements AutoCloseable {
         public ValidationCheckEvent.ReadBoundary read() { return read; }
         public List<ValidationRootCheck.Finding> causes() { return causes; }
         public long accountedBytes() { return accountedBytes; }
-        List<SourceGroup> groups() { return groups; }
+        public List<SourceGroup> groups() { return groups; }
     }
 
     private final ValidationObservation observation;

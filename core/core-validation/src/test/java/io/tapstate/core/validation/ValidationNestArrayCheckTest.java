@@ -65,6 +65,18 @@ class ValidationNestArrayCheckTest {
         }
     }
 
+    @Test void sourceProblemsImportedBeforeTargetCheckingAreNotCountedAgain() {
+        var observation = observation(102, 1);
+        var facts = members(observation, List.of(member(11, 1, "A"), member(12, 1, "B")),
+                List.of(member(11, 1, "A"), member(12, 1, "B")));
+        var root = builder(observation, ValidationMethod.FULL_COLUMN);
+        var location = new Location(facts.groups().getFirst().scope(), List.of());
+        var cause = new Finding(Kind.SOURCE_DUPLICATE, location, Optional.of(new Multiplicity(2, true)));
+        root.finding(cause).notCompared(Check.STRUCTURE, location, cause).notCompared(Check.VALUES, location, cause);
+        ValidationNestArrayCheck.check(facts, root, group -> { throw new AssertionError("Both sides are duplicated"); });
+        assertThat(finish(root).counts()).containsExactlyInAnyOrderEntriesOf(Map.of(Kind.SOURCE_DUPLICATE, 1L, Kind.TARGET_DUPLICATE, 1L));
+    }
+
     @Test void targetDuplicatesAndAbsentMembersRetainInapplicablePathsWithoutPickingWinners() {
         var root = observation(102, 1);
         var facts = members(root, List.of(member(11, 1, "A"), member(12, 2, "B")),

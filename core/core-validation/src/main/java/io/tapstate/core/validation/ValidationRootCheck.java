@@ -416,6 +416,12 @@ public final class ValidationRootCheck {
             }
         }
 
+        boolean hasSourceFinding(Finding finding) {
+            ensureOpen();
+            if (!finding.kind().sourceProblem()) throw ValidationError.invalid("rootCheck.sourceFinding");
+            return findings.containsKey(finding);
+        }
+
         Builder requireBlocked(Check check, Location location) {
             return mutate(() -> {
                 if (blocked.stream().noneMatch(item -> item.check() == check && item.location().equals(location))) {

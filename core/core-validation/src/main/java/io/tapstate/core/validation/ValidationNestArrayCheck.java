@@ -72,7 +72,8 @@ public final class ValidationNestArrayCheck {
             root.read(Side.SOURCE, source.read());
             var array = new Location(actual.root(), new java.util.ArrayList<>(source.arrayPath()));
             for (var cause : source.causes()) {
-                root.finding(cause).notCompared(Check.STRUCTURE, array, cause);
+                recordSourceFinding(root, cause, Optional.empty());
+                root.notCompared(Check.STRUCTURE, array, cause);
                 if (root.method() == ValidationMethod.FULL_COLUMN) root.notCompared(Check.VALUES, array, cause);
             }
             for (var group : source.groups()) {
@@ -98,8 +99,15 @@ public final class ValidationNestArrayCheck {
     private static void sourceProblem(long count, Location location, Optional<SampledSide> sample, Builder root, boolean exact) {
         Finding cause = count > 1 ? new Finding(Kind.SOURCE_DUPLICATE, location, Optional.of(new Multiplicity(count, exact)))
                 : new Finding(Kind.SOURCE_ROW_DUPLICATE, location, Optional.of(new Multiplicity(2, false)));
-        root.finding(cause, sample, Optional.empty()).notCompared(Check.STRUCTURE, location, cause);
+        recordSourceFinding(root, cause, sample);
+        root.notCompared(Check.STRUCTURE, location, cause);
         if (root.method() == ValidationMethod.FULL_COLUMN) root.notCompared(Check.VALUES, location, cause);
+    }
+
+    private static void recordSourceFinding(Builder root, Finding cause, Optional<SampledSide> sample) {
+        // Source-only staging may already have imported this exact observation before the target read.
+        sample.ifPresent(value -> root.requireSampleRead(Side.SOURCE, value));
+        if (!root.hasSourceFinding(cause)) root.finding(cause, sample, Optional.empty());
     }
 
     private static void requireScope(ValidationNestArrayMembers.Result members, Builder root) {

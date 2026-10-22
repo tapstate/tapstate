@@ -62,6 +62,80 @@ public final class ValidationRootReader {
                     .map(issue -> new SourceIssue(issue.finding(), issue.sample(), issue.affected())).toList());
         }
 
+        /** Source array identity problems survive a missing or duplicated target root and absent content callbacks. */
+        public static SourceEvidence fromArraySource(ValidationObservation root, ValidationNestArrayMembers.Source source, long maxBytes) {
+            Objects.requireNonNull(root, "root"); Objects.requireNonNull(source, "source");
+            requireNestedScope(root, source.observation());
+            var facts = new ArrayFacts(root, source.accountedBytes(), maxBytes);
+            for (var group : source.groups()) if (group.conflict()) facts.group(group, source.read(), true);
+            return facts.finish(source.read());
+        }
+
+        /** Unknown membership blocks the whole array, while known source duplicates keep lower-bound multiplicity. */
+        public static SourceEvidence fromUncertainArraySource(ValidationObservation root, ValidationNestArrayMembers.UncertainSource source, long maxBytes) {
+            Objects.requireNonNull(root, "root"); Objects.requireNonNull(source, "source");
+            requireNestedScope(root, source.observation());
+            var facts = new ArrayFacts(root, source.accountedBytes(), maxBytes);
+            var array = new Location(source.observation().root(), new ArrayList<>(source.arrayPath()));
+            for (var cause : source.causes()) facts.add(cause, Optional.empty(), array);
+            for (var group : source.groups()) if (group.conflict()) facts.group(group, source.read(), false);
+            return facts.finish(source.read());
+        }
+
+        private static final class ArrayFacts {
+            private final ValidationObservation root;
+            private final long limit;
+            private final Map<Finding, SourceIssue> issues = new LinkedHashMap<>();
+            private long bytes;
+            private ArrayFacts(ValidationObservation root, long retained, long limit) {
+                if (limit < 1 || limit > 32L * 1024 * 1024) throw invalid("rootRead.arrayEvidenceLimit");
+                this.root = root; this.limit = limit;
+                charge(retained + 256);
+            }
+            private void group(ValidationNestArrayMembers.SourceGroup group, ValidationCheckEvent.ReadBoundary read, boolean exact) {
+                var at = new Location(group.scope(), List.of());
+                var cause = new Finding(group.count() > 1 ? Kind.SOURCE_DUPLICATE : Kind.SOURCE_ROW_DUPLICATE, at,
+                        Optional.of(new Multiplicity(group.count() > 1 ? group.count() : 2, group.count() > 1 && exact)));
+                var sample = group.samples().isEmpty() ? Optional.<SampledSide>empty() : Optional.of(new SampledSide(
+                        group.samples().getFirst().physical(), group.samples().getFirst().original(), read.readId()));
+                add(cause, sample, at);
+            }
+            private void add(Finding cause, Optional<SampledSide> sample, Location affected) {
+                var previous = issues.get(cause);
+                if (previous == null) {
+                    if (issues.size() == 256) throw new io.tapstate.core.common.TapstateException(ValidationError.VALUE_LIMIT_EXCEEDED, Map.of("limit", "rootRead.arrayEvidenceIssues"), null);
+                    charge(256 + locationBytes(cause.location()) + sample.map(SampledSide::accountedBytes).orElse(0L));
+                } else if (previous.sample().isPresent()) sample = previous.sample();
+                else if (sample.isPresent()) charge(sample.orElseThrow().accountedBytes());
+                var paths = new LinkedHashSet<Location>();
+                if (previous != null) paths.addAll(previous.affected());
+                if (paths.add(affected)) {
+                    if (paths.size() > 256) throw new io.tapstate.core.common.TapstateException(ValidationError.VALUE_LIMIT_EXCEEDED, Map.of("limit", "rootRead.arrayEvidencePaths"), null);
+                    charge(64 + locationBytes(affected));
+                }
+                issues.put(cause, new SourceIssue(cause, sample, new ArrayList<>(paths)));
+            }
+            private SourceEvidence finish(ValidationCheckEvent.ReadBoundary read) {
+                charge(128L + 2L * read.readId().length() + 2L * read.contractVersion().length());
+                return new SourceEvidence(root, List.of(read), new ArrayList<>(issues.values()));
+            }
+            private void charge(long amount) {
+                if (amount > limit - bytes) throw new io.tapstate.core.common.TapstateException(ValidationError.VALUE_LIMIT_EXCEEDED,
+                        Map.of("limit", "rootRead.arrayEvidence"), null);
+                bytes += amount;
+            }
+            private static long locationBytes(Location location) {
+                var scope = location.scope();
+                long bytes = 128L + 2L * (scope.mappingId().length() + scope.outputId().length()) + scope.rootKey().retainedBytes();
+                for (var ancestor : scope.ancestors()) {
+                    bytes += 64 + ancestor.key().retainedBytes();
+                    for (String segment : ancestor.fieldPath()) bytes += 40L + 2L * segment.length();
+                }
+                for (Object segment : location.fieldPath()) bytes += segment instanceof String text ? 40L + 2L * text.length() : 24;
+                return bytes;
+            }
+        }
+
         /** Records each conflict cause once, retaining all affected literal/embedded locations. */
         public static SourceEvidence fromFieldConflicts(ValidationObservation root, ValidationObservation parent,
                 ValidationNestFieldCheck.Result fields, Optional<SampledSide> originalParent) {
