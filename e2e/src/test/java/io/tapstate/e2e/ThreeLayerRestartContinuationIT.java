@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import io.tapstate.adapters.mongostore.MongoCacheDomain;
 import io.tapstate.adapters.mongostore.MongoConfigurationBootstrap;
+import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
 import io.tapstate.app.BCryptPasswordHasher;
 import io.tapstate.core.lifecycle.LifecycleVerb;
@@ -12,6 +13,13 @@ import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.store.StorageBinding;
 import io.tapstate.spi.store.StorageSetupScope;
 import io.tapstate.spi.store.User;
+import io.tapstate.spi.store.*;
+import io.tapstate.core.dsl.DslParser;
+import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.canonical.CanonicalHash;
+import com.mongodb.client.MongoClients;
+import org.bson.Document;
 import io.tapstate.testsupport.RequiresDocker;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -48,22 +56,7 @@ class ThreeLayerRestartContinuationIT {
         String cacheDb = "cache_" + suffix;
         String sourceUri = DATA.getReplicaSetUrl("source_" + suffix);
         String targetUri = DATA.getReplicaSetUrl("target_" + suffix);
-        var scope = new StorageSetupScope(cluster, "installation", "setup", 1);
-        var binding = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,
-                CACHE.getReplicaSetUrl(cacheDb), cacheDb, null);
-        try (var configuration = MongoConfigurationBootstrap.prepare(
-                new MongoConnectionSettings(configUri, null, Duration.ofSeconds(5)), cluster, "installation", "setup", 1)) {
-            var target = new SourceResource("views", null, "mongodb", Map.of("isUri", true, "uri", targetUri),
-                    null, null, null, null);
-            var committed = configuration.bindings().commitWithFirstCache(scope, StorageBinding.Mode.OP, binding, target);
-            try (var cache = MongoCacheDomain.connect(binding, Duration.ofSeconds(5), "fixture")) {
-                cache.prepareFirstAuth(committed.firstCreation().orElseThrow());
-                cache.prepareInitialBusiness(committed.preparation(), () -> {});
-            }
-            configuration.bindings().complete(scope);
-            configuration.firstAdmin().create(configuration.firstAdmin().load().orElseThrow().scope(),
-                    new User("admin", new BCryptPasswordHasher().hash("native-restart-password"), "admin"));
-        }
+        prepareStorage(configUri, cacheDb, targetUri, cluster);
         EndpointAddress source = EndpointAddress.uri(sourceUri), target = EndpointAddress.uri(targetUri);
         try (var mongo = new MongoEndpoints()) {
             mongo.seed(source, TABLE, SeedRows.generated(8));
@@ -114,6 +107,92 @@ class ThreeLayerRestartContinuationIT {
                 assertThat(rows(mongo, target)).isEqualTo(rows(mongo, source))
                         .containsEntry(1L, 10L).containsEntry(2L, 22L).containsEntry(4L, 44L).containsEntry(9L, 90L)
                         .doesNotContainKey(3L);
+            }
+        }
+    }
+
+    private static void prepareStorage(String configUri, String cacheDb, String targetUri, String cluster) {
+        var scope = new StorageSetupScope(cluster, "installation", "setup", 1);
+        var binding = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB, CACHE.getReplicaSetUrl(cacheDb), cacheDb, null);
+        try (var configuration = MongoConfigurationBootstrap.prepare(
+                new MongoConnectionSettings(configUri, null, Duration.ofSeconds(5)), cluster, "installation", "setup", 1)) {
+            var target = new SourceResource("views", null, "mongodb", Map.of("isUri", true, "uri", targetUri),
+                    null, null, null, null);
+            var committed = configuration.bindings().commitWithFirstCache(scope, StorageBinding.Mode.OP, binding, target);
+            try (var cache = MongoCacheDomain.connect(binding, Duration.ofSeconds(5), "fixture")) {
+                cache.prepareFirstAuth(committed.firstCreation().orElseThrow());
+                cache.prepareInitialBusiness(committed.preparation(), () -> {});
+            }
+            configuration.bindings().complete(scope);
+            configuration.firstAdmin().create(configuration.firstAdmin().load().orElseThrow().scope(),
+                    new User("admin", new BCryptPasswordHasher().hash("native-restart-password"), "admin"));
+        }
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    @Timeout(180)
+    void aNewRuntimeReclaimsTheFrozenPayloadOfAnAlreadyDeletedPipeline(boolean unreadableEarlier) {
+        String suffix = UUID.randomUUID().toString().replace("-", "");
+        String cluster = "cleanup-" + suffix, configDb = "cleanup_cfg_" + suffix, cacheDb = "cleanup_cache_" + suffix;
+        String configUri = CONFIG.getReplicaSetUrl(configDb);
+        prepareStorage(configUri, cacheDb, DATA.getReplicaSetUrl("cleanup_target_" + suffix), cluster);
+        var connection = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB, CACHE.getReplicaSetUrl(cacheDb), cacheDb, null);
+        var active = (Runnable) () -> {};
+        var owner = new WorkloadOwner("fixture-node", "fixture-boot");
+        var ttl = Duration.ofMinutes(2);
+        try (var configuration = MongoConfigurationDomain.open(new MongoConnectionSettings(configUri, null, Duration.ofSeconds(5)), cluster);
+             var cache = MongoCacheDomain.connect(connection, Duration.ofSeconds(5), "retired-fixture")) {
+            var business = configuration.bindings().cachePreparation().orElseThrow().businessScope();
+            var claims = cache.workloadClaims(business);
+            var node = claims.acquire(new WorkloadClaimKey(cluster, WorkloadClaimType.NODE_SESSION, owner.nodeId()), owner, 1, ttl).claim();
+            var nodeFence = WorkloadClaimFence.from(node);
+            var pipeline = (PipelineResource) new DslParser().parse("version: tapstate/v1\nkind: pipeline\nid: retired\nsource: []\n");
+            configuration.artifacts().create(pipeline);
+            var old = new PipelineIntentScope(cluster, business.bindingVersion(), business.cacheIncarnation(), "retired", 1);
+            configuration.intents().compareAndSet(old, 0, new DesiredState("retired", PipelineState.STOPPED, CanonicalHash.of(pipeline), true));
+            var grant = ((FirstPipelineCreationResult.Issued) configuration.preparations().issueFirstCreate(old, nodeFence)).creation();
+            var preparer = cache.pipelinePreparations(business, active);
+            configuration.preparations().complete(preparer.seed(preparer.reserveFirst(grant, ttl), configuration.preparations(), java.time.Instant.now()));
+            var claim = claims.advanceExecution(claims.readPipeline(old).orElseThrow().claim(), 1, java.util.Set.of(owner.nodeId())).orElseThrow();
+            var location = new OperatorPlacement(old, cacheDb, OperatorPlacement.Resource.JOIN_FACTS, "join", "fact", "facts");
+            var cold = cache.operatorState(location, WorkloadClaimFence.from(claim), active);
+            for (int index = 0; index < 270; index++) cold.save(location.mapName(), "key-" + index, new byte[]{1, 2});
+            var successor = new PipelineIntentScope(cluster, business.bindingVersion(), business.cacheIncarnation(), "retired", 2);
+            var request = new PipelineRebuildRequest("fixture-full", configuration.intents().load("retired").orElseThrow(),
+                    WorkloadClaimFence.from(claim), 0, PipelinePreparationInputs.of(successor, pipeline, Map.of(), Map.of()));
+            var pending = configuration.rebuilds().begin(request);
+            var receipt = cache.pipelineRebuilds(business, active).prepare(pending, nodeFence, ttl, java.time.Instant.now());
+            configuration.rebuilds().complete(receipt);
+            var replacementClaim = WorkloadClaimFence.from(claims.advanceExecution(claims.readPipeline(successor).orElseThrow().claim(),
+                    1, java.util.Set.of(owner.nodeId())).orElseThrow());
+            var laterLocation = new OperatorPlacement(successor, cacheDb, OperatorPlacement.Resource.JOIN_FACTS, "join", "fact", "facts");
+            cache.operatorState(laterLocation, replacementClaim, active).save(laterLocation.mapName(), "later", new byte[]{9});
+            var deletion = configuration.retirements().begin(new PipelineRetirementRequest("fixture-delete", successor,
+                    CanonicalHash.of(pipeline), java.util.Optional.of(new PipelineRetirementRequest.CacheOriginal(replacementClaim,
+                    cache.pipelineStates(successor).read("retired").orElseThrow().epoch()))));
+            configuration.retirements().complete(cache.pipelineRetirements(business, active).retire(deletion, nodeFence));
+            assertThat(configuration.intents().pipelineIds()).doesNotContain("retired");
+            assertThat(cache.retiredPipelinePayloads(business, active).find(old)).isPresent();
+            assertThat(claims.release(node)).isTrue();
+        }
+        try (var client = MongoClients.create(CACHE.getReplicaSetUrl()); var configClient = MongoClients.create(CONFIG.getReplicaSetUrl())) {
+            var rows = client.getDatabase(cacheDb).getCollection("join_facts");
+            assertThat(rows.countDocuments()).isEqualTo(271);
+            var mapping = configClient.getDatabase(configDb).getCollection("operator_generations").find(new Document("_id", "retired")).first();
+            assertThat(mapping).isNotNull().containsEntry("phase", "RETIRED").containsEntry("stateGeneration", 2L);
+            var ledger = client.getDatabase(cacheDb).getCollection("operator_cleanup");
+            if (unreadableEarlier) ledger.updateOne(new Document("_id.stateGeneration", 1L),
+                    new Document("$set", new Document("retirement.contentHash", "b".repeat(64))));
+            var inventories = ledger.find().sort(new Document("_id", 1)).into(new java.util.ArrayList<>());
+            assertThat(inventories).hasSize(2);
+            try (var server = start(configUri, cluster)) {
+                login(server);
+                Await.until("the new runtime to reclaim retained deleted-pipeline payloads in bounded passes", Duration.ofSeconds(20),
+                        () -> rows.countDocuments() == (unreadableEarlier ? 270 : 0), () -> "retained rows=" + rows.countDocuments());
+                assertThat(rows.countDocuments(new Document("_id.placement.scope.stateGeneration", 2L))).isZero();
+                assertThat(configClient.getDatabase(configDb).getCollection("operator_generations").find(new Document("_id", "retired")).first()).isEqualTo(mapping);
+                assertThat(client.getDatabase(cacheDb).getCollection("operator_cleanup").find().sort(new Document("_id", 1)).into(new java.util.ArrayList<>())).isEqualTo(inventories);
             }
         }
     }

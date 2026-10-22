@@ -83,6 +83,24 @@ final class MongoRetiredPipelinePayloads implements RetiredPipelinePayloads {
             active.run();return deleted;
         });
     }
+    @Override public List<PipelineIntentScope> listAfter(PipelineIntentScope after, int limit) {
+        if (limit <= 0 || limit > 128) throw new IllegalArgumentException("invalid retired inventory page");
+        if (after != null) requireScope(after);
+        return transaction(session -> {
+            var filter = new Document("_id.clusterId", business.clusterId()).append("_id.bindingVersion", business.bindingVersion())
+                    .append("_id.cacheIncarnation", business.cacheIncarnation()).append("retirement", new Document("$exists", true));
+            if (after != null) filter.append("_id", new Document("$gt", MongoPipelinePreparationFacts.scope(after)));
+            var result = new ArrayList<PipelineIntentScope>();
+            for (var row : SystemCollections.CACHE_OPERATOR_CLEANUP.on(database).find(session, filter)
+                    .sort(new Document("_id", 1)).limit(limit)) {
+                try { result.add(MongoPipelinePreparationFacts.scope(row.get("_id", Document.class))); }
+                catch (IllegalArgumentException | ClassCastException | NullPointerException malformed) {
+                    throw new io.tapstate.core.common.TapstateException(IoError.CACHE_BUSINESS_FENCED, Map.of(), malformed);
+                }
+            }
+            return List.copyOf(result);
+        });
+    }
     private static long reclaimRows(ClientSession session,MongoCollection<Document> table,Document filter,int remaining) {
         if(remaining<=0)return 0;var ids=new ArrayList<Object>();
         for(var row:table.find(session,filter).projection(new Document("_id",1)).limit(remaining))ids.add(row.get("_id"));

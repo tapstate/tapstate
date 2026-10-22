@@ -42,6 +42,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
     private GenericApplicationContext context;
     private ThreeLayerStorePort port;
     private NativeMemberStorage memberStorage;
+    private RetiredPipelinePayloadCleanup payloadCleanup;
     private List<HandlerMapping> handlers = List.of();
 
     NativeBusinessContext(StorageRoot root, StorageRuntime.Bound original, ConfigurableApplicationContext parent) {
@@ -178,7 +179,11 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         active.set(false); handlers = List.of();
         Object member = context == null ? null : context.getBeanFactory().getSingleton("hazelcastMember");
         Throwable failure = null;
-        try { if (memberStorage != null) memberStorage.close(); } catch (RuntimeException | Error cleanup) { failure = cleanup; }
+        try { if (payloadCleanup != null) { payloadCleanup.close(); payloadCleanup = null; } }
+        catch (RuntimeException | Error cleanup) { failure = cleanup; }
+        try { if (memberStorage != null) memberStorage.close(); } catch (RuntimeException | Error cleanup) {
+            if (failure == null) failure = cleanup; else if (failure != cleanup) failure.addSuppressed(cleanup);
+        }
         try { if (context != null) context.close(); } catch (RuntimeException | Error cleanup) {
             if (failure == null) failure = cleanup; else if (failure != cleanup) failure.addSuppressed(cleanup);
         }
@@ -374,6 +379,15 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                     () -> node.active() && (cluster.getProfile() == ClusterProperties.Profile.SINGLE || membership.businessEligible()),
                     ownership, new ConvergenceDriver.ScopedPorts(owner.configuration.intents(), owner.original.cache(),
                             owner.memberStorage::requireNode, pass -> actuator.forPass(pass, ports), pass -> admission, admission::retain));
+        }
+        @Bean(initMethod = "start", destroyMethod = "")
+        RetiredPipelinePayloadCleanup retiredPipelinePayloadCleanup(NativeBusinessContext owner, NodeSessionLease node) {
+            var scope = owner.original.preparation().businessScope();
+            if (owner.payloadCleanup != null) throw new IllegalStateException("retired payload cleanup already owned");
+            owner.payloadCleanup = new RetiredPipelinePayloadCleanup(guard -> owner.original.cache().retiredPipelinePayloads(scope, () -> {
+                guard.run(); owner.memberStorage.requireNode();
+            }), node::currentFence, () -> owner.active.get() && node.active());
+            return owner.payloadCleanup;
         }
         @Bean RequestMappingHandlerMapping runtimeRequestMappingHandlerMapping() {
             var mapping = new RequestMappingHandlerMapping(); mapping.setOrder(0);

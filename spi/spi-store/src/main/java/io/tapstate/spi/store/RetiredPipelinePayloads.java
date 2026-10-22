@@ -16,6 +16,8 @@ public interface RetiredPipelinePayloads {
     Optional<Original> find(PipelineIntentScope scope);
     /** Page only frozen inventories for one logical Pipeline, in increasing original generation. */
     List<Original> list(String pipelineId,long afterGeneration,int limit);
+    /** Pages retired coordinates only; each frozen inventory must be verified separately by find. */
+    List<PipelineIntentScope> listAfter(PipelineIntentScope after, int limit);
     /** At most 256 original payload rows; small history and shared database identities remain. */
     long reclaim(Original original,WorkloadClaimFence currentNode);
 }
