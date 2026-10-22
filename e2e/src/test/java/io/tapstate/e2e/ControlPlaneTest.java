@@ -53,6 +53,39 @@ class ControlPlaneTest {
     }
 
     @Test
+    void nonPositivePublicationBudgetsAreRejectedWithoutReadingMetrics() throws Exception {
+        try (SnapshotMetrics fixture = new SnapshotMetrics(List.of(Map.of("alpha", 2L)))) {
+            for (Duration invalid : List.of(Duration.ZERO, Duration.ofNanos(-1))) {
+                assertThatThrownBy(() -> fixture.control.awaitSnapshotRowsRead(PIPELINE, Set.of("alpha"), invalid))
+                        .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("positive");
+            }
+            assertThat(fixture.reads.get()).isZero();
+        }
+    }
+
+    @Test
+    void collidingTableNamesKeepTheirQualifiedKeysAndSeparateCounts() throws Exception {
+        try (SnapshotMetrics fixture = new SnapshotMetrics(List.of(
+                Map.of("left.orders", 2L), Map.of("left.orders", 2L, "right.orders", 5L)))) {
+            assertThat(fixture.control.awaitSnapshotRowsRead(
+                    PIPELINE, Set.of("left.orders", "right.orders")))
+                    .containsExactlyInAnyOrderEntriesOf(Map.of("left.orders", 2L, "right.orders", 5L));
+            assertThat(fixture.reads.get()).isEqualTo(2);
+        }
+    }
+
+    @Test
+    void aCompleteSampleIsReturnedBeforeALaterSampleCanRepairItsWrongCounts() throws Exception {
+        try (SnapshotMetrics fixture = new SnapshotMetrics(List.of(
+                Map.of("alpha", 2L, "beta", 99L), Map.of("alpha", 2L, "beta", 3L)))) {
+            assertThat(fixture.control.awaitSnapshotRowsRead(
+                    PIPELINE, Set.of("alpha", "beta"), Duration.ofSeconds(2)))
+                    .containsEntry("beta", 99L);
+            assertThat(fixture.reads.get()).isEqualTo(1);
+        }
+    }
+
+    @Test
     void readsThePublishedState() {
         assertThat(ControlPlane.interpretState(200, status("RUNNING"), PIPELINE)).contains(PipelineState.RUNNING);
     }

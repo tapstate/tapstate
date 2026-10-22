@@ -49,6 +49,8 @@ final class ControlPlane {
 
     private static final Duration TIMEOUT = Duration.ofSeconds(20);
 
+    private static final Duration SNAPSHOT_METRICS_PUBLICATION_TIMEOUT = Duration.ofSeconds(5);
+
     /** How often a caller waiting on a pushed change looks again; a follow is told, never asked. */
     private static final Duration POLL = Duration.ofMillis(100);
 
@@ -2000,13 +2002,25 @@ final class ControlPlane {
         return read;
     }
 
-    /** The accepted sample itself, after every selected table has reached the metrics face. */
-    Map<String, Long> awaitSnapshotRowsRead(String pipelineId, Set<String> tables, Duration bound) {
+    /** A fresh publication allowance after the caller has proved durable completion. */
+    Map<String, Long> awaitSnapshotRowsRead(String pipelineId, Set<String> metricKeys) {
+        return awaitSnapshotRowsRead(pipelineId, metricKeys, SNAPSHOT_METRICS_PUBLICATION_TIMEOUT);
+    }
+
+    /**
+     * The accepted sample itself, containing every requested key from {@link #snapshotRowsRead}.
+     * Unique table names are bare; colliding names are {@code sourceId.table}. Keys and counts are
+     * preserved without aliasing or aggregation. The caller asserts the exact counts afterwards.
+     */
+    Map<String, Long> awaitSnapshotRowsRead(String pipelineId, Set<String> metricKeys, Duration bound) {
+        if (bound.isZero() || bound.isNegative()) {
+            throw new IllegalArgumentException("snapshot metric publication bound must be positive");
+        }
         AtomicReference<Map<String, Long>> observed = new AtomicReference<>(Map.of());
-        Await.until("snapshot read metrics for every selected table " + tables, bound, () -> {
+        Await.until("snapshot read metrics for every requested key " + metricKeys, bound, () -> {
             Map<String, Long> sample = snapshotRowsRead(pipelineId);
             observed.set(sample);
-            return sample.keySet().containsAll(tables);
+            return sample.keySet().containsAll(metricKeys);
         }, () -> observed.get().toString());
         return observed.get();
     }

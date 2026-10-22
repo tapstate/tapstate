@@ -150,16 +150,14 @@ class PauseInSnapshotResumesAtTheUnfinishedTableIT {
 
             // A durable synchronisation point rather than a sleep: the record itself is what says the two
             // tables are confirmed, and it is the only thing this test carries across the restart.
-            long confirmationDeadline = System.nanoTime() + TIMEOUT.toNanos();
-            awaitCompleted(storeUri, Set.of(FIRST, SECOND), confirmationDeadline);
+            awaitCompleted(storeUri, Set.of(FIRST, SECOND));
             assertThat(completedTables(storeUri))
                     .as("the third table is in no selection that has run, so nothing has confirmed it")
                     .doesNotContain(OWED);
 
-            // Durable completion can precede its sampled metrics. Share the original bound and take the
-            // accepted sample before stopping; the original exact row-count assertions remain below.
-            confirmingRunReads = control.awaitSnapshotRowsRead(PIPELINE, Set.of(FIRST, SECOND),
-                    Duration.ofNanos(Math.max(0L, confirmationDeadline - System.nanoTime())));
+            // The durable proof keeps its original bound. Metrics then get a separate, fresh publication
+            // allowance, so completion near that bound cannot reduce this phase to a single sample.
+            confirmingRunReads = control.awaitSnapshotRowsRead(PIPELINE, Set.of(FIRST, SECOND));
 
             // Stopped without clearing: the pipeline has to be at rest before its selection can be widened,
             // and what it confirmed has to survive that. A clearing stop would give its record back and the
@@ -215,7 +213,8 @@ class PauseInSnapshotResumesAtTheUnfinishedTableIT {
     }
 
     /** Waits until the chain record names every table a sink is expected to have confirmed. */
-    private static void awaitCompleted(String storeUri, Set<String> expected, long deadline) {
+    private static void awaitCompleted(String storeUri, Set<String> expected) {
+        long deadline = System.nanoTime() + TIMEOUT.toNanos();
         List<String> last = List.of();
         while (System.nanoTime() - deadline < 0) {
             last = completedTables(storeUri);

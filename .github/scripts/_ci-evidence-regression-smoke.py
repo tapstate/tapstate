@@ -48,13 +48,13 @@ class SourceIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'invalid production class file'):
             evidence.crc64(b'invalid')
 
-    def inventory(self, root, declaration, class_annotations='', parent='', preamble=''):
+    def inventory(self, root, declaration, class_annotations='', parent='', preamble='', type_declaration='class IdentityTest'):
         (root / 'core/src/test/java/sample').mkdir(parents=True, exist_ok=True)
         (root / 'pom.xml').write_text('<project><modules><module>core</module></modules></project>')
         (root / 'core/pom.xml').write_text('<project/>')
         source = root / 'core/src/test/java/sample/IdentityTest.java'
         source.write_text('package sample; import org.junit.jupiter.api.*; ' + preamble + ' '
-                          + class_annotations + ' class IdentityTest ' + parent + ' {\n' + declaration + '\n}')
+                          + class_annotations + ' ' + type_declaration + ' ' + parent + ' {\n' + declaration + '\n}')
         target = root / 'inventory.json'
         evidence.inventory(SimpleNamespace(root=str(root), lane='ci', kind=None, parameters=None,
             source_archive=None, source_receipt=None, published_connectors='unknown',
@@ -360,6 +360,147 @@ class SourceIdentityTests(unittest.TestCase):
                     self.assertEqual(inv['methods'][0]['mapping'], 'disabled-method')
                     name = 'disabled(String)' if 'String' in declaration else 'disabled'
                     self.assertTrue(self.observe(Path(temporary), inventory, name)['complete'])
+
+    def test_record_components_named_permits_do_not_hide_interfaces(self):
+        for declaration in ('record IdentityTest(int permits)',
+                'record IdentityTest(@TA( permits = "x") int value)'):
+            with self.subTest(declaration=declaration), tempfile.TemporaryDirectory() as temporary:
+                _, inv = self.inventory(Path(temporary), '@Test void disabled() {}', parent='implements Marker',
+                    preamble='@Disabled interface Marker {} @interface TA { String permits(); }',
+                    type_declaration=declaration)
+                self.assertTrue(inv['complete'], inv['unresolved'])
+                self.assertEqual(inv['methods'][0]['mapping'], 'disabled-method')
+
+    def test_type_use_annotations_do_not_hide_disabled_supertypes(self):
+        for annotation in ('@TA', '@TA(value="a")'):
+            with self.subTest(annotation=annotation), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                _, inv = self.inventory(root, '@Test void disabled() {}', parent='implements ' + annotation + ' Marker',
+                    preamble='@Disabled interface Marker {} @java.lang.annotation.Target(java.lang.annotation.ElementType.TYPE_USE) @interface TA { String[] value() default {}; }')
+                self.assertEqual([m['mapping'] for m in inv['methods']], ['disabled-method'])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.inventory(root, '@Test void disabled() {}')
+            (root / 'core/src/test/java/sample/Base.java').write_text('package sample; import org.junit.jupiter.api.Disabled; '
+                '@java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.RUNTIME) '
+                '@java.lang.annotation.Inherited @Disabled @interface Slow {} @Slow class Base {}')
+            _, inv = self.inventory(root, '@Test void disabled() {}', parent='extends @TA Base',
+                preamble='@java.lang.annotation.Target(java.lang.annotation.ElementType.TYPE_USE) @interface TA {}')
+            self.assertEqual([m['mapping'] for m in inv['methods']], ['disabled-method'])
+
+    def test_type_use_annotation_itself_does_not_disable_the_test(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, inv = self.inventory(Path(temporary), '@Test void ordinary() {}', parent='implements @TA Marker',
+                preamble='@java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.RUNTIME) '
+                    '@java.lang.annotation.Target(java.lang.annotation.ElementType.TYPE_USE) @Disabled @interface TA {} interface Marker {}')
+            self.assertTrue(inv['complete'], inv['unresolved'])
+            self.assertEqual([m['mapping'] for m in inv['methods']], ['method'])
+
+    def test_annotation_array_braces_preserve_class_record_and_enum_bodies(self):
+        for declaration, parent in [('class IdentityTest', 'implements @TA({"a", "b"}) Marker'),
+                ('record IdentityTest(@TA({"a", "b"}) int value)', '')]:
+            with self.subTest(declaration=declaration), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                preamble = 'interface Marker {} @java.lang.annotation.Target({java.lang.annotation.ElementType.TYPE_USE, java.lang.annotation.ElementType.RECORD_COMPONENT}) @interface TA { String[] value(); }'
+                # Check the owner first, so the old truncated span fails for the expected reason.
+                text = preamble + ' ' + declaration + ' ' + parent + ' { @Test void ordinary() {} }'
+                node = next(n for n in evidence.class_declarations(text, evidence.masked(text), '')
+                            if n['name'] == 'IdentityTest')
+                self.assertEqual(text[node['start'] + 1:node['end']].strip(), '@Test void ordinary() {}')
+                _, inv = self.inventory(root, '@Test void ordinary() {}', parent=parent,
+                    preamble=preamble, type_declaration=declaration)
+                self.assertEqual([m['method'] for m in inv['methods']], ['ordinary'])
+        text = 'enum Flavor implements @TA({"a", "b"}) Marker { ONE, TWO; }'
+        node = evidence.class_declarations(text, evidence.masked(text), '')[0]
+        self.assertEqual(text[node['start'] + 1:node['end']].strip(), 'ONE, TWO;')
+        self.assertEqual(evidence.enum_constants(text, 'Flavor'), ['ONE', 'TWO'])
+
+    def test_qualified_package_fallback_keeps_nonmatching_and_nested_definitions(self):
+        for annotation in ('sample.Hidden', 'sample.Holder.Hidden'):
+            with self.subTest(annotation=annotation), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                self.inventory(root, '@Test void disabled() {}')
+                definition = root / 'core/src/test/java/sample/Other.java'
+                declaration = '@java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.RUNTIME) @Disabled @interface Hidden {}'
+                definition.write_text('package sample; import org.junit.jupiter.api.Disabled; '
+                    + (('class Holder { ' + declaration + ' }') if 'Holder' in annotation else declaration))
+                _, inv = self.inventory(root, '@Test void disabled() {}', '@' + annotation)
+                self.assertEqual([m['mapping'] for m in inv['methods']], ['disabled-method'])
+                self.assertEqual(inv['sources'][definition.relative_to(root).as_posix()],
+                    hashlib.sha256(definition.read_bytes()).hexdigest())
+
+    def test_injected_temp_dir_accepts_token_separators_without_reading_annotation_strings(self):
+        for separator in (' ', '\n', '/* token separator */'):
+            with self.subTest(separator=separator), tempfile.TemporaryDirectory() as temporary:
+                _, inv = self.inventory(Path(temporary), '@ParameterizedTest @ValueSource(strings={"a"}) '
+                    'void injected(String value, @' + separator + 'TempDir java.nio.file.Path directory) {}')
+                self.assertTrue(inv['complete'], inv['unresolved'])
+                self.assertEqual(inv['methods'][0]['argument_digests'], [evidence.argument_digest([
+                    ['java.lang.String', 'a'], ['injected', 'org.junit.jupiter.api.io.TempDir', 'java.nio.file.Path']])])
+        with tempfile.TemporaryDirectory() as temporary:
+            _, inv = self.inventory(Path(temporary), '@ParameterizedTest @ValueSource(strings={"a"}) '
+                'void ordinary(String value, @Label("@ TempDir") java.nio.file.Path directory) {}')
+            self.assertFalse(inv['complete'])
+
+    def test_before_all_accepts_token_separators_and_retains_gate_policy(self):
+        for separator in (' ', '\n', '/* token separator */'):
+            with self.subTest(separator=separator), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                self.inventory(root, '@Test void ordinary() {}')
+                source = root / 'core/src/test/java/sample/IdentityTest.java'
+                source.write_text('package sample; class IdentityTest { @' + separator + 'BeforeAll '
+                    'static void gate() { Assumptions.assumeTrue(System.getenv("TAPSTATE_ATLAS_TEST_URI") != null, "private test gate"); } }')
+                rows = evidence.before_all_contracts(root, source, {})
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]['method'], 'gate')
+                self.assertEqual(rows[0]['policy']['inputs'], ['TAPSTATE_ATLAS_TEST_URI'])
+
+    def test_type_annotated_parent_keeps_inherited_methods_from_nonmatching_files(self):
+        for same_file in (False, True):
+            with self.subTest(same_file=same_file), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                self.inventory(root, '@Test void ordinary() {}')
+                base = 'class Base { @org.junit.jupiter.api.Test void inherited() {} }'
+                preamble = '@java.lang.annotation.Target(java.lang.annotation.ElementType.TYPE_USE) @interface TA {} '
+                if same_file:
+                    preamble += base
+                else:
+                    (root / 'core/src/test/java/sample/Other.java').write_text('package sample; ' + base)
+                _, inv = self.inventory(root, '@Test void ordinary() {}', parent='extends @TA Base', preamble=preamble)
+                self.assertEqual({(m['class'], m['method']) for m in inv['methods']},
+                    {('sample.IdentityTest', 'ordinary'), ('sample.IdentityTest', 'inherited')})
+
+    def test_qualified_fallback_preserves_ambiguity_on_repeated_reads(self):
+        for matching_file in (False, True):
+            with self.subTest(matching_file=matching_file), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                self.inventory(root, '@Test void ordinary() {}')
+                source = root / 'core/src/test/java/sample/IdentityTest.java'
+                source.with_name('Other.java').write_text('package sample; @interface Hidden {}')
+                second = root / 'core/src/main/java/sample' if matching_file else source.parent
+                second.mkdir(parents=True, exist_ok=True)
+                (second / ('Hidden.java' if matching_file else 'Duplicate.java')).write_text(
+                    'package sample; @interface Hidden {}')
+                lookup = evidence.DisabledLookup(root, {})
+                for _ in range(2):
+                    with self.assertRaisesRegex(ValueError, 'ambiguous'):
+                        lookup.resolve(source, 'sample.Hidden')
+
+    def test_before_all_does_not_read_annotation_argument_strings_as_callbacks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.inventory(root, '@Test void ordinary() {}')
+            source = root / 'core/src/test/java/sample/IdentityTest.java'
+            source.write_text('package sample; class IdentityTest { @Label("@ BeforeAll") '
+                'static void ordinary() { Assumptions.assumeTrue(System.getenv("TAPSTATE_ATLAS_TEST_URI") != null, "not a callback"); } }')
+            self.assertEqual(evidence.before_all_contracts(root, source, {}), [])
+
+    def test_nested_annotation_arguments_preserve_nested_type_owners(self):
+        text = 'class IdentityTest implements @TA(value=@Nested({"a", "b"})) Marker { '
+        text += '@Nested class Child { @Test void nested() {} } @Test void outer() {} }'
+        declarations = evidence.declarations(text, 'IdentityTest', '')
+        self.assertEqual({(m['class'], m['method']) for m in declarations},
+                         {('IdentityTest$Child', 'nested'), ('IdentityTest', 'outer')})
 
     def test_annotation_name_token_separators_preserve_skip_contract(self):
         for separator in (' ', '\n', '/* token separator */'):

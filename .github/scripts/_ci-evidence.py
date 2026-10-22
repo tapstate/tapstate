@@ -82,6 +82,49 @@ def close_at(text, start, left='(', right=')'):
     raise ValueError('unclosed source delimiter')
 
 
+def annotation_spans(clean, start=0, end=None):
+    end = len(clean) if end is None else end
+    consumed = start
+    for found in re.finditer(r'@\s*([\w.]+)\b', clean[start:end]):
+        offset, finish = start + found.start(), start + found.end()
+        if offset < consumed:
+            continue
+        while finish < end and clean[finish].isspace():
+            finish += 1
+        argument = None
+        if finish < end and clean[finish] == '(':
+            closing = close_at(clean, finish)
+            require(closing < end, 'annotation extends beyond its declaration')
+            argument = (finish + 1, closing)
+            finish = closing + 1
+        consumed = finish
+        yield offset, finish, found.group(1), argument
+
+
+def without_annotations(text):
+    clean = masked(text)
+    result = list(clean)
+    for start, end, unused_name, unused_argument in annotation_spans(clean):
+        result[start:end] = ['\n' if char == '\n' else ' ' for char in clean[start:end]]
+    return ''.join(result)
+
+
+def declaration_body(clean, start):
+    parentheses = 0
+    for position in range(start, len(clean)):
+        char = clean[position]
+        if char == '(':
+            parentheses += 1
+        elif char == ')':
+            parentheses -= 1
+            require(parentheses >= 0, 'unbalanced type declaration header')
+        elif parentheses == 0 and char == '{':
+            return position
+        elif parentheses == 0 and char == ';':
+            return None
+    return None
+
+
 def uncomment(text):
     pattern = r'/\*[\s\S]*?\*/|//[^\n]*|"""[\s\S]*?"""|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\''
     return re.sub(pattern, lambda m: ' ' if m.group().startswith(('/', '*')) else m.group(), text)
@@ -89,10 +132,13 @@ def uncomment(text):
 
 def enum_constants(text, simple):
     clean = masked(text)
-    match = re.search(r'\benum\s+' + re.escape(simple) + r'\b[^\{]*\{', clean)
+    match = re.search(r'\benum\s+' + re.escape(simple) + r'\b', clean)
     if not match:
         return None
-    start = match.end()
+    opening = declaration_body(clean, match.end())
+    if opening is None:
+        return None
+    start = opening + 1
     end = close_at(clean, start - 1, '{', '}')
     body = clean[start:end]
     depth, stop = 0, len(body)
@@ -230,20 +276,9 @@ def annotation_prefix(text, clean, position, floor=0):
         elif depth == 0 and char in '{};':
             start = index + 1
             break
-    result, consumed = [], start
-    for found in re.finditer(r'@\s*([\w.]+)\b', clean[start:position]):
-        offset = start + found.start()
-        if offset < consumed:
-            continue
-        end = start + found.end()
-        while end < position and clean[end].isspace():
-            end += 1
-        argument = ''
-        if end < position and clean[end] == '(':
-            closing = close_at(clean, end)
-            argument = text[end + 1:closing]
-            consumed = closing + 1
-        result.append(dict(name=found.group(1), argument=argument, offset=offset))
+    result = []
+    for offset, end, name, argument in annotation_spans(clean, start, position):
+        result.append(dict(name=name, argument=text[argument[0]:argument[1]] if argument else '', offset=offset))
     return result, start
 
 
@@ -264,8 +299,10 @@ def disabled_annotation(text, clean, position, floor=0, lookup=None, source=None
 
 def class_declarations(text, clean, package, lookup=None, source=None):
     classes = []
-    for match in re.finditer(r'\b(class|interface|enum|record)\s+(\w+)\b[^;{]*\{', clean):
-        start = match.end() - 1
+    for match in re.finditer(r'\b(class|interface|enum|record)\s+(\w+)\b', clean):
+        start = declaration_body(clean, match.end())
+        if start is None:
+            continue
         end = close_at(clean, start, '{', '}')
         parent = next((c for c in reversed(classes) if c['start'] < start < c['end']), None)
         name = parent['name'] + '$' + match.group(2) if parent else package + match.group(2)
@@ -292,7 +329,7 @@ class DisabledLookup:
         self.root, self.sources, self.contexts = root, sources, {}
         self.directories = [root / module / tree for module, _ in source_modules(root)
                             for tree in ('src/main/java', 'src/test/java')]
-        self.named_cache, self.packages = {}, {}
+        self.named_cache, self.qualified_cache, self.packages = {}, {}, {}
 
     def context(self, source):
         if source not in self.contexts:
@@ -331,6 +368,22 @@ class DisabledLookup:
             self.packages[prefix] = found
         return self.packages[prefix].get(name, [])
 
+    def definition(self, name):
+        if name not in self.qualified_cache:
+            direct = self.named(name)
+            candidates = {(direct[0], direct[1]['name']): direct} if direct else {}
+            parts = name.split('.')
+            # A canonical name can end in nested types, not only a package and one type.
+            # Include nonmatching filenames even after a direct hit to reject source-root ambiguity.
+            for length in range(len(parts) - 1, -1, -1):
+                prefix = '.'.join(parts[:length]) + ('.' if length else '')
+                for path, node in self.package_named(prefix, name):
+                    candidates[(path, node['name'])] = (path, node)
+            require(len(candidates) <= 1, 'ambiguous annotation or interface source: ' + name)
+            found = next(iter(candidates.values()), None)
+            self.qualified_cache[name] = found
+        return self.qualified_cache[name]
+
     def resolve(self, source, name, offset=0):
         context = self.context(source)
         lexical = [node for node in reversed(context['classes']) if node['start'] < offset < node['end']]
@@ -347,24 +400,19 @@ class DisabledLookup:
         imported = re.search(r'\bimport\s+(?:static\s+)?([\w.]+\.' + re.escape(first) + r')\s*;', context['clean'])
         if imported:
             qualified = imported.group(1) + name[len(first):]
-            return qualified, self.named(qualified)
+            return qualified, self.definition(qualified)
         if '.' in name and name[0].islower():
-            return name, self.named(name)
+            return name, self.definition(name)
         qualified = context['prefix'] + name
         if qualified in (self.DISABLED, self.INHERITED, self.RETENTION):
             return qualified, None
-        found = self.named(qualified)
-        if found is None:
-            # Package-private annotation types need not have a matching filename.
-            candidates = self.package_named(context['prefix'], qualified)
-            require(len(candidates) <= 1, 'ambiguous annotation or interface source: ' + qualified)
-            found = candidates[0] if candidates else None
+        found = self.definition(qualified)
         if found:
             return qualified, found
         candidates = []
         for imported in re.finditer(r'\bimport\s+(?:static\s+)?([\w.]+)\.\*\s*;', context['clean']):
             qualified = imported.group(1) + '.' + name
-            target = self.named(qualified)
+            target = self.definition(qualified)
             if target or qualified in (self.DISABLED, self.INHERITED, self.RETENTION):
                 candidates.append((qualified, target))
         require(len(candidates) <= 1, 'ambiguous annotation or interface imports: ' + name)
@@ -402,8 +450,12 @@ class DisabledLookup:
         return None
 
     def parent(self, source, node):
+        name = self.parent_name(node)
+        return self.resolve(source, name, node['offset'])[1] if name else None
+
+    def parent_name(self, node):
         match = re.search(r'\bextends\s+([\w.]+)', self.type_header(node)) if node['kind'] == 'class' else None
-        return self.resolve(source, match.group(1), node['offset'])[1] if match else None
+        return match.group(1) if match else None
 
     def interfaces(self, source, node):
         keyword = 'extends' if node['kind'] == 'interface' else 'implements'
@@ -429,11 +481,25 @@ class DisabledLookup:
 
     @staticmethod
     def type_header(node):
-        header = re.sub(r'\s+permits\b[\s\S]*$', '', node['header'])
+        header = without_annotations(node['header'])
+        parentheses = angles = 0
+        for token in re.finditer(r'[()<>]|\bpermits\b', header):
+            char = token.group()
+            if char == '(':
+                parentheses += 1
+            elif char == ')':
+                parentheses -= 1
+            elif char == '<':
+                angles += 1
+            elif char == '>':
+                angles -= 1
+            elif parentheses == angles == 0 and not header[:token.start()].rstrip().endswith('.') and not header[token.end():].lstrip().startswith('.'):
+                header = header[:token.start()]
+                break
         while re.search(r'<[^<>]*>', header):
             header = re.sub(r'<[^<>]*>', '', header)
         require('<' not in header and '>' not in header, 'unsupported source type parameters')
-        return header
+        return re.sub(r'\s*\.\s*', '.', header)
 
     def class_disabled(self, source, name, seen=frozenset()):
         if name in seen:
@@ -501,8 +567,9 @@ def declarations(text, outer, package, lookup=None, source=None):
             parameter_end = close_at(clean, consumed - 1)
             parameter_types, parameter_injected = [], []
             for parameter in split_values(text[consumed:parameter_end], generic=True):
-                temporary = bool(re.search(r'@(?:[\w.]+\.)?TempDir\b', parameter))
-                parameter = re.sub(r'@[\w.]+(?:\([^)]*\))?\s*', '', parameter).strip()
+                temporary = any(name.rsplit('.', 1)[-1] == 'TempDir'
+                                for unused_start, unused_end, name, unused_arg in annotation_spans(masked(parameter)))
+                parameter = without_annotations(parameter).strip()
                 typename = re.sub(r'\s+\w+\s*$', '', parameter).replace('final ', '').strip()
                 parameter_types.append(typename)
                 parameter_injected.append(temporary or typename in ('TestInfo', 'org.junit.jupiter.api.TestInfo',
@@ -762,48 +829,45 @@ def with_injected(arguments, declaration, repetition=None):
     return result
 
 
-def inherited_declarations(root, source, sources, stack=None, lookup=None):
+def inherited_declarations(root, source, sources, stack=None, lookup=None, target=None):
     stack = set() if stack is None else stack
-    require(source not in stack, 'cyclic test inheritance')
-    stack = stack | {source}
     text, clean = source.read_text(), masked(source.read_text())
     package = re.search(r'\bpackage\s+([\w.]+)\s*;', clean)
     prefix = package.group(1) + '.' if package else ''
     lookup = lookup or DisabledLookup(root, sources)
-    own = [(source, item) for item in declarations(text, source.stem, prefix, lookup, source)]
-    parent = re.search(r'\bclass\s+' + re.escape(source.stem) + r'\s+extends\s+([\w.]+)', clean)
-    if parent is None:
+    context = lookup.context(source)
+    owner = target or next((node for node in context['classes'] if node['name'] == prefix + source.stem), None)
+    key = (source, owner['name'] if owner else prefix + source.stem)
+    require(key not in stack, 'cyclic test inheritance')
+    stack = stack | {key}
+    outer = target['name'].removeprefix(prefix) if target else source.stem
+    own = [(source, item) for item in declarations(text, outer, prefix, lookup, source)]
+    if target:
+        own = [(path, item) for path, item in own if 'class' not in item or
+               item['class'] == target['name'] or item['class'].startswith(target['name'] + '$')]
+    parent_name = lookup.parent_name(owner) if owner else None
+    if parent_name is None:
         return own
-    parent_name = parent.group(1)
-    first = parent_name.split('.')[0]
-    imported = re.search(r'\bimport\s+([\w.]+\.' + re.escape(first) + r')\s*;', clean)
-    names = [(imported.group(1) + parent_name[len(first):]) if imported else prefix + parent_name]
-    if imported is None:
-        names += [m.group(1) + '.' + parent_name for m in re.finditer(r'\bimport\s+([\w.]+)\.\*\s*;', clean)]
-    found = []
-    for module, _ in source_modules(root):
-        for tree in ('src/main/java', 'src/test/java'):
-            for name in names:
-                candidate = root / module / tree / (name.replace('.', '/') + '.java')
-                if candidate.is_file():
-                    found.append(candidate)
-    require(len(found) == 1, 'test parent source requires an independent inheritance contract: ' + parent_name)
-    base = found[0]
+    parent = lookup.resolve(source, parent_name, owner['offset'])[1]
+    require(parent is not None, 'test parent source requires an independent inheritance contract: ' + parent_name)
+    base, base_node = parent
     sources[base.relative_to(root).as_posix()] = digest(base.read_bytes())
-    overrides = {(item['class'].removeprefix(prefix + source.stem), item['method']) for _, item in own if 'method' in item}
-    base_package = re.search(r'\bpackage\s+([\w.]+)\s*;', masked(base.read_text()))
-    base_name = (base_package.group(1) + '.' if base_package else '') + base.stem
+    if base == source:
+        own = [(path, item) for path, item in own if 'class' not in item or
+               item['class'] != base_node['name'] and not item['class'].startswith(base_node['name'] + '$')]
+    overrides = {(item['class'].removeprefix(owner['name']), item['method']) for _, item in own if 'method' in item}
+    base_name = base_node['name']
     owners = {c['name']: c for c in class_declarations(text, clean, prefix, lookup, source)}
-    for declaring_source, item in inherited_declarations(root, base, sources, stack, lookup):
+    for declaring_source, item in inherited_declarations(root, base, sources, stack, lookup, base_node):
         if 'class' not in item:
             own.append((declaring_source, item))
             continue
         suffix = item['class'].removeprefix(base_name)
         if (suffix, item['method']) not in overrides:
             inherited = dict(item)
-            inherited['class'] = prefix + source.stem + suffix
+            inherited['class'] = owner['name'] + suffix
             # Disabled is not inherited from a superclass; method annotations are.
-            container = owners.get(inherited['class'], owners[prefix + source.stem])
+            container = owners.get(inherited['class'], owners[owner['name']])
             local = inherited.get('method_disabled_source')
             inherited['disabled_source'] = local if local is not None else container['disabled_source']
             inherited['class_disabled_source'] = container['disabled_source']
@@ -816,11 +880,13 @@ def before_all_contracts(root, source, sources):
     callbacks = []
     package = re.search(r'\bpackage\s+([\w.]+)\s*;', clean)
     classname = (package.group(1) + '.' if package else '') + source.stem
-    for annotation in re.finditer(r'@(?:org\.junit\.jupiter\.api\.)?BeforeAll\b', clean):
-        header = re.search(r'\b(?:void|[\w.]+)\s+(\w+)\s*\(', clean[annotation.end():annotation.end() + 500])
+    for unused_start, annotation_end, name, unused_argument in annotation_spans(clean):
+        if name not in ('BeforeAll', 'org.junit.jupiter.api.BeforeAll'):
+            continue
+        header = re.search(r'\b(?:void|[\w.]+)\s+(\w+)\s*\(', clean[annotation_end:annotation_end + 500])
         if header is None:
             continue
-        opening = annotation.end() + header.end() - 1
+        opening = annotation_end + header.end() - 1
         parameters_end = close_at(clean, opening)
         body_start = clean.find('{', parameters_end)
         require(body_start >= 0, 'BeforeAll source body is missing')
