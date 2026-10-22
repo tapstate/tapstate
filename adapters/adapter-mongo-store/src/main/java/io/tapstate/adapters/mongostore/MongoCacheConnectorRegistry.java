@@ -29,7 +29,6 @@ import org.bson.BsonString;
 import org.bson.Document;
 
 import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -173,10 +172,10 @@ final class MongoCacheConnectorRegistry implements ConnectorRegistry {
         Objects.requireNonNull(contentHash, "contentHash");
         Stored original = readHash(contentHash);
         if (original == null) return Optional.empty();
-        var bytes = new ByteArrayOutputStream();
+        var bytes = new MongoConnectorRegistry.ExactArtifactBytes(contentHash, original.length());
         try { copyArtifact(original, contentHash, bytes); }
         catch (IOException impossible) { throw new IllegalStateException("In-memory artifact could not be written", impossible); }
-        return Optional.of(bytes.toByteArray());
+        return Optional.of(bytes.complete());
     }
 
     @Override public boolean copyArtifactTo(String contentHash, OutputStream target) throws IOException {

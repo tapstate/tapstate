@@ -27,6 +27,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -114,7 +115,10 @@ class SplitStoreLeaseLifecycleIT {
                 admin.runCommand(new Document("waitForFailPoint", "failCommand").append("timesEntered", entered + 1).append("maxTimeMS", 5000));
                 long originalDeadline = (long) ReflectionTestUtils.getField(lease, "provenUntil");
                 assertThat(originalDeadline - System.nanoTime()).isPositive();
-                await().atMost(TTL.plusSeconds(2)).until(() -> lease.currentFence().isEmpty());
+                // Observe closure without invoking a lease accessor that can trigger expiry itself.
+                AtomicBoolean closed = (AtomicBoolean) ReflectionTestUtils.getField(lease, "closed");
+                await().atMost(TTL.plusSeconds(2)).untilTrue(closed);
+                assertThat(lease.currentFence()).isEmpty();
                 assertThat(System.nanoTime()).isGreaterThanOrEqualTo(originalDeadline);
                 assertThat(ReflectionTestUtils.getField(lease, "provenUntil")).isEqualTo(originalDeadline);
                 await().atMost(Duration.ofSeconds(10)).until(() -> !member.getLifecycleService().isRunning());

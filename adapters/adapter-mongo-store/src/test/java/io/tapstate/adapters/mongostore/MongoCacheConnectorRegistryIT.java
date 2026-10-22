@@ -123,6 +123,7 @@ class MongoCacheConnectorRegistryIT {
                     }
                 };
                 assertThat(registry.copyArtifactTo(hash, output)).isTrue(); assertThat(count).hasValue(length);
+                assertCode(() -> registry.artifact(hash), IoError.DOCUMENT_UNREADABLE);
                 assertThat(registry.register("other", "2", RegistrationSource.REGISTER, hash, length, zeros(length)).newlyRegistered()).isFalse();
             }
         }
