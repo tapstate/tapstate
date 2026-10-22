@@ -101,21 +101,28 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
     @SuppressWarnings("unchecked")
     private Optional<Map<String, Object>> read(AiProviderSettings settings, Map<String, Object> body, Consumer<String> text,
             boolean proposalEnabled) {
-        long deadline = System.nanoTime() + Duration.ofSeconds(90).toNanos();
-        try {
-            var response = http.send(request(settings, body), HttpResponse.BodyHandlers.ofInputStream());
-            try (var input = response.body(); var bounded = new ResponseDeadline(input, deadline)) {
-                if (response.statusCode() < 200 || response.statusCode() >= 300) {
-                    LOG.log(System.Logger.Level.WARNING, "AI provider stream returned HTTP {0}", response.statusCode());
+        for (int attempt = 0; attempt < 2; attempt++) {
+            long deadline = System.nanoTime() + Duration.ofSeconds(90).toNanos();
+            boolean[] emitted = {false};
+            try {
+                var response = http.send(request(settings, body), HttpResponse.BodyHandlers.ofInputStream());
+                try (var input = response.body(); var bounded = new ResponseDeadline(input, deadline)) {
+                    if (response.statusCode() < 200 || response.statusCode() >= 300) {
+                        LOG.log(System.Logger.Level.WARNING, "AI provider stream returned HTTP {0}", response.statusCode());
+                    }
+                    requireSuccessfulResponse(response.statusCode());
+                    return readEvents(input, delta -> { emitted[0] = true; text.accept(delta); }, proposalEnabled);
                 }
-                requireSuccessfulResponse(response.statusCode());
-                return readEvents(input, text, proposalEnabled);
-            }
-        } catch (java.io.IOException | InterruptedException error) {
-            if (error instanceof InterruptedException) Thread.currentThread().interrupt();
-            LOG.log(System.Logger.Level.WARNING, "AI provider stream transport failed: {0}", error.getClass().getSimpleName());
-            throw failed();
-        } catch (IllegalArgumentException | ClassCastException error) { throw invalid(); }
+            } catch (RetryableStreamException error) {
+                if (attempt > 0 || emitted[0]) throw failed();
+                LOG.log(System.Logger.Level.WARNING, "Retrying AI provider after an empty upstream error stream");
+            } catch (java.io.IOException | InterruptedException error) {
+                if (error instanceof InterruptedException) Thread.currentThread().interrupt();
+                LOG.log(System.Logger.Level.WARNING, "AI provider stream transport failed: {0}", error.getClass().getSimpleName());
+                throw failed();
+            } catch (IllegalArgumentException | ClassCastException error) { throw invalid(); }
+        }
+        throw failed();
     }
     private static Optional<Map<String, Object>> readEvents(InputStream input, Consumer<String> text, boolean proposalEnabled) throws java.io.IOException {
         BufferedReader reader = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8));
@@ -151,6 +158,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
             String type = error instanceof Map<?, ?> details && details.get("type") instanceof String value
                     && value.matches("[A-Za-z0-9_.-]{1,80}") ? value : "unspecified";
             LOG.log(System.Logger.Level.WARNING, "AI provider stream error: code={0}, type={1}", code, type);
+            if ("upstream_error".equals(type)) throw new RetryableStreamException();
             throw failed();
         }
         Object rawChoices = chunk.get("choices");
@@ -195,6 +203,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         private boolean done;
         private boolean toolCallStarted;
     }
+    private static final class RetryableStreamException extends RuntimeException { }
     private static Map<String, Object> object(Object value) {
         if (!(value instanceof Map<?, ?> source)) throw invalid();
         Map<String, Object> result = new java.util.LinkedHashMap<>();
