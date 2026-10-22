@@ -88,12 +88,18 @@ public final class ValidationRelationRows implements AutoCloseable {
         this.observation = Objects.requireNonNull(observation, "observation");
         this.readId = ValidationError.identifier(readId, "relationRows.readId");
         this.limits = Objects.requireNonNull(limits, "limits");
+        charge(initialReservationBytes(this.observation, this.readId));
+    }
+
+    /** Reserves only staging metadata; every retained original/working sample is charged separately. */
+    public static long initialReservationBytes(ValidationObservation observation, String readId) {
+        Objects.requireNonNull(observation, "observation"); ValidationError.identifier(readId, "relationRows.readId");
         long metadata = 16 * 1024L + 32L + 2L * readId.length() + observation.root().rootKey().retainedBytes();
         for (ValidationRoot.Ancestor ancestor : observation.root().ancestors()) {
             metadata += 64L + ancestor.key().retainedBytes();
             for (String segment : ancestor.fieldPath()) metadata += 40L + 2L * segment.length();
         }
-        charge(metadata);
+        return metadata;
     }
 
     /** Every returned row receives an explicit disposition, including uncertain participation. */

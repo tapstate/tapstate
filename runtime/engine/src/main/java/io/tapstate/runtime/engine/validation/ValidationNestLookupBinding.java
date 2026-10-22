@@ -75,6 +75,7 @@ public final class ValidationNestLookupBinding {
     }
 
     public ValidationKeyBinding physical() { return physical; }
+    public ValidationNestRelations.Relation relation() { return relation; }
 
     /**
      * Uses the projection's knowledge before inspecting reference values. An explicit static assignment
