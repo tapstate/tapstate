@@ -92,7 +92,10 @@ final class SharedOracle {
         System.err.printf("oracle-fixture-probe container-ready id=%s epoch-ms=%d%n",
                 starting.getContainerId(), System.currentTimeMillis());
         try {
-            // Supplemental logging waits for in-flight transactions after the database reopens.
+            // Keep the application PDB closed during database-wide logging changes. Opening it first
+            // lets unrelated PDB transaction recovery hold the supplemental-logging statement after
+            // the controlled ROOT transaction has already finished. Reopen it before provisioning.
+            // Supplemental logging still waits for in-flight ROOT transactions.
             // Give that wait the same bounded budget as container startup.
             // SQL*Plus does not echo redirected input, so mark statements before executing them.
             var result = starting.execInContainer("bash", "-c", """
@@ -110,12 +113,12 @@ final class SharedOracle {
                     HOST date -u '+oracle-fixture-probe main-stage=database-open epoch-ms=%%s%%3N' >> /tmp/tapstate-main-stage-probe.log
                     PROMPT ALTER DATABASE OPEN;
                     ALTER DATABASE OPEN;
-                    HOST date -u '+oracle-fixture-probe main-stage=pdb-open epoch-ms=%%s%%3N' >> /tmp/tapstate-main-stage-probe.log
-                    PROMPT ALTER PLUGGABLE DATABASE FREEPDB1 OPEN;
+                    HOST date -u '+oracle-fixture-probe main-stage=pdb-close epoch-ms=%%s%%3N' >> /tmp/tapstate-main-stage-probe.log
+                    PROMPT ALTER PLUGGABLE DATABASE FREEPDB1 CLOSE IMMEDIATE;
                     BEGIN
-                      EXECUTE IMMEDIATE 'ALTER PLUGGABLE DATABASE FREEPDB1 OPEN';
+                      EXECUTE IMMEDIATE 'ALTER PLUGGABLE DATABASE FREEPDB1 CLOSE IMMEDIATE';
                     EXCEPTION WHEN OTHERS THEN
-                      IF SQLCODE != -65019 THEN RAISE; END IF;
+                      IF SQLCODE != -65020 THEN RAISE; END IF;
                     END;
                     /
                     HOST date -u '+oracle-fixture-probe main-stage=supplemental epoch-ms=%%s%%3N' >> /tmp/tapstate-main-stage-probe.log
@@ -124,6 +127,14 @@ final class SharedOracle {
                     HOST date -u '+oracle-fixture-probe main-stage=force-logging epoch-ms=%%s%%3N' >> /tmp/tapstate-main-stage-probe.log
                     PROMPT ALTER DATABASE FORCE LOGGING;
                     ALTER DATABASE FORCE LOGGING;
+                    HOST date -u '+oracle-fixture-probe main-stage=pdb-open epoch-ms=%%s%%3N' >> /tmp/tapstate-main-stage-probe.log
+                    PROMPT ALTER PLUGGABLE DATABASE FREEPDB1 OPEN;
+                    BEGIN
+                      EXECUTE IMMEDIATE 'ALTER PLUGGABLE DATABASE FREEPDB1 OPEN';
+                    EXCEPTION WHEN OTHERS THEN
+                      IF SQLCODE != -65019 THEN RAISE; END IF;
+                    END;
+                    /
                     HOST date -u '+oracle-fixture-probe main-stage=create-user epoch-ms=%%s%%3N' >> /tmp/tapstate-main-stage-probe.log
                     PROMPT CREATE USER C##TAPSTATE;
                     CREATE USER C##TAPSTATE IDENTIFIED BY "Tapstate_Test_42" CONTAINER=ALL;
