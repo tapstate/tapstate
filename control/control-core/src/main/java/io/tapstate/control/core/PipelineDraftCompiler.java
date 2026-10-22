@@ -43,10 +43,16 @@ public final class PipelineDraftCompiler {
     /** Compiles one complete or incomplete draft without persisting or mutating it. */
     public PipelineResource compile(PipelineDraft draft) {
         Objects.requireNonNull(draft, "draft");
-        return draft.mode() == PipelineDraft.Mode.WIZARD ? compileWizard(draft) : compileGraph(draft);
+        return draft.mode() == PipelineDraft.Mode.WIZARD ? compileWizard(draft, false) : compileGraph(draft);
     }
 
-    private PipelineResource compileWizard(PipelineDraft draft) {
+    /** Validates an editor proposal while preserving an unfinished destination. */
+    public PipelineResource compileCandidate(PipelineDraft draft) {
+        Objects.requireNonNull(draft, "draft");
+        return draft.mode() == PipelineDraft.Mode.WIZARD ? compileWizard(draft, true) : compileGraph(draft);
+    }
+
+    private PipelineResource compileWizard(PipelineDraft draft, boolean allowIncompleteOutput) {
         PipelineDraft.Wizard wizard = Objects.requireNonNull(draft.wizard(), "wizard payload");
         PipelineDraft.Root root = wizard.root();
         if (root == null) {
@@ -100,7 +106,10 @@ public final class PipelineDraftCompiler {
             steps.add(step);
             previous = step.id();
         }
-        ServeBlock serve = compileWizardOutput(wizard.output(), previous, root.table());
+        ServeBlock serve = allowIncompleteOutput && (wizard.output() == null
+                || firstText(wizard.output().config(), "sourceId", "destinationId", "source") == null
+                || firstText(wizard.output().config(), "table", "destinationTable") == null)
+                ? null : compileWizardOutput(wizard.output(), previous, root.table());
         return new PipelineResource(draft.pipelineId(), metadata(draft),
                 sourceIds.stream().map(id -> (SourceRef) SourceRef.bare(id)).toList(), steps, null, serve, null, Map.of());
     }

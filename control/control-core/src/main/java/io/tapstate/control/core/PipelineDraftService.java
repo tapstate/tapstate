@@ -209,7 +209,26 @@ public final class PipelineDraftService {
                 candidate.graph(), candidate.wizard(), current.baseArtifactHash(),
                 current.publishedDraftRevision(), current.publishedArtifactHash(), current.createdAt(),
                 current.updatedAt(), current.updatedBy());
+        if (candidate.mode() == PipelineDraft.Mode.WIZARD && candidate.wizard() != null
+                && candidate.wizard().output() != null
+                && !hasDestination(candidate.wizard().output())) {
+            try {
+                PipelineResource partial = compiler.compileCandidate(transientDraft);
+                parser.parse(writer.write(partial));
+                return partial;
+            } catch (DslException | IllegalArgumentException error) {
+                throw new TapstateException(PipelineDraftError.INVALID,
+                        java.util.Map.of("id", pipelineId, "reason", error.getMessage() == null
+                                ? "candidate cannot be compiled" : error.getMessage()), error);
+            }
+        }
         return validateAndPrepare(pipelineId, compile(pipelineId, transientDraft));
+    }
+
+    private static boolean hasDestination(PipelineDraft.Output output) {
+        Object source = output.config().get("sourceId");
+        Object table = output.config().get("table");
+        return source instanceof String s && !s.isBlank() && table instanceof String t && !t.isBlank();
     }
 
     /**

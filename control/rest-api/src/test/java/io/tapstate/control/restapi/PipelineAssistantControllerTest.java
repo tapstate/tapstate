@@ -379,6 +379,36 @@ class PipelineAssistantControllerTest {
         view.put("destinationSourceId", "unselected-destination");
         assertThat(controller.validate("orders", 1, view)).containsEntry("valid", false).doesNotContainKey("candidateWizard");
     }
+    @Test void unfinishedDestinationStillAllowsAFilterProposalWithoutSaving() {
+        var store = new PipelineApiTest.FakePipelineDraftStore();
+        var configured = draft();
+        var unfinished = new PipelineDraft(configured.pipelineId(), configured.schemaVersion(), configured.revision(),
+                configured.mode(), configured.name(), configured.description(), configured.graph(),
+                new PipelineDraft.Wizard(configured.wizard().root(), configured.wizard().related(),
+                        configured.wizard().transforms(), new PipelineDraft.Output("atlas",
+                                Map.of("sourceId", "", "table", "", "writeMode", "upsert"))),
+                configured.baseArtifactHash(), configured.publishedDraftRevision(), configured.publishedArtifactHash(),
+                configured.createdAt(), configured.updatedAt(), configured.updatedBy());
+        store.create(unfinished);
+        var beans = new DefaultListableBeanFactory();
+        beans.registerSingleton("drafts", new PipelineDraftService(store));
+        var mapper = JsonMapper.builder().build();
+        var controller = new PipelineAssistantController(beans.getBeanProvider(PipelineDraftService.class),
+                beans.getBeanProvider(io.tapstate.control.core.SourceProjectionService.class),
+                beans.getBeanProvider(io.tapstate.control.core.SourceSchemaQueryService.class), null,
+                new OpenAiCompatibleClient(), mapper);
+        Map<String, Object> view = AssistantWizardJson.view(AssistantWizardJson.object(
+                PipelineDraftJson.write(mapper, unfinished).get("wizard")));
+        Map<String, Object> root = new java.util.LinkedHashMap<>(AssistantWizardJson.object(view.get("root")));
+        root.put("transforms", List.of(Map.of("id", "assistant-filter", "name", "filter", "type", "filter",
+                "enabled", true, "config", Map.of("filter", Map.of("expr", "after.User == 'root'")))));
+        view.put("root", root);
+        var input = new java.util.LinkedHashMap<>(PipelineDraftJson.write(mapper, unfinished));
+        input.put("wizard", AssistantWizardJson.wire(view, AssistantWizardJson.object(input.get("wizard"))));
+        assertThat(new PipelineDraftService(store).previewCandidate("orders", PipelineDraftJson.read(mapper,
+                input, "orders", 1, unfinished.updatedBy())).serve()).isNull();
+        assertThat(store.get("orders")).contains(unfinished);
+    }
     @Test void focusProjectsOnlyKnownBuilderContextAndNeverArbitraryData() {
         assertThat(PipelineAssistantController.focus(draft(), Map.of("kind", "root", "nodeId", "root", "rows", List.of("private-row"))))
                 .containsExactlyInAnyOrderEntriesOf(Map.of("kind", "root", "nodeId", "root"));
