@@ -123,7 +123,10 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         String line;
         while ((line = boundedLine(reader)) != null) {
             state.bytes += line.length();
-            if (state.bytes > MAX_BYTES || Thread.currentThread().isInterrupted()) throw failed();
+            if (state.bytes > MAX_BYTES || Thread.currentThread().isInterrupted()) {
+                LOG.log(System.Logger.Level.WARNING, "AI provider stream exceeded its limit or was interrupted");
+                throw failed();
+            }
             if (!line.startsWith("data:")) continue;
             String data = line.substring(5).strip();
             if ("[DONE]".equals(data)) {
@@ -141,7 +144,10 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
     }
     private static void readChunk(String data, StreamState state, Consumer<String> text) {
         Map<String, Object> chunk = object(JsonReader.parse(data));
-        if (chunk.containsKey("error")) throw failed();
+        if (chunk.containsKey("error")) {
+            LOG.log(System.Logger.Level.WARNING, "AI provider returned a stream error event");
+            throw failed();
+        }
         Object rawChoices = chunk.get("choices");
         if (!(rawChoices instanceof List<?> choices)) {
             if (chunk.containsKey("usage")) return;
@@ -159,7 +165,10 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
     private static void appendToolCall(Object raw, StreamState state) {
         state.toolCallStarted = true;
         Map<String, Object> call = object(raw);
-        if (!(call.get("index") instanceof Number index) || index.intValue() != 0) throw failed();
+        if (!(call.get("index") instanceof Number index) || index.intValue() != 0) {
+            LOG.log(System.Logger.Level.WARNING, "AI provider returned an unsupported tool call index");
+            throw failed();
+        }
         Map<String, Object> function = object(call.getOrDefault("function", Map.of()));
         if (function.get("name") instanceof String name) state.function = name;
         if (function.get("arguments") instanceof String arguments) state.arguments.append(arguments);
