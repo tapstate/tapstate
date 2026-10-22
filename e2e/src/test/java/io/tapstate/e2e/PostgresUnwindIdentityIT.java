@@ -51,9 +51,11 @@ class PostgresUnwindIdentityIT {
                 long generated;
                 try (var writer = sink.open(config)) {
                     writer.write(List.of(Envelope.insert(1L, "expanded", row(700, 0, "a"), null),
-                            Envelope.insert(1L, "expanded", row(700, 1, "b"), null)))
+                            Envelope.insert(1L, "expanded", row(700, 1, "b"), null),
+                            Envelope.insert(1L, "expanded", row(701, 0, "other-a"), null),
+                            Envelope.insert(1L, "expanded", row(701, 1, "other-b"), null)))
                             .toCompletableFuture().get(30, TimeUnit.SECONDS);
-                    try (var rows = sql.executeQuery("SELECT id, _unwind_source_id FROM expanded ORDER BY position")) {
+                    try (var rows = sql.executeQuery("SELECT id, _unwind_source_id FROM expanded WHERE _unwind_source_id = 700 ORDER BY position")) {
                         assertThat(rows.next()).isTrue();
                         generated = rows.getLong(1);
                         assertThat(generated).isNotEqualTo(700);
@@ -69,10 +71,19 @@ class PostgresUnwindIdentityIT {
                     writer.write(changes).toCompletableFuture().get(30, TimeUnit.SECONDS);
                     writer.write(changes).toCompletableFuture().get(30, TimeUnit.SECONDS);
                 }
-                try (var rows = sql.executeQuery("SELECT id, value FROM expanded")) {
+                try (var rows = sql.executeQuery("SELECT id, value FROM expanded WHERE _unwind_source_id = 700")) {
                     assertThat(rows.next()).isTrue();
                     assertThat(rows.getLong(1)).isEqualTo(generated);
                     assertThat(rows.getString(2)).isEqualTo("changed");
+                    assertThat(rows.next()).isFalse();
+                }
+                try (var rows = sql.executeQuery("SELECT position, value FROM expanded WHERE _unwind_source_id = 701 ORDER BY position")) {
+                    assertThat(rows.next()).isTrue();
+                    assertThat(rows.getLong(1)).isZero();
+                    assertThat(rows.getString(2)).isEqualTo("other-a");
+                    assertThat(rows.next()).isTrue();
+                    assertThat(rows.getLong(1)).isEqualTo(1L);
+                    assertThat(rows.getString(2)).isEqualTo("other-b");
                     assertThat(rows.next()).isFalse();
                 }
                 sql.execute("CREATE UNIQUE INDEX business_partial ON expanded(value) WHERE value IS NOT NULL");
