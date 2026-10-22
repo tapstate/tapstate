@@ -27,7 +27,7 @@ class McpToolCatalogTest {
             "data_browser_collections", "data_browser_find", "data_browser_stats");
 
     private static final List<String> WRITE_TOOLS = List.of(
-            "storage_test", "storage_setup_commit", "storage_recovery_plan", "storage_recovery_confirm", "configuration_import_preflight", "configuration_import_commit", "artifact_apply", "artifact_delete", "connection_test", "connection_discover_schema",
+            "storage_test", "storage_setup_commit", "storage_recovery_plan", "storage_recovery_confirm", "configuration_export", "configuration_import_preflight", "configuration_import_commit", "artifact_apply", "artifact_delete", "connection_test", "connection_discover_schema",
             "pipeline_start", "pipeline_stop", "pipeline_pause", "pipeline_resume");
 
     /**
