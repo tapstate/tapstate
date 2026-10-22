@@ -27,9 +27,17 @@ An empty timezone option uses the server default. Explicit aliases such as `Etc/
 they are not rewritten to `UTC`. Some older Oracle servers reject `Etc/UTC` with `ORA-01882`, so pin
 `-Duser.timezone=UTC` when canonical UTC is required. Avoid trailing whitespace in the value.
 
-Startup logs report the effective timezone and whether it came from a JVM option or the default,
-once in both the console and the rolling log file after logging is configured and before the
-application context is refreshed. If the JDK resolves a requested ID differently (an unknown name
+When INFO is enabled for the `io.tapstate.app.Bootstrap` logger, startup logs report the effective
+timezone and whether it came from a JVM option or the default, once in both the console and the
+rolling log file after logging is configured and before the application context is refreshed.
+If the root level is WARN or higher, enable this logger separately to retain the report:
+
+```properties
+logging.level.io.tapstate.app.Bootstrap=INFO
+```
+
+Filtering out the report does not affect timezone selection: the UTC default and explicit JVM
+timezone options still apply. If the JDK resolves a requested ID differently (an unknown name
 such as `Asia/Tokio`, whitespace, or a normalized custom offset), the report includes the requested
 value and the resolved value; it retains the JDK's resolution behavior. Merely loading the assembly
 class in an embedded application or a test does not change that process's timezone.
