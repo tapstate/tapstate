@@ -10,6 +10,9 @@ import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.TransformResource;
 import io.tapstate.app.ValidationLinearRules;
 import io.tapstate.core.model.FieldRule;
+import io.tapstate.core.model.Embed;
+import io.tapstate.core.model.EmbedAs;
+import io.tapstate.core.model.NestRoot;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.validation.ValidationMethod;
 import io.tapstate.core.validation.ValidationMode;
@@ -23,6 +26,9 @@ import io.tapstate.core.validation.ValidationRootCheck;
 import io.tapstate.core.validation.ValidationRunIdentity;
 import io.tapstate.core.validation.ValidationCheckEvent;
 import io.tapstate.runtime.engine.validation.ValidationRelationReader;
+import io.tapstate.runtime.engine.validation.ValidationNestRelations;
+import io.tapstate.runtime.engine.validation.ValidationNestLookupBinding;
+import io.tapstate.runtime.engine.validation.ValidationNestObjectProjection;
 import io.tapstate.runtime.engine.validation.ValidationRootReader;
 import io.tapstate.runtime.engine.validation.ValidationStaticMap;
 import io.tapstate.runtime.engine.validation.ValidationReadScope;
@@ -63,6 +69,7 @@ import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.utility.DockerImageName;
 import static org.assertj.core.api.Assertions.*;
+import static io.tapstate.core.validation.ValidationRootCheck.Kind.*;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /** Real independent JDBC/Mongo reads; no pipeline execution, strict window or general admission proof. */
@@ -220,6 +227,7 @@ class ValidationJdbcMongoReadIT {
             assertThat(fullChecks).containsExactly("1:EQUAL", "2:{TARGET_VALUE=1}", "4:{TARGET_EXTRA=1}", "5:{TARGET_VALUE=1}");
             verifyLookups(jdbc, mysql, kind, sourceRef, sourceSettings, targetRef, uri);
             verifyRootReads(jdbc, mysql, kind, sourceRef, sourceSettings, targetRef, uri, projectionBody);
+            verifyObjectReads(jdbc, mysql, kind, sourceRef, sourceSettings, targetRef, uri);
             // These are fresh read-only sessions; no CDC slot or source mutation was needed.
             assertThat(sql(jdbc, mysql, "SELECT COUNT(*) FROM source_records;").trim()).isEqualTo("5");
             if (!mysql) {
@@ -308,6 +316,145 @@ class ValidationJdbcMongoReadIT {
             assertThat(actual).containsExactly("7:EQUAL", "8:{SOURCE_DUPLICATE=1}", "9:{SOURCE_FIELD_INVALID=1}",
                     "10:{TARGET_DUPLICATE=1}", "11:{TARGET_EXTRA=1}");
         }
+    }
+
+    private static void verifyObjectReads(GenericContainer<?> jdbc, boolean mysql, String kind, ConnectorRef sourceRef,
+            Map<String, Object> sourceSettings, ConnectorRef targetRef, String uri) throws Exception {
+        sql(jdbc, mysql, "CREATE TABLE nest_roots (id BIGINT PRIMARY KEY, customer_id BIGINT, label VARCHAR(40));"
+                + "CREATE TABLE nest_customers (id BIGINT NOT NULL, region_id BIGINT, name VARCHAR(40));"
+                + "CREATE INDEX customer_lookup ON nest_customers(id);"
+                + "CREATE TABLE nest_regions (id BIGINT PRIMARY KEY, label VARCHAR(40));"
+                + "INSERT INTO nest_roots VALUES (" + EXACT + ",10,'root'),(2,10,'root'),(3,NULL,'root'),(4,99,'root'),(5,20,'root'),(6,10,'root');"
+                + "INSERT INTO nest_customers VALUES (10,100,'Ada'),(20,100,'first'),(20,100,'second');"
+                + "INSERT INTO nest_regions VALUES (100,'north');"
+                + "CREATE TABLE nest_conflict_roots (id BIGINT PRIMARY KEY, customer_id BIGINT, label VARCHAR(40), customer VARCHAR(40));"
+                + "INSERT INTO nest_conflict_roots VALUES (7,NULL,'root','legacy');");
+        try (var mongo = MongoClients.create(uri)) {
+            var documents = new ArrayList<Document>();
+            for (long id : List.of(EXACT, 2L, 3L, 4L, 5L, 6L, 7L)) {
+                Long customer = id == 3 || id == 7 ? null : id == 4 ? 99L : id == 5 ? 20L : 10L;
+                var document = new Document("id", id).append("customer_id", customer)
+                        .append("label", id == 4 || id == 7 ? "wrong" : "root");
+                if (id == 4 || id == 5 || id == 7) document.append("customer", new Document("unproved", true));
+                else if (id != 3) document.append("customer", new Document("id", 10L).append("region_id", 100L).append("name", "Ada")
+                        .append("region", new Document("id", 100L).append("label", id == 2 ? "wrong" : "north")));
+                documents.add(document);
+            }
+            mongo.getDatabase(DATABASE).getCollection("nest_targets").insertMany(documents);
+        }
+        var targetSettings = Map.<String, Object>of("uri", uri, "database", DATABASE, "isUri", true);
+        // A parent can remain backpressured while its independent child is read: each live read owns
+        // separate query/decode capacity. These controlled numeric fixtures do not admit other models.
+        try (var queryIo = Executors.newFixedThreadPool(2); var decodeIo = Executors.newFixedThreadPool(2)) {
+            var results = new LinkedHashMap<Long, Map<ValidationRootCheck.Kind, Long>>();
+            for (long id : List.of(EXACT, 2L, 3L, 4L, 5L, 6L, 7L)) {
+                var result = objectRootRead(kind, sourceRef, sourceSettings, targetRef, targetSettings,
+                        id == 7 ? "nest_conflict_roots" : "nest_roots", id, queryIo, decodeIo);
+                results.put(id, result.counts());
+                assertThat(result.observedAgreement()).as("agreement for root %s", id).isEqualTo(id == EXACT || id == 3 || id == 6);
+                int reads = id == 3 || id == 7 ? 2 : id == 4 || id == 5 ? 3 : 4;
+                assertThat(result.reads()).hasSize(reads);
+                if (id == 2) assertThat(result.findings().keySet()).singleElement().satisfies(finding ->
+                        assertThat(finding.location().fieldPath()).containsExactly("customer", "region", "label"));
+            }
+            assertThat(results).isEqualTo(Map.of(EXACT, Map.of(), 2L, Map.of(TARGET_VALUE, 1L), 3L, Map.of(),
+                    4L, Map.of(SOURCE_REFERENCE_MISSING, 1L, TARGET_VALUE, 1L), 5L, Map.of(SOURCE_DUPLICATE, 1L), 6L, Map.of(),
+                    7L, Map.of(SOURCE_FIELD_CONFLICT, 1L, TARGET_VALUE, 1L)));
+        }
+        assertThat(sql(jdbc, mysql, "SELECT COUNT(*) FROM nest_roots;").trim()).isEqualTo("6");
+        assertThat(sql(jdbc, mysql, "SELECT COUNT(*) FROM nest_customers;").trim()).isEqualTo("3");
+    }
+
+    private static ValidationRootCheck objectRootRead(String kind, ConnectorRef sourceRef, Map<String, Object> sourceSettings,
+            ConnectorRef targetRef, Map<String, Object> targetSettings, String rootTable, long id,
+            ExecutorService queryIo, ExecutorService decodeIo) throws Exception {
+        var rootKey = new ValidationKey(List.of(ValidationKey.Part.number(id)));
+        var observation = new ValidationObservation(new ValidationRunIdentity(new ValidationOwner("cluster", "pipeline", "node", "boot", 1, 1, 0),
+                "task", "native-objects-" + kind, ValidationMode.FULL, "fixed-object-tree", 1, "rules"),
+                new ValidationRoot(rootTable, "output", rootKey, List.of()), 1);
+        var region = new Embed("nest_regions", Map.of("id", "region_id"), EmbedAs.OBJECT, "region", List.of("id"), null, null, null, List.of());
+        var customer = new Embed("nest_customers", Map.of("id", "customer_id"), EmbedAs.OBJECT, "customer", List.of("id"), null, null, null, List.of(region));
+        var plan = ValidationNestRelations.compile("objects", new NestRoot("root", List.of("id"), null, null, List.of(customer)),
+                Set.of("root", "nest_customers", "nest_regions"), Map.of(), new ValidationNestRelations.Limits(8, 8, 65536));
+        var identity = new ValidationKeyBinding("native-object-key", List.of(objectComponent("id")), Set.of(), LIMITS);
+        var emptyMap = ValidationStaticMap.compile("object-input", new TransformBody.MapProjection(Map.of()), LIMITS);
+        var handles = new ArrayList<ValidationReadHandle>();
+        try (var cleanup = new java.util.concurrent.ThreadPoolExecutor(1, 1, 0, java.util.concurrent.TimeUnit.SECONDS,
+                new java.util.concurrent.ArrayBlockingQueue<>(8), new java.util.concurrent.ThreadPoolExecutor.AbortPolicy());
+             var scope = new ValidationReadScope(observation, cleanup, () -> {}, 8)) {
+            var bindings = new LinkedHashMap<List<String>, ValidationNestObjectProjection.Binding>();
+            bindObjectRelations(kind, sourceRef, sourceSettings, plan.children(), observation, identity, bindings, scope, handles, queryIo, decodeIo);
+            var projection = new ValidationNestObjectProjection(new ValidationNestObjectProjection.Scope(observation.run(), rootTable, "output"), plan,
+                    new ValidationNestObjectProjection.RootKeys(identity, identity), bindings,
+                    new ValidationNestObjectProjection.Limits(LIMITS, 8 * 1024 * 1024, 64 * 1024 * 1024, 8, 100, 8));
+            String sourceRead = "object-source-" + id;
+            var generated = ValidationFieldCheck.generatedId(observation.run(), rootTable, "output", true, false, false,
+                    value -> value instanceof ValidationValues.Typed typed && typed.logicalType().equals("text") && typed.value() instanceof String);
+            var result = ValidationRootReader.read(observation, ValidationMethod.FULL_COLUMN,
+                    new ValidationRootReader.Query(sourceRead, "native-object-v1", () -> openObjectRead(kind, sourceRef, sourceSettings,
+                            rootTable, identity, rootKey, scope, handles, queryIo, decodeIo)),
+                    new ValidationRootReader.Query("object-target-" + id, "native-object-v1", () -> openObjectRead("mongodb", targetRef, targetSettings,
+                            "nest_targets", identity, rootKey, scope, handles, queryIo, decodeIo)),
+                    new ValidationRelationRows.Limits(65536, LIMITS), new ValidationRootCheck.Limits(1048576, 100, 100, 20, 8), Clock.systemUTC(), scope::requireActive,
+                    original -> {
+                        var physical = objectPhysical(kind, rootTable, identity, original);
+                        var view = projection.read(observation, new ValidationRootCheck.SampledSide(physical, original, sourceRead),
+                                emptyMap.apply(original, List.of()), ValidationRootReader.SourceEvidence.empty(), Clock.systemUTC(), scope::requireActive);
+                        return new ValidationRootReader.Source(new ValidationRelationReader.Evaluation(ValidationRelationRows.Disposition.INCLUDED,
+                                view.view().row(), Optional.of(physical)), List.of(), view.evidence());
+                    }, actual -> new ValidationRootReader.Target(actual, objectPhysical("mongodb", "nest_targets", identity, actual)),
+                    (pair, root) -> ValidationFieldCheck.checkPartial(observation, List.of(), pair.source().working(), pair.target().working(),
+                            pair.sourceSample(), pair.targetSample(), generated, String::equals, new ValidationValueComparison.TraversalLimits(LIMITS, 100000),
+                            pair.sourceEvidence().issues().stream().flatMap(issue -> issue.affected().stream())
+                                    .map(ValidationRootCheck.Location::fieldPath).distinct().toList(), root));
+            for (var handle : handles) {
+                assertThat(handle.workersExited().toCompletableFuture().get(5, java.util.concurrent.TimeUnit.SECONDS)).isNull();
+                assertThat(handle.rowsReleased().toCompletableFuture().get(5, java.util.concurrent.TimeUnit.SECONDS)).isNull();
+            }
+            scope.close(); assertThat(scope.drained().toCompletableFuture().get(5, java.util.concurrent.TimeUnit.SECONDS)).isNull();
+            return result;
+        }
+    }
+
+    private static void bindObjectRelations(String kind, ConnectorRef artifact, Map<String, Object> settings,
+            List<ValidationNestRelations.Relation> relations, ValidationObservation observation, ValidationKeyBinding identity,
+            Map<List<String>, ValidationNestObjectProjection.Binding> bindings, ValidationReadScope scope, List<ValidationReadHandle> handles,
+            ExecutorService queryIo, ExecutorService decodeIo) {
+        for (var relation : relations) {
+            var physical = new ValidationKeyBinding("native-relation", relation.join().stream().map(pair -> objectComponent(pair.child())).toList(), Set.of(), LIMITS);
+            var lookup = new ValidationNestLookupBinding("objects", relation, relation.join().stream().map(pair -> objectComponent(pair.parent())).toList(), physical, LIMITS);
+            bindings.put(relation.treePath(), new ValidationNestObjectProjection.Binding(lookup, request ->
+                    new ValidationRootReader.Query("object-child-" + observation.root().rootKey().parts().getFirst().value() + "-" + String.join("-", relation.treePath()),
+                            "native-object-v1", () -> openObjectRead(kind, artifact, settings, relation.alias(), physical, request.key(), scope, handles, queryIo, decodeIo)),
+                    (context, raw) -> new ValidationRootReader.Source(new ValidationRelationReader.Evaluation(ValidationRelationRows.Disposition.INCLUDED,
+                            raw, Optional.of(objectPhysical(kind, relation.alias(), identity, raw))), List.of())));
+            bindObjectRelations(kind, artifact, settings, relation.children(), observation, identity, bindings, scope, handles, queryIo, decodeIo);
+        }
+    }
+
+    private static ValidationReadHandle openObjectRead(String kind, ConnectorRef artifact, Map<String, Object> settings, String table,
+            ValidationKeyBinding binding, ValidationKey key, ValidationReadScope scope, List<ValidationReadHandle> handles,
+            ExecutorService queryIo, ExecutorService decodeIo) {
+        var handle = scope.open(table, guard -> PdkValidationSession.lookup(kind, artifact, settings, "retained-" + kind + "-artifact",
+                new PdkValidationSession.Lookup(table, List.of(), List.of(), 2, binding, key),
+                (model, codecs) -> new PdkValidationRows(model, codecs, path -> {
+                    if (Set.of("id", "customer_id", "region_id").contains(path.getLast())) return PdkValidationRows.Rule.of(PdkValidationRows.Shape.EXACT_NUMBER);
+                    return PdkValidationRows.Rule.AUTO;
+                }, LIMITS), (model, codecs, logical) -> {
+                    var match = new LinkedHashMap<String, Object>();
+                    for (int i = 0; i < binding.components().size(); i++) match.put(binding.components().get(i).path().getFirst(), logical.parts().get(i).value());
+                    return match;
+                }, guard, queryIo, decodeIo, 1, LIMITS));
+        handles.add(handle); return handle;
+    }
+    private static ValidationKeyBinding.Component objectComponent(String field) {
+        return new ValidationKeyBinding.Component(List.of(field), ValidationKey.Kind.EXACT_NUMBER, Set.of("exact-number"));
+    }
+    private static ValidationPhysicalIdentity objectPhysical(String kind, String table, ValidationKeyBinding binding, ValidationValues.Row row) {
+        var actual = binding.read(row);
+        assertThat(actual).isInstanceOf(ValidationKeyBinding.Bound.class);
+        return new ValidationPhysicalIdentity(kind + "-fixture", DATABASE, kind.equals("postgres") ? "public" : null, table,
+                binding.components().stream().map(ValidationKeyBinding.Component::path).toList(), ((ValidationKeyBinding.Bound) actual).key());
     }
 
     private static ValidationLinearRules linearRules(String kind, String table, TransformBody.MapProjection projection,
