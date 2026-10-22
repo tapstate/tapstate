@@ -777,7 +777,7 @@ class AuthTest {
             ClusterTopologyTestConfiguration.class,
             PipelinePositionTestConfiguration.class,
             DerivedSchemaTestConfiguration.class, ObservabilityTestConfiguration.class,
-            PipelinePreviewTestConfiguration.class})
+            StartChecksTestConfiguration.class, PipelinePreviewTestConfiguration.class})
     static class TestApp {
 
         @Bean

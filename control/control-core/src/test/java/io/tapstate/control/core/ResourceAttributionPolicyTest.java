@@ -4,6 +4,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.Metadata;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.ViewResource;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import org.junit.jupiter.api.Test;
 
@@ -40,6 +41,29 @@ class ResourceAttributionPolicyTest {
         assertThat(unchanged).isSameAs(source);
         assertThat(unchanged.metadata().cloud()).isNull();
         assertThat(unchanged.metadata().userId()).isNull();
+    }
+
+    @Test
+    void attributingAndUpdatingAViewPreservesItsWriteAndExecutionSettings() {
+        ViewResource submitted = (ViewResource) parser.parse("""
+                version: tapstate/v1
+                kind: view
+                id: view_a
+                primary_key: id
+                write_mode: append
+                on_full_load: clear
+                execution: { parallelism: 3 }
+                """);
+        for (ResourceAttributionPolicy policy : List.of(
+                ResourceAttributionPolicy.managedCloud(), ResourceAttributionPolicy.onPrem())) {
+            ViewResource created = (ViewResource) policy.attribute(USER_ID, submitted, null);
+            ViewResource updated = (ViewResource) policy.attribute(USER_ID, submitted, created);
+            for (ViewResource actual : List.of(created, updated)) {
+                assertThat(actual.writeMode()).isEqualTo(submitted.writeMode());
+                assertThat(actual.onFullLoad()).isEqualTo(submitted.onFullLoad());
+                assertThat(actual.execution()).isEqualTo(submitted.execution());
+            }
+        }
     }
 
     @Test
