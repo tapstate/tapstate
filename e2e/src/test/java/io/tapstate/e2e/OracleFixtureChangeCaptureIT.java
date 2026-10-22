@@ -4,6 +4,7 @@ import io.tapstate.testsupport.DockerGate;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.parallel.Isolated;
+import org.testcontainers.DockerClientFactory;
 import org.testcontainers.images.builder.ImageFromDockerfile;
 import org.testcontainers.oracle.OracleContainer;
 import org.testcontainers.utility.DockerImageName;
@@ -144,6 +145,7 @@ class OracleFixtureChangeCaptureIT {
                         RUN mv "$ORACLE_HOME/bin/sqlplus" "$ORACLE_HOME/bin/sqlplus-probe-real"
                         COPY sqlplus /tmp/tapstate-probe-sqlplus
                         COPY hold-transaction.sh /tmp/tapstate-hold-transaction.sh
+                        COPY observe-wait.sh /tmp/tapstate-observe-wait.sh
                         RUN cp /tmp/tapstate-probe-sqlplus "$ORACLE_HOME/bin/sqlplus"
                         RUN chmod 755 "$ORACLE_HOME/bin/sqlplus"
                         USER oracle
@@ -161,6 +163,7 @@ class OracleFixtureChangeCaptureIT {
                         fi
                         exec "$ORACLE_HOME/bin/sqlplus-probe-real" "$@" < "$input"
                         """)
+                .withFileFromClasspath("observe-wait.sh", "oracle-fixture/observe-wait.sh")
                 .withFileFromString("hold-transaction.sh", """
                         #!/bin/bash
                         set -eu
@@ -184,6 +187,7 @@ class OracleFixtureChangeCaptureIT {
                         holder=$!
                         for attempt in {1..30}; do
                           if [ -f /tmp/tapstate-transaction-ready ]; then
+                            bash /tmp/tapstate-observe-wait.sh </dev/null > /tmp/tapstate-live-wait.log 2>&1 &
                             printf 'capture-probe: real transaction active; bounded rollback in 130 seconds\\n'
                             exit 0
                           fi
@@ -197,6 +201,10 @@ class OracleFixtureChangeCaptureIT {
                         exit 1
                         """)
                 .get();
+
+        var baseImage = DockerClientFactory.instance().client().inspectImageCmd(ORACLE_IMAGE).exec();
+        System.err.printf("oracle-fixture-probe base-image id=%s digests=%s%n",
+                baseImage.getId(), baseImage.getRepoDigests());
 
         // Image substitution keeps SharedOracle's initialization and failure handling under test.
         Field substitutor = accessibleField(ImageNameSubstitutor.class, "instance");

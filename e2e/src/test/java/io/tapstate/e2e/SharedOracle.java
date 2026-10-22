@@ -137,7 +137,7 @@ final class SharedOracle {
                     SQL
                     status=$?
                     printf '\nOracle bounded diagnostic stage journal:\n'
-                    for journal in /tmp/tapstate-main-stage-probe.log /tmp/tapstate-holder-stage-probe.log /tmp/tapstate-transaction.log; do
+                    for journal in /tmp/tapstate-main-stage-probe.log /tmp/tapstate-holder-stage-probe.log /tmp/tapstate-transaction.log /tmp/tapstate-live-wait.log; do
                       [ -f "$journal" ] || continue
                       printf '\nOracle diagnostic journal: %%s\n' "$journal"
                       head -c 65536 "$journal" || true
@@ -182,7 +182,7 @@ final class SharedOracle {
     /** Retains live initialization state before a failed fixture is stopped. */
     private static boolean captureInitializationState(OracleContainer server, Exception failure) {
         var capture = new FutureTask<>(() -> server.execInContainer("bash", "-c", """
-                for journal in /tmp/tapstate-main-stage-probe.log /tmp/tapstate-holder-stage-probe.log /tmp/tapstate-transaction.log; do
+                for journal in /tmp/tapstate-main-stage-probe.log /tmp/tapstate-holder-stage-probe.log /tmp/tapstate-transaction.log /tmp/tapstate-live-wait.log; do
                   [ -f "$journal" ] || continue
                   printf '\nOracle diagnostic journal before cleanup: %s\n' "$journal"
                   head -c 65536 "$journal" || true
