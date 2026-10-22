@@ -5,6 +5,7 @@ import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.store.StorageBinding;
 import java.util.List;
 import java.util.UUID;
+import java.util.function.Function;
 
 /** One explicit native installation per scenario; server restarts reuse it without preparing again. */
 final class PreparedNativeStore implements AutoCloseable {
@@ -15,18 +16,26 @@ final class PreparedNativeStore implements AutoCloseable {
     private final String username;
     private final String password;
     private final SourceResource borrowedMaster;
+    private final Function<String, String> uriForDatabase;
 
-    private PreparedNativeStore(String cluster, String username, String password, SourceResource borrowedMaster) {
+    private PreparedNativeStore(String cluster, String username, String password, SourceResource borrowedMaster,
+            Function<String, String> uriForDatabase) {
         String identity = "e2e_" + UUID.randomUUID().toString().replace("-", "");
         configurationDatabase = identity + "_config";
         cacheDatabase = identity + "_cache";
         masterDatabase = identity + "_master";
         this.cluster = cluster; this.username = username; this.password = password;
         this.borrowedMaster = borrowedMaster;
+        this.uriForDatabase = uriForDatabase;
     }
 
     static PreparedNativeStore create() {
         return create("e2e", "e2e-password");
+    }
+
+    /** Uses the scenario's own Mongo server so a fault reaches all three installed domains. */
+    static PreparedNativeStore createOn(NetworkedMongo server) {
+        return install("e2e-" + UUID.randomUUID(), "e2e", "e2e-password", null, server::uriForThisHost);
     }
 
     static PreparedNativeStore create(String username, String password) {
@@ -43,7 +52,12 @@ final class PreparedNativeStore implements AutoCloseable {
     }
 
     private static PreparedNativeStore install(String cluster, String username, String password, SourceResource target) {
-        var result = new PreparedNativeStore(cluster, username, password, target);
+        return install(cluster, username, password, target, SharedMongo::replicaSetUrl);
+    }
+
+    private static PreparedNativeStore install(String cluster, String username, String password, SourceResource target,
+            Function<String, String> uriForDatabase) {
+        var result = new PreparedNativeStore(cluster, username, password, target, uriForDatabase);
         try {
             var cache = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB, result.cacheUri(), result.cacheDatabase, null);
             if (target == null) NativeMongoStorageFixture.prepare(result.configurationUri(), cache, result.masterUri(), cluster, username, password);
@@ -55,9 +69,9 @@ final class PreparedNativeStore implements AutoCloseable {
         }
     }
 
-    String configurationUri() { return SharedMongo.replicaSetUrl(configurationDatabase); }
-    String cacheUri() { return SharedMongo.replicaSetUrl(cacheDatabase); }
-    String masterUri() { requireOwnedMaster(); return SharedMongo.replicaSetUrl(masterDatabase); }
+    String configurationUri() { return uriForDatabase.apply(configurationDatabase); }
+    String cacheUri() { return uriForDatabase.apply(cacheDatabase); }
+    String masterUri() { requireOwnedMaster(); return uriForDatabase.apply(masterDatabase); }
     String configurationDatabase() { return configurationDatabase; }
     String cacheDatabase() { return cacheDatabase; }
     String masterDatabase() { requireOwnedMaster(); return masterDatabase; }
@@ -65,8 +79,14 @@ final class PreparedNativeStore implements AutoCloseable {
         if (borrowedMaster != null) throw new IllegalStateException("the scenario owns the borrowed master endpoint");
     }
     String clusterId() { return cluster; }
+    String username() { return username; }
+    String password() { return password; }
     void loginAndAwaitBusiness(ControlPlane control) {
         control.login(username, password);
+        awaitBusiness(control);
+    }
+
+    void awaitBusiness(ControlPlane control) {
         var last = new java.util.concurrent.atomic.AtomicReference<java.util.Map<?, ?>>();
         Await.until("the prepared installation to admit business work", () -> {
             var status = control.storageStatus(); last.set(status);

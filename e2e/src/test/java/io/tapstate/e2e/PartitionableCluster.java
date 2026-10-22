@@ -112,6 +112,19 @@ final class PartitionableCluster implements AutoCloseable {
         return start(storeUri, name + "-" + UUID.randomUUID(), nodeIds, false, ADMIN, PASSWORD, List.of());
     }
 
+    /** The caller owns the installation and closes it only after every member has stopped. */
+    static PartitionableCluster startPrepared(PreparedNativeStore storage, List<String> nodeIds) {
+        var cluster = startPrepared(storage.configurationUri(), storage.clusterId(), nodeIds,
+                storage.username(), storage.password(), List.of());
+        try {
+            nodeIds.forEach(node -> storage.awaitBusiness(cluster.member(node)));
+            return cluster;
+        } catch (RuntimeException | Error failure) {
+            cluster.close();
+            throw failure;
+        }
+    }
+
     /** Uses a native installation prepared by the owning test; never invokes first-admin bootstrap. */
     static PartitionableCluster startPrepared(String configurationUri, String clusterId, List<String> nodeIds,
             String admin, String password, List<String> additionalArguments) {
