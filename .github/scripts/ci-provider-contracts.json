@@ -15,6 +15,17 @@
       "source": "adapters/adapter-pdk/src/test/java/io/tapstate/adapters/pdk/PdkTypeMappingTest.java",
       "source_sha256": "c77042856e3be8ba50a67f44a8067aa3d3a4c08287b706b679ca9908b8c0da5a"
     },
+    "io.tapstate.app.ServerTimeZoneTest": {
+      "module": "app",
+      "providers": {
+        "scenarios": {
+          "kind": "source",
+          "projection": "strict"
+        }
+      },
+      "source": "app/src/test/java/io/tapstate/app/ServerTimeZoneTest.java",
+      "source_sha256": "0bb41345aec4adf5ae141456a7f46aa60dda4ff977222eecb5276dc5a140b4a6"
+    },
     "io.tapstate.cli.PublishedConnectorArtifactsTest": {
       "module": "cli",
       "providers": {
