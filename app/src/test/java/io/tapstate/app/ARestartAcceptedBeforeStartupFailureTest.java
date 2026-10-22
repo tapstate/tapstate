@@ -57,7 +57,7 @@ class ARestartAcceptedBeforeStartupFailureTest {
         List<AuditRecord> audit = new ArrayList<>();
         PipelineLifecycleService lifecycle = new PipelineLifecycleService(
                 new ArtifactQueryService(artifacts), desired, new AuditGate(audit::add, clock),
-                id -> state.read(id).map(CheckpointDoc::epoch));
+                state::read);
         StartingRun actuator = new StartingRun();
         ConvergenceDriver driver = new ConvergenceDriver(
                 new PipelineConverger(desired, state, actuator, clock), desired,

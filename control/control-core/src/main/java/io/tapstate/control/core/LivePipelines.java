@@ -3,6 +3,7 @@ package io.tapstate.control.core;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.ReferenceGraph;
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.core.model.PipelineResource;
@@ -54,10 +55,17 @@ public final class LivePipelines {
 
     /** Whether the pipeline is at rest right now: not executing, and not headed back up. */
     public boolean isAtRest(String pipelineId) {
-        return isAtRest(actualStateOf(pipelineId), intentOf(pipelineId));
+        return isAtRest(state.read(pipelineId).orElse(null), desired.read(pipelineId).orElse(null));
     }
 
-    /** Whether those two readings together mean at rest -- the one definition every caller shares. */
+    /** A completion consumes an old run intent, while an accepted new start remains live. */
+    public static boolean isAtRest(CheckpointDoc actual, DesiredState intent) {
+        PipelineState current = actual == null ? PipelineState.NEW : StateJson.parse(actual.stateJson());
+        PipelineState target = intent == null ? PipelineState.NEW : intent.targetStateAt(actual);
+        return isAtRest(current, target);
+    }
+
+    /** Conservative state-only reading: without epochs, a RUNNING intent cannot be known to be consumed. */
     public static boolean isAtRest(PipelineState actual, PipelineState intent) {
         return RESTING.contains(actual) && !HEADED_UP.contains(intent);
     }
@@ -83,9 +91,9 @@ public final class LivePipelines {
      * wave through the one pipeline that is about to raise a held job onto the change.
      */
     public boolean changeWouldGoUnreported(String pipelineId) {
-        PipelineState actual = actualStateOf(pipelineId);
-        PipelineState intent = intentOf(pipelineId);
-        return !isAtRest(actual, intent) && intent != PipelineState.PAUSED;
+        CheckpointDoc actual = state.read(pipelineId).orElse(null);
+        DesiredState intent = desired.read(pipelineId).orElse(null);
+        return !isAtRest(actual, intent) && (intent == null || intent.targetState() != PipelineState.PAUSED);
     }
 
     /** What the pipeline is doing. A pipeline with no checkpoint has never run. */

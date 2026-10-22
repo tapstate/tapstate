@@ -458,12 +458,10 @@ public final class ArtifactMutationService {
      * never run, which is the clean case rather than an unknown one.
      */
     private void refuseWhenNotStopped(String id) {
-        PipelineState actual = actualStateOf(id);
-        PipelineState intent = intentOf(id);
-        if (!isAtRest(actual, intent)) {
+        if (!isAtRest(id)) {
             throw error(
                     ArtifactError.PIPELINE_NOT_STOPPED,
-                    Map.of("id", id, "actual", actual.name(), "desired", intent.name()));
+                    Map.of("id", id, "actual", actualStateOf(id).name(), "desired", intentOf(id).name()));
         }
     }
 
@@ -474,10 +472,6 @@ public final class ArtifactMutationService {
      */
     private boolean isAtRest(String id) {
         return live.isAtRest(id);
-    }
-
-    private static boolean isAtRest(PipelineState actual, PipelineState intent) {
-        return LivePipelines.isAtRest(actual, intent);
     }
 
     private PipelineState actualStateOf(String id) {
