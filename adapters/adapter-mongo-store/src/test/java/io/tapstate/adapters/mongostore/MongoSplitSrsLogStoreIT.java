@@ -164,6 +164,68 @@ class MongoSplitSrsLogStoreIT {
     }
 
     @Test
+    void anAppendAlreadyAtMongoCannotOutliveItsOriginalCaptureOwner() {
+        withCache(f -> {
+            f.log().store(RING, 1, record(1, f.fence()));
+            String appName = "held-append-" + UUID.randomUUID();
+            var sent = new java.util.concurrent.atomic.AtomicReference<org.bson.BsonDocument>();
+            var witness = new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    if (event.getCommandName().equals("update") && event.getCommand().getString("update").getValue().equals("workload_claims"))
+                        sent.compareAndSet(null, event.getCommand().clone());
+                }
+            };
+            try (var delayed = MongoClients.create(MongoClientSettings.builder()
+                    .applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl())).applicationName(appName).addCommandListener(witness).build());
+                 var executor = Executors.newSingleThreadExecutor()) {
+                var oldLog = log(delayed, delayed.getDatabase(f.database().getName()));
+                var admin = f.client().getDatabase("admin");
+                long entered = ((Number) admin.runCommand(new Document("configureFailPoint", "failCommand")
+                        .append("mode", new Document("times", 1)).append("data", new Document("failCommands", List.of("update"))
+                                .append("namespace", f.database().getName() + ".workload_claims").append("appName", appName)
+                                .append("blockConnection", true).append("blockTimeMS", 8000))).get("count")).longValue();
+                try {
+                    var append = executor.submit(() -> {
+                        try { oldLog.store(RING, 3, record(3, f.fence())); return null; }
+                        catch (TapstateException refused) { return refused.code(); }
+                    });
+                    admin.runCommand(new Document("waitForFailPoint", "failCommand")
+                            .append("timesEntered", entered + 1).append("maxTimeMS", 5000));
+                    var held = admin.runCommand(new Document("currentOp", 1).append("$all", true))
+                            .getList("inprog", Document.class).stream().filter(op -> appName.equals(op.getString("appName")))
+                            .filter(op -> op.get("command") instanceof Document command && "workload_claims".equals(command.getString("update")))
+                            .findFirst().orElseThrow();
+                    var command = held.get("command", Document.class);
+                    // Mongo's pre-execution currentOp omits the update document sequence. Bind the
+                    // actual driver's full command to the held server transaction before reading it.
+                    assertThat(sent.get()).isNotNull();
+                    assertThat(command).containsEntry("autocommit", false);
+                    assertThat(command.toBsonDocument(Document.class, MongoClientSettings.getDefaultCodecRegistry()))
+                            .containsEntry("txnNumber", sent.get().get("txnNumber")).containsEntry("lsid", sent.get().get("lsid"));
+                    assertThat(sent.get().getArray("updates").getFirst().asDocument().getDocument("q"))
+                            .isEqualTo(WorkloadClaimDocuments.live(f.fence()).toBsonDocument(Document.class, MongoClientSettings.getDefaultCodecRegistry()));
+                    assertThat(append.isDone()).isFalse();
+                    var claims = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()));
+                    assertThat(claims.release(f.claim())).isTrue();
+                    var successor = claims.acquire(f.claim().key(), new WorkloadOwner("node-b", "boot-b"), 8, Duration.ofSeconds(30)).claim();
+                    assertThat(successor.claimGeneration()).isGreaterThan(f.claim().claimGeneration());
+                    var next = record(2, WorkloadClaimFence.from(successor));
+                    f.log().store(RING, 2, next);
+                    var successorDocument = claim(f.database());
+                    assertThat(append.isDone()).isFalse();
+                    assertThat(admin.runCommand(new Document("currentOp", 1).append("$all", true)).getList("inprog", Document.class))
+                            .anySatisfy(op -> assertThat(op).containsEntry("opid", held.get("opid")));
+                    assertThat(append.get(15, TimeUnit.SECONDS)).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED);
+                    assertThat(claim(f.database())).isEqualTo(successorDocument);
+                    assertThat(f.log().bounds(RING)).isEqualTo(new SrsLogBounds(2, -1));
+                    assertThat(f.log().readBatch(RING, 1, 4).records()).containsOnlyKeys(1L, 2L).containsEntry(2L, next);
+                    assertThat(f.log().load(RING, 3)).isEmpty();
+                } finally { admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off")); }
+            }
+        });
+    }
+
+    @Test
     void concurrentOriginalOwnerAppendsKeepEveryRowAndTheMaximumBoundary() {
         withCache(f -> {
             try (var other = client(); var executor = Executors.newFixedThreadPool(2)) {
