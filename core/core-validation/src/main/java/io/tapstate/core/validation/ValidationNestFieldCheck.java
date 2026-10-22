@@ -12,7 +12,7 @@ import java.util.Set;
 import static io.tapstate.core.validation.ValidationRootCheck.*;
 
 /**
- * Checks actual flat fields against parent fields, other flat rows and declared embedded paths.
+ * Checks actual parent/flat field contributions against other writers and declared embedded paths.
  * Embedded paths remain reserved when an object is omitted or an array is empty. Unknown relation
  * contents must be blocked separately, never supplied here as an empty field set. This check neither
  * renders a document nor validates target values or the model's configured path syntax.
@@ -43,7 +43,7 @@ public final class ValidationNestFieldCheck {
             }
         }
     }
-    public record Conflict(Field flat, Field occupied) {}
+    public record Conflict(Field contributor, Field occupied) {}
     public record Result(List<Field> uncontested, List<Conflict> conflicts) {
         public Result {
             uncontested = List.copyOf(uncontested);
@@ -87,11 +87,11 @@ public final class ValidationNestFieldCheck {
                     if (!overlaps(left.dotted(), right.dotted())) continue;
                     if (conflicts.size() == limits.conflicts()) throw limit("conflicts");
                     budget.bytes(160);
-                    Field flat = left.field().kind() == FieldKind.FLAT ? left.field() : right.field();
-                    Field occupied = flat == left.field() ? right.field() : left.field();
-                    conflicts.add(new Conflict(flat, occupied));
-                    blocked.add(flat); blocked.add(occupied);
-                    Location location = location(parent, flat);
+                    Field contributor = contributor(left.field(), right.field());
+                    Field occupied = contributor == left.field() ? right.field() : left.field();
+                    conflicts.add(new Conflict(contributor, occupied));
+                    blocked.add(contributor); blocked.add(occupied);
+                    Location location = location(parent, contributor);
                     Finding cause = new Finding(Kind.SOURCE_FIELD_CONFLICT, location);
                     if (findings.add(cause)) root.finding(cause);
                     block(root, location, cause);
@@ -108,9 +108,17 @@ public final class ValidationNestFieldCheck {
     }
 
     private static boolean compete(Field left, Field right) {
+        if (left.kind() == FieldKind.PARENT && right.kind() == FieldKind.EMBED_PATH
+                || right.kind() == FieldKind.PARENT && left.kind() == FieldKind.EMBED_PATH) return true;
         if (left.kind() != FieldKind.FLAT && right.kind() != FieldKind.FLAT) return false;
         // A single row's literal fields are not separate writers. Its embedded paths are separate claims.
         return left.kind() != right.kind() || !left.owner().equals(right.owner());
+    }
+    private static Field contributor(Field left, Field right) {
+        if (left.kind() == FieldKind.FLAT) return left;
+        if (right.kind() == FieldKind.FLAT) return right;
+        // Reserve the declared object/array path before examining its current reference or children.
+        return left.kind() == FieldKind.EMBED_PATH ? left : right;
     }
     private static boolean overlaps(String left, String right) {
         String shorter = left.length() <= right.length() ? left : right;
