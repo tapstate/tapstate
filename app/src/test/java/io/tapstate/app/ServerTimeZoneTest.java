@@ -2,6 +2,7 @@ package io.tapstate.app;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.lang.management.ManagementFactory;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -63,6 +64,11 @@ class ServerTimeZoneTest {
         List<String> command = new ArrayList<>(List.of(
                 Path.of(System.getProperty("java.home"), "bin", "java").toString(),
                 "-Xmx128m", "-Dlogback.configurationFile=" + logging));
+        // These children execute the assertions' product path. Retain coverage instrumentation,
+        // but do not inherit the test runner's timezone or unrelated Java agents.
+        ManagementFactory.getRuntimeMXBean().getInputArguments().stream()
+                .filter(argument -> argument.startsWith("-javaagent:") && argument.contains("org.jacoco.agent"))
+                .forEach(command::add);
         command.addAll(scenario.options());
         command.addAll(List.of("-cp", classpath, Probe.class.getName(), Boolean.toString(scenario.warmCache())));
         Path output = work.resolve("child.log");
