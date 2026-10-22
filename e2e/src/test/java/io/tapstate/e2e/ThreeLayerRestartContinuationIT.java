@@ -113,16 +113,27 @@ class ThreeLayerRestartContinuationIT {
 
     @Test @Timeout(300)
     void aCacheOnlyOutageRefusesANewProcessAndResumesTheOriginalStateAfterNormalLogin() throws Exception {
+        storageOutage(false);
+    }
+
+    @Test @Timeout(300)
+    void anOnPremInstanceOutageNeverReopensInstallationAndResumesAfterTheOriginalStoresReturn() throws Exception {
+        storageOutage(true);
+    }
+
+    private void storageOutage(boolean together) throws Exception {
         String suffix = UUID.randomUUID().toString().replace("-", "");
         String cluster = "outage-" + suffix, configDb = "outage_cfg_" + suffix, cacheDb = "outage_cache_" + suffix;
-        String configUri = CONFIG.getReplicaSetUrl(configDb), sourceUri = DATA.getReplicaSetUrl("outage_source_" + suffix);
-        String targetUri = DATA.getReplicaSetUrl("outage_target_" + suffix), cacheUri = CACHE.getReplicaSetUrl(cacheDb);
+        String configUri = (together ? CACHE : CONFIG).getReplicaSetUrl(configDb);
+        configUri += (configUri.contains("?") ? "&" : "?") + "socketTimeoutMS=1500&connectTimeoutMS=1500";
+        String sourceUri = DATA.getReplicaSetUrl("outage_source_" + suffix);
+        String targetUri = (together ? CACHE : DATA).getReplicaSetUrl("outage_target_" + suffix), cacheUri = CACHE.getReplicaSetUrl(cacheDb);
         cacheUri += (cacheUri.contains("?") ? "&" : "?") + "socketTimeoutMS=1500&connectTimeoutMS=1500";
         NativeMongoStorageFixture.prepare(configUri, new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,
                 cacheUri, cacheDb, null), targetUri, cluster);
         var source = EndpointAddress.uri(sourceUri); var target = EndpointAddress.uri(targetUri);
         try (var mongo = new MongoEndpoints(); var cacheClient = MongoClients.create(CACHE.getReplicaSetUrl());
-             var configClient = MongoClients.create(CONFIG.getReplicaSetUrl()); var http = java.net.http.HttpClient.newHttpClient()) {
+             var configClient = MongoClients.create(configUri); var http = java.net.http.HttpClient.newHttpClient()) {
             mongo.seed(source, TABLE, SeedRows.generated(8));
             var configuration = configClient.getDatabase(configDb);
             Map<String, List<Document>> originalConfiguration;
@@ -140,11 +151,11 @@ class ThreeLayerRestartContinuationIT {
                     resources.put("views.tap.yml", control.artifact("views").orElseThrow().canonicalForm());
                     control.apply(resources); control.discoverSchema(SOURCE, "mongodb", Map.of("isUri", true, "uri", sourceUri));
                     control.lifecycle(PIPELINE, LifecycleVerb.START);
-                    awaitRows(mongo, source, target, "the snapshot before a cache-only outage");
+                    awaitRows(mongo, source, target, "the snapshot before a storage outage");
                     String snapshotAck = Await.answered("the initial target confirmation", BOUND,
                             () -> control.durablePosition(PIPELINE, TABLE));
                     mongo.update(source, TABLE, Map.of("id", 1L), Map.of("seq", 11L));
-                    awaitRows(mongo, source, target, "live CDC before the cache-only outage");
+                    awaitRows(mongo, source, target, "live CDC before the storage outage");
                     acknowledged = Await.answered("the live CDC confirmation", BOUND,
                             () -> control.durablePosition(PIPELINE, TABLE).filter(value -> !value.equals(snapshotAck)));
                     beforeOutage = rows(mongo, target);
@@ -158,10 +169,25 @@ class ThreeLayerRestartContinuationIT {
                     Await.until("the original process to revoke its unavailable node session", Duration.ofSeconds(45),
                             () -> first.tail().contains("Node session lost:"), first::tail);
                     assertThat(first.isAlive()).isTrue();
-                    assertThat(rows(mongo, target)).isEqualTo(beforeOutage);
-                    assertThat(installationFacts(configuration)).isEqualTo(originalConfiguration);
+                    if (!together) {
+                        assertThat(rows(mongo, target)).isEqualTo(beforeOutage);
+                        assertThat(installationFacts(configuration)).isEqualTo(originalConfiguration);
+                    }
                 }
                 assertThat(first.isAlive()).isFalse();
+                java.util.function.Consumer<RealProcessServer> verifyResume = resumed -> {
+                    var control = login(resumed);
+                    awaitRows(mongo, source, target, "all outage changes to resume after normal login");
+                    Await.answered("the original target position to advance after restoration", BOUND,
+                            () -> control.durablePosition(PIPELINE, TABLE).filter(value -> !value.equals(acknowledged)));
+                    mongo.insert(source, TABLE, List.of(Map.of("id", 9L, "seq", 999L)));
+                    awaitRows(mongo, source, target, "fresh CDC after storage restoration");
+                    assertThat(control.snapshotRowsRead(PIPELINE)).containsEntry(TABLE, 0L);
+                    assertThat(control.state(PIPELINE)).contains(PipelineState.RUNNING);
+                    assertThat(installationFacts(configuration)).isEqualTo(originalConfiguration);
+                    assertThat(configuration.getCollection("operator_generations").find(new Document("_id", PIPELINE)).first())
+                            .containsEntry("stateGeneration", 1L);
+                };
                 try (var blocked = start(configUri, cluster)) {
                     var entry = http.send(java.net.http.HttpRequest.newBuilder(blocked.baseUrl().resolve("/auth/storage-entry"))
                             .timeout(Duration.ofSeconds(30)).GET().build(), java.net.http.HttpResponse.BodyHandlers.ofString());
@@ -174,23 +200,19 @@ class ThreeLayerRestartContinuationIT {
                             .build(), java.net.http.HttpResponse.BodyHandlers.ofString());
                     assertThat(login.statusCode()).isEqualTo(503);
                     assertThat(Document.parse(login.body())).containsEntry("code", io.tapstate.control.core.ControlError.STORAGE_UNAVAILABLE.code());
+                    if (!together) {
+                        assertThat(installationFacts(configuration)).isEqualTo(originalConfiguration);
+                        assertThat(rows(mongo, target)).isEqualTo(beforeOutage);
+                    }
+                    CACHE.getDockerClient().unpauseContainerCmd(CACHE.getContainerId()).exec(); paused = false;
                     assertThat(installationFacts(configuration)).isEqualTo(originalConfiguration);
                     assertThat(rows(mongo, target)).isEqualTo(beforeOutage);
-                    CACHE.getDockerClient().unpauseContainerCmd(CACHE.getContainerId()).exec(); paused = false;
                     assertThat(chains.find(new Document("_id", originalChain.get("_id"))).first())
                             .containsEntry("checkpoint", originalChain.get("checkpoint"));
-                    var control = login(blocked);
-                    awaitRows(mongo, source, target, "all outage changes to resume after normal login");
-                    Await.answered("the original target position to advance after restoration", BOUND,
-                            () -> control.durablePosition(PIPELINE, TABLE).filter(value -> !value.equals(acknowledged)));
-                    mongo.insert(source, TABLE, List.of(Map.of("id", 9L, "seq", 999L)));
-                    awaitRows(mongo, source, target, "fresh CDC after storage restoration");
-                    assertThat(control.snapshotRowsRead(PIPELINE)).containsEntry(TABLE, 0L);
-                    assertThat(control.state(PIPELINE)).contains(PipelineState.RUNNING);
-                    assertThat(installationFacts(configuration)).isEqualTo(originalConfiguration);
-                    assertThat(configuration.getCollection("operator_generations").find(new Document("_id", PIPELINE)).first())
-                            .containsEntry("stateGeneration", 1L);
+                    if (!together) verifyResume.accept(blocked);
                 }
+                // A process that could not load CONFIG has no authenticated local context to retry.
+                if (together) try (var restored = start(configUri, cluster)) { verifyResume.accept(restored); }
             } finally {
                 if (paused) CACHE.getDockerClient().unpauseContainerCmd(CACHE.getContainerId()).exec();
             }
