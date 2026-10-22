@@ -98,6 +98,53 @@ class PipelineLifecycleServiceTest {
     }
 
     @Test
+    void aNaturallyCompletedRunCanBeStoppedAndRerunWithEitherRetentionChoice() {
+        artifacts.save(PIPELINE_V1);
+        checkpoint = Optional.of(new CheckpointDoc("pl1", "COMPLETED", 8L, FIXED));
+        for (boolean purge : List.of(false, true)) {
+            desired.save(new DesiredState("pl1", PipelineState.RUNNING, revisionOf(PIPELINE_V1)));
+
+            DesiredState stopped = service.stop("alice", "pl1", purge);
+            assertThat(stopped.targetState()).isEqualTo(PipelineState.STOPPED);
+            assertThat(stopped.purgeState()).isEqualTo(purge);
+            DesiredState restarted = service.start("alice", "pl1");
+            assertThat(restarted.targetState()).isEqualTo(PipelineState.RUNNING);
+            assertThat(restarted.purgeState()).isEqualTo(purge);
+            assertThat(restarted.rebuildOwedAt(checkpoint.orElseThrow())).isTrue();
+        }
+    }
+
+    @Test
+    void anExplicitStopCanCancelAStartStillWaitingAtCompletion() {
+        artifacts.save(PIPELINE_V1);
+        checkpoint = Optional.of(new CheckpointDoc("pl1", "COMPLETED", 8L, FIXED));
+        desired.save(new DesiredState("pl1", PipelineState.RUNNING,
+                revisionOf(PIPELINE_V1), true, assemblyOf(PIPELINE_V1), true, 8L));
+
+        DesiredState stopped = service.stop("alice", "pl1", false);
+
+        assertThat(stopped.targetState()).isEqualTo(PipelineState.STOPPED);
+        assertThat(stopped.purgeState()).isFalse();
+        assertThat(stopped.reassemble()).isFalse();
+    }
+
+    @Test
+    void anOlderCheckpointCannotConsumeANewerAcceptedStart() {
+        artifacts.save(PIPELINE_V1);
+        checkpoint = Optional.of(new CheckpointDoc("pl1", "COMPLETED", 7L, FIXED));
+        DesiredState pending = new DesiredState("pl1", PipelineState.RUNNING,
+                revisionOf(PIPELINE_V1), false, assemblyOf(PIPELINE_V1), true, 8L);
+        desired.save(pending);
+
+        TapstateException refused = catchThrowableOfType(TapstateException.class,
+                () -> service.start("alice", "pl1"));
+
+        assertThat(refused).isNotNull();
+        assertThat(refused.code().code()).isEqualTo("lifecycle.illegal-transition");
+        assertThat(desired.read("pl1")).contains(pending);
+    }
+
+    @Test
     void anIllegalTransitionIsRefusedWithACodeAndWritesNothing() {
         artifacts.save(PIPELINE_V1);
 

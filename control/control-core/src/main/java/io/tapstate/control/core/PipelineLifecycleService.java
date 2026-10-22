@@ -3,7 +3,6 @@ package io.tapstate.control.core;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.CheckpointDoc;
-import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.LifecycleMachine;
 import io.tapstate.core.lifecycle.LifecycleVerb;
@@ -156,16 +155,7 @@ public final class PipelineLifecycleService {
     }
 
     private static PipelineState currentState(Optional<DesiredState> prior, Optional<CheckpointDoc> actual) {
-        PipelineState intended = prior.map(DesiredState::targetState).orElse(PipelineState.NEW);
-        if (intended != PipelineState.RUNNING || actual.isEmpty()
-                || StateJson.parse(actual.get().stateJson()) != PipelineState.COMPLETED) {
-            return intended;
-        }
-        DesiredState intent = prior.orElseThrow();
-        // A second start already accepted at this completed checkpoint is still waiting to run.
-        // The old completion cannot authorize a third start over that pending instruction.
-        boolean pendingStart = intent.rebuildOwedAt(actual.get());
-        return pendingStart ? PipelineState.RUNNING : PipelineState.COMPLETED;
+        return prior.map(intent -> intent.targetStateAt(actual.orElse(null))).orElse(PipelineState.NEW);
     }
 
     private DesiredState apply(String principal, String pipelineId, LifecycleVerb verb, boolean purgeState,

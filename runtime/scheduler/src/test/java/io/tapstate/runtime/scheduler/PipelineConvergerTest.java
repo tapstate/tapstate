@@ -21,6 +21,7 @@ import org.junit.jupiter.api.Test;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -76,6 +77,21 @@ class PipelineConvergerTest {
         assertThat(state.read("p1").orElseThrow().stateJson()).isEqualTo(StateJson.of(COMPLETED));
         assertThat(desired.read("p1").orElseThrow().targetState()).isEqualTo(RUNNING);
         assertThat(actuator.calls()).containsExactly("stop:p1:keep");
+    }
+
+    @Test
+    void anExplicitStopAfterCompletionStillDrivesItsRetentionChoice() {
+        for (boolean purge : List.of(false, true)) {
+            String id = "completed-" + purge;
+            state.create(id, StateJson.of(COMPLETED), T0);
+            desired.save(new DesiredState(id, STOPPED, REV, purge));
+            actuator.reset();
+
+            converger.converge(id);
+
+            assertThat(state.read(id).orElseThrow().stateJson()).isEqualTo(StateJson.of(STOPPED));
+            assertThat(actuator.calls()).containsExactly("stop:" + id + (purge ? ":purge" : ":keep"));
+        }
     }
 
     @Test

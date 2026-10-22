@@ -72,6 +72,21 @@ public record DesiredState(
     }
 
     /**
+     * The intent after accounting for natural completion. A consumed RUNNING intent stays on file,
+     * but does not request another run. A newly accepted start, including one newer than the checkpoint
+     * this reader observed, must still be treated as RUNNING until its own execution has completed.
+     */
+    public PipelineState targetStateAt(CheckpointDoc checkpoint) {
+        if (targetState != PipelineState.RUNNING || checkpoint == null
+                || StateJson.parse(checkpoint.stateJson()) != PipelineState.COMPLETED) {
+            return targetState;
+        }
+        boolean pending = rebuildOwedAt(checkpoint)
+                || reassemble && rebuiltAtStateEpoch != null && rebuiltAtStateEpoch > checkpoint.epoch();
+        return pending ? PipelineState.RUNNING : PipelineState.COMPLETED;
+    }
+
+    /**
      * An intent that builds nothing afresh and knows nothing about what its run was assembled from —
      * every verb but the resume that re-assembles, and every intent stored before those fields existed.
      */

@@ -64,7 +64,11 @@ final class TestLifecycleStores {
         private final Map<String, CheckpointDoc> docs = new LinkedHashMap<>();
 
         void put(String pipelineId, PipelineState actual) {
-            docs.put(pipelineId, CheckpointDoc.initial(pipelineId, StateJson.of(actual), Instant.EPOCH));
+            put(pipelineId, actual, 0);
+        }
+
+        void put(String pipelineId, PipelineState actual, long epoch) {
+            docs.put(pipelineId, new CheckpointDoc(pipelineId, StateJson.of(actual), epoch, Instant.EPOCH));
         }
 
         @Override
