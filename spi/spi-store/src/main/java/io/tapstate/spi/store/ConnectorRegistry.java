@@ -1,6 +1,5 @@
 package io.tapstate.spi.store;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -32,9 +31,7 @@ public interface ConnectorRegistry {
      */
     default RegistrationOutcome register(String connectorId, String pdkApiVersion, RegistrationSource source,
                                          String contentHash, long length, InputStream artifact) throws IOException {
-        var bytes = new ByteArrayOutputStream();
-        ArtifactStreams.copyVerified(artifact, bytes, contentHash, length);
-        return register(connectorId, pdkApiVersion, source, bytes.toByteArray());
+        return register(connectorId, pdkApiVersion, source, ArtifactStreams.readVerified(artifact, contentHash, length));
     }
 
     /** Every registered connector. */

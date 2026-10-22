@@ -4,6 +4,10 @@ import io.tapstate.adapters.pdk.*;
 import io.tapstate.control.core.*;
 import io.tapstate.core.catalog.*;
 import io.tapstate.spi.store.*;
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.time.Clock;
 import java.util.*;
 
@@ -16,15 +20,28 @@ final class InstalledConnectorTests {
         var artifacts = new LinkedHashMap<String,byte[]>();
         ConnectorRegistry registry = new ConnectorRegistry() {
             @Override public RegistrationOutcome register(String id, String api, RegistrationSource source, byte[] bytes) {
-                String hash = ContentHash.of(bytes);
+                byte[] owned = bytes.clone();
+                return registerOwned(id, api, source, ContentHash.of(owned), owned);
+            }
+            @Override public RegistrationOutcome register(String id, String api, RegistrationSource source,
+                                                            String hash, long length, InputStream bytes) throws IOException {
+                return registerOwned(id, api, source, hash, ArtifactStreams.readVerified(bytes, hash, length));
+            }
+            private RegistrationOutcome registerOwned(String id, String api, RegistrationSource source, String hash, byte[] bytes) {
                 var existing = registrations.get(hash);
                 if (existing != null) return new RegistrationOutcome(existing, false);
                 var created = new ConnectorRegistration(id, hash, api, source);
-                registrations.put(hash, created); artifacts.put(hash, bytes.clone());
+                registrations.put(hash, created); artifacts.put(hash, bytes);
                 return new RegistrationOutcome(created, true);
             }
             @Override public List<ConnectorRegistration> list() { return List.copyOf(registrations.values()); }
             @Override public Optional<byte[]> artifact(String hash) { return Optional.ofNullable(artifacts.get(hash)).map(byte[]::clone); }
+            @Override public boolean copyArtifactTo(String hash, OutputStream target) throws IOException {
+                byte[] bytes = artifacts.get(hash);
+                if (bytes == null) return false;
+                ArtifactStreams.copyVerified(new ByteArrayInputStream(bytes), target, hash, bytes.length);
+                return true;
+            }
             @Override public boolean hasArtifact(String hash) { return artifacts.containsKey(hash); }
         };
         var rows = new LinkedHashMap<String,ConnectorCatalogEntry>();
