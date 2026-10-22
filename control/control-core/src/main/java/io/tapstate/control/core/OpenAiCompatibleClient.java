@@ -145,7 +145,12 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
     private static void readChunk(String data, StreamState state, Consumer<String> text) {
         Map<String, Object> chunk = object(JsonReader.parse(data));
         if (chunk.containsKey("error")) {
-            LOG.log(System.Logger.Level.WARNING, "AI provider returned a stream error event");
+            Object error = chunk.get("error");
+            String code = error instanceof Map<?, ?> details && details.get("code") instanceof String value
+                    && value.matches("[A-Za-z0-9_.-]{1,80}") ? value : "unspecified";
+            String type = error instanceof Map<?, ?> details && details.get("type") instanceof String value
+                    && value.matches("[A-Za-z0-9_.-]{1,80}") ? value : "unspecified";
+            LOG.log(System.Logger.Level.WARNING, "AI provider stream error: code={0}, type={1}", code, type);
             throw failed();
         }
         Object rawChoices = chunk.get("choices");
