@@ -46,6 +46,10 @@ final class MongoCacheIdentity {
         return StoreIo.call(() -> rawTransaction(operation));
     }
 
+    <T> T transaction(MongoReadBudget budget, Function<ClientSession, T> operation) {
+        return budget.transaction(client, operation);
+    }
+
     private <T> T rawTransaction(Function<ClientSession, T> operation) {
         try (var session = client.startSession()) {
             return session.withTransaction(() -> operation.apply(session), TRANSACTION);

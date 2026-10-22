@@ -26,6 +26,8 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
+import java.util.concurrent.TimeUnit;
+import com.mongodb.client.cursor.TimeoutMode;
 
 /** Necessary configuration security facts; sessions belong to the independently prepared cache domain. */
 final class MongoConfigurationSecurityStores {
@@ -37,7 +39,7 @@ final class MongoConfigurationSecurityStores {
     private final MongoCollection<Document> tokens;
     private final MongoCollection<Document> versions;
     private final AuditStore audit;
-    private final TokenStore tokenStore = new Tokens();
+    private final TokenStore tokenStore = new Tokens(null);
     private final ClusterIdentityStore identityStore = new Identity();
 
     MongoConfigurationSecurityStores(MongoClient client, MongoDatabase database, String clusterId) {
@@ -50,6 +52,7 @@ final class MongoConfigurationSecurityStores {
     }
 
     TokenStore tokens() { return tokenStore; }
+    TokenStore tokens(MongoReadBudget budget) { return new Tokens(Objects.requireNonNull(budget)); }
     AuditStore audit() { return audit; }
     ClusterIdentityStore clusterIdentity() { return identityStore; }
 
@@ -63,6 +66,14 @@ final class MongoConfigurationSecurityStores {
     }
 
     private final class Tokens implements TokenStore {
+        private final MongoReadBudget budget;
+        private Tokens(MongoReadBudget budget) { this.budget = budget; }
+        private MongoCollection<Document> reads() {
+            return budget == null ? tokens : tokens.withTimeout(budget.operationMillis(), TimeUnit.MILLISECONDS);
+        }
+        private <T> T transaction(Function<ClientSession, T> body) {
+            return budget == null ? MongoConfigurationSecurityStores.this.transaction(body) : budget.transaction(client, body);
+        }
         @Override public void save(TokenRecord record) {
             Objects.requireNonNull(record, "record");
             StoreIo.run(record.tokenId(), () -> transaction(session -> {
@@ -76,8 +87,12 @@ final class MongoConfigurationSecurityStores {
 
         @Override public Optional<TokenRecord> find(String id) {
             Objects.requireNonNull(id, "id");
-            return StoreIo.call(() -> Optional.ofNullable(tokens.find(new Document("_id", id)).first())
-                    .map(MongoConfigurationSecurityStores::decodeToken));
+            return StoreIo.call(() -> {
+                var found = Optional.ofNullable(reads().find(new Document("_id", id)).first())
+                        .map(MongoConfigurationSecurityStores::decodeToken);
+                if (budget != null) budget.requireRemaining();
+                return found;
+            });
         }
 
         @Override public void revoke(String id) {
@@ -95,9 +110,12 @@ final class MongoConfigurationSecurityStores {
         @Override public List<TokenRecord> list() {
             return StoreIo.call(() -> {
                 List<TokenRecord> result = new ArrayList<>();
-                try (var cursor = tokens.find().iterator()) {
+                var query = reads().find();
+                if (budget != null) query.timeoutMode(TimeoutMode.CURSOR_LIFETIME);
+                try (var cursor = query.iterator()) {
                     while (cursor.hasNext()) result.add(decodeToken(cursor.next()));
                 }
+                if (budget != null) budget.requireRemaining();
                 return List.copyOf(result);
             });
         }

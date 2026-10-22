@@ -1,10 +1,12 @@
 package io.tapstate.app;
 
 import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
+import io.tapstate.adapters.mongostore.MongoReadBudget;
 import io.tapstate.control.core.*;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.*;
 import java.time.Clock;
+import java.time.Duration;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -12,6 +14,8 @@ import java.util.concurrent.atomic.AtomicReference;
 
 /** Publishes a formal authentication owner independently from Hazelcast, claims and business readiness. */
 final class StorageAuthentication implements AutoCloseable {
+    // Store operations also have a five-second cap, leaving time for transaction abort before HTTP expires.
+    private static final Duration AUTHORIZATION_READ_BUDGET = Duration.ofSeconds(10);
     private final MongoConfigurationDomain configuration;
     private final CloudRuntimeSettings cloud;
     private final CloudSdkBridge bridge;
@@ -71,19 +75,22 @@ final class StorageAuthentication implements AutoCloseable {
 
     private Optional<CredentialAuthentication> authenticate(String presented) {
         if (current.get() == null && bootstrap != null) return bootstrap.authenticate(presented);
-        Epoch original = selected(); original.requireActive();
-        Optional<VerifiedToken> verified = original.authenticate(presented);
+        var budget = new MongoReadBudget(AUTHORIZATION_READ_BUDGET);
+        Epoch original = selected(); original.requireActive(budget);
+        Optional<VerifiedToken> verified = original.authenticate(presented, budget);
         if (verified.isEmpty()) return Optional.empty();
         Optional<String> organization = cloud.cloud()
-                ? original.managed.clusterContext(presented).map(CloudSessionContext::organizationId) : Optional.empty();
+                ? original.managed(budget).clusterContext(presented).map(CloudSessionContext::organizationId) : Optional.empty();
         if (cloud.cloud() && organization.isEmpty()) return Optional.empty();
-        original.requireActive();
+        original.requireActive(budget);
         VerifiedToken identity = verified.orElseThrow();
         return Optional.of(new CredentialAuthentication(identity, Optional.of(original.bound.preparation().authScope()),
                 organization, () -> {
-                    original.requireActive();
-                    if (original.authenticate(presented).filter(identity::equals).isEmpty()) throw unauthenticated();
-                    original.requireActive();
+                    // Revalidation is a later IO operation, not the lifetime of the original request.
+                    var revalidation = new MongoReadBudget(AUTHORIZATION_READ_BUDGET);
+                    original.requireActive(revalidation);
+                    if (original.authenticate(presented, revalidation).filter(identity::equals).isEmpty()) throw unauthenticated();
+                    original.requireActive(revalidation);
                 }));
     }
 
@@ -133,7 +140,6 @@ final class StorageAuthentication implements AutoCloseable {
         final StorageRuntime.Bound bound;
         final LocalAuthenticationContext local;
         final CloudAuthenticationService managed;
-        final TokenService tokens;
         final TokenSigner signer;
         Epoch(StorageRuntime.Bound bound) {
             this.bound = bound;
@@ -141,7 +147,7 @@ final class StorageAuthentication implements AutoCloseable {
             if (cloud.cloud() != (scope.mode() == StorageBinding.Mode.CLOUD)) throw StorageRuntime.unavailable();
             if (cloud.cloud()) {
                 if (bridge == null || !cloud.clusterId().equals(scope.clusterId())) throw StorageRuntime.unavailable();
-                local = null; tokens = null; signer = null;
+                local = null; signer = null;
                 var identity = new CloudSessionIdentity(cloud.baseUrl().toString(), CloudSdkBridge.DEPLOYMENT_ORGANIZATION, cloud.clusterId());
                 var observer = CloudRuntimeConfiguration.authenticationObserver();
                 managed = new CloudAuthenticationService(bridge, bridge,
@@ -149,26 +155,34 @@ final class StorageAuthentication implements AutoCloseable {
             } else {
                 managed = null;
                 signer = new HmacTokenSigner(signingKey, HmacTokenSigner.DEFAULT_TTL, clock, scope);
-                tokens = new TokenService(configuration.tokens(), secrets, clock);
                 var access = new AccessTokenService(signer, clock);
                 local = new LocalAuthenticationContext(new LoginService(configuration.users(), new BCryptPasswordHasher(), access),
                         new SessionService(bound.cache().sessions(scope), secrets, access, clock),
                         new ClusterIdentityService(configuration.clusterIdentity()), this::requireActive);
             }
         }
-        Optional<VerifiedToken> authenticate(String presented) {
-            requireActive();
-            Optional<VerifiedToken> result = cloud.cloud() ? managed.authenticate(presented)
-                    : TokenService.isMachineToken(presented) ? tokens.authenticate(presented) : signer.verify(presented);
-            if (result.isPresent()) bound.cache().loadAuthScope(bound.preparation().authScope());
-            requireActive(); return result;
+        CloudAuthenticationService managed(MongoReadBudget budget) {
+            var observer = CloudRuntimeConfiguration.authenticationObserver();
+            return new CloudAuthenticationService(bridge, bridge,
+                    new CloudSessionService(bound.cache().cloudSessions(bound.preparation().authScope(), budget),
+                            managed.identity(), secrets, clock, observer), observer, egressAddresses);
         }
-        void requireActive() {
+        Optional<VerifiedToken> authenticate(String presented, MongoReadBudget budget) {
+            requireActive(budget);
+            Optional<VerifiedToken> result = cloud.cloud() ? managed(budget).authenticate(presented)
+                    : TokenService.isMachineToken(presented)
+                            ? new TokenService(configuration.tokens(budget), secrets, clock).authenticate(presented)
+                            : signer.verify(presented);
+            if (result.isPresent()) bound.cache().loadAuthScope(bound.preparation().authScope(), budget);
+            requireActive(budget); return result;
+        }
+        void requireActive() { requireActive(new MongoReadBudget(AUTHORIZATION_READ_BUDGET)); }
+        void requireActive(MongoReadBudget budget) {
             bound.requireAuthentication();
             if (closed || current.get() != this) throw unauthenticated();
             try {
-                configuration.requireAuthenticationPublished(bound.preparation());
-                bound.cache().loadAuthScope(bound.preparation().authScope());
+                configuration.requireAuthenticationPublished(bound.preparation(), budget);
+                bound.cache().loadAuthScope(bound.preparation().authScope(), budget);
             }
             catch (TapstateException unavailable) { throw StorageRuntime.unavailable(); }
             bound.requireAuthentication();

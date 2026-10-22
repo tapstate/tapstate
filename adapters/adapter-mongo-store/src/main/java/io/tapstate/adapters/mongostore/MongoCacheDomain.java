@@ -63,6 +63,20 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         verifyAuthCollections(expected.mode());
         return expected;
     }
+
+    /** Request-time validation keeps the original generation and bounds every dependency read. */
+    public CacheAuthScope loadAuthScope(CacheAuthScope expected, Duration timeout) {
+        return loadAuthScope(expected, new MongoReadBudget(timeout));
+    }
+
+    public CacheAuthScope loadAuthScope(CacheAuthScope expected, MongoReadBudget budget) {
+        Objects.requireNonNull(budget, "budget");
+        var facts = facts(expected);
+        facts.transaction(budget, session -> { facts.requireReady(session); return null; });
+        verifyAuthCollections(expected.mode(), budget);
+        budget.requireRemaining();
+        return expected;
+    }
     void requireRecoveryTarget(StorageBinding binding) {
         businessActive();
         if (!targetFingerprint.equals(MongoStorageBindingStore.targetFingerprint(binding.cache()))) throw MongoCacheIdentity.fenced();
@@ -185,6 +199,14 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         if (scope.mode() != StorageBinding.Mode.CLOUD) throw MongoCacheIdentity.fenced();
         loadAuthScope(scope);
         return new MongoCacheCloudSessionStore(facts(scope), connection.database(), () -> verifyAuthPresence(scope.mode()));
+    }
+
+    /** A credential verification uses the same deadline for scope, session and revocation checks. */
+    public CloudSessionStore cloudSessions(CacheAuthScope scope, MongoReadBudget budget) {
+        if (scope.mode() != StorageBinding.Mode.CLOUD) throw MongoCacheIdentity.fenced();
+        loadAuthScope(scope, Objects.requireNonNull(budget));
+        return new MongoCacheCloudSessionStore(facts(scope), connection.database(),
+                () -> verifyAuthPresence(scope.mode(), budget), budget);
     }
 
     /** Verifies a fixed business identity and its schema; individual facets verify their own structures. */
@@ -483,11 +505,16 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         return new MongoCacheIdentity(connection.client(), connection.database(), Objects.requireNonNull(scope, "scope"));
     }
 
-    private void verifyAuthCollections(StorageBinding.Mode mode) {
-        verifyAuthPresence(mode);
+    private void verifyAuthCollections(StorageBinding.Mode mode) { verifyAuthCollections(mode, null); }
+
+    private void verifyAuthCollections(StorageBinding.Mode mode, MongoReadBudget budget) {
+        verifyAuthPresence(mode, budget);
         StoreIo.run(() -> {
             for (var table : authTables(mode)) {
-                var existing = table.on(connection.database()).listIndexes().into(new ArrayList<>());
+                var database = budget == null ? connection.database() : budget.database(connection.database());
+                var indexes = table.on(database).listIndexes();
+                if (budget != null) indexes.timeoutMode(com.mongodb.client.cursor.TimeoutMode.CURSOR_LIFETIME);
+                var existing = indexes.into(new ArrayList<>());
                 if (existing.stream().anyMatch(index -> index.containsKey("expireAfterSeconds"))) throw unreadableIndex();
                 for (var declared : table.indexes()) {
                     var found = existing.stream().filter(index -> declared.indexName().equals(index.get("name"))).findFirst().orElse(null);
@@ -500,12 +527,15 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         });
     }
 
-    private void verifyAuthPresence(StorageBinding.Mode mode) {
+    private void verifyAuthPresence(StorageBinding.Mode mode) { verifyAuthPresence(mode, null); }
+
+    private void verifyAuthPresence(StorageBinding.Mode mode, MongoReadBudget budget) {
         StoreIo.run(() -> {
             var tables = new ArrayList<>(authTables(mode));
             tables.add(SystemCollections.CACHE_IDENTITY); tables.add(SystemCollections.CACHE_SCHEMA_MIGRATIONS);
             Set<String> required = tables.stream().map(SystemCollections::collectionName).collect(java.util.stream.Collectors.toSet());
-            var actual = MongoCollectionMetadata.matching(connection.database(), required);
+            var database = budget == null ? connection.database() : budget.database(connection.database());
+            var actual = MongoCollectionMetadata.matching(database, required, budget != null);
             if (actual.size() != required.size() || actual.stream().anyMatch(row -> !"collection".equals(row.get("type")))) throw unreadableIndex();
         });
     }

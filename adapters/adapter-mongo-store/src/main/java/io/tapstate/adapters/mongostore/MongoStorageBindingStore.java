@@ -22,6 +22,7 @@ import io.tapstate.spi.store.StorageSetupScope;
 import org.bson.Document;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
@@ -149,12 +150,23 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
         }));
     }
     void requireAuthenticationPublished(CachePreparation original) {
-        StoreIo.call(() -> transaction(session -> {
-            var bound = load(session).orElseThrow(MongoStorageBindingStore::refused).binding();
-            var current = MongoStorageRecoveryStore.authentication(session, database, bound);
-            if (current.pending() || !current.preparation().equals(original)) throw refused();
+        StoreIo.call(() -> transaction(session -> { requireAuthenticationPublished(session, original); return null; }));
+    }
+    void requireAuthenticationPublished(CachePreparation original, Duration budget) {
+        requireAuthenticationPublished(original, new MongoReadBudget(budget));
+    }
+    void requireAuthenticationPublished(CachePreparation original, MongoReadBudget budget) {
+        budget.transaction(client, session -> {
+            requireActive.run();
+            requireAuthenticationPublished(session, original);
+            requireActive.run();
             return null;
-        }));
+        });
+    }
+    private void requireAuthenticationPublished(ClientSession session, CachePreparation original) {
+        var bound = load(session).orElseThrow(MongoStorageBindingStore::refused).binding();
+        var current = MongoStorageRecoveryStore.authentication(session, database, bound);
+        if (current.pending() || !current.preparation().equals(original)) throw refused();
     }
     private StorageBinding requireAuthenticationRecoveryConfiguration(ClientSession session) {
         var bound = load(session).orElseThrow(MongoStorageBindingStore::refused).binding();

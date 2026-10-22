@@ -13,6 +13,8 @@ import io.tapstate.spi.store.StorageBinding;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
@@ -32,11 +34,48 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /** Real cache-only session semantics through fixed-generation views of one pooled client. */
 @RequiresDocker
 class MongoCacheSessionStoresIT {
-    @Container private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
+    @Container private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
+            .withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");
     private static final Instant CREATED = Instant.parse("2026-10-17T01:00:00Z");
     private static final CloudSessionIdentity CLOUD = new CloudSessionIdentity("https://cloud.example", "org-a", "cluster-a");
     private static final String HASH = "sha256-secret-fixture";
     private static final Runnable ACTIVE = () -> {};
+
+    @ParameterizedTest
+    @EnumSource(value = SystemCollections.class, names = {"CLOUD_SESSIONS", "CLOUD_REVOCATIONS"})
+    void aCredentialReadStalledAfterScopeValidationIsBoundedAndRollsBackItsFence(SystemCollections table) {
+        withCache(StorageBinding.Mode.CLOUD, (root, database, binding, scope) -> {
+            assertThat(root.cloudSessions(scope).create(cloud("bounded"))).isTrue();
+            var sessions = root.cloudSessions(scope, new MongoReadBudget(Duration.ofSeconds(5)));
+            Document original = SystemCollections.CLOUD_SESSIONS.on(database).find().first();
+            Document identity = SystemCollections.CACHE_IDENTITY.on(database).find().first();
+            try (var adminClient = MongoClients.create(MONGO.getReplicaSetUrl()); var worker = Executors.newSingleThreadExecutor()) {
+                var admin = adminClient.getDatabase("admin");
+                long entered = ((Number) admin.runCommand(new Document("configureFailPoint", "failCommand")
+                        .append("mode", "alwaysOn").append("data", new Document("failCommands", List.of("find"))
+                                .append("namespace", database.getName() + "." + table.collectionName())
+                                .append("blockConnection", true).append("blockTimeMS", 20000))).get("count")).longValue();
+                var result = worker.submit(() -> table == SystemCollections.CLOUD_SESSIONS
+                        ? sessions.find(CLOUD, "bounded")
+                        : sessions.authenticate(CLOUD, "bounded", HASH, CREATED, CREATED.plusSeconds(60)));
+                try {
+                    assertThatThrownBy(() -> result.get(15, TimeUnit.SECONDS))
+                            .isInstanceOf(java.util.concurrent.ExecutionException.class)
+                            .hasCauseInstanceOf(TapstateException.class)
+                            .satisfies(failure -> assertThat(((TapstateException) failure.getCause()).code())
+                                    .isEqualTo(IoError.STORE_UNAVAILABLE));
+                } finally {
+                    long finished = ((Number) admin.runCommand(new Document("configureFailPoint", "failCommand")
+                            .append("mode", "off")).get("count")).longValue();
+                    assertThat(finished - entered).isPositive();
+                }
+            }
+            assertThat(SystemCollections.CLOUD_SESSIONS.on(database).find().first()).isEqualTo(original);
+            assertThat(SystemCollections.CACHE_IDENTITY.on(database).find().first()).isEqualTo(identity);
+            assertThat(SystemCollections.CLOUD_REVOCATIONS.on(database).countDocuments()).isZero();
+            assertThat(root.cloudSessions(scope).find(CLOUD, "bounded")).contains(cloud("bounded"));
+        });
+    }
 
     @Test
     void opPersistsOnlySessionFactsAndReopensThroughTheOriginalScope() {

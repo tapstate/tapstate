@@ -34,8 +34,14 @@ final class MongoCacheCloudSessionStore implements CloudSessionStore {
     private final Runnable requireStructures;
     private final MongoCollection<Document> sessions;
     private final MongoCollection<Document> revocations;
+    private final MongoReadBudget budget;
 
     MongoCacheCloudSessionStore(MongoCacheIdentity facts, MongoDatabase database, Runnable requireStructures) {
+        this(facts, database, requireStructures, null);
+    }
+
+    MongoCacheCloudSessionStore(MongoCacheIdentity facts, MongoDatabase database, Runnable requireStructures, MongoReadBudget budget) {
+        this.budget = budget;
         this.facts = Objects.requireNonNull(facts, "facts");
         this.requireStructures = Objects.requireNonNull(requireStructures, "requireStructures");
         if (facts.scope().mode() != StorageBinding.Mode.CLOUD) throw new IllegalArgumentException("Cloud sessions require a managed cache scope");
@@ -136,11 +142,12 @@ final class MongoCacheCloudSessionStore implements CloudSessionStore {
         Objects.requireNonNull(now, "now");
     }
     private <T> T transaction(Function<ClientSession, T> operation) {
-        return facts.transaction(session -> {
+        Function<ClientSession, T> verified = session -> {
             // Check structure before the session's first command; retries retain the original scope.
             requireStructures.run();
             return operation.apply(session);
-        });
+        };
+        return budget == null ? facts.transaction(verified) : facts.transaction(budget, verified);
     }
     private static TapstateException unreadable() { return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "cloud-session", "field", "session"), null); }
 }

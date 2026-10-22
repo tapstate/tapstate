@@ -381,6 +381,13 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         requireOpen(); bindings.requireAuthenticationPublished(Objects.requireNonNull(original));
     }
 
+    public void requireAuthenticationPublished(io.tapstate.spi.store.CachePreparation original, java.time.Duration budget) {
+        requireOpen(); bindings.requireAuthenticationPublished(Objects.requireNonNull(original), budget);
+    }
+    public void requireAuthenticationPublished(io.tapstate.spi.store.CachePreparation original, MongoReadBudget budget) {
+        requireOpen(); bindings.requireAuthenticationPublished(Objects.requireNonNull(original), Objects.requireNonNull(budget));
+    }
+
     public io.tapstate.spi.store.StorageSetupStateStore setupStates() {
         requireOpen();
         return new MongoStorageSetupStateStore(connection.client(), connection.database(), bindings, this::requireOpen);
@@ -421,6 +428,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     public UserStore users() { return firstAdmin.users(); }
 
     public TokenStore tokens() { return security.tokens(); }
+    public TokenStore tokens(MongoReadBudget budget) { requireOpen(); return security.tokens(Objects.requireNonNull(budget)); }
 
     public AuditStore audit() { return security.audit(); }
 

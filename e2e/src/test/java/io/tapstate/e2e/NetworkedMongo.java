@@ -48,13 +48,24 @@ final class NetworkedMongo implements AutoCloseable {
 
     /** Starts the store and returns once a primary has been elected, not merely once the port opens. */
     static NetworkedMongo start() {
+        return start(false);
+    }
+
+    /** A private server whose owning case may inject namespace-specific command failures. */
+    static NetworkedMongo startWithTestCommands() {
+        return start(true);
+    }
+
+    private static NetworkedMongo start(boolean testCommands) {
         DockerGate.require();
         Network network = Network.newNetwork();
         GenericContainer<?> container = new GenericContainer<>(IMAGE)
                 .withNetwork(network)
                 .withNetworkAliases(ALIAS)
                 .withExposedPorts(MONGO_PORT)
-                .withCommand("--replSet", "rs0", "--bind_ip_all");
+                .withCommand(testCommands
+                        ? new String[] {"--replSet", "rs0", "--bind_ip_all", "--setParameter", "enableTestCommands=1"}
+                        : new String[] {"--replSet", "rs0", "--bind_ip_all"});
         container.start();
         initiate(container);
         return new NetworkedMongo(network, container);
