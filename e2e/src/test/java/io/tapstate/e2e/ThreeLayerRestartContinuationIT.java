@@ -111,6 +111,107 @@ class ThreeLayerRestartContinuationIT {
         NativeMongoStorageFixture.prepare(configUri, binding, targetUri, cluster);
     }
 
+    @Test @Timeout(300)
+    void aCacheOnlyOutageRefusesANewProcessAndResumesTheOriginalStateAfterNormalLogin() throws Exception {
+        String suffix = UUID.randomUUID().toString().replace("-", "");
+        String cluster = "outage-" + suffix, configDb = "outage_cfg_" + suffix, cacheDb = "outage_cache_" + suffix;
+        String configUri = CONFIG.getReplicaSetUrl(configDb), sourceUri = DATA.getReplicaSetUrl("outage_source_" + suffix);
+        String targetUri = DATA.getReplicaSetUrl("outage_target_" + suffix), cacheUri = CACHE.getReplicaSetUrl(cacheDb);
+        cacheUri += (cacheUri.contains("?") ? "&" : "?") + "socketTimeoutMS=1500&connectTimeoutMS=1500";
+        NativeMongoStorageFixture.prepare(configUri, new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,
+                cacheUri, cacheDb, null), targetUri, cluster);
+        var source = EndpointAddress.uri(sourceUri); var target = EndpointAddress.uri(targetUri);
+        try (var mongo = new MongoEndpoints(); var cacheClient = MongoClients.create(CACHE.getReplicaSetUrl());
+             var configClient = MongoClients.create(CONFIG.getReplicaSetUrl()); var http = java.net.http.HttpClient.newHttpClient()) {
+            mongo.seed(source, TABLE, SeedRows.generated(8));
+            var configuration = configClient.getDatabase(configDb);
+            Map<String, List<Document>> originalConfiguration;
+            var chains = cacheClient.getDatabase(cacheDb).getCollection("srs_chains");
+            Map<Long, Long> beforeOutage;
+            String acknowledged;
+            Document originalChain;
+            boolean paused = false;
+            try {
+                var first = start(configUri, cluster);
+                try (first) {
+                    var control = login(first);
+                    control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+                    var resources = resources(sourceUri);
+                    resources.put("views.tap.yml", control.artifact("views").orElseThrow().canonicalForm());
+                    control.apply(resources); control.discoverSchema(SOURCE, "mongodb", Map.of("isUri", true, "uri", sourceUri));
+                    control.lifecycle(PIPELINE, LifecycleVerb.START);
+                    awaitRows(mongo, source, target, "the snapshot before a cache-only outage");
+                    String snapshotAck = Await.answered("the initial target confirmation", BOUND,
+                            () -> control.durablePosition(PIPELINE, TABLE));
+                    mongo.update(source, TABLE, Map.of("id", 1L), Map.of("seq", 11L));
+                    awaitRows(mongo, source, target, "live CDC before the cache-only outage");
+                    acknowledged = Await.answered("the live CDC confirmation", BOUND,
+                            () -> control.durablePosition(PIPELINE, TABLE).filter(value -> !value.equals(snapshotAck)));
+                    beforeOutage = rows(mongo, target);
+                    // Source registration and apply legitimately fence the key before the outage begins.
+                    originalConfiguration = installationFacts(configuration);
+                    assertThat(chains.countDocuments()).isOne(); originalChain = chains.find().first();
+                    assertThat(originalChain.get("checkpoint", Document.class)).isNotEmpty();
+                    CACHE.getDockerClient().pauseContainerCmd(CACHE.getContainerId()).exec(); paused = true;
+                    mongo.update(source, TABLE, Map.of("id", 2L), Map.of("seq", 222L));
+                    mongo.delete(source, TABLE, Map.of("id", 3L));
+                    Await.until("the original process to revoke its unavailable node session", Duration.ofSeconds(45),
+                            () -> first.tail().contains("Node session lost:"), first::tail);
+                    assertThat(first.isAlive()).isTrue();
+                    assertThat(rows(mongo, target)).isEqualTo(beforeOutage);
+                    assertThat(installationFacts(configuration)).isEqualTo(originalConfiguration);
+                }
+                assertThat(first.isAlive()).isFalse();
+                try (var blocked = start(configUri, cluster)) {
+                    var entry = http.send(java.net.http.HttpRequest.newBuilder(blocked.baseUrl().resolve("/auth/storage-entry"))
+                            .timeout(Duration.ofSeconds(30)).GET().build(), java.net.http.HttpResponse.BodyHandlers.ofString());
+                    assertThat(entry.statusCode()).isEqualTo(200);
+                    assertThat(Document.parse(entry.body())).containsEntry("entry", "UNAVAILABLE");
+                    var login = http.send(java.net.http.HttpRequest.newBuilder(blocked.baseUrl().resolve("/auth/login"))
+                            .timeout(Duration.ofSeconds(30)).header("Content-Type", "application/json")
+                            .POST(java.net.http.HttpRequest.BodyPublishers.ofString(io.tapstate.core.common.JsonWriter.write(
+                                    Map.of("username", NativeMongoStorageFixture.USER, "password", NativeMongoStorageFixture.PASSWORD))))
+                            .build(), java.net.http.HttpResponse.BodyHandlers.ofString());
+                    assertThat(login.statusCode()).isEqualTo(503);
+                    assertThat(Document.parse(login.body())).containsEntry("code", io.tapstate.control.core.ControlError.STORAGE_UNAVAILABLE.code());
+                    assertThat(installationFacts(configuration)).isEqualTo(originalConfiguration);
+                    assertThat(rows(mongo, target)).isEqualTo(beforeOutage);
+                    CACHE.getDockerClient().unpauseContainerCmd(CACHE.getContainerId()).exec(); paused = false;
+                    assertThat(chains.find(new Document("_id", originalChain.get("_id"))).first())
+                            .containsEntry("checkpoint", originalChain.get("checkpoint"));
+                    var control = login(blocked);
+                    awaitRows(mongo, source, target, "all outage changes to resume after normal login");
+                    Await.answered("the original target position to advance after restoration", BOUND,
+                            () -> control.durablePosition(PIPELINE, TABLE).filter(value -> !value.equals(acknowledged)));
+                    mongo.insert(source, TABLE, List.of(Map.of("id", 9L, "seq", 999L)));
+                    awaitRows(mongo, source, target, "fresh CDC after storage restoration");
+                    assertThat(control.snapshotRowsRead(PIPELINE)).containsEntry(TABLE, 0L);
+                    assertThat(control.state(PIPELINE)).contains(PipelineState.RUNNING);
+                    assertThat(installationFacts(configuration)).isEqualTo(originalConfiguration);
+                    assertThat(configuration.getCollection("operator_generations").find(new Document("_id", PIPELINE)).first())
+                            .containsEntry("stateGeneration", 1L);
+                }
+            } finally {
+                if (paused) CACHE.getDockerClient().unpauseContainerCmd(CACHE.getContainerId()).exec();
+            }
+        }
+    }
+
+    private static Map<String, List<Document>> installationFacts(com.mongodb.client.MongoDatabase configuration) {
+        var result = new LinkedHashMap<String, List<Document>>();
+        for (var name : List.of("cluster_keys", "storage_binding", "storage_setup", "op_bootstrap", "users")) {
+            var facts = configuration.getCollection(name).find().sort(new Document("_id", 1)).into(new java.util.ArrayList<>());
+            assertThat(facts).as(name).isNotEmpty();
+            if (name.equals("cluster_keys")) {
+                // Normal encrypted connector-note writes also fence the existing key on resume.
+                // Its material and identity must remain exact; the write counter is operational state.
+                for (var fact : facts) assertThat(fact.remove("sourceWriteFence")).isInstanceOf(Long.class);
+            }
+            result.put(name, facts);
+        }
+        return result;
+    }
+
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
     @Timeout(180)
