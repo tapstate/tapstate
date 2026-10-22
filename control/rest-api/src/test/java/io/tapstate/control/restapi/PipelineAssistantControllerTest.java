@@ -124,11 +124,19 @@ class PipelineAssistantControllerTest {
         verifyValidatedStream("mysql");
     }
 
+    @Test void assistantAssignsAnIdWhenTheModelOmitsOrReturnsABlankOne() throws Exception {
+        verifyValidatedStream("mysql", true);
+    }
+
     @Test void postgresProposalStreamUsesOnlyItsDiscoveredSchema() throws Exception {
         verifyValidatedStream("postgres");
     }
 
     private static void verifyValidatedStream(String connector) throws Exception {
+        verifyValidatedStream(connector, false);
+    }
+
+    private static void verifyValidatedStream(String connector, boolean missingTransformId) throws Exception {
         var store = new PipelineApiTest.FakePipelineDraftStore();
         PipelineDraft base = draft(); store.create(base);
         var artifacts = new PipelineApiTest.FakeArtifactStore();
@@ -213,6 +221,36 @@ class PipelineAssistantControllerTest {
             }
         }
 
+        if (missingTransformId) {
+            for (boolean blankId : List.of(false, true)) {
+                Map<String, Object> incompleteCandidate = new java.util.LinkedHashMap<>(candidate);
+                Map<String, Object> incompleteRoot = new java.util.LinkedHashMap<>(
+                        AssistantWizardJson.object(candidate.get("root")));
+                Map<String, Object> transformInput = new java.util.LinkedHashMap<>();
+                if (blankId) transformInput.put("id", "");
+                transformInput.put("name", "filter");
+                transformInput.put("type", "filter");
+                transformInput.put("enabled", true);
+                transformInput.put("config", Map.of("filter", Map.of("expr", "true")));
+                incompleteRoot.put("transforms", List.of(transformInput));
+                incompleteCandidate.put("root", incompleteRoot);
+                proposedCandidate.set(incompleteCandidate);
+
+                var missingIdOutput = new ByteArrayOutputStream();
+                controller.assistant("orders", body, request).getBody().writeTo(missingIdOutput);
+                String missingIdStream = missingIdOutput.toString(StandardCharsets.UTF_8);
+                assertThat(missingIdStream).contains("data-proposal", "\"finishReason\":\"stop\"")
+                        .doesNotContain(ControlError.AI_INVALID_PROPOSAL.code());
+
+                Map<String, Object> validated = controller.validate("orders", 1, incompleteCandidate);
+                Map<String, Object> normalized = AssistantWizardJson.object(validated.get("candidateWizard"));
+                Map<String, Object> normalizedRoot = AssistantWizardJson.object(normalized.get("root"));
+                Map<String, Object> transform = AssistantWizardJson.object(
+                        AssistantWizardJson.list(normalizedRoot.get("transforms")).getFirst());
+                assertThat(AssistantWizardJson.text(transform.get("id"))).isNotBlank();
+            }
+        }
+
         proposedCandidate.set(Map.of());
         var emptyCandidateResponse = controller.assistant("orders", body, request);
         var emptyCandidateOutput = new ByteArrayOutputStream();
@@ -237,7 +275,7 @@ class PipelineAssistantControllerTest {
             }
         };
         controller.assistant("orders", body, request).getBody().writeTo(disconnected);
-        assertThat(providerCalls).hasValue(8);
+        assertThat(providerCalls).hasValue(8 + (missingTransformId ? 2 : 0));
         assertThat(failedStream).doesNotContain("sk-test");
         assertThat(store.get("orders")).contains(base);
 
@@ -282,6 +320,25 @@ class PipelineAssistantControllerTest {
         assertThat(result).containsEntry("valid", false).doesNotContainKey("candidateWizard");
         assertThat(store.get("orders")).contains(draft);
     }
+
+    @Test void malformedWizardShapeIsReturnedAsAnInvalidProposal() {
+        var store = new PipelineApiTest.FakePipelineDraftStore();
+        var draft = draft(); store.create(draft);
+        var mapper = JsonMapper.builder().build();
+        Map<String, Object> candidate = AssistantWizardJson.view(
+                AssistantWizardJson.object(PipelineDraftJson.write(mapper, draft).get("wizard")));
+        Map<String, Object> root = new java.util.LinkedHashMap<>(AssistantWizardJson.object(candidate.get("root")));
+        root.put("columns", "not-an-array");
+        candidate.put("root", root);
+
+        Map<String, Object> result = controller(new PipelineDraftService(store)).validate("orders", 1, candidate);
+
+        assertThat(result).containsEntry("valid", false).doesNotContainKey("candidateWizard");
+        List<?> diagnostics = (List<?>) AssistantWizardJson.object(result.get("validation")).get("diagnostics");
+        assertThat(AssistantWizardJson.object(diagnostics.getFirst()))
+                .containsEntry("code", ControlError.AI_INVALID_PROPOSAL.code());
+    }
+
     @Test void validCandidateGetsServerDiffWithoutSavingOrPublishing() {
         var store = new PipelineApiTest.FakePipelineDraftStore(); var base = draft(); store.create(base);
         var artifacts = new PipelineApiTest.FakeArtifactStore();
@@ -326,7 +383,7 @@ class PipelineAssistantControllerTest {
                 .containsEntry("valid", false).doesNotContainKey("candidateWizard");
 
         Map<String, Object> relation = new java.util.LinkedHashMap<>(Map.ofEntries(
-                Map.entry("id", "relation-1"), Map.entry("source", "src"), Map.entry("table", "orders"),
+                Map.entry("source", "src"), Map.entry("table", "orders"),
                 Map.entry("type", "flatten"), Map.entry("primaryKey", List.of("id")), Map.entry("arrayKey", List.of()),
                 Map.entry("targetField", ""), Map.entry("key", "id"), Map.entry("parentKey", "id"),
                 Map.entry("parentTable", "orders"), Map.entry("preProcessing", List.of()),
@@ -334,7 +391,12 @@ class PipelineAssistantControllerTest {
                 Map.entry("transforms", List.of()), Map.entry("children", List.of())));
         Map<String, Object> relationCandidate = new java.util.LinkedHashMap<>(view);
         relationCandidate.put("relations", List.of(relation));
-        assertThat(controller.validate("orders", 1, relationCandidate)).containsEntry("valid", true);
+        Map<String, Object> relationResult = controller.validate("orders", 1, relationCandidate);
+        assertThat(relationResult).containsEntry("valid", true);
+        Map<String, Object> normalizedRelation = AssistantWizardJson.object(
+                AssistantWizardJson.list(AssistantWizardJson.object(relationResult.get("candidateWizard")).get("relations"))
+                        .getFirst());
+        assertThat(AssistantWizardJson.text(normalizedRelation.get("id"))).isNotBlank();
         for (String arrayField : List.of("transforms", "children")) {
             Map<String, Object> nullRelationArray = new java.util.LinkedHashMap<>(relation);
             nullRelationArray.put(arrayField, null);

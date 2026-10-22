@@ -6,6 +6,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 /** Explicit translation between the Builder view and durable Wizard wire shapes. */
 final class AssistantWizardJson {
@@ -125,15 +126,16 @@ final class AssistantWizardJson {
     private static void writeRelatedNode(Map<String, Object> node, String parent, List<Map<String, Object>> rows, int depth) {
         String type = text(node.get("type"));
         if (!List.of(FLATTEN, SUB_ARRAY, "sub_doc").contains(type)) throw new IllegalArgumentException("invalid relation kind");
+        String id = candidateId(node.get("id"));
         Map<String, Object> row = new LinkedHashMap<>();
-        row.put("id", text(node.get("id")));
+        row.put("id", id);
         row.put("parentId", parent);
         row.put(SOURCE_ID, text(node.get(SOURCE)));
         row.put(TABLE, text(node.get(TABLE)));
         row.put("relation", relation(node, type));
         row.put(PRE_TRANSFORMS, writeTransforms(node.get(TRANSFORMS)));
         rows.add(row);
-        writeRelated(list(node.get("children")), text(node.get("id")), rows, depth + 1);
+        writeRelated(list(node.get("children")), id, rows, depth + 1);
     }
     private static Map<String, Object> relation(Map<String, Object> node, String type) {
         Map<String, Object> value = new LinkedHashMap<>();
@@ -199,7 +201,11 @@ final class AssistantWizardJson {
         String type = text(step.get("type"));
         if (!List.of("filter", "map", "unwind", "js").contains(type)) throw new IllegalArgumentException("unsupported transform kind");
         Map<String, Object> config = object(object(step.get(CONFIG)).get(type));
-        return Map.of("id", text(step.get("id")), "type", type, FIELDS, writeTransformFields(type, config));
+        return Map.of("id", candidateId(step.get("id")), "type", type, FIELDS, writeTransformFields(type, config));
+    }
+    private static String candidateId(Object value) {
+        String id = text(value);
+        return id.isBlank() ? UUID.randomUUID().toString() : id;
     }
     private static Map<String, Object> writeTransformFields(String type, Map<String, Object> config) {
         return switch (type) {
