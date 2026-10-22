@@ -8,7 +8,8 @@ setup:
     src_mssql: { kind: sqlserver }
     store: { kind: mongo }
   connectors: [sqlserver, mongodb]
-  apply: [src_mssql.tap.yml, views.tap.yml, pipeline.tap.yml]
+  managed_target: views.tap.yml
+  apply: [src_mssql.tap.yml, pipeline.tap.yml]
   discover: [src_mssql]
 pipeline: pipeline.tap.yml
 seed:

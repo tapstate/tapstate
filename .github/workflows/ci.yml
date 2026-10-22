@@ -51,6 +51,14 @@ jobs:
           path: ${{ runner.temp }}/shards.json
           if-no-files-found: error
           retention-days: 7
+      - name: Prepare the verified Mongo dependency for managed-target examples
+        run: python3 deploy/cloud/prepare-test-inputs.py --mongodb-only --output "$RUNNER_TEMP/managed-mongo"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: managed-mongo-test-input
+          path: ${{ runner.temp }}/managed-mongo/
+          if-no-files-found: error
+          retention-days: 7
 
   test-shards:
     needs: shard-plan
@@ -61,6 +69,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        if: startsWith(matrix.shard, 'e2e-')
+        with:
+          name: managed-mongo-test-input
+          path: ${{ runner.temp }}/managed-mongo/
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -118,6 +131,9 @@ jobs:
             -Dtapstate.it.jvmArgs=-Djava.io.tmpdir=${{ runner.temp }}/test-tmp
         run: |
           mkdir -p "$RUNNER_TEMP/test-tmp"
+          if [[ "$SHARD" == e2e-* ]]; then
+            export MAVEN_ARGS="$MAVEN_ARGS -Dtapstate.e2e.managed-mongo-jar=$RUNNER_TEMP/managed-mongo/mongodb-connector.jar"
+          fi
           .github/scripts/ci-shard.sh run --plan "$RUNNER_TEMP/shards.json" --shard "$SHARD" --repo-local "$RUNNER_TEMP/m2"
       - name: Record storage after the test shard
         if: always()
@@ -461,7 +477,9 @@ jobs:
       - name: Web release provenance cases
         run: python3 .github/scripts/web-provenance-smoke.py
       - name: Cloud connector input and test-preparation cases
-        run: python3 deploy/cloud/stage-connectors-test.py
+        run: |
+          python3 deploy/cloud/stage-connectors-test.py
+          PYTHONDONTWRITEBYTECODE=1 python3 deploy/cloud/prepare-test-inputs-test.py
       - name: Cloud image runtime helper cases
         run: |
           node --test deploy/cloud/image-runtime-probe.test.mjs

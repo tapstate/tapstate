@@ -89,6 +89,7 @@ final class FailureScene {
                 case Step.Await await -> await.matcher();
                 case Step.Assertion assertion -> assertion.matcher();
                 case Step.Lifecycle ignored -> null;
+                case Step.StartRefused ignored -> null;
                 case Step.StreamLifecycle ignored -> null;
                 case Step.Composed ignored -> null;
                 case Step.Cdc ignored -> null;
@@ -131,6 +132,7 @@ final class FailureScene {
                 case Step.Await await -> places.addAll(tablesOf(await.matcher()));
                 case Step.Assertion assertion -> places.addAll(tablesOf(assertion.matcher()));
                 case Step.Lifecycle ignored -> { }
+                case Step.StartRefused ignored -> { }
                 case Step.StreamLifecycle ignored -> { }
                 case Step.Composed ignored -> { }
             }

@@ -1309,6 +1309,12 @@ final class ControlPlane {
                 200, verb.id() + " " + pipelineId);
     }
 
+    /** A refused admission must be a coded client response, never an accepted intent or server failure. */
+    Refusal startExpectingRefusal(String pipelineId) {
+        var response = send(authed("/api/pipelines/" + urlSegment(pipelineId) + ":start", ""));
+        return interpretRefusal(response.statusCode(), response.body(), "starting " + pipelineId);
+    }
+
     /**
      * Starts the pipeline unless it is running already, and answers whether this call is what started it.
      *

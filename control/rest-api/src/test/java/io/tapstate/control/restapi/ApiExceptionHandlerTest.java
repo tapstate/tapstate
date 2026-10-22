@@ -38,6 +38,12 @@ class ApiExceptionHandlerTest {
     private final ApiExceptionHandler handler = new ApiExceptionHandler(MessageCatalog.bundled());
 
     @Test
+    void aStartMissingItsRequiredSourceModelIsAStateConflict() {
+        assertThat(ApiExceptionHandler.statusFor(new StubCode("actuation.source-schema-not-discovered")))
+                .isEqualTo(HttpStatus.CONFLICT);
+    }
+
+    @Test
     void mvcAndSecurityExposeOnlyTheExistingErrorWhileCloudDiagnosticsKeepItsCode() throws Exception {
         RequestAttributes previous = RequestContextHolder.getRequestAttributes();
         try {

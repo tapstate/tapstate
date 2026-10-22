@@ -120,6 +120,7 @@ class ApiExceptionHandler {
             case "control.storage-test-required", "control.storage-scope-conflict", "io.configuration-import-refused", "store.initialization-refused" -> HttpStatus.CONFLICT;
             case "control.storage-test-failed", "control.storage-databases-overlap", "store.storage-connection-unsupported", "store.invalid-uri", "store.tls-trust-invalid" -> HttpStatus.BAD_REQUEST;
             case "control.bootstrap-closed" -> HttpStatus.CONFLICT;
+            case "actuation.source-schema-not-discovered" -> HttpStatus.CONFLICT;
             case "source.id-mismatch" -> HttpStatus.BAD_REQUEST;
             case "source.not-found" -> HttpStatus.NOT_FOUND;
             case "source.already-exists", "source.in-use", "source.srs-change-while-running" ->
