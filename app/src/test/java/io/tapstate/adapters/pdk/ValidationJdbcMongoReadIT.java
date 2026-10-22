@@ -29,6 +29,10 @@ import io.tapstate.runtime.engine.validation.ValidationRelationReader;
 import io.tapstate.runtime.engine.validation.ValidationNestRelations;
 import io.tapstate.runtime.engine.validation.ValidationNestLookupBinding;
 import io.tapstate.runtime.engine.validation.ValidationNestObjectProjection;
+import io.tapstate.runtime.engine.validation.ValidationNestArraySourceRead;
+import io.tapstate.core.validation.ValidationNestArrayMembers;
+import io.tapstate.core.validation.ValidationNestArrayFieldCheck;
+import io.tapstate.core.validation.ValidationNestTargetArray;
 import io.tapstate.runtime.engine.validation.ValidationRootReader;
 import io.tapstate.runtime.engine.validation.ValidationStaticMap;
 import io.tapstate.runtime.engine.validation.ValidationReadScope;
@@ -79,12 +83,227 @@ class ValidationJdbcMongoReadIT {
     private static final String PASSWORD = "validation-fixture-only";
     private static final long EXACT = 9_007_199_254_740_993L;
     private static final ValidationValues.Limits LIMITS = new ValidationValues.Limits(8192, 100, 12);
+    // Nested values retain per-value type and codec provenance, in addition to the small raw document.
+    private static final ValidationValues.Limits ARRAY_LIMITS = new ValidationValues.Limits(32768, 100, 12);
 
     @Test @Timeout(120)
     void mysqlNativeReadPreservesDecimalsAndCompletesBothMergeTails() throws Exception { verify(true); }
 
     @Test @Timeout(120)
     void postgresNativeReadPreservesDecimalsAndCompletesBothMergeTails() throws Exception { verify(false); }
+
+    @Test @Timeout(120)
+    void mysqlNativeArraysKeepAllMembersAndRootProblems() throws Exception { verifyArrays(true); }
+
+    @Test @Timeout(120)
+    void postgresNativeArraysKeepAllMembersAndRootProblems() throws Exception { verifyArrays(false); }
+
+    private void verifyArrays(boolean mysql) throws Exception {
+        String kind = mysql ? "mysql" : "postgres";
+        var sourceRef = artifact(kind); var targetRef = artifact("mongodb");
+        int port = mysql ? 3306 : 5432;
+        try (var jdbc = new GenericContainer<>(DockerImageName.parse(mysql ? "mysql:8.0" : "postgres:16"))
+                    .withExposedPorts(port).withStartupTimeout(Duration.ofSeconds(75));
+             var mongo = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))) {
+            if (mysql) jdbc.withEnv("MYSQL_ROOT_PASSWORD", PASSWORD).withEnv("MYSQL_DATABASE", DATABASE)
+                    .withEnv("MYSQL_USER", "validation").withEnv("MYSQL_PASSWORD", PASSWORD)
+                    .withCommand("--innodb-buffer-pool-size=64M", "--max-connections=20")
+                    .waitingFor(Wait.forLogMessage(".*mysqld: ready for connections\\..*port: 3306.*\\n", 1));
+            else jdbc.withEnv("POSTGRES_PASSWORD", PASSWORD).withEnv("POSTGRES_USER", "validation").withEnv("POSTGRES_DB", DATABASE)
+                    .waitingFor(Wait.forLogMessage(".*database system is ready to accept connections.*\\n", 2));
+            jdbc.start(); mongo.start();
+            sql(jdbc, mysql, "CREATE TABLE array_roots (id BIGINT PRIMARY KEY, label VARCHAR(40));"
+                    + "CREATE TABLE array_children (id BIGINT NOT NULL, root_id BIGINT NOT NULL, sku VARCHAR(40), value VARCHAR(40));"
+                    + "CREATE INDEX array_parent_lookup ON array_children(root_id);"
+                    + "INSERT INTO array_roots VALUES (" + EXACT + ",'root'),(2,'root'),(3,'root'),(4,'root'),(5,'root'),(6,'root'),(7,'root'),(8,'root'),(9,'root'),(10,'root');"
+                    + "INSERT INTO array_children VALUES (11," + EXACT + ",'same','A'),(12," + EXACT + ",'same','B'),(13," + EXACT + ",'same','C'),"
+                    + "(14," + EXACT + ",'same','D'),(15," + EXACT + ",'same','E'),(16," + EXACT + ",'same','F'),"
+                    + "(21,2,'same','A'),(41,4,'same','A'),(42,4,'same','B'),(51,5,'same','first'),(51,5,'same','second'),"
+                    + "(61,6,'same','A'),(71,7,'same','A'),(81,8,'same','A'),(91,9,'same','first'),(91,9,'same','second'),"
+                    + "(101,10,'same','first'),(101,10,'same','second');");
+            var sourceSettings = new LinkedHashMap<String, Object>();
+            sourceSettings.put("host", jdbc.getHost()); sourceSettings.put("port", jdbc.getMappedPort(port));
+            sourceSettings.put("database", DATABASE); sourceSettings.put(mysql ? "username" : "user", "validation");
+            sourceSettings.put("password", PASSWORD); sourceSettings.put("timezone", "+00:00"); sourceSettings.put("oldVersionTimezone", false);
+            if (mysql) sourceSettings.put("addtionalString", "useSSL=false&allowPublicKeyRetrieval=true");
+            else sourceSettings.put("schema", "public");
+            String uri = mongo.getReplicaSetUrl(DATABASE);
+            try (var client = MongoClients.create(uri)) {
+                var roots = new ArrayList<Document>();
+                roots.add(arrayDocument(EXACT, "root", List.of(arrayItem(16, EXACT, "F"), arrayItem(15, EXACT, "E"), arrayItem(14, EXACT, "D"),
+                        arrayItem(13, EXACT, "C"), arrayItem(12, EXACT, "B"), arrayItem(11, EXACT, "A"))));
+                roots.add(arrayDocument(2, "root", List.of(arrayItem(21, 2, "wrong"))));
+                roots.add(arrayDocument(3, "root", List.of()));
+                roots.add(arrayDocument(4, "root", List.of(arrayItem(42, 4, "B"), arrayItem(43, 4, "extra"))));
+                roots.add(arrayDocument(5, "wrong", List.of(arrayItem(51, 5, "unproved"))));
+                roots.add(arrayDocument(6, "root", List.of(arrayItem(61, 6, "A"), arrayItem(61, 6, "A"))));
+                roots.add(new Document("id", 7L).append("label", "wrong"));
+                roots.add(arrayDocument(8, "root", List.of(arrayItem(81, 8, "A"))));
+                roots.add(arrayDocument(10, "root", List.of(arrayItem(101, 10, "unproved"))));
+                roots.add(arrayDocument(10, "root", List.of(arrayItem(101, 10, "unproved"))));
+                client.getDatabase(DATABASE).getCollection("array_targets").insertMany(roots);
+            }
+            var settings = Map.<String, Object>of("uri", uri, "database", DATABASE, "isUri", true);
+            var results = new LinkedHashMap<Long, Map<ValidationRootCheck.Kind, Long>>();
+            try (var queryIo = Executors.newFixedThreadPool(2); var decodeIo = Executors.newFixedThreadPool(2)) {
+                verifyArrayBudgetRejection(targetRef, settings, queryIo, decodeIo);
+                for (long id : List.of(EXACT, 2L, 3L, 4L, 5L, 6L, 7L, 8L, 9L, 10L)) {
+                    var result = arrayRootRead(kind, sourceRef, sourceSettings, targetRef, settings, id, queryIo, decodeIo);
+                    assertThat(result.reads()).hasSize(3);
+                    assertThat(result.observedAgreement()).as("agreement for array root %s", id).isEqualTo(id == EXACT || id == 3 || id == 8);
+                    if (id == 2) assertThat(result.findings().keySet()).singleElement().satisfies(finding -> {
+                        assertThat(finding.location().scope().ancestors()).containsExactly(new ValidationRoot.Ancestor(List.of("items"),
+                                new ValidationKey(List.of(ValidationKey.Part.number(21)))));
+                        assertThat(finding.location().fieldPath()).containsExactly("value");
+                    });
+                    results.put(id, result.counts());
+                }
+            }
+            assertThat(results).isEqualTo(Map.of(EXACT, Map.of(), 2L, Map.of(TARGET_VALUE, 1L), 3L, Map.of(),
+                    4L, Map.of(TARGET_MISSING, 1L, TARGET_EXTRA, 1L), 5L, Map.of(SOURCE_DUPLICATE, 1L, TARGET_VALUE, 1L),
+                    6L, Map.of(TARGET_DUPLICATE, 1L), 7L, Map.of(TARGET_STRUCTURE, 1L, TARGET_VALUE, 1L), 8L, Map.of(),
+                    9L, Map.of(SOURCE_DUPLICATE, 1L, TARGET_MISSING, 1L), 10L, Map.of(SOURCE_DUPLICATE, 1L, TARGET_DUPLICATE, 1L)));
+            assertThat(sql(jdbc, mysql, "SELECT COUNT(*) FROM array_roots;").trim()).isEqualTo("10");
+            assertThat(sql(jdbc, mysql, "SELECT COUNT(*) FROM array_children;").trim()).isEqualTo("18");
+        }
+    }
+
+    private static Document arrayDocument(long id, String label, List<Document> items) {
+        return new Document("id", id).append("label", label).append("items", items);
+    }
+    private static Document arrayItem(long id, long parent, String value) {
+        return new Document("id", id).append("root_id", parent).append("sku", "same").append("value", value);
+    }
+
+    private static ValidationRootCheck arrayRootRead(String kind, ConnectorRef sourceRef, Map<String, Object> sourceSettings,
+            ConnectorRef targetRef, Map<String, Object> targetSettings, long id, ExecutorService queryIo, ExecutorService decodeIo) throws Exception {
+        var rootKey = new ValidationKey(List.of(ValidationKey.Part.number(id)));
+        var observation = new ValidationObservation(new ValidationRunIdentity(new ValidationOwner("cluster", "pipeline", "node", "boot", 1, 1, 0),
+                "task", "native-arrays-" + kind, ValidationMode.FULL, "fixed-array-tree", 1, "rules"),
+                new ValidationRoot("array_roots", "output", rootKey, List.of()), 1);
+        var identity = new ValidationKeyBinding("array-identity", List.of(objectComponent("id")), Set.of(), ARRAY_LIMITS);
+        var parentKey = new ValidationKeyBinding("array-parent", List.of(objectComponent("root_id")), Set.of(), ARRAY_LIMITS);
+        var embed = new Embed("array_children", Map.of("root_id", "id"), EmbedAs.ARRAY, "items", List.of("id"), List.of("id"), null, null, List.of());
+        var plan = ValidationNestRelations.compile("arrays", new NestRoot("root", List.of("id"), null, null, List.of(embed)),
+                Set.of("root", "array_children"), Map.of(), new ValidationNestRelations.Limits(8, 8, 65536));
+        var lookup = new ValidationNestLookupBinding("arrays", plan.children().getFirst(), List.of(objectComponent("id")), parentKey, ARRAY_LIMITS);
+        var emptyMap = ValidationStaticMap.compile("array-parent", new TransformBody.MapProjection(Map.of()), ARRAY_LIMITS);
+        var handles = new ArrayList<ValidationReadHandle>();
+        var sourceFacts = new ValidationNestArrayMembers.Source[1];
+        String sourceRead = "array-root-source-" + id;
+        try (var cleanup = new java.util.concurrent.ThreadPoolExecutor(1, 1, 0, java.util.concurrent.TimeUnit.SECONDS,
+                new java.util.concurrent.ArrayBlockingQueue<>(8), new java.util.concurrent.ThreadPoolExecutor.AbortPolicy());
+             var scope = new ValidationReadScope(observation, cleanup, () -> {}, 8)) {
+            var generated = ValidationFieldCheck.generatedId(observation.run(), "array_roots", "output", true, false, false,
+                    value -> value instanceof ValidationValues.Typed typed && typed.logicalType().equals("text") && typed.value() instanceof String);
+            var result = ValidationRootReader.read(observation, ValidationMethod.FULL_COLUMN,
+                    new ValidationRootReader.Query(sourceRead, "native-array-v1", () -> openArrayRead(kind, sourceRef, sourceSettings,
+                            "array_roots", identity, rootKey, scope, handles, queryIo, decodeIo)),
+                    new ValidationRootReader.Query("array-root-target-" + id, "native-array-v1", () -> openArrayRead("mongodb", targetRef, targetSettings,
+                            "array_targets", identity, rootKey, scope, handles, queryIo, decodeIo)),
+                    new ValidationRelationRows.Limits(65536, ARRAY_LIMITS), new ValidationRootCheck.Limits(1048576, 100, 100, 20, 8), Clock.systemUTC(), scope::requireActive,
+                    raw -> {
+                        var physical = objectPhysical(kind, "array_roots", identity, raw);
+                        var children = ValidationNestArraySourceRead.read(observation, lookup, emptyMap.apply(raw, List.of()),
+                                new ValidationRootCheck.SampledSide(physical, raw, sourceRead), request ->
+                                        new ValidationRootReader.Query("array-children-" + id, "native-array-v1", () -> openArrayRead(kind, sourceRef, sourceSettings,
+                                                "array_children", parentKey, request.key(), scope, handles, queryIo, decodeIo)),
+                                new ValidationNestArraySourceRead.Limits(new ValidationRelationRows.Limits(65536, ARRAY_LIMITS),
+                                        new ValidationNestArrayMembers.Limits(1048576, 100, 100, ARRAY_LIMITS), 100, 20), Clock.systemUTC(), scope::requireActive,
+                                (context, child) -> {
+                                    var actual = objectPhysical(kind, "array_children", identity, child);
+                                    var key = ((ValidationKeyBinding.Bound) identity.read(child)).key();
+                                    return new ValidationNestArraySourceRead.Classified(new ValidationRootReader.Source(new ValidationRelationReader.Evaluation(
+                                            ValidationRelationRows.Disposition.INCLUDED, child, Optional.of(actual)), List.of()),
+                                            Optional.of(new ValidationNestArrayMembers.Member(key, key, actual, child)));
+                                }, (context, source) -> {
+                                    assertThat(context.parent()).isEqualTo(observation);
+                                    assertThat(source.uncertainty()).isEmpty(); assertThat(source.evidence()).isEqualTo(ValidationRootReader.SourceEvidence.empty());
+                                });
+                        sourceFacts[0] = children.source().orElseThrow();
+                        return new ValidationRootReader.Source(new ValidationRelationReader.Evaluation(ValidationRelationRows.Disposition.INCLUDED, raw, Optional.of(physical)),
+                                List.of(), ValidationRootReader.SourceEvidence.fromArraySource(observation, sourceFacts[0], 1048576));
+                    }, raw -> {
+                        if (id == EXACT) System.out.printf("Native array fixture %s: retainedBytes=%d nodes=%d depth=%d%n", kind,
+                                raw.accountedBytes(), raw.nodes(), raw.depth());
+                        if (raw.fields().containsKey("items")) assertThat(raw.fields().get("items")).isInstanceOfSatisfying(ValidationValues.Typed.class,
+                                typed -> { assertThat(typed.logicalType()).isEqualTo("array"); assertThat(typed.value()).isInstanceOf(List.class); });
+                        return new ValidationRootReader.Target(raw, objectPhysical("mongodb", "array_targets", identity, raw));
+                    }, (pair, root) -> {
+                        try (var members = ValidationNestArrayMembers.forTarget(sourceFacts[0])) {
+                            var physical = new ValidationCheckEvent.Side(pair.target().physical().orElseThrow(), pair.target().original(), 1,
+                                    ValidationCheckEvent.GroupStatus.COMPLETE, pair.targetRead());
+                            var checked = ValidationNestArrayFieldCheck.check(observation, List.of("items"), pair.source().working(), physical,
+                                    pair.target().working(), identity, Optional.of(identity), Set.of("array", "object", "json"),
+                                    new ValidationNestTargetArray.Limits(ARRAY_LIMITS, 100, 100000), members, root, group -> {
+                                        var source = group.sourceSamples().getFirst(); var target = group.targetSamples().getFirst();
+                                        ValidationFieldCheck.check(new ValidationObservation(observation.run(), group.scope(), observation.revision()), List.of(),
+                                                source.values(), target.values(), Optional.of(new ValidationRootCheck.SampledSide(source.physical(), source.original(), sourceFacts[0].read().readId())),
+                                                Optional.of(new ValidationRootCheck.SampledSide(target.physical(), target.original(), pair.targetRead().readId())),
+                                                Optional.empty(), String::equals, new ValidationValueComparison.TraversalLimits(ARRAY_LIMITS, 100000), root);
+                                    });
+                            ValidationFieldCheck.checkComposed(observation, pair.source().working(), pair.target().working(), pair.sourceSample(), pair.targetSample(),
+                                    generated, String::equals, new ValidationValueComparison.TraversalLimits(ARRAY_LIMITS, 100000), List.of(), Set.of(), List.of(checked), root);
+                        }
+                    });
+            for (var handle : handles) {
+                assertThat(handle.workersExited().toCompletableFuture().get(5, java.util.concurrent.TimeUnit.SECONDS)).isNull();
+                assertThat(handle.rowsReleased().toCompletableFuture().get(5, java.util.concurrent.TimeUnit.SECONDS)).isNull();
+            }
+            scope.close(); assertThat(scope.drained().toCompletableFuture().get(5, java.util.concurrent.TimeUnit.SECONDS)).isNull();
+            return result;
+        }
+    }
+
+    private static ValidationReadHandle openArrayRead(String kind, ConnectorRef artifact, Map<String, Object> settings, String table,
+            ValidationKeyBinding binding, ValidationKey key, ValidationReadScope scope, List<ValidationReadHandle> handles,
+            ExecutorService queryIo, ExecutorService decodeIo) {
+        var handle = scope.open(table, guard -> PdkValidationSession.lookup(kind, artifact, settings, "retained-" + kind + "-artifact",
+                new PdkValidationSession.Lookup(table, List.of(), List.of(), 2, binding, key),
+                arrayAdmission(ARRAY_LIMITS), (model, codecs, logical) -> {
+                    var match = new LinkedHashMap<String, Object>();
+                    for (int i = 0; i < binding.components().size(); i++) match.put(binding.components().get(i).path().getFirst(), logical.parts().get(i).value());
+                    return match;
+                }, guard, queryIo, decodeIo, 1, ARRAY_LIMITS));
+        handles.add(handle); return handle;
+    }
+
+    private static PdkValidationSession.ReadAdmission arrayAdmission(ValidationValues.Limits limits) {
+        return (model, codecs) -> new PdkValidationRows(model, codecs, path -> {
+            if (path.equals(List.of("items"))) return PdkValidationRows.Rule.of(PdkValidationRows.Shape.ARRAY);
+            if (Set.of("id", "root_id").contains(path.getLast())) return PdkValidationRows.Rule.of(PdkValidationRows.Shape.EXACT_NUMBER);
+            return PdkValidationRows.Rule.AUTO;
+        }, limits);
+    }
+
+    private static void verifyArrayBudgetRejection(ConnectorRef target, Map<String, Object> settings,
+            ExecutorService queryIo, ExecutorService decodeIo) throws Exception {
+        var binding = new ValidationKeyBinding("array-budget-key", List.of(objectComponent("id")), Set.of(), ARRAY_LIMITS);
+        var key = new ValidationKey(List.of(ValidationKey.Part.number(EXACT)));
+        try (var handle = PdkValidationSession.lookup("mongodb", target, settings, "retained-mongodb-artifact",
+                new PdkValidationSession.Lookup("array_targets", List.of(), List.of(), 2, binding, key), arrayAdmission(LIMITS),
+                (model, codecs, logical) -> Map.of("id", logical.parts().getFirst().value()), () -> {}, queryIo, decodeIo, 1, LIMITS)) {
+            Throwable primary = catchThrowable(handle::next);
+            assertThat(primary).isInstanceOfSatisfying(TapstateException.class, failure -> {
+                assertThat(failure.code()).isEqualTo(ValidationError.VALUE_LIMIT_EXCEEDED);
+                assertThat(failure.args()).containsEntry("limit", "bytes");
+            });
+            handle.close();
+            Throwable exited = catchThrowable(() -> handle.workersExited().toCompletableFuture().get(5, java.util.concurrent.TimeUnit.SECONDS));
+            assertThat(exited).isInstanceOf(java.util.concurrent.ExecutionException.class).hasCauseInstanceOf(TapstateException.class);
+            assertThat(((TapstateException) exited.getCause()).code()).isEqualTo(ValidationError.VALUE_LIMIT_EXCEEDED);
+            assertThat(handle.rowsReleased().toCompletableFuture().get(5, java.util.concurrent.TimeUnit.SECONDS)).isNull();
+            var pending = new java.util.ArrayDeque<Throwable>(); pending.add(primary); pending.add(exited);
+            var seen = new java.util.IdentityHashMap<Throwable, Boolean>();
+            for (int i = 0; i < 64 && !pending.isEmpty(); i++) {
+                var error = pending.removeFirst(); if (seen.put(error, true) != null) continue;
+                assertThat(error.getClass().getName()).isNotEqualTo("com.mongodb.MongoInterruptedException");
+                if (error.getCause() != null) pending.addLast(error.getCause());
+                for (var suppressed : error.getSuppressed()) pending.addLast(suppressed);
+            }
+            assertThat(pending).isEmpty();
+        }
+    }
 
     private void verify(boolean mysql) throws Exception {
         String kind = mysql ? "mysql" : "postgres";
