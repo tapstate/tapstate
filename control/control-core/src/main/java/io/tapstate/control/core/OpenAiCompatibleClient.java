@@ -114,7 +114,8 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
                     return readEvents(input, delta -> { emitted[0] = true; text.accept(delta); }, proposalEnabled);
                 }
             } catch (RetryableStreamException error) {
-                if (attempt > 0 || emitted[0]) throw failed();
+                if (emitted[0]) throw failed();
+                if (attempt > 0) return readNonStreaming(settings, body, text, proposalEnabled);
                 LOG.log(System.Logger.Level.WARNING, "Retrying AI provider after an empty upstream error stream");
             } catch (java.io.IOException | InterruptedException error) {
                 if (error instanceof InterruptedException) Thread.currentThread().interrupt();
@@ -123,6 +124,36 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
             } catch (IllegalArgumentException | ClassCastException error) { throw invalid(); }
         }
         throw failed();
+    }
+    private Optional<Map<String, Object>> readNonStreaming(AiProviderSettings settings, Map<String, Object> body,
+            Consumer<String> text, boolean proposalEnabled) {
+        Map<String, Object> fallback = new java.util.LinkedHashMap<>(body);
+        fallback.put("stream", false);
+        try {
+            var response = http.send(request(settings, fallback), HttpResponse.BodyHandlers.ofInputStream());
+            try (var input = response.body()) {
+                requireSuccessfulResponse(response.statusCode());
+                byte[] bytes = input.readNBytes(MAX_BYTES + 1);
+                if (bytes.length > MAX_BYTES) throw failed();
+                Map<String, Object> envelope = object(JsonReader.parse(new String(bytes, StandardCharsets.UTF_8)));
+                if (!(envelope.get("choices") instanceof List<?> choices) || choices.isEmpty()) throw invalid();
+                Map<String, Object> message = object(object(choices.getFirst()).get("message"));
+                boolean hasText = message.get("content") instanceof String content && !content.isEmpty();
+                if (hasText) text.accept((String) message.get("content"));
+                if (!(message.get("tool_calls") instanceof List<?> calls) || calls.isEmpty()) {
+                    if (!hasText) throw invalid();
+                    return Optional.empty();
+                }
+                if (!proposalEnabled || calls.size() != 1) throw invalid();
+                Map<String, Object> function = object(object(calls.getFirst()).get("function"));
+                if (!"propose_pipeline".equals(function.get("name"))
+                        || !(function.get("arguments") instanceof String arguments)) throw invalid();
+                return Optional.of(candidate(arguments));
+            }
+        } catch (java.io.IOException | InterruptedException error) {
+            if (error instanceof InterruptedException) Thread.currentThread().interrupt();
+            throw failed();
+        } catch (IllegalArgumentException | ClassCastException error) { throw invalid(); }
     }
     private static Optional<Map<String, Object>> readEvents(InputStream input, Consumer<String> text, boolean proposalEnabled) throws java.io.IOException {
         BufferedReader reader = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8));
