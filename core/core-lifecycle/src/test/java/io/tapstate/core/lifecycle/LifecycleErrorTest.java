@@ -26,7 +26,12 @@ class LifecycleErrorTest {
                 // a start or resume named a draft without an executable source-to-output path
                 "lifecycle.pipeline-not-runnable",
                 // a lifecycle verb named a pipeline that was never applied
-                "lifecycle.unknown-pipeline");
+                "lifecycle.unknown-pipeline",
+                // a start its start checks stopped: to ask a question, or to refuse it outright
+                "lifecycle.start-needs-confirmation",
+                "lifecycle.start-blocked",
+                // a start whose answer names something its start checks do not offer
+                "lifecycle.invalid-start-decision");
     }
 
     @Test

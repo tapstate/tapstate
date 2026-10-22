@@ -102,7 +102,44 @@ class ANestWithNothingToAssembleLandsItsRowsWhereItsDocumentsLandTest {
         assertThat(planned.shape().sinkTargetsOf(SINK)).containsEntry(TABLE, new SinkTarget(TABLE, List.of("id")));
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void targetInspectionUsesTheSameQualifiedRootLandingAndRenamesAsTheSink(boolean serveLeft) {
+        InMemoryStorePort store = seedStore();
+        store.artifacts().save(new SourceResource("right", null, "fake", Map.of("host", "right"), SourceMode.CDC,
+                List.of(TableRef.literal(TABLE)), null, null));
+        store.schemas().save(new DiscoveredSourceModel("right", "fake", 0L, new SourceModel(List.of(
+                new SourceTable(TABLE, List.of(new SourceField("id", "int"), new SourceField("cust_no", "string")),
+                        List.of("id"), List.of())))));
+        Step nest = Step.inline(STEP, FromClause.aliases(Map.of("c", FromRef.literal("right." + TABLE))),
+                new TransformBody.Nest(null, null, new NestRoot("c", List.of("cust_no"), null, null, List.of())), null);
+        SyncElement sync = new SyncElement("sync_1", DEST_ID, null,
+                new io.tapstate.core.model.RenameSpec(Map.of(SOURCE + "." + TABLE, "left_customers",
+                        "right." + TABLE, "right_customers"), null, null, null), null);
+        PipelineResource pipeline = new PipelineResource(PIPELINE, null,
+                List.of(SourceRef.spec(SOURCE, true), SourceRef.spec("right", true)), List.of(nest), null,
+                new ServeBlock.Inline(null, serveLeft
+                        ? FromClause.list(FromRef.literal(STEP), FromRef.literal(SOURCE + "." + TABLE))
+                        : FromClause.list(FromRef.literal(STEP)), List.of(sync), null, null), null, null);
+        store.artifacts().save(pipeline);
+        AtomicReference<Map<String, TargetTable>> bound = new AtomicReference<>();
+        new StoreBackedDagSource(store, capturing(bound)).plannedDagFor(PIPELINE, null);
+        assertThat(bound.get().values()).extracting(TargetTable::name).contains("right_customers");
+        if (!serveLeft) {
+            assertThat(bound.get().values().stream().map(TargetTable::name).distinct())
+                    .as("an unused source must not contribute another renamed target").containsExactly("right_customers");
+        }
+
+        assertThat(new StoreBackedPipelineWriteTargets(store).of(pipeline))
+                .extracting(io.tapstate.control.core.PipelineWriteTargets.WriteTarget::table)
+                .containsExactlyInAnyOrderElementsOf(bound.get().values().stream().map(TargetTable::name).distinct().toList());
+    }
+
     private static void assertRefused(InMemoryStorePort store, String nest, String other) {
+        PipelineResource pipeline = (PipelineResource) store.artifacts().get(PIPELINE).orElseThrow();
+        assertThatThrownBy(() -> new StoreBackedPipelineWriteTargets(store).of(pipeline))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        refused -> assertThat(refused.code()).isEqualTo(ActuationError.STREAM_LANDS_TWO_WAYS));
         assertThatThrownBy(() -> new StoreBackedDagSource(store, capturing(new AtomicReference<>()))
                 .plannedDagFor(PIPELINE, null))
                 .isInstanceOfSatisfying(TapstateException.class, refused -> {

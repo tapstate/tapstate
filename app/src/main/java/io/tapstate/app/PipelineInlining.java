@@ -51,7 +51,8 @@ final class PipelineInlining {
         // so both come from the definition, and dropping the first here would run the view at its default
         // width with the artifact saying otherwise.
         return new ViewBlock.Inline(use.id(), use.from(),
-                definition.primaryKey(), definition.storage(), definition.execution());
+                definition.primaryKey(), definition.storage(), definition.writeMode(), definition.onFullLoad(),
+                definition.execution());
     }
 
     private static ServeBlock inlineServe(ServeBlock serve, ArtifactStore artifacts) {
