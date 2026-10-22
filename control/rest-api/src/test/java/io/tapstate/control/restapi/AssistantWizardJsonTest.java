@@ -23,6 +23,36 @@ class AssistantWizardJsonTest {
             assertThat(AssistantWizardJson.wire(AssistantWizardJson.view(wizard), wizard)).isEqualTo(wizard);
         }
     }
+
+    @Test void defaultsUnknownRelationsToObjectsAndBuildsTheLegacyJoinCondition() {
+        Map<String, Object> view = Map.of("root", Map.of("source", "src", "table", "orders",
+                        "keys", List.of("id"), "transforms", List.of()),
+                "relations", List.of(Map.ofEntries(Map.entry("id", "items"), Map.entry("type", "sub_doc"),
+                        Map.entry("source", "src"), Map.entry("table", "items"), Map.entry("targetField", "items"),
+                        Map.entry("primaryKey", List.of("order_id")), Map.entry("arrayKey", List.of()),
+                        Map.entry("key", "order_id"), Map.entry("parentKey", "id"),
+                        Map.entry("transforms", List.of()), Map.entry("children", List.of()))),
+                "transforms", List.of(), "destinationSourceId", "target", "destinationTable", "view",
+                "destinationWriteMode", "upsert");
+        Map<String, Object> original = Map.of("output", Map.of("kind", "atlas", "config", Map.of()));
+
+        Map<String, Object> relation = AssistantWizardJson.object(
+                AssistantWizardJson.list(AssistantWizardJson.wire(view, original).get("related")).getFirst());
+        Map<String, Object> relationContract = AssistantWizardJson.object(relation.get("relation"));
+
+        assertThat(relationContract).containsEntry("shape", "object")
+                .containsEntry("on", List.of(Map.of("childField", "order_id", "parentField", "id")));
+    }
+
+    @Test void roundTripsJavascriptAndUnwindTransforms() {
+        List<Map<String, Object>> transforms = List.of(
+                Map.of("id", "script", "type", "js", "fields", Map.of("script", "return record;")),
+                Map.of("id", "expand", "type", "unwind", "fields", Map.of("path", "items")));
+
+        assertThat(AssistantWizardJson.writeTransforms(AssistantWizardJson.readTransforms(transforms)))
+                .containsExactly(Map.of("id", "script", "type", "js", "fields", Map.of("script", "return record;")),
+                        Map.of("id", "expand", "type", "unwind", "fields", Map.of("path", "items")));
+    }
     @Test void mapTransformsRoundTripLiteralRenameComputeAndDeleteValues() {
         Map<String, Object> wizard = Map.of("root", Map.of("id", "root", "sourceId", "orders", "table", "orders", "key", List.of("id"), "preTransforms", List.of()),
                 "related", List.of(),

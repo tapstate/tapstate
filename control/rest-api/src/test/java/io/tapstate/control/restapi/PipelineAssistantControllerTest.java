@@ -65,6 +65,14 @@ class PipelineAssistantControllerTest {
                 Map.of("revision", 2, "messages", List.of(Map.of("role", "user", "text", "proposal"))), request))
                 .isInstanceOfSatisfying(TapstateException.class,
                         failure -> assertThat(failure.code()).isEqualTo(PipelineDraftError.REVISION_CONFLICT));
+        assertThatThrownBy(() -> controller.assistant("orders",
+                Map.of("revision", 1.5, "messages", List.of(Map.of("role", "user", "text", "proposal"))), request))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(ControlError.MALFORMED_REQUEST));
+        assertThatThrownBy(() -> controller.assistant("orders",
+                Map.of("revision", 1, "messages", List.of(Map.of("role", "system", "text", "proposal"))), request))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(ControlError.MALFORMED_REQUEST));
         assertThat(store.get("orders")).contains(draft());
     }
 
@@ -478,13 +486,139 @@ class PipelineAssistantControllerTest {
         input.put("wizard", AssistantWizardJson.wire(view, AssistantWizardJson.object(input.get("wizard"))));
         assertThat(new PipelineDraftService(store).previewCandidate("orders", PipelineDraftJson.read(mapper,
                 input, "orders", 1, unfinished.updatedBy())).serve()).isNull();
+
+        Map<String, Object> invalidView = AssistantWizardJson.view(AssistantWizardJson.object(
+                PipelineDraftJson.write(mapper, unfinished).get("wizard")));
+        Map<String, Object> invalidRoot = new java.util.LinkedHashMap<>(AssistantWizardJson.object(invalidView.get("root")));
+        invalidRoot.put("transforms", List.of(Map.of("id", "assistant-filter", "name", "filter", "type", "filter",
+                "enabled", true, "config", Map.of("filter", Map.of("expr", "after.User ==")))));
+        invalidView.put("root", invalidRoot);
+        var invalidInput = new java.util.LinkedHashMap<>(PipelineDraftJson.write(mapper, unfinished));
+        invalidInput.put("wizard", AssistantWizardJson.wire(invalidView,
+                AssistantWizardJson.object(invalidInput.get("wizard"))));
+        assertThatThrownBy(() -> new PipelineDraftService(store).previewCandidate("orders", PipelineDraftJson.read(mapper,
+                invalidInput, "orders", 1, unfinished.updatedBy())))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(PipelineDraftError.INVALID));
         assertThat(store.get("orders")).contains(unfinished);
+    }
+
+    @Test void oversizedDiscoveredSchemaIsOmittedFromProviderContext() throws Exception {
+        var store = new PipelineApiTest.FakePipelineDraftStore();
+        PipelineDraft base = draft(); store.create(base);
+        var artifacts = new PipelineApiTest.FakeArtifactStore();
+        artifacts.seed("version: tapstate/v1\nkind: source\nid: src\nconnector: mysql\nmode: cdc\nconfig: {}\n");
+        artifacts.seed("version: tapstate/v1\nkind: source\nid: dst\nconnector: mongodb\nconfig: {}\n");
+        String oversizedField = "field_" + "x".repeat(125_000);
+        var schema = new DiscoveredSourceModel("src", "mysql", 1,
+                new io.tapstate.spi.store.SourceModel(List.of(new io.tapstate.spi.store.SourceTable("orders",
+                        List.of(new io.tapstate.spi.store.SourceField(oversizedField, "string")), List.of(), List.of()))));
+        SchemaStore schemaStore = new SchemaStore() {
+            public void save(DiscoveredSourceModel ignored) { throw new AssertionError("must not write schema"); }
+            public Optional<DiscoveredSourceModel> get(String id) { return Optional.of(schema); }
+        };
+        var audit = new AuditGate(new PipelineApiTest.RecordingAuditStore(), Clock.systemUTC());
+        var services = new PipelineApiTest.TestApp();
+        var apply = new ApplyService(TapstateCatalog::load, artifacts, audit, schemaStore,
+                PlanAdvisories.none(), SchemaDerivation.none());
+        var sources = new SourceProjectionService(apply,
+                services.artifactQueryService(artifacts), services.artifactMutationService(artifacts, audit),
+                new SourceRepresentation(TapstateCatalog::load));
+        var schemas = new io.tapstate.control.core.SourceSchemaQueryService(artifacts, schemaStore);
+        var beans = new DefaultListableBeanFactory();
+        beans.registerSingleton("drafts", new PipelineDraftService(store, services.artifactQueryService(artifacts), audit, apply));
+        beans.registerSingleton("sources", sources);
+        beans.registerSingleton("schemas", schemas);
+        AtomicReference<Map<String, Object>> sentContext = new AtomicReference<>();
+        AiProviderClient fake = new AiProviderClient() {
+            public void check(AiProviderSettings ignored) { }
+            public Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
+                    Map<String, Object> context, java.util.function.Consumer<String> text) {
+                sentContext.set(context);
+                text.accept("Choose a smaller schema selection to generate a proposal.");
+                return Optional.empty();
+            }
+        };
+        var controller = new PipelineAssistantController(beans.getBeanProvider(PipelineDraftService.class),
+                beans.getBeanProvider(SourceProjectionService.class),
+                beans.getBeanProvider(io.tapstate.control.core.SourceSchemaQueryService.class),
+                providerController(fake), fake, JsonMapper.builder().build());
+        var response = controller.assistant("orders", Map.of("revision", 1,
+                "messages", List.of(Map.of("role", "user", "text", "How do I start?"))),
+                new MockHttpServletRequest("POST", "/pipelines/orders/draft:assistant"));
+        var output = new ByteArrayOutputStream(); response.getBody().writeTo(output);
+
+        assertThat(sentContext.get()).containsEntry("sources", List.of()).containsEntry("proposalEnabled", false)
+                .containsEntry("schemaUnavailable", "selected schema is too large to include");
+        assertThat(output.toString(StandardCharsets.UTF_8)).contains("Choose a smaller schema selection")
+                .doesNotContain("data-proposal", oversizedField);
+        assertThat(store.get("orders")).contains(base);
     }
     @Test void focusProjectsOnlyKnownBuilderContextAndNeverArbitraryData() {
         assertThat(PipelineAssistantController.focus(draft(), Map.of("kind", "root", "nodeId", "root", "rows", List.of("private-row"))))
                 .containsExactlyInAnyOrderEntriesOf(Map.of("kind", "root", "nodeId", "root"));
+        assertThat(PipelineAssistantController.focus(draft(), Map.of("kind", "transforms", "nodeId", "doc_process")))
+                .containsExactlyInAnyOrderEntriesOf(Map.of("kind", "transforms", "nodeId", "doc_process"));
+        assertThat(PipelineAssistantController.focus(draft(), Map.of("kind", "root", "nodeId", "x".repeat(201))))
+                .isEmpty();
+        PipelineDraft related = new PipelineDraft("orders", 1, 1, PipelineDraft.Mode.WIZARD, "Orders", null, null,
+                new PipelineDraft.Wizard(draft().wizard().root(), List.of(new PipelineDraft.Related("items", "root",
+                        "src", "items", new PipelineDraft.Relation(List.of(), PipelineDraft.Shape.ARRAY,
+                                "items", List.of("id"), List.of("id")), List.of())), List.of(), draft().wizard().output()),
+                null, null, null, Instant.EPOCH, Instant.EPOCH, "author");
+        assertThat(PipelineAssistantController.focus(related, Map.of("kind", "relation", "nodeId", "items")))
+                .containsExactlyInAnyOrderEntriesOf(Map.of("kind", "relation", "nodeId", "items"));
         assertThat(PipelineAssistantController.focus(draft(), Map.of("kind", "arbitrary", "nodeId", "secret"))).isEmpty();
         assertThat(PipelineAssistantController.focus(draft(), "root")).isEmpty();
+    }
+
+    @Test void assistantOverloadReturnsACodedStreamAndReleasesEveryCapacityPermit() throws Exception {
+        var store = new PipelineApiTest.FakePipelineDraftStore();
+        PipelineDraft blank = new PipelineDraft("blank", 1, 1, PipelineDraft.Mode.WIZARD, "Blank", null, null,
+                new PipelineDraft.Wizard(null, List.of(), List.of(), new PipelineDraft.Output("atlas",
+                        Map.of("sourceId", "", "table", "", "writeMode", "upsert"))),
+                null, null, null, Instant.EPOCH, Instant.EPOCH, "author");
+        store.create(blank);
+        var beans = new DefaultListableBeanFactory();
+        beans.registerSingleton("drafts", new PipelineDraftService(store));
+        AiProviderClient fake = new AiProviderClient() {
+            public void check(AiProviderSettings ignored) { }
+            public Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
+                    Map<String, Object> context, java.util.function.Consumer<String> text) {
+                text.accept("The Builder is ready for a supported Source.");
+                return Optional.empty();
+            }
+        };
+        PipelineAssistantController controller = new PipelineAssistantController(
+                beans.getBeanProvider(PipelineDraftService.class),
+                beans.getBeanProvider(io.tapstate.control.core.SourceProjectionService.class),
+                beans.getBeanProvider(io.tapstate.control.core.SourceSchemaQueryService.class), providerController(fake),
+                fake, JsonMapper.builder().build());
+        var capacityField = PipelineAssistantController.class.getDeclaredField("CAPACITY");
+        capacityField.setAccessible(true);
+        java.util.concurrent.Semaphore capacity = (java.util.concurrent.Semaphore) capacityField.get(null);
+        assertThat(capacity.tryAcquire(4)).isTrue();
+        try {
+            MockHttpServletRequest request = new MockHttpServletRequest("POST", "/pipelines/blank/draft:assistant");
+            var response = controller.assistant("blank", Map.of("revision", 1,
+                    "messages", List.of(Map.of("role", "user", "text", "How do I start?"))), request);
+            var output = new ByteArrayOutputStream();
+            response.getBody().writeTo(output);
+            String stream = output.toString(StandardCharsets.UTF_8);
+            assertThat(stream).contains(ControlError.AI_OVERLOADED.code(), "\"finishReason\":\"error\"", "[DONE]")
+                    .doesNotContain("data-proposal");
+            assertThat(capacity.availablePermits()).isZero();
+        } finally {
+            capacity.release(4);
+        }
+
+        for (int attempt = 0; attempt < 2; attempt++) {
+            var response = controller.assistant("blank", Map.of("revision", 1,
+                    "messages", List.of(Map.of("role", "user", "text", "How do I start?"))),
+                    new MockHttpServletRequest("POST", "/pipelines/blank/draft:assistant"));
+            response.getBody().writeTo(new ByteArrayOutputStream());
+            assertThat(capacity.availablePermits()).isEqualTo(4);
+        }
     }
     @Test void missingDraftCannotProduceAProposal() {
         var controller = controller(new PipelineDraftService(new PipelineApiTest.FakePipelineDraftStore()));

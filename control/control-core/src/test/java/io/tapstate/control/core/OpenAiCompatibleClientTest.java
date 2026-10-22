@@ -24,6 +24,7 @@ import static org.assertj.core.api.Assertions.*;
 class OpenAiCompatibleClientTest {
     @Test void returnsAPlainConversationWhenNoSchemaIsAvailable() throws Exception {
         String stream = chunk(Map.of("content", "Tell me which Source and table to choose."), null)
+                + "data: " + JsonWriter.write(Map.of("usage", Map.of("total_tokens", 12))) + "\n\n"
                 + "data: [DONE]\n\n";
         withServer(200, stream, settings -> {
             List<String> text = new ArrayList<>();
@@ -157,8 +158,165 @@ class OpenAiCompatibleClientTest {
         }
         withServer(401, "sk-test leaked upstream diagnostic", settings -> assertThatThrownBy(() -> localClient().check(settings))
                 .isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.code()).isEqualTo(ControlError.AI_PROVIDER_AUTH_FAILED)).hasMessageNotContaining("sk-test"));
+        withServer(403, "sk-test leaked upstream diagnostic", settings -> assertThatThrownBy(() -> localClient().check(settings))
+                .isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.code()).isEqualTo(ControlError.AI_PROVIDER_AUTH_FAILED)).hasMessageNotContaining("sk-test"));
         withServer(503, "provider outage diagnostic", settings -> assertThatThrownBy(() -> localClient().check(settings))
                 .isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.code()).isEqualTo(ControlError.AI_PROVIDER_FAILED)));
+        withServer(500, "provider outage diagnostic", settings -> assertThatThrownBy(() -> localClient().propose(settings, List.of(), Map.of(), ignored -> { }))
+                .isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.code()).isEqualTo(ControlError.AI_PROVIDER_FAILED)));
+    }
+
+    @Test void connectionCheckAcceptsAChoicesEnvelopeAndRejectsAnEmptyChoicesList() throws Exception {
+        withServer(200, "{\"choices\":[{}]}", settings ->
+                assertThatCode(() -> localClient().check(settings)).doesNotThrowAnyException());
+        withServer(200, "{\"choices\":[]}", settings -> assertThatThrownBy(() -> localClient().check(settings))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_PROVIDER_FAILED)));
+        withServer(200, "not-json", settings -> assertThatThrownBy(() -> localClient().check(settings))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_PROVIDER_FAILED)));
+        withServer(200, "x".repeat(524_289), settings -> assertThatThrownBy(() -> localClient().check(settings))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_PROVIDER_FAILED)));
+    }
+
+    @Test void interruptedCheckAndProposalRestoreTheInterruptFlagAndReturnCodedFailures() throws Exception {
+        var settings = new AiProviderSettings("openai-compatible", "http://127.0.0.1:1", "test", "sk-test");
+        try {
+            Thread.currentThread().interrupt();
+            assertThatThrownBy(() -> localClient().check(settings))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(ControlError.AI_PROVIDER_FAILED));
+            assertThat(Thread.currentThread().isInterrupted()).isTrue();
+        } finally {
+            Thread.interrupted();
+        }
+        try {
+            Thread.currentThread().interrupt();
+            assertThatThrownBy(() -> localClient().propose(settings, List.of(), Map.of(), ignored -> { }))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(ControlError.AI_PROVIDER_FAILED));
+            assertThat(Thread.currentThread().isInterrupted()).isTrue();
+        } finally {
+            Thread.interrupted();
+        }
+    }
+
+    @Test void invalidRequestUriFactoryIsReturnedAsACodedProposalFailure() throws Exception {
+        withServer(200, "data: [DONE]\n\n", settings -> assertThatThrownBy(() ->
+                new OpenAiCompatibleClient(baseUrl -> { throw new IllegalArgumentException("invalid uri"); })
+                        .propose(settings, List.of(), Map.of(), ignored -> { }))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(ControlError.AI_INVALID_PROPOSAL)));
+    }
+
+    @Test void retriesEmptyToolStreamsWithNonStreamingConversationAndProposalFallbacks() throws Exception {
+        AtomicInteger streamRequests = new AtomicInteger();
+        AtomicInteger fallbackRequests = new AtomicInteger();
+        String arguments = JsonWriter.write(Map.of("candidateWizard", Map.of("root", Map.of("table", "orders"))));
+        Map<String, Object> fallbackToolCall = Map.of("function", Map.of(
+                "name", "propose_pipeline", "arguments", arguments));
+        Map<String, Object> fallbackMessage = Map.of("content", "I added the requested filter.",
+                "tool_calls", List.of(fallbackToolCall));
+        List<String> fallbacks = List.of(
+                JsonWriter.write(Map.of("choices", List.of(Map.of("message", Map.of("content", "Fallback answer."))))),
+                JsonWriter.write(Map.of("choices", List.of(Map.of("message", fallbackMessage)))));
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/chat/completions", exchange -> {
+            Map<?, ?> request = (Map<?, ?>) JsonReader.parse(
+                    new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            String body;
+            if (Boolean.TRUE.equals(request.get("stream"))) {
+                streamRequests.incrementAndGet();
+                body = "data: " + JsonWriter.write(Map.of("error",
+                        Map.of("code", "temporary", "type", "upstream_error"))) + "\n\n";
+            } else {
+                int fallback = fallbackRequests.getAndIncrement();
+                body = fallbacks.get(fallback);
+            }
+            byte[] response = body.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, response.length);
+            try (var output = exchange.getResponseBody()) { output.write(response); }
+        });
+        server.start();
+        try {
+            var settings = new AiProviderSettings("openai-compatible",
+                    "http://127.0.0.1:" + server.getAddress().getPort(), "test", "sk-test");
+            List<String> conversationalText = new ArrayList<>();
+            Optional<Map<String, Object>> conversation = localClient().propose(settings,
+                    List.of(Map.of("role", "user", "content", "How do I start?")),
+                    Map.of("proposalEnabled", false), conversationalText::add);
+            assertThat(conversation).isEmpty();
+            assertThat(String.join("", conversationalText)).isEqualTo("Fallback answer.");
+
+            List<String> proposalText = new ArrayList<>();
+            Optional<Map<String, Object>> proposal = localClient().propose(settings,
+                    List.of(Map.of("role", "user", "content", "Add a filter for active orders")),
+                    Map.of("proposalEnabled", true), proposalText::add);
+            assertThat(String.join("", proposalText)).isEqualTo("I added the requested filter.");
+            assertThat(proposal).hasValueSatisfying(value -> assertThat(value).containsEntry("root", Map.of("table", "orders")));
+            assertThat(streamRequests).hasValue(4);
+            assertThat(fallbackRequests).hasValue(2);
+        } finally { server.stop(0); }
+    }
+
+    @Test void rejectsMalformedOrAmbiguousNonStreamingProposalFallbacks() throws Exception {
+        Map<String, Object> proposedCall = Map.of("function", Map.of("name", "propose_pipeline", "arguments", "{}"));
+        Map<String, Object> otherCall = Map.of("function", Map.of("name", "other_tool", "arguments", "{}"));
+        String multipleCalls = JsonWriter.write(Map.of("choices", List.of(Map.of("message", Map.of(
+                "content", "Try again.", "tool_calls", List.of(proposedCall, proposedCall))))));
+        String wrongCall = JsonWriter.write(Map.of("choices", List.of(Map.of("message", Map.of(
+                "content", "Try again.", "tool_calls", List.of(otherCall))))));
+        for (String fallback : List.of(
+                "{\"choices\":[]}",
+                "{\"choices\":[{\"message\":{}}]}",
+                multipleCalls,
+                wrongCall)) {
+            assertFallbackFailure(fallback);
+        }
+    }
+
+    private static void assertFallbackFailure(String fallback) throws Exception {
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/chat/completions", exchange -> {
+            Map<?, ?> request = (Map<?, ?>) JsonReader.parse(
+                    new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            String response = Boolean.TRUE.equals(request.get("stream"))
+                    ? "data: " + JsonWriter.write(Map.of("error", Map.of("code", "temporary", "type", "upstream_error"))) + "\n\n"
+                    : fallback;
+            byte[] body = response.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            try (var output = exchange.getResponseBody()) { output.write(body); }
+        });
+        server.start();
+        try {
+            var settings = new AiProviderSettings("openai-compatible",
+                    "http://127.0.0.1:" + server.getAddress().getPort(), "test", "sk-test");
+            Throwable failure = catchThrowable(() -> localClient().propose(settings,
+                    List.of(Map.of("role", "user", "content", "Add a filter")),
+                    Map.of("proposalEnabled", true), ignored -> { }));
+            assertThat(failure).as("fallback response: %s", fallback)
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(ControlError.AI_INVALID_PROPOSAL));
+        } finally { server.stop(0); }
+    }
+
+    @Test void rejectsUnsupportedToolIndexesAndOversizedStreamingBodies() throws Exception {
+        String unsupportedIndex = chunk(Map.of("tool_calls", List.of(Map.of("index", 1,
+                "function", Map.of("name", "propose_pipeline", "arguments", "{}")))), "tool_calls")
+                + "data: [DONE]\n\n";
+        withServer(200, unsupportedIndex, settings -> assertThatThrownBy(() ->
+                localClient().propose(settings, List.of(), Map.of(), ignored -> { }))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_PROVIDER_FAILED)));
+
+        String largeDelta = "a".repeat(300_000);
+        String oversized = chunk(Map.of("content", largeDelta), null)
+                + chunk(Map.of("content", largeDelta), null) + "data: [DONE]\n\n";
+        withServer(200, oversized, settings -> assertThatThrownBy(() ->
+                localClient().propose(settings, List.of(), Map.of(), ignored -> { }))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_PROVIDER_FAILED)));
     }
     @Test void malformedProviderStreamObjectsBecomeCodedProposalFailures() throws Exception {
         for (String malformed : List.of("null", "{\"choices\":[null]}", "{\"choices\":[{\"delta\":null}]")) {

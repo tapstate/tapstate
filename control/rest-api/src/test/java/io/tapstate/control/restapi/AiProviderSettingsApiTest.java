@@ -120,6 +120,10 @@ class AiProviderSettingsApiTest {
                             failure -> assertThat(failure.code()).isEqualTo(ControlError.MALFORMED_REQUEST));
             assertThat(auditRecords.toString()).doesNotContain("sk-old-key", "sk-new-key", "sk-bad-key");
             assertThat(metadata.toString()).doesNotContain("sk-old-key", "sk-new-key");
+            controller.delete(workspaceA);
+            assertThat(service.get(owner("org-a", "cluster-a"))).isEmpty();
+            assertThat(controller.get(workspaceA).getBody()).containsEntry("configured", false)
+                    .doesNotContainKey("apiKey");
         } finally {
             SecurityContextHolder.clearContext();
         }
