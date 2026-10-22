@@ -174,6 +174,20 @@ class ValidationNestObjectProjectionTest {
                 .satisfies(finding -> assertThat(finding.location().fieldPath()).containsExactly("shipping", "label"));
     }
 
+    @Test void aRowOutsideTheRequestedPhysicalRelationCannotBecomeAnAgreedExpectedObject() {
+        var fixture = new Fixture(false, 8);
+        var wrongChild = row(Map.of("id", 999, "region_id", 3, "name", "Ada"));
+        fixture.data.put("customer", List.of(wrongChild));
+        var actual = new HashMap<String, Object>(parent().fields()); actual.put("customer", wrongChild.fields());
+        var target = new Cursor(List.of(row(actual)));
+        assertThatThrownBy(() -> rootRead(fixture, new Cursor(List.of(parent())), target)).isInstanceOfSatisfying(TapstateException.class,
+                error -> assertThat(error.code()).isEqualTo(ValidationError.READ_PROTOCOL_VIOLATION));
+        assertThat(target.opens).isZero();
+        assertThat(fixture.cursors).singleElement().satisfies(cursor -> {
+            assertThat(cursor.closed).isTrue(); assertThat(cursor.released).isEqualTo(1);
+        });
+    }
+
     private static ValidationRootCheck rootRead(Fixture fixture, Cursor source, Cursor target) {
         return ValidationRootReader.read(ROOT, ValidationMethod.FULL_COLUMN,
                 new ValidationRootReader.Query("source", "v1", source::open), new ValidationRootReader.Query("target", "v1", target::open),

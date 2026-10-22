@@ -28,7 +28,7 @@ class ValidationNestRelationReadTest {
     private static final Clock CLOCK = Clock.fixed(Instant.EPOCH, ZoneOffset.UTC);
 
     @Test void onlyReadyKeysBuildThePhysicalQueryAndEveryRowReachesNormalEof() {
-        var key = new BigInteger("9007199254740993"); var cursor = new Cursor(7); var built = new AtomicInteger();
+        var key = new BigInteger("9007199254740993"); var cursor = new Cursor(7, key); var built = new AtomicInteger();
         var binding = binding(); var observation = observation();
         var result = read(binding, view(Map.of("customer", key), List.of()), request -> {
             built.incrementAndGet();
@@ -111,8 +111,9 @@ class ValidationNestRelationReadTest {
                 new ValidationRoot("mapping", "output", new ValidationKey(List.of(ValidationKey.Part.number(102))), List.of()), 1);
     }
     private static final class Cursor implements ValidationRowCursor {
-        final int count; int delivered; int released; boolean closed; RuntimeException failure;
-        Cursor(int count) { this.count = count; }
+        final int count; final Object relationKey; int delivered; int released; boolean closed; RuntimeException failure;
+        Cursor(int count) { this(count, 7); }
+        Cursor(int count, Object relationKey) { this.count = count; this.relationKey = relationKey; }
         @Override public Optional<Row> next() {
             if (closed || released != delivered) throw new IllegalStateException("unreleased row");
             if (failure != null) throw failure;
@@ -120,7 +121,7 @@ class ValidationNestRelationReadTest {
             int ordinal = delivered++;
             return Optional.of(new Row() {
                 @Override public long ordinal() { return ordinal; }
-                @Override public ValidationValues.Row values() { return ValidationValues.ownRow(Map.of("id", ordinal), ROW); }
+                @Override public ValidationValues.Row values() { return ValidationValues.ownRow(Map.of("id", ordinal, "native_customer_id", relationKey), ROW); }
                 @Override public void close() { released++; }
             });
         }

@@ -1,11 +1,14 @@
 package io.tapstate.runtime.engine.validation;
 
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.validation.ValidationError;
 import io.tapstate.core.validation.ValidationKey;
 import io.tapstate.core.validation.ValidationKeyBinding;
 import io.tapstate.core.validation.ValidationObservation;
 import io.tapstate.core.validation.ValidationRelationRows;
 import io.tapstate.core.validation.ValidationValues;
 import java.time.Clock;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Function;
@@ -49,7 +52,9 @@ public final class ValidationNestRelationRead {
     /**
      * Classifies complete independently projected child rows. Any partial descendant knowledge and its
      * causes must remain in the enclosing source tree; passing only its row here would discard facts.
-     * Execution failures propagate, and the caller cannot publish a partial result after an exception.
+     * The caller also reserves physical-key binding scratch under the admitted row/key limits. Every
+     * returned raw row must independently match the requested physical equality predicate before its
+     * rule runs. Execution failures propagate; no partial result may be published after an exception.
      */
     public static Result read(ValidationObservation parent, ValidationNestLookupBinding binding,
             ValidationStaticMap.Projection workingParent, Queries queries, ValidationRelationRows.Limits limits,
@@ -65,7 +70,13 @@ public final class ValidationNestRelationRead {
         var query = Objects.requireNonNull(queries.prepare(new Request(parent, binding.physical(), ready.key())), "relation query");
         requireAuthorized.run();
         var rows = ValidationRelationReader.read(parent, query.readId(), query.contractVersion(), query.open().get(),
-                limits, clock, requireAuthorized, classify);
+                limits, clock, requireAuthorized, raw -> {
+                    var actual = binding.physical().read(raw);
+                    if (!(actual instanceof ValidationKeyBinding.Bound bound) || !bound.key().equals(ready.key())) {
+                        throw new TapstateException(ValidationError.READ_PROTOCOL_VIOLATION, Map.of("table", query.readId()), null);
+                    }
+                    return classify.apply(raw);
+                });
         requireAuthorized.run();
         return new Result(parent, prepared, Optional.of(rows));
     }
