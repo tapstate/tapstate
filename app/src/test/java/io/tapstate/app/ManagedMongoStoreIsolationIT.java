@@ -2007,6 +2007,7 @@ class ManagedMongoStoreIsolationIT {
             byte[] artifact = Files.readAllBytes(CloudConnectorTestInputs.seedDirectory().resolve("mongodb-connector.jar"));
             String hash = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(artifact));
             for (var set : List.of(a, b)) {
+                recordConfigurationFootprint(set, "installed-before-runtime");
                 for (var entry : Map.of(set.configUser(), set.config(), set.cacheUser(), set.cache(), set.masterUser(), set.master()).entrySet()) {
                     try (MongoClient limited = MongoClients.create(uri(entry.getKey(), entry.getValue()))) {
                         for (String database : allDatabases) if (!database.equals(entry.getValue())) assertDenied(limited, database);
@@ -2040,7 +2041,61 @@ class ManagedMongoStoreIsolationIT {
                     assertThat(admin.getDatabase(set.master()).getCollection("orders").find().first())
                             .containsEntry("_id", 1).containsEntry("owner", set.master());
                 }
+                recordConfigurationFootprint(set, "after-runtime-and-restart");
             }
+        }
+    }
+
+    private static void recordConfigurationFootprint(NativeDatabases set, String phase) {
+        // Observe the actual limited CONFIG identity, without logging stored values or credentials.
+        try (MongoClient limited = MongoClients.create(uri(set.configUser(), set.config()))) {
+            var database = limited.getDatabase(set.config());
+            var actualNames = database.listCollectionNames().into(new ArrayList<>());
+            assertThat(SystemCollections.physicalNamesIn(SystemCollections.Database.CONFIG)).containsAll(actualNames);
+            var measurements = new ArrayList<Document>();
+            for (var resource : SystemCollections.values()) {
+                if (resource.database() != SystemCollections.Database.CONFIG) continue;
+                for (String name : resource.physicalNames()) {
+                    if (!actualNames.contains(name)) {
+                        measurements.add(new Document("collection", name).append("present", false));
+                        continue;
+                    }
+                    var collection = database.getCollection(name);
+                    var indexes = collection.listIndexes().into(new ArrayList<>());
+                    assertThat(indexes).anySatisfy(index -> assertThat(index.get("key", Document.class))
+                            .isEqualTo(new Document("_id", 1)));
+                    if (name.equals(resource.indexTarget())) for (var required : resource.indexes()) {
+                        Document index = indexes.stream().filter(value -> required.indexName().equals(value.getString("name")))
+                                .findFirst().orElseThrow();
+                        var keys = new Document(); required.keys().forEach(key -> keys.append(key, 1));
+                        assertThat(index.get("key", Document.class)).isEqualTo(keys);
+                        assertThat(Boolean.TRUE.equals(index.getBoolean("unique"))).isEqualTo(required.unique());
+                        if (required.partialFilterJson() != null)
+                            assertThat(index.get("partialFilterExpression", Document.class))
+                                    .isEqualTo(Document.parse(required.partialFilterJson()));
+                    }
+                    Document stats = database.runCommand(new Document("collStats", name).append("scale", 1));
+                    long count = collection.countDocuments();
+                    assertThat(stats.get("count", Number.class).longValue()).isEqualTo(count);
+                    var measurement = new Document("collection", name).append("present", true).append("documents", count);
+                    for (String metric : List.of("size", "storageSize", "totalIndexSize", "nindexes")) {
+                        long value = stats.get(metric, Number.class).longValue();
+                        assertThat(value).isGreaterThanOrEqualTo(0);
+                        measurement.append(metric, value);
+                    }
+                    measurement.append("indexNames", indexes.stream().map(index -> index.getString("name")).sorted().toList());
+                    measurements.add(measurement);
+                }
+            }
+            Document stats = database.runCommand(new Document("dbStats", 1).append("scale", 1));
+            var report = new Document("phase", phase).append("mode", "OP")
+                    .append("sources", database.getCollection("sources").countDocuments())
+                    .append("pipelines", database.getCollection("pipelines").countDocuments())
+                    .append("users", database.getCollection("users").countDocuments());
+            for (String metric : List.of("objects", "dataSize", "storageSize", "indexes", "indexSize"))
+                report.append(metric, stats.get(metric, Number.class).longValue());
+            report.append("collections", measurements);
+            System.out.println("CONFIG_FOOTPRINT " + report.toJson());
         }
     }
 
