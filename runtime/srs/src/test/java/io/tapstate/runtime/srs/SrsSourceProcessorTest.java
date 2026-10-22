@@ -147,7 +147,7 @@ class SrsSourceProcessorTest {
             var project = graph.newVertex("project", Processors.mapP(SrsSourceProcessorTest::describe)).localParallelism(1);
             var sink = graph.newVertex("sink", SinkProcessors.writeListP("out-arrival-later")).localParallelism(1);
             graph.edge(between(source, project)).edge(between(project, sink));
-            later = hz.getJet().newJob(graph);
+            later = hz.getJet().newJob(graph, new com.hazelcast.jet.config.JobConfig().setName("arrival-later"));
             awaitSize(hz.getList("out-arrival-later"), 2);
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15);
             while (later.getMetrics().get("sourceRowsIn.i.orders").isEmpty() && System.nanoTime() < deadline) Thread.sleep(50);
@@ -157,6 +157,10 @@ class SrsSourceProcessorTest {
             assertThat(later.getMetrics().get("sourceBytesIn.orders").stream().mapToLong(value -> value.value()).sum()).isPositive();
             assertThat(later.getMetrics().get("sourceCountingSince")).isNotEmpty();
             assertThat(later.getMetrics().metrics()).doesNotContain("sourceRowsIn.i.other");
+            var reading = new io.tapstate.runtime.engine.Engine(hz).capturedRows("arrival-later");
+            assertThat(reading.rowsByTableAndOp()).containsExactly(Map.entry("orders", Map.of("i", 1L, "r", 1L)));
+            assertThat(reading.bytesByTable().get("orders")).isPositive();
+            assertThat(reading.countingSince()).isNotNull();
         } finally {
             first.cancel(); if (later != null) later.cancel();
             hz.getUserContext().remove(SnapshotBuffer.USER_CONTEXT_KEY);

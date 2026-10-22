@@ -1,7 +1,6 @@
 package io.tapstate.runtime.srs;
 
 import io.tapstate.runtime.engine.StageTimer;
-import io.tapstate.runtime.engine.SourceArrivals;
 import com.hazelcast.function.SupplierEx;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.Processor;
