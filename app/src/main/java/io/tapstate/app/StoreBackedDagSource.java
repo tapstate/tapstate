@@ -8,6 +8,7 @@ import io.tapstate.adapters.pdk.ConnectorStateNamespace;
 import io.tapstate.adapters.transform.MapSpec;
 import io.tapstate.adapters.transform.StatelessTransforms;
 import io.tapstate.adapters.transform.UnwindSpec;
+import io.tapstate.control.core.PipelineWriteTargets;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.dsl.UnwindWriteKeys;
@@ -69,6 +70,8 @@ import io.tapstate.spi.store.SourceIndex;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.store.SrsConsumerId;
+import io.tapstate.spi.store.SrsMeta;
+import io.tapstate.spi.store.StartLoad;
 import io.tapstate.spi.store.StorePort;
 import io.tapstate.spi.capture.FieldSchema;
 import io.tapstate.spi.capture.TableSchema;
@@ -249,8 +252,15 @@ final class StoreBackedDagSource implements DagSource {
 
     @Override
     public void validateStart(String pipelineId) {
-        PipelineResource pipeline = PipelineInlining.inline(
-                StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
+        requireDiscovered(PipelineInlining.inline(
+                StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts()));
+    }
+
+    /**
+     * Refuses a pipeline that writes a view or a sync while a source reaching what it writes has never been
+     * discovered: a write target is built from the discovered fields and key, so nothing can bind it yet.
+     */
+    private void requireDiscovered(PipelineResource pipeline) {
         boolean writesView = pipeline.view() instanceof ViewBlock.Inline;
         boolean writesSync = pipeline.serve() instanceof ServeBlock.Inline serve
                 && serve.sync() != null && !serve.sync().isEmpty();
@@ -592,40 +602,18 @@ final class StoreBackedDagSource implements DagSource {
         // back to a bare name carrying neither.
         Map<String, TargetTable> assembled =
                 assembledTargets(pipeline, bySourceTable, sourceVertices, compiledJoins);
-        Map<String, TargetTable> targets = new LinkedHashMap<>(bySourceTable);
-        targets.putAll(assembled);
-        Map<String, TargetTable> viewTargets = new LinkedHashMap<>(targets);
-        Set<String> serveStreams = pipeline.serve() instanceof ServeBlock.Inline serve
-                && serve.sync() != null && !serve.sync().isEmpty()
-                ? streamsReaching(pipeline, serve.from(), sourceKeyByTable, sourceKeysById,
-                        sourceVertices, stepIds)
-                : Set.of();
-        Set<String> viewStreams = pipeline.view() instanceof ViewBlock.Inline view
-                ? streamsReaching(pipeline, view.from(), sourceKeyByTable, sourceKeysById,
-                        sourceVertices, stepIds)
-                : Set.of();
-        // Each stream a sink receives, narrowed to what the pipeline actually publishes on it rather
-        // than to what its source table holds. The two terminals keep independent maps because the
-        // same stream can reach them through different transform paths.
-        if (pipeline.serve() instanceof ServeBlock.Inline serving && !serveStreams.isEmpty()) {
-            targets.putAll(publishedTargets(pipelineId, pipeline, serving.from(), serveStreams,
-                    bySourceTable, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds));
-        }
-        // A view validates and binds against the rows at its own input, not against the source model
-        // those rows started from.
-        if (pipeline.view() instanceof ViewBlock.Inline viewing && !viewStreams.isEmpty()) {
-            viewTargets.putAll(publishedTargets(pipelineId, pipeline,
-                    FromClause.list(viewing.from()), viewStreams,
-                    bySourceTable, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds));
-        }
-        requireFactKeyPublishedWhereAWriteMatchesOnIt(pipeline, compiledJoins, serveStreams);
-        // A nest with nothing to assemble passes its root's rows on under their own streams, not under the nest's,
-        // so each stream they arrive on is landed where the nest's documents land: in its target, matched on its
-        // root's key, and routed among a sink's writers by those.
-        Map<String, Set<String>> passedOn =
-                passedOnStreams(pipeline, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds);
-        Set<String> serveLanding = landing(pipelineId, serveStreams, targets, passedOn);
-        Set<String> viewLanding = landing(pipelineId, viewStreams, viewTargets, passedOn);
+        TerminalTargets serving = terminalTargets(pipelineId, pipeline,
+                pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync() != null && !serve.sync().isEmpty()
+                        ? serve.from() : null,
+                bySourceTable, assembled, sourceVertices, vertex -> copiedColumns(pipelineId, vertex));
+        TerminalTargets viewing = terminalTargets(pipelineId, pipeline,
+                pipeline.view() instanceof ViewBlock.Inline view ? FromClause.list(view.from()) : null,
+                bySourceTable, assembled, sourceVertices, vertex -> copiedColumns(pipelineId, vertex));
+        requireFactKeyPublishedWhereAWriteMatchesOnIt(pipeline, compiledJoins, serving.streams());
+        Map<String, TargetTable> targets = serving.targets();
+        Map<String, TargetTable> viewTargets = viewing.targets();
+        Set<String> serveLanding = serving.landing();
+        Set<String> viewLanding = viewing.landing();
         FrontierBinding frontier = frontierBinding(sourceVertices);
         PipelineResource builtPipeline = new PipelineResource(
                 pipeline.id(), pipeline.metadata(),
@@ -1782,7 +1770,8 @@ final class StoreBackedDagSource implements DagSource {
                 ref -> upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds),
                 sourceKeysById::get,
                 view -> FencedSinkWriterFactory.heldTo(
-                        viewSink(pipeline, view, viewTargets, viewStreams, sourceStreamsById(sourceVertices)), fence),
+                        viewSink(pipeline, view, viewTargets, viewStreams, sourceStreamsById(sourceVertices),
+                                freshFullLoad), fence),
                 nestBinding(pipeline, sourceTablesByName(sourceVertices)),
                 joinBinding(compiledJoins));
     }
@@ -2016,13 +2005,14 @@ final class StoreBackedDagSource implements DagSource {
      * deployment's managed state store is resolved on the view's behalf. Everything after that is the
      * same seam the sync path uses, so a view is written by the same writer over the same binding.
      *
-     * <p>Write mode and ddl policy take the sync defaults. A view converges on its key, which is what
-     * upsert means; and the ddl policy governs how an incoming schema change is handled, not whether the
+     * <p>Write mode and full-load policy are the view's own, with the defaults a sync element has: upsert,
+     * because a view converges on its key, and keeping the rows already there on a new full load. The ddl
+     * policy stays the sync default -- it governs how an incoming schema change is handled, not whether the
      * target may be created, so refusing to drift costs the materialization nothing.
      */
     private SupplierEx<? extends SinkWriter> viewSink(
             PipelineResource pipeline, ViewBlock view, Map<String, TargetTable> targets,
-            Set<String> viewStreams, Map<String, List<String>> tablesBySourceId) {
+            Set<String> viewStreams, Map<String, List<String>> tablesBySourceId, boolean freshFullLoad) {
         if (!(view instanceof ViewBlock.Inline inline)) {
             throw new IllegalArgumentException(
                     "view block is a use-reference; resolve it to an inline view first");
@@ -2030,21 +2020,7 @@ final class StoreBackedDagSource implements DagSource {
         // Resolve first: it holds the simpler facts - a missing key among them - and a view without a
         // key has nothing for the identity gate to compare. Review found the reverse order turning the
         // coded missing-key refusal into a bare NullPointerException inside the gate.
-        List<SourceResource> markedStores = artifacts().list().stream()
-                .filter(SourceResource.class::isInstance)
-                .map(SourceResource.class::cast)
-                .filter(source -> source.metadata() != null
-                        && "true".equals(source.metadata().labels().get("store")))
-                .toList();
-        if (markedStores.size() > 1) {
-            throw new IllegalStateException("Multiple marked state stores");
-        }
-        if (requireMarkedStore && markedStores.isEmpty()) {
-            throw new TapstateException(ActuationError.VIEW_STORE_NOT_CONFIGURED,
-                    Map.of("store", "atlas-store"), null);
-        }
-        String storeId = markedStores.isEmpty()
-                ? ViewTargetResolver.STATE_STORE_SOURCE_ID : markedStores.getFirst().id();
+        String storeId = viewStoreId();
         ViewTargetResolver.ViewTarget target = ViewTargetResolver.resolve(inline, storeId);
         boolean alternateKey = requireKeyIsTheFeedIdentity(
                 pipeline, inline, targets, tablesBySourceId);
@@ -2079,14 +2055,33 @@ final class StoreBackedDagSource implements DagSource {
                     viewTargetTable(target, targets == null ? null : targets.get(sourceTable)));
         }
         SupplierEx<? extends SinkWriter> writer = sinkWriterBinder.bind(
-                store.connector(), store.config(), WriteMode.UPSERT, DdlPolicy.FAIL, bySourceTable,
-                new PipelineNode(pipeline.id(), inline.id()));
+                store.connector(), store.config(), writeMode(inline.writeMode()), DdlPolicy.FAIL, bySourceTable,
+                new PipelineNode(pipeline.id(), inline.id()), onFullLoad(inline.onFullLoad()), freshFullLoad);
         String viewId = inline.id();
         String viewKey = inline.primaryKey();
         // A unique current value says nothing about what the capture stream puts in an earlier image.
         // Guard only an accepted alternate identity: the discovered primary identity is the capture
         // contract already used throughout the pipeline, while an alternate has no such guarantee.
         return alternateKey ? ViewSinkWriters.requiringAlternateKeyInBeforeImage(writer, viewId, viewKey) : writer;
+    }
+
+    /** The managed view store selected by both a start check and the sink it predicts. */
+    private String viewStoreId() {
+        List<SourceResource> markedStores = artifacts().list().stream()
+                .filter(SourceResource.class::isInstance)
+                .map(SourceResource.class::cast)
+                .filter(source -> source.metadata() != null
+                        && "true".equals(source.metadata().labels().get("store")))
+                .toList();
+        if (markedStores.size() > 1) {
+            throw new IllegalStateException("Multiple marked state stores");
+        }
+        if (requireMarkedStore && markedStores.isEmpty()) {
+            throw new TapstateException(ActuationError.VIEW_STORE_NOT_CONFIGURED,
+                    Map.of("store", "atlas-store"), null);
+        }
+        return markedStores.isEmpty()
+                ? ViewTargetResolver.STATE_STORE_SOURCE_ID : markedStores.getFirst().id();
     }
 
     /**
@@ -3146,34 +3141,106 @@ final class StoreBackedDagSource implements DagSource {
                 sink.connector(), sink.config(), writeMode(element.writeMode()), ddl(element.ddl()),
                 TargetModelResolver.renameAll(targets, serveStreams, element.rename(), sourceIdByTable),
                 new PipelineNode(pipeline.id(), syncNodeId(element)),
-                element.onFullLoad() == null ? OnFullLoad.APPEND : OnFullLoad.valueOf(element.onFullLoad().name()),
-                freshFullLoad);
+                onFullLoad(element.onFullLoad()), freshFullLoad);
     }
 
-    /** A CDC-only read and any durable consumer state suppress target preparation. */
+    /** A declared full-load policy as the sink takes it, keeping the rows already there when none is declared. */
+    private static OnFullLoad onFullLoad(io.tapstate.core.model.OnFullLoad declared) {
+        return declared == null ? OnFullLoad.APPEND : OnFullLoad.valueOf(declared.name());
+    }
+
+    /**
+     * Whether this start is a new full load, by the same judgement the start verb predicts it with: a
+     * CDC-only read never is, and any durable state this pipeline recorded on a chain it reads makes it a
+     * resume, which suppresses target preparation. A direct capture's older progress, recorded on the shared
+     * chain before it read a channel of its own, counts as well.
+     */
     private boolean freshFullLoad(PipelineResource pipeline) {
-        if (pipeline.settings() != null
-                && pipeline.settings().readMode() == io.tapstate.core.model.ReadMode.CDC_ONLY) {
-            return false;
-        }
-        return sourceVertices(pipeline).values().stream().noneMatch(vertex ->
-                List.of(vertex.resolution().chainId().value(),
-                                vertex.resolution().scopedTo(pipeline.id(), true).chainId().value())
-                        .stream().distinct().anyMatch(chain -> hasRetainedConsumerProgress(vertex, chain)));
+        List<SrsMeta> records = sourceVertices(pipeline).values().stream()
+                .flatMap(vertex -> vertex.resolution().progressChainIds(pipeline.id()).stream())
+                .distinct()
+                .map(chainId -> storePort.meta().read(chainId))
+                .flatMap(Optional::stream)
+                .toList();
+        ReadMode readMode = pipeline.settings() == null ? null : pipeline.settings().readMode();
+        return StartLoad.of(readMode, pipeline.id(), records) == StartLoad.FULL_LOAD;
     }
 
-    /** Legacy direct captures used the shared chain; their state must also suppress target clearing. */
-    private boolean hasRetainedConsumerProgress(SourceVertex vertex, String chain) {
-        return storePort.meta().read(chain)
-                .map(meta -> meta.consumerOffsets().stream().anyMatch(
-                        consumer -> (consumer.pipelineId().equals(vertex.consumerId())
-                                        || consumer.pipelineId().equals(vertex.pipelineId()))
-                                && (!consumer.perTableSeq().isEmpty()
-                                        || consumer.sinkAcked() != null
-                                        || !consumer.sinkAckedByTable().isEmpty()
-                                        || !consumer.snapshotCompletedTables().isEmpty()
-                                        || consumer.cdcStartPosition() != null)))
-                .orElse(false);
+    /** The same published models and arriving streams for a run and its read-only start inspection. */
+    private TerminalTargets terminalTargets(String pipelineId, PipelineResource pipeline, FromClause from,
+            Map<String, TargetTable> bySourceTable, Map<String, TargetTable> assembled,
+            Map<String, SourceVertex> vertices, Function<SourceVertex, NodeColumns> sourceColumns) {
+        Map<String, String> sourceKeyByTable = sourceKeyByTable(vertices);
+        Map<String, List<String>> sourceKeysById = sourceKeysById(vertices);
+        Set<String> steps = stepIds(pipeline);
+        Map<String, TargetTable> targets = new LinkedHashMap<>(bySourceTable);
+        targets.putAll(assembled);
+        Set<String> streams = from == null ? Set.of() : streamsReaching(pipeline, from, sourceKeyByTable,
+                sourceKeysById, vertices, steps);
+        if (!streams.isEmpty()) {
+            targets.putAll(publishedTargets(pipelineId, pipeline, from, streams, bySourceTable,
+                    vertices, sourceKeyByTable, sourceKeysById, steps, sourceColumns));
+        }
+        Set<String> landed = landing(pipelineId, streams, targets,
+                passedOnStreams(pipeline, sourceKeyByTable, sourceKeysById, vertices, steps));
+        return new TerminalTargets(targets, streams, landed);
+    }
+
+    private record TerminalTargets(Map<String, TargetTable> targets, Set<String> streams, Set<String> landing) { }
+
+    /**
+     * Where each write element of {@code definition} lands: every sync element's tables under the names its
+     * sink binds them by, then the view's collection in the managed store.
+     *
+     * <p>Worked out with the helpers the topology build names its sinks with -- the target models of the
+     * selected tables, the assemblies a nest or a join publishes under its step id, the streams that reach
+     * the serve block and each element's rename rules -- and with none of what that build records along the
+     * way, because the question is asked before a start is accepted and a refused start must leave nothing
+     * behind.
+     *
+     * <p>{@code definition} is the pipeline as stored, not expanded: whether an element is written in the
+     * pipeline itself or comes from a shared definition is part of the answer, and expanding first erases it.
+     *
+     * <p>A pipeline the start would refuse because a source reaching what it writes was never discovered is
+     * refused here first, with the same coded error: the question meets every pipeline a start is asked for,
+     * and a coded refusal is what a start check reports as a target it could not check.
+     */
+    List<PipelineWriteTargets.WriteTarget> writeTargets(PipelineResource definition) {
+        PipelineResource pipeline = PipelineInlining.inline(definition, artifacts());
+        requireDiscovered(pipeline);
+        List<PipelineWriteTargets.WriteTarget> written = new ArrayList<>();
+        if (pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync() != null && !serve.sync().isEmpty()) {
+            Map<String, SourceVertex> vertices = sourceVertices(pipeline);
+            Map<String, String> sourceIdByTable = sourceIdByTable(vertices);
+            Map<String, TargetTable> bySourceTable = sourceTargets(vertices);
+            Map<String, TargetTable> assembled = assembledTargets(
+                    pipeline, bySourceTable, vertices, compiledJoins(pipeline, sourceTablesByName(vertices)));
+            TerminalTargets terminal = terminalTargets(pipeline.id(), pipeline, serve.from(), bySourceTable,
+                    assembled, vertices, this::discoveredColumns);
+            String definedIn = definition.serve() instanceof ServeBlock.Use use ? use.use() : null;
+            for (SyncElement element : serve.sync()) {
+                io.tapstate.core.model.OnFullLoad policy = element.onFullLoad() == null
+                        ? io.tapstate.core.model.OnFullLoad.APPEND : element.onFullLoad();
+                Set<String> tables = new LinkedHashSet<>();
+                for (TargetTable table : TargetModelResolver.renameAll(
+                        terminal.targets(), terminal.landing(), element.rename(), sourceIdByTable).values()) {
+                    if (tables.add(table.name())) {
+                        written.add(new PipelineWriteTargets.WriteTarget(syncNodeId(element),
+                                PipelineWriteTargets.WriteTarget.Kind.SYNC, element.source(), table.name(),
+                                policy, definedIn));
+                    }
+                }
+            }
+        }
+        if (pipeline.view() instanceof ViewBlock.Inline view) {
+            ViewTargetResolver.ViewTarget target = ViewTargetResolver.resolve(view, viewStoreId());
+            String definedIn = definition.view() instanceof ViewBlock.Use use ? use.use() : null;
+            written.add(new PipelineWriteTargets.WriteTarget(view.id(),
+                    PipelineWriteTargets.WriteTarget.Kind.VIEW, target.sourceId(), target.collection(),
+                    view.onFullLoad() == null ? io.tapstate.core.model.OnFullLoad.APPEND : view.onFullLoad(),
+                    definedIn));
+        }
+        return List.copyOf(written);
     }
 
     /**

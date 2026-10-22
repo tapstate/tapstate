@@ -49,6 +49,21 @@ class PdkTargetPreparationTest {
     }
 
     @Test
+    void oneClearingWriterClearsEvenWhenAnotherWriterAppendsToTheSameTable() throws Throwable {
+        for (List<OnFullLoad> policies : List.of(List.of(OnFullLoad.CLEAR, OnFullLoad.APPEND),
+                List.of(OnFullLoad.APPEND, OnFullLoad.CLEAR))) {
+            State state = new State();
+            List<String> calls = new ArrayList<>();
+            for (int i = 0; i < policies.size(); i++) {
+                new PdkTargetPreparation(null, functions(true, calls), policies.get(i), true,
+                        new PipelineNode("pipeline", "sink_" + i), state)
+                        .prepare(TARGET, TargetTapTable.build(TARGET));
+            }
+            assertThat(calls).as("writer order: %s", policies).containsOnlyOnce("clear");
+        }
+    }
+
+    @Test
     void failChecksRowsRatherThanRejectingAnExistingEmptyTable() throws Throwable {
         ConnectorFunctions functions = functions(true, new ArrayList<>());
         functions.supportCountByPartitionFilterFunction((context, table, filter) -> {

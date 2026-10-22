@@ -68,7 +68,7 @@ public final class PdkTargetPreviewRenderer {
                 for (Map<String, Object> document : documents) {
                     checkpoint.run();
                     TapEvent targetEvent = TapEventCodec.encode(
-                            Envelope.read(0L, PREVIEW_STREAM, document, null), connector.codecs());
+                            Envelope.read(0L, PREVIEW_STREAM, document, null), connector.conversions());
                     Map<String, Object> targetValues = ((TapInsertRecordEvent) targetEvent).getAfter();
                     String extendedJson = writeExtendedJson(targetValues, loader);
                     Object parsed = JsonReader.parse(extendedJson);

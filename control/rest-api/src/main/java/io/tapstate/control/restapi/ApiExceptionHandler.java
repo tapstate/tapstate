@@ -1,6 +1,7 @@
 package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.ControlError;
+import io.tapstate.control.core.StartRefusal;
 import io.tapstate.control.core.CloudAuthenticationObserver;
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.TapstateException;
@@ -50,6 +51,18 @@ class ApiExceptionHandler {
         MessageCatalog.Rendered rendered = catalog.render(e.code(), e.args());
         // Sorted so the params render identically regardless of throw-site order (a stable machine contract).
         ApiError body = new ApiError(e.code().code(), new TreeMap<>(e.args()), rendered.message());
+        return ResponseEntity.status(statusFor(e.code())).cacheControl(CacheControl.noStore()).body(body);
+    }
+
+    /**
+     * A start that did not go ahead answers with the coded error a client already knows how to read, and
+     * beside it what the start checks said and what the start had already changed in the definition.
+     */
+    @ExceptionHandler(StartRefusal.class)
+    ResponseEntity<StartRefusalError> handle(StartRefusal e) {
+        MessageCatalog.Rendered rendered = catalog.render(e.code(), e.args());
+        StartRefusalError body = new StartRefusalError(e.code().code(), new TreeMap<>(e.args()),
+                rendered.message(), e.report(), e.decisionsApplied().isEmpty() ? null : e.decisionsApplied());
         return ResponseEntity.status(statusFor(e.code())).cacheControl(CacheControl.noStore()).body(body);
     }
 
@@ -137,6 +150,7 @@ class ApiExceptionHandler {
             Map.entry("pipeline.id-mismatch", HttpStatus.BAD_REQUEST),
             Map.entry("pipeline.precondition-required", HttpStatus.PRECONDITION_REQUIRED),
             Map.entry("pipeline.version-conflict", HttpStatus.PRECONDITION_FAILED),
+            Map.entry("pipeline.definition-change-unavailable", HttpStatus.SERVICE_UNAVAILABLE),
             Map.entry("pipeline-draft.not-found", HttpStatus.NOT_FOUND),
             Map.entry("pipeline-draft.already-exists", HttpStatus.CONFLICT),
             Map.entry("pipeline-draft.mode-conflict", HttpStatus.CONFLICT),
@@ -149,6 +163,10 @@ class ApiExceptionHandler {
             Map.entry("lifecycle.unknown-pipeline", HttpStatus.NOT_FOUND),
             Map.entry("lifecycle.illegal-transition", HttpStatus.CONFLICT),
             Map.entry("lifecycle.incompatible-revision", HttpStatus.CONFLICT),
+            Map.entry("lifecycle.start-needs-confirmation", HttpStatus.CONFLICT),
+            Map.entry("lifecycle.start-blocked", HttpStatus.CONFLICT),
+            Map.entry("lifecycle.invalid-start-decision", HttpStatus.BAD_REQUEST),
+            Map.entry("lifecycle.pipeline-not-runnable", HttpStatus.CONFLICT),
             Map.entry("lifecycle.purge-state-not-stated", HttpStatus.BAD_REQUEST),
             Map.entry("monitor.no-observation", HttpStatus.NOT_FOUND),
             Map.entry("monitor.invalid-cursor", HttpStatus.BAD_REQUEST),

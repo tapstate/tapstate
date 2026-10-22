@@ -14,14 +14,14 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
 
 import java.io.IOException;
-import java.nio.file.StandardOpenOption;
-import java.util.jar.JarFile;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.jar.JarFile;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -70,7 +70,7 @@ class CloudConnectorSeedReadinessIT {
     void aCorruptCloudJarRefusesReadyWithoutWeakeningTheOtherLockedInputs() throws Exception {
         Path seeds = copyRelease();
         Path atlas = seeds.resolve("mongodb-atlas-connector.jar");
-        // Break only the owned hard link, then create the damaged file. Never modify the shared input.
+        // Replace only the owned copy with the damaged file. Never modify the shared input.
         Files.delete(atlas);
         Files.write(atlas, new byte[] {0x13, 0x37});
         refusesReady(database("corrupt"), seeds);
@@ -177,7 +177,8 @@ class CloudConnectorSeedReadinessIT {
                 if (Files.isDirectory(input)) {
                     Files.createDirectories(destination);
                 } else {
-                    Files.createLink(destination, input);
+                    // The release and JUnit's temporary directory can be on different filesystems.
+                    Files.copy(input, destination);
                 }
             }
         }

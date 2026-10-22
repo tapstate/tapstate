@@ -34,8 +34,8 @@ public final class MongoAuditStore implements AuditStore {
 
     /**
      * Maps an audit record to its append-only document; the timestamp as epoch millis, the rest as
-     * fields. The declared version precondition is appended only when the operation had one, so a
-     * record without it produces the same document shape every already-written record has.
+     * fields. The declared version precondition and the detail are appended only when the operation had
+     * them, so a record without them produces the same document shape every already-written record has.
      */
     static Document toDocument(AuditRecord record) {
         Document document = new Document("ts", record.timestamp().toEpochMilli())
@@ -44,6 +44,9 @@ public final class MongoAuditStore implements AuditStore {
                 .append("resourceId", record.resourceId());
         if (record.expectedContentHash() != null) {
             document.append("expectedContentHash", record.expectedContentHash());
+        }
+        if (record.detail() != null) {
+            document.append("detail", new Document(record.detail()));
         }
         return document;
     }

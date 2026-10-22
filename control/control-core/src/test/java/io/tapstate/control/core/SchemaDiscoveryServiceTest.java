@@ -40,8 +40,9 @@ class SchemaDiscoveryServiceTest {
             return MODEL;
         };
         RecordingSchemaStore store = new RecordingSchemaStore();
-        SchemaDiscoveryService service =
-                new SchemaDiscoveryService(probe, store, gate(new RecordingAuditStore()), fixedClock());
+        SchemaDiscoveryService service = new SchemaDiscoveryService(
+                probe, store, gate(new RecordingAuditStore()), fixedClock(), null,
+                SourceConnectionResolver.forAdHocConnections());
 
         SchemaReport returned = service.discover(CONFIG.id(), CONFIG.connectorId(), CONFIG.settings(), "alice");
 
@@ -61,7 +62,8 @@ class SchemaDiscoveryServiceTest {
     void auditsTheDiscoveryUnderConnectionDiscoverSchemaAgainstTheConnectionId() {
         RecordingAuditStore auditStore = new RecordingAuditStore();
         SchemaDiscoveryService service = new SchemaDiscoveryService(
-                config -> MODEL, new RecordingSchemaStore(), gate(auditStore), fixedClock());
+                config -> MODEL, new RecordingSchemaStore(), gate(auditStore), fixedClock(), null,
+                SourceConnectionResolver.forAdHocConnections());
 
         service.discover(CONFIG.id(), CONFIG.connectorId(), CONFIG.settings(), "alice");
 
@@ -83,7 +85,9 @@ class SchemaDiscoveryServiceTest {
         AuditStore failing = record -> {
             throw new RuntimeException("audit log unavailable");
         };
-        SchemaDiscoveryService service = new SchemaDiscoveryService(probe, store, gate(failing), fixedClock());
+        SchemaDiscoveryService service = new SchemaDiscoveryService(
+                probe, store, gate(failing), fixedClock(), null,
+                SourceConnectionResolver.forAdHocConnections());
 
         assertThatThrownBy(() -> service.discover(CONFIG.id(), CONFIG.connectorId(), CONFIG.settings(), "alice"))
                 .isInstanceOf(TapstateException.class);
@@ -92,18 +96,42 @@ class SchemaDiscoveryServiceTest {
     }
 
     @Test
+    void redactsConnectorDiagnosticsAndDropsTheCauseBeforeReturningDiscoveryErrors() {
+        String privateKey = "schema-private-key-sentinel";
+        TapstateException failure = new TapstateException(
+                ControlError.MALFORMED_REQUEST,
+                Map.of("reason", "cannot parse private key: " + privateKey),
+                new IllegalStateException("key content " + privateKey));
+        SchemaDiscoveryService service = new SchemaDiscoveryService(
+                config -> { throw failure; }, new RecordingSchemaStore(),
+                gate(new RecordingAuditStore()), fixedClock(), null,
+                SourceConnectionResolver.forAdHocConnections());
+
+        assertThatThrownBy(() -> service.discover(
+                "source-1", "mysql", Map.of("sslKey", privateKey), "alice"))
+                .isInstanceOfSatisfying(TapstateException.class, safe -> {
+                    assertThat(safe.args().get("reason")).isEqualTo("cannot parse private key: <redacted>");
+                    assertThat(safe.getCause()).isNull();
+                    assertThat(safe.getMessage()).doesNotContain(privateKey);
+                });
+    }
+
+    @Test
     void requiresItsCollaborators() {
         SchemaDiscoveryProbe probe = config -> MODEL;
         RecordingSchemaStore store = new RecordingSchemaStore();
         AuditGate auditGate = gate(new RecordingAuditStore());
         Clock clock = fixedClock();
-        assertThatThrownBy(() -> new SchemaDiscoveryService(null, store, auditGate, clock))
+        SourceConnectionResolver resolver = SourceConnectionResolver.forAdHocConnections();
+        assertThatThrownBy(() -> new SchemaDiscoveryService(null, store, auditGate, clock, null, resolver))
                 .isInstanceOf(NullPointerException.class);
-        assertThatThrownBy(() -> new SchemaDiscoveryService(probe, null, auditGate, clock))
+        assertThatThrownBy(() -> new SchemaDiscoveryService(probe, null, auditGate, clock, null, resolver))
                 .isInstanceOf(NullPointerException.class);
-        assertThatThrownBy(() -> new SchemaDiscoveryService(probe, store, null, clock))
+        assertThatThrownBy(() -> new SchemaDiscoveryService(probe, store, null, clock, null, resolver))
                 .isInstanceOf(NullPointerException.class);
-        assertThatThrownBy(() -> new SchemaDiscoveryService(probe, store, auditGate, null))
+        assertThatThrownBy(() -> new SchemaDiscoveryService(probe, store, auditGate, null, null, resolver))
+                .isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> new SchemaDiscoveryService(probe, store, auditGate, clock, null, null))
                 .isInstanceOf(NullPointerException.class);
     }
 

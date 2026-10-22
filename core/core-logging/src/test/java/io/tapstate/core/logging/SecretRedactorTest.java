@@ -39,6 +39,26 @@ class SecretRedactorTest {
     }
 
     @Test
+    void redactsShortCredentialsAsTokensAndLeavesDiagnosticsAndMarkersIntact() {
+        SecretRedactor redactor = new SecretRedactor();
+        redactor.replace("source", List.of("ed", "pass"));
+
+        assertThat(redactor.redact("authentication <redacted>; password; ed; passphrase; pass"))
+                .isEqualTo("authentication <redacted>; password; ********; passphrase; ********");
+    }
+
+    @Test
+    void repeatedRedactionDoesNotRewriteExistingMarkers() {
+        SecretRedactor redactor = new SecretRedactor();
+        redactor.replace("source", List.of("ed"));
+
+        String once = redactor.redact("private key ed");
+
+        assertThat(redactor.redact(once)).isEqualTo(once);
+        assertThat(redactor.redact("already <redacted>")).isEqualTo("already <redacted>");
+    }
+
+    @Test
     void publishesCompleteSnapshotsToConcurrentReaders() throws Exception {
         SecretRedactor redactor = new SecretRedactor();
         CountDownLatch start = new CountDownLatch(1);

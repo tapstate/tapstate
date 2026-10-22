@@ -43,6 +43,21 @@ class RowImagesTest {
     private static final String OID = "650f1a2b3c4d5e6f70819200";
 
     @Test
+    void codecMetadataAndNanosecondsSurviveTheStoredRowImage() {
+        var instant = java.time.Instant.parse("2021-11-22T00:08:03.849711123Z");
+        var value = new ConvertedValue(instant, "timestamp(9)", "TapDateTimeValue",
+                "{\"fraction\":9,\"withTimeZone\":true}", "{\"seconds\":1637539683,\"nano\":849711123}");
+        assertThat(overTheWire(Map.of("stamp", value))).containsEntry("stamp", value);
+    }
+
+    @Test
+    void nestedConversionMetadataSurvivesTheStoredRowImage() {
+        var value = new ConvertedValue("payload", "varchar(30)", "TapStringValue", "{\"bytes\":30}", null);
+        Map<String, Object> row = Map.of("object", Map.of("value", value), "array", List.of(value));
+        assertThat(overTheWire(row)).isEqualTo(row);
+    }
+
+    @Test
     void aCarriedValueSurvivesWithTheTypeItsColumnWasDeclaredAs() {
         Map<String, Object> read = overTheWire(Map.of("_id", new ConvertedValue(OID, "OBJECT_ID")));
 

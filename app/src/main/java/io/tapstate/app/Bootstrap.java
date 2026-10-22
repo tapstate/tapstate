@@ -8,6 +8,8 @@ import io.tapstate.messages.MessageCatalog;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.context.ConfigurableApplicationContext;
+import org.springframework.context.ApplicationListener;
+import org.springframework.boot.context.event.ApplicationPreparedEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -34,12 +36,12 @@ import java.util.List;
 @SpringBootApplication
 public class Bootstrap {
 
-    private static final Logger LOG = LoggerFactory.getLogger(Bootstrap.class);
-
     /** Exit code when a coded diagnostic was reported (matches the CLI's convention). */
     private static final int EXIT_CODED_DIAGNOSTIC = 1;
 
     public static void main(String[] args) {
+        ServerTimeZone timeZone = ServerTimeZone.initialize();
+        Logger log = LoggerFactory.getLogger(Bootstrap.class);
         try {
             RoleArguments.parse(args);
         } catch (TapstateException e) {
@@ -58,6 +60,9 @@ public class Bootstrap {
             return;
         }
         SpringApplication app = new SpringApplication(Bootstrap.class);
+        // Logging is configured by this event, but context refresh (including connector creation)
+        // has not begun. Record the choice once in both operational appenders, even if refresh fails.
+        app.addListeners((ApplicationListener<ApplicationPreparedEvent>) event -> timeZone.log(log));
         // The server owns process termination. Spring's own shutdown hook would close the context on
         // SIGTERM but leave the JVM to exit with the signal's default disposition (128+15 = 143);
         // disabling it and installing our own hook lets the orderly stop finish and then force
@@ -65,7 +70,7 @@ public class Bootstrap {
         app.setRegisterShutdownHook(false);
         ConfigurableApplicationContext context = app.run(args);
         // run() returns only after all startup runners and the application-ready event complete.
-        LOG.info("Tapstate application is ready");
+        log.info("Tapstate application is ready");
         new GracefulShutdown(context::close, Runtime.getRuntime()::halt).install();
     }
 

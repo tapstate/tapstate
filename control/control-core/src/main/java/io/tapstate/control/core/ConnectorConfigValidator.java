@@ -20,8 +20,13 @@ public final class ConnectorConfigValidator {
 
     /** Validates connector-specific settings without persisting or mutating them. */
     public void validate(String connector, Map<String, Object> settings) {
+        validate(connector, settings, Objects.requireNonNull(catalog.get(), "catalog.get()"));
+    }
+
+    /** Validates against a catalog snapshot already used to resolve the same connection operation. */
+    void validate(String connector, Map<String, Object> settings, TapstateCatalog live) {
         Objects.requireNonNull(connector, "connector");
-        TapstateCatalog live = Objects.requireNonNull(catalog.get(), "catalog.get()");
+        Objects.requireNonNull(live, "catalog");
         if (!live.ids().contains(connector)) {
             throw new TapstateException(
                     ControlError.MALFORMED_REQUEST,

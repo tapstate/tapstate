@@ -28,13 +28,19 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
     private static final System.Logger LOG = System.getLogger(OpenAiCompatibleClient.class.getName());
     private final HttpClient http;
     private final Function<String, URI> requestUriFactory;
+    private final Duration responseTimeout;
 
     public OpenAiCompatibleClient() {
-        this(OpenAiCompatibleEndpointPolicy::requestUri);
+        this(OpenAiCompatibleEndpointPolicy::requestUri, Duration.ofSeconds(90));
     }
 
     OpenAiCompatibleClient(Function<String, URI> requestUriFactory) {
+        this(requestUriFactory, Duration.ofSeconds(90));
+    }
+
+    OpenAiCompatibleClient(Function<String, URI> requestUriFactory, Duration responseTimeout) {
         this.requestUriFactory = java.util.Objects.requireNonNull(requestUriFactory);
+        this.responseTimeout = java.util.Objects.requireNonNull(responseTimeout);
         this.http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10))
                 .proxy(ProxySelector.getDefault())
                 .followRedirects(HttpClient.Redirect.NEVER).build();
@@ -42,7 +48,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
     @Override public void check(AiProviderSettings settings) {
         Map<String, Object> body = Map.of("model", settings.model(), "max_tokens", 1,
                 "messages", List.of(Map.of("role", "user", "content", "Reply OK.")));
-        long deadline = System.nanoTime() + Duration.ofSeconds(90).toNanos();
+        long deadline = System.nanoTime() + responseTimeout.toNanos();
         try {
             var response = http.send(request(settings, body), HttpResponse.BodyHandlers.ofInputStream());
             try (var input = response.body(); var bounded = new ResponseDeadline(input, deadline)) {
@@ -180,7 +186,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
     private Optional<Map<String, Object>> read(AiProviderSettings settings, Map<String, Object> body, Consumer<String> text,
             boolean proposalEnabled) {
         for (int attempt = 0; attempt < 2; attempt++) {
-            long deadline = System.nanoTime() + Duration.ofSeconds(90).toNanos();
+            long deadline = System.nanoTime() + responseTimeout.toNanos();
             boolean[] emitted = {false};
             try {
                 var response = http.send(request(settings, body), HttpResponse.BodyHandlers.ofInputStream());
@@ -207,11 +213,13 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
             Consumer<String> text, boolean proposalEnabled) {
         Map<String, Object> fallback = new java.util.LinkedHashMap<>(body);
         fallback.put("stream", false);
+        long deadline = System.nanoTime() + responseTimeout.toNanos();
         try {
             var response = http.send(request(settings, fallback), HttpResponse.BodyHandlers.ofInputStream());
-            try (var input = response.body()) {
+            try (var input = response.body(); var bounded = new ResponseDeadline(input, deadline)) {
                 requireSuccessfulResponse(response.statusCode());
                 byte[] bytes = input.readNBytes(MAX_BYTES + 1);
+                if (System.nanoTime() >= deadline) throw failed();
                 if (bytes.length > MAX_BYTES) throw failed();
                 Map<String, Object> envelope = object(JsonReader.parse(new String(bytes, StandardCharsets.UTF_8)));
                 if (!(envelope.get("choices") instanceof List<?> choices) || choices.isEmpty()) throw invalid();
@@ -262,11 +270,9 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         Map<String, Object> chunk = object(JsonReader.parse(data));
         if (chunk.containsKey("error")) {
             Object error = chunk.get("error");
-            String code = error instanceof Map<?, ?> details && details.get("code") instanceof String value
-                    && value.matches("[A-Za-z0-9_.-]{1,80}") ? value : "unspecified";
             String type = error instanceof Map<?, ?> details && details.get("type") instanceof String value
                     && value.matches("[A-Za-z0-9_.-]{1,80}") ? value : "unspecified";
-            LOG.log(System.Logger.Level.WARNING, "AI provider stream error: code={0}, type={1}", code, type);
+            LOG.log(System.Logger.Level.WARNING, "AI provider stream error payload received");
             if ("upstream_error".equals(type)) throw new RetryableStreamException();
             throw failed();
         }
@@ -353,7 +359,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
     private HttpRequest request(AiProviderSettings settings, Map<String, Object> body) {
         URI uri = requestUriFactory.apply(settings.baseUrl());
         return HttpRequest.newBuilder(uri)
-                .timeout(Duration.ofSeconds(90)).header("Content-Type", "application/json")
+                .timeout(responseTimeout).header("Content-Type", "application/json")
                 .header("Authorization", "Bearer " + settings.apiKey())
                 .POST(HttpRequest.BodyPublishers.ofString(JsonWriter.write(body))).build();
     }

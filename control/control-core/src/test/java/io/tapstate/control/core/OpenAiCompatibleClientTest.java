@@ -12,7 +12,13 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
+import java.time.Duration;
 import static org.assertj.core.api.Assertions.*;
 
 class OpenAiCompatibleClientTest {
@@ -160,6 +166,74 @@ class OpenAiCompatibleClientTest {
                     assertThatThrownBy(() -> localClient().propose(settings, List.of(), Map.of(), ignored -> { }))
                             .isInstanceOfSatisfying(TapstateException.class,
                                     failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_INVALID_PROPOSAL)));
+        }
+    }
+    @Test void providerErrorFieldsCannotLeakTheCredentialIntoLogs() throws Exception {
+        String payload = "data: " + JsonWriter.write(Map.of("error",
+                Map.of("code", "sk-test", "type", "invalid_api_key"))) + "\n\n";
+        Logger logger = Logger.getLogger(OpenAiCompatibleClient.class.getName());
+        List<String> messages = new ArrayList<>();
+        java.util.logging.Handler handler = new java.util.logging.Handler() {
+            @Override public void publish(LogRecord record) {
+                messages.add(record.getMessage());
+                Object[] parameters = record.getParameters();
+                if (parameters != null) for (Object parameter : parameters) messages.add(String.valueOf(parameter));
+            }
+            @Override public void flush() { }
+            @Override public void close() { }
+        };
+        logger.addHandler(handler);
+        try {
+            withServer(200, payload, settings -> assertThatThrownBy(() ->
+                    localClient().propose(settings, List.of(), Map.of(), ignored -> { }))
+                    .isInstanceOf(TapstateException.class).hasMessageNotContaining("sk-test"));
+        } finally {
+            logger.removeHandler(handler);
+        }
+        assertThat(messages).isNotEmpty();
+        assertThat(String.join("\n", messages)).doesNotContain("sk-test");
+    }
+
+    @Test void boundsTheBodyOfTheNonStreamingFallbackResponse() throws Exception {
+        AtomicInteger requests = new AtomicInteger();
+        CountDownLatch releaseBody = new CountDownLatch(1);
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/chat/completions", exchange -> {
+            Map<?, ?> request = (Map<?, ?>) JsonReader.parse(
+                    new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            requests.incrementAndGet();
+            if (Boolean.TRUE.equals(request.get("stream"))) {
+                byte[] body = ("data: " + JsonWriter.write(Map.of("error",
+                        Map.of("code", "temporary", "type", "upstream_error"))) + "\n\n")
+                        .getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(200, body.length);
+                try (var output = exchange.getResponseBody()) { output.write(body); }
+                return;
+            }
+            exchange.sendResponseHeaders(200, 0);
+            try (var output = exchange.getResponseBody()) {
+                try {
+                    releaseBody.await(2, TimeUnit.SECONDS);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        });
+        server.start();
+        try {
+            var settings = new AiProviderSettings("openai-compatible",
+                    "http://127.0.0.1:" + server.getAddress().getPort(), "test", "sk-test");
+            long started = System.nanoTime();
+            assertThatThrownBy(() -> new OpenAiCompatibleClient(
+                    baseUrl -> URI.create(baseUrl + "/chat/completions"), Duration.ofMillis(300))
+                    .propose(settings, List.of(), Map.of(), ignored -> { }))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(ControlError.AI_PROVIDER_FAILED));
+            assertThat(Duration.ofNanos(System.nanoTime() - started)).isLessThan(Duration.ofSeconds(2));
+            assertThat(requests).hasValue(3);
+        } finally {
+            releaseBody.countDown();
+            server.stop(0);
         }
     }
     private static String chunk(Map<String, Object> delta, String reason) {

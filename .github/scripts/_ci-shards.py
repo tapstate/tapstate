@@ -6,6 +6,7 @@ from collections import Counter
 import fnmatch
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -207,7 +208,7 @@ def run_shard(args, root, plan):
             shutil.rmtree(target / directory, ignore_errors=True)
         for filename in ['jacoco.exec', 'jacoco-it.exec']:
             (target / filename).unlink(missing_ok=True)
-    command = ['mvn', '-B', '-Dmaven.repo.local=' + str(Path(args.repo_local).resolve()), '-pl', ','.join(modules), 'verify']
+    command = ['mvn', '-B', '-Dapi.version=1.44', '-Dmaven.repo.local=' + str(Path(args.repo_local).resolve()), '-pl', ','.join(modules), 'verify']
     for kind, flag in [('unit', 'test'), ('it', 'it.test')]:
         names = sorted({t['class'] for t in shard['tests'] if t['kind'] == kind})
         command.append('-D' + flag + '=' + (','.join(names) if names else '__ci_shard_no_tests__'))
@@ -218,7 +219,15 @@ def run_shard(args, root, plan):
     if examples:
         command += ['-Dtapstate.e2e.published-examples=' + ','.join(examples),
                     '-DforkCount=1', '-DreuseForks=true', '-Djunit.jupiter.execution.parallel.enabled=false']
-    subprocess.run(command, cwd=root, check=True)
+    env = dict(os.environ)
+    runner_temp = env.get('RUNNER_TEMP')
+    if runner_temp:
+        java_tmp = Path(runner_temp).resolve() / 'tapstate-java-tmp'
+        java_tmp.mkdir(parents=True, exist_ok=True)
+        java_option = '-Djava.io.tmpdir=' + str(java_tmp)
+        command.insert(command.index('-pl'), java_option)
+        command.insert(command.index('-pl'), '-Dtapstate.it.jvmArgs=' + java_option)
+    subprocess.run(command, cwd=root, check=True, env=env)
 
 
 def reports(root, shard):

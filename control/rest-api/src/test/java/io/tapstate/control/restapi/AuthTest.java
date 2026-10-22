@@ -777,7 +777,7 @@ class AuthTest {
             ClusterTopologyTestConfiguration.class,
             PipelinePositionTestConfiguration.class,
             DerivedSchemaTestConfiguration.class, ObservabilityTestConfiguration.class,
-            PipelinePreviewTestConfiguration.class})
+            StartChecksTestConfiguration.class, PipelinePreviewTestConfiguration.class})
     static class TestApp {
 
         @Bean
@@ -1004,7 +1004,8 @@ class AuthTest {
                     return Optional.empty();
                 }
             };
-            return new ConnectionTestService(probe, resultStore, auditGate);
+            return new ConnectionTestService(probe, resultStore, auditGate, null,
+                    io.tapstate.control.core.SourceConnectionResolver.forAdHocConnections());
         }
 
         // The read-back controller is bundled too, so its query service must be present for the context to
@@ -1040,7 +1041,8 @@ class AuthTest {
                 public Optional<DiscoveredSourceModel> get(String connectionId) {
                     return Optional.empty();
                 }
-            }, auditGate, Clock.systemUTC());
+            }, auditGate, Clock.systemUTC(), null,
+                    io.tapstate.control.core.SourceConnectionResolver.forAdHocConnections());
         }
 
         @Bean
