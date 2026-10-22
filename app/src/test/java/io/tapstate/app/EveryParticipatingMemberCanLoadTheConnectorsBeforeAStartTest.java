@@ -349,6 +349,10 @@ class EveryParticipatingMemberCanLoadTheConnectorsBeforeAStartTest {
                 @Override
                 public void forget(String pipelineId) {
                 }
+
+                @Override
+                public void forget(ExecutionPlan expected) {
+                }
             };
             return new EngineLifecycleActuator(new Engine(m1), source, capture,
                     new NestStateTeardown(m1, new InMemoryKeyedStateStore(), new InMemoryNestDeadLetterStore()),

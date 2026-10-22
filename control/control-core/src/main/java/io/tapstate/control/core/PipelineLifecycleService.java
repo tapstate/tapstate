@@ -2,6 +2,8 @@ package io.tapstate.control.core;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.CheckpointDoc;
+import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.LifecycleMachine;
 import io.tapstate.core.lifecycle.LifecycleVerb;
@@ -23,7 +25,8 @@ import java.util.function.Function;
  *
  * <p>Current state comes from the pipeline's last desired intent: a pipeline with no desired doc is
  * {@link PipelineState#NEW}, and each verb advances the intent. This lets the four verbs be issued before
- * the converge side writes any actual state; once it does, current state is read from there instead.
+ * the converge side writes any actual state. Natural completion is read from its actual checkpoint,
+ * while a new start accepted at that checkpoint remains a pending RUNNING intent.
  *
  * <p>A pipeline's revision is the content hash of its applied artifact's canonical form. The minimal
  * check is that a run verb (start / resume) runs at the latest applied revision: start always adopts the
@@ -45,22 +48,16 @@ public final class PipelineLifecycleService {
     private final ArtifactQueryService artifacts;
     private final DesiredStore desired;
     private final AuditGate auditGate;
-    /**
-     * One question about the actual state, and no way to ask another: where the pipeline's fencing
-     * epoch stands, empty where it has no checkpoint yet. A start superseding a stop nobody has read
-     * yet is an instruction carried out once rather than a wish held true, and this is the mark it is
-     * stamped with. Narrow on purpose -- writing actual state is the converge loop's alone, and this
-     * side is not handed a store it could write.
-     */
-    private final Function<String, Optional<Long>> actualStateEpoch;
+    /** Read-only actual state: its epoch stamps one-shot starts, and completion permits a new start. */
+    private final Function<String, Optional<CheckpointDoc>> actualCheckpoint;
 
     public PipelineLifecycleService(
             ArtifactQueryService artifacts, DesiredStore desired, AuditGate auditGate,
-            Function<String, Optional<Long>> actualStateEpoch) {
+            Function<String, Optional<CheckpointDoc>> actualCheckpoint) {
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
         this.desired = Objects.requireNonNull(desired, "desired");
         this.auditGate = Objects.requireNonNull(auditGate, "auditGate");
-        this.actualStateEpoch = Objects.requireNonNull(actualStateEpoch, "actualStateEpoch");
+        this.actualCheckpoint = Objects.requireNonNull(actualCheckpoint, "actualCheckpoint");
     }
 
     /** Starts the pipeline (from NEW / STOPPED / COMPLETED), running it at the latest applied revision. */
@@ -89,7 +86,7 @@ public final class PipelineLifecycleService {
         Objects.requireNonNull(pipelineId, "pipelineId");
         StoredResource latestArtifact = requireRunnable(pipelineId);
         Optional<DesiredState> prior = desired.read(pipelineId);
-        LifecycleMachine.transition(prior.map(DesiredState::targetState).orElse(PipelineState.NEW), LifecycleVerb.START);
+        LifecycleMachine.transition(currentState(prior, actualCheckpoint.apply(pipelineId)), LifecycleVerb.START);
         return new Startable(latestArtifact, (PipelineResource) latestArtifact.resource(), prior);
     }
 
@@ -158,6 +155,19 @@ public final class PipelineLifecycleService {
                         LifecycleError.UNKNOWN_PIPELINE, Map.of("pipeline", pipelineId), null));
     }
 
+    private static PipelineState currentState(Optional<DesiredState> prior, Optional<CheckpointDoc> actual) {
+        PipelineState intended = prior.map(DesiredState::targetState).orElse(PipelineState.NEW);
+        if (intended != PipelineState.RUNNING || actual.isEmpty()
+                || StateJson.parse(actual.get().stateJson()) != PipelineState.COMPLETED) {
+            return intended;
+        }
+        DesiredState intent = prior.orElseThrow();
+        // A second start already accepted at this completed checkpoint is still waiting to run.
+        // The old completion cannot authorize a third start over that pending instruction.
+        boolean pendingStart = intent.rebuildOwedAt(actual.get());
+        return pendingStart ? PipelineState.RUNNING : PipelineState.COMPLETED;
+    }
+
     private DesiredState apply(String principal, String pipelineId, LifecycleVerb verb, boolean purgeState,
             String expectedContentHash, Map<String, Object> detail) {
         Objects.requireNonNull(principal, "principal");
@@ -172,7 +182,8 @@ public final class PipelineLifecycleService {
         }
 
         Optional<DesiredState> prior = desired.read(pipelineId);
-        PipelineState current = prior.map(DesiredState::targetState).orElse(PipelineState.NEW);
+        Optional<CheckpointDoc> checkpoint = actualCheckpoint.apply(pipelineId);
+        PipelineState current = currentState(prior, checkpoint);
         PipelineState target = LifecycleMachine.transition(current, verb);
 
         // What the latest artifact would be assembled from, alongside what it hashes to. Both are taken off
@@ -211,7 +222,8 @@ public final class PipelineLifecycleService {
                 && prior.map(DesiredState::targetState).orElse(null) == PipelineState.STOPPED;
         boolean clears =
                 purgeState || (rebuildAfterStop && prior.map(DesiredState::purgeState).orElse(false));
-        Long stampedAt = rebuildAfterStop ? actualStateEpoch.apply(pipelineId).orElse(null) : null;
+        boolean startAfterCompletion = verb == LifecycleVerb.START && current == PipelineState.COMPLETED;
+        Long stampedAt = rebuildAfterStop || startAfterCompletion ? checkpoint.map(CheckpointDoc::epoch).orElse(null) : null;
 
         if ((verb == LifecycleVerb.START || verb == LifecycleVerb.RESUME)
                 && !runRevision.equals(latest) && !reassemble) {
@@ -239,7 +251,7 @@ public final class PipelineLifecycleService {
                 : prior.map(DesiredState::assemblyRevision).orElse(null);
 
         DesiredState next = new DesiredState(pipelineId, target, runRevision, clears, runAssembly,
-                reassemble || rebuildAfterStop, stampedAt);
+                reassemble || rebuildAfterStop || startAfterCompletion, stampedAt);
         return auditGate.dispatch(OPERATIONS.get(verb),
                 new AuditContext(principal, pipelineId, expectedContentHash, detail), () -> {
                     // Asked again at the last moment for a start held to a definition: the definition could

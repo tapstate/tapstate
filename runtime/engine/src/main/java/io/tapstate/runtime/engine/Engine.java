@@ -122,9 +122,15 @@ public final class Engine {
     /** Submits after pinning every nest namespace to the database the compiled artifact resolved. */
     public void submit(String pipelineId, DAG dag, Map<String, String> stateDatabases,
             NestSettings settings) {
+        submitTracked(pipelineId, dag, stateDatabases, settings);
+    }
+
+    /** Submits the run and returns its exact job identity, including an already active submission. */
+    public long submitTracked(String pipelineId, DAG dag, Map<String, String> stateDatabases,
+            NestSettings settings) {
         refuseIfLost(pipelineId);
         configureNestState(stateDatabases, settings);
-        submitJob(pipelineId, dag);
+        return submitJob(pipelineId, dag).getId();
     }
 
     /** Validates and pins placement before capture or graph construction performs a side effect. */
@@ -159,7 +165,7 @@ public final class Engine {
      * no engine-side re-planning of a changed cluster, and a previous run that has to be over first -- is
      * carried here, so an overload cannot be added that quietly starts a run without any of it.
      */
-    private void submitJob(String pipelineId, DAG dag) {
+    private Job submitJob(String pipelineId, DAG dag) {
         JobFailureRegistry.of(member).clear(pipelineId);
         awaitPreviousRunOver(pipelineId);
         JobConfig config = new JobConfig()
@@ -173,7 +179,7 @@ public final class Engine {
                 // members changed ends, and what starts in its place is submitted deliberately, once, by
                 // whoever holds the pipeline.
                 .setAutoScaling(false);
-        member.getJet().newJobIfAbsent(dag, config);
+        return member.getJet().newJobIfAbsent(dag, config);
     }
 
     /**
@@ -270,6 +276,15 @@ public final class Engine {
         }
         JobStatus status = job.getStatus();
         return status != JobStatus.FAILED && status != JobStatus.COMPLETED;
+    }
+
+    /** Success of the exact submitted job; absence, cancellation and a different run prove nothing. */
+    public boolean completed(String pipelineId, long jobId) {
+        if (isLost()) {
+            return false;
+        }
+        Job job = jobNamed(pipelineId);
+        return job != null && job.getId() == jobId && job.getStatus() == JobStatus.COMPLETED;
     }
 
     public boolean awaitTerminal(String pipelineId, Duration budget) {

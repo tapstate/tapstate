@@ -313,6 +313,72 @@ class SrsSourceProcessorTest {
     }
 
     @Test
+    void aSnapshotOnlySourceEndsAfterItsDeclaredLoadIncludingAnEmptyLoad() throws Exception {
+        for (int rows : List.of(0, 3)) {
+            exerciseDeclaredBufferSource(rows, false);
+        }
+    }
+
+    @Test
+    void aDirectChangeSourceKeepsReadingAfterItsLoadEndsAndItsBufferGoesQuiet() throws Exception {
+        exerciseDeclaredBufferSource(3, true);
+    }
+
+    private void exerciseDeclaredBufferSource(int rows, boolean direct) throws Exception {
+        String ring = "srs.chain.bounded-" + rows + "-" + direct;
+        String output = "out-bounded-" + rows + "-" + direct;
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        buffer.declareSnapshot(PIPELINE, ring);
+        hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
+        DAG dag = new DAG();
+        ProcessorMetaSupplier supplier = direct
+                ? SrsSourceProcessor.directMetaSupplier(PIPELINE, ring, "orders", 1L,
+                        RECORDED_STAMP, SourcePlacement.anyMember())
+                : SrsSourceProcessor.snapshotOnlyMetaSupplier(PIPELINE, ring, "orders", 1L,
+                        RECORDED_STAMP, SourcePlacement.anyMember());
+        // Native multi-writer sinks install this gate even for a load without a CDC tail.
+        supplier = new LoadGate(SinkAckFactory.NONE,
+                List.of(new AwaitedLoad("target", "orders", List.of("target#0")))).appliedTo(supplier);
+        Vertex source = dag.newVertex("source", supplier);
+        Vertex project = dag.newVertex("project", Processors.mapP(SrsSourceProcessorTest::describe))
+                .localParallelism(1);
+        Vertex sink = dag.newVertex("sink", SinkProcessors.writeListP(output)).localParallelism(1);
+        dag.edge(between(source, project).setConfig(new EdgeConfig().setQueueSize(1)))
+                .edge(between(project, sink));
+        Job job = hz.getJet().newJob(dag);
+        IList<String> out = hz.getList(output);
+        try {
+            long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
+            while (job.getStatus() != JobStatus.RUNNING && System.nanoTime() < deadline) {
+                Thread.sleep(20);
+            }
+            assertThat(job.getStatus()).as("an empty buffer is not end of input").isEqualTo(JobStatus.RUNNING);
+            for (int row = 0; row < rows; row++) {
+                buffer.append(PIPELINE, ring, snapshotRow(row).withOrder(SourceOrder.snapshotRow(1L)));
+            }
+            buffer.endSnapshot(PIPELINE, ring);
+            if (direct) {
+                awaitSize(out, rows);
+                Thread.sleep(300);
+                assertThat(job.getStatus()).isEqualTo(JobStatus.RUNNING);
+                buffer.append(PIPELINE, ring, snapshotRow(99).withOrder(new SourceOrder(1L, 1L)));
+                awaitSize(out, rows + 1);
+                assertThat(job.getStatus()).as("a later change must still be consumed").isEqualTo(JobStatus.RUNNING);
+            } else {
+                job.getFuture().get(5, TimeUnit.SECONDS);
+                assertThat(job.getStatus()).isEqualTo(JobStatus.COMPLETED);
+                assertThat(out).hasSize(rows);
+            }
+        } finally {
+            if (!job.getStatus().isTerminal()) {
+                job.cancel();
+            }
+            hz.getUserContext().remove(SnapshotBuffer.USER_CONTEXT_KEY);
+            out.destroy();
+        }
+    }
+
+    @Test
     void refusesAChangeFoundOnARingWhoseChainHasNoGenerationOpen() throws InterruptedException {
         // A source with no generation reads no chain of its own, so its ring is one nobody fills. A change
         // sitting on it means a capture is writing a chain that was never opened -- and the alternative to
