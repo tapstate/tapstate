@@ -99,11 +99,17 @@ class PipelineAssistantController {
                 streamEvents.status("connecting");
                 streamEvents.event(Map.of("type", "text-start", "id", textId));
                 streamEvents.status("streaming");
-                Map<String, Object> candidate = client.propose(settings, messages, context,
+                var candidate = client.propose(settings, messages, context,
                         delta -> streamEvents.event(Map.of("type", "text-delta", "id", textId, "delta", delta)));
                 streamEvents.event(Map.of("type", "text-end", "id", textId));
+                if (candidate.isEmpty()) {
+                    streamEvents.status("complete");
+                    streamEvents.event(Map.of("type", FINISH, FINISH_REASON, "stop"));
+                    streamEvents.done();
+                    return;
+                }
                 streamEvents.status("validating");
-                Map<String, Object> validated = validate(id, revision, candidate);
+                Map<String, Object> validated = validate(id, revision, candidate.orElseThrow());
                 if (!Boolean.TRUE.equals(validated.get(VALID))) {
                     List<Map<String, Object>> diagnostics = diagnostics(validated);
                     String code = diagnostics.isEmpty()
@@ -193,16 +199,22 @@ class PipelineAssistantController {
         for (String sourceId : inputSources(base)) {
             var source = sources.getObject().get(sourceId);
             String connector = source.connector().toLowerCase(java.util.Locale.ROOT);
-            if (!connector.contains("postgres") && !connector.contains("mysql")) throw malformed("assistant inputs require PostgreSQL or MySQL");
-            var schema = schemas.getObject().find(sourceId).orElseThrow(() -> malformed("discover the selected Source schema before requesting a proposal"));
+            if (!connector.contains("postgres") && !connector.contains("mysql")) continue;
+            var schema = schemas.getObject().find(sourceId).orElse(null);
+            if (schema == null) continue;
             List<Map<String, Object>> tables = schema.tables().stream().map(table -> Map.<String, Object>of(
                     "name", table.name(), "primaryKey", table.primaryKey(), "fields", table.fields().stream()
                             .map(field -> Map.of("name", field.name(), "type", field.type() == null ? "unknown" : field.type())).toList())).toList();
             inventory.add(Map.of(SOURCE_ID, sourceId, "connector", source.connector(), "tables", tables));
         }
-        if (inventory.isEmpty()) throw malformed("select a root table before requesting a proposal");
         result.put("sources", inventory);
-        if (JsonWriter.write(result).length() > 120000) throw malformed("selected schema is too large for the assistant");
+        result.put("proposalEnabled", !inventory.isEmpty());
+        if (JsonWriter.write(result).length() > 120000) {
+            result.put("sources", List.of());
+            result.put("proposalEnabled", false);
+            result.put("schemaUnavailable", "selected schema is too large to include");
+            if (JsonWriter.write(result).length() > 120000) throw malformed("pipeline context is too large for the assistant");
+        }
         return result;
     }
     private void enforceScope(PipelineDraft base, Map<String, Object> candidate) {

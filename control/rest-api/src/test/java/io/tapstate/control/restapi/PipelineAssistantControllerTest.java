@@ -68,6 +68,58 @@ class PipelineAssistantControllerTest {
         assertThat(store.get("orders")).contains(draft());
     }
 
+    @Test void blankBuilderCanHaveAUsefulAssistantConversationWithoutConfiguredSources() throws Exception {
+        PipelineDraft configured = draft();
+        PipelineDraft blank = new PipelineDraft("blank", 1, 1, PipelineDraft.Mode.WIZARD, "Blank", null, null,
+                new PipelineDraft.Wizard(null, List.of(), List.of(), configured.wizard().output()),
+                null, null, null, Instant.EPOCH, Instant.EPOCH, "author");
+        var store = new PipelineApiTest.FakePipelineDraftStore();
+        store.create(blank);
+        var artifacts = new PipelineApiTest.FakeArtifactStore();
+        var schemaStore = new SchemaStore() {
+            public void save(DiscoveredSourceModel ignored) { throw new AssertionError("must not write schema"); }
+            public Optional<DiscoveredSourceModel> get(String id) { return Optional.empty(); }
+        };
+        var audit = new AuditGate(new PipelineApiTest.RecordingAuditStore(), Clock.systemUTC());
+        var services = new PipelineApiTest.TestApp();
+        var apply = new ApplyService(TapstateCatalog::load, artifacts, audit, schemaStore,
+                PlanAdvisories.none(), SchemaDerivation.none());
+        var sources = new SourceProjectionService(apply,
+                services.artifactQueryService(artifacts), services.artifactMutationService(artifacts, audit),
+                new SourceRepresentation(TapstateCatalog::load));
+        var beans = new DefaultListableBeanFactory();
+        beans.registerSingleton("drafts", new PipelineDraftService(store));
+        beans.registerSingleton("sources", sources);
+        beans.registerSingleton("schemas", new io.tapstate.control.core.SourceSchemaQueryService(artifacts, schemaStore));
+        AtomicReference<Map<String, Object>> sentContext = new AtomicReference<>();
+        AiProviderClient fake = new AiProviderClient() {
+            public void check(AiProviderSettings ignored) { }
+            public Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
+                    Map<String, Object> context, java.util.function.Consumer<String> text) {
+                sentContext.set(context);
+                text.accept("Connect a PostgreSQL or MySQL Source and discover its schema to draft a pipeline.");
+                return Optional.empty();
+            }
+        };
+        var controller = new PipelineAssistantController(beans.getBeanProvider(PipelineDraftService.class),
+                beans.getBeanProvider(SourceProjectionService.class),
+                beans.getBeanProvider(io.tapstate.control.core.SourceSchemaQueryService.class),
+                providerController(fake), fake, JsonMapper.builder().build());
+        MockHttpServletRequest request = new MockHttpServletRequest("POST", "/pipelines/blank/draft:assistant");
+        var response = controller.assistant("blank", Map.of("revision", 1,
+                "messages", List.of(Map.of("role", "user", "text", "Help me create a pipeline"))), request);
+        var output = new ByteArrayOutputStream();
+        response.getBody().writeTo(output);
+        String stream = output.toString(StandardCharsets.UTF_8);
+
+        assertThat(sentContext.get()).containsKey("currentWizard").containsEntry("sources", List.of())
+                .containsEntry("proposalEnabled", false);
+        assertThat(stream).contains("Connect a PostgreSQL or MySQL Source", "data-status", "complete",
+                "\"finishReason\":\"stop\"")
+                .doesNotContain("data-proposal", "control.malformed-request", "\\\"type\\\":\\\"error\\\"");
+        assertThat(store.get("blank")).contains(blank);
+    }
+
     @Test void mysqlProposalStreamIsValidatedAndReleasesCapacityAfterEachBody() throws Exception {
         verifyValidatedStream("mysql");
     }
@@ -121,13 +173,13 @@ class PipelineAssistantControllerTest {
         AtomicInteger providerCalls = new AtomicInteger();
         AiProviderClient fake = new AiProviderClient() {
             public void check(AiProviderSettings ignored) { }
-            public Map<String, Object> propose(AiProviderSettings settings, List<Map<String, String>> messages,
+            public Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
                     Map<String, Object> context, java.util.function.Consumer<String> text) {
                 providerCalls.incrementAndGet();
                 sentContext.set(context);
                 text.accept("I used the selected schema.");
                 if (providerFailure.get()) throw AiProviderService.error(ControlError.AI_INVALID_PROPOSAL);
-                return proposedCandidate.get();
+                return Optional.of(proposedCandidate.get());
             }
         };
         var controller = new PipelineAssistantController(beans.getBeanProvider(PipelineDraftService.class),
@@ -160,6 +212,15 @@ class PipelineAssistantControllerTest {
                 Files.write(fixture, output.toByteArray());
             }
         }
+
+        proposedCandidate.set(Map.of());
+        var emptyCandidateResponse = controller.assistant("orders", body, request);
+        var emptyCandidateOutput = new ByteArrayOutputStream();
+        emptyCandidateResponse.getBody().writeTo(emptyCandidateOutput);
+        String emptyCandidateStream = emptyCandidateOutput.toString(StandardCharsets.UTF_8);
+        assertThat(emptyCandidateStream).contains(ControlError.AI_INVALID_PROPOSAL.code())
+                .doesNotContain("\"state\":\"complete\"", "data-proposal");
+        assertThat(store.get("orders")).contains(base);
         providerFailure.set(true);
         var failedOutput = new ByteArrayOutputStream();
         controller.assistant("orders", body, request).getBody().writeTo(failedOutput);
@@ -176,7 +237,7 @@ class PipelineAssistantControllerTest {
             }
         };
         controller.assistant("orders", body, request).getBody().writeTo(disconnected);
-        assertThat(providerCalls).hasValue(7);
+        assertThat(providerCalls).hasValue(8);
         assertThat(failedStream).doesNotContain("sk-test");
         assertThat(store.get("orders")).contains(base);
 

@@ -63,7 +63,7 @@ class AiProviderSettingsApiTest {
         AtomicReference<AiProviderSettings> checked = new AtomicReference<>();
         AiProviderClient fake = new AiProviderClient() {
             @Override public void check(AiProviderSettings value) { checked.set(value); }
-            @Override public Map<String, Object> propose(AiProviderSettings ignored, List<Map<String, String>> messages,
+            @Override public Optional<Map<String, Object>> propose(AiProviderSettings ignored, List<Map<String, String>> messages,
                     Map<String, Object> context, java.util.function.Consumer<String> text) {
                 throw new AssertionError("provider settings test must not request a proposal");
             }
