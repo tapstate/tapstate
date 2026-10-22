@@ -173,6 +173,24 @@ class ValidationNestSingleSourceTest {
         assertThat(root.notCompared()).hasSize(2).allSatisfy(blocked -> assertThat(blocked.check()).isEqualTo(Check.STRUCTURE));
     }
 
+    @Test void pureClassificationRetainsTheParentSampleWithoutClaimingItsReadHasCompleted() {
+        var observation = observation(List.of(), 1);
+        var originalReference = reference();
+        var result = classify(rows(observation, 0, 0), Relation.REFERENCE, Optional.of(originalReference),
+                location(observation), affected(observation), List.of(), 1024 * 1024);
+        assertThat(result.state()).isEqualTo(State.BLOCKED);
+        assertThat(result.read().readId()).isEqualTo("relation");
+        assertThat(result.issues()).singleElement().satisfies(issue -> {
+            assertThat(issue.finding().kind()).isEqualTo(Kind.SOURCE_REFERENCE_MISSING);
+            assertThat(issue.sample()).containsSame(originalReference.parent());
+            assertThat(issue.affected()).containsExactlyElementsOf(affected(observation));
+        });
+        assertThat(result.accountedBytes()).isGreaterThan(parent().accountedBytes());
+        assertThatThrownBy(() -> classify(rows(observation, 0, 0), Relation.REFERENCE, Optional.of(reference()),
+                location(observation), affected(observation), List.of(), 1)).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(ValidationError.VALUE_LIMIT_EXCEEDED));
+    }
+
     private static ValidationRelationRows.Result rows(ValidationObservation observation, int included, int unknown) {
         try (var rows = new ValidationRelationRows(observation, "relation", new ValidationRelationRows.Limits(32 * 1024, ROW))) {
             for (int i = 0; i < included + unknown; i++) {

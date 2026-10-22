@@ -54,6 +54,22 @@ public final class ValidationRootReader {
             reads = List.copyOf(reads); issues = List.copyOf(issues);
         }
         public static SourceEvidence empty() { return new SourceEvidence(null, List.of(), List.of()); }
+        /** Imports one completed Nest relation's facts without pretending its enclosing parent read ended. */
+        public static SourceEvidence fromSingleSource(ValidationObservation root, ValidationNestSingleSource.Result source) {
+            Objects.requireNonNull(root, "root"); Objects.requireNonNull(source, "source");
+            var actual = source.observation();
+            if (!root.run().equals(actual.run()) || root.revision() != actual.revision()
+                    || !root.root().mappingId().equals(actual.root().mappingId())
+                    || !root.root().outputId().equals(actual.root().outputId())
+                    || !root.root().rootKey().equals(actual.root().rootKey())
+                    || actual.root().ancestors().size() < root.root().ancestors().size()
+                    || !actual.root().ancestors().subList(0, root.root().ancestors().size()).equals(root.root().ancestors())) {
+                throw invalid("rootRead.singleSourceObservation");
+            }
+            return new SourceEvidence(root, List.of(source.read()), source.issues().stream()
+                    .map(issue -> new SourceIssue(issue.finding(), issue.sample(), issue.affected())).toList());
+        }
+
     }
 
     /** Known source data issues may survive a definite predicate; uncertainty specifically prevents participation. */

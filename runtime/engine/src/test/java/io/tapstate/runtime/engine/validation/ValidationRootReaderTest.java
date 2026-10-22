@@ -318,6 +318,59 @@ class ValidationRootReaderTest {
         assertThat(result.observedAgreement()).isFalse();
     }
 
+    @Test void classifiedMissingReferenceWaitsForActualParentEofAndIsImportedOnlyOnce() {
+        var source = new Cursor(List.of(row(Map.of("id", 7, "customer_id", 9, "known", 1))));
+        var target = new Cursor(List.of(row(Map.of("id", 7, "customer_id", 9, "customer", Map.of("id", 9), "known", 2))));
+        var child = new Cursor(List.of());
+        var reference = new ValidationReferenceFields(List.of("customer_id"), ROW);
+        var location = new Location(observation().root(), List.of("customer"));
+        var result = read(source, target, original -> {
+            var rows = ValidationRelationReader.read(observation(), "child", "complete", child.open(), READ, CLOCK, () -> {},
+                    raw -> new ValidationRelationReader.Evaluation(INCLUDED, raw, Optional.of(identity("child"))));
+            assertThat(source.closed).isFalse();
+            assertThat(source.rowsClosed).isZero();
+            assertThat(target.opened).isZero();
+            var facts = ValidationNestSingleSource.classify(rows, ValidationNestSingleSource.Relation.REFERENCE,
+                    Optional.of(new ValidationNestSingleSource.Reference((ValidationReferenceFields.Complete) reference.read(original),
+                            new SampledSide(identity("source"), original, "source"))),
+                    location, List.of(location), List.of(), 1024 * 1024);
+            return new ValidationRootReader.Source(evaluation(original, INCLUDED), List.of(),
+                    ValidationRootReader.SourceEvidence.fromSingleSource(observation(), facts));
+        }, (pair, root) -> {
+            assertThat(source.closed).isTrue(); assertThat(source.rowsClosed).isEqualTo(1);
+            assertThat(pair.sourceEvidence().reads()).extracting(ValidationCheckEvent.ReadBoundary::readId).containsExactly("child");
+            ValidationFieldCheck.checkPartial(observation(), List.of(), pair.source().working(), pair.target().working(),
+                    pair.sourceSample(), pair.targetSample(), Optional.empty(), String::equals,
+                    new ValidationValueComparison.TraversalLimits(ROW, 10000), List.of(List.of("customer")), root);
+        });
+        assertThat(result.counts()).containsExactlyInAnyOrderEntriesOf(Map.of(Kind.SOURCE_REFERENCE_MISSING, 1L, Kind.TARGET_VALUE, 1L));
+        assertThat(result.reads()).extracting(read -> read.boundary().readId()).containsExactlyInAnyOrder("source", "child", "target");
+        assertThat(result.samples()).anySatisfy(sample -> {
+            assertThat(sample.finding().kind()).isEqualTo(Kind.SOURCE_REFERENCE_MISSING);
+            assertThat(sample.source().orElseThrow().readId()).isEqualTo("source");
+        });
+    }
+
+    @Test void completedChildFactsCannotMakeAFailedParentReadPublishOrOpenTheTarget() {
+        var source = new Cursor(List.of(row(Map.of("id", 7, "customer_id", 9))));
+        var target = new Cursor(List.of(row(Map.of("id", 7)))); var child = new Cursor(List.of());
+        source.endFailure = failure(ValidationError.READ_FAILED);
+        Throwable actual = catchThrowable(() -> read(source, target, original -> {
+            var rows = ValidationRelationReader.read(observation(), "child", "complete", child.open(), READ, CLOCK, () -> {},
+                    raw -> new ValidationRelationReader.Evaluation(INCLUDED, raw, Optional.empty()));
+            var fields = new ValidationReferenceFields(List.of("customer_id"), ROW);
+            var location = new Location(observation().root(), List.of("customer"));
+            var facts = ValidationNestSingleSource.classify(rows, ValidationNestSingleSource.Relation.REFERENCE,
+                    Optional.of(new ValidationNestSingleSource.Reference((ValidationReferenceFields.Complete) fields.read(original),
+                            new SampledSide(identity("source"), original, "source"))), location, List.of(location), List.of(), 1024 * 1024);
+            return new ValidationRootReader.Source(evaluation(original, INCLUDED), List.of(),
+                    ValidationRootReader.SourceEvidence.fromSingleSource(observation(), facts));
+        }, (pair, root) -> fail("failed parent cannot compare targets")));
+        assertThat(actual).isSameAs(source.endFailure);
+        assertThat(target.opened).isZero(); assertThat(source.closed).isTrue(); assertThat(child.closed).isTrue();
+        assertThat(source.rowsClosed).isEqualTo(1);
+    }
+
     private static Function<ValidationValues.Row, ValidationRootReader.Source> mappedFilter() {
         var map = ValidationStaticMap.compile("map", new TransformBody.MapProjection(Map.of("price", FieldRule.rename("amount"))), ROW);
         var predicate = ValidationPredicate.compile("filter", new ValidationPredicate.Compare(ValidationPredicate.Operator.GT,
