@@ -31,6 +31,22 @@ class SecretTrackingArtifactStoreTest {
     }
 
     @Test
+    void tracksSharedTlsAndNestedSshCredentialsForRegisteredSources() {
+        RecordingStore delegate = new RecordingStore();
+        SecretRedactor redactor = new SecretRedactor();
+        SecretTrackingArtifactStore store = tracking(delegate, redactor);
+
+        store.save(new SourceResource(
+                "transport", null, "mongodb",
+                Map.of("sslKey", "tls-private-key", "sslKeyPassword", "tls-key-password",
+                        "__TAPDATA", Map.of("sshPassword", "bastion-password")),
+                null, null, null, null));
+
+        assertThat(redactor.redact("tls-private-key tls-key-password bastion-password"))
+                .isEqualTo("******** ******** ********");
+    }
+
+    @Test
     void tracksOnlyClearlySecretValuesWhenAStoredConnectorIsNoLongerInTheCatalog() {
         RecordingStore delegate = new RecordingStore();
         SecretRedactor redactor = new SecretRedactor();

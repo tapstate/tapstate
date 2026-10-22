@@ -109,7 +109,7 @@ class TapEventCodecTest {
     }
 
     @Test
-    void decodesZonedDateTimesToDatesAtEveryRowDepth() {
+    void decodesZonedDateTimesToPortableInstantsAtEveryRowDepth() {
         ZonedDateTime topLevel = ZonedDateTime.of(2026, 8, 12, 21, 8, 43, 123_000_000, ZoneId.of("Asia/Shanghai"));
         ZonedDateTime nestedMap = topLevel.plusHours(1);
         ZonedDateTime nestedList = topLevel.plusHours(2);
@@ -120,10 +120,10 @@ class TapEventCodecTest {
 
         Envelope env = TapEventCodec.decodeChange(event, CODECS, java.util.Map.of());
 
-        assertThat(env.after()).isEqualTo(Map.of(
-                "top_level", Date.from(topLevel.toInstant()),
-                "nested", Map.of("map_value", Date.from(nestedMap.toInstant())),
-                "items", List.of(Date.from(nestedList.toInstant()))));
+        assertThat(io.tapstate.core.event.ConvertedValue.unwrapRow(env.after())).isEqualTo(Map.of(
+                "top_level", topLevel.toInstant(),
+                "nested", Map.of("map_value", nestedMap.toInstant()),
+                "items", List.of(nestedList.toInstant())));
     }
 
     // ---- ts: source reference time, falling back to event time ----

@@ -56,6 +56,10 @@ final class RowImages {
 
     /** The marker naming a binary column's bytes, reserved for the same reason as the carrier's. */
     private static final String BINARY = "__tapstate_bytes";
+    private static final String VALUE_KIND = "__tapstate_valueKind";
+    private static final String TYPE_DESCRIPTION = "__tapstate_typeDescription";
+    private static final String TEMPORAL_DESCRIPTION = "__tapstate_temporalDescription";
+    private static final String INSTANT = "__tapstate_instant";
 
     private RowImages() {
     }
@@ -80,7 +84,15 @@ final class RowImages {
             if (carrier.originType() != null) {
                 held.append(ORIGIN_TYPE, carrier.originType());
             }
+            if (carrier.valueKind() != null) {
+                held.append(VALUE_KIND, carrier.valueKind());
+                held.append(TYPE_DESCRIPTION, carrier.typeDescription());
+                held.append(TEMPORAL_DESCRIPTION, carrier.temporalDescription());
+            }
             return held;
+        }
+        if (value instanceof java.time.Instant instant) {
+            return new Document(INSTANT, instant.toString());
         }
         if (value instanceof Bytes bytes) {
             return new Document(BINARY, new Binary(bytes.tag(), bytes.value()));
@@ -129,7 +141,12 @@ final class RowImages {
         }
         if (value instanceof Map<?, ?> map) {
             if (map.get(CARRIED) != null) {
-                return new ConvertedValue(decoded(map.get(CARRIED)), (String) map.get(ORIGIN_TYPE));
+                return new ConvertedValue(decoded(map.get(CARRIED)), (String) map.get(ORIGIN_TYPE),
+                        (String) map.get(VALUE_KIND), (String) map.get(TYPE_DESCRIPTION),
+                        (String) map.get(TEMPORAL_DESCRIPTION));
+            }
+            if (map.get(INSTANT) instanceof String instant) {
+                return java.time.Instant.parse(instant);
             }
             Object bytes = map.get(BINARY);
             if (bytes instanceof Binary binary) {
