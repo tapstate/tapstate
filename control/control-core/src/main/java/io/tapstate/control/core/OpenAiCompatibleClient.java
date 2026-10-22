@@ -25,6 +25,7 @@ import java.util.function.Function;
 /** Bounded provider protocol adapter. Only text and complete tool arguments leave this boundary. */
 public final class OpenAiCompatibleClient implements AiProviderClient {
     private static final int MAX_BYTES = 524288;
+    private static final System.Logger LOG = System.getLogger(OpenAiCompatibleClient.class.getName());
     private final HttpClient http;
     private final Function<String, URI> requestUriFactory;
 
@@ -104,11 +105,15 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         try {
             var response = http.send(request(settings, body), HttpResponse.BodyHandlers.ofInputStream());
             try (var input = response.body(); var bounded = new ResponseDeadline(input, deadline)) {
+                if (response.statusCode() < 200 || response.statusCode() >= 300) {
+                    LOG.log(System.Logger.Level.WARNING, "AI provider stream returned HTTP {0}", response.statusCode());
+                }
                 requireSuccessfulResponse(response.statusCode());
                 return readEvents(input, text, proposalEnabled);
             }
         } catch (java.io.IOException | InterruptedException error) {
             if (error instanceof InterruptedException) Thread.currentThread().interrupt();
+            LOG.log(System.Logger.Level.WARNING, "AI provider stream transport failed: {0}", error.getClass().getSimpleName());
             throw failed();
         } catch (IllegalArgumentException | ClassCastException error) { throw invalid(); }
     }
