@@ -102,6 +102,35 @@ public final class ValidationNestArrayMembers implements AutoCloseable {
         public long accountedBytes() { return accountedBytes; }
     }
 
+    /**
+     * Immutable complete source membership, with no target count or completion claim. It preserves
+     * all element counts and cross-element row collisions, including identities outside retained
+     * diagnostic samples. The original limits remain binding when target staging is created.
+     */
+    public static final class Source {
+        private final ValidationObservation observation;
+        private final List<String> arrayPath;
+        private final ValidationCheckEvent.ReadBoundary read;
+        private final List<SourceGroup> groups;
+        private final Map<ValidationKey, Long> rows;
+        private final ValidationKey elementDomain;
+        private final ValidationKey rowDomain;
+        private final Limits limits;
+        private final long accountedBytes;
+        private Source(ValidationObservation observation, List<String> arrayPath, ValidationCheckEvent.ReadBoundary read,
+                List<SourceGroup> groups, Map<ValidationKey, Long> rows, ValidationKey elementDomain, ValidationKey rowDomain,
+                Limits limits, long accountedBytes) {
+            this.observation = observation; this.arrayPath = List.copyOf(arrayPath); this.read = read;
+            this.groups = List.copyOf(groups); this.rows = Map.copyOf(rows);
+            this.elementDomain = elementDomain; this.rowDomain = rowDomain; this.limits = limits; this.accountedBytes = accountedBytes;
+        }
+        public ValidationObservation observation() { return observation; }
+        public List<String> arrayPath() { return arrayPath; }
+        public ValidationCheckEvent.ReadBoundary read() { return read; }
+        public List<SourceGroup> groups() { return groups; }
+        public long accountedBytes() { return accountedBytes; }
+    }
+
     /** A complete source query whose omitted indeterminate participants leave membership unknown. */
     public static final class UncertainSource {
         private final ValidationObservation observation;
@@ -226,8 +255,8 @@ public final class ValidationNestArrayMembers implements AutoCloseable {
         });
     }
 
-    record SourceGroup(ValidationRoot scope, long count, List<Member> samples, boolean conflict) {
-        SourceGroup { samples = List.copyOf(samples); }
+    public record SourceGroup(ValidationRoot scope, long count, List<Member> samples, boolean conflict) {
+        public SourceGroup { samples = List.copyOf(samples); }
     }
 
     ValidationCheckEvent.ReadBoundary requireSourceComplete() {
@@ -286,6 +315,45 @@ public final class ValidationNestArrayMembers implements AutoCloseable {
             close();
             return result;
         } catch (RuntimeException | Error error) { fail(error); throw error; }
+    }
+
+    /** Normal complete source facts only; callers must separately preserve any indeterminate participation. */
+    public Source finishSource() {
+        ensureOpen();
+        try {
+            var read = requireSourceComplete();
+            if (reads.containsKey(Side.TARGET) || targetRowIdentityVisible != null) throw ValidationError.invalid("nestMembers.sourceOnly");
+            // Reserve the immutable handoff metadata before copying it while staging is still live.
+            charge(128L + 64L * sourceRows.size());
+            var groups = new ArrayList<SourceGroup>();
+            visitSourceGroups(group -> { charge(64L + 8L * group.samples().size()); groups.add(group); });
+            var result = new Source(observation, path, read, groups, sourceRows, elementDomain, sourceRowDomain, limits, bytes);
+            close();
+            return result;
+        } catch (RuntimeException | Error error) { fail(error); throw error; }
+    }
+
+    /**
+     * Reopens target staging under exactly the same immutable source scope and original limits.
+     * The source handoff and the new mutable indexes coexist, so both are charged to this frame.
+     * The root caller still reserves all simultaneously live frames; this is not a global quota.
+     */
+    public static ValidationNestArrayMembers forTarget(Source source) {
+        Objects.requireNonNull(source, "source");
+        var result = new ValidationNestArrayMembers(source.observation, source.arrayPath, source.limits);
+        try {
+            result.charge(source.accountedBytes);
+            result.charge(128L + 64L * source.rows.size());
+            result.sourceRows.putAll(source.rows);
+            result.elementDomain = source.elementDomain; result.sourceRowDomain = source.rowDomain;
+            for (var group : source.groups) {
+                result.charge(512L + 8L * group.samples().size());
+                var bucket = new Bucket(); bucket.sourceCount = group.count(); bucket.source.addAll(group.samples());
+                result.buckets.put(group.scope().ancestors().getLast().key(), bucket);
+            }
+            result.reads.put(Side.SOURCE, source.read);
+            return result;
+        } catch (RuntimeException | Error error) { result.fail(error); throw error; }
     }
 
     public Result finish() {
