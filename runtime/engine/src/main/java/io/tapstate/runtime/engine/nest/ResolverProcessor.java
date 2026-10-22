@@ -264,6 +264,12 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
         return failures.recording(this::tryProcessRecording);
     }
 
+    @Override
+    public boolean complete() {
+        // End of input can follow a backpressured final drain without another idle callback.
+        return tryProcess();
+    }
+
     private boolean tryProcessRecording() {
         // Anything already worked out goes first, and what this turn works out goes after it. A second look
         // that finds something has something to send, and a path that never empties what it queued would

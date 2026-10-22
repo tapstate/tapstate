@@ -1,5 +1,7 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.lifecycle.CheckpointDoc;
+
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.lifecycle.DesiredState;
@@ -45,10 +47,11 @@ class PipelineLifecycleServiceTest {
     private final FakeDesiredStore desired = new FakeDesiredStore();
     private final RecordingAuditStore audit = new RecordingAuditStore();
     /** Where the pipeline's fencing epoch stands, as the lifecycle service is allowed to see it. */
-    private Optional<Long> stateEpoch = Optional.of(7L);
+    private Optional<CheckpointDoc> checkpoint = Optional.of(
+            new CheckpointDoc("pl1", "RUNNING", 7L, FIXED));
     private final PipelineLifecycleService service = new PipelineLifecycleService(
             new ArtifactQueryService(artifacts), desired, new AuditGate(audit, FIXED_CLOCK),
-            pipelineId -> stateEpoch);
+            pipelineId -> checkpoint);
 
     @Test
     void startFromNewWritesRunningDesiredAtTheLatestRevision() {
@@ -59,6 +62,86 @@ class PipelineLifecycleServiceTest {
         assertThat(written).isEqualTo(new DesiredState("pl1", PipelineState.RUNNING,
                 revisionOf(PIPELINE_V1), false, assemblyOf(PIPELINE_V1), false));
         assertThat(desired.read("pl1")).contains(written);
+    }
+
+    @Test
+    void aCompletedRunAcceptsOneExplicitStartEvenThoughItsOldIntentStillSaysRunning() {
+        artifacts.save(PIPELINE_V1);
+        service.start("alice", "pl1");
+        checkpoint = Optional.of(new CheckpointDoc("pl1", "COMPLETED", 8L, FIXED));
+
+        assertThat(service.startable("pl1").pipeline().id()).isEqualTo("pl1");
+        DesiredState next = service.start("alice", "pl1");
+        assertThat(next.targetState()).isEqualTo(PipelineState.RUNNING);
+        assertThat(next.reassemble()).isTrue();
+        assertThat(next.rebuiltAtStateEpoch()).isEqualTo(8L);
+        TapstateException duplicate = catchThrowableOfType(TapstateException.class,
+                () -> service.start("alice", "pl1"));
+        assertThat(duplicate.code().code()).isEqualTo("lifecycle.illegal-transition");
+
+        checkpoint = Optional.of(new CheckpointDoc("pl1", "COMPLETED", 10L, FIXED));
+        assertThat(service.start("alice", "pl1").rebuiltAtStateEpoch()).isEqualTo(10L);
+    }
+
+    @Test
+    void aCompletionThatOvertookAClearingStartCannotAuthorizeAnotherStartOverIt() {
+        artifacts.save(PIPELINE_V1);
+        DesiredState pending = new DesiredState("pl1", PipelineState.RUNNING,
+                revisionOf(PIPELINE_V1), true, assemblyOf(PIPELINE_V1), true, 7L);
+        desired.save(pending);
+        checkpoint = Optional.of(new CheckpointDoc("pl1", "COMPLETED", 8L, FIXED));
+
+        TapstateException refused = catchThrowableOfType(TapstateException.class,
+                () -> service.start("alice", "pl1"));
+        assertThat(refused.code().code()).isEqualTo("lifecycle.illegal-transition");
+        assertThat(desired.read("pl1")).contains(pending);
+    }
+
+    @Test
+    void aNaturallyCompletedRunCanBeStoppedAndRerunWithEitherRetentionChoice() {
+        artifacts.save(PIPELINE_V1);
+        checkpoint = Optional.of(new CheckpointDoc("pl1", "COMPLETED", 8L, FIXED));
+        for (boolean purge : List.of(false, true)) {
+            desired.save(new DesiredState("pl1", PipelineState.RUNNING, revisionOf(PIPELINE_V1)));
+
+            DesiredState stopped = service.stop("alice", "pl1", purge);
+            assertThat(stopped.targetState()).isEqualTo(PipelineState.STOPPED);
+            assertThat(stopped.purgeState()).isEqualTo(purge);
+            DesiredState restarted = service.start("alice", "pl1");
+            assertThat(restarted.targetState()).isEqualTo(PipelineState.RUNNING);
+            assertThat(restarted.purgeState()).isEqualTo(purge);
+            assertThat(restarted.rebuildOwedAt(checkpoint.orElseThrow())).isTrue();
+        }
+    }
+
+    @Test
+    void anExplicitStopCanCancelAStartStillWaitingAtCompletion() {
+        artifacts.save(PIPELINE_V1);
+        checkpoint = Optional.of(new CheckpointDoc("pl1", "COMPLETED", 8L, FIXED));
+        desired.save(new DesiredState("pl1", PipelineState.RUNNING,
+                revisionOf(PIPELINE_V1), true, assemblyOf(PIPELINE_V1), true, 8L));
+
+        DesiredState stopped = service.stop("alice", "pl1", false);
+
+        assertThat(stopped.targetState()).isEqualTo(PipelineState.STOPPED);
+        assertThat(stopped.purgeState()).isFalse();
+        assertThat(stopped.reassemble()).isFalse();
+    }
+
+    @Test
+    void anOlderCheckpointCannotConsumeANewerAcceptedStart() {
+        artifacts.save(PIPELINE_V1);
+        checkpoint = Optional.of(new CheckpointDoc("pl1", "COMPLETED", 7L, FIXED));
+        DesiredState pending = new DesiredState("pl1", PipelineState.RUNNING,
+                revisionOf(PIPELINE_V1), false, assemblyOf(PIPELINE_V1), true, 8L);
+        desired.save(pending);
+
+        TapstateException refused = catchThrowableOfType(TapstateException.class,
+                () -> service.start("alice", "pl1"));
+
+        assertThat(refused).isNotNull();
+        assertThat(refused.code().code()).isEqualTo("lifecycle.illegal-transition");
+        assertThat(desired.read("pl1")).contains(pending);
     }
 
     @Test
@@ -145,7 +228,7 @@ class PipelineLifecycleServiceTest {
     void aFailedAuditRefusesTheWriteSoNoDesiredStateIsPersisted() {
         artifacts.save(PIPELINE_V1);
         PipelineLifecycleService gated = new PipelineLifecycleService(
-                new ArtifactQueryService(artifacts), desired, new AuditGate(new FailingAuditStore(), FIXED_CLOCK), pipelineId -> stateEpoch);
+                new ArtifactQueryService(artifacts), desired, new AuditGate(new FailingAuditStore(), FIXED_CLOCK), pipelineId -> checkpoint);
 
         TapstateException thrown = catchThrowableOfType(TapstateException.class, () -> gated.start("alice", "pl1"));
 
