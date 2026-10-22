@@ -53,7 +53,7 @@ public final class ValidationFieldCheck {
             ValidationValues.Row target, Optional<SampledSide> sourceSample, Optional<SampledSide> targetSample,
             Optional<GeneratedId> generatedId, BiPredicate<String, String> compatible,
             ValidationValueComparison.TraversalLimits limits, Builder root) {
-        return checkView(parent, path, source, target, sourceSample, targetSample, generatedId, compatible, limits, List.of(), Set.of(), root);
+        return checkView(parent, path, source, target, sourceSample, targetSample, generatedId, compatible, limits, List.of(), Set.of(), List.of(), root);
     }
 
     /**
@@ -66,7 +66,7 @@ public final class ValidationFieldCheck {
             ValidationValues.Row target, Optional<SampledSide> sourceSample, Optional<SampledSide> targetSample,
             Optional<GeneratedId> generatedId, BiPredicate<String, String> compatible,
             ValidationValueComparison.TraversalLimits limits, List<List<Object>> unavailablePaths, Builder root) {
-        return checkView(parent, path, source, target, sourceSample, targetSample, generatedId, compatible, limits, unavailablePaths, Set.of(), root);
+        return checkView(parent, path, source, target, sourceSample, targetSample, generatedId, compatible, limits, unavailablePaths, Set.of(), List.of(), root);
     }
 
     /** Defined fields override only the whole-row unknown marker, as established by explicit static rules. */
@@ -74,13 +74,29 @@ public final class ValidationFieldCheck {
             ValidationValues.Row target, Optional<SampledSide> sourceSample, Optional<SampledSide> targetSample,
             Optional<GeneratedId> generatedId, BiPredicate<String, String> compatible,
             ValidationValueComparison.TraversalLimits limits, List<List<Object>> unavailablePaths, Set<String> definedFields, Builder root) {
-        return checkView(parent, path, source, target, sourceSample, targetSample, generatedId, compatible, limits, unavailablePaths, definedFields, root);
+        return checkView(parent, path, source, target, sourceSample, targetSample, generatedId, compatible, limits, unavailablePaths, definedFields, List.of(), root);
+    }
+
+    /**
+     * Combines independently checked Nest arrays with ordinary fields in the same complete parent
+     * view. Evidence is valid only for these exact rows, observation, and builder; no arbitrary
+     * ignore paths are accepted. Unknown source paths remain separate and require source blocks.
+     * Nested members use their full ancestor observation and their own complete working views.
+     */
+    public static Result checkComposed(ValidationObservation parent, ValidationValues.Row source,
+            ValidationValues.Row target, Optional<SampledSide> sourceSample, Optional<SampledSide> targetSample,
+            Optional<GeneratedId> generatedId, BiPredicate<String, String> compatible,
+            ValidationValueComparison.TraversalLimits limits, List<List<Object>> unavailablePaths, Set<String> definedFields,
+            List<ValidationNestArrayFieldCheck.Checked> arrays, Builder root) {
+        return checkView(parent, List.of(), source, target, sourceSample, targetSample, generatedId, compatible, limits,
+                unavailablePaths, definedFields, arrays, root);
     }
 
     private static Result checkView(ValidationObservation parent, List<Object> path, ValidationValues.Row source,
             ValidationValues.Row target, Optional<SampledSide> sourceSample, Optional<SampledSide> targetSample,
             Optional<GeneratedId> generatedId, BiPredicate<String, String> compatible,
-            ValidationValueComparison.TraversalLimits limits, List<List<Object>> unavailablePaths, Set<String> definedFields, Builder root) {
+            ValidationValueComparison.TraversalLimits limits, List<List<Object>> unavailablePaths, Set<String> definedFields,
+            List<ValidationNestArrayFieldCheck.Checked> arrays, Builder root) {
         Objects.requireNonNull(root, "root");
         try {
             Objects.requireNonNull(parent, "parent");
@@ -95,7 +111,9 @@ public final class ValidationFieldCheck {
             List<Object> fieldPath = location.fieldPath();
             requireScope(parent, root);
             var masks = unavailable(parent, fieldPath, unavailablePaths, definedFields, limits.row().bytes(), root);
-            var unavailable = masks.paths(); var defined = masks.definedFields();
+            var composition = composed(parent, source, target, masks, arrays, limits.row().bytes(), limits.operations(), root);
+            var unavailable = composition.paths();
+            var defined = masks.definedFields();
             sourceSample.ifPresent(sample -> root.requireSampleRead(Side.SOURCE, sample));
             targetSample.ifPresent(sample -> root.requireSampleRead(Side.TARGET, sample));
             bounded(source, limits.row()); bounded(target, limits.row());
@@ -123,7 +141,8 @@ public final class ValidationFieldCheck {
                     comparedTarget = ValidationValues.ownRow(fields, limits.row());
                 }
             }
-            long differences = ValidationValueComparison.visitKnownDifferences(source, comparedTarget, compatible, limits, unavailable, defined, difference -> {
+            long differences = ValidationValueComparison.visitKnownDifferences(source, comparedTarget, compatible,
+                    new ValidationValueComparison.TraversalLimits(limits.row(), composition.remainingOperations()), unavailable, defined, difference -> {
                 var field = new ArrayList<Object>(fieldPath); field.addAll(difference.path());
                 Kind kind = switch (difference.kind()) {
                     case VALUE -> Kind.TARGET_VALUE;
@@ -140,7 +159,7 @@ public final class ValidationFieldCheck {
         }
     }
 
-    private record Masks(List<List<Object>> paths, Set<String> definedFields) {}
+    private record Masks(List<List<Object>> paths, Set<String> definedFields, long bytes) {}
     private static Masks unavailable(ValidationObservation parent, List<Object> base, List<List<Object>> paths,
             Set<String> definedFields, long maxBytes, Builder root) {
         if (paths == null || paths.size() > 256 || definedFields == null || definedFields.size() > 256)
@@ -165,7 +184,55 @@ public final class ValidationFieldCheck {
             root.requireBlocked(Check.STRUCTURE, location).requireBlocked(Check.VALUES, location);
             masks.add(List.copyOf(path));
         }
-        return new Masks(List.copyOf(masks), Set.copyOf(definedFields));
+        return new Masks(List.copyOf(masks), Set.copyOf(definedFields), bytes);
+    }
+
+    private record Composition(List<List<Object>> paths, long remainingOperations) {}
+    private static Composition composed(ValidationObservation parent, ValidationValues.Row source, ValidationValues.Row target,
+            Masks masks, List<ValidationNestArrayFieldCheck.Checked> arrays, long maxBytes, long operations, Builder root) {
+        if (arrays == null || arrays.size() > 256 - masks.paths().size()) throw ValidationError.invalid("fieldCheck.arrays");
+        if (arrays.isEmpty()) return new Composition(masks.paths(), operations);
+        var work = new MaskWork(operations);
+        long bytes = masks.bytes();
+        var paths = new ArrayList<>(masks.paths());
+        for (var array : arrays) {
+            if (array == null) throw ValidationError.invalid("fieldCheck.arrays");
+            work.step(1);
+            List<String> declared = array.require(parent, source, target, root);
+            bytes += 96L + 16L * declared.size();
+            for (String segment : declared) { work.step(1L + segment.length()); bytes += 48L + 2L * segment.length(); }
+            if (bytes > maxBytes) throw new io.tapstate.core.common.TapstateException(ValidationError.VALUE_LIMIT_EXCEEDED,
+                    java.util.Map.of("limit", "fieldCheck.arrays"), null);
+            for (var path : paths) {
+                work.step(1L + declared.getFirst().length());
+                if (path.isEmpty() && masks.definedFields().contains(declared.getFirst())) continue;
+                if (prefix(path, declared, work) || prefix(declared, path, work)) throw ValidationError.invalid("fieldCheck.arrayOverlap");
+            }
+            paths.add(new ArrayList<>(declared));
+        }
+        return new Composition(List.copyOf(paths), work.remaining);
+    }
+
+    private static boolean prefix(List<?> left, List<?> right, MaskWork work) {
+        work.step(1);
+        if (left.size() > right.size()) return false;
+        for (int i = 0; i < left.size(); i++) {
+            Object a = left.get(i); Object b = right.get(i);
+            work.step(1L + (a instanceof String text && b instanceof String other ? Math.min(text.length(), other.length()) : 0));
+            if (!a.equals(b)) return false;
+        }
+        return true;
+    }
+
+    private static final class MaskWork {
+        private long remaining;
+        private MaskWork(long operations) { remaining = operations; }
+        private void step(long amount) {
+            // Leave at least the root traversal step to the value walker.
+            if (amount >= remaining) throw new io.tapstate.core.common.TapstateException(ValidationError.VALUE_LIMIT_EXCEEDED,
+                    java.util.Map.of("limit", "fieldCheck.arrayOperations"), null);
+            remaining -= amount;
+        }
     }
 
     private static void record(Builder root, Kind kind, Location location, Optional<SampledSide> source, Optional<SampledSide> target) {

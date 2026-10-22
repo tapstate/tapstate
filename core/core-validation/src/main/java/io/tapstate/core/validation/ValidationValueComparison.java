@@ -68,7 +68,7 @@ public final class ValidationValueComparison {
         return visitKnownDifferences(source, target, compatible, limits, List.of(), consumer);
     }
 
-    /** Package boundary: the field checker first requires recorded source blocks for every path. */
+    /** Package boundary: the field checker proves source blocks or completed Nest checks for every skipped path. */
     static long visitKnownDifferences(ValidationValues.Row source, ValidationValues.Row target,
             BiPredicate<String, String> compatible, TraversalLimits limits, List<List<Object>> unavailable,
             Consumer<Difference> consumer) {
