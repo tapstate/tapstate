@@ -237,7 +237,7 @@ class RegistryConnectorProvisionerTest {
     }
 
     @Test
-    void refusesMismatchedStoreBytesBeforeCreatingTheCache(@TempDir Path dir) throws IOException {
+    void refusesMismatchedStoreBytesBeforePublishingTheCache(@TempDir Path dir) throws IOException {
         byte[] artifact = Files.readAllBytes(Synthetic.annotatedConnector(dir));
         InMemoryConnectorRegistry registry = new InMemoryConnectorRegistry();
         String hash = registry.register("orders", "1.3.5", RegistrationSource.SEED, artifact)
@@ -249,7 +249,7 @@ class RegistryConnectorProvisionerTest {
 
         assertSafeLoadFailure(() -> provisioner.resolve("orders"));
 
-        assertThat(cacheDir).doesNotExist();
+        assertThat(cacheDir).isEmptyDirectory();
         assertThat(registry.artifactCalls).isEqualTo(1);
     }
 

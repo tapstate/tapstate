@@ -110,14 +110,16 @@ public final class RegistryConnectorProvisioner implements ConnectorProvisioner 
             if (Files.exists(target)) {
                 return validatedCache(connectorId, contentHash, target);
             }
-            byte[] bytes = registry.artifact(contentHash).orElseThrow(() ->
-                    new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", connectorId), null));
-            validateContent(connectorId, contentHash, ContentHash.of(bytes));
             try {
                 Files.createDirectories(cacheDir);
                 Path tmp = Files.createTempFile(cacheDir, contentHash, ".tmp");
                 try {
-                    Files.write(tmp, bytes);
+                    try (var output = Files.newOutputStream(tmp)) {
+                        if (!registry.copyArtifactTo(contentHash, output)) {
+                            throw new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", connectorId), null);
+                        }
+                    }
+                    validatedCache(connectorId, contentHash, tmp);
                     Files.move(tmp, target);
                 } catch (FileAlreadyExistsException stagedElsewhere) {
                     // Keep the other stager's file and validate it before returning it.

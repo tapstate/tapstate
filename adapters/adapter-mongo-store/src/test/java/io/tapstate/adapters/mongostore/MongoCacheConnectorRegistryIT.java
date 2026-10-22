@@ -23,11 +23,19 @@ import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.bson.types.Binary;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -76,6 +84,92 @@ class MongoCacheConnectorRegistryIT {
             assertThat(all).extracting(r -> r.contentHash()).isSorted();
             assertThat(registry.findAll("example")).containsExactlyElementsOf(all);
             assertThat(registry.list()).containsExactlyElementsOf(all);
+        });
+    }
+
+    @Test void streamsLargerThanTheHeapRoundTripThroughRealGridFs(@TempDir Path dir) {
+        withFixture(f -> {
+            Path log = dir.resolve("heap.log");
+            var builder = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                    "-Xmx64m", "-XX:+UseSerialGC", "-cp",
+                    System.getProperty("surefire.test.class.path", System.getProperty("java.class.path")),
+                    StreamingHeapProbe.class.getName(), MONGO.getReplicaSetUrl(), f.database.getName());
+            for (String key : List.of("JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS")) builder.environment().remove(key);
+            Process child = builder.redirectErrorStream(true).redirectOutput(log.toFile()).start();
+            try {
+                assertThat(child.waitFor(60, TimeUnit.SECONDS)).as("real GridFS streaming completes").isTrue();
+                assertThat(child.exitValue()).withFailMessage("GridFS heap probe failed:%n%s", Files.readString(log)).isZero();
+            } finally { child.destroyForcibly(); }
+            assertThat(f.files().countDocuments()).isEqualTo(1);
+            assertThat(f.files().find().first().get("metadata", Document.class)).containsEntry("publication", "PUBLISHED");
+            assertThat(f.admissions()).isEqualTo(1);
+        });
+    }
+
+    public static final class StreamingHeapProbe {
+        public static void main(String[] args) throws Exception {
+            long length = 96L * 1024 * 1024;
+            assertThat(length).isGreaterThan(Runtime.getRuntime().maxMemory());
+            String hash = ContentHash.of(zeros(length));
+            try (var client = MongoClients.create(args[0])) {
+                var registry = new MongoCacheConnectorRegistry(client, client.getDatabase(args[1]), SCOPE, ACTIVE, ACTIVE);
+                assertThat(registry.register("large", "1", RegistrationSource.SEED, hash, length, zeros(length)).newlyRegistered()).isTrue();
+                var count = new java.util.concurrent.atomic.AtomicLong();
+                var output = new OutputStream() {
+                    @Override public void write(int value) { assertThat(value).isZero(); count.incrementAndGet(); }
+                    @Override public void write(byte[] bytes, int offset, int size) {
+                        for (int i = offset; i < offset + size; i++) if (bytes[i] != 0) throw new AssertionError("Corrupt bytes");
+                        count.addAndGet(size);
+                    }
+                };
+                assertThat(registry.copyArtifactTo(hash, output)).isTrue(); assertThat(count).hasValue(length);
+                assertThat(registry.register("other", "2", RegistrationSource.REGISTER, hash, length, zeros(length)).newlyRegistered()).isFalse();
+            }
+        }
+    }
+
+    private static InputStream zeros(long length) {
+        return new InputStream() {
+            private long remaining = length;
+            @Override public int read() { if (remaining == 0) return -1; remaining--; return 0; }
+            @Override public int read(byte[] target, int offset, int count) {
+                if (remaining == 0) return -1;
+                int take = (int) Math.min(count, remaining); Arrays.fill(target, offset, offset + take, (byte) 0);
+                remaining -= take; return take;
+            }
+        };
+    }
+
+    @Test void streamLengthHashAndReadFailuresNeverPublishAndCleanOnlyTheirOwnStage() {
+        withFixture(f -> {
+            var registry = f.registry();
+            assertUnreadable(() -> registry.register("bad", "1", RegistrationSource.SEED, HASH, JAR.length + 1,
+                    new ByteArrayInputStream(JAR)));
+            assertUnreadable(() -> registry.register("bad", "1", RegistrationSource.SEED, HASH, JAR.length - 1,
+                    new ByteArrayInputStream(JAR)));
+            assertUnreadable(() -> registry.register("bad", "1", RegistrationSource.SEED, ContentHash.of(new byte[0]), JAR.length,
+                    new ByteArrayInputStream(JAR)));
+            InputStream broken = new InputStream() {
+                private int remaining = 300_000;
+                @Override public int read() throws IOException { throw new IOException("private-sentinel"); }
+                @Override public int read(byte[] bytes, int offset, int length) throws IOException {
+                    if (remaining == 0) throw new IOException("private-sentinel");
+                    int take = Math.min(length, remaining); Arrays.fill(bytes, offset, offset + take, (byte) 0);
+                    remaining -= take; return take;
+                }
+            };
+            assertThatThrownBy(() -> registry.register("bad", "1", RegistrationSource.SEED, HASH, 600_000, broken)).isInstanceOf(IOException.class);
+            assertThat(f.files().countDocuments()).isZero(); assertThat(f.chunks().countDocuments()).isZero();
+            assertThat(f.admissions()).isZero();
+            registry.register("original", "1", RegistrationSource.SEED, JAR);
+            assertUnreadable(() -> registry.register("bad", "1", RegistrationSource.SEED, HASH, JAR.length, zeros(JAR.length)));
+            var output = new ByteArrayOutputStream(); assertThat(registry.copyArtifactTo(HASH, output)).isTrue();
+            assertThat(output.toByteArray()).isEqualTo(JAR); assertThat(f.files().countDocuments()).isEqualTo(1);
+            assertThat(registry.copyArtifactTo("missing", OutputStream.nullOutputStream())).isFalse();
+            assertThatThrownBy(() -> registry.copyArtifactTo(HASH, new OutputStream() {
+                @Override public void write(int value) throws IOException { throw new IOException("destination failed"); }
+            })).isInstanceOf(IOException.class);
+            assertThat(registry.artifact(HASH)).contains(JAR); assertThat(f.admissions()).isEqualTo(1);
         });
     }
 

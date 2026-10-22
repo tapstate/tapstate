@@ -1,5 +1,9 @@
 package io.tapstate.spi.store;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.util.List;
 import java.util.Optional;
 
@@ -20,6 +24,18 @@ public interface ConnectorRegistry {
      * store's to decide, not the caller's.
      */
     RegistrationOutcome register(String connectorId, String pdkApiVersion, RegistrationSource source, byte[] artifact);
+
+    /**
+     * Registers a caller-owned stream, verifying its declared hash and length even when already stored.
+     * Implementations with a streaming store override this compatibility bridge to avoid materializing
+     * the full artifact. Neither entry closes the input; only verified bytes may become visible.
+     */
+    default RegistrationOutcome register(String connectorId, String pdkApiVersion, RegistrationSource source,
+                                         String contentHash, long length, InputStream artifact) throws IOException {
+        var bytes = new ByteArrayOutputStream();
+        ArtifactStreams.copyVerified(artifact, bytes, contentHash, length);
+        return register(connectorId, pdkApiVersion, source, bytes.toByteArray());
+    }
 
     /** Every registered connector. */
     List<ConnectorRegistration> list();
@@ -47,6 +63,18 @@ public interface ConnectorRegistry {
 
     /** The artifact bytes stored under a content hash, or empty if none is stored. */
     Optional<byte[]> artifact(String contentHash);
+
+    /**
+     * Copies an artifact to a caller-owned destination, returning false when absent. The destination
+     * can contain partial bytes on failure and must remain unpublished until successful verification.
+     * Streaming stores override this compatibility bridge; the output is never closed here.
+     */
+    default boolean copyArtifactTo(String contentHash, OutputStream target) throws IOException {
+        var bytes = artifact(contentHash);
+        if (bytes.isEmpty()) return false;
+        target.write(bytes.orElseThrow());
+        return true;
+    }
 
     /**
      * The version of the certification that one instance of the artifact stored under {@code contentHash} may

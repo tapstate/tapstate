@@ -14,6 +14,7 @@ import com.mongodb.client.gridfs.GridFSBucket;
 import com.mongodb.client.gridfs.GridFSUploadStream;
 import com.mongodb.client.gridfs.model.GridFSUploadOptions;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.ArtifactStreams;
 import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.ConnectorRegistration;
 import io.tapstate.spi.store.ConnectorRegistry;
@@ -27,7 +28,11 @@ import org.bson.BsonMaximumSizeExceededException;
 import org.bson.BsonString;
 import org.bson.Document;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashSet;
@@ -68,10 +73,25 @@ final class MongoCacheConnectorRegistry implements ConnectorRegistry {
     @Override public RegistrationOutcome register(String connectorId, String pdkApiVersion, RegistrationSource source, byte[] artifact) {
         Objects.requireNonNull(connectorId, "connectorId"); Objects.requireNonNull(source, "source");
         byte[] captured = Objects.requireNonNull(artifact, "artifact").clone();
-        String hash = ContentHash.of(captured);
+        try {
+            return register(connectorId, pdkApiVersion, source, ContentHash.of(captured), captured.length,
+                    new ByteArrayInputStream(captured));
+        } catch (IOException impossible) { throw new IllegalStateException("In-memory artifact could not be read", impossible); }
+    }
+
+    @Override public RegistrationOutcome register(String connectorId, String pdkApiVersion, RegistrationSource source,
+                                                  String hash, long length, InputStream artifact) throws IOException {
+        Objects.requireNonNull(connectorId, "connectorId"); Objects.requireNonNull(source, "source");
+        Objects.requireNonNull(artifact, "artifact");
+        if (hash == null || !hash.matches("[0-9a-f]{64}") || length < 0) throw unreadable("connector-artifact");
         var registration = new ConnectorRegistration(connectorId, hash, pdkApiVersion, source);
         Stored existing = readHash(hash);
-        if (existing != null) return new RegistrationOutcome(existing.registration(), false);
+        if (existing != null) {
+            ArtifactStreams.copyVerified(artifact, guarded(OutputStream.nullOutputStream()), hash, length);
+            Stored current = readHash(hash);
+            if (current == null || !existing.id().equals(current.id())) throw unreadable(hash);
+            active(); return new RegistrationOutcome(existing.registration(), false);
+        }
         String upload = UUID.randomUUID().toString();
         BsonDocument id = uploadId(upload);
         String filename = "staging-" + upload;
@@ -84,12 +104,8 @@ final class MongoCacheConnectorRegistry implements ConnectorRegistry {
         try {
             active();
             stream = bucket.openUploadStream(id, filename, new GridFSUploadOptions().chunkSizeBytes(CHUNK_SIZE).metadata(stage));
-            for (int at = 0; at < captured.length;) {
-                int count = Math.min(CHUNK_SIZE, captured.length - at);
-                active(); ioAttempted = true;
-                stream.write(captured, at, count);
-                at += count; active();
-            }
+            ioAttempted = true;
+            ArtifactStreams.copyVerified(artifact, guarded(stream), hash, length);
             active(); ioAttempted = true; stream.close(); complete = true; active();
             publicationAttempted = true;
             var outcome = access.write(session -> {
@@ -97,7 +113,7 @@ final class MongoCacheConnectorRegistry implements ConnectorRegistry {
                 if (winner != null) return new RegistrationOutcome(winner.registration(), id.equals(winner.id()));
                 Document row = access.collection.find(session, new Document("_id", id)).first();
                 if (row == null || !row.keySet().equals(FILE_FIELDS) || !filename.equals(row.get("filename"))
-                        || !Long.valueOf(captured.length).equals(row.get("length")) || !Integer.valueOf(CHUNK_SIZE).equals(row.get("chunkSize"))
+                        || !Long.valueOf(length).equals(row.get("length")) || !Integer.valueOf(CHUNK_SIZE).equals(row.get("chunkSize"))
                         || !(row.get("uploadDate") instanceof Date) || !stage.equals(row.get("metadata"))) throw unreadable(hash);
                 Document published = access.stamp(MongoConnectorRegistry.metadata(connectorId, pdkApiVersion, source)
                         .append("publication", PUBLISHED).append("contentHash", hash));
@@ -107,8 +123,8 @@ final class MongoCacheConnectorRegistry implements ConnectorRegistry {
             });
             if (!outcome.newlyRegistered()) cleanup(id, hash, upload, publicationAttempted);
             return outcome;
-        } catch (RuntimeException original) {
-            RuntimeException failure = safeFailure(original, hash);
+        } catch (IOException | RuntimeException original) {
+            Throwable failure = original instanceof RuntimeException runtime ? safeFailure(runtime, hash) : original;
             boolean cleanupConfirmed = true;
             if (stream != null && !complete) {
                 try { stream.abort(); }
@@ -121,8 +137,18 @@ final class MongoCacheConnectorRegistry implements ConnectorRegistry {
                 if (!complete && original instanceof MongoException) cleanupConfirmed = false;
             }
             if (!cleanupConfirmed) failure.addSuppressed(cleanupUnconfirmed(hash, upload));
-            throw failure;
+            if (failure instanceof IOException io) throw io;
+            throw (RuntimeException) failure;
         }
+    }
+
+    private OutputStream guarded(OutputStream target) {
+        return new OutputStream() {
+            @Override public void write(int value) throws IOException { active(); target.write(value); active(); }
+            @Override public void write(byte[] bytes, int offset, int length) throws IOException {
+                active(); target.write(bytes, offset, length); active();
+            }
+        };
     }
 
     @Override public List<ConnectorRegistration> list() { return registrations(null); }
@@ -147,23 +173,33 @@ final class MongoCacheConnectorRegistry implements ConnectorRegistry {
         Objects.requireNonNull(contentHash, "contentHash");
         Stored original = readHash(contentHash);
         if (original == null) return Optional.empty();
-        return StoreIo.call(contentHash, () -> {
-            try {
-                active();
-                var bytes = new ByteArrayOutputStream();
-                try (var stream = bucket.openDownloadStream(original.id())) {
-                    byte[] buffer = new byte[8192]; int count;
-                    while ((count = stream.read(buffer)) != -1) { active(); bytes.write(buffer, 0, count); }
-                }
-                active(); byte[] result = bytes.toByteArray();
-                if (result.length != original.length() || !contentHash.equals(ContentHash.of(result))) throw unreadable(contentHash);
-                // The download is outside the metadata transaction; query the same original result again.
-                Stored current = readHash(contentHash);
-                if (current == null || !original.id().equals(current.id())) throw unreadable(contentHash);
-                active(); return Optional.of(result);
-            } catch (MongoGridFSException invalid) { active(); throw unreadable(contentHash); }
-            catch (RuntimeException failure) { active(); throw failure; }
-        });
+        var bytes = new ByteArrayOutputStream();
+        try { copyArtifact(original, contentHash, bytes); }
+        catch (IOException impossible) { throw new IllegalStateException("In-memory artifact could not be written", impossible); }
+        return Optional.of(bytes.toByteArray());
+    }
+
+    @Override public boolean copyArtifactTo(String contentHash, OutputStream target) throws IOException {
+        Objects.requireNonNull(contentHash, "contentHash"); Objects.requireNonNull(target, "target");
+        Stored original = readHash(contentHash);
+        if (original == null) return false;
+        copyArtifact(original, contentHash, target);
+        return true;
+    }
+
+    private void copyArtifact(Stored original, String contentHash, OutputStream target) throws IOException {
+        try {
+            active();
+            try (var stream = bucket.openDownloadStream(original.id())) {
+                ArtifactStreams.copyVerified(stream, guarded(target), contentHash, original.length());
+            }
+            active();
+            // The download is outside the metadata transaction; query the same original result again.
+            Stored current = readHash(contentHash);
+            if (current == null || !original.id().equals(current.id())) throw unreadable(contentHash);
+            active();
+        } catch (MongoGridFSException invalid) { active(); throw unreadable(contentHash); }
+        catch (RuntimeException failure) { active(); throw safeFailure(failure, contentHash); }
     }
 
     private Stored readHash(String hash) { return access.read(session -> findHash(session, hash)); }
