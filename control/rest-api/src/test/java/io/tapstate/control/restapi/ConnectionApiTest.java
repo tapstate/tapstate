@@ -463,7 +463,8 @@ class ConnectionApiTest {
         @Bean
         ConnectionTestService connectionTestService(
                 ConnectionProbe probe, ConnectionTestResultStore resultStore, AuditGate auditGate) {
-            return new ConnectionTestService(probe, resultStore, auditGate);
+            return new ConnectionTestService(probe, resultStore, auditGate, null,
+                    io.tapstate.control.core.SourceConnectionResolver.forAdHocConnections());
         }
 
         @Bean
@@ -484,7 +485,8 @@ class ConnectionApiTest {
         @Bean
         SchemaDiscoveryService schemaDiscoveryService(
                 SchemaDiscoveryProbe probe, SchemaStore schemaStore, AuditGate auditGate, Clock clock) {
-            return new SchemaDiscoveryService(probe, schemaStore, auditGate, clock);
+            return new SchemaDiscoveryService(probe, schemaStore, auditGate, clock, null,
+                    io.tapstate.control.core.SourceConnectionResolver.forAdHocConnections());
         }
 
         @Bean
