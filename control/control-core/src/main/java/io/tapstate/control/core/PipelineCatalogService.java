@@ -99,12 +99,13 @@ public final class PipelineCatalogService {
     }
 
     private PipelineCatalogItem toItem(String id, PipelineDraftSummary draft, ArtifactSummary artifact) {
-        boolean needsRecovery=artifact!=null && recoveryRequired.test(id);
-        PipelineStatus observation = observations.findStatus(id).orElse(null);
+        boolean hasArtifact = artifact != null;
+        boolean needsRecovery=hasArtifact && recoveryRequired.test(id);
+        PipelineStatus observation = hasArtifact ? observations.findStatus(id).orElse(null) : null;
         PipelineState observed = observation == null ? null : observation.state();
         PipelineState target;
         try {
-            target = desired.read(id).map(state -> state.targetState()).orElse(null);
+            target = hasArtifact ? desired.read(id).map(state -> state.targetState()).orElse(null) : null;
         } catch (TapstateException unreadable) {
             if (unreadable.code() != IoError.DOCUMENT_UNREADABLE) {
                 throw unreadable;
@@ -112,7 +113,6 @@ public final class PipelineCatalogService {
             LOG.log(Level.WARNING, "Ignoring unreadable desired state for Pipeline {0}", id);
             target = null;
         }
-        boolean hasArtifact = artifact != null;
         boolean recoveryAtRest=needsRecovery && (observed==null || observed==PipelineState.NEW || observed==PipelineState.STOPPED);
         PipelineCatalogItem.DisplayState state = recoveryAtRest
                 ? observed==null?PipelineCatalogItem.DisplayState.UNAVAILABLE:PipelineCatalogItem.DisplayState.valueOf(observed.name())

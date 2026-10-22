@@ -29,6 +29,28 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class PipelineCatalogServiceTest {
 
+    @Test void aDraftWithoutAnArtifactDoesNotReadRuntimeStateFromAnAbsentOrRetiredScope() {
+        var artifacts = new ArtifactQueryService(artifactStore(List.of()));
+        var drafts = new MemoryDraftStore(); drafts.seed(draft("draft-only", "Draft", null, 1));
+        var observations = new ObservationStore() {
+            public Optional<Observation> read(String id) { throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null); }
+            public void save(Observation value) { throw new AssertionError("a draft has no runtime observation"); }
+            public void delete(String id) { throw new AssertionError("a draft has no runtime observation"); }
+        };
+        var desired = new DesiredStore() {
+            public Optional<DesiredState> read(String id) { throw new AssertionError("a draft has no runtime intent"); }
+            public void save(DesiredState value) { throw new AssertionError("a draft has no runtime intent"); }
+            public List<String> pipelineIds() { throw new AssertionError("a draft has no runtime intent"); }
+            public void delete(String id) { throw new AssertionError("a draft has no runtime intent"); }
+        };
+        var service = new PipelineCatalogService(artifacts, new PipelineDraftService(drafts), desired,
+                new PipelineObservationQueryService(artifacts, observations));
+        var item = service.find("draft-only").orElseThrow();
+        assertThat(item.status().state()).isEqualTo(PipelineCatalogItem.DisplayState.NEW);
+        assertThat(item.status().displayState()).isEqualTo(PipelineCatalogItem.UiState.DRAFT);
+        assertThat(item.hasArtifact()).isFalse();
+    }
+
     @Test void anExplicitFullRequirementIsNotAnInventedObservationOrAPendingStop() {
         var artifacts=new ArtifactQueryService(artifactStore(List.of(pipeline("recover",null))));
         var desired=new MemoryDesiredStore();desired.save(intent("recover",PipelineState.STOPPED));
