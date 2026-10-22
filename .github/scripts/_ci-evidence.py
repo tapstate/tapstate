@@ -82,11 +82,14 @@ def close_at(text, start, left='(', right=')'):
     raise ValueError('unclosed source delimiter')
 
 
+ANNOTATION_NAME = re.compile(r'@\s*([\w$]+(?:\s*\.\s*[\w$]+)*)(?![\w$])')
+
+
 def annotation_spans(clean, start=0, end=None):
     end = len(clean) if end is None else end
     consumed = start
-    for found in re.finditer(r'@\s*([\w.]+)\b', clean[start:end]):
-        offset, finish = start + found.start(), start + found.end()
+    for found in ANNOTATION_NAME.finditer(clean, start, end):
+        offset, finish = found.start(), found.end()
         if offset < consumed:
             continue
         while finish < end and clean[finish].isspace():
@@ -98,7 +101,7 @@ def annotation_spans(clean, start=0, end=None):
             argument = (finish + 1, closing)
             finish = closing + 1
         consumed = finish
-        yield offset, finish, found.group(1), argument
+        yield offset, finish, re.sub(r'\s+', '', found.group(1)), argument
 
 
 def without_annotations(text):
@@ -290,11 +293,8 @@ def disabled_annotation(text, clean, position, floor=0, lookup=None, source=None
             if found is not None:
                 return found
         return None
-    prefix = clean[start:position]
-    found = re.search(r'@\s*(?:org\.junit\.jupiter\.api\.)?Disabled\b(?:\s*\((.*?)\))?', prefix, re.S)
-    if found is None:
-        return None
-    return text[start + found.start(1):start + found.end(1)] if found.group(1) is not None else ''
+    return next((annotation['argument'] for annotation in annotations
+                 if annotation['name'] in ('Disabled', 'org.junit.jupiter.api.Disabled')), None)
 
 
 def class_declarations(text, clean, package, lookup=None, source=None):
@@ -541,17 +541,19 @@ def declarations(text, outer, package, lookup=None, source=None):
     clean = masked(text)
     classes = class_declarations(text, clean, package, lookup, source)
     result, consumed = [], -1
-    for found in re.finditer(r'@\s*([\w.]+)\b', clean):
-        if found.start() < consumed or found.group(1).rsplit('.', 1)[-1] not in TEST_ANNOTATIONS:
+    for offset, unused_end, qualified, unused_argument in annotation_spans(clean):
+        if offset < consumed or qualified.rsplit('.', 1)[-1] not in TEST_ANNOTATIONS:
             continue
         # Start at this test annotation and collect following declaration annotations.
-        position, annotations = found.start(), {}
+        position, annotations = offset, {}
         while True:
-            annotation = re.match(r'\s*@\s*([\w.]+)\b', clean[position:])
+            while position < len(clean) and clean[position].isspace():
+                position += 1
+            annotation = ANNOTATION_NAME.match(clean, position)
             if not annotation:
                 break
-            name = annotation.group(1).rsplit('.', 1)[-1]
-            position += annotation.end()
+            name = re.sub(r'\s+', '', annotation.group(1)).rsplit('.', 1)[-1]
+            position = annotation.end()
             while position < len(clean) and clean[position].isspace():
                 position += 1
             argument = ''
@@ -577,27 +579,26 @@ def declarations(text, outer, package, lookup=None, source=None):
         elif 'ArchTest' in annotations:
             field = re.match(r'\s*(?:[\w<>\[\].?,]+\s+)+?(\w+)\s*=', clean[position:])
             if not field:
-                result.append(dict(unresolved='unsupported ArchTest declaration', offset=found.start()))
+                result.append(dict(unresolved='unsupported ArchTest declaration', offset=offset))
                 continue
             name = field.group(1)
             consumed = position + field.end()
             parameter_types, parameter_injected = [], []
         else:
-            result.append(dict(unresolved='unsupported test declaration', offset=found.start()))
+            result.append(dict(unresolved='unsupported test declaration', offset=offset))
             continue
         if 'ArchTest' not in annotations and re.search(r'\bprivate\b', clean[position:consumed]):
             continue
-        owner = next((c for c in reversed(classes) if c['start'] < found.start() < c['end']), None)
+        owner = next((c for c in reversed(classes) if c['start'] < offset < c['end']), None)
         if owner is None or not (owner['name'] == package + outer or owner['name'].startswith(package + outer + '$')):
             continue
         # Include preceding Disabled annotations in the declaration's contract.
-        method_disabled = (disabled_annotation(text, clean, position, owner['start'] + 1, lookup, source) if lookup else
-                           annotations.get('Disabled', disabled_annotation(text, clean, found.start(), owner['start'] + 1)))
+        method_disabled = disabled_annotation(text, clean, position, owner['start'] + 1, lookup, source)
         disabled_source = method_disabled if method_disabled is not None else owner['disabled_source']
         result.append(dict(**{'class': owner['name']}, method=name, annotations=annotations,
                            disabled_source=disabled_source, method_disabled_source=method_disabled,
                            class_disabled_source=owner['disabled_source'],
-                           parameter_types=parameter_types, parameter_injected=parameter_injected, declaration_sha256=digest(text[found.start():consumed].encode())))
+                           parameter_types=parameter_types, parameter_injected=parameter_injected, declaration_sha256=digest(text[offset:consumed].encode())))
     return result
 
 

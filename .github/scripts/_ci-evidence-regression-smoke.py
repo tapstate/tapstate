@@ -486,6 +486,98 @@ class SourceIdentityTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, 'ambiguous'):
                         lookup.resolve(source, 'sample.Hidden')
 
+    def test_qualified_annotation_tokens_reconcile_plain_cases_and_exported_hashes(self):
+        for separator in (' . ', '/* before */ . /* after */', '\n.\n'):
+            with self.subTest(separator=separator), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                annotation = '@' + separator.join('org.junit.jupiter.api.Test'.split('.'))
+                inventory, inv = self.inventory(root, '@Test void ordinary() {} ' + annotation + ' void dotted() {}')
+                self.assertTrue(inv['complete'], inv['unresolved'])
+                self.assertEqual({m['method'] for m in inv['methods']}, {'ordinary', 'dotted'})
+                report = root / 'core/target/surefire-reports/TEST-sample.IdentityTest.xml'
+                report.parent.mkdir(parents=True)
+                report.write_text('<testsuite name="sample.IdentityTest" tests="2" skipped="0" errors="0" failures="0">'
+                    '<testcase classname="sample.IdentityTest" name="ordinary"/>'
+                    '<testcase classname="sample.IdentityTest" name="dotted"/></testsuite>')
+                observation = root / 'observation.json'
+                evidence.reports(SimpleNamespace(root=str(root), inventory=str(inventory), lane='ci',
+                    artifact_manifest=None, shard_plan=None, class_gates=None, inputs=None, binding=None, output=str(observation)))
+                self.assertTrue(json.loads(observation.read_text())['complete'])
+                hashes = []
+                for source in (inventory, observation):
+                    target = source.with_suffix('.hashes.json')
+                    evidence.export_hashes(SimpleNamespace(input=str(source), output=str(target)))
+                    hashes.append({r['case_digest'] for r in json.loads(target.read_text())['cases']})
+                self.assertEqual(hashes[0], hashes[1])
+                self.assertEqual(len(hashes[0]), 2)
+
+    def test_qualified_disabled_tokens_preserve_markerless_template_skip(self):
+        for separator in (' . ', '/* before */ . /* after */', '\n.\n'):
+            with self.subTest(separator=separator), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                annotation = '@' + separator.join('org.junit.jupiter.api.Disabled'.split('.'))
+                inventory, inv = self.inventory(root, annotation + '("disabled reason") '
+                    '@ParameterizedTest @ValueSource(strings={"a", "b"}) void disabled(String value) {}')
+                self.assertEqual(inv['methods'][0]['mapping'], 'disabled-method')
+                self.assertEqual(len(inv['cases']), 1)
+                self.assertTrue(self.observe(root, inventory, 'disabled(String)')['complete'])
+                declarations = evidence.declarations((root / 'core/src/test/java/sample/IdentityTest.java').read_text(),
+                    'IdentityTest', 'sample.')
+                self.assertEqual(declarations[0]['disabled_source'], '"disabled reason"')
+
+    def test_qualified_provider_and_temp_dir_tokens_preserve_injected_arguments(self):
+        for separator in (' . ', '/* before */ . /* after */', '\n.\n'):
+            with self.subTest(separator=separator), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                def annotation(name):
+                    return '@' + separator.join(name.split('.'))
+                inventory, inv = self.inventory(root, '@ParameterizedTest '
+                    + annotation('org.junit.jupiter.params.provider.ValueSource') + '(strings={"a"}) '
+                    'void injected(String value, ' + annotation('org.junit.jupiter.api.io.TempDir') + ' java.nio.file.Path directory) {}')
+                self.assertTrue(inv['complete'], inv['unresolved'])
+                self.assertEqual(len(inv['methods']), 1)
+                expected = evidence.argument_digest([['java.lang.String', 'a'],
+                    ['injected', 'org.junit.jupiter.api.io.TempDir', 'java.nio.file.Path']])
+                self.assertEqual(inv['methods'][0]['argument_digests'], [expected])
+                marker = dict(schema=1, unique_id='dotted-annotation', stable=True, **{'class': 'sample.IdentityTest'},
+                    method='injected', argument_digest=expected)
+                markers = '\n'.join('tapstate.ci-case=' + json.dumps(marker | extra) for extra in
+                    [dict(phase='start'), dict(phase='finish', status='executed')])
+                self.assertTrue(self.observe(root, inventory, 'injected(String, Path)[1]', skipped=False, markers=markers)['complete'])
+
+    def test_qualified_before_all_tokens_preserve_class_gate_contract(self):
+        for separator in (' . ', '/* before */ . /* after */', '\n.\n'):
+            with self.subTest(separator=separator), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                self.inventory(root, '@Test void ordinary() {}')
+                source = root / 'core/src/test/java/sample/IdentityTest.java'
+                annotation = '@' + separator.join('org.junit.jupiter.api.BeforeAll'.split('.'))
+                source.write_text('package sample; class IdentityTest { ' + annotation + ' static void gate() { '
+                    'Assumptions.assumeTrue(System.getenv("TAPSTATE_ATLAS_TEST_URI") != null, "private test gate"); } }')
+                contracts = evidence.before_all_contracts(root, source, {})
+                self.assertEqual(len(contracts), 1)
+                self.assertEqual(contracts[0]['policy']['inputs'], ['TAPSTATE_ATLAS_TEST_URI'])
+
+    def test_qualified_annotations_do_not_authorize_foreign_disabled_or_unknown_providers(self):
+        for annotation in ('@sample.Disabled("metadata")', '@sample /* qualifier */ . Disabled("metadata")'):
+            for after_test in (False, True):
+                with self.subTest(annotation=annotation, after_test=after_test), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    inventory, inv = self.inventory(root, ('@Test ' + annotation if after_test else annotation + ' @Test')
+                        + ' void ordinary() {}', preamble='@java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.RUNTIME) '
+                            '@interface Disabled { String value(); }')
+                    self.assertTrue(inv['complete'], inv['unresolved'])
+                    self.assertIsNone(inv['methods'][0]['disabled_source'])
+                    self.assertTrue(self.observe(root, inventory, 'ordinary', skipped=False)['complete'])
+                    text = (root / 'core/src/test/java/sample/IdentityTest.java').read_text()
+                    self.assertIsNone(evidence.declarations(text, 'IdentityTest', 'sample.')[0]['disabled_source'])
+        with tempfile.TemporaryDirectory() as temporary:
+            _, inv = self.inventory(Path(temporary), '@org . junit . jupiter . params . ParameterizedTest '
+                '@org . junit . jupiter . params . provider . MethodSource("unresolvedProvider") void computed(String value) {}')
+            self.assertEqual(len(inv['methods']), 1)
+            self.assertFalse(inv['complete'])
+            self.assertIsNone(inv['methods'][0]['parameters'])
+
     def test_before_all_does_not_read_annotation_argument_strings_as_callbacks(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
