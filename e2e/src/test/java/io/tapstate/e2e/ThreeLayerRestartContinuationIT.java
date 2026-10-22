@@ -3,16 +3,11 @@ package io.tapstate.e2e;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.tapstate.adapters.mongostore.MongoCacheDomain;
-import io.tapstate.adapters.mongostore.MongoConfigurationBootstrap;
 import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
-import io.tapstate.app.BCryptPasswordHasher;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
-import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.store.StorageBinding;
-import io.tapstate.spi.store.StorageSetupScope;
-import io.tapstate.spi.store.User;
 import io.tapstate.spi.store.*;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.lifecycle.DesiredState;
@@ -112,21 +107,8 @@ class ThreeLayerRestartContinuationIT {
     }
 
     private static void prepareStorage(String configUri, String cacheDb, String targetUri, String cluster) {
-        var scope = new StorageSetupScope(cluster, "installation", "setup", 1);
         var binding = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB, CACHE.getReplicaSetUrl(cacheDb), cacheDb, null);
-        try (var configuration = MongoConfigurationBootstrap.prepare(
-                new MongoConnectionSettings(configUri, null, Duration.ofSeconds(5)), cluster, "installation", "setup", 1)) {
-            var target = new SourceResource("views", null, "mongodb", Map.of("isUri", true, "uri", targetUri),
-                    null, null, null, null);
-            var committed = configuration.bindings().commitWithFirstCache(scope, StorageBinding.Mode.OP, binding, target);
-            try (var cache = MongoCacheDomain.connect(binding, Duration.ofSeconds(5), "fixture")) {
-                cache.prepareFirstAuth(committed.firstCreation().orElseThrow());
-                cache.prepareInitialBusiness(committed.preparation(), () -> {});
-            }
-            configuration.bindings().complete(scope);
-            configuration.firstAdmin().create(configuration.firstAdmin().load().orElseThrow().scope(),
-                    new User("admin", new BCryptPasswordHasher().hash("native-restart-password"), "admin"));
-        }
+        NativeMongoStorageFixture.prepare(configUri, binding, targetUri, cluster);
     }
 
     @org.junit.jupiter.params.ParameterizedTest
@@ -206,7 +188,7 @@ class ThreeLayerRestartContinuationIT {
 
     private static ControlPlane login(RealProcessServer server) {
         var control = new ControlPlane(server.baseUrl());
-        control.login("admin", "native-restart-password");
+        control.login(NativeMongoStorageFixture.USER, NativeMongoStorageFixture.PASSWORD);
         return control;
     }
 
