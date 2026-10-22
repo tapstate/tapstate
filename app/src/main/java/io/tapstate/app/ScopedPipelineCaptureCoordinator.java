@@ -137,13 +137,8 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         }
         @Override public boolean loadDelivered(String pipeline) { requireId(pipeline); var held=current(); if(held==null || !held.snapshot || held.sources.isEmpty())return true;
             requireSession(held);if(held.bounded)return stores.boundedLoads().complete(original);
-            return held.sources.values().stream().allMatch(source -> {
-                ConsumerOffset cursor;
-                if(source.shared){var progress=source.srs.consumers().progress(source.consumer.context()).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
-                    if(progress.membershipRevision()!=source.consumer.membershipRevision())throw refused();cursor=progress.cursor();}
-                else {var progress=source.channels.load(source.direct.context());held.bindings.direct().get(source.id).requireOriginal(progress);cursor=progress.cursor();}
-                return cursor.snapshotCompletedTables().containsAll(source.selected.tables());
-            }); }
+            return held.sources.values().stream().allMatch(source ->
+                    streamingCursor(held,source).snapshotCompletedTables().containsAll(source.selected.tables())); }
         @Override public SnapshotReading snapshotProgress(String pipeline) { requireId(pipeline); var held=current(); return held==null?SnapshotReading.NONE:snapshotReading(held); }
         @Override public SnapshotReading runSnapshotProgress(String pipeline) { requireId(pipeline); var held=current(); return held==null?SnapshotReading.NONE:runSnapshotReading(held); }
         private Session current() { synchronized(ScopedPipelineCaptureCoordinator.this) { return sessions.get(original); } }
@@ -350,23 +345,45 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         requireSession(session); if(!session.snapshot)return SnapshotReading.NONE;
         var state=stores.pipelines().snapshotStates(session.original.scope(),claim(session.original),() -> requireSession(session));
         var result=new LinkedHashMap<String,TableSnapshot>();
-        boolean landed=session.bounded && stores.boundedLoads().complete(session.original);
-        for(var source:session.sources.values())for(String table:source.completed) {
-            var count=state.count(source.id,table,source.snapshotEpoch);
-            if(count.isPresent())result.put(session.label(source.id,table),new TableSnapshot(count.getAsLong(),
-                    landed?count.getAsLong():null,landed?100:null,landed));
+        boolean boundedLanded=session.bounded && stores.boundedLoads().complete(session.original);
+        for(var source:session.sources.values()) {
+            var confirmed=session.bounded?List.<String>of():streamingCursor(session,source).snapshotCompletedTables();
+            for(String table:source.completed) {
+                boolean landed=boundedLanded || confirmed.contains(table);
+                var count=state.count(source.id,table,source.snapshotEpoch);
+                if(count.isPresent())result.put(session.label(source.id,table),new TableSnapshot(count.getAsLong(),
+                        landed?count.getAsLong():null,landed?100:null,landed));
+            }
         }
         requireSession(session); return new SnapshotReading(result,session.began);
     }
     private SnapshotReading runSnapshotReading(Session session) {
         requireSession(session); if(!session.snapshot)return SnapshotReading.NONE;
         var result=new LinkedHashMap<String,TableSnapshot>();
-        boolean landed=session.bounded && stores.boundedLoads().complete(session.original);
-        for(var source:session.sources.values())for(String table:source.selected.tables()) {
-            long rows=source.rows.getOrDefault(table,0L);
-            result.put(session.label(source.id,table),new TableSnapshot(rows,landed?rows:null,landed?100:null,landed));
+        boolean boundedLanded=session.bounded && stores.boundedLoads().complete(session.original);
+        for(var source:session.sources.values()) {
+            var confirmed=session.bounded?List.<String>of():streamingCursor(session,source).snapshotCompletedTables();
+            for(String table:source.selected.tables()) {
+                boolean landed=boundedLanded || confirmed.contains(table);
+                long rows=source.rows.getOrDefault(table,0L);
+                result.put(session.label(source.id,table),new TableSnapshot(rows,landed?rows:null,landed?100:null,landed));
+            }
         }
         requireSession(session); return new SnapshotReading(result,session.began);
+    }
+
+    private ConsumerOffset streamingCursor(Session session,Source source) {
+        ConsumerOffset cursor;
+        if(source.shared) {
+            var progress=source.srs.consumers().progress(source.consumer.context()).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
+            if(!progress.context().equals(source.consumer.context()) || progress.membershipRevision()!=source.consumer.membershipRevision())throw refused();
+            cursor=progress.cursor();
+        } else {
+            var progress=source.channels.load(source.direct.context());
+            session.bindings.direct().get(source.id).requireOriginal(progress);cursor=progress.cursor();
+        }
+        if(session.snapshot && cursor.snapshotEpoch()!=source.snapshotEpoch)throw refused();
+        return cursor;
     }
     private final class Physical {
         final AtomicBoolean live=new AtomicBoolean(true);final Owner owner;NativeSrsCaptureRunUnit.Tail tail;final Runnable guard=this::require;

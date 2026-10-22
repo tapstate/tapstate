@@ -60,6 +60,34 @@ class ScopedPipelineCaptureCoordinatorTest {
         }
     }
 
+    @Test void streamingSnapshotProgressRequiresItsOwnDurableCompletionMarker() throws Exception {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var run = f.coordinator.forRun(SCOPE, PIPELINE, ORIGINAL);
+            run.startCapture("flow", f.snapshot(), f.models());
+            assertThat(run.loadDelivered("flow")).isFalse();
+            assertThat(run.snapshotProgress("flow").byTable().get("orders"))
+                    .isEqualTo(new TableSnapshot(0, null, null, false));
+            f.streamingProgress.set(f.progress(true, 1, 1));
+            assertThat(run.loadDelivered("flow")).isTrue();
+            assertThat(run.snapshotProgress("flow").byTable().get("orders"))
+                    .isEqualTo(new TableSnapshot(0, 0L, 100, true));
+            assertThat(run.runSnapshotProgress("flow").byTable().get("orders"))
+                    .isEqualTo(new TableSnapshot(0, 0L, 100, true));
+        }
+    }
+
+    @ParameterizedTest @ValueSource(strings = {"missing", "membership", "snapshot"})
+    void streamingSnapshotReadCannotBorrowAnotherProgressIdentity(String damage) throws Exception {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var run = f.coordinator.forRun(SCOPE, PIPELINE, ORIGINAL);
+            run.startCapture("flow", f.snapshot(), f.models());
+            f.streamingProgress.set("missing".equals(damage) ? null
+                    : f.progress(true, "membership".equals(damage) ? 2 : 1, "snapshot".equals(damage) ? 2 : 1));
+            assertThatThrownBy(() -> run.snapshotProgress("flow")).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> run.runSnapshotProgress("flow")).isInstanceOf(TapstateException.class);
+        }
+    }
+
     @Test void currentRunCountsDoNotAdoptTheRetainedSnapshotTotal() throws Exception {
         try(var f=new Fixture()) {
             var run=f.coordinator.forRun(SCOPE,PIPELINE,ORIGINAL); run.startCapture("flow",f.snapshot(),f.models());
@@ -179,9 +207,13 @@ class ScopedPipelineCaptureCoordinatorTest {
         final AtomicInteger opened=new AtomicInteger(),closedPorts=new AtomicInteger(),readRows=new AtomicInteger(),rowCount=new AtomicInteger(1);
         final AtomicReference<Throwable> closeFailure=new AtomicReference<>();
         final WorkloadClaim capture;
+        final SrsConsumerContext streamingContext = new SrsConsumerContext(new SrsConsumerKey("mck-key", "flow", "input"), 7);
+        final AtomicReference<SrsConsumerProgress> streamingProgress = new AtomicReference<>();
+        Fixture(ReadMode mode) { this(List.of("input"), 8, mode); }
         Fixture() { this(List.of("input")); }
         Fixture(List<String> ids) { this(ids,8); }
-        Fixture(List<String> ids,int capacity) {
+        Fixture(List<String> ids,int capacity) { this(ids, capacity, ReadMode.SNAPSHOT_ONLY); }
+        Fixture(List<String> ids,int capacity,ReadMode mode) {
             buffer=new SnapshotBuffer(capacity);
             for(String id:ids) {
                 var definition=new SourceResource(id,null,"fixture",Map.of("database","x"),SourceMode.CDC,List.of(TableRef.literal("orders")),new Srs("key",null,null,null,true),null);
@@ -189,13 +221,16 @@ class ScopedPipelineCaptureCoordinatorTest {
             }
             source=definitions.getFirst();
             var pipeline=new PipelineResource("flow",null,ids.stream().<SourceRef>map(id -> SourceRef.spec(id,true)).toList(),null,null,null,
-                    new Settings(null,null,null,null,ReadMode.SNAPSHOT_ONLY,"latest"),null);
+                    new Settings(null,null,null,null,mode,"latest"),null);
             memory.artifacts().create(pipeline);
-            String id=SourceCaptureIdentity.snapshotCapture("mck-key",Set.of("orders"));
-            var prepared=new CapturePreparation(BUSINESS,CapturePreparation.Mode.SNAPSHOT_ONLY,"mck-key",id,SourceCaptureIdentity.physical(source.connector(),source.config()),UUID.randomUUID().toString());
-            capture=new WorkloadClaim(new WorkloadClaimKey("cluster",WorkloadClaimType.CAPTURE,id),OWNER,1,0,1,Instant.now().plusSeconds(60));
+            boolean bounded = mode == ReadMode.SNAPSHOT_ONLY;
+            String id = bounded ? SourceCaptureIdentity.snapshotCapture("mck-key", Set.of("orders")) : "mck-key";
+            var prepared=new CapturePreparation(BUSINESS,bounded?CapturePreparation.Mode.SNAPSHOT_ONLY:CapturePreparation.Mode.SHARED_SRS,"mck-key",id,SourceCaptureIdentity.physical(source.connector(),source.config()),UUID.randomUUID().toString());
+            capture=new WorkloadClaim(new WorkloadClaimKey("cluster",WorkloadClaimType.CAPTURE,id),bounded?OWNER:new WorkloadOwner("remote","remote-boot"),1,0,1,Instant.now().plusSeconds(60));
             when(configuration.issueFirstCreate(any())).thenReturn(new CaptureCreationResult.AlreadyIssued(prepared));
-            when(cache.load(prepared)).thenReturn(new CaptureCacheState(prepared,WorkloadClaimFence.from(capture),Optional.empty()));
+            var cached = new CaptureCacheState(prepared, WorkloadClaimFence.from(capture),
+                    bounded ? Optional.empty() : Optional.of(streamingChain()));
+            when(cache.load(prepared)).thenReturn(cached);
             when(pipelines.snapshotStates(any(),any(),any())).thenReturn(snapshots);
             when(snapshots.advanceOrder(anyLong(),anyLong(),anyMap())).thenReturn(1L);
             when(snapshots.count(anyString(),anyString(),anyLong())).thenReturn(OptionalLong.of(1));
@@ -213,7 +248,47 @@ class ScopedPipelineCaptureCoordinatorTest {
             coordinator=new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(BUSINESS,pipelines,sources,configuration,cache,notes),
                     new ScopedPipelineCaptureCoordinator.Execution(() -> Optional.of(node),authorization,ownership,Duration.ofSeconds(10),() -> {},Clock.systemUTC()),
                     runtime,buffer,connectors,(original,config,guard,preparation,stream) -> { guard.run(); opened.incrementAndGet(); return new Port(config.node().nodeId(),guard,closedPorts,readRows,rowCount.get(),closeFailure); });
+            if (!bounded) streaming();
         }
+        private SrsConsumerProgress progress(boolean complete, long membership, long epoch) {
+            var key = new SrsModelKey("mck-key", "orders", "cache", 1, 0);
+            var cursor = new ConsumerOffset(streamingContext.key().consumerId(), Map.of("orders", 0L), null,
+                    complete ? List.of("orders") : List.of(), "seam", epoch, Map.of(), ConsumerProgressKind.SRS);
+            return new SrsConsumerProgress(streamingContext, membership, 1, cursor,
+                    new SrsSnapshotPin(epoch, "seam", Map.of("orders", key)), null, Map.of("orders", 0L));
+        }
+
+        private static SrsChainState streamingChain() {
+            return new SrsChainState("mck-key", "mck-key", "1h", 1, Set.of("orders"), Set.of("orders"),
+                    0, null, null, 1, 1);
+        }
+
+        private void streaming() {
+            when(ownership.acquire(any())).thenReturn(new CaptureOwnership.Permit(false, capture));
+            when(snapshots.count(anyString(), anyString(), anyLong())).thenReturn(OptionalLong.of(0));
+            var consumers = mock(SrsConsumerStore.class);
+            streamingProgress.set(progress(false, 1, 1));
+            when(consumers.find(streamingContext.key())).thenReturn(Optional.of(
+                    new SrsConsumerMembership(streamingContext, 1, false, Set.of("orders"), PIPELINE)));
+            when(consumers.progress(streamingContext)).thenAnswer(ignored -> Optional.ofNullable(streamingProgress.get()));
+            var chains = mock(SrsChainStore.class);
+            when(chains.load("mck-key")).thenReturn(Optional.of(streamingChain()));
+            var models = mock(SrsModelStore.class);
+            var key = new SrsModelKey("mck-key", "orders", "cache", 1, 0);
+            when(models.publishedForNewSnapshot(anyString(), anyMap())).thenReturn(Optional.of(Map.of("orders",
+                    new SrsModel(key, SrsRingbuffer.ringName("mck-key", "orders"), new SourceTable("orders", List.of(), List.of(), List.of()), 0))));
+            when(sources.srs(any(), any())).thenReturn(new SrsStores(chains, models, mock(SrsLogStore.class), consumers));
+            doAnswer(call -> {
+                var preparation = mock(SrsSnapshotPreparation.class);
+                when(preparation.request()).thenReturn(new SnapshotPreparation(1, new SourcePosition("seam")));
+                when(preparation.stillOwed()).thenReturn(List.of("orders"));
+                java.util.function.Function<SrsSnapshotPreparation, CapturePort> ports = call.getArgument(3);
+                ports.apply(preparation);
+                CaptureHandoff output = call.getArgument(4); output.loaded("orders");
+                return mock(CaptureRun.class);
+            }).when(runtime).beginSnapshot(any(), any(), anyLong(), any(), any(), any());
+        }
+
         ArtifactStore snapshot() { return ReadOnlyArtifactSnapshot.capture(memory.artifacts()); }
         SourceModelSnapshot models() { return SourceModelSnapshot.capture("flow",definitions,memory.schemas()); }
         @Override public void close() { try { coordinator.close(); } finally { runtime.close(); } }
