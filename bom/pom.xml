@@ -358,7 +358,7 @@
            connector's base class bootstraps the runtime through the host loader, and adapter-pdk pulls it
            as an unconditional test-scoped dependency for the real-connector regression. Managing the version
            pulls nothing on its own: a module gets the heavy tree only by declaring the runner (the
-           assembly root at runtime, that profile at test) or by depending on a module that does (the
+           assembly root at runtime, adapter-pdk at test) or by depending on a module that does (the
            tests that consume the assembly root). -->
       <dependency>
         <groupId>io.tapdata</groupId>
