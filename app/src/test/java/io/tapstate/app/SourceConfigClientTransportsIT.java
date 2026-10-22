@@ -18,6 +18,7 @@ import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.testsupport.JvmTestEnvironment;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
@@ -531,8 +532,9 @@ class SourceConfigClientTransportsIT {
     }
 
     private static void isolatedProcessEnvironment(ProcessBuilder builder) {
+        JvmTestEnvironment.configure(builder, Map.of());
         builder.environment().keySet().removeIf(name -> name.startsWith("TAPSTATE_") || name.startsWith("SPRING_")
-                || name.equals("JAVA_TOOL_OPTIONS") || name.equals("JDK_JAVA_OPTIONS") || name.equals("CLUSTER_ID"));
+                || name.equals("CLUSTER_ID"));
     }
 
     private static void stop(Process process) throws InterruptedException {
