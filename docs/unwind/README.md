@@ -99,8 +99,8 @@ table, remove business constraints, or rename unrelated unique fields to make a
 write succeed. Partial, expression, prefix, sparse or non-simple-collation unique
 indexes do not establish the required guarantee and block automatic separation.
 MySQL character-collated unique keys are conservatively refused, including binary
-collations with unproven padding semantics; numeric and binary key columns are
-supported. PostgreSQL nondeterministic collations are refused. A compatible
+collations with unproven padding semantics. PostgreSQL nondeterministic collations
+are refused. A compatible
 composite primary key does not exempt conflicting secondary business indexes.
 Existing targets whose connectors cannot expose exact constraint metadata are
 refused until that metadata can be verified.
