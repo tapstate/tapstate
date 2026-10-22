@@ -7,6 +7,7 @@ import java.io.BufferedReader;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.net.URI;
+import java.net.ProxySelector;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
@@ -34,6 +35,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
     OpenAiCompatibleClient(Function<String, URI> requestUriFactory) {
         this.requestUriFactory = java.util.Objects.requireNonNull(requestUriFactory);
         this.http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10))
+                .proxy(ProxySelector.getDefault())
                 .followRedirects(HttpClient.Redirect.NEVER).build();
     }
     @Override public void check(AiProviderSettings settings) {

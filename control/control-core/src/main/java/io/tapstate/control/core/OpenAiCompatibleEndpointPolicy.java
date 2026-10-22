@@ -5,6 +5,7 @@ import java.net.Inet4Address;
 import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.net.URI;
+import java.net.ProxySelector;
 import java.net.UnknownHostException;
 import java.util.Map;
 
@@ -35,10 +36,14 @@ final class OpenAiCompatibleEndpointPolicy {
     }
 
     static URI requestUri(String baseUrl) {
-        return requestUri(baseUrl, InetAddress::getAllByName);
+        return requestUri(baseUrl, InetAddress::getAllByName, ProxySelector.getDefault());
     }
 
     static URI requestUri(String baseUrl, AddressResolver resolver) {
+        return requestUri(baseUrl, resolver, null);
+    }
+
+    static URI requestUri(String baseUrl, AddressResolver resolver, ProxySelector proxySelector) {
         String normalized = normalizedBaseUrl(baseUrl);
         URI base = URI.create(normalized);
         InetAddress[] addresses;
@@ -47,8 +52,17 @@ final class OpenAiCompatibleEndpointPolicy {
         } catch (UnknownHostException | RuntimeException error) {
             throw providerUnavailable();
         }
+        boolean proxied;
+        try {
+            proxied = proxySelector != null && !base.getHost().matches("[0-9.]+")
+                    && proxySelector.select(base).stream()
+                    .anyMatch(proxy -> proxy.type() == java.net.Proxy.Type.HTTP);
+        } catch (RuntimeException error) {
+            throw providerUnavailable();
+        }
         if (addresses == null || addresses.length == 0
-                || java.util.Arrays.stream(addresses).anyMatch(address -> !isPublicAddress(address))) {
+                || java.util.Arrays.stream(addresses).anyMatch(address ->
+                        !isPublicAddress(address) && !(proxied && isFakeProxyAddress(address)))) {
             throw providerUnavailable();
         }
         String path = base.getRawPath();
@@ -95,6 +109,13 @@ final class OpenAiCompatibleEndpointPolicy {
                             && bytes[2] == 0x0d && Byte.toUnsignedInt(bytes[3]) == 0xb8);
         }
         return false;
+    }
+
+    private static boolean isFakeProxyAddress(InetAddress address) {
+        if (!(address instanceof Inet4Address)) return false;
+        byte[] bytes = address.getAddress();
+        return Byte.toUnsignedInt(bytes[0]) == 198
+                && (Byte.toUnsignedInt(bytes[1]) == 18 || Byte.toUnsignedInt(bytes[1]) == 19);
     }
 
     private static TapstateException providerUnavailable() {
