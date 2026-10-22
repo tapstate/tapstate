@@ -61,8 +61,8 @@ public final class ControlOperations {
     // infer it: a remote model reads this text and nothing else before deciding to call it.
     public static final Operation ARTIFACT_DELETE = mcp(
             "artifact.delete", Scope.WRITE, true,
-            "Permanently remove one applied resource of any kind by id. This is not reversible and leaves "
-                    + "no tombstone; restoring means applying the resource again. The expectedContentHash "
+            "Permanently remove one applied resource of any kind by id. This is not reversible; restoring "
+                    + "means applying the resource again after its private resources are retired. The expectedContentHash "
                     + "must be the hash of the version just read, and the removal is refused if the stored "
                     + "version has moved on, if another resource still references the id, or if the id is a "
                     + "pipeline that is not stopped.");

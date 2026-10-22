@@ -541,7 +541,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     public DeleteOutcome delete(URI baseUrl, String credential, String id, String expectedContentHash) {
         try {
             HttpRequest.Builder builder = authed(
-                    baseUrl, "/api/artifacts/" + urlSegment(id), credential);
+                    baseUrl, "/api/artifacts/" + urlSegment(id), credential, heavyTimeout);
             // Send no If-Match at all rather than an empty one when the caller supplied no precondition:
             // the server tells "you sent none" (428) apart from "yours is stale" (412), and an empty
             // header would turn the first into the second.

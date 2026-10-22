@@ -34,7 +34,10 @@ class CliTest {
     }
 
     private static Run run(String... args) {
-        CommandLine cl = Cli.newCommandLine();
+        return run(Cli.newCommandLine(), args);
+    }
+
+    private static Run run(CommandLine cl, String... args) {
         StringWriter out = new StringWriter();
         StringWriter err = new StringWriter();
         cl.setOut(new PrintWriter(out));
@@ -705,9 +708,11 @@ class CliTest {
         // the grammar is the half of the answer a description cannot carry: `schema` taking an optional
         // table, `status` taking --watch, and which verbs accept -o at all were discoverable only by
         // typing the verb wrong and reading the complaint
-        // read as words rather than as lines: a grammar or a summary longer than the help width wraps, and
-        // where it breaks is the renderer's choice, not part of what the help says
-        Run r = run(verb, "--help");
+        // Verify the grammar independently of wrapping, which can split a filename after its dot.
+        // The ordinary-width layout has its own witness above.
+        CommandLine command = Cli.newCommandLine();
+        command.getSubcommands().get(verb).getCommandSpec().usageMessage().width(240);
+        Run r = run(command, verb, "--help");
         String words = r.out().replaceAll("\\s+", " ");
         assertThat(words).contains(Cli.VERB_HELP.get(verb).operands());
         assertThat(words).contains(Cli.VERB_HELP.get(verb).summary());
