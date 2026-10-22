@@ -42,6 +42,9 @@ class StorageMinimumStartupTest {
     @Test void livenessRemainsAvailableAndLoginReportsItsMissingDependency() throws Exception {
         var client = HttpClient.newHttpClient();
         assertThat(client.send(HttpRequest.newBuilder(base.resolve("/healthz")).GET().build(), HttpResponse.BodyHandlers.ofString()).statusCode()).isEqualTo(200);
+        var version = client.send(HttpRequest.newBuilder(base.resolve("/version")).GET().build(), HttpResponse.BodyHandlers.ofString());
+        assertThat(version.statusCode()).isEqualTo(200);
+        assertThat(((Map<?,?>)JsonReader.parse(version.body())).get("dataVersion")).isNull();
         var response = client.send(HttpRequest.newBuilder(base.resolve("/auth/login")).header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString("{\"username\":\"admin\",\"password\":\"sentinel-password\"}")).build(), HttpResponse.BodyHandlers.ofString());
         assertThat(response.statusCode()).isEqualTo(503);

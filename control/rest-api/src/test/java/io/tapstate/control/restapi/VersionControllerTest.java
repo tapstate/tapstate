@@ -53,6 +53,15 @@ class VersionControllerTest {
     }
 
     @Test
+    void aSameProcessSetupPublishesTheVerifiedConfigurationVersionWhenItBecomesKnown() {
+        var installed = new java.util.concurrent.atomic.AtomicReference<Integer>();
+        var controller = new VersionController(installed::get);
+        assertThat(controller.version().getBody()).containsEntry("dataVersion", null);
+        installed.set(1);
+        assertThat(controller.version().getBody()).containsEntry("dataVersion", 1);
+    }
+
+    @Test
     void theVersionIsTheSubstitutedValueTheBuildFilteredIn() {
         assertThat(VersionController.versionIn(properties("version=0.4.0\n"))).isEqualTo("0.4.0");
     }

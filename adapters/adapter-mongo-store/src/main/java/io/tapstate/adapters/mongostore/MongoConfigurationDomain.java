@@ -45,6 +45,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     private final MongoFirstAdminStore firstAdmin;
     private final MongoConfigurationDraftStore drafts;
     private final String clusterId;
+    private final int installedSchemaVersion;
     private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
 
     MongoConfigurationDomain(MongoConnection connection, String clusterId) {
@@ -67,6 +68,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
             throw new TapstateException(MigrationError.DATA_NEWER_THAN_BINARY,
                     Map.of("installed", String.valueOf(installed), "supported", String.valueOf(SCHEMA_VERSION)), null);
         }
+        this.installedSchemaVersion = installed;
         Document version = StoreIo.call(() -> durable(SystemCollections.CONFIGURATION_VERSION.on(database))
                 .find(new Document("_id", ConfigurationVersion.ID)).first());
         if (version == null || !(version.get("revision") instanceof Long revision)
@@ -124,6 +126,8 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     }
 
     public String clusterId() { requireOpen(); return clusterId; }
+    /** The CONFIG schema fact verified when this domain was opened, not a CACHE readiness signal. */
+    public int schemaVersion() { requireOpen(); return installedSchemaVersion; }
     public String databaseName() { requireOpen(); return connection.database().getName(); }
 
     public ArtifactStore artifacts() {

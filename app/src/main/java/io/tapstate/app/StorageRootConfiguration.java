@@ -58,6 +58,9 @@ class StorageRootConfiguration {
         return cloud.cloud() ? AuthenticationMode.CLOUD : AuthenticationMode.ON_PREM;
     }
     @Bean OperationRegistry operationRegistry() { return ControlOperations.registry(); }
+    @Bean io.tapstate.control.restapi.SystemDataVersion systemDataVersion(StorageRoot root) {
+        return () -> root.runtime().configuration().map(io.tapstate.adapters.mongostore.MongoConfigurationDomain::schemaVersion).orElse(null);
+    }
     @Bean CredentialAuthenticator credentialAuthenticator(StorageRoot root) {
         return CredentialAuthenticator.scoped(presented -> root.authentication().credentials().authenticateContext(presented));
     }
