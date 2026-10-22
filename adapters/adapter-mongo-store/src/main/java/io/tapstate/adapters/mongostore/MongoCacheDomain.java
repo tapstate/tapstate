@@ -206,6 +206,13 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         });
     }
 
+    /** Admission validates retained business structures and configured indexes without repairing them. */
+    public void verifyBusinessReady(CacheBusinessScope expected) {
+        loadBusinessScope(expected);
+        new MongoCacheMetadataStructure(database, rateRetention).verifyBusiness();
+        loadBusinessScope(expected);
+    }
+
     /** Controlled continuation requires the original operation and already retained authentication facts. */
     public CacheBusinessScope prepareInitialBusiness(io.tapstate.spi.store.CachePreparation original, Runnable requireActive) {
         Objects.requireNonNull(original, "original"); Objects.requireNonNull(requireActive, "requireActive");

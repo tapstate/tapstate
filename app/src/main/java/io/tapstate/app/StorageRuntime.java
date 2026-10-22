@@ -216,7 +216,7 @@ final class StorageRuntime implements AutoCloseable {
         }
         void verifyBusiness() {
             requireActive();
-            try { cache.loadBusinessScope(preparation.businessScope()); requireActive(); businessReady = true; }
+            try { cache.verifyBusinessReady(preparation.businessScope()); requireActive(); businessReady = true; }
             catch (RuntimeException | Error unavailable) { businessReady = false; throw unavailable; }
         }
         void requireAuthentication() { requireActive(); if (!authReady) throw unavailable(); }

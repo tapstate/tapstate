@@ -1503,12 +1503,14 @@ class ManagedMongoStoreIsolationIT {
     }
 
     private ConfigurableApplicationContext nativeRoot(String configurationUri) {return nativeRoot(configurationUri,work.resolve("no-seeds"));}
-    private ConfigurableApplicationContext nativeRoot(String configurationUri,Path seeds) {
+    private ConfigurableApplicationContext nativeRoot(String configurationUri, Path seeds, String... overrides) {
         return new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated()).run(
+                java.util.stream.Stream.concat(java.util.stream.Stream.of(
                 "--server.address=127.0.0.1", "--server.port=0", "--tapstate.hz.member-port=0", "--logging.level.root=ERROR",
                 "--tapstate.hz.jet.cooperative-thread-count=2", "--SDK_STATUS_SENDER_ENABLED=false",
                 "--tapstate.store.mongo.uri=" + configurationUri, "--tapstate.control.auth.jwt-secret=loss-restart-stable-test-key",
-                "--tapstate.connectors.seed-dir=" + seeds, "--tapstate.connectors.plugins-dir=" + work.resolve("plugins"));
+                "--tapstate.connectors.seed-dir=" + seeds, "--tapstate.connectors.plugins-dir=" + work.resolve("plugins")),
+                java.util.Arrays.stream(overrides)).toArray(String[]::new));
     }
     private static org.springframework.web.client.RestClient rootClient(ConfigurableApplicationContext application) {
         int port = ((org.springframework.boot.web.server.context.WebServerApplicationContext)application).getWebServer().getPort();
@@ -1846,352 +1848,202 @@ class ManagedMongoStoreIsolationIT {
     @Test
     void twoClusterUsersCanUseOnlyTheirOwnThreeDatabasesAndRecoverAfterRestart() throws Exception {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
-        String a = "isolation_a_" + suffix;
-        String b = "isolation_b_" + suffix;
-        String userA = "user_a_" + suffix;
-        String userB = "user_b_" + suffix;
         try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
-            createUser(admin, userA, List.of(a, a + "_operator", a + "_views"));
-            createUser(admin, userB, List.of(b, b + "_operator", b + "_views"));
-            try (MongoClient ownA = MongoClients.create(uri(userA, a));
-                 MongoClient ownB = MongoClients.create(uri(userB, b));
-                 MongoClient anonymous = MongoClients.create("mongodb://" + MONGO.getHost() + ":" + MONGO.getMappedPort(27017)
-                         + "/" + a + "?directConnection=true")) {
-                assertDenied(anonymous, a);
-                for (String other : List.of(b, b + "_operator", b + "_views")) assertDenied(ownA, other);
-                for (String other : List.of(a, a + "_operator", a + "_views")) assertDenied(ownB, other);
-
-                for (String metadata : List.of(a, b)) {
-                    String user = metadata.equals(a) ? userA : userB;
-                    StorageProof proof;
-                    try (ConfigurableApplicationContext first = start(uri(user, metadata), metadata)) {
-                        StorePort store = first.getBean(StorePort.class);
-                        proof = writeStorageProof(store, metadata);
-                        assertStorageProof(admin.getDatabase(metadata), store, proof);
-                        store.keyedState().save("permissions-proof", "same-key", metadata.getBytes(StandardCharsets.UTF_8));
-                        assertViewsNotSeeded(admin.getDatabase(metadata), store);
-                        try (MongoClient view = MongoClients.create(uri(user, metadata + "_views"))) {
-                            view.getDatabase(metadata + "_views").getCollection("proof")
-                                    .insertOne(new Document("_id", "same-key").append("owner", metadata));
-                        }
-                        assertNoProbes(admin, metadata);
+            var a = prepareNativeDatabases(admin, "a_" + suffix);
+            var b = prepareNativeDatabases(admin, "b_" + suffix);
+            List<String> allDatabases = List.of(a.config(), a.cache(), a.master(), b.config(), b.cache(), b.master());
+            byte[] artifact = Files.readAllBytes(CloudConnectorTestInputs.seedDirectory().resolve("mongodb-connector.jar"));
+            String hash = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(artifact));
+            for (var set : List.of(a, b)) {
+                for (var entry : Map.of(set.configUser(), set.config(), set.cacheUser(), set.cache(), set.masterUser(), set.master()).entrySet()) {
+                    try (MongoClient limited = MongoClients.create(uri(entry.getKey(), entry.getValue()))) {
+                        for (String database : allDatabases) if (!database.equals(entry.getValue())) assertDenied(limited, database);
                     }
-                    try (ConfigurableApplicationContext restarted = start(uri(user, metadata), metadata)) {
-                        assertStorageProof(admin.getDatabase(metadata), restarted.getBean(StorePort.class), proof);
-                        assertViewsNotSeeded(admin.getDatabase(metadata), restarted.getBean(StorePort.class));
-                        assertThat(restarted.getBean(StorePort.class).keyedState().load("permissions-proof", "same-key"))
-                                .hasValueSatisfying(value -> assertThat(value).isEqualTo(metadata.getBytes(StandardCharsets.UTF_8)));
-                        assertThat(admin.getDatabase(metadata + "_views").getCollection("proof")
-                                .find(new Document("_id", "same-key")).first().getString("owner")).isEqualTo(metadata);
-                        assertNoProbes(admin, metadata);
+                }
+                try (var application = nativeRoot(uri(set.configUser(), set.config()))) {
+                    var root = application.getBean(StorageRoot.class);
+                    org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(15)).until(root.runtime()::businessStarted);
+                    var bound = root.runtime().current().orElseThrow();
+                    var registry = bound.cache().connectors(bound.preparation().businessScope(), () -> {});
+                    assertThat(registry.register("mongodb", "2.0.7-SNAPSHOT", RegistrationSource.REGISTER, artifact).newlyRegistered()).isTrue();
+                    assertThat(registry.artifact(hash)).hasValueSatisfying(bytes -> assertThat(bytes).isEqualTo(artifact));
+                    bound.cache().schemas(bound.preparation().businessScope(), () -> {}).save(new DiscoveredSourceModel(
+                            "native-input", "mongodb", 1L, new SourceModel(List.of(new SourceTable("orders",
+                            List.of(new SourceField("id", "bigint", io.tapstate.core.common.TapstateType.INT64)), List.of("id"), List.of())))));
+                    try (MongoClient master = MongoClients.create(uri(set.masterUser(), set.master()))) {
+                        master.getDatabase(set.master()).getCollection("orders").insertOne(new Document("_id", 1).append("owner", set.master()));
                     }
+                    assertNativeDatabasePlacement(admin, set);
+                }
+                try (var restarted = nativeRoot(uri(set.configUser(), set.config()))) {
+                    var root = restarted.getBean(StorageRoot.class);
+                    org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(15)).until(root.runtime()::businessStarted);
+                    var bound = root.runtime().current().orElseThrow();
+                    assertThat(bound.preparation()).isEqualTo(set.preparation());
+                    assertThat(bound.cache().connectors(bound.preparation().businessScope(), () -> {}).artifact(hash))
+                            .hasValueSatisfying(bytes -> assertThat(bytes).isEqualTo(artifact));
+                    assertThat(bound.cache().schemas(bound.preparation().businessScope(), () -> {}).get("native-input")).isPresent();
+                    assertThat(ordinaryLogin(restarted, true)).isNotNull();
+                    assertNativeDatabasePlacement(admin, set);
+                    assertThat(admin.getDatabase(set.master()).getCollection("orders").find().first())
+                            .containsEntry("_id", 1).containsEntry("owner", set.master());
                 }
             }
         }
     }
 
-    private record StorageProof(CheckpointDoc checkpoint, SrsMeta meta, List<SrsLogRecord> log,
-            RateSample sample, List<ConnectorRegistration> connectors) { }
-
-    private static StorageProof writeStorageProof(StorePort store, String cluster) {
-        Instant now = Instant.now().truncatedTo(ChronoUnit.MILLIS);
-        store.state().create("permissions-proof", "{\"cluster\":\"" + cluster + "\"}", now);
-        store.meta().create("permissions-chain", "7d");
-        long epoch = store.meta().openEpoch("permissions-chain");
-        ChainPosition position = new ChainPosition(new SourceOrder(epoch, 3), cluster + "/position-3");
-        var claim = store.workloadClaims().acquire(
-                new WorkloadClaimKey(cluster, WorkloadClaimType.CAPTURE, "permissions-capture"),
-                new WorkloadOwner("permissions-node", "permissions-boot"), 1, Duration.ofMinutes(5)).claim();
-        WorkloadClaimFence fence = WorkloadClaimFence.from(claim);
-        List<SrsLogRecord> log = List.of(
-                new SrsLogRecord(cluster + "/position-1", Op.INSERT, 1, null,
-                        Map.of("id", 1, "owner", cluster), 0, fence),
-                new SrsLogRecord(cluster + "/position-2", Op.UPDATE, 2,
-                        Map.of("id", 1, "owner", cluster), Map.of("id", 1, "owner", cluster, "changed", true), 0, fence),
-                new SrsLogRecord(cluster + "/position-3", Op.DELETE, 3,
-                        Map.of("id", 1, "owner", cluster, "changed", true), null, 0, fence));
-        store.srsLog().storeAll("srs.permissions", 1, log);
-        store.meta().advanceSourceReadOffset("permissions-chain", position);
-        assertThat(store.workloadClaims().release(claim)).isTrue();
-        assertThatThrownBy(() -> store.srsLog().storeAll("srs.permissions", 4, List.of(
-                new SrsLogRecord("released-owner-position", Op.INSERT, 4, null, Map.of("id", 2), 0, fence))))
-                .isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
-        assertThat(store.srsLog().load("srs.permissions", 4)).isEmpty();
-        RateSample sample = new RateSample("permissions-proof", now, Map.of("records.out", 3L), Map.of(), now.minusSeconds(60));
-        store.rateHistory().append(sample);
-        SrsMeta meta = store.meta().read("permissions-chain").orElseThrow();
-        assertThat(meta.sourceRead()).isEqualTo(position);
-        assertThat(meta.epoch()).isEqualTo(epoch).isEqualTo(1);
-        assertThat(meta.retention()).isEqualTo("7d");
-        assertThat(meta.consumerOffsets()).isEmpty();
-        assertThat(meta.schemaHistory()).isEmpty();
-        assertThat(meta.sourceReadAt()).isNotNull().isAfterOrEqualTo(now.minusSeconds(2))
-                .isBeforeOrEqualTo(Instant.now().plusSeconds(2));
-        return new StorageProof(CheckpointDoc.initial("permissions-proof", "{\"cluster\":\"" + cluster + "\"}", now),
-                meta, log, sample, store.connectors().list());
+    private record NativeDatabases(String config, String cache, String master, String configUser,
+            String cacheUser, String masterUser, CachePreparation preparation) {
+        StorageBinding.Connection cacheConnection() {
+            return new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB, uri(cacheUser, cache), cache, null);
+        }
     }
 
-    private static void assertStorageProof(MongoDatabase database, StorePort store, StorageProof proof) throws Exception {
-        assertThat(store.state().read("permissions-proof")).contains(proof.checkpoint());
-        assertThat(store.meta().read("permissions-chain")).contains(proof.meta());
-        assertThat(store.srsLog().largestSequence("srs.permissions")).isEqualTo(3);
-        for (int index = 0; index < proof.log().size(); index++) {
-            assertThat(store.srsLog().load("srs.permissions", index + 1)).contains(proof.log().get(index));
-        }
-        assertThat(store.srsLog().load("srs.permissions", 4)).isEmpty();
-        assertThat(store.rateHistory().readPage("permissions-proof", proof.sample().observedAt().minusSeconds(1),
-                proof.sample().observedAt().plusSeconds(1), null, 1).entries())
-                .singleElement().satisfies(entry -> assertThat(entry.sample()).isEqualTo(proof.sample()));
-        assertThat(store.connectors().list()).containsExactlyInAnyOrderElementsOf(proof.connectors());
-        assertThat(proof.connectors()).extracting(ConnectorRegistration::connectorId).containsExactlyInAnyOrder(
-                "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2");
-        for (ConnectorRegistration registration : proof.connectors()) {
-            byte[] bytes = store.connectors().artifact(registration.contentHash()).orElseThrow();
-            Path seed = CloudConnectorTestInputs.seedDirectory().resolve(registration.connectorId() + "-connector.jar");
-            assertThat(bytes.length).isEqualTo(Files.size(seed));
-            assertThat(HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes)))
-                    .isEqualTo(registration.contentHash());
-            MessageDigest expected = MessageDigest.getInstance("SHA-256");
-            try (var input = Files.newInputStream(seed)) {
-                byte[] buffer = new byte[8192];
-                for (int length; (length = input.read(buffer)) != -1;) expected.update(buffer, 0, length);
+    private NativeDatabases prepareNativeDatabases(MongoClient admin, String suffix) {
+        String config = "native_config_" + suffix, cache = "native_cache_" + suffix, master = "native_master_" + suffix;
+        String configUser = "config_" + suffix, cacheUser = "cache_" + suffix, masterUser = "master_" + suffix;
+        createUser(admin, configUser, List.of(config)); createUser(admin, cacheUser, List.of(cache)); createUser(admin, masterUser, List.of(master));
+        var setup = new StorageSetupScope("native-" + suffix, "installation", "setup-" + suffix, 1);
+        var endpoint = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB, uri(cacheUser, cache), cache, null);
+        try (var configuration = io.tapstate.adapters.mongostore.MongoConfigurationBootstrap.prepare(
+                new io.tapstate.adapters.mongostore.MongoConnectionSettings(uri(configUser, config), null, Duration.ofSeconds(2)),
+                setup.clusterId(), setup.installationId(), setup.operationId(), 1)) {
+            var target = new SourceResource("views", null, "mongodb", Map.of("isUri", true, "uri", uri(masterUser, master)), null, null, null, null);
+            var initial = configuration.bindings().commitWithFirstCache(setup, StorageBinding.Mode.OP, endpoint, target);
+            try (var domain = io.tapstate.adapters.mongostore.MongoCacheDomain.connect(endpoint, Duration.ofSeconds(2), "native-isolation-fixture")) {
+                domain.prepareFirstAuth(initial.firstCreation().orElseThrow()); domain.prepareInitialBusiness(initial.preparation(), () -> {});
             }
-            assertThat(HexFormat.of().formatHex(expected.digest())).isEqualTo(registration.contentHash());
+            configuration.bindings().complete(setup);
+            configuration.firstAdmin().create(configuration.firstAdmin().load().orElseThrow().scope(),
+                    new User("admin", new BCryptPasswordHasher().hash("sentinel-login-password"), "admin"));
+            return new NativeDatabases(config, cache, master, configUser, cacheUser, masterUser, initial.preparation());
         }
-        assertThat(SystemCollections.PIPELINE_STATE.on(database).countDocuments(new Document("_id", "permissions-proof"))).isEqualTo(1);
-        assertThat(SystemCollections.SRS_META.on(database).countDocuments(new Document("_id", "permissions-chain"))).isEqualTo(1);
-        // Change rows share the collection with a private high-water mark; the latter is not an event.
-        var logs = SystemCollections.SRS_LOG.on(database);
-        assertThat(logs.countDocuments(new Document("_id.ring", "srs.permissions"))).isEqualTo(3);
-        assertThat(logs.find(new Document("_id", "srs-log-bounds:srs.permissions")).first())
-                .containsEntry("largestSequence", 3L).containsEntry("trimmedThrough", -1L);
-        Document history = SystemCollections.PIPELINE_RATE_HISTORY.on(database)
-                .find(new Document("pipelineId", "permissions-proof")).first();
-        assertThat(history.getDate("observedAt").toInstant()).isEqualTo(proof.sample().observedAt());
-        assertThat(database.getCollection("connector_artifacts.files").countDocuments()).isEqualTo(8);
-        assertThat(database.getCollection("connector_artifacts.chunks").countDocuments()).isGreaterThan(8);
-        assertThat(historyIndex(database).get("expireAfterSeconds", Number.class).longValue()).isEqualTo(Duration.ofDays(15).toSeconds());
     }
 
-    private ConfigurableApplicationContext start(String metadataUri, String clusterId) {
-        return start(metadataUri, clusterId, new AtomicInteger());
+    private static void assertNativeDatabasePlacement(MongoClient admin, NativeDatabases set) {
+        var config = admin.getDatabase(set.config()); var cache = admin.getDatabase(set.cache());
+        assertThat(config.getCollection("sources").countDocuments(new Document("_id", "views"))).isEqualTo(1);
+        assertThat(config.getCollection("users").countDocuments()).isEqualTo(1);
+        assertThat(config.getCollection("cluster_keys").countDocuments()).isEqualTo(1);
+        assertThat(config.listCollectionNames().into(new ArrayList<>())).doesNotContain(
+                "workload_claims", "pipeline_state", "srs_events", "connector_artifacts.files", "connector_artifacts.chunks", "schema_discovery", "orders");
+        assertThat(cache.listCollectionNames().into(new ArrayList<>())).contains("connector_artifacts.files", "connector_artifacts.chunks", "workload_claims")
+                .doesNotContain("sources", "users", "cluster_keys", "storage_binding", "system_meta", "orders");
+        assertThat(cache.getCollection("connector_artifacts.files").countDocuments()).isEqualTo(1);
+        assertThat(cache.getCollection("connector_artifacts.chunks").countDocuments()).isPositive();
+        assertThat(admin.getDatabase(set.master()).listCollectionNames().into(new ArrayList<>())).containsExactly("orders");
+        for (String name : List.of(set.config(), set.cache(), set.master())) {
+            assertThat(admin.getDatabase(name).listCollectionNames().into(new ArrayList<>()))
+                    .noneMatch(value -> value.startsWith("tapstate_access_probe_"));
+        }
     }
 
     @Test
-    void changingHistoryRetentionNeedsOnlyTheHistoryCollectionsAlterPrivilege() {
+    void changingHistoryRetentionNeedsExplicitOfflineMaintenanceOfOnlyItsCacheCollection() {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
-        String metadata = "isolation_ttl_" + suffix;
-        String user = "user_ttl_" + suffix;
-        long originalSeconds = Duration.ofDays(15).toSeconds();
-        long changedSeconds = Duration.ofDays(7).toSeconds();
         try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
-            createUser(admin, user, List.of(metadata, metadata + "_operator", metadata + "_views"));
-            MongoDatabase database = admin.getDatabase(metadata);
-            Instant observedAt = Instant.now().minusSeconds(60).truncatedTo(ChronoUnit.MILLIS);
-            RateSample sample = new RateSample("retention-proof", observedAt,
-                    Map.of("records.out", 3L), Map.of(), observedAt.minusSeconds(60));
-            try (ConfigurableApplicationContext first = start(uri(user, metadata), metadata)) {
-                first.getBean(StorePort.class).rateHistory().append(sample);
-            }
-            Document originalIndex = historyIndex(database);
-            Document originalCollection = historyCollection(database);
-            Document originalSample = SystemCollections.PIPELINE_RATE_HISTORY.on(database).find().first();
-            Document originalSource = SystemCollections.ARTIFACTS.on(database).find(new Document("_id", "views")).first();
-            assertThat(originalIndex.get("expireAfterSeconds", Number.class).longValue()).isEqualTo(originalSeconds);
-            try (ConfigurableApplicationContext unchanged = start(uri(user, metadata), metadata)) {
-                assertThat(unchanged.getBean(StorePort.class).rateHistory()
-                        .readPage(sample.pipelineId(), observedAt.minusSeconds(1), observedAt.plusSeconds(1), null, 1)
-                        .entries()).singleElement().satisfies(entry -> assertThat(entry.sample()).isEqualTo(sample));
-            }
-            try (MongoClient limited = MongoClients.create(uri(user, metadata))) {
-                assertThatThrownBy(() -> limited.getDatabase(metadata).runCommand(historyExpiry(changedSeconds)))
+            var set = prepareNativeDatabases(admin, "ttl_" + suffix);
+            var database = admin.getDatabase(set.cache());
+            var history = SystemCollections.CACHE_PIPELINE_RATE_HISTORY.on(database);
+            long originalSeconds = Duration.ofDays(15).toSeconds(), changedSeconds = Duration.ofDays(7).toSeconds();
+            history.insertOne(new Document("_id", "retained-sample").append("observedAt", java.util.Date.from(Instant.now())));
+            Document sample = history.find().first(); Document originalIndex = history.listIndexes().into(new ArrayList<>()).stream()
+                    .filter(row -> row.containsKey("expireAfterSeconds")).findFirst().orElseThrow();
+            assertThat(((Number) originalIndex.get("expireAfterSeconds")).longValue()).isEqualTo(originalSeconds);
+            var alteration = new Document("collMod", history.getNamespace().getCollectionName()).append("index",
+                    new Document("name", originalIndex.getString("name")).append("expireAfterSeconds", changedSeconds));
+            try (MongoClient limited = MongoClients.create(uri(set.cacheUser(), set.cache()))) {
+                assertThatThrownBy(() -> limited.getDatabase(set.cache()).runCommand(alteration))
                         .isInstanceOfSatisfying(MongoCommandException.class, error -> assertThat(error.getErrorCode()).isEqualTo(13));
             }
-            AtomicInteger ready = new AtomicInteger();
-            Throwable failure = catchThrowable(() -> {
-                try (var unexpected = start(uri(user, metadata), metadata, ready,
-                        "--tapstate.metrics.history.retention=7d")) {
-                    throw new AssertionError("Cloud startup accepted an unchanged TTL under a changed retention");
-                }
-            });
-            assertThat(ready.get()).isZero();
-            assertThat(coded(failure)).isInstanceOfSatisfying(TapstateException.class, error -> {
-                assertThat(error.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
-                assertThat(error.args()).containsExactlyEntriesOf(Map.of("detail", "MongoCommandException code=13"));
-                assertThat(error.getCause()).isNull();
-            });
-            assertThat(historyIndex(database)).isEqualTo(originalIndex);
-            assertThat(historyCollection(database)).isEqualTo(originalCollection);
-            assertThat(SystemCollections.PIPELINE_RATE_HISTORY.on(database).find().first()).isEqualTo(originalSample);
-            assertThat(SystemCollections.ARTIFACTS.on(database).find(new Document("_id", "views")).first()).isEqualTo(originalSource);
-
+            try (var application = nativeRoot(uri(set.configUser(), set.config()), work.resolve("no-seeds"),
+                    "--tapstate.metrics.history.retention=7d")) {
+                var root = application.getBean(StorageRoot.class);
+                assertThat(root.phase()).isEqualTo(StorageRoot.Phase.AUTH_READY);
+                assertThat(root.runtime().businessStarted()).isFalse();
+                assertThat(ordinaryLogin(application, true)).isNotNull();
+            }
+            assertThat(history.listIndexes().into(new ArrayList<>())).contains(originalIndex);
             String role = "alter_history_" + suffix;
             database.runCommand(new Document("createRole", role).append("roles", List.of()).append("privileges", List.of(
-                    new Document("resource", new Document("db", metadata)
-                            .append("collection", SystemCollections.PIPELINE_RATE_HISTORY.collectionName()))
+                    new Document("resource", new Document("db", set.cache()).append("collection", history.getNamespace().getCollectionName()))
                             .append("actions", List.of("collMod")))));
-            admin.getDatabase("admin").runCommand(new Document("grantRolesToUser", user).append("roles", List.of(
-                    new Document("role", role).append("db", metadata))));
-            database.getCollection("unrelated_history").createIndex(new Document("observedAt", 1),
-                    new IndexOptions().name("observedAt_idx").expireAfter(originalSeconds, TimeUnit.SECONDS));
-            try (MongoClient limited = MongoClients.create(uri(user, metadata))) {
-                assertThatThrownBy(() -> limited.getDatabase(metadata).runCommand(
-                        historyExpiry(changedSeconds).append("collMod", "unrelated_history")))
+            admin.getDatabase("admin").runCommand(new Document("grantRolesToUser", set.cacheUser()).append("roles", List.of(new Document("role", role).append("db", set.cache()))));
+            database.getCollection("unrelated_history").createIndex(new Document("observedAt", 1), new IndexOptions().name("observedAt_idx").expireAfter(originalSeconds, TimeUnit.SECONDS));
+            // No application is running: maintenance is an explicit database operation between owners.
+            try (MongoClient limited = MongoClients.create(uri(set.cacheUser(), set.cache()))) {
+                assertThatThrownBy(() -> limited.getDatabase(set.cache()).runCommand(new Document(alteration).append("collMod", "unrelated_history")))
                         .isInstanceOfSatisfying(MongoCommandException.class, error -> assertThat(error.getErrorCode()).isEqualTo(13));
+                limited.getDatabase(set.cache()).runCommand(alteration);
             }
-            AtomicInteger recoveredReady = new AtomicInteger();
-            try (ConfigurableApplicationContext recovered = start(uri(user, metadata), metadata, recoveredReady,
+            try (var reopened = nativeRoot(uri(set.configUser(), set.config()), work.resolve("no-seeds"),
                     "--tapstate.metrics.history.retention=7d")) {
-                assertThat(recoveredReady.get()).isEqualTo(1);
-                assertThat(recovered.getBean(StorePort.class).rateHistory().retention()).isEqualTo(Duration.ofDays(7));
-                assertThat(recovered.getBean(StorePort.class).rateHistory()
-                        .readPage(sample.pipelineId(), observedAt.minusSeconds(1), observedAt.plusSeconds(1), null, 1)
-                        .entries()).singleElement().satisfies(entry -> assertThat(entry.sample()).isEqualTo(sample));
+                var root = reopened.getBean(StorageRoot.class);
+                assertThat(root.phase()).isEqualTo(StorageRoot.Phase.BUSINESS_READY);
+                assertThat(ordinaryLogin(reopened, true)).isNotNull();
             }
-            Document expectedIndex = new Document(originalIndex).append("expireAfterSeconds", changedSeconds);
-            Document actualIndex = historyIndex(database);
-            assertThat(actualIndex.get("expireAfterSeconds", Number.class).longValue()).isEqualTo(changedSeconds);
-            // The server may store the altered expiry as an int rather than the original long.
-            assertThat(new Document(actualIndex).append("expireAfterSeconds", changedSeconds)).isEqualTo(expectedIndex);
-            assertThat(historyCollection(database)).isEqualTo(originalCollection);
-            assertThat(SystemCollections.PIPELINE_RATE_HISTORY.on(database).find().first()).isEqualTo(originalSample);
-            assertThat(SystemCollections.ARTIFACTS.on(database).find(new Document("_id", "views")).first()).isEqualTo(originalSource);
-            assertNoProbes(admin, metadata);
+            assertThat(history.find().first()).isEqualTo(sample);
+            assertThat(history.listIndexes().into(new ArrayList<>()).stream().filter(row -> row.containsKey("expireAfterSeconds")).findFirst().orElseThrow()
+                    .get("expireAfterSeconds", Number.class).longValue()).isEqualTo(changedSeconds);
         }
     }
 
     @Test
-    void missingMigrationIndexPrivilegeIsCodedWithoutTheDriverMessageOrCause() {
+    void missingNativeConfigurationIndexPrivilegeIsCodedAndTheOriginalPreparationCanResume() {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
-        String metadata = "isolation_migration_" + suffix;
-        String user = "user_migration_" + suffix;
-        String role = "without_create_index_" + suffix;
+        String config = "native_privileges_" + suffix, user = "config_limited_" + suffix, role = "without_indexes_" + suffix;
         try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
             Document builtin = admin.getDatabase("admin").runCommand(new Document("rolesInfo",
-                    new Document("role", "readWrite").append("db", metadata)).append("showPrivileges", true))
-                    .getList("roles", Document.class).getFirst();
-            List<Document> privileges = builtin.getList("privileges", Document.class).stream()
-                    .map(privilege -> new Document(privilege).append("actions", privilege.getList("actions", String.class)
-                            .stream().filter(action -> !"createIndex".equals(action)).toList())).toList();
-            admin.getDatabase(metadata).runCommand(new Document("createRole", role)
-                    .append("roles", List.of()).append("privileges", privileges));
-            admin.getDatabase("admin").runCommand(new Document("createUser", user).append("pwd", PASSWORD).append("roles", List.of(
-                    new Document("role", role).append("db", metadata),
-                    new Document("role", "readWrite").append("db", metadata + "_operator"),
-                    new Document("role", "readWrite").append("db", metadata + "_views"))));
-            try (MongoClient limited = MongoClients.create(uri(user, metadata))) {
-                assertThatThrownBy(() -> limited.getDatabase(metadata).getCollection("index_denied")
-                        .createIndex(new Document("value", 1)))
-                        .isInstanceOfSatisfying(MongoCommandException.class, error -> assertThat(error.getErrorCode()).isEqualTo(13));
+                    new Document("role", "readWrite").append("db", config)).append("showPrivileges", true)).getList("roles", Document.class).getFirst();
+            List<Document> privileges = builtin.getList("privileges", Document.class).stream().map(row -> new Document(row).append("actions",
+                    row.getList("actions", String.class).stream().filter(action -> !"createIndex".equals(action)).toList())).toList();
+            admin.getDatabase(config).runCommand(new Document("createRole", role).append("roles", List.of()).append("privileges", privileges));
+            admin.getDatabase("admin").runCommand(new Document("createUser", user).append("pwd", PASSWORD)
+                    .append("roles", List.of(new Document("role", role).append("db", config))));
+            var settings = new io.tapstate.adapters.mongostore.MongoConnectionSettings(uri(user, config), null, Duration.ofSeconds(2));
+            assertThatThrownBy(() -> io.tapstate.adapters.mongostore.MongoConfigurationBootstrap.prepare(settings, config, "installation", "original", 1))
+                    .isInstanceOfSatisfying(TapstateException.class, error -> {
+                        assertThat(error.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+                        assertThat(error.args().toString()).contains("code=13").doesNotContain(PASSWORD, "mongodb://");
+                        assertThat(error.getCause()).isNull();
+                    });
+            Document originalKey = admin.getDatabase(config).getCollection("cluster_keys").find().first();
+            admin.getDatabase(config).runCommand(new Document("updateRole", role).append("privileges", builtin.getList("privileges", Document.class)));
+            try (var prepared = io.tapstate.adapters.mongostore.MongoConfigurationBootstrap.prepare(settings, config, "installation", "original", 1)) {
+                assertThat(prepared.setupStates().load().scope().operationId()).isEqualTo("original");
+                assertThat(prepared.bindings().load()).isEmpty();
+                if (originalKey != null) assertThat(admin.getDatabase(config).getCollection("cluster_keys").find().first()).isEqualTo(originalKey);
             }
-            AtomicInteger ready = new AtomicInteger();
-            Throwable failure = catchThrowable(() -> {
-                try (var unexpected = start(uri(user, metadata), metadata, ready)) {
-                    throw new AssertionError("Cloud startup accepted a failed index migration");
-                }
-            });
-            assertThat(ready.get()).isZero();
-            assertThat(coded(failure)).isInstanceOfSatisfying(TapstateException.class, error -> {
-                assertThat(error.code()).isEqualTo(MigrationError.CHANGESET_FAILED);
-                assertThat(error.args()).containsExactlyEntriesOf(Map.of(
-                        "changeset", "V1BaselineIndexes", "cause", "MongoCommandException code=13"));
-                assertThat(error.getCause()).isNull();
-            });
-            Document schema = SystemCollections.SYSTEM_META.on(admin.getDatabase(metadata)).find(new Document("_id", "schema")).first();
-            assertThat(schema).doesNotContainKey("installedVersion");
-            assertThat(schema.get("lock", Document.class)).doesNotContainKeys("owner", "since", "heartbeat");
-            assertNoProbes(admin, metadata);
-
-            admin.getDatabase(metadata).runCommand(new Document("updateRole", role)
-                    .append("privileges", builtin.getList("privileges", Document.class)));
-            AtomicInteger recoveredReady = new AtomicInteger();
-            try (ConfigurableApplicationContext recovered = start(uri(user, metadata), metadata, recoveredReady)) {
-                assertThat(recoveredReady.get()).isEqualTo(1);
-                assertViewsNotSeeded(admin.getDatabase(metadata), recovered.getBean(StorePort.class));
-            }
-            assertThat(SystemCollections.SYSTEM_META.on(admin.getDatabase(metadata)).find(new Document("_id", "schema"))
-                    .first().getInteger("installedVersion"))
-                    .isEqualTo(io.tapstate.adapters.mongostore.migration.MigrationRunner.SUPPORTED_VERSION);
-            assertNoProbes(admin, metadata);
+            assertThat(admin.getDatabase(config).getCollection("cluster_keys").countDocuments()).isEqualTo(1);
         }
-    }
-
-    private static Throwable coded(Throwable failure) {
-        Throwable current = failure;
-        for (int depth = 0; depth < 16 && current != null && !(current instanceof TapstateException); depth++) current = current.getCause();
-        return current;
-    }
-
-    private static Document historyExpiry(long seconds) {
-        return new Document("collMod", SystemCollections.PIPELINE_RATE_HISTORY.collectionName())
-                .append("index", new Document("name", "observedAt_idx").append("expireAfterSeconds", seconds));
-    }
-
-    private static Document historyIndex(MongoDatabase database) {
-        return SystemCollections.PIPELINE_RATE_HISTORY.on(database).listIndexes().into(new ArrayList<>()).stream()
-                .filter(index -> "observedAt_idx".equals(index.getString("name"))).findFirst().orElseThrow();
-    }
-
-    private static Document historyCollection(MongoDatabase database) {
-        return database.listCollections().filter(new Document("name", SystemCollections.PIPELINE_RATE_HISTORY.collectionName())).first();
     }
 
     @Test
-    void changingCloudMetadataCredentialsDoesNotCreateOrRenewAViewsSource() {
+    void changingConfigurationCredentialsPreservesTheOriginalDefaultSourceAndCacheBinding() {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
-        String metadata = "isolation_renewed_" + suffix;
-        String user = "user_renewed_" + suffix;
-        String renewedPassword = "controlled-renewed-mongo-password";
-        SourceResource authored = new SourceResource("views",
-                new Metadata(Map.of(), "authored", true, "verified-user"), "mongodb",
-                Map.of("isUri", true, "uri", "mongodb://source-user:source-secret@user.example/owned"),
-                null, null, null, null);
+        String renewedPassword = "controlled-renewed-config-password";
         try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
-            createUser(admin, user, List.of(metadata, metadata + "_operator", metadata + "_views"));
-            try (ConfigurableApplicationContext first = start(uri(user, metadata), metadata)) {
-                StorePort store = first.getBean(StorePort.class);
-                store.keyedState().save("permissions-proof", "renewed-key", new byte[] {7});
-                assertViewsNotSeeded(admin.getDatabase(metadata), store);
-                store.artifacts().create(authored);
-                try (MongoClient materialization = MongoClients.create(uri(user, metadata + "_views"))) {
-                    materialization.getDatabase(metadata + "_views").getCollection("proof")
-                            .insertOne(new Document("_id", "before-renewal").append("owner", metadata));
-                }
+            var set = prepareNativeDatabases(admin, "renew_" + suffix);
+            var configuration = admin.getDatabase(set.config());
+            Document source = configuration.getCollection("sources").find(new Document("_id", "views")).first();
+            Document binding = configuration.getCollection("storage_binding").find().first();
+            Document key = configuration.getCollection("cluster_keys").find().first();
+            try (var first = nativeRoot(uri(set.configUser(), set.config()))) {
+                assertThat(ordinaryLogin(first, true)).isNotNull();
             }
-            Document originalSource = SystemCollections.ARTIFACTS.on(admin.getDatabase(metadata))
-                    .find(new Document("_id", "views")).first();
-            assertThat(originalSource.get("body", Document.class).get("config")).isInstanceOf(String.class);
-            admin.getDatabase("admin").runCommand(new Document("updateUser", user).append("pwd", renewedPassword));
-            try (MongoClient revoked = MongoClients.create(uri(user, metadata))) {
-                assertThatThrownBy(() -> revoked.getDatabase(metadata).getCollection("proof").countDocuments())
-                        .as("the server no longer accepts the original password")
-                        .isInstanceOf(MongoSecurityException.class);
+            admin.getDatabase("admin").runCommand(new Document("updateUser", set.configUser()).append("pwd", renewedPassword));
+            try (MongoClient revoked = MongoClients.create(uri(set.configUser(), set.config()))) {
+                assertThatThrownBy(() -> revoked.getDatabase(set.config()).getCollection("sources").countDocuments()).isInstanceOf(MongoSecurityException.class);
             }
-            try (ConfigurableApplicationContext restarted = start(uri(user, metadata, renewedPassword), metadata)) {
-                StorePort store = restarted.getBean(StorePort.class);
-                assertThat(store.keyedState().load("permissions-proof", "renewed-key"))
-                        .hasValueSatisfying(value -> assertThat(value).isEqualTo(new byte[] {7}));
-                assertThat(store.artifacts().get("views")).contains(authored);
-                assertThat(SystemCollections.ARTIFACTS.on(admin.getDatabase(metadata))
-                        .find(new Document("_id", "views")).first()).isEqualTo(originalSource);
-                try (MongoClient materialization = MongoClients.create(uri(user, metadata + "_views", renewedPassword))) {
-                    materialization.getDatabase(metadata + "_views").getCollection("proof")
-                            .insertOne(new Document("_id", "after-renewal").append("owner", metadata));
-                }
-                assertThat(admin.getDatabase(metadata + "_views").getCollection("proof").countDocuments()).isEqualTo(2);
-                Object rawConfig = admin.getDatabase(metadata).getCollection(SystemCollections.ARTIFACTS.collectionName())
-                        .find(new Document("_id", "views")).first().get("body", Document.class).get("config");
-                assertThat(rawConfig).isInstanceOf(String.class);
-                assertThat((String) rawConfig).doesNotContain(PASSWORD, renewedPassword);
-                assertNoProbes(admin, metadata);
+            try (var restarted = nativeRoot(uri(set.configUser(), set.config(), renewedPassword))) {
+                assertThat(ordinaryLogin(restarted, true)).isNotNull();
+                assertThat(restarted.getBean(StorageRoot.class).runtime().current().orElseThrow().preparation()).isEqualTo(set.preparation());
+                assertThat(configuration.getCollection("sources").find(new Document("_id", "views")).first()).isEqualTo(source);
+                assertThat(configuration.getCollection("storage_binding").find().first()).isEqualTo(binding);
+                assertThat(configuration.getCollection("cluster_keys").find().first()).isEqualTo(key);
+                assertThat(source.toJson()).doesNotContain(PASSWORD, renewedPassword);
             }
         }
-    }
-
-    private static void assertViewsNotSeeded(MongoDatabase metadata, StorePort store) {
-        assertThat(store.artifacts().get(ViewTargetResolver.STATE_STORE_SOURCE_ID)).isEmpty();
-        assertThat(SystemCollections.ARTIFACTS.on(metadata)
-                .countDocuments(new Document("_id", ViewTargetResolver.STATE_STORE_SOURCE_ID))).isZero();
     }
 
     private static void assertNoProbes(MongoClient admin, String metadata) {
