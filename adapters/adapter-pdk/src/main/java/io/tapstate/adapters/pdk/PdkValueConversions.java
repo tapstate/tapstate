@@ -65,11 +65,12 @@ final class PdkValueConversions {
         if (row == null) {
             return Optional.empty();
         }
-        PdkSourceRow converted = new PdkSourceRow(row);
-        source.transformToTapValueMap(converted, schema.fields());
-        ReadContext context = new ReadContext(schema, origin, compatibility, converted);
-        converted.replaceAll((key, value) -> carry(value, row.get(key), key, key, context));
-        return Optional.of(converted);
+        try (PdkSourceRow converted = new PdkSourceRow(row)) {
+            source.transformToTapValueMap(converted, schema.fields());
+            ReadContext context = new ReadContext(schema, origin, compatibility, converted);
+            converted.replaceAll((key, value) -> carry(value, row.get(key), key, key, context));
+            return Optional.of(converted);
+        }
     }
 
     private record ReadContext(PdkRowSchema schema, BiFunction<Object, String, String> origin,

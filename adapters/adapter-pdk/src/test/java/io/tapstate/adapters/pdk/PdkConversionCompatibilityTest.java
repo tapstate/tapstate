@@ -19,6 +19,7 @@ import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatNullPointerException;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class PdkConversionCompatibilityTest {
     private static final Instant PRECISE = Instant.parse("2021-11-22T00:08:03.849711123Z");
@@ -210,6 +211,151 @@ class PdkConversionCompatibilityTest {
                 .after(Map.of("map", map)), source, Map.of());
         Object payload = ((ConvertedValue) decoded.after().get("map")).value();
         assertThat(payload).isEqualTo(Map.of("key", "value")).isNotInstanceOf(DriverMap.class);
+    }
+
+    @Test
+    void aSharedCustomContainerKeepsBothUpdateImagesTyped() {
+        DriverMap shared = new DriverMap();
+        List<Object> tags = List.of(new NativeKey("array-key"));
+        shared.put("tags", tags);
+        TapCodecsRegistry source = new TapCodecsRegistry();
+        source.registerToTapValue(NativeKey.class, (value, type) -> new TapStringValue(((NativeKey) value).value()));
+        source.registerToTapValue(DriverMap.class, (value, type) ->
+                new io.tapdata.entity.schema.value.TapMapValue((DriverMap) value));
+        TapTable table = new TapTable("values");
+        table.add(new TapField("known", "native-key").tapType(new io.tapdata.entity.schema.type.TapString()));
+        table.add(new TapField("container.tags", "outer-array").tapType(new io.tapdata.entity.schema.type.TapArray()));
+        Map<String, Object> before = Map.of("known", new NativeKey("known"), "container", shared, "label", "before");
+        Map<String, Object> after = Map.of("known", new NativeKey("known"), "container", shared, "label", "after");
+        Envelope decoded = TapEventCodec.decodeChange(io.tapdata.entity.event.dml.TapUpdateRecordEvent.create()
+                .table("values").before(before).after(after), source, PdkRowSchema.of(table));
+        var encoded = (io.tapdata.entity.event.dml.TapUpdateRecordEvent) TapEventCodec.encode(decoded, nativeKeys());
+        Map<String, Object> expected = Map.of("tags", List.of(new NativeKey("array-key")));
+        assertThat(encoded.getBefore()).containsEntry("container", expected);
+        assertThat(encoded.getAfter()).containsEntry("container", expected);
+        assertThat(shared).containsEntry("tags", tags);
+    }
+
+    @Test
+    void aMapCopyCannotSelectAnUnrelatedConcreteClassCodec() {
+        TapCodecsRegistry source = new TapCodecsRegistry();
+        source.registerToTapValue(LinkedHashMap.class, (value, type) -> new TapStringValue("wrong-codec"));
+        Map<String, Object> nested = new java.util.HashMap<>(Map.of("nested", new java.util.HashMap<>(Map.of("id", 1L))));
+        Map<String, Object> row = Map.of("container", nested);
+        assertThat(roundTrip(row, source, new TapCodecsRegistry())).isEqualTo(row);
+    }
+
+    @Test
+    void unchangedListsUseThePdksNormalizedArrayCodec() {
+        TapCodecsRegistry source = new TapCodecsRegistry();
+        source.registerToTapValue(java.util.ArrayList.class, (value, type) ->
+                new TapStringValue("list:" + ((List<?>) value).size()));
+        Map<String, Object> row = Map.of("list", List.of("value"));
+        Map<String, Object> stock = new LinkedHashMap<>(row);
+        new io.tapdata.entity.codec.filter.TapCodecsFilterManager(source).transformToTapValueMap(stock, Map.of());
+        assertThat(stock.get("list")).isInstanceOfSatisfying(TapStringValue.class,
+                value -> assertThat(value.getValue()).isEqualTo("list:1"));
+        assertThat(roundTrip(row, source, new TapCodecsRegistry())).containsEntry("list", "list:1");
+    }
+
+    @Test
+    void aSharedCustomListKeepsBothUpdateImagesTyped() {
+        DriverList shared = new DriverList();
+        shared.add(new NativeKey("array-key"));
+        TapCodecsRegistry source = new TapCodecsRegistry();
+        source.registerToTapValue(NativeKey.class, (value, type) -> new TapStringValue(((NativeKey) value).value()));
+        source.registerToTapValue(DriverList.class, (value, type) ->
+                new io.tapdata.entity.schema.value.TapArrayValue((DriverList) value));
+        TapTable table = new TapTable("values");
+        table.add(new TapField("known", "native-key").tapType(new io.tapdata.entity.schema.type.TapString()));
+        table.add(new TapField("tags", "outer-array").tapType(new io.tapdata.entity.schema.type.TapArray()));
+        Map<String, Object> row = Map.of("known", new NativeKey("known"), "tags", shared);
+        Envelope decoded = TapEventCodec.decodeChange(io.tapdata.entity.event.dml.TapUpdateRecordEvent.create()
+                .table("values").before(row).after(row), source, PdkRowSchema.of(table));
+        var encoded = (io.tapdata.entity.event.dml.TapUpdateRecordEvent) TapEventCodec.encode(decoded, nativeKeys());
+        assertThat(encoded.getBefore()).containsEntry("tags", List.of(new NativeKey("array-key")));
+        assertThat(encoded.getAfter()).containsEntry("tags", List.of(new NativeKey("array-key")));
+        assertThat(shared).containsExactly(new NativeKey("array-key"));
+    }
+
+    @Test
+    void aCodecFailureStillRestoresTemporaryHostReplacements() {
+        DriverMap map = new DriverMap();
+        map.put("key", new NativeKey("key"));
+        TapCodecsRegistry source = new TapCodecsRegistry();
+        source.registerToTapValue(NativeKey.class, (value, type) -> new TapStringValue(((NativeKey) value).value()));
+        IllegalStateException failure = new IllegalStateException("synthetic codec failure");
+        source.registerToTapValue(DriverMap.class, (value, type) -> { throw failure; });
+        assertThatThrownBy(() -> TapEventCodec.decodeChange(TapInsertRecordEvent.create().table("values")
+                .after(Map.of("map", map)), source, Map.of())).isSameAs(failure);
+        assertThat(map).containsEntry("key", new NativeKey("key"));
+    }
+
+    @Test
+    void cleanupDoesNotUndoAConnectorsDeliberateReplacement() {
+        DriverMap map = new DriverMap();
+        map.put("key", new NativeKey("key"));
+        TapStringValue replacement = new TapStringValue("replacement");
+        replacement.setOriginType("native-key");
+        TapCodecsRegistry source = new TapCodecsRegistry();
+        source.registerToTapValue(NativeKey.class, (value, type) -> new TapStringValue(((NativeKey) value).value()));
+        source.registerToTapValue(DriverMap.class, (value, type) -> {
+            DriverMap driver = (DriverMap) value;
+            driver.put("key", replacement);
+            return new io.tapdata.entity.schema.value.TapMapValue(driver);
+        });
+        assertThat(roundTrip(Map.of("map", map), source, nativeKeys()))
+                .containsEntry("map", Map.of("key", new NativeKey("replacement")));
+        assertThat(map.get("key")).isSameAs(replacement);
+    }
+
+    @Test
+    void failedCollectionInstallationRetainsTheSourceContents() {
+        List<NativeKey> checked = java.util.Collections.checkedList(
+                new java.util.ArrayList<>(List.of(new NativeKey("key"))), NativeKey.class);
+        TapCodecsRegistry source = new TapCodecsRegistry();
+        source.registerToTapValue(NativeKey.class, (value, type) -> new TapStringValue(((NativeKey) value).value()));
+        source.registerToTapValue(checked.getClass(), (value, type) ->
+                new io.tapdata.entity.schema.value.TapArrayValue(new java.util.ArrayList<>((List<?>) value)));
+        assertThatThrownBy(() -> TapEventCodec.decodeChange(TapInsertRecordEvent.create().table("values")
+                .after(Map.of("tags", checked)), source, Map.of())).isInstanceOf(ClassCastException.class);
+        assertThat(checked).containsExactly(new NativeKey("key"));
+    }
+
+    @Test
+    void anUnrelatedMapCodecDoesNotRequireMutableInput() {
+        TapCodecsRegistry source = new TapCodecsRegistry();
+        source.registerToTapValue(LinkedHashMap.class, (value, type) -> new TapStringValue("wrong-codec"));
+        Map<String, Object> row = Map.of("container", Map.of("nested", Map.of("id", 1L)));
+        assertThatCode(() -> assertThat(roundTrip(row, source, new TapCodecsRegistry())).isEqualTo(row))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    void aDeliberateListReplacementDoesNotRetainOtherTemporaryValues() {
+        DriverList shared = new DriverList();
+        shared.add(new NativeKey("first"));
+        shared.add(new NativeKey("second"));
+        TapStringValue replacement = new TapStringValue("replacement");
+        replacement.setOriginType("native-key");
+        TapCodecsRegistry source = new TapCodecsRegistry();
+        source.registerToTapValue(NativeKey.class, (value, type) -> new TapStringValue(((NativeKey) value).value()));
+        source.registerToTapValue(DriverList.class, (value, type) -> {
+            DriverList driver = (DriverList) value;
+            driver.set(0, replacement);
+            return new io.tapdata.entity.schema.value.TapArrayValue(driver);
+        });
+        TapTable table = new TapTable("values");
+        table.add(new TapField("known", "native-key").tapType(new io.tapdata.entity.schema.type.TapString()));
+        table.add(new TapField("tags", "outer-array").tapType(new io.tapdata.entity.schema.type.TapArray()));
+        Map<String, Object> row = Map.of("known", new NativeKey("known"), "tags", shared);
+        Envelope decoded = TapEventCodec.decodeChange(io.tapdata.entity.event.dml.TapUpdateRecordEvent.create()
+                .table("values").before(row).after(row), source, PdkRowSchema.of(table));
+        var encoded = (io.tapdata.entity.event.dml.TapUpdateRecordEvent) TapEventCodec.encode(decoded, nativeKeys());
+        List<NativeKey> expected = List.of(new NativeKey("replacement"), new NativeKey("second"));
+        assertThat(encoded.getBefore()).containsEntry("tags", expected);
+        assertThat(encoded.getAfter()).containsEntry("tags", expected);
+        assertThat(shared).containsExactly(replacement, new NativeKey("second"));
     }
 
     @Test
