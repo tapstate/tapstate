@@ -61,14 +61,22 @@ with tempfile.TemporaryDirectory() as tmp:
     put('e2e/target/witness-ledger.txt','old ordinary ledger')
     put('e2e/target/witness-ledgers/123.txt','old selected ledger')
     put('bin/mvn', '#!/bin/sh\nprintf "%s\\n" "$@" > "'+str(root/'mvn-args')+'"\n'
+        +'printf "%s" "${JAVA_TOOL_OPTIONS:-}" > "'+str(root/'mvn-env')+'"\n'
         +'mkdir -p "'+str(root/'core/target/surefire-reports')+'"\n'
         +'printf new > "'+str(root/'core/target/surefire-reports/TEST-new.xml')+'"\n'
         +'printf new >> "'+str(root/'core/target/jacoco.exec')+'"\n')
     (root/'bin/mvn').chmod(0o755)
-    environment={**os.environ,'PATH':str(root/'bin')+':'+os.environ['PATH']}
+    runner_temp=root/'runner-temp'
+    environment={**os.environ,'PATH':str(root/'bin')+':'+os.environ['PATH'],'RUNNER_TEMP':str(runner_temp),'JAVA_TOOL_OPTIONS':'-Dfile.encoding=UTF-8'}
     run_command=[os.environ['SHARD_GATE'],'run','--root',tmp,'--plan',str(root/'plan.json'),'--shard','rest','--repo-local',str(root/'m2')]
     executed=subprocess.run(run_command,check=True,env=environment,capture_output=True,text=True)
     args=(root/'mvn-args').read_text().splitlines()
+    assert '-am' not in args and 'verify' in args and '-pl' in args
+    assert '-Dapi.version=1.44' in args, 'Docker 29 requires a supported Testcontainers API version'
+    assert '-Djava.io.tmpdir='+str(runner_temp.resolve()/'tapstate-java-tmp') in args
+    assert '-Dtapstate.it.jvmArgs=-Djava.io.tmpdir='+str(runner_temp.resolve()/'tapstate-java-tmp') in args, 'Failsafe forks must keep JUnit temp files on the runner temp filesystem'
+    assert (root/'mvn-env').read_text()=='-Dfile.encoding=UTF-8', 'do not inject JVM options into child Java processes'
+    assert (runner_temp/'tapstate-java-tmp').is_dir(), 'runner-backed Java temporary directory must exist before Maven starts'
     assert not (root/'target/jacoco-reactor.exec').exists(), 'old merged coverage survived'
     assert not (root/'e2e/target/witness-ledger.txt').exists(), 'old ordinary ledger survived'
     assert not (root/'e2e/target/witness-ledgers').exists(), 'old selected ledger survived'
@@ -353,7 +361,13 @@ with tempfile.TemporaryDirectory() as tmp:
         runtime_args=(root/'mvn-args').read_text().splitlines()
         runtime_flag='-Djacoco.classDumpDir='+str(runtime.resolve())
         assert runtime_args.count(runtime_flag)==1
-        assert [a for a in runtime_args if a!=runtime_flag]==observed, 'runtime capture must retain the original agent/selector/lifecycle settings'
+        original_tmp=[a for a in observed if a.startswith(('-Djava.io.tmpdir=', '-Dtapstate.it.jvmArgs='))]
+        current_tmp=[a for a in runtime_args if a.startswith(('-Djava.io.tmpdir=', '-Dtapstate.it.jvmArgs='))]
+        def tmp_args(directory):
+            option='-Djava.io.tmpdir='+str(directory.resolve()/'tapstate-java-tmp')
+            return [option, '-Dtapstate.it.jvmArgs='+option]
+        assert original_tmp==tmp_args(runner_temp) and current_tmp==tmp_args(worker)
+        assert [a for a in runtime_args if a!=runtime_flag and a not in current_tmp]==[a for a in observed if a not in original_tmp], 'runtime capture must retain the original agent/selector/lifecycle settings'
         marker=json.loads((root/'target/ci-shards/run-rest.json').read_text())
         origin=runtime/'capture-origin.json'
         assert marker['runtime_class_capture']['capture_origin_sha256']==hashlib.sha256(origin.read_bytes()).hexdigest()

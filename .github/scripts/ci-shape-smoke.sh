@@ -29,12 +29,19 @@ def jobs(text):
     return {k: '\n'.join(v) for k, v in result.items()}
 
 
+MAVEN_ARGS = ('          MAVEN_ARGS: >-\n'
+              '            -Dapi.version=1.44\n'
+              '            -Dtapstate.it.jvmArgs=-Djava.io.tmpdir=${{ runner.temp }}/test-tmp')
+
+
 def check(workflows, contexts, inputs):
     assert not re.search(r'^(?: {2}| {6})MAVEN_ARGS:', workflows['ci.yml'], re.M), \
         'Docker API configuration must not enter unrelated job or connector environments'
     execute = re.search(r'(?ms)^      - name: Execute exactly this shard\n(.*?)(?=^      - |\Z)', workflows['ci.yml'])
-    assert execute and re.search(r'^        env:\n          MAVEN_ARGS: "-Dapi\.version=1\.44"\n', execute[1], re.M), \
+    assert execute and re.search(r'^        env:\n(?:          #[^\n]*\n)*' + re.escape(MAVEN_ARGS) + r'\n', execute[1], re.M), \
         'Docker API configuration must reach only the selected Maven verify and its test forks'
+    assert 'mkdir -p "$RUNNER_TEMP/test-tmp"' in execute[1], \
+        'the selected test step must prepare its runner-backed JVM temporary directory'
     assert workflows['ci.yml'].count('MAVEN_ARGS:') == 1 and 'JAVA_TOOL_OPTIONS:' not in workflows['ci.yml'], \
         'Docker API configuration must not leak into other steps or JVM child output'
     ci = jobs(workflows['ci.yml'])
@@ -185,9 +192,12 @@ assert contexts, 'required context list is empty'
 check(workflows, contexts, inputs)
 mutations = 0
 for original, replacement in [
-    ('          MAVEN_ARGS: "-Dapi.version=1.44"', ''),
-    ('          MAVEN_ARGS: "-Dapi.version=1.44"', '          MAVEN_ARGS: "-Dapi.version=1.32"'),
-    ('          MAVEN_ARGS: "-Dapi.version=1.44"', '    env:\n      MAVEN_ARGS: "-Dapi.version=1.44"'),
+    (MAVEN_ARGS, ''),
+    (MAVEN_ARGS, MAVEN_ARGS.replace('1.44', '1.32')),
+    (MAVEN_ARGS, '    env:\n' + '\n'.join('      ' + line[10:] for line in MAVEN_ARGS.splitlines())),
+    (MAVEN_ARGS, '          MAVEN_ARGS: "-Dapi.version=1.44"'),
+    (MAVEN_ARGS, MAVEN_ARGS.replace('${{ runner.temp }}/test-tmp', '/tmp')),
+    ('mkdir -p "$RUNNER_TEMP/test-tmp"', 'echo missing-test-tmp'),
     ('permissions:\n', 'env:\n  MAVEN_ARGS: "-Dapi.version=1.44"\npermissions:\n'),
     ('ci-receipt.sh event-inputs', 'echo event-capture-removed'),
     ('${{ runner.temp }}/ci-event-inputs.json', '${{ runner.temp }}/missing-event.json'),

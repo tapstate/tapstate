@@ -826,7 +826,7 @@ def run_shard(args, root, plan):
     write(marker, receipt)
     if runtime_directory:
         write(runtime_directory / 'capture-origin.json', receipt)
-    command = ['mvn', '-B', '-Dmaven.repo.local=' + str(Path(args.repo_local).resolve()), '-pl', ','.join(modules), 'verify']
+    command = ['mvn', '-B', '-Dapi.version=1.44', '-Dmaven.repo.local=' + str(Path(args.repo_local).resolve()), '-pl', ','.join(modules), 'verify']
     for kind, flag in [('unit', 'test'), ('it', 'it.test')]:
         names = sorted({t['class'] for t in shard['tests'] if t['kind'] == kind})
         command.append('-D' + flag + '=' + (','.join(names) if names else '__ci_shard_no_tests__'))
@@ -844,10 +844,18 @@ def run_shard(args, root, plan):
     if examples:
         command += ['-Dtapstate.e2e.published-examples=' + ','.join(examples),
                     '-DforkCount=1', '-DreuseForks=true', '-Djunit.jupiter.execution.parallel.enabled=false']
+    env = dict(os.environ)
+    runner_temp = env.get('RUNNER_TEMP')
+    if runner_temp:
+        java_tmp = Path(runner_temp).resolve() / 'tapstate-java-tmp'
+        java_tmp.mkdir(parents=True, exist_ok=True)
+        java_option = '-Djava.io.tmpdir=' + str(java_tmp)
+        command.insert(command.index('-pl'), java_option)
+        command.insert(command.index('-pl'), '-Dtapstate.it.jvmArgs=' + java_option)
     observed = None
     try:
         with phase_timing('selected-verify', 'run', plan, shard['id']) as observed:
-            subprocess.run(command, cwd=root, check=True)
+            subprocess.run(command, cwd=root, check=True, env=env)
     finally:
         receipt['status'] = observed['status'] if observed is not None else 'failure'
         if observed is not None:
