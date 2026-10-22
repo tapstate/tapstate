@@ -76,6 +76,7 @@ capture.cluster-refused-the-read
 capture.cluster-refused-writes
 capture.event-table-not-selected
 capture.no-ring-to-attach
+capture.observer-failed
 capture.recovery-log-gap
 capture.recovery-progress-unproven
 capture.snapshot-reports-no-seam

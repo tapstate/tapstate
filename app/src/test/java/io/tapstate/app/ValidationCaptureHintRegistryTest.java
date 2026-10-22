@@ -236,6 +236,27 @@ class ValidationCaptureHintRegistryTest {
     }
 
     @Test
+    void lifecycleInvalidationDoesNotRunDrainCallbacksOrReportAnErrorToTheOriginalListener() {
+        var batches = new AtomicInteger(); var errors = new AtomicInteger(); var drained = new AtomicInteger();
+        var reason = new IllegalStateException("physical opening retired");
+        try (var registry = registry(1); var outbox = outbox("one")) {
+            var listener = registry.install(new CaptureListener() {
+                @Override public void onBatch(List<Envelope> events, Optional<SourcePosition> position) { batches.incrementAndGet(); }
+                @Override public void onError(Throwable failure) { errors.incrementAndGet(); }
+            });
+            var registration = registry.register(scope("opening"), binding(outbox));
+            outbox.drained().thenRun(drained::incrementAndGet);
+            registry.invalidate(reason);
+            listener.onBatch(List.of(event(1)), Optional.empty());
+            assertThat(batches).hasValue(1); assertThat(errors).hasValue(0); assertThat(drained).hasValue(0);
+            assertThat(registration.failure()).contains(reason); assertThat(registration.drained()).isFalse();
+            assertThat(outbox.snapshot().packets()).isZero();
+            registry.close();
+            assertThat(drained).hasValue(1); assertThat(registration.drained()).isTrue();
+        }
+    }
+
+    @Test
     void sourceFailureCannotHideAFatalExtractorErrorThatArrivesLater() throws Exception {
         var entered = new CountDownLatch(1); var release = new CountDownLatch(1);
         var fatal = new AssertionError("fatal extractor"); var sourceFailure = new IllegalStateException("source failed first");
@@ -335,7 +356,7 @@ class ValidationCaptureHintRegistryTest {
         var fence = new WorkloadClaimFence(new WorkloadClaimKey("cluster", WorkloadClaimType.CAPTURE, "physical"),
                 new WorkloadOwner("capture", "capture-boot"), 1, 2, 3);
         return new ValidationCaptureHintRegistry.Scope("cluster", "physical", opening, "source", "capture", "capture-boot", 1,
-                fence, "route", Set.of("orders"));
+                fence, Set.of("orders"));
     }
     private static ValidationRootHintOutbox outbox(String id) {
         var run = new ValidationRunIdentity(new ValidationOwner("cluster", "pipeline", "owner", "owner-boot", 1, 1, 1),

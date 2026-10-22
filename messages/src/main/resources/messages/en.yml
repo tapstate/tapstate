@@ -273,6 +273,9 @@ capture.srs-not-recoverable:
 io.srs-progress-unproven:
   message: "Pipeline `{pipeline}` has legacy progress that cannot prove each source node's confirmed SRS cursor."
   solution: "Keep the retained state for diagnosis and perform a full reload, or explicitly accept a new incremental baseline with the missing interval."
+capture.observer-failed:
+  message: "Capture `{captureId}` could not apply optional observer opening `{openingId}` during {phase}."
+  solution: "Inspect the observer failure and retry its operation after correcting the cause. The observer diagnostic does not change the normal source operation outcome."
 capture.claim-lost:
   message: "Capture `{captureId}` lost its cluster ownership claim."
   solution: "Let the current owner continue from the durable position; do not restart the fenced process."

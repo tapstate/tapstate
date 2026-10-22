@@ -14,11 +14,13 @@ import java.util.Set;
  * name, and the build-time placeholder gate checks the message catalog templates against it. Bounded
  * control flow (a refused headroom write, a ring operation the cluster refuses while its members'
  * verdicts converge, a frontier that cannot yet advance) and connector read faults (already coded
- * {@code connector.*} by the pdk bridge) are deliberately not here — only genuine capture-configuration
- * errors are. Where such a wait carries a bound, reaching that bound is a fault and is coded; being
+ * {@code connector.*} by the pdk bridge) are deliberately not here — capture-configuration errors and optional observer diagnostics are. Where such a wait carries a bound, reaching that bound is a fault and is coded; being
  * inside it is not.
  */
 public enum CaptureError implements TapstateErrorCode {
+
+    /** An optional observer failed; this diagnostic does not fail normal source processing. */
+    OBSERVER_FAILED("capture.observer-failed", Set.of("captureId", "openingId", "phase")),
 
     /** A live capture could no longer renew the cluster ownership generation that fences its writes. */
     CLAIM_LOST("capture.claim-lost", Set.of("captureId")),
@@ -98,7 +100,7 @@ public enum CaptureError implements TapstateErrorCode {
 
     @Override
     public Severity severity() {
-        return Severity.ERROR;
+        return this == OBSERVER_FAILED ? Severity.WARNING : Severity.ERROR;
     }
 
     @Override

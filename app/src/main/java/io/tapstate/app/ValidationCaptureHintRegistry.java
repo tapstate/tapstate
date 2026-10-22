@@ -31,7 +31,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * registry locks, transport, control I/O or future callbacks. Concurrent callbacks cannot reorder one
  * sender's keys: overlap fails that binding instead of waiting or silently dropping a batch.
  *
- * <p>The caller authenticates current run, Pipeline execution and capture authority before registration,
+ * <p>The caller authenticates current run, Pipeline execution, routing/key revisions and capture authority before registration,
  * supplies a fresh registration ID per run/opening, and invalidates bindings on their loss. No ID may
  * be reused after reaping. Scope equality is not authorization, source readiness or a coverage barrier.
  * A registration covers callbacks that read the newly published entry snapshot; already-entered
@@ -39,12 +39,11 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public final class ValidationCaptureHintRegistry implements AutoCloseable {
     public record Scope(String clusterId, String captureId, String openingId, String sourceId, String nodeId, String bootId,
-                        long epoch, WorkloadClaimFence fence, String routeRevision, Set<String> tables) {
+                        long epoch, WorkloadClaimFence fence, Set<String> tables) {
         public Scope {
             clusterId = id(clusterId, "clusterId");
             captureId = id(captureId, "captureId"); openingId = id(openingId, "openingId");
             sourceId = id(sourceId, "sourceId"); nodeId = id(nodeId, "nodeId"); bootId = id(bootId, "bootId");
-            routeRevision = id(routeRevision, "routeRevision");
             if (epoch < 0 || tables == null || tables.isEmpty() || tables.size() > 4096) throw invalid("hint.captureScope");
             for (String table : tables) id(table, "table");
             tables = Set.copyOf(tables);
@@ -56,7 +55,7 @@ public final class ValidationCaptureHintRegistry implements AutoCloseable {
         }
         private long bytes() {
             long bytes = 2048L + 2L * (clusterId.length() + captureId.length() + openingId.length() + sourceId.length()
-                    + nodeId.length() + bootId.length() + routeRevision.length());
+                    + nodeId.length() + bootId.length());
             for (String table : tables) bytes += 64L + 2L * table.length();
             if (fence != null) bytes += 512L + 2L * (fence.key().clusterId().length() + fence.key().resourceId().length());
             return bytes;
@@ -150,7 +149,7 @@ public final class ValidationCaptureHintRegistry implements AutoCloseable {
                 || !sender.sourceId().equals(scope.sourceId()) || !sender.nodeId().equals(scope.nodeId())
                 || !sender.bootId().equals(scope.bootId()) || sender.captureEpoch() != scope.epoch()
                 || sender.captureFence() != (scope.fence() == null ? 0 : scope.fence().claimGeneration())
-                || !sender.routeRevision().equals(scope.routeRevision()) || !scope.tables().contains(sender.tableId())) {
+                || !scope.tables().contains(sender.tableId())) {
             throw invalid("hint.senderCaptureScope");
         }
         long charge = 1024L + sender.retainedBytes();
@@ -173,6 +172,18 @@ public final class ValidationCaptureHintRegistry implements AutoCloseable {
             throw invalid("hint.captureNotOpen");
         }
         return added;
+    }
+
+    /**
+     * Source-side retirement signal: closes admission and records the original reason without registry
+     * or outbox locks, transport, or completing drain callbacks. It never stops the original source.
+     * The control path must still call close/reap and await actual callbacks/packet requests before
+     * releasing reservations. This is safe to invoke from a physical capture's locked lifecycle path.
+     */
+    public void invalidate(Throwable reason) {
+        failure.record(Objects.requireNonNull(reason, "reason"));
+        closed = true;
+        broadcast(reason);
     }
 
     /** Reclaims metadata only after both actual key callbacks and physical packet requests have exited. */
@@ -256,7 +267,7 @@ public final class ValidationCaptureHintRegistry implements AutoCloseable {
             }
         }
         @Override public void onError(Throwable problem) {
-            failure.record(problem); closed = true; broadcast(problem);
+            invalidate(problem);
             original.onError(problem);
         }
         @Override public void onAcknowledged(SourcePosition position) { original.onAcknowledged(position); }
