@@ -639,8 +639,10 @@ def enum_qualified_name(root, source, enum_name, sources):
         package = re.search(r'\bpackage\s+([\w.]+)\s*;', clean)
         prefix = package.group(1) + '.' if package else ''
         classes = []
-        for match in re.finditer(r'\b(class|interface|enum|record)\s+(\w+)\b[^;{]*\{', clean):
-            start = match.end() - 1
+        for match in re.finditer(r'\b(class|interface|enum|record)\s+(\w+)\b', clean):
+            start = declaration_body(clean, match.end())
+            if start is None:
+                continue
             parent = next((c for c in reversed(classes) if c['start'] < start < c['end']), None)
             name = parent['name'] + '$' + match.group(2) if parent else prefix + match.group(2)
             record = dict(start=start, end=close_at(clean, start, '{', '}'), name=name)

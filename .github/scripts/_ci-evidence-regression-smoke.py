@@ -415,6 +415,29 @@ class SourceIdentityTests(unittest.TestCase):
         self.assertEqual(text[node['start'] + 1:node['end']].strip(), 'ONE, TWO;')
         self.assertEqual(evidence.enum_constants(text, 'Flavor'), ['ONE', 'TWO'])
 
+    def test_annotation_array_headers_preserve_nested_enum_argument_identities(self):
+        headers = [
+            'class Holder extends @TA({1, 2}) Base',
+            'class Holder implements @TA({1, 2}) Marker',
+            'record Holder(@TA({1, 2}) int value)',
+            'interface Holder extends @TA({1, 2}) Marker',
+            'enum Holder implements @TA({1, 2}) Marker',
+        ]
+        for header in headers:
+            with self.subTest(header=header), tempfile.TemporaryDirectory() as temporary:
+                preamble = ('class Base {} interface Marker {} '
+                    '@java.lang.annotation.Target({java.lang.annotation.ElementType.TYPE_USE, '
+                    'java.lang.annotation.ElementType.RECORD_COMPONENT}) @interface TA { int[] value(); } '
+                    + header + ' { ' + ('INSTANCE; ' if header.startswith('enum ') else '')
+                    + 'enum Flavor { VANILLA, CHOCOLATE } }')
+                _, inv = self.inventory(Path(temporary),
+                    '@ParameterizedTest @EnumSource(Holder.Flavor.class) void flavor(Holder.Flavor value) {}',
+                    preamble=preamble)
+                self.assertTrue(inv['complete'], inv['unresolved'])
+                self.assertEqual(inv['methods'][0]['argument_digests'], [
+                    evidence.argument_digest([['enum', 'sample.Holder$Flavor', value]])
+                    for value in ('VANILLA', 'CHOCOLATE')])
+
     def test_qualified_package_fallback_keeps_nonmatching_and_nested_definitions(self):
         for annotation in ('sample.Hidden', 'sample.Holder.Hidden'):
             with self.subTest(annotation=annotation), tempfile.TemporaryDirectory() as temporary:
