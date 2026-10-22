@@ -106,7 +106,7 @@ final class PdkIdentityIndexes {
     static Evidence mongo(PdkConnector connector, String table) throws Throwable {
         List<List<String>> keys = new ArrayList<>();
         boolean opaque = false;
-        List<Map<?, ?>> rows = execute(connector, "aggregate", Map.of("collection", table,
+        var rows = execute(connector, "aggregate", Map.of("collection", table,
                 "pipeline", List.of(Map.of("$indexStats", Map.of())), "batchSize", 1000));
         if (rows.isEmpty()) throw new IllegalStateException("target index inspection returned no index specs");
         for (Map<?, ?> row : rows) {
@@ -129,14 +129,14 @@ final class PdkIdentityIndexes {
                         && (number.intValue() == 1 || number.intValue() == -1));
     }
 
-    private static List<Map<?, ?>> query(PdkConnector connector, String sql) throws Throwable {
+    private static List<Map<Object, Object>> query(PdkConnector connector, String sql) throws Throwable {
         return execute(connector, "executeQuery", Map.of("sql", sql, "batchSize", 1000));
     }
 
-    static List<Map<?, ?>> execute(PdkConnector connector, String command, Map<String, Object> params) throws Throwable {
+    static List<Map<Object, Object>> execute(PdkConnector connector, String command, Map<String, Object> params) throws Throwable {
         var execute = connector.functions().getExecuteCommandFunction();
         if (execute == null) throw new IllegalStateException("exact target index inspection is unavailable");
-        List<Map<?, ?>> rows = new ArrayList<>();
+        List<Map<Object, Object>> rows = new ArrayList<>();
         java.util.concurrent.atomic.AtomicBoolean answered = new java.util.concurrent.atomic.AtomicBoolean();
         java.util.concurrent.atomic.AtomicReference<Throwable> failure = new java.util.concurrent.atomic.AtomicReference<>();
         execute.execute(connector.context(), TapExecuteCommand.create().command(command)
@@ -150,7 +150,7 @@ final class PdkIdentityIndexes {
                                 failure.set(new IllegalStateException("target index inspection returned a non-row value"));
                                 break;
                             }
-                            rows.add(values);
+                            rows.add(new LinkedHashMap<>(values));
                         }
                     }
                 });

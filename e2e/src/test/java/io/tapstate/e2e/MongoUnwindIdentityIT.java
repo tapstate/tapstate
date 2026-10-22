@@ -225,7 +225,7 @@ class MongoUnwindIdentityIT {
                     writer.write(changes).toCompletableFuture().get(30, TimeUnit.SECONDS);
                     assertThat(mongo.getCollection("orders").countDocuments()).isEqualTo(keys.size() - 1);
                     assertThat(mongo.getCollection("orders").find().into(new ArrayList<>())).allSatisfy(doc ->
-                            assertThat(snapshot).anySatisfy(old -> assertThat(old.get("_id")).isEqualTo(doc.get("_id"))));
+                            assertThat(snapshot).anySatisfy(old -> assertThat(old).containsEntry("_id", doc.get("_id"))));
                     var deletes = expand(Envelope.delete(3L, "orders", parent(keys.subList(1, keys.size())), null));
                     writer.write(deletes).toCompletableFuture().get(30, TimeUnit.SECONDS);
                     writer.write(deletes).toCompletableFuture().get(30, TimeUnit.SECONDS);

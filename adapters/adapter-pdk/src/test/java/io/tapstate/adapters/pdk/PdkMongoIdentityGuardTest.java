@@ -42,8 +42,8 @@ class PdkMongoIdentityGuardTest {
                     default -> throw new IllegalStateException("query failed");
                 }
             });
-            assertThatThrownBy(() -> PdkMongoIdentityGuard.verify(connector, MongoIdentityKeysTest.PLAN,
-                    List.of(Map.of("original", Map.of("$eq", "p"), "k", Map.of("$eq", "a")))))
+            List<Map<String, Object>> keys = List.of(Map.of("original", Map.of("$eq", "p"), "k", Map.of("$eq", "a")));
+            assertThatThrownBy(() -> PdkMongoIdentityGuard.verify(connector, MongoIdentityKeysTest.PLAN, keys))
                     .isInstanceOf(TapstateException.class);
         }
     }

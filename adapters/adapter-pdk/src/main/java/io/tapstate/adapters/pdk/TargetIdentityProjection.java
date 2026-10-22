@@ -11,6 +11,8 @@ import java.util.Set;
 
 /** Applies an assessed target projection to both images while preserving converted value carriers. */
 public final class TargetIdentityProjection {
+    private static final String UNSUPPORTED_KEY = "key-representation-unsupported";
+
     private TargetIdentityProjection() { }
 
     public static Envelope apply(TargetIdentityPlan plan, Envelope event) {
@@ -19,7 +21,7 @@ public final class TargetIdentityProjection {
         if (event.before() == null && event.after() == null
                 || event.op() == io.tapstate.core.event.Op.DELETE && event.before() == null
                 || event.op() != io.tapstate.core.event.Op.DELETE && event.after() == null) {
-            throw failure(plan, "key-representation-unsupported");
+            throw failure(plan, UNSUPPORTED_KEY);
         }
         Set<String> removed = new LinkedHashSet<>();
         for (String field : event.removed()) {
@@ -31,7 +33,7 @@ public final class TargetIdentityProjection {
                 && !MongoIdentityKeys.key(plan, before).equals(MongoIdentityKeys.key(plan, after))) {
             // Expansion emits delete/insert for key changes. A type-only change hidden by logical
             // equality would leave an update whose old native predicate cannot match on replay.
-            throw failure(plan, "key-representation-unsupported");
+            throw failure(plan, UNSUPPORTED_KEY);
         }
         return new Envelope(event.op(), event.ts(), event.src(), before, after, event.schema()).withRemoved(removed);
     }
@@ -51,7 +53,7 @@ public final class TargetIdentityProjection {
         // Discovery is sampled; reject runtime drift before a connector can coerce distinct keys.
         if (plan.requireSignedInt64Keys() && plan.writeKey().stream()
                 .anyMatch(field -> !signedInt64(ConvertedValue.unwrap(projected.get(field))))) {
-            throw failure(plan, "key-representation-unsupported");
+            throw failure(plan, UNSUPPORTED_KEY);
         }
         if (plan.requireDocumentKeys()) MongoIdentityKeys.key(plan, projected);
         return projected;

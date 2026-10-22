@@ -38,13 +38,7 @@ final class MongoIdentityKeys {
             return Map.of("$numberLong", number.toString());
         }
         if (value instanceof Boolean bool && kindMatches(kind, "TapBooleanValue")) return bool;
-        if (value instanceof String text && kindMatches(kind, "TapStringValue")) {
-            if (carrier != null && "OBJECT_ID".equals(carrier.originType())) {
-                if (!text.matches("[0-9a-f]{24}")) throw unsupported(plan);
-                return Map.of("$oid", text);
-            }
-            return text;
-        }
+        if (value instanceof String text && kindMatches(kind, "TapStringValue")) return string(plan, carrier, text);
         if (value instanceof Bytes bytes && carrier != null && kindMatches(kind, "TapBinaryValue")) {
             return Map.of("$binary", Map.of("base64", Base64.getEncoder().encodeToString(bytes.value()),
                     "subType", String.format(java.util.Locale.ROOT, "%02x", bytes.tag() & 0xff)));
@@ -52,20 +46,41 @@ final class MongoIdentityKeys {
         throw unsupported(plan);
     }
 
+    private static Object string(TargetIdentityPlan plan, ConvertedValue carrier, String text) {
+        if (carrier == null || !"OBJECT_ID".equals(carrier.originType())) return text;
+        if (!text.matches("[0-9a-f]{24}")) throw unsupported(plan);
+        return Map.of("$oid", text);
+    }
+
     private static Object instant(TargetIdentityPlan plan, ConvertedValue carrier, Instant instant) {
-        String kind = carrier == null ? null : carrier.valueKind();
-        boolean temporal = List.of("TapDateTimeValue", "TapDateValue", "TapTimeValue").contains(kind == null ? "" : kind);
-        if (kind != null && !temporal || instant.getNano() % 1_000_000 != 0) throw unsupported(plan);
+        if (carrier == null) return instantValue(plan, instant);
+        String kind = carrier.valueKind();
+        if (kind == null) {
+            if (carrier.temporalDescription() != null) throw unsupported(plan);
+            return instantValue(plan, instant);
+        }
+        if (!List.of("TapDateTimeValue", "TapDateValue", "TapTimeValue").contains(kind)) throw unsupported(plan);
+        validateCarriedTime(plan, carrier, instant);
+        return instantValue(plan, instant);
+    }
+
+    private static void validateCarriedTime(TargetIdentityPlan plan, ConvertedValue carrier, Instant instant) {
         try {
-            if (temporal) {
-                Object parsed = io.tapstate.core.common.JsonReader.parse(carrier.temporalDescription());
-                if (!(parsed instanceof Map<?, ?> state) || state.get("illegal") != null
-                        || !(state.get("seconds") instanceof Number seconds)
-                        || !(state.get("nano") instanceof Number nano)
-                        || !instant.equals(Instant.ofEpochSecond(seconds.longValue(), nano.longValue()))) throw unsupported(plan);
-            } else if (carrier != null && carrier.temporalDescription() != null) throw unsupported(plan);
-            return Map.of("$date", Map.of("$numberLong", Long.toString(instant.toEpochMilli())));
+            Object parsed = io.tapstate.core.common.JsonReader.parse(carrier.temporalDescription());
+            if (!(parsed instanceof Map<?, ?> state) || state.get("illegal") != null
+                    || !(state.get("seconds") instanceof Number seconds)
+                    || !(state.get("nano") instanceof Number nano)
+                    || !instant.equals(Instant.ofEpochSecond(seconds.longValue(), nano.longValue()))) throw unsupported(plan);
         } catch (RuntimeException invalid) {
+            throw unsupported(plan);
+        }
+    }
+
+    private static Object instantValue(TargetIdentityPlan plan, Instant instant) {
+        if (instant.getNano() % 1_000_000 != 0) throw unsupported(plan);
+        try {
+            return Map.of("$date", Map.of("$numberLong", Long.toString(instant.toEpochMilli())));
+        } catch (ArithmeticException invalid) {
             throw unsupported(plan);
         }
     }
@@ -106,7 +121,7 @@ final class MongoIdentityKeys {
         if (encoded == null) return false;
         if (portable instanceof String text) {
             boolean objectId = carried instanceof ConvertedValue carrier && "OBJECT_ID".equals(carrier.originType());
-            return objectId ? encoded.getClass().getName().equals("org.bson.types.ObjectId") && text.equals(encoded.toString())
+            return objectId ? driverInstance("org.bson.types.ObjectId", encoded) && text.equals(encoded.toString())
                     : encoded instanceof String && text.equals(encoded);
         }
         if (portable instanceof Long || portable instanceof Boolean) return portable.equals(encoded);
@@ -115,7 +130,16 @@ final class MongoIdentityKeys {
                     || encoded instanceof java.util.Date date && instant.equals(date.toInstant());
         }
         // Content and subtype were compared after the frozen codec decoded this native value.
-        return portable instanceof Bytes && encoded.getClass().getName().equals("org.bson.types.Binary");
+        return portable instanceof Bytes && driverInstance("org.bson.types.Binary", encoded);
+    }
+
+    private static boolean driverInstance(String className, Object value) {
+        try {
+            // Driver types belong to the connector's isolated loader, not the host's dependencies.
+            return Class.forName(className, false, value.getClass().getClassLoader()).isInstance(value);
+        } catch (ClassNotFoundException unavailable) {
+            return false;
+        }
     }
 
     private static boolean kindMatches(String actual, String expected) {

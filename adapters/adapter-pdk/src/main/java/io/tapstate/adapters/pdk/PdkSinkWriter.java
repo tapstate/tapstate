@@ -223,18 +223,28 @@ final class PdkSinkWriter implements SinkWriter {
             }
             TargetIdentityPlan identity = identities.get(env.src());
             Envelope row = identity == null ? env : TargetIdentityProjection.apply(identity, env);
-            if (identity != null && identity.isAutomatic() && identity.requireDocumentKeys()) {
-                List<Map<String, Object>> streamKeys = keys.computeIfAbsent(env.src(), ignored -> new ArrayList<>());
-                if (row.before() != null) streamKeys.add(MongoIdentityKeys.key(identity, row.before()));
-                if (row.after() != null) streamKeys.add(MongoIdentityKeys.key(identity, row.after()));
-            }
+            collectDocumentKeys(identity, row, keys);
             TapRecordEvent encoded = encode(mode == WriteMode.APPEND ? asInsert(row) : row);
-            if (identity != null && identity.isAutomatic() && identity.requireDocumentKeys()) {
-                MongoIdentityKeys.verifyEncoded(connector.conversions(), identity, row, encoded);
-            }
+            verifyDocumentKeys(identity, row, encoded);
             rowsByTable.computeIfAbsent(env.src(), ignored -> new ArrayList<>()).add(encoded);
         }
         return new EncodedBatch(rowsByTable, keys);
+    }
+
+    private static boolean documentIdentity(TargetIdentityPlan identity) {
+        return identity.isAutomatic() && identity.requireDocumentKeys();
+    }
+
+    private static void collectDocumentKeys(TargetIdentityPlan identity, Envelope row,
+            Map<String, List<Map<String, Object>>> keys) {
+        if (identity == null || !documentIdentity(identity)) return;
+        List<Map<String, Object>> streamKeys = keys.computeIfAbsent(row.src(), ignored -> new ArrayList<>());
+        if (row.before() != null) streamKeys.add(MongoIdentityKeys.key(identity, row.before()));
+        if (row.after() != null) streamKeys.add(MongoIdentityKeys.key(identity, row.after()));
+    }
+
+    private void verifyDocumentKeys(TargetIdentityPlan identity, Envelope row, TapRecordEvent encoded) {
+        if (identity != null && documentIdentity(identity)) MongoIdentityKeys.verifyEncoded(connector.conversions(), identity, row, encoded);
     }
 
     private WriteResult writeRows(Map<String, List<TapRecordEvent>> rowsByTable) throws Throwable {

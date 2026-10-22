@@ -58,15 +58,19 @@ class MongoIdentityKeysTest {
 
     @Test
     void absentKeysImagesAndNonLiteralFieldNamesCannotBypassTheGuard() {
-        assertThatThrownBy(() -> TargetIdentityProjection.row(PLAN, Map.of("_id", "p"))).isInstanceOf(TapstateException.class);
-        assertThatThrownBy(() -> TargetIdentityProjection.apply(PLAN, Envelope.delete(1L, "orders", null, null)))
+        var missingKey = Map.<String, Object>of("_id", "p");
+        assertThatThrownBy(() -> TargetIdentityProjection.row(PLAN, missingKey)).isInstanceOf(TapstateException.class);
+        var missingDelete = Envelope.delete(1L, "orders", null, null);
+        var missingInsert = Envelope.insert(1L, "orders", null, null);
+        assertThatThrownBy(() -> TargetIdentityProjection.apply(PLAN, missingDelete))
                 .isInstanceOf(TapstateException.class);
-        assertThatThrownBy(() -> TargetIdentityProjection.apply(PLAN, Envelope.insert(1L, "orders", null, null)))
+        assertThatThrownBy(() -> TargetIdentityProjection.apply(PLAN, missingInsert))
                 .isInstanceOf(TapstateException.class);
         for (String field : List.of("a.b", "$key", "", "a\0b")) {
             var plan = new TargetIdentityPlan("automatic", "generated-target-identity", PLAN.target(), "_id", "original",
                     List.of("original", field), false, true);
-            assertThatThrownBy(() -> MongoIdentityKeys.key(plan, Map.of("original", "p", field, "x")))
+            var invalidName = Map.<String, Object>of("original", "p", field, "x");
+            assertThatThrownBy(() -> MongoIdentityKeys.key(plan, invalidName))
                     .isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.args()).containsEntry("reason", "invalid-field-name"));
         }
     }
@@ -95,14 +99,16 @@ class MongoIdentityKeysTest {
         MongoIdentityKeys.verifyEncoded(conversions, PLAN, envelope,
                 io.tapdata.entity.event.dml.TapInsertRecordEvent.create().table("orders").after(portable));
         for (Object different : List.of(2L, 1.0, "1")) {
-            assertThatThrownBy(() -> MongoIdentityKeys.verifyEncoded(conversions, PLAN, envelope,
-                    io.tapdata.entity.event.dml.TapInsertRecordEvent.create().table("orders").after(Map.of("original", "p", "k", different))))
+            var encoded = io.tapdata.entity.event.dml.TapInsertRecordEvent.create().table("orders")
+                    .after(Map.of("original", "p", "k", different));
+            assertThatThrownBy(() -> MongoIdentityKeys.verifyEncoded(conversions, PLAN, envelope, encoded))
                     .isInstanceOf(TapstateException.class);
         }
         var objectId = Map.<String, Object>of("original", "p", "k", new ConvertedValue("012345678901234567890123", "OBJECT_ID"));
-        assertThatThrownBy(() -> MongoIdentityKeys.verifyEncoded(conversions, PLAN,
-                Envelope.insert(1L, "orders", objectId, null), io.tapdata.entity.event.dml.TapInsertRecordEvent.create().table("orders")
-                        .after(Map.of("original", "p", "k", "012345678901234567890123"))))
+        var objectEnvelope = Envelope.insert(1L, "orders", objectId, null);
+        var encodedString = io.tapdata.entity.event.dml.TapInsertRecordEvent.create().table("orders")
+                .after(Map.of("original", "p", "k", "012345678901234567890123"));
+        assertThatThrownBy(() -> MongoIdentityKeys.verifyEncoded(conversions, PLAN, objectEnvelope, encodedString))
                 .isInstanceOf(TapstateException.class);
     }
 
@@ -111,9 +117,11 @@ class MongoIdentityKeysTest {
         String hex = "012345678901234567890123";
         var before = Map.<String, Object>of("_id", "p", "k", new ConvertedValue(hex, "OBJECT_ID"));
         var after = Map.<String, Object>of("_id", "p", "k", hex);
-        assertThatThrownBy(() -> TargetIdentityProjection.apply(PLAN, Envelope.update(1L, "orders", before, after, null)))
+        var toString = Envelope.update(1L, "orders", before, after, null);
+        var toObject = Envelope.update(1L, "orders", after, before, null);
+        assertThatThrownBy(() -> TargetIdentityProjection.apply(PLAN, toString))
                 .isInstanceOf(TapstateException.class);
-        assertThatThrownBy(() -> TargetIdentityProjection.apply(PLAN, Envelope.update(1L, "orders", after, before, null)))
+        assertThatThrownBy(() -> TargetIdentityProjection.apply(PLAN, toObject))
                 .isInstanceOf(TapstateException.class);
     }
 
