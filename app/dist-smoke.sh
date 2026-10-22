@@ -179,6 +179,7 @@ else
   # the reserved MDC attribution slots ("[] [] []" while unpopulated) — proof the shipped format is
   # live end to end, which a JVM unit test asserting the logback context cannot cover.
   check     "wrote an operational log file"    test -f "$WORK/logs-boot/tapstate-server.log"
+  check     "timezone is in the operational file" grep -qF "Server time zone: UTC (default)" "$WORK/logs-boot/tapstate-server.log"
   check     "log format carries the MDC slots" grep -qE '\-\-\- \[\] \[\] \[\]' "$WORK/logs-boot/tapstate-server.log"
 fi
 
@@ -222,6 +223,7 @@ else
     # wrapper's own non-zero signal disposition): the member's own SHUTDOWN line is the discriminator.
     check   "launcher member shut down cleanly on SIGTERM" grep -q "is SHUTDOWN" "$WORK/dist-all.txt"
     check   "launcher wrote an operational log file" test -f "$WORK/logs-dist/tapstate-server.log"
+    check   "explicit timezone is in the operational file" grep -qF "Server time zone: Asia/Tokyo (JVM option)" "$WORK/logs-dist/tapstate-server.log"
 
     # Prove the launcher's conf/ search-path wiring is load-bearing, not decorative: with the shipped
     # comment-only conf the Spring banner prints (control); writing a boot-time property into conf/

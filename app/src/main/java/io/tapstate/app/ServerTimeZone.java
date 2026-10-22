@@ -2,9 +2,10 @@ package io.tapstate.app;
 
 import java.lang.management.ManagementFactory;
 import java.util.TimeZone;
+import org.slf4j.Logger;
 
 /** Selects the server process timezone before logging, framework and connector initialization. */
-record ServerTimeZone(String id, String source) {
+record ServerTimeZone(String id, String source, String requested) {
     private static final String PROPERTY = "user.timezone";
     private static final String OPTION = "-D" + PROPERTY;
 
@@ -25,6 +26,20 @@ record ServerTimeZone(String id, String source) {
         // Resolve through the JDK after invalidating its cache, retaining its timezone-ID semantics.
         // Setting the property alone would leave an earlier getDefault() result in force.
         TimeZone.setDefault(null);
-        return new ServerTimeZone(TimeZone.getDefault().getID(), explicit ? "JVM option" : "default");
+        return new ServerTimeZone(TimeZone.getDefault().getID(), explicit ? "JVM option" : "default",
+                explicit ? configured : "UTC");
+    }
+
+    void log(Logger logger) {
+        if (logger.isInfoEnabled()) {
+            if (requested.equals(id)) {
+                logger.info("Server time zone: {} ({})", id, source);
+            } else {
+                // The JDK can normalize a valid custom offset or fall back from an unknown ID.
+                // Show both values without mislabelling a valid normalization as an invalid option.
+                logger.info("Server time zone: {} ({}); requested=\"{}\", resolved differently by the JDK",
+                        id, source, requested.replace("\r", "\\r").replace("\n", "\\n"));
+            }
+        }
     }
 }
