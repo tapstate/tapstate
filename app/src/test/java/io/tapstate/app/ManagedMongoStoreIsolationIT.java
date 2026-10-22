@@ -1997,6 +1997,42 @@ class ManagedMongoStoreIsolationIT {
         }
     }
 
+    @Test void anUnstartedPipelineRetiresThroughTheNativeApplicationWithoutInventingRuntimeHistory() {
+        try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
+            var databases = prepareNativeDatabases(admin, "delete_" + UUID.randomUUID().toString().substring(0, 8));
+            try (var application = nativeRoot(uri(databases.configUser(), databases.config()))) {
+                var root = application.getBean(StorageRoot.class);
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(15)).until(root.runtime()::businessStarted);
+                var business = (NativeBusinessContext) root.runtime().business().orElseThrow();
+                var child = (ConfigurableApplicationContext) org.springframework.test.util.ReflectionTestUtils.getField(business, "context");
+                var configuration = root.runtime().requireConfiguration();
+                var source = new SourceResource("input", null, "mongodb", Map.of("isUri", true, "uri", uri(databases.masterUser(), databases.master())),
+                        SourceMode.CDC, List.of(TableRef.literal("orders")), null, null);
+                var pipeline = new PipelineResource("never_run", null, List.of(SourceRef.spec("input", false)), null, null,
+                        new ServeBlock.Inline("serve", FromRef.literal("orders"), List.of(new SyncElement("sync", "views", null, null, null, OnFullLoad.APPEND)), null, null),
+                        null, null);
+                configuration.artifacts().saveAll(List.of(source, pipeline));
+                assertThat(configuration.preparations().read(pipeline.id()).orElseThrow().phase()).isEqualTo(PipelinePreparation.Phase.UNASSIGNED);
+                assertThat(child.getBean(io.tapstate.runtime.engine.Engine.class).captureRun(pipeline.id())).isEmpty();
+                var node = child.getBean(NodeSessionLease.class).currentFence().orElseThrow();
+                var reading = business.statusStore().workloadClaims().read(node.key()).orElseThrow();
+                assertThat(reading.leased()).isTrue();
+                assertThat(WorkloadClaimFence.from(reading.claim())).isEqualTo(node);
+                child.getBean(io.tapstate.control.core.ArtifactMutationService.class).delete("admin", pipeline.id(),
+                        io.tapstate.core.model.canonical.CanonicalHash.of(pipeline));
+                assertThat(configuration.artifacts().get(pipeline.id())).isEmpty();
+                var mapping = configuration.pipelineStates().read(pipeline.id()).orElseThrow();
+                assertThat(mapping.phase()).isEqualTo(PipelineStateMapping.Phase.RETIRED);
+                assertThat(configuration.retirements().completed(pipeline.id(), mapping.operationId())).isPresent();
+                assertThat(admin.getDatabase(databases.cache()).getCollection("workload_claims")
+                        .countDocuments(new Document("resourceType", "PIPELINE_ACTUATION"))).isZero();
+                for (String collection : List.of("pipeline_state", "srs_consumers", "nest_state", "join_facts"))
+                    assertThat(admin.getDatabase(databases.cache()).getCollection(collection).countDocuments()).isZero();
+                assertThat(admin.getDatabase(databases.config()).getCollection("sources").countDocuments()).isEqualTo(2);
+            }
+        }
+    }
+
     @Test
     void twoClusterUsersCanUseOnlyTheirOwnThreeDatabasesAndRecoverAfterRestart() throws Exception {
         String suffix = UUID.randomUUID().toString().substring(0, 8);

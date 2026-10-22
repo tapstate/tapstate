@@ -97,6 +97,25 @@ class MongoCachePipelineRebuildsIT {
         });
     }
 
+    @Test void anUnpreparedDeletionPreservesUnexpectedCacheHistoryAndRefusesCompletion() {
+        withFixture(f -> {
+            var pipeline=new DslParser().parse("version: tapstate/v1\nkind: pipeline\nid: unused\nsource: []\n");
+            f.configuration.artifacts().create(pipeline);
+            var scope=new PipelineIntentScope(f.business.clusterId(),1,f.business.cacheIncarnation(),"unused",1);
+            var request=new PipelineRetirementRequest("delete-unknown-history",scope,CanonicalHash.of(pipeline),java.util.Optional.empty());
+            var pending=f.configuration.retirements().begin(request);
+            f.states().insertOne(new Document("_id","unused").append("retainedEvidence","unknown-history"));
+            var before=f.snapshot();
+
+            assertCode(() -> f.domain.pipelineRetirements(f.business,ACTIVE).retire(pending,f.node),IoError.PIPELINE_STATE_REBUILD_REQUIRED);
+
+            assertThat(f.snapshot()).isEqualTo(before);
+            assertThat(f.configuration.artifacts().get("unused")).contains(pipeline);
+            assertThat(f.configuration.retirements().completed("unused",request.operationId())).isEmpty();
+            assertThat(f.configuration.pipelineStates().read("unused").orElseThrow().phase()).isEqualTo(PipelineStateMapping.Phase.RETIRING);
+        });
+    }
+
     @Test void retirementResumesAcrossIndependentClientsWithoutReissuingOrAdvancingItsResult() {
         withFixture(f -> {
             var pipeline=f.configuration.artifacts().get("flow").orElseThrow();

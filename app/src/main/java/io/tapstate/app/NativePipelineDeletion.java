@@ -67,7 +67,8 @@ final class NativePipelineDeletion implements ArtifactMutationService.PipelineDe
         if (pending.isPresent() && !pending.orElseThrow().request().definitionHash().equals(expectedHash)) throw conflict(original.id());
         var preparation=configuration.preparations().read(original.id()).orElseThrow(NativePipelineDeletion::fenced);
         if (preparation.phase()==PipelinePreparation.Phase.ISSUED) throw fenced();
-        boolean alreadyRetired=pending.isPresent() && retirement.completed(pending.orElseThrow(),node.get()).isPresent();
+        boolean alreadyRetired=pending.isPresent() && pending.orElseThrow().request().cache().isPresent()
+                && retirement.completed(pending.orElseThrow(),node.get()).isPresent();
         try (var control=alreadyRetired || preparation.phase()==PipelinePreparation.Phase.UNASSIGNED
                 ? ownership.unpreparedControl(scope) : ownership.control(scope)) {
             control.requireHeld(); active.run();
@@ -102,7 +103,11 @@ final class NativePipelineDeletion implements ArtifactMutationService.PipelineDe
                 } else if (current.phase()==PipelineStateMapping.Phase.RETIRING && request.operationId().equals(current.operationId())) {
                     var held=lifecycle.pending(scope,request.operationId()).orElseThrow(NativePipelineDeletion::fenced);
                     if (!held.request().equals(request)) throw fenced();
-                    if (retirement.completed(held,node.get()).isEmpty()) { control.requireActive(); requireRest(scope); }
+                    // Empty original history never has a CACHE receipt. The actual retirement still proves
+                    // the live node and absence of unexpected history in its own CACHE transaction.
+                    if (held.request().cache().isEmpty() || retirement.completed(held,node.get()).isEmpty()) {
+                        control.requireActive(); requireRest(scope);
+                    }
                 } else throw fenced();
             };
             var coordinator=new PipelineDeletionCoordinator(lifecycle,retirement,consumers,notes,node,active,(fixed, ignored) -> {
