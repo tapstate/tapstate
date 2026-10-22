@@ -66,6 +66,36 @@ class TargetIdentityResolverTest {
     }
 
     @Test
+    void discoveredIntegerKeysSurvivePdkConversionBeforeTheRuntimeGuard() {
+        var table = new io.tapdata.entity.schema.TapTable("rows");
+        table.add(new io.tapdata.entity.schema.TapField("id", "bigint")
+                .tapType(new io.tapdata.entity.schema.type.TapNumber().fixed(true).bit(64).scale(0)));
+        table.add(new io.tapdata.entity.schema.TapField("position", "bigint")
+                .tapType(new io.tapdata.entity.schema.type.TapNumber().fixed(true).bit(64).scale(0)));
+        var codecs = new io.tapdata.entity.codec.TapCodecsRegistry();
+        var plan = TargetIdentityResolver.resolve(expanded("id", PRESERVED),
+                relational(true, Set.of("id", PRESERVED, "position"),
+                        List.of(List.of(PRESERVED, "position")), Set.of()));
+        for (long id : new long[] {700L, 9007199254740993L, Long.MIN_VALUE, Long.MAX_VALUE}) {
+            var row = Map.<String, Object>of("id", id, "position", 0L);
+            var snapshot = TapEventCodec.decodeSnapshotRow(io.tapdata.entity.event.dml.TapInsertRecordEvent.create()
+                    .table("rows").after(row), codecs, PdkRowSchema.of(table));
+            var update = TapEventCodec.decodeChange(io.tapdata.entity.event.dml.TapUpdateRecordEvent.create()
+                    .table("rows").before(row).after(row), codecs, PdkRowSchema.of(table));
+            assertThat(ConvertedValue.unwrap(snapshot.after().get("id"))).isEqualTo(id);
+            var written = (io.tapdata.entity.event.dml.TapInsertRecordEvent) TapEventCodec.encode(
+                    TargetIdentityProjection.apply(plan, snapshot), codecs);
+            assertThat(written.getAfter()).containsEntry(PRESERVED, id);
+            assertThat(ConvertedValue.unwrap(TargetIdentityProjection.apply(plan, update).before().get(PRESERVED)))
+                    .isEqualTo(id);
+        }
+        codecs.registerToTapValue(Long.class, (raw, schema) -> new io.tapdata.entity.schema.value.TapNumberValue(42.5));
+        var custom = TapEventCodec.decodeSnapshotRow(io.tapdata.entity.event.dml.TapInsertRecordEvent.create()
+                .table("rows").after(Map.of("id", 700L, "position", 0L)), codecs, PdkRowSchema.of(table));
+        assertThat(ConvertedValue.unwrap(custom.after().get("id"))).isEqualTo(42.5);
+    }
+
+    @Test
     void runtimeKeyValuesCannotContradictTheSampledIntegerModel() {
         var plan = TargetIdentityResolver.resolve(expanded("id", PRESERVED),
                 relational(true, Set.of("id", PRESERVED, "position"),
