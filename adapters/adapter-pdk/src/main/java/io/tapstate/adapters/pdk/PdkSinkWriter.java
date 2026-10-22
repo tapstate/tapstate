@@ -56,6 +56,7 @@ final class PdkSinkWriter implements SinkWriter {
     private final PdkTargetPreparation preparation;
     private Map<String, TargetIdentityPlan> identities = Map.of();
     private SinkConfig identityConfig;
+    private boolean identityPrepared;
     // What closing this writer does to its connector: stops and closes it, or - where the connector is shared
     // by the writers of one sink - lets go of this writer's hold on it.
     private final Runnable letGo;
@@ -140,6 +141,7 @@ final class PdkSinkWriter implements SinkWriter {
             }
             if (identityConfig != null) {
                 PdkTargetIdentityPlanner.verifyPrepared(connector, identityConfig, targets, identities);
+                identityPrepared = true;
             }
             return null;
         });
@@ -178,7 +180,8 @@ final class PdkSinkWriter implements SinkWriter {
     }
 
     private synchronized WriteResult deliver(List<Envelope> records) {
-        Map<String, List<TapRecordEvent>> rowsByTable = encodedRows(records);
+        EncodedBatch batch = encodedRows(records);
+        Map<String, List<TapRecordEvent>> rowsByTable = batch.rows();
         if (rowsByTable.isEmpty()) {
             return new WriteResult(0);
         }
@@ -189,7 +192,13 @@ final class PdkSinkWriter implements SinkWriter {
                     "append mode rejects a multi-table batch before any connector write"));
         }
         try {
-            return connector.underLoader(() -> writeRows(rowsByTable));
+            return connector.underLoader(() -> {
+                if (!batch.keys().isEmpty()) {
+                    if (!identityPrepared) prepareTargets();
+                    batch.keys().forEach((stream, keys) -> PdkMongoIdentityGuard.verify(connector, identities.get(stream), keys));
+                }
+                return writeRows(rowsByTable);
+            });
         } catch (TapstateException e) {
             throw e;
         } catch (Throwable t) {
@@ -197,7 +206,11 @@ final class PdkSinkWriter implements SinkWriter {
         }
     }
 
-    private Map<String, List<TapRecordEvent>> encodedRows(List<Envelope> records) {
+    private record EncodedBatch(Map<String, List<TapRecordEvent>> rows,
+            Map<String, List<Map<String, Object>>> keys) { }
+
+    private EncodedBatch encodedRows(List<Envelope> records) {
+        Map<String, List<Map<String, Object>>> keys = new LinkedHashMap<>();
         Map<String, List<TapRecordEvent>> rowsByTable = new LinkedHashMap<>();
         for (Envelope env : records) {
             if (env.op() == Op.DDL) {
@@ -210,10 +223,18 @@ final class PdkSinkWriter implements SinkWriter {
             }
             TargetIdentityPlan identity = identities.get(env.src());
             Envelope row = identity == null ? env : TargetIdentityProjection.apply(identity, env);
-            rowsByTable.computeIfAbsent(env.src(), ignored -> new ArrayList<>())
-                    .add(encode(mode == WriteMode.APPEND ? asInsert(row) : row));
+            if (identity != null && identity.isAutomatic() && identity.requireDocumentKeys()) {
+                List<Map<String, Object>> streamKeys = keys.computeIfAbsent(env.src(), ignored -> new ArrayList<>());
+                if (row.before() != null) streamKeys.add(MongoIdentityKeys.key(identity, row.before()));
+                if (row.after() != null) streamKeys.add(MongoIdentityKeys.key(identity, row.after()));
+            }
+            TapRecordEvent encoded = encode(mode == WriteMode.APPEND ? asInsert(row) : row);
+            if (identity != null && identity.isAutomatic() && identity.requireDocumentKeys()) {
+                MongoIdentityKeys.verifyEncoded(connector.conversions(), identity, row, encoded);
+            }
+            rowsByTable.computeIfAbsent(env.src(), ignored -> new ArrayList<>()).add(encoded);
         }
-        return rowsByTable;
+        return new EncodedBatch(rowsByTable, keys);
     }
 
     private WriteResult writeRows(Map<String, List<TapRecordEvent>> rowsByTable) throws Throwable {

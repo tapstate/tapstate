@@ -204,6 +204,38 @@ class TargetIdentityResolverTest {
                 .isEqualTo("other-unique-constraint");
     }
 
+    @Test
+    void competingNamesOnlyBlockATargetThatActuallyNeedsSeparation() {
+        var original = expanded("_id", PRESERVED);
+        var target = new TargetTable(original.name(), original.fields(), original.indexes(),
+                new UnwindIdentity(List.of("_id"), List.of("original_a", "original_b")));
+        assertThat(TargetIdentityResolver.resolve(target, document()).reason()).isEqualTo("ambiguous-source-id-field");
+        var compatible = new TargetIdentityFacts(true, false, List.of("_id", "position"), Set.of(),
+                Set.of("_id", "position"), List.of(List.of("_id", "position")), Set.of(), false, true, false, false, Set.of());
+        assertThat(TargetIdentityResolver.resolve(target, compatible).status()).isEqualTo(TargetIdentityPlan.NOT_REQUIRED);
+    }
+
+    @Test
+    void onlyIncompatibleEffectiveKeysAtOnePhysicalTargetConflict() {
+        var first = TargetIdentityResolver.resolve(expanded("_id", "original_a"), document());
+        var second = TargetIdentityResolver.resolve(expanded("_id", "original_b"), document());
+        assertThat(TargetIdentityResolver.reconcile(Map.of("a", first, "b", second)).values())
+                .allSatisfy(plan -> assertThat(plan.reason()).isEqualTo("target-key-conflict"));
+        assertThat(TargetIdentityResolver.reconcile(Map.of("a", first, "b", first)).values())
+                .allSatisfy(plan -> assertThat(plan.isAutomatic()).isTrue());
+        var differentTable = new TargetIdentityPlan(second.status(), second.reason(),
+                new TargetTable("other", second.target().fields(), second.target().indexes()),
+                second.sourceField(), second.preservedField(), second.writeKey());
+        assertThat(TargetIdentityResolver.reconcile(Map.of("a", first, "b", differentTable)).values())
+                .allSatisfy(plan -> assertThat(plan.isAutomatic()).isTrue());
+        var unchanged = new TargetIdentityPlan("not-required", "compatible-key", first.target(), null, null, first.writeKey());
+        assertThat(TargetIdentityResolver.reconcile(Map.of("a", first, "b", unchanged)).values())
+                .noneMatch(TargetIdentityPlan::blocked);
+        var ordinary = new TargetIdentityPlan("not-required", "compatible-key", first.target(), null, null, List.of("id"));
+        assertThat(TargetIdentityResolver.reconcile(Map.of("a", unchanged, "b", ordinary)).values())
+                .noneMatch(TargetIdentityPlan::blocked);
+    }
+
     private static TargetTable expanded(String id, String preserved) {
         return new TargetTable("rows", List.of(new TargetField(id, "string", true, id.equals("id") ? io.tapstate.core.common.TapstateType.INT64 : io.tapstate.core.common.TapstateType.STRING),
                 new TargetField("position", "long", true, io.tapstate.core.common.TapstateType.INT64), new TargetField("value", "string", false)),

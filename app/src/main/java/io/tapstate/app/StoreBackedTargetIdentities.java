@@ -75,7 +75,6 @@ final class StoreBackedTargetIdentities implements PipelineTargetIdentities {
         var source = new StoreBackedDagSource(store, NestSettings.defaults(), artifacts);
         List<Resolved> results = new ArrayList<>();
         source.writeTargets(definition, (coordinate, stream, target) -> {
-            if (target.unwindIdentity() == null) return;
             SourceResource connection = StoredArtifacts.requireSource(artifacts, coordinate.connection());
             SinkConfig config = new SinkConfig(connection.connector(), connection.config(), WriteMode.UPSERT,
                     DdlPolicy.FAIL, target, null, OnFullLoad.valueOf(coordinate.onFullLoad().name()), fullLoad);
@@ -85,7 +84,26 @@ final class StoreBackedTargetIdentities implements PipelineTargetIdentities {
                     plan.status(), plan.reason(), plan.sourceField(), plan.preservedField(), plan.writeKey());
             results.add(new Resolved(assessment, stream, plan));
         });
-        return List.copyOf(results);
+        return reconcile(results);
+    }
+
+    static List<Resolved> reconcile(List<Resolved> results) {
+        Map<String, Map<String, TargetIdentityPlan>> byConnection = new LinkedHashMap<>();
+        for (int i = 0; i < results.size(); i++) {
+            var result = results.get(i);
+            byConnection.computeIfAbsent(result.assessment().connection(), ignored -> new LinkedHashMap<>())
+                    .put(Integer.toString(i), result.plan());
+        }
+        byConnection.replaceAll((connection, plans) -> io.tapstate.adapters.pdk.TargetIdentityResolver.reconcile(plans));
+        List<Resolved> reconciled = new ArrayList<>();
+        for (int i = 0; i < results.size(); i++) {
+            var result = results.get(i);
+            var assessment = result.assessment();
+            var plan = byConnection.get(assessment.connection()).get(Integer.toString(i));
+            reconciled.add(new Resolved(new Assessment(assessment.element(), assessment.connection(), assessment.table(),
+                    plan.status(), plan.reason(), plan.sourceField(), plan.preservedField(), plan.writeKey()), result.stream(), plan));
+        }
+        return List.copyOf(reconciled);
     }
 
     static Map<String, Object> payload(Resolved resolved) {

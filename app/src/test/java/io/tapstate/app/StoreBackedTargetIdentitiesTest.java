@@ -73,6 +73,28 @@ class StoreBackedTargetIdentitiesTest {
                 .containsEntry("generatedFields", java.util.List.of());
     }
 
+    @Test
+    void separateSinkNodesOnOneConnectionAndTableMustAgreeOnAutomaticMatching() {
+        var first = resolved("sink_a", "connection", "orders", "original_a");
+        var second = resolved("sink_b", "connection", "orders", "original_b");
+        assertThat(StoreBackedTargetIdentities.reconcile(java.util.List.of(first, second)))
+                .allSatisfy(result -> assertThat(result.assessment().reason()).isEqualTo("target-key-conflict"));
+        for (var independent : java.util.List.of(resolved("sink_b", "other", "orders", "original_b"),
+                resolved("sink_b", "connection", "other", "original_b"),
+                resolved("sink_b", "connection", "orders", "original_a"))) {
+            assertThat(StoreBackedTargetIdentities.reconcile(java.util.List.of(first, independent)))
+                    .allSatisfy(result -> assertThat(result.plan().isAutomatic()).isTrue());
+        }
+    }
+
+    private static StoreBackedTargetIdentities.Resolved resolved(String element, String connection, String table, String preserved) {
+        var target = new io.tapstate.spi.sink.TargetTable(table, java.util.List.of());
+        var plan = new io.tapstate.adapters.pdk.TargetIdentityPlan("automatic", "generated-target-identity", target,
+                "_id", preserved, java.util.List.of(preserved, "position"));
+        return new StoreBackedTargetIdentities.Resolved(new io.tapstate.control.core.PipelineTargetIdentities.Assessment(
+                element, connection, table, plan.status(), plan.reason(), plan.sourceField(), preserved, plan.writeKey()), element, plan);
+    }
+
     private void source() {
         store.artifacts().save(parser.parse("""
                 version: tapstate/v1

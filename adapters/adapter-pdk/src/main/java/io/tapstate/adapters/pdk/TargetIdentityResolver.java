@@ -27,6 +27,9 @@ public final class TargetIdentityResolver {
                     identity.sourceIdField(), logicalKey);
         }
         String field = facts.primaryKey().getFirst();
+        if (identity.sourceIdFields().size() != 1) {
+            return blocked("ambiguous-source-id-field", input, field, String.join(", ", identity.sourceIdFields()), logicalKey);
+        }
         String preserved = identity.sourceIdField();
         String identityProblem = identityProblem(input, facts, field, preserved);
         if (identityProblem != null) return blocked(identityProblem, input, field, preserved, logicalKey);
@@ -40,7 +43,28 @@ public final class TargetIdentityResolver {
         List<TargetIndex> indexes = input.indexes().stream().map(index -> new TargetIndex(
                 index.fields().stream().map(rename).toList(), index.unique(), index.constrainsEveryRow())).toList();
         return new TargetIdentityPlan(TargetIdentityPlan.AUTOMATIC, "generated-target-identity",
-                new TargetTable(input.name(), fields, indexes), field, preserved, projectedKey, !facts.flexibleColumns());
+                new TargetTable(input.name(), fields, indexes), field, preserved, projectedKey, !facts.flexibleColumns(), facts.flexibleColumns());
+    }
+
+    /** Reconciles actual destination contracts while leaving unused expansion settings alone. */
+    public static java.util.Map<String, TargetIdentityPlan> reconcile(java.util.Map<String, TargetIdentityPlan> plans) {
+        java.util.Map<String, TargetIdentityPlan> result = new java.util.LinkedHashMap<>(plans);
+        java.util.Map<String, java.util.List<String>> byTable = new java.util.LinkedHashMap<>();
+        plans.forEach((stream, plan) -> byTable.computeIfAbsent(plan.target().name(), ignored -> new java.util.ArrayList<>()).add(stream));
+        for (var streams : byTable.values()) {
+            var automatic = streams.stream().map(plans::get).filter(TargetIdentityPlan::isAutomatic).findFirst();
+            if (automatic.isEmpty()) continue;
+            Set<String> key = Set.copyOf(automatic.get().writeKey());
+            if (streams.stream().map(plans::get).filter(plan -> !plan.blocked())
+                    .anyMatch(plan -> !key.equals(Set.copyOf(plan.writeKey())))) {
+                for (String stream : streams) {
+                    var plan = plans.get(stream);
+                    if (!plan.blocked()) result.put(stream, blocked("target-key-conflict", plan.target(),
+                            plan.sourceField(), plan.preservedField(), plan.writeKey()));
+                }
+            }
+        }
+        return result;
     }
 
     private static TargetIdentityPlan compatiblePlan(TargetTable input, TargetIdentityFacts facts,

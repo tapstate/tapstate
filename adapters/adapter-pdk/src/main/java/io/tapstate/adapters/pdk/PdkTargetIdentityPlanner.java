@@ -51,7 +51,7 @@ public final class PdkTargetIdentityPlanner {
             Map<String, TargetTable> targets) {
         Map<String, TargetIdentityPlan> plans = new LinkedHashMap<>();
         targets.forEach((stream, target) -> plans.put(stream, assess(connector, config, target, true)));
-        return plans;
+        return TargetIdentityResolver.reconcile(plans);
     }
 
     private static TargetIdentityPlan assess(PdkConnector connector, SinkConfig config, TargetTable target, boolean allowPreparation) {

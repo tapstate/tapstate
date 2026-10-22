@@ -133,7 +133,7 @@ final class PdkIdentityIndexes {
         return execute(connector, "executeQuery", Map.of("sql", sql, "batchSize", 1000));
     }
 
-    private static List<Map<?, ?>> execute(PdkConnector connector, String command, Map<String, Object> params) throws Throwable {
+    static List<Map<?, ?>> execute(PdkConnector connector, String command, Map<String, Object> params) throws Throwable {
         var execute = connector.functions().getExecuteCommandFunction();
         if (execute == null) throw new IllegalStateException("exact target index inspection is unavailable");
         List<Map<?, ?>> rows = new ArrayList<>();

@@ -116,10 +116,35 @@ policy explicitly clears the collection. Preparation is followed by another exac
 index check before writes begin. A populated collection without the matching index
 requires an explicit migration or a new destination.
 
+MongoDB automatic matching accepts canonical scalar keys: strings, booleans,
+signed 64-bit integers, ObjectIds, binary values with preserved subtype, and dates
+with millisecond precision. Arrays, objects, null or missing key components,
+floating-point/decimal values and sub-millisecond dates are refused. This applies
+to every component of every before and after key; `preserve_null_and_empty_arrays`
+cannot produce a null locator for an automatically separated target. Use a stable
+scalar element key or an ordinal locator for these targets. Integer input is
+normalized by source capture; manually generated keys must use that canonical
+representation. ObjectId and its hexadecimal string share a logical source key;
+they are not independent element identifiers. A CDC update that changes only a
+key's BSON representation (for example ObjectId to the same hexadecimal string)
+is refused before writing, because its previous native predicate would not remain
+replayable. Keep each logical key's representation stable.
+
+Before any connector write in a batch, Tapstate also reads the target records that
+its before/after keys could match and checks their actual BSON key types. A full
+unique index alone does not rule out MongoDB multikey matching: scalar `"a"` can
+match an existing `["a"]`. Such a row blocks the batch before an update or delete
+can affect it. The checks use bounded groups of complete key predicates through
+the connector's read-only aggregate command; the target must permit these reads.
+Unavailable or incomplete checks fail closed. Only matching records are examined;
+this is not a complete audit of existing data. Keep the target key/index contract
+stable while the pipeline runs and explicitly migrate incompatible existing data.
+
 ### Configuration and preview
 
 The Wizard's unwind advanced options expose **Source identity field**, initialized
-to `_unwind_source_id`, with a restore-default action. For example:
+to the effective upstream name or `_unwind_source_id`. Restore default explicitly
+sets `_unwind_source_id`, overriding an inherited custom name. For example:
 
 ```yaml
 - id: lines
@@ -135,6 +160,12 @@ A collision with a source field is shown beside the setting and blocks START;
 a collision detected only in a runtime row also fails before overwriting data.
 With successive unwinds, an omitted setting inherits the upstream choice; an explicit setting overrides
 it for downstream targets. The full matching key includes every locator.
+Different source streams may keep different settings when they reach independent
+targets, or when their target needs no automatic separation. If branches reaching
+one target actually require automatic separation, the chosen name and complete
+matching key must agree; otherwise the target panel reports **Action required**.
+Resolve that target's conflicting settings or send the streams to separate targets.
+An unused difference never adds fields or blocks an ordinary compatible target.
 
 The target panel reports **No change needed**, **Automatic**, or **Action required**
 for each destination. An automatic result shows the original and preserved field,

@@ -30,8 +30,13 @@ final class IdentityConnectorFixture {
                         f.supportCreateIndex((c, table, event) -> {});
                         f.supportWriteRecord((c, events, table, out) ->
                             out.accept(new WriteListResult<io.tapdata.entity.event.dml.TapRecordEvent>().insertedCount(events.size())));
-                        f.supportExecuteCommandFunction((c, command, out) ->
-                            out.accept(new ExecuteResult<>().result(c.getConnectionConfig().getOrDefault("rows", List.of()))));
+                        f.supportExecuteCommandFunction((c, command, out) -> {
+                            Object pipeline = command.getParams().get("pipeline");
+                            boolean pointCheck = pipeline instanceof List<?> stages && !stages.isEmpty()
+                                && stages.get(0) instanceof Map<?, ?> first && first.containsKey("$match");
+                            out.accept(new ExecuteResult<>().result(pointCheck ? List.of(Map.of("rows", List.of()))
+                                : c.getConnectionConfig().getOrDefault("rows", List.of())));
+                        });
                     }
                     public void init(TapConnectionContext c) {
                         if (Boolean.TRUE.equals(c.getConnectionConfig().get("initFails"))) throw new IllegalStateException("init failed");

@@ -46,17 +46,20 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class NodeColumnsTest {
 
     @Test
-    void mergedExpansionsRequireOnePreservedName() {
-        NodeColumns source = known("id", "INT64 NOT NULL", "items", "JSON NULL");
+    void mergedSchemaRetainsEachConfiguredIdentityUntilTargetResolution() {
+        NodeColumns source = known("id", "INT64 NOT NULL", "items", "JSON NULL", "tags", "JSON NULL");
         NodeColumns first = NodeColumns.of(new TransformBody.Unwind("items", "position", false, null, null, "parent_id"),
                 one(source), null);
         NodeColumns other = NodeColumns.of(new TransformBody.Unwind("items", "position", false, null, null, "root_id"),
                 one(source), null);
-        assertThat(NodeColumns.merged(List.of(source, first)).unwindSourceIdField()).isEqualTo("parent_id");
-        assertThat(NodeColumns.merged(List.of(first, first)).unwindSourceIdField()).isEqualTo("parent_id");
-        assertThatThrownBy(() -> NodeColumns.merged(List.of(first, other)))
-                .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class, error ->
-                        assertThat(error.code()).isEqualTo(io.tapstate.core.dsl.DslError.ILLEGAL_VALUE));
+        assertThat(NodeColumns.merged(List.of(source, first)).unwindSourceIdFields()).containsExactly("parent_id");
+        assertThat(NodeColumns.merged(List.of(first, first)).unwindSourceIdFields()).containsExactly("parent_id");
+        NodeColumns mixed = NodeColumns.merged(List.of(first, other));
+        assertThat(mixed.unwindSourceIdFields()).containsExactly("parent_id", "root_id");
+        assertThat(NodeColumns.of(new TransformBody.Unwind("tags", "tag_no", false, null, null), one(mixed), null)
+                .unwindSourceIdFields()).containsExactly("parent_id", "root_id");
+        assertThat(NodeColumns.of(new TransformBody.Unwind("tags", "tag_no", false, null, null, "unified"), one(mixed), null)
+                .unwindSourceIdFields()).containsExactly("unified");
     }
 
     @Test

@@ -1495,10 +1495,10 @@ final class StoreBackedDagSource implements DagSource {
                         // A same-named computed value likewise cannot inherit source uniqueness.
                         .filter(index -> !index.unique() || (!produced.expanded()
                                 && produced.unchangedFields().containsAll(index.fields())))
-                        .toList(), produced.expanded() && produced.unwindSourceIdField() != null
+                        .toList(), produced.expanded() && !produced.unwindSourceIdFields().isEmpty()
                                 ? new io.tapstate.spi.sink.UnwindIdentity(
                                         key.stream().filter(column -> !produced.key().contains(column)).toList(),
-                                        produced.unwindSourceIdField()) : null), key);
+                                        produced.unwindSourceIdFields()) : null), key);
     }
 
     private static TargetField publishedField(String column, TargetField carried,

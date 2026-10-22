@@ -16,12 +16,24 @@ public final class TargetIdentityProjection {
     public static Envelope apply(TargetIdentityPlan plan, Envelope event) {
         requireUsable(plan);
         if (!plan.isAutomatic()) return event;
+        if (event.before() == null && event.after() == null
+                || event.op() == io.tapstate.core.event.Op.DELETE && event.before() == null
+                || event.op() != io.tapstate.core.event.Op.DELETE && event.after() == null) {
+            throw failure(plan, "key-representation-unsupported");
+        }
         Set<String> removed = new LinkedHashSet<>();
         for (String field : event.removed()) {
             removed.add(field.equals(plan.sourceField()) ? plan.preservedField() : field);
         }
-        return new Envelope(event.op(), event.ts(), event.src(), row(plan, event.before()),
-                row(plan, event.after()), event.schema()).withRemoved(removed);
+        Map<String, Object> before = row(plan, event.before());
+        Map<String, Object> after = row(plan, event.after());
+        if (plan.requireDocumentKeys() && event.op() == io.tapstate.core.event.Op.UPDATE && before != null && after != null
+                && !MongoIdentityKeys.key(plan, before).equals(MongoIdentityKeys.key(plan, after))) {
+            // Expansion emits delete/insert for key changes. A type-only change hidden by logical
+            // equality would leave an update whose old native predicate cannot match on replay.
+            throw failure(plan, "key-representation-unsupported");
+        }
+        return new Envelope(event.op(), event.ts(), event.src(), before, after, event.schema()).withRemoved(removed);
     }
 
     public static Map<String, Object> row(TargetIdentityPlan plan, Map<String, Object> image) {
@@ -41,6 +53,7 @@ public final class TargetIdentityProjection {
                 .anyMatch(field -> !signedInt64(ConvertedValue.unwrap(projected.get(field))))) {
             throw failure(plan, "key-representation-unsupported");
         }
+        if (plan.requireDocumentKeys()) MongoIdentityKeys.key(plan, projected);
         return projected;
     }
 
