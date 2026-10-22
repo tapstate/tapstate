@@ -56,6 +56,7 @@ import org.bson.Document;
  * lands later.
  */
 public final class MongoConnection implements AutoCloseable {
+    private static final org.slf4j.Logger LOG = org.slf4j.LoggerFactory.getLogger(MongoConnection.class);
 
     /** The database used when the connection URI names none. */
     private static final String DEFAULT_DATABASE = "tapstate";
@@ -276,12 +277,17 @@ public final class MongoConnection implements AutoCloseable {
             }
             // Only an explicit server authentication rejection proves bad credentials. The driver also
             // wraps socket failures during SASL in MongoSecurityException; those remain connectivity failures.
-            if (e instanceof com.mongodb.MongoSecurityException
-                    && e.getCause() instanceof com.mongodb.MongoCommandException command
-                    && command.getErrorCode() == 18) throw StoreIo.coded(e);
-            // Driver failures may quote connection options, including credentials, in their messages.
-            // The safe host and coded error are enough for the public and application-log boundary.
-            throw new TapstateException(StoreError.UNREACHABLE, Map.of("target", target), null);
+            boolean authenticationRejected = e instanceof com.mongodb.MongoSecurityException
+                    && e.getCause() instanceof com.mongodb.MongoCommandException command && command.getErrorCode() == 18;
+            var failure = authenticationRejected ? StoreIo.coded(e)
+                    : new TapstateException(StoreError.UNREACHABLE, Map.of("target", target), null);
+            // Driver messages and causes can contain credentials. Log only bounded type and numeric metadata.
+            Throwable cause = e.getCause();
+            LOG.warn("Storage connection check failed [code={}, driver_type={}, driver_code={}, cause_type={}, cause_code={}]",
+                    failure.code().code(), e.getClass().getSimpleName(), e.getCode(),
+                    cause == null ? "none" : cause.getClass().getSimpleName(),
+                    cause instanceof MongoException mongo ? mongo.getCode() : -1);
+            throw failure;
         }
         // A replica-set member reports setName; a sharded router reports msg=isdbgrid.
         // A standalone server reports neither and cannot host checkpoint transactions.

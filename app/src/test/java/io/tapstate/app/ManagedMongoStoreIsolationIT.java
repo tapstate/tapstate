@@ -687,12 +687,23 @@ class ManagedMongoStoreIsolationIT {
             var probe = new io.tapstate.adapters.mongostore.MongoStorageConnectionProbe(Duration.ofSeconds(5));
             var input = probe.normalize(new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,
                     uri(user, database, rejectedPassword), database, null));
-            assertThatThrownBy(() -> probe.test(input)).isInstanceOfSatisfying(TapstateException.class, failure -> {
-                assertThat(failure.code()).isEqualTo(IoError.STORE_UNAUTHORIZED);
-                assertThat(failure.args()).isEmpty();
-                assertThat(failure.getCause()).isNull();
-                assertThat(failure.getMessage()).doesNotContain(user, PASSWORD, rejectedPassword, "mongodb://");
-            });
+            var logger = (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(io.tapstate.adapters.mongostore.MongoConnection.class);
+            var previousLevel = logger.getLevel();
+            var events = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>();
+            events.start(); logger.setLevel(ch.qos.logback.classic.Level.WARN); logger.addAppender(events);
+            try {
+                assertThatThrownBy(() -> probe.test(input)).isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(IoError.STORE_UNAUTHORIZED);
+                    assertThat(failure.args()).isEmpty();
+                    assertThat(failure.getCause()).isNull();
+                    assertThat(failure.getMessage()).doesNotContain(user, PASSWORD, rejectedPassword, "mongodb://");
+                });
+                String logged = events.list.stream().map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage)
+                        .collect(java.util.stream.Collectors.joining("\n"));
+                assertThat(logged).contains("code=io.store-unauthorized", "driver_type=MongoSecurityException", "cause_code=18")
+                        .doesNotContain(user, PASSWORD, rejectedPassword, "mongodb://");
+                assertThat(events.list).allSatisfy(event -> assertThat(event.getThrowableProxy()).isNull());
+            } finally { logger.detachAppender(events); events.stop(); logger.setLevel(previousLevel); }
             assertThat(admin.getDatabase(database).listCollectionNames().into(new ArrayList<>())).isEmpty();
         }
     }
