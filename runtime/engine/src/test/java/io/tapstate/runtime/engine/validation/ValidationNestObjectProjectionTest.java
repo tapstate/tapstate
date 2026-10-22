@@ -104,6 +104,71 @@ class ValidationNestObjectProjectionTest {
         assertThat(otherTarget.opens).isZero(); assertThat(failed.cursors).allSatisfy(cursor -> assertThat(cursor.closed).isTrue());
     }
 
+    @Test void sharingAWiderRootLedgerCannotRaiseAnObjectComponentsLocalQueryLimit() {
+        var fixture = new Fixture(true, 1); var original = parent();
+        var shared = new ValidationNestBudget(ROOT, "source", new ValidationNestBudget.Limits(8 * 1024 * 1024, 64 * 1024 * 1024, 8, 100, 8), "tree");
+        assertThatThrownBy(() -> fixture.projection.read(ROOT, sample("orders", original, "source"), view(original, List.of()),
+                ValidationRootReader.SourceEvidence.empty(), CLOCK, () -> {}, shared)).isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.args()).containsEntry("limit", "objectProjection.queries"));
+        assertThat(fixture.requested).hasSize(1);
+        assertThat(fixture.cursors).allSatisfy(cursor -> assertThat(cursor.closed).isTrue());
+    }
+
+    @Test void localBytesRowsAndOperationsStillApplyAndPoisonTheSharedRoot() {
+        for (String dimension : List.of("bytes", "rows", "operations")) {
+            var fixture = new Fixture(true, 8); var original = parent();
+            var shared = new ValidationNestBudget(ROOT, "source", new ValidationNestBudget.Limits(8 * 1024 * 1024, 64 * 1024 * 1024, 8, 100, 8), "tree");
+            var local = new ValidationNestObjectProjection.Limits(ROW, dimension.equals("bytes") ? 1 : 8 * 1024 * 1024,
+                    dimension.equals("operations") ? 1 : 64 * 1024 * 1024, 8, dimension.equals("rows") ? 1 : 100, 8);
+            var projection = new ValidationNestObjectProjection(new ValidationNestObjectProjection.Scope(RUN, "mapping", "output"),
+                    fixture.plan, keys(), fixture.bindings, local);
+            var failure = catchThrowable(() -> projection.read(ROOT, sample("orders", original, "source"), view(original, List.of()),
+                    ValidationRootReader.SourceEvidence.empty(), CLOCK, () -> {}, shared));
+            assertThat(failure).isInstanceOfSatisfying(TapstateException.class,
+                    error -> assertThat(error.args()).containsEntry("limit", "objectProjection." + dimension));
+            assertThat(catchThrowable(shared::reads)).isSameAs(failure);
+            assertThat(fixture.cursors).allSatisfy(cursor -> assertThat(cursor.closed).isTrue());
+            var later = new Fixture(false, 8);
+            assertThat(catchThrowable(() -> later.projection.read(ROOT, sample("orders", original, "source"), view(original, List.of()),
+                    ValidationRootReader.SourceEvidence.empty(), CLOCK, () -> {}, shared))).isSameAs(failure);
+            assertThat(later.requested).isEmpty();
+        }
+    }
+
+    @Test void sharingKeepsEachComponentsReadEvidenceLocalAndCallsEachQueryFactoryOnce() {
+        var original = parent();
+        var shared = new ValidationNestBudget(ROOT, "source", new ValidationNestBudget.Limits(8 * 1024 * 1024, 64 * 1024 * 1024, 8, 100, 8), "tree");
+        var first = new Fixture(false, 8); first.forcedReadId = "first-read";
+        var second = new Fixture(false, 8); second.forcedReadId = "second-read";
+        for (var fixture : List.of(first, second)) {
+            var result = fixture.projection.read(ROOT, sample("orders", original, "source"), view(original, List.of()),
+                    ValidationRootReader.SourceEvidence.empty(), CLOCK, () -> {}, shared);
+            assertThat(result.evidence().reads()).extracting(ValidationCheckEvent.ReadBoundary::readId).containsExactly(fixture.forcedReadId);
+            assertThat(fixture.requested).hasSize(1);
+        }
+        assertThat(shared.reads()).extracting(ValidationCheckEvent.ReadBoundary::readId).containsExactly("first-read", "second-read");
+    }
+
+    @Test void aNarrowSharedBudgetStillGatesWiderObjectLimitsBeforeAnotherQueryFactory() {
+        var fixture = new Fixture(true, 8); var original = parent();
+        var shared = new ValidationNestBudget(ROOT, "source", new ValidationNestBudget.Limits(8 * 1024 * 1024, 64 * 1024 * 1024, 1, 100, 8), "tree");
+        assertThatThrownBy(() -> fixture.projection.read(ROOT, sample("orders", original, "source"), view(original, List.of()),
+                ValidationRootReader.SourceEvidence.empty(), CLOCK, () -> {}, shared)).isInstanceOfSatisfying(TapstateException.class,
+                error -> assertThat(error.args()).containsEntry("limit", "tree.queries"));
+        assertThat(fixture.requested).hasSize(1);
+        assertThat(fixture.cursors).allSatisfy(cursor -> assertThat(cursor.closed).isTrue());
+    }
+
+    @Test void sharedDepthIsAdmittedBeforeOpeningTheChildQuery() {
+        var fixture = new Fixture(true, 8); var original = parent();
+        var shared = new ValidationNestBudget(ROOT, "source", new ValidationNestBudget.Limits(8 * 1024 * 1024, 64 * 1024 * 1024, 8, 100, 1), "tree");
+        assertThatThrownBy(() -> fixture.projection.read(ROOT, sample("orders", original, "source"), view(original, List.of()),
+                ValidationRootReader.SourceEvidence.empty(), CLOCK, () -> {}, shared)).isInstanceOfSatisfying(TapstateException.class,
+                error -> assertThat(error.args()).containsEntry("limit", "tree.depth"));
+        assertThat(fixture.requested).isEmpty();
+        assertThat(fixture.cursors).isEmpty();
+    }
+
     @Test void oldScopeChangedRootKeysAndUnsupportedShapesAreRefusedBeforeChildQueries() {
         var fixture = new Fixture(true, 8); var original = parent();
         var wrong = new ValidationObservation(RUN, new ValidationRoot("mapping", "output", key(8), List.of()), 1);

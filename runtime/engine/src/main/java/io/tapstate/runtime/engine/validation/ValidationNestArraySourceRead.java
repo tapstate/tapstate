@@ -81,6 +81,20 @@ public final class ValidationNestArraySourceRead {
     public static Result read(ValidationNestScope scope, ValidationNestLookupBinding binding,
             ValidationStaticMap.Projection workingParent, ValidationRootCheck.SampledSide originalParent, ValidationNestRelationRead.Queries queries, Limits limits,
             Clock clock, Runnable requireAuthorized, Rule rule, Facts facts) {
+        return read(scope, binding, workingParent, originalParent, queries, limits, clock, requireAuthorized, rule, facts, null);
+    }
+
+    /** Owner-local recursive drivers share this ledger; native and rule scratch still need separate admission. */
+    static Result read(ValidationNestScope scope, ValidationNestLookupBinding binding,
+            ValidationStaticMap.Projection workingParent, ValidationRootCheck.SampledSide originalParent, ValidationNestRelationRead.Queries queries, Limits limits,
+            Clock clock, Runnable requireAuthorized, Rule rule, Facts facts, ValidationNestBudget budget) {
+        try { return readShared(scope, binding, workingParent, originalParent, queries, limits, clock, requireAuthorized, rule, facts, budget); }
+        catch (RuntimeException | Error error) { if (budget != null) budget.abort(error); throw error; }
+    }
+
+    private static Result readShared(ValidationNestScope scope, ValidationNestLookupBinding binding,
+            ValidationStaticMap.Projection workingParent, ValidationRootCheck.SampledSide originalParent, ValidationNestRelationRead.Queries queries, Limits limits,
+            Clock clock, Runnable requireAuthorized, Rule rule, Facts facts, ValidationNestBudget budget) {
         Objects.requireNonNull(scope, "scope");
         var parent = scope.observation();
         Objects.requireNonNull(binding, "binding");
@@ -92,15 +106,25 @@ public final class ValidationNestArraySourceRead {
         final Context[] context = { null };
         final int[] rows = { 0 };
         var causes = new LinkedHashSet<ValidationRootCheck.Finding>();
-        try (var members = new ValidationNestArrayMembers(parent, path, limits.members())) {
+        if (budget != null) {
+            budget.requireScope(parent); budget.requireParentRead(originalParent.readId());
+            // Full relation paths preserve object levels; detached subtree scopes impose a conservative
+            // lower bound including their existing keyed ancestors and object path segments.
+            budget.depth(Math.max(binding.relation().treePath().size() + 1,
+                    parent.root().ancestors().size() + scope.objectPath().size() + 2));
+        }
+        try (var members = budget == null ? new ValidationNestArrayMembers(parent, path, limits.members())
+                : ValidationNestArrayMembers.reserved(parent, path, limits.members(), budget::reserve)) {
             var relation = ValidationNestRelationRead.read(parent, binding, workingParent, request -> {
-                var query = Objects.requireNonNull(queries.prepare(request), "array source query");
+                var query = budget == null ? Objects.requireNonNull(queries.prepare(request), "array source query")
+                        : budget.prepare(parent, () -> queries.prepare(request));
                 if (query.readId().equals(originalParent.readId())) throw invalid("arrayRead.reusedParentReadId");
                 context[0] = new Context(parent, path, query.readId());
                 return query;
             }, limits.read(), clock, requireAuthorized, raw -> {
                 if (rows[0] == limits.rows()) throw limit("rows");
                 rows[0]++;
+                if (budget != null) { budget.row(parent); budget.reserve(raw.accountedBytes()); }
                 var classified = Objects.requireNonNull(rule.apply(context[0], raw), "array classification");
                 var source = classified.source();
                 if (classified.member().isPresent()) {
@@ -109,6 +133,8 @@ public final class ValidationNestArraySourceRead {
                             || !source.row().physical().equals(Optional.of(member.physical())))
                         throw invalid("arrayRead.memberFacts");
                 }
+                if (budget != null) budget.reserve(128L + (source.row().working() == raw ? 0 : source.row().working().accountedBytes())
+                        + source.row().physical().map(ValidationPhysicalIdentity::retainedBytes).orElse(0L));
                 facts.retain(context[0], source);
                 for (var cause : source.uncertainty()) {
                     if (!causes.contains(cause) && causes.size() == limits.causes()) throw limit("causes");
@@ -120,12 +146,14 @@ public final class ValidationNestArraySourceRead {
             requireAuthorized.run();
             if (relation.rows().isEmpty()) return new Result(relation.preparation(), Optional.empty(), Optional.empty(), Optional.empty());
             var complete = relation.rows().orElseThrow();
+            if (budget != null) budget.read(complete.read());
             members.complete(ValidationNestArrayMembers.Side.SOURCE, parent, complete.read());
             if (binding.relation().direction() == ValidationNestRelations.Direction.REFERENCE) {
                 var reference = new ValidationNestSingleSource.Reference(binding.requireReferenceFields(workingParent.row()), originalParent);
                 var location = new ValidationRootCheck.Location(parent.root(), new ArrayList<>(path));
                 var single = ValidationNestSingleSource.classify(complete, ValidationNestSingleSource.Relation.REFERENCE,
                         Optional.of(reference), location, List.of(location), new ArrayList<>(causes), limits.members().bytes());
+                if (budget != null) budget.bytes(single.accountedBytes());
                 if (single.state() != ValidationNestSingleSource.State.UNIQUE) {
                     requireAuthorized.run();
                     return new Result(relation.preparation(), Optional.empty(), Optional.empty(), Optional.of(single));

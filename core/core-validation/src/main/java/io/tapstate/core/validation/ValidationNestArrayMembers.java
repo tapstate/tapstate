@@ -9,6 +9,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Consumer;
+import java.util.function.LongConsumer;
 
 /**
  * Bounded unordered membership facts for one declared array under one exact parent observation.
@@ -155,6 +156,8 @@ public final class ValidationNestArrayMembers implements AutoCloseable {
     private final ValidationObservation observation;
     private final List<String> path;
     private final Limits limits;
+    private final LongConsumer reserve;
+    private final Consumer<Throwable> failureSink;
     private final Map<ValidationKey, Bucket> buckets = new LinkedHashMap<>();
     private final Map<ValidationKey, Long> sourceRows = new LinkedHashMap<>();
     private final Map<ValidationKey, Long> targetRows = new LinkedHashMap<>();
@@ -168,15 +171,39 @@ public final class ValidationNestArrayMembers implements AutoCloseable {
     private boolean closed;
 
     public ValidationNestArrayMembers(ValidationObservation parent, List<String> arrayPath, Limits limits) {
+        this(parent, arrayPath, limits, ignored -> {}, ignored -> {}, initialReservationBytes(parent, arrayPath));
+    }
+
+    private ValidationNestArrayMembers(ValidationObservation parent, List<String> arrayPath, Limits limits, LongConsumer reserve, Consumer<Throwable> failureSink, long initial) {
         observation = Objects.requireNonNull(parent, "parent");
-        this.limits = Objects.requireNonNull(limits, "limits");
-        if (parent.root().ancestors().size() >= 32 || arrayPath == null || arrayPath.isEmpty() || arrayPath.size() > 32) {
-            throw ValidationError.invalid("nestMembers.scope");
-        }
-        for (String segment : arrayPath) ValidationError.identifier(segment, "nestMembers.arrayPath");
+        this.limits = Objects.requireNonNull(limits, "limits"); this.reserve = Objects.requireNonNull(reserve, "reserve");
+        this.failureSink = Objects.requireNonNull(failureSink, "failureSink");
+        if (initial > limits.bytes()) throw limit("bytes");
         path = List.copyOf(arrayPath);
-        charge(16 * 1024L + rootBytes(parent.root()));
-        for (String segment : path) charge(textBytes(segment));
+        bytes = initial;
+    }
+
+    /** Shared-root admission happens before frame allocation; every later growth calls the same reservation. */
+    public static ValidationNestArrayMembers reserved(ValidationObservation parent, List<String> arrayPath, Limits limits, LongConsumer reserve) {
+        return reserved(parent, arrayPath, limits, reserve, ignored -> {});
+    }
+
+    private static ValidationNestArrayMembers reserved(ValidationObservation parent, List<String> arrayPath, Limits limits,
+            LongConsumer reserve, Consumer<Throwable> failureSink) {
+        Objects.requireNonNull(limits, "limits"); Objects.requireNonNull(reserve, "reserve");
+        long initial = initialReservationBytes(parent, arrayPath);
+        if (initial > limits.bytes()) throw limit("bytes");
+        reserve.accept(initial);
+        return new ValidationNestArrayMembers(parent, arrayPath, limits, reserve, failureSink, initial);
+    }
+
+    public static long initialReservationBytes(ValidationObservation parent, List<String> arrayPath) {
+        Objects.requireNonNull(parent, "parent");
+        if (parent.root().ancestors().size() >= 32 || arrayPath == null || arrayPath.isEmpty() || arrayPath.size() > 32)
+            throw ValidationError.invalid("nestMembers.scope");
+        long initial = 16 * 1024L + rootBytes(parent.root());
+        for (String segment : arrayPath) { ValidationError.identifier(segment, "nestMembers.arrayPath"); initial += textBytes(segment); }
+        return initial;
     }
 
     void requireRequest(ValidationObservation parent, List<String> arrayPath) {
@@ -338,9 +365,17 @@ public final class ValidationNestArrayMembers implements AutoCloseable {
      * The source handoff and the new mutable indexes coexist, so both are charged to this frame.
      * The root caller still reserves all simultaneously live frames; this is not a global quota.
      */
-    public static ValidationNestArrayMembers forTarget(Source source) {
+    public static ValidationNestArrayMembers forTarget(Source source) { return forTarget(source, ignored -> {}); }
+
+    /** The shared root must also cover the source handoff and target-index coexistence. */
+    public static ValidationNestArrayMembers forTarget(Source source, LongConsumer reserve) {
+        return forTarget(source, reserve, ignored -> {});
+    }
+
+    /** Construction and later local failures invalidate the owning root, not only this frame. */
+    public static ValidationNestArrayMembers forTarget(Source source, LongConsumer reserve, Consumer<Throwable> failureSink) {
         Objects.requireNonNull(source, "source");
-        var result = new ValidationNestArrayMembers(source.observation, source.arrayPath, source.limits);
+        var result = reserved(source.observation, source.arrayPath, source.limits, reserve, failureSink);
         try {
             result.charge(source.accountedBytes);
             result.charge(128L + 64L * source.rows.size());
@@ -399,6 +434,7 @@ public final class ValidationNestArrayMembers implements AutoCloseable {
     }
     private void charge(long amount) {
         if (amount > limits.bytes() - bytes) throw limit("bytes");
+        reserve.accept(amount);
         bytes += amount;
     }
     private static long increment(long count) {
@@ -411,7 +447,14 @@ public final class ValidationNestArrayMembers implements AutoCloseable {
         if (cause instanceof RuntimeException error) throw error;
         if (closed) throw new IllegalStateException("Array member staging is closed");
     }
-    private void fail(Throwable cause) { failure.record(cause); close(); }
+    private void fail(Throwable cause) {
+        failure.record(cause); close();
+        try { failureSink.accept(failure.get()); }
+        catch (RuntimeException | Error callbackFailure) {
+            failure.record(callbackFailure);
+            if (failure.get() instanceof Error fatal) throw fatal;
+        }
+    }
     @Override public void close() {
         closed = true;
         buckets.clear(); sourceRows.clear(); targetRows.clear(); reads.clear();

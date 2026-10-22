@@ -91,6 +91,19 @@ public final class ValidationNestObjectProjection {
     /** Caller reserves compilation inputs, native workers/decoders and this complete root working budget. */
     public Result read(ValidationObservation root, SampledSide original, ValidationStaticMap.Projection working,
             ValidationRootReader.SourceEvidence incoming, Clock clock, Runnable requireAuthorized) {
+        return read(root, original, working, incoming, clock, requireAuthorized, null);
+    }
+
+    /** A composite root driver can share one ledger across successive independent source components. */
+    Result read(ValidationObservation root, SampledSide original, ValidationStaticMap.Projection working,
+            ValidationRootReader.SourceEvidence incoming, Clock clock, Runnable requireAuthorized, ValidationNestBudget shared) {
+        try { return readShared(root, original, working, incoming, clock, requireAuthorized, shared); }
+        catch (RuntimeException | Error error) { if (shared != null) shared.abort(error); throw error; }
+    }
+
+    private Result readShared(ValidationObservation root, SampledSide original, ValidationStaticMap.Projection working,
+            ValidationRootReader.SourceEvidence incoming, Clock clock, Runnable requireAuthorized, ValidationNestBudget shared) {
+        if (shared != null) shared.requireScope(root);
         Objects.requireNonNull(root, "root"); Objects.requireNonNull(original, "original"); Objects.requireNonNull(working, "working");
         Objects.requireNonNull(incoming, "incoming"); Objects.requireNonNull(clock, "clock"); Objects.requireNonNull(requireAuthorized, "requireAuthorized");
         if (!root.run().equals(scope.run()) || !root.root().mappingId().equals(scope.mapping()) || !root.root().outputId().equals(scope.output())
@@ -101,14 +114,13 @@ public final class ValidationNestObjectProjection {
             if (starts(component.path(), mask) || starts(mask, component.path())) throw unsupported("root", "nest.rootKeyUnavailable");
         if (!keys.physical().components().stream().map(ValidationKeyBinding.Component::path).toList().equals(original.identity().keyFields()))
             throw invalid("objectProjection.originalKeyFields");
-        var budget = new Work(root, clock, requireAuthorized);
+        var budget = new Work(root, original.readId(), clock, requireAuthorized, shared);
         budget.bytes(plan.retainedBytes() + identity.retainedBytes() + original.accountedBytes() + working.accountedBytes()
                 + 6L * ValidationKey.MAX_KEY_BYTES);
         if (!bound(keys.physical().read(original.row())).equals(original.identity().actualKey())
                 || !bound(keys.original().read(original.row())).equals(root.root().rootKey())
                 || !bound(keys.projected().read(working.row())).equals(root.root().rootKey()))
             throw unsupported("root", "nest.rootIdentityChanged");
-        budget.invocations.add(original.readId());
         budget.merge(incoming);
         for (var path : working.unavailablePaths()) budget.requireExactCause(path);
         for (var problem : incoming.issues()) for (var affected : problem.affected())
@@ -135,19 +147,21 @@ public final class ValidationNestObjectProjection {
         private final ValidationObservation root;
         private final Clock clock;
         private final Runnable authorized;
-        private final Map<String, ValidationCheckEvent.ReadBoundary> reads = new LinkedHashMap<>();
         private final Map<Finding, ValidationRootReader.SourceIssue> issues = new LinkedHashMap<>();
-        private final Set<String> invocations = new LinkedHashSet<>();
-        private long bytes;
-        private long operations;
-        private int queryCount;
-        private int rowCount;
-        private Work(ValidationObservation root, Clock clock, Runnable authorized) { this.root = root; this.clock = clock; this.authorized = authorized; }
+        private final ValidationNestBudget quota;
+        private final ValidationNestBudget shared;
+        private Work(ValidationObservation root, String originalReadId, Clock clock, Runnable authorized, ValidationNestBudget shared) {
+            this.root = root; this.clock = clock; this.authorized = authorized;
+            this.shared = shared;
+            quota = new ValidationNestBudget(root, originalReadId, new ValidationNestBudget.Limits(limits.bytes(), limits.operations(),
+                    limits.queries(), limits.rows(), limits.depth()), "objectProjection");
+            if (shared != null) { shared.requireScope(root); shared.requireParentRead(originalReadId); }
+        }
 
         private ValidationStaticMap.Projection node(SampledSide original, ValidationStaticMap.Projection input,
                 List<ValidationNestRelations.Relation> children, List<String> prefix, int depth) {
             authorized.run();
-            if (depth > limits.depth()) throw limit("depth");
+            quota.depth(depth); if (shared != null) shared.depth(depth);
             operations(1L + 1024L * (input.row().fields().size() + children.size()) * input.unavailablePaths().size());
             var fields = new ArrayList<ValidationNestFieldCheck.Field>();
             for (String name : input.row().fields().keySet()) if (knownPresence(input, name))
@@ -177,21 +191,18 @@ public final class ValidationNestObjectProjection {
                     requireCause(absolute);
                     continue;
                 }
+                quota.depth(depth + 1); if (shared != null) shared.depth(depth + 1);
                 var binding = bindings.get(relation.treePath());
                 operations(1L + 1024L * relation.join().size() * input.unavailablePaths().size());
                 var uncertain = new LinkedHashSet<Finding>();
                 final String[] readId = { null };
                 var result = ValidationNestRelationRead.read(root, binding.lookup(), input, request -> {
-                    if (queryCount == limits.queries()) throw limit("queries");
-                    queryCount++;
-                    var query = binding.queries().prepare(request);
-                    if (!invocations.add(query.readId()) || reads.containsKey(query.readId())) throw invalid("objectProjection.reusedReadId");
+                    var query = quota.prepare(root, () -> shared == null ? binding.queries().prepare(request)
+                            : shared.prepare(root, () -> binding.queries().prepare(request)));
                     readId[0] = query.readId();
-                    bytes(256L + 2L * query.readId().length() + ValidationRelationRows.initialReservationBytes(root, query.readId()));
                     return query;
                 }, new ValidationRelationRows.Limits(limits.bytes(), limits.row()), clock, authorized, raw -> {
-                    if (rowCount == limits.rows()) throw limit("rows");
-                    rowCount++;
+                    quota.row(root); if (shared != null) shared.row(root);
                     bytes(raw.accountedBytes());
                     var classified = Objects.requireNonNull(binding.rule().classify(new Context(root, absolute, readId[0]), raw), "child classification");
                     bytes(128L + (classified.row().working() == raw ? 0 : classified.row().working().accountedBytes())
@@ -276,11 +287,7 @@ public final class ValidationNestObjectProjection {
         }
         private void merge(ValidationRootReader.SourceEvidence evidence) {
             if (evidence.observation() != null && !evidence.observation().equals(root)) throw invalid("objectProjection.evidenceScope");
-            for (var read : evidence.reads()) {
-                var previous = reads.get(read.readId());
-                if (previous != null && !previous.equals(read)) throw invalid("objectProjection.readIdentity");
-                if (previous == null) { if (reads.size() == 256) throw limit("reads"); bytes(256L + 2L * (read.readId().length() + read.contractVersion().length())); reads.put(read.readId(), read); }
-            }
+            for (var read : evidence.reads()) { quota.read(read); if (shared != null) shared.read(read); }
             for (var issue : evidence.issues()) issue(issue);
         }
         private void issue(ValidationRootReader.SourceIssue value) {
@@ -301,14 +308,14 @@ public final class ValidationNestObjectProjection {
             if (!at.scope().equals(root.root())) throw invalid("objectProjection.issueScope");
         }
         private Location location(List<?> path) { return new Location(root.root(), new ArrayList<>(path)); }
-        private ValidationRootReader.SourceEvidence evidence() { return new ValidationRootReader.SourceEvidence(root, new ArrayList<>(reads.values()), new ArrayList<>(issues.values())); }
+        private ValidationRootReader.SourceEvidence evidence() { return new ValidationRootReader.SourceEvidence(root, quota.reads(), new ArrayList<>(issues.values())); }
         private ValidationRootReader.SourceEvidence prefixed(ValidationRootReader.SourceEvidence evidence, List<String> prefix) {
             return new ValidationRootReader.SourceEvidence(root, evidence.reads(), evidence.issues().stream().map(issue ->
                     new ValidationRootReader.SourceIssue(new Finding(issue.finding().kind(), location(concatObjects(prefix, issue.finding().location().fieldPath())), issue.finding().multiplicity()),
                             issue.sample(), issue.affected().stream().map(at -> location(concatObjects(prefix, at.fieldPath()))).toList())).toList());
         }
-        private void bytes(long amount) { if (amount < 0 || amount > limits.bytes() - bytes) throw limit("bytes"); bytes += amount; }
-        private void operations(long amount) { if (amount < 0 || amount > limits.operations() - operations) throw limit("operations"); operations += amount; }
+        private void bytes(long amount) { quota.bytes(amount); if (shared != null) shared.bytes(amount); }
+        private void operations(long amount) { quota.operations(amount); if (shared != null) shared.operations(amount); }
     }
 
     private static boolean knownPresence(ValidationStaticMap.Projection view, String field) {

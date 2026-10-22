@@ -203,6 +203,155 @@ class ValidationNestArraySourceReadTest {
         assertThat(cursor.closed).isTrue(); assertThat(cursor.released).isEqualTo(3);
     }
 
+    @Test void siblingArrayFramesShareRowQuotaAndAFailureCannotResetTheLedger() {
+        var budget = budget(4 * 1024 * 1024, 64 * 1024 * 1024, 8, 3);
+        var first = new Cursor(List.of(1, 2));
+        var source = sharedRead(new ValidationNestScope(PARENT).object(List.of("profile")), first, "first", budget,
+                ValidationNestArraySourceReadTest::included).source().orElseThrow();
+        assertThat(source.groups()).hasSize(2);
+        var second = new Cursor(List.of(3, 4)); var classified = new AtomicInteger();
+        Throwable failure = catchThrowable(() -> sharedRead(new ValidationNestScope(PARENT).object(List.of("billing")), second, "second", budget,
+                (context, raw) -> { classified.incrementAndGet(); return included(context, raw); }));
+        assertThat(failure).isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.args()).containsEntry("limit", "tree.rows"));
+        assertThat(classified).hasValue(1); assertThat(second.released).isEqualTo(2); assertThat(second.closed).isTrue();
+        assertThat(catchThrowable(budget::reads)).isSameAs(failure);
+        assertThat(catchThrowable(() -> budget.targetMembers(source))).isSameAs(failure);
+        var third = new Cursor(List.of(5));
+        assertThat(catchThrowable(() -> sharedRead(new ValidationNestScope(PARENT), third, "third", budget, ValidationNestArraySourceReadTest::included))).isSameAs(failure);
+        assertThat(third.opens).isZero();
+    }
+
+    @Test void aLocalArrayFailureAlsoClosesTheSharedRootAndAllBorrowedRows() {
+        var budget = budget(4 * 1024 * 1024, 64 * 1024 * 1024, 8, 100);
+        var cursor = new Cursor(List.of(1, 2));
+        var failure = catchThrowable(() -> ValidationNestArraySourceRead.read(new ValidationNestScope(PARENT), binding(false),
+                view(Map.of("id", 7), List.of()), parentSample(), request -> new ValidationRootReader.Query("child", "v1", () -> cursor),
+                new ValidationNestArraySourceRead.Limits(LIMITS.read(), LIMITS.members(), 1, LIMITS.causes()),
+                CLOCK, () -> {}, ValidationNestArraySourceReadTest::included, (context, source) -> {}, budget));
+        assertThat(failure).isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.args()).containsEntry("limit", "arrayRead.rows"));
+        assertThat(cursor.closed).isTrue(); assertThat(cursor.released).isEqualTo(2);
+        assertThat(catchThrowable(budget::reads)).isSameAs(failure);
+        var later = new Cursor(List.of(3));
+        assertThat(catchThrowable(() -> sharedRead(new ValidationNestScope(PARENT), later, "later", budget,
+                ValidationNestArraySourceReadTest::included))).isSameAs(failure);
+        assertThat(later.opens).isZero();
+    }
+
+    @Test void sharedDepthRejectsANestedArrayBeforePreparingOrOpeningItsRead() {
+        var budget = new ValidationNestBudget(ROOT, "parent-read", new ValidationNestBudget.Limits(4 * 1024 * 1024, 64 * 1024 * 1024, 8, 100, 1), "tree");
+        var cursor = new Cursor(List.of(1)); var prepared = new AtomicInteger();
+        assertThatThrownBy(() -> ValidationNestArraySourceRead.read(new ValidationNestScope(PARENT), binding(false), view(Map.of("id", 7), List.of()),
+                parentSample(), request -> { prepared.incrementAndGet(); return new ValidationRootReader.Query("child", "v1", () -> { cursor.opens++; return cursor; }); },
+                LIMITS, CLOCK, () -> {}, ValidationNestArraySourceReadTest::included, (context, source) -> {}, budget))
+                .isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.args()).containsEntry("limit", "tree.depth"));
+        assertThat(prepared).hasValue(0); assertThat(cursor.opens).isZero();
+    }
+
+    @Test void targetLocalConstructionAndMutationFailuresInvalidateTheSharedRoot() {
+        for (boolean construction : List.of(true, false)) {
+            var budget = budget(4 * 1024 * 1024, 64 * 1024 * 1024, 8, 100);
+            var cursor = new Cursor(construction ? List.of() : List.of(1));
+            var local = new ValidationNestArraySourceRead.Limits(LIMITS.read(),
+                    new ValidationNestArrayMembers.Limits(construction ? 32 * 1024 : 1024 * 1024, 1, 10, ROW), 100, 20);
+            var source = ValidationNestArraySourceRead.read(new ValidationNestScope(PARENT), binding(false), view(Map.of("id", 7), List.of()),
+                    parentSample(), request -> new ValidationRootReader.Query("child", "v1", () -> cursor), local, CLOCK, () -> {},
+                    ValidationNestArraySourceReadTest::included, (context, facts) -> {}, budget).source().orElseThrow();
+            Throwable failure;
+            if (construction) failure = catchThrowable(() -> budget.targetMembers(source));
+            else {
+                try (var target = budget.targetMembers(source)) {
+                    var member = included(new ValidationNestArraySourceRead.Context(PARENT, List.of("items"), "target"), row(value(2))).member().orElseThrow();
+                    failure = catchThrowable(() -> target.add(ValidationNestArrayMembers.Side.TARGET, PARENT, member));
+                }
+            }
+            assertThat(failure).isInstanceOfSatisfying(TapstateException.class,
+                    error -> assertThat(error.args()).containsEntry("limit", construction ? "nestMembers.bytes" : "nestMembers.elementKeys"));
+            assertThat(catchThrowable(budget::reads)).isSameAs(failure);
+            var later = new Cursor(List.of(3));
+            assertThat(catchThrowable(() -> sharedRead(new ValidationNestScope(PARENT), later, "later", budget,
+                    ValidationNestArraySourceReadTest::included))).isSameAs(failure);
+            assertThat(later.opens).isZero();
+        }
+    }
+
+    @Test void frameBytesAndWorkAreReservedBeforeQueryPreparationOrOpening() {
+        for (boolean bytes : List.of(true, false)) {
+            var budget = budget(bytes ? 100 : 4 * 1024 * 1024, bytes ? 64 * 1024 * 1024 : 1, 8, 100);
+            var prepares = new AtomicInteger(); var cursor = new Cursor(List.of(1));
+            assertThatThrownBy(() -> ValidationNestArraySourceRead.read(new ValidationNestScope(PARENT), binding(false), view(Map.of("id", 7), List.of()),
+                    parentSample(), request -> { prepares.incrementAndGet(); return new ValidationRootReader.Query("child", "v1", () -> { cursor.opens++; return cursor; }); },
+                    LIMITS, CLOCK, () -> {}, ValidationNestArraySourceReadTest::included, (context, source) -> {}, budget))
+                    .isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.args()).containsEntry("limit", bytes ? "tree.bytes" : "tree.operations"));
+            assertThat(prepares).hasValue(0); assertThat(cursor.opens).isZero();
+        }
+    }
+
+    @Test void recursiveReadsAccountForTheirStillLiveOuterRowAndCloseBothCursorsOnExhaustion() {
+        var budget = budget(4 * 1024 * 1024, 64 * 1024 * 1024, 8, 2);
+        var outer = new Cursor(List.of(1)); var inner = new Cursor(List.of(2, 3)); inner.relationKey = 1;
+        var visited = new AtomicInteger();
+        assertThatThrownBy(() -> sharedRead(new ValidationNestScope(PARENT), outer, "outer", budget, (context, raw) -> {
+            var projected = included(context, raw); var member = projected.member().orElseThrow();
+            var child = new ValidationNestScope(PARENT).member(List.of("items"), member.elementKey());
+            ValidationNestArraySourceRead.read(child, binding(false), view(projected.source().row().working().fields(), List.of()),
+                    new SampledSide(member.physical(), raw, context.readId()), request -> new ValidationRootReader.Query("inner", "v1", () -> { inner.opens++; return inner; }),
+                    LIMITS, CLOCK, () -> {}, (nested, value) -> { visited.incrementAndGet(); return included(nested, value); }, (nested, source) -> {}, budget);
+            return projected;
+        })).isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.args()).containsEntry("limit", "tree.rows"));
+        assertThat(visited).hasValue(1); assertThat(outer.released).isEqualTo(1); assertThat(inner.released).isEqualTo(2);
+        assertThat(outer.closed).isTrue(); assertThat(inner.closed).isTrue();
+    }
+
+    @Test void queryIdsAndQueryLimitsRemainGlobalAcrossSiblingFrames() {
+        for (boolean duplicate : List.of(true, false)) {
+            var budget = budget(4 * 1024 * 1024, 64 * 1024 * 1024, duplicate ? 8 : 1, 100);
+            sharedRead(new ValidationNestScope(PARENT), new Cursor(List.of(1)), "first", budget, ValidationNestArraySourceReadTest::included);
+            var next = new Cursor(List.of(2));
+            assertThatThrownBy(() -> sharedRead(new ValidationNestScope(PARENT).object(List.of("billing")), next, duplicate ? "first" : "second", budget,
+                    ValidationNestArraySourceReadTest::included)).isInstanceOfSatisfying(TapstateException.class, error ->
+                            assertThat(error.args()).containsEntry(duplicate ? "field" : "limit", duplicate ? "tree.reusedReadId" : "tree.queries"));
+            assertThat(next.opens).isZero();
+        }
+    }
+
+    @Test void targetIndexCoexistenceUsesTheSameRootReservationAndRequiresTheActualCompletedRead() {
+        long capacity = 4 * 1024 * 1024;
+        var budget = budget(capacity, 64 * 1024 * 1024, 8, 100);
+        var source = sharedRead(new ValidationNestScope(PARENT), new Cursor(List.of(1, 2)), "source", budget,
+                ValidationNestArraySourceReadTest::included).source().orElseThrow();
+        long initial = ValidationNestArrayMembers.initialReservationBytes(source.observation(), source.arrayPath());
+        budget.bytes(capacity - budget.accountedBytes() - initial);
+        assertThatThrownBy(() -> budget.targetMembers(source)).isInstanceOfSatisfying(TapstateException.class,
+                error -> assertThat(error.args()).containsEntry("limit", "tree.bytes"));
+        assertThat(source.groups()).hasSize(2);
+        var unrelated = budget(capacity, 64 * 1024 * 1024, 8, 100);
+        assertThatThrownBy(() -> unrelated.targetMembers(source)).isInstanceOfSatisfying(TapstateException.class,
+                error -> assertThat(error.args()).containsEntry("field", "tree.sourceReadIncomplete"));
+    }
+
+    @Test void foreignObservationsAndUnregisteredParentReadsCannotSpendTheRootBudget() {
+        for (boolean foreign : List.of(true, false)) {
+            var budget = budget(4 * 1024 * 1024, 64 * 1024 * 1024, 8, 100);
+            var scope = new ValidationNestScope(foreign ? new ValidationObservation(PARENT.run(), PARENT.root(), PARENT.revision() + 1) : PARENT);
+            var sample = foreign ? parentSample() : new SampledSide(parentSample().identity(), parentSample().row(), "unknown-parent");
+            var cursor = new Cursor(List.of(1));
+            assertThatThrownBy(() -> ValidationNestArraySourceRead.read(scope, binding(false), view(Map.of("id", 7), List.of()), sample,
+                    request -> new ValidationRootReader.Query("child", "v1", () -> { cursor.opens++; return cursor; }), LIMITS, CLOCK, () -> {},
+                    ValidationNestArraySourceReadTest::included, (context, source) -> {}, budget)).isInstanceOfSatisfying(TapstateException.class,
+                            error -> assertThat(error.args()).containsEntry("field", foreign ? "tree.scope" : "tree.parentRead"));
+            assertThat(cursor.opens).isZero();
+        }
+    }
+
+    private static ValidationNestBudget budget(long bytes, long operations, int queries, int rows) {
+        return new ValidationNestBudget(ROOT, "parent-read", new ValidationNestBudget.Limits(bytes, operations, queries, rows, 16), "tree");
+    }
+    private static ValidationNestArraySourceRead.Result sharedRead(ValidationNestScope scope, Cursor cursor, String id, ValidationNestBudget budget,
+            ValidationNestArraySourceRead.Rule rule) {
+        return ValidationNestArraySourceRead.read(scope, binding(false), view(Map.of("id", 7), List.of()), parentSample(), request ->
+                new ValidationRootReader.Query(id, "v1", () -> { cursor.opens++; return cursor; }), LIMITS, CLOCK, () -> {}, rule, (context, source) -> {}, budget);
+    }
+
     private static ValidationNestArraySourceRead.Result read(Cursor cursor, ValidationNestArraySourceRead.Limits limits,
             ValidationNestArraySourceRead.Rule rule, ValidationNestArraySourceRead.Facts facts, Runnable guard) {
         return ValidationNestArraySourceRead.read(PARENT, binding(false), view(Map.of("id", 7), List.of()), parentSample(), request ->
@@ -247,7 +396,7 @@ class ValidationNestArraySourceReadTest {
     private static ValidationValues.Row row(Map<String, ?> fields) { return ValidationValues.ownRow(fields, ROW); }
     private static ValidationCheckEvent.ReadBoundary boundary(String id) { return new ValidationCheckEvent.ReadBoundary(id, "v1", Instant.EPOCH, Instant.EPOCH); }
     private static final class Cursor implements ValidationRowCursor {
-        final List<Integer> ids; int delivered; int released; int calls; boolean closed; int badPredicateAt = -1;
+        final List<Integer> ids; int delivered; int released; int calls; int opens; int relationKey = 7; boolean closed; int badPredicateAt = -1;
         RuntimeException eofFailure; RuntimeException closeFailure; Runnable onClose = () -> {};
         Cursor(List<Integer> ids) { this.ids = ids; }
         @Override public Optional<Row> next() {
@@ -257,7 +406,7 @@ class ValidationNestArraySourceReadTest {
             int ordinal = delivered++; int id = ids.get(ordinal);
             return Optional.of(new Row() {
                 @Override public long ordinal() { return ordinal; }
-                @Override public ValidationValues.Row values() { return row(Map.of("id", id, "element", id + 100, "native_parent_id", ordinal == badPredicateAt ? 999 : 7)); }
+                @Override public ValidationValues.Row values() { return row(Map.of("id", id, "element", id + 100, "native_parent_id", ordinal == badPredicateAt ? 999 : relationKey)); }
                 @Override public void close() { released++; }
             });
         }
