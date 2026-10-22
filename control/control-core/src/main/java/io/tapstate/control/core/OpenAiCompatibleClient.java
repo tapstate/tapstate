@@ -68,6 +68,8 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         if (proposalEnabled) {
             guidance += "For a concrete request to create or change the pipeline, return a proposal by calling propose_pipeline. "
                     + "Copy the complete currentWizard and change only the requested fields. Preserve existing IDs, root source, table, keys, relations, transforms, and an unfinished destination unless the user asks to change them. "
+                    + "candidateWizard must use the complete Builder view shape: root, relations, transforms, destinationSourceId, destinationTable, and destinationWriteMode. "
+                    + "For a map transform, config.map.fields is an array of {id, outputField, ruleType, value}; use ruleType rename and value $<sourceField> to copy a source field, and set passthroughUnlisted to true to keep every other field. "
                     + "For a root-table row filter, add a filter step to root.transforms with a valid expression using the named field and value. "
                     + "Use only the supplied PostgreSQL and MySQL source/table/field inventory. Never invent a missing field, value, table, or destination. "
                     + "If a necessary detail is missing, ask only for that detail instead of proposing a guess. "
@@ -78,8 +80,8 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         prompt.add(Map.of("role", "system", "content", guidance + " Current context: " + JsonWriter.write(context)));
         prompt.addAll(messages);
         Map<String, Object> tool = Map.of("type", "function", "function", Map.of("name", "propose_pipeline",
-                "description", "Propose a complete editable wizard after explaining the changes.",
-                "parameters", Map.of("type", "object", "properties", Map.of("candidateWizard", Map.of("type", "object")),
+                "description", "Propose a complete editable Builder wizard after briefly explaining the changes. For copied fields use a map rule with ruleType rename and value $<sourceField>; set passthroughUnlisted true to retain other fields.",
+                "parameters", Map.of("type", "object", "properties", Map.of("candidateWizard", wizardSchema()),
                         "required", List.of("candidateWizard"))));
         Map<String, Object> requestBody = new java.util.LinkedHashMap<>();
         requestBody.put("model", settings.model());
@@ -115,8 +117,63 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         if (messages.isEmpty()) return false;
         String request = messages.getLast().getOrDefault("content", "").toLowerCase(java.util.Locale.ROOT);
         boolean edit = request.matches("(?s).*(只保留|仅保留|过滤|筛选|删除|移除|添加|新增|修改|调整|生成|创建|keep only|filter|remove|add|change|modify|create).*?");
-        boolean detail = request.matches("(?s).*([=<>]|'[^']+'|\\\"[^\\\"]+\\\"|\\b\\d+\\b).*?");
-        return edit && detail;
+        boolean englishEdit = request.matches("(?s).*(keep|preserve|filter|remove|delete|add|change|modify|rename|create).*?");
+        boolean question = request.matches("(?s).*(\\x{600e}\\x{4e48}|\\x{5982}\\x{4f55}|\\x{4e3a}\\x{4ec0}\\x{4e48}|\\x{662f}\\x{5426}|\\x{80fd}\\x{5426}|\\x{4ec0}\\x{4e48}\\x{662f}|\\x{8bf4}\\x{660e}|\\x{89e3}\\x{91ca}|how\\s+(do|can|to)|why\\b|what\\s+(is|does)|should\\s+i\\b|do\\s+i\\b).*?");
+        return (edit || englishEdit) && !question;
+    }
+
+    private static Map<String, Object> wizardSchema() {
+        Map<String, Object> string = Map.of("type", "string");
+        Map<String, Object> mapRule = schemaObject(Map.of(
+                "id", string,
+                "outputField", Map.of("type", "string", "description", "Output field name."),
+                "ruleType", Map.of("type", "string", "enum", List.of("delete", "rename", "compute", "literal"),
+                        "description", "Use rename to copy or rename a source field."),
+                "value", Map.of("type", "string", "description", "Use $<sourceField> for rename, =<expression> for compute, JSON text for literal, or an empty string for delete.")),
+                List.of("id", "outputField", "ruleType", "value"));
+        Map<String, Object> mapConfig = schemaObject(Map.of(
+                "fields", schemaArray(mapRule),
+                "passthroughUnlisted", Map.of("type", "boolean", "description", "Set true to preserve source fields without an explicit mapping rule.")),
+                List.of("fields", "passthroughUnlisted"));
+        Map<String, Object> transform = schemaObject(Map.of(
+                "id", string,
+                "name", string,
+                "type", Map.of("type", "string", "enum", List.of("filter", "map", "unwind", "js")),
+                "enabled", Map.of("type", "boolean"),
+                "config", schemaObject(Map.of(
+                        "map", mapConfig,
+                        "filter", schemaObject(Map.of("expr", string), List.of("expr")),
+                        "unwind", Map.of("type", "object"),
+                        "js", schemaObject(Map.of("script", string), List.of("script"))), List.of())),
+                List.of("id", "name", "type", "enabled", "config"));
+        Map<String, Object> root = schemaObject(Map.of(
+                "source", string,
+                "table", string,
+                "keys", schemaArray(string),
+                "primaryKey", string,
+                "rowCount", string,
+                "columns", schemaArray(Map.of("type", "object")),
+                "transforms", schemaArray(transform)), List.of("source", "table", "keys", "columns", "transforms"));
+        return schemaObject(Map.of(
+                "root", root,
+                "relations", schemaArray(Map.of("type", "object")),
+                "transforms", schemaArray(transform),
+                "destinationSourceId", string,
+                "destinationTable", string,
+                "destinationWriteMode", string),
+                List.of("root", "relations", "transforms", "destinationSourceId", "destinationTable", "destinationWriteMode"));
+    }
+
+    private static Map<String, Object> schemaObject(Map<String, Object> properties, List<String> required) {
+        Map<String, Object> schema = new java.util.LinkedHashMap<>();
+        schema.put("type", "object");
+        schema.put("properties", properties);
+        if (!required.isEmpty()) schema.put("required", required);
+        return Map.copyOf(schema);
+    }
+
+    private static Map<String, Object> schemaArray(Map<String, Object> items) {
+        return Map.of("type", "array", "items", items);
     }
 
     @SuppressWarnings("unchecked")

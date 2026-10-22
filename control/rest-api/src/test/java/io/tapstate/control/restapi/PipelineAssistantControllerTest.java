@@ -344,7 +344,9 @@ class PipelineAssistantControllerTest {
         var artifacts = new PipelineApiTest.FakeArtifactStore();
         artifacts.seed("version: tapstate/v1\nkind: source\nid: src\nconnector: mysql\nconfig: {}\n");
         var schema = new io.tapstate.spi.store.DiscoveredSourceModel("src", "mysql", 1,
-                new io.tapstate.spi.store.SourceModel(List.of(new io.tapstate.spi.store.SourceTable("orders", List.of(new io.tapstate.spi.store.SourceField("id", "integer")), List.of("id"), List.of()))));
+                new io.tapstate.spi.store.SourceModel(List.of(new io.tapstate.spi.store.SourceTable("orders",
+                        List.of(new io.tapstate.spi.store.SourceField("id", "integer"),
+                                new io.tapstate.spi.store.SourceField("Db", "string")), List.of("id"), List.of()))));
         var schemaStore = new io.tapstate.spi.store.SchemaStore() {
             public void save(io.tapstate.spi.store.DiscoveredSourceModel ignored) { throw new AssertionError("must not write schema"); }
             public java.util.Optional<io.tapstate.spi.store.DiscoveredSourceModel> get(String id) { return java.util.Optional.of(schema); }
@@ -408,10 +410,17 @@ class PipelineAssistantControllerTest {
         }
 
         Map<String, Object> mapTransform = new java.util.LinkedHashMap<>(Map.of("id", "assistant-map", "name", "map",
-                "type", "map", "enabled", true, "config", Map.of("map", Map.of("fields", List.of()))));
+                "type", "map", "enabled", true, "config", Map.of("map", Map.of("fields", List.of(Map.of(
+                        "id", "name-rule", "outputField", "name", "ruleType", "rename", "value", "$Db")),
+                        "passthroughUnlisted", true))));
         Map<String, Object> mapCandidate = new java.util.LinkedHashMap<>(view);
-        mapCandidate.put("transforms", List.of(mapTransform));
-        assertThat(controller.validate("orders", 1, mapCandidate)).containsEntry("valid", true);
+        Map<String, Object> mappedRoot = new java.util.LinkedHashMap<>(AssistantWizardJson.object(view.get("root")));
+        mappedRoot.put("transforms", List.of(mapTransform));
+        mapCandidate.put("root", mappedRoot);
+        Map<String, Object> mapResult = controller.validate("orders", 1, mapCandidate);
+        assertThat(mapResult).containsEntry("valid", true);
+        assertThat(AssistantWizardJson.object(mapResult.get("diff")).get("after").toString())
+                .contains("name", "$Db");
         Map<String, Object> nullMapFields = new java.util.LinkedHashMap<>(view);
         Map<String, Object> invalidMapTransform = new java.util.LinkedHashMap<>(mapTransform);
         Map<String, Object> mapConfig = new java.util.LinkedHashMap<>(AssistantWizardJson.object(invalidMapTransform.get("config")));
