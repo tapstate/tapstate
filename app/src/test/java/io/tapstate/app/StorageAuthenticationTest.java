@@ -22,6 +22,9 @@ class StorageAuthenticationTest {
             @Override public CloudSdkBridge.ExchangeResult exchange(String code) {
                 return new CloudSdkBridge.ExchangeResult("signed-jwt", "organization", "cluster", "Org", "Cluster", "region");
             }
+            @Override public io.tapstate.cloud.sdk.client.ClusterEgressAddress currentEgressAddress() {
+                return new io.tapstate.cloud.sdk.client.ClusterEgressAddress("organization", "cluster", "192.0.2.7", "STABLE");
+            }
             @Override public CloudSdkBridge.VerifiedClaims verify(String jwt) {
                 return new CloudSdkBridge.VerifiedClaims("user", "organization", "cluster", "jti", clock.instant().plusSeconds(600),
                         "https://cloud.example", "cluster.example", List.of("workload:write"));
@@ -40,6 +43,7 @@ class StorageAuthenticationTest {
                 new RandomTokenSecrets(), clock, new byte[32])) {
             var original = authentication.managed();
             var created = original.service().exchangeCode("code", "cluster.example");
+            assertThat(original.service().clusterContextView(created.token()).orElseThrow().ec2PublicIp()).isEqualTo("192.0.2.7");
             var proof = authentication.credentials().authenticateContext(created.token()).orElseThrow();
             assertThat(proof.storageScope()).isEmpty();
             assertThat(proof.organizationId()).contains("organization");

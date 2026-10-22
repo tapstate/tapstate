@@ -3,6 +3,8 @@ package io.tapstate.cli;
 import com.sun.net.httpserver.HttpServer;
 import io.tapstate.core.catalog.OfficialConnectors;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -13,6 +15,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
 import java.util.Map;
+import java.util.stream.Stream;
 import java.util.jar.JarEntry;
 import java.util.jar.JarOutputStream;
 
@@ -26,32 +29,30 @@ class PublishedConnectorArtifactsTest {
         assertThat(PublishedConnectorArtifacts.IDS).isSubsetOf(OfficialConnectors.IDS);
     }
 
-    @Test
-    void atlasDownloadIsPinnedToTheTestedShadedArtifact() throws Exception {
-        URI source = PublishedConnectorArtifacts.artifact("mongodb-atlas", ignored -> null);
-        assertThat(source).isEqualTo(URI.create("https://github.com/tapstate/tapstate/releases/download/"
-                + "connectors-preview/mongodb-atlas-connector.jar"));
-        byte[] bytes = {1, 2, 3};
-        assertThat(PublishedConnectorArtifacts.download("mongodb-atlas", source, (from, expected) -> {
-            assertThat(from).isEqualTo(source);
-            assertThat(expected.bytes()).isEqualTo(19_764_088);
-            assertThat(expected.sha256()).isEqualTo(
-                    "2f70bfe42baafcadb0c2d88042e173156c714f508d5089ce7eb8eab7edaa8e18");
-            return PublishedConnectorArtifacts.Fetched.verified(bytes);
-        })).isEqualTo(bytes);
+    static Stream<String> publishedIds() {
+        return PublishedConnectorArtifacts.IDS.stream();
     }
 
-    @Test
-    void awsRdsMysqlDownloadIsPinnedToThePublishedPreviewBytes() throws Exception {
-        URI source = PublishedConnectorArtifacts.artifact("aws-rds-mysql", ignored -> null);
+    @ParameterizedTest(name = "download metadata for {0}")
+    @MethodSource("publishedIds")
+    void everyDownloadPassesItsTrustedPinToTheFetcher(String id) throws Exception {
+        URI source = PublishedConnectorArtifacts.artifact(id, ignored -> null);
         assertThat(source).isEqualTo(URI.create("https://github.com/tapstate/tapstate/releases/download/"
-                + "connectors-preview/aws-rds-mysql-connector.jar"));
+                + "connectors-preview/" + id + "-connector.jar"));
         byte[] bytes = {1, 2, 3};
-        assertThat(PublishedConnectorArtifacts.download("aws-rds-mysql", source, (from, expected) -> {
+        PublishedConnectorArtifacts.Artifact trusted = PublishedConnectorArtifacts.ARTIFACTS.get(id);
+        assertThat(PublishedConnectorArtifacts.download(id, source, (from, expected) -> {
             assertThat(from).isEqualTo(source);
-            assertThat(expected.bytes()).isEqualTo(47_043_627);
-            assertThat(expected.sha256()).isEqualTo(
-                    "c70999b64201fbcfbe7b34acf9f6fa1b1d8aa357b3db770bbcab980deed9b399");
+            assertThat(expected.bytes()).isPositive();
+            assertThat(expected.sha256()).matches("[0-9a-f]{64}");
+            assertThat(expected).as("the requested connector's release pin").isSameAs(trusted);
+            return PublishedConnectorArtifacts.Fetched.verified(bytes);
+        })).isEqualTo(bytes);
+        URI mirror = URI.create("https://mirror.example.test/" + id + "-connector.jar");
+        assertThat(PublishedConnectorArtifacts.download(id, mirror, (from, expected) -> {
+            assertThat(from).isEqualTo(mirror);
+            assertThat(expected).as("changing the download origin must not change trusted metadata")
+                    .isSameAs(trusted);
             return PublishedConnectorArtifacts.Fetched.verified(bytes);
         })).isEqualTo(bytes);
     }

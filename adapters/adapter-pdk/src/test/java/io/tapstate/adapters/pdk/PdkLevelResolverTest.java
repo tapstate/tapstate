@@ -109,6 +109,18 @@ class PdkLevelResolverTest {
         assertThat(PdkLevelResolver.resolve("2.0.10", null).outcome()).isEqualTo(LevelOutcome.UNKNOWN_VERSION);
     }
 
+    @Test
+    void theDb2ForIBuildLineResolvesToTheBaselineLevel() {
+        // The Db2 for i connector declares 2.0.6. Every public and protected member of the 2.0.6 PDK API
+        // is present in the baseline, which only adds the alter-table-TTL function on top, so a
+        // connector built against it links against the baseline unchanged.
+        for (String version : new String[] {"2.0.6", "2.0.6-SNAPSHOT", "2.0.6-20260721.071057-17"}) {
+            LevelResolution result = PdkLevelResolver.resolve(version, null);
+            assertThat(result.outcome()).as(version).isEqualTo(LevelOutcome.COMPATIBLE);
+            assertThat(result.requiredLevel()).as(version).isEqualTo(ENGINE);
+        }
+    }
+
     // ---- an unrecognized declared version is a verdict (UNKNOWN_VERSION), not a bare crash ----
 
     @Test

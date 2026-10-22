@@ -66,6 +66,8 @@ boot.node-id-required
 boot.node-session-renew-interval-invalid
 boot.node-session-ttl-invalid
 boot.web-console-url-invalid
+boot.web-development-artifact-invalid
+boot.web-development-confirmation-required
 boot.web-profile-invalid
 boot.web-profile-mode-mismatch
 boot.workload-claim-renew-interval-invalid
@@ -251,6 +253,7 @@ io.capture-state-rebuild-required
 io.configuration-import-limit
 io.configuration-import-refused
 io.connector-artifact-cleanup-unconfirmed
+io.connector-upload-unsettled
 io.direct-channel-unavailable
 io.document-invalid
 io.document-too-large

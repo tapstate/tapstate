@@ -34,8 +34,8 @@ reads a live Db2 database. The earlier preview was verified by hand against Db2 
 for snapshot, change capture of inserts, updates and deletes, and continuation across a server
 restart in both change-capture modes below. Replacing the floating preview JAR does not transfer
 that database certification to the replacement bytes.
-Db2 is supported as a source only. Its connector can write, but its catalog row is not
-sink-capable, so a `serve.sync` naming a `db2` connection is refused on-prem as well as in
+Db2 is supported as a source only. Its connector can write, but the server enforces the source-only policy even if
+its catalog row is missing, so a `serve.sync` naming a `db2` connection is refused on-prem as well as in
 the cloud profile. Change capture needs archive logging on the database and
 `DATA CAPTURE CHANGES` on each captured table. With `useNativeMiner: true` the connector reads
 the log in-process; that needs the server on Linux x86_64, running as root at least for the
@@ -57,6 +57,21 @@ The ordinary on-prem image continues to run as UID 10001; native Db2 setup
 there remains the operator's responsibility. The Cloud arm64 image still cannot execute the
 connector's Linux x86_64 native bridge. Image initialization does not certify live Db2 CDC.
 
+Db2 for i (IBM i, formerly AS/400) is accepted as a source-only **preview** under the id
+`db2i`, outside the certified table: no release lane reads a live IBM i system. Snapshot, journal
+capture of inserts, updates and deletes, and continuation across a server restart were verified
+by hand against IBM i 7.4.
+Db2 for i is supported as a source only. Its connector can write, but the server enforces the source-only policy even if
+its catalog row is missing, so a `serve.sync` naming a `db2i` connection is refused on-prem as well as in
+the cloud profile. Reads take a snapshot through the IBM Toolbox for Java JDBC driver and then
+capture inserts, updates and deletes from the journal named by `journalLibraryName` and
+`journalName`; every captured table must be journaled to it. The connection user needs `*USE`
+authority on the data library and its files, on that journal and its attached receiver, and on
+the `DSPJRN` command; `SELECT` on the `QSYS2` catalog views `SYSSCHEMAS`, `SYSTABLES`,
+`SYSCOLUMNS`, `SYSKEYCST`, `SYSINDEXES`, `OBJECT_PRIVILEGES`, `JOURNAL_INFO` and
+`JOURNAL_RECEIVER_INFO`; and `EXECUTE` on `QSYS2.DISPLAY_JOURNAL`. Change capture carries
+neither large-object values nor DDL changes; a snapshot reads large objects in full.
+
 Both image targets use the Ubuntu 24.04 Noble JRE base. Cloud runs can create root-owned files in
 the persistent `/var/lib/tapstate` working volume. Reusing that volume unchanged with an earlier
 UID-10001 Cloud image is not rollback-safe. Stop the cluster before restoring a pre-upgrade working
@@ -66,8 +81,8 @@ Reads are verified on Oracle Free 23 and SQL Server 2022, and across MySQL, Post
 MongoDB, with snapshot and CDC inserts, updates and deletes.
 Decimal validation includes a persisted MySQL DECIMAL(18,4) model, large values,
 negative fractions and CDC updates. This is not an exhaustive cross-version or
-all-data-type matrix. The default accepted set contains 17 connector ids: the Db2 preview,
-and 16 across these five database kinds, including existing managed variants of MySQL,
+all-data-type matrix. The default accepted set contains 18 connector ids: the Db2 and
+Db2 for i previews, and 16 across these five database kinds, including existing managed variants of MySQL,
 PostgreSQL and MongoDB. Except for `mongodb-atlas`, those managed variants have not been
 live-verified individually. The Atlas connector was verified with snapshot and change-stream
 reads, restart continuation, and target writes against a real Atlas deployment in both cloud
@@ -102,12 +117,19 @@ tapstate register aws-rds-mysql
 tapstate register db2
 ```
 
+The Db2 for i asset is scheduled for publication after this connector change is merged.
+Until `db2i-connector.jar` appears on that release, register an available local JAR with
+`tapstate register /path/to/db2i-connector.jar`. After publication, `tapstate register db2i`
+downloads and verifies the pinned asset automatically.
+
 The Oracle jar bundles `ojdbc8`, `orai18n`, and `xdb` 21.5.0.0 under the
 Oracle Free Use Terms; the SQL Server jar bundles Microsoft JDBC Driver 12.2.0 under the MIT License;
 the Db2 jar bundles IBM Data Server Driver for JDBC and SQLJ 4.25.13 under
-IBM's International Program License Agreement.
+IBM's International Program License Agreement; the Db2 for i jar bundles IBM Toolbox for Java
+(JTOpen) 21.0.5 under the IBM Public License 1.0; the complete license text is
+`license.html` at the JAR root.
 Those dependency terms govern only the bundled drivers and do not change Tapstate's Apache-2.0
-license. The Oracle, SQL Server and Db2 implementations are paid connector implementations; their use
+license. The Oracle, SQL Server, Db2 and Db2 for i implementations are paid connector implementations; their use
 remains subject to the applicable Tapdata agreement.
 The upstream enterprise connector repository has no LICENSE file; publishing these binary
 assets does not relicense that source repository.

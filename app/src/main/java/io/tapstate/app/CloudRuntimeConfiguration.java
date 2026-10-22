@@ -83,7 +83,8 @@ class CloudRuntimeConfiguration {
                 settings.baseUrl().toString(), CloudSdkBridge.DEPLOYMENT_ORGANIZATION, settings.clusterId());
         var observer = authenticationObserver();
         return new CloudAuthenticationService(
-                bridge, bridge, new CloudSessionService(store, identity, tokenSecrets, clock, observer), observer);
+                bridge, bridge, new CloudSessionService(store, identity, tokenSecrets, clock, observer), observer,
+                new CachedCloudClusterEgressAddressProvider(bridge, clock));
     }
 
     static CloudAuthenticationObserver authenticationObserver() {

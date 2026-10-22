@@ -59,6 +59,58 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class HazelcastMemberTest {
 
     @Test
+    void optionalSingleIdentityKeepsLocalControlUrlsWithoutEnablingDiscovery() {
+        ClusterProperties cluster = new ClusterProperties();
+        ControlEndpointProperties control = new ControlEndpointProperties();
+        Config anonymous = HazelcastConfiguration.memberConfig(new HazelcastProperties());
+        HazelcastConfiguration.identifyConfiguredSingleMember(anonymous, cluster, control, new BootId("boot-a"));
+        assertThat(anonymous.getMemberAttributeConfig().getAttributes()).isEmpty();
+        cluster.setId(" cluster-a ");
+        cluster.setNodeId(" node-a ");
+        for (String url : new String[]{null, "http://localhost:8080/"}) {
+            control.setAdvertiseUrl(url);
+            Config config = HazelcastConfiguration.memberConfig(new HazelcastProperties());
+            HazelcastConfiguration.identifyConfiguredSingleMember(config, cluster, control, new BootId("boot-a"));
+            assertThat(config.getMemberAttributeConfig().getAttributes())
+                    .containsEntry(ClusterMembershipGate.NODE_ID_ATTRIBUTE, "node-a")
+                    .containsEntry(ClusterMembershipGate.BOOT_ID_ATTRIBUTE, "boot-a");
+            if (url == null) {
+                assertThat(config.getMemberAttributeConfig().getAttributes())
+                        .doesNotContainKey(ClusterMembershipGate.CONTROL_URL_ATTRIBUTE);
+            } else {
+                assertThat(config.getMemberAttributeConfig().getAttributes())
+                        .containsEntry(ClusterMembershipGate.CONTROL_URL_ATTRIBUTE, url);
+            }
+            assertThat(config.getNetworkConfig().getJoin().getTcpIpConfig().isEnabled()).isFalse();
+        }
+        cluster.setNodeId(" ");
+        Config blank = HazelcastConfiguration.memberConfig(new HazelcastProperties());
+        HazelcastConfiguration.identifyConfiguredSingleMember(blank, cluster, control, new BootId("boot-a"));
+        assertThat(blank.getMemberAttributeConfig().getAttributes()).isEmpty();
+    }
+
+    @Test
+    void singleIdentityUsesTheSharedClusterAndControlUrlValidation() {
+        ClusterProperties cluster = new ClusterProperties();
+        cluster.setNodeId("node-a");
+        ControlEndpointProperties control = new ControlEndpointProperties();
+        Config config = HazelcastConfiguration.memberConfig(new HazelcastProperties());
+        for (String id : new String[]{null, " ", "bad:cluster"}) {
+            cluster.setId(id);
+            BootError expected = id != null && id.contains(":") ? BootError.CLUSTER_ID_INVALID : BootError.CLUSTER_ID_REQUIRED;
+            assertThatThrownBy(() -> HazelcastConfiguration.identifyConfiguredSingleMember(config, cluster, control, new BootId("boot-a")))
+                    .isInstanceOfSatisfying(TapstateException.class, coded -> assertThat(coded.code()).isEqualTo(expected));
+        }
+        cluster.setId("cluster-a");
+        for (String url : List.of("relative/path", "ftp://localhost/file", "http://", "http://bad host/")) {
+            control.setAdvertiseUrl(url);
+            assertThatThrownBy(() -> HazelcastConfiguration.identifyConfiguredSingleMember(config, cluster, control, new BootId("boot-a")))
+                    .isInstanceOfSatisfying(TapstateException.class, coded ->
+                            assertThat(coded.code()).isEqualTo(BootError.CONTROL_ADVERTISE_URL_INVALID));
+        }
+    }
+
+    @Test
     void memberConfigDisablesAllJoinDiscovery() {
         JoinConfig join = HazelcastConfiguration.memberConfig(new HazelcastProperties())
                 .getNetworkConfig().getJoin();
@@ -659,7 +711,10 @@ class HazelcastMemberTest {
         try (ConfigurableApplicationContext context = new SpringApplicationBuilder(Bootstrap.class)
                 .web(WebApplicationType.NONE)
                 .properties("tapstate.store.mongo.enabled=false",
-                        "tapstate.hz.jet.cooperative-thread-count=2")
+                        "tapstate.hz.jet.cooperative-thread-count=2",
+                        "tapstate.cluster.id=local-single",
+                        "tapstate.cluster.node-id=stable-single",
+                        "tapstate.control.advertise-url=http://localhost:28081")
                 .run()) {
             member = context.getBean(HazelcastInstance.class);
             assertThat(member.getLifecycleService().isRunning()).isTrue();
@@ -672,6 +727,12 @@ class HazelcastMemberTest {
             assertThat(member.getConfig().getJetConfig().getCooperativeThreadCount()).isEqualTo(2);
             // The Jet engine is up and reachable; no jobs exist at the substrate level.
             assertThat(member.getJet().getJobs()).isEmpty();
+            assertThat(new HazelcastLiveClusterMembers(member).members()).singleElement()
+                    .satisfies(live -> {
+                        assertThat(live.nodeId()).isEqualTo("stable-single");
+                        assertThat(live.bootId()).isEqualTo(context.getBean(BootId.class).value());
+                        assertThat(live.controlUrl()).isEqualTo("http://localhost:28081");
+                    });
         }
         // The member's lifecycle is bound to the context: closing the context shuts it down.
         assertThat(member.getLifecycleService().isRunning()).isFalse();

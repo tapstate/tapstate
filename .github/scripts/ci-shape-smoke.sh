@@ -46,8 +46,9 @@ def check(workflows, contexts, inputs):
     namespace = {'m': 'http://maven.apache.org/POM/4.0.0'}
     reactor = ET.fromstring(inputs['pom.xml'])
     version = reactor.findtext('m:properties/m:cloud.sdk.version', namespaces=namespace)
-    assert version and re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+-[0-9a-f]{8}-SNAPSHOT', version), \
-        'the reactor must declare the published Cloud SDK revision'
+    # The Cloud SDK snapshot publisher preserves either a major.minor or major.minor.patch tag.
+    assert version and re.fullmatch(r'[0-9]+\.[0-9]+(?:\.[0-9]+)?-[0-9a-f]{8}-SNAPSHOT', version), \
+        'the reactor must declare a published Cloud SDK snapshot revision'
     app = ET.fromstring(inputs['app/pom.xml'])
     sdk = [dependency for dependency in app.findall('m:dependencies/m:dependency', namespace)
            if dependency.findtext('m:groupId', namespaces=namespace) == 'io.tapstate'
@@ -75,6 +76,22 @@ def check(workflows, contexts, inputs):
     assert 'bash deploy/docker/image-smoke.sh --build' in ci['image-smoke'] \
         and 'mvn -q -pl app -am -DskipTests package' in inputs['deploy/docker/image-smoke.sh'], \
         'image-smoke must build the actual application through Maven dependency resolution'
+    cloud_context_test = 'io.tapstate.e2e.CloudClusterContextCarriesTheCurrentEgressAddressIT'
+    assert cloud_context_test in shards, 'the Cloud context e2e shard must prepare its release inputs'
+    cloud_context_source = inputs['e2e/src/test/java/io/tapstate/e2e/CloudClusterContextCarriesTheCurrentEgressAddressIT.java']
+    assert 'package io.tapstate.e2e;' in cloud_context_source \
+        and re.search(r'\bclass\s+CloudClusterContextCarriesTheCurrentEgressAddressIT\b', cloud_context_source), \
+        'the Cloud context test class named by CI must still exist at its declared package'
+    cloud_dev = jobs(workflows['cloud-cluster-dev.yml']).get('image', '')
+    assert cloud_dev, 'the Cloud dev image job must exist'
+    assert "github.repository == 'tapstate/tapstate'" in cloud_dev \
+        and "github.ref_type == 'branch'" in cloud_dev, 'Cloud dev image dispatch must exclude tag refs'
+    assert '.github/scripts/next-version.sh "$BUMP" origin/main' in cloud_dev, \
+        'Cloud dev version calculation must use the tagged main history'
+    assert '--dev-source-sha "$SOURCE_SHA"' in cloud_dev, \
+        'feature builds must publish under a source-specific dev tag'
+    assert "if: github.ref == 'refs/heads/main'" in cloud_dev and 'DEV_BRANCH: main' in cloud_dev, \
+        'only main may register the image in the dev version catalog'
     sonar = ci.get('sonarqube', '')
     sonar_name = '    name: sonarqube'
     assert sonar_name in sonar.splitlines(), 'sonarqube must keep its exact name on analysis events'
@@ -93,7 +110,8 @@ root = Path(sys.argv[1]).resolve()
 workflows = {p.name: p.read_text() for p in root.glob('*.yml')}
 repository = root.parents[1]
 inputs = {name: (repository / name).read_text()
-          for name in ('pom.xml', 'app/pom.xml', 'deploy/docker/image-smoke.sh')}
+          for name in ('pom.xml', 'app/pom.xml', 'deploy/docker/image-smoke.sh',
+                       'e2e/src/test/java/io/tapstate/e2e/CloudClusterContextCarriesTheCurrentEgressAddressIT.java')}
 # Snapshot of the protected branch's context names; the live list can be supplied as argv[1].
 contexts = Path(sys.argv[2]).read_text().splitlines() if sys.argv[2] else [
     'build', 'no-cjk', 'no-agent-footprint', 'sonarqube', 'e2e-admission',
@@ -120,8 +138,12 @@ for original, replacement in [
     raise AssertionError(f'workflow mutation escaped: {replacement}')
 sdk_version = ET.fromstring(inputs['pom.xml']).findtext(
     './/{http://maven.apache.org/POM/4.0.0}cloud.sdk.version')
+patch_sdk_version = '0.1.1-' + sdk_version.split('-', 1)[1]
+accepted_patch_version = {**inputs, 'pom.xml': inputs['pom.xml'].replace(sdk_version, patch_sdk_version, 1)}
+check(workflows, contexts, accepted_patch_version)
 for name, original, replacement in [
     ('pom.xml', sdk_version, 'LATEST'),
+    ('pom.xml', sdk_version, sdk_version.replace('-', '.1.2-', 1)),
     ('app/pom.xml', '<artifactId>cloud-control-plane-sdk</artifactId>',
      '<artifactId>missing-cloud-sdk</artifactId>'),
     ('app/pom.xml', '${cloud.sdk.version}', 'LATEST'),
@@ -137,5 +159,29 @@ for name, original, replacement in [
         mutations += 1
         continue
     raise AssertionError(f'SDK input mutation escaped: {replacement}')
+mutated_test = {**inputs, 'e2e/src/test/java/io/tapstate/e2e/CloudClusterContextCarriesTheCurrentEgressAddressIT.java':
+                inputs['e2e/src/test/java/io/tapstate/e2e/CloudClusterContextCarriesTheCurrentEgressAddressIT.java']
+                .replace('CloudClusterContextCarriesTheCurrentEgressAddressIT', 'RenamedCloudContextIT')}
+try:
+    check(workflows, contexts, mutated_test)
+except AssertionError:
+    mutations += 1
+else:
+    raise AssertionError('renaming the Cloud context integration test escaped CI-shape validation')
+for original, replacement in [
+    ('&& github.ref_type == \'branch\'', ''),
+    ('.github/scripts/next-version.sh "$BUMP" origin/main', '.github/scripts/next-version.sh "$BUMP" HEAD'),
+    ('--dev-source-sha "$SOURCE_SHA"', ''),
+    ('DEV_BRANCH: main', 'DEV_BRANCH: ${{ github.ref_name }}'),
+]:
+    assert original in workflows['cloud-cluster-dev.yml'], f'Cloud dev mutation target absent: {original}'
+    mutated_workflows = {**workflows,
+                         'cloud-cluster-dev.yml': workflows['cloud-cluster-dev.yml'].replace(original, replacement, 1)}
+    try:
+        check(mutated_workflows, contexts, inputs)
+    except AssertionError:
+        mutations += 1
+        continue
+    raise AssertionError(f'Cloud dev workflow mutation escaped: {replacement}')
 print(f'ci-shape smoke: workflow contracts and {mutations} mutations passed')
 PY

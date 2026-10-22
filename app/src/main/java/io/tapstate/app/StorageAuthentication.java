@@ -17,6 +17,7 @@ final class StorageAuthentication implements AutoCloseable {
     private final CloudSdkBridge bridge;
     private final TokenSecrets secrets;
     private final Clock clock;
+    private final CloudClusterEgressAddressProvider egressAddresses;
     private final byte[] signingKey;
     private final AtomicReference<Epoch> current = new AtomicReference<>();
     private final Bootstrap bootstrap;
@@ -26,6 +27,8 @@ final class StorageAuthentication implements AutoCloseable {
             TokenSecrets secrets, Clock clock, byte[] signingKey) {
         this.configuration = configuration; this.cloud = Objects.requireNonNull(cloud);
         this.bridge = bridge; this.secrets = Objects.requireNonNull(secrets); this.clock = Objects.requireNonNull(clock);
+        this.egressAddresses = bridge == null ? (organizationId, clusterId) -> Optional.empty()
+                : new CachedCloudClusterEgressAddressProvider(bridge, clock);
         this.signingKey = signingKey.clone();
         bootstrap = configuration != null && cloud.cloud() && bridge != null
                 && configuration.setupStates().load().phase() != StorageSetupStateStore.Phase.COMPLETE ? new Bootstrap() : null;
@@ -93,7 +96,7 @@ final class StorageAuthentication implements AutoCloseable {
             sessions = new BootstrapCloudSessions(identity, this::requireActive);
             var observer = CloudRuntimeConfiguration.authenticationObserver();
             managed = new CloudAuthenticationService(bridge, bridge,
-                    new CloudSessionService(sessions, identity, secrets, clock, observer), observer);
+                    new CloudSessionService(sessions, identity, secrets, clock, observer), observer, egressAddresses);
         }
         boolean incomplete() {
             try { return configuration.setupStates().load().phase() != StorageSetupStateStore.Phase.COMPLETE
@@ -142,7 +145,7 @@ final class StorageAuthentication implements AutoCloseable {
                 var identity = new CloudSessionIdentity(cloud.baseUrl().toString(), CloudSdkBridge.DEPLOYMENT_ORGANIZATION, cloud.clusterId());
                 var observer = CloudRuntimeConfiguration.authenticationObserver();
                 managed = new CloudAuthenticationService(bridge, bridge,
-                        new CloudSessionService(bound.cache().cloudSessions(scope), identity, secrets, clock, observer), observer);
+                        new CloudSessionService(bound.cache().cloudSessions(scope), identity, secrets, clock, observer), observer, egressAddresses);
             } else {
                 managed = null;
                 signer = new HmacTokenSigner(signingKey, HmacTokenSigner.DEFAULT_TTL, clock, scope);

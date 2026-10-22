@@ -18,7 +18,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.function.UnaryOperator;
 
-/** Connector jars available from the floating {@code connectors-preview} release. */
+/** Trusted connector pins for the floating {@code connectors-preview} release. */
 final class PublishedConnectorArtifacts {
 
     private static final String RELEASES = "https://github.com/tapstate/tapstate/releases";
@@ -30,7 +30,7 @@ final class PublishedConnectorArtifacts {
     private static final long MAX_ARTIFACT_BYTES = 256L * 1024 * 1024;
     private static final int COPY_BUFFER_BYTES = 8192;
 
-    private static final Map<String, Artifact> ARTIFACTS = Map.of(
+    static final Map<String, Artifact> ARTIFACTS = Map.of(
             "mysql", new Artifact(47_131_206,
                     "34def7fca33fdf80f9d7e5561b2a2d9b7a2733fd06da9974359bbb77066ca0e2"),
             "mongodb", new Artifact(20_400_364,
@@ -46,9 +46,11 @@ final class PublishedConnectorArtifacts {
             "sqlserver", new Artifact(16_232_120,
                     "3254471003dbb5cb6512610efae34bc35f4d4a77c8c02cfbf9fc883659a4c826"),
             "db2", new Artifact(203_082_147,
-                    "3c7c34e54e110402dca4699ecafce9aa04f719457fccba14e3b759d8e8fdb500"));
+                    "3c7c34e54e110402dca4699ecafce9aa04f719457fccba14e3b759d8e8fdb500"),
+            "db2i", new Artifact(34_343_764,
+                    "510a34799ee3dc8d55a5f8205d1a96209b45679d68eed4f5283b87289e1848ff"));
 
-    /** Exact public ids with a matching {@code <id>-connector.jar} release asset and trusted digest. */
+    /** Connector ids pinned to an expected {@code <id>-connector.jar} asset and trusted digest. */
     static final List<String> IDS = List.copyOf(ARTIFACTS.keySet());
 
     /** Fetches one complete response body; tests replace the network at this seam. */

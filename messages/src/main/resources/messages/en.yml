@@ -192,6 +192,12 @@ boot.workload-claim-renew-interval-invalid:
 boot.workload-claim-ttl-invalid:
   message: "The workload-claim lease must be positive."
   solution: "Set tapstate.cluster.workload-claim-ttl to a positive duration."
+boot.web-development-confirmation-required:
+  message: "This embedded Web artifact is for local development and requires explicit confirmation."
+  solution: "For an intended development environment, set tapstate.local-development.enabled=true; otherwise use a release artifact."
+boot.web-development-artifact-invalid:
+  message: "The development Web artifact is invalid: {reason}."
+  solution: "Rebuild the intended supported development profile or use a verified release artifact."
 capture.start-from-unparsable:
   message: "Cannot start consuming from `{value}`; expected `earliest`, `latest`, or an ISO-8601 timestamp."
   solution: "Set start_from to earliest, latest, or an ISO-8601 timestamp like 2026-07-11T00:00:00Z."
@@ -549,6 +555,9 @@ io.note-referenced:
 io.note-scope-unavailable:
   message: "The captured connector-note scope is missing, changed, or no longer current."
   solution: "Stop this connector drive and verify the original configuration binding and note scope before reopening. Do not substitute an empty map or retry against a newer generation."
+io.connector-upload-unsettled:
+  message: "Connector artifact '{hash}' upload '{attempt}' could not be reconciled."
+  solution: "Restore store connectivity and inspect this upload's file and chunks. Retained chunks may still belong to a committed artifact; do not delete them based only on a missing-file read."
 io.store-unavailable:
   message: "A store operation could not complete: {detail}."
   solution: "Check the store is reachable and healthy, then retry."

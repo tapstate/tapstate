@@ -23,7 +23,13 @@ import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 
 /** Reads immutable Web deployment metadata only from the archive or directory carrying this class. */
-record WebDistribution(Profile profile, String consoleUrl) {
+record WebDistribution(Profile profile, String consoleUrl, boolean localDevelopment) {
+
+    WebDistribution(Profile profile, String consoleUrl) {
+        this(profile, consoleUrl, false);
+    }
+
+    static final String DEVELOPMENT_CONFIRMATION_PROPERTY = "tapstate.local-development.enabled";
 
     private static final String CLASS_RESOURCE = "io/tapstate/app/WebDistribution.class";
     private static final String METADATA_RESOURCE = "META-INF/tapstate-web.properties";
@@ -204,6 +210,15 @@ record WebDistribution(Profile profile, String consoleUrl) {
             throw invalid("Web metadata copies conflict");
         }
         if (!index) throw invalid("Web index payload is missing or empty");
+        String purpose = metadata.getProperty("purpose");
+        if (purpose != null && !"release".equals(purpose) && !"local-development".equals(purpose)) {
+            throw invalidDevelopment("artifact purpose is unsupported");
+        }
+        if ("local-development".equals(purpose)) {
+            Profile local = developmentProfile(metadata);
+            return new WebDistribution(local,
+                    local == Profile.CLOUD ? metadata.getProperty("cloud.console.url") : null, true);
+        }
         String profile = metadata.getProperty("web.profile");
         if ("cloud".equals(profile)) {
             String consoleUrl = metadata.getProperty("cloud.console.url");
@@ -234,7 +249,41 @@ record WebDistribution(Profile profile, String consoleUrl) {
         }
     }
 
-    void validate(CloudRuntimeSettings settings) {
+    static Profile developmentProfile(Properties metadata) {
+        String profile = metadata.getProperty("web.profile");
+        String producerProfile = metadata.getProperty("profile");
+        // Previously produced local OP artifacts predate the immutable Web profile reader.
+        if (profile == null && "op".equals(producerProfile)) profile = "onprem";
+        Profile selected = "cloud".equals(profile) ? Profile.CLOUD
+                : "onprem".equals(profile) ? Profile.ON_PREM : null;
+        if (selected == null || producerProfile != null
+                && !producerProfile.equals(selected == Profile.CLOUD ? "cloud" : "op")) {
+            throw invalidDevelopment("development profile is missing, unsupported or inconsistent");
+        }
+        if (selected == Profile.CLOUD) {
+            validateLocalConsoleUrl(metadata.getProperty("cloud.console.url"));
+        } else if (metadata.containsKey("cloud.console.url")) {
+            throw invalidConsoleUrl();
+        }
+        return selected;
+    }
+
+    private static void validateLocalConsoleUrl(String value) {
+        if (value == null || !value.matches("http://localhost:[1-9][0-9]{0,4}/?")) {
+            throw invalidConsoleUrl();
+        }
+        URI uri = URI.create(value);
+        if (uri.getPort() < 1 || uri.getPort() > 65535) throw invalidConsoleUrl();
+    }
+
+    private static TapstateException invalidDevelopment(String reason) {
+        return new TapstateException(BootError.WEB_DEVELOPMENT_ARTIFACT_INVALID, Map.of("reason", reason), null);
+    }
+
+    void validate(CloudRuntimeSettings settings, boolean confirmedDevelopment) {
+        if (localDevelopment && !confirmedDevelopment) {
+            throw new TapstateException(BootError.WEB_DEVELOPMENT_CONFIRMATION_REQUIRED, Map.of(), null);
+        }
         if (profile == Profile.SERVER_ONLY) return;
         if ((profile == Profile.CLOUD) != settings.cloud()) {
             throw new TapstateException(BootError.WEB_PROFILE_MODE_MISMATCH, Map.of(

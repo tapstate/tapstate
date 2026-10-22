@@ -1313,6 +1313,9 @@ class ManagedMongoStoreIsolationIT {
             if (!List.of("old", "blocked", "fresh", "late", "restarted").contains(code) || !consumed.add(code)) throw new CloudSdkBridge.ProviderFailure();
             return new CloudSdkBridge.ExchangeResult(code, "organization", cluster, "Fixture", "Cluster", "local");
         }
+        @Override public io.tapstate.cloud.sdk.client.ClusterEgressAddress currentEgressAddress() {
+            return new io.tapstate.cloud.sdk.client.ClusterEgressAddress("organization", cluster, null, "PROVISIONING");
+        }
         @Override public CloudSdkBridge.VerifiedClaims verify(String jwt) {
             return new CloudSdkBridge.VerifiedClaims("cloud-user", "organization", cluster, jwt, Instant.now().plusSeconds(600),
                     "https://cloud.example", "127.0.0.1", List.of("workload:write"));
