@@ -1012,7 +1012,8 @@ class ControlApiTest {
             };
             AuditGate auditGate = new AuditGate(record -> {
             }, Clock.systemUTC());
-            return new ConnectionTestService(probe, resultStore, auditGate);
+            return new ConnectionTestService(probe, resultStore, auditGate, null,
+                    io.tapstate.control.core.SourceConnectionResolver.forAdHocConnections());
         }
 
         // The read-back controller is imported too, so its query service must be present for the context to
@@ -1049,7 +1050,8 @@ class ControlApiTest {
                     return Optional.empty();
                 }
             }, new AuditGate(record -> {
-            }, Clock.systemUTC()), Clock.systemUTC());
+            }, Clock.systemUTC()), Clock.systemUTC(), null,
+                    io.tapstate.control.core.SourceConnectionResolver.forAdHocConnections());
         }
 
         @Bean
