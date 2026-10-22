@@ -226,6 +226,47 @@ class MongoSplitSrsLogStoreIT {
     }
 
     @Test
+    void aReleaseAlreadyAtMongoCannotExpireTheReplacementCapture() {
+        withCache(f -> {
+            String appName = "held-release-" + UUID.randomUUID();
+            try (var delayed = MongoClients.create(MongoClientSettings.builder()
+                    .applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl())).applicationName(appName).build());
+                 var executor = Executors.newSingleThreadExecutor()) {
+                var oldClaims = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(delayed.getDatabase(f.database().getName())));
+                var admin = f.client().getDatabase("admin");
+                long entered = ((Number) admin.runCommand(new Document("configureFailPoint", "failCommand")
+                        .append("mode", new Document("times", 1)).append("data", new Document("failCommands", List.of("findAndModify"))
+                                .append("namespace", f.database().getName() + ".workload_claims").append("appName", appName)
+                                .append("blockConnection", true).append("blockTimeMS", 8000))).get("count")).longValue();
+                try {
+                    var release = executor.submit(() -> oldClaims.release(f.claim()));
+                    admin.runCommand(new Document("waitForFailPoint", "failCommand")
+                            .append("timesEntered", entered + 1).append("maxTimeMS", 5000));
+                    var held = admin.runCommand(new Document("currentOp", 1).append("$all", true)).getList("inprog", Document.class)
+                            .stream().filter(op -> appName.equals(op.getString("appName")))
+                            .filter(op -> op.get("command") instanceof Document command && "workload_claims".equals(command.getString("findAndModify")))
+                            .findFirst().orElseThrow();
+                    assertThat(held.get("command", Document.class).get("query", Document.class))
+                            .containsEntry("ownerNodeId", f.claim().owner().nodeId()).containsEntry("ownerBootId", f.claim().owner().bootId())
+                            .containsEntry("claimGeneration", f.claim().claimGeneration()).containsEntry("executionGeneration", f.claim().executionGeneration());
+                    var claims = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()));
+                    assertThat(claims.release(f.claim())).isTrue();
+                    var successor = claims.acquire(f.claim().key(), new WorkloadOwner("node-b", "boot-b"), 8, Duration.ofSeconds(30)).claim();
+                    assertThat(successor.claimGeneration()).isGreaterThan(f.claim().claimGeneration());
+                    assertThat(claims.renew(successor, Duration.ofSeconds(30))).isPresent();
+                    var successorDocument = claim(f.database());
+                    assertThat(release.isDone()).isFalse();
+                    assertThat(admin.runCommand(new Document("currentOp", 1).append("$all", true)).getList("inprog", Document.class))
+                            .anySatisfy(op -> assertThat(op).containsEntry("opid", held.get("opid")));
+                    assertThat(release.get(15, TimeUnit.SECONDS)).isFalse();
+                    assertThat(claim(f.database())).isEqualTo(successorDocument);
+                    assertThat(claims.read(successor.key()).orElseThrow().leased()).isTrue();
+                } finally { admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off")); }
+            }
+        });
+    }
+
+    @Test
     void concurrentOriginalOwnerAppendsKeepEveryRowAndTheMaximumBoundary() {
         withCache(f -> {
             try (var other = client(); var executor = Executors.newFixedThreadPool(2)) {
