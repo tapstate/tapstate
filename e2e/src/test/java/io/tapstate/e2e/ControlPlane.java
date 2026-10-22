@@ -340,6 +340,21 @@ final class ControlPlane {
     /** The ids the server holds - read back from the server, which is the truth, not from the files sent. */
     List<String> artifactIds() {
         HttpResponse<String> response = send(authedGet("/api/artifacts"));
+        return artifactIds(response);
+    }
+
+    /** A fault witness can wait through the driver's transaction retry window, preserving coded refusals. */
+    Optional<List<String>> artifactIdsIfConfigurationAvailable(Duration timeout) {
+        HttpResponse<String> response = send(authedGet("/api/artifacts", timeout));
+        if (response.statusCode() == 503
+                && Set.of(io.tapstate.spi.store.IoError.STORE_UNAVAILABLE.code(),
+                        io.tapstate.control.core.ControlError.STORAGE_UNAVAILABLE.code()).contains(codeOf(response.body()))) {
+            return Optional.empty();
+        }
+        return Optional.of(artifactIds(response));
+    }
+
+    private static List<String> artifactIds(HttpResponse<String> response) {
         expect(response, 200, "list artifacts");
         if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> map)
                 || !(map.get("artifacts") instanceof List<?> artifacts)) {
@@ -2163,8 +2178,12 @@ final class ControlPlane {
     }
 
     private HttpRequest authedGet(String path) {
+        return authedGet(path, TIMEOUT);
+    }
+
+    private HttpRequest authedGet(String path, Duration timeout) {
         return authenticate(HttpRequest.newBuilder(baseUrl.resolve(path))
-                .timeout(TIMEOUT)
+                .timeout(timeout)
                 .GET()).build();
     }
 
