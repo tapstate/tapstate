@@ -317,6 +317,30 @@ class DerivedSchemaReportTest {
     }
 
     @Test
+    void completionAllowsSchemaAcceptanceUntilAnotherStartIsAccepted() {
+        InMemoryStorePort store = seeded();
+        new StoreBackedDagSource(store).dagFor("wide");
+        store.state().create("wide", StateJson.of(PipelineState.RUNNING), Instant.EPOCH);
+        store.state().compareAndSwap("wide", 0, StateJson.of(PipelineState.COMPLETED), Instant.EPOCH);
+        store.desired().save(new DesiredState("wide", PipelineState.RUNNING, "revision"));
+        widenTheFactKeyColumn(store);
+        StoreBackedDerivedSchemas schemas = new StoreBackedDerivedSchemas(store, auditGate);
+
+        schemas.accept("alice", "wide");
+
+        var refreshed = store.derivedSchemas().latest("wide", "orders_src.orders").orElseThrow();
+        assertThat(refreshed.schema()).containsEntry("id", "DECIMAL NULL");
+        List<AuditRecord> before = List.copyOf(audited);
+        store.desired().save(new DesiredState("wide", PipelineState.RUNNING,
+                "revision", false, "assembly", true, 1L));
+        assertThatThrownBy(() -> schemas.accept("alice", "wide"))
+                .isInstanceOfSatisfying(TapstateException.class, error ->
+                        assertThat(error.code()).isEqualTo(ActuationError.SCHEMA_SYNC_WHILE_RUNNING));
+        assertThat(store.derivedSchemas().latest("wide", "orders_src.orders")).contains(refreshed);
+        assertThat(audited).isEqualTo(before);
+    }
+
+    @Test
     @DisplayName("syncing is refused while a job is carrying the pipeline, and says what it is doing")
     void syncingIsRefusedWhileAJobIsCarryingThePipeline() {
         InMemoryStorePort store = seeded();

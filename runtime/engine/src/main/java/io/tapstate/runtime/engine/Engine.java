@@ -127,9 +127,15 @@ public final class Engine {
     /** Submits after pinning every nest namespace to the database the compiled artifact resolved. */
     public void submit(String pipelineId, DAG dag, Map<String, String> stateDatabases,
             NestSettings settings) {
+        submitTracked(pipelineId, dag, stateDatabases, settings);
+    }
+
+    /** Submits the run and returns its exact job identity, including an already active submission. */
+    public long submitTracked(String pipelineId, DAG dag, Map<String, String> stateDatabases,
+            NestSettings settings) {
         refuseIfLost(pipelineId);
         configureNestState(stateDatabases, settings);
-        submitJob(pipelineId, dag);
+        return submitJob(pipelineId, dag).getId();
     }
 
     /** Submits under one immutable execution identity, refusing an active same-name job from another run. */
@@ -218,6 +224,10 @@ public final class Engine {
             return originalManifest;
         }
         public boolean isCarryingAJob() { return !isLost() && !job.getStatus().isTerminal(); }
+        public boolean completed() {
+            return !isLost() && job.getStatus() == JobStatus.COMPLETED
+                    && identity.equals(job.getConfig().getArgument(RUN_IDENTITY_ARGUMENT));
+        }
         public void suspend() { requireLive(); job.suspend(); }
         public void resume() { requireLive(); job.resume(); }
         public void cancel() {
@@ -285,7 +295,7 @@ public final class Engine {
      * no engine-side re-planning of a changed cluster, and a previous run that has to be over first -- is
      * carried here, so an overload cannot be added that quietly starts a run without any of it.
      */
-    private void submitJob(String pipelineId, DAG dag) { submitJob(pipelineId, dag, null, null); }
+    private Job submitJob(String pipelineId, DAG dag) { return submitJob(pipelineId, dag, null, null); }
 
     private Job submitJob(String pipelineId, DAG dag, java.io.Serializable originalIdentity, OperatorRunManifest manifest) {
         if (originalIdentity == null) JobFailureRegistry.of(member).clear(pipelineId);
@@ -400,6 +410,15 @@ public final class Engine {
         }
         JobStatus status = job.getStatus();
         return status != JobStatus.FAILED && status != JobStatus.COMPLETED;
+    }
+
+    /** Success of the exact submitted job; absence, cancellation and a different run prove nothing. */
+    public boolean completed(String pipelineId, long jobId) {
+        if (isLost()) {
+            return false;
+        }
+        Job job = jobNamed(pipelineId);
+        return job != null && job.getId() == jobId && job.getStatus() == JobStatus.COMPLETED;
     }
 
     public boolean awaitTerminal(String pipelineId, Duration budget) {

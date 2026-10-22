@@ -1,5 +1,7 @@
 package io.tapstate.app;
 
+import io.tapstate.testsupport.JvmTestEnvironment;
+
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mongodb.client.MongoClients;
@@ -642,8 +644,8 @@ class CloudExternalConfigStartupIT {
                 .redirectErrorStream(true).redirectOutput(log.toFile());
         // Do not inherit a developer's Cloud configuration, Java injection options, or external Spring file.
         builder.environment().keySet().removeIf(key -> key.startsWith("TAPSTATE_") || key.startsWith("SPRING_")
-                || key.equals("SDK_STATUS_SENDER_ENABLED") || key.equals("CLUSTER_ID")
-                || key.equals("JAVA_TOOL_OPTIONS") || key.equals("JDK_JAVA_OPTIONS") || key.equals("_JAVA_OPTIONS"));
+                || key.equals("SDK_STATUS_SENDER_ENABLED") || key.equals("CLUSTER_ID"));
+        JvmTestEnvironment.configure(builder, Map.of());
         if (carrier == Carrier.ENVIRONMENT) {
             values.forEach((key, value) -> builder.environment().put(
                     key.toUpperCase(java.util.Locale.ROOT).replace('.', '_').replace('-', '_'), value));

@@ -109,6 +109,14 @@ interface PipelineCaptureCoordinator {
     }
 
     /**
+     * Records the load as landed after the exact bounded job has succeeded at every sink. False while
+     * its capture is still finishing, or when this member cannot account for the whole load.
+     */
+    default boolean confirmBoundedLoad(String pipelineId) {
+        return true;
+    }
+
+    /**
      * How far each of the pipeline's tables got through its initial load, keyed by table, with the moment
      * that load began; nothing when no capture is running for it. A coordinator that runs no capture
      * reports nothing.

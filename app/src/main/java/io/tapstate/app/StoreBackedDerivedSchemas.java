@@ -8,6 +8,7 @@ import io.tapstate.control.core.LivePipelines;
 import io.tapstate.control.core.SchemaDerivation;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.core.model.PipelineResource;
@@ -167,11 +168,13 @@ final class StoreBackedDerivedSchemas implements DerivedSchemas, SchemaDerivatio
      * states must be at rest before any record is moved.
      */
     private void refuseUnlessAtRest(String pipelineId) {
-        PipelineState actual = actualStateOf(pipelineId);
-        PipelineState desired = desiredStateOf(pipelineId);
+        CheckpointDoc actual = storePort.state().read(pipelineId).orElse(null);
+        DesiredState desired = storePort.desired().read(pipelineId).orElse(null);
         if (!LivePipelines.isAtRest(actual, desired)) {
             throw new TapstateException(ActuationError.SCHEMA_SYNC_WHILE_RUNNING,
-                    Map.of("pipeline", pipelineId, "state", actual.name(), "desired", desired.name()),
+                    Map.of("pipeline", pipelineId,
+                            "state", actual == null ? PipelineState.NEW.name() : StateJson.parse(actual.stateJson()).name(),
+                            "desired", desired == null ? PipelineState.NEW.name() : desired.targetState().name()),
                     null);
         }
     }
@@ -200,12 +203,6 @@ final class StoreBackedDerivedSchemas implements DerivedSchemas, SchemaDerivatio
     private PipelineState actualStateOf(String pipelineId) {
         return storePort.state().read(pipelineId)
                 .map(checkpoint -> StateJson.parse(checkpoint.stateJson()))
-                .orElse(PipelineState.NEW);
-    }
-
-    private PipelineState desiredStateOf(String pipelineId) {
-        return storePort.desired().read(pipelineId)
-                .map(DesiredState::targetState)
                 .orElse(PipelineState.NEW);
     }
 

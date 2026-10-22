@@ -64,6 +64,7 @@ final class PdkConnector implements AutoCloseable {
     /** The pipeline this handle was opened for, or null for a drive that names none. */
     private final String pipelineId;
     private final TapCodecsRegistry codecs;
+    private final PdkValueConversions conversions;
     /** Volatile because the thread that stops an instance is rarely the thread that drove it. */
     private volatile boolean stopped;
     private final Runnable closeNotes;
@@ -84,6 +85,7 @@ final class PdkConnector implements AutoCloseable {
         this.codecs = codecs;
         this.closeNotes = closeNotes;
         this.driveGuard = driveGuard;
+        this.conversions = new PdkValueConversions(codecs);
     }
 
     /**
@@ -363,6 +365,11 @@ final class PdkConnector implements AutoCloseable {
     /** The value codecs this connector registered when it was opened; empty when it registered none. */
     TapCodecsRegistry codecs() {
         return codecs;
+    }
+
+    /** Immutable conversion managers share this connector's codec registry and lifecycle. */
+    PdkValueConversions conversions() {
+        return conversions;
     }
 
     ConnectorFunctions functions() {

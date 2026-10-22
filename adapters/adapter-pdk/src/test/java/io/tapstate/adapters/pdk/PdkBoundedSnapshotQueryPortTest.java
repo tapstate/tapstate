@@ -344,9 +344,12 @@ class PdkBoundedSnapshotQueryPortTest {
         assertThat(result.complete()).isTrue();
         assertThat(result.rows()).hasSize(1);
         Map<String, Object> row = result.rows().getFirst().after();
-        ConvertedValue expected = new ConvertedValue(new DateTime(Instant.ofEpochSecond(1_700_000_000)), "timestamp");
-        assertThat(row.get("created_at")).isEqualTo(expected);
-        assertThat(((Map<?, ?>) row.get("nested")).get("history")).isEqualTo(List.of(expected));
+        Instant expected = Instant.ofEpochSecond(1_700_000_000);
+        assertThat(ConvertedValue.unwrap(row.get("created_at"))).isEqualTo(expected);
+        assertThat(((ConvertedValue) row.get("created_at")).originType()).isEqualTo("timestamp");
+        assertThat(((ConvertedValue) row.get("created_at")).valueKind()).isEqualTo("TapDateTimeValue");
+        assertThat(ConvertedValue.unwrap(row.get("nested")))
+                .isEqualTo(Map.of("history", List.of(expected)));
         BoundedSnapshotQueryRequest tooSmall = new BoundedSnapshotQueryRequest(
                 "source-1", "connector-1", Map.of(), request.table(), request.stableOrder(),
                 new AllRows(), List.of(), 1, 1, Instant.now().plusSeconds(5));

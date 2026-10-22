@@ -135,7 +135,8 @@ public final class ResourceAttributionPolicy {
             case TransformResource transform -> new TransformResource(
                     transform.id(), metadata, transform.body(), transform.experimental());
             case ViewResource view -> new ViewResource(
-                    view.id(), metadata, view.primaryKey(), view.storage(), view.execution(), view.experimental());
+                    view.id(), metadata, view.primaryKey(), view.storage(), view.writeMode(), view.onFullLoad(),
+                    view.execution(), view.experimental());
             case ServeResource serve -> new ServeResource(
                     serve.id(), metadata, serve.sync(), serve.query(), serve.push(), serve.experimental());
         };

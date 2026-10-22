@@ -101,6 +101,30 @@ class ResolverProcessorTest {
     }
 
     @Test
+    void completionDrainsTheLastRowsRetainedByBackpressure() throws Exception {
+        ResolverProcessor bounded =
+                new ResolverProcessor(POLICIES, new HeapNestStore<>(), (from, released) -> {});
+        TestOutbox blocked = new TestOutbox(1);
+        bounded.init(blocked, new TestProcessorContext());
+        TestInbox inbox = new TestInbox();
+        inbox.queue().add(policy(1, "P1", "C1"));
+        inbox.queue().add(policy(2, "P2", "C2"));
+
+        bounded.process(OWN_ROWS, inbox);
+
+        assertThat(inbox.isEmpty()).isTrue();
+        assertThat(bounded.complete())
+                .as("end of input cannot discard the last routed row while the outbox is full")
+                .isFalse();
+        List<Object> received = new ArrayList<>();
+        blocked.drainQueueAndReset(0, received, false);
+        assertThat(bounded.complete()).isTrue();
+        blocked.drainQueueAndReset(0, received, false);
+        assertThat(received).map(item -> ((KeyedElement) item).key())
+                .containsExactly(List.of("C1"), List.of("C2"));
+    }
+
+    @Test
     void aChildThatOutrunsItsParentWaitsAndLeavesWithItWhenItArrives() {
         assertThat(feed(CLAIMS, claim(2, "CL1", "P1")))
                 .describedAs("nothing can be said about where it belongs yet")

@@ -112,6 +112,53 @@ class ThreeLayerRestartContinuationIT {
     }
 
     @Test @Timeout(300)
+    void aBoundedRunKeepsItsCompletedObservationAndDoesNotRestartItsSourceAfterProcessReplacement() {
+        String suffix = UUID.randomUUID().toString().replace("-", "");
+        String cluster = "bounded-" + suffix, cacheDb = "bounded_cache_" + suffix;
+        String configUri = CONFIG.getReplicaSetUrl("bounded_cfg_" + suffix);
+        String sourceUri = DATA.getReplicaSetUrl("bounded_source_" + suffix), targetUri = DATA.getReplicaSetUrl("bounded_target_" + suffix);
+        prepareStorage(configUri,cacheDb,targetUri,cluster);
+        var source=EndpointAddress.uri(sourceUri); var target=EndpointAddress.uri(targetUri);
+        try(var mongo=new MongoEndpoints();var cache=MongoClients.create(CACHE.getReplicaSetUrl())) {
+            mongo.seed(source,TABLE,SeedRows.generated(8));
+            Map<Long,Long> completedRows;
+            java.time.Instant lastObservation;
+            long execution;
+            var claims=cache.getDatabase(cacheDb).getCollection("workload_claims");
+            var pipelineClaim=new Document("resourceType","PIPELINE_ACTUATION").append("resourceId",PIPELINE);
+            var first=start(configUri,cluster);
+            try(first) {
+                var control=login(first); control.registerConnector("mongodb",ConnectorJars.bytesFor("mongodb"));
+                var resources=resources(sourceUri,true);
+                resources.put("views.tap.yml",control.artifact("views").orElseThrow().canonicalForm());
+                control.apply(resources);control.discoverSchema(SOURCE,"mongodb",Map.of("isUri",true,"uri",sourceUri));
+                control.lifecycle(PIPELINE,LifecycleVerb.START);
+                Await.until("the real bounded job and target writes to complete",BOUND,
+                        () -> control.state(PIPELINE).filter(PipelineState.COMPLETED::equals).isPresent(),() -> control.logs(PIPELINE));
+                awaitRows(mongo,source,target,"the completed bounded target values");
+                assertThat(control.snapshotTable(PIPELINE,TABLE)).contains(new io.tapstate.core.lifecycle.TableSnapshot(8,8L,100,true));
+                var observed=Await.answered("the completed observation timestamp",BOUND,() -> control.observedAt(PIPELINE));
+                mongo.insert(source,TABLE,List.of(Map.of("id",99L,"seq",999L)));
+                lastObservation=Await.answered("another completed pass after capture cleanup",BOUND,
+                        () -> control.observedAt(PIPELINE).filter(at -> at.isAfter(observed)));
+                completedRows=rows(mongo,target);assertThat(completedRows).hasSize(8).doesNotContainKey(99L);
+                assertThat(control.snapshotTable(PIPELINE,TABLE)).contains(new io.tapstate.core.lifecycle.TableSnapshot(8,8L,100,true));
+                execution=claims.find(pipelineClaim).first().getLong("executionGeneration");
+            }
+            assertThat(first.isAlive()).isFalse();
+            try(var replacement=start(configUri,cluster)) {
+                var control=login(replacement);
+                Await.answered("the replacement to observe the retained completed result",BOUND,
+                        () -> control.observedAt(PIPELINE).filter(at -> at.isAfter(lastObservation)));
+                assertThat(control.state(PIPELINE)).contains(PipelineState.COMPLETED);
+                assertThat(control.snapshotTable(PIPELINE,TABLE)).contains(new io.tapstate.core.lifecycle.TableSnapshot(8,8L,100,true));
+                assertThat(rows(mongo,target)).isEqualTo(completedRows);
+                assertThat(claims.find(pipelineClaim).first()).containsEntry("executionGeneration",execution);
+            }
+        }
+    }
+
+    @Test @Timeout(300)
     void aCacheOnlyOutageRefusesANewProcessAndResumesTheOriginalStateAfterNormalLogin() throws Exception {
         storageOutage(false);
     }
@@ -339,6 +386,10 @@ class ThreeLayerRestartContinuationIT {
     }
 
     private static Map<String, String> resources(String sourceUri) {
+        return resources(sourceUri,false);
+    }
+
+    private static Map<String, String> resources(String sourceUri,boolean bounded) {
         var resources = new LinkedHashMap<String, String>();
         resources.put("input.tap.yml", """
                 version: tapstate/v1
@@ -346,21 +397,21 @@ class ThreeLayerRestartContinuationIT {
                 id: input
                 connector: mongodb
                 config: { isUri: true, uri: "%s" }
-                mode: cdc
+                mode: %s
                 tables: [ orders ]
-                """.formatted(sourceUri));
+                """.formatted(sourceUri,bounded?"snapshot":"cdc"));
         resources.put("pipeline.tap.yml", """
                 version: tapstate/v1
                 kind: pipeline
                 id: native_resume
-                source: [ { id: input, srs: true } ]
-                settings: { read_mode: snapshot_and_cdc }
+                source: [ { id: input, srs: %s } ]
+                settings: { read_mode: %s }
                 serve:
                   from: orders
                   sync:
                     - source: views
                       on_full_load: clear
-                """);
+                """.formatted(!bounded,bounded?"snapshot_only":"snapshot_and_cdc"));
         return resources;
     }
 

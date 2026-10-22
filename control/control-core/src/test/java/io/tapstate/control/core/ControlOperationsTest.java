@@ -63,6 +63,7 @@ class ControlOperationsTest {
                         "pipeline-draft.publish",
                         "pipeline-draft.rebase",
                         "pipeline.start",
+                        "pipeline.start-checks",
                         "pipeline.stop",
                         "pipeline.pause",
                         "pipeline.resume",
@@ -138,7 +139,8 @@ class ControlOperationsTest {
         // read faces; read-scoped, unaudited.
         for (String id : List.of(
                 "pipeline.list", "pipeline.catalog", "pipeline.get", "pipeline.layout.get", "pipeline.status", "pipeline.metrics",
-                "pipeline.snapshot", "pipeline.logs", "pipeline.metrics.history", "pipeline.explain")) {
+                "pipeline.snapshot", "pipeline.logs", "pipeline.metrics.history", "pipeline.explain",
+                "pipeline.start-checks")) {
             assertThat(registry.resolve(id).scope()).as(id).isEqualTo(Scope.READ);
         }
         for (String id : List.of("user.create", "user.passwd", "user.list", "token.create", "token.revoke", "token.list")) {
@@ -205,7 +207,8 @@ class ControlOperationsTest {
                 "pipeline.snapshot",
                 "pipeline.logs",
                 "pipeline.metrics.history",
-                "pipeline.explain")) {
+                "pipeline.explain",
+                "pipeline.start-checks")) {
             assertThat(registry.resolve(id).audited()).as(id).isFalse();
         }
     }
@@ -214,7 +217,7 @@ class ControlOperationsTest {
     void theRegistryOpensEveryUsableOperationOnCliAndKeepsTheRevealReservationClosed() {
         // The cluster context is REST-only. The reveal reservation stays unpublished until its
         // dedicated authorizer exists.
-        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(77);
+        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(78);
         assertThat(registry.all()).filteredOn(op -> !"source.reveal-config".equals(op.id())
                 && !"cluster.context".equals(op.id())).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
@@ -253,6 +256,8 @@ class ControlOperationsTest {
                         "connection.discover-schema", "connection.schema",
                         "artifact.validate", "artifact.apply", "artifact.delete", "artifact.get",
                         "pipeline.list", "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume",
+                        // read-scoped, so a caller with no write capability sees why a start would stop
+                        "pipeline.start-checks",
                         "pipeline.status",
                         "pipeline.metrics", "pipeline.snapshot", "pipeline.logs",
                         "pipeline.metrics.history", "pipeline.explain",

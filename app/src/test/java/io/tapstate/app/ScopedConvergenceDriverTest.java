@@ -64,6 +64,9 @@ class ScopedConvergenceDriverTest {
     private io.tapstate.runtime.scheduler.RateSampler sampler;
     private boolean sampleMetrics;
     private Consumer<PipelineConvergencePass> onStart = this::advance;
+    private boolean readyToComplete, releasedSnapshot, completionObserved, pendingCleanup, rejectCleanup;
+    private final List<String> completionTrace = new ArrayList<>();
+    private Runnable onFinalObservation = () -> {};
 
     private ConvergenceDriver driver() {
         claims.acquire(KEY, OWNER, 7, Duration.ofMinutes(1));
@@ -81,6 +84,18 @@ class ScopedConvergenceDriverTest {
                 @Override public Optional<Throwable> failure(String id) { return Optional.empty(); }
                 @Override public Optional<Throwable> lost(String id) { return Optional.empty(); }
                 @Override public boolean isCarryingAJob(String id) { return carrying.get(); }
+                @Override public Optional<Completion> completion(String id) {
+                    return readyToComplete ? Optional.of(new Completion("original-job",pass.claim())) : Optional.empty();
+                }
+                @Override public void complete(String id,Completion completion) {
+                    assertThat(completion.fence()).isEqualTo(pass.claim()); pendingCleanup=true; finishCleanup();
+                }
+                @Override public void retryCompletion(String id) { if(pendingCleanup)finishCleanup(); }
+                private void finishCleanup() {
+                    completionTrace.add("cleanup"); releasedSnapshot=true;
+                    if(rejectCleanup)throw fenced();
+                    pendingCleanup=false; carrying.set(false);
+                }
             };
         }, pass -> RebuildAdmission.never(), ids -> retained.add(List.copyOf(ids)));
         StateStore poisonState = mock(StateStore.class, call -> { throw new AssertionError("unscoped state accessed"); });
@@ -97,7 +112,12 @@ class ScopedConvergenceDriverTest {
         var converger = new PipelineConverger(poisonDesired, poisonState, poisonActuator,
                 Clock.fixed(T0, ZoneOffset.UTC), poisonRebuilds);
         return ConvergenceDriver.scoped(converger, new ObservationPublisher(poisonState, poisonObservations,
-                id -> sampleMetrics ? java.util.OptionalLong.of(5) : java.util.OptionalLong.empty(), id -> Map.of()),
+                id -> sampleMetrics ? java.util.OptionalLong.of(5) : java.util.OptionalLong.empty(), id -> Map.of(), id -> {
+                    if(releasedSnapshot)throw new AssertionError("completed observations must not sample released capture");
+                    return readyToComplete ? new io.tapstate.core.lifecycle.SnapshotReading(
+                            Map.of("orders",new io.tapstate.core.lifecycle.TableSnapshot(8,8L,100,true)),T0)
+                            : io.tapstate.core.lifecycle.SnapshotReading.NONE;
+                }),
                 sampler, MetricsExport.none(), eligible::get, ownership, bindings);
     }
 
@@ -110,6 +130,56 @@ class ScopedConvergenceDriverTest {
         }
         if (startFailure != null) throw startFailure;
         carrying.set(true);
+    }
+
+    @Test void scopedCompletionPublishesBeforeItsFencedCasAndRetainsTheFinalReadingAfterCleanup() {
+        var driver=driver(); driver.reconcile(); views.writes.clear(); readyToComplete=true;
+        driver.reconcile();
+        assertThat(completionTrace).containsExactly("final-observation","completion-cas","cleanup");
+        assertThat(views.writes.stream().filter(write -> write.kind().equals("state")).map(Write::claim))
+                .containsExactly(WorkloadClaimFence.from(claims.read(KEY).orElseThrow().claim()));
+        var completed=views.observations(FIRST).read("orders").orElseThrow();
+        assertThat(completed.state()).isEqualTo(PipelineState.COMPLETED);
+        assertThat(completed.snapshot()).containsEntry("orders",new io.tapstate.core.lifecycle.TableSnapshot(8,8L,100,true));
+        driver.reconcile();
+        assertThat(views.observations(FIRST).read("orders").orElseThrow().snapshot()).isEqualTo(completed.snapshot());
+        assertThat(intents.loads).isEqualTo(4);
+    }
+
+    @Test void aNewIntentRevisionAfterFinalPublicationCannotBeCompletedByTheOldPass() {
+        var driver=driver(); driver.reconcile(); views.writes.clear(); readyToComplete=true;
+        onFinalObservation=() -> intents.snapshot=new PipelineIntentSnapshot(FIRST,5,intents.snapshot.desired());
+        driver.reconcile();
+        assertThat(completionTrace).containsExactly("final-observation");
+        assertThat(intents.loads).isEqualTo(3);
+        assertThat(views.writes).noneMatch(write -> write.kind().equals("state"));
+        assertThat(views.state(FIRST).read("orders").orElseThrow().stateJson()).isEqualTo(StateJson.of(PipelineState.RUNNING));
+        assertThat(views.observations(FIRST).read("orders").orElseThrow().metrics()).doesNotContainKey("reconcileFailuresInARow");
+    }
+
+    @Test void aPhysicalReplacementDuringFinalPublicationNeverReceivesTheOldCompletion() {
+        var driver=driver(); driver.reconcile(); views.writes.clear(); readyToComplete=true;
+        onFinalObservation=() -> {intents.snapshot=snapshot(scope(2));views.current=scope(2);};
+        driver.reconcile();
+        assertThat(completionTrace).containsExactly("final-observation");
+        assertThat(views.writes).noneMatch(write -> write.kind().equals("state"));
+        assertThat(views.requested).containsOnly(FIRST);
+        assertThat(views.observations(scope(2)).read("orders")).isEmpty();
+        verify(ownership,never()).permit(scope(2));
+    }
+
+    @Test void failedCompletedCleanupKeepsItsFinalLoadAndRetriesWithoutAnotherTransition() {
+        var driver=driver(); driver.reconcile(); views.writes.clear(); readyToComplete=true; rejectCleanup=true;
+        driver.reconcile();
+        var checkpoint=views.state(FIRST).read("orders").orElseThrow();
+        var failedCleanup=views.observations(FIRST).read("orders").orElseThrow();
+        assertThat(failedCleanup.state()).isEqualTo(PipelineState.COMPLETED);
+        assertThat(failedCleanup.snapshot()).containsEntry("orders",new io.tapstate.core.lifecycle.TableSnapshot(8,8L,100,true));
+        rejectCleanup=false; driver.reconcile();
+        assertThat(views.state(FIRST).read("orders")).contains(checkpoint);
+        assertThat(views.observations(FIRST).read("orders").orElseThrow().snapshot()).isEqualTo(failedCleanup.snapshot());
+        assertThat(views.observations(FIRST).read("orders").orElseThrow().metrics()).doesNotContainKey("reconcileFailuresInARow");
+        assertThat(completionTrace).containsExactly("final-observation","completion-cas","cleanup","cleanup");
     }
 
     @Test void thePublishedObservationIsSampledOnlyThroughItsSamePassAndActuallyAdvancedClaim() {
@@ -310,6 +380,7 @@ class ScopedConvergenceDriverTest {
                 @Override public Optional<CheckpointDoc> read(String id) { check(scope); return state(scope).read(id); }
                 @Override public CasOutcome compareAndSwap(String id, long epoch, String next, Instant at) {
                     check(scope, original, active); writes.add(new Write("state", scope, original));
+                    if(next.equals(StateJson.of(PipelineState.COMPLETED)))completionTrace.add("completion-cas");
                     return state(scope).compareAndSwap(id, epoch, next, at);
                 }
                 @Override public void create(String id, String next, Instant at) { throw new AssertionError("no ordinary seed"); }
@@ -320,7 +391,12 @@ class ScopedConvergenceDriverTest {
         @Override public ObservationStore pipelineObservations(PipelineIntentScope scope, WorkloadClaimFence original, Runnable active) {
             return new ObservationStore() {
                 @Override public Optional<Observation> read(String id) { check(scope); return observations(scope).read(id); }
-                @Override public void save(Observation value) { check(scope, original, active); writes.add(new Write("observation", scope, original)); observations(scope).save(value); }
+                @Override public void save(Observation value) {
+                    check(scope, original, active); writes.add(new Write("observation", scope, original)); observations(scope).save(value);
+                    if(readyToComplete && !completionObserved && value.state()==PipelineState.RUNNING) {
+                        completionObserved=true;completionTrace.add("final-observation");onFinalObservation.run();
+                    }
+                }
                 @Override public void delete(String id) { throw new AssertionError("no ordinary delete"); }
             };
         }

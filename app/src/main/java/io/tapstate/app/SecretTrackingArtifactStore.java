@@ -1,7 +1,7 @@
 package io.tapstate.app;
 
-import io.tapstate.core.catalog.ConfigField;
 import io.tapstate.core.catalog.ConnectorCatalogEntry;
+import io.tapstate.core.catalog.SecretConfigPaths;
 import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.logging.SecretRedactor;
@@ -162,12 +162,12 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
             connector = catalog.get().byId(source.connector());
         } catch (IllegalArgumentException unavailable) {
             secrets.addAll(namedSecretValues(source.config()));
+            SecretConfigPaths.shared().forEach(path -> collectScalars(path.value(source.config()), secrets));
             return secrets;
         }
 
-        connector.config().stream()
-                .filter(ConfigField::secret)
-                .map(field -> configValue(source.config(), field.name()))
+        SecretConfigPaths.forConnector(connector).stream()
+                .map(path -> path.value(source.config()))
                 .filter(Objects::nonNull)
                 .forEach(value -> collectScalars(value, secrets));
         boolean trackedMongoUri = "mongodb-atlas".equals(source.connector())
@@ -177,20 +177,6 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
             secrets.addAll(MongoUriUserInfo.secretValues(uri));
         }
         return secrets;
-    }
-
-    private static Object configValue(Map<String, Object> config, String name) {
-        if (config.containsKey(name)) {
-            return config.get(name);
-        }
-        Object current = config;
-        for (String part : name.split("\\.")) {
-            if (!(current instanceof Map<?, ?> map) || !map.containsKey(part)) {
-                return null;
-            }
-            current = map.get(part);
-        }
-        return current;
     }
 
     private static Collection<String> namedSecretValues(Object value) {

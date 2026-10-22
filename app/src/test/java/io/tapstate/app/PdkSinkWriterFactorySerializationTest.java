@@ -69,12 +69,14 @@ class PdkSinkWriterFactorySerializationTest {
         var binder = new StoreBackedDagSource.PdkSinkWriterBinder();
         PipelineNode node = new PipelineNode("p1", "shared");
         var view = (PdkSinkWriterFactory) roundTrip(binder.bindView("mongodb", Map.of(), WriteMode.UPSERT,
-                DdlPolicy.FAIL, Map.of(), node));
+                DdlPolicy.FAIL, Map.of(), node, io.tapstate.spi.sink.OnFullLoad.CLEAR, false));
         var sync = (PdkSinkWriterFactory) roundTrip(binder.bind("mongodb", Map.of(), WriteMode.UPSERT,
                 DdlPolicy.FAIL, Map.<String, TargetTable>of(), node));
         assertThat(view.node()).isEqualTo(node);
         assertThat(sync.node()).isEqualTo(node);
         assertThat(view.purpose()).isEqualTo(PipelineNode.Purpose.VIEW);
+        assertThat(view.onFullLoad()).isEqualTo(io.tapstate.spi.sink.OnFullLoad.CLEAR);
+        assertThat(view.fullLoad()).isFalse();
         assertThat(sync.purpose()).isEqualTo(PipelineNode.Purpose.SYNC);
     }
 

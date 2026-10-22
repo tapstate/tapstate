@@ -164,9 +164,12 @@ final class ConvergenceDriver {
                     // this member's own run statistics, which are absent because the run is not here.
                     continue;
                 }
+                PipelineConvergencePass originalPass = pass;
                 ConvergeResult result = scoped == null ? converger.converge(pipelineId)
                         : converger.convergeScoped(pass.intent(), pass.state(), scoped.actuators().apply(pass),
-                                scoped.rebuilds().apply(pass));
+                                scoped.rebuilds().apply(pass), ignored -> publisher.publishScoped(originalPass.scope(),
+                                        originalPass.state(), originalPass.observations(), null),
+                                () -> scoped.intents().loadForActuation(pipelineId).filter(originalPass.intent()::equals).isPresent());
                 ObservationFailure failure = null;
                 if (result.status() == ConvergeStatus.FAILED) {
                     // The job died on its own; the converge side moved the pipeline to the observable FAILED

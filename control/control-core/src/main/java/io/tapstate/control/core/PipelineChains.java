@@ -18,6 +18,15 @@ public interface PipelineChains {
     List<Chain> of(String pipelineId);
 
     /**
+     * Every chain that can hold {@code pipelineId}'s durable progress: the chains it reads, and any older
+     * chain a source recorded its progress on before it read the one it reads now. Whether a start is a
+     * new full load is judged from all of them; a position is reported only from the chains it reads.
+     */
+    default List<String> progressChainsOf(String pipelineId) {
+        return of(pipelineId).stream().map(Chain::chainId).distinct().toList();
+    }
+
+    /**
      * One chain a pipeline reads.
      *
      * @param chainId  the mining chain the ring and the durable record are both keyed by

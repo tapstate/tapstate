@@ -55,7 +55,9 @@ final class PreviewDocumentStorage {
             if (!(path instanceof String pointer) || !(kind instanceof String type)) {
                 throw new IllegalStateException("preview materializer stored incomplete type metadata");
             }
-            Carrier carrier = new Carrier(type, raw.get("originType"), raw.get("value"));
+            Carrier carrier = new Carrier(type, raw.get("originType"), raw.get("value"),
+                    optionalString(raw.get("valueKind")), optionalString(raw.get("typeDescription")),
+                    optionalString(raw.get("temporalDescription")));
             if (carriers.put(pointer, carrier) != null) {
                 throw new IllegalStateException("preview materializer stored duplicate type metadata");
             }
@@ -71,7 +73,11 @@ final class PreviewDocumentStorage {
             metadata.put("kind", kind(carrier.value()));
             metadata.put("originType", carrier.originType());
             metadata.put("value", wireValue(carrier.value()));
+            metadata.put("valueKind", carrier.valueKind());
+            metadata.put("typeDescription", carrier.typeDescription());
+            metadata.put("temporalDescription", carrier.temporalDescription());
             carriers.add(metadata);
+            collect(carrier.value(), path, carriers);
             return;
         }
         if (value instanceof Map<?, ?> map) {
@@ -107,8 +113,14 @@ final class PreviewDocumentStorage {
         Carrier carrier = carriers.get(pointer);
         if (carrier != null) {
             Object restoredValue = readWireValue(carrier.kind(), carrier.value());
-            return new ConvertedValue(restoredValue, carrier.originType() instanceof String origin ? origin : null);
+            return new ConvertedValue(restoreMembers(restoredValue, pointer, carriers),
+                    carrier.originType() instanceof String origin ? origin : null,
+                    carrier.valueKind(), carrier.typeDescription(), carrier.temporalDescription());
         }
+        return restoreMembers(value, pointer, carriers);
+    }
+
+    private static Object restoreMembers(Object value, String pointer, Map<String, Carrier> carriers) {
         if (value instanceof Map<?, ?> map) {
             Map<String, Object> restored = new LinkedHashMap<>();
             map.forEach((key, item) -> {
@@ -130,6 +142,9 @@ final class PreviewDocumentStorage {
     private static String kind(Object value) {
         if (PdkPreviewDateTimes.isDateTime(value)) {
             return "datetime";
+        }
+        if (value instanceof java.time.Instant) {
+            return "instant";
         }
         return switch (value) {
             case Bytes ignored -> "bytes";
@@ -183,6 +198,7 @@ final class PreviewDocumentStorage {
             case "byte" -> number(value).byteValueExact();
             case "float" -> number(value).floatValue();
             case "date" -> new Date(number(value).longValueExact());
+            case "instant" -> java.time.Instant.parse(requireString(value));
             case "byte-array" -> Base64.getDecoder().decode(requireString(value));
             case "boolean" -> {
                 if (!(value instanceof Boolean bool)) {
@@ -252,6 +268,11 @@ final class PreviewDocumentStorage {
         throw new IllegalStateException("preview materializer stored invalid numeric metadata");
     }
 
-    private record Carrier(String kind, Object originType, Object value) {
+    private static String optionalString(Object value) {
+        return value == null ? null : requireString(value);
+    }
+
+    private record Carrier(String kind, Object originType, Object value,
+            String valueKind, String typeDescription, String temporalDescription) {
     }
 }

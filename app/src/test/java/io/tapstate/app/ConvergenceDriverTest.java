@@ -1,5 +1,17 @@
 package io.tapstate.app;
 
+import java.util.OptionalLong;
+
+import java.util.Map;
+
+import java.util.concurrent.atomic.AtomicReference;
+
+import io.tapstate.core.lifecycle.PipelineState;
+
+import io.tapstate.core.lifecycle.TableSnapshot;
+
+import io.tapstate.core.lifecycle.SnapshotReading;
+
 import ch.qos.logback.classic.Logger;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.Observation;
@@ -83,6 +95,38 @@ class ConvergenceDriverTest {
 
         // The healthy pipeline still converges even though the broken one threw mid-pass.
         assertThat(state.read("healthy").orElseThrow().stateJson()).isEqualTo(StateJson.of(RUNNING));
+    }
+
+    @Test
+    void aCompletionCleanupFailureAndItsRetryKeepTheFinalConfirmedSnapshot() {
+        var reading = new AtomicReference<>(new SnapshotReading(
+                Map.of("orders", new TableSnapshot(3, 3L, 100, true)), T0));
+        FailingActuator actuator = new FailingActuator();
+        ObservationPublisher publisher = new ObservationPublisher(state, observations,
+                id -> OptionalLong.empty(), id -> Map.of(), id -> reading.get());
+        PipelineConverger completing = new PipelineConverger(desired, state, actuator,
+                Clock.fixed(T0, ZoneOffset.UTC), RebuildAdmission.never(), publisher::publish);
+        ConvergenceDriver completingDriver = new ConvergenceDriver(completing, desired, publisher);
+        desired.save(new DesiredState("orders", RUNNING, "rev-1"));
+        completingDriver.reconcile();
+        actuator.completed = true;
+        actuator.cleanup = () -> {
+            reading.set(SnapshotReading.NONE);
+            throw new IllegalStateException("temporary plan cleanup refusal");
+        };
+        completingDriver.reconcile();
+        Observation refused = observations.read("orders").orElseThrow();
+        assertThat(refused.state()).isEqualTo(PipelineState.COMPLETED);
+        assertThat(refused.snapshot()).containsEntry("orders", new TableSnapshot(3, 3L, 100, true));
+        assertThat(refused.metrics()).containsEntry("reconcileFailuresInARow", 1L);
+
+        actuator.cleanup = () -> { };
+        completingDriver.reconcile();
+        Observation completed = observations.read("orders").orElseThrow();
+        assertThat(completed.snapshot()).isEqualTo(refused.snapshot());
+        assertThat(completed.metrics()).doesNotContainKey("reconcileFailuresInARow");
+        completingDriver.reconcile();
+        assertThat(actuator.cleanupCalls).isEqualTo(2);
     }
 
     @Test
@@ -399,6 +443,28 @@ class ConvergenceDriverTest {
     /** A no-op actuator whose failure() a test can arm, to drive a pipeline to FAILED without a real job. */
     private static final class FailingActuator implements LifecycleActuator {
         private Throwable failure;
+        private boolean completed;
+        private Runnable cleanup = () -> { };
+        private int cleanupCalls;
+
+        @Override
+        public boolean completed(String pipelineId) {
+            return completed;
+        }
+
+        @Override
+        public void complete(String pipelineId) {
+            cleanupCalls++;
+            cleanup.run();
+            completed = false;
+        }
+
+        @Override
+        public void retryCompletion(String pipelineId) {
+            if (completed) {
+                complete(pipelineId);
+            }
+        }
 
         void failWith(Throwable cause) {
             this.failure = cause;

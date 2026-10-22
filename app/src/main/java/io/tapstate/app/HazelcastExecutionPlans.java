@@ -59,6 +59,18 @@ final class HazelcastExecutionPlans implements ExecutionPlans, ExecutionPlanReco
                 if (prior.original().equals(original) && prior.live())
                     map.replace(pipeline, prior, new ScopedPlan(original, prior.plan(), false));
             }
+            @Override public void forget(ExecutionPlan expected) {
+                Objects.requireNonNull(expected, "expected");
+                if (!original.pipelineId().equals(expected.pipelineId())
+                        || !Long.valueOf(original.claimGeneration()).equals(expected.claimGeneration())
+                        || !Long.valueOf(original.executionGeneration()).equals(expected.executionGeneration())
+                        || !Long.valueOf(original.topologyRevision()).equals(expected.topologyRevision())) throw ThreeLayerStorePort.refused();
+                var map = member.<String,Object>getMap(MAP_NAME); Object held = map.get(expected.pipelineId());
+                if (held == null) return;
+                if (!(held instanceof ScopedPlan prior)) throw ThreeLayerStorePort.refused();
+                if (prior.original().equals(original) && prior.live() && prior.plan().equals(expected))
+                    map.replace(expected.pipelineId(), prior, new ScopedPlan(original, expected, false));
+            }
             @Override public ExecutionPlan last(String pipeline) {
                 active.run(); if (!original.pipelineId().equals(pipeline)) throw ThreeLayerStorePort.refused();
                 Object held = member.<String,Object>getMap(LAST_MAP_NAME).get(pipeline); active.run();
@@ -116,6 +128,11 @@ final class HazelcastExecutionPlans implements ExecutionPlans, ExecutionPlanReco
     public void forget(String pipelineId) {
         if (member.<String,Object>getMap(MAP_NAME).get(pipelineId) instanceof ScopedPlan) throw ThreeLayerStorePort.refused();
         plans().delete(pipelineId);
+    }
+
+    @Override
+    public void forget(ExecutionPlan expected) {
+        plans().remove(expected.pipelineId(), expected);
     }
 
     @Override

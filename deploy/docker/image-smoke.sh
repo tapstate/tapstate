@@ -213,6 +213,7 @@ if [[ -z "$host_ip" ]]; then
   FAIL=$((FAIL + 1))
 fi
 if docker run -d --name "$SERVER" --network "$NET" \
+     -e TZ=Etc/UTC \
      -e TAPSTATE_STORE_MONGO_URI="mongodb://$MONGO:27017/tapstate?directConnection=true" \
      -p "$host_ip::8080" \
      "$IMAGE" --role=all >/dev/null; then
@@ -272,6 +273,7 @@ if is_running "$SERVER"; then
   # The member's own orderly-leave line proves the shutdown hooks ran, rather than the process merely
   # happening to end at 0.
   docker logs "$SERVER" >"$WORK/run.log" 2>&1 || true
+  check "image uses the canonical server timezone" grep -qF "Server time zone: UTC (default)" "$WORK/run.log"
   check "member logged an orderly SHUTDOWN" grep -q "is SHUTDOWN" "$WORK/run.log"
 else
   red "  FAIL: container was not running to stop (boot check failed above)"; FAIL=$((FAIL + 1))

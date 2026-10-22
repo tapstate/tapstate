@@ -58,6 +58,7 @@ import java.util.Base64;
 import java.util.List;
 import java.util.HexFormat;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.LockSupport;
@@ -571,6 +572,32 @@ class ManagedMongoStoreIsolationIT {
     @Container
     private static final GenericContainer<?> MONGO = mongo();
     @TempDir Path work;
+    private final Set<String> ownedDatabases = new java.util.LinkedHashSet<>();
+
+    private String ownedDatabase(String database) {
+        if (Set.of("admin", "config", "local").contains(database)) throw new IllegalArgumentException("a fixture must name its own database");
+        ownedDatabases.add(database);
+        return database;
+    }
+
+    @org.junit.jupiter.api.AfterEach
+    void releaseThisInvocationsDatabases() {
+        if (ownedDatabases.isEmpty()) return;
+        // Preserve every restart assertion, then release only this invocation's exact databases.
+        // Native CONFIG, CACHE and target names are independent, so no suffix is inferred here.
+        try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
+            long connectorBytes = 0;
+            for (String database : ownedDatabases) {
+                for (Document artifact : admin.getDatabase(database).getCollection("connector_artifacts.files")
+                        .find().projection(new Document("length", 1))) {
+                    connectorBytes += artifact.get("length", Number.class).longValue();
+                }
+                admin.getDatabase(database).drop();
+            }
+            assertThat(admin.listDatabaseNames().into(new ArrayList<>())).doesNotContainAnyElementsOf(ownedDatabases);
+            System.out.printf("Managed store fixture released %d databases and %d connector bytes%n", ownedDatabases.size(), connectorBytes);
+        }
+    }
 
     private static GenericContainer<?> mongo() {
         byte[] key = new byte[64];
@@ -735,7 +762,7 @@ class ManagedMongoStoreIsolationIT {
     @ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
     void atlasPasswordAuthenticationNegotiatesAvailableScramAndPrefersSha256(boolean sha256Available) {
-        String database = "scram_choice_" + UUID.randomUUID().toString().substring(0, 8);
+        String database = ownedDatabase("scram_choice_" + UUID.randomUUID().toString().substring(0, 8));
         String user = "scram_user_" + database;
         try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
             admin.getDatabase("admin").runCommand(new Document("createUser", user).append("pwd", PASSWORD)
@@ -2117,6 +2144,7 @@ class ManagedMongoStoreIsolationIT {
     void missingNativeConfigurationIndexPrivilegeIsCodedAndTheOriginalPreparationCanResume() {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
         String config = "native_privileges_" + suffix, user = "config_limited_" + suffix, role = "without_indexes_" + suffix;
+        ownedDatabase(config);
         try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
             Document builtin = admin.getDatabase("admin").runCommand(new Document("rolesInfo",
                     new Document("role", "readWrite").append("db", config)).append("showPrivileges", true)).getList("roles", Document.class).getFirst();
@@ -2184,6 +2212,7 @@ class ManagedMongoStoreIsolationIT {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
         String config = "consumer_config_" + suffix, user = "consumer_" + suffix, cluster = "consumer-" + suffix;
         var legacy = List.of(config + "_operator", config + "_views");
+        ownedDatabase(config); legacy.forEach(this::ownedDatabase);
         var marker = new Document("_id", "retained").append("value", "must-not-change");
         try (MongoClient admin = MongoClients.create(uri("root", "admin"));
                 var wire = new CloudConsumerWireFixture(cluster)) {
@@ -2286,7 +2315,8 @@ class ManagedMongoStoreIsolationIT {
                 .run(args.toArray(String[]::new));
     }
 
-    private static void createUser(MongoClient admin, String user, List<String> databases) {
+    private void createUser(MongoClient admin, String user, List<String> databases) {
+        databases.forEach(this::ownedDatabase);
         admin.getDatabase("admin").runCommand(new Document("createUser", user).append("pwd", PASSWORD)
                 .append("roles", databases.stream().map(database -> new Document("role", "readWrite").append("db", database)).toList()));
     }

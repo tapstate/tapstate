@@ -257,5 +257,10 @@ class ARunWritesDownThePlanItIsSubmittedOnTest {
         public void forget(String pipelineId) {
             forgotten.add(pipelineId);
         }
+
+        @Override
+        public void forget(ExecutionPlan expected) {
+            forgotten.add(expected.pipelineId());
+        }
     }
 }

@@ -23,7 +23,7 @@ class McpToolCatalogTest {
             "source_draft", "source_list",
             "connection_test_result", "connection_schema", "artifact_validate", "artifact_get",
             "pipeline_list", "pipeline_status", "pipeline_metrics", "pipeline_snapshot", "pipeline_logs",
-            "pipeline_metrics_history", "pipeline_explain",
+            "pipeline_metrics_history", "pipeline_explain", "pipeline_start_checks",
             "data_browser_collections", "data_browser_find", "data_browser_stats");
 
     private static final List<String> WRITE_TOOLS = List.of(

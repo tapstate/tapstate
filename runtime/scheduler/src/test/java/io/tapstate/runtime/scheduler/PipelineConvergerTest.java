@@ -1,5 +1,13 @@
 package io.tapstate.runtime.scheduler;
 
+import io.tapstate.spi.store.WorkloadOwner;
+
+import io.tapstate.spi.store.WorkloadClaimType;
+
+import io.tapstate.spi.store.WorkloadClaimKey;
+
+import io.tapstate.spi.store.WorkloadClaimFence;
+
 import io.tapstate.core.common.Severity;
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.TapstateException;
@@ -13,6 +21,7 @@ import org.junit.jupiter.api.Test;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -60,13 +69,15 @@ class PipelineConvergerTest {
     @Test void initialBoundedCompletionKeepsItsDurableResultWhenCleanupNeedsRetry() {
         desired.save(new DesiredState("p1",RUNNING,REV));converger.converge("p1");actuator.completeLoad();
         var refused=new TapstateException(new StubCode("test.cleanup-refused"),Map.of(),null);
-        actuator.refuseStopWith(refused);converger.converge("p1");
+        actuator.refuseStopWith(refused);
+        assertThatThrownBy(() -> converger.converge("p1")).isSameAs(refused);
         assertThat(state.read("p1").orElseThrow().stateJson()).isEqualTo(StateJson.of(COMPLETED));
     }
 
     @Test void completedCheckpointFinishesInterruptedCleanupWithoutRestarting() {
         desired.save(new DesiredState("p1",RUNNING,REV));converger.converge("p1");actuator.reset();
         var running=state.read("p1").orElseThrow();
+        actuator.finishBoundedRun();
         state.applySwap("p1",running.epoch(),StateJson.of(COMPLETED),T0);
         converger.converge("p1");converger.converge("p1");
         assertThat(actuator.calls()).containsExactly("stop:p1:keep");
@@ -91,6 +102,160 @@ class PipelineConvergerTest {
 
         assertThat(result.status()).isEqualTo(NOTHING_TO_DO);
         assertThat(state.read("p1")).isEmpty();
+    }
+
+    @Test
+    void aSuccessfulBoundedRunCompletesOnceWithoutRestartingUnderRunningIntent() {
+        converge(RUNNING);
+        actuator.reset();
+        actuator.finishBoundedRun();
+
+        converger.converge("p1");
+        converger.converge("p1");
+
+        assertThat(state.read("p1").orElseThrow().stateJson()).isEqualTo(StateJson.of(COMPLETED));
+        assertThat(desired.read("p1").orElseThrow().targetState()).isEqualTo(RUNNING);
+        assertThat(actuator.calls()).containsExactly("stop:p1:keep");
+    }
+
+    @Test
+    void anExplicitStopAfterCompletionStillDrivesItsRetentionChoice() {
+        for (boolean purge : List.of(false, true)) {
+            String id = "completed-" + purge;
+            state.create(id, StateJson.of(COMPLETED), T0);
+            desired.save(new DesiredState(id, STOPPED, REV, purge));
+            actuator.reset();
+
+            converger.converge(id);
+
+            assertThat(state.read(id).orElseThrow().stateJson()).isEqualTo(StateJson.of(STOPPED));
+            assertThat(actuator.calls()).containsExactly("stop:" + id + (purge ? ":purge" : ":keep"));
+        }
+    }
+
+    @Test
+    void completionCannotConsumeAClearingRestartAcceptedDuringItsCompareAndSwap() {
+        converge(RUNNING);
+        actuator.finishBoundedRun();
+        long oldEpoch = state.read("p1").orElseThrow().epoch();
+        AtomicBoolean accepted = new AtomicBoolean();
+        state.onBeforeSwap(() -> {
+            if (accepted.compareAndSet(false, true)) {
+                desired.save(new DesiredState("p1", RUNNING, REV, true, null, true, oldEpoch));
+            }
+        });
+
+        converger.converge("p1");
+        actuator.reset();
+        converger.converge("p1");
+        converger.converge("p1");
+        assertThat(actuator.calls()).containsExactly("stop:p1:purge", "start:p1");
+        actuator.finishBoundedRun();
+        converger.converge("p1");
+        converger.converge("p1");
+        assertThat(actuator.calls()).containsExactly("stop:p1:purge", "start:p1", "stop:p1:keep");
+        assertThat(state.read("p1").orElseThrow().stateJson()).isEqualTo(StateJson.of(COMPLETED));
+    }
+
+    @Test
+    void anOldCleanupFailureCannotFailOrStopTheReplacement() {
+        converge(RUNNING);
+        actuator.reset();
+        actuator.finishBoundedRun();
+        actuator.onComplete = () -> {
+            long completedEpoch = state.read("p1").orElseThrow().epoch();
+            state.applySwap("p1", completedEpoch, StateJson.of(RUNNING), T0.plusSeconds(1));
+            throw new TapstateException(new StubCode("test.cleanup-refused"), Map.of(), null);
+        };
+
+        assertThatThrownBy(() -> converger.converge("p1")).isInstanceOf(TapstateException.class);
+        assertThat(state.read("p1").orElseThrow().stateJson()).isEqualTo(StateJson.of(RUNNING));
+        assertThat(actuator.calls()).isEmpty();
+    }
+
+    @Test
+    void cleanupFailureCannotConsumeAStartAcceptedAfterCompletion() {
+        converge(RUNNING);
+        actuator.finishBoundedRun();
+        actuator.onComplete = () -> {
+            long completedEpoch = state.read("p1").orElseThrow().epoch();
+            desired.save(new DesiredState("p1", RUNNING, REV, true, null, true, completedEpoch));
+            throw new TapstateException(new StubCode("test.cleanup-refused"), Map.of(), null);
+        };
+        assertThatThrownBy(() -> converger.converge("p1")).isInstanceOf(TapstateException.class);
+        assertThat(state.read("p1").orElseThrow().stateJson()).isEqualTo(StateJson.of(COMPLETED));
+        actuator.onComplete = () -> { };
+        actuator.reset();
+
+        converger.converge("p1");
+        converger.converge("p1");
+        assertThat(actuator.calls()).containsExactly("stop:p1:purge", "start:p1");
+    }
+
+    @Test
+    void aCompletionThatLosesItsCheckpointRaceCannotStopTheReplacementRun() {
+        converge(RUNNING);
+        actuator.reset();
+        actuator.finishBoundedRun();
+        long oldEpoch = state.read("p1").orElseThrow().epoch();
+        AtomicBoolean fired = new AtomicBoolean();
+        state.onBeforeSwap(() -> {
+            if (fired.compareAndSet(false, true)) {
+                state.applySwap("p1", oldEpoch, StateJson.of(RUNNING), T0.plusSeconds(1));
+            }
+        });
+
+        assertThat(converger.converge("p1").status()).isEqualTo(SUPERSEDED);
+        assertThat(state.read("p1").orElseThrow().stateJson()).isEqualTo(StateJson.of(RUNNING));
+        assertThat(actuator.calls()).isEmpty();
+    }
+
+    @Test
+    void anExplicitStartAfterCompletionRunsOnceAndCanCompleteAgain() {
+        converge(RUNNING);
+        actuator.finishBoundedRun();
+        converger.converge("p1");
+        long completedAt = state.read("p1").orElseThrow().epoch();
+        desired.save(new DesiredState("p1", RUNNING, REV, false, null, true, completedAt));
+        actuator.reset();
+
+        converger.converge("p1");
+        converger.converge("p1");
+        assertThat(actuator.calls()).containsExactly("stop:p1:keep", "start:p1");
+        actuator.finishBoundedRun();
+        converger.converge("p1");
+        converger.converge("p1");
+        assertThat(state.read("p1").orElseThrow().stateJson()).isEqualTo(StateJson.of(COMPLETED));
+        assertThat(actuator.calls()).containsExactly("stop:p1:keep", "start:p1", "stop:p1:keep");
+    }
+
+    @Test
+    void aReplacementDriverFencesAnOldCompletionEvenWhenTheStateWasAlreadyRunning() {
+        converge(RUNNING);
+        actuator.reset();
+        var fence = new WorkloadClaimFence(
+                new WorkloadClaimKey("cluster",
+                        WorkloadClaimType.PIPELINE_ACTUATION, "p1"),
+                new WorkloadOwner("node", "boot"), 1L, 1L, 1L);
+        actuator.finishBoundedRun(fence);
+        state.liveFence = fence;
+        RecordingActuator replacement = new RecordingActuator();
+        replacement.carryingNothing();
+        PipelineConverger newDriver = new PipelineConverger(desired, state, replacement,
+                Clock.fixed(T0, ZoneOffset.UTC));
+        AtomicBoolean replaced = new AtomicBoolean();
+        state.onBeforeSwap(() -> {
+            if (replaced.compareAndSet(false, true)) {
+                state.liveFence = new WorkloadClaimFence(
+                        fence.key(), fence.owner(), 1L, 2L, 1L);
+                newDriver.converge("p1");
+            }
+        });
+
+        assertThat(converger.converge("p1").status()).isEqualTo(SUPERSEDED);
+        assertThat(actuator.calls()).isEmpty();
+        assertThat(replacement.calls()).containsExactly("start:p1");
+        assertThat(state.read("p1").orElseThrow().stateJson()).isEqualTo(StateJson.of(RUNNING));
     }
 
     @Test

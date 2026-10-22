@@ -47,6 +47,15 @@ public interface StateStore {
     CasOutcome compareAndSwap(String pipelineId, long expectedEpoch, String nextStateJson, Instant touchTime);
 
     /**
+     * Applies a transition only while the expected workload owner and execution are still live, in the
+     * same atomic operation as the checkpoint CAS. A store without that boundary must refuse support.
+     */
+    default CasOutcome compareAndSwap(String pipelineId, long expectedEpoch, String nextStateJson,
+            Instant touchTime, WorkloadClaimFence fence) {
+        throw new UnsupportedOperationException("atomic workload-fenced checkpoint transitions are not implemented");
+    }
+
+    /**
      * Removes a pipeline's checkpoint, discarding its fencing epoch along with it. That discard is the
      * point rather than a side effect: an id whose pipeline is gone must not hand a later pipeline of the
      * same id an epoch — and a state — accumulated by something else entirely. It is legal only once the

@@ -56,6 +56,7 @@ class MongoConnectionTestResultStoreTest {
         assertThat(document.getString("connectorId")).isEqualTo("mongodb");
         assertThat(document.getString("outcome")).isEqualTo("FAILED");
         assertThat(document.getLong("testedAt")).isEqualTo(1783939200000L);
+        assertThat(document.getBoolean("diagnosticsRedacted")).isFalse();
 
         List<Document> items = document.getList("items", Document.class);
         assertThat(items)
@@ -89,6 +90,18 @@ class MongoConnectionTestResultStoreTest {
     }
 
     @Test
+    void roundTripsTheDiagnosticsSafetyMarker() {
+        ConnectionTestResult result = new ConnectionTestResult(
+                "safe", "mysql", ConnectionTestResult.Outcome.FAILED,
+                List.of(new ConnectionTestItem("Login", ConnectionTestItem.Status.FAILED,
+                        "safe diagnostic", null, null, null)),
+                42L, true);
+
+        assertThat(MongoConnectionTestResultStore.toResult(MongoConnectionTestResultStore.toDocument(result)))
+                .isEqualTo(result);
+    }
+
+    @Test
     void anItemWithNoDiagnosticsRoundTripsWithNulls() {
         ConnectionTestResult result = new ConnectionTestResult(
                 "x",
@@ -116,6 +129,17 @@ class MongoConnectionTestResultStoreTest {
                 .append("testedAt", 42L);
 
         assertThat(MongoConnectionTestResultStore.toResult(document).items()).isEmpty();
+    }
+
+    @Test
+    void legacyDocumentsWithoutTheSafetyMarkerAreUntrusted() {
+        Document document = new Document("_id", "legacy")
+                .append("connectorId", "mysql")
+                .append("outcome", "FAILED")
+                .append("items", List.of(new Document("name", "Login").append("status", "FAILED")))
+                .append("testedAt", 42L);
+
+        assertThat(MongoConnectionTestResultStore.toResult(document).diagnosticsRedacted()).isFalse();
     }
 
     @Test

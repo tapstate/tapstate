@@ -4,6 +4,8 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.ExecutionPlan;
 import io.tapstate.core.lifecycle.NodeParallelism;
 import io.tapstate.core.model.BatchSpec;
+import io.tapstate.core.model.ReadMode;
+import io.tapstate.core.model.PipelineResource;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.runtime.engine.OperatorRunManifest;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
@@ -70,6 +72,9 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     private final ConnectorReadiness connectors;
     private final Map<String, Long> waitingForCapture = new ConcurrentHashMap<>();
     private final ScopedEngineLifecycleActuator.Submissions scopedSubmissions = new ScopedEngineLifecycleActuator.Submissions();
+    private final Map<String, SubmittedRun> submittedRuns = new ConcurrentHashMap<>();
+
+    private record SubmittedRun(long jobId, ExecutionFence fence, boolean snapshotOnly, ExecutionPlan plan) { }
 
     EngineLifecycleActuator(Engine engine, DagSource dagSource, PipelineCaptureCoordinator captureCoordinator,
             NestStateTeardown stateTeardown) {
@@ -129,18 +134,19 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     }
 
     @Override
-    public void start(String pipelineId) {
+    public synchronized void start(String pipelineId) {
         startOriginal(pipelineId, null, null);
     }
 
     /** The callback records this pass's actual advanced claim before any later start operation can fail. */
-    void start(String pipelineId, WorkloadClaimFence expected, Consumer<WorkloadClaimFence> onAdvanced) {
+    synchronized void start(String pipelineId, WorkloadClaimFence expected, Consumer<WorkloadClaimFence> onAdvanced) {
         Objects.requireNonNull(expected, "expected"); Objects.requireNonNull(onAdvanced, "onAdvanced");
         startOriginal(pipelineId, expected, onAdvanced);
     }
 
     private void startOriginal(String pipelineId, WorkloadClaimFence expected, Consumer<WorkloadClaimFence> onAdvanced) {
         requireLegacy();
+        submittedRuns.remove(pipelineId);
         // A refusal here is deliberately before teardown, capture, and submission: an unmet source-model
         // prerequisite must leave no data-plane component running and no start-side state mutation behind.
         // An engine whose member was shut down for want of memory is the first such refusal. Everything
@@ -239,12 +245,20 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         // recorded; a run that goes on to fail keeps its plan until the next start replaces it or a stop lets go.
         // Compared with the plan of the run before - lost to a failed member, a stop or a restart - so a node
         // whose width moved says what it was and which of its inputs moved it.
-        plans.record(planOf(pipelineId, execution, plan.planned(), clock.instant(), prepared.sinkConnectors(),
-                sharedConnectors).replacing(plans.last(pipelineId)));
+        ExecutionPlan recorded = planOf(pipelineId, execution, plan.planned(), clock.instant(), prepared.sinkConnectors(),
+                sharedConnectors).replacing(plans.last(pipelineId));
+        plans.record(recorded);
         // The capacity travels with the submission because the maps are made by the job: what a state map
         // holds is fixed as it is created, so a number applied after the job started would be accepted and
         // change nothing.
-        engine.submit(pipelineId, plan.dag(), capacity.mapDatabases(), capacity.settings());
+        boolean snapshotOnly = prepared.artifactSnapshot()
+                .flatMap(snapshot -> snapshot.get(pipelineId))
+                .filter(PipelineResource.class::isInstance).map(PipelineResource.class::cast)
+                .map(pipeline -> pipeline.settings() != null
+                        && pipeline.settings().readMode() == ReadMode.SNAPSHOT_ONLY)
+                .orElse(false);
+        long jobId = engine.submitTracked(pipelineId, plan.dag(), capacity.mapDatabases(), capacity.settings());
+        submittedRuns.put(pipelineId, new SubmittedRun(jobId, execution.fence(), snapshotOnly, recorded));
         waitingForCapture.remove(pipelineId);
     }
 
@@ -282,8 +296,9 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     }
 
     @Override
-    public void stop(String pipelineId, boolean purgeState) {
+    public synchronized void stop(String pipelineId, boolean purgeState) {
         requireLegacy();
+        submittedRuns.remove(pipelineId);
         waitingForCapture.remove(pipelineId);
         engine.cancel(pipelineId);
         if (!engine.isLost()) {
@@ -337,6 +352,57 @@ final class EngineLifecycleActuator implements LifecycleActuator {
     }
 
     @Override
+    public synchronized boolean completed(String pipelineId) {
+        requireLegacy();
+        SubmittedRun run = submittedRuns.get(pipelineId);
+        return successfulBoundedJob(pipelineId, run)
+                && captureCoordinator.captureFailure(pipelineId).isEmpty()
+                && captureCoordinator.confirmBoundedLoad(pipelineId);
+    }
+
+    private boolean successfulBoundedJob(String pipelineId, SubmittedRun run) {
+        return run != null && run.snapshotOnly() && !waitingForCapture.containsKey(pipelineId)
+                && actuation.proveExecution(run.fence()) && engine.completed(pipelineId, run.jobId());
+    }
+
+    @Override
+    public synchronized Optional<Completion> completion(String pipelineId) {
+        if (!completed(pipelineId)) {
+            return Optional.empty();
+        }
+        SubmittedRun run = submittedRuns.get(pipelineId);
+        return Optional.of(new Completion(Long.toString(run.jobId()), actuation.completionFence(run.fence())));
+    }
+
+    @Override
+    public synchronized void complete(String pipelineId, Completion completion) {
+        requireLegacy();
+        SubmittedRun run = submittedRuns.get(pipelineId);
+        if (run != null && Long.toString(run.jobId()).equals(completion.executionId())) {
+            complete(pipelineId);
+        }
+    }
+
+    @Override
+    public void retryCompletion(String pipelineId) {
+        complete(pipelineId);
+    }
+
+    @Override
+    public synchronized void complete(String pipelineId) {
+        requireLegacy();
+        SubmittedRun run = submittedRuns.get(pipelineId);
+        if (!successfulBoundedJob(pipelineId, run)) {
+            return;
+        }
+        // The job already succeeded. Cancelling by pipeline name here could cancel a replacement on
+        // another member after ownership moved. Only this member's capture handles need releasing.
+        captureCoordinator.stopCapture(pipelineId, false);
+        plans.forget(run.plan());
+        submittedRuns.remove(pipelineId, run);
+    }
+
+    @Override
     public Optional<Throwable> lost(String pipelineId) {
         requireLegacy();
         // The engine alone: a member shut down for want of memory took every job it held with it. The capture is
@@ -350,7 +416,7 @@ final class EngineLifecycleActuator implements LifecycleActuator {
         // The job side alone. A capture that died while the job runs is a failure, reported above; what
         // is asked here is whether anything is running this pipeline at all, and a process that has just
         // come up to a checkpoint an earlier one wrote answers no.
-        return engine.hasLiveJob(pipelineId);
+        return engine.hasLiveJob(pipelineId) || successfulBoundedJob(pipelineId, submittedRuns.get(pipelineId));
     }
 
     /** As below, for a run none of whose sinks opens a connector named here. */

@@ -213,14 +213,41 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
     @Override public synchronized boolean isCarryingAJob(String pipeline) {
         requireId(pipeline); boolean carrying = run != null && isCurrentRun() && run.isCarryingAJob(); require(); return carrying;
     }
-    @Override public synchronized void settleCompleted(String pipeline) {requireId(pipeline);stopOriginal();}
+    @Override public synchronized void settleCompleted(String pipeline) { retryCompletion(pipeline); }
     @Override public synchronized boolean completed(String pipeline) {
         requireId(pipeline);
-        if(run==null || !isCurrentRun() || capture==null || !capture.isCapturing(pipeline))return false;
+        if(run==null || !isCurrentRun() || !run.completed() || capture==null || !capture.isCapturing(pipeline))return false;
         var bindings=capture.captureBindings();
         boolean complete=!bindings.snapshots().isEmpty() && capture.loadDelivered(pipeline)
                 && capture.captureFailure(pipeline).isEmpty() && run.failure().isEmpty();
         require();return complete;
+    }
+    @Override public synchronized Optional<Completion> completion(String pipeline) {
+        if (!completed(pipeline)) return Optional.empty();
+        var proof = new Completion(Long.toString(run.jobId()),command); require(); return Optional.of(proof);
+    }
+    @Override public synchronized void complete(String pipeline) {
+        complete(pipeline,completion(pipeline).orElseThrow(ScopedEngineLifecycleActuator::fenced));
+    }
+    @Override public synchronized void complete(String pipeline,Completion proof) {
+        requireId(pipeline); Objects.requireNonNull(proof,"completion");
+        if (run==null || !isCurrentRun() || !run.completed() || !Long.toString(run.jobId()).equals(proof.executionId())
+                || !command.equals(proof.fence())) throw fenced();
+        releaseCompletedOriginal();
+    }
+    @Override public synchronized void retryCompletion(String pipeline) {
+        requireId(pipeline);
+        // The persisted terminal result authorizes retrying exact cleanup, not cancelling a live run.
+        // A prior partial cleanup may already have removed its capture and target-ACK registration.
+        if (run!=null && run.isCarryingAJob()) throw fenced();
+        releaseCompletedOriginal();
+    }
+    private void releaseCompletedOriginal() {
+        require();
+        if (run!=null && run.isCarryingAJob()) throw fenced();
+        if (capture!=null) { capture.stopCapture(id(),false); require(); }
+        if (manifest!=null && !engine.isLost()) { ports.releaseHot().accept(manifest); require(); }
+        if (original!=null) { ports.plans().apply(original,command).forget(id()); require(); }
     }
     private static TapstateException fenced() { return new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null); }
 }

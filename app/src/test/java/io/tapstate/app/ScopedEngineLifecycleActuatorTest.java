@@ -47,6 +47,7 @@ class ScopedEngineLifecycleActuatorTest {
     private final PipelineConvergencePass pass;
     private DagSource.StartPreparation preparation;
     private Runnable onPrepare = () -> {};
+    private Runnable onRelease = () -> {};
     private Runnable onDatabasePrepare = () -> {};
 
     ScopedEngineLifecycleActuatorTest() {
@@ -86,9 +87,12 @@ class ScopedEngineLifecycleActuatorTest {
         return new ScopedEngineLifecycleActuator.Ports((original,capacities,members,guard) -> {
             events.add("operators"); prepared.add(original); assertThat(members).containsExactly("node");
             onPrepare.run(); guard.run();
-        },released::add,(original,manifest) -> rebuilds.add(original),(original,command) -> new ExecutionPlanRecorder() {
+        },original -> { onRelease.run(); released.add(original); },(original,manifest) -> rebuilds.add(original),(original,command) -> new ExecutionPlanRecorder() {
             @Override public void record(io.tapstate.core.lifecycle.ExecutionPlan plan) {}
             @Override public void forget(String pipeline) { assertThat(pipeline).isEqualTo(original.pipelineId()); forgottenPlans.add(original); }
+            @Override public void forget(io.tapstate.core.lifecycle.ExecutionPlan expected) {
+                assertThat(expected.pipelineId()).isEqualTo(original.pipelineId()); forgottenPlans.add(original);
+            }
         });
     }
     private ScopedEngineLifecycleActuator actuator() {
@@ -103,6 +107,49 @@ class ScopedEngineLifecycleActuatorTest {
     }
     private static OperatorRunManifest manifest(long execution) { return new OperatorRunManifest("p",new ExecutionFence(SCOPE,claim(execution)),List.of()); }
     private static TapstateException fenced() { return new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null); }
+
+    @Test void targetAcknowledgementAloneCannotCompleteAStillRunningOriginalJob() {
+        boundedCapture();
+        assertThat(actuator().completed("p")).isFalse();
+        verify(previous,never()).cancel();
+        verify(fixedCapture,never()).stopCapture(anyString(),anyBoolean());
+    }
+
+    private void boundedCapture() {
+        when(fixedCapture.isCapturing("p")).thenReturn(true);
+        when(fixedCapture.captureBindings()).thenReturn(new PipelineCaptureBindings(new ExecutionFence(SCOPE,claim(1)),
+                Map.of(),Map.of(),Map.of("source",new PipelineCaptureBindings.SnapshotOnlySource("snapshot",Set.of("orders"),1)),false));
+        when(previous.jobId()).thenReturn(71L);
+    }
+
+    @Test void completionCarriesTheOriginalJobAndClaimWithoutCancellingAReplacement() {
+        boundedCapture(); when(previous.completed()).thenReturn(true); when(previous.isCarryingAJob()).thenReturn(false);
+        var actor=actuator(); var proof=actor.completion("p").orElseThrow();
+        assertThat(proof).isEqualTo(new LifecycleActuator.Completion("71",claim(1)));
+        var replacement=mock(Engine.Run.class); when(engine.captureRun("p")).thenReturn(Optional.of(replacement));
+        actor.complete("p",proof);
+        verify(fixedCapture).stopCapture("p",false); assertThat(released).containsExactly(manifest(1));
+        assertThat(forgottenPlans).containsExactly(new ExecutionFence(SCOPE,claim(1)));
+        verify(engine,times(1)).captureRun("p"); verify(replacement,never()).cancel();
+        verify(previous,never()).cancel();
+    }
+
+    @Test void completedCleanupCanRetryAfterItsCaptureAndAckEvidenceHaveBeenReleased() {
+        boundedCapture(); when(previous.completed()).thenReturn(true); when(previous.isCarryingAJob()).thenReturn(false);
+        var actor=actuator(); var proof=actor.completion("p").orElseThrow();
+        doAnswer(call -> {
+            when(fixedCapture.isCapturing("p")).thenReturn(false);
+            doThrow(new AssertionError("released capture must not be required again")).when(fixedCapture).captureBindings();
+            return null;
+        }).when(fixedCapture).stopCapture("p",false);
+        onRelease=() -> { throw fenced(); };
+        assertThatThrownBy(() -> actor.complete("p",proof)).isInstanceOf(TapstateException.class);
+        onRelease=() -> {};
+        actor.retryCompletion("p");
+        assertThat(released).containsExactly(manifest(1));
+        assertThat(forgottenPlans).containsExactly(new ExecutionFence(SCOPE,claim(1)));
+        verify(fixedCapture,times(2)).stopCapture("p",false); verify(previous,never()).cancel();
+    }
 
     @Test void aCompletedCheckpointStillSettlesCaptureAndHotResourcesAfterTheJobWasCancelled() {
         when(previous.isCarryingAJob()).thenReturn(false);

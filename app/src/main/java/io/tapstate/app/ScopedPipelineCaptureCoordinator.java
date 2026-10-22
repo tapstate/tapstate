@@ -350,17 +350,22 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         requireSession(session); if(!session.snapshot)return SnapshotReading.NONE;
         var state=stores.pipelines().snapshotStates(session.original.scope(),claim(session.original),() -> requireSession(session));
         var result=new LinkedHashMap<String,TableSnapshot>();
+        boolean landed=session.bounded && stores.boundedLoads().complete(session.original);
         for(var source:session.sources.values())for(String table:source.completed) {
             var count=state.count(source.id,table,source.snapshotEpoch);
-            if(count.isPresent())result.put(session.label(source.id,table),new TableSnapshot(count.getAsLong(),null,null,false));
+            if(count.isPresent())result.put(session.label(source.id,table),new TableSnapshot(count.getAsLong(),
+                    landed?count.getAsLong():null,landed?100:null,landed));
         }
         requireSession(session); return new SnapshotReading(result,session.began);
     }
     private SnapshotReading runSnapshotReading(Session session) {
         requireSession(session); if(!session.snapshot)return SnapshotReading.NONE;
         var result=new LinkedHashMap<String,TableSnapshot>();
-        for(var source:session.sources.values())for(String table:source.selected.tables())
-            result.put(session.label(source.id,table),new TableSnapshot(source.rows.getOrDefault(table,0L),null,null,false));
+        boolean landed=session.bounded && stores.boundedLoads().complete(session.original);
+        for(var source:session.sources.values())for(String table:source.selected.tables()) {
+            long rows=source.rows.getOrDefault(table,0L);
+            result.put(session.label(source.id,table),new TableSnapshot(rows,landed?rows:null,landed?100:null,landed));
+        }
         requireSession(session); return new SnapshotReading(result,session.began);
     }
     private final class Physical {

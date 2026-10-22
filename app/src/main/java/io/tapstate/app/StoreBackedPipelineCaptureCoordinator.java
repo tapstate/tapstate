@@ -1033,6 +1033,19 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         return load == null ? SnapshotReading.NONE : load.reading();
     }
 
+    @Override
+    public synchronized boolean confirmBoundedLoad(String pipelineId) {
+        PipelineLoad load = loadsByPipeline.get(pipelineId);
+        List<PipelineRun> runs = runsByPipeline.get(pipelineId);
+        if (load == null || runs == null || runs.stream().anyMatch(run -> run.run().loading()
+                || run.run().failure().isPresent()) || load.through.size() != load.keys.size()) {
+            return false;
+        }
+        load.through.replaceAll((table, reading) ->
+                new TableSnapshot(reading.rowsDone(), reading.rowsDone(), 100, true));
+        return true;
+    }
+
     /**
      * What this pipeline's source runs have taken in, added together. A pipeline reads through one run per
      * source and each counts its own tables, so the sum is over runs that do not overlap -- except where two

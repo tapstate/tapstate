@@ -84,6 +84,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     private final long epoch;
     private final SourceBoundStamp stamp;
     private final RingTail ringTail;
+    private final boolean bounded;
     // The most changes one pass reads from the ring and sends on before yielding: the batch the source's author
     // asked for, which is how many rows it hands on at a time - never how many the connector fetches.
     private final int readBatch;
@@ -130,13 +131,14 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     private long nextLookNanos;
 
     private SrsSourceProcessor(String pipelineId, String ringName, String src, long epoch,
-            SourceBoundStamp stamp, RingTail ringTail, int readBatch) {
+            SourceBoundStamp stamp, RingTail ringTail, int readBatch, boolean bounded) {
         this.pipelineId = pipelineId;
         this.ringName = ringName;
         this.src = src;
         this.epoch = epoch;
         this.stamp = stamp;
         this.ringTail = ringTail;
+        this.bounded = bounded;
         this.readBatch = readBatch;
     }
 
@@ -275,10 +277,11 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             stampWhatHasLeft();
             announce();
         }
-        // This source never completes: on an empty ring or buffer it returns having emitted nothing and,
-        // being non-cooperative, its worker backs off before the next call rather than spinning. Keeping a
-        // buffer-only source live also keeps Jet from advancing the downstream frontier past its last bound.
-        return false;
+        // Only an explicitly bounded read ends. A direct CDC source also has no ring reader and can
+        // remain quiet indefinitely. A missing or partially consumed declaration is not proof of EOF.
+        return bounded && buffered != null && buffered.snapshotState(pipelineId, ringName).declared()
+                && vouchesForSnapshot && !awaitingSnapshot && !snapshotBoundDue
+                && pending.isEmpty() && held.isEmpty() && unannounced == null;
     }
 
     /**
@@ -594,13 +597,13 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             throw new IllegalArgumentException("a source reads at least one change a pass, got " + readBatch);
         }
         SupplierEx<Processor> supplier = () -> new SrsSourceProcessor(pipelineId, ringName, src, epoch, stamp,
-                new RingTail(start, resumeAfter, publisherFactory), readBatch);
+                new RingTail(start, resumeAfter, publisherFactory), readBatch, false);
         return placement.place(ProcessorSupplier.of(supplier));
     }
 
     /**
      * A source for a bounded snapshot with no incremental tail. It drains only this pipeline's member-local
-     * hand-off, stamps its rows with {@code epoch}, and stays live so the downstream frontier remains sound.
+     * hand-off and ends once the declared load and its final bound have been handed downstream.
      * It deliberately accepts neither a start point nor a cursor publisher: {@code ringName} is only the
      * buffer key, and another pipeline may be filling the shared ring behind that name. Everything it emits
      * comes from that hand-off, so where {@code placement} puts it decides whether it reads anything at all.
@@ -608,6 +611,12 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     public static ProcessorMetaSupplier snapshotOnlyMetaSupplier(
             String pipelineId, String ringName, String src, long epoch, SourceBoundStamp stamp,
             SourcePlacement placement) {
+        return bufferMetaSupplier(pipelineId, ringName, src, epoch, stamp, placement, true);
+    }
+
+    private static ProcessorMetaSupplier bufferMetaSupplier(
+            String pipelineId, String ringName, String src, long epoch, SourceBoundStamp stamp,
+            SourcePlacement placement, boolean bounded) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(ringName, "ringName");
         Objects.requireNonNull(src, "src");
@@ -616,14 +625,14 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             throw new IllegalArgumentException("a snapshot generation is never negative, got " + epoch);
         }
         SupplierEx<Processor> supplier = () -> new SrsSourceProcessor(pipelineId, ringName, src, epoch, stamp, null,
-                BatchSpec.DEFAULT_MAX_RECORDS);
+                BatchSpec.DEFAULT_MAX_RECORDS, bounded);
         return placement.place(ProcessorSupplier.of(supplier));
     }
 
     /** An unbounded direct source drains its private hand-off without opening an SRS recovery reader. */
     public static ProcessorMetaSupplier directMetaSupplier(String pipelineId, String bufferName, String src,
             long epoch, SourceBoundStamp stamp, SourcePlacement placement) {
-        return snapshotOnlyMetaSupplier(pipelineId, bufferName, src, epoch, stamp, placement);
+        return bufferMetaSupplier(pipelineId, bufferName, src, epoch, stamp, placement, false);
     }
 
     /** Present only on the source shape that follows a shared ring and publishes its read cursor. */

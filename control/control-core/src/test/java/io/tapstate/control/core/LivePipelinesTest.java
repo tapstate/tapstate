@@ -2,6 +2,7 @@ package io.tapstate.control.core;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
@@ -60,6 +61,23 @@ class LivePipelinesTest {
         desired.put("p1", PipelineState.RUNNING);
 
         assertThat(live.isAtRest("p1")).isFalse();
+    }
+
+    @Test
+    void naturalCompletionConsumesTheOldRunningIntentButNotAnAcceptedNewStart() {
+        state.put("p1", PipelineState.COMPLETED, 8L);
+        desired.put("p1", PipelineState.RUNNING);
+        assertThat(live.isAtRest("p1")).isTrue();
+        assertThat(live.changeWouldGoUnreported("p1")).isFalse();
+
+        desired.save(new DesiredState("p1", PipelineState.RUNNING, "revision", false, "assembly", true, 8L));
+        for (long epoch : List.of(7L, 8L, 9L)) {
+            state.put("p1", PipelineState.COMPLETED, epoch);
+            assertThat(live.isAtRest("p1")).as("the start at epoch 8 is still owed at %d", epoch).isFalse();
+            assertThat(live.changeWouldGoUnreported("p1")).isTrue();
+        }
+        state.put("p1", PipelineState.COMPLETED, 10L);
+        assertThat(live.isAtRest("p1")).as("the new run itself has now completed").isTrue();
     }
 
     @Test

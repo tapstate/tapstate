@@ -948,7 +948,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
     }
 
     private record PreparedSnapshot(Map<String, TapTable> discovered,
-            Map<String, Map<String, String>> declared, Optional<SourcePosition> seam) {
+            Map<String, PdkRowSchema> declared, Optional<SourcePosition> seam) {
     }
 
     /**
@@ -965,28 +965,15 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
      * that consult it run once per event: worked out inside them, a wide table's whole field map is walked
      * and copied for every row read, on the hottest path this adapter has.
      */
-    private static Map<String, Map<String, String>> declaredTypes(Map<String, TapTable> tables) {
-        Map<String, Map<String, String>> byTable = new LinkedHashMap<>();
-        tables.forEach((id, table) -> {
-            if (table == null || table.getNameFieldMap() == null) {
-                return;
-            }
-            Map<String, String> declared = new LinkedHashMap<>();
-            table.getNameFieldMap().forEach((column, field) -> {
-                if (field != null && field.getDataType() != null) {
-                    declared.put(column, field.getDataType());
-                }
-            });
-            byTable.put(id, declared);
-        });
-        return byTable;
+    private static Map<String, PdkRowSchema> declaredTypes(Map<String, TapTable> tables) {
+        Map<String, PdkRowSchema> schemas = new LinkedHashMap<>();
+        tables.forEach((id, table) -> schemas.put(id, PdkRowSchema.of(table)));
+        return schemas;
     }
 
-    /** What that reading says about the table this event came from, or empty where it describes none. */
-    private static Map<String, String> declaredTypes(
-            Map<String, Map<String, String>> byTable, TapEvent event) {
+    private static PdkRowSchema declaredTypes(Map<String, PdkRowSchema> tables, TapEvent event) {
         String tableId = event instanceof TapBaseEvent based ? based.getTableId() : null;
-        return tableId == null ? Map.of() : byTable.getOrDefault(tableId, Map.of());
+        return tables.getOrDefault(tableId, PdkRowSchema.EMPTY);
     }
 
     /** Indexes discovered tables by id, keeping discovery order. */
@@ -1101,7 +1088,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                 if (listener instanceof CaptureStartedListener started) {
                     position(connector, startOffset).ifPresent(started::onStart);
                 }
-                Map<String, Map<String, String>> declared = declaredTypes(tables);
+                Map<String, PdkRowSchema> declared = declaredTypes(tables);
                 StreamReadConsumer consumer = StreamReadConsumer.create((events, offset) -> {
                     // Every delivery is the moment to hand the connector what its source may release: this
                     // is the connector's own delivery thread, the one thread any connector can safely be
@@ -1167,7 +1154,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
      * keeping, because everything downstream that costs per act rather than per change -- writing the changes
      * down above all -- costs one act per batch only while the batch still exists.
      */
-    private static void handOver(PdkConnector connector, Map<String, Map<String, String>> declared,
+    private static void handOver(PdkConnector connector, Map<String, PdkRowSchema> declared,
             CaptureListener listener, List<TapEvent> events, Object offset) {
         List<TapEvent> changes = new ArrayList<>(events.size());
         for (TapEvent event : events) {
@@ -1177,7 +1164,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
         }
         List<Envelope> decoded = new ArrayList<>(changes.size());
         for (TapEvent change : changes) {
-            decoded.add(TapEventCodec.decodeChange(change, connector.codecs(), declaredTypes(declared, change)));
+            decoded.add(TapEventCodec.decodeChange(change, connector.conversions(), declaredTypes(declared, change)));
         }
         listener.onBatch(decoded, position(connector, offset));
     }
@@ -1434,12 +1421,12 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
 
     /** The same, against the declared types already read off the tables -- once per read, not per batch. */
     private static List<Envelope> decodeSnapshotRows(
-            PdkConnector connector, List<TapEvent> raw, Map<String, Map<String, String>> declared) {
+            PdkConnector connector, List<TapEvent> raw, Map<String, PdkRowSchema> declared) {
         List<Envelope> rows = new ArrayList<>(raw.size());
         try {
             for (TapEvent event : raw) {
                 rows.add(TapEventCodec.decodeSnapshotRow(
-                        event, connector.codecs(), declaredTypes(declared, event)));
+                        event, connector.conversions(), declaredTypes(declared, event)));
             }
         } catch (RuntimeException e) {
             throw new TapstateException(ConnectorError.PROJECTION_FAILED,

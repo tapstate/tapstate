@@ -1,5 +1,7 @@
 package io.tapstate.runtime.scheduler;
 
+import io.tapstate.spi.store.WorkloadClaimFence;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -20,13 +22,16 @@ final class RecordingActuator implements LifecycleActuator {
     private final List<String> calls = new ArrayList<>();
     private Throwable failure;
     private Throwable lost;
+    private boolean completed;
+    private Completion completion;
+    Runnable onComplete = () -> { };
 
     /**
      * Whether a job is carrying the pipeline. True by default, which is the state every existing case
      * was written against - a converge loop driving a pipeline it has itself been running.
      */
     private boolean carryingAJob = true;
-    private boolean boundedComplete;
+    private boolean completionCleanupPending;
 
     /** Armed to make start() throw, as if building the job refused before any job existed. */
     private RuntimeException refuseStartWith;
@@ -40,6 +45,8 @@ final class RecordingActuator implements LifecycleActuator {
             throw refuseStartWith;
         }
         carryingAJob = true;
+        completed = false;
+        completionCleanupPending = false;
     }
 
     @Override
@@ -57,6 +64,7 @@ final class RecordingActuator implements LifecycleActuator {
         calls.add("stop:" + pipelineId + (purgeState ? ":purge" : ":keep"));
         carryingAJob=false;
         if(refuseStopWith!=null)throw refuseStopWith;
+        completionCleanupPending = false;
     }
 
     @Override
@@ -73,8 +81,39 @@ final class RecordingActuator implements LifecycleActuator {
     public boolean isCarryingAJob(String pipelineId) {
         return carryingAJob;
     }
-    @Override public boolean completed(String pipelineId){return boundedComplete && carryingAJob;}
-    void completeLoad(){boundedComplete=true;}
+    void completeLoad(){finishBoundedRun();}
+
+    @Override
+    public boolean completed(String pipelineId) {
+        return completed;
+    }
+
+    void finishBoundedRun() {
+        carryingAJob = false;
+        completed = true;
+        completionCleanupPending = true;
+    }
+
+    void finishBoundedRun(WorkloadClaimFence fence) {
+        finishBoundedRun();
+        completion = new Completion("job-1", fence);
+    }
+
+    @Override
+    public Optional<Completion> completion(String pipelineId) {
+        return completion == null ? LifecycleActuator.super.completion(pipelineId)
+                : completed ? Optional.of(completion) : Optional.empty();
+    }
+
+    @Override
+    public void complete(String pipelineId) {
+        onComplete.run();
+        stop(pipelineId, false);
+    }
+
+    @Override public void retryCompletion(String pipelineId) {
+        if (completionCleanupPending) complete(pipelineId);
+    }
 
     /** The verbs actuated so far, in order. */
     List<String> calls() {

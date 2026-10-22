@@ -393,6 +393,59 @@ class ArtifactMutationServiceTest {
     }
 
     @Test
+    void aNaturallyCompletedPipelineIsDeletedWithItsConsumedRunningIntent() {
+        PipelineResource flow = pipeline("flow");
+        store.save(flow);
+        state.put("flow", PipelineState.COMPLETED, 8L);
+        desired.put("flow", PipelineState.RUNNING);
+
+        service.delete(PRINCIPAL, "flow", hash(flow));
+
+        assertThat(store.get("flow")).isEmpty();
+        assertThat(state.read("flow")).isEmpty();
+        assertThat(desired.read("flow")).isEmpty();
+    }
+
+    @Test
+    void completionCannotMakeAPendingStartDeletable() {
+        PipelineResource flow = pipeline("flow");
+        store.save(flow);
+        DesiredState pending = new DesiredState("flow", PipelineState.RUNNING,
+                "revision", false, "assembly", true, 8L);
+        desired.save(pending);
+        for (long epoch : List.of(7L, 8L, 9L)) {
+            state.put("flow", PipelineState.COMPLETED, epoch);
+            assertArtifactError(() -> service.delete(PRINCIPAL, "flow", hash(flow)),
+                    ArtifactError.PIPELINE_NOT_STOPPED,
+                    Map.of("id", "flow", "actual", "COMPLETED", "desired", "RUNNING"));
+            assertThat(store.get("flow")).isPresent();
+            assertThat(desired.read("flow")).contains(pending);
+        }
+    }
+
+    @Test
+    void aStartAcceptedAfterTheCompletedPipelineDeleteCheckKeepsItsCheckpoint() {
+        PipelineResource flow = pipeline("flow");
+        store.save(flow);
+        state.put("flow", PipelineState.COMPLETED, 8L);
+        desired.put("flow", PipelineState.RUNNING);
+        DesiredState pending = new DesiredState("flow", PipelineState.RUNNING,
+                "revision", false, "assembly", true, 8L);
+        store.afterDelete = () -> desired.save(pending);
+
+        assertThatThrownBy(() -> service.delete(PRINCIPAL, "flow", hash(flow)))
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code()).isEqualTo(ArtifactError.RECLAIM_INCOMPLETE);
+                    assertThat(error.args()).containsEntry("reason", "pipeline-live");
+                });
+
+        assertThat(store.get("flow")).isEmpty();
+        assertThat(state.read("flow")).isPresent();
+        assertThat(desired.read("flow")).contains(pending);
+        assertThat(reclaimOrder).isEmpty();
+    }
+
+    @Test
     void aPausedPipelineIsRefusedOnBothHalvesOfTheVerdict() {
         PipelineResource flow = pipeline("flow");
         store.save(flow);
@@ -1088,7 +1141,11 @@ class ArtifactMutationServiceTest {
         private RuntimeException deleteFailure;
 
         void put(String pipelineId, PipelineState actual) {
-            docs.put(pipelineId, CheckpointDoc.initial(pipelineId, StateJson.of(actual), Instant.EPOCH));
+            put(pipelineId, actual, 0);
+        }
+
+        void put(String pipelineId, PipelineState actual, long epoch) {
+            docs.put(pipelineId, new CheckpointDoc(pipelineId, StateJson.of(actual), epoch, Instant.EPOCH));
         }
 
         void failDeleteWith(RuntimeException failure) {
