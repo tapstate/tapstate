@@ -561,7 +561,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         var tables = List.of(SystemCollections.SRS_CHAINS, SystemCollections.SRS_CONSUMERS, SystemCollections.CACHE_SRS_CONSUMER_OFFSETS,
                 SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS, SystemCollections.SRS_EVENTS, SystemCollections.SRS_LOG_BOUNDS);
         var names = tables.stream().map(SystemCollections::collectionName).toList();
-        var present = database.listCollections().filter(new Document("name", new Document("$in", names))).into(new ArrayList<>());
+        var present = MongoCollectionMetadata.matching(database, names);
         if (present.size() != tables.size() || present.stream().anyMatch(row -> !"collection".equals(row.get("type")))) throw unreadableStructure();
         for (var table : tables) {
             var indexes = table.on(database).listIndexes().into(new ArrayList<>());

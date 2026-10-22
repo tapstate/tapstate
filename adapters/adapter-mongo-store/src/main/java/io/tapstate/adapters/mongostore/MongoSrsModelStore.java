@@ -251,7 +251,7 @@ public final class MongoSrsModelStore implements SrsModelStore {
     private void requireSnapshotResources() {
         var names = java.util.List.of(SystemCollections.SRS_CHAINS, SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS,
                 SystemCollections.SRS_EVENTS, SystemCollections.SRS_LOG_BOUNDS).stream().map(SystemCollections::collectionName).toList();
-        var present = database.listCollections().filter(new Document("name", new Document("$in", names))).into(new java.util.ArrayList<>());
+        var present = MongoCollectionMetadata.matching(database, names);
         if (present.size() != names.size() || present.stream().anyMatch(row -> !"collection".equals(row.get("type")))) throw unreadable();
     }
 

@@ -130,7 +130,7 @@ final class MongoCacheMetadataStructure {
 
     private Map<String, Document> collections(Set<String> required) {
         var result = new java.util.LinkedHashMap<String, Document>();
-        for (Document row : database.listCollections().filter(new Document("name", new Document("$in", new ArrayList<>(required))))) {
+        for (Document row : MongoCollectionMetadata.matching(database, required)) {
             String name = row.getString("name");
             if (result.put(name, row) != null) throw unreadable("collections");
         }

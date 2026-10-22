@@ -505,7 +505,7 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
             var tables = new ArrayList<>(authTables(mode));
             tables.add(SystemCollections.CACHE_IDENTITY); tables.add(SystemCollections.CACHE_SCHEMA_MIGRATIONS);
             Set<String> required = tables.stream().map(SystemCollections::collectionName).collect(java.util.stream.Collectors.toSet());
-            var actual = connection.database().listCollections().filter(new Document("name", new Document("$in", new ArrayList<>(required)))).into(new ArrayList<>());
+            var actual = MongoCollectionMetadata.matching(connection.database(), required);
             if (actual.size() != required.size() || actual.stream().anyMatch(row -> !"collection".equals(row.get("type")))) throw unreadableIndex();
         });
     }

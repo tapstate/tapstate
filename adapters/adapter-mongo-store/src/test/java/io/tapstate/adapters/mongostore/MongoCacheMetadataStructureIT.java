@@ -66,6 +66,42 @@ class MongoCacheMetadataStructureIT {
         });
     }
 
+    @Test void metadataVerificationSupportsServersThatRejectCollectionInFilters() {
+        withFixture(f -> {
+            f.prepare(() -> {});
+            MongoDatabase restricted = (MongoDatabase) java.lang.reflect.Proxy.newProxyInstance(MongoDatabase.class.getClassLoader(),
+                    new Class<?>[]{MongoDatabase.class}, (proxy, method, arguments) -> {
+                        if (method.getName().equals("listCollections") && (arguments == null || arguments.length == 0)) {
+                            var listing = f.database.listCollections();
+                            return java.lang.reflect.Proxy.newProxyInstance(com.mongodb.client.ListCollectionsIterable.class.getClassLoader(),
+                                    new Class<?>[]{com.mongodb.client.ListCollectionsIterable.class}, (iterator, operation, values) -> {
+                                        if (operation.getName().equals("filter")) {
+                                            var predicate = ((org.bson.conversions.Bson) values[0])
+                                                    .toBsonDocument(Document.class, MongoClientSettings.getDefaultCodecRegistry());
+                                            if (predicate.get("name") instanceof org.bson.BsonDocument operators && operators.containsKey("$in")) {
+                                                throw new com.mongodb.MongoCommandException(new org.bson.BsonDocument("ok", new org.bson.BsonInt32(0))
+                                                        .append("code", new org.bson.BsonInt32(8000)).append("errmsg", new org.bson.BsonString("unsupported type in filter")),
+                                                        new com.mongodb.ServerAddress("localhost"));
+                                            }
+                                        }
+                                        try { return operation.invoke(listing, values); }
+                                        catch (java.lang.reflect.InvocationTargetException failure) { throw failure.getCause(); }
+                                    });
+                        }
+                        try { return method.invoke(f.database, arguments); }
+                        catch (java.lang.reflect.InvocationTargetException failure) { throw failure.getCause(); }
+                    });
+            var structure = new MongoCacheMetadataStructure(restricted, RETENTION);
+            structure.verify();
+            // Unrelated metadata cannot substitute for a missing or wrong-kind declared collection.
+            SystemCollections.CACHE_SOURCE_SCHEMAS.on(f.database).drop();
+            f.database.createView("source_schemas", "connector_catalog", List.of());
+            assertUnreadable(structure::verify);
+            f.database.getCollection("source_schemas").drop();
+            assertUnreadable(structure::verify);
+        });
+    }
+
     @Test void aChangedRetentionIsDiagnosedWithoutAnImplicitCollMod() {
         withFixture(f -> {
             f.prepare(() -> {}); var before = f.snapshot();
