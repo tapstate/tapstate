@@ -127,7 +127,8 @@ final class PipelineRecoveryInspector {
         if(pipeline.view() instanceof ViewBlock.Inline view) {
             String managed=snapshot.managedDefaultSourceId().orElseThrow(PipelineRecoveryInspector::fenced);
             var target=StoredArtifacts.requireSource(snapshot,ViewTargetResolver.resolve(view,managed).sourceId());
-            inspectTarget(target,OnFullLoad.APPEND,artifacts);targets.add(new Target(view.id(),target.id(),OnFullLoad.APPEND));
+            var policy=view.onFullLoad()==null?OnFullLoad.APPEND:view.onFullLoad();
+            inspectTarget(target,policy,artifacts);targets.add(new Target(view.id(),target.id(),policy));
             originalContexts.put(RequiredNoteOwner.namespace(new PipelineNode(id,view.id()),PipelineNode.Purpose.VIEW),target);
         }
         if(targets.isEmpty())throw invalid("Full recovery requires a configured write target.");

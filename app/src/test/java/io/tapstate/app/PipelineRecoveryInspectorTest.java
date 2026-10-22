@@ -78,6 +78,25 @@ class PipelineRecoveryInspectorTest {
                 failure -> assertThat(failure.code()).isEqualTo(ConnectorError.CAPABILITY_MISSING));
         verify(recoveries,never()).authorizeFull(any(),anyString());
     }
+    @Test void aViewRecoveryPreflightUsesItsDeclaredFullLoadPolicyAndRequiredCapability() {
+        var view = new ViewBlock.Inline("view", FromRef.literal("orders"), "id", null, WriteMode.UPSERT, OnFullLoad.CLEAR);
+        store.artifacts().saveAll(List.of(new PipelineResource("flow", null, List.of(SourceRef.spec("src", true)),
+                null, view, null, null, null)));
+        stopped();
+        var artifacts = mock(ArtifactStore.class, org.mockito.AdditionalAnswers.delegatesTo(store.artifacts()));
+        when(artifacts.managedDefaultSourceId()).thenReturn(Optional.of("target"));
+        var wrapped = spy(store); doReturn(artifacts).when(wrapped).artifacts();
+        ConnectorProvisioner connectors = id -> new ConnectorRef(List.of(), "fixture.Connector", "2.0.8", null, null, hashes.get(id), false);
+        var reader = new PipelineRecoveryInspector(configuration, wrapped, connectors,
+                (id, hash) -> new ConnectorCapabilities(functions.get(id)),
+                (source, hash) -> store.schemas().get(source.id()).orElseThrow().model(), () -> {});
+        assertThat(reader.inspect(AUTH, SELECT).targets())
+                .containsExactly(new PipelineRecoveryInspector.Target("view", "target", OnFullLoad.CLEAR));
+        functions.put("postgres", Set.of("write_record_function"));
+        assertThatThrownBy(() -> reader.inspect(AUTH, SELECT)).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(ConnectorError.CAPABILITY_MISSING));
+        verify(recoveries, never()).authorizeFull(any(), anyString());
+    }
     @Test void cdcOnlyAnotherScopeAndMultiplePipelineSelectionsCannotAuthorizeAFull() {
         store.artifacts().saveAll(List.of(pipeline(OnFullLoad.APPEND,ReadMode.CDC_ONLY)));stopped();
         assertThatThrownBy(() -> inspector.inspect(AUTH,SELECT)).isInstanceOfSatisfying(TapstateException.class,
