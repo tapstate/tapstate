@@ -116,10 +116,10 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
     private static boolean isConcreteEditRequest(List<Map<String, String>> messages) {
         if (messages.isEmpty()) return false;
         String request = messages.getLast().getOrDefault("content", "").toLowerCase(java.util.Locale.ROOT);
-        boolean edit = request.matches("(?s).*(只保留|仅保留|过滤|筛选|删除|移除|添加|新增|修改|调整|生成|创建|keep only|filter|remove|add|change|modify|create).*?");
+        boolean chineseEdit = request.matches("(?s).*(\\x{53ea}\\x{4fdd}\\x{7559}|\\x{4ec5}\\x{4fdd}\\x{7559}|\\x{4fdd}\\x{7559}|\\x{8fc7}\\x{6ee4}|\\x{7b5b}\\x{9009}|\\x{5220}\\x{9664}|\\x{79fb}\\x{9664}|\\x{6dfb}\\x{52a0}|\\x{65b0}\\x{589e}|\\x{4fee}\\x{6539}|\\x{8c03}\\x{6574}|\\x{751f}\\x{6210}|\\x{521b}\\x{5efa}).*?");
         boolean englishEdit = request.matches("(?s).*(keep|preserve|filter|remove|delete|add|change|modify|rename|create).*?");
         boolean question = request.matches("(?s).*(\\x{600e}\\x{4e48}|\\x{5982}\\x{4f55}|\\x{4e3a}\\x{4ec0}\\x{4e48}|\\x{662f}\\x{5426}|\\x{80fd}\\x{5426}|\\x{4ec0}\\x{4e48}\\x{662f}|\\x{8bf4}\\x{660e}|\\x{89e3}\\x{91ca}|how\\s+(do|can|to)|why\\b|what\\s+(is|does)|should\\s+i\\b|do\\s+i\\b).*?");
-        return (edit || englishEdit) && !question;
+        return (chineseEdit || englishEdit) && !question;
     }
 
     private static Map<String, Object> wizardSchema() {
