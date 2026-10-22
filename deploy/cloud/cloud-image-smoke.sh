@@ -125,6 +125,7 @@ CLOUD_VOLUME="$VOLUME"
 new_container cloud
 SERVER="$CURRENT"
 docker run -d --name "$SERVER" --label "$label=$OWNER" --network "$NETWORK" \
+  -e TZ=Etc/UTC \
   -p 127.0.0.1::8080 --mount "type=volume,src=$CLOUD_VOLUME,dst=/var/lib/tapstate" \
   "${CLOUD_ENV[@]}" -e 'TAPSTATE_CLOUD_ATLAS_URI=mongodb://mongo:27017/image_cloud?replicaSet=rs0' \
   -e 'TAPSTATE_STORE_MONGO_URI=mongodb://unreachable.invalid:27017/no_fallback' \
@@ -142,6 +143,7 @@ node "$ROOT/deploy/cloud/image-runtime-probe.mjs" verify cloud "$SERVER_URL" "$F
 docker stop --time 30 "$SERVER" >/dev/null
 [[ "$(docker inspect -f '{{.State.ExitCode}}' "$SERVER")" = 0 ]]
 logs "$SERVER" cloud-first
+grep -F 'Server time zone: UTC (default)' "$WORK/cloud-first.log" >/dev/null
 node "$ROOT/deploy/cloud/image-runtime-probe.mjs" verify cloud-stopped "$SERVER_URL" "$FIXTURE_URL" "$WORK/cloud.json" "$WORK/cloud-state.json"
 docker start "$SERVER" >/dev/null
 ready "$SERVER"
