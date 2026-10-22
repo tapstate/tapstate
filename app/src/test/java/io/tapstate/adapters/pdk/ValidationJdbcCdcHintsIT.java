@@ -24,6 +24,11 @@ import io.tapstate.runtime.engine.validation.ValidationCandidateQueue;
 import io.tapstate.runtime.engine.validation.ValidationRootHintInbox;
 import io.tapstate.runtime.engine.validation.ValidationRootHintOutbox;
 import io.tapstate.app.ValidationCaptureHintTap;
+import io.tapstate.app.ValidationCaptureHintRegistry;
+import io.tapstate.spi.store.WorkloadClaimFence;
+import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimType;
+import io.tapstate.spi.store.WorkloadOwner;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.capture.CaptureListener;
 import io.tapstate.spi.capture.CaptureStart;
@@ -93,6 +98,10 @@ class ValidationJdbcCdcHintsIT {
             var sender = new ValidationRootHintBatch.Sender("fixture-sender", "fixture-execution", "source", TABLE,
                     "capture", "boot", 1, 1, "route", "controlled-bigint", "mapping", "output",
                     List.of(new ValidationRootHintBatch.Domain(ValidationKey.Kind.EXACT_NUMBER)));
+            // The fixture supplies a local registration scope, not a distributed claim receipt.
+            var captureScope = new ValidationCaptureHintRegistry.Scope("fixture", "physical", kind + "-opening", "source", "capture", "boot", 1,
+                    new WorkloadClaimFence(new WorkloadClaimKey("fixture", WorkloadClaimType.CAPTURE, "physical"),
+                            new WorkloadOwner("capture", "boot"), 1, 1, 1), "route", Set.of(TABLE));
             var count = new AtomicInteger();
             var delivered = new ArrayList<Change>();
             var deliveryShapes = new ArrayList<List<ValidationRootHintBatch.ChangeKind>>();
@@ -108,7 +117,9 @@ class ValidationJdbcCdcHintsIT {
                         new ValidationCandidateQueue.Limits(8, 65536, 64, 2, 0, Duration.ofSeconds(60).toNanos()), System::nanoTime);
                  var inbox = new ValidationRootHintInbox(queue, List.of(sender), new ValidationRootHintInbox.Limits(1, 65536, 32, 65536));
                  var outbox = new ValidationRootHintOutbox(run, sender, new ValidationRootHintOutbox.Limits(16, 262144, 32, 65536,
-                        2, Duration.ofMillis(10).toNanos(), Duration.ofSeconds(60).toNanos()), System::nanoTime)) {
+                        2, Duration.ofMillis(10).toNanos(), Duration.ofSeconds(60).toNanos()), System::nanoTime);
+                 var registry = new ValidationCaptureHintRegistry(captureScope, new ValidationCaptureHintRegistry.Limits(1, 65536,
+                         new ValidationCaptureHintTap.Limits(32, 1, 65536)))) {
                 CaptureListener listener = new CaptureListener() {
                     @Override public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
                         try {
@@ -123,9 +134,7 @@ class ValidationJdbcCdcHintsIT {
                     }
                     @Override public void onError(Throwable failure) { failures.record(failure); }
                 };
-                CaptureListener tapped = ValidationCaptureHintTap.wrap(listener,
-                        List.of(new ValidationCaptureHintTap.Binding(outbox, extractor::extract)),
-                        new ValidationCaptureHintTap.Limits(32, 1, 65536));
+                CaptureListener tapped = registry.install(listener);
                 MysqlReader mysqlReader = null;
                 try (var tail = capture.cdc(config, CaptureStart.present(), tapped)) {
                     awaitReader(source, mysql, failures, true);
@@ -133,6 +142,9 @@ class ValidationJdbcCdcHintsIT {
                         mysqlReader = mysqlReader(source);
                         assertThat(mysqlSocketStates(source, mysqlReader.port())).containsExactly("01");
                     }
+                    String originalReader = readerIdentity(source, mysql);
+                    var registration = registry.register(captureScope, new ValidationCaptureHintTap.Binding(outbox, extractor::extract));
+                    assertThat(readerIdentity(source, mysql)).isEqualTo(originalReader);
                     sql(source, mysql, "INSERT INTO " + TABLE + " VALUES (" + FIRST + ", 'inserted'); "
                             + "UPDATE " + TABLE + " SET value='same-key' WHERE id=" + FIRST + "; "
                             + "UPDATE " + TABLE + " SET id=" + (FIRST + 1) + " WHERE id=" + FIRST + "; "
@@ -155,12 +167,26 @@ class ValidationJdbcCdcHintsIT {
                     }
                     assertThat(roots).containsExactlyInAnyOrder(key(FIRST), key(FIRST + 1));
                     assertThat(queue.snapshot().bytes()).isZero();
+                    registration.close();
+                    long drainDeadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+                    while (!registration.drained() && System.nanoTime() < drainDeadline) {
+                        assertHealthy(failures, outbox, inbox); Thread.sleep(20);
+                    }
+                    assertThat(registration.drained()).isTrue(); assertThat(registry.reap()).isEqualTo(1);
+                    sql(source, mysql, "INSERT INTO " + TABLE + " VALUES (2, 'after-retirement');");
+                    long deliveryDeadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+                    while (count.get() != expected.size() + 1 && System.nanoTime() < deliveryDeadline) {
+                        assertHealthy(failures, outbox, inbox); Thread.sleep(20);
+                    }
+                    assertThat(count.get()).isEqualTo(expected.size() + 1);
+                    assertThat(readerIdentity(source, mysql)).isEqualTo(originalReader);
+                    assertThat(outbox.snapshot().packets()).isZero(); assertThat(queue.snapshot().roots()).isZero();
                 }
                 // A post-close fixture change must not deliver another callback.
-                sql(source, mysql, "INSERT INTO " + TABLE + " VALUES (2, 'after-close-probe');");
+                sql(source, mysql, "INSERT INTO " + TABLE + " VALUES (3, 'after-close-probe');");
                 if (mysql) awaitMysqlPeerClose(source, mysqlReader, failures);
                 else awaitReader(source, false, failures, false);
-                assertThat(count.get()).isEqualTo(expected.size());
+                assertThat(count.get()).isEqualTo(expected.size() + 1);
                 assertHealthy(failures, outbox, inbox);
             }
         }
@@ -231,6 +257,12 @@ class ValidationJdbcCdcHintsIT {
         } while (System.nanoTime() < deadline);
         assertThat(states).as("the exact previously established binlog socket must observe peer shutdown")
                 .allMatch(state -> Set.of("06", "07", "08", "09").contains(state));
+    }
+
+    private static String readerIdentity(GenericContainer<?> source, boolean mysql) throws Exception {
+        return sql(source, mysql, mysql
+                ? "SELECT ID FROM information_schema.PROCESSLIST WHERE COMMAND LIKE 'Binlog Dump%';"
+                : "SELECT active_pid FROM pg_replication_slots WHERE database='" + DATABASE + "' AND active;").trim();
     }
 
     private static PdkValidationHintKeys extractor() {
