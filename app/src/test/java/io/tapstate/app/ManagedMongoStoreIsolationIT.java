@@ -583,7 +583,7 @@ class ManagedMongoStoreIsolationIT {
                 .withCopyToContainer(Transferable.of(TLS.server(), 0400), "/data/configdb/server.pem")
                 .withCopyToContainer(Transferable.of(TLS.ca().getBytes(StandardCharsets.UTF_8), 0444), "/data/configdb/ca.pem")
                 .withCommand("--replSet", REPLICA_SET, "--keyFile", "/data/configdb/member.key", "--bind_ip_all",
-                        "--tlsMode", "allowTLS", "--tlsCertificateKeyFile", "/data/configdb/server.pem",
+                        "--setParameter", "enableTestCommands=1", "--tlsMode", "allowTLS", "--tlsCertificateKeyFile", "/data/configdb/server.pem",
                         "--tlsCAFile", "/data/configdb/ca.pem", "--tlsAllowConnectionsWithoutCertificates")
                 // The image opens a temporary unauthenticated server while creating its administrator.
                 .waitingFor(new WaitAllStrategy()
@@ -673,6 +673,50 @@ class ManagedMongoStoreIsolationIT {
                                             io.tapstate.adapters.mongostore.StoreError.DATABASE_ACCESS_FAILED));
                 }
                 assertThat(admin.getDatabase(database).listCollectionNames().into(new ArrayList<>())).isEmpty();
+            }
+        }
+    }
+
+    @Test
+    void invalidStorageCredentialsAreDiagnosedSeparatelyFromNetworkFailureWithoutExposingSecrets() {
+        String database = "credential_probe_" + UUID.randomUUID().toString().substring(0, 8);
+        String user = "credential_user_" + database;
+        String rejectedPassword = "rejected-password-sentinel";
+        try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
+            createUser(admin, user, List.of(database));
+            var probe = new io.tapstate.adapters.mongostore.MongoStorageConnectionProbe(Duration.ofSeconds(5));
+            var input = probe.normalize(new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,
+                    uri(user, database, rejectedPassword), database, null));
+            assertThatThrownBy(() -> probe.test(input)).isInstanceOfSatisfying(TapstateException.class, failure -> {
+                assertThat(failure.code()).isEqualTo(IoError.STORE_UNAUTHORIZED);
+                assertThat(failure.args()).isEmpty();
+                assertThat(failure.getCause()).isNull();
+                assertThat(failure.getMessage()).doesNotContain(user, PASSWORD, rejectedPassword, "mongodb://");
+            });
+            assertThat(admin.getDatabase(database).listCollectionNames().into(new ArrayList<>())).isEmpty();
+        }
+    }
+
+    @Test
+    void aSocketClosedDuringAuthenticationIsNotReportedAsRejectedCredentials() {
+        String database = "auth_network_" + UUID.randomUUID().toString().substring(0, 8);
+        String user = "auth_network_user_" + database;
+        try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
+            createUser(admin, user, List.of(database));
+            admin.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand")
+                    .append("mode", new Document("times", 20)).append("data", new Document("failCommands", List.of("saslStart", "saslContinue"))
+                            .append("closeConnection", true).append("appName", "storage-auth-transport")));
+            try {
+                var probe = new io.tapstate.adapters.mongostore.MongoStorageConnectionProbe(Duration.ofSeconds(5));
+                var input = probe.normalize(new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,
+                        uri(user, database) + "&appName=storage-auth-transport", database, null));
+                assertThatThrownBy(() -> probe.test(input)).isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(StoreError.UNREACHABLE);
+                    assertThat(failure.getCause()).isNull();
+                    assertThat(failure.getMessage()).doesNotContain(user, PASSWORD, "mongodb://");
+                });
+            } finally {
+                admin.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
             }
         }
     }

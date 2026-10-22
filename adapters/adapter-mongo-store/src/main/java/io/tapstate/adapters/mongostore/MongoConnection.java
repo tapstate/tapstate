@@ -248,8 +248,8 @@ public final class MongoConnection implements AutoCloseable {
     /**
      * Opens the client and verifies the store is reachable and supports transactions, and nothing further.
      * Raises a {@code store.unreachable} coded diagnostic if the target cannot be reached within the
-     * configured server-selection timeout, or {@code store.not-replica-set} if it is reached but is a
-     * standalone server. On success the client is held open for the process lifetime.
+     * configured server-selection timeout, {@code io.store-unauthorized} for rejected database
+     * credentials, or {@code store.not-replica-set} if it is reached but is a standalone server. On success the client is held open for the process lifetime.
      *
      * <p>Separate from {@link #verify()} for the read-only inspection commands, whose whole point is to
      * work on a store a normal start refuses on: they have to reach it without changing it.
@@ -274,6 +274,11 @@ public final class MongoConnection implements AutoCloseable {
             if (opened != null) {
                 opened.close();
             }
+            // Only an explicit server authentication rejection proves bad credentials. The driver also
+            // wraps socket failures during SASL in MongoSecurityException; those remain connectivity failures.
+            if (e instanceof com.mongodb.MongoSecurityException
+                    && e.getCause() instanceof com.mongodb.MongoCommandException command
+                    && command.getErrorCode() == 18) throw StoreIo.coded(e);
             // Driver failures may quote connection options, including credentials, in their messages.
             // The safe host and coded error are enough for the public and application-log boundary.
             throw new TapstateException(StoreError.UNREACHABLE, Map.of("target", target), null);
