@@ -50,7 +50,7 @@ class UnwindTargetIdentityCheckTest {
                 () -> bench.service().start("alice", "pl", List.of(), null));
         assertThat(refusal.report().outcome()).isEqualTo(StartCheckReport.Outcome.BLOCKED);
         assertThat(refusal.report().findings()).anySatisfy(finding -> {
-            assertThat(finding.check()).isEqualTo(UnwindTargetIdentityCheck.ID);
+            assertThat(finding.check()).isEqualTo(UnwindTargetIdentityCheck.CHECK_ID);
             assertThat(finding.evaluation()).isEqualTo(StartFinding.Evaluation.UNAVAILABLE);
         });
         assertThat(bench.desiredById).isEmpty();
@@ -68,7 +68,7 @@ class UnwindTargetIdentityCheckTest {
         }));
         StartOutcome outcome = bench.service().start("alice", "pl", List.of(), null);
         assertThat(outcome.report().outcome()).isEqualTo(StartCheckReport.Outcome.READY);
-        assertThat(outcome.report().findings()).noneMatch(finding -> finding.check().equals(UnwindTargetIdentityCheck.ID));
+        assertThat(outcome.report().findings()).noneMatch(finding -> finding.check().equals(UnwindTargetIdentityCheck.CHECK_ID));
         assertThat(bench.desiredById).containsKey("pl");
     }
 
@@ -80,7 +80,7 @@ class UnwindTargetIdentityCheckTest {
                     Map.of("column", "position", "option", "include_array_index"), null);
         }));
         StartOutcome outcome = bench.service().start("alice", "pl", List.of(), null);
-        assertThat(outcome.report().findings()).noneMatch(finding -> finding.check().equals(UnwindTargetIdentityCheck.ID));
+        assertThat(outcome.report().findings()).noneMatch(finding -> finding.check().equals(UnwindTargetIdentityCheck.CHECK_ID));
         assertThat(bench.desiredById).containsKey("pl");
     }
 

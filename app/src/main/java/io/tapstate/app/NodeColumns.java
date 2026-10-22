@@ -277,26 +277,28 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
                     !entry.getValue().equals(input.origins().get(entry.getKey())));
             expanded |= input.expanded();
         }
-        Map<String, NumericType> numbers = new LinkedHashMap<>();
-        Map<String, StringType> strings = new LinkedHashMap<>();
-        for (String column : out.keySet()) {
-            NumericType candidate = inputs.iterator().next().numericTypes().get(column);
-            if (candidate != null && inputs.stream().allMatch(input ->
-                    Objects.equals(candidate, input.numericTypes().get(column)))) {
-                numbers.put(column, candidate);
-            }
-        }
-        for (String column : out.keySet()) {
-            StringType candidate = inputs.iterator().next().stringTypes().get(column);
-            if (candidate != null && inputs.stream().allMatch(input ->
-                    Objects.equals(candidate, input.stringTypes().get(column)))) {
-                strings.put(column, candidate);
-            }
-        }
+        Map<String, NumericType> numbers = commonDescriptors(inputs, out.keySet(), NodeColumns::numericTypes);
+        Map<String, StringType> strings = commonDescriptors(inputs, out.keySet(), NodeColumns::stringTypes);
         Set<String> unchanged = new LinkedHashSet<>(out.keySet());
         inputs.forEach(input -> unchanged.retainAll(input.unchangedFields()));
         return new NodeColumns(out, agreed.stream().filter(out::containsKey).toList(), null,
-                origins, expanded, numbers, unchanged, strings, inputs.stream()
+                origins, expanded, numbers, unchanged, strings, mergedSourceIdentityField(inputs));
+    }
+
+    private static <T> Map<String, T> commonDescriptors(Collection<NodeColumns> inputs, Set<String> columns,
+            java.util.function.Function<NodeColumns, Map<String, T>> descriptors) {
+        Map<String, T> result = new LinkedHashMap<>();
+        Map<String, T> first = descriptors.apply(inputs.iterator().next());
+        for (String column : columns) {
+            T candidate = first.get(column);
+            if (candidate != null && inputs.stream().allMatch(input ->
+                    Objects.equals(candidate, descriptors.apply(input).get(column)))) result.put(column, candidate);
+        }
+        return result;
+    }
+
+    private static String mergedSourceIdentityField(Collection<NodeColumns> inputs) {
+        return inputs.stream()
                         .map(NodeColumns::unwindSourceIdField).filter(java.util.Objects::nonNull)
                         .distinct().reduce((left, right) -> {
                             if (!left.equals(right)) {
@@ -305,7 +307,7 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
                                         Map.of("value", left + ", " + right, "expected", "one source identity field for merged expansions"), null);
                             }
                             return left;
-                        }).orElse(null));
+                        }).orElse(null);
     }
 
     /** Two inputs' answers for one column: the type they agree on, and null wherever either allows it. */

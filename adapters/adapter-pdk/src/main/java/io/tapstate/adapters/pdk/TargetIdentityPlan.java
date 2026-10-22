@@ -19,6 +19,6 @@ public record TargetIdentityPlan(String status, String reason, TargetTable targe
         this(status, reason, target, sourceField, preservedField, writeKey, false);
     }
 
-    public boolean automatic() { return AUTOMATIC.equals(status); }
+    public boolean isAutomatic() { return AUTOMATIC.equals(status); }
     public boolean blocked() { return ACTION_REQUIRED.equals(status); }
 }

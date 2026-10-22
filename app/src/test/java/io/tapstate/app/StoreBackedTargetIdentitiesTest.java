@@ -54,6 +54,25 @@ class StoreBackedTargetIdentitiesTest {
         assertThat(identities.relevant(referencedServe)).isTrue();
     }
 
+    @Test
+    void previewSeparatesThePreservedLogicalKeyFromTheGeneratedIdentityAnnotation() {
+        var target = new io.tapstate.spi.sink.TargetTable("orders", java.util.List.of());
+        var key = java.util.List.of("original_id", "position");
+        var plan = new io.tapstate.adapters.pdk.TargetIdentityPlan("automatic", "generated-target-identity",
+                target, "_id", "original_id", key);
+        var assessment = new io.tapstate.control.core.PipelineTargetIdentities.Assessment(
+                "out", "target", "orders", plan.status(), plan.reason(), plan.sourceField(), plan.preservedField(), key);
+        var payload = StoreBackedTargetIdentities.payload(new StoreBackedTargetIdentities.Resolved(assessment, "expanded", plan));
+        assertThat(payload).containsEntry("generatedFields", java.util.List.of("_id"))
+                .containsEntry("preservedField", "original_id").containsEntry("writeKey", key)
+                .containsEntry("stream", "expanded").doesNotContainKey("documents");
+        var unchanged = new io.tapstate.adapters.pdk.TargetIdentityPlan("not-required", "compatible-key", target, null, null, key);
+        assertThat(StoreBackedTargetIdentities.payload(new StoreBackedTargetIdentities.Resolved(
+                new io.tapstate.control.core.PipelineTargetIdentities.Assessment("out", "target", "orders",
+                        unchanged.status(), unchanged.reason(), null, null, key), "expanded", unchanged)))
+                .containsEntry("generatedFields", java.util.List.of());
+    }
+
     private void source() {
         store.artifacts().save(parser.parse("""
                 version: tapstate/v1

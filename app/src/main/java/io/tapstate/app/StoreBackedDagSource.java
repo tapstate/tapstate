@@ -1472,16 +1472,7 @@ final class StoreBackedDagSource implements DagSource {
         produced.origins().forEach((output, origin) -> parentNames.put(origin, output));
         for (String column : produced.columns().keySet()) {
             TargetField carried = declared.get(column);
-            var inferred = JoinSchemaDrift.typeOf(produced.columns().get(column));
-            // A decimal without a descriptor can reuse an older source spelling only while the value
-            // is unchanged. A computed value with the same name has no declared source range.
-            boolean spellingStillHolds = carried != null && !retyped(column, produced, atTheSource)
-                    && (inferred != io.tapstate.core.common.TapstateType.DECIMAL
-                    || produced.numericTypes().containsKey(column)
-                    || produced.unchangedFields().contains(column));
-            fields.add(new TargetField(column, spellingStillHolds ? carried.type() : null, false,
-                    inferred,
-                    produced.numericTypes().get(column), produced.stringTypes().get(column)));
+            fields.add(publishedField(column, carried, produced, atTheSource));
             TargetField identity = produced.expanded()
                     ? declared.get(produced.origins().get(column)) : carried;
             if (identity != null && identity.primaryKey()
@@ -1508,6 +1499,20 @@ final class StoreBackedDagSource implements DagSource {
                                 ? new io.tapstate.spi.sink.UnwindIdentity(
                                         key.stream().filter(column -> !produced.key().contains(column)).toList(),
                                         produced.unwindSourceIdField()) : null), key);
+    }
+
+    private static TargetField publishedField(String column, TargetField carried,
+            NodeColumns produced, NodeColumns atTheSource) {
+        var inferred = JoinSchemaDrift.typeOf(produced.columns().get(column));
+        // A decimal without a descriptor can reuse an older source spelling only while the value
+        // is unchanged. A computed value with the same name has no declared source range.
+        boolean spellingStillHolds = carried != null && !retyped(column, produced, atTheSource)
+                && (inferred != io.tapstate.core.common.TapstateType.DECIMAL
+                || produced.numericTypes().containsKey(column)
+                || produced.unchangedFields().contains(column));
+        return new TargetField(column, spellingStillHolds ? carried.type() : null, false,
+                inferred,
+                produced.numericTypes().get(column), produced.stringTypes().get(column));
     }
 
     /**
@@ -3222,28 +3227,7 @@ final class StoreBackedDagSource implements DagSource {
         requireDiscovered(pipeline);
         List<PipelineWriteTargets.WriteTarget> written = new ArrayList<>();
         if (pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync() != null && !serve.sync().isEmpty()) {
-            Map<String, SourceVertex> vertices = sourceVertices(pipeline);
-            Map<String, String> sourceIdByTable = sourceIdByTable(vertices);
-            Map<String, TargetTable> bySourceTable = sourceTargets(vertices);
-            Map<String, TargetTable> assembled = assembledTargets(
-                    pipeline, bySourceTable, vertices, compiledJoins(pipeline, sourceTablesByName(vertices)));
-            TerminalTargets terminal = terminalTargets(pipeline.id(), pipeline, serve.from(), bySourceTable,
-                    assembled, vertices, this::discoveredColumns);
-            String definedIn = definition.serve() instanceof ServeBlock.Use use ? use.use() : null;
-            for (SyncElement element : serve.sync()) {
-                io.tapstate.core.model.OnFullLoad policy = element.onFullLoad() == null
-                        ? io.tapstate.core.model.OnFullLoad.APPEND : element.onFullLoad();
-                Set<String> tables = new LinkedHashSet<>();
-                for (var entry : TargetModelResolver.renameAll(
-                        terminal.targets(), terminal.landing(), element.rename(), sourceIdByTable).entrySet()) {
-                    TargetTable table = entry.getValue();
-                    var coordinate = new PipelineWriteTargets.WriteTarget(syncNodeId(element),
-                            PipelineWriteTargets.WriteTarget.Kind.SYNC, element.source(), table.name(),
-                            policy, definedIn);
-                    if (tables.add(table.name())) written.add(coordinate);
-                    models.accept(coordinate, entry.getKey(), table);
-                }
-            }
+            collectSyncWriteTargets(definition, pipeline, serve, models, written);
         }
         if (pipeline.view() instanceof ViewBlock.Inline view) {
             ViewTargetResolver.ViewTarget target = ViewTargetResolver.resolve(view, viewStoreId());
@@ -3254,6 +3238,32 @@ final class StoreBackedDagSource implements DagSource {
                     definedIn));
         }
         return List.copyOf(written);
+    }
+
+    private void collectSyncWriteTargets(PipelineResource definition, PipelineResource pipeline,
+            ServeBlock.Inline serve, TargetModelConsumer models, List<PipelineWriteTargets.WriteTarget> written) {
+        Map<String, SourceVertex> vertices = sourceVertices(pipeline);
+        Map<String, String> sourceIdByTable = sourceIdByTable(vertices);
+        Map<String, TargetTable> bySourceTable = sourceTargets(vertices);
+        Map<String, TargetTable> assembled = assembledTargets(
+                pipeline, bySourceTable, vertices, compiledJoins(pipeline, sourceTablesByName(vertices)));
+        TerminalTargets terminal = terminalTargets(pipeline.id(), pipeline, serve.from(), bySourceTable,
+                assembled, vertices, this::discoveredColumns);
+        String definedIn = definition.serve() instanceof ServeBlock.Use use ? use.use() : null;
+        for (SyncElement element : serve.sync()) {
+            io.tapstate.core.model.OnFullLoad policy = element.onFullLoad() == null
+                    ? io.tapstate.core.model.OnFullLoad.APPEND : element.onFullLoad();
+            Set<String> tables = new LinkedHashSet<>();
+            for (var entry : TargetModelResolver.renameAll(
+                    terminal.targets(), terminal.landing(), element.rename(), sourceIdByTable).entrySet()) {
+                TargetTable table = entry.getValue();
+                var coordinate = new PipelineWriteTargets.WriteTarget(syncNodeId(element),
+                        PipelineWriteTargets.WriteTarget.Kind.SYNC, element.source(), table.name(),
+                        policy, definedIn);
+                if (tables.add(table.name())) written.add(coordinate);
+                models.accept(coordinate, entry.getKey(), table);
+            }
+        }
     }
 
     /**

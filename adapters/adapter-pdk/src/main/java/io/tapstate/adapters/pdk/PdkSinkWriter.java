@@ -178,6 +178,26 @@ final class PdkSinkWriter implements SinkWriter {
     }
 
     private synchronized WriteResult deliver(List<Envelope> records) {
+        Map<String, List<TapRecordEvent>> rowsByTable = encodedRows(records);
+        if (rowsByTable.isEmpty()) {
+            return new WriteResult(0);
+        }
+        if (mode == WriteMode.APPEND && rowsByTable.size() > 1) {
+            // APPEND has no rollback or idempotency contract. Reject before the first connector call so a
+            // retry cannot duplicate an earlier table after a later table fails.
+            throw writeFailed(connector.connectorId(), new IllegalStateException(
+                    "append mode rejects a multi-table batch before any connector write"));
+        }
+        try {
+            return connector.underLoader(() -> writeRows(rowsByTable));
+        } catch (TapstateException e) {
+            throw e;
+        } catch (Throwable t) {
+            throw writeFailed(connector.connectorId(), t);
+        }
+    }
+
+    private Map<String, List<TapRecordEvent>> encodedRows(List<Envelope> records) {
         Map<String, List<TapRecordEvent>> rowsByTable = new LinkedHashMap<>();
         for (Envelope env : records) {
             if (env.op() == Op.DDL) {
@@ -193,41 +213,28 @@ final class PdkSinkWriter implements SinkWriter {
             rowsByTable.computeIfAbsent(env.src(), ignored -> new ArrayList<>())
                     .add(encode(mode == WriteMode.APPEND ? asInsert(row) : row));
         }
-        if (rowsByTable.isEmpty()) {
-            return new WriteResult(0);
+        return rowsByTable;
+    }
+
+    private WriteResult writeRows(Map<String, List<TapRecordEvent>> rowsByTable) throws Throwable {
+        long[] accepted = {0};
+        for (Map.Entry<String, List<TapRecordEvent>> entry : rowsByTable.entrySet()) {
+            List<TapRecordEvent> rows = entry.getValue();
+            TargetTable target = projectedTarget(entry.getKey(), targets.get(entry.getKey()));
+            TapTable table = target != null
+                    ? tableModel(entry.getKey(), target)
+                    : TargetTapTable.bare(rows.get(0).getTableId());
+            preparation.prepare(target, table);
+            if (target != null) {
+                // The connector receives both a table model and record events; its write path may
+                // route by the event table id, so both must name the resolved target collection.
+                rows.forEach(row -> row.setTableId(target.name()));
+            }
+            // A connector may report the batch in several flushes, one callback each; accumulate.
+            write.writeRecord(connector.context(), rows, table,
+                    result -> accepted[0] += accepted(result));
         }
-        if (mode == WriteMode.APPEND && rowsByTable.size() > 1) {
-            // APPEND has no rollback or idempotency contract. Reject before the first connector call so a
-            // retry cannot duplicate an earlier table after a later table fails.
-            throw writeFailed(connector.connectorId(), new IllegalStateException(
-                    "append mode rejects a multi-table batch before any connector write"));
-        }
-        try {
-            return connector.underLoader(() -> {
-                long[] accepted = {0};
-                for (Map.Entry<String, List<TapRecordEvent>> entry : rowsByTable.entrySet()) {
-                    List<TapRecordEvent> rows = entry.getValue();
-                    TargetTable target = projectedTarget(entry.getKey(), targets.get(entry.getKey()));
-                    TapTable table = target != null
-                            ? tableModel(entry.getKey(), target)
-                            : TargetTapTable.bare(rows.get(0).getTableId());
-                    preparation.prepare(target, table);
-                    if (target != null) {
-                        // The connector receives both a table model and record events; its write path may
-                        // route by the event table id, so both must name the resolved target collection.
-                        rows.forEach(row -> row.setTableId(target.name()));
-                    }
-                    // A connector may report the batch in several flushes, one callback each; accumulate.
-                    write.writeRecord(connector.context(), rows, table,
-                            result -> accepted[0] += accepted(result));
-                }
-                return new WriteResult(accepted[0]);
-            });
-        } catch (TapstateException e) {
-            throw e;
-        } catch (Throwable t) {
-            throw writeFailed(connector.connectorId(), t);
-        }
+        return new WriteResult(accepted[0]);
     }
 
     private TargetTable projectedTarget(String stream, TargetTable original) {

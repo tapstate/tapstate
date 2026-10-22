@@ -100,7 +100,7 @@ final class StoreBackedTargetIdentities implements PipelineTargetIdentities {
         values.put("sourceField", assessment.sourceField());
         values.put("preservedField", assessment.preservedField());
         values.put("writeKey", assessment.writeKey());
-        values.put("generatedFields", resolved.plan().automatic() ? List.of(resolved.plan().sourceField()) : List.of());
+        values.put("generatedFields", resolved.plan().isAutomatic() ? List.of(resolved.plan().sourceField()) : List.of());
         return values;
     }
 }

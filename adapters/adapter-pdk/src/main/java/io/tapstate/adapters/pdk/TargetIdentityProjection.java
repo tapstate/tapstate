@@ -15,7 +15,7 @@ public final class TargetIdentityProjection {
 
     public static Envelope apply(TargetIdentityPlan plan, Envelope event) {
         requireUsable(plan);
-        if (!plan.automatic()) return event;
+        if (!plan.isAutomatic()) return event;
         Set<String> removed = new LinkedHashSet<>();
         for (String field : event.removed()) {
             removed.add(field.equals(plan.sourceField()) ? plan.preservedField() : field);
@@ -26,7 +26,7 @@ public final class TargetIdentityProjection {
 
     public static Map<String, Object> row(TargetIdentityPlan plan, Map<String, Object> image) {
         requireUsable(plan);
-        if (!plan.automatic() || image == null) return image;
+        if (!plan.isAutomatic() || image == null) return image;
         if (image.containsKey(plan.preservedField())) {
             throw failure(plan, "field-collision");
         }

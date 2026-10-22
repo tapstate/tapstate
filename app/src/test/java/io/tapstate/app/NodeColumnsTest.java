@@ -46,6 +46,20 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class NodeColumnsTest {
 
     @Test
+    void mergedExpansionsRequireOnePreservedName() {
+        NodeColumns source = known("id", "INT64 NOT NULL", "items", "JSON NULL");
+        NodeColumns first = NodeColumns.of(new TransformBody.Unwind("items", "position", false, null, null, "parent_id"),
+                one(source), null);
+        NodeColumns other = NodeColumns.of(new TransformBody.Unwind("items", "position", false, null, null, "root_id"),
+                one(source), null);
+        assertThat(NodeColumns.merged(List.of(source, first)).unwindSourceIdField()).isEqualTo("parent_id");
+        assertThat(NodeColumns.merged(List.of(first, first)).unwindSourceIdField()).isEqualTo("parent_id");
+        assertThatThrownBy(() -> NodeColumns.merged(List.of(first, other)))
+                .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class, error ->
+                        assertThat(error.code()).isEqualTo(io.tapstate.core.dsl.DslError.ILLEGAL_VALUE));
+    }
+
+    @Test
     void successiveExpansionsInheritOrExplicitlyOverrideThePreservedIdentityName() {
         NodeColumns source = known("id", "INT64", "items", "JSON", "tags", "JSON");
         NodeColumns first = NodeColumns.of(new TransformBody.Unwind("items", "item_no", false, null, null, "original_id"),

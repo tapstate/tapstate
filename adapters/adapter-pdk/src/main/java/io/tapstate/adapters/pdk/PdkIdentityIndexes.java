@@ -47,26 +47,35 @@ final class PdkIdentityIndexes {
         boolean opaque = false;
         Set<String> integers = new java.util.HashSet<>();
         for (Map<?, ?> row : query(connector, sql)) {
-            if (!Boolean.TRUE.equals(row.get("is_valid")) || !Boolean.TRUE.equals(row.get("is_ready"))
-                    || row.get("predicate") != null || row.get("expressions") != null
-                    || !Boolean.TRUE.equals(row.get("deterministic"))) {
-                opaque = true;
-                continue;
-            }
-            Object integerColumns = row.get("int64_columns_json");
-            if (integerColumns instanceof String json && JsonReader.parse(json) instanceof List<?> fields) {
-                fields.stream().filter(String.class::isInstance).map(String.class::cast).forEach(integers::add);
-            }
-            Object encoded = row.get("columns_json");
-            Object decoded = encoded instanceof String json ? JsonReader.parse(json) : null;
-            if (!(decoded instanceof List<?> fields) || fields.isEmpty()
-                    || fields.stream().anyMatch(field -> !(field instanceof String))) {
-                opaque = true;
-                continue;
-            }
-            result.add(fields.stream().map(String.class::cast).toList());
+            if (!addPostgresIndex(row, result, integers)) opaque = true;
         }
         return new Evidence(result, opaque, integers);
+    }
+
+    private static boolean addPostgresIndex(Map<?, ?> row, List<List<String>> result, Set<String> integers) {
+        if (!safePostgresIndex(row)) return false;
+        Object integerColumns = row.get("int64_columns_json");
+        if (integerColumns instanceof String json && JsonReader.parse(json) instanceof List<?> fields) {
+            fields.stream().filter(String.class::isInstance).map(String.class::cast).forEach(integers::add);
+        }
+        Object encoded = row.get("columns_json");
+        Object decoded = encoded instanceof String json ? JsonReader.parse(json) : null;
+        List<String> fields = columnNames(decoded);
+        if (fields.isEmpty()) return false;
+        result.add(fields);
+        return true;
+    }
+
+    private static boolean safePostgresIndex(Map<?, ?> row) {
+        return Boolean.TRUE.equals(row.get("is_valid")) && Boolean.TRUE.equals(row.get("is_ready"))
+                && row.get("predicate") == null && row.get("expressions") == null
+                && Boolean.TRUE.equals(row.get("deterministic"));
+    }
+
+    private static List<String> columnNames(Object decoded) {
+        if (!(decoded instanceof List<?> fields) || fields.isEmpty()
+                || fields.stream().anyMatch(field -> !(field instanceof String))) return List.of();
+        return fields.stream().map(String.class::cast).toList();
     }
 
     private static Evidence mysql(PdkConnector connector, String table) throws Throwable {
@@ -87,7 +96,7 @@ final class PdkIdentityIndexes {
             } else {
                 indexes.computeIfAbsent(name, ignored -> new ArrayList<>()).add(field);
                 if ("".equals(row.get("generated_expression")) && row.get("column_type") instanceof String type && type.toLowerCase(java.util.Locale.ROOT)
-                        .matches("bigint(?:\\([0-9]+\\))?")) integers.add(field);
+                        .matches("bigint(?:\\(\\d+\\))?")) integers.add(field);
             }
         }
         unsupported.forEach(indexes::remove);
@@ -104,18 +113,20 @@ final class PdkIdentityIndexes {
             if (!(row.get("spec") instanceof Map<?, ?> spec) || !(spec.get("key") instanceof Map<?, ?> fields)) {
                 throw new IllegalStateException("target index inspection returned an incomplete index spec");
             }
-            if (!Boolean.TRUE.equals(spec.get("unique")) && !"_id_".equals(spec.get("name"))) continue;
-            if (Boolean.TRUE.equals(spec.get("sparse")) || spec.containsKey("partialFilterExpression")
-                    || spec.containsKey("collation") || fields.isEmpty()
-                    || fields.keySet().stream().anyMatch(key -> !(key instanceof String))
-                    || fields.values().stream().anyMatch(value -> !(value instanceof Number number)
-                            || (number.intValue() != 1 && number.intValue() != -1))) {
-                opaque = true;
-                continue;
+            if (Boolean.TRUE.equals(spec.get("unique")) || "_id_".equals(spec.get("name"))) {
+                if (safeMongoIndex(spec, fields)) keys.add(fields.keySet().stream().map(String.class::cast).toList());
+                else opaque = true;
             }
-            keys.add(fields.keySet().stream().map(String.class::cast).toList());
         }
         return new Evidence(keys, opaque, Set.of());
+    }
+
+    private static boolean safeMongoIndex(Map<?, ?> spec, Map<?, ?> fields) {
+        return !Boolean.TRUE.equals(spec.get("sparse")) && !spec.containsKey("partialFilterExpression")
+                && !spec.containsKey("collation") && !fields.isEmpty()
+                && fields.keySet().stream().allMatch(String.class::isInstance)
+                && fields.values().stream().allMatch(value -> value instanceof Number number
+                        && (number.intValue() == 1 || number.intValue() == -1));
     }
 
     private static List<Map<?, ?>> query(PdkConnector connector, String sql) throws Throwable {
