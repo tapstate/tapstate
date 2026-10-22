@@ -4,7 +4,6 @@ import io.tapstate.testsupport.DockerGate;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.parallel.Isolated;
-import org.testcontainers.DockerClientFactory;
 import org.testcontainers.images.builder.ImageFromDockerfile;
 import org.testcontainers.oracle.OracleContainer;
 import org.testcontainers.utility.DockerImageName;
@@ -145,7 +144,6 @@ class OracleFixtureChangeCaptureIT {
                         RUN mv "$ORACLE_HOME/bin/sqlplus" "$ORACLE_HOME/bin/sqlplus-probe-real"
                         COPY sqlplus /tmp/tapstate-probe-sqlplus
                         COPY hold-transaction.sh /tmp/tapstate-hold-transaction.sh
-                        COPY observe-wait.sh /tmp/tapstate-observe-wait.sh
                         RUN cp /tmp/tapstate-probe-sqlplus "$ORACLE_HOME/bin/sqlplus"
                         RUN chmod 755 "$ORACLE_HOME/bin/sqlplus"
                         USER oracle
@@ -163,7 +161,6 @@ class OracleFixtureChangeCaptureIT {
                         fi
                         exec "$ORACLE_HOME/bin/sqlplus-probe-real" "$@" < "$input"
                         """)
-                .withFileFromClasspath("observe-wait.sh", "oracle-fixture/observe-wait.sh")
                 .withFileFromString("hold-transaction.sh", """
                         #!/bin/bash
                         set -eu
@@ -187,7 +184,6 @@ class OracleFixtureChangeCaptureIT {
                         holder=$!
                         for attempt in {1..30}; do
                           if [ -f /tmp/tapstate-transaction-ready ]; then
-                            bash /tmp/tapstate-observe-wait.sh </dev/null > /tmp/tapstate-live-wait.log 2>&1 &
                             printf 'capture-probe: real transaction active; bounded rollback in 130 seconds\\n'
                             exit 0
                           fi
@@ -201,10 +197,6 @@ class OracleFixtureChangeCaptureIT {
                         exit 1
                         """)
                 .get();
-
-        var baseImage = DockerClientFactory.instance().client().inspectImageCmd(ORACLE_IMAGE).exec();
-        System.err.printf("oracle-fixture-probe base-image id=%s digests=%s%n",
-                baseImage.getId(), baseImage.getRepoDigests());
 
         // Image substitution keeps SharedOracle's initialization and failure handling under test.
         Field substitutor = accessibleField(ImageNameSubstitutor.class, "instance");
@@ -226,6 +218,13 @@ class OracleFixtureChangeCaptureIT {
         sharedServer.set(null, null);
         try {
             var settings = SharedOracle.settings("logging_wait_probe");
+            OracleContainer runningServer = (OracleContainer) sharedServer.get(null);
+            var journal = runningServer.execInContainer("bash", "-c",
+                    "cat /tmp/tapstate-main-stage-probe.log /tmp/tapstate-holder-stage-probe.log");
+            assertThat(journal.getExitCode()).isZero();
+            assertThat(stageTime(journal.getStdout(), "main-stage=force-logging"))
+                    .as("logging setup must wait until the controlled ROOT transaction is released")
+                    .isGreaterThanOrEqualTo(stageTime(journal.getStdout(), "holder-stage=holder-sleep-end"));
             try (var connection = DriverManager.getConnection(
                     "jdbc:oracle:thin:@//" + settings.get("host") + ":" + settings.get("port") + "/FREE",
                     settings.get("user").toString(), settings.get("password").toString());
@@ -236,6 +235,21 @@ class OracleFixtureChangeCaptureIT {
                 assertThat(logging.getString(1)).isEqualTo("ARCHIVELOG");
                 assertThat(logging.getString(2)).isEqualTo("YES");
                 assertThat(logging.getString(3)).isEqualTo("YES");
+            }
+            try (var connection = DriverManager.getConnection(
+                    "jdbc:oracle:thin:@//" + settings.get("host") + ":" + settings.get("port") + "/FREEPDB1",
+                    settings.get("user").toString(), settings.get("password").toString());
+                 var statement = connection.createStatement();
+                 var logging = statement.executeQuery(
+                         "SELECT SYS_CONTEXT('USERENV', 'CON_NAME'), LOG_MODE, SUPPLEMENTAL_LOG_DATA_MIN, "
+                                 + "FORCE_LOGGING, (SELECT OPEN_MODE FROM V$PDBS WHERE NAME = 'FREEPDB1') "
+                                 + "FROM V$DATABASE")) {
+                assertThat(logging.next()).isTrue();
+                assertThat(logging.getString(1)).isEqualTo("FREEPDB1");
+                assertThat(logging.getString(2)).isEqualTo("ARCHIVELOG");
+                assertThat(logging.getString(3)).isEqualTo("YES");
+                assertThat(logging.getString(4)).isEqualTo("YES");
+                assertThat(logging.getString(5)).isEqualTo("READ WRITE");
             }
         } finally {
             try {
@@ -248,6 +262,13 @@ class OracleFixtureChangeCaptureIT {
                 substitutor.set(null, originalSubstitutor);
             }
         }
+    }
+
+    private static long stageTime(String journal, String stage) {
+        String prefix = "oracle-fixture-probe " + stage + " epoch-ms=";
+        return journal.lines().filter(line -> line.startsWith(prefix))
+                .mapToLong(line -> Long.parseLong(line.substring(prefix.length())))
+                .findFirst().orElseThrow(() -> new AssertionError("Missing Oracle fixture stage: " + stage));
     }
 
     private static Field accessibleField(Class<?> owner, String name) throws NoSuchFieldException {
