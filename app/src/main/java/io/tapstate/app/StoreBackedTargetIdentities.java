@@ -37,11 +37,41 @@ final class StoreBackedTargetIdentities implements PipelineTargetIdentities {
     record Resolved(Assessment assessment, String stream, TargetIdentityPlan plan) { }
 
     @Override
+    public boolean relevant(PipelineResource definition) {
+        if (definition.serve() == null || definition.transforms() == null || definition.transforms().isEmpty()) return false;
+        Map<String, io.tapstate.core.model.Resource> resources = new LinkedHashMap<>();
+        boolean hasExpansion = false;
+        for (var step : definition.transforms()) {
+            io.tapstate.core.model.TransformBody body;
+            if (step instanceof io.tapstate.core.model.Step.Inline inline) body = inline.body();
+            else {
+                var use = (io.tapstate.core.model.Step.Use) step;
+                var resource = referenced(use.use());
+                resources.put(resource.id(), resource);
+                body = resource instanceof io.tapstate.core.model.TransformResource transform ? transform.body() : null;
+            }
+            hasExpansion |= body instanceof io.tapstate.core.model.TransformBody.Unwind;
+        }
+        if (!hasExpansion) return false;
+        for (var source : definition.sources()) resources.put(source.id(), referenced(source.id()));
+        if (definition.serve() instanceof io.tapstate.core.model.ServeBlock.Use use) {
+            resources.put(use.use(), referenced(use.use()));
+        }
+        return io.tapstate.core.dsl.UnwindRules.reachesSyncTarget(definition, resources);
+    }
+
+    private io.tapstate.core.model.Resource referenced(String id) {
+        return artifacts.get(id).orElseThrow(() -> new io.tapstate.core.common.TapstateException(
+                io.tapstate.core.dsl.DslError.MISSING_REFERENCE, Map.of("path", "unwind target identity", "ref", id), null));
+    }
+
+    @Override
     public List<Assessment> assess(PipelineResource definition, boolean fullLoad) {
         return resolve(definition, fullLoad).stream().map(Resolved::assessment).distinct().toList();
     }
 
     List<Resolved> resolve(PipelineResource definition, boolean fullLoad) {
+        if (!relevant(definition)) return List.of();
         var source = new StoreBackedDagSource(store, NestSettings.defaults(), artifacts);
         List<Resolved> results = new ArrayList<>();
         source.writeTargets(definition, (coordinate, stream, target) -> {

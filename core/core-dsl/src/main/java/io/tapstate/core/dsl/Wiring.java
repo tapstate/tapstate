@@ -159,9 +159,21 @@ final class Wiring {
 
     private void collect(FromRef ref, Set<Upstream> reached, Set<String> visiting,
             List<Route> routes, List<Step> steps) {
-        if (ref instanceof FromRef.Regex) {
-            // which tables it selects needs a connection to answer, so every table is in play
+        if (ref instanceof FromRef.Regex regex) {
+            // Table discovery stays conservative, but declared transform IDs are already known.
             arrive(whole(allSources), reached, routes, steps);
+            java.util.regex.Pattern pattern;
+            try {
+                pattern = java.util.regex.Pattern.compile(regex.pattern());
+            } catch (java.util.regex.PatternSyntaxException invalid) {
+                // Runtime owns the syntax diagnostic; an unresolvable selector cannot hide a step.
+                pattern = null;
+            }
+            for (String stepId : stepsById.keySet()) {
+                if (pattern == null || pattern.matcher(stepId).matches()) {
+                    followNode(stepId, reached, visiting, routes, steps);
+                }
+            }
             return;
         }
         String token = ((FromRef.Literal) ref).ref();

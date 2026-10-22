@@ -164,8 +164,9 @@ class BoundedPipelinePreviewIT {
             assertThat((List<?>) documentBy(documents(nested), "id", "order-3").get("items")).isEmpty();
 
             Map<String, Object> unwound = result(control, source, unwindPipelineYaml(), "preview_sync",
-                    SAMPLE_ID + "-unwind", true);
-            assertThat(unwound).containsEntry("format", "logical-json").containsEntry("complete", true);
+                    SAMPLE_ID + "-unwind", true, true);
+            assertThat(unwound).containsEntry("format", "logical-json").containsEntry("complete", true)
+                    .containsEntry("logicalDocuments", unwound.get("documents"));
             assertThat(((Number) unwound.get("rowCount")).intValue()).isEqualTo(6);
             assertThat(values(documents(unwound), "item_index").stream()
                     .map(Number.class::cast)
@@ -209,6 +210,12 @@ class BoundedPipelinePreviewIT {
     private static Map<String, Object> result(
             ControlPlane control, Path directory, String pipelineYaml, String outputId, String sampleId,
             boolean includeTarget) {
+        return result(control, directory, pipelineYaml, outputId, sampleId, includeTarget, false);
+    }
+
+    private static Map<String, Object> result(
+            ControlPlane control, Path directory, String pipelineYaml, String outputId, String sampleId,
+            boolean includeTarget, boolean expectIdentity) {
         List<ControlPlane.PreviewDraft> drafts = new java.util.ArrayList<>();
         drafts.add(new ControlPlane.PreviewDraft("preview_source.tap.yml", sourceYaml(directory)));
         drafts.add(new ControlPlane.PreviewDraft("preview_pipeline.tap.yml", pipelineYaml));
@@ -217,9 +224,17 @@ class BoundedPipelinePreviewIT {
                     "preview_target.tap.yml", targetYaml(directory.resolve("preview-target"))));
         }
         List<Map<String, Object>> events = control.preview(PIPELINE_ID, outputId, 100, sampleId, drafts);
+        Object[] prefix = expectIdentity
+                ? new String[] {"run.accepted", "compile.completed", "identity.completed", "sample.completed"}
+                : new String[] {"run.accepted", "compile.completed", "sample.completed"};
         assertThat(events).extracting(event -> event.get("kind"))
-                .startsWith("run.accepted", "compile.completed", "sample.completed")
-                .endsWith("result.completed", "run.completed");
+                .startsWith(prefix).endsWith("result.completed", "run.completed");
+        if (expectIdentity) {
+            List<?> targets = (List<?>) payload(events, "identity.completed").get("targets");
+            assertThat(targets).hasSize(1);
+            assertThat(((Map<?, ?>) targets.getFirst()).get("status")).isEqualTo("not-required");
+            assertThat(((Map<?, ?>) targets.getFirst()).get("generatedFields")).isEqualTo(List.of());
+        }
         return payload(events, "result.completed");
     }
 

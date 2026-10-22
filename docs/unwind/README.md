@@ -87,7 +87,14 @@ This decision is based on constraints, not just a database name. An ordinary
 composite-key target keeps its fields unchanged. An existing PostgreSQL or MySQL
 table with an independently generated identity can also qualify, provided its
 schema already contains the preserved field and a non-null, complete unique
-matching key. Tapstate does not add missing columns to an existing relational
+matching key. Automatic relational mapping currently requires signed 64-bit
+integer source keys and ordinary writable signed BIGINT target columns for every
+matching component. Every before/after key value is also checked at write time:
+strings, floating-point values, decimals, nulls and values outside the signed
+64-bit range are rejected before any row in that batch reaches the connector.
+Sampled integer metadata therefore cannot silently authorize later CDC type drift.
+Other representations, including string-to-number coercion, decimal rounding and
+unknown widths, are refused until lossless equality can be established. Tapstate does not add missing columns to an existing relational
 table, remove business constraints, or rename unrelated unique fields to make a
 write succeed. Partial, expression, prefix, sparse or non-simple-collation unique
 indexes do not establish the required guarantee and block automatic separation.

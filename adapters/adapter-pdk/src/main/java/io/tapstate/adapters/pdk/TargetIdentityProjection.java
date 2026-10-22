@@ -2,6 +2,8 @@ package io.tapstate.adapters.pdk;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.ConvertedValue;
+import java.math.BigInteger;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.Map;
@@ -34,7 +36,17 @@ public final class TargetIdentityProjection {
         Map<String, Object> projected = new LinkedHashMap<>();
         image.forEach((field, value) -> projected.put(
                 field.equals(plan.sourceField()) ? plan.preservedField() : field, value));
+        // Discovery is sampled; reject runtime drift before a connector can coerce distinct keys.
+        if (plan.requireSignedInt64Keys() && plan.writeKey().stream()
+                .anyMatch(field -> !signedInt64(ConvertedValue.unwrap(projected.get(field))))) {
+            throw failure(plan, "key-representation-unsupported");
+        }
         return projected;
+    }
+
+    private static boolean signedInt64(Object value) {
+        return value instanceof Byte || value instanceof Short || value instanceof Integer || value instanceof Long
+                || value instanceof BigInteger integer && integer.bitLength() <= 63;
     }
 
     public static void requireUsable(TargetIdentityPlan plan) {

@@ -17,7 +17,7 @@ final class PdkIdentityIndexes {
         return connector.equals("postgres") || MYSQL.contains(connector);
     }
 
-    record Evidence(List<List<String>> keys, boolean opaqueUniqueConstraints) { }
+    record Evidence(List<List<String>> keys, boolean opaqueUniqueConstraints, Set<String> signedInt64Columns) { }
 
     static Evidence read(PdkConnector connector, String table) throws Throwable {
         return connector.connectorId().equals("postgres") ? postgres(connector, table) : mysql(connector, table);
@@ -30,6 +30,9 @@ final class PdkIdentityIndexes {
                 SELECT i.relname AS index_name, ix.indisvalid AS is_valid, ix.indisready AS is_ready,
                   pg_get_expr(ix.indpred, ix.indrelid) AS predicate,
                   pg_get_expr(ix.indexprs, ix.indrelid) AS expressions,
+                  (SELECT json_agg(a.attname)::text FROM unnest(ix.indkey) AS k(attnum)
+                   JOIN pg_attribute a ON a.attrelid = ct.oid AND a.attnum = k.attnum
+                   WHERE a.atttypid = 'int8'::regtype AND a.attgenerated = '' AND a.attidentity = '') AS int64_columns_json,
                   NOT EXISTS (SELECT 1 FROM unnest(ix.indcollation) AS ic(oid)
                     JOIN pg_collation co ON co.oid = ic.oid WHERE NOT co.collisdeterministic) AS deterministic,
                   (SELECT json_agg(a.attname ORDER BY k.ordinality)::text
@@ -42,12 +45,17 @@ final class PdkIdentityIndexes {
                 """.formatted(schemaExpression, literal(table, true));
         List<List<String>> result = new ArrayList<>();
         boolean opaque = false;
+        Set<String> integers = new java.util.HashSet<>();
         for (Map<?, ?> row : query(connector, sql)) {
             if (!Boolean.TRUE.equals(row.get("is_valid")) || !Boolean.TRUE.equals(row.get("is_ready"))
                     || row.get("predicate") != null || row.get("expressions") != null
                     || !Boolean.TRUE.equals(row.get("deterministic"))) {
                 opaque = true;
                 continue;
+            }
+            Object integerColumns = row.get("int64_columns_json");
+            if (integerColumns instanceof String json && JsonReader.parse(json) instanceof List<?> fields) {
+                fields.stream().filter(String.class::isInstance).map(String.class::cast).forEach(integers::add);
             }
             Object encoded = row.get("columns_json");
             Object decoded = encoded instanceof String json ? JsonReader.parse(json) : null;
@@ -58,17 +66,18 @@ final class PdkIdentityIndexes {
             }
             result.add(fields.stream().map(String.class::cast).toList());
         }
-        return new Evidence(result, opaque);
+        return new Evidence(result, opaque, integers);
     }
 
     private static Evidence mysql(PdkConnector connector, String table) throws Throwable {
         String sql = "SELECT s.INDEX_NAME AS index_name, s.COLUMN_NAME AS column_name, s.SUB_PART AS prefix_length, "
-                + "c.COLLATION_NAME AS collation_name FROM information_schema.statistics s "
+                + "c.COLLATION_NAME AS collation_name, c.COLUMN_TYPE AS column_type, c.GENERATION_EXPRESSION AS generated_expression FROM information_schema.statistics s "
                 + "LEFT JOIN information_schema.columns c ON c.TABLE_SCHEMA = s.TABLE_SCHEMA "
                 + "AND c.TABLE_NAME = s.TABLE_NAME AND c.COLUMN_NAME = s.COLUMN_NAME "
                 + "WHERE s.NON_UNIQUE = 0 AND s.TABLE_SCHEMA = DATABASE() "
                 + "AND s.TABLE_NAME = " + literal(table, false) + " ORDER BY s.INDEX_NAME, s.SEQ_IN_INDEX";
         Map<String, List<String>> indexes = new LinkedHashMap<>();
+        Set<String> integers = new java.util.HashSet<>();
         Set<String> unsupported = new java.util.HashSet<>();
         for (Map<?, ?> row : query(connector, sql)) {
             String name = String.valueOf(row.get("index_name"));
@@ -77,10 +86,12 @@ final class PdkIdentityIndexes {
                 unsupported.add(name);
             } else {
                 indexes.computeIfAbsent(name, ignored -> new ArrayList<>()).add(field);
+                if ("".equals(row.get("generated_expression")) && row.get("column_type") instanceof String type && type.toLowerCase(java.util.Locale.ROOT)
+                        .matches("bigint(?:\\([0-9]+\\))?")) integers.add(field);
             }
         }
         unsupported.forEach(indexes::remove);
-        return new Evidence(new ArrayList<>(indexes.values()), !unsupported.isEmpty());
+        return new Evidence(new ArrayList<>(indexes.values()), !unsupported.isEmpty(), integers);
     }
 
     static Evidence mongo(PdkConnector connector, String table) throws Throwable {
@@ -104,7 +115,7 @@ final class PdkIdentityIndexes {
             }
             keys.add(fields.keySet().stream().map(String.class::cast).toList());
         }
-        return new Evidence(keys, opaque);
+        return new Evidence(keys, opaque, Set.of());
     }
 
     private static List<Map<?, ?>> query(PdkConnector connector, String sql) throws Throwable {

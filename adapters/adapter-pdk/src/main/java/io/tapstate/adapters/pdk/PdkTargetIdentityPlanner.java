@@ -106,12 +106,14 @@ public final class PdkTargetIdentityPlanner {
                         unique.add(index.getIndexFields().stream().map(field -> field.getName()).toList());
                     }
                 }
+                Set<String> signedInt64Columns = Set.of();
                 boolean opaqueUniqueConstraints = existing != null && !documentIdentity
                         && !PdkIdentityIndexes.supports(connector.connectorId());
                 if (documentIdentity && existing != null) {
                     var evidence = PdkIdentityIndexes.mongo(connector, target.name());
                     unique = evidence.keys();
                     opaqueUniqueConstraints = evidence.opaqueUniqueConstraints();
+                    signedInt64Columns = evidence.signedInt64Columns();
                 }
                 boolean exactRelational = PdkIdentityIndexes.supports(connector.connectorId());
                 if (existing != null && !documentIdentity && exactRelational) {
@@ -119,6 +121,7 @@ public final class PdkTargetIdentityPlanner {
                     var evidence = PdkIdentityIndexes.read(connector, target.name());
                     unique = evidence.keys();
                     opaqueUniqueConstraints = evidence.opaqueUniqueConstraints();
+                    signedInt64Columns = evidence.signedInt64Columns();
                 }
                 boolean mayPrepare = existing == null;
                 if (documentIdentity && existing != null) {
@@ -135,7 +138,7 @@ public final class PdkTargetIdentityPlanner {
                 return TargetIdentityResolver.resolve(target, new TargetIdentityFacts(existing != null,
                         documentIdentity, primary, generated, columns, unique, nullable, documentIdentity,
                         connector.functions().getWriteRecordFunction() != null
-                                && (documentIdentity || exactRelational), mayPrepare, opaqueUniqueConstraints));
+                                && (documentIdentity || exactRelational), mayPrepare, opaqueUniqueConstraints, signedInt64Columns));
             });
         } catch (TapstateException coded) {
             throw coded;

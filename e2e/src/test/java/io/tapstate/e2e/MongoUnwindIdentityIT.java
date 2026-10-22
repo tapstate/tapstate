@@ -9,7 +9,6 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.core.model.PipelineNode;
 import io.tapstate.spi.sink.*;
 import io.tapstate.testsupport.RequiresDocker;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -29,11 +28,7 @@ class MongoUnwindIdentityIT {
     @BeforeAll
     static void loadConnector() throws Exception {
         RealConnectorGate.require("mongodb");
-        Path jar;
-        try (var entries = Files.list(Path.of(System.getProperty("tapstate.e2e.connectors-dir")))) {
-            jar = entries.filter(path -> path.getFileName().toString().startsWith("mongodb")
-                    && path.toString().endsWith(".jar")).findFirst().orElseThrow();
-        }
+        Path jar = ConnectorJars.pathFor("mongodb");
         var inspected = new ConnectorIntrospector().introspect(List.of(jar));
         connector = new ConnectorRef(List.of(jar), inspected.className(), inspected.pdkApiVersion(),
                 null, inspected.spec());

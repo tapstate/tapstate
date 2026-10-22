@@ -20,8 +20,18 @@ public final class UnwindTargetIdentityCheck implements StartCheck {
 
     @Override
     public List<StartFinding> evaluate(StartCheckContext context) {
-        return identities.assess(context.definition(), context.plan().load() == StartLoad.FULL_LOAD)
-                .stream().map(this::finding).toList();
+        if (!identities.relevant(context.definition())) return List.of();
+        try {
+            return identities.assess(context.definition(), context.plan().load() == StartLoad.FULL_LOAD)
+                    .stream().map(this::finding).toList();
+        } catch (io.tapstate.core.common.TapstateException diagnosed) {
+            if (diagnosed.code() == io.tapstate.core.dsl.DslError.UNWIND_COLUMN_ALREADY_EXISTS) {
+                // Assembly already rejects this source-column collision before any sink opens.
+                // Preserve that lifecycle diagnosis rather than replace it with a target-identity error.
+                return List.of();
+            }
+            throw diagnosed;
+        }
     }
 
     private StartFinding finding(PipelineTargetIdentities.Assessment assessment) {

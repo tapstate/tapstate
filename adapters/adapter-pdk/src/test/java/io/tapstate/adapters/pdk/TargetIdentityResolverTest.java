@@ -31,7 +31,7 @@ class TargetIdentityResolverTest {
     void aCompositeTargetKeyNeedsNoProjection() {
         var facts = new TargetIdentityFacts(true, false, List.of("id", "position"), Set.of(),
                 Set.of("id", "position", "value"), List.of(List.of("id", "position")),
-                Set.of(), false, true, false, false);
+                Set.of(), false, true, false, false, Set.of(PRESERVED, "position"));
         assertThat(TargetIdentityResolver.resolve(expanded("id", PRESERVED), facts).status())
                 .isEqualTo(TargetIdentityPlan.NOT_REQUIRED);
     }
@@ -40,7 +40,7 @@ class TargetIdentityResolverTest {
     void aCompositePrimaryKeyDoesNotHideAConflictingBusinessUniqueKey() {
         var facts = new TargetIdentityFacts(true, false, List.of("id", "position"), Set.of(),
                 Set.of("id", "position", "value"), List.of(List.of("id", "position"), List.of("id")),
-                Set.of(), false, true, false, false);
+                Set.of(), false, true, false, false, Set.of(PRESERVED, "position"));
         assertThat(TargetIdentityResolver.resolve(expanded("id", PRESERVED), facts).reason())
                 .isEqualTo("other-unique-constraint");
     }
@@ -53,6 +53,46 @@ class TargetIdentityResolverTest {
         assertThat(plan.status()).isEqualTo(TargetIdentityPlan.AUTOMATIC);
         assertThat(plan.target().fields()).extracting(TargetField::name).doesNotContain("id");
         assertThat(plan.writeKey()).containsExactly(PRESERVED, "position");
+    }
+
+    @Test
+    void targetKeyCoercionCannotCollapseDistinctSourceIdentities() {
+        var numeric = expanded("id", PRESERVED);
+        var fields = new java.util.ArrayList<>(numeric.fields());
+        fields.set(0, new TargetField("id", "varchar(80)", true, io.tapstate.core.common.TapstateType.STRING));
+        var strings = new TargetTable(numeric.name(), fields, numeric.indexes(), numeric.unwindIdentity());
+        assertThat(TargetIdentityResolver.resolve(strings, relational(true, Set.of("id", PRESERVED, "position"),
+                List.of(List.of(PRESERVED, "position")), Set.of())).reason()).isEqualTo("key-representation-unsupported");
+    }
+
+    @Test
+    void runtimeKeyValuesCannotContradictTheSampledIntegerModel() {
+        var plan = TargetIdentityResolver.resolve(expanded("id", PRESERVED),
+                relational(true, Set.of("id", PRESERVED, "position"),
+                        List.of(List.of(PRESERVED, "position")), Set.of()));
+        var valid = Map.<String, Object>of("id", new ConvertedValue(700L, "bigint"), "position", 0L);
+        assertThat(TargetIdentityProjection.row(plan, valid)).containsEntry(PRESERVED, valid.get("id"));
+        for (Object invalid : java.util.Arrays.asList("01", "1", 1.0, java.math.BigDecimal.ONE,
+                java.math.BigInteger.valueOf(Long.MAX_VALUE).add(java.math.BigInteger.ONE), null)) {
+            for (String field : List.of("id", "position")) {
+                var bad = new java.util.LinkedHashMap<>(valid);
+                bad.put(field, invalid);
+                for (Envelope event : List.of(Envelope.insert(1L, "rows", bad, null),
+                        Envelope.update(1L, "rows", bad, valid, null),
+                        Envelope.delete(1L, "rows", bad, null))) {
+                    assertThatThrownBy(() -> TargetIdentityProjection.apply(plan, event))
+                            .isInstanceOfSatisfying(TapstateException.class, error -> {
+                                assertThat(error.code()).isEqualTo(ConnectorError.TARGET_IDENTITY_CONFLICT);
+                                assertThat(error.args()).containsEntry("reason", "key-representation-unsupported");
+                            });
+                }
+            }
+        }
+        for (Object validInteger : List.of((byte) 1, (short) 1, 1, Long.MIN_VALUE, Long.MAX_VALUE,
+                java.math.BigInteger.valueOf(Long.MAX_VALUE))) {
+            assertThat(TargetIdentityProjection.row(plan, Map.of("id", validInteger, "position", 0L)))
+                    .containsEntry(PRESERVED, validInteger);
+        }
     }
 
     @Test
@@ -129,26 +169,26 @@ class TargetIdentityResolverTest {
     void opaqueUniqueConstraintsCannotBeDiscardedAsIfTheyDidNotExist() {
         var facts = new TargetIdentityFacts(true, false, List.of("id"), Set.of("id"),
                 Set.of("id", PRESERVED, "position", "value"),
-                List.of(List.of("id"), List.of(PRESERVED, "position")), Set.of(), false, true, false, true);
+                List.of(List.of("id"), List.of(PRESERVED, "position")), Set.of(), false, true, false, true, Set.of(PRESERVED, "position"));
         assertThat(TargetIdentityResolver.resolve(expanded("id", PRESERVED), facts).reason())
                 .isEqualTo("other-unique-constraint");
     }
 
     private static TargetTable expanded(String id, String preserved) {
-        return new TargetTable("rows", List.of(new TargetField(id, "string", true),
-                new TargetField("position", "long", true), new TargetField("value", "string", false)),
+        return new TargetTable("rows", List.of(new TargetField(id, "string", true, id.equals("id") ? io.tapstate.core.common.TapstateType.INT64 : io.tapstate.core.common.TapstateType.STRING),
+                new TargetField("position", "long", true, io.tapstate.core.common.TapstateType.INT64), new TargetField("value", "string", false)),
                 List.of(new TargetIndex(List.of(id, "position"), true)),
                 new UnwindIdentity(List.of(id), preserved));
     }
 
     private static TargetIdentityFacts document() {
         return new TargetIdentityFacts(false, true, List.of("_id"), Set.of("_id"), Set.of(),
-                List.of(List.of("_id")), Set.of(), true, true, true, false);
+                List.of(List.of("_id")), Set.of(), true, true, true, false, Set.of());
     }
 
     private static TargetIdentityFacts relational(boolean generated, Set<String> columns,
             List<List<String>> indexes, Set<String> nullable) {
         return new TargetIdentityFacts(true, false, List.of("id"), generated ? Set.of("id") : Set.of(),
-                columns, indexes, nullable, false, true, false, false);
+                columns, indexes, nullable, false, true, false, false, Set.of(PRESERVED, "position"));
     }
 }

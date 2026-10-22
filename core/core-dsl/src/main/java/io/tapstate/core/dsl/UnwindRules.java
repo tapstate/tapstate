@@ -84,6 +84,18 @@ public final class UnwindRules {
         }
     }
 
+    /** Whether a resolved unwind contributes rows to an external sync target, without reading schemas. */
+    public static boolean reachesSyncTarget(PipelineResource pipeline, Map<String, Resource> resources) {
+        if (pipeline.serve() == null || pipeline.transforms() == null
+                || syncElements(pipeline.serve(), resources).isEmpty()) return false;
+        Set<String> reaching = new Wiring(pipeline, resources).nodesReaching(switch (pipeline.serve()) {
+            case ServeBlock.Inline inline -> inline.from();
+            case ServeBlock.Use use -> use.from();
+        });
+        return pipeline.transforms().stream().anyMatch(step -> reaching.contains(step.id())
+                && bodyOf(step, resources) instanceof TransformBody.Unwind);
+    }
+
     private static void validatePipeline(PipelineResource p, Map<String, Resource> byId) {
         List<Step> steps = p.transforms() == null ? List.of() : p.transforms();
         Set<String> unwinds = new LinkedHashSet<>();

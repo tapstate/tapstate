@@ -95,9 +95,10 @@ class RealMongoUnwindIdentityIT {
                                 include_array_index: TAG_NO
                                 element_type: string
                             %sserve:
-                              from: expanded
+                              from: %s
                               sync: [{ id: output, source: tgt_orders, write_mode: upsert, on_full_load: clear }]
-                            """.formatted(pipeline, objectIds ? "    source_id_field: original_order_id\n" : ""));
+                            """.formatted(pipeline, objectIds ? "    source_id_field: original_order_id\n" : "",
+                                    objectIds ? "/^expanded$/" : "expanded"));
                     control.apply(resources);
                     control.lifecycle(pipeline, LifecycleVerb.START);
                     Await.until("all 400 expanded snapshot rows", TIMEOUT,

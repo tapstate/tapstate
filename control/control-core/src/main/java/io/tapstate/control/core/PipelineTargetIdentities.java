@@ -6,6 +6,9 @@ import java.util.List;
 /** Read-only identity assessment of the exact definition and target tables a start would write. */
 @FunctionalInterface
 public interface PipelineTargetIdentities {
+    /** A reader can prove this check irrelevant before target planning asks for metadata. */
+    default boolean relevant(PipelineResource definition) { return true; }
+
     List<Assessment> assess(PipelineResource definition, boolean fullLoad);
 
     record Assessment(String element, String connection, String table, String status, String reason,

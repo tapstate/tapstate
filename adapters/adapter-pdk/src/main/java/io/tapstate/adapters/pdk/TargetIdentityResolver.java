@@ -60,6 +60,10 @@ public final class TargetIdentityResolver {
         if (facts.exists() && !indexed && !facts.mayPrepareLogicalIndex()) {
             return blocked("logical-key-index-missing", input, field, preserved, projectedKey);
         }
+        if (facts.exists() && !facts.flexibleColumns() && input.fields().stream().filter(TargetField::primaryKey)
+                .anyMatch(column -> !losslessIntegerKey(column, rename.apply(column.name()), facts))) {
+            return blocked("key-representation-unsupported", input, field, preserved, projectedKey);
+        }
         for (List<String> unique : facts.uniqueKeys()) {
             if (!unique.contains(field) && !unique.containsAll(projectedKey)) {
                 return blocked("other-unique-constraint", input, field, preserved, projectedKey);
@@ -70,8 +74,19 @@ public final class TargetIdentityResolver {
                 column.numericType(), column.stringType())).toList();
         List<TargetIndex> indexes = input.indexes().stream().map(index -> new TargetIndex(
                 index.fields().stream().map(rename).toList(), index.unique(), index.constrainsEveryRow())).toList();
-        return plan(TargetIdentityPlan.AUTOMATIC, "generated-target-identity",
-                new TargetTable(input.name(), fields, indexes), field, preserved, projectedKey);
+        return new TargetIdentityPlan(TargetIdentityPlan.AUTOMATIC, "generated-target-identity",
+                new TargetTable(input.name(), fields, indexes), field, preserved, projectedKey, !facts.flexibleColumns());
+    }
+
+    private static boolean losslessIntegerKey(TargetField source, String target, TargetIdentityFacts facts) {
+        if (source.inferredType() != io.tapstate.core.common.TapstateType.INT64
+                || !facts.signedInt64Columns().contains(target)) return false;
+        var number = source.numericType();
+        return number == null || (!Boolean.TRUE.equals(number.unsigned())
+                && !Boolean.FALSE.equals(number.fixed()) && (number.bit() == null || number.bit() <= 64)
+                && (number.scale() == null || number.scale() == 0)
+                && (number.minValue() == null || number.minValue().compareTo(java.math.BigDecimal.valueOf(Long.MIN_VALUE)) >= 0)
+                && (number.maxValue() == null || number.maxValue().compareTo(java.math.BigDecimal.valueOf(Long.MAX_VALUE)) <= 0));
     }
 
     private static TargetIdentityPlan blocked(String reason, TargetTable input, String field,

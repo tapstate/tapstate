@@ -9,7 +9,6 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.core.model.PipelineNode;
 import io.tapstate.spi.sink.*;
 import io.tapstate.testsupport.RequiresDocker;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
@@ -24,11 +23,7 @@ class PostgresUnwindIdentityIT {
     @Test
     void generatedIdentityKeepsSiblingRowsAndReplaysWithoutDuplicates() throws Exception {
         RealConnectorGate.require("postgres");
-        Path jar;
-        try (var paths = Files.list(Path.of(System.getProperty("tapstate.e2e.connectors-dir")))) {
-            jar = paths.filter(path -> path.getFileName().toString().startsWith("postgres-connector")
-                    && path.toString().endsWith(".jar")).findFirst().orElseThrow();
-        }
+        Path jar = ConnectorJars.pathFor("postgres");
         var inspected = new ConnectorIntrospector().introspect(List.of(jar));
         ConnectorRef connector = new ConnectorRef(List.of(jar), inspected.className(), inspected.pdkApiVersion(), null, inspected.spec());
         var settings = SharedPostgres.settings("unwind_" + UUID.randomUUID().toString().replace("-", ""));
@@ -90,6 +85,12 @@ class PostgresUnwindIdentityIT {
                 var refused = new PdkTargetIdentityPlanner(id -> connector).assess(config, Map.of("expanded", target)).get("expanded");
                 assertThat(refused.status()).isEqualTo("action-required");
                 assertThat(refused.reason()).isEqualTo("other-unique-constraint");
+                sql.execute("DROP TABLE expanded");
+                sql.execute("CREATE TABLE expanded (id bigserial PRIMARY KEY, "
+                        + "_unwind_source_id bigint GENERATED ALWAYS AS (42) STORED NOT NULL, "
+                        + "position bigint NOT NULL, value text, UNIQUE (_unwind_source_id, position))");
+                assertThat(new PdkTargetIdentityPlanner(id -> connector).assess(config, Map.of("expanded", target))
+                        .get("expanded").reason()).isEqualTo("key-representation-unsupported");
             } finally {
                 sql.execute("DROP TABLE expanded");
             }

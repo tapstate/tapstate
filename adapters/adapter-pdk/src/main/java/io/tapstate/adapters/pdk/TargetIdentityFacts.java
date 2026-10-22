@@ -7,12 +7,13 @@ import java.util.Set;
 public record TargetIdentityFacts(boolean exists, boolean flexibleColumns, List<String> primaryKey,
         Set<String> generatedColumns, Set<String> columns, List<List<String>> uniqueKeys,
         Set<String> nullableColumns, boolean nullsCompareEqual, boolean logicalKeyWrites,
-        boolean mayPrepareLogicalIndex, boolean opaqueUniqueConstraints) {
+        boolean mayPrepareLogicalIndex, boolean opaqueUniqueConstraints, Set<String> signedInt64Columns) {
     public TargetIdentityFacts {
         primaryKey = List.copyOf(primaryKey);
         generatedColumns = Set.copyOf(generatedColumns);
         columns = Set.copyOf(columns);
         uniqueKeys = uniqueKeys.stream().map(List::copyOf).toList();
         nullableColumns = Set.copyOf(nullableColumns);
+        signedInt64Columns = Set.copyOf(signedInt64Columns);
     }
 }
