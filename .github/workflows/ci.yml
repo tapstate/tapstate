@@ -5,8 +5,8 @@
 # separate workflow (no-agent-footprint.yml).
 # Specifications (e2e/*IT) run here against real containers: this runner has a Docker daemon, and
 # the e2e module fails rather than skips when one is missing, so a green build here means they ran.
-# On a developer machine they skip instead — and note Docker 29 rejects the API version the client
-# negotiates by default, so running them locally needs -Dapi.version=1.44.
+# On a developer machine they skip instead. Docker 29 rejects the client's default API version;
+# the test steps pass API 1.44 explicitly, as local verification can with -Dapi.version=1.44.
 # Deliberately excluded for now: native-image build (pinned to local darwin-arm64 until D5) and the
 # connector catalog *refresh* - regenerating it needs a connectors checkout and built connector jars.
 # The catalog's own consistency gates are PDK-free and run in the build above; the shell that drives
@@ -129,6 +129,12 @@ jobs:
           .github/scripts/ci-evidence.sh inventory --root . --lane ci --published-connectors absent --native-cli-presence absent --output "$RUNNER_TEMP/source-inventory.json"
           .github/scripts/ci-evidence.sh resolve --root . --inventory "$RUNNER_TEMP/source-inventory.json" --inputs "$RUNNER_TEMP/ci-inputs/build-inputs.json" --repo-local "$RUNNER_TEMP/m2" --output "$RUNNER_TEMP/resolved-inventory.json" --probe-receipt "$RUNNER_TEMP/ci-inputs/provider-probe-receipt.json"
           .github/scripts/ci-evidence.sh export-hashes --input "$RUNNER_TEMP/resolved-inventory.json" --output "$RUNNER_TEMP/ci-inputs/expected-case-hashes.json"
+      - name: Record storage before the test shard
+        run: |
+          df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP" /tmp
+          if ! docker system df; then
+            echo '::warning::Docker storage could not be observed before the test shard.'
+          fi
       - name: Execute exactly this shard
         env:
           MAVEN_ARGS: "-Dapi.version=1.44"
@@ -157,6 +163,16 @@ jobs:
       - name: Record post-test input hashes
         if: always()
         run: .github/scripts/ci-receipt.sh inputs --root . --repo-local "$RUNNER_TEMP/m2" --phase post-test-before-pack --runtime-class-dir "$RUNNER_TEMP/ci-runtime-bytecode" --output "$RUNNER_TEMP/ci-inputs/post-test-inputs.json" --shard-id "${{ matrix.shard }}" --maven-observation "$RUNNER_TEMP/maven-observation/summary.json"
+      - name: Record storage after the test shard
+        if: always()
+        run: |
+          df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP" /tmp
+          if ! docker system df; then
+            echo '::warning::Docker storage could not be observed after the test shard.'
+          fi
+          if ! du -sh "$RUNNER_TEMP/m2" "$GITHUB_WORKSPACE" /tmp; then
+            echo '::warning::Some test storage could not be measured.'
+          fi
       - name: Preserve downloaded dependencies
         if: always()
         run: .github/scripts/ci-maven-cache.sh collect "$HOME/.m2/repository" "$RUNNER_TEMP/m2"

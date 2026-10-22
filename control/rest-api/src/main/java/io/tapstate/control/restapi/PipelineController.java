@@ -3,19 +3,26 @@ package io.tapstate.control.restapi;
 import io.tapstate.control.core.PipelineError;
 import io.tapstate.control.core.PipelineInput;
 import io.tapstate.control.core.PipelineLifecycleService;
+import io.tapstate.control.core.ControlError;
 import io.tapstate.control.core.PipelineProjectionService;
+import io.tapstate.control.core.PipelineStartService;
 import io.tapstate.control.core.PipelineView;
+import io.tapstate.control.core.StartCheckReport;
+import io.tapstate.control.core.StartIntent;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.DesiredState;
 import java.net.URI;
+import java.util.Locale;
 import java.util.Map;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
@@ -31,9 +38,13 @@ import org.springframework.web.bind.annotation.RestController;
  * There is deliberately no {@code rewind} verb: a re-dig is the explicit two-step stop then start, composed
  * by the caller.
  *
- * <p>Stop is the one verb here that takes a body, and the one that refuses without it. It is also the only
- * one that can destroy something a caller may have wanted: reading the absent answer as either yes or no
- * would make the same request mean two different outcomes to two callers, and only one of them finds out.
+ * <p>Stop is the one verb here that refuses without a body. It is also the only one that can destroy
+ * something a caller may have wanted: reading the absent answer as either yes or no would make the same
+ * request mean two different outcomes to two callers, and only one of them finds out.
+ *
+ * <p>Start takes an optional body: the answers to the questions its start checks ask. A start that
+ * answers anything carries {@code If-Match} with the content hash the answers were given against, and the
+ * start checks a start would be asked can be read beforehand, without starting anything.
  */
 @RestController
 class PipelineController {
@@ -42,10 +53,13 @@ class PipelineController {
 
     private final PipelineLifecycleService lifecycle;
     private final PipelineProjectionService pipelines;
+    private final PipelineStartService starts;
 
-    PipelineController(PipelineLifecycleService lifecycle, PipelineProjectionService pipelines) {
+    PipelineController(PipelineLifecycleService lifecycle, PipelineProjectionService pipelines,
+            PipelineStartService starts) {
         this.lifecycle = lifecycle;
         this.pipelines = pipelines;
+        this.starts = starts;
     }
 
     @Verb("pipeline.create")
@@ -70,8 +84,31 @@ class PipelineController {
 
     @Verb("pipeline.start")
     @PostMapping("/pipelines/{id}:start")
-    DesiredState start(@PathVariable("id") String id) {
-        return lifecycle.start(AuthenticatedCaller.subject(), id);
+    PipelineStartResponse start(@PathVariable("id") String id,
+            @RequestHeader(name = HttpHeaders.IF_MATCH, required = false) String ifMatch,
+            @RequestBody(required = false) PipelineStartRequest request) {
+        return PipelineStartResponse.of(starts.start(AuthenticatedCaller.subject(), id,
+                PipelineStartRequest.decisionsOf(request), ifMatch == null ? null : expectedHash(id, ifMatch)));
+    }
+
+    @Verb("pipeline.start-checks")
+    @GetMapping("/pipelines/{id}/start-checks")
+    StartCheckReport startChecks(@PathVariable("id") String id,
+            @RequestParam(name = "intent", required = false) String intent) {
+        return starts.checks(id, intentOf(intent));
+    }
+
+    /** The start a preview is asked about: a plain start unless the caller names the rerun. */
+    private static StartIntent intentOf(String intent) {
+        if (intent == null || intent.isBlank()) {
+            return StartIntent.START;
+        }
+        try {
+            return StartIntent.valueOf(intent.strip().toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException unknown) {
+            throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                    Map.of("reason", "intent must be start or rerun"), null);
+        }
     }
 
     @Verb("pipeline.stop")

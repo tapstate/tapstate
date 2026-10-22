@@ -27,15 +27,30 @@ final class StoreBackedPipelineChains implements PipelineChains {
 
     @Override
     public List<Chain> of(String pipelineId) {
+        return resolutions(pipelineId).stream()
+                .map(resolution -> new Chain(resolution.chainId().value(), resolution.sourceId(),
+                        resolution.tables()))
+                .toList();
+    }
+
+    @Override
+    public List<String> progressChainsOf(String pipelineId) {
+        return resolutions(pipelineId).stream()
+                .flatMap(resolution -> resolution.progressChainIds(pipelineId).stream())
+                .distinct()
+                .toList();
+    }
+
+    /** Each source the pipeline reads, resolved the way its capture resolves it, in declaration order. */
+    private List<SourceCaptureResolution> resolutions(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         PipelineResource pipeline = StoredArtifacts.requirePipeline(storePort.artifacts(), pipelineId);
-        List<Chain> chains = new ArrayList<>();
+        List<SourceCaptureResolution> resolutions = new ArrayList<>();
         for (String sourceId : pipeline.sourceIds()) {
             SourceResource source = StoredArtifacts.requireSource(storePort.artifacts(), sourceId);
             SourceCaptureResolution.forPipeline(pipeline, source, SourceDiscovery.model(storePort, source))
-                    .ifPresent(resolution -> chains.add(
-                            new Chain(resolution.chainId().value(), sourceId, resolution.tables())));
+                    .ifPresent(resolutions::add);
         }
-        return List.copyOf(chains);
+        return List.copyOf(resolutions);
     }
 }

@@ -1,0 +1,129 @@
+{
+  "fixtureVersion": 1,
+  "about": "Start check reports as a server writes them, carrying values no client knows yet. Every client renders them from what they say and answers them without code of its own for any check. answerable: every question can be answered. unknownBehavior: a finding with a behavior no client knows, which a client treats as refusing the start. unknownOutcome: an outcome no client knows, which a client treats as refusing the start.",
+  "answerable": {
+    "pipelineId": "lead_view",
+    "intent": "START",
+    "contentHash": "3f9a6c1d2e4b5a69788796a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5",
+    "evaluatedAt": "2026-10-02T08:15:02.120Z",
+    "outcome": "NEEDS_CONFIRMATION",
+    "plan": [
+      { "element": "lead", "target": { "connection": "views", "table": "lead" }, "load": "FULL_LOAD", "onFullLoad": "append" },
+      { "element": "archive", "target": { "connection": "warehouse", "table": "orders_archive" }, "load": "SAMPLED_LOAD", "onFullLoad": "append" }
+    ],
+    "findings": [
+      {
+        "key": "target-not-empty/views/lead",
+        "check": "target-not-empty",
+        "subject": { "kind": "TARGET", "id": "views/lead", "element": "lead", "label": "view lead (views)" },
+        "behavior": "CONFIRM",
+        "evaluation": "COMPLETE",
+        "code": "start-check.target-not-empty",
+        "params": { "target": "lead", "connection": "views", "element": "lead", "onFullLoad": "append", "rows": 1465, "rowsExact": false, "holding": "1465 rows" },
+        "message": "lead on views already holds 1465 rows. This start runs a new full load without clearing it, so rows whose source rows were deleted will stay.",
+        "actions": [
+          {
+            "id": "clear", "kind": "CHANGE_DEFINITION", "destructive": true,
+            "code": "start-check.clear-before-full-load",
+            "message": "Clear lead before the full load, and set on_full_load: clear on lead",
+            "changes": [ { "element": "lead", "field": "on_full_load", "from": "append", "to": "clear" } ]
+          },
+          {
+            "id": "keep", "kind": "ACKNOWLEDGE", "destructive": false,
+            "code": "start-check.keep-existing-rows",
+            "message": "Keep the rows already in lead and start anyway",
+            "changes": []
+          }
+        ]
+      },
+      {
+        "key": "derived-schema-drift/join_orders",
+        "check": "derived-schema-drift",
+        "subject": { "kind": "STEP", "id": "join_orders", "element": null, "label": "step join_orders" },
+        "behavior": "CONFIRM",
+        "evaluation": "COMPLETE",
+        "code": "start-check.derived-schema-drift",
+        "params": { "step": "join_orders", "added": 2 },
+        "message": "join_orders now produces 2 columns it did not produce when it was last accepted.",
+        "actions": [
+          {
+            "id": "accept", "kind": "RUN_OPERATION", "destructive": false,
+            "code": "start-check.accept-derived-schema",
+            "message": "Accept the new columns and start",
+            "changes": []
+          },
+          {
+            "id": "keep", "kind": "ACKNOWLEDGE", "destructive": false,
+            "code": "start-check.keep-derived-schema",
+            "message": "Start with the columns as they were accepted",
+            "changes": []
+          }
+        ]
+      },
+      {
+        "key": "source-retention/src_pg",
+        "check": "source-retention",
+        "subject": { "kind": "SOURCE", "id": "src_pg", "element": null, "label": "source src_pg" },
+        "behavior": "WARN",
+        "evaluation": "PARTIAL",
+        "code": "start-check.source-retention-short",
+        "params": { "source": "src_pg", "hours": 6 },
+        "message": "src_pg keeps its change log for 6 hours; a stop longer than that cannot resume.",
+        "actions": []
+      },
+      {
+        "key": "target-not-empty/warehouse/orders_archive",
+        "check": "target-not-empty",
+        "subject": { "kind": "TARGET", "id": "warehouse/orders_archive", "element": "archive", "label": "orders_archive on warehouse" },
+        "behavior": "PASS",
+        "evaluation": "COMPLETE",
+        "code": "start-check.target-empty",
+        "params": { "target": "orders_archive", "connection": "warehouse", "element": "archive", "onFullLoad": "append", "rows": 0, "rowsExact": true },
+        "message": "orders_archive on warehouse is empty, so the full load starts from nothing.",
+        "actions": []
+      }
+    ]
+  },
+  "unknownBehavior": {
+    "pipelineId": "lead_view",
+    "intent": "START",
+    "contentHash": "3f9a6c1d2e4b5a69788796a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5",
+    "evaluatedAt": "2026-10-02T08:15:02.120Z",
+    "outcome": "NEEDS_CONFIRMATION",
+    "plan": [],
+    "findings": [
+      {
+        "key": "source-quarantine/src_pg",
+        "check": "source-quarantine",
+        "subject": { "kind": "SOURCE", "id": "src_pg", "element": null, "label": "source src_pg" },
+        "behavior": "QUARANTINE",
+        "evaluation": "COMPLETE",
+        "code": "start-check.source-quarantined",
+        "params": { "source": "src_pg" },
+        "message": "src_pg is quarantined until an operator releases it.",
+        "actions": []
+      }
+    ]
+  },
+  "unknownOutcome": {
+    "pipelineId": "lead_view",
+    "intent": "RERUN",
+    "contentHash": "3f9a6c1d2e4b5a69788796a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5",
+    "evaluatedAt": "2026-10-02T08:15:02.120Z",
+    "outcome": "DEFERRED",
+    "plan": [],
+    "findings": [
+      {
+        "key": "target-not-empty/views/lead",
+        "check": "target-not-empty",
+        "subject": { "kind": "TARGET", "id": "views/lead", "element": "lead", "label": "view lead (views)" },
+        "behavior": "PASS",
+        "evaluation": "COMPLETE",
+        "code": "start-check.target-empty",
+        "params": { "target": "lead", "connection": "views", "element": "lead", "onFullLoad": "append", "rows": 0, "rowsExact": true },
+        "message": "lead on views is empty, so the full load starts from nothing.",
+        "actions": []
+      }
+    ]
+  }
+}

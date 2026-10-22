@@ -70,7 +70,7 @@ class CloudConnectorSeedReadinessIT {
     void aCorruptCloudJarRefusesReadyWithoutWeakeningTheOtherLockedInputs() throws Exception {
         Path seeds = copyRelease();
         Path atlas = seeds.resolve("mongodb-atlas-connector.jar");
-        // Replace the owned copy with a damaged file. Never modify the shared input.
+        // Replace only the owned copy with the damaged file. Never modify the shared input.
         Files.delete(atlas);
         Files.write(atlas, new byte[] {0x13, 0x37});
         refusesReady(database("corrupt"), seeds);
@@ -178,6 +178,7 @@ class CloudConnectorSeedReadinessIT {
                 if (Files.isDirectory(input)) {
                     Files.createDirectories(destination);
                 } else {
+                    // The release and JUnit's temporary directory can be on different filesystems.
                     Files.copy(input, destination);
                 }
             }

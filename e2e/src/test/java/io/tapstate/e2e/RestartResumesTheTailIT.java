@@ -220,8 +220,10 @@ class RestartResumesTheTailIT {
             awaitName(mongo, target, 1, BEFORE_STOP, "the change the first run captured");
 
             // The pair `restart --rerun` composes: the stop clears, so there is nothing to carry on from.
+            // The new full load goes into a target holding the first run's rows, so the start asks first;
+            // keeping them is the answer, because what this case reads is how much the rerun read.
             control.stop(pipelineId, true);
-            control.lifecycle(pipelineId, LifecycleVerb.START);
+            control.startAnswering(pipelineId, "target-not-empty", "keep");
 
             // The count itself is the liveness here: nought would mean the run never started, and the
             // whole table is the only reading that says it really read the table again.

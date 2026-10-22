@@ -9,6 +9,7 @@ import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.store.SourceModel;
 import java.util.List;
 import java.util.Optional;
+import java.util.stream.Stream;
 
 /**
  * How a pipeline-referenced source resolves into its capture/read ring identity: the connector config, the
@@ -56,6 +57,15 @@ record SourceCaptureResolution(
         MiningChainId scoped = srsEnabled ? MiningChainId.resolve(config, srsKey)
                 : MiningChainId.forChannel(config, srsKey, pipelineId, sourceId);
         return new SourceCaptureResolution(sourceId, config, tables, srsKey, scoped);
+    }
+
+    /**
+     * Every chain that can hold {@code pipelineId}'s durable progress through this source: the one it reads,
+     * and the shared chain a direct capture recorded its progress on before it read a channel of its own.
+     * A start's load is judged from all of them, by the run and by the verb predicting it alike.
+     */
+    List<String> progressChainIds(String pipelineId) {
+        return Stream.of(chainId.value(), scopedTo(pipelineId, true).chainId().value()).distinct().toList();
     }
 
     private static SourceCaptureResolution withTables(SourceResource source, List<String> tables) {
