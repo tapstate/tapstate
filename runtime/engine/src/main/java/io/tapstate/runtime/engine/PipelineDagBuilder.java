@@ -11,6 +11,7 @@ import io.tapstate.core.model.ExecutionSpec;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.SyncElement;
@@ -509,7 +510,8 @@ public final class PipelineDagBuilder {
 
         // Only once every sink is known: what a source's changes wait for depends on every sink its rows reach.
         // Held against the durable record the acks write, so a graph whose sinks record nothing holds nothing.
-        if (sinkAck != null && chains != null) {
+        boolean readsSnapshot = pipeline.settings() == null || pipeline.settings().readMode() != ReadMode.CDC_ONLY;
+        if (sinkAck != null && chains != null && readsSnapshot) {
             Map<String, List<AwaitedLoad>> gates = loadGates(sinks, chains, shape);
             for (String sourceId : pipeline.sourceIds()) {
                 for (String sourceKey : bindings.sourceKeys().apply(sourceId)) {
