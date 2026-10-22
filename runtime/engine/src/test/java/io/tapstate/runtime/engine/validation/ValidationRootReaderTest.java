@@ -371,6 +371,45 @@ class ValidationRootReaderTest {
         assertThat(source.rowsClosed).isEqualTo(1);
     }
 
+    @Test void inspectedParentFieldConflictsKeepPendingReadIdentityAndIndependentDifferences() {
+        var original = row(Map.of("id", 7, "customer", Map.of("legacy", 1), "known", 1));
+        var source = new Cursor(List.of(original));
+        var target = new Cursor(List.of(row(Map.of("id", 7, "customer", Map.of("new", 2), "known", 2))));
+        var result = read(source, target, raw -> {
+            var fields = ValidationNestFieldCheck.inspect(List.of(
+                    new ValidationNestFieldCheck.Field("parent", ValidationNestFieldCheck.FieldKind.PARENT, List.of("customer")),
+                    new ValidationNestFieldCheck.Field("customer", ValidationNestFieldCheck.FieldKind.EMBED_PATH, List.of("customer"))),
+                    new ValidationNestFieldCheck.Limits(65536, 10000, 32, 32));
+            assertThat(source.closed).isFalse(); assertThat(target.opened).isZero();
+            return new ValidationRootReader.Source(evaluation(raw, INCLUDED), List.of(),
+                    ValidationRootReader.SourceEvidence.fromFieldConflicts(observation(), observation(), fields,
+                            Optional.of(new SampledSide(identity("source"), raw, "source"))));
+        }, (pair, root) -> ValidationFieldCheck.checkPartial(observation(), List.of(), pair.source().working(), pair.target().working(),
+                pair.sourceSample(), pair.targetSample(), Optional.empty(), String::equals,
+                new ValidationValueComparison.TraversalLimits(ROW, 10000), List.of(List.of("customer")), root));
+        assertThat(result.counts()).containsExactlyInAnyOrderEntriesOf(Map.of(Kind.SOURCE_FIELD_CONFLICT, 1L, Kind.TARGET_VALUE, 1L));
+        assertThat(result.reads()).extracting(read -> read.boundary().readId()).containsExactlyInAnyOrder("source", "target");
+        assertThat(result.samples()).anySatisfy(sample -> {
+            assertThat(sample.finding().kind()).isEqualTo(Kind.SOURCE_FIELD_CONFLICT);
+            assertThat(sample.source().orElseThrow().row()).isSameAs(original);
+        });
+    }
+
+    @Test void conflictEvidenceDeduplicatesCausesWithoutLosingLiteralOrEmbeddedBlockedPaths() {
+        var fields = ValidationNestFieldCheck.inspect(List.of(
+                new ValidationNestFieldCheck.Field("flat", ValidationNestFieldCheck.FieldKind.FLAT, List.of("a.b")),
+                new ValidationNestFieldCheck.Field("parent", ValidationNestFieldCheck.FieldKind.PARENT, List.of("a")),
+                new ValidationNestFieldCheck.Field("parent", ValidationNestFieldCheck.FieldKind.PARENT, List.of("a.b.c")),
+                new ValidationNestFieldCheck.Field("embedded", ValidationNestFieldCheck.FieldKind.EMBED_PATH, List.of("a", "b"))),
+                new ValidationNestFieldCheck.Limits(65536, 10000, 32, 32));
+        var evidence = ValidationRootReader.SourceEvidence.fromFieldConflicts(observation(), observation(), fields, Optional.empty());
+        assertThat(evidence.reads()).isEmpty();
+        assertThat(evidence.issues()).hasSize(2);
+        assertThat(evidence.issues()).filteredOn(issue -> issue.finding().location().fieldPath().equals(List.of("a.b")))
+                .singleElement().satisfies(issue -> assertThat(issue.affected()).extracting(Location::fieldPath)
+                        .containsExactlyInAnyOrder(List.of("a.b"), List.of("a"), List.of("a.b.c"), List.of("a", "b")));
+    }
+
     private static Function<ValidationValues.Row, ValidationRootReader.Source> mappedFilter() {
         var map = ValidationStaticMap.compile("map", new TransformBody.MapProjection(Map.of("price", FieldRule.rename("amount"))), ROW);
         var predicate = ValidationPredicate.compile("filter", new ValidationPredicate.Compare(ValidationPredicate.Operator.GT,

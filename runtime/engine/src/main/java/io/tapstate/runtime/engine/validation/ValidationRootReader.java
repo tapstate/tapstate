@@ -57,19 +57,38 @@ public final class ValidationRootReader {
         /** Imports one completed Nest relation's facts without pretending its enclosing parent read ended. */
         public static SourceEvidence fromSingleSource(ValidationObservation root, ValidationNestSingleSource.Result source) {
             Objects.requireNonNull(root, "root"); Objects.requireNonNull(source, "source");
-            var actual = source.observation();
+            requireNestedScope(root, source.observation());
+            return new SourceEvidence(root, List.of(source.read()), source.issues().stream()
+                    .map(issue -> new SourceIssue(issue.finding(), issue.sample(), issue.affected())).toList());
+        }
+
+        /** Records each conflict cause once, retaining all affected literal/embedded locations. */
+        public static SourceEvidence fromFieldConflicts(ValidationObservation root, ValidationObservation parent,
+                ValidationNestFieldCheck.Result fields, Optional<SampledSide> originalParent) {
+            Objects.requireNonNull(root, "root"); Objects.requireNonNull(parent, "parent");
+            Objects.requireNonNull(fields, "fields"); Objects.requireNonNull(originalParent, "originalParent");
+            requireNestedScope(root, parent);
+            var affected = new LinkedHashMap<Finding, LinkedHashSet<Location>>();
+            for (var conflict : fields.conflicts()) {
+                var at = new Location(parent.root(), new ArrayList<>(conflict.contributor().path()));
+                var cause = new Finding(Kind.SOURCE_FIELD_CONFLICT, at);
+                var paths = affected.computeIfAbsent(cause, ignored -> new LinkedHashSet<>());
+                paths.add(at);
+                paths.add(new Location(parent.root(), new ArrayList<>(conflict.occupied().path())));
+            }
+            return new SourceEvidence(root, List.of(), affected.entrySet().stream()
+                    .map(entry -> new SourceIssue(entry.getKey(), originalParent, new ArrayList<>(entry.getValue()))).toList());
+        }
+        private static void requireNestedScope(ValidationObservation root, ValidationObservation actual) {
             if (!root.run().equals(actual.run()) || root.revision() != actual.revision()
                     || !root.root().mappingId().equals(actual.root().mappingId())
                     || !root.root().outputId().equals(actual.root().outputId())
                     || !root.root().rootKey().equals(actual.root().rootKey())
                     || actual.root().ancestors().size() < root.root().ancestors().size()
                     || !actual.root().ancestors().subList(0, root.root().ancestors().size()).equals(root.root().ancestors())) {
-                throw invalid("rootRead.singleSourceObservation");
+                throw invalid("rootRead.nestObservation");
             }
-            return new SourceEvidence(root, List.of(source.read()), source.issues().stream()
-                    .map(issue -> new SourceIssue(issue.finding(), issue.sample(), issue.affected())).toList());
         }
-
     }
 
     /** Known source data issues may survive a definite predicate; uncertainty specifically prevents participation. */

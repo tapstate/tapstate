@@ -58,53 +58,64 @@ public final class ValidationNestFieldCheck {
         Objects.requireNonNull(root, "root");
         try {
             Objects.requireNonNull(parent, "parent");
-            Objects.requireNonNull(fields, "fields");
-            Objects.requireNonNull(limits, "limits");
             requireScope(parent, root.observation());
-            if (fields.size() > limits.fields()) throw limit("fields");
-            Budget budget = new Budget(limits);
-            var names = new ArrayList<Named>(fields.size());
-            var distinct = new HashSet<Field>();
-            for (Field field : fields) {
-                Objects.requireNonNull(field, "field");
-                long chars = field.path().size() - 1L;
-                for (String segment : field.path()) chars += segment.length();
-                budget.bytes(256L + 2L * field.owner().length() + 4L * chars + 40L * field.path().size());
-                budget.operations(chars + 1);
-                if (!distinct.add(field)) throw ValidationError.invalid("nestFields.repeatedField");
-                names.add(new Named(field, String.join(".", field.path())));
-            }
-            var conflicts = new ArrayList<Conflict>();
-            Set<Field> blocked = new LinkedHashSet<>();
+            Result result = inspect(fields, limits);
             Set<Finding> findings = new HashSet<>();
-            for (int i = 0; i < names.size(); i++) {
-                Named left = names.get(i);
-                for (int j = i + 1; j < names.size(); j++) {
-                    Named right = names.get(j);
-                    budget.operations(1);
-                    if (!compete(left.field(), right.field())) continue;
-                    budget.operations(2L * Math.min(left.dotted().length(), right.dotted().length()) + 1);
-                    if (!overlaps(left.dotted(), right.dotted())) continue;
-                    if (conflicts.size() == limits.conflicts()) throw limit("conflicts");
-                    budget.bytes(160);
-                    Field contributor = contributor(left.field(), right.field());
-                    Field occupied = contributor == left.field() ? right.field() : left.field();
-                    conflicts.add(new Conflict(contributor, occupied));
-                    blocked.add(contributor); blocked.add(occupied);
-                    Location location = location(parent, contributor);
-                    Finding cause = new Finding(Kind.SOURCE_FIELD_CONFLICT, location);
-                    if (findings.add(cause)) root.finding(cause);
-                    block(root, location, cause);
-                    block(root, location(parent, occupied), cause);
-                }
+            for (Conflict conflict : result.conflicts()) {
+                Location at = location(parent, conflict.contributor());
+                Finding cause = new Finding(Kind.SOURCE_FIELD_CONFLICT, at);
+                if (findings.add(cause)) root.finding(cause);
+                block(root, at, cause);
+                block(root, location(parent, conflict.occupied()), cause);
             }
-            var uncontested = new ArrayList<Field>();
-            for (Named name : names) if (!blocked.contains(name.field())) uncontested.add(name.field());
-            return new Result(uncontested, conflicts);
+            return result;
         } catch (RuntimeException | Error failure) {
             root.close();
             throw failure;
         }
+    }
+
+    /**
+     * Bounded source-only inspection, usable before the enclosing source query finishes. It reserves
+     * every declared embedded path independently of current contents and never inspects a target.
+     * Unknown parent fields must stay unknown in the caller's projection, not be supplied as absent.
+     */
+    public static Result inspect(List<Field> fields, Limits limits) {
+        Objects.requireNonNull(fields, "fields"); Objects.requireNonNull(limits, "limits");
+        if (fields.size() > limits.fields()) throw limit("fields");
+        Budget budget = new Budget(limits);
+        var names = new ArrayList<Named>(fields.size());
+        var distinct = new HashSet<Field>();
+        for (Field field : fields) {
+            Objects.requireNonNull(field, "field");
+            long chars = field.path().size() - 1L;
+            for (String segment : field.path()) chars += segment.length();
+            budget.bytes(256L + 2L * field.owner().length() + 4L * chars + 40L * field.path().size());
+            budget.operations(chars + 1);
+            if (!distinct.add(field)) throw ValidationError.invalid("nestFields.repeatedField");
+            names.add(new Named(field, String.join(".", field.path())));
+        }
+        var conflicts = new ArrayList<Conflict>();
+        Set<Field> blocked = new LinkedHashSet<>();
+        for (int i = 0; i < names.size(); i++) {
+            Named left = names.get(i);
+            for (int j = i + 1; j < names.size(); j++) {
+                Named right = names.get(j);
+                budget.operations(1);
+                if (!compete(left.field(), right.field())) continue;
+                budget.operations(2L * Math.min(left.dotted().length(), right.dotted().length()) + 1);
+                if (!overlaps(left.dotted(), right.dotted())) continue;
+                if (conflicts.size() == limits.conflicts()) throw limit("conflicts");
+                budget.bytes(160);
+                Field contributor = contributor(left.field(), right.field());
+                Field occupied = contributor == left.field() ? right.field() : left.field();
+                conflicts.add(new Conflict(contributor, occupied));
+                blocked.add(contributor); blocked.add(occupied);
+            }
+        }
+        var uncontested = new ArrayList<Field>();
+        for (Named name : names) if (!blocked.contains(name.field())) uncontested.add(name.field());
+        return new Result(uncontested, conflicts);
     }
 
     private static boolean compete(Field left, Field right) {
