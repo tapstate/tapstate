@@ -14,6 +14,7 @@ import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimType;
 import org.bson.Document;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -23,6 +24,8 @@ import java.util.Set;
 
 /** Known genesis and committed topology are distinct from missing membership history. */
 final class MongoCacheClusterMembershipStore implements ClusterMembershipStore {
+    // Leave time for the driver to abort a timed-out read before the HTTP caller gives up.
+    private static final Duration READ_BUDGET = Duration.ofSeconds(5);
     private static final String GENESIS = "GENESIS";
     private static final String COMMITTED = "COMMITTED";
     private static final String NODE_WRITES = "fencedMembershipWrites";
@@ -54,7 +57,7 @@ final class MongoCacheClusterMembershipStore implements ClusterMembershipStore {
 
     @Override public Optional<ClusterMembership> read(String clusterId) {
         requireCluster(clusterId);
-        return access.read(session -> Optional.ofNullable(read(session)));
+        return access.read(READ_BUDGET, session -> Optional.ofNullable(read(session)));
     }
 
     @Override public ClusterMembership createIfAbsent(String clusterId, Set<String> activeNodeIds) {

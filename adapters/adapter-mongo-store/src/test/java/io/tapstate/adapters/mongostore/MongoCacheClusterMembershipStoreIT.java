@@ -25,6 +25,8 @@ import io.tapstate.spi.store.WorkloadOwner;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
@@ -60,6 +62,75 @@ class MongoCacheClusterMembershipStoreIT {
             assertCode(() -> reader.createIfAbsent("cluster-a", Set.of("node-a")), IoError.CACHE_BUSINESS_FENCED);
             assertCode(() -> reader.compareAndSet("cluster-a", 1, Set.of("node-a")), IoError.CACHE_BUSINESS_FENCED);
             assertThat(f.snapshot()).isEqualTo(before); assertThat(f.member()).containsEntry("phase", "GENESIS").containsEntry("revision", 0L);
+        });
+    }
+
+    @Test void aMembershipReadExhaustsItsRetryBudgetBeforeTheHttpCallerDeadline() {
+        withFixture(f -> {
+            var committed = f.writer().createIfAbsent("cluster-a", Set.of("node-a"));
+            var reader = f.domain.clusterMembership(SCOPE);
+            assertThat(reader.read("cluster-a")).contains(committed);
+            var before = f.snapshot();
+            var admin = f.client.getDatabase("admin");
+            long entered = ((Number) admin.runCommand(new Document("configureFailPoint", "failCommand")
+                    .append("mode", "alwaysOn").append("data", new Document("failCommands", List.of("find"))
+                            .append("errorCode", 112).append("errorLabels", List.of("TransientTransactionError"))))
+                    .get("count")).longValue();
+            try (var worker = Executors.newSingleThreadExecutor()) {
+                var result = worker.submit(() -> reader.read("cluster-a"));
+                try {
+                    assertThatThrownBy(() -> result.get(15, TimeUnit.SECONDS))
+                            .isInstanceOf(java.util.concurrent.ExecutionException.class)
+                            .hasCauseInstanceOf(TapstateException.class)
+                            .satisfies(failure -> assertThat(((TapstateException) failure.getCause()).code())
+                                    .isEqualTo(IoError.STORE_UNAVAILABLE));
+                } finally {
+                    long completed = ((Number) admin.runCommand(new Document("configureFailPoint", "failCommand")
+                            .append("mode", "off")).get("count")).longValue();
+                    assertThat(completed - entered).as("the read retried actual server-side conflicts").isGreaterThan(1);
+                }
+            }
+            assertThat(f.snapshot()).isEqualTo(before);
+            assertThat(reader.read("cluster-a")).contains(committed);
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"listCollections", "listIndexes", "abortTransaction"})
+    void stalledMetadataAndAbortRemainInsideTheReadDeadline(String stalledCommand) {
+        withFixture(f -> {
+            var committed = f.writer().createIfAbsent("cluster-a", Set.of("node-a"));
+            var before = f.snapshot();
+            var abortSeen = new AtomicBoolean();
+            var listener = new CommandListener() { @Override public void commandStarted(CommandStartedEvent event) {
+                if ("abortTransaction".equals(event.getCommandName())) abortSeen.set(true);
+            } };
+            try (var observed = client(listener); var worker = Executors.newSingleThreadExecutor()) {
+                var reader = f.writer(observed, ACTIVE);
+                assertThat(reader.read("cluster-a")).contains(committed);
+                var commands = "abortTransaction".equals(stalledCommand)
+                        ? List.of("find", "abortTransaction") : List.of(stalledCommand);
+                var admin = f.client.getDatabase("admin");
+                long entered = ((Number) admin.runCommand(new Document("configureFailPoint", "failCommand")
+                        .append("mode", "alwaysOn").append("data", new Document("failCommands", commands)
+                                .append("blockConnection", true).append("blockTimeMS", 20000)))
+                        .get("count")).longValue();
+                var result = worker.submit(() -> reader.read("cluster-a"));
+                try {
+                    assertThatThrownBy(() -> result.get(15, TimeUnit.SECONDS))
+                            .isInstanceOf(java.util.concurrent.ExecutionException.class)
+                            .hasCauseInstanceOf(TapstateException.class)
+                            .satisfies(failure -> assertThat(((TapstateException) failure.getCause()).code())
+                                    .isEqualTo(IoError.STORE_UNAVAILABLE));
+                    if ("abortTransaction".equals(stalledCommand)) assertThat(abortSeen).isTrue();
+                } finally {
+                    long completed = ((Number) admin.runCommand(new Document("configureFailPoint", "failCommand")
+                            .append("mode", "off")).get("count")).longValue();
+                    assertThat(completed - entered).as("the chosen command really reached the server").isPositive();
+                }
+            }
+            assertThat(f.snapshot()).isEqualTo(before);
+            assertThat(f.domain.clusterMembership(SCOPE).read("cluster-a")).contains(committed);
         });
     }
 

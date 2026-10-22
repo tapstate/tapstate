@@ -14,6 +14,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.function.LongSupplier;
+import com.mongodb.client.cursor.TimeoutMode;
 
 /** Explicit metadata schema DDL, separate from ordinary facet opening and business READY publication. */
 final class MongoCacheMetadataStructure {
@@ -83,9 +86,11 @@ final class MongoCacheMetadataStructure {
 
     void verifyBusiness() { verify(BUSINESS_TABLES); }
 
-    void verifyFacet(SystemCollections table) {
+    void verifyFacet(SystemCollections table) { verifyFacet(table, null); }
+
+    void verifyFacet(SystemCollections table, LongSupplier remainingMillis) {
         if (Objects.requireNonNull(table, "table").database() != SystemCollections.Database.CACHE) throw new IllegalArgumentException("not a CACHE resource");
-        verify(List.of(table));
+        verify(List.of(table), remainingMillis);
     }
 
     void verifySrs() {
@@ -98,10 +103,12 @@ final class MongoCacheMetadataStructure {
         verify(List.of(SystemCollections.CACHE_WORKLOAD_CLAIMS,SystemCollections.DIRECT_CHANNEL_OFFSETS,SystemCollections.DIRECT_BATCHES));
     }
 
-    private void verify(List<SystemCollections> tables) {
+    private void verify(List<SystemCollections> tables) { verify(tables, null); }
+
+    private void verify(List<SystemCollections> tables, LongSupplier remainingMillis) {
         StoreIo.run(() -> {
             var required = names(tables);
-            var existing = collections(required);
+            var existing = collections(required, remainingMillis);
             if (!existing.keySet().equals(required)) throw unreadable("collections");
             for (var table : tables) {
                 for (String name : table.physicalNames()) {
@@ -110,7 +117,7 @@ final class MongoCacheMetadataStructure {
                     Document options = description.get("options", Document.class);
                     if (options != null && (Boolean.TRUE.equals(options.get("capped")) || options.containsKey("timeseries"))) throw unreadable("collection-options");
                 }
-                var rows = table.indexTargetOn(database).listIndexes().into(new ArrayList<>());
+                var rows = readIndexes(table.indexTargetOn(metadataDatabase(remainingMillis)), remainingMillis != null);
                 verifyId(rows);
                 if (table != SystemCollections.CACHE_PIPELINE_RATE_HISTORY && rows.stream().anyMatch(row -> row.containsKey("expireAfterSeconds"))) throw unreadable("ttl-index");
                 for (var index : indexes(table)) verifyIndex(rows, index);
@@ -118,7 +125,7 @@ final class MongoCacheMetadataStructure {
                         && !indexes(table).getFirst().indexName().equals(row.get("name")))) throw unreadable("ttl-index");
                 if (table == SystemCollections.CACHE_CONNECTOR_ARTIFACTS) {
                     verifyIndex(rows, FILE_NAMES);
-                    var chunks = table.chunksOn(database).listIndexes().into(new ArrayList<>());
+                    var chunks = readIndexes(table.chunksOn(metadataDatabase(remainingMillis)), remainingMillis != null);
                     verifyId(chunks); verifyIndex(chunks, CHUNK_ORDER);
                     if (chunks.stream().anyMatch(row -> row.containsKey("expireAfterSeconds"))) throw unreadable("ttl-index");
                 }
@@ -128,9 +135,21 @@ final class MongoCacheMetadataStructure {
 
     private Map<String, Document> collections() { return collections(names()); }
 
-    private Map<String, Document> collections(Set<String> required) {
+    private MongoDatabase metadataDatabase(LongSupplier remainingMillis) {
+        return remainingMillis == null ? database : database.withTimeout(remainingMillis.getAsLong(), TimeUnit.MILLISECONDS);
+    }
+
+    private static List<Document> readIndexes(MongoCollection<Document> collection, boolean bounded) {
+        var indexes = collection.listIndexes();
+        if (bounded) indexes.timeoutMode(TimeoutMode.CURSOR_LIFETIME);
+        return indexes.into(new ArrayList<>());
+    }
+
+    private Map<String, Document> collections(Set<String> required) { return collections(required, null); }
+
+    private Map<String, Document> collections(Set<String> required, LongSupplier remainingMillis) {
         var result = new java.util.LinkedHashMap<String, Document>();
-        for (Document row : MongoCollectionMetadata.matching(database, required)) {
+        for (Document row : MongoCollectionMetadata.matching(metadataDatabase(remainingMillis), required, remainingMillis != null)) {
             String name = row.getString("name");
             if (result.put(name, row) != null) throw unreadable("collections");
         }
