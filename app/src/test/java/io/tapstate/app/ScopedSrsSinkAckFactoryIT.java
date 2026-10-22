@@ -21,7 +21,6 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
@@ -31,14 +30,18 @@ import static org.mockito.Mockito.*;
 /** Actual configured and cache owners behind a deserialized member-side factory; no Jet job is submitted. */
 @RequiresDocker
 class ScopedSrsSinkAckFactoryIT {
-    @Container private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
-    @Test void originalWriterCallbacksCommitThroughNativePreparedStoresAndCannotBorrowANewerExecution() throws Exception {
+    @Container private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
+            .withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void originalWriterCallbacksCommitThroughNativePreparedStoresAndCannotBorrowANewerExecution(boolean heldAtMongo) throws Exception {
         String suffix = UUID.randomUUID().toString().replace("-",""); String configName = "ack_config_"+suffix, cacheName = "ack_cache_"+suffix;
+        String application = "scoped-writer-it-" + suffix;
         var endpoint = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,MONGO.getReplicaSetUrl(),cacheName,null);
         var settings = new MongoConnectionSettings(MONGO.getReplicaSetUrl(configName),null,Duration.ofSeconds(5));
         try (var observer = MongoClients.create(MONGO.getReplicaSetUrl())) {
             try (var configuration = MongoConfigurationBootstrap.prepare(settings,"cluster","installation","setup",1);
-                 var cache = MongoCacheDomain.connect(endpoint,Duration.ofSeconds(5),"scoped-writer-it")) {
+                 var cache = MongoCacheDomain.connect(endpoint,Duration.ofSeconds(5),application)) {
                 var target = new SourceResource(StorageBinding.defaultSourceId(StorageBinding.Mode.OP),null,"mongodb",Map.of("uri","mongodb://master.invalid/master"),null,null,null,null);
                 var committed = configuration.bindings().commitWithFirstCache(new StorageSetupScope("cluster","installation","setup",1),StorageBinding.Mode.OP,endpoint,target);
                 cache.prepareFirstAuth(committed.firstCreation().orElseThrow()); var business = cache.prepareInitialBusiness(committed.preparation(),() -> {});
@@ -93,10 +96,63 @@ class ScopedSrsSinkAckFactoryIT {
                     assertThat(readerFactory.recoverySequence(member)).hasValue(4);
                     assertThat(readerFactory.confirmedPosition(member)).contains(confirmed.cursor().sinkAcked());
                     assertThat(stores.chains().load("mck-chain").orElseThrow().checkpoint()).isNull();
-                    claims.advanceExecution(running,1,Set.of(owner.nodeId())).orElseThrow();
-                    assertThatThrownBy(() -> slow.advance("source.orders",new ChainPosition(new SourceOrder(7,99),"late"),original)).isInstanceOf(TapstateException.class);
-                    assertThatThrownBy(() -> reader.accept(100)).isInstanceOf(TapstateException.class);
-                    assertThat(stores.consumers().progress(context)).contains(confirmed);
+                    if (!heldAtMongo) {
+                        claims.advanceExecution(running,1,Set.of(owner.nodeId())).orElseThrow();
+                        assertThatThrownBy(() -> slow.advance("source.orders",new ChainPosition(new SourceOrder(7,99),"late"),original)).isInstanceOf(TapstateException.class);
+                        assertThatThrownBy(() -> reader.accept(100)).isInstanceOf(TapstateException.class);
+                        assertThat(stores.consumers().progress(context)).contains(confirmed);
+                    } else {
+                        var admin = observer.getDatabase("admin");
+                        long entered = ((Number) admin.runCommand(new org.bson.Document("configureFailPoint", "failCommand")
+                                .append("mode", new org.bson.Document("times", 1)).append("data", new org.bson.Document("failCommands", List.of("update"))
+                                        .append("namespace", cacheName + ".workload_claims").append("appName", "tapstate/" + application)
+                                        .append("blockConnection", true).append("blockTimeMS", 15000))).get("count")).longValue();
+                        try (var executor = java.util.concurrent.Executors.newSingleThreadExecutor()) {
+                            try {
+                                var late = executor.submit(() -> {
+                                    try { slow.advance("source.orders",new ChainPosition(new SourceOrder(7,99),"late"),original); return null; }
+                                    catch (TapstateException refused) { return refused.code(); }
+                                });
+                                admin.runCommand(new org.bson.Document("waitForFailPoint", "failCommand")
+                                        .append("timesEntered", entered + 1).append("maxTimeMS", 5000));
+                                var held = admin.runCommand(new org.bson.Document("currentOp", 1).append("$all", true))
+                                        .getList("inprog", org.bson.Document.class).stream().filter(op -> ("tapstate/" + application).equals(op.getString("appName")))
+                                        .filter(op -> op.get("command") instanceof org.bson.Document command && "workload_claims".equals(command.getString("update")))
+                                        .findFirst().orElseThrow();
+                                assertThat(held.get("command", org.bson.Document.class)).containsEntry("autocommit", false)
+                                        .doesNotContainKey("startTransaction");
+                                assertThat(late.isDone()).isFalse();
+                                assertThat(claims.release(running)).isTrue();
+                                var nextOwner = new WorkloadOwner("replacement-node", "replacement-boot");
+                                claims.acquire(new WorkloadClaimKey("cluster",WorkloadClaimType.NODE_SESSION,nextOwner.nodeId()),nextOwner,2,Duration.ofMinutes(2));
+                                var taken = claims.acquirePipeline(physical,nextOwner,2,Duration.ofMinutes(2)).claim();
+                                assertThat(taken.claimGeneration()).isGreaterThan(running.claimGeneration());
+                                var nextClaim = WorkloadClaimFence.from(claims.advanceExecution(taken,2,Set.of(nextOwner.nodeId())).orElseThrow());
+                                var nextMembership = stores.consumers().attach(context,membership.revision(),Set.of("orders"),nextClaim).orElseThrow();
+                                var nextRun = SrsConsumerRun.of(physical,nextMembership);
+                                var nextFactory = new ScopedSrsSinkAckFactory(Map.of("source.orders",new ScopedSrsSinkAckFactory.Source(nextRun,"orders")),"replacement-run");
+                                nextFactory.beginRun(member,Map.of("source.orders",List.of("fast","slow")),nextClaim);
+                                var nextAck = nextFactory.resolve(member);
+                                var newPosition = new ChainPosition(new SourceOrder(7,6),"replacement-6");
+                                nextAck.forWriter("fast").advance("source.orders",newPosition,nextClaim);
+                                nextAck.forWriter("slow").advance("source.orders",newPosition,nextClaim);
+                                var nextProgress = stores.consumers().progress(context).orElseThrow();
+                                assertThat(nextProgress.cursor().sinkAcked()).isEqualTo(newPosition);
+                                var rawClaims = observer.getDatabase(cacheName).getCollection("workload_claims");
+                                var originalNextClaim = rawClaims.find(new org.bson.Document("resourceType", "PIPELINE_ACTUATION")).first();
+                                assertThat(originalNextClaim).isNotNull().containsEntry("ownerNodeId",nextOwner.nodeId())
+                                        .containsEntry("ownerBootId",nextOwner.bootId()).containsEntry("claimGeneration",nextClaim.claimGeneration());
+                                assertThat(late.isDone()).isFalse();
+                                assertThat(admin.runCommand(new org.bson.Document("currentOp", 1).append("$all", true)).getList("inprog",org.bson.Document.class))
+                                        .anySatisfy(op -> assertThat(op).containsEntry("opid",held.get("opid")));
+                                assertThat(late.get(25,java.util.concurrent.TimeUnit.SECONDS))
+                                        .isIn(IoError.WORKLOAD_CLAIM_FENCED,io.tapstate.runtime.engine.EngineError.EXECUTION_NOT_AUTHORIZED);
+                                assertThat(stores.consumers().progress(context)).contains(nextProgress);
+                                assertThat(rawClaims.find(new org.bson.Document("resourceType", "PIPELINE_ACTUATION")).first()).isEqualTo(originalNextClaim);
+                                assertThatThrownBy(() -> reader.accept(100)).isInstanceOf(TapstateException.class);
+                            } finally { admin.runCommand(new org.bson.Document("configureFailPoint", "failCommand").append("mode", "off")); }
+                        }
+                    }
                 }
                 assertThat(observer.getDatabase(configName).listCollectionNames()).doesNotContain("srs_consumer_offsets","srs_consumers","srs_chains");
             } finally { observer.getDatabase(cacheName).drop(); observer.getDatabase(configName).drop(); }
