@@ -100,7 +100,13 @@ import java.util.Set;
  */
 record NodeColumns(Map<String, String> columns, List<String> key, String unknownBecause,
         Map<String, String> origins, boolean expanded, Map<String, NumericType> numericTypes,
-        Set<String> unchangedFields, Map<String, StringType> stringTypes) {
+        Set<String> unchangedFields, Map<String, StringType> stringTypes, String unwindSourceIdField) {
+
+    NodeColumns(Map<String, String> columns, List<String> key, String unknownBecause,
+            Map<String, String> origins, boolean expanded, Map<String, NumericType> numericTypes,
+            Set<String> unchangedFields, Map<String, StringType> stringTypes) {
+        this(columns, key, unknownBecause, origins, expanded, numericTypes, unchangedFields, stringTypes, null);
+    }
 
     NodeColumns(Map<String, String> columns, List<String> key, String unknownBecause,
             Map<String, String> origins, boolean expanded) {
@@ -122,15 +128,15 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
     }
 
     NodeColumns withStringTypes(Map<String, StringType> types) {
-        return new NodeColumns(columns, key, unknownBecause, origins, expanded, numericTypes, unchangedFields, types);
+        return new NodeColumns(columns, key, unknownBecause, origins, expanded, numericTypes, unchangedFields, types, unwindSourceIdField);
     }
 
     NodeColumns withUnchangedFields(Set<String> fields) {
-        return new NodeColumns(columns, key, unknownBecause, origins, expanded, numericTypes, fields, stringTypes);
+        return new NodeColumns(columns, key, unknownBecause, origins, expanded, numericTypes, fields, stringTypes, unwindSourceIdField);
     }
 
     NodeColumns withNumericTypes(Map<String, NumericType> types) {
-        return new NodeColumns(columns, key, unknownBecause, origins, expanded, types, unchangedFields, stringTypes);
+        return new NodeColumns(columns, key, unknownBecause, origins, expanded, types, unchangedFields, stringTypes, unwindSourceIdField);
     }
 
     NodeColumns {
@@ -290,7 +296,16 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         Set<String> unchanged = new LinkedHashSet<>(out.keySet());
         inputs.forEach(input -> unchanged.retainAll(input.unchangedFields()));
         return new NodeColumns(out, agreed.stream().filter(out::containsKey).toList(), null,
-                origins, expanded, numbers, unchanged, strings);
+                origins, expanded, numbers, unchanged, strings, inputs.stream()
+                        .map(NodeColumns::unwindSourceIdField).filter(java.util.Objects::nonNull)
+                        .distinct().reduce((left, right) -> {
+                            if (!left.equals(right)) {
+                                throw new io.tapstate.core.common.TapstateException(
+                                        io.tapstate.core.dsl.DslError.ILLEGAL_VALUE,
+                                        Map.of("value", left + ", " + right, "expected", "one source identity field for merged expansions"), null);
+                            }
+                            return left;
+                        }).orElse(null));
     }
 
     /** Two inputs' answers for one column: the type they agree on, and null wherever either allows it. */
@@ -380,7 +395,9 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
             strings.remove(replaced);
             unchanged.remove(replaced);
         }
-        return new NodeColumns(out, key, null, origins, true, numbers, unchanged, strings);
+        return new NodeColumns(out, key, null, origins, true, numbers, unchanged, strings,
+                unwind.sourceIdField() != null || upstream.unwindSourceIdField() == null
+                        ? unwind.resolvedSourceIdField() : upstream.unwindSourceIdField());
     }
 
     /** The declared element type as the shared vocabulary spells it, or unknown for anything else. */
@@ -593,7 +610,7 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
             }
         }
         return new NodeColumns(out, projectedKey(rules, upstream.key(), out), null,
-                origins, upstream.expanded(), numbers, unchanged, strings);
+                origins, upstream.expanded(), numbers, unchanged, strings, upstream.unwindSourceIdField());
     }
 
     /**

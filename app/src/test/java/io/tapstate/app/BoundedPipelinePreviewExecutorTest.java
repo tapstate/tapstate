@@ -272,6 +272,28 @@ class BoundedPipelinePreviewExecutorTest {
             assertThat((List<Map<String, Object>>) invoke(stream, "readDocuments", new Class<?>[0]))
                     .containsExactly(Map.of("id", 1L), Map.of("id", 2L));
 
+            member.getMap(resultMapName).clear();
+            member.<String, String>getMap(resultMapName).put("expanded:[1,0]",
+                    PreviewDocumentStorage.encode(Map.of("_id", "parent", "position", 0L)));
+            var target = new io.tapstate.spi.sink.TargetTable("rows", List.of());
+            var plan = new io.tapstate.adapters.pdk.TargetIdentityPlan("automatic", "generated-target-identity",
+                    target, "_id", "original_id", List.of("original_id", "position"));
+            var resolved = new StoreBackedTargetIdentities.Resolved(null, "expanded", plan);
+            assertThat((List<Map<String, Object>>) invoke(stream, "readDocuments", new Class<?>[0]))
+                    .containsExactly(Map.of("_id", "parent", "position", 0L));
+            assertThat((List<Map<String, Object>>) invoke(stream, "readDocuments", new Class<?>[] {List.class}, List.of(resolved)))
+                    .containsExactly(Map.of("original_id", "parent", "position", 0L));
+
+            member.getMap(resultMapName).clear();
+            member.<String, String>getMap(resultMapName).put("expanded:[2,0]", PreviewDocumentStorage.encode(Map.of(
+                    "_id", new io.tapstate.core.event.ConvertedValue("012345678901234567890123", "ObjectId"),
+                    "created", new io.tapstate.core.event.ConvertedValue(new io.tapdata.entity.schema.value.DateTime(
+                            java.time.Instant.parse("2026-10-02T00:00:00Z")), "timestamp"))));
+            List<Map<String, Object>> logical = invoke(stream, "readLogicalDocuments", new Class<?>[0]);
+            assertThat(logical.getFirst()).containsEntry("_id", "012345678901234567890123")
+                    .containsEntry("created", "2026-10-02T00:00:00Z");
+            assertThat(io.tapstate.core.event.EventJsonValues.encodedSize(logical, 4096)).isLessThan(4096);
+
             assertThatThrownBy(() -> invoke(stream, "stageSampleInputs", new Class<?>[] {Map.class}, Map.of()))
                     .isInstanceOf(TapstateException.class);
             Envelope row = Envelope.read(1L, "orders", Map.of("id", 1), Map.of());

@@ -46,6 +46,20 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class NodeColumnsTest {
 
     @Test
+    void successiveExpansionsInheritOrExplicitlyOverrideThePreservedIdentityName() {
+        NodeColumns source = known("id", "INT64", "items", "JSON", "tags", "JSON");
+        NodeColumns first = NodeColumns.of(new TransformBody.Unwind("items", "item_no", false, null, null, "original_id"),
+                one(source), null);
+        NodeColumns inherited = NodeColumns.of(new TransformBody.Unwind("tags", "tag_no", false, null, null),
+                one(first), null);
+        NodeColumns overridden = NodeColumns.of(new TransformBody.Unwind("tags", "tag_no", false, null, null, "root_id"),
+                one(first), null);
+        assertThat(inherited.unwindSourceIdField()).isEqualTo("original_id");
+        assertThat(overridden.unwindSourceIdField()).isEqualTo("root_id");
+        assertThat(overridden.key()).containsExactly("item_no", "tag_no");
+    }
+
+    @Test
     void expansionAndRenamesKeepParentDescriptorsWithoutReusingElementDeclarations() {
         var number = new io.tapstate.core.common.NumericType(64, true, false, true, null, null, 18, 4);
         var string = new io.tapstate.core.common.StringType(36L, false, true, 255L, 2);

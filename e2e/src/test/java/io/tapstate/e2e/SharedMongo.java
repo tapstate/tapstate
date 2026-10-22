@@ -15,7 +15,7 @@ import org.testcontainers.utility.DockerImageName;
  */
 final class SharedMongo {
 
-    private static final DockerImageName IMAGE = DockerImageName.parse("mongo:7.0");
+    private static final DockerImageName IMAGE = DockerImageName.parse(System.getProperty("tapstate.e2e.mongo-image", "mongo:7.0"));
 
     /** Kept as its own constant rather than reached for across modules: this module depends on neither. */
     static final String OPERATOR_STATE_DATABASE = "tapstate_nest";

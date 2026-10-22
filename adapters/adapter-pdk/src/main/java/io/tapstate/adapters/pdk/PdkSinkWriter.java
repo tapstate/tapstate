@@ -54,6 +54,8 @@ final class PdkSinkWriter implements SinkWriter {
     private final DdlPolicy ddl;
     private final Map<String, TargetTable> targets;
     private final PdkTargetPreparation preparation;
+    private Map<String, TargetIdentityPlan> identities = Map.of();
+    private SinkConfig identityConfig;
     // What closing this writer does to its connector: stops and closes it, or - where the connector is shared
     // by the writers of one sink - lets go of this writer's hold on it.
     private final Runnable letGo;
@@ -105,6 +107,9 @@ final class PdkSinkWriter implements SinkWriter {
         this(connector, write, config.writeMode(), config.ddl(), targets,
                 new PdkTargetPreparation(connector.connectorId(), connector.context(), connector.functions(),
                         config.onFullLoad(), config.fullLoad(), config.node(), stateStore, preparedAhead), letGo);
+        identityConfig = config;
+        identities = PdkTargetIdentityPlanner.assess(connector, config, this.targets);
+        identities.values().forEach(TargetIdentityProjection::requireUsable);
     }
 
     private PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, WriteMode mode, DdlPolicy ddl,
@@ -130,7 +135,11 @@ final class PdkSinkWriter implements SinkWriter {
     void prepareTargets() throws Throwable {
         connector.underLoader(() -> {
             for (Map.Entry<String, TargetTable> entry : targets.entrySet()) {
-                preparation.prepare(entry.getValue(), tableModel(entry.getKey(), entry.getValue()));
+                TargetTable target = projectedTarget(entry.getKey(), entry.getValue());
+                preparation.prepare(target, tableModel(entry.getKey(), target));
+            }
+            if (identityConfig != null) {
+                PdkTargetIdentityPlanner.verifyPrepared(connector, identityConfig, targets, identities);
             }
             return null;
         });
@@ -179,8 +188,10 @@ final class PdkSinkWriter implements SinkWriter {
                 // ignore: drop the schema change. apply: applying it to the target is a later slice, so drop it too.
                 continue;
             }
+            TargetIdentityPlan identity = identities.get(env.src());
+            Envelope row = identity == null ? env : TargetIdentityProjection.apply(identity, env);
             rowsByTable.computeIfAbsent(env.src(), ignored -> new ArrayList<>())
-                    .add(encode(mode == WriteMode.APPEND ? asInsert(env) : env));
+                    .add(encode(mode == WriteMode.APPEND ? asInsert(row) : row));
         }
         if (rowsByTable.isEmpty()) {
             return new WriteResult(0);
@@ -196,7 +207,7 @@ final class PdkSinkWriter implements SinkWriter {
                 long[] accepted = {0};
                 for (Map.Entry<String, List<TapRecordEvent>> entry : rowsByTable.entrySet()) {
                     List<TapRecordEvent> rows = entry.getValue();
-                    TargetTable target = targets.get(entry.getKey());
+                    TargetTable target = projectedTarget(entry.getKey(), targets.get(entry.getKey()));
                     TapTable table = target != null
                             ? tableModel(entry.getKey(), target)
                             : TargetTapTable.bare(rows.get(0).getTableId());
@@ -217,6 +228,11 @@ final class PdkSinkWriter implements SinkWriter {
         } catch (Throwable t) {
             throw writeFailed(connector.connectorId(), t);
         }
+    }
+
+    private TargetTable projectedTarget(String stream, TargetTable original) {
+        TargetIdentityPlan plan = identities.get(stream);
+        return plan == null ? original : plan.target();
     }
 
     private static long accepted(WriteListResult<TapRecordEvent> result) {

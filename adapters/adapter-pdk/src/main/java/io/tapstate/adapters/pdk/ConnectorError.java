@@ -25,6 +25,10 @@ import java.util.Set;
  */
 public enum ConnectorError implements TapstateErrorCode {
 
+    TARGET_IDENTITY_CONFLICT("connector.target-identity-conflict", Set.of("table", "field", "preserved", "reason")),
+    TARGET_IDENTITY_CHECK_FAILED("connector.target-identity-check-failed", Set.of("connector", "table", "detail")),
+
+
     /**
      * No artifact is registered in the distribution store for this connector id, so it resolves to
      * nothing and cannot be loaded. {@code connector} is the connector id that resolved to no artifact.

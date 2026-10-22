@@ -1504,7 +1504,10 @@ final class StoreBackedDagSource implements DagSource {
                         // A same-named computed value likewise cannot inherit source uniqueness.
                         .filter(index -> !index.unique() || (!produced.expanded()
                                 && produced.unchangedFields().containsAll(index.fields())))
-                        .toList()), key);
+                        .toList(), produced.expanded() && produced.unwindSourceIdField() != null
+                                ? new io.tapstate.spi.sink.UnwindIdentity(
+                                        key.stream().filter(column -> !produced.key().contains(column)).toList(),
+                                        produced.unwindSourceIdField()) : null), key);
     }
 
     /**
@@ -3206,6 +3209,15 @@ final class StoreBackedDagSource implements DagSource {
      * and a coded refusal is what a start check reports as a target it could not check.
      */
     List<PipelineWriteTargets.WriteTarget> writeTargets(PipelineResource definition) {
+        return writeTargets(definition, (coordinate, stream, model) -> { });
+    }
+
+    @FunctionalInterface
+    interface TargetModelConsumer {
+        void accept(PipelineWriteTargets.WriteTarget coordinate, String stream, TargetTable model);
+    }
+
+    List<PipelineWriteTargets.WriteTarget> writeTargets(PipelineResource definition, TargetModelConsumer models) {
         PipelineResource pipeline = PipelineInlining.inline(definition, artifacts());
         requireDiscovered(pipeline);
         List<PipelineWriteTargets.WriteTarget> written = new ArrayList<>();
@@ -3222,13 +3234,14 @@ final class StoreBackedDagSource implements DagSource {
                 io.tapstate.core.model.OnFullLoad policy = element.onFullLoad() == null
                         ? io.tapstate.core.model.OnFullLoad.APPEND : element.onFullLoad();
                 Set<String> tables = new LinkedHashSet<>();
-                for (TargetTable table : TargetModelResolver.renameAll(
-                        terminal.targets(), terminal.landing(), element.rename(), sourceIdByTable).values()) {
-                    if (tables.add(table.name())) {
-                        written.add(new PipelineWriteTargets.WriteTarget(syncNodeId(element),
-                                PipelineWriteTargets.WriteTarget.Kind.SYNC, element.source(), table.name(),
-                                policy, definedIn));
-                    }
+                for (var entry : TargetModelResolver.renameAll(
+                        terminal.targets(), terminal.landing(), element.rename(), sourceIdByTable).entrySet()) {
+                    TargetTable table = entry.getValue();
+                    var coordinate = new PipelineWriteTargets.WriteTarget(syncNodeId(element),
+                            PipelineWriteTargets.WriteTarget.Kind.SYNC, element.source(), table.name(),
+                            policy, definedIn);
+                    if (tables.add(table.name())) written.add(coordinate);
+                    models.accept(coordinate, entry.getKey(), table);
                 }
             }
         }

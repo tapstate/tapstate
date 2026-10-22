@@ -220,6 +220,7 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
             PipelineResource executionPipeline = null;
             Throwable failure = null;
             List<Map<String, Object>> documents = List.of();
+            List<Map<String, Object>> logicalDocuments = List.of();
             List<Map<String, Object>> trace = List.of();
             String resultFormat = PdkTargetPreviewRenderer.LOGICAL_JSON;
             PreviewSelectionPlanner.Sample sample = null;
@@ -237,6 +238,14 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
                 }
                 PipelineResource inlined = PipelineInlining.inline(original, snapshot);
                 PipelineResource selected = selectOutput(inlined, request.outputId());
+                List<StoreBackedTargetIdentities.Resolved> identities = new StoreBackedTargetIdentities(
+                        storePort, connectors, snapshot).resolve(selected, true);
+                if (!identities.isEmpty()) {
+                    emit("identity.completed", Map.of("targets", identities.stream()
+                            .map(StoreBackedTargetIdentities::payload).toList()));
+                    identities.forEach(identity -> io.tapstate.adapters.pdk.TargetIdentityProjection
+                            .requireUsable(identity.plan()));
+                }
                 executionPipeline = isolatedPipeline(pruneToOutput(selected));
                 StoreBackedDagSource dagSource = new StoreBackedDagSource(storePort, nestSettings, snapshot);
                 String sampleId = request.sampleId() == null ? request.runId() : request.sampleId();
@@ -277,12 +286,14 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
                 Job submitted = member.getJet().newJob(dag, config);
                 job.set(submitted);
                 waitForJob(submitted);
-                documents = readDocuments();
+                logicalDocuments = readLogicalDocuments();
+                documents = readDocuments(identities);
                 PdkTargetPreviewRenderer.Result rendered = targetPreviewRenderer.render(
                         selectedTarget(executionPipeline, snapshot), documents, this::checkActive);
                 documents = rendered.documents();
                 resultFormat = rendered.format();
-                if (EventJsonValues.encodedSize(documents, MAX_RESULT_BYTES) > MAX_RESULT_BYTES) {
+                if (EventJsonValues.encodedSize(documents, MAX_RESULT_BYTES)
+                        + EventJsonValues.encodedSize(logicalDocuments, MAX_RESULT_BYTES) > MAX_RESULT_BYTES) {
                     throw refused("the final preview result exceeds the 8 MiB response limit");
                 }
                 trace = readTrace(executionPipeline);
@@ -349,6 +360,7 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
                 emit("result.completed", Map.of(
                         "format", resultFormat,
                         "documents", documents,
+                        "logicalDocuments", logicalDocuments,
                         "complete", true,
                         "rowCount", documents.size(),
                         "rootRows", sample == null ? 0 : sample.rootRows(),
@@ -490,7 +502,19 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
             return String.join(" <- ", types);
         }
 
+        private List<Map<String, Object>> readLogicalDocuments() {
+            return readDocuments().stream().map(document -> {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> normalized = (Map<String, Object>) PreviewJsonValues.normalize(document);
+                return normalized;
+            }).toList();
+        }
+
         private List<Map<String, Object>> readDocuments() {
+            return readDocuments(List.of());
+        }
+
+        private List<Map<String, Object>> readDocuments(List<StoreBackedTargetIdentities.Resolved> identities) {
             IMap<String, String> results = member.getMap(resultMapName);
             List<Map.Entry<String, String>> entries = new ArrayList<>(results.entrySet());
             entries.sort(Map.Entry.comparingByKey());
@@ -500,7 +524,14 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
                 if (json == null) {
                     continue;
                 }
-                docs.add(Collections.unmodifiableMap(PreviewDocumentStorage.decode(json)));
+                Map<String, Object> document = PreviewDocumentStorage.decode(json);
+                var identity = identities.stream()
+                        .filter(candidate -> entry.getKey().startsWith(candidate.stream() + ":["))
+                        .max(Comparator.comparingInt(candidate -> candidate.stream().length())).orElse(null);
+                if (identity != null) {
+                    document = io.tapstate.adapters.pdk.TargetIdentityProjection.row(identity.plan(), document);
+                }
+                docs.add(Collections.unmodifiableMap(document));
             }
             return List.copyOf(docs);
         }

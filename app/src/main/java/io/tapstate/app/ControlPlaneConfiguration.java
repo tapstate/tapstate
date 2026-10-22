@@ -788,9 +788,10 @@ class ControlPlaneConfiguration {
     @Bean
     PipelineStartService pipelineStartService(PipelineLifecycleService lifecycle, PipelineChains pipelineChains,
             PipelineWriteTargets pipelineWriteTargets, StorePort storePort, DataBrowserService dataBrowserService,
-            ApplyService applyService, AuditGate auditGate, Clock clock) {
+            ApplyService applyService, AuditGate auditGate, Clock clock, ConnectorProvisioner connectorProvisioner) {
         MessageCatalog catalog = MessageCatalog.bundled();
-        StartCheckEvaluator evaluator = new StartCheckEvaluator(StartChecks.registered(),
+        StartCheckEvaluator evaluator = new StartCheckEvaluator(StartChecks.registered(
+                new StoreBackedTargetIdentities(storePort, connectorProvisioner)),
                 new StartPlanner(pipelineChains, storePort.meta(), pipelineWriteTargets),
                 new DataBrowserTargetProbe(dataBrowserService),
                 (code, params) -> catalog.render(code, params).message(),

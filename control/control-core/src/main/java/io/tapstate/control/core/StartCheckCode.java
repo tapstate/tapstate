@@ -20,6 +20,10 @@ import java.util.Set;
  */
 public enum StartCheckCode implements TapstateErrorCode {
 
+    TARGET_IDENTITY_AUTOMATIC("start-check.target-identity-automatic", Set.of("target", "connection", "field", "preserved", "key")),
+    TARGET_IDENTITY_COMPATIBLE("start-check.target-identity-compatible", Set.of("target", "connection", "key")),
+    TARGET_IDENTITY_REFUSED("start-check.target-identity-refused", Set.of("target", "connection", "reason", "field", "preserved")),
+
     /** A new full load into a target that holds nothing, or that does not exist yet. */
     TARGET_EMPTY("start-check.target-empty", Set.of("target", "connection")),
 

@@ -516,7 +516,7 @@ public final class DslParser {
             case "map" -> Set.of("fields");
             case FILTER_TOKEN -> Set.of("expr");
             case "unwind" -> Set.of("path", "include_array_index",
-                    "preserve_null_and_empty_arrays", "element_key", "element_type");
+                    "preserve_null_and_empty_arrays", "element_key", "element_type", "source_id_field");
             case "union" -> Set.of();
             case "nest" -> Set.of(
                     PRIMARY_KEY_FIELD, "order", "entries_in_memory", "max_elements_per_document",
@@ -558,7 +558,8 @@ public final class DslParser {
                     s.string("include_array_index"),
                     boolValue(s, "preserve_null_and_empty_arrays"),
                     s.string("element_key"),
-                    elementType(s));
+                    elementType(s),
+                    sourceIdField(s));
             case "union" -> new TransformBody.Union();
             case "nest" -> new TransformBody.Nest(
                     s.string(PRIMARY_KEY_FIELD),
@@ -1124,6 +1125,16 @@ public final class DslParser {
      * silently become whatever the target guessed. Kept as the string the model carries: what
      * travels downstream is the token, not the enum.
      */
+    private static String sourceIdField(YamlMap s) {
+        String field = s.string("source_id_field");
+        if (field != null && (field.isBlank() || field.contains(".") || field.startsWith("$")
+                || field.indexOf('\0') >= 0)) {
+            throw s.errorAt("source_id_field", DslError.ILLEGAL_VALUE,
+                    Map.of("value", field, "expected", "a nonblank top-level field name without dots or a dollar prefix"));
+        }
+        return field;
+    }
+
     private static String elementType(YamlMap s) {
         TapstateType declared = enumByYaml(
                 TapstateType.values(), t -> t.name().toLowerCase(Locale.ROOT), s, "element_type");
