@@ -92,6 +92,20 @@ public final class ValidationFieldCheck {
                 unavailablePaths, definedFields, arrays, root);
     }
 
+    /** Composes the current object row without dropping its position inside the current keyed parent. */
+    public static Result checkComposed(ValidationNestScope scope, ValidationValues.Row source,
+            ValidationValues.Row target, Optional<SampledSide> sourceSample, Optional<SampledSide> targetSample,
+            Optional<GeneratedId> generatedId, BiPredicate<String, String> compatible,
+            ValidationValueComparison.TraversalLimits limits, List<List<Object>> unavailablePaths, Set<String> definedFields,
+            List<ValidationNestArrayFieldCheck.Checked> arrays, Builder root) {
+        Objects.requireNonNull(root, "root");
+        try {
+            Objects.requireNonNull(scope, "scope");
+            return checkView(scope.observation(), new ArrayList<>(scope.objectPath()), source, target, sourceSample, targetSample,
+                    generatedId, compatible, limits, unavailablePaths, definedFields, arrays, root);
+        } catch (RuntimeException | Error failure) { root.close(); throw failure; }
+    }
+
     private static Result checkView(ValidationObservation parent, List<Object> path, ValidationValues.Row source,
             ValidationValues.Row target, Optional<SampledSide> sourceSample, Optional<SampledSide> targetSample,
             Optional<GeneratedId> generatedId, BiPredicate<String, String> compatible,
@@ -111,7 +125,7 @@ public final class ValidationFieldCheck {
             List<Object> fieldPath = location.fieldPath();
             requireScope(parent, root);
             var masks = unavailable(parent, fieldPath, unavailablePaths, definedFields, limits.row().bytes(), root);
-            var composition = composed(parent, source, target, masks, arrays, limits.row().bytes(), limits.operations(), root);
+            var composition = composed(parent, fieldPath, source, target, masks, arrays, limits.row().bytes(), limits.operations(), root);
             var unavailable = composition.paths();
             var defined = masks.definedFields();
             sourceSample.ifPresent(sample -> root.requireSampleRead(Side.SOURCE, sample));
@@ -188,7 +202,7 @@ public final class ValidationFieldCheck {
     }
 
     private record Composition(List<List<Object>> paths, long remainingOperations) {}
-    private static Composition composed(ValidationObservation parent, ValidationValues.Row source, ValidationValues.Row target,
+    private static Composition composed(ValidationObservation parent, List<Object> prefix, ValidationValues.Row source, ValidationValues.Row target,
             Masks masks, List<ValidationNestArrayFieldCheck.Checked> arrays, long maxBytes, long operations, Builder root) {
         if (arrays == null || arrays.size() > 256 - masks.paths().size()) throw ValidationError.invalid("fieldCheck.arrays");
         if (arrays.isEmpty()) return new Composition(masks.paths(), operations);
@@ -198,7 +212,7 @@ public final class ValidationFieldCheck {
         for (var array : arrays) {
             if (array == null) throw ValidationError.invalid("fieldCheck.arrays");
             work.step(1);
-            List<String> declared = array.require(parent, source, target, root);
+            List<String> declared = array.require(parent, prefix, source, target, root);
             bytes += 96L + 16L * declared.size();
             for (String segment : declared) { work.step(1L + segment.length()); bytes += 48L + 2L * segment.length(); }
             if (bytes > maxBytes) throw new io.tapstate.core.common.TapstateException(ValidationError.VALUE_LIMIT_EXCEEDED,

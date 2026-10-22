@@ -20,20 +20,20 @@ public final class ValidationNestArrayFieldCheck {
 
     /** Opaque evidence tied to this builder, observation, and the same immutable working row objects. */
     public static final class Checked {
-        private final ValidationObservation parent;
+        private final ValidationNestScope scope;
         private final ValidationValues.Row source;
         private final ValidationValues.Row target;
         private final Builder root;
         private final List<String> path;
 
-        private Checked(ValidationObservation parent, ValidationValues.Row source, ValidationValues.Row target,
+        private Checked(ValidationNestScope scope, ValidationValues.Row source, ValidationValues.Row target,
                 Builder root, List<String> path) {
-            this.parent = parent; this.source = source; this.target = target; this.root = root;
+            this.scope = scope; this.source = source; this.target = target; this.root = root;
             this.path = List.copyOf(path);
         }
 
-        List<String> require(ValidationObservation parent, ValidationValues.Row source, ValidationValues.Row target, Builder root) {
-            if (!this.parent.equals(parent) || this.source != source || this.target != target || this.root != root) {
+        List<String> require(ValidationObservation parent, List<Object> prefix, ValidationValues.Row source, ValidationValues.Row target, Builder root) {
+            if (!scope.observation().equals(parent) || !scope.objectPath().equals(prefix) || this.source != source || this.target != target || this.root != root) {
                 throw ValidationError.invalid("fieldCheck.arrayEvidenceScope");
             }
             return path;
@@ -52,9 +52,20 @@ public final class ValidationNestArrayFieldCheck {
             ValidationCheckEvent.Side physicalTarget, ValidationValues.Row targetView, ValidationKeyBinding elementKey,
             Optional<ValidationKeyBinding> rowKey, Set<String> containerTypes, ValidationNestTargetArray.Limits limits,
             ValidationNestArrayMembers members, Builder root, Consumer<ValidationNestArrayMembers.Group> uniquePair) {
+        Objects.requireNonNull(root, "root"); Objects.requireNonNull(members, "members");
+        try { return check(new ValidationNestScope(parent), arrayPath, sourceView, physicalTarget, targetView, elementKey, rowKey,
+                containerTypes, limits, members, root, uniquePair); }
+        catch (RuntimeException | Error failure) { members.close(); root.close(); throw failure; }
+    }
+
+    public static Checked check(ValidationNestScope scope, List<String> arrayPath, ValidationValues.Row sourceView,
+            ValidationCheckEvent.Side physicalTarget, ValidationValues.Row targetView, ValidationKeyBinding elementKey,
+            Optional<ValidationKeyBinding> rowKey, Set<String> containerTypes, ValidationNestTargetArray.Limits limits,
+            ValidationNestArrayMembers members, Builder root, Consumer<ValidationNestArrayMembers.Group> uniquePair) {
         Objects.requireNonNull(root, "root");
         Objects.requireNonNull(members, "members");
         try {
+            Objects.requireNonNull(scope, "scope");
             Objects.requireNonNull(sourceView, "sourceView");
             Objects.requireNonNull(uniquePair, "uniquePair");
             Objects.requireNonNull(limits, "limits");
@@ -70,10 +81,10 @@ public final class ValidationNestArrayFieldCheck {
             for (String type : containerTypes) ValidationError.identifier(type, "fieldCheck.arrayContainerType");
             arrayPath = List.copyOf(arrayPath); containerTypes = Set.copyOf(containerTypes);
             var remaining = sourcePrefixes(sourceView, arrayPath, containerTypes, limits.operations());
-            var state = ValidationNestTargetArray.read(parent, arrayPath, physicalTarget, targetView, elementKey,
+            var state = ValidationNestTargetArray.read(scope, arrayPath, physicalTarget, targetView, elementKey,
                     rowKey, containerTypes, new ValidationNestTargetArray.Limits(limits.row(), limits.elements(), remaining), members, root);
             if (state == ValidationNestTargetArray.State.COMPLETE) ValidationNestArrayCheck.check(members.finish(), root, uniquePair);
-            return new Checked(parent, sourceView, targetView, root, arrayPath);
+            return new Checked(scope, sourceView, targetView, root, arrayPath);
         } catch (RuntimeException | Error failure) {
             members.close(); root.close();
             throw failure;

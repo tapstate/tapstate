@@ -74,12 +74,21 @@ public final class ValidationNestArraySourceRead {
     public static Result read(ValidationObservation parent, ValidationNestLookupBinding binding,
             ValidationStaticMap.Projection workingParent, ValidationRootCheck.SampledSide originalParent, ValidationNestRelationRead.Queries queries, Limits limits,
             Clock clock, Runnable requireAuthorized, Rule rule, Facts facts) {
-        Objects.requireNonNull(parent, "parent"); Objects.requireNonNull(binding, "binding");
+        return read(new ValidationNestScope(parent), binding, workingParent, originalParent, queries, limits, clock, requireAuthorized, rule, facts);
+    }
+
+    /** The parent projection supplies local join fields; object prefixes belong only to logical scope. */
+    public static Result read(ValidationNestScope scope, ValidationNestLookupBinding binding,
+            ValidationStaticMap.Projection workingParent, ValidationRootCheck.SampledSide originalParent, ValidationNestRelationRead.Queries queries, Limits limits,
+            Clock clock, Runnable requireAuthorized, Rule rule, Facts facts) {
+        Objects.requireNonNull(scope, "scope");
+        var parent = scope.observation();
+        Objects.requireNonNull(binding, "binding");
         Objects.requireNonNull(limits, "limits"); Objects.requireNonNull(rule, "rule"); Objects.requireNonNull(facts, "facts");
         Objects.requireNonNull(queries, "queries"); Objects.requireNonNull(requireAuthorized, "requireAuthorized");
         Objects.requireNonNull(originalParent, "originalParent");
         if (binding.relation().shape() != EmbedAs.ARRAY) throw invalid("arrayRead.shape");
-        var path = List.of(binding.relation().outputPath().orElseThrow().split("\\.", -1));
+        var path = scope.path(List.of(binding.relation().outputPath().orElseThrow().split("\\.", -1)));
         final Context[] context = { null };
         final int[] rows = { 0 };
         var causes = new LinkedHashSet<ValidationRootCheck.Finding>();

@@ -181,6 +181,28 @@ class ValidationNestArraySourceReadTest {
         assertThat(result.referenceProblem()).isEmpty(); assertThat(cursor.closed).isTrue(); assertThat(cursor.released).isEqualTo(1);
     }
 
+    @Test void objectPrefixChangesOnlyLogicalScopeWhileQueriesStillBindLocalParentColumns() {
+        var scope = new ValidationNestScope(PARENT).object(List.of("profile"));
+        var cursor = new Cursor(List.of(1, 2, 3));
+        var result = ValidationNestArraySourceRead.read(scope, binding(false), view(Map.of("id", 7), List.of()), parentSample(), request -> {
+            assertThat(request.key()).isEqualTo(key(7));
+            assertThat(request.physical().components().getFirst().path()).containsExactly("native_parent_id");
+            return new ValidationRootReader.Query("profile-children", "v1", () -> cursor);
+        }, LIMITS, CLOCK, () -> {}, (context, raw) -> {
+            assertThat(context.path()).containsExactly("profile", "items");
+            assertThat(context.parent()).isEqualTo(PARENT);
+            return included(context, raw);
+        }, (context, source) -> {});
+        var facts = result.source().orElseThrow();
+        assertThat(facts.arrayPath()).containsExactly("profile", "items");
+        assertThat(facts.groups()).allSatisfy(group -> {
+            assertThat(group.scope().rootKey()).isEqualTo(PARENT.root().rootKey());
+            assertThat(group.scope().ancestors().getFirst()).isEqualTo(PARENT.root().ancestors().getFirst());
+            assertThat(group.scope().ancestors().getLast().fieldPath()).containsExactly("profile", "items");
+        });
+        assertThat(cursor.closed).isTrue(); assertThat(cursor.released).isEqualTo(3);
+    }
+
     private static ValidationNestArraySourceRead.Result read(Cursor cursor, ValidationNestArraySourceRead.Limits limits,
             ValidationNestArraySourceRead.Rule rule, ValidationNestArraySourceRead.Facts facts, Runnable guard) {
         return ValidationNestArraySourceRead.read(PARENT, binding(false), view(Map.of("id", 7), List.of()), parentSample(), request ->

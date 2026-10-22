@@ -34,10 +34,20 @@ public final class ValidationNestTargetArray {
     public static State read(ValidationObservation parent, List<String> arrayPath, ValidationCheckEvent.Side physicalParent,
             ValidationValues.Row workingParent, ValidationKeyBinding elementKey, Optional<ValidationKeyBinding> rowKey,
             Set<String> containerTypes, Limits limits, ValidationNestArrayMembers members, Builder root) {
+        Objects.requireNonNull(root, "root"); Objects.requireNonNull(members, "members");
+        try { return read(new ValidationNestScope(parent), arrayPath, physicalParent, workingParent, elementKey, rowKey, containerTypes, limits, members, root); }
+        catch (RuntimeException | Error failure) { members.close(); root.close(); throw failure; }
+    }
+
+    /** Traversal uses the current working row; diagnostics and member identity use its complete object prefix. */
+    public static State read(ValidationNestScope scope, List<String> arrayPath, ValidationCheckEvent.Side physicalParent,
+            ValidationValues.Row workingParent, ValidationKeyBinding elementKey, Optional<ValidationKeyBinding> rowKey,
+            Set<String> containerTypes, Limits limits, ValidationNestArrayMembers members, Builder root) {
         Objects.requireNonNull(root, "root");
         Objects.requireNonNull(members, "members");
         try {
-            Objects.requireNonNull(parent, "parent");
+            Objects.requireNonNull(scope, "scope");
+            var parent = scope.observation();
             Objects.requireNonNull(physicalParent, "physicalParent");
             Objects.requireNonNull(workingParent, "workingParent");
             Objects.requireNonNull(elementKey, "elementKey");
@@ -50,13 +60,14 @@ public final class ValidationNestTargetArray {
             arrayPath = List.copyOf(arrayPath);
             containerTypes = Set.copyOf(containerTypes);
             requireScope(parent, root);
-            members.requireRequest(parent, arrayPath);
+            var fullPath = scope.path(arrayPath);
+            members.requireRequest(parent, fullPath);
             members.requireSourceComplete();
             if (physicalParent.groupStatus() != ValidationCheckEvent.GroupStatus.COMPLETE || physicalParent.observedOccurrences() != 1) {
                 throw ValidationError.invalid("targetArray.parent");
             }
-            checkPathBudget(arrayPath, elementKey);
-            if (rowKey.isPresent()) checkPathBudget(arrayPath, rowKey.orElseThrow());
+            checkPathBudget(fullPath, elementKey);
+            if (rowKey.isPresent()) checkPathBudget(fullPath, rowKey.orElseThrow());
             bounded(physicalParent.row(), limits.row()); bounded(workingParent, limits.row());
             root.read(Side.TARGET, physicalParent.boundary());
             var sample = new SampledSide(physicalParent.identity(), physicalParent.row(), physicalParent.boundary().readId());
@@ -66,22 +77,22 @@ public final class ValidationNestTargetArray {
                 meter.step(1);
                 array = unwrap(array, containerTypes, meter);
                 if (!(array instanceof Map<?, ?> map) || !map.containsKey(segment)) {
-                    return invalid(root, members, parent, arrayPath, arrayPath, Kind.TARGET_STRUCTURE, sample);
+                    return invalid(root, members, parent, fullPath, fullPath, Kind.TARGET_STRUCTURE, sample);
                 }
                 array = map.get(segment);
             }
             array = unwrap(array, containerTypes, meter);
             if (!(array instanceof List<?> values)) {
-                return invalid(root, members, parent, arrayPath, arrayPath, Kind.TARGET_STRUCTURE, sample);
+                return invalid(root, members, parent, fullPath, fullPath, Kind.TARGET_STRUCTURE, sample);
             }
             if (values.size() > limits.elements()) throw limit("elements");
             boolean valid = true;
             for (int ordinal = 0; ordinal < values.size(); ordinal++) {
                 meter.step(1);
-                var position = new ArrayList<Object>(arrayPath); position.add(ordinal);
+                var position = new ArrayList<Object>(fullPath); position.add(ordinal);
                 Object value = unwrap(values.get(ordinal), containerTypes, meter);
                 if (!(value instanceof Map<?, ?> object)) {
-                    finding(root, parent, arrayPath, position, Kind.TARGET_STRUCTURE, sample);
+                    finding(root, parent, fullPath, position, Kind.TARGET_STRUCTURE, sample);
                     valid = false;
                     continue;
                 }
@@ -92,8 +103,8 @@ public final class ValidationNestTargetArray {
                 var element = elementKey.read(row);
                 var declared = rowKey.isPresent() ? rowKey.orElseThrow().read(row) : null;
                 Set<List<String>> reported = new HashSet<>();
-                boolean keyed = recordProblems(element, position, arrayPath, parent, sample, root, reported)
-                        & (declared == null || recordProblems(declared, position, arrayPath, parent, sample, root, reported));
+                boolean keyed = recordProblems(element, position, fullPath, parent, sample, root, reported)
+                        & (declared == null || recordProblems(declared, position, fullPath, parent, sample, root, reported));
                 if (!keyed) { valid = false; continue; }
                 if (valid) members.add(ValidationNestArrayMembers.Side.TARGET, parent,
                         new ValidationNestArrayMembers.Member(declared == null ? Optional.empty() : Optional.of(((ValidationKeyBinding.Bound) declared).key()),

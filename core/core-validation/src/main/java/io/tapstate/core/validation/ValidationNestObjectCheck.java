@@ -1,6 +1,5 @@
 package io.tapstate.core.validation;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -30,8 +29,18 @@ public final class ValidationNestObjectCheck {
             Optional<Target> target, Set<String> containerTypes, ValidationValues.Limits limits, Builder root,
             BiConsumer<ValidationRelationRows.Sample, ValidationValues.Row> matched) {
         Objects.requireNonNull(root, "root");
+        try { check(new ValidationNestScope(parent), path, source, target, containerTypes, limits, root, matched); }
+        catch (RuntimeException | Error failure) { root.close(); throw failure; }
+    }
+
+    /** Local target traversal and complete diagnostic coordinates are distinct for mixed object/array trees. */
+    public static void check(ValidationNestScope scope, List<String> path, ValidationNestSingleSource.Result source,
+            Optional<Target> target, Set<String> containerTypes, ValidationValues.Limits limits, Builder root,
+            BiConsumer<ValidationRelationRows.Sample, ValidationValues.Row> matched) {
+        Objects.requireNonNull(root, "root");
         try {
-            Objects.requireNonNull(parent, "parent");
+            Objects.requireNonNull(scope, "scope");
+            var parent = scope.observation();
             Objects.requireNonNull(source, "source");
             Objects.requireNonNull(target, "target");
             Objects.requireNonNull(limits, "limits");
@@ -43,7 +52,7 @@ public final class ValidationNestObjectCheck {
             for (String type : containerTypes) ValidationError.identifier(type, "objectCheck.containerTypes");
             path = List.copyOf(path); containerTypes = Set.copyOf(containerTypes);
             requireScope(parent, root.observation());
-            Location location = new Location(parent.root(), new ArrayList<>(path));
+            Location location = scope.location(path);
             if (!source.observation().equals(parent) || !source.location().equals(location)) throw ValidationError.invalid("objectCheck.source");
             root.read(Side.SOURCE, source.read());
             if (source.state() == ValidationNestSingleSource.State.BLOCKED) {
@@ -70,7 +79,7 @@ public final class ValidationNestObjectCheck {
             bounded(sourceRow.original(), limits); bounded(sourceRow.working(), limits);
             var sourceSample = sourceRow.physical().map(identity -> new SampledSide(identity, sourceRow.original(), source.read().readId()));
             if (slot.invalidPrefix() != null) {
-                difference(root, Kind.TARGET_STRUCTURE, new Location(parent.root(), new ArrayList<>(slot.invalidPrefix())), location, sourceSample, targetSample);
+                difference(root, Kind.TARGET_STRUCTURE, scope.location(slot.invalidPrefix()), location, sourceSample, targetSample);
             } else if (!slot.present()) {
                 difference(root, Kind.TARGET_MISSING, location, location, sourceSample, targetSample);
             } else {
