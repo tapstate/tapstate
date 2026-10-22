@@ -124,6 +124,7 @@ class PdkValidationSessionTest {
                     }
                     public void stop(TapConnectionContext c) {
                         loader(); count(c, "stops"); signal(c, "release");
+                        if (Thread.currentThread().isInterrupted()) count(c, "interruptedStops");
                         if (mode(c).equals("query-failure") || mode(c).equals("stop-failure"))
                             throw new IllegalStateException("cleanup failed");
                     }
@@ -480,6 +481,22 @@ class PdkValidationSessionTest {
         }
     }
 
+    @Test void anInterruptedQueryStillRunsConnectorCleanupWithoutAnInheritedInterrupt() throws Exception {
+        var probe = new Probe("interrupt-cleanup", "abandon");
+        try (var io = Executors.newSingleThreadExecutor(); var cursor = scan(probe, io)) {
+            assertThatThrownBy(() -> {
+                while (true) {
+                    var next = cursor.next();
+                    if (next.isEmpty()) break;
+                    next.orElseThrow().close();
+                }
+            }).isInstanceOf(TapstateException.class);
+            io.submit(() -> {}).get(3, TimeUnit.SECONDS);
+            assertThat(probe.stops.get()).isGreaterThanOrEqualTo(1);
+            assertThat(probe.interruptedStops).hasValue(0);
+        }
+    }
+
     private static PdkValidationCursor.Decoder decoder(TapTable model, PdkValidationCodecs codecs) {
         return row -> {
             assertThat(Thread.currentThread().getName()).isEqualTo("validation-decode-fixture");
@@ -514,6 +531,7 @@ class PdkValidationSessionTest {
         private final AtomicInteger queries = new AtomicInteger();
         private final AtomicInteger discoveries = new AtomicInteger();
         private final AtomicInteger stops = new AtomicInteger();
+        private final AtomicInteger interruptedStops = new AtomicInteger();
         private final CountDownLatch entered = new CountDownLatch(1);
         private final CountDownLatch release = new CountDownLatch(1);
         private final AtomicReference<Consumer<List<TapTable>>> discovery = new AtomicReference<>();
@@ -521,7 +539,7 @@ class PdkValidationSessionTest {
         private Map<String, Object> settings() {
             return Map.of("tag", tag, "mode", mode, "inits", inits, "queries", queries,
                     "discoveries", discoveries, "stops", stops, "entered", entered,
-                    "release", release, "discovery", discovery);
+                    "release", release, "discovery", discovery, "interruptedStops", interruptedStops);
         }
     }
 }

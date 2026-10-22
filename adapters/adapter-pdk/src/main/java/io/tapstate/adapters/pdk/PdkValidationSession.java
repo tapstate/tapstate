@@ -138,6 +138,7 @@ final class PdkValidationSession {
     private boolean queryExited;
     private int decoding;
     private PdkValidationCursor.Decoder decoder;
+    private final PdkValidationQueryCancellation queryCancellation = new PdkValidationQueryCancellation();
 
     private PdkValidationSession(String connectorId, ConnectorRef artifact, Map<String, Object> settings,
             String codecBinding, Request scan, ReadAdmission admission, MatchEncoding matchEncoding,
@@ -175,7 +176,7 @@ final class PdkValidationSession {
 
     private ValidationReadHandle open(ExecutorService io, int maxInFlightRows, ValidationValues.Limits rowLimits) {
         var cursor = new PdkValidationCursor(scan.table(), this::read, row -> decoder.decode(project(row)),
-                this::checkActive, this::cancel, io, maxInFlightRows, rowLimits);
+                this::checkActive, this::cancel, io, maxInFlightRows, rowLimits, queryCancellation);
         cursor.workersExited().whenComplete((ignored, error) -> activityExited(true, error));
         return new ValidationReadHandle() {
             @Override public java.util.Optional<Row> next() { return cursor.next(); }
@@ -470,21 +471,28 @@ final class PdkValidationSession {
     }
 
     private void finish() {
-        synchronized (stopLock) {
-            PdkConnector opened = connector;
-            if (opened == null) return;
-            try {
-                // Cancellation can race initialization; stop again after that invocation exits so late
-                // resources cannot survive an earlier stop. This never touches a successor's handle.
-                stop(opened);
-            } finally {
-                connector = null;
-                opened.close();
+        // A cancelled Future is not an exited query. Once cleanup starts, host cancellation must not
+        // interrupt the connector's close operation; prior interruption is restored after it exits.
+        boolean interrupted = queryCancellation.enterCleanup();
+        try {
+            synchronized (stopLock) {
+                PdkConnector opened = connector;
+                if (opened == null) return;
+                try {
+                    // Cancellation can race initialization; stop again after that invocation exits so late
+                    // resources cannot survive an earlier stop. This never touches a successor's handle.
+                    stop(opened);
+                } finally {
+                    connector = null;
+                    opened.close();
+                }
             }
-        }
+        } finally { if (interrupted) Thread.currentThread().interrupt(); }
     }
 
     private void stop(PdkConnector opened) {
+        // A caller may itself be cancelled. Its existing flag must not abort mandatory close work.
+        boolean interrupted = Thread.interrupted();
         try {
             opened.underLoader(() -> invoke(() -> {
                 opened.connector().stop(opened.context());
@@ -493,6 +501,6 @@ final class PdkValidationSession {
         } catch (RuntimeException | Error failure) { throw failure; }
         catch (Throwable failure) {
             throw new TapstateException(ValidationError.READ_FAILED, Map.of("table", scan.table()), failure);
-        }
+        } finally { if (interrupted) Thread.currentThread().interrupt(); }
     }
 }

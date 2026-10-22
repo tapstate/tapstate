@@ -33,6 +33,7 @@ final class PdkValidationCursor implements ValidationReadHandle {
     private final Decoder decoder;
     private final Runnable requireAuthorized;
     private final Runnable cancelQuery;
+    private final PdkValidationQueryCancellation queryCancellation;
     private final ValidationValues.Limits rowLimits;
     private final ArrayBlockingQueue<BorrowedRow> rows;
     private final Semaphore slots;
@@ -50,6 +51,13 @@ final class PdkValidationCursor implements ValidationReadHandle {
 
     PdkValidationCursor(String table, QueryCall query, Decoder decoder, Runnable requireAuthorized,
             Runnable cancelQuery, ExecutorService executor, int maxInFlightRows, ValidationValues.Limits rowLimits) {
+        this(table, query, decoder, requireAuthorized, cancelQuery, executor, maxInFlightRows, rowLimits, new PdkValidationQueryCancellation());
+    }
+
+    PdkValidationCursor(String table, QueryCall query, Decoder decoder, Runnable requireAuthorized,
+            Runnable cancelQuery, ExecutorService executor, int maxInFlightRows, ValidationValues.Limits rowLimits,
+            PdkValidationQueryCancellation queryCancellation) {
+        this.queryCancellation = Objects.requireNonNull(queryCancellation, "queryCancellation");
         this.table = Objects.requireNonNull(table, "table");
         this.query = Objects.requireNonNull(query, "query");
         this.decoder = Objects.requireNonNull(decoder, "decoder");
@@ -67,10 +75,10 @@ final class PdkValidationCursor implements ValidationReadHandle {
         try {
             requireAuthorized.run();
             executor.execute(worker);
-            if (closed.get()) worker.cancel(true);
+            if (closed.get()) queryCancellation.cancel(worker);
         } catch (RuntimeException | Error rejected) {
             closed.set(true);
-            worker.cancel(true);
+            queryCancellation.cancel(worker);
             Throwable primary = rejected instanceof RejectedExecutionException
                     ? new TapstateException(ValidationError.READ_FAILED, Map.of("table", table), rejected) : rejected;
             failure.record(primary);
@@ -258,7 +266,7 @@ final class PdkValidationCursor implements ValidationReadHandle {
     @Override public void close() {
         if (!closed.compareAndSet(false, true)) return;
         boolean cancellationFirst = failure.record(cancelled());
-        if (worker != null) worker.cancel(true);
+        if (worker != null) queryCancellation.cancel(worker);
         BorrowedRow queued;
         while ((queued = rows.poll()) != null) queued.close();
         completeReleasedRows();
