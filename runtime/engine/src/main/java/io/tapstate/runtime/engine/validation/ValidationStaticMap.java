@@ -154,7 +154,8 @@ public final class ValidationStaticMap {
         return applyPartial(input.row(), input.unavailablePaths(), input.definedFields());
     }
 
-    private Projection applyPartial(ValidationValues.Row input, List<List<Object>> unavailablePaths, Set<String> definedFields) {
+    /** Package-local independent tree composition preserves known overrides when adding structural paths. */
+    Projection applyPartial(ValidationValues.Row input, List<List<Object>> unavailablePaths, Set<String> definedFields) {
         checkInput(input);
         var inputPaths = new PathSet(input.accountedBytes());
         if (unavailablePaths == null || unavailablePaths.size() > 256) throw invalid("map.unavailablePaths");

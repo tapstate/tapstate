@@ -19,7 +19,7 @@ public final class ValidationNestArrayFieldCheck {
     private ValidationNestArrayFieldCheck() {}
 
     /** Opaque evidence tied to this builder, observation, and the same immutable working row objects. */
-    public static final class Checked {
+    public static final class Checked implements ValidationNestCheckedSubtree {
         private final ValidationNestScope scope;
         private final ValidationValues.Row source;
         private final ValidationValues.Row target;
@@ -32,7 +32,7 @@ public final class ValidationNestArrayFieldCheck {
             this.path = List.copyOf(path);
         }
 
-        List<String> require(ValidationObservation parent, List<Object> prefix, ValidationValues.Row source, ValidationValues.Row target, Builder root) {
+        @Override public List<String> require(ValidationObservation parent, List<Object> prefix, ValidationValues.Row source, ValidationValues.Row target, Builder root) {
             if (!scope.observation().equals(parent) || !scope.objectPath().equals(prefix) || this.source != source || this.target != target || this.root != root) {
                 throw ValidationError.invalid("fieldCheck.arrayEvidenceScope");
             }
@@ -91,7 +91,7 @@ public final class ValidationNestArrayFieldCheck {
         }
     }
 
-    private static long sourcePrefixes(ValidationValues.Row source, List<String> path, Set<String> containers, long operations) {
+    static long sourcePrefixes(ValidationValues.Row source, List<String> path, Set<String> containers, long operations) {
         Object current = source.fields();
         for (int i = 0; i < path.size() - 1; i++) {
             operations = work(operations, 1L + path.get(i).length());

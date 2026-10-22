@@ -88,6 +88,7 @@ public final class ValidationNestTargetArray {
             if (values.size() > limits.elements()) throw limit("elements");
             boolean valid = true;
             for (int ordinal = 0; ordinal < values.size(); ordinal++) {
+                var admission = members.admitTargetRow(parent);
                 meter.step(1);
                 var position = new ArrayList<Object>(fullPath); position.add(ordinal);
                 Object value = unwrap(values.get(ordinal), containerTypes, meter);
@@ -106,9 +107,9 @@ public final class ValidationNestTargetArray {
                 boolean keyed = recordProblems(element, position, fullPath, parent, sample, root, reported)
                         & (declared == null || recordProblems(declared, position, fullPath, parent, sample, root, reported));
                 if (!keyed) { valid = false; continue; }
-                if (valid) members.add(ValidationNestArrayMembers.Side.TARGET, parent,
+                if (valid) members.addAdmittedTarget(parent,
                         new ValidationNestArrayMembers.Member(declared == null ? Optional.empty() : Optional.of(((ValidationKeyBinding.Bound) declared).key()),
-                                ((ValidationKeyBinding.Bound) element).key(), physicalParent.identity(), physicalParent.row(), row));
+                                ((ValidationKeyBinding.Bound) element).key(), physicalParent.identity(), physicalParent.row(), row), admission);
             }
             if (!valid) return discardInvalid(members, root);
             members.complete(ValidationNestArrayMembers.Side.TARGET, parent, physicalParent.boundary());

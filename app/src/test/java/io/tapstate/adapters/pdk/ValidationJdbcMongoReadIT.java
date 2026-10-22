@@ -29,6 +29,7 @@ import io.tapstate.runtime.engine.validation.ValidationRelationReader;
 import io.tapstate.runtime.engine.validation.ValidationNestRelations;
 import io.tapstate.runtime.engine.validation.ValidationNestLookupBinding;
 import io.tapstate.runtime.engine.validation.ValidationNestObjectProjection;
+import io.tapstate.runtime.engine.validation.ValidationNestTree;
 import io.tapstate.runtime.engine.validation.ValidationNestArraySourceRead;
 import io.tapstate.core.validation.ValidationNestArrayMembers;
 import io.tapstate.core.validation.ValidationNestArrayFieldCheck;
@@ -97,6 +98,158 @@ class ValidationJdbcMongoReadIT {
 
     @Test @Timeout(120)
     void postgresNativeArraysKeepAllMembersAndRootProblems() throws Exception { verifyArrays(false); }
+
+    @Test @Timeout(120)
+    void mysqlNativeMixedTreeKeepsObjectArrayScopes() throws Exception { verifyMixedTree(true); }
+
+    @Test @Timeout(120)
+    void postgresNativeMixedTreeKeepsObjectArrayScopes() throws Exception { verifyMixedTree(false); }
+
+    private void verifyMixedTree(boolean mysql) throws Exception {
+        String kind = mysql ? "mysql" : "postgres";
+        var sourceRef = artifact(kind); var targetRef = artifact("mongodb");
+        int port = mysql ? 3306 : 5432;
+        try (var jdbc = new GenericContainer<>(DockerImageName.parse(mysql ? "mysql:8.0" : "postgres:16"))
+                    .withExposedPorts(port).withStartupTimeout(Duration.ofSeconds(75));
+             var mongo = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))) {
+            if (mysql) jdbc.withEnv("MYSQL_ROOT_PASSWORD", PASSWORD).withEnv("MYSQL_DATABASE", DATABASE)
+                    .withEnv("MYSQL_USER", "validation").withEnv("MYSQL_PASSWORD", PASSWORD)
+                    .withCommand("--innodb-buffer-pool-size=64M", "--max-connections=20")
+                    .waitingFor(Wait.forLogMessage(".*mysqld: ready for connections\\..*port: 3306.*\\n", 1));
+            else jdbc.withEnv("POSTGRES_PASSWORD", PASSWORD).withEnv("POSTGRES_USER", "validation").withEnv("POSTGRES_DB", DATABASE)
+                    .waitingFor(Wait.forLogMessage(".*database system is ready to accept connections.*\\n", 2));
+            jdbc.start(); mongo.start();
+            sql(jdbc, mysql, "CREATE TABLE mixed_roots (id BIGINT PRIMARY KEY, customer_id BIGINT, shipping_id BIGINT, label VARCHAR(40));"
+                    + "CREATE TABLE mixed_customers (id BIGINT PRIMARY KEY, name VARCHAR(40));"
+                    + "CREATE TABLE mixed_items (id BIGINT PRIMARY KEY, customer_id BIGINT, product_id BIGINT, amount BIGINT);"
+                    + "CREATE INDEX mixed_parent_lookup ON mixed_items(customer_id);"
+                    + "CREATE TABLE mixed_products (id BIGINT PRIMARY KEY, name VARCHAR(40));"
+                    + "CREATE TABLE mixed_shipping (id BIGINT PRIMARY KEY, label VARCHAR(40));"
+                    + "INSERT INTO mixed_roots VALUES (" + EXACT + ",9,77,'root'),(2,9,77,'root');"
+                    + "INSERT INTO mixed_customers VALUES (9,'Ada');"
+                    + "INSERT INTO mixed_items VALUES (11,9,501,5),(12,9,502,6);"
+                    + "INSERT INTO mixed_products VALUES (501,'P1'),(502,'P2');"
+                    + "INSERT INTO mixed_shipping VALUES (77,'ship');");
+            var sourceSettings = new LinkedHashMap<String, Object>();
+            sourceSettings.put("host", jdbc.getHost()); sourceSettings.put("port", jdbc.getMappedPort(port));
+            sourceSettings.put("database", DATABASE); sourceSettings.put(mysql ? "username" : "user", "validation");
+            sourceSettings.put("password", PASSWORD); sourceSettings.put("timezone", "+00:00"); sourceSettings.put("oldVersionTimezone", false);
+            if (mysql) sourceSettings.put("addtionalString", "useSSL=false&allowPublicKeyRetrieval=true"); else sourceSettings.put("schema", "public");
+            String uri = mongo.getReplicaSetUrl(DATABASE);
+            try (var client = MongoClients.create(uri)) {
+                client.getDatabase(DATABASE).getCollection("mixed_targets").insertMany(List.of(mixedDocument(EXACT, false), mixedDocument(2, true)));
+            }
+            var targetSettings = Map.<String, Object>of("uri", uri, "database", DATABASE, "isUri", true);
+            try (var queryIo = Executors.newFixedThreadPool(2); var decodeIo = Executors.newFixedThreadPool(2)) {
+                var good = mixedRootRead(kind, sourceRef, sourceSettings, targetRef, targetSettings, EXACT, queryIo, decodeIo);
+                assertThat(good.observedAgreement()).isTrue(); assertThat(good.reads()).hasSize(7);
+                var bad = mixedRootRead(kind, sourceRef, sourceSettings, targetRef, targetSettings, 2, queryIo, decodeIo);
+                assertThat(bad.counts()).containsExactly(entry(TARGET_VALUE, 2L)); assertThat(bad.reads()).hasSize(7);
+                assertThat(bad.findings().keySet()).anySatisfy(finding -> {
+                    assertThat(finding.location().scope().rootKey()).isEqualTo(new ValidationKey(List.of(ValidationKey.Part.number(2))));
+                    assertThat(finding.location().scope().ancestors()).containsExactly(new ValidationRoot.Ancestor(List.of("customer", "items"),
+                            new ValidationKey(List.of(ValidationKey.Part.number(11)))));
+                    assertThat(finding.location().fieldPath()).containsExactly("product", "name");
+                }).anySatisfy(finding -> {
+                    assertThat(finding.location().scope().ancestors()).isEmpty();
+                    assertThat(finding.location().fieldPath()).containsExactly("shipping", "label");
+                });
+            }
+            for (var table : Map.of("mixed_roots", "2", "mixed_customers", "1", "mixed_items", "2", "mixed_products", "2", "mixed_shipping", "1").entrySet())
+                assertThat(sql(jdbc, mysql, "SELECT COUNT(*) FROM " + table.getKey() + ";").trim()).isEqualTo(table.getValue());
+            System.out.printf("Native mixed tree %s: roots=2 reads=14, source tables unchanged%n", kind);
+        }
+    }
+
+    private static Document mixedDocument(long root, boolean wrong) {
+        var first = new Document("id", 11L).append("customer_id", 9L).append("product_id", 501L).append("amount", 5L)
+                .append("product", new Document("id", 501L).append("name", wrong ? "wrong" : "P1"));
+        var second = new Document("id", 12L).append("customer_id", 9L).append("product_id", 502L).append("amount", 6L)
+                .append("product", new Document("id", 502L).append("name", "P2"));
+        return new Document("id", root).append("customer_id", 9L).append("shipping_id", 77L).append("label", "root")
+                .append("customer", new Document("id", 9L).append("name", "Ada").append("items", List.of(second, first)))
+                .append("shipping", new Document("id", 77L).append("label", wrong ? "wrong" : "ship"));
+    }
+
+    private static ValidationRootCheck mixedRootRead(String kind, ConnectorRef sourceRef, Map<String, Object> sourceSettings,
+            ConnectorRef targetRef, Map<String, Object> targetSettings, long id, ExecutorService queryIo, ExecutorService decodeIo) throws Exception {
+        var key = new ValidationKey(List.of(ValidationKey.Part.number(id)));
+        var observation = new ValidationObservation(new ValidationRunIdentity(new ValidationOwner("cluster", "pipeline", "node", "boot", 1, 1, 0),
+                "task", "native-mixed-" + kind, ValidationMode.FULL, "fixed-mixed-tree", 1, "rules"), new ValidationRoot("mixed_roots", "output", key, List.of()), 1);
+        var product = new Embed("mixed_products", Map.of("id", "product_id"), EmbedAs.OBJECT, "product", List.of("id"), null, null, null, List.of());
+        var items = new Embed("mixed_items", Map.of("customer_id", "id"), EmbedAs.ARRAY, "items", List.of("id"), null, null, null, List.of(product));
+        var customer = new Embed("mixed_customers", Map.of("id", "customer_id"), EmbedAs.OBJECT, "customer", List.of("id"), null, null, null, List.of(items));
+        var shipping = new Embed("mixed_shipping", Map.of("id", "shipping_id"), EmbedAs.OBJECT, "shipping", List.of("id"), null, null, null, List.of());
+        var plan = ValidationNestRelations.compile("mixed", new NestRoot("mixed_roots", List.of("id"), null, null, List.of(customer, shipping)),
+                Set.of("mixed_roots", "mixed_customers", "mixed_items", "mixed_products", "mixed_shipping"), Map.of(), new ValidationNestRelations.Limits(16, 8, 65536));
+        var identity = new ValidationKeyBinding("mixed-id", List.of(objectComponent("id")), Set.of(), ARRAY_LIMITS);
+        var identityMap = ValidationStaticMap.compile("mixed-input", new TransformBody.MapProjection(Map.of()), ARRAY_LIMITS);
+        var handles = new ArrayList<ValidationReadHandle>(); var ids = new java.util.concurrent.atomic.AtomicInteger();
+        try (var cleanup = new java.util.concurrent.ThreadPoolExecutor(1, 1, 0, java.util.concurrent.TimeUnit.SECONDS,
+                new java.util.concurrent.ArrayBlockingQueue<>(8), new java.util.concurrent.ThreadPoolExecutor.AbortPolicy());
+             var scope = new ValidationReadScope(observation, cleanup, () -> {}, 8)) {
+            var bindings = new LinkedHashMap<List<String>, ValidationNestTree.Binding>();
+            bindMixedRelations(kind, sourceRef, sourceSettings, plan.children(), identity, identityMap, bindings, scope, handles, ids, queryIo, decodeIo);
+            var generated = ValidationFieldCheck.generatedId(observation.run(), "mixed_roots", "output", true, false, false,
+                    value -> value instanceof ValidationValues.Typed typed && typed.logicalType().equals("text") && typed.value() instanceof String);
+            var tree = new ValidationNestTree(new ValidationNestObjectProjection.Scope(observation.run(), "mixed_roots", "output"), plan,
+                    new ValidationNestObjectProjection.RootKeys(identity, identity), bindings,
+                    new ValidationNestTree.Limits(ARRAY_LIMITS, 32 * 1024 * 1024, 64 * 1024 * 1024, 100_000, 20, 100, 8, 100,
+                            new ValidationRootCheck.Limits(4 * 1024 * 1024, 100, 100, 100, 10)), Set.of("array", "object", "json"), String::equals, generated);
+            var result = tree.read(observation,
+                    new ValidationRootReader.Query("mixed-source-" + id, "native-mixed-v1", () -> openMixedRead(kind, sourceRef, sourceSettings,
+                            "mixed_roots", identity, key, scope, handles, queryIo, decodeIo)),
+                    new ValidationRootReader.Query("mixed-target-" + id, "native-mixed-v1", () -> openMixedRead("mongodb", targetRef, targetSettings,
+                            "mixed_targets", identity, key, scope, handles, queryIo, decodeIo)), Clock.systemUTC(), scope::requireActive,
+                    (context, raw) -> mixedRow(kind, "mixed_roots", identity, identityMap, raw),
+                    raw -> new ValidationRootReader.Target(raw, objectPhysical("mongodb", "mixed_targets", identity, raw)));
+            assertThat(handles).hasSize(7);
+            for (var handle : handles) {
+                assertThat(handle.workersExited().toCompletableFuture().get(5, java.util.concurrent.TimeUnit.SECONDS)).isNull();
+                assertThat(handle.rowsReleased().toCompletableFuture().get(5, java.util.concurrent.TimeUnit.SECONDS)).isNull();
+            }
+            scope.close(); assertThat(scope.drained().toCompletableFuture().get(5, java.util.concurrent.TimeUnit.SECONDS)).isNull();
+            return result;
+        }
+    }
+
+    private static void bindMixedRelations(String kind, ConnectorRef artifact, Map<String, Object> settings,
+            List<ValidationNestRelations.Relation> relations, ValidationKeyBinding identity, ValidationStaticMap identityMap,
+            Map<List<String>, ValidationNestTree.Binding> bindings, ValidationReadScope scope, List<ValidationReadHandle> handles,
+            java.util.concurrent.atomic.AtomicInteger ids, ExecutorService queryIo, ExecutorService decodeIo) {
+        for (var relation : relations) {
+            var physical = new ValidationKeyBinding("mixed-relation", relation.join().stream().map(pair -> objectComponent(pair.child())).toList(), Set.of(), ARRAY_LIMITS);
+            var lookup = new ValidationNestLookupBinding("mixed", relation, relation.join().stream().map(pair -> objectComponent(pair.parent())).toList(), physical, ARRAY_LIMITS);
+            bindings.put(relation.treePath(), new ValidationNestTree.Binding(lookup, request ->
+                    new ValidationRootReader.Query("mixed-child-" + ids.incrementAndGet(), "native-mixed-v1", () ->
+                            openMixedRead(kind, artifact, settings, relation.alias(), physical, request.key(), scope, handles, queryIo, decodeIo)),
+                    (context, raw) -> mixedRow(kind, relation.alias(), identity, identityMap, raw), relation.shape() == EmbedAs.ARRAY
+                            ? Optional.of(new ValidationNestTree.ArrayKeys(identity, identity, identity, Optional.of(identity))) : Optional.empty()));
+            bindMixedRelations(kind, artifact, settings, relation.children(), identity, identityMap, bindings, scope, handles, ids, queryIo, decodeIo);
+        }
+    }
+    private static ValidationNestTree.Row mixedRow(String kind, String table, ValidationKeyBinding identity, ValidationStaticMap identityMap, ValidationValues.Row raw) {
+        var view = identityMap.apply(raw, List.of());
+        return new ValidationNestTree.Row(new ValidationRootReader.Source(new ValidationRelationReader.Evaluation(ValidationRelationRows.Disposition.INCLUDED,
+                view.row(), Optional.of(objectPhysical(kind, table, identity, raw))), List.of()), view);
+    }
+    private static ValidationReadHandle openMixedRead(String kind, ConnectorRef artifact, Map<String, Object> settings, String table,
+            ValidationKeyBinding binding, ValidationKey key, ValidationReadScope scope, List<ValidationReadHandle> handles,
+            ExecutorService queryIo, ExecutorService decodeIo) {
+        var handle = scope.open(table, guard -> PdkValidationSession.lookup(kind, artifact, settings, "retained-" + kind + "-artifact",
+                new PdkValidationSession.Lookup(table, List.of(), List.of(), 2, binding, key),
+                (model, codecs) -> new PdkValidationRows(model, codecs, path -> {
+                    if (path.getLast().equals("items")) return PdkValidationRows.Rule.of(PdkValidationRows.Shape.ARRAY);
+                    if (Set.of("customer", "shipping", "product").contains(path.getLast())) return PdkValidationRows.Rule.of(PdkValidationRows.Shape.OBJECT);
+                    if (Set.of("id", "customer_id", "shipping_id", "product_id", "amount").contains(path.getLast())) return PdkValidationRows.Rule.of(PdkValidationRows.Shape.EXACT_NUMBER);
+                    return PdkValidationRows.Rule.AUTO;
+                }, ARRAY_LIMITS), (model, codecs, logical) -> {
+                    var match = new LinkedHashMap<String, Object>();
+                    for (int i = 0; i < binding.components().size(); i++) match.put(binding.components().get(i).path().getFirst(), logical.parts().get(i).value());
+                    return match;
+                }, guard, queryIo, decodeIo, 1, ARRAY_LIMITS));
+        handles.add(handle); return handle;
+    }
 
     private void verifyArrays(boolean mysql) throws Exception {
         String kind = mysql ? "mysql" : "postgres";

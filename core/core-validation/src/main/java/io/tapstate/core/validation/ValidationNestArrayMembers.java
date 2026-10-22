@@ -158,6 +158,7 @@ public final class ValidationNestArrayMembers implements AutoCloseable {
     private final Limits limits;
     private final LongConsumer reserve;
     private final Consumer<Throwable> failureSink;
+    private final Runnable targetRow;
     private final Map<ValidationKey, Bucket> buckets = new LinkedHashMap<>();
     private final Map<ValidationKey, Long> sourceRows = new LinkedHashMap<>();
     private final Map<ValidationKey, Long> targetRows = new LinkedHashMap<>();
@@ -171,13 +172,14 @@ public final class ValidationNestArrayMembers implements AutoCloseable {
     private boolean closed;
 
     public ValidationNestArrayMembers(ValidationObservation parent, List<String> arrayPath, Limits limits) {
-        this(parent, arrayPath, limits, ignored -> {}, ignored -> {}, initialReservationBytes(parent, arrayPath));
+        this(parent, arrayPath, limits, ignored -> {}, ignored -> {}, () -> {}, initialReservationBytes(parent, arrayPath));
     }
 
-    private ValidationNestArrayMembers(ValidationObservation parent, List<String> arrayPath, Limits limits, LongConsumer reserve, Consumer<Throwable> failureSink, long initial) {
+    private ValidationNestArrayMembers(ValidationObservation parent, List<String> arrayPath, Limits limits, LongConsumer reserve, Consumer<Throwable> failureSink, Runnable targetRow, long initial) {
         observation = Objects.requireNonNull(parent, "parent");
         this.limits = Objects.requireNonNull(limits, "limits"); this.reserve = Objects.requireNonNull(reserve, "reserve");
         this.failureSink = Objects.requireNonNull(failureSink, "failureSink");
+        this.targetRow = Objects.requireNonNull(targetRow, "targetRow");
         if (initial > limits.bytes()) throw limit("bytes");
         path = List.copyOf(arrayPath);
         bytes = initial;
@@ -185,16 +187,16 @@ public final class ValidationNestArrayMembers implements AutoCloseable {
 
     /** Shared-root admission happens before frame allocation; every later growth calls the same reservation. */
     public static ValidationNestArrayMembers reserved(ValidationObservation parent, List<String> arrayPath, Limits limits, LongConsumer reserve) {
-        return reserved(parent, arrayPath, limits, reserve, ignored -> {});
+        return reserved(parent, arrayPath, limits, reserve, ignored -> {}, () -> {});
     }
 
     private static ValidationNestArrayMembers reserved(ValidationObservation parent, List<String> arrayPath, Limits limits,
-            LongConsumer reserve, Consumer<Throwable> failureSink) {
+            LongConsumer reserve, Consumer<Throwable> failureSink, Runnable targetRow) {
         Objects.requireNonNull(limits, "limits"); Objects.requireNonNull(reserve, "reserve");
         long initial = initialReservationBytes(parent, arrayPath);
         if (initial > limits.bytes()) throw limit("bytes");
         reserve.accept(initial);
-        return new ValidationNestArrayMembers(parent, arrayPath, limits, reserve, failureSink, initial);
+        return new ValidationNestArrayMembers(parent, arrayPath, limits, reserve, failureSink, targetRow, initial);
     }
 
     public static long initialReservationBytes(ValidationObservation parent, List<String> arrayPath) {
@@ -215,6 +217,35 @@ public final class ValidationNestArrayMembers implements AutoCloseable {
 
     /** The caller may interleave sides; order does not change membership or overwrite duplicates. */
     public void add(Side side, ValidationObservation request, Member member) {
+        if (side == Side.TARGET) { addAdmittedTarget(request, member, admitTargetRow(request)); return; }
+        addMember(side, request, member);
+    }
+
+    static final class TargetAdmission {
+        private final ValidationNestArrayMembers owner;
+        private boolean used;
+        private TargetAdmission(ValidationNestArrayMembers owner) { this.owner = owner; }
+    }
+
+    /** Count every traversed value before extracting its shape or key, including malformed entries. */
+    TargetAdmission admitTargetRow(ValidationObservation request) {
+        mutate(() -> {
+            sameObservation(request);
+            if (reads.containsKey(Side.TARGET)) throw ValidationError.invalid("nestMembers.readAlreadyComplete");
+            targetRow.run(); charge(32);
+        });
+        return new TargetAdmission(this);
+    }
+
+    void addAdmittedTarget(ValidationObservation request, Member member, TargetAdmission admission) {
+        mutate(() -> {
+            if (admission == null || admission.owner != this || admission.used) throw ValidationError.invalid("nestMembers.targetAdmission");
+            admission.used = true;
+        });
+        addMember(Side.TARGET, request, member);
+    }
+
+    private void addMember(Side side, ValidationObservation request, Member member) {
         mutate(() -> {
             sameObservation(request);
             Objects.requireNonNull(side, "side");
@@ -374,8 +405,13 @@ public final class ValidationNestArrayMembers implements AutoCloseable {
 
     /** Construction and later local failures invalidate the owning root, not only this frame. */
     public static ValidationNestArrayMembers forTarget(Source source, LongConsumer reserve, Consumer<Throwable> failureSink) {
+        return forTarget(source, reserve, failureSink, () -> {});
+    }
+
+    /** Every actual target member, including duplicates and extras, is admitted before local retention. */
+    public static ValidationNestArrayMembers forTarget(Source source, LongConsumer reserve, Consumer<Throwable> failureSink, Runnable targetRow) {
         Objects.requireNonNull(source, "source");
-        var result = reserved(source.observation, source.arrayPath, source.limits, reserve, failureSink);
+        var result = reserved(source.observation, source.arrayPath, source.limits, reserve, failureSink, targetRow);
         try {
             result.charge(source.accountedBytes);
             result.charge(128L + 64L * source.rows.size());

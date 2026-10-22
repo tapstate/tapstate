@@ -78,7 +78,7 @@ public final class ValidationFieldCheck {
     }
 
     /**
-     * Combines independently checked Nest arrays with ordinary fields in the same complete parent
+     * Combines independently checked Nest subtrees with ordinary fields in the same complete parent
      * view. Evidence is valid only for these exact rows, observation, and builder; no arbitrary
      * ignore paths are accepted. Unknown source paths remain separate and require source blocks.
      * Nested members use their full ancestor observation and their own complete working views.
@@ -87,7 +87,7 @@ public final class ValidationFieldCheck {
             ValidationValues.Row target, Optional<SampledSide> sourceSample, Optional<SampledSide> targetSample,
             Optional<GeneratedId> generatedId, BiPredicate<String, String> compatible,
             ValidationValueComparison.TraversalLimits limits, List<List<Object>> unavailablePaths, Set<String> definedFields,
-            List<ValidationNestArrayFieldCheck.Checked> arrays, Builder root) {
+            List<? extends ValidationNestCheckedSubtree> arrays, Builder root) {
         return checkView(parent, List.of(), source, target, sourceSample, targetSample, generatedId, compatible, limits,
                 unavailablePaths, definedFields, arrays, root);
     }
@@ -97,7 +97,7 @@ public final class ValidationFieldCheck {
             ValidationValues.Row target, Optional<SampledSide> sourceSample, Optional<SampledSide> targetSample,
             Optional<GeneratedId> generatedId, BiPredicate<String, String> compatible,
             ValidationValueComparison.TraversalLimits limits, List<List<Object>> unavailablePaths, Set<String> definedFields,
-            List<ValidationNestArrayFieldCheck.Checked> arrays, Builder root) {
+            List<? extends ValidationNestCheckedSubtree> arrays, Builder root) {
         Objects.requireNonNull(root, "root");
         try {
             Objects.requireNonNull(scope, "scope");
@@ -110,7 +110,7 @@ public final class ValidationFieldCheck {
             ValidationValues.Row target, Optional<SampledSide> sourceSample, Optional<SampledSide> targetSample,
             Optional<GeneratedId> generatedId, BiPredicate<String, String> compatible,
             ValidationValueComparison.TraversalLimits limits, List<List<Object>> unavailablePaths, Set<String> definedFields,
-            List<ValidationNestArrayFieldCheck.Checked> arrays, Builder root) {
+            List<? extends ValidationNestCheckedSubtree> arrays, Builder root) {
         Objects.requireNonNull(root, "root");
         try {
             Objects.requireNonNull(parent, "parent");
@@ -203,7 +203,7 @@ public final class ValidationFieldCheck {
 
     private record Composition(List<List<Object>> paths, long remainingOperations) {}
     private static Composition composed(ValidationObservation parent, List<Object> prefix, ValidationValues.Row source, ValidationValues.Row target,
-            Masks masks, List<ValidationNestArrayFieldCheck.Checked> arrays, long maxBytes, long operations, Builder root) {
+            Masks masks, List<? extends ValidationNestCheckedSubtree> arrays, long maxBytes, long operations, Builder root) {
         if (arrays == null || arrays.size() > 256 - masks.paths().size()) throw ValidationError.invalid("fieldCheck.arrays");
         if (arrays.isEmpty()) return new Composition(masks.paths(), operations);
         var work = new MaskWork(operations);

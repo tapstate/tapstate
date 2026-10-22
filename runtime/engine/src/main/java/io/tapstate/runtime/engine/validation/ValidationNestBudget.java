@@ -34,13 +34,15 @@ final class ValidationNestBudget {
     private int queryCount;
     private int rowCount;
     private Throwable failure;
+    private final String originalReadId;
+    private boolean originalOpened;
 
     ValidationNestBudget(ValidationObservation root, String originalReadId, Limits limits, String prefix) {
         this.root = Objects.requireNonNull(root, "root"); this.limits = Objects.requireNonNull(limits, "limits");
         this.prefix = Objects.requireNonNull(prefix, "prefix");
         if (!root.root().ancestors().isEmpty() || originalReadId == null || originalReadId.isBlank() || originalReadId.length() > 1024
                 || prefix.isBlank() || prefix.length() > 128) throw invalid("root");
-        invocations.add(originalReadId);
+        this.originalReadId = originalReadId; invocations.add(originalReadId);
     }
 
     void requireScope(ValidationObservation actual) {
@@ -64,6 +66,15 @@ final class ValidationNestBudget {
             return query;
         } catch (RuntimeException | Error error) { remember(error); throw error; }
     }
+    /** The root read was registered at construction; count and reserve it only when actually opened. */
+    void originalQuery(ValidationRootReader.Query query) {
+        ensureActive();
+        if (originalOpened || !originalReadId.equals(query.readId())) throw fail(invalid("originalQuery"));
+        if (queryCount == limits.queries()) throw fail(limit("queries"));
+        queryCount++; originalOpened = true;
+        reserve(256L + 2L * query.readId().length() + ValidationRelationRows.initialReservationBytes(root, query.readId()));
+    }
+
     void row(ValidationObservation parent) {
         requireScope(parent);
         if (rowCount == limits.rows()) throw fail(limit("rows"));
@@ -84,7 +95,7 @@ final class ValidationNestBudget {
     ValidationNestArrayMembers targetMembers(ValidationNestArrayMembers.Source source) {
         requireScope(source.observation());
         if (!source.read().equals(reads.get(source.read().readId()))) throw fail(invalid("sourceReadIncomplete"));
-        try { return ValidationNestArrayMembers.forTarget(source, this::reserve, this::abort); }
+        try { return ValidationNestArrayMembers.forTarget(source, this::reserve, this::abort, () -> row(source.observation())); }
         catch (RuntimeException | Error error) { abort(error); throw error; }
     }
 
