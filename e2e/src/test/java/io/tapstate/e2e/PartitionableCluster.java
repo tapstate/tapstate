@@ -272,6 +272,12 @@ final class PartitionableCluster implements AutoCloseable {
         planes.put(known, plane);
     }
 
+    /** The caller owns the extra boot; the original process and its delayed replies remain alive. */
+    RealProcessServer launchReplacementPrepared(String nodeId) {
+        if (!prepared) throw new IllegalStateException("replacement requires a prepared native installation");
+        return RealProcessServer.startPrepared(storeUri, "0.0.0.0", launchArguments.get(requireKnown(nodeId)));
+    }
+
     /** Whether one member's process is still running -- what tells failing closed from falling over. */
     boolean isAlive(String nodeId) {
         return servers.get(requireKnown(nodeId)).isAlive();
