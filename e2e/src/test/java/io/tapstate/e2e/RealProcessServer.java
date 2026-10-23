@@ -259,6 +259,17 @@ final class RealProcessServer implements ServerHandle {
                 jvmOptions, null, port -> List.of()));
     }
 
+    /** Retains native storage admission while the scenario selects the child JVM's original runtime shape. */
+    static RealProcessServer startPreparedInJvm(String configurationUri, List<String> jvmOptions,
+            IntFunction<List<String>> extraArguments) {
+        return healthy(launchingPreparedInJvm(configurationUri, jvmOptions, extraArguments));
+    }
+
+    static RealProcessServer launchingPreparedInJvm(String configurationUri, List<String> jvmOptions,
+            IntFunction<List<String>> extraArguments) {
+        return launching(configurationUri, null, bootJar(), LOOPBACK, jvmOptions, null, extraArguments);
+    }
+
     /**
      * Returns the launch once its health probe answers, and ends it otherwise.
      *
@@ -351,8 +362,12 @@ final class RealProcessServer implements ServerHandle {
 
     /** Waits for all startup runners, not merely the earlier Tomcat health response. */
     void awaitReady() {
+        awaitReady(STARTUP_BUDGET);
+    }
+
+    void awaitReady(Duration budget) {
         ControlPlane control = new ControlPlane(baseUrl);
-        Await.until("the process to complete application startup", STARTUP_BUDGET, () -> {
+        Await.until("the process to complete application startup", budget, () -> {
             if (!process.isAlive()) {
                 throw new AssertionError("the server exited with status " + process.exitValue()
                         + " before application readiness; its output was:\n" + tail());

@@ -6,6 +6,8 @@ import com.mongodb.client.MongoDatabase;
 import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
 import io.tapstate.adapters.mongostore.SystemCollections;
+import io.tapstate.spi.store.CacheBusinessScope;
+import io.tapstate.spi.store.SrsConsumerId;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Set;
@@ -17,14 +19,42 @@ final class NativeSrsDocuments implements AutoCloseable {
     private final MongoClient client;
     private final MongoDatabase database;
     private final String incarnation;
+    private final CacheBusinessScope scope;
 
     NativeSrsDocuments(PreparedNativeStore storage) {
         try (var configuration = MongoConfigurationDomain.openExisting(
                 new MongoConnectionSettings(storage.configurationUri(), null, Duration.ofSeconds(5)))) {
-            incarnation = configuration.bindings().cachePreparation().orElseThrow().businessScope().cacheIncarnation();
+            scope = configuration.bindings().cachePreparation().orElseThrow().businessScope();
+            incarnation = scope.cacheIncarnation();
         }
         client = MongoClients.create(storage.cacheUri());
         database = client.getDatabase(storage.cacheDatabase());
+    }
+
+    CacheBusinessScope scope() { return scope; }
+
+    Document pipelineMembership(String pipeline, String source) {
+        var members = SystemCollections.SRS_CONSUMERS.on(database).find(
+                new Document("_id.cacheIncarnation", incarnation).append("pipelineId", pipeline)
+                        .append("sourceId", source).append("detached", false)).into(new ArrayList<>());
+        if (members.isEmpty()) return null;
+        if (members.size() != 1) throw new AssertionError("expected one original active source consumer: " + members);
+        var member = members.getFirst();
+        if (!SrsConsumerId.of(pipeline, source).value().equals(member.get("_id", Document.class).getString("consumer")))
+            throw new AssertionError("the membership names another source consumer");
+        if (chain(member.get("_id", Document.class).getString("chain")) == null)
+            throw new AssertionError("the consumer's original chain is unavailable");
+        return member;
+    }
+
+    Document directChannel(String pipeline, String source) {
+        var channels = SystemCollections.DIRECT_CHANNEL_OFFSETS.on(database).find(
+                new Document("_id.scope.clusterId", scope.clusterId()).append("_id.scope.bindingVersion", scope.bindingVersion())
+                        .append("_id.scope.cacheIncarnation", incarnation).append("_id.scope.pipelineId", pipeline)
+                        .append("_id.sourceId", source)).into(new ArrayList<>());
+        if (channels.isEmpty()) return null;
+        if (channels.size() != 1) throw new AssertionError("expected one original direct channel: " + channels);
+        return channels.getFirst();
     }
 
     Set<String> miningChainIds() {

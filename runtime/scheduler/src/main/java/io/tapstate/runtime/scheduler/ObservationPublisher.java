@@ -754,41 +754,46 @@ public final class ObservationPublisher {
                         .computeIfAbsent(pipelineId, id -> new ConcurrentHashMap<>())
                         .merge(failure.code(), 1L, Long::sum);
             }
-            Map<String, NestStateReading> readings = nestStateReadings.apply(pipelineId);
-            // Both frontier readings are taken once and used twice - published as metrics and judged by
-            // the watch. Asking each source again for the watch would pay for a second collection of the
-            // run's statistics per pass, and would let the two answers disagree: what an operator reads
-            // and what raised the alarm they are reading would then be different passes of the same run.
-            Map<String, Long> gaps = frontierGaps.apply(pipelineId);
-            Map<String, Long> pinned = frontierStalls.apply(pipelineId);
-            // One instant for the whole pass, shared by the observation and by every point in it. Asking
-            // the clock again per metric would stamp one pass with a spread of times, and a consumer
-            // computing a rate across two passes would divide by a difference that is partly this
-            // publisher's own loop.
             Instant at = observedNow();
-            // The stored document carries these facts twice, from this one measurement: whole, as the
-            // facts themselves, and as the flat numeric view of them. The flat view is a projection and it
-            // drops what it cannot hold; what it drops is still on the document as a fact, so a reader who
-            // finds a metric missing from the flat view finds it whole next to it rather than nowhere. What
-            // the flat view drops today is pinned by this publisher's own test, so that the first metric it
-            // cannot carry is a decision somebody makes rather than a metric that quietly fails to appear.
-            // Taken once and used twice, like the frontier readings above: the load is published as two
-            // metrics and as the observation's own snapshot dataset, and asking its source again for the
-            // second use would let the two faces of one load describe different passes of it.
-            SnapshotReading loaded = snapshots.apply(pipelineId);
-            SnapshotReading readThisRun = runSnapshots.apply(pipelineId);
-            List<MetricFact> measured = facts(pipelineId, actual, at, readings, gaps, pinned,
-                    nestDeadLetters.apply(pipelineId), joinRecomputeDone.apply(pipelineId),
-                    joinRecomputeExpected.apply(pipelineId), loaded, readThisRun);
-            Observation published = new Observation(pipelineId, actual,
-                    FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(),
-                    loaded.byTable(), positions.apply(pipelineId), carried, at, measured);
+            Map<String, NestStateReading> readings = Map.of();
+            Map<String, Long> gaps = Map.of();
+            Map<String, Long> pinned = Map.of();
+            boolean measuredSuccessfully = false;
+            Observation published;
+            try {
+                // Share each measurement between the observation and its alert watches. A second read
+                // could describe a different pass, especially while a failed execution is being released.
+                readings = nestStateReadings.apply(pipelineId);
+                gaps = frontierGaps.apply(pipelineId);
+                pinned = frontierStalls.apply(pipelineId);
+                SnapshotReading loaded = snapshots.apply(pipelineId);
+                SnapshotReading readThisRun = runSnapshots.apply(pipelineId);
+                List<MetricFact> measured = facts(pipelineId, actual, at, readings, gaps, pinned,
+                        nestDeadLetters.apply(pipelineId), joinRecomputeDone.apply(pipelineId),
+                        joinRecomputeExpected.apply(pipelineId), loaded, readThisRun);
+                published = new Observation(pipelineId, actual,
+                        FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(),
+                        loaded.byTable(), positions.apply(pipelineId), carried, at, measured);
+                measuredSuccessfully = true;
+            } catch (TapstateException unavailable) {
+                if (actual != PipelineState.FAILED) throw unavailable;
+                // A durable failure must remain visible when its own damaged recovery data cannot be
+                // measured. Retain only the previous positions/load and the locally witnessed failures;
+                // neither an empty reading nor the measurement error is a new execution fact.
+                Observation previous = observations.read(pipelineId).orElse(null);
+                List<MetricFact> known = failures(pipelineId, at).stream().toList();
+                published = new Observation(pipelineId, actual,
+                        FlatMetricProjection.of(known, FLAT_REDUCTIONS).metrics(),
+                        previous != null ? previous.snapshot() : Map.of(),
+                        previous != null ? previous.positions() : Map.of(), carried, at, known);
+            }
+            // Both paths use the original observation port. Its scope, checkpoint and claim checks
+            // remain authoritative, and a refusal here cannot be mistaken for unreadable telemetry.
             observations.save(published);
-            // Fed after the observation is written and never before. The observation is the contract and
-            // the alert is a courtesy on top of it, so a fault in the alerting path must not be able to
-            // cost a pipeline the read face that says it is alive at all.
-            coldLayer.saw(pipelineId, readings);
-            frontierStall.saw(pipelineId, pinned, gaps);
+            if (measuredSuccessfully) {
+                coldLayer.saw(pipelineId, readings);
+                frontierStall.saw(pipelineId, pinned, gaps);
+            }
             // Handed back so that whoever runs the pass can take a sample off exactly what was published,
             // at the time it was published, rather than reading it back or measuring it again.
             return published;
