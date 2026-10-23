@@ -272,6 +272,7 @@ class SrsCaptureWriterTest {
         @Override public boolean beginWriterRun(SrsConsumerContext c,long m,String r,Map<String,List<String>> w,WorkloadClaimFence f) { throw new AssertionError(); }
         @Override public boolean advanceWriter(SrsConsumerContext c,long m,String r,String t,String w,WriterProgress p,WorkloadClaimFence f) { throw new AssertionError(); }
         @Override public boolean startReadingAfter(SrsConsumerContext c,long m,long p,String t,long s,WorkloadClaimFence f) { throw new AssertionError(); }
+        @Override public boolean startReadingAfter(SrsConsumerContext c,long m,long p,Map<String,Long> arrivals,WorkloadClaimFence f) { throw new AssertionError(); }
         @Override public boolean advanceReadSequence(SrsConsumerContext c,long m,String t,long s,WorkloadClaimFence f) { throw new AssertionError(); }
         @Override public Optional<SrsConsumerMembership> attach(SrsConsumerContext c,long e,Set<String> t,WorkloadClaimFence f) { throw new AssertionError(); }
         @Override public Optional<SrsConsumerMembership> detach(SrsConsumerContext c,long e,WorkloadClaimFence f) { throw new AssertionError(); }

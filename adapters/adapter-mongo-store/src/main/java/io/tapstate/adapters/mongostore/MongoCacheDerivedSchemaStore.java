@@ -34,6 +34,24 @@ final class MongoCacheDerivedSchemaStore implements DerivedSchemaStore {
         });
     }
 
+    @Override public Map<String, DerivedSchema> latestMany(String pipelineId, Set<String> stepIds) {
+        access.requirePipeline(Objects.requireNonNull(pipelineId, "pipelineId"));
+        var requested = new java.util.LinkedHashMap<String, String>();
+        for (String step : Set.copyOf(stepIds)) requested.put(key(pipelineId, step), step);
+        return access.metadataTransaction(SystemCollections.CACHE_DERIVED_SCHEMAS, false, session -> {
+            var found = new java.util.LinkedHashMap<String, DerivedSchema>();
+            try (var cursor = rows.find(session, new Document("_id", new Document("$in", requested.keySet()))).batchSize(64).iterator()) {
+                while (cursor.hasNext()) {
+                    var raw = cursor.next();
+                    if (!(raw.get("_id") instanceof String id) || !requested.containsKey(id)) throw unreadable();
+                    Stored row = decode(id, raw);
+                    if (row != null && found.put(requested.get(id), row.versions().getLast()) != null) throw unreadable();
+                }
+            }
+            return java.util.Collections.unmodifiableMap(found);
+        });
+    }
+
     @Override public void record(String pipelineId, String stepId, Map<String, String> schema, String statement, String derivedFrom, String derivedBy) {
         String key = key(pipelineId, stepId);
         var captured = new DerivedSchema(0, schema, statement, derivedFrom, derivedBy);
@@ -106,6 +124,10 @@ final class MongoCacheDerivedSchemaStore implements DerivedSchemaStore {
 
     private Stored read(ClientSession session, String key) {
         Document row = rows.find(session, new Document("_id", key)).first();
+        return decode(key, row);
+    }
+
+    private Stored decode(String key, Document row) {
         if (row == null) return null;
         try {
             if (!(row.get("scope") instanceof Document scope)) throw unreadable();

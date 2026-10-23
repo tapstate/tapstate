@@ -230,10 +230,14 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                 // Metadata preflight precedes the asynchronous source-start baseline. Keep this original live tail.
                 // A later owner still requires the existing checkpoint before it can open another capture epoch.
                 var progress=source.srs.consumers().progress(source.consumer.context()).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
+                var arrivals = new LinkedHashMap<String,Long>();
                 for(String table:source.selected.tables())if(!progress.ringDoneThrough().containsKey(table)) {
                     var start=session.snapshot?StartFrom.latest():readStart(pipeline);
                     long after=runtime.initialReadAfter(stores.scope(),source.prepared.chainId(),table,start,chain.retention(),() -> requireSession(session));
-                    if(!source.srs.consumers().startReadingAfter(source.consumer.context(),source.consumer.membershipRevision(),progress.revision(),table,after,claim(session.original)))throw refused();
+                    arrivals.put(table,after);
+                }
+                if (!arrivals.isEmpty()) {
+                    if(!source.srs.consumers().startReadingAfter(source.consumer.context(),source.consumer.membershipRevision(),progress.revision(),arrivals,claim(session.original)))throw refused();
                     progress=source.srs.consumers().progress(source.consumer.context()).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
                 }
                 waiting.remove(source.consumer.context().key());

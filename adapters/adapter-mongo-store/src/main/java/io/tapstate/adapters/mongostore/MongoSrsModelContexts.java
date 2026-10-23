@@ -66,6 +66,12 @@ final class MongoSrsModelContexts {
         Document head = head(chain, context.key().table());
         if (head == null || !context.ring().equals(head.get("ringName"))) throw unavailable(context.key());
         Context latest = require(session, head.get("contextId", Document.class));
+        requireAnchor(chain, context, latest);
+    }
+
+    void requireAnchor(Document chain, Context context, Context latest) {
+        Document head = head(chain, context.key().table());
+        if (head == null || !context.ring().equals(head.get("ringName")) || !latest.id().equals(head.get("contextId"))) throw unavailable(context.key());
         if (!latest.ring().equals(context.ring()) || latest.nextId() != null
                 || latest.key().captureEpoch() < context.key().captureEpoch()
                 || !(chain.get("epoch") instanceof Long current) || latest.key().captureEpoch() > current) throw unreadable();
@@ -129,7 +135,7 @@ final class MongoSrsModelContexts {
         return result;
     }
 
-    private Context decode(Document row) {
+    Context decode(Document row) {
         try {
             if (!row.keySet().equals(Set.of("_id", "formatVersion", "cacheIncarnation", "ringName", "captureFence", "firstSequence",
                     "publishedVersion", "publishedSequence", "publishedHash", "nextContext", "nextSequence", "contentHash"))

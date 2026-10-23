@@ -338,6 +338,24 @@ public final class MongoSrsLogStore implements SrsLogStore {
             if (collection.find(session, ringRange(ring, Long.MAX_VALUE)).limit(1).first() != null) throw unreadableSplit("bounds");
             return new SrsLogBounds(-1L, -1L);
         }
+        return decodeSplitBounds(stored);
+    }
+
+    /** The caller has proved each ring's exact retained model, sole context and current anchor in this session. */
+    Map<String, SrsLogBounds> boundsForProvenRings(ClientSession session, java.util.Set<String> rings) {
+        var result = new java.util.HashMap<String, SrsLogBounds>();
+        var byId = rings.stream().collect(java.util.stream.Collectors.toMap(MongoSrsLogStore::boundsId, ring -> ring));
+        try (var rows = boundsCollection.find(session, new Document("_id", new Document("$in", byId.keySet()))).batchSize(64).iterator()) {
+            while (rows.hasNext()) {
+                if (models != null) models.checkActive();
+                var row = rows.next(); String ring = byId.get(row.get("_id"));
+                if (ring == null || result.put(ring, decodeSplitBounds(row)) != null) throw unreadableSplit("bounds");
+            }
+        }
+        return Map.copyOf(result);
+    }
+
+    private static SrsLogBounds decodeSplitBounds(Document stored) {
         if (!stored.keySet().equals(java.util.Set.of("_id", LARGEST_SEQUENCE, TRIMMED_THROUGH))
                 || !(stored.get(LARGEST_SEQUENCE) instanceof Long largest) || !(stored.get(TRIMMED_THROUGH) instanceof Long trimmed)) {
             throw unreadableSplit("bounds");

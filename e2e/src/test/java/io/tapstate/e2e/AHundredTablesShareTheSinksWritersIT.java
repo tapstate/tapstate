@@ -55,8 +55,8 @@ class AHundredTablesShareTheSinksWritersIT {
         List<String> tables = IntStream.range(0, TABLES).mapToObj(i -> String.format("t%03d", i)).toList();
 
         try (FileEndpoints files = new FileEndpoints()) {
-            String store = SharedMongo.replicaSetUrl("e2e_hundred_tables_cluster");
-            try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-hundred-tables")) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                 TwoMemberCluster cluster = TwoMemberCluster.startPrepared(storage)) {
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.first();
                 control.registerConnector(E2eConnectorJar.CONNECTOR_ID, connector);

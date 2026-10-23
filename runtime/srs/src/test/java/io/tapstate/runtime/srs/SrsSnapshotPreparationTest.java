@@ -221,6 +221,7 @@ class SrsSnapshotPreparationTest {
         @Override public boolean advanceWriter(SrsConsumerContext context,long revision,String id,String table,String writer,WriterProgress progress,WorkloadClaimFence fence) { throw new AssertionError(); }
         @Override public boolean advanceReadSequence(SrsConsumerContext context,long revision,String table,long sequence,WorkloadClaimFence fence) { throw new AssertionError(); }
         @Override public boolean startReadingAfter(SrsConsumerContext context,long membership,long revision,String table,long sequence,WorkloadClaimFence fence) { throw new AssertionError(); }
+        @Override public boolean startReadingAfter(SrsConsumerContext c,long m,long p,Map<String,Long> arrivals,WorkloadClaimFence f) { throw new AssertionError(); }
         @Override public Optional<SrsConsumerMembership> attach(SrsConsumerContext context,long revision,Set<String> tables,WorkloadClaimFence fence) { throw new AssertionError(); }
         @Override public Optional<SrsConsumerMembership> detach(SrsConsumerContext context,long revision,WorkloadClaimFence fence) { throw new AssertionError(); }
         @Override public SrsChainState prepare(String chain,String retention,WorkloadClaimFence fence) { throw new AssertionError(); }

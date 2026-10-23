@@ -15,12 +15,14 @@ final class ScopedSrsConsumerAccess {
         requireActive.run();
         if (!(member.getUserContext().get(SrsStoreViews.USER_CONTEXT_KEY) instanceof SrsStoreViews views)) throw refused(run);
         var stores = views.srs(run.cacheScope(),requireActive);
-        return new Bound(run,stores.consumers().guardedBy(requireActive),stores.models(),requireActive);
+        var reads = (SrsConsumerProgressReads)member.getUserContext().computeIfAbsent(
+                SrsConsumerProgressReads.USER_CONTEXT_KEY, ignored -> new SrsConsumerProgressReads());
+        return new Bound(run,stores.consumers().guardedBy(requireActive),stores.models(),requireActive,reads);
     }
-    record Bound(SrsConsumerRun run,SrsConsumerStore store,SrsModelStore models,Runnable requireActive) {
+    record Bound(SrsConsumerRun run,SrsConsumerStore store,SrsModelStore models,Runnable requireActive,SrsConsumerProgressReads reads) {
         void requireClaim(WorkloadClaimFence claimed) { requireActive.run(); if (claimed != null && !run.originalClaim().equals(claimed)) throw refused(run); }
         SrsConsumerProgress progress() {
-            requireActive.run(); var held = store.progress(run.context()).orElseThrow(() -> refused(run)); requireActive.run();
+            requireActive.run(); var held = reads.read(run,() -> store.progress(run.context()).orElseThrow(() -> refused(run))); requireActive.run();
             if (held.membershipRevision() != run.membershipRevision()) throw refused(run); return held;
         }
     }

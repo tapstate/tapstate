@@ -150,7 +150,7 @@ public final class MongoSrsChainStore implements SrsChainStore {
                     if (next == null || next.sequence() < before.getValue().sequence()) throw unproven(chain);
                 }
             }
-            validateCheckpoint(session, chain, checkpoint, fence, true);
+            validateCheckpoint(session, row, checkpoint, fence, true);
             var replacement = new Document(row).append("checkpointRevision", expectedRevision + 1)
                     .append("checkpoint", checkpointDocument(checkpoint)).append("checkpointAt", Date.from(Instant.now()));
             if (held.resumeOverride() != null && checkpoint.position().order().epoch() > held.resumeOverride().fromEpoch()) replacement.put("resumeOverride", null);
@@ -158,16 +158,27 @@ public final class MongoSrsChainStore implements SrsChainStore {
         });
     }
 
-    private void validateCheckpoint(ClientSession session, String chain, SrsCaptureCheckpoint checkpoint,
+    private void validateCheckpoint(ClientSession session, Document root, SrsCaptureCheckpoint checkpoint,
                                     WorkloadClaimFence fence, boolean writing) {
-        for (var entry : checkpoint.tables().entrySet()) {
-            var at = entry.getValue(); var key = at.model();
+        String chain = root.getString("_id");
+        for (var at : checkpoint.tables().values()) {
+            var key = at.model();
             if (!chain.equals(key.miningChainId()) || !scope.cacheIncarnation().equals(key.cacheIncarnation())
                     || key.captureEpoch() != checkpoint.position().order().epoch()) throw unproven(chain);
-            var reference = models.requireReference(session, key); var range = reference.range(); String ring = reference.model().ringName();
+        }
+        var keys = checkpoint.tables().values().stream().map(SrsTableCheckpoint::model).collect(java.util.stream.Collectors.toSet());
+        var current = models.currentReferences(session, root, keys);
+        var boundsByRing = current.isEmpty() ? Map.<String, io.tapstate.spi.store.SrsLogBounds>of()
+                : log.boundsForProvenRings(session, current.orElseThrow().values().stream().map(reference -> reference.model().ringName())
+                        .collect(java.util.stream.Collectors.toSet()));
+        for (var entry : checkpoint.tables().entrySet()) {
+            var at = entry.getValue(); var key = at.model();
+            var reference = current.isPresent() ? current.orElseThrow().get(key) : models.requireReference(session, key);
+            var range = reference.range(); String ring = reference.model().ringName();
             if ((writing && !fence.equals(reference.fence())) || at.sequence() < range.firstSequence() - 1
                     || (range.nextSequence() != null && at.sequence() >= range.nextSequence())) throw unproven(chain);
-            var bounds = log.boundsInSession(session, ring);
+            var bounds = boundsByRing.get(ring);
+            if (bounds == null) bounds = log.boundsInSession(session, ring);
             if (at.sequence() > bounds.largestSequence()) throw unproven(chain);
             if (at.sequence() >= 0 && at.sequence() > bounds.trimmedThrough()) {
                 var event = log.loadInSession(session, ring, at.sequence()).orElseThrow(() -> unproven(chain));
@@ -178,7 +189,7 @@ public final class MongoSrsChainStore implements SrsChainStore {
     }
     SrsChainState state(ClientSession session, Document row) {
         SrsChainState state = decode(row);
-        if (state.checkpoint() != null) validateCheckpoint(session, state.miningChainId(), state.checkpoint(), null, false);
+        if (state.checkpoint() != null) validateCheckpoint(session, row, state.checkpoint(), null, false);
         return state;
     }
     private Document root(ClientSession session, String chain) {

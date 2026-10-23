@@ -36,6 +36,34 @@ class MongoSrsChainStoreIT {
     private static final String QUIET = "quiet";
 
     @Test
+    void aWideCurrentCheckpointReadsItsModelClosureInBatchesWithinTheOriginalTransaction() {
+        withBusiness(f -> {
+            var tables = java.util.stream.IntStream.range(0, 12).mapToObj(i -> "table-" + i)
+                    .collect(java.util.stream.Collectors.toSet());
+            prepare(f, tables);
+            var baseline = checkpoint(1, SourceOrder.SNAPSHOT_SEQ, "wide-baseline", tables.stream()
+                    .collect(java.util.stream.Collectors.toMap(table -> table, table -> -1L)));
+            var saved = f.chains().checkpoint(CHAIN, 0, baseline, f.fence()).orElseThrow();
+            var reads = new java.util.concurrent.atomic.AtomicInteger();
+            var transactions = new java.util.HashSet<String>();
+            var listener = new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    if (!event.getDatabaseName().equals(f.database().getName()) || !event.getCommandName().equals("find")) return;
+                    reads.incrementAndGet();
+                    assertThat(event.getCommand().containsKey("txnNumber")).isTrue();
+                    transactions.add(event.getCommand().get("txnNumber").toString());
+                }
+            };
+            try (var observed = MongoClients.create(com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl())).addCommandListener(listener).build())) {
+                assertThat(new MongoSrsChainStore(observed, observed.getDatabase(f.database().getName()), SCOPE).load(CHAIN)).contains(saved);
+                assertThat(transactions).hasSize(1);
+                assertThat(reads.get()).as("one closure proof must not reread every table through each reference layer").isLessThanOrEqualTo(12);
+            }
+        });
+    }
+
+    @Test
     void aSourceCheckpointKeepsExactModelsForQuietTablesAndSurvivesANewCaptureEpoch() {
         withBusiness(f -> {
             prepare(f, Set.of(ORDERS, QUIET));
@@ -57,6 +85,41 @@ class MongoSrsChainStoreIT {
             assertThat(f.chains().checkpoint(CHAIN, 2, next, f.fence()).orElseThrow().checkpoint()).isEqualTo(next);
             assertThat(SystemCollections.SRS_CHAINS.on(f.database()).find().first().keySet())
                     .doesNotContain("schemaHistory", "consumerOffsets");
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"model", "control", "bounds", "event", "malformed-bounds"})
+    void aBatchedClosureStillRequiresEveryTablesExactRecoveryFacts(String loss) {
+        withBusiness(f -> {
+            prepare(f, Set.of(ORDERS, QUIET));
+            f.log().store(ring(ORDERS), 0, event(0, 1, f.fence()));
+            f.log().store(ring(QUIET), 0, event(0, 1, f.fence()));
+            var saved = checkpoint(1, 1, "both-landed", Map.of(ORDERS, 0L, QUIET, 0L));
+            f.chains().checkpoint(CHAIN, 0, saved, f.fence()).orElseThrow();
+            // One legitimately trimmed table must not excuse the other table's untrimmed frontier.
+            f.log().trim(ring(ORDERS), 0, f.fence());
+            switch (loss) {
+                case "model" -> SystemCollections.SRS_MODELS.on(f.database()).deleteOne(new Document("_id", MongoSrsModelStore.key(key(QUIET, 1, 0))));
+                case "control" -> SystemCollections.SRS_MODEL_CONTEXTS.on(f.database()).deleteOne(new Document("_id", MongoSrsModelContexts.contextId(key(QUIET, 1, 0))));
+                case "bounds" -> SystemCollections.SRS_LOG_BOUNDS.on(f.database()).deleteOne(new Document("_id", MongoSrsLogStore.boundsId(ring(QUIET))));
+                case "event" -> SystemCollections.SRS_EVENTS.on(f.database()).deleteMany(MongoSrsLogStore.ringRange(ring(QUIET), 0));
+                case "malformed-bounds" -> SystemCollections.SRS_LOG_BOUNDS.on(f.database()).updateOne(new Document("_id", MongoSrsLogStore.boundsId(ring(QUIET))),
+                        new Document("$set", new Document("trimmedThrough", 1L)));
+                default -> throw new AssertionError(loss);
+            }
+            var expected = switch (loss) {
+                case "model", "control" -> IoError.SRS_MODEL_UNAVAILABLE;
+                case "bounds" -> IoError.SRS_EVENT_MODEL_UNAVAILABLE;
+                case "event" -> IoError.SRS_CHECKPOINT_UNPROVEN;
+                default -> IoError.DOCUMENT_UNREADABLE;
+            };
+            Document before = root(f); Document originalClaim = claim(f);
+            assertThatThrownBy(() -> f.chains().load(CHAIN)).satisfies(failure -> code(failure, expected));
+            assertThatThrownBy(() -> f.chains().checkpoint(CHAIN, 1,
+                    checkpoint(1, 2, "cannot-advance", Map.of(ORDERS, 0L, QUIET, 0L)), f.fence()))
+                    .satisfies(failure -> code(failure, expected));
+            assertThat(root(f)).isEqualTo(before); assertThat(claim(f)).isEqualTo(originalClaim);
         });
     }
 

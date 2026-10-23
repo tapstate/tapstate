@@ -380,6 +380,7 @@ final class StoreBackedDagSource implements DagSource {
         Objects.requireNonNull(store,"store");
         return new io.tapstate.spi.store.DerivedSchemaStore() {
             @Override public Optional<io.tapstate.spi.store.DerivedSchema> latest(String pipeline,String step) { return store.derivedSchemas().latest(pipeline,step); }
+            @Override public Map<String,io.tapstate.spi.store.DerivedSchema> latestMany(String pipeline,Set<String> steps) { return store.derivedSchemas().latestMany(pipeline,steps); }
             @Override public void record(String pipeline,String step,Map<String,String> columns,String statement,String from,String by) {
                 store.derivedSchemas().record(pipeline,step,columns,statement,from,by);
             }
@@ -1461,16 +1462,22 @@ final class StoreBackedDagSource implements DagSource {
         Map<String, List<String>> keysBySource = sourceKeysById(vertices);
         Set<String> steps = stepIds(pipeline);
         boolean incomplete = keysBySource.size() < pipeline.sourceIds().size();
+        Map<String,io.tapstate.spi.store.DerivedSchema> sourceModels = vertices.isEmpty() ? Map.of() : modelRecords.latestMany(pipelineId,vertices.values().stream()
+                .map(vertex -> SourceSchemaCopy.nodeId(vertex.sourceId(),vertex.table())).collect(java.util.stream.Collectors.toSet()));
+        Function<SourceVertex,NodeColumns> copied = vertex -> {
+            var recorded = sourceModels.get(SourceSchemaCopy.nodeId(vertex.sourceId(),vertex.table()));
+            return recorded == null ? null : NodeColumns.known(recorded.schema());
+        };
         Map<String, CompiledJoin> compiled = new LinkedHashMap<>();
         for (Step step : pipeline.transforms() == null ? List.<Step>of() : pipeline.transforms()) {
             if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Join join
                     && inputsOf(refsOf(inline.from()), vertices, keysByTable, keysBySource, steps,
-                            Map.of(), vertex -> copiedColumns(pipelineId, vertex), incomplete) != null) {
+                            Map.of(), copied, incomplete) != null) {
                 compiled.put(step.id(), compileJoin(inline, join, sourceTablesByName(vertices), steps));
             }
         }
         recordStepSchemas(pipelineId, deriveSteps(pipeline, vertices, keysByTable, keysBySource,
-                steps, compiled, vertex -> copiedColumns(pipelineId, vertex), incomplete));
+                steps, compiled, copied, incomplete));
     }
 
     /**

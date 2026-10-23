@@ -27,6 +27,193 @@ class ScopedSrsSinkAckFactoryTest {
             new SrsConsumerContext(new SrsConsumerKey("chain","pipeline","source"),7),4,false,Set.of("orders"),FENCE));
     private static ScopedSrsSinkAckFactory factory() { return new ScopedSrsSinkAckFactory(Map.of("source.orders",new ScopedSrsSinkAckFactory.Source(RUN,"orders")),"original-run"); }
 
+    @Test void aReaderAfterAWriteCannotBorrowAnOlderUnfinishedSnapshot() throws Exception {
+        var reads = new SrsConsumerProgressReads(); var original = progress(4,List.of(),null);
+        var latest = new AtomicReference<>(original); var captured = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1); var lateEntered = new java.util.concurrent.CountDownLatch(1);
+        var threads = new java.util.concurrent.CopyOnWriteArrayList<Thread>();
+        try (var executor = java.util.concurrent.Executors.newFixedThreadPool(2, task -> {
+            var thread = new Thread(task); threads.add(thread); return thread;
+        })) {
+            var first = executor.submit(() -> reads.read(RUN,() -> {
+                var snapshot = latest.get(); captured.countDown();
+                try { assertThat(release.await(10,java.util.concurrent.TimeUnit.SECONDS)).isTrue(); }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new AssertionError(interrupted); }
+                return snapshot;
+            }));
+            try {
+                assertThat(captured.await(10,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                var written = progress(4,List.of("orders"),null); latest.set(written);
+                var later = executor.submit(() -> { lateEntered.countDown(); return reads.read(RUN,latest::get); });
+                assertThat(lateEntered.await(10,java.util.concurrent.TimeUnit.SECONDS)).isTrue(); awaitParked(threads);
+                release.countDown();
+                assertThat(first.get(10,java.util.concurrent.TimeUnit.SECONDS)).isSameAs(original);
+                assertThat(later.get(10,java.util.concurrent.TimeUnit.SECONDS)).isSameAs(written);
+            } finally { release.countDown(); }
+        }
+    }
+
+    @Test void queuedReadersShareOnlyANewTransactionForTheSameOriginalRun() throws Exception {
+        var f = new Fixture(); f.held.set(progress(4,List.of(),null));
+        var first = ScopedSrsConsumerAccess.bind(f.member,RUN); var second = ScopedSrsConsumerAccess.bind(f.member,RUN);
+        var third = ScopedSrsConsumerAccess.bind(f.member,RUN);
+        var entered = new java.util.concurrent.CountDownLatch(3); var release = new java.util.concurrent.CountDownLatch(1);
+        var reads = new java.util.concurrent.atomic.AtomicInteger();
+        when(f.store.progress(RUN.context())).thenAnswer(call -> {
+            reads.incrementAndGet(); assertThat(release.await(10,java.util.concurrent.TimeUnit.SECONDS)).isTrue(); return Optional.of(f.held.get());
+        });
+        var threads = new java.util.concurrent.CopyOnWriteArrayList<Thread>();
+        try (var executor = java.util.concurrent.Executors.newFixedThreadPool(3, task -> {
+            var thread = new Thread(task,"consumer-progress-reader-"+threads.size()); threads.add(thread); return thread;
+        })) {
+            var a = executor.submit(() -> { entered.countDown(); return first.progress(); });
+            var b = executor.submit(() -> { entered.countDown(); return second.progress(); });
+            var c = executor.submit(() -> { entered.countDown(); return third.progress(); });
+            try {
+                assertThat(entered.await(10,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                awaitParked(threads,3);
+                assertThat(reads).hasValue(1);
+            } finally { release.countDown(); }
+            assertThat(a.get(10,java.util.concurrent.TimeUnit.SECONDS)).isSameAs(f.held.get());
+            assertThat(b.get(10,java.util.concurrent.TimeUnit.SECONDS)).isSameAs(f.held.get());
+            assertThat(c.get(10,java.util.concurrent.TimeUnit.SECONDS)).isSameAs(f.held.get()); assertThat(reads).hasValue(2);
+            f.held.set(progress(4,List.of("orders"),null));
+            assertThat(first.progress()).isSameAs(f.held.get()); assertThat(reads).hasValue(3);
+        }
+    }
+
+    @Test void aSharedReadCannotOutliveEitherCallersOriginalAuthorization() throws Exception {
+        var f = new Fixture(); f.held.set(progress(4,List.of(),null));
+        var first = ScopedSrsConsumerAccess.bind(f.member,RUN); var second = ScopedSrsConsumerAccess.bind(f.member,RUN);
+        var entered = new java.util.concurrent.CountDownLatch(1); var release = new java.util.concurrent.CountDownLatch(1);
+        when(f.store.progress(RUN.context())).thenAnswer(call -> {
+            entered.countDown(); assertThat(release.await(10,java.util.concurrent.TimeUnit.SECONDS)).isTrue(); return Optional.of(f.held.get());
+        });
+        var threads = new java.util.concurrent.CopyOnWriteArrayList<Thread>();
+        try (var executor = java.util.concurrent.Executors.newFixedThreadPool(2, task -> {
+            var thread = new Thread(task); threads.add(thread); return thread;
+        })) {
+            var a = executor.submit(first::progress);
+            try {
+                assertThat(entered.await(10,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                var b = executor.submit(second::progress);
+                awaitParked(threads); verify(f.store,times(1)).progress(RUN.context());
+                f.active.set(false); release.countDown();
+                for (var read : List.of(a,b)) assertThatThrownBy(() -> read.get(10,java.util.concurrent.TimeUnit.SECONDS))
+                        .isInstanceOf(java.util.concurrent.ExecutionException.class)
+                        .satisfies(failure -> refused(failure.getCause()));
+            } finally { release.countDown(); }
+        }
+    }
+
+    @Test void aQueuedFollowerKeepsItsOwnGuardBeforeJoiningAndAfterAnotherCallersRead() throws Exception {
+        var f = new Fixture(); var original = progress(4,List.of(),null); f.held.set(original);
+        var first = ScopedSrsConsumerAccess.bind(f.member,RUN); var leader = ScopedSrsConsumerAccess.bind(f.member,RUN);
+        var permitted = new AtomicBoolean(); var unused = mock(SrsConsumerStore.class);
+        var follower = new ScopedSrsConsumerAccess.Bound(RUN,unused,first.models(),() -> {
+            if (!permitted.get()) throw ScopedSrsConsumerAccess.refused(RUN);
+        },first.reads());
+        var entered = new java.util.concurrent.CountDownLatch(1); var release = new java.util.concurrent.CountDownLatch(1);
+        when(f.store.progress(RUN.context())).thenAnswer(call -> {
+            entered.countDown(); assertThat(release.await(10,java.util.concurrent.TimeUnit.SECONDS)).isTrue(); return Optional.of(original);
+        });
+        var threads = new java.util.concurrent.CopyOnWriteArrayList<Thread>();
+        try (var executor = java.util.concurrent.Executors.newFixedThreadPool(3, task -> {
+            var thread = new Thread(task); threads.add(thread); return thread;
+        })) {
+            var a = executor.submit(first::progress);
+            try {
+                assertThat(entered.await(10,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                assertThatThrownBy(follower::progress).satisfies(ScopedSrsSinkAckFactoryTest::refused);
+                var b = executor.submit(leader::progress); awaitParked(threads);
+                permitted.set(true); var c = executor.submit(follower::progress); awaitParked(threads,3);
+                permitted.set(false); release.countDown();
+                assertThat(a.get(10,java.util.concurrent.TimeUnit.SECONDS)).isSameAs(original);
+                assertThat(b.get(10,java.util.concurrent.TimeUnit.SECONDS)).isSameAs(original);
+                assertThatThrownBy(() -> c.get(10,java.util.concurrent.TimeUnit.SECONDS))
+                        .isInstanceOf(java.util.concurrent.ExecutionException.class).satisfies(failure -> refused(failure.getCause()));
+                verify(f.store,times(2)).progress(RUN.context()); verifyNoInteractions(unused);
+            } finally { release.countDown(); }
+        }
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"coded", "wrapped", "programmer"})
+    void anInFlightFailureKeepsItsExactCauseAndDoesNotRemainCached(String kind) throws Exception {
+        var reads = new SrsConsumerProgressReads();
+        var coded = new TapstateException(IoError.SRS_CONSUMER_UNAVAILABLE,Map.of("chain","chain"),null);
+        Throwable failure = switch (kind) {
+            case "coded" -> coded;
+            case "wrapped" -> new java.util.concurrent.CompletionException(coded);
+            default -> new AssertionError("programmer failure");
+        };
+        var entered = new java.util.concurrent.CountDownLatch(3); var release = new java.util.concurrent.CountDownLatch(1);
+        var lookups = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.function.Supplier<SrsConsumerProgress> lookup = () -> {
+            lookups.incrementAndGet();
+            try { assertThat(release.await(10,java.util.concurrent.TimeUnit.SECONDS)).isTrue(); }
+            catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new AssertionError(interrupted); }
+            if (failure instanceof Error error) throw error;
+            throw (RuntimeException)failure;
+        };
+        var threads = new java.util.concurrent.CopyOnWriteArrayList<Thread>();
+        try (var executor = java.util.concurrent.Executors.newFixedThreadPool(3, task -> {
+            var thread = new Thread(task); threads.add(thread); return thread;
+        })) {
+            var a = executor.submit(() -> { entered.countDown(); return reads.read(RUN,lookup); });
+            var b = executor.submit(() -> { entered.countDown(); return reads.read(RUN,lookup); });
+            var c = executor.submit(() -> { entered.countDown(); return reads.read(RUN,lookup); });
+            try {
+                assertThat(entered.await(10,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                awaitParked(threads,3); assertThat(lookups).hasValue(1);
+            } finally { release.countDown(); }
+            for (var result : List.of(a,b,c)) assertThatThrownBy(() -> result.get(10,java.util.concurrent.TimeUnit.SECONDS))
+                    .isInstanceOf(java.util.concurrent.ExecutionException.class)
+                    .satisfies(thrown -> assertThat(thrown.getCause()).isSameAs(failure));
+            assertThat(lookups).hasValue(2);
+        }
+        var after = progress(4,List.of("orders"),null);
+        assertThat(reads.read(RUN,() -> after)).isSameAs(after);
+    }
+
+    private static void awaitParked(List<Thread> threads) {
+        awaitParked(threads,2);
+    }
+    private static void awaitParked(List<Thread> threads, int count) {
+        long deadline = System.nanoTime()+java.util.concurrent.TimeUnit.SECONDS.toNanos(10);
+        while ((threads.size()!=count || threads.stream().anyMatch(thread -> thread.getState()!=Thread.State.WAITING
+                && thread.getState()!=Thread.State.TIMED_WAITING)) && System.nanoTime()<deadline)
+            java.util.concurrent.locks.LockSupport.parkNanos(1_000_000);
+        assertThat(threads).hasSize(count).allSatisfy(thread -> assertThat(thread.getState()).isIn(Thread.State.WAITING,Thread.State.TIMED_WAITING));
+    }
+
+    @Test void anotherScopeMembershipOrClaimCannotBorrowAnUnfinishedReadAndEveryFailureIsRetriedFresh() throws Exception {
+        var reads = new SrsConsumerProgressReads(); var original = progress(4,List.of(),null);
+        var next = SrsConsumerRun.of(SCOPE,new SrsConsumerMembership(RUN.context(),5,false,Set.of("orders"),FENCE));
+        var claim = new WorkloadClaimFence(FENCE.key(),FENCE.owner(),FENCE.claimGeneration(),6,FENCE.topologyRevision());
+        var nextClaim = SrsConsumerRun.of(SCOPE,new SrsConsumerMembership(RUN.context(),4,false,Set.of("orders"),claim));
+        var scope = new PipelineIntentScope(SCOPE.clusterId(),SCOPE.bindingVersion(),"new-cache",SCOPE.pipelineId(),SCOPE.stateGeneration());
+        var nextScope = SrsConsumerRun.of(scope,new SrsConsumerMembership(RUN.context(),4,false,Set.of("orders"),FENCE));
+        var entered = new java.util.concurrent.CountDownLatch(4); var release = new java.util.concurrent.CountDownLatch(1);
+        java.util.function.Supplier<SrsConsumerProgress> lookup = () -> {
+            entered.countDown();
+            try { assertThat(release.await(10,java.util.concurrent.TimeUnit.SECONDS)).isTrue(); }
+            catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new AssertionError(interrupted); }
+            return original;
+        };
+        try (var executor = java.util.concurrent.Executors.newFixedThreadPool(4)) {
+            var results = List.of(RUN,next,nextClaim,nextScope).stream().map(run -> executor.submit(() -> reads.read(run,lookup))).toList();
+            try { assertThat(entered.await(10,java.util.concurrent.TimeUnit.SECONDS)).isTrue(); }
+            finally { release.countDown(); }
+            for (var result : results) assertThat(result.get(10,java.util.concurrent.TimeUnit.SECONDS)).isSameAs(original);
+        }
+        var failure = new TapstateException(IoError.SRS_CONSUMER_UNAVAILABLE,Map.of("chain","chain"),null);
+        assertThatThrownBy(() -> reads.read(RUN,() -> { throw failure; })).isSameAs(failure);
+        var bug = new AssertionError("programmer failure");
+        assertThatThrownBy(() -> reads.read(RUN,() -> { throw bug; })).isSameAs(bug);
+        assertThat(reads.read(RUN,() -> original)).isSameAs(original);
+    }
+
     @Test void sharedAndPrivateStreamsKeepSeparateWriterStoresAfterFactorySerialization() throws Exception {
         var f = new Fixture(); var privateStore = mock(DirectChannelStore.class);
         var context = new DirectChannelContext(SCOPE,"private-channel","private-source","private-capture");

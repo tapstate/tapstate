@@ -42,6 +42,14 @@ public interface SrsConsumerStore {
     boolean startReadingAfter(SrsConsumerContext context, long membershipRevision, long expectedProgressRevision, String table, long sequence,
                               WorkloadClaimFence originalPipelineFence);
 
+    /**
+     * Records the supplied per-table first arrivals in one original-claim transaction and progress CAS.
+     * Every table keeps its separately sampled floor. Existing covering floors are unchanged; adding any
+     * missing floor requires the original expected revision. No subset is written on refusal.
+     */
+    boolean startReadingAfter(SrsConsumerContext context, long membershipRevision, long expectedProgressRevision,
+                              Map<String, Long> sequences, WorkloadClaimFence originalPipelineFence);
+
     /** Advances only this consumer's read cursor; it cannot acknowledge a sink or advance the source checkpoint. */
     boolean advanceReadSequence(SrsConsumerContext context, long membershipRevision, String table, long sequence,
                                 WorkloadClaimFence originalPipelineFence);

@@ -59,6 +59,74 @@ class MongoCacheDerivedSchemaStoreIT {
     }
     private static void record(DerivedSchemaStore store, String type) { store.record("orders", "source.orders", columns(type), "statement", "sources", "derivation"); }
 
+    @Test void aWideModelReadUsesOneOriginalMetadataTransactionAndOneExactKeyQuery() {
+        withFixture(f -> {
+            var steps = java.util.stream.IntStream.range(0,12).mapToObj(i -> "source.table-"+i).collect(java.util.stream.Collectors.toSet());
+            for (String step : steps) f.writer().record("orders",step,columns("text"),step,"sources","derivation");
+            var requested = new java.util.HashSet<>(steps); requested.add("missing");
+            var transactions = new java.util.HashSet<String>(); var queries = new java.util.concurrent.atomic.AtomicInteger();
+            var guardCalls = new java.util.concurrent.atomic.AtomicInteger();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (event.getDatabaseName().equals(f.database.getName()) && event.getCommandName().equals("find")
+                            && event.getCommand().getString("find").getValue().equals(SystemCollections.CACHE_DERIVED_SCHEMAS.collectionName())) {
+                        queries.incrementAndGet(); transactions.add(event.getCommand().get("lsid")+":"+event.getCommand().get("txnNumber"));
+                    }
+                }
+            };
+            try (var client = MongoClients.create(MongoClientSettings.builder().applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(listener).build())) {
+                var reader = new MongoCacheDerivedSchemaStore(new MongoCachePipelineAccess(client,client.getDatabase(f.database.getName()),SCOPE,null,guardCalls::incrementAndGet));
+                var found = reader.latestMany("orders",requested);
+                assertThat(found).containsOnlyKeys(steps).allSatisfy((step, model) -> {
+                    assertThat(model.statement()).isEqualTo(step); assertThat(model.schema().keySet()).containsExactly("order.id","note");
+                });
+                assertThat(transactions).hasSize(1); assertThat(queries).hasValue(1); assertThat(guardCalls.get()).isLessThanOrEqualTo(5);
+            }
+        });
+    }
+
+    @Test void batchReadsCaptureTheRequestedKeysBeforeTheOriginalGuardRuns() {
+        withFixture(f -> {
+            record(f.writer(),"text"); var requested = new java.util.HashSet<>(Set.of("source.orders")); var once = new AtomicBoolean();
+            var reader = new MongoCacheDerivedSchemaStore(new MongoCachePipelineAccess(f.client,f.database,SCOPE,null,() -> {
+                if (once.compareAndSet(false,true)) { requested.clear(); requested.add("different"); }
+            }));
+            assertThat(reader.latestMany("orders",requested)).containsOnlyKeys("source.orders");
+            assertThat(requested).containsExactly("different");
+        });
+    }
+
+    @Test void oneMalformedBatchMemberRefusesTheWholeReadAndOtherGenerationsRemainMissing() {
+        withFixture(f -> {
+            record(f.writer(),"text"); f.writer().record("orders","other",columns("text"),"other","sources","v1");
+            var reader = f.domain.pipelineDerivedSchemas(SCOPE); var filter = new Document("_id","orders.other");
+            var otherGeneration = new PipelineIntentScope(SCOPE.clusterId(),SCOPE.bindingVersion(),SCOPE.cacheIncarnation(),SCOPE.pipelineId(),2);
+            f.rows().updateOne(filter,new Document("$set",new Document("scope",MongoPipelinePreparationFacts.scope(otherGeneration))));
+            assertThat(reader.latestMany("orders",Set.of("source.orders","other","missing"))).containsOnlyKeys("source.orders");
+            var otherPipeline = new PipelineIntentScope(SCOPE.clusterId(),SCOPE.bindingVersion(),SCOPE.cacheIncarnation(),"foreign",1);
+            f.rows().updateOne(filter,new Document("$set",new Document("scope",MongoPipelinePreparationFacts.scope(otherPipeline))));
+            var before = f.snapshot();
+            assertUnreadable(() -> reader.latestMany("orders",Set.of("source.orders","other")));
+            assertThat(f.snapshot()).isEqualTo(before);
+            assertCode(() -> reader.latestMany("foreign",Set.of("source.orders")),IoError.CACHE_BUSINESS_FENCED);
+        });
+    }
+
+    @Test void aBatchCannotEscapeAnExpiredCommandAfterItsActualQueryOrUseTheWrongPreparationPhase() {
+        withFixture(f -> {
+            record(f.writer(),"text"); var before = f.snapshot();
+            try (var witness = new MongoCommandWitness(MONGO.getReplicaSetUrl(),f.database.getName(),"find",SystemCollections.CACHE_DERIVED_SCHEMAS.collectionName())) {
+                var reader = new MongoCacheDerivedSchemaStore(new MongoCachePipelineAccess(witness.client,witness.database,SCOPE,null,witness::refuseAfterCommand));
+                assertCode(() -> reader.latestMany("orders",Set.of("source.orders","missing")),IoError.CACHE_BUSINESS_FENCED);
+                witness.requireCommand();
+            }
+            var authoring = new MongoCacheDerivedSchemaStore(MongoCachePipelineAccess.unpreparedModels(f.client,f.database,SCOPE,null,ACTIVE,MongoRateHistoryStore.DEFAULT_RETENTION));
+            assertCode(() -> authoring.latestMany("orders",Set.of("source.orders")),IoError.CACHE_BUSINESS_FENCED);
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
     @Test void historyAppendsOnlyOnShapeChangeAndPreservesAPinDuringProvenanceRefresh() {
         withFixture(f -> {
             var writer = f.writer(); var reader = f.domain.pipelineDerivedSchemas(SCOPE);

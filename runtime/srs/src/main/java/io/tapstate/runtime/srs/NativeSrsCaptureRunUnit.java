@@ -55,18 +55,21 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
         Runnable fixed=guard(requireActive);fixed.run();var stores=views.srs(scope,fixed);
         var chain=stores.chains().load(chainId).orElseThrow(() -> new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN,Map.of("chain",chainId),null));
         var members=stores.consumers().attached(chainId);
-        for(String table:chain.servingTables()) {
-            long floor=Long.MAX_VALUE;boolean subscribed=false;
-            for(var member:members.consumers())if(member.tables().contains(table)) {
-                subscribed=true;var held=stores.consumers().progress(member.context());
-                // A coherent detach may remove this cursor after the topology snapshot. Abandon this cut.
-                // The adapter still rejects missing progress for an attached or corrupt relation.
-                if(held.isEmpty())return;
-                var progress=held.orElseThrow();if(progress.membershipRevision()!=member.revision())return;
-                floor=Math.min(floor,progress.ringDoneThrough().getOrDefault(table,-1L));
-            }
-            String ring=SrsRingbuffer.ringName(chainId,table);
-            if(subscribed && floor>=0 && floor!=Long.MAX_VALUE && floor>stores.log().bounds(ring).trimmedThrough())stores.log().trim(ring,floor,originalCapture);
+        var floors=new TreeMap<String,Long>();
+        for(var member:members.consumers()) {
+            if(Collections.disjoint(member.tables(),chain.servingTables()))continue;
+            var held=stores.consumers().progress(member.context());
+            // Read each original consumer once. A coherent detach or replacement abandons this pass;
+            // CACHE still rechecks current subscribers in each actual trim transaction.
+            if(held.isEmpty())return;
+            var progress=held.orElseThrow();if(progress.membershipRevision()!=member.revision())return;
+            for(String table:member.tables())if(chain.servingTables().contains(table))
+                floors.merge(table,progress.ringDoneThrough().getOrDefault(table,-1L),Math::min);
+        }
+        for(var entry:floors.entrySet())if(entry.getValue()>=0) {
+            fixed.run();String ring=SrsRingbuffer.ringName(chainId,entry.getKey());
+            long trimmed=stores.log().bounds(ring).trimmedThrough();fixed.run();
+            if(entry.getValue()>trimmed) {stores.log().trim(ring,entry.getValue(),originalCapture);fixed.run();}
         }
         stores.models().reclaim(chainId,originalCapture);fixed.run();
     }

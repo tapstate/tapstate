@@ -281,17 +281,35 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             String table,long sequence,WorkloadClaimFence fence) {
         Objects.requireNonNull(context,"context"); requireRevision(membershipRevision); requireRevision(expectedProgressRevision);
         if (table == null || table.isBlank() || sequence < -1 || sequence == Long.MAX_VALUE) throw new IllegalArgumentException("invalid original consumer arrival");
+        return startReadingAfter(context,membershipRevision,expectedProgressRevision,Map.of(table,sequence),fence);
+    }
+
+    @Override public boolean startReadingAfter(SrsConsumerContext context,long membershipRevision,long expectedProgressRevision,
+            Map<String,Long> sequences,WorkloadClaimFence fence) {
+        Objects.requireNonNull(context,"context"); requireRevision(membershipRevision); requireRevision(expectedProgressRevision);
+        Objects.requireNonNull(sequences,"sequences");
+        if (sequences.isEmpty() || sequences.entrySet().stream().anyMatch(entry -> entry.getKey() == null || entry.getKey().isBlank()
+                || entry.getValue() == null || entry.getValue() < -1 || entry.getValue() == Long.MAX_VALUE))
+            throw new IllegalArgumentException("invalid original consumer arrivals");
+        var captured = Map.copyOf(sequences);
         return transaction(session -> {
             prove(session,context,fence); var own = requireOwn(session,context);
             if (!bound(own.member(),membershipRevision,fence)) return false;
-            if (!own.member().tables().contains(table)) throw unavailable(context.key().miningChainId());
+            if (!own.member().tables().containsAll(captured.keySet())) throw unavailable(context.key().miningChainId());
             var held = own.cursor(); var old = held.value();
-            if (held.ringDoneThrough().containsKey(table)) return sequence <= held.ringDoneThrough().get(table);
+            var missing = new HashMap<String,Long>();
+            for (var entry : captured.entrySet()) {
+                var confirmed = held.ringDoneThrough().get(entry.getKey());
+                if (confirmed == null) missing.put(entry.getKey(),entry.getValue());
+                else if (entry.getValue() > confirmed) return false;
+            }
+            if (missing.isEmpty()) return true;
             if (held.revision() != expectedProgressRevision) return false;
-            // An unexplained read-ahead is not proof that a later arrival may skip those changes.
-            if (old.perTableSeq().get(table) != -1L) throw unavailable(context.key().miningChainId());
-            var done = new HashMap<>(held.ringDoneThrough()); done.put(table,sequence);
-            var read = new HashMap<>(old.perTableSeq()); read.put(table,sequence);
+            // Validate every new arrival before replacing any part of the consumer's original cursor.
+            if (missing.keySet().stream().anyMatch(table -> old.perTableSeq().get(table) != -1L))
+                throw unavailable(context.key().miningChainId());
+            var done = new HashMap<>(held.ringDoneThrough()); done.putAll(missing);
+            var read = new HashMap<>(old.perTableSeq()); read.putAll(missing);
             var next = new ConsumerOffset(old.pipelineId(),read,old.sinkAcked(),old.snapshotCompletedTables(),old.cdcStartPosition(),
                     old.snapshotEpoch(),old.sinkAckedByTable(),old.progressKind());
             replaceProgress(session,own,next,held.writerRun(),done); return true;
@@ -368,8 +386,8 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             if (!context.key().miningChainId().equals(key.miningChainId()) || !scope.cacheIncarnation().equals(key.cacheIncarnation())) {
                 throw unavailable(context.key().miningChainId());
             }
-            models.requireSnapshotReference(session, key);
         }
+        models.requireSnapshotReferences(session, Set.copyOf(snapshot.models().values()));
     }
     @Override public Optional<SrsConsumerMembership> attach(SrsConsumerContext context, long expectedRevision, Set<String> tables, WorkloadClaimFence fence) {
         Objects.requireNonNull(context, "context"); requireRevision(expectedRevision); Set<String> selected = Set.copyOf(Objects.requireNonNull(tables, "tables"));
