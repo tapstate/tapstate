@@ -54,6 +54,40 @@ class ConfiguredSinkRunTest {
         clearInvocations(notes);var member=Hazelcast.newHazelcastInstance(config);
         try{assertThatThrownBy(() -> copy(original.forRun(run)).prepareTargets(member)).isInstanceOfSatisfying(TapstateException.class,e -> assertThat(e.code()).isEqualTo(IoError.NOTE_SCOPE_UNAVAILABLE));assertThat(Files.readAllLines(trace)).isEmpty();verify(notes,never()).open(any());verify(notes,never()).initialize(any());}finally{member.shutdown();}
     }
+
+    @Test void projectedIdentityUsesTheSameFrozenModelThroughPreparationAndSerializedReopen(@TempDir Path directory)throws Exception {
+        var ref=IdentityConnectorFixture.ref(directory);
+        var settings=Map.<String,Object>of("rows",List.of(
+                Map.of("spec",Map.of("name","_id_","key",Map.of("_id",1),"unique",true)),
+                Map.of("spec",Map.of("name","logical","key",Map.of("_unwind_source_id",1,"position",1),"unique",true))));
+        var logical=new TargetTable("orders",List.of(new TargetField("_id","string",true),new TargetField("position","long",true)),
+                List.of(new TargetIndex(List.of("_id","position"),true)),new UnwindIdentity(List.of("_id"),"_unwind_source_id"));
+        var physical=new TargetTable("orders",List.of(new TargetField("_unwind_source_id","string",true),new TargetField("position","long",true)),
+                List.of(new TargetIndex(List.of("_unwind_source_id","position"),true)));
+        var original=new PdkSinkWriterFactory("mongodb",settings,WriteMode.UPSERT,DdlPolicy.FAIL,Map.of("input",logical),NODE,OnFullLoad.APPEND,false);
+        var provisioner=mock(ConnectorProvisioner.class);when(provisioner.resolve("mongodb")).thenReturn(ref);when(provisioner.resolve("mongodb",HASH)).thenReturn(ref);
+        var notes=notes();when(notes.origin(any())).thenReturn(ConnectorNoteOrigin.capture("mongodb",HASH,settings));
+        var roster=new ArrayList<SinkPreparationStore.Input>();
+        var bound=(PdkSinkWriterFactory)new StoreBackedDagSource.PdkSinkWriterBinder(notes,provisioner)
+                .scoped(original,FENCE,roster,() -> {});
+        assertThat(roster).containsExactly(PdkSinkPreparations.input(SCOPE,NODE,PipelineNode.Purpose.SYNC,OnFullLoad.APPEND,false,physical));
+        var receipts=new Receipts();receipts.prepareTargets(roster);
+        var cache=mock(PipelineStoreViews.class);when(cache.sinkPreparations(eq(SCOPE),eq(CLAIM),any())).thenReturn(receipts);
+        var auth=mock(ExecutionAuthorization.class);when(auth.require(FENCE)).thenReturn(CLAIM);
+        var config=config();ScopedSinkStateProvider.bind(config,cache,notes);config.getUserContext().put(ExecutionAuthorization.USER_CONTEXT_KEY,auth);
+        config.getUserContext().put(PdkSinkWriterFactory.CONNECTOR_PROVISIONER_USER_CONTEXT_KEY,provisioner);
+        var member=Hazelcast.newHazelcastInstance(config);
+        try {
+            var copied=copy(bound);copied.prepareTargets(member);
+            for(int i=0;i<2;i++)try(var writer=copied.getEx()) {
+                var row=Map.<String,Object>of("_id","parent","position",1L);
+                assertThat(writer.write(List.of(io.tapstate.core.event.Envelope.update(1L,"input",row,row,null)))
+                        .toCompletableFuture().get(5,java.util.concurrent.TimeUnit.SECONDS).written()).isEqualTo(1);
+            }
+            assertThat(receipts.rows).hasSize(1);
+            assertThat(receipts.rows.values()).allSatisfy(row -> assertThat(row.phase()).isEqualTo(SinkPreparationStore.Phase.READY));
+        }finally{member.shutdown();}
+    }
     @Test void theCoordinateDtoCarriesNoSettingsAndChecksBindingPurposeAndStateGeneration()throws Exception {
         var config=new SinkConfig("demo",Map.of("password","secret-sentinel"),WriteMode.UPSERT,DdlPolicy.FAIL,null,NODE);
         var notes=notes();var ref=new ConnectorRef(List.of(),"not.loaded","2.0.8",null,null,HASH,false);

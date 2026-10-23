@@ -32,6 +32,13 @@ public final class PdkSinkPort implements SinkPort {
     private final ConnectorNoteScopes noteScopes;
     private final WorkloadClaimFence execution;
     private final PdkSinkPreparations preparations;
+    private final Map<String, TargetIdentityPlan> plannedIdentities;
+
+    /** The exact assessed models frozen into this run's preparation roster, separate from input lineage. */
+    public PdkSinkPort withTargetIdentities(Map<String, TargetIdentityPlan> identities) {
+        return new PdkSinkPort(provisioner, stateStore, sharing, purpose, noteScopes, execution, preparations,
+                Objects.requireNonNull(identities, "identities"));
+    }
 
     /** Configured writes use already prepared CONFIG notes and the caller's fixed run authority. */
     public static PdkSinkPort withRequiredNotes(ConnectorProvisioner provisioner, KeyedStateStore stateStore,
@@ -78,7 +85,14 @@ public final class PdkSinkPort implements SinkPort {
 
     private PdkSinkPort(ConnectorProvisioner provisioner,KeyedStateStore stateStore,SharedSinkConnectors sharing,
             PipelineNode.Purpose purpose,ConnectorNoteScopes noteScopes,WorkloadClaimFence execution,PdkSinkPreparations preparations) {
+        this(provisioner,stateStore,sharing,purpose,noteScopes,execution,preparations,null);
+    }
+
+    private PdkSinkPort(ConnectorProvisioner provisioner,KeyedStateStore stateStore,SharedSinkConnectors sharing,
+            PipelineNode.Purpose purpose,ConnectorNoteScopes noteScopes,WorkloadClaimFence execution,
+            PdkSinkPreparations preparations,Map<String,TargetIdentityPlan> plannedIdentities) {
         if(preparations!=null)preparations.requireClaim(execution);
+        this.plannedIdentities=plannedIdentities==null?null:Map.copyOf(plannedIdentities);
         this.preparations=preparations;
         if (purpose != PipelineNode.Purpose.VIEW && purpose != PipelineNode.Purpose.SYNC) {
             throw new IllegalArgumentException("sink purpose must be view or sync");
@@ -113,7 +127,12 @@ public final class PdkSinkPort implements SinkPort {
      */
     public SinkWriter openPrepared(SinkConfig config, Map<String, TargetTable> targets) {
         requireInputs(config);requireActive();
-        if(preparations!=null)for(var target:targets.values())preparations.requireReady(target);
+        if(preparations!=null) {
+            if(plannedIdentities!=null && !plannedIdentities.keySet().equals(targets.keySet()))
+                throw new IllegalArgumentException("frozen identities must cover every input stream");
+            var physical=plannedIdentities==null?targets.values():plannedIdentities.values().stream().map(TargetIdentityPlan::target).toList();
+            for(var target:physical)preparations.requireReady(target);
+        }
         ConnectorRef ref = provisioner.resolve(config.connectorId());
         ConfiguredDrive drive = configuredDrive(config, ref);
         SharedSinkConnectors.NoteIdentity identity = drive.identity();
@@ -138,7 +157,7 @@ public final class PdkSinkPort implements SinkPort {
             Runnable letGo) {
         WriteRecordFunction write = requireWriteFunction(connector.functions().getWriteRecordFunction());
         try {
-            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, true, letGo, purpose,preparations);
+            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, true, letGo, purpose,preparations,plannedIdentities);
             writer.prepareTargets();
             return writer;
         } catch (TapstateException e) {
@@ -185,11 +204,16 @@ public final class PdkSinkPort implements SinkPort {
                 PdkTargetPreparation preparation = new PdkTargetPreparation(connector.connectorId(),
                         connector.context(), connector.functions(), config.onFullLoad(), config.fullLoad(),
                         config.node(), stateStore, false, purpose, connector::requireActive,preparations);
-                for (TargetTable target : targets.values()) {
+                Map<String, TargetIdentityPlan> identities = PdkTargetIdentityPlanner.assess(connector, config, targets);
+                identities.values().forEach(TargetIdentityProjection::requireUsable);
+                PdkTargetIdentityPlanner.requireSame(config, plannedIdentities, identities);
+                for (TargetIdentityPlan identity : identities.values()) {
+                    TargetTable target = identity.target();
                     TapTable table = TargetTapTable.build(target);
                     connector.resolveTargetTypes(table);
                     preparation.prepare(target, table);
                 }
+                PdkTargetIdentityPlanner.verifyPrepared(connector, config, targets, identities);
                 return null;
             });
         } catch (TapstateException e) {
@@ -199,6 +223,34 @@ public final class PdkSinkPort implements SinkPort {
         } finally {
             connector.stopQuietly();
             connector.close();
+        }
+    }
+
+    /** Read-only assessment under the configured note scopes and exact artifact, before the roster is frozen. */
+    public Map<String, TargetIdentityPlan> assessTargets(SinkConfig config, Map<String, TargetTable> targets) {
+        requireInputs(config);requireActive();
+        if(targets.values().stream().noneMatch(target -> target.unwindIdentity()!=null)) {
+            var unchanged=new java.util.LinkedHashMap<String,TargetIdentityPlan>();
+            targets.forEach((stream,target) -> unchanged.put(stream,PdkTargetIdentityPlanner.unchanged(target)));
+            return Map.copyOf(unchanged);
+        }
+        var ref=provisioner.resolve(config.connectorId());
+        var drive=configuredDrive(config,ref);
+        var connector=PdkConnector.open(config.connectorId(),ref,config.settings(),config.node(),stateStore,null,drive.scopes(),purpose);
+        try {
+            return connector.underLoader(() -> {
+                connector.connector().init(connector.context());
+                var identities=PdkTargetIdentityPlanner.assess(connector,config,targets);
+                identities.values().forEach(TargetIdentityProjection::requireUsable);
+                connector.requireActive();
+                return Map.copyOf(identities);
+            });
+        } catch(TapstateException coded) {
+            throw coded;
+        } catch(Throwable failure) {
+            throw PdkSinkWriter.writeFailed(config.connectorId(),failure);
+        } finally {
+            connector.stopQuietly();connector.close();
         }
     }
 
@@ -218,7 +270,7 @@ public final class PdkSinkPort implements SinkPort {
                 connector.connector().init(connector.context());
                 return null;
             });
-            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, preparedAhead, null, purpose,preparations);
+            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, preparedAhead, null, purpose,preparations,plannedIdentities);
             writer.prepareTargets();
             return writer;
         } catch (TapstateException e) {

@@ -15,6 +15,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
+import io.tapstate.core.event.RowValueError;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.capture.CaptureBatch;
 import io.tapstate.spi.capture.CaptureConfig;
@@ -75,6 +76,20 @@ class CdcPhaseTest {
     /** Orders the mock positions {@code w1 < w2 < w3 < ...} by their numeric suffix; a source position is never ordered lexically. */
     /** The generation the ring under test is running under; every order on it carries this first. */
     private static final long RING_GENERATION = 1L;
+
+    @Test
+    void invalidKeysDoNotAdvanceTheSourceReadOffset() {
+        SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer("srs.chain.invalidkeys"));
+        RecordingMeta meta = new RecordingMeta();
+        CdcChain chain = new CdcChain(new SrsWriteGate(ring), meta, "chain", RING_GENERATION, 0L);
+        FakeCdcPort port = new FakeCdcPort(List.of(
+                Envelope.insert(1, "orders", Map.of("dict", Map.of(7, "value")), Map.of())));
+        assertThatThrownBy(() -> CdcPhase.run(port, config(), chain, List::of, new CaptureHealth()))
+                .isInstanceOfSatisfying(TapstateException.class, failure ->
+                        assertThat(failure.code()).isEqualTo(RowValueError.NON_STRING_MAP_KEY));
+        assertThat(meta.advances).isEmpty();
+        assertThat(ring.tailSequence()).isEqualTo(-1L);
+    }
 
     @BeforeAll
     static void startMember() {

@@ -3,6 +3,8 @@ package io.tapstate.adapters.mongostore;
 import com.mongodb.MongoClientSettings;
 import io.tapstate.core.event.Bytes;
 import io.tapstate.core.event.ConvertedValue;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.event.RowValueError;
 import org.bson.BsonDocument;
 import org.bson.BsonDocumentReader;
 import org.bson.BsonDocumentWriter;
@@ -19,6 +21,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Witnesses that a row image survives being stored -- through an actual BSON encode and decode, not
@@ -55,6 +58,23 @@ class RowImagesTest {
         var value = new ConvertedValue("payload", "varchar(30)", "TapStringValue", "{\"bytes\":30}", null);
         Map<String, Object> row = Map.of("object", Map.of("value", value), "array", List.of(value));
         assertThat(overTheWire(row)).isEqualTo(row);
+    }
+
+    @Test
+    void distinctNestedMapKeysSurviveTheStoredRowImage() {
+        Map<Object, Object> nested = new LinkedHashMap<>();
+        nested.put(7, "number-key");
+        nested.put("7", "text-key");
+        Map<String, Object> row = Map.of("dict", nested);
+
+        assertThatThrownBy(() -> overTheWire(row))
+                .as("Non-string keys must be refused before the row-image BSON round trip loses an entry")
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(RowValueError.NON_STRING_MAP_KEY);
+                    assertThat(failure.args()).containsExactlyInAnyOrderEntriesOf(
+                            Map.of("path", "$/dict", "keyType", "java.lang.Integer"));
+                });
+        assertThat(nested).hasSize(2).containsEntry(7, "number-key").containsEntry("7", "text-key");
     }
 
     @Test

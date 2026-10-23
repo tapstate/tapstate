@@ -8,6 +8,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.EventJsonValues;
+import io.tapstate.core.event.RowMapKeys;
 import io.tapstate.core.model.SourceResource;
 import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
@@ -49,6 +50,10 @@ public final class PdkTargetPreviewRenderer {
         if (target == null || !isMongoConnector(target.connector())) {
             return logicalJson(documents, checkpoint);
         }
+        for (Map<String, Object> document : documents) {
+            checkpoint.run();
+            RowMapKeys.validate(document, MAX_NESTING);
+        }
 
         ConnectorRef ref;
         try {
@@ -70,6 +75,7 @@ public final class PdkTargetPreviewRenderer {
                     TapEvent targetEvent = TapEventCodec.encode(
                             Envelope.read(0L, PREVIEW_STREAM, document, null), connector.conversions());
                     Map<String, Object> targetValues = ((TapInsertRecordEvent) targetEvent).getAfter();
+                    RowMapKeys.validate(targetValues, MAX_NESTING);
                     String extendedJson = writeExtendedJson(targetValues, loader);
                     Object parsed = JsonReader.parse(extendedJson);
                     if (!(parsed instanceof Map<?, ?> map)) {
@@ -102,6 +108,7 @@ public final class PdkTargetPreviewRenderer {
         List<Map<String, Object>> normalized = new ArrayList<>(documents.size());
         for (Map<String, Object> document : documents) {
             checkpoint.run();
+            RowMapKeys.validate(document, MAX_NESTING);
             Object value = logicalValue(document);
             if (!(value instanceof Map<?, ?> map)) {
                 throw new IllegalStateException("preview result is not a JSON document");
@@ -126,9 +133,7 @@ public final class PdkTargetPreviewRenderer {
             case Map<?, ?> map -> {
                 Map<String, Object> normalized = new LinkedHashMap<>();
                 map.forEach((key, item) -> {
-                    if (!(key instanceof String field)) {
-                        throw new IllegalArgumentException("preview document field names must be strings");
-                    }
+                    String field = RowMapKeys.requireString(key, "$");
                     normalized.put(field, logicalValue(item, depth + 1));
                 });
                 yield normalized;
@@ -206,9 +211,7 @@ public final class PdkTargetPreviewRenderer {
         if (value instanceof Map<?, ?> map && !documentType.isInstance(value)) {
             Map<String, Object> nested = new LinkedHashMap<>();
             for (Map.Entry<?, ?> entry : map.entrySet()) {
-                if (!(entry.getKey() instanceof String key)) {
-                    throw new IllegalArgumentException("preview document field names must be strings");
-                }
+                String key = RowMapKeys.requireString(entry.getKey(), "$");
                 nested.put(key, bsonValue(entry.getValue(), documentType, loader, depth + 1));
             }
             return documentType.getConstructor(Map.class).newInstance(nested);

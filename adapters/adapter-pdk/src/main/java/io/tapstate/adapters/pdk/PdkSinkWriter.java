@@ -54,6 +54,9 @@ final class PdkSinkWriter implements SinkWriter {
     private final DdlPolicy ddl;
     private final Map<String, TargetTable> targets;
     private final PdkTargetPreparation preparation;
+    private Map<String, TargetIdentityPlan> identities = Map.of();
+    private SinkConfig identityConfig;
+    private boolean identityPrepared;
     // What closing this writer does to its connector: stops and closes it, or - where the connector is shared
     // by the writers of one sink - lets go of this writer's hold on it.
     private final Runnable letGo;
@@ -119,9 +122,20 @@ final class PdkSinkWriter implements SinkWriter {
     PdkSinkWriter(PdkConnector connector,WriteRecordFunction write,SinkConfig config,
             Map<String,TargetTable> targets,KeyedStateStore stateStore,boolean preparedAhead,Runnable letGo,
             io.tapstate.core.model.PipelineNode.Purpose purpose,PdkSinkPreparations receipts) {
+        this(connector,write,config,targets,stateStore,preparedAhead,letGo,purpose,receipts,null);
+    }
+
+    PdkSinkWriter(PdkConnector connector,WriteRecordFunction write,SinkConfig config,
+            Map<String,TargetTable> targets,KeyedStateStore stateStore,boolean preparedAhead,Runnable letGo,
+            io.tapstate.core.model.PipelineNode.Purpose purpose,PdkSinkPreparations receipts,
+            Map<String,TargetIdentityPlan> plannedIdentities) {
         this(connector, write, config.writeMode(), config.ddl(), targets,
                 new PdkTargetPreparation(connector.connectorId(), connector.context(), connector.functions(),
                         config.onFullLoad(), config.fullLoad(), config.node(), stateStore, preparedAhead, purpose, connector::requireActive,receipts), letGo);
+        identityConfig = config;
+        identities = PdkTargetIdentityPlanner.assess(connector, config, this.targets);
+        identities.values().forEach(TargetIdentityProjection::requireUsable);
+        PdkTargetIdentityPlanner.requireSame(config, plannedIdentities, identities);
     }
 
     private PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, WriteMode mode, DdlPolicy ddl,
@@ -147,7 +161,12 @@ final class PdkSinkWriter implements SinkWriter {
     void prepareTargets() throws Throwable {
         connector.underLoader(() -> {
             for (Map.Entry<String, TargetTable> entry : targets.entrySet()) {
-                preparation.prepare(entry.getValue(), tableModel(entry.getKey(), entry.getValue()));
+                TargetTable target = projectedTarget(entry.getKey(), entry.getValue());
+                preparation.prepare(target, tableModel(entry.getKey(), target));
+            }
+            if (identityConfig != null) {
+                PdkTargetIdentityPlanner.verifyPrepared(connector, identityConfig, targets, identities);
+                identityPrepared = true;
             }
             return null;
         });
@@ -193,19 +212,8 @@ final class PdkSinkWriter implements SinkWriter {
     }
 
     private synchronized WriteResult deliver(List<Envelope> records) {
-        Map<String, List<TapRecordEvent>> rowsByTable = new LinkedHashMap<>();
-        for (Envelope env : records) {
-            if (env.op() == Op.DDL) {
-                if (ddl == DdlPolicy.FAIL) {
-                    throw writeFailed(connector.connectorId(),
-                            new IllegalStateException("schema change reached a sink whose ddl policy is fail"));
-                }
-                // ignore: drop the schema change. apply: applying it to the target is a later slice, so drop it too.
-                continue;
-            }
-            rowsByTable.computeIfAbsent(env.src(), ignored -> new ArrayList<>())
-                    .add(encode(mode == WriteMode.APPEND ? asInsert(env) : env));
-        }
+        EncodedBatch batch = encodedRows(records);
+        Map<String, List<TapRecordEvent>> rowsByTable = batch.rows();
         if (rowsByTable.isEmpty()) {
             return new WriteResult(0);
         }
@@ -217,31 +225,85 @@ final class PdkSinkWriter implements SinkWriter {
         }
         try {
             return connector.underLoader(() -> {
-                long[] accepted = {0};
-                for (Map.Entry<String, List<TapRecordEvent>> entry : rowsByTable.entrySet()) {
-                    List<TapRecordEvent> rows = entry.getValue();
-                    TargetTable target = targets.get(entry.getKey());
-                    TapTable table = target != null
-                            ? tableModel(entry.getKey(), target)
-                            : TargetTapTable.bare(rows.get(0).getTableId());
-                    preparation.prepare(target, table);
-                    if (target != null) {
-                        // The connector receives both a table model and record events; its write path may
-                        // route by the event table id, so both must name the resolved target collection.
-                        rows.forEach(row -> row.setTableId(target.name()));
-                    }
-                    // A connector may report the batch in several flushes, one callback each; accumulate.
-                    connector.requireActive();
-                    write.writeRecord(connector.context(), rows, table,
-                            result -> accepted[0] += accepted(result));
+                if (!batch.keys().isEmpty()) {
+                    if (!identityPrepared) prepareTargets();
+                    batch.keys().forEach((stream, keys) -> PdkMongoIdentityGuard.verify(connector, identities.get(stream), keys));
                 }
-                return new WriteResult(accepted[0]);
+                return writeRows(rowsByTable);
             });
         } catch (TapstateException e) {
             throw e;
         } catch (Throwable t) {
             throw writeFailed(connector.connectorId(), t);
         }
+    }
+
+    private record EncodedBatch(Map<String, List<TapRecordEvent>> rows,
+            Map<String, List<Map<String, Object>>> keys) { }
+
+    private EncodedBatch encodedRows(List<Envelope> records) {
+        Map<String, List<Map<String, Object>>> keys = new LinkedHashMap<>();
+        Map<String, List<TapRecordEvent>> rowsByTable = new LinkedHashMap<>();
+        for (Envelope env : records) {
+            if (env.op() == Op.DDL) {
+                if (ddl == DdlPolicy.FAIL) {
+                    throw writeFailed(connector.connectorId(),
+                            new IllegalStateException("schema change reached a sink whose ddl policy is fail"));
+                }
+                // ignore: drop the schema change. apply: applying it to the target is a later slice, so drop it too.
+                continue;
+            }
+            TargetIdentityPlan identity = identities.get(env.src());
+            Envelope row = identity == null ? env : TargetIdentityProjection.apply(identity, env);
+            collectDocumentKeys(identity, row, keys);
+            TapRecordEvent encoded = encode(mode == WriteMode.APPEND ? asInsert(row) : row);
+            verifyDocumentKeys(identity, row, encoded);
+            rowsByTable.computeIfAbsent(env.src(), ignored -> new ArrayList<>()).add(encoded);
+        }
+        return new EncodedBatch(rowsByTable, keys);
+    }
+
+    private static boolean documentIdentity(TargetIdentityPlan identity) {
+        return identity.isAutomatic() && identity.requireDocumentKeys();
+    }
+
+    private static void collectDocumentKeys(TargetIdentityPlan identity, Envelope row,
+            Map<String, List<Map<String, Object>>> keys) {
+        if (identity == null || !documentIdentity(identity)) return;
+        List<Map<String, Object>> streamKeys = keys.computeIfAbsent(row.src(), ignored -> new ArrayList<>());
+        if (row.before() != null) streamKeys.add(MongoIdentityKeys.key(identity, row.before()));
+        if (row.after() != null) streamKeys.add(MongoIdentityKeys.key(identity, row.after()));
+    }
+
+    private void verifyDocumentKeys(TargetIdentityPlan identity, Envelope row, TapRecordEvent encoded) {
+        if (identity != null && documentIdentity(identity)) MongoIdentityKeys.verifyEncoded(connector.conversions(), identity, row, encoded);
+    }
+
+    private WriteResult writeRows(Map<String, List<TapRecordEvent>> rowsByTable) throws Throwable {
+        long[] accepted = {0};
+        for (Map.Entry<String, List<TapRecordEvent>> entry : rowsByTable.entrySet()) {
+            List<TapRecordEvent> rows = entry.getValue();
+            TargetTable target = projectedTarget(entry.getKey(), targets.get(entry.getKey()));
+            TapTable table = target != null
+                    ? tableModel(entry.getKey(), target)
+                    : TargetTapTable.bare(rows.get(0).getTableId());
+            preparation.prepare(target, table);
+            if (target != null) {
+                // The connector receives both a table model and record events; its write path may
+                // route by the event table id, so both must name the resolved target collection.
+                rows.forEach(row -> row.setTableId(target.name()));
+            }
+            // A connector may report the batch in several flushes, one callback each; accumulate.
+            connector.requireActive();
+            write.writeRecord(connector.context(), rows, table,
+                    result -> accepted[0] += accepted(result));
+        }
+        return new WriteResult(accepted[0]);
+    }
+
+    private TargetTable projectedTarget(String stream, TargetTable original) {
+        TargetIdentityPlan plan = identities.get(stream);
+        return plan == null ? original : plan.target();
     }
 
     private static long accepted(WriteListResult<TapRecordEvent> result) {

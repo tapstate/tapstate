@@ -2,6 +2,9 @@ package io.tapstate.app;
 
 import io.tapstate.adapters.pdk.ConnectorNoteOrigin;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
+import io.tapstate.adapters.pdk.ConnectorNoteScopes;
+import io.tapstate.adapters.pdk.PdkSinkPort;
+import io.tapstate.adapters.pdk.TargetIdentityPlan;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.PipelineNode;
 import io.tapstate.spi.sink.SinkConfig;
@@ -45,6 +48,23 @@ record ConfiguredSinkRun(ExecutionFence original,PipelineNode node,PipelineNode.
         if(pinned!=null && !pinned.equals(expected))throw unavailable();
         if(!expected.equals(fixed.prepareOrigin(primary,expected)))throw unavailable();
         requireActive.run();return new ConfiguredSinkRun(original,config.node(),purpose,new Note(primary),new Note(global),ref.contentHash());
+    }
+
+    Map<String,TargetIdentityPlan> assessTargets(SinkConfig config,Map<String,io.tapstate.spi.sink.TargetTable> targets,
+            RequiredNoteStore notes,ConnectorProvisioner provisioner,Runnable active) {
+        active.run();if(!node.equals(config.node()))throw unavailable();
+        var fixed=Map.of(primary.namespace(),primary.token(),global.namespace(),global.token());
+        var scopes=ConnectorNoteScopes.of(notes,namespace -> {
+            var token=fixed.get(namespace);if(token==null)throw unavailable();return token;
+        },active);
+        ConnectorProvisioner exact=id -> {
+            active.run();if(!config.connectorId().equals(id))throw unavailable();
+            var ref=provisioner.resolve(id,artifactHash);active.run();return ref;
+        };
+        var claim=new WorkloadClaimFence(new WorkloadClaimKey(original.scope().clusterId(),WorkloadClaimType.PIPELINE_ACTUATION,original.pipelineId()),
+                new WorkloadOwner(original.ownerNodeId(),original.ownerBootId()),original.claimGeneration(),original.executionGeneration(),original.topologyRevision());
+        return PdkSinkPort.withRequiredNotes(exact,null,null,purpose,scopes,claim)
+                .assessTargets(config,targets);
     }
     private static TapstateException unavailable(){return new TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE,Map.of(),null);}
 }

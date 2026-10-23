@@ -2,6 +2,7 @@ package io.tapstate.adapters.mongostore;
 
 import io.tapstate.core.event.Bytes;
 import io.tapstate.core.event.ConvertedValue;
+import io.tapstate.core.event.RowMapKeys;
 import org.bson.Document;
 import org.bson.types.Binary;
 import org.bson.types.Decimal128;
@@ -66,6 +67,7 @@ final class RowImages {
 
     /** One row image as the document to store. */
     static Document toDocument(Map<String, Object> row) {
+        RowMapKeys.validate(row);
         Document document = new Document();
         row.forEach((name, value) -> document.append(name, encoded(value)));
         return document;
@@ -99,7 +101,7 @@ final class RowImages {
         }
         if (value instanceof Map<?, ?> map) {
             Document nested = new Document();
-            map.forEach((name, element) -> nested.append(String.valueOf(name), encoded(element)));
+            map.forEach((name, element) -> nested.append((String) name, encoded(element)));
             return nested;
         }
         if (value instanceof List<?> list) {

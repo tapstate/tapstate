@@ -58,121 +58,11 @@ class BoundedPipelinePreviewIT {
             Map<String, Object> settings = Map.of("uri", source.toString());
             control.discoverSchema(SOURCE_ID, E2eConnectorJar.CONNECTOR_ID, settings);
 
-            List<ControlPlane.PreviewDraft> drafts = List.of(
-                    new ControlPlane.PreviewDraft("preview_source.tap.yml", sourceYaml(source)),
-                    new ControlPlane.PreviewDraft("preview_pipeline.tap.yml", pipelineYaml()));
-            List<Map<String, Object>> events = control.preview(
-                    PIPELINE_ID, OUTPUT_ID, 2, SAMPLE_ID, drafts);
-
-            assertThat(events).extracting(event -> event.get("kind"))
-                    .as("preview events including terminal failure payload: %s", events)
-                    .startsWith("run.accepted", "compile.completed", "sample.completed")
-                    .endsWith("result.completed", "run.completed");
-            List<Long> sequences = events.stream()
-                    .map(event -> ((Number) event.get("seq")).longValue())
-                    .toList();
-            assertThat(sequences)
-                    .containsExactlyElementsOf(java.util.stream.LongStream.range(0, events.size()).boxed().toList());
-            assertThat(events).extracting(event -> event.get("runId"))
-                    .containsOnly(events.getFirst().get("runId"));
-            assertThat(events).extracting(event -> event.get("candidateHash"))
-                    .containsOnly(events.getFirst().get("candidateHash"));
-
-            Map<String, Object> sample = payload(events, "sample.completed");
-            assertThat(sample).containsEntry("complete", true).containsEntry("rootTruncated", true);
-            assertThat(((Number) sample.get("rootRows")).intValue()).isEqualTo(2);
-            assertThat(((Number) sample.get("queryCount")).intValue()).isEqualTo(1);
-
-            Map<String, Object> result = payload(events, "result.completed");
-            assertThat(result).containsEntry("format", "logical-json").containsEntry("complete", true);
-            assertThat(((Number) result.get("rowCount")).intValue()).isEqualTo(2);
-            assertThat(result.get("documents")).isInstanceOf(List.class);
-            List<?> documents = (List<?>) result.get("documents");
-            assertThat(documents).hasSize(2);
-            assertDocument(documents.get(0), "order-1", "Northwind", 24);
-            assertDocument(documents.get(1), "order-2", "Contoso", 14);
-
-            List<Map<String, Object>> cached = control.preview(PIPELINE_ID, OUTPUT_ID, 2, SAMPLE_ID, drafts);
-            assertThat(payload(cached, "sample.completed")).containsEntry("cacheHit", true);
-            assertThat(payload(cached, "result.completed").get("documents")).isEqualTo(documents);
-
-            List<ControlPlane.PreviewDraft> javascriptDrafts = List.of(
-                    new ControlPlane.PreviewDraft("preview_source.tap.yml", sourceYaml(source)),
-                    new ControlPlane.PreviewDraft("preview_pipeline.tap.yml", javascriptPipelineYaml()));
-            List<Map<String, Object>> javascriptEvents = control.preview(
-                    PIPELINE_ID, OUTPUT_ID, 2, SAMPLE_ID + "-javascript", javascriptDrafts);
-            Map<String, Object> javascriptResult = payload(javascriptEvents, "result.completed");
-            assertThat(javascriptResult).containsEntry("format", "logical-json");
-            assertThat(javascriptResult.get("documents")).isInstanceOf(List.class);
-            List<?> javascriptDocuments = (List<?>) javascriptResult.get("documents");
-            assertThat(javascriptDocuments).hasSize(2);
-            assertDocument(javascriptDocuments.get(0), "order-1", "Northwind", 24);
-            assertDocument(javascriptDocuments.get(1), "order-2", "Contoso", 14);
-
-            Map<String, Object> filtered = result(control, source, filterPipelineYaml(), OUTPUT_ID,
-                    SAMPLE_ID + "-filter", false);
-            assertThat(filtered).containsEntry("complete", true);
-            assertThat(((Number) filtered.get("rowCount")).intValue()).isEqualTo(1);
-            assertThat(values(documents(filtered), "id"))
-                    .containsExactly("order-1");
-
-            Map<String, Object> allFiltered = result(control, source, emptyFilterPipelineYaml(), OUTPUT_ID,
-                    SAMPLE_ID + "-filter-empty", false);
-            assertThat(allFiltered).containsEntry("complete", true);
-            assertThat(((Number) allFiltered.get("rowCount")).intValue()).isZero();
-            assertThat(documents(allFiltered)).isEmpty();
-
-            Map<String, Object> union = result(control, source, unionPipelineYaml(), OUTPUT_ID,
-                    SAMPLE_ID + "-union", false);
-            assertThat(union).containsEntry("complete", true);
-            assertThat(((Number) union.get("rowCount")).intValue()).isEqualTo(4);
-            assertThat(values(documents(union), "id"))
-                    .containsExactlyInAnyOrder("order-1", "order-2", "order-3", "order-4");
-            List<Map<String, Object>> boundedUnion = control.preview(PIPELINE_ID, OUTPUT_ID, 2,
-                    SAMPLE_ID + "-union-bounded", List.of(
-                            new ControlPlane.PreviewDraft("preview_source.tap.yml", sourceYaml(source)),
-                            new ControlPlane.PreviewDraft("preview_pipeline.tap.yml", unionPipelineYaml())));
-            Map<String, Object> unionSample = payload(boundedUnion, "sample.completed");
-            assertThat(((Number) unionSample.get("rootRows")).intValue()).isEqualTo(2);
-            assertThat(unionSample).containsEntry("rootTruncated", true);
-            List<String> unionRootKeys = ((List<?>) unionSample.get("rootSourceKeys")).stream()
-                    .map(String::valueOf)
-                    .toList();
-            assertThat(unionRootKeys).hasSize(2)
-                    .containsExactlyElementsOf(unionRootKeys.stream().sorted().toList());
-
-            Map<String, Object> joined = result(control, source, joinPipelineYaml(), OUTPUT_ID,
-                    SAMPLE_ID + "-join", false);
-            assertThat(joined).containsEntry("complete", true);
-            assertThat(((Number) joined.get("rowCount")).intValue()).isEqualTo(3);
-            Map<?, ?> joinedOrder = documentBy(documents(joined), "order_id", "order-1");
-            assertThat(joinedOrder.get("customer_name")).isEqualTo("Northwind Ltd");
-
-            Map<String, Object> nested = result(control, source, nestedPipelineYaml(), OUTPUT_ID,
-                    SAMPLE_ID + "-nest", false);
-            assertThat(nested).containsEntry("complete", true);
-            assertThat(((Number) nested.get("rowCount")).intValue()).isEqualTo(3);
-            Map<?, ?> firstOrder = documentBy(documents(nested), "id", "order-1");
-            List<?> items = (List<?>) firstOrder.get("items");
-            assertThat(items).hasSize(2);
-            Map<?, ?> firstItem = documentBy(items, "id", "item-1");
-            assertThat(values((List<?>) firstItem.get("labels"), "label"))
-                    .containsExactlyInAnyOrder("fragile", "gift");
-            Map<?, ?> secondItem = documentBy(items, "id", "item-2");
-            assertThat((List<?>) secondItem.get("labels")).isEmpty();
-            assertThat((List<?>) documentBy(documents(nested), "id", "order-3").get("items")).isEmpty();
-
-            Map<String, Object> unwound = result(control, source, unwindPipelineYaml(), "preview_sync",
-                    SAMPLE_ID + "-unwind", true);
-            assertThat(unwound).containsEntry("format", "logical-json").containsEntry("complete", true);
-            assertThat(((Number) unwound.get("rowCount")).intValue()).isEqualTo(6);
-            assertThat(values(documents(unwound), "item_index").stream()
-                    .map(Number.class::cast)
-                    .map(Number::intValue)
-                    .toList())
-                    .containsExactly(0, 1, 0, 1, 0, 1);
-            assertThat(values(documents(unwound), "items"))
-                    .contains("first-item", "second-item");
+            assertSampleAndCache(control, source);
+            assertJavascriptAndFilters(control, source);
+            assertUnionSample(control, source);
+            assertJoinedAndNested(control, source);
+            assertUnwindSample(control, source);
 
             assertThat(control.artifactIds())
                     .as("preview compiles drafts without applying them to the artifact store")
@@ -181,6 +71,138 @@ class BoundedPipelinePreviewIT {
                     .as("preview replaces the target sink and never creates a target directory")
                     .isFalse();
         }
+    }
+
+    private static void assertSampleAndCache(ControlPlane control, Path source) throws Exception {
+        List<ControlPlane.PreviewDraft> drafts = List.of(
+                new ControlPlane.PreviewDraft("preview_source.tap.yml", sourceYaml(source)),
+                new ControlPlane.PreviewDraft("preview_pipeline.tap.yml", pipelineYaml()));
+        List<Map<String, Object>> events = control.preview(
+                PIPELINE_ID, OUTPUT_ID, 2, SAMPLE_ID, drafts);
+
+        assertThat(events).extracting(event -> event.get("kind"))
+                .as("preview events including terminal failure payload: %s", events)
+                .startsWith("run.accepted", "compile.completed", "sample.completed")
+                .endsWith("result.completed", "run.completed");
+        List<Long> sequences = events.stream()
+                .map(event -> ((Number) event.get("seq")).longValue())
+                .toList();
+        assertThat(sequences)
+                .containsExactlyElementsOf(java.util.stream.LongStream.range(0, events.size()).boxed().toList());
+        assertThat(events).extracting(event -> event.get("runId"))
+                .containsOnly(events.getFirst().get("runId"));
+        assertThat(events).extracting(event -> event.get("candidateHash"))
+                .containsOnly(events.getFirst().get("candidateHash"));
+
+        Map<String, Object> sample = payload(events, "sample.completed");
+        assertThat(sample).containsEntry("complete", true).containsEntry("rootTruncated", true);
+        assertThat(((Number) sample.get("rootRows")).intValue()).isEqualTo(2);
+        assertThat(((Number) sample.get("queryCount")).intValue()).isEqualTo(1);
+
+        Map<String, Object> result = payload(events, "result.completed");
+        assertThat(result).containsEntry("format", "logical-json").containsEntry("complete", true);
+        assertThat(((Number) result.get("rowCount")).intValue()).isEqualTo(2);
+        assertThat(result.get("documents")).isInstanceOf(List.class);
+        List<?> documents = (List<?>) result.get("documents");
+        assertThat(documents).hasSize(2);
+        assertDocument(documents.get(0), "order-1", "Northwind", 24);
+        assertDocument(documents.get(1), "order-2", "Contoso", 14);
+
+        List<Map<String, Object>> cached = control.preview(PIPELINE_ID, OUTPUT_ID, 2, SAMPLE_ID, drafts);
+        assertThat(payload(cached, "sample.completed")).containsEntry("cacheHit", true);
+        assertThat(payload(cached, "result.completed").get("documents")).isEqualTo(documents);
+
+    }
+
+    private static void assertJavascriptAndFilters(ControlPlane control, Path source) throws Exception {
+        List<ControlPlane.PreviewDraft> javascriptDrafts = List.of(
+                new ControlPlane.PreviewDraft("preview_source.tap.yml", sourceYaml(source)),
+                new ControlPlane.PreviewDraft("preview_pipeline.tap.yml", javascriptPipelineYaml()));
+        List<Map<String, Object>> javascriptEvents = control.preview(
+                PIPELINE_ID, OUTPUT_ID, 2, SAMPLE_ID + "-javascript", javascriptDrafts);
+        Map<String, Object> javascriptResult = payload(javascriptEvents, "result.completed");
+        assertThat(javascriptResult).containsEntry("format", "logical-json");
+        assertThat(javascriptResult.get("documents")).isInstanceOf(List.class);
+        List<?> javascriptDocuments = (List<?>) javascriptResult.get("documents");
+        assertThat(javascriptDocuments).hasSize(2);
+        assertDocument(javascriptDocuments.get(0), "order-1", "Northwind", 24);
+        assertDocument(javascriptDocuments.get(1), "order-2", "Contoso", 14);
+
+        Map<String, Object> filtered = result(control, source, filterPipelineYaml(), OUTPUT_ID,
+                SAMPLE_ID + "-filter", false);
+        assertThat(filtered).containsEntry("complete", true);
+        assertThat(((Number) filtered.get("rowCount")).intValue()).isEqualTo(1);
+        assertThat(values(documents(filtered), "id"))
+                .containsExactly("order-1");
+
+        Map<String, Object> allFiltered = result(control, source, emptyFilterPipelineYaml(), OUTPUT_ID,
+                SAMPLE_ID + "-filter-empty", false);
+        assertThat(allFiltered).containsEntry("complete", true);
+        assertThat(((Number) allFiltered.get("rowCount")).intValue()).isZero();
+        assertThat(documents(allFiltered)).isEmpty();
+
+    }
+
+    private static void assertUnionSample(ControlPlane control, Path source) throws Exception {
+        Map<String, Object> union = result(control, source, unionPipelineYaml(), OUTPUT_ID,
+                SAMPLE_ID + "-union", false);
+        assertThat(union).containsEntry("complete", true);
+        assertThat(((Number) union.get("rowCount")).intValue()).isEqualTo(4);
+        assertThat(values(documents(union), "id"))
+                .containsExactlyInAnyOrder("order-1", "order-2", "order-3", "order-4");
+        List<Map<String, Object>> boundedUnion = control.preview(PIPELINE_ID, OUTPUT_ID, 2,
+                SAMPLE_ID + "-union-bounded", List.of(
+                        new ControlPlane.PreviewDraft("preview_source.tap.yml", sourceYaml(source)),
+                        new ControlPlane.PreviewDraft("preview_pipeline.tap.yml", unionPipelineYaml())));
+        Map<String, Object> unionSample = payload(boundedUnion, "sample.completed");
+        assertThat(((Number) unionSample.get("rootRows")).intValue()).isEqualTo(2);
+        assertThat(unionSample).containsEntry("rootTruncated", true);
+        List<String> unionRootKeys = ((List<?>) unionSample.get("rootSourceKeys")).stream()
+                .map(String::valueOf)
+                .toList();
+        assertThat(unionRootKeys).hasSize(2)
+                .containsExactlyElementsOf(unionRootKeys.stream().sorted().toList());
+
+    }
+
+    private static void assertJoinedAndNested(ControlPlane control, Path source) throws Exception {
+        Map<String, Object> joined = result(control, source, joinPipelineYaml(), OUTPUT_ID,
+                SAMPLE_ID + "-join", false);
+        assertThat(joined).containsEntry("complete", true);
+        assertThat(((Number) joined.get("rowCount")).intValue()).isEqualTo(3);
+        Map<?, ?> joinedOrder = documentBy(documents(joined), "order_id", "order-1");
+        assertThat(joinedOrder.get("customer_name")).isEqualTo("Northwind Ltd");
+
+        Map<String, Object> nested = result(control, source, nestedPipelineYaml(), OUTPUT_ID,
+                SAMPLE_ID + "-nest", false);
+        assertThat(nested).containsEntry("complete", true);
+        assertThat(((Number) nested.get("rowCount")).intValue()).isEqualTo(3);
+        Map<?, ?> firstOrder = documentBy(documents(nested), "id", "order-1");
+        List<?> items = (List<?>) firstOrder.get("items");
+        assertThat(items).hasSize(2);
+        Map<?, ?> firstItem = documentBy(items, "id", "item-1");
+        assertThat(values((List<?>) firstItem.get("labels"), "label"))
+                .containsExactlyInAnyOrder("fragile", "gift");
+        Map<?, ?> secondItem = documentBy(items, "id", "item-2");
+        assertThat((List<?>) secondItem.get("labels")).isEmpty();
+        assertThat((List<?>) documentBy(documents(nested), "id", "order-3").get("items")).isEmpty();
+
+    }
+
+    private static void assertUnwindSample(ControlPlane control, Path source) throws Exception {
+        Map<String, Object> unwound = result(control, source, unwindPipelineYaml(), "preview_sync",
+                SAMPLE_ID + "-unwind", true, true);
+        assertThat(unwound).containsEntry("format", "logical-json").containsEntry("complete", true)
+                .containsEntry("logicalDocuments", unwound.get("documents"));
+        assertThat(((Number) unwound.get("rowCount")).intValue()).isEqualTo(6);
+        assertThat(values(documents(unwound), "item_index").stream()
+                .map(Number.class::cast)
+                .map(Number::intValue)
+                .toList())
+                .containsExactly(0, 1, 0, 1, 0, 1);
+        assertThat(values(documents(unwound), "items"))
+                .contains("first-item", "second-item");
+
     }
 
     private static void assertDocument(Object value, String id, String company, int doubledAmount) {
@@ -208,6 +230,12 @@ class BoundedPipelinePreviewIT {
     private static Map<String, Object> result(
             ControlPlane control, Path directory, String pipelineYaml, String outputId, String sampleId,
             boolean includeTarget) {
+        return result(control, directory, pipelineYaml, outputId, sampleId, includeTarget, false);
+    }
+
+    private static Map<String, Object> result(
+            ControlPlane control, Path directory, String pipelineYaml, String outputId, String sampleId,
+            boolean includeTarget, boolean expectIdentity) {
         List<ControlPlane.PreviewDraft> drafts = new java.util.ArrayList<>();
         drafts.add(new ControlPlane.PreviewDraft("preview_source.tap.yml", sourceYaml(directory)));
         drafts.add(new ControlPlane.PreviewDraft("preview_pipeline.tap.yml", pipelineYaml));
@@ -216,9 +244,17 @@ class BoundedPipelinePreviewIT {
                     "preview_target.tap.yml", targetYaml(directory.resolve("preview-target"))));
         }
         List<Map<String, Object>> events = control.preview(PIPELINE_ID, outputId, 100, sampleId, drafts);
+        Object[] prefix = expectIdentity
+                ? new String[] {"run.accepted", "compile.completed", "identity.completed", "sample.completed"}
+                : new String[] {"run.accepted", "compile.completed", "sample.completed"};
         assertThat(events).extracting(event -> event.get("kind"))
-                .startsWith("run.accepted", "compile.completed", "sample.completed")
-                .endsWith("result.completed", "run.completed");
+                .startsWith(prefix).endsWith("result.completed", "run.completed");
+        if (expectIdentity) {
+            List<?> targets = (List<?>) payload(events, "identity.completed").get("targets");
+            assertThat(targets).hasSize(1);
+            assertThat(targets.getFirst()).asInstanceOf(org.assertj.core.api.InstanceOfAssertFactories.MAP)
+                    .containsEntry("status", "not-required").containsEntry("generatedFields", List.of());
+        }
         return payload(events, "result.completed");
     }
 

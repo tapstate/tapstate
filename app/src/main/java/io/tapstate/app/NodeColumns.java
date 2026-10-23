@@ -100,7 +100,13 @@ import java.util.Set;
  */
 record NodeColumns(Map<String, String> columns, List<String> key, String unknownBecause,
         Map<String, String> origins, boolean expanded, Map<String, NumericType> numericTypes,
-        Set<String> unchangedFields, Map<String, StringType> stringTypes) {
+        Set<String> unchangedFields, Map<String, StringType> stringTypes, List<String> unwindSourceIdFields) {
+
+    NodeColumns(Map<String, String> columns, List<String> key, String unknownBecause,
+            Map<String, String> origins, boolean expanded, Map<String, NumericType> numericTypes,
+            Set<String> unchangedFields, Map<String, StringType> stringTypes) {
+        this(columns, key, unknownBecause, origins, expanded, numericTypes, unchangedFields, stringTypes, List.of());
+    }
 
     NodeColumns(Map<String, String> columns, List<String> key, String unknownBecause,
             Map<String, String> origins, boolean expanded) {
@@ -122,15 +128,15 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
     }
 
     NodeColumns withStringTypes(Map<String, StringType> types) {
-        return new NodeColumns(columns, key, unknownBecause, origins, expanded, numericTypes, unchangedFields, types);
+        return new NodeColumns(columns, key, unknownBecause, origins, expanded, numericTypes, unchangedFields, types, unwindSourceIdFields);
     }
 
     NodeColumns withUnchangedFields(Set<String> fields) {
-        return new NodeColumns(columns, key, unknownBecause, origins, expanded, numericTypes, fields, stringTypes);
+        return new NodeColumns(columns, key, unknownBecause, origins, expanded, numericTypes, fields, stringTypes, unwindSourceIdFields);
     }
 
     NodeColumns withNumericTypes(Map<String, NumericType> types) {
-        return new NodeColumns(columns, key, unknownBecause, origins, expanded, types, unchangedFields, stringTypes);
+        return new NodeColumns(columns, key, unknownBecause, origins, expanded, types, unchangedFields, stringTypes, unwindSourceIdFields);
     }
 
     NodeColumns {
@@ -138,6 +144,7 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         // that loses it turns every rebuild of the same node into a differently ordered record.
         columns = Collections.unmodifiableMap(new LinkedHashMap<>(columns));
         key = List.copyOf(key);
+        unwindSourceIdFields = List.copyOf(unwindSourceIdFields);
         origins = Collections.unmodifiableMap(new LinkedHashMap<>(origins));
         numericTypes = Collections.unmodifiableMap(new LinkedHashMap<>(numericTypes));
         stringTypes = Collections.unmodifiableMap(new LinkedHashMap<>(stringTypes));
@@ -271,26 +278,32 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
                     !entry.getValue().equals(input.origins().get(entry.getKey())));
             expanded |= input.expanded();
         }
-        Map<String, NumericType> numbers = new LinkedHashMap<>();
-        Map<String, StringType> strings = new LinkedHashMap<>();
-        for (String column : out.keySet()) {
-            NumericType candidate = inputs.iterator().next().numericTypes().get(column);
-            if (candidate != null && inputs.stream().allMatch(input ->
-                    Objects.equals(candidate, input.numericTypes().get(column)))) {
-                numbers.put(column, candidate);
-            }
-        }
-        for (String column : out.keySet()) {
-            StringType candidate = inputs.iterator().next().stringTypes().get(column);
-            if (candidate != null && inputs.stream().allMatch(input ->
-                    Objects.equals(candidate, input.stringTypes().get(column)))) {
-                strings.put(column, candidate);
-            }
-        }
+        Map<String, NumericType> numbers = commonDescriptors(inputs, out.keySet(), NodeColumns::numericTypes);
+        Map<String, StringType> strings = commonDescriptors(inputs, out.keySet(), NodeColumns::stringTypes);
         Set<String> unchanged = new LinkedHashSet<>(out.keySet());
         inputs.forEach(input -> unchanged.retainAll(input.unchangedFields()));
         return new NodeColumns(out, agreed.stream().filter(out::containsKey).toList(), null,
-                origins, expanded, numbers, unchanged, strings);
+                origins, expanded, numbers, unchanged, strings, mergedSourceIdentityFields(inputs));
+    }
+
+    private static <T> Map<String, T> commonDescriptors(Collection<NodeColumns> inputs, Set<String> columns,
+            java.util.function.Function<NodeColumns, Map<String, T>> descriptors) {
+        Map<String, T> result = new LinkedHashMap<>();
+        Map<String, T> first = descriptors.apply(inputs.iterator().next());
+        for (String column : columns) {
+            T candidate = first.get(column);
+            if (candidate != null && inputs.stream().allMatch(input ->
+                    Objects.equals(candidate, descriptors.apply(input).get(column)))) result.put(column, candidate);
+        }
+        return result;
+    }
+
+    private static List<String> mergedSourceIdentityFields(Collection<NodeColumns> inputs) {
+        return inputs.stream().flatMap(input -> input.unwindSourceIdFields().stream()).distinct().toList();
+    }
+
+    String unwindSourceIdField() {
+        return unwindSourceIdFields.size() == 1 ? unwindSourceIdFields.getFirst() : null;
     }
 
     /** Two inputs' answers for one column: the type they agree on, and null wherever either allows it. */
@@ -380,7 +393,9 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
             strings.remove(replaced);
             unchanged.remove(replaced);
         }
-        return new NodeColumns(out, key, null, origins, true, numbers, unchanged, strings);
+        return new NodeColumns(out, key, null, origins, true, numbers, unchanged, strings,
+                unwind.sourceIdField() != null || upstream.unwindSourceIdFields().isEmpty()
+                        ? List.of(unwind.resolvedSourceIdField()) : upstream.unwindSourceIdFields());
     }
 
     /** The declared element type as the shared vocabulary spells it, or unknown for anything else. */
@@ -593,7 +608,7 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
             }
         }
         return new NodeColumns(out, projectedKey(rules, upstream.key(), out), null,
-                origins, upstream.expanded(), numbers, unchanged, strings);
+                origins, upstream.expanded(), numbers, unchanged, strings, upstream.unwindSourceIdFields());
     }
 
     /**

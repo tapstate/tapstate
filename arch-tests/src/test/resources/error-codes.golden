@@ -178,6 +178,8 @@ connector.spec-invalid
 connector.spec-not-found
 connector.state-unreadable
 connector.state-value-unsupported
+connector.target-identity-check-failed
+connector.target-identity-conflict
 connector.test-failed
 connector.tls-material-cleanup-failed
 connector.tls-trust-invalid
@@ -201,6 +203,7 @@ control.storage-test-required
 control.storage-unavailable
 control.unauthenticated
 control.unreachable
+core.row-map-key-unsupported
 data-browser.connector-not-browsable
 data-browser.follow-idle
 data-browser.follow-stopped
@@ -365,6 +368,9 @@ source.version-conflict
 start-check.clear-before-full-load
 start-check.keep-existing-rows
 start-check.target-empty
+start-check.target-identity-automatic
+start-check.target-identity-compatible
+start-check.target-identity-refused
 start-check.target-not-empty
 start-check.target-not-empty-refused
 start-check.target-not-empty-shared
