@@ -157,12 +157,16 @@ class InstallationFilesTest {
     @Test void interruptingAWaitForAnotherProcessMutationKeepsRuntimeOwnership() throws Exception {
         var files = InstallationFiles.initialize(temporary.resolve("interrupted-wait"));
         try (var owner = files.ownRuntime()) {
+            Path output = temporary.resolve("mutation-probe.stdout"), errors = temporary.resolve("mutation-probe.stderr");
             var blocker = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(), "-Xmx64m", "-cp",
                     System.getProperty("surefire.test.class.path", System.getProperty("java.class.path")), InstallationRuntimeProbe.class.getName(), files.directory().toString(), "mutation")
-                    .redirectErrorStream(true).start();
+                    .redirectOutput(output.toFile()).redirectError(errors.toFile()).start();
             Thread reader = null;
-            try (var lines = new java.io.BufferedReader(new java.io.InputStreamReader(blocker.getInputStream(), java.nio.charset.StandardCharsets.UTF_8))) {
-                assertThat(lines.readLine()).isEqualTo("MUTATION_HELD");
+            try {
+                org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(10)).untilAsserted(() -> {
+                    assertThat(blocker.isAlive()).as("mutation probe diagnostics: %s", Files.readString(errors)).isTrue();
+                    assertThat(Files.readAllLines(output)).contains("MUTATION_HELD");
+                });
                 var entered = new CountDownLatch(1); var done = new CountDownLatch(1);
                 var failure = new java.util.concurrent.atomic.AtomicReference<Throwable>();
                 reader = Thread.ofPlatform().start(() -> { entered.countDown(); failure.set(catchThrowable(files::stage)); done.countDown(); });
