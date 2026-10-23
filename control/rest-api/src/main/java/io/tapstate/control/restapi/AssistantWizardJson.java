@@ -211,7 +211,7 @@ final class AssistantWizardJson {
     }
     private static Map<String, Object> writeTransform(Map<String, Object> step) {
         String type = text(step.get("type"));
-        if (!List.of("filter", "map", "unwind", "js", "union").contains(type)) throw new IllegalArgumentException("unsupported transform kind");
+        if (!List.of("filter", "map", "unwind", "js").contains(type)) throw new IllegalArgumentException("unsupported transform kind");
         Map<String, Object> config = object(object(step.get(CONFIG)).get(type));
         return Map.of("id", candidateId(step.get("id")), "type", type, FIELDS, writeTransformFields(type, config));
     }

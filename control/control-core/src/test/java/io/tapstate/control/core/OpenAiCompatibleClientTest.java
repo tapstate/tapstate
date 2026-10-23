@@ -95,9 +95,9 @@ class OpenAiCompatibleClientTest {
             Map<?, ?> transformSchema = (Map<?, ?>) ((Map<?, ?>) rootSchema.get("properties")).get("transforms");
             Map<?, ?> transformItem = (Map<?, ?>) transformSchema.get("items");
             Map<?, ?> typeSchema = (Map<?, ?>) ((Map<?, ?>) transformItem.get("properties")).get("type");
-            assertThat(((List<?>) typeSchema.get("enum")).toString()).contains("union");
+            assertThat(((List<?>) typeSchema.get("enum")).toString()).doesNotContain("union");
             Map<?, ?> configSchema = (Map<?, ?>) ((Map<?, ?>) transformItem.get("properties")).get("config");
-            assertThat(((Map<?, ?>) configSchema.get("properties")).get("union")).isNotNull();
+            assertThat(((Map<?, ?>) configSchema.get("properties")).get("union")).isNull();
             Map<?, ?> mapSchema = (Map<?, ?>) ((Map<?, ?>) configSchema.get("properties")).get("map");
             Map<?, ?> fieldsSchema = (Map<?, ?>) ((Map<?, ?>) mapSchema.get("properties")).get("fields");
             Map<?, ?> ruleSchema = (Map<?, ?>) ((Map<?, ?>) fieldsSchema.get("items")).get("properties");

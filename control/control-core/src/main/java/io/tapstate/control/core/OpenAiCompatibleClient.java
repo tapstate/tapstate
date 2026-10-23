@@ -151,14 +151,13 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         Map<String, Object> transform = schemaObject(Map.of(
                 "id", string,
                 "name", string,
-                "type", Map.of("type", "string", "enum", List.of("filter", "map", "unwind", "js", "union")),
+                "type", Map.of("type", "string", "enum", List.of("filter", "map", "unwind", "js")),
                 "enabled", Map.of("type", "boolean"),
                 "config", schemaObject(Map.of(
                         "map", mapConfig,
                         "filter", schemaObject(Map.of("expr", string), List.of("expr")),
                         "unwind", Map.of("type", "object"),
-                        "js", schemaObject(Map.of("script", string), List.of("script")),
-                        "union", schemaObject(Map.of("from", schemaArray(string)), List.of("from"))), List.of())),
+                        "js", schemaObject(Map.of("script", string), List.of("script"))), List.of())),
                 List.of("id", "name", "type", "enabled", "config"));
         Map<String, Object> root = schemaObject(Map.of(
                 "source", string,
