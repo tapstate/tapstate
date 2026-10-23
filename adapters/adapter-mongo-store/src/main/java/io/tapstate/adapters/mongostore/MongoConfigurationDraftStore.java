@@ -212,6 +212,54 @@ final class MongoConfigurationDraftStore implements PipelineDraftStore {
         }
     }
 
+    @Override public PipelineDraftMutation changeDefinition(PipelineDraft.DefinitionChange change) {
+        Objects.requireNonNull(change, "change");
+        if (!(change.artifact() instanceof PipelineResource) || !change.pipelineId().equals(change.artifact().id())) {
+            throw new IllegalArgumentException("definition change requires the same Pipeline id");
+        }
+        var captured = (PipelineResource) new DslParser().parse(new CanonicalWriter().write(change.artifact()));
+        if (!change.artifactHash().equals(CanonicalHash.of(captured))) {
+            throw new IllegalArgumentException("definition change hash must match the captured Pipeline");
+        }
+        try {
+            return transaction(session -> {
+                var observed = artifacts.getInTransaction(session, change.pipelineId());
+                if (observed.isEmpty() || !(observed.orElseThrow() instanceof PipelineResource)
+                        || !change.expectedArtifactHash().equals(CanonicalHash.of(observed.orElseThrow()))) {
+                    return PipelineDraftMutation.ARTIFACT_CONFLICT;
+                }
+                Document row = drafts.find(session, new Document("_id", change.pipelineId())).first();
+                PipelineDraft current = row == null || deleted(row) ? null : codec.decode(row);
+                PipelineDraft candidate = null;
+                if (current != null && change.expectedArtifactHash().equals(current.baseArtifactHash())) {
+                    candidate = codec.capture(Objects.requireNonNull(change.draftChange().apply(current), "changed draft"));
+                    if (!candidate.equals(current) && (!current.pipelineId().equals(candidate.pipelineId())
+                            || candidate.revision() != current.revision() + 1
+                            || !change.artifactHash().equals(candidate.baseArtifactHash()))) {
+                        throw new IllegalArgumentException("changed draft must retain its id and advance its revision and base");
+                    }
+                }
+                ArtifactWrite write = ArtifactWrite.replaceOnly(captured, change.expectedArtifactHash())
+                        .guardedBy(change.workspacePreconditions());
+                ConfigurationVersion.advance(session, versions);
+                artifacts.writeAllInTransaction(session, List.of(write));
+                if (candidate != null && !candidate.equals(current)
+                        && drafts.replaceOne(session, new Document("_id", current.pipelineId())
+                                        .append("revision", current.revision()).append("deleted", false),
+                                codec.encode(candidate, session)).getMatchedCount() != 1) {
+                    throw new DefinitionConflict();
+                }
+                return PipelineDraftMutation.REPLACED;
+            });
+        } catch (MongoConfigurationArtifactStore.Refused | DefinitionConflict conflict) {
+            return PipelineDraftMutation.ARTIFACT_CONFLICT;
+        }
+    }
+
+    private static final class DefinitionConflict extends RuntimeException {
+        private DefinitionConflict() { super(null, null, false, false); }
+    }
+
     private boolean deleted(Document row) {
         if (!Boolean.TRUE.equals(row.get("deleted"))) return false;
         codec.tombstoneRevision(row); return true;

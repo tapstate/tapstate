@@ -176,6 +176,108 @@ class MongoConfigurationDraftStoreIT {
     }
 
     @Test
+    void definitionChangesCarryTheMatchingEncryptedDraftAndAdvanceOnePublishedRevision() {
+        withConfiguration((domain, database) -> {
+            var publication = publishedDefinition(domain);
+            var changed = changedDefinition();
+            String hash = CanonicalHash.of(changed);
+            long before = revision(database);
+            var mapping = SystemCollections.OPERATOR_GENERATIONS.on(database).find(new Document("_id", "orders")).first();
+            assertThat(domain.drafts().changeDefinition(new PipelineDraft.DefinitionChange("orders",
+                    publication.publishedArtifactHash(), changed, hash, Map.of(), current -> changedDraft(current, hash))))
+                    .isEqualTo(PipelineDraftMutation.REPLACED);
+            assertThat(domain.artifacts().get("orders")).contains(changed);
+            var saved = domain.drafts().get("orders").orElseThrow();
+            assertThat(saved.revision()).isEqualTo(2);
+            assertThat(saved.baseArtifactHash()).isEqualTo(hash);
+            assertThat(saved.name()).isEqualTo("definition-change-secret");
+            assertThat(saved.publishedDraftRevision()).isOne();
+            assertThat(saved.publishedArtifactHash()).isEqualTo(publication.publishedArtifactHash());
+            assertThat(revision(database)).isEqualTo(before + 1);
+            assertThat(SystemCollections.OPERATOR_GENERATIONS.on(database).find(new Document("_id", "orders")).first())
+                    .isEqualTo(mapping);
+            assertThat(SystemCollections.CONFIG_PIPELINE_DRAFTS.on(database).find().first().toJson())
+                    .doesNotContain("definition-change-secret");
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"absent", "deleted", "unrelated"})
+    void definitionChangesNeverCreateResurrectOrRebaseAnUnrelatedDraft(String state) {
+        withConfiguration((domain, database) -> {
+            var original = publication("orders", 1, null, Map.of()).artifact();
+            domain.artifacts().create(original);
+            if (!state.equals("absent")) {
+                domain.drafts().create(draft("orders", 1, PipelineDraft.Mode.DAG, "another-definition", null, null));
+                if (state.equals("deleted")) domain.drafts().delete("orders", 1);
+            }
+            var rows = SystemCollections.CONFIG_PIPELINE_DRAFTS.on(database);
+            var beforeDraft = rows.find().first();
+            long before = revision(database);
+            var changed = changedDefinition();
+            assertThat(domain.drafts().changeDefinition(new PipelineDraft.DefinitionChange("orders",
+                    CanonicalHash.of(original), changed, CanonicalHash.of(changed), Map.of(), current -> {
+                        throw new AssertionError("an unrelated or absent draft must not be changed");
+                    }))).isEqualTo(PipelineDraftMutation.REPLACED);
+            assertThat(domain.artifacts().get("orders")).contains(changed);
+            assertThat(rows.find().first()).isEqualTo(beforeDraft);
+            assertThat(revision(database)).isEqualTo(before + 1);
+        });
+    }
+
+    @Test
+    void movedDefinitionOrWorkspaceDependencyRefusesWithoutChangingConfigurationOrDraft() {
+        withConfiguration((domain, database) -> {
+            var source = source("src", "first-secret");
+            domain.artifacts().create(source);
+            var publication = publishedDefinition(domain);
+            var changed = changedDefinition();
+            domain.artifacts().replace("src", CanonicalHash.of(source), source("src", "changed-secret"));
+            long before = revision(database);
+            var beforeDraft = SystemCollections.CONFIG_PIPELINE_DRAFTS.on(database).find().first();
+            for (var expected : List.of(Map.of("hash", "moved", "dependency", "current"),
+                    Map.of("hash", publication.publishedArtifactHash(), "dependency", CanonicalHash.of(source)))) {
+                Map<String, String> dependencies = expected.get("dependency").equals("current") ? Map.of()
+                        : Map.of("src", expected.get("dependency"));
+                assertThat(domain.drafts().changeDefinition(new PipelineDraft.DefinitionChange("orders",
+                        expected.get("hash"), changed, CanonicalHash.of(changed), dependencies,
+                        current -> changedDraft(current, CanonicalHash.of(changed)))))
+                        .isEqualTo(PipelineDraftMutation.ARTIFACT_CONFLICT);
+            }
+            assertThat(domain.artifacts().get("orders")).contains(publication.artifact());
+            assertThat(SystemCollections.CONFIG_PIPELINE_DRAFTS.on(database).find().first()).isEqualTo(beforeDraft);
+            assertThat(revision(database)).isEqualTo(before);
+        });
+    }
+
+    @Test
+    void aFailedFinalDefinitionDraftWriteRollsBackArtifactVersionMappingAndKeyFence() {
+        withConfiguration((domain, database) -> {
+            var publication = publishedDefinition(domain);
+            var other = draft("another", 1, PipelineDraft.Mode.DAG, null, null, null);
+            domain.drafts().create(new PipelineDraft(other.pipelineId(), other.schemaVersion(), other.revision(), other.mode(),
+                    other.name(), other.description(), other.graph(), other.wizard(), other.baseArtifactHash(),
+                    other.publishedDraftRevision(), other.publishedArtifactHash(), NOW, NOW.plusSeconds(2), "author"));
+            var rows = SystemCollections.CONFIG_PIPELINE_DRAFTS.on(database);
+            rows.createIndex(new Document("updatedAt", 1), new IndexOptions().unique(true).name("forced_definition_updated_at"));
+            var beforeDraft = rows.find(new Document("_id", "orders")).first();
+            long before = revision(database);
+            var mapping = SystemCollections.OPERATOR_GENERATIONS.on(database).find(new Document("_id", "orders")).first();
+            var key = SystemCollections.CLUSTER_KEYS.on(database).find().first();
+            var changed = changedDefinition();
+            assertThatThrownBy(() -> domain.drafts().changeDefinition(new PipelineDraft.DefinitionChange("orders",
+                    publication.publishedArtifactHash(), changed, CanonicalHash.of(changed), Map.of(),
+                    current -> changedDraft(current, CanonicalHash.of(changed)))))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(domain.artifacts().get("orders")).contains(publication.artifact());
+            assertThat(rows.find(new Document("_id", "orders")).first()).isEqualTo(beforeDraft);
+            assertThat(revision(database)).isEqualTo(before);
+            assertThat(SystemCollections.OPERATOR_GENERATIONS.on(database).find(new Document("_id", "orders")).first()).isEqualTo(mapping);
+            assertThat(SystemCollections.CLUSTER_KEYS.on(database).find().first()).isEqualTo(key);
+        });
+    }
+
+    @Test
     void staleDependenciesAndEveryOtherArtifactKindRefusePublicationWithoutSideEffects() {
         withConfiguration((domain, database) -> {
             var original = source("src", "old"); domain.artifacts().create(original);
@@ -369,6 +471,20 @@ class MongoConfigurationDraftStoreIT {
         });
     }
 
+    private static PipelineDraft.Publication publishedDefinition(MongoConfigurationDomain domain) {
+        domain.drafts().create(draft("orders", 1, PipelineDraft.Mode.DAG, null, null, null));
+        var publication = publication("orders", 1, null, Map.of());
+        assertThat(domain.drafts().publish(publication)).isEqualTo(PipelineDraftMutation.PUBLISHED);
+        return publication;
+    }
+    private static PipelineResource changedDefinition() {
+        return (PipelineResource) PARSER.parse("version: tapstate/v1\nkind: pipeline\nid: orders\nsource: src\nmetadata: {description: changed}\n");
+    }
+    private static PipelineDraft changedDraft(PipelineDraft draft, String base) {
+        return new PipelineDraft(draft.pipelineId(), draft.schemaVersion(), draft.revision() + 1, draft.mode(),
+                "definition-change-secret", draft.description(), draft.graph(), draft.wizard(), base,
+                draft.publishedDraftRevision(), draft.publishedArtifactHash(), draft.createdAt(), NOW.plusSeconds(2), "editor");
+    }
     private static PipelineDraft draft(String id, long revision, PipelineDraft.Mode mode, String base, Long publishedRevision, String publishedHash) {
         return new PipelineDraft(id, 1, revision, mode, id, "", mode == PipelineDraft.Mode.DAG ? new PipelineDraft.Graph(List.of(), List.of(), new PipelineDraft.Viewport(0, 0, 1)) : null,
                 mode == PipelineDraft.Mode.WIZARD ? new PipelineDraft.Wizard(new PipelineDraft.Root(id, "src", "orders", List.of(), List.of()), List.of(), List.of(), null) : null,
