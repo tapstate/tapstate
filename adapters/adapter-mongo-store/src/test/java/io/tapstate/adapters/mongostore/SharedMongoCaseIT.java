@@ -20,6 +20,8 @@ import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.junit.jupiter.api.extension.BeforeEachCallback;
+import org.junit.jupiter.api.extension.ExtensionContext;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -43,6 +45,11 @@ class SharedMongoCaseIT {
     @RegisterExtension
     static final SharedMongoCase MONGO = SharedMongoCase.forSuite(SharedMongoCaseIT.class);
 
+    private ExtensionContext invocationContext;
+
+    @RegisterExtension
+    private final BeforeEachCallback captureContext = context -> invocationContext = context;
+
     private static final DslParser PARSER = new DslParser();
     private static final String PIPELINE = "same-pipeline";
     private static final String CHAIN = "orders@mysql-1";
@@ -57,6 +64,59 @@ class SharedMongoCaseIT {
             config:
               host: localhost
             """;
+
+    @Test
+    void fencingAndDefinitionCasesWriteToTheScopeThatTeardownActuallyDrops() throws Exception {
+        var invocations = List.of(
+                new ScopedInvocation(MongoStateStoreIT.class,
+                        "anOldExecutionCannotCompleteTheUnchangedCheckpointOfItsReplacement", "fenced_completion"),
+                new ScopedInvocation(MongoStateStoreIT.class,
+                        "provingTheClaimAndWritingCompletionCannotBeSeparatedByAReplacement", "atomic_completion"),
+                new ScopedInvocation(MongoPipelineDraftStoreIT.class,
+                        "changesTheDefinitionAndTheDraftBasedOnItInOneTransaction", "tapstate_definition_change_it"),
+                new ScopedInvocation(MongoPipelineDraftStoreIT.class,
+                        "leavesADraftBasedOnAnotherDefinitionAsItIs", "tapstate_definition_change_behind_it"),
+                new ScopedInvocation(MongoPipelineDraftStoreIT.class,
+                        "refusesADefinitionThatMovedOrADependencyThatMovedAndWritesNothing", "tapstate_definition_change_conflict_it"));
+        try (MongoClient observer = MongoClients.create(MONGO.getReplicaSetUrl())) {
+            List<org.junit.jupiter.api.function.Executable> controls = new ArrayList<>();
+            for (ScopedInvocation invocation : invocations) {
+                controls.add(() -> assertInvocationDatabaseIsReleased(invocation, observer));
+            }
+            org.junit.jupiter.api.Assertions.assertAll("shared database ownership", controls);
+        }
+    }
+
+    private void assertInvocationDatabaseIsReleased(ScopedInvocation invocation, MongoClient observer) throws Exception {
+        var field = invocation.suite().getDeclaredField("REPLICA_SET");
+        field.setAccessible(true);
+        SharedMongoCase fixture = (SharedMongoCase) field.get(null);
+        String owner = invocationContext.getUniqueId() + "/cleanup-control/" + invocation.method();
+        ExtensionContext context = (ExtensionContext) java.lang.reflect.Proxy.newProxyInstance(
+                ExtensionContext.class.getClassLoader(), new Class<?>[] { ExtensionContext.class },
+                (proxy, method, arguments) -> switch (method.getName()) {
+                    case "getUniqueId" -> owner;
+                    case "getRoot" -> invocationContext.getRoot();
+                    default -> throw new AssertionError("Unexpected scope context access: " + method.getName());
+                });
+        fixture.beforeEach(context);
+        String physical = fixture.database(invocation.database());
+        List<String> collections;
+        try (AutoCloseable teardown = () -> fixture.afterEach(context)) {
+            invocation.suite().getDeclaredMethod(invocation.method())
+                    .invoke(invocation.suite().getDeclaredConstructor().newInstance());
+            collections = observer.getDatabase(physical).listCollectionNames().into(new ArrayList<>());
+        }
+        List<String> remaining = observer.listDatabaseNames().into(new ArrayList<>());
+        org.junit.jupiter.api.Assertions.assertAll(
+                () -> assertThat(collections)
+                        .as("the actual %s body wrote to its registered case database", invocation.method()).isNotEmpty(),
+                () -> assertThat(remaining)
+                        .as("teardown removed the actual database used by %s", invocation.method())
+                        .doesNotContain(physical, invocation.database()));
+    }
+
+    private record ScopedInvocation(Class<?> suite, String method, String database) { }
 
     @Test
     void anotherInvocationsTeardownCannotReleaseTheLiveCasesDatabase() {

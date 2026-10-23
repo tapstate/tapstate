@@ -302,7 +302,7 @@ class MongoPipelineDraftStoreIT {
     }
 
     private static Fixture fixture(MongoClient client, String databaseName) {
-        var database = client.getDatabase(databaseName);
+        var database = client.getDatabase(REPLICA_SET.database(databaseName));
         var drafts = database.getCollection("pipeline_drafts");
         var artifacts = database.getCollection("artifacts");
         drafts.drop();
