@@ -4,7 +4,7 @@ import com.sun.net.httpserver.HttpServer;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.common.TapstateException;
-import io.tapstate.spi.store.AiProviderSettingsStore.Settings;
+import io.tapstate.control.core.AiProviderSettings;
 import org.junit.jupiter.api.Test;
 import java.net.InetSocketAddress;
 import java.net.URI;
@@ -78,7 +78,7 @@ class OpenAiCompatibleClientTest {
         });
         server.start();
         try {
-            var settings = new Settings("openai-compatible", "http://127.0.0.1:" + server.getAddress().getPort(), "test", "sk-test");
+            var settings = new AiProviderSettings("openai-compatible", "http://127.0.0.1:" + server.getAddress().getPort(), "test", "sk-test");
             String editRequest = "\u4fdd\u7559\u539f\u6709 Db \u5b57\u6bb5\uff0c\u5e76\u65b0\u589e name \u5b57\u6bb5\uff0c\u503c\u53d6\u81ea Db\uff1b\u5176\u4ed6\u914d\u7f6e\u4fdd\u6301\u4e0d\u53d8\u3002";
             var result = localClient().propose(settings, List.of(Map.of("role", "user",
                     "content", editRequest)),
@@ -122,7 +122,7 @@ class OpenAiCompatibleClientTest {
         });
         server.start();
         try {
-            var settings = new Settings("openai-compatible", "http://127.0.0.1:" + server.getAddress().getPort(), "test", "sk-test");
+            var settings = new AiProviderSettings("openai-compatible", "http://127.0.0.1:" + server.getAddress().getPort(), "test", "sk-test");
             String question = "\u5982\u4f55\u65b0\u589e name \u5b57\u6bb5\uff1f";
             var result = localClient().propose(settings, List.of(Map.of("role", "user", "content", question)),
                     Map.of("proposalEnabled", true, "currentWizard", Map.of()), ignored -> { });
@@ -156,7 +156,7 @@ class OpenAiCompatibleClientTest {
             String arguments = JsonWriter.write(Map.of("candidateWizard", candidate));
             String stream = chunk(Map.of("tool_calls", List.of(Map.of("index", 0, "function", Map.of("name", "propose_pipeline", "arguments", arguments)))), "tool_calls") + "data: [DONE]\n\n";
             withServer(200, stream, settings -> {
-                var escapedSettings = new Settings(settings.providerId(), settings.baseUrl(), settings.model(), secret);
+                var escapedSettings = new AiProviderSettings(settings.providerId(), settings.baseUrl(), settings.model(), secret);
                 assertThatThrownBy(() -> localClient().propose(escapedSettings, List.of(), Map.of(), ignored -> { }))
                         .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_INVALID_PROPOSAL))
                         .hasMessageNotContaining(secret);
@@ -194,7 +194,7 @@ class OpenAiCompatibleClientTest {
     }
 
     @Test void interruptedCheckAndProposalRestoreTheInterruptFlagAndReturnCodedFailures() throws Exception {
-        var settings = new Settings("openai-compatible", "http://127.0.0.1:1", "test", "sk-test");
+        var settings = new AiProviderSettings("openai-compatible", "http://127.0.0.1:1", "test", "sk-test");
         try {
             Thread.currentThread().interrupt();
             assertThatThrownBy(() -> localClient().check(settings))
@@ -253,7 +253,7 @@ class OpenAiCompatibleClientTest {
         });
         server.start();
         try {
-            var settings = new Settings("openai-compatible",
+            var settings = new AiProviderSettings("openai-compatible",
                     "http://127.0.0.1:" + server.getAddress().getPort(), "test", "sk-test");
             List<String> conversationalText = new ArrayList<>();
             Optional<Map<String, Object>> conversation = localClient().propose(settings,
@@ -303,7 +303,7 @@ class OpenAiCompatibleClientTest {
         });
         server.start();
         try {
-            var settings = new Settings("openai-compatible",
+            var settings = new AiProviderSettings("openai-compatible",
                     "http://127.0.0.1:" + server.getAddress().getPort(), "test", "sk-test");
             Throwable failure = catchThrowable(() -> localClient().propose(settings,
                     List.of(Map.of("role", "user", "content", "Add a filter")),
@@ -399,7 +399,7 @@ class OpenAiCompatibleClientTest {
         });
         server.start();
         try {
-            var settings = new Settings("openai-compatible",
+            var settings = new AiProviderSettings("openai-compatible",
                     "http://127.0.0.1:" + server.getAddress().getPort(), "test", "sk-test");
             long started = System.nanoTime();
             assertThatThrownBy(() -> new OpenAiCompatibleClient(
@@ -422,7 +422,7 @@ class OpenAiCompatibleClientTest {
     private static OpenAiCompatibleClient localClient() {
         return new OpenAiCompatibleClient(baseUrl -> URI.create(baseUrl + "/chat/completions"));
     }
-    private static void withServer(int status, String body, java.util.function.Consumer<Settings> action) throws Exception {
+    private static void withServer(int status, String body, java.util.function.Consumer<AiProviderSettings> action) throws Exception {
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/chat/completions", exchange -> {
             exchange.getRequestBody().readAllBytes();
@@ -431,7 +431,7 @@ class OpenAiCompatibleClientTest {
             try (var output = exchange.getResponseBody()) { output.write(response); }
         });
         server.start();
-        try { action.accept(new Settings("openai-compatible", "http://127.0.0.1:" + server.getAddress().getPort(), "test", "sk-test")); }
+        try { action.accept(new AiProviderSettings("openai-compatible", "http://127.0.0.1:" + server.getAddress().getPort(), "test", "sk-test")); }
         finally { server.stop(0); }
     }
 }

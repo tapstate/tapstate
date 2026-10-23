@@ -16,7 +16,7 @@ import io.tapstate.control.core.OpenAiCompatibleClient;
 import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.AiProviderSettingsStore;
-import io.tapstate.spi.store.AiProviderSettingsStore.Settings;
+import io.tapstate.control.core.AiProviderSettings;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.PipelineDraft;
 import io.tapstate.spi.store.SchemaStore;
@@ -101,8 +101,8 @@ class PipelineAssistantControllerTest {
         beans.registerSingleton("schemas", new io.tapstate.control.core.SourceSchemaQueryService(artifacts, schemaStore));
         AtomicReference<Map<String, Object>> sentContext = new AtomicReference<>();
         AiProviderClient fake = new AiProviderClient() {
-            public void check(Settings ignored) { }
-            public Optional<Map<String, Object>> propose(Settings settings, List<Map<String, String>> messages,
+            public void check(AiProviderSettings ignored) { }
+            public Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
                     Map<String, Object> context, java.util.function.Consumer<String> text) {
                 sentContext.set(context);
                 text.accept("Connect a PostgreSQL or MySQL Source and discover its schema to draft a pipeline.");
@@ -162,8 +162,8 @@ class PipelineAssistantControllerTest {
         beans.registerSingleton("schemas", schemas);
         AtomicReference<Map<String, Object>> sentContext = new AtomicReference<>();
         AiProviderClient fake = new AiProviderClient() {
-            public void check(Settings ignored) { }
-            public Optional<Map<String, Object>> propose(Settings settings, List<Map<String, String>> messages,
+            public void check(AiProviderSettings ignored) { }
+            public Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
                     Map<String, Object> context, java.util.function.Consumer<String> text) {
                 sentContext.set(context);
                 text.accept("I can still help with the remaining pipeline settings.");
@@ -233,8 +233,8 @@ class PipelineAssistantControllerTest {
         AtomicBoolean providerFailure = new AtomicBoolean();
         AtomicInteger providerCalls = new AtomicInteger();
         AiProviderClient fake = new AiProviderClient() {
-            public void check(Settings ignored) { }
-            public Optional<Map<String, Object>> propose(Settings settings, List<Map<String, String>> messages,
+            public void check(AiProviderSettings ignored) { }
+            public Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
                     Map<String, Object> context, java.util.function.Consumer<String> text) {
                 providerCalls.incrementAndGet();
                 sentContext.set(context);
@@ -613,8 +613,8 @@ class PipelineAssistantControllerTest {
         beans.registerSingleton("schemas", schemas);
         AtomicReference<Map<String, Object>> sentContext = new AtomicReference<>();
         AiProviderClient fake = new AiProviderClient() {
-            public void check(Settings ignored) { }
-            public Optional<Map<String, Object>> propose(Settings settings, List<Map<String, String>> messages,
+            public void check(AiProviderSettings ignored) { }
+            public Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
                     Map<String, Object> context, java.util.function.Consumer<String> text) {
                 sentContext.set(context);
                 text.accept("Choose a smaller schema selection to generate a proposal.");
@@ -664,8 +664,8 @@ class PipelineAssistantControllerTest {
         var beans = new DefaultListableBeanFactory();
         beans.registerSingleton("drafts", new PipelineDraftService(store));
         AiProviderClient fake = new AiProviderClient() {
-            public void check(Settings ignored) { }
-            public Optional<Map<String, Object>> propose(Settings settings, List<Map<String, String>> messages,
+            public void check(AiProviderSettings ignored) { }
+            public Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
                     Map<String, Object> context, java.util.function.Consumer<String> text) {
                 text.accept("The Builder is ready for a supported Source.");
                 return Optional.empty();
@@ -727,10 +727,10 @@ class PipelineAssistantControllerTest {
 
     private static AiProviderController providerController(AiProviderClient client) {
         AiProviderSettingsStore store = new AiProviderSettingsStore() {
-            public java.util.Optional<Settings> get(String owner) {
-                return java.util.Optional.of(new Settings("openai-compatible", "https://api.openai.com/v1", "model", "sk-test"));
+            public java.util.Optional<AiProviderSettingsStore.Settings> get(String owner) {
+                return java.util.Optional.of(new AiProviderSettingsStore.Settings("openai-compatible", "https://api.openai.com/v1", "model", "sk-test"));
             }
-            public void put(String owner, Settings settings) { }
+            public void put(String owner, AiProviderSettingsStore.Settings settings) { }
             public void delete(String owner) { }
         };
         var audit = new AuditStore() {

@@ -3,7 +3,7 @@ package io.tapstate.control.core;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.common.TapstateException;
-import io.tapstate.spi.store.AiProviderSettingsStore.Settings;
+import io.tapstate.control.core.AiProviderSettings;
 import java.io.BufferedReader;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -52,7 +52,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
                 .proxy(ProxySelector.getDefault())
                 .followRedirects(HttpClient.Redirect.NEVER).build();
     }
-    @Override public void check(Settings settings) {
+    @Override public void check(AiProviderSettings settings) {
         Map<String, Object> body = Map.of("model", settings.model(), "max_tokens", 1,
                 "messages", List.of(Map.of("role", "user", "content", "Reply OK.")));
         long deadline = System.nanoTime() + responseTimeout.toNanos();
@@ -72,7 +72,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
             throw failed();
         }
     }
-    @Override public Optional<Map<String, Object>> propose(Settings settings, List<Map<String, String>> messages,
+    @Override public Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
             Map<String, Object> context, Consumer<String> text) {
         boolean proposalEnabled = !Boolean.FALSE.equals(context.get("proposalEnabled"));
         List<Map<String, String>> prompt = new ArrayList<>();
@@ -191,7 +191,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
     }
 
     @SuppressWarnings("unchecked")
-    private Optional<Map<String, Object>> read(Settings settings, Map<String, Object> body, Consumer<String> text,
+    private Optional<Map<String, Object>> read(AiProviderSettings settings, Map<String, Object> body, Consumer<String> text,
             boolean proposalEnabled) {
         for (int attempt = 0; attempt < STREAM_ATTEMPTS; attempt++) {
             long deadline = System.nanoTime() + responseTimeout.toNanos();
@@ -217,7 +217,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         }
         throw failed();
     }
-    private Optional<Map<String, Object>> readNonStreaming(Settings settings, Map<String, Object> body,
+    private Optional<Map<String, Object>> readNonStreaming(AiProviderSettings settings, Map<String, Object> body,
             Consumer<String> text, boolean proposalEnabled) {
         Map<String, Object> fallback = new java.util.LinkedHashMap<>(body);
         fallback.put("stream", false);
@@ -399,7 +399,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         }
         @Override public void close() { scheduled.cancel(false); timer.shutdownNow(); }
     }
-    private HttpRequest request(Settings settings, Map<String, Object> body) {
+    private HttpRequest request(AiProviderSettings settings, Map<String, Object> body) {
         URI uri = requestUriFactory.apply(settings.baseUrl());
         return HttpRequest.newBuilder(uri)
                 .timeout(responseTimeout).header("Content-Type", "application/json")

@@ -1,7 +1,7 @@
 package io.tapstate.control.core;
 
 import io.tapstate.core.common.TapstateException;
-import io.tapstate.spi.store.AiProviderSettingsStore.Settings;
+import io.tapstate.control.core.AiProviderSettings;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.URI;
@@ -13,13 +13,13 @@ import static org.assertj.core.api.Assertions.*;
 
 class OpenAiCompatibleEndpointPolicyTest {
     @Test void acceptsUserConfiguredRelaysWithoutAProviderHostAllowlist() {
-        assertThat(AiProviderService.validated(new Settings(
+        assertThat(AiProviderService.validated(new AiProviderSettings(
                 "openai-compatible", "https://api.super-nb.me", "model", "sk-test")).baseUrl())
                 .isEqualTo("https://api.super-nb.me/v1");
-        assertThat(AiProviderService.validated(new Settings(
+        assertThat(AiProviderService.validated(new AiProviderSettings(
                 "openai-compatible", "https://relay.example.com:8443/openai/v1/", "model", "sk-test")).baseUrl())
                 .isEqualTo("https://relay.example.com:8443/openai/v1");
-        assertThat(AiProviderService.validated(new Settings(
+        assertThat(AiProviderService.validated(new AiProviderSettings(
                 "openai-compatible", "https://198.18.0.230/v1", "model", "sk-test")).baseUrl())
                 .isEqualTo("https://198.18.0.230/v1");
     }
@@ -117,7 +117,7 @@ class OpenAiCompatibleEndpointPolicyTest {
     }
 
     @Test void rejectsAProviderBaseUrlThatIsNotAnHttpsUrl() {
-        assertThatThrownBy(() -> AiProviderService.validated(new Settings(
+        assertThatThrownBy(() -> AiProviderService.validated(new AiProviderSettings(
                 "openai-compatible", "http://relay.example.com/v1", "model", "sk-test")))
                 .isInstanceOfSatisfying(TapstateException.class,
                         error -> assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST))

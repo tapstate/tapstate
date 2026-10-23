@@ -7,7 +7,7 @@ import io.tapstate.control.core.CloudAuthenticationService;
 import io.tapstate.control.core.ControlError;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.common.TapstateException;
-import io.tapstate.spi.store.AiProviderSettingsStore.Settings;
+import io.tapstate.control.core.AiProviderSettings;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.http.CacheControl;
@@ -33,7 +33,7 @@ class AiProviderController {
     }
     @Verb("ai-provider.get") @GetMapping("/ai-provider-settings")
     ResponseEntity<Map<String, Object>> get(HttpServletRequest request) {
-        Settings settings = service().get(owner(request)).orElse(null);
+        AiProviderSettings settings = service().get(owner(request)).orElse(null);
         Map<String, Object> result = new LinkedHashMap<>(); result.put("configured", settings != null);
         result.put("providerId", settings == null ? null : settings.providerId());
         result.put("baseUrl", settings == null ? null : settings.baseUrl());
@@ -41,7 +41,7 @@ class AiProviderController {
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(result);
     }
     @Verb("ai-provider.replace") @PutMapping("/ai-provider-settings")
-    ResponseEntity<Void> put(HttpServletRequest request, @RequestBody Settings settings) {
+    ResponseEntity<Void> put(HttpServletRequest request, @RequestBody AiProviderSettings settings) {
         service().put(owner(request), AuthenticatedCaller.subject(), settings);
         return ResponseEntity.noContent().cacheControl(CacheControl.noStore()).build();
     }
@@ -51,7 +51,7 @@ class AiProviderController {
         return ResponseEntity.noContent().cacheControl(CacheControl.noStore()).build();
     }
     @Verb("ai-provider.check") @PostMapping("/ai-provider-settings:check")
-    ResponseEntity<Map<String, Object>> check(HttpServletRequest request, @RequestBody Settings settings) {
+    ResponseEntity<Map<String, Object>> check(HttpServletRequest request, @RequestBody AiProviderSettings settings) {
         String scope = owner(request);
         if (!CHECK_CAPACITY.tryAcquire()) throw AiProviderService.error(ControlError.AI_OVERLOADED);
         try {
