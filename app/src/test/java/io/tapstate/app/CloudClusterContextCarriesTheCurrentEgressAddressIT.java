@@ -1,21 +1,20 @@
-package io.tapstate.e2e;
+package io.tapstate.app;
 
-import io.tapstate.app.Bootstrap;
-import io.tapstate.control.core.CloudAuthenticationService;
 import io.tapstate.control.core.CloudClusterEgressAddress;
-import io.tapstate.control.core.CloudClusterEgressAddressProvider;
-import io.tapstate.control.core.CloudCodeExchangeResult;
-import io.tapstate.control.core.CloudCodeExchanger;
-import io.tapstate.control.core.CloudJwtValidator;
-import io.tapstate.control.core.CloudLoginIdentity;
-import io.tapstate.control.core.CloudSessionService;
-import io.tapstate.control.core.Scope;
-import io.tapstate.control.core.TokenSecrets;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.spi.store.CloudSessionContext;
-import io.tapstate.spi.store.CloudSessionIdentity;
-import io.tapstate.spi.store.CloudSessionStore;
 import io.tapstate.testsupport.RequiresDocker;
+import io.tapstate.cloud.sdk.client.ClusterEgressAddress;
+import io.tapstate.control.core.CloudRuntimeStatus;
+import io.tapstate.spi.store.StorageBinding;
+import org.junit.jupiter.api.io.TempDir;
+import org.testcontainers.containers.MongoDBContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.utility.DockerImageName;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.web.server.context.WebServerApplicationContext;
@@ -33,7 +32,6 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -49,8 +47,6 @@ class CloudClusterContextCarriesTheCurrentEgressAddressIT {
     private static final String JWT_WITHOUT_ADDRESS = "controlled-context-no-address-jwt-sentinel";
     private static final String JTI = "context-jti";
     private static final String JTI_WITHOUT_ADDRESS = "context-no-address-jti";
-    private static final CloudSessionIdentity DEPLOYMENT =
-            new CloudSessionIdentity(CLOUD_URL, ORGANIZATION, CLUSTER);
     private static final CloudSessionContext LOGIN_CONTEXT = new CloudSessionContext(
             ORGANIZATION, CLUSTER, "Workspace organization", "Workspace cluster", "workspace-region",
             "198.51.100.1", "DYNAMIC");
@@ -59,26 +55,28 @@ class CloudClusterContextCarriesTheCurrentEgressAddressIT {
     private static final CloudSessionContext LOGIN_CONTEXT_WITHOUT_ADDRESS = new CloudSessionContext(
             ORGANIZATION, CLUSTER, "Workspace organization", "Workspace cluster", "workspace-region");
 
+    @Container
+    private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
+    @TempDir Path stagingDirectory;
+
     @Test
     void authenticatedClusterContextReturnsTheCurrentAddressAndRepresentsUnavailableAddressExplicitly()
             throws Exception {
-        String database = "cloud_egress_context_" + Long.toUnsignedString(System.nanoTime(), 16);
-        String storeUri = SharedMongo.replicaSetUrl(database);
-        Path stagingDirectory = ServerHandle.privateStagingDirectory();
-        try {
-            try (var context = new SpringApplicationBuilder(Bootstrap.class, ControlledCloudAuthentication.class).run(
-                    "--server.address=127.0.0.1", "--server.port=0",
-                    "--tapstate.store.mongo.enabled=true",
+        var storage = NativeAppStorage.create(MONGO, "cloud_egress_context", StorageBinding.Mode.CLOUD, CLUSTER);
+        String storeUri = storage.configurationUri();
+        try (var context = new SpringApplicationBuilder(Bootstrap.class, ControlledCloudAuthentication.class)
+                .environment(CloudFixtureEnvironment.isolated()).run(
+                    "--server.address=127.0.0.1", "--server.port=0", "--tapstate.hz.member-port=0",
+                    "--tapstate.hz.jet.cooperative-thread-count=2",
                     "--tapstate.store.mongo.uri=" + storeUri,
-                    "--tapstate.store.mongo.operator-state-database=" + database + "_operator",
                     "--tapstate.cloud.base-url=" + CLOUD_URL,
                     "--tapstate.cloud.token=controlled-machine-token",
                     "--tapstate.cloud.atlas-uri=" + storeUri,
                     "--tapstate.cloud.cluster-id=" + CLUSTER,
-                    "--tapstate.connectors.seed-dir=" + AtlasRuntime.seedDirectory(),
+                    "--tapstate.connectors.seed-dir=" + CloudConnectorTestInputs.seedDirectory(),
                     "--tapstate.connectors.plugins-dir=" + stagingDirectory,
-                    "--tapstate.connectors.also-accept-ids=" + E2eConnectorJar.CONNECTOR_ID,
                     "--SDK_STATUS_SENDER_ENABLED=false")) {
+                assertThat(NativeAppStorage.business(context).isRunning()).isTrue();
                 URI base = URI.create("http://127.0.0.1:"
                         + ((WebServerApplicationContext) context).getWebServer().getPort());
                 HttpClient client = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NEVER).build();
@@ -115,6 +113,8 @@ class CloudClusterContextCarriesTheCurrentEgressAddressIT {
                         .containsEntry("clusterState", null);
                 assertThat(response.body()).doesNotContain(JWT, cookie, "controlled-machine-token");
 
+                // The production provider retains recent observations; advance beyond its stale budget.
+                context.getBean(ContextClock.class).advance(CachedCloudClusterEgressAddressProvider.MAX_STALE_AGE.plusSeconds(1));
                 HttpResponse<String> noAddressLogin = client.send(HttpRequest.newBuilder(
                                 base.resolve("/auth/exchange?code=controlled-code-without-egress"))
                         .timeout(Duration.ofSeconds(10)).GET().build(), HttpResponse.BodyHandlers.ofString());
@@ -140,9 +140,6 @@ class CloudClusterContextCarriesTheCurrentEgressAddressIT {
                 assertThat(anonymous.statusCode()).isEqualTo(401);
                 assertThat(anonymous.body()).doesNotContain(
                         LOGIN_CONTEXT.ec2PublicIp(), JWT, JWT_WITHOUT_ADDRESS);
-            }
-        } finally {
-            ServerHandle.discardStagingDirectory(stagingDirectory);
         }
     }
 
@@ -150,44 +147,48 @@ class CloudClusterContextCarriesTheCurrentEgressAddressIT {
     static class ControlledCloudAuthentication {
         @Bean
         @Primary
-        CloudAuthenticationService controlledAuthentication(CloudSessionStore sessions, TokenSecrets secrets,
-                Clock clock) {
-            CloudCodeExchanger exchanger = new CloudCodeExchanger() {
-                @Override
-                public String exchange(String exchangeCode, String clusterId) {
-                    return JWT;
-                }
-
-                @Override
-                public CloudCodeExchangeResult exchangeWithContext(String exchangeCode, String clusterId) {
-                    assertThat(clusterId).isEqualTo(CLUSTER);
-                    return switch (exchangeCode) {
-                        case "controlled-code" -> new CloudCodeExchangeResult(JWT, LOGIN_CONTEXT);
-                        case "controlled-code-without-egress" ->
-                                new CloudCodeExchangeResult(JWT_WITHOUT_ADDRESS, LOGIN_CONTEXT_WITHOUT_ADDRESS);
+        CloudSdkBridge controlledAuthentication(CloudRuntimeSettings settings, ContextClock clock) {
+            AtomicInteger addressReads = new AtomicInteger();
+            return new CloudSdkBridge(settings, new CloudSdkBridge.SdkRuntime() {
+                @Override public CloudSdkBridge.ExchangeResult exchange(String code) {
+                    var selected = switch (code) {
+                        case "controlled-code" -> LOGIN_CONTEXT;
+                        case "controlled-code-without-egress" -> LOGIN_CONTEXT_WITHOUT_ADDRESS;
                         default -> throw new AssertionError("unexpected exchange code");
                     };
+                    return new CloudSdkBridge.ExchangeResult(selected == LOGIN_CONTEXT ? JWT : JWT_WITHOUT_ADDRESS,
+                            ORGANIZATION, CLUSTER, selected.organizationName(), selected.clusterName(), selected.region(),
+                            selected.ec2PublicIp(), selected.egressAddressStatus());
                 }
-
-            };
-            CloudJwtValidator validator = (jwt, deployment, audience) -> {
-                if (!DEPLOYMENT.equals(deployment)) return Optional.empty();
-                if (JWT.equals(jwt)) {
-                    return Optional.of(new CloudLoginIdentity(DEPLOYMENT, "context-user", ORGANIZATION, CLUSTER,
-                            JTI, Scope.WRITE, Instant.now(clock).plusSeconds(300)));
+                @Override public CloudSdkBridge.VerifiedClaims verify(String jwt) {
+                    String jti = JWT.equals(jwt) ? JTI : JWT_WITHOUT_ADDRESS.equals(jwt) ? JTI_WITHOUT_ADDRESS : null;
+                    if (jti == null) throw new CloudSdkBridge.ProviderFailure();
+                    return new CloudSdkBridge.VerifiedClaims("context-user", ORGANIZATION, CLUSTER, jti,
+                            clock.instant().plusSeconds(300), CLOUD_URL, "127.0.0.1", List.of("workload:write"));
                 }
-                if (JWT_WITHOUT_ADDRESS.equals(jwt)) {
-                    return Optional.of(new CloudLoginIdentity(DEPLOYMENT, "context-user", ORGANIZATION, CLUSTER,
-                            JTI_WITHOUT_ADDRESS, Scope.WRITE, Instant.now(clock).plusSeconds(300)));
+                @Override public ClusterEgressAddress currentEgressAddress() {
+                    if (addressReads.getAndIncrement() == 0)
+                        return new ClusterEgressAddress(ORGANIZATION, CLUSTER, CURRENT_ADDRESS.ec2PublicIp(),
+                                CURRENT_ADDRESS.egressAddressStatus());
+                    throw new CloudSdkBridge.ProviderFailure();
                 }
-                return Optional.empty();
-            };
-            AtomicInteger addressReads = new AtomicInteger();
-            CloudClusterEgressAddressProvider addressProvider = (organizationId, clusterId) ->
-                    addressReads.getAndIncrement() == 0 ? Optional.of(CURRENT_ADDRESS) : Optional.empty();
-            return new CloudAuthenticationService(exchanger, validator,
-                    new CloudSessionService(sessions, DEPLOYMENT, secrets, clock),
-                    io.tapstate.control.core.CloudAuthenticationObserver.NONE, addressProvider);
+                @Override public boolean verifyCallback(String method, String timestamp, String nonce, String data, String signature) {
+                    throw new AssertionError("no callback in this scenario");
+                }
+                @Override public void report(String clusterId, String nonce, CloudRuntimeStatus status, String token) {
+                    throw new AssertionError("status reporting is disabled in this scenario");
+                }
+            });
         }
+
+        @Bean @Primary ContextClock contextClock() { return new ContextClock(); }
+    }
+
+    static final class ContextClock extends Clock {
+        private final AtomicReference<Instant> now = new AtomicReference<>(Instant.now());
+        void advance(Duration duration) { now.updateAndGet(value -> value.plus(duration)); }
+        @Override public Instant instant() { return now.get(); }
+        @Override public ZoneId getZone() { return ZoneOffset.UTC; }
+        @Override public Clock withZone(ZoneId zone) { return Clock.fixed(instant(), zone); }
     }
 }

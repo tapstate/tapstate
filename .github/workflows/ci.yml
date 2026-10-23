@@ -106,7 +106,7 @@ jobs:
           shard = next((item for item in plan["shards"] if item["id"] == sys.argv[2]), None)
           if shard is None:
               raise SystemExit("unknown test shard")
-          cloud_context_test = "io.tapstate.e2e.CloudClusterContextCarriesTheCurrentEgressAddressIT"
+          cloud_context_test = "io.tapstate.app.CloudClusterContextCarriesTheCurrentEgressAddressIT"
           print("true" if any(test["class"] == cloud_context_test for test in shard["tests"]) else "false")
           PY
           )"
