@@ -603,6 +603,10 @@ jobs:
       # cases are the only exercise this script gets outside a published release.
       - name: The roadmap step still reports what the board kept, not what it asked for
         run: bash .github/scripts/roadmap-shipped-smoke.sh
+      - name: Milestone board automation cases
+        run: |
+          shellcheck .github/scripts/milestone-board.sh
+          python3 .github/scripts/milestone-board-smoke.py
       # Not a script's cases -- the release workflow's own shape. The three acts that cannot be
       # taken back are all downstream of the approval, and every one of them is one line from
       # moving; a rejected release is otherwise the only thing that would find out.
