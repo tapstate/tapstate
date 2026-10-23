@@ -192,6 +192,7 @@ control.source-config-reveal-unavailable
 control.state-database-unavailable
 control.unauthenticated
 control.unreachable
+core.row-map-key-unsupported
 data-browser.connector-not-browsable
 data-browser.follow-idle
 data-browser.follow-stopped
