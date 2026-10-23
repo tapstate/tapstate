@@ -169,6 +169,13 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
             new MongoCacheMetadataStructure(database,MongoRateHistoryStore.DEFAULT_RETENTION).verifyDirect();
             var original = MongoPipelineSourcePreparations.retained(session,database,scope);
             if (!original.sameRecovery(expected)) throw MongoPipelineSourcePreparations.identityUnproven(scope);
+            var added = new java.util.TreeSet<String>();
+            expected.selectedTables().forEach((source,tables) -> tables.forEach(table -> {
+                if (!original.selectedTables().getOrDefault(source,java.util.Set.of()).contains(table))
+                    added.add(source + "." + table);
+            }));
+            if (!added.isEmpty()) throw new TapstateException(IoError.PIPELINE_TABLE_SELECTION_REBUILD_REQUIRED,
+                    Map.of("pipeline",scope.pipelineId(),"tables",String.join(", ",added)),null);
             MongoPipelineSourcePreparations.verifyAll(session,client,database,scope,original,requireActive);
             MongoSnapshotStateStore.order(session,database,scope); return null;
         });

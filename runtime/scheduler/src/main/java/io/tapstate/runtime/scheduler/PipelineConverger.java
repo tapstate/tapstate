@@ -124,8 +124,11 @@ public final class PipelineConverger {
         // An epoch that has already moved on is not a lost instruction: it means the stop was
         // converged after all, and then what is wanted is exactly the ordinary start below.
         Long stampedAt = intent.get().rebuiltAtStateEpoch();
-        boolean rebuildOwed = intent.get().rebuildOwedAt(actualDoc.orElse(null));
-        boolean rebuild = reassemble && (stampedAt == null || rebuildOwed);
+        // A native clearing operation is consumed only by CONFIG successor completion, which clears
+        // purgeState. An earlier STOP may have moved the CACHE epoch without finishing replacement.
+        boolean nativeClearingStart = requirePreparedState && target == PipelineState.RUNNING && purgeState;
+        boolean rebuildOwed = nativeClearingStart || intent.get().rebuildOwedAt(actualDoc.orElse(null));
+        boolean rebuild = nativeClearingStart || reassemble && (stampedAt == null || rebuildOwed);
 
         // An owed restart must reach the fenced stop/start below before checking the old run.
         // Recording that run's failure would advance the epoch without carrying out the restart,
@@ -160,7 +163,11 @@ public final class PipelineConverger {
             return ConvergeResult.converged(actualDoc.orElseThrow());
         }
 
-        return driveTo(pipelineId, target, true, actualDoc.orElse(null), purgeState, rebuild, rebuildOwed);
+        // Native replacement consumes the explicit clearing flag in the successor CONFIG intent.
+        // STOPPED alone proves no clearing: a prior keeping stop may already have reached it.
+        boolean clearRetainedState = requirePreparedState && target == PipelineState.STOPPED && purgeState;
+        return driveTo(pipelineId, target, true, actualDoc.orElse(null), purgeState, rebuild,
+                rebuildOwed || clearRetainedState);
     }
 
     private ConvergeResult convergeRunning(

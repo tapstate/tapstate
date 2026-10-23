@@ -68,10 +68,15 @@ final class NativePipelineRecovery {
                 .map(io.tapstate.core.lifecycle.ObservationFailure::code).orElse(io.tapstate.control.core.ControlError.STORAGE_UNAVAILABLE.code());
     }
     Map<String,String> inspectCaptured(PipelineConvergencePass pass,ReadOnlyArtifactSnapshot snapshot,SourceModelSnapshot models) {
-        requireAvailable();var summary=configuration.cacheRecoveries().read(pass.scope().pipelineId());
+        requireAvailable();String id=pass.scope().pipelineId();pass.requirePipeline(id);
+        var authored=StoredArtifacts.requirePipeline(snapshot,id);
+        var pipeline=PipelineInlining.inline(authored,snapshot);
+        var sources=new LinkedHashMap<String,SourceResource>();
+        for(String source:pipeline.sourceIds())sources.put(source,StoredArtifacts.requireSource(snapshot,source));
+        preparer.verifyRetainedSources(pass.scope(),models.preparationInputs(pass.scope(),authored,pipeline,sources));
+        var summary=configuration.cacheRecoveries().read(id);
         if(summary.isEmpty())return Map.of();
         if(!summary.orElseThrow().targetScope().equals(pass.scope()))throw fenced();
-        String id=pass.scope().pipelineId();var pipeline=PipelineInlining.inline(StoredArtifacts.requirePipeline(snapshot,id),snapshot);
         var contexts=new LinkedHashMap<String,SourceResource>();
         for(String source:pipeline.sourceIds())contexts.put(RequiredNoteOwner.namespace(new PipelineNode(id,source),PipelineNode.Purpose.CAPTURE),StoredArtifacts.requireSource(snapshot,source));
         if(pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync()!=null)for(var sync:serve.sync())

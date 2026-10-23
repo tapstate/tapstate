@@ -123,7 +123,12 @@ final class ThreeLayerStorePort implements StorePort {
                 var intents = configuration.intents().guardedBy(ThreeLayerStorePort.this::active);
                 var previous = intents.load(desired.pipelineId());
                 if (previous.isPresent() && !previous.orElseThrow().scope().equals(original)) throw refused();
-                if (desired.targetState() == PipelineState.RUNNING) prepare.accept(original);
+                // An immediate start may supersede an explicitly clearing stop before convergence.
+                // That same fenced intent must finish replacement before preparing the new selection.
+                boolean clearsFirst = desired.purgeState() && desired.reassemble()
+                        && previous.filter(value -> value.desired().targetState() == PipelineState.STOPPED
+                                && value.desired().purgeState()).isPresent();
+                if (desired.targetState() == PipelineState.RUNNING && !clearsFirst) prepare.accept(original);
                 if (!intents.compareAndSet(original, previous.map(PipelineIntentSnapshot::intentRevision).orElse(0L), desired)) throw refused();
             }
             @Override public Optional<DesiredState> read(String pipeline) {

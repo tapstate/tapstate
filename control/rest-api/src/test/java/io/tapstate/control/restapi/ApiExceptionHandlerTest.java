@@ -10,6 +10,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.common.Severity;
 import io.tapstate.core.dsl.DslError;
 import io.tapstate.messages.MessageCatalog;
+import io.tapstate.spi.store.IoError;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -36,6 +37,16 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ApiExceptionHandlerTest {
 
     private final ApiExceptionHandler handler = new ApiExceptionHandler(MessageCatalog.bundled());
+
+    @Test
+    void addedTablesExplainTheRequiredClearStateFullLoadAsAStateConflict() {
+        var response = handler.handle(new TapstateException(IoError.PIPELINE_TABLE_SELECTION_REBUILD_REQUIRED,
+                Map.of("pipeline", "flow", "tables", "input.quiet"), null));
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(response.getBody().code()).isEqualTo(IoError.PIPELINE_TABLE_SELECTION_REBUILD_REQUIRED.code());
+        assertThat(response.getBody().params()).containsEntry("pipeline", "flow").containsEntry("tables", "input.quiet");
+        assertThat(response.getBody().message()).contains("input.quiet", "Clear all state", "full load");
+    }
 
     @Test
     void aStartMissingItsRequiredSourceModelIsAStateConflict() {

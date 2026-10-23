@@ -132,6 +132,9 @@ public enum IoError implements TapstateErrorCode {
     /** The requested private source/read contract cannot reuse the prepared physical state. */
     PIPELINE_CAPTURE_IDENTITY_UNPROVEN("io.pipeline-capture-identity-unproven", Set.of("pipeline")),
 
+    /** Added tables cannot join an already prepared Pipeline while its prior state is retained. */
+    PIPELINE_TABLE_SELECTION_REBUILD_REQUIRED("io.pipeline-table-selection-rebuild-required", Set.of("pipeline", "tables")),
+
     /** A configuration import cannot satisfy its original scope, input or publication conditions. */
     CONFIGURATION_IMPORT_REFUSED("io.configuration-import-refused", Set.of("reason")),
 

@@ -54,6 +54,15 @@ class PipelineFirstStatePreparerTest {
     private static PipelinePreparation issued() { return new PipelinePreparation("flow", 1, PipelinePreparation.Phase.ISSUED, SCOPE, ID, NODE); }
     private static PipelinePreparation complete() { return new PipelinePreparation("flow", 1, PipelinePreparation.Phase.COMPLETE, SCOPE, ID, NODE); }
 
+    @Test void runtimeSourceVerificationCannotIssueReserveOrSeedFirstState() {
+        var inputs = new io.tapstate.spi.store.PipelinePreparationInputs("a".repeat(64),Map.of(),Map.of(),List.of());
+        preparer().verifyRetainedSources(SCOPE,inputs);
+        assertThat(calls).containsExactly("verify-sources");
+        assertThat(configuration.facts.phase()).isEqualTo(PipelinePreparation.Phase.UNASSIGNED);
+        assertThat(configuration.node).isNull();
+        assertThat(cache.original).isNull();
+    }
+
     @Test void firstPreparationUsesOneNodeAndOneGrantAndCompletesOnlyAfterItsCacheReceipt() {
         assertThat(preparer().prepare(SCOPE)).isEqualTo(complete());
         assertThat(calls).containsExactly("read", "node", "issue", "reserve", "consume", "seed", "require-issued", "complete");
@@ -222,7 +231,7 @@ class PipelineFirstStatePreparerTest {
             if (resumeFailure != null) throw resumeFailure;
             return new Reservation(SCOPE, ID, Phase.RESERVED, PIPELINE);
         }
-        @Override public void verifySources(PipelineIntentScope scope,io.tapstate.spi.store.PipelinePreparationInputs inputs) {}
+        @Override public void verifySources(PipelineIntentScope scope,io.tapstate.spi.store.PipelinePreparationInputs inputs) { calls.add("verify-sources"); }
         @Override public PipelinePreparationReceipt seed(Reservation original, PipelineStatePreparations configuration, Instant time) {
             calls.add("seed"); this.original = original; this.seedTime = time; beforeSeed.run(); configuration.requireIssued(original.scope(), original.preparationId());
             return new Receipt(SCOPE, receiptId);

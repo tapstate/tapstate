@@ -44,6 +44,12 @@ final class PipelineFirstStatePreparer {
 
     PipelinePreparation prepare(PipelineIntentScope original) { return prepareAttempt(original,null,null,() -> {}); }
 
+    /** Runtime admission only verifies the captured scope; it cannot issue or resume first creation. */
+    void verifyRetainedSources(PipelineIntentScope original,PipelinePreparationInputs inputs) {
+        Objects.requireNonNull(original,"original");Objects.requireNonNull(inputs,"inputs");
+        requireActive.run();cache.verifySources(original,inputs);requireActive.run();
+    }
+
     /** Runtime preparation requires the current captured source contract even when CONFIG already says COMPLETE. */
     PipelinePreparation prepare(PipelineIntentScope original,PipelinePreparationInputs inputs) {
         Objects.requireNonNull(inputs,"inputs"); requireActive.run();

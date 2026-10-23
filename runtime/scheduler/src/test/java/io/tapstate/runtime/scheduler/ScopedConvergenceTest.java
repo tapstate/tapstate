@@ -15,6 +15,8 @@ import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.PipelineIntentSnapshot;
 import io.tapstate.spi.store.StateStore;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import java.time.Clock;
 import java.time.Instant;
@@ -93,6 +95,34 @@ class ScopedConvergenceTest {
         assertThat(converger.convergeScoped(deleted, poisonState(), actuator, RebuildAdmission.never()).status())
                 .isEqualTo(ConvergeStatus.NOTHING_TO_DO);
         assertThat(actuator.calls()).isEmpty();
+    }
+
+    @Test void anExplicitNativeClearingStopIsActuatedEvenWhenTheRetainedRunIsAlreadyStopped() {
+        prepare(PipelineState.STOPPED);
+        var clearing = new PipelineIntentSnapshot(SCOPE, 3,
+                new DesiredState("orders", PipelineState.STOPPED, "original", true));
+        converger.convergeScoped(clearing, state, actuator, RebuildAdmission.never());
+        assertThat(actuator.calls()).containsExactly("stop:orders:purge");
+
+        // Completing native replacement consumes the clearing flag in the successor CONFIG intent.
+        var consumed = new PipelineIntentSnapshot(new PipelineIntentScope("cluster", 3, "cache-a", "orders", 2), 4,
+                new DesiredState("orders", PipelineState.STOPPED, "original", false));
+        converger.convergeScoped(consumed, state, actuator, RebuildAdmission.never());
+        assertThat(actuator.calls()).containsExactly("stop:orders:purge");
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = PipelineState.class, names = {"STOPPED", "RUNNING", "FAILED"})
+    void aClearingStartCannotMistakeAnEarlierStopsStateCasForCompletedReplacement(PipelineState movedState) {
+        prepare(PipelineState.RUNNING);
+        // START captured epoch zero before the preceding STOP's state write won its CAS.
+        var starting = new PipelineIntentSnapshot(SCOPE, 4,
+                new DesiredState("orders", PipelineState.RUNNING, "original", true, null, true, 0L));
+        state.applySwap("orders", 0, StateJson.of(movedState), T0);
+
+        converger.convergeScoped(starting, state, actuator, RebuildAdmission.never());
+
+        assertThat(actuator.calls()).containsExactly("stop:orders:purge", "start:orders");
     }
 
     @Test void aLaterStartFailureUsesTheSamePassPortsAfterItsActualAdvance() {

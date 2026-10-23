@@ -858,6 +858,49 @@ class PipelineDirectPreparationIT {
             assertThat(f.configuration.pipelineStates().read("flow").orElseThrow().stateGeneration()).isOne();
         });
     }
+    @Test void sharedTableAdditionsRefuseThePreparedSelectionWithoutWrites() {
+        withFixture(f -> {
+            f.configuration.artifacts().save(pipeline("input",true,ReadMode.CDC_ONLY,"latest",null));
+            var source = f.source();
+            f.configuration.artifacts().save(new SourceResource(source.id(),source.metadata(),source.connector(),source.config(),
+                    source.mode(),List.of(TableRef.literal("orders")),source.srs(),null));
+            var original = f.inputs(); f.preparer(f.configuration,f.cache).prepare(f.scope,original);
+            f.configuration.artifacts().save(source);
+            var requested = f.inputs();
+            assertThat(original.selectedTables().get("input")).containsExactly("orders");
+            assertThat(requested.selectedTables().get("input")).containsExactlyInAnyOrder("orders","quiet");
+            var before = f.cacheSnapshot(); var mapping = f.configDatabase.getCollection("operator_generations").find().first();
+            long version = f.version();
+            assertCode(() -> f.preparer(f.configuration,f.cache).prepare(f.scope,requested),IoError.PIPELINE_TABLE_SELECTION_REBUILD_REQUIRED);
+            assertThat(f.cacheSnapshot()).isEqualTo(before);
+            assertThat(f.configDatabase.getCollection("operator_generations").find().first()).isEqualTo(mapping);
+            assertThat(f.version()).isEqualTo(version);
+        });
+    }
+    @Test void sharedReductionKeepsTheOriginalPreparationWithoutRewritingIt() {
+        withFixture(f -> {
+            f.configuration.artifacts().save(pipeline("input",true,ReadMode.CDC_ONLY,"latest",null));
+            var original = f.inputs(); f.preparer(f.configuration,f.cache).prepare(f.scope,original);
+            var source = f.source();
+            f.configuration.artifacts().save(new SourceResource(source.id(),source.metadata(),source.connector(),source.config(),
+                    source.mode(),List.of(TableRef.literal("orders")),source.srs(),null));
+            var before = f.cacheSnapshot();
+            assertThat(f.preparer(f.configuration,f.cache).prepare(f.scope,f.inputs()).phase()).isEqualTo(PipelinePreparation.Phase.COMPLETE);
+            assertThat(f.cacheSnapshot()).isEqualTo(before);
+        });
+    }
+    @Test void sharedInitialSelectionAndUnchangedReopenRemainSupported() {
+        withFixture(f -> {
+            f.configuration.artifacts().save(pipeline("input",true,ReadMode.CDC_ONLY,"latest",null));
+            var inputs = f.inputs();
+            assertThat(f.preparer(f.configuration,f.cache).prepare(f.scope,inputs).phase()).isEqualTo(PipelinePreparation.Phase.COMPLETE);
+            var before = f.cacheSnapshot();
+            try (var reopened = MongoConfigurationDomain.open(f.settings(),f.scope.clusterId())) {
+                assertThat(f.preparer(reopened,f.cache).prepare(f.scope,inputs).phase()).isEqualTo(PipelinePreparation.Phase.COMPLETE);
+            }
+            assertThat(f.cacheSnapshot()).isEqualTo(before);
+        });
+    }
     @Test void metadataOnlyEditsUseTheSameRetainedRecoveryContract() {
         withFixture(f -> {
             var original = f.inputs(); f.preparer(f.configuration,f.cache).prepare(f.scope,original); var before = f.cacheSnapshot();

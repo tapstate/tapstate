@@ -1202,8 +1202,12 @@ io.direct-channel-unavailable:
   solution: "Restore the original cache facts or explicitly confirm a full rebuild before continuing."
 
 io.pipeline-capture-identity-unproven:
-  message: "Pipeline {pipeline} cannot prove that its capture identity matches the prepared state."
+  message: "Pipeline {pipeline} cannot prove that its capture identity matches the prepared state. If its source or table selection changed, stop with Clear all state and start a full load before applying it."
   solution: "Keep the retained recovery facts. If source references, coordinates, SRS mode or selection changed, explicitly confirm a full rebuild."
+
+io.pipeline-table-selection-rebuild-required:
+  message: "Pipeline {pipeline} cannot apply added tables ({tables}) while retaining state. Stop with Clear all state, then start a full load to apply them."
+  solution: "Pause/resume and ordinary stop/start retain the original table selection."
 
 io.configuration-import-refused:
   message: "Configuration import was refused ({reason})."

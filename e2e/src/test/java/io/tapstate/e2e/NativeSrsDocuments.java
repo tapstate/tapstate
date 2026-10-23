@@ -48,13 +48,32 @@ final class NativeSrsDocuments implements AutoCloseable {
     }
 
     Document directChannel(String pipeline, String source) {
+        return directChannel(pipeline, source, null);
+    }
+
+    Document directChannel(String pipeline, String source, long generation) {
+        return directChannel(pipeline, source, Long.valueOf(generation));
+    }
+
+    private Document directChannel(String pipeline, String source, Long generation) {
+        var filter = new Document("_id.scope.clusterId", scope.clusterId()).append("_id.scope.bindingVersion", scope.bindingVersion())
+                .append("_id.scope.cacheIncarnation", incarnation).append("_id.scope.pipelineId", pipeline).append("_id.sourceId", source);
+        if (generation != null) filter.append("_id.scope.stateGeneration", generation);
         var channels = SystemCollections.DIRECT_CHANNEL_OFFSETS.on(database).find(
-                new Document("_id.scope.clusterId", scope.clusterId()).append("_id.scope.bindingVersion", scope.bindingVersion())
-                        .append("_id.scope.cacheIncarnation", incarnation).append("_id.scope.pipelineId", pipeline)
-                        .append("_id.sourceId", source)).into(new ArrayList<>());
+                filter).into(new ArrayList<>());
         if (channels.isEmpty()) return null;
         if (channels.size() != 1) throw new AssertionError("expected one original direct channel: " + channels);
         return channels.getFirst();
+    }
+
+    java.util.List<Document> directBatches(Document originalKey) {
+        Document originalScope = originalKey.get("scope", Document.class);
+        if (!scope.clusterId().equals(originalScope.getString("clusterId"))
+                || scope.bindingVersion() != originalScope.getLong("bindingVersion")
+                || !incarnation.equals(originalScope.getString("cacheIncarnation")))
+            throw new AssertionError("the direct batch key belongs to another installation");
+        return SystemCollections.DIRECT_BATCHES.on(database).find(new Document("_id.channel", originalKey))
+                .sort(new Document("_id.epoch", 1).append("_id.ordinal", 1)).into(new ArrayList<>());
     }
 
     Set<String> miningChainIds() {
