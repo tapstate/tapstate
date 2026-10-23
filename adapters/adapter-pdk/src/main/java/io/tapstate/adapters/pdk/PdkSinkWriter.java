@@ -51,6 +51,7 @@ final class PdkSinkWriter implements SinkWriter {
     private final PdkConnector connector;
     private final WriteRecordFunction write;
     private final WriteMode mode;
+    private final Map<String,String> writeAlternatives;
     private final DdlPolicy ddl;
     private final Map<String, TargetTable> targets;
     private final PdkTargetPreparation preparation;
@@ -150,6 +151,7 @@ final class PdkSinkWriter implements SinkWriter {
             connector.close();
         };
         this.connector = connector;
+        this.writeAlternatives=connector.writeAlternatives(mode);
         this.write = write;
         this.mode = mode;
         this.ddl = ddl;
@@ -294,6 +296,8 @@ final class PdkSinkWriter implements SinkWriter {
                 rows.forEach(row -> row.setTableId(target.name()));
             }
             // A connector may report the batch in several flushes, one callback each; accumulate.
+            // The frozen PDK API stores alternatives by the current thread name.
+            writeAlternatives.forEach(connector.context().getConnectorCapabilities()::alternative);
             connector.requireActive();
             write.writeRecord(connector.context(), rows, table,
                     result -> accepted[0] += accepted(result));

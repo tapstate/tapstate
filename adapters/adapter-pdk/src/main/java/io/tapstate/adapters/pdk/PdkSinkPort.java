@@ -194,6 +194,7 @@ public final class PdkSinkPort implements SinkPort {
     public void prepare(SinkConfig config, Map<String, TargetTable> targets) {
         requireInputs(config);requireActive();
         ConnectorRef ref = provisioner.resolve(config.connectorId());
+        PdkWritePolicies.select(config.connectorId(),ref.spec(),config.writeMode());
         ConfiguredDrive drive = configuredDrive(config, ref);
         PdkConnector connector = PdkConnector.open(
                 config.connectorId(), ref, config.settings(),

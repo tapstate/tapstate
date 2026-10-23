@@ -10,7 +10,6 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.io.TempDir;
@@ -36,10 +35,10 @@ class AJoinResumesAfterItsTargetConfirmsIT {
         Path target = Files.createDirectory(directory.resolve("target"));
         FileEndpoints.replaceTable(source.resolve("orders.csv"), "id,seq\n10,1\n11,1\n");
         FileEndpoints.replaceTable(source.resolve("customers.csv"), "id,seq\n1,7\n");
-        String store = SharedMongo.replicaSetUrl("join_resume_" + tier.name().toLowerCase(Locale.ROOT));
-        try (ServerHandle server = tier.launch(store); FileEndpoints files = new FileEndpoints()) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+             ServerHandle server = tier.launch(storage); FileEndpoints files = new FileEndpoints()) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID,
                     Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
             control.apply(workspace(source, target));

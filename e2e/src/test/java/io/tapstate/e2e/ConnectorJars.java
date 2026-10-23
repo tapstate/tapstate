@@ -61,6 +61,18 @@ final class ConnectorJars {
         }
     }
 
+    /** A native installation's managed Mongo target uses the separately supplied connector input. */
+    static byte[] managedMongoBytes() {
+        String supplied = System.getProperty("tapstate.e2e.managed-mongo-jar");
+        if (supplied == null || supplied.isBlank()) {
+            if (!directoryNamed()) throw new EnvelopeException(
+                    "a managed Mongo target requires tapstate.e2e.managed-mongo-jar or " + DIRECTORY_PROPERTY);
+            return bytesFor("mongodb");
+        }
+        try { return Files.readAllBytes(Path.of(supplied)); }
+        catch (IOException failure) { throw new UncheckedIOException("cannot read the managed Mongo connector at " + supplied, failure); }
+    }
+
     private static Path directory() {
         String configured = System.getProperty(DIRECTORY_PROPERTY);
         if (configured == null || configured.isBlank()) {

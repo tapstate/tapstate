@@ -58,7 +58,10 @@ class PipelineDirectPreparationIT {
                 var physical=ports.getFirst();
                 physical.listener.get().onBatch(List.of(Envelope.insert(1,"orders",Map.of("id",1),null)),Optional.of(new SourcePosition("one")));
                 physical.listener.get().onBatch(List.of(Envelope.insert(3,"orders",Map.of("id",2),null)),Optional.of(new SourcePosition("two")));
-                assertThat(first.capturedRows("flow").rowsByTableAndOp()).containsEntry("orders",Map.of("i",2L));
+                var captured=first.captureBindings().logged().get("input");
+                var events=stores.log().readBatch(SrsRingbuffer.ringName(captured.run().miningChainId(),"orders"),0,2).records();
+                assertThat(events).containsOnlyKeys(0L,1L).allSatisfy((sequence,event) -> assertThat(event.op()).isEqualTo(io.tapstate.core.event.Op.INSERT));
+                assertThat(events.values()).extracting(event -> ((Number)event.after().get("id")).intValue()).containsExactly(1,2);
                 for(String start:List.of("earliest",Instant.ofEpochMilli(2).toString(),"latest")) {
                     String id="reader-"+(start.equals("earliest")?"earliest":start.equals("latest")?"latest":"time");
                     var pipeline=new PipelineResource(id,null,List.of(SourceRef.spec("input",true)),null,null,null,new Settings(null,null,null,null,ReadMode.CDC_ONLY,start),null);

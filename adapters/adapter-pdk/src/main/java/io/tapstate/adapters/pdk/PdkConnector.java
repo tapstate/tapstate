@@ -70,10 +70,13 @@ final class PdkConnector implements AutoCloseable {
     private final Runnable closeNotes;
     private final ConnectorTrustMaterial trust;
     private final Runnable driveGuard;
+    private final String specification;
 
     private PdkConnector(String connectorId, ConnectorClassLoader loader, TapConnector connector,
                          ConnectorFunctions functions, TapConnectorContext context,
-                         TapCodecsRegistry codecs, String stateNamespace, String pipelineId, Runnable closeNotes, Runnable driveGuard, ConnectorTrustMaterial trust) {
+                         TapCodecsRegistry codecs, String stateNamespace, String pipelineId, Runnable closeNotes, Runnable driveGuard, ConnectorTrustMaterial trust,
+                         String specification) {
+        this.specification=specification;
         this.trust = trust;
         this.connectorId = connectorId;
         this.loader = loader;
@@ -262,12 +265,12 @@ final class PdkConnector implements AutoCloseable {
                     ? new InMemoryStateMap()
                     : new DurableStateMap(stateStore, ConnectorStateNamespace.GLOBAL));
             // A connector reads its capability alternatives off the context during the drive; the context
-            // leaves them null, so give it an empty set or the first read NPEs. Empty means no overrides:
-            // the connector uses its own default capability behaviour, which is the L1 intent.
+            // leaves them null, so install a context. Sink writers select declared DML alternatives
+            // on the actual drive thread; other operations retain the connector's defaults.
             context.setConnectorCapabilities(ConnectorCapabilities.create());
             PdkConnector result = new PdkConnector(
                     connectorId, loader, connector, functions, context, codecs, stateNamespace, pipelineId,
-                    () -> notesActive.set(false), driveGuard, material);
+                    () -> notesActive.set(false), driveGuard, material, ref.spec());
             try {
                 result.requireActive();
             } catch (RuntimeException | Error failure) {
@@ -469,6 +472,10 @@ final class PdkConnector implements AutoCloseable {
 
     TapConnectorContext context() {
         return context;
+    }
+
+    Map<String,String> writeAlternatives(io.tapstate.spi.sink.WriteMode mode) {
+        return PdkWritePolicies.select(connectorId,specification,mode);
     }
 
     /**
