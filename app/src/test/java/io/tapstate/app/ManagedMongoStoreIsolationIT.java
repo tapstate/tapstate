@@ -56,6 +56,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
+import java.util.LinkedHashMap;
 import java.util.HexFormat;
 import java.util.Map;
 import java.util.Set;
@@ -1304,6 +1305,114 @@ class ManagedMongoStoreIsolationIT {
         org.springframework.test.util.ReflectionTestUtils.setField(configuration, "bindings", bindings);
     }
 
+    @Test void aDisconnectedCloudSetupCallerCannotCloseItsRetainedNativeCandidate() throws Exception {
+        String suffix=UUID.randomUUID().toString().replace("-","");
+        String configDb="disconnect_config_"+suffix,cacheDb="disconnect_cache_"+suffix,masterDb="disconnect_master_"+suffix;
+        String configUser="disconnect_config_"+suffix,customerUser="disconnect_customer_"+suffix;
+        String cluster="disconnect-"+suffix; var sdk=new RecoverySdk(cluster);
+        Path trace=work.resolve("disconnect-target-tests"),seeds=Files.createDirectory(work.resolve("disconnect-setup-seeds"));
+        Path artifact=io.tapstate.adapters.pdk.SyntheticSinkJars.registeredStorageProbe(work.resolve("disconnect-probe"),trace,"mongodb-atlas","mongodb://");
+        Files.copy(artifact,seeds.resolve("mongodb-atlas.jar"));
+        var paused=new java.util.concurrent.CountDownLatch(1); var publish=new java.util.concurrent.CountDownLatch(1);
+        var childRef=new AtomicReference<ConfigurableApplicationContext>(); var ownerRef=new AtomicReference<NativeBusinessContext>();
+        var assemblies=new java.util.concurrent.atomic.AtomicInteger(); var response=new DisconnectedResponse();
+        try (MongoClient admin=MongoClients.create(uri("root","admin"))) {
+            createUser(admin,configUser,List.of(configDb)); createUser(admin,customerUser,List.of(cacheDb,masterDb));
+            var settings=new io.tapstate.adapters.mongostore.MongoConnectionSettings(uri(configUser,configDb),null,Duration.ofSeconds(5));
+            try (var ignored=io.tapstate.adapters.mongostore.MongoConfigurationBootstrap.prepare(settings,cluster,"installation","setup",1)) { }
+            try (var application=cloudRecoveryRoot(settings.uri(),sdk,CloudConnectorTestInputs.seedDirectory(),seeds,context -> {
+                var factory=new org.springframework.beans.factory.support.RootBeanDefinition(StorageBusinessFactory.class,
+                        () -> (StorageBusinessFactory)bound -> {
+                            assemblies.incrementAndGet(); var owner=new NativeBusinessContext(context.getBean(StorageRoot.class),bound,context);
+                            ownerRef.set(owner); return owner;
+                        }); factory.setPrimary(true);
+                var registry=(org.springframework.beans.factory.support.BeanDefinitionRegistry)context.getBeanFactory();
+                registry.registerBeanDefinition("observedNativeSetupFactory",factory);
+                registry.registerBeanDefinition("disconnectResponseProbe",new org.springframework.beans.factory.support.RootBeanDefinition(
+                        org.springframework.boot.web.servlet.FilterRegistrationBean.class,() -> new org.springframework.boot.web.servlet.FilterRegistrationBean<>(response)));
+                context.addApplicationListener((org.springframework.context.ApplicationListener<org.springframework.context.event.ContextRefreshedEvent>)event -> {
+                    if (event.getApplicationContext() instanceof ConfigurableApplicationContext child && child.getParent()==context
+                            && child.containsLocalBean("nativeBusinessContext")) {
+                        childRef.set(child); paused.countDown();
+                        try { if (!publish.await(60,java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError("the test did not release its native candidate"); }
+                        catch (InterruptedException failure) { Thread.currentThread().interrupt(); throw new AssertionError(failure); }
+                    }
+                });
+            })) {
+                String temporary=exchangeCookie(application,"old"); var root=application.getBean(StorageRoot.class);
+                var original=root.runtime().requireConfiguration().setupStates().load().scope();
+                var candidate=Map.of("cache",Map.of("kind","ATLAS","uri",uri(customerUser,cacheDb)+"&tls=true&authMechanism=SCRAM-SHA-256","database",cacheDb,"caPem",TLS.ca()),
+                        "master",Map.of("kind","ATLAS","uri",uri(customerUser,masterDb)+"&tls=true&authMechanism=SCRAM-SHA-256","database",masterDb,"caPem",TLS.ca()));
+                var stamps=new LinkedHashMap<String,Object>();
+                for (var layer:io.tapstate.control.core.StorageSetupService.Layer.values()) {
+                    var tested=cloudPost(application,temporary,"/api/storage/test",Map.of("operationId",original.operationId(),"generation",original.generation(),
+                            "candidate",candidate,"layer",layer.name())); stamps.put(layer.name(),tested.get("testStamp"));
+                }
+                var request=Map.<String,Object>of("operationId",original.operationId(),"generation",original.generation(),"candidate",candidate,"testStamps",stamps);
+                int port=((org.springframework.boot.web.server.context.WebServerApplicationContext)application).getWebServer().getPort();
+                byte[] body=io.tapstate.core.common.JsonWriter.write(request).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                try {
+                    try (var socket=new java.net.Socket("127.0.0.1",port)) {
+                        socket.setSoLinger(true,0);
+                        String headers="POST /api/storage/setup/commit HTTP/1.1\r\nHost: 127.0.0.1:"+port+"\r\nOrigin: http://127.0.0.1:"+port
+                                +"\r\nCookie: "+temporary+"\r\nContent-Type: application/json\r\nContent-Length: "+body.length+"\r\nConnection: close\r\n\r\n";
+                        socket.getOutputStream().write(headers.getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+                        socket.getOutputStream().write(body); socket.getOutputStream().flush();
+                        assertThat(paused.await(60,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                        assertThat(assemblies.get()).isEqualTo(1);
+                        assertThat(admin.getDatabase(configDb).getCollection("storage_setup").find().first()).containsEntry("phase","COMPLETE");
+                    }
+                    var child=childRef.get(); var member=child.getBean(com.hazelcast.core.HazelcastInstance.class);
+                    assertThat(child.isActive()).isTrue(); assertThat(member.getLifecycleService().isRunning()).isTrue();
+                    publish.countDown();
+                    assertThat(response.finished.await(60,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                    assertThat(response.failure.get()).as("the original HTTP reply meets an actually reset client socket").isNotNull();
+                    org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(20)).until(root.runtime()::businessStarted);
+                    assertThat(root.runtime().business()).contains(ownerRef.get());
+                    assertThat(child.isActive()).isTrue(); assertThat(member.getLifecycleService().isRunning()).isTrue();
+                    assertCloudStatus(application,temporary,401);
+                    String fresh=exchangeCookie(application,"fresh");
+                    assertThat(cloudPost(application,fresh,"/api/storage/setup/commit",request)).containsEntry("setupPhase","COMPLETE");
+                    assertThat(cloudPost(application,fresh,"/api/storage/status",Map.of())).containsEntry("businessPhase","READY");
+                    assertThat(assemblies.get()).isEqualTo(1); assertThat(root.runtime().business()).contains(ownerRef.get());
+                    String sources=rootClient(application).get().uri("/api/sources").header("Cookie",fresh).retrieve().body(String.class);
+                    assertThat(sources).contains("atlas-store").doesNotContain(PASSWORD,"BEGIN CERTIFICATE");
+                    assertThat(admin.getDatabase(configDb).getCollection("sources").countDocuments()).isOne();
+                    assertThat(admin.getDatabase(configDb).getCollection("storage_binding").countDocuments()).isOne();
+                    assertThat(Files.readAllLines(trace)).hasSize(2);
+                } finally { publish.countDown(); }
+            } finally { publish.countDown(); }
+        }
+    }
+
+    private static final class DisconnectedResponse implements jakarta.servlet.Filter {
+        final java.util.concurrent.CountDownLatch finished=new java.util.concurrent.CountDownLatch(1);
+        final AtomicReference<java.io.IOException> failure=new AtomicReference<>();
+        private final java.util.concurrent.atomic.AtomicBoolean first=new java.util.concurrent.atomic.AtomicBoolean(true);
+        @Override public void doFilter(jakarta.servlet.ServletRequest request,jakarta.servlet.ServletResponse response,jakarta.servlet.FilterChain chain)
+                throws java.io.IOException,jakarta.servlet.ServletException {
+            if (!(request instanceof jakarta.servlet.http.HttpServletRequest http) || !http.getRequestURI().equals("/api/storage/setup/commit")
+                    || !first.compareAndSet(true,false)) { chain.doFilter(request,response); return; }
+            var wrapped=new jakarta.servlet.http.HttpServletResponseWrapper((jakarta.servlet.http.HttpServletResponse)response) {
+                private jakarta.servlet.ServletOutputStream observed;
+                @Override public jakarta.servlet.ServletOutputStream getOutputStream() throws java.io.IOException {
+                    if (observed!=null) return observed; var output=super.getOutputStream();
+                    observed=new jakarta.servlet.ServletOutputStream() {
+                        @Override public boolean isReady() { return output.isReady(); }
+                        @Override public void setWriteListener(jakarta.servlet.WriteListener listener) { output.setWriteListener(listener); }
+                        @Override public void write(int value) throws java.io.IOException { try { output.write(value); } catch (java.io.IOException error) { failure.compareAndSet(null,error); throw error; } }
+                        @Override public void write(byte[] value,int offset,int length) throws java.io.IOException { try { output.write(value,offset,length); } catch (java.io.IOException error) { failure.compareAndSet(null,error); throw error; } }
+                        @Override public void flush() throws java.io.IOException { try { output.flush(); } catch (java.io.IOException error) { failure.compareAndSet(null,error); throw error; } }
+                        @Override public void close() throws java.io.IOException { try { output.close(); } catch (java.io.IOException error) { failure.compareAndSet(null,error); throw error; } }
+                    }; return observed;
+                }
+            };
+            try { chain.doFilter(request,wrapped); wrapped.flushBuffer(); }
+            catch (java.io.IOException error) { failure.compareAndSet(null,error); throw error; }
+            finally { finished.countDown(); }
+        }
+    }
+
     @ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(booleans = {true})
     void cloudFirstSetupContinuesInTheSameProcessAndReauthenticatesAfterCutover(boolean failAfterCompletion) throws Exception {
@@ -1447,6 +1556,10 @@ class ManagedMongoStoreIsolationIT {
         return cloudRecoveryRoot(configurationUri, sdk, seeds, null);
     }
     private ConfigurableApplicationContext cloudRecoveryRoot(String configurationUri, RecoverySdk sdk, Path seeds, Path setupFixtureSeeds) {
+        return cloudRecoveryRoot(configurationUri,sdk,seeds,setupFixtureSeeds,ignored -> {});
+    }
+    private ConfigurableApplicationContext cloudRecoveryRoot(String configurationUri, RecoverySdk sdk, Path seeds, Path setupFixtureSeeds,
+            java.util.function.Consumer<ConfigurableApplicationContext> fixtureInitialization) {
         return new SpringApplicationBuilder(Bootstrap.class, RecoverySdkConfiguration.class)
                 .environment(CloudFixtureEnvironment.isolated())
                 .initializers(context -> {
@@ -1460,6 +1573,7 @@ class ManagedMongoStoreIsolationIT {
                         ((org.springframework.beans.factory.support.BeanDefinitionRegistry)context.getBeanFactory())
                                 .registerBeanDefinition("fixtureInstalledConnectorTests", definition);
                     }
+                    fixtureInitialization.accept(context);
                 }).run(
                         "--server.address=127.0.0.1", "--server.port=0", "--logging.level.root=ERROR", "--SDK_STATUS_SENDER_ENABLED=false",
                         "--tapstate.cloud.base-url=https://cloud.example", "--tapstate.cloud.token=fixture-runtime-token",
