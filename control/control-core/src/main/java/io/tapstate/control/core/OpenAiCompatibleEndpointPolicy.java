@@ -17,7 +17,7 @@ final class OpenAiCompatibleEndpointPolicy {
 
     static String normalizedBaseUrl(String baseUrl) {
         String value = baseUrl == null || baseUrl.isBlank() ? DEFAULT_BASE_URL : baseUrl.trim();
-        value = value.replaceAll("/+$", "");
+        value = stripTrailingSlashes(value);
         URI uri;
         try {
             uri = URI.create(value);
@@ -30,9 +30,15 @@ final class OpenAiCompatibleEndpointPolicy {
                 || uri.getRawFragment() != null || uri.getPort() == 0 || uri.getPort() > 65535) {
             throw malformed();
         }
-        String path = uri.getRawPath() == null ? "" : uri.getRawPath().replaceAll("/+$", "");
+        String path = uri.getRawPath() == null ? "" : stripTrailingSlashes(uri.getRawPath());
         if (path.isEmpty()) path = "/v1";
         return "https://" + uri.getRawAuthority() + path;
+    }
+
+    private static String stripTrailingSlashes(String value) {
+        int end = value.length();
+        while (end > 0 && value.charAt(end - 1) == '/') end--;
+        return value.substring(0, end);
     }
 
     static URI requestUri(String baseUrl) {
