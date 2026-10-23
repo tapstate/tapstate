@@ -1,0 +1,576 @@
+#!/usr/bin/env python3
+"""Bounded trigger policy controls with real original Git/ZIP readback."""
+import copy
+import hashlib
+import importlib.util
+import json
+import subprocess
+import sys
+from unittest.mock import patch
+sys.dont_write_bytecode = True
+from pathlib import Path
+
+
+def module(name, filename):
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name(filename))
+    value = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(value)
+    return value
+
+
+m = module('contract', '_ci-trigger-contract.py')
+fixture = module('fixture', '_ci-archive-inputs-smoke.py')
+count = 0
+
+
+def check(value, message):
+    global count
+    assert value, message
+    count += 1
+
+
+def unsupported(call):
+    try:
+        call()
+    except m.Unsupported:
+        check(True, 'unsupported policy is unknown')
+    else:
+        raise AssertionError('unsupported policy was evaluated')
+
+
+def workflow(options='', guard=''):
+    return 'name: Fixture\non:\n  pull_request:\n' + options + '\njobs:\n  test:\n' + guard + '    steps: []\n'
+
+
+def fact(options='', guard=''):
+    return m.basis_reader.workflow_fact(workflow(options, guard).encode())
+
+
+check(m.trigger(fact(), 'synchronize', 'main', []), 'default ordinary activity applies')
+check(not m.trigger(fact(), 'labeled', 'main', []), 'default does not invent a labeled activity')
+check(not m.trigger(fact('    types: [labeled]\n'), 'synchronize', 'main', []), 'explicit activity excludes synchronize')
+check(m.trigger(fact('    branches:\n      - main\n    paths:\n      - "src/**"\n'), 'opened', 'main', ['src/a.java']), 'branch and path filters both match')
+check(not m.trigger(fact('    branches: [release]\n    paths: ["src/**"]\n'), 'opened', 'main', ['src/a.java']), 'branch mismatch is not applicable')
+check(not m.trigger(fact('    paths: ["src/**"]\n'), 'opened', 'main', ['docs/a.md']), 'unmatched path is not applicable')
+check(not m.trigger(fact('    paths: ["src/**"]\n'), 'opened', 'main', []), 'empty diff does not match a path filter')
+check(not m.included(['src/**', '!src/private/**'], 'src/private/a.java'), 'negative pattern excludes after positive')
+check(m.included(['src/**', '!src/private/**', 'src/private/a.java'], 'src/private/a.java'), 'later positive includes again')
+for text in ['    paths: ["**/*.java"]\n', '    paths: &paths ["src/**"]\n', '    paths: []\n', '    tags: [main]\n', '    paths: ["src/**"]\n    paths-ignore: ["docs/**"]\n']:
+    unsupported(lambda: m.trigger(fact(text), 'opened', 'main', ['src/a.java']))
+unsupported(lambda: m.trigger(m.basis_reader.workflow_fact(b'on: [pull_request]\njobs: {}\n'), 'opened', 'main', []))
+unsupported(lambda: m.trigger(fact('    paths: ["src/**"]\n'), 'opened', 'main', None))
+labels = {'snapshot': 'captured', 'label_ascii_case_complete': True, 'label_ascii_lower_sha256': []}
+guard = fact(guard="    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'upgrade-lane')\n")['job_guard_blocks'][0]
+check(m.guard_fact(guard, labels)['value'] is False, 'original empty labels do not enable a conditional job')
+labels['label_ascii_lower_sha256'] = [hashlib.sha256(b'upgrade-lane').hexdigest()]
+check(m.guard_fact(guard, labels)['value'] is True, 'original ASCII membership enables a conditional job')
+unsupported(lambda: m.guard_fact(guard, {'snapshot': 'unknown'}))
+unsupported(lambda: m.guard_fact(fact(guard="    if: needs.other.result == 'success'\n")['job_guard_blocks'][0], labels))
+check(m.guard_fact(fact(guard='    if: ${{ always() }}\n')['job_guard_blocks'][0], labels)['predicate'] == 'native-result-required', 'lifecycle predicate never becomes a fabricated result')
+
+
+def seed(context):
+    event = context['event']
+    event['repository_default_branch'] = {'snapshot': 'captured', 'name': 'main'}
+    event['pull_request'] = {'number': 7, 'action': 'synchronize', 'head_sha': context['anchor'],
+        'base_sha': context['base'], 'head_ref': 'ws/fixture', 'base_ref': 'main',
+        'head_repository': 'example/project', 'base_repository': 'example/project',
+        'labels_snapshot_complete': True, 'label_name_sha256': [], 'label_ascii_lower_sha256': [],
+        'label_ascii_case_complete': True}
+    event['workflow_source'] = {'snapshot': 'captured',
+        'workflow_ref': 'example/project/.github/workflows/ci.yml@refs/pull/7/merge',
+        'workflow_sha': event['checkout_sha'], 'workflow_path': '.github/workflows/ci.yml',
+        'job': 'shard-plan', 'source_bytes_verified': False}
+    context['artifacts']['ci-shard-plan']['ci-event-inputs.json'] = copy.deepcopy(event)
+    context['reseal']()
+    request = {'schema': 1, 'type': 'trigger-contract-request',
+               'source': context['save']('trigger-contract-source.json', context['source_request'])}
+    return request
+
+
+def controls(context):
+    request = seed(context)
+    event = context['event']
+
+    def project():
+        return m.project(m.g.References(context['evidence']), context['work'], request)
+
+    answer = project()
+    check(answer['source_policy_eligible'] and not answer['unknown'], 'bound original source policy has no unsupported facts')
+    check(answer['ordinary_applicable_workflows'] == ['.github/workflows/ci.yml', '.github/workflows/conditional.yml', '.github/workflows/label.yml'], 'policy derives workflow set from actual source and Git diff')
+    check(answer['changed_paths']['path_count'] == 1 and answer['changed_paths']['status'] == 'source-derived', 'diff uses original base/head objects')
+    check(answer['workflows']['.github/workflows/label.yml']['job_guards'][0]['value'] is False, 'original label skip remains visible')
+    check(not answer['R_G_complete'] and not answer['backend_applicability_observed'] and not answer['first_complete_PR_sample'] and not answer['performance_accepted'], 'source policy does not certify backend or first sample')
+    scope = answer['scope']
+    pr = {'number': 7, 'state': 'open', 'draft': True, 'merge_commit_sha': answer['checkout']['sha'],
+        'head': {'sha': scope['head_sha'], 'ref': scope['branch'], 'repo': {'full_name': scope['repository']}},
+        'base': {'sha': scope['base_sha'], 'ref': 'main', 'repo': {'full_name': scope['repository']}}}
+    association = {'number': 7, 'head': {'sha': scope['head_sha']}, 'base': {'sha': scope['base_sha']}}
+    runs = [{'id': number + 42, 'path': path, 'run_attempt': 1, 'status': 'completed', 'conclusion': 'success',
+        'head_sha': scope['head_sha'], 'head_branch': scope['branch'], 'event': 'pull_request',
+        'repository': {'full_name': scope['repository']}, 'pull_requests': [association],
+        'created_at': '2026-01-01T10:00:00Z', 'updated_at': '2026-01-01T10:01:00Z'}
+        for number, path in enumerate(answer['ordinary_applicable_workflows'])]
+    jobs = {run['id']: [] for run in runs}
+    attempt_views = {}
+
+    def api(endpoint):
+        if endpoint.endswith('/pulls/7'):
+            return copy.deepcopy(pr)
+        if '/git/commits/' in endpoint:
+            return {'sha': pr['merge_commit_sha'], 'parents': [{'sha': scope['base_sha']}, {'sha': scope['head_sha']}]}
+        if '/actions/runs?' in endpoint:
+            return {'total_count': len(runs), 'workflow_runs': copy.deepcopy(runs)}
+        if '/check-runs?' in endpoint:
+            commit = endpoint.split('/commits/', 1)[1].split('/', 1)[0]
+            offset = 100 if commit == scope['head_sha'] else 200
+            rows = [{'id': offset + number, 'name': name, 'head_sha': commit, 'status': 'completed',
+                'conclusion': 'success', 'pull_requests': [association]} for number, name in enumerate(answer['minimum_required_checks'])]
+            return {'total_count': len(rows), 'check_runs': rows}
+        if '/attempts/1/jobs?' in endpoint:
+            identity = int(endpoint.split('/actions/runs/', 1)[1].split('/', 1)[0])
+            return {'total_count': len(jobs[identity]), 'jobs': copy.deepcopy(jobs[identity])}
+        if '/attempts/1' in endpoint:
+            identity = int(endpoint.split('/actions/runs/', 1)[1].split('/', 1)[0])
+            return copy.deepcopy(attempt_views.get(identity, next(run for run in runs if run['id'] == identity)))
+        raise AssertionError('unexpected API: ' + endpoint)
+
+    check(m.policy_head_status(answer, api)['can_advance_after_archiving'], 'fresh head inventory agrees with original source policy')
+    unknown = copy.deepcopy(answer); unknown['source_policy_eligible'] = False; unknown['unknown'] = ['target source unknown']
+    check(not m.policy_head_status(unknown, api)['can_advance_after_archiving'], 'source unknown blocks advancing even with terminal runs')
+    missing = runs.pop()
+    check(not m.policy_head_status(answer, api)['can_advance_after_archiving'], 'missing applicable source workflow cannot advance')
+    runs.append(missing)
+    runs[0]['status'] = 'queued'
+    check(not m.policy_head_status(answer, api)['can_advance_after_archiving'], 'queued workflow cannot advance')
+    runs[0]['status'] = 'completed'
+    changed = copy.deepcopy(answer); changed['checkout']['sha'] = '0' * 40
+    try:
+        m.policy_head_status(changed, api)
+    except ValueError:
+        check(True, 'foreign merge source rejected')
+    else:
+        raise AssertionError('foreign merge accepted')
+    archives = []
+    for run in runs:
+        prefix = 'transition/' + str(run['id']) + '/'
+        context['save'](prefix + 'run.json', run)
+        context['save'](prefix + 'attempt-1/run.json', run)
+        context['save'](prefix + 'attempt-1/jobs-1.json', {'total_count': 0, 'jobs': []})
+        context['save'](prefix + 'attempt-1/logs.zip', fixture.zipped({'setup.log': b'original offline native log fixture'}))
+        directory = context['evidence'] / prefix
+        m.g.receipt.manifest(directory, {'archive_root': str(directory), 'archive_complete': True,
+            'purpose': 'offline raw workflow evidence', 'gaps': []})
+        archives.append({'run_id': run['id'], 'receipt': {'path': prefix + 'receipt.json',
+            'sha256': m.g.checksum((directory / 'receipt.json').read_bytes())}})
+    pages = {commit: [context['save']('transition/checks-' + commit + '.json',
+        api('repos/example/project/commits/' + commit + '/check-runs?filter=all'))]
+        for commit in [scope['head_sha'], answer['checkout']['sha']]}
+    transition = {'schema': 1, 'type': 'serial-transition-request',
+        'scope': {name: scope[name] for name in ['repository', 'pr', 'branch', 'head_sha']},
+        'expected_base_sha': scope['base_sha'], 'contract': {'applicable_workflows': answer['ordinary_applicable_workflows'],
+        'required_checks': answer['minimum_required_checks']}, 'archives': archives, 'check_pages': pages,
+        'trigger_policy': {'request': context['save']('transition-trigger-request.json', request),
+        'source_root': str(context['work'])}}
+    result = m.basis_reader.source.variants.transition(m.g.References(context['evidence']), transition, api)
+    check(result['source_trigger_policy']['trigger_policy_source_bound'] and result['archive_readback_verified'],
+          'source-aware transition independently replays policy and raw archives')
+    serial = m.g.module('serial_fixture_readback', '_ci-serial-readback.py')
+    reference = context['save']('serial-request.json', transition)
+    captured = serial.capture(m.g.References(context['evidence']), reference, api)
+    compact = len(m.g.canonical(captured))
+    pretty = len((json.dumps(captured, indent=2, sort_keys=True) + '\n').encode())
+    check(pretty > compact, 'serialized receipt includes actual indentation cost')
+    with patch.object(serial, 'MAX_TRACE', (compact + pretty) // 2):
+        try:
+            serial.capture(m.g.References(context['evidence']), reference, api)
+        except ValueError as error:
+            check('serialized payload exceeds' in str(error), 'actual persisted size is bounded before writing')
+        else:
+            raise AssertionError('accepted indented serial receipt beyond its reader bound')
+    def passive(value=captured):
+        with patch.object(serial.v.groups.receipt, 'api', side_effect=AssertionError('passive consumer called GitHub')):
+            return serial.readback(m.g.References(context['evidence']), value)
+    check(passive() == captured['readback'] and captured['readback']['snapshot'] == result['snapshot'], 'passive trace independently reproduces source policy, original jobs/logs and terminal snapshot')
+    def refused(value, reason):
+        try:
+            passive(value)
+        except (ValueError, KeyError, TypeError, OSError) as error:
+            check(reason in str(error), 'specific serial readback rejection: ' + str(error))
+        else:
+            raise AssertionError('accepted serial capture mutation: ' + reason)
+    changed = copy.deepcopy(captured); changed['api_trace'].pop()
+    refused(changed, 'trace is incomplete')
+    changed = copy.deepcopy(captured); changed['api_trace'].append(copy.deepcopy(changed['api_trace'][0]))
+    refused(changed, 'unused responses')
+    changed = copy.deepcopy(captured); changed['api_trace'][0]['endpoint'] += '-foreign'
+    refused(changed, 'endpoint/order differs')
+    changed = copy.deepcopy(captured); changed['readback']['snapshot']['merge_sha'] = 'f' * 40
+    refused(changed, 'differs from independent replay')
+    changed = copy.deepcopy(captured); changed['input_files'].clear()
+    refused(changed, 'differs from independent replay')
+    changed = copy.deepcopy(captured); changed['request']['sha256'] = 'f' * 64
+    refused(changed, 'referenced input hash differs')
+    changed = copy.deepcopy(captured); changed['backend_response_attestation_proven'] = True
+    refused(changed, 'unsupported proof')
+    changed = copy.deepcopy(transition); changed.pop('trigger_policy')
+    try:
+        serial.capture(m.g.References(context['evidence']), context['save']('no-source-policy.json', changed), api)
+    except ValueError as error:
+        check('requires source-derived trigger policy' in str(error), 'unbound terminal declarations cannot be captured')
+    else:
+        raise AssertionError('captured an unbound serial transition')
+    capture_ref = context['save']('serial-capture.json', captured)
+    group_scope = {key: scope[key] for key in ('repository', 'pr', 'branch')}
+    identity = {**group_scope, 'head_sha': scope['head_sha'], 'base_sha': scope['base_sha'],
+                'checkout_sha': answer['checkout']['sha'], 'run_id': runs[0]['id']}
+    joined = serial.bind(m.g.References(context['evidence']), capture_ref, group_scope,
+                         {'identity': identity}, archives[0]['receipt'])
+    check(joined['recorded_transition_replayed'] and not joined['backend_response_attestation_proven'],
+          'group identity binds exact original receipt to independently replayed serial evidence')
+    check(joined['workflow_created_at']=='2026-01-01T10:00:00Z'
+          and joined['workflow_terminal_observed_at']=='2026-01-01T10:01:00Z'
+          and len(joined['workflow_intervals'])==3, 'all applicable archived workflows contribute to the interval')
+    # Keep the raw archive and live boundary responses consistent while a non-CI workflow finishes later.
+    late = runs[1]
+    late['updated_at']='2026-01-01T10:03:00Z'
+    def reseal_timeline():
+        for run in runs:
+            prefix='transition/'+str(run['id'])+'/'
+            context['save'](prefix+'run.json',run)
+            context['save'](prefix+'attempt-1/run.json',attempt_views.get(run['id'],run))
+            context['save'](prefix+'attempt-1/jobs-1.json',{'total_count':len(jobs[run['id']]),'jobs':jobs[run['id']]})
+            directory=context['evidence']/prefix
+            m.g.receipt.manifest(directory, {'archive_root':str(directory),'archive_complete':True,
+                'purpose':'offline raw workflow evidence','gaps':[]})
+            next(entry for entry in archives if entry['run_id']==run['id'])['receipt']['sha256']=m.g.checksum((directory/'receipt.json').read_bytes())
+        request_ref=context['save']('serial-request.json',transition)
+        return serial.capture(m.g.References(context['evidence']),request_ref,api)
+    late_capture=reseal_timeline()
+    late_ref=context['save']('serial-late-workflow.json',late_capture)
+    late_joined=serial.bind(m.g.References(context['evidence']),late_ref,group_scope,{'identity':identity},archives[0]['receipt'])
+    check(late_joined['workflow_terminal_observed_at']=='2026-01-01T10:03:00Z',
+          'a later non-CI workflow controls the complete group interval')
+    # A resealed, internally valid archive cannot disagree with the original recorded API timeline.
+    for filename in ['run.json','attempt-1/run.json']:
+        prefix='transition/'+str(late['id'])+'/'
+        changed=copy.deepcopy(late);changed['updated_at']='2026-01-01T10:02:00Z'
+        context['save'](prefix+filename,changed)
+        directory=context['evidence']/prefix
+        m.g.receipt.manifest(directory,{'archive_root':str(directory),'archive_complete':True,'gaps':[]})
+        # Re-capture the transition: legacy identity/status checks accept it; strict binding must reject its times.
+        next(entry for entry in archives if entry['run_id']==late['id'])['receipt']['sha256']=m.g.checksum((directory/'receipt.json').read_bytes())
+        candidate=serial.capture(m.g.References(context['evidence']),context['save']('serial-request.json',transition),api)
+        candidate_ref=context['save']('serial-time-mismatch.json',candidate)
+        try:
+            serial.bind(m.g.References(context['evidence']),candidate_ref,group_scope,{'identity':identity},archives[0]['receipt'])
+        except ValueError as error:
+            check('timeline differs from recorded original API' in str(error),'raw/recorded workflow time contradiction rejected')
+        else:raise AssertionError('accepted raw/recorded workflow time contradiction')
+        context['save'](prefix+filename,late)
+    late['updated_at']='2026-01-01T10:01:00Z'
+    run = runs[0]
+    jobs[run['id']] = [{'id':999,'run_id':run['id'],'run_attempt':1,'name':'fixture','status':'completed',
+        'conclusion':'success','started_at':'2026-01-01T10:00:10Z','completed_at':'2026-01-01T10:00:30Z','steps':[]}]
+    valid=reseal_timeline()
+    valid_ref=context['save']('serial-real-job.json',valid)
+    check(serial.bind(m.g.References(context['evidence']),valid_ref,group_scope,{'identity':identity},archives[0]['receipt'])['workflow_terminal_observed_at']=='2026-01-01T10:01:00Z',
+          'bound original jobs fit every completed workflow view')
+    # Both API views are recorded faithfully, but the root view contradicts its own job completion.
+    attempt_views[run['id']]=dict(run,updated_at='2026-01-01T10:03:00Z')
+    jobs[run['id']][0]['completed_at']='2026-01-01T10:02:00Z'
+    contradictory=reseal_timeline()
+    contradictory_ref=context['save']('serial-contradictory-completed-views.json',contradictory)
+    try:
+        serial.bind(m.g.References(context['evidence']),contradictory_ref,group_scope,{'identity':identity},archives[0]['receipt'])
+    except ValueError as error:
+        check('job timeline is outside its workflow interval' in str(error),'each completed workflow view must cover its own jobs')
+    else:raise AssertionError('accepted contradictory completed workflow views')
+    jobs[run['id']][0]['completed_at']='2026-01-01T10:00:30Z'
+    valid=reseal_timeline()
+    valid_ref=context['save']('serial-later-metadata-view.json',valid)
+    check(serial.bind(m.g.References(context['evidence']),valid_ref,group_scope,{'identity':identity},archives[0]['receipt'])['workflow_terminal_observed_at']=='2026-01-01T10:03:00Z',
+          'a later metadata update remains a conservative bound when both completed views cover every job')
+    attempt_views.clear()
+    baseline_run=copy.deepcopy(run);baseline_job=copy.deepcopy(jobs[run['id']][0])
+    for label,change,reason in [
+            ('missing-run-time',lambda:run.update(created_at=None),'workflow timeline timestamp is missing'),
+            ('reversed-run',lambda:run.update(updated_at='2026-01-01T09:59:00Z'),'workflow timeline is reversed'),
+            ('missing-job-time',lambda:jobs[run['id']][0].update(started_at=None),'job timeline timestamp is missing'),
+            ('reversed-job',lambda:jobs[run['id']][0].update(started_at='2026-01-01T10:00:40Z'),'job timeline is outside its workflow interval')]:
+        change();candidate=reseal_timeline();candidate_ref=context['save']('serial-'+label+'.json',candidate)
+        try:serial.bind(m.g.References(context['evidence']),candidate_ref,group_scope,{'identity':identity},archives[0]['receipt'])
+        except ValueError as error:check(reason in str(error),'specific invalid workflow/job timeline rejection: '+str(error))
+        else:raise AssertionError('accepted '+label)
+        run.clear();run.update(copy.deepcopy(baseline_run));jobs[run['id']][0]=copy.deepcopy(baseline_job)
+    jobs[run['id']]=[]
+    captured=reseal_timeline()
+    capture_ref=context['save']('serial-capture.json',captured)
+    for changed_identity, archive_ref, reason in [
+            (dict(identity, head_sha='f' * 40), archives[0]['receipt'], 'another variant scope'),
+            (dict(identity, checkout_sha='f' * 40), archives[0]['receipt'], 'another variant scope'),
+            (dict(identity, run_id=999999), archives[0]['receipt'], 'another archive or rerun'),
+            (identity, archives[-1]['receipt'], 'another archive or rerun')]:
+        try:
+            serial.bind(m.g.References(context['evidence']), capture_ref, group_scope,
+                        {'identity': changed_identity}, archive_ref)
+        except ValueError as error:
+            check(reason in str(error), 'serial group binding refuses wrong head/tree/run/receipt: ' + str(error))
+        else:
+            raise AssertionError('accepted foreign serial group binding')
+    manifest = context['evidence'] / capture_ref['path']
+    output = context['evidence'] / 'serial-passive-cli.json'
+    command = ['bash', str(Path(__file__).with_name('ci-variants.sh')), 'readback-transition',
+               '--manifest', str(manifest), '--evidence-root', str(context['evidence']), '--output', str(output)]
+    cli = subprocess.run(command, capture_output=True, text=True)
+    check(cli.returncode == 0 and json.loads(output.read_bytes())['snapshot'] == result['snapshot'],
+          'actual passive serial CLI succeeds: ' + cli.stderr)
+    original_output = output.read_bytes()
+    cli = subprocess.run(command, capture_output=True, text=True)
+    check(cli.returncode != 0 and output.read_bytes() == original_output, 'passive serial output is exclusive')
+    missing = runs.pop()
+    changed = copy.deepcopy(transition)
+    changed['contract']['applicable_workflows'] = [run['path'] for run in runs]
+    check(m.g.head_status(changed['scope'], changed['contract'], api)['can_advance_after_archiving'],
+          'legacy declared terminal snapshot alone cannot detect an omitted source workflow')
+    try:
+        m.basis_reader.source.variants.transition(m.g.References(context['evidence']), changed, api)
+    except ValueError as error:
+        check('declared workflow set differs' in str(error), 'source-aware transition detects caller and API omission')
+    else:
+        raise AssertionError('source-aware transition accepted omitted workflow')
+    runs.append(missing)
+    original = copy.deepcopy(event)
+    event['workflow_source']['workflow_sha'] = context['base']
+    context['artifacts']['ci-shard-plan']['ci-event-inputs.json'] = copy.deepcopy(event)
+    context['reseal'](); request['source'] = context['save']('trigger-contract-source.json', context['source_request'])
+    check(not project()['source_policy_eligible'], 'separate workflow source cannot authorize a policy')
+    event.clear(); event.update(copy.deepcopy(original))
+    event['pull_request'].update(labels_snapshot_complete=False, label_name_sha256=None,
+        label_ascii_lower_sha256=None, label_ascii_case_complete=False)
+    context['artifacts']['ci-shard-plan']['ci-event-inputs.json'] = copy.deepcopy(event)
+    context['reseal'](); request['source'] = context['save']('trigger-contract-source.json', context['source_request'])
+    check(not project()['source_policy_eligible'], 'missing original labels leave conditional policy ineligible')
+
+
+fixture.run(controls, only_callback=True, base_source=True, workflow_sources={
+    'ci.yml': workflow('    branches: [main]\n', '    if: ${{ always() }}\n'),
+    'conditional.yml': workflow('    paths: [fixture.cfg]\n'),
+    'excluded.yml': workflow('    paths: ["docs/**"]\n'),
+    'labeled-only.yml': workflow('    types: [labeled]\n'),
+    'label.yml': workflow(guard="    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'upgrade-lane')\n"),
+})
+
+
+def target_controls(context):
+    request = seed(context)
+    answer = m.project(m.g.References(context['evidence']), context['work'], request)
+    target = answer['workflows']['.github/workflows/target.yml']
+    check(target['target_trigger'] == 'unknown', 'ordinary checkout cannot supply target workflow provenance')
+    check(not answer['source_policy_eligible'] and answer['unknown'], 'target unknown makes policy ineligible')
+    check(not answer['R_G_complete'] and not answer['performance_accepted'], 'target unknown never certifies complete evidence')
+
+
+fixture.run(target_controls, only_callback=True, workflow_sources={
+    'ci.yml': workflow('    branches: [main]\n'),
+    'target.yml': 'on:\n  pull_request_target:\n    types: [opened]\njobs:\n  target:\n    steps: []\n',
+})
+
+
+def quoted_controls(context):
+    request = seed(context)
+    answer = m.project(m.g.References(context['evidence']), context['work'], request)
+    check(not answer['source_policy_eligible'], 'partially parsed event maps remain ineligible')
+    for name in ['quoted-ordinary.yml', 'quoted-target.yml']:
+        check(answer['workflows']['.github/workflows/' + name]['ordinary_trigger'] == 'unknown',
+              'quoted event key never becomes an absent ordinary or target event')
+
+
+fixture.run(quoted_controls, only_callback=True, workflow_sources={
+    'ci.yml': workflow('    branches: [main]\n'),
+    'quoted-ordinary.yml': "on:\n  push:\n  'pull_request':\njobs:\n  ordinary:\n    steps: []\n",
+    'quoted-target.yml': 'on:\n  pull_request:\n  "pull_request_target":\njobs:\n  target:\n    steps: []\n',
+})
+
+
+def base_target_controls(context):
+    request = seed(context)
+    event = context['event']
+
+    def project():
+        return m.project(m.g.References(context['evidence']), context['work'], request)
+
+    def reseal():
+        context['artifacts']['ci-shard-plan']['ci-event-inputs.json'] = copy.deepcopy(event)
+        context['reseal']()
+        request['source'] = context['save']('trigger-contract-source.json', context['source_request'])
+
+    def reindex():
+        context['source_request']['archive'] = context['seal']()
+        request['source'] = context['save']('trigger-contract-source.json', context['source_request'])
+
+    answer = project()
+    check(answer['original_default_base_source_eligible'] and answer['source_policy_eligible'],
+          'independent original default/base bytes support bounded target nonapplicability')
+    for name in ['opened-target.yml', 'closed-target.yml']:
+        fact = answer['target_workflows']['.github/workflows/' + name]
+        check(fact['target_trigger'] is False and fact['source_commit'] == context['base']
+              and fact['backend_definition_used_verified'] is False, 'synchronize does not match original opened/closed target source')
+    check(not answer['R_G_complete'] and not answer['backend_applicability_observed'], 'base source never supplies complete backend proof')
+    original = copy.deepcopy(event)
+    for default in [{'snapshot': 'unknown'}, {'snapshot': 'captured', 'name': 'different'}]:
+        event['repository_default_branch'] = default; reseal()
+        check(not project()['source_policy_eligible'], 'unknown/different default branch cannot supply target policy')
+    event.clear(); event.update(copy.deepcopy(original))
+    event['pull_request']['action'] = 'opened'; reseal()
+    answer = project()
+    check(answer['target_workflows']['.github/workflows/opened-target.yml']['target_trigger'] is True
+          and not answer['source_policy_eligible'], 'actually applicable target retains unresolved membership/execution')
+    event.clear(); event.update(copy.deepcopy(original)); reseal()
+    base_commit = context['evidence'] / 'run/base-commit.json'
+    value = m.g.load(base_commit); original_commit = copy.deepcopy(value)
+    value['sha'] = context['anchor']; context['save']('run/base-commit.json', value); reindex()
+    try: project()
+    except ValueError as error: check('source commit/tree differs' in str(error), 'wrong original base commit rejects')
+    else: raise AssertionError('wrong base source accepted')
+    context['save']('run/base-commit.json', original_commit)
+    archive = context['evidence'] / 'run/base-source.tar'; raw = archive.read_bytes(); archive.unlink(); reindex()
+    try: project()
+    except ValueError as error: check('base source is incomplete' in str(error), 'partial original base source rejects')
+    else: raise AssertionError('partial base source accepted')
+    context['save']('run/base-source.tar', raw); reindex()
+    check(project()['source_policy_eligible'], 'restored original base data remains readable')
+
+
+fixture.run(base_target_controls, only_callback=True, base_source=True, workflow_sources={
+    'ci.yml': workflow('    branches: [main]\n'),
+    'opened-target.yml': 'on:\n  pull_request_target:\n    types: [opened]\njobs:\n  target:\n    steps: []\n',
+    'closed-target.yml': 'on:\n  pull_request_target:\n    types: [closed]\njobs:\n  target:\n    steps: []\n',
+})
+def missing_push_instance_controls(context):
+    request = seed(context)
+    policy = m.project(m.g.References(context['evidence']), context['work'], request)
+    check(policy['source_policy_eligible'], 'dual-event source remains eligible for its original PR')
+    scope = policy['scope']
+    association = {'number': 7, 'head': {'sha': scope['head_sha']}, 'base': {'sha': scope['base_sha']}}
+    pr = {'number': 7, 'state': 'open', 'draft': True, 'merge_commit_sha': policy['checkout']['sha'],
+          'head': {'sha': scope['head_sha'], 'ref': scope['branch'], 'repo': {'full_name': scope['repository']}},
+          'base': {'sha': scope['base_sha'], 'ref': 'main', 'repo': {'full_name': scope['repository']}}}
+    runs = [{'id': number + 42, 'path': path, 'run_attempt': 1, 'status': 'completed', 'conclusion': 'success',
+             'head_sha': scope['head_sha'], 'head_branch': scope['branch'], 'event': 'pull_request',
+             'repository': {'full_name': scope['repository']}, 'pull_requests': [association],
+             'created_at': '2026-01-01T10:00:00Z', 'updated_at': '2026-01-01T10:01:00Z'}
+            for number, path in enumerate(policy['ordinary_applicable_workflows'])]
+    push_runs, head_checks = [], []
+
+    def api(endpoint):
+        if endpoint.endswith('/pulls/7'):
+            return copy.deepcopy(pr)
+        if '/git/commits/' in endpoint:
+            return {'sha': pr['merge_commit_sha'], 'parents': [{'sha': scope['base_sha']}, {'sha': scope['head_sha']}]}
+        if '/actions/runs?' in endpoint:
+            rows = push_runs if 'event=push' in endpoint else runs
+            return {'total_count': len(rows), 'workflow_runs': copy.deepcopy(rows)}
+        if '/check-runs?' in endpoint:
+            commit = endpoint.split('/commits/', 1)[1].split('/', 1)[0]
+            rows = head_checks if commit == scope['head_sha'] else [
+                {'id': 700 + number, 'name': name, 'head_sha': commit, 'status': 'completed',
+                 'conclusion': 'success', 'pull_requests': [association]}
+                for number, name in enumerate(policy['minimum_required_checks'])]
+            return {'total_count': len(rows), 'check_runs': rows}
+        if '/attempts/1/jobs?' in endpoint:
+            return {'total_count': 0, 'jobs': []}
+        if endpoint.endswith('/attempts/1'):
+            identity = int(endpoint.split('/actions/runs/', 1)[1].split('/', 1)[0])
+            return copy.deepcopy(next(run for run in runs + push_runs if run['id'] == identity))
+        raise AssertionError('unexpected missing-push API: ' + endpoint)
+
+    check(not m.policy_head_status(policy, api)['can_advance_after_archiving'],
+          'missing branch push instance must not be hidden by its successful PR counterpart')
+    check(policy['head_push_source_sha'] == scope['head_sha']
+          and policy['head_push_applicable_workflows'] == ['.github/workflows/no-cjk.yml'],
+          'push membership is derived from original head source and its branch filter')
+    push_runs.append({'id': 44, 'path': '.github/workflows/no-cjk.yml', 'run_attempt': 1,
+        'status': 'completed', 'conclusion': 'success', 'head_sha': scope['head_sha'],
+        'head_branch': scope['branch'], 'event': 'push', 'repository': {'full_name': scope['repository']},
+        'pull_requests': [], 'check_suite_id': 8000,
+        'created_at': '2026-01-01T09:59:00Z', 'updated_at': '2026-01-01T10:02:00Z'})
+    head_checks.append({'id': 8001, 'name': 'no-cjk', 'head_sha': scope['head_sha'], 'status': 'completed',
+                        'conclusion': 'success', 'pull_requests': [], 'check_suite': {'id': 8000}})
+    status = m.policy_head_status(policy, api)
+    check(status['can_advance_after_archiving'] and len(status['runs']) == 2
+          and [run['id'] for run in status['head_push_runs']] == [44], 'PR and head push instances remain distinct')
+    push_runs[0]['status'] = 'queued'
+    check(not m.policy_head_status(policy, api)['can_advance_after_archiving'], 'queued push blocks a successful PR counterpart')
+    push_runs[0]['status'] = 'completed'
+    saved = head_checks.pop()
+    check(not m.policy_head_status(policy, api)['can_advance_after_archiving'], 'absent push check cannot borrow the PR check name')
+    head_checks.append(saved)
+    saved['check_suite']['id'] = 8002
+    check(not m.policy_head_status(policy, api)['can_advance_after_archiving'], 'foreign check suite cannot satisfy the push instance')
+    saved['check_suite']['id'] = 8000
+    for key, value in [('head_branch', 'ws/foreign'), ('head_sha', 'f' * 40), ('event', 'workflow_dispatch')]:
+        old = push_runs[0][key]
+        push_runs[0][key] = value
+        try: m.policy_head_status(policy, api)
+        except ValueError as error: check('foreign workflow run' in str(error), 'wrong push scope is rejected')
+        else: raise AssertionError('foreign push scope accepted')
+        push_runs[0][key] = old
+
+    archives = []
+    for run in runs + push_runs:
+        prefix = 'dual-transition/' + str(run['id']) + '/'
+        context['save'](prefix + 'run.json', run)
+        context['save'](prefix + 'attempt-1/run.json', run)
+        context['save'](prefix + 'attempt-1/jobs-1.json', {'total_count': 0, 'jobs': []})
+        context['save'](prefix + 'attempt-1/logs.zip', fixture.zipped({'setup.log': b'original event-specific workflow log'}))
+        directory = context['evidence'] / prefix
+        m.g.receipt.manifest(directory, {'archive_root': str(directory), 'archive_complete': True,
+            'purpose': 'offline raw workflow evidence', 'gaps': []})
+        archives.append({'run_id': run['id'], 'receipt': {'path': prefix + 'receipt.json',
+                         'sha256': m.g.checksum((directory / 'receipt.json').read_bytes())}})
+    pages = {commit: [context['save']('dual-transition/checks-' + commit + '.json',
+             api('repos/example/project/commits/' + commit + '/check-runs?filter=all'))]
+             for commit in [scope['head_sha'], policy['checkout']['sha']]}
+    transition = {'schema': 1, 'type': 'serial-transition-request',
+        'scope': {name: scope[name] for name in ['repository', 'pr', 'branch', 'head_sha']},
+        'expected_base_sha': scope['base_sha'], 'contract': {'applicable_workflows': policy['ordinary_applicable_workflows'],
+        'required_checks': policy['minimum_required_checks']}, 'archives': archives, 'check_pages': pages,
+        'trigger_policy': {'request': context['save']('dual-transition/policy.json', request),
+                           'source_root': str(context['work'])}}
+    variants = m.basis_reader.source.variants
+    result = variants.transition(m.g.References(context['evidence']), transition, api)
+    check([row['event'] for row in result['archives']] == ['pull_request', 'pull_request', 'push'],
+          'original raw archives retain both event types without inventing a PR association for push')
+    missing = copy.deepcopy(transition)
+    missing['archives'] = [row for row in missing['archives'] if row['run_id'] != 44]
+    try: variants.transition(m.g.References(context['evidence']), missing, api)
+    except ValueError as error: check('archive set differs' in str(error), 'missing push raw archive is rejected')
+    else: raise AssertionError('push archive omitted')
+    wrong = copy.deepcopy(transition)
+    raw = copy.deepcopy(api('repos/example/project/commits/' + scope['head_sha'] + '/check-runs?filter=all'))
+    raw['check_runs'][0]['check_suite']['id'] = 8002
+    wrong['check_pages'][scope['head_sha']] = [context['save']('dual-transition/wrong-suite.json', raw)]
+    try: variants.transition(m.g.References(context['evidence']), wrong, api)
+    except ValueError as error: check('push check suite differs' in str(error), 'raw push suite tampering is rejected')
+    else: raise AssertionError('raw push check suite tampering accepted')
+    serial = m.g.module('dual_serial_readback', '_ci-serial-readback.py')
+    reference = context['save']('dual-transition/request.json', transition)
+    captured = serial.capture(m.g.References(context['evidence']), reference, api)
+    serial_reference = context['save']('dual-transition/captured.json', captured)
+    variant = {'identity': {'head_sha': scope['head_sha'], 'base_sha': scope['base_sha'],
+                           'checkout_sha': policy['checkout']['sha'], 'run_id': runs[0]['id']}}
+    bound = serial.bind(m.g.References(context['evidence']), serial_reference,
+        {name: scope[name] for name in ['repository', 'pr', 'branch']}, variant, archives[0]['receipt'])
+    check(bound['workflow_created_at'] == '2026-01-01T10:00:00Z'
+          and bound['workflow_terminal_observed_at'] == '2026-01-01T10:01:00Z'
+          and bound['whole_wave_workflow_created_at'] == '2026-01-01T09:59:00Z'
+          and bound['whole_wave_workflow_terminal_observed_at'] == '2026-01-01T10:02:00Z',
+          'passive replay retains PR timing and separately reports the earlier and later push work')
+
+
+fixture.run(missing_push_instance_controls, only_callback=True, base_source=True, workflow_sources={
+    'ci.yml': workflow('    branches: [main]\n'),
+    'no-cjk.yml': 'on:\n  push:\n    branches: [main, "ws/**"]\n  pull_request:\n    branches: [main]\njobs:\n  no-cjk:\n    steps: []\n',
+})
+print('CI trigger contract controls passed:', count)

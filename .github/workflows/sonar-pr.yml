@@ -24,14 +24,13 @@ permissions:
   contents: read
   pull-requests: read
 
-# Community Edition keeps a single project state; serialize with CI's analysis group shape so
-# an on-demand run and a push analysis cannot interleave.
-concurrency:
-  group: sonarqube-${{ inputs.pr }}
-  cancel-in-progress: false
-
 jobs:
   analyze:
+    # Match CI's analysis lock, including its pending queue policy.
+    concurrency:
+      group: sonarqube-${{ inputs.pr }}
+      cancel-in-progress: false
+      queue: max
     runs-on: ubuntu-latest
     steps:
       # Read through env, never interpolated into the script body: the same rule the intake

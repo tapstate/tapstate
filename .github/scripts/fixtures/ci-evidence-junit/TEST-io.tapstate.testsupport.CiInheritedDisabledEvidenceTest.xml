@@ -1,0 +1,5 @@
+<testsuite name="io.tapstate.testsupport.CiInheritedDisabledEvidenceTest" tests="1" errors="0" skipped="1" failures="0">
+  <testcase name="inheritedComposedDisabled(String)" classname="io.tapstate.testsupport.CiInheritedDisabledEvidenceTest">
+    <skipped message="composed skip control" />
+  </testcase>
+</testsuite>

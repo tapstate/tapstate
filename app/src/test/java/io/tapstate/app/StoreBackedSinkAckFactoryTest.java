@@ -22,6 +22,7 @@ import io.tapstate.runtime.engine.ChainAxes;
 import io.tapstate.runtime.engine.FrontierOrders;
 import io.tapstate.runtime.engine.LevelBounds;
 import io.tapstate.runtime.engine.SinkAck;
+import io.tapstate.runtime.engine.FrontierOrders;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.ConsumerProgressKind;
@@ -40,6 +41,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.AdditionalAnswers;
 import org.mockito.invocation.InvocationOnMock;
 import org.mockito.stubbing.Answer;
@@ -494,6 +497,22 @@ class StoreBackedSinkAckFactoryTest {
                 .isNull();
     }
 
+    @Test
+    void theFirstTokenAfterAnUntokenedLandingBecomesTheResumablePosition() {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        HazelcastInstance member = memberWith(store);
+        SinkAck ack = soleWriter(member, Map.of("orders", "mc-orders"), "pipe-1");
+
+        ack.advance("orders", at(7, null));
+        assertThat(ackedChainPosition(store, "mc-orders", "pipe-1")).isNull();
+        ack.advance("orders", at(8, "w8"));
+
+        assertThat(ackedChainPosition(store, "mc-orders", "pipe-1")).isEqualTo(at(8, "w8"));
+        assertThat(store.ringDoneThrough("mc-orders", "pipe-1")).containsEntry("orders", 8L);
+        assertThat(store.read("mc-orders").orElseThrow().sourceReadOffset()).isEqualTo("w8");
+    }
+
     /**
      * A table's confirmation is how far it has landed, and carries a token only where the change there named
      * one. Paired with the token of an earlier change, the order would read back as a place the source had
@@ -752,6 +771,71 @@ class StoreBackedSinkAckFactoryTest {
         assertThat(store.ringDoneThrough("mc-orders", "pipe-1"))
                 .as("and the ring no further than the busy writer got: the bound runs past it, the rows do not")
                 .containsEntry("orders", 7L);
+    }
+
+    /** A held load's predecessor is a cap in the previous generation, never a ring recovery position. */
+    @ParameterizedTest
+    @ValueSource(longs = {1, 2})
+    void aBoundBelowTheRecordedLoadCannotRaiseAnExistingRingCursor(long snapshotEpoch) {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        store.setCdcStart("mc-orders", "pipe-1", "w0", snapshotEpoch);
+        ChainPosition confirmed = new ChainPosition(new SourceOrder(snapshotEpoch, 3), "w3");
+        store.advanceTableConfirmed("mc-orders", "pipe-1", "orders", confirmed);
+        HazelcastInstance member = memberWith(store);
+        StoreBackedSinkAckFactory factory = startedRun(member, Map.of("orders", "mc-orders"), "pipe-1",
+                Map.of("orders", List.of(WRITER, OTHER_WRITER)), "replacement-run");
+        SourceOrder cap = FrontierOrders.unpack(
+                FrontierOrders.pack("orders", SourceOrder.snapshotRow(snapshotEpoch)) - 1);
+
+        factory.resolve(member).forWriter(WRITER).bounded("orders", cap);
+        factory.resolve(member).forWriter(OTHER_WRITER).bounded("orders", cap);
+
+        assertThat(store.ringDoneThrough("mc-orders", "pipe-1"))
+                .as("the constructed previous-generation maximum is not a retained ring sequence")
+                .containsExactlyEntriesOf(Map.of("orders", 3L));
+        assertThat(store.read("mc-orders").orElseThrow().consumerOffsets().get(0).sinkAckedByTable())
+                .containsEntry("orders", confirmed);
+    }
+
+    /** With no prior cursor either, the cap cannot invent one; an actual load and idle bound still land. */
+    @ParameterizedTest
+    @ValueSource(longs = {1, 2})
+    void aBoundBelowTheRecordedLoadCannotCreateARingCursor(long snapshotEpoch) {
+        InMemorySrsMetaStore store = new InMemorySrsMetaStore();
+        store.create("mc-orders", null);
+        store.setCdcStart("mc-orders", "pipe-1", "w0", snapshotEpoch);
+        HazelcastInstance member = memberWith(store);
+        StoreBackedSinkAckFactory factory = startedRun(member, Map.of("orders", "mc-orders"), "pipe-1",
+                Map.of("orders", List.of(WRITER, OTHER_WRITER)));
+        SinkAck writing = factory.resolve(member).forWriter(WRITER);
+        SinkAck idle = factory.resolve(member).forWriter(OTHER_WRITER);
+        SourceOrder cap = FrontierOrders.unpack(
+                FrontierOrders.pack("orders", SourceOrder.snapshotRow(snapshotEpoch)) - 1);
+
+        writing.bounded("orders", cap);
+        idle.bounded("orders", cap);
+
+        assertThat(store.writerRun("mc-orders", "pipe-1").orElseThrow().progressFor("orders"))
+                .allSatisfy((writer, progress) -> assertThat(progress.durableThrough()).isEqualTo(cap));
+        assertThat(store.ringDoneThrough("mc-orders", "pipe-1")).isEmpty();
+        assertThat(ackedChainPosition(store, "mc-orders", "pipe-1")).isNull();
+        assertThat(store.read("mc-orders").orElseThrow().sourceReadOffset()).isNull();
+        assertThat(store.read("mc-orders").orElseThrow().consumerOffsets().get(0).sinkAckedByTable()).isEmpty();
+        assertThat(store.read("mc-orders").orElseThrow().snapshotCompletedTables("pipe-1")).isEmpty();
+
+        writing.advance("orders", new ChainPosition(SourceOrder.snapshotRow(snapshotEpoch), null));
+        idle.bounded("orders", SourceOrder.snapshotRow(snapshotEpoch));
+        assertThat(store.read("mc-orders").orElseThrow().snapshotCompletedTables("pipe-1"))
+                .containsExactly("orders");
+        assertThat(store.ringDoneThrough("mc-orders", "pipe-1")).isEmpty();
+
+        ChainPosition change = new ChainPosition(new SourceOrder(snapshotEpoch, 0), "first-change");
+        writing.advance("orders", change);
+        idle.bounded("orders", new SourceOrder(snapshotEpoch, 2));
+        assertThat(store.ringDoneThrough("mc-orders", "pipe-1"))
+                .containsExactlyEntriesOf(Map.of("orders", 0L));
+        assertThat(ackedChainPosition(store, "mc-orders", "pipe-1")).isEqualTo(change);
     }
 
     @Test

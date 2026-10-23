@@ -155,7 +155,9 @@ class PauseInSnapshotResumesAtTheUnfinishedTableIT {
                     .as("the third table is in no selection that has run, so nothing has confirmed it")
                     .doesNotContain(OWED);
 
-            confirmingRunReads = control.snapshotRowsRead(PIPELINE);
+            // The durable proof keeps its original bound. Metrics then get a separate, fresh publication
+            // allowance, so completion near that bound cannot reduce this phase to a single sample.
+            confirmingRunReads = control.awaitSnapshotRowsRead(PIPELINE, Set.of(FIRST, SECOND));
 
             // Stopped without clearing: the pipeline has to be at rest before its selection can be widened,
             // and what it confirmed has to survive that. A clearing stop would give its record back and the
@@ -225,9 +227,9 @@ class PauseInSnapshotResumesAtTheUnfinishedTableIT {
     }
 
     /**
-     * The later run's per-table read counts, once they stop moving. The map is published whole once the
-     * bounded round finishes, never part way through, so the wait is for the run to exist rather than for
-     * the reading to complete.
+     * The later run's per-table read counts, once they stop moving. Tables reach the sampled observation
+     * individually after their bounded reads finish; keep the original quiet window before taking the
+     * sample whose exact selected-table counts are asserted by the caller.
      */
     private static Map<String, Long> awaitSettledReads(ControlPlane control) {
         long deadline = System.nanoTime() + TIMEOUT.toNanos();

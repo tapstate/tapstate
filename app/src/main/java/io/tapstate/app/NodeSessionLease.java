@@ -171,6 +171,11 @@ final class NodeSessionLease implements AutoCloseable {
         }
     }
 
+    /** Whether the exact session is still proved on the local monotonic clock. */
+    boolean isCurrent() {
+        return !closed.get() && System.nanoTime() - provenUntil < 0;
+    }
+
     private boolean proofRemainsLive(long deadline) {
         if (closed.get()) return false;
         if (System.nanoTime() - deadline >= 0) {
@@ -208,13 +213,36 @@ final class NodeSessionLease implements AutoCloseable {
 
     @Override
     public void close() {
-        if (store == null) {
-            return;
+        stopAndClose(() -> { });
+    }
+
+    /** Fence locally before stopping, and never put coordination I/O ahead of the member stop. */
+    void stopAndClose(Runnable stop) {
+        boolean release = store != null && closed.compareAndSet(false, true);
+        try {
+            stop.run();
+        } finally {
+            if (release) {
+                renewer.shutdownNow();
+                releaseCurrent();
+            }
         }
-        if (!closed.compareAndSet(false, true)) {
-            return;
-        }
-        renewer.shutdownNow();
+    }
+
+    /** A library lifecycle listener cannot wait for coordination-store I/O. */
+    void closeAfterMemberStops() {
+        if (store == null || !closed.compareAndSet(false, true)) return;
+        renewer.execute(() -> {
+            try {
+                releaseCurrent();
+            } finally {
+                renewer.shutdownNow();
+            }
+        });
+        renewer.shutdown();
+    }
+
+    private void releaseCurrent() {
         WorkloadClaim ending = current.get();
         try {
             store.release(ending);

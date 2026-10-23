@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "versions": {
+    "junit": "5.11.4",
+    "surefire": "3.5.2"
+  },
+  "source_hashes": {
+    "test-support/src/test/java/io/tapstate/testsupport/CiInjectedEvidenceTest.java": "68f0b4ce37e00bd250d736bec717b7d5ec8393c48acfc557eb3de8ad78ce4a42",
+    "test-support/src/test/java/io/tapstate/testsupport/CiDisabledContainerEvidenceTest.java": "8514d8f3946e3963073de8efc9c89103521ae8c4e512281d2a0f21746204285b",
+    "test-support/src/test/java/io/tapstate/testsupport/CiComposedDisabledEvidenceTest.java": "e10c3f3c286dc942bb1575d1271fe86efbca03391e7c1564673e48705a10c14c",
+    "test-support/src/test/java/io/tapstate/testsupport/CiInheritedDisabledEvidenceTest.java": "5a932fdddbde86806d7889972769e3914ad0f78faa2667b8eb1ba0665f4bcbcf",
+    "test-support/src/test/java/io/tapstate/testsupport/CiInterfaceDisabledEvidenceTest.java": "573043501daa804c44a620a089d706dde3243a63ce2767fd9d60de6c6cf736d1",
+    "test-support/src/test/java/io/tapstate/testsupport/CiDisabledBase.java": "4ee4f3f974346949176dc01aa99d3aa0f1fc9462a90a89d20da95d79af3cb8ee",
+    "test-support/src/test/java/io/tapstate/testsupport/CiInheritedDisabledBase.java": "bf5bab946a940154163a4a15f6ae1d280e84135f75f9b76e50d81fb34783744a",
+    "test-support/src/test/java/io/tapstate/testsupport/CiCaseEvidence.java": "ee66efe7f75e1a7502436273debe944e168ef695d830cdac10f35d6081170d48"
+  },
+  "reports": {
+    "TEST-io.tapstate.testsupport.CiInjectedEvidenceTest.xml": "e91f8bf0f553d078ee1331fe05f39e124e2e6b7ffefdb1078d3b4a849d9aa050",
+    "TEST-io.tapstate.testsupport.CiDisabledContainerEvidenceTest.xml": "11a28a4d0680ab0f3a3a20848fdc75aa61ddb6402a02d534e10ad3cc0d7588f0",
+    "TEST-io.tapstate.testsupport.CiComposedDisabledEvidenceTest.xml": "442db6f127762eb7a330cdd220252f59d898f95dccbc5972c4cf0ec9d73ad057",
+    "TEST-io.tapstate.testsupport.CiInheritedDisabledEvidenceTest.xml": "328a9a445676f09b68814619f09ea3170cbcb71f9f669271c0a26145b2c80729",
+    "TEST-io.tapstate.testsupport.CiInterfaceDisabledEvidenceTest.xml": "aa720f540eed37400de093b581a44f776dec7fca83f39a64768630246bf4e572"
+  },
+  "projection": "Actual JUnit XML with environment properties, timing and non-marker output removed; original testcase names, skips and identity markers retained.",
+  "command": "mvn -B -pl test-support '-Dtest=Ci*EvidenceTest' -Dtapstate.ci.case-evidence=true -Djunit.jupiter.extensions.autodetection.enabled=true verify"
+}

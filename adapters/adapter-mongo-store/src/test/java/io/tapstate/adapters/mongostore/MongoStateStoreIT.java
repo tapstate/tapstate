@@ -17,9 +17,7 @@ import io.tapstate.spi.store.WorkloadOwner;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.containers.MongoDBContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.utility.DockerImageName;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.time.Instant;
 import java.time.Duration;
@@ -47,12 +45,12 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 @RequiresDocker
 class MongoStateStoreIT {
 
-    private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
     private static final Instant T0 = Instant.parse("2026-07-01T00:00:00Z");
     private static final String PIPELINE = "orders-sync";
 
-    @Container
-    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
+    @RegisterExtension
+    private static final SharedMongoCase REPLICA_SET =
+            SharedMongoCase.forSuite(MongoStateStoreIT.class);
 
     @Test
     void createSeedsEpochZeroAndReadReturnsIt() {
@@ -239,7 +237,7 @@ class MongoStateStoreIT {
     @Test
     void anOldExecutionCannotCompleteTheUnchangedCheckpointOfItsReplacement() {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            var database = client.getDatabase("fenced_completion");
+            var database = client.getDatabase(REPLICA_SET.database("fenced_completion"));
             database.drop();
             var claimsCollection = database.getCollection("claims");
             var claims = new MongoWorkloadClaimStore(claimsCollection);
@@ -286,14 +284,15 @@ class MongoStateStoreIT {
                 }
             }
         };
+        String databaseName = REPLICA_SET.database("atomic_completion");
         var settings = MongoClientSettings.builder().applyConnectionString(
                 new ConnectionString(REPLICA_SET.getReplicaSetUrl())).addCommandListener(gate).build();
         try (MongoClient completingClient = MongoClients.create(settings);
                 MongoClient replacingClient = MongoClients.create(REPLICA_SET.getReplicaSetUrl());
                 ExecutorService pool = Executors.newFixedThreadPool(2)) {
-            var database = completingClient.getDatabase("atomic_completion");
+            var database = completingClient.getDatabase(databaseName);
             database.drop();
-            var claims = new MongoWorkloadClaimStore(replacingClient.getDatabase("atomic_completion").getCollection("claims"));
+            var claims = new MongoWorkloadClaimStore(replacingClient.getDatabase(databaseName).getCollection("claims"));
             var state = new MongoStateStore(completingClient, database.getCollection("states"), database.getCollection("claims"));
             var key = new WorkloadClaimKey("cluster", WorkloadClaimType.PIPELINE_ACTUATION, PIPELINE);
             var acquired = claims.acquire(key, new WorkloadOwner("node", "boot"), 1L, Duration.ofMinutes(1)).claim();
@@ -337,7 +336,7 @@ class MongoStateStoreIT {
     /** Runs a test body against a fresh state store over a clean checkpoints collection on the replica-set. */
     private static void withStore(StoreTest test) {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            MongoCollection<Document> collection = client.getDatabase("tapstate").getCollection("checkpoints");
+            MongoCollection<Document> collection = client.getDatabase(REPLICA_SET.database("tapstate")).getCollection("checkpoints");
             collection.drop();
             test.run(new MongoStateStore(collection));
         } catch (Exception e) {

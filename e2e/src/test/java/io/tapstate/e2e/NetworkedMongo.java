@@ -38,12 +38,14 @@ final class NetworkedMongo implements AutoCloseable {
 
     private final Network network;
     private final GenericContainer<?> container;
+    private final StoreProcessScope processes;
 
     private boolean frozen;
 
     private NetworkedMongo(Network network, GenericContainer<?> container) {
         this.network = network;
         this.container = container;
+        this.processes = StoreProcessScope.open();
     }
 
     /** Starts the store and returns once a primary has been elected, not merely once the port opens. */
@@ -99,8 +101,8 @@ final class NetworkedMongo implements AutoCloseable {
 
     /** How a process on this host - the shipped jar, or this test - addresses the same store. */
     String uriForThisHost(String database) {
-        return "mongodb://127.0.0.1:" + container.getMappedPort(MONGO_PORT) + "/" + database
-                + "?directConnection=true";
+        return processes.rememberHostUri("mongodb://127.0.0.1:" + container.getMappedPort(MONGO_PORT) + "/" + database
+                + "?directConnection=true");
     }
 
     /**
@@ -130,8 +132,10 @@ final class NetworkedMongo implements AutoCloseable {
     public void close() {
         // A frozen container cannot be stopped, and leaving one paused on a shared machine is leaving
         // it running: it holds its memory and nothing reaps it.
-        thaw();
-        container.stop();
-        network.close();
+        processes.closeWith(() -> {
+            thaw();
+            container.stop();
+            network.close();
+        });
     }
 }

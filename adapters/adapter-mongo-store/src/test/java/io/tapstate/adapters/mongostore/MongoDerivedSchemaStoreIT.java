@@ -9,9 +9,7 @@ import io.tapstate.spi.store.DerivedSchema;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.containers.MongoDBContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.utility.DockerImageName;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -37,10 +35,10 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 @RequiresDocker
 class MongoDerivedSchemaStoreIT {
 
-    private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
 
-    @Container
-    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
+    @RegisterExtension
+    private static final SharedMongoCase REPLICA_SET =
+            SharedMongoCase.forSuite(MongoDerivedSchemaStoreIT.class);
 
     private static Map<String, String> columns(String... namesAndTypes) {
         Map<String, String> columns = new LinkedHashMap<>();
@@ -279,8 +277,8 @@ class MongoDerivedSchemaStoreIT {
                             version(0, "name", "STRING NULL", "sql-c"))))));
 
             try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-                SystemCollections.SYSTEM_META.on(client.getDatabase("tapstate")).drop();
-                MigrationRunner.migrate(client.getDatabase("tapstate"));
+                SystemCollections.SYSTEM_META.on(client.getDatabase(REPLICA_SET.database("tapstate"))).drop();
+                MigrationRunner.migrate(client.getDatabase(REPLICA_SET.database("tapstate")));
             }
             // Startup has moved every step before the first store read or write.
             assertThat(store.latest("legacy", "widen").orElseThrow().version()).isEqualTo(1L);
@@ -320,7 +318,7 @@ class MongoDerivedSchemaStoreIT {
     private static void withStore(StoreTest test) {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
             MongoCollection<Document> collection =
-                    client.getDatabase("tapstate").getCollection(MongoStorePort.DERIVED_SCHEMAS);
+                    client.getDatabase(REPLICA_SET.database("tapstate")).getCollection(MongoStorePort.DERIVED_SCHEMAS);
             collection.drop();
             test.run(new MongoDerivedSchemaStore(collection), collection);
         }

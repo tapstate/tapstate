@@ -3,6 +3,7 @@ package io.tapstate.e2e;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -120,31 +121,55 @@ final class TwoMemberCluster implements AutoCloseable {
     private static TwoMemberCluster start(String storeUri, String clusterId, Duration nodeSessionTtl,
             boolean concurrent, boolean existingAdministrator, Map<String, Path> stagingByNode) {
         String bindAddress = RoutableAddress.ofThisMachine();
-        int memberPortA = RealProcessServer.reservePort();
-        int memberPortB = RealProcessServer.reservePort();
-        String seeds = bindAddress + ":" + memberPortA + "," + bindAddress + ":" + memberPortB;
-
+        Map<String, Integer> memberPorts = new LinkedHashMap<>();
+        Map<String, RealProcessServer.PreparedLaunch> prepared = new LinkedHashMap<>();
+        String seeds;
         RealProcessServer first = null;
-        RealProcessServer second;
+        RealProcessServer second = null;
+        Throwable startingFailure = null;
         try {
+            int memberPortA = RealProcessServer.reservePort();
+            memberPorts.put(NODE_A, memberPortA);
+            int memberPortB = RealProcessServer.reservePort();
+            memberPorts.put(NODE_B, memberPortB);
+            seeds = bindAddress + ":" + memberPortA + "," + bindAddress + ":" + memberPortB;
             java.util.function.IntFunction<List<String>> firstArguments = httpPort -> arguments(
                     clusterId, NODE_A, memberPortA, seeds, httpPort, bindAddress, nodeSessionTtl);
-            first = concurrent
-                    ? RealProcessServer.launching(storeUri, "0.0.0.0", staging(NODE_A, stagingByNode), firstArguments)
-                    : RealProcessServer.start(storeUri, "0.0.0.0", staging(NODE_A, stagingByNode), firstArguments);
             java.util.function.IntFunction<List<String>> secondArguments = httpPort -> arguments(
                     clusterId, NODE_B, memberPortB, seeds, httpPort, bindAddress, nodeSessionTtl);
-            second = concurrent
-                    ? RealProcessServer.launching(storeUri, "0.0.0.0", staging(NODE_B, stagingByNode), secondArguments)
-                    : RealProcessServer.start(storeUri, "0.0.0.0", staging(NODE_B, stagingByNode), secondArguments);
+            prepared.put(NODE_A, RealProcessServer.prepare(
+                    storeUri, "0.0.0.0", staging(NODE_A, stagingByNode), firstArguments));
+            first = prepared.get(NODE_A).launch();
+            if (!concurrent) first.awaitHealthy();
+            prepared.put(NODE_B, RealProcessServer.prepare(
+                    storeUri, "0.0.0.0", staging(NODE_B, stagingByNode), secondArguments));
+            second = prepared.get(NODE_B).launch();
+            if (!concurrent) second.awaitHealthy();
         } catch (RuntimeException | Error failure) {
-            if (first != null) {
-                first.close();
+            startingFailure = failure;
+            try { closeOwned(first, second, prepared, clusterId); }
+            catch (RuntimeException | Error cleanup) {
+                if (cleanup != failure) failure.addSuppressed(cleanup);
             }
             throw failure;
         } finally {
-            RealProcessServer.releasePort(memberPortA);
-            RealProcessServer.releasePort(memberPortB);
+            List<Throwable> portFailures = new ArrayList<>();
+            for (int memberPort : memberPorts.values()) {
+                try { RealProcessServer.releasePort(memberPort); }
+                catch (RuntimeException | Error cleanup) { portFailures.add(cleanup); }
+            }
+            if (!portFailures.isEmpty()) {
+                Throwable primary = startingFailure == null ? portFailures.getFirst() : startingFailure;
+                portFailures.stream().filter(cleanup -> cleanup != primary).forEach(primary::addSuppressed);
+                if (startingFailure == null) {
+                    try { closeOwned(first, second, prepared, clusterId); }
+                    catch (RuntimeException | Error cleanup) {
+                        if (cleanup != primary) primary.addSuppressed(cleanup);
+                    }
+                    if (primary instanceof RuntimeException failure) throw failure;
+                    throw (Error) primary;
+                }
+            }
         }
         TwoMemberCluster cluster = new TwoMemberCluster(
                 first, second, storeUri, clusterId, bindAddress, seeds, nodeSessionTtl, stagingByNode);
@@ -158,7 +183,10 @@ final class TwoMemberCluster implements AutoCloseable {
             // The administrator lives in the store both of them share, so the second does not create one.
             cluster.b.login(ADMIN, PASSWORD);
         } catch (RuntimeException | Error failure) {
-            cluster.close();
+            try { cluster.close(); }
+            catch (RuntimeException | Error cleanup) {
+                if (cleanup != failure) failure.addSuppressed(cleanup);
+            }
             throw failure;
         }
         return cluster;
@@ -259,16 +287,45 @@ final class TwoMemberCluster implements AutoCloseable {
 
     @Override
     public void close() {
-        try {
+        closeOwned(first, second, Map.of(), clusterId);
+    }
+
+    /** Closes owned members in their original order and retains every cleanup failure. */
+    private static void closeOwned(RealProcessServer first, RealProcessServer second,
+            Map<String, RealProcessServer.PreparedLaunch> prepared, String clusterId) {
+        Map<String, RealProcessServer> owned = new LinkedHashMap<>();
+        if (second != null) owned.put(NODE_B, second);
+        if (first != null) owned.put(NODE_A, first);
+        List<Throwable> failures = new ArrayList<>();
+        for (RealProcessServer server : owned.values()) {
             try {
-                second.close();
-            } finally {
-                first.close();
+                server.requestClose();
+            } catch (RuntimeException | Error failure) {
+                failures.add(failure);
             }
-        } finally {
-            // After both are down, so what a member said on its way out is in what is kept.
-            FailureScene.writeMemberLogs(
-                    clusterId, Map.of(NODE_A, first.output(), NODE_B, second.output()));
+            try {
+                server.awaitClosed();
+            } catch (RuntimeException | Error failure) {
+                failures.add(failure);
+            }
+        }
+        for (RealProcessServer.PreparedLaunch launch : prepared.values()) {
+            try {
+                launch.close();
+            } catch (RuntimeException | Error failure) {
+                failures.add(failure);
+            }
+        }
+        Map<String, Path> logs = new LinkedHashMap<>();
+        prepared.forEach((nodeId, launch) -> logs.put(nodeId, launch.output()));
+        owned.forEach((nodeId, server) -> logs.put(nodeId, server.output()));
+        try { FailureScene.writeMemberLogs(clusterId, logs); }
+        catch (RuntimeException | Error failure) { failures.add(failure); }
+        if (!failures.isEmpty()) {
+            Throwable primary = failures.getFirst();
+            failures.stream().skip(1).filter(failure -> failure != primary).forEach(primary::addSuppressed);
+            if (primary instanceof RuntimeException failure) throw failure;
+            throw (Error) primary;
         }
     }
 

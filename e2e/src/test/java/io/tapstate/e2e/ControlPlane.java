@@ -49,6 +49,8 @@ final class ControlPlane {
 
     private static final Duration TIMEOUT = Duration.ofSeconds(20);
 
+    private static final Duration SNAPSHOT_METRICS_PUBLICATION_TIMEOUT = Duration.ofSeconds(5);
+
     /** How often a caller waiting on a pushed change looks again; a follow is told, never asked. */
     private static final Duration POLL = Duration.ofMillis(100);
 
@@ -93,10 +95,14 @@ final class ControlPlane {
 
     /** Whether the product answers its health probe; the readiness signal a launcher waits on. */
     boolean healthy() {
+        HttpRequest request = get("/healthz");
+        long started = ClusterHealthProbe.started();
         try {
-            HttpResponse<String> response = send(get("/healthz"));
+            HttpResponse<String> response = send(request);
+            ClusterHealthProbe.response(request, response.statusCode(), response.body(), started);
             return response.statusCode() == 200 && "ok".equals(response.body());
         } catch (UncheckedIOException e) {
+            ClusterHealthProbe.failure(request, e, started);
             return false;
         }
     }
@@ -1419,8 +1425,13 @@ final class ControlPlane {
      * its whole bound before saying so.
      */
     Optional<PipelineState> state(String pipelineId) {
-        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/status"));
-        return interpretState(response.statusCode(), response.body(), pipelineId);
+        HttpRequest request = authedGet("/api/pipelines/" + pipelineId + "/status");
+        HttpResponse<String> response = send(request);
+        Optional<PipelineState> state = interpretState(response.statusCode(), response.body(), pipelineId);
+        ClusterHealthProbe.pipelineStatus(request, response.statusCode(), response.body(), pipelineId,
+                state,
+                () -> interpretFailureCode(response.statusCode(), response.body(), pipelineId));
+        return state;
     }
 
     /**
@@ -1964,7 +1975,8 @@ final class ControlPlane {
      * <p>The per-run counter is read from the metrics face. The snapshot face reports completed load
      * progress across replacement runs, so it cannot say whether the live run read a table again. A
      * resumed run that skips a table reports zero here while the target still holds its earlier rows.
-     * Every selected table appears while its run is live; a missing key is a broken reading.
+     * Tables arrive individually after their bounded reads finish. This sampled observation can lag a
+     * sink's durable completion record, so callers needing several tables must wait for all of them.
      */
     Map<String, Long> snapshotRowsRead(String pipelineId) {
         HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/metrics"));
@@ -1988,6 +2000,29 @@ final class ControlPlane {
             }
         }
         return read;
+    }
+
+    /** A fresh publication allowance after the caller has proved durable completion. */
+    Map<String, Long> awaitSnapshotRowsRead(String pipelineId, Set<String> metricKeys) {
+        return awaitSnapshotRowsRead(pipelineId, metricKeys, SNAPSHOT_METRICS_PUBLICATION_TIMEOUT);
+    }
+
+    /**
+     * The accepted sample itself, containing every requested key from {@link #snapshotRowsRead}.
+     * Unique table names are bare; colliding names are {@code sourceId.table}. Keys and counts are
+     * preserved without aliasing or aggregation. The caller asserts the exact counts afterwards.
+     */
+    Map<String, Long> awaitSnapshotRowsRead(String pipelineId, Set<String> metricKeys, Duration bound) {
+        if (bound.isZero() || bound.isNegative()) {
+            throw new IllegalArgumentException("snapshot metric publication bound must be positive");
+        }
+        AtomicReference<Map<String, Long>> observed = new AtomicReference<>(Map.of());
+        Await.until("snapshot read metrics for every requested key " + metricKeys, bound, () -> {
+            Map<String, Long> sample = snapshotRowsRead(pipelineId);
+            observed.set(sample);
+            return sample.keySet().containsAll(metricKeys);
+        }, () -> observed.get().toString());
+        return observed.get();
     }
 
     /**
