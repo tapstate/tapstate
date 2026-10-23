@@ -24,7 +24,6 @@ import xml.etree.ElementTree as ET
 sys.dont_write_bytecode = True
 
 SCHEMA = 1
-ENUM_PATHS = {}
 TEST_ANNOTATIONS = {'Test', 'ParameterizedTest', 'RepeatedTest', 'TestFactory', 'TestTemplate', 'ArchTest'}
 
 
@@ -133,17 +132,9 @@ def uncomment(text):
     return re.sub(pattern, lambda m: ' ' if m.group().startswith(('/', '*')) else m.group(), text)
 
 
-def enum_constants(text, simple):
+def enum_constants(text, declaration):
     clean = masked(text)
-    match = re.search(r'\benum\s+' + re.escape(simple) + r'\b', clean)
-    if not match:
-        return None
-    opening = declaration_body(clean, match.end())
-    if opening is None:
-        return None
-    start = opening + 1
-    end = close_at(clean, start - 1, '{', '}')
-    body = clean[start:end]
+    body = clean[declaration['start'] + 1:declaration['end']]
     depth, stop = 0, len(body)
     for position, char in enumerate(body):
         if char in '({[':
@@ -162,37 +153,17 @@ def enum_constants(text, simple):
     return values
 
 
-def resolve_enum(root, source, name, sources):
-    text = source.read_text()
-    simple = name.rsplit('.', 1)[-1]
-    local = enum_constants(text, simple)
-    if local:
-        ENUM_PATHS[(str(source), name)] = source
-        return local
-    first = name.split('.')[0]
-    imported = re.search(r'\bimport\s+([\w.]+\.' + re.escape(first) + r')\s*;', masked(text))
-    package = re.search(r'\bpackage\s+([\w.]+)\s*;', masked(text))
-    full = (imported.group(1) + name[len(first):]) if imported else ((package.group(1) + '.' if package else '') + name)
-    names = [full]
-    if imported is None:
-        names += [m.group(1) + '.' + name for m in re.finditer(r'\bimport\s+([\w.]+)\.\*\s*;', masked(text))]
-    matches = []
-    for module, _ in source_modules(root):
-        for tree in ('src/main/java', 'src/test/java'):
-            for full_name in names:
-                parts = full_name.split('.')
-                for count in range(len(parts), 0, -1):
-                    candidate = root / module / tree / ('/'.join(parts[:count]) + '.java')
-                    if candidate.is_file():
-                        values = enum_constants(candidate.read_text(), simple)
-                        if values:
-                            matches.append((candidate, values))
-                        break
-    require(len(matches) == 1, 'external enum cannot be independently resolved: ' + name)
-    candidate, values = matches[0]
-    ENUM_PATHS[(str(source), name)] = candidate
-    sources[candidate.relative_to(root).as_posix()] = digest(candidate.read_bytes())
-    return values
+def enum_definition(root, source, name, sources, enum_context=None):
+    lookup, offset = enum_context or (DisabledLookup(root, sources), 0)
+    unused_name, target = lookup.resolve(source, name, offset)
+    require(target is not None and target[1]['kind'] == 'enum',
+            'enum declaration cannot be independently resolved: ' + name)
+    return target
+
+
+def resolve_enum(root, source, name, sources, enum_context=None):
+    path, declaration = enum_definition(root, source, name, sources, enum_context)
+    return enum_constants(path.read_text(), declaration)
 
 
 def split_values(value, generic=False):
@@ -342,6 +313,18 @@ class DisabledLookup:
             self.sources[source.relative_to(self.root).as_posix()] = digest(source.read_bytes())
         return self.contexts[source]
 
+    def member_type(self, source, node):
+        context = self.context(source)
+        current = node
+        while current is not None:
+            parent = next((item for item in reversed(context['classes'])
+                           if item['start'] < current['offset'] < item['end']), None)
+            prefix = context['clean'][parent['start'] + 1 if parent else 0:current['offset']]
+            if prefix.count('{') != prefix.count('}'):
+                return False
+            current = parent
+        return True
+
     def named(self, name):
         if name in self.named_cache:
             return self.named_cache[name]
@@ -352,7 +335,7 @@ class DisabledLookup:
                 candidate = directory.joinpath(*parts[:length]).with_suffix('.java')
                 if candidate.is_file():
                     found.extend((candidate, node) for node in self.context(candidate)['classes']
-                                 if node['name'].replace('$', '.') == name)
+                                 if node['name'].replace('$', '.') == name and self.member_type(candidate, node))
         require(len(found) <= 1, 'ambiguous annotation or interface source: ' + name)
         self.named_cache[name] = found[0] if found else None
         return self.named_cache[name]
@@ -364,6 +347,8 @@ class DisabledLookup:
                 package = directory.joinpath(*prefix.rstrip('.').split('.'))
                 for candidate in package.glob('*.java'):
                     for node in self.context(candidate)['classes']:
+                        if not self.member_type(candidate, node):
+                            continue
                         found.setdefault(node['name'].replace('$', '.'), []).append((candidate, node))
             self.packages[prefix] = found
         return self.packages[prefix].get(name, [])
@@ -386,14 +371,14 @@ class DisabledLookup:
 
     def resolve(self, source, name, offset=0):
         context = self.context(source)
-        lexical = [node for node in reversed(context['classes']) if node['start'] < offset < node['end']]
+        lexical = [node for node in reversed(context['classes']) if node['start'] < offset < node['end'] and self.member_type(source, node)]
         for owner in lexical:
             members = self.members(source, owner, name)
             require(len(members) <= 1, 'ambiguous inherited annotation source: ' + name)
             if members:
                 path, node = members[0]
                 return node['name'].replace('$', '.'), (path, node)
-        local = [node for node in context['classes'] if node['name'].replace('$', '.') == context['prefix'] + name]
+        local = [node for node in context['classes'] if node['name'].replace('$', '.') == context['prefix'] + name and self.member_type(source, node)]
         if local:
             return local[0]['name'].replace('$', '.'), (source, local[0])
         first = name.split('.')[0]
@@ -468,7 +453,7 @@ class DisabledLookup:
         if key in seen:
             return []
         direct = [(source, member) for member in self.context(source)['classes']
-                  if member['name'].replace('$', '.') == node['name'].replace('$', '.') + '.' + name]
+                  if member['name'].replace('$', '.') == node['name'].replace('$', '.') + '.' + name and self.member_type(source, member)]
         inherited = {}
         if not direct:
             for parent in [self.parent(source, node), *self.interfaces(source, node)]:
@@ -598,7 +583,7 @@ def declarations(text, outer, package, lookup=None, source=None):
         result.append(dict(**{'class': owner['name']}, method=name, annotations=annotations,
                            disabled_source=disabled_source, method_disabled_source=method_disabled,
                            class_disabled_source=owner['disabled_source'],
-                           parameter_types=parameter_types, parameter_injected=parameter_injected, declaration_sha256=digest(text[offset:consumed].encode())))
+                           parameter_types=parameter_types, parameter_injected=parameter_injected, source_offset=offset, declaration_sha256=digest(text[offset:consumed].encode())))
     return result
 
 
@@ -628,39 +613,44 @@ def canonical_literal(value, typename):
     return [typename, spelling]
 
 
-def enum_qualified_name(root, source, enum_name, sources):
-    simple = enum_name.rsplit('.', 1)[-1]
-    candidates = [ENUM_PATHS.get((str(source), enum_name), source)]
-    for candidate in candidates:
-        text = candidate.read_text()
-        if enum_constants(text, simple) is None:
-            continue
-        clean = masked(text)
-        package = re.search(r'\bpackage\s+([\w.]+)\s*;', clean)
-        prefix = package.group(1) + '.' if package else ''
-        classes = []
-        for match in re.finditer(r'\b(class|interface|enum|record)\s+(\w+)\b', clean):
-            start = declaration_body(clean, match.end())
-            if start is None:
-                continue
-            parent = next((c for c in reversed(classes) if c['start'] < start < c['end']), None)
-            name = parent['name'] + '$' + match.group(2) if parent else prefix + match.group(2)
-            record = dict(start=start, end=close_at(clean, start, '{', '}'), name=name)
-            classes.append(record)
-            if match.group(1) == 'enum' and match.group(2) == simple:
-                return name
-    raise ValueError('enum binary identity cannot be independently resolved: ' + enum_name)
+def enum_qualified_name(root, source, enum_name, sources, enum_context=None):
+    unused_path, declaration = enum_definition(root, source, enum_name, sources, enum_context)
+    return declaration['name']
 
 
-def provider_body(text, name):
-    clean = masked(text)
-    match = re.search(r'\b' + re.escape(name) + r'\s*\(\s*\)\s*(?:throws[^\{]+)?\{', clean)
-    require(match is not None, 'external or overloaded parameter provider requires an independent contract: ' + name)
-    start = match.end() - 1
-    return text[start + 1:close_at(clean, start, '{', '}')]
+def provider_body(root, source, declaration, name, sources, enum_context):
+    lookup, unused_offset = enum_context
+    target = lookup.definition(declaration['class'].replace('$', '.'))
+    require(target is not None, 'parameter provider owner cannot be independently resolved')
+
+    def find(path, owner, seen=frozenset()):
+        key = (path, owner['name'])
+        require(key not in seen, 'cyclic parameter provider inheritance')
+        context = lookup.context(path)
+        matches = []
+        for match in re.finditer(r'\b' + re.escape(name) + r'\s*\(\s*\)\s*(?:throws[^\{;]+)?\{', context['clean']):
+            enclosing = next((node for node in reversed(context['classes'])
+                              if node['start'] < match.start() < node['end']), None)
+            prefix = context['clean'][owner['start'] + 1:match.start()]
+            if enclosing is not None and enclosing['name'] == owner['name'] and prefix.count('{') == prefix.count('}'):
+                matches.append(match.end() - 1)
+        require(len(matches) <= 1, 'overloaded parameter provider requires an independent contract: ' + name)
+        if matches:
+            start = matches[0]
+            end = close_at(context['clean'], start, '{', '}')
+            body = context['text'][start + 1:end]
+            require(re.search(r'\b(?:class|interface|enum|record)\s+\w+', masked(body)) is None,
+                    'local parameter provider types require an independent binary identity contract')
+            return path, body, (lookup, start + 1)
+        parent = lookup.parent(path, owner)
+        return find(*parent, seen | {key}) if parent else None
+
+    result = find(*target)
+    require(result is not None, 'external or overloaded parameter provider requires an independent contract: ' + name)
+    return result
 
 
-def canonical_expression(expression, root, source, sources, body):
+def canonical_expression(expression, root, source, sources, body, enum_context=None):
     expression = uncomment(expression).strip()
     expression = re.sub(r'^\(Object\)\s*', '', expression)
     if expression == 'null':
@@ -688,10 +678,10 @@ def canonical_expression(expression, root, source, sources, body):
         return canonical_literal(expression.replace('_', ''), typename)
     array = re.fullmatch(r'new\s+String\s*\[\s*\]\s*\{([\s\S]*)\}', expression)
     if array:
-        return ['array', 'java.lang.String', [canonical_expression(v, root, source, sources, body) for v in split_values(array.group(1))]]
+        return ['array', 'java.lang.String', [canonical_expression(v, root, source, sources, body, enum_context) for v in split_values(array.group(1))]]
     call = re.fullmatch(r'(List\.of|Map\.of|new Document|TableRef\.literal|TableRef\.regex)\s*\(([\s\S]*)\)', expression)
     if call:
-        values = [canonical_expression(v, root, source, sources, body) for v in split_values(call.group(2))]
+        values = [canonical_expression(v, root, source, sources, body, enum_context) for v in split_values(call.group(2))]
         if call.group(1) == 'List.of':
             return ['list', values]
         if call.group(1) in ('Map.of', 'new Document'):
@@ -711,30 +701,30 @@ def canonical_expression(expression, root, source, sources, body):
         return ['record', 'io.tapstate.core.model.TableRef$' + record_name, [[field, values[0]]]]
     enum = re.fullmatch(r'([\w.]+)\.(\w+)', expression)
     if enum:
-        names = resolve_enum(root, source, enum.group(1), sources)
+        names = resolve_enum(root, source, enum.group(1), sources, enum_context)
         require(enum.group(2) in names, 'source enum constant is absent')
-        return ['enum', enum_qualified_name(root, source, enum.group(1), sources), enum.group(2)]
+        return ['enum', enum_qualified_name(root, source, enum.group(1), sources, enum_context), enum.group(2)]
     if re.fullmatch(r'\w+', expression):
         local = re.search(r'\b(?:String|int|long|double|boolean)\s+' + re.escape(expression) + r'\s*=\s*([^;]+);', body)
         if local:
-            return canonical_expression(local.group(1), root, source, sources, body)
+            return canonical_expression(local.group(1), root, source, sources, body, enum_context)
     raise ValueError('source parameter expression requires an independent contract: ' + expression[:100])
 
 
-def static_provider_arguments(root, source, declaration, sources):
+def static_provider_arguments(root, source, declaration, sources, enum_context=None):
     annotation = declaration['annotations'].get('MethodSource')
     require(annotation is not None, 'custom parameter provider requires an independent contract')
     names = literals(annotation or '"' + declaration['method'] + '"', source.read_text())
     require(len(names) == 1, 'multiple parameter providers require an independent contract')
-    body = provider_body(source.read_text(), names[0])
+    source, body, enum_context = provider_body(root, source, declaration, names[0], sources, enum_context)
     declaration['provider_body_sha256'] = digest(body.encode())
     clean = masked(body)
     native = re.sub(r'\s+', '', body)
     if native == 'returnSystem.getenv().containsKey("TAPSTATE_TEST_NATIVE_CLI")?List.of(CliFlavor.JVM,CliFlavor.NATIVE):List.of(CliFlavor.JVM);':
         presence = declaration.get('native_cli_presence', 'unknown')
         require(presence in ('absent', 'present'), 'native CLI environment presence must be frozen independently')
-        resolve_enum(root, source, 'CliFlavor', sources)
-        binary = enum_qualified_name(root, source, 'CliFlavor', sources)
+        resolve_enum(root, source, 'CliFlavor', sources, enum_context)
+        binary = enum_qualified_name(root, source, 'CliFlavor', sources, enum_context)
         declaration['environment_contract'] = dict(TAPSTATE_TEST_NATIVE_CLI=presence)
         return [[['enum', binary, value]] for value in (['JVM', 'NATIVE'] if presence == 'present' else ['JVM'])]
     compact = re.sub(r'\s+', '', clean)
@@ -742,19 +732,19 @@ def static_provider_arguments(root, source, declaration, sources):
     if cross:
         first_type, first_name, second_type, second_name, first_arg, second_arg = cross.groups()
         require((first_name, second_name) == (first_arg, second_arg), 'enum matrix argument binding changed')
-        first = resolve_enum(root, source, first_type, sources)
-        second = resolve_enum(root, source, second_type, sources)
-        first_binary = enum_qualified_name(root, source, first_type, sources)
-        second_binary = enum_qualified_name(root, source, second_type, sources)
+        first = resolve_enum(root, source, first_type, sources, enum_context)
+        second = resolve_enum(root, source, second_type, sources, enum_context)
+        first_binary = enum_qualified_name(root, source, first_type, sources, enum_context)
+        second_binary = enum_qualified_name(root, source, second_type, sources, enum_context)
         return [[['enum', first_binary, a], ['enum', second_binary, b]] for a in first for b in second]
     matrix = re.fullmatch(r'returnArrays\.stream\(([\w.]+)\.values\(\)\)\.flatMap\((\w+)->Stream\.of\(([^()]+)\)\.flatMap\((\w+)->(?:java\.util\.stream\.)?IntStream\.range\((\d+),(\d+)\)\.mapToObj\((\w+)->Arguments\.of\((\w+),(\w+),(\w+)\)\)\)\);', compact)
     if matrix:
         first_type, first_name, second_values, second_name, low, high, third_name, first_arg, second_arg, third_arg = matrix.groups()
         require((first_name, second_name, third_name) == (first_arg, second_arg, third_arg), 'matrix argument binding changed')
         require(0 <= int(low) <= int(high) <= 256, 'matrix range requires an independent bounded contract')
-        first = resolve_enum(root, source, first_type, sources)
-        first_binary = enum_qualified_name(root, source, first_type, sources)
-        second = [canonical_expression(v, root, source, sources, body) for v in split_values(second_values)]
+        first = resolve_enum(root, source, first_type, sources, enum_context)
+        first_binary = enum_qualified_name(root, source, first_type, sources, enum_context)
+        second = [canonical_expression(v, root, source, sources, body, enum_context) for v in split_values(second_values)]
         return [[['enum', first_binary, a], b, ['java.lang.Integer', str(c)]] for a in first for b in second for c in range(int(low), int(high))]
     returned = re.search(r'\breturn\s+Stream\.of\s*\(', clean)
     if returned:
@@ -766,7 +756,7 @@ def static_provider_arguments(root, source, declaration, sources):
         for expression in split_values(body[start + 1:end]):
             argument_call = re.fullmatch(r'(?:Arguments\.of|org\.junit\.jupiter\.params\.provider\.Arguments\.of)\s*\(([\s\S]*)\)', expression.strip())
             arguments = split_values(argument_call.group(1)) if argument_call else [expression]
-            result.append([canonical_expression(value, root, source, sources, body) for value in arguments])
+            result.append([canonical_expression(value, root, source, sources, body, enum_context) for value in arguments])
         return result
     cli = re.fullmatch(r'\s*return\s+Cli\.(\w+)\.stream\(\);\s*', body)
     if cli:
@@ -1072,7 +1062,8 @@ def signature_types(declaration):
     return result
 
 
-def source_parameters(root, source, declaration, sources):
+def source_parameters(root, source, declaration, sources, lookup=None):
+    enum_context = (lookup or DisabledLookup(root, sources), declaration.get('source_offset', 0))
     annotations, text = declaration['annotations'], source.read_text()
     # Disabled templates are reported once without invoking their providers or interceptor.
     if declaration.get('disabled_source') is not None:
@@ -1137,14 +1128,13 @@ def source_parameters(root, source, declaration, sources):
         names = re.search(r'\bnames\s*=\s*(\{[\s\S]*?\}|"(?:\\.|[^"\\])*")', argument)
         mode = re.search(r'\bmode\s*=\s*([\w.]+)', argument)
         require(mode is None or mode.group(1).endswith(('INCLUDE', 'EXCLUDE')), 'regex EnumSource requires an independent parameter contract')
-        simple = enum.group(1).rsplit('.', 1)[-1]
-        constants = resolve_enum(root, source, enum.group(1), sources)
+        constants = resolve_enum(root, source, enum.group(1), sources, enum_context)
         selected = literals(names.group(1), text) if names else constants
         values = [[enum.group(1), v] for v in constants if (v not in selected if mode and mode.group(1).endswith('EXCLUDE') else v in selected)]
-        binary_name = enum_qualified_name(root, source, enum.group(1), sources)
+        binary_name = enum_qualified_name(root, source, enum.group(1), sources, enum_context)
         declaration['argument_digests'] = [argument_digest(with_injected([['enum', binary_name, value[1]]], declaration)) for value in values]
     elif 'MethodSource' in annotations:
-        arguments = static_provider_arguments(root, source, declaration, sources)
+        arguments = static_provider_arguments(root, source, declaration, sources, enum_context)
         values = arguments
         declaration['argument_digests'] = [argument_digest(with_injected(args, declaration)) for args in arguments]
     elif any(name in annotations for name in ('NullSource', 'EmptySource', 'NullAndEmptySource')):
@@ -1255,7 +1245,7 @@ def inventory(args):
                             declaration['argument_digests'] = spec.get('argument_digests')
                             used.add(override_key)
                         else:
-                            parameters, mapping = source_parameters(root, declaring_source, declaration, sources)
+                            parameters, mapping = source_parameters(root, declaring_source, declaration, sources, disabled_lookup)
                         require(all(isinstance(p, str) for p in parameters) and len(parameters) == len(set(parameters)), 'invalid stable parameter contract')
                         record.update(parameters=parameters, mapping=mapping, argument_digests=declaration.get('argument_digests'), provider_body_sha256=declaration.get('provider_body_sha256'), published_policy=declaration.get('published_policy'), environment_contract=declaration.get('environment_contract'))
                     except ValueError as error:

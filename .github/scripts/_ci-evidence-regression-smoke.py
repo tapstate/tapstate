@@ -413,7 +413,7 @@ class SourceIdentityTests(unittest.TestCase):
         text = 'enum Flavor implements @TA({"a", "b"}) Marker { ONE, TWO; }'
         node = evidence.class_declarations(text, evidence.masked(text), '')[0]
         self.assertEqual(text[node['start'] + 1:node['end']].strip(), 'ONE, TWO;')
-        self.assertEqual(evidence.enum_constants(text, 'Flavor'), ['ONE', 'TWO'])
+        self.assertEqual(evidence.enum_constants(text, node), ['ONE', 'TWO'])
 
     def test_annotation_array_headers_preserve_nested_enum_argument_identities(self):
         headers = [
@@ -437,6 +437,127 @@ class SourceIdentityTests(unittest.TestCase):
                 self.assertEqual(inv['methods'][0]['argument_digests'], [
                     evidence.argument_digest([['enum', 'sample.Holder$Flavor', value]])
                     for value in ('VANILLA', 'CHOCOLATE')])
+
+    def test_enum_sources_bind_full_local_owner_independently_of_declaration_order(self):
+        for reverse in (False, True):
+            for shared_names in (False, True):
+                with self.subTest(reverse=reverse, shared_names=shared_names), tempfile.TemporaryDirectory() as temporary:
+                    first = 'static class First { enum Flavor { ONE, TWO } }'
+                    constants = ('ONE', 'TWO') if shared_names else ('THREE', 'FOUR')
+                    second = 'static class Second { enum Flavor { ' + ', '.join(constants) + ' } }'
+                    owners = [second, first] if reverse else [first, second]
+                    _, inv = self.inventory(Path(temporary), ' '.join(owners) +
+                        '@ParameterizedTest @EnumSource(Second.Flavor.class) void selected(Second.Flavor flavor) {}')
+                    self.assertTrue(inv['complete'], inv['unresolved'])
+                    method = inv['methods'][0]
+                    self.assertEqual(method['parameters'], [json.dumps(['Second.Flavor', value], separators=(',', ':'))
+                                                           for value in constants])
+                    self.assertEqual(method['argument_digests'], [
+                        evidence.argument_digest([['enum', 'sample.IdentityTest$Second$Flavor', value]])
+                        for value in constants])
+
+    def test_enum_simple_names_are_resolved_in_each_declaring_lexical_scope(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, inv = self.inventory(Path(temporary),
+                '@Nested class First { enum Flavor { ONE, TWO } '
+                '@ParameterizedTest @EnumSource(Flavor.class) void selected(Flavor value) {} } '
+                '@Nested class Second { enum Flavor { THREE, FOUR } '
+                '@ParameterizedTest @EnumSource(Flavor.class) void selected(Flavor value) {} }')
+            self.assertTrue(inv['complete'], inv['unresolved'])
+            for method, owner, values in zip(inv['methods'], ('First', 'Second'), (('ONE', 'TWO'), ('THREE', 'FOUR'))):
+                self.assertEqual(method['argument_digests'], [
+                    evidence.argument_digest([['enum', 'sample.IdentityTest$' + owner + '$Flavor', value]])
+                    for value in values])
+
+    def test_imported_enum_owners_are_not_shadowed_by_unrelated_local_simple_names(self):
+        for imports, typename in [('import other.Holder.Second;', 'Second.Flavor'),
+                ('import other.Holder.Second.Flavor;', 'Flavor'),
+                ('import static other.Holder.Second.Flavor;', 'Flavor'),
+                ('import other.Holder.Second.*;', 'Flavor'), ('', 'other.Holder.Second.Flavor')]:
+            with self.subTest(typename=typename, imports=imports), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                self.inventory(root, '@Test void ordinary() {}')
+                external = root / 'core/src/main/java/other/Holder.java'
+                external.parent.mkdir(parents=True)
+                external.write_text('package other; public class Holder { '
+                    'public static class First { public enum Flavor { ONE, TWO } } '
+                    'public static class Second { public enum Flavor { THREE, FOUR } } }')
+                _, inv = self.inventory(root,
+                    'static class Unrelated { enum Flavor { ONE, TWO } } '
+                    '@ParameterizedTest @EnumSource(' + typename + '.class) void selected(' + typename + ' value) {}',
+                    preamble=imports)
+                self.assertTrue(inv['complete'], inv['unresolved'])
+                self.assertEqual(inv['methods'][0]['argument_digests'], [
+                    evidence.argument_digest([['enum', 'other.Holder$Second$Flavor', value]])
+                    for value in ('THREE', 'FOUR')])
+                self.assertEqual(inv['sources']['core/src/main/java/other/Holder.java'],
+                                 hashlib.sha256(external.read_bytes()).hexdigest())
+
+    def test_method_source_enum_arguments_and_matrix_keep_the_declaring_owner(self):
+        providers = [
+            ('Second.Flavor value', 'return Stream.of(Arguments.of(Second.Flavor.THREE), Arguments.of(Second.Flavor.FOUR));',
+             [[['enum', 'sample.IdentityTest$Second$Flavor', value]] for value in ('THREE', 'FOUR')]),
+            ('First.Flavor first, Second.Flavor second',
+             'return Stream.of(First.Flavor.values()).flatMap(a -> Stream.of(Second.Flavor.values()).map(b -> Arguments.of(a,b)));',
+             [[['enum', 'sample.IdentityTest$First$Flavor', a], ['enum', 'sample.IdentityTest$Second$Flavor', b]]
+              for a in ('ONE', 'TWO') for b in ('THREE', 'FOUR')])]
+        for parameters, body, arguments in providers:
+            with self.subTest(body=body), tempfile.TemporaryDirectory() as temporary:
+                _, inv = self.inventory(Path(temporary),
+                    'static class First { enum Flavor { ONE, TWO } } '
+                    'static class Second { enum Flavor { THREE, FOUR } } '
+                    '@ParameterizedTest @MethodSource("choices") void selected(' + parameters + ') {} '
+                    'static Stream<Arguments> choices() { ' + body + ' }')
+                self.assertTrue(inv['complete'], inv['unresolved'])
+                self.assertEqual(inv['methods'][0]['argument_digests'], [evidence.argument_digest(row) for row in arguments])
+
+    def test_unresolved_enum_owner_cannot_fall_back_to_any_matching_simple_name(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, inv = self.inventory(Path(temporary),
+                'enum Flavor { ONE, TWO } '
+                '@ParameterizedTest @EnumSource(Missing.Flavor.class) void selected(Flavor value) {}')
+            self.assertFalse(inv['complete'])
+            self.assertIsNone(inv['methods'][0]['parameters'])
+
+    def test_method_source_uses_the_actual_inherited_or_hidden_factory_scope(self):
+        for own_factory in (False, True):
+            with self.subTest(own_factory=own_factory), tempfile.TemporaryDirectory() as temporary:
+                preamble = ('class Base { enum Flavor { ONE, TWO } '
+                    'static Stream<Arguments> choices() { return Stream.of(Arguments.of(Flavor.ONE)); } }')
+                _, inv = self.inventory(Path(temporary),
+                    'enum Flavor { ONE, TWO } '
+                    '@ParameterizedTest @MethodSource("choices") void selected(' +
+                    ('Flavor' if own_factory else 'Base.Flavor') + ' value) {} ' +
+                    ('static Stream<Arguments> choices() { return Stream.of(Arguments.of(Flavor.ONE)); }' if own_factory else ''),
+                    preamble=preamble, parent='extends Base')
+                self.assertTrue(inv['complete'], inv['unresolved'])
+                owner = 'IdentityTest' if own_factory else 'Base'
+                self.assertEqual(inv['methods'][0]['argument_digests'], [
+                    evidence.argument_digest([['enum', 'sample.' + owner + '$Flavor', 'ONE']])])
+
+    def test_helper_local_enum_cannot_shadow_an_imported_member_enum(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.inventory(root, '@Test void ordinary() {}')
+            external = root / 'core/src/main/java/other/Holder.java'
+            external.parent.mkdir(parents=True)
+            external.write_text('package other; public class Holder { public enum Flavor { THREE, FOUR } }')
+            _, inv = self.inventory(root,
+                'void helper() { enum Flavor { ONE, TWO } } '
+                '@ParameterizedTest @EnumSource(Flavor.class) void selected(Flavor value) {}',
+                preamble='import other.Holder.Flavor;')
+            self.assertTrue(inv['complete'], inv['unresolved'])
+            self.assertEqual(inv['methods'][0]['argument_digests'], [
+                evidence.argument_digest([['enum', 'other.Holder$Flavor', value]]) for value in ('THREE', 'FOUR')])
+
+    def test_local_provider_enum_requires_an_independent_binary_identity_contract(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, inv = self.inventory(Path(temporary),
+                '@ParameterizedTest @MethodSource("choices") void selected(Object value) {} '
+                'static Stream<Arguments> choices() { enum Flavor { ONE, TWO } '
+                'return Stream.of(Arguments.of(Flavor.ONE)); }')
+            self.assertFalse(inv['complete'])
+            self.assertIsNone(inv['methods'][0]['parameters'])
 
     def test_qualified_package_fallback_keeps_nonmatching_and_nested_definitions(self):
         for annotation in ('sample.Hidden', 'sample.Holder.Hidden'):
