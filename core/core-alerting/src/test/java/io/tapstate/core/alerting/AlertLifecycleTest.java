@@ -1,6 +1,5 @@
 package io.tapstate.core.alerting;
 
-import io.tapstate.core.common.TapstateException;
 import java.time.Duration;
 import java.time.Instant;
 import org.junit.jupiter.api.Test;
@@ -63,35 +62,34 @@ class AlertLifecycleTest {
         s = sample(s, 9, 41, GOOD);
         assertThat(s.status()).isEqualTo(Status.FIRING);
     }
-    @Test void ackAndRecoveryAreIndependentAndOldActionsCannotTouchNewEpisodes() {
-        AlertSnapshot s = sample(AlertSnapshot.initial(rule(1, 0, 0)), 1, 0, BAD);
-        s = AlertLifecycle.acknowledge(s, 1, "user-1", T.plusSeconds(1)).snapshot();
-        assertThat(s.status()).isEqualTo(Status.FIRING);
-        assertThat(s.episode().recoveredAt()).isNull();
-        s = AlertLifecycle.acknowledge(s, 1, "user-2", T.plusSeconds(2)).snapshot();
-        assertThat(s.episode().acknowledgement().principal()).isEqualTo("user-1");
-        assertThat(s.episode().acknowledgement().at()).isEqualTo(T.plusSeconds(1));
-        s = sample(s, 2, 3, GOOD);
-        assertThat(s.episode().acknowledgement()).isNotNull();
-        s = sample(s, 3, 4, BAD);
-        assertThat(s.episode().number()).isEqualTo(2);
-        assertThat(s.episode().acknowledgement()).isNull();
-        AlertSnapshot current = s;
-        assertThatThrownBy(() -> AlertLifecycle.acknowledge(current, 1, "user-1", T.plusSeconds(5)))
-                .isInstanceOf(TapstateException.class).extracting(e -> ((TapstateException) e).code()).isEqualTo(AlertError.STALE_ACTION);
-        AlertSnapshot unacked = sample(AlertSnapshot.initial(rule(1, 0, 0)), 1, 0, BAD);
-        unacked = sample(unacked, 2, 1, GOOD);
-        assertThat(unacked.status()).isEqualTo(Status.RESOLVED);
-        unacked = AlertLifecycle.acknowledge(unacked, 1, "user-1", T.plusSeconds(2)).snapshot();
-        assertThat(unacked.status()).isEqualTo(Status.RESOLVED);
+    @Test void recoveryAndRecurrenceNeedOnlyFreshEvidenceAndPreserveEndedHistory() {
+        AlertSnapshot active = sample(AlertSnapshot.initial(rule(1, 0, 0)), 1, 0, BAD);
+        AlertUpdate recovery = AlertLifecycle.evaluate(active, signal(active.rule(), 2, 3, GOOD, AlarmSeverity.MAJOR), T.plusSeconds(3));
+        AlertSnapshot recovered = recovery.snapshot();
+        Episode first = recovered.episode();
+        assertThat(recovered.status()).isEqualTo(Status.RESOLVED);
+        assertThat(first.endReason()).isEqualTo(EndReason.RECOVERED);
+        assertThat(first.recoveredAt()).isEqualTo(T.plusSeconds(3));
+        assertThat(recovery.transitions()).extracting(AlertUpdate.Transition::kind).containsExactly(AlertUpdate.Kind.RESOLVED);
+        AlertSnapshot next = sample(recovered, 3, 4, BAD);
+        assertThat(next.status()).isEqualTo(Status.FIRING);
+        assertThat(next.episode().number()).isEqualTo(2);
+        assertThat(next.episode().firedAt()).isEqualTo(T.plusSeconds(4));
+        assertThat(next.episode().recoveredAt()).isNull();
+        assertThat(next.episode().endedAt()).isNull();
+        assertThat(recovered.episode()).isSameAs(first);
+        assertThat(first.recoveredAt()).isEqualTo(T.plusSeconds(3));
+        assertThat(sample(next, 2, 3, GOOD)).isEqualTo(next);
+        assertThat(sample(next, 4, 3, GOOD)).isEqualTo(next);
     }
-    @Test void severityChangesDoNotReplaceIdentityOrAckAndBindingsRejectOldCallbacks() {
+    @Test void severityChangesPreserveEpisodeAndBindingsRejectOldCallbacks() {
         AlertSnapshot s = sample(AlertSnapshot.initial(rule(1, 0, 0)), 1, 0, BAD);
-        s = AlertLifecycle.acknowledge(s, 1, "user-1", T.plusSeconds(1)).snapshot();
         AlertUpdate update = AlertLifecycle.evaluate(s, signal(s.rule(), 2, 2, BAD, AlarmSeverity.CRITICAL), T.plusSeconds(2));
         s = update.snapshot();
         assertThat(s.episode().number()).isEqualTo(1);
-        assertThat(s.episode().acknowledgement()).isNotNull();
+        assertThat(s.episode().firedAt()).isEqualTo(T);
+        assertThat(s.episode().severity()).isEqualTo(AlarmSeverity.CRITICAL);
+        assertThat(s.episode().recoveredAt()).isNull();
         assertThat(update.transitions()).extracting(AlertUpdate.Transition::kind).containsExactly(AlertUpdate.Kind.SEVERITY_CHANGED);
         AlertSignal old = signal(s.rule(), 999, 3, GOOD, AlarmSeverity.MAJOR);
         s = AlertLifecycle.replace(s, rule(2, 0, 0), T.plusSeconds(3)).snapshot();
@@ -100,7 +98,6 @@ class AlertLifecycleTest {
         assertThat(AlertLifecycle.evaluate(s, old, T.plusSeconds(3)).ignored()).isTrue();
         s = sample(s, 1, 4, BAD);
         assertThat(s.episode().number()).isEqualTo(2);
-        assertThat(s.episode().acknowledgement()).isNull();
         assertThat(key("org-b", "resource-1", "rule-a")).isNotEqualTo(s.rule().key());
         assertThat(key("org-a", "resource-2", "rule-a")).isNotEqualTo(s.rule().key());
         assertThat(key("org-a", "resource-1", "rule-b")).isNotEqualTo(s.rule().key());

@@ -51,7 +51,7 @@ public final class AlertLifecycle {
                 if (pending == null) { pending = signal.observedAt(); }
                 if (!signal.observedAt().isBefore(pending.plus(rule.triggerFor()))) {
                     number = Math.incrementExact(number);
-                    episode = new Episode(number, signal.observedAt(), signal.severity(), null, null, null, null);
+                    episode = new Episode(number, signal.observedAt(), signal.severity(), null, null, null);
                     status = Status.FIRING;
                     pending = null;
                     add(transitions, Kind.FIRING, signal.observedAt(), number, signal.severity());
@@ -60,7 +60,7 @@ public final class AlertLifecycle {
                     status = Status.PENDING;
                 }
             } else if (episode.severity() != signal.severity()) {
-                episode = new Episode(number, episode.firedAt(), signal.severity(), null, null, null, episode.acknowledgement());
+                episode = new Episode(number, episode.firedAt(), signal.severity(), null, null, null);
                 add(transitions, Kind.SEVERITY_CHANGED, signal.observedAt(), number, signal.severity());
             }
         } else {
@@ -69,7 +69,7 @@ public final class AlertLifecycle {
                 if (recovery == null) { recovery = signal.observedAt(); }
                 if (!signal.observedAt().isBefore(recovery.plus(rule.resolveFor()))) {
                     episode = new Episode(number, episode.firedAt(), episode.severity(), signal.observedAt(),
-                            signal.observedAt(), EndReason.RECOVERED, episode.acknowledgement());
+                            signal.observedAt(), EndReason.RECOVERED);
                     status = Status.RESOLVED;
                     recovery = null;
                     add(transitions, Kind.RESOLVED, signal.observedAt(), number, episode.severity());
@@ -96,22 +96,6 @@ public final class AlertLifecycle {
         return new AlertUpdate(old, List.of(), false);
     }
 
-    public static AlertUpdate acknowledge(AlertSnapshot old, long episodeNumber, String principal, Instant now) {
-        Episode episode = old.episode();
-        if (episode == null || episode.number() != episodeNumber
-                || (episode.endReason() != null && episode.endReason() != EndReason.RECOVERED)) {
-            throw stale("acknowledge");
-        }
-        Acknowledgement ack = new Acknowledgement(principal, now);
-        if (now.isBefore(episode.firedAt())) { throw stale("acknowledge"); }
-        if (episode.acknowledgement() != null) { return new AlertUpdate(old, List.of(), false); }
-        Episode updated = new Episode(episode.number(), episode.firedAt(), episode.severity(), episode.endedAt(),
-                episode.recoveredAt(), episode.endReason(), ack);
-        AlertSnapshot state = new AlertSnapshot(old.rule(), old.enabled(), old.status(), old.quality(), old.lastSequence(),
-                old.lastObservedAt(), old.pendingSince(), old.recoverySince(), old.episodeSequence(), updated);
-        return new AlertUpdate(state, List.of(new AlertUpdate.Transition(Kind.ACKNOWLEDGED, now, episodeNumber, episode.severity())), false);
-    }
-
     public static AlertUpdate terminate(AlertSnapshot old, EndReason reason, Instant now) {
         Objects.requireNonNull(reason, "reason");
         Objects.requireNonNull(now, "now");
@@ -120,7 +104,7 @@ public final class AlertLifecycle {
         List<AlertUpdate.Transition> transitions = List.of();
         if (episode != null && episode.endedAt() == null) {
             if (now.isBefore(episode.firedAt())) { throw stale("terminate"); }
-            episode = new Episode(episode.number(), episode.firedAt(), episode.severity(), now, null, reason, episode.acknowledgement());
+            episode = new Episode(episode.number(), episode.firedAt(), episode.severity(), now, null, reason);
             transitions = List.of(new AlertUpdate.Transition(Kind.ADMINISTRATIVELY_ENDED, now, episode.number(), episode.severity()));
         }
         return new AlertUpdate(new AlertSnapshot(old.rule(), false, Status.CLEAR, Quality.DISABLED,

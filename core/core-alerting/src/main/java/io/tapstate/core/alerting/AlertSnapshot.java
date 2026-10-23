@@ -10,14 +10,8 @@ public record AlertSnapshot(AlertRule rule, boolean enabled, Status status, Qual
     public enum Status { CLEAR, PENDING, FIRING, RESOLVED }
     public enum Quality { VALID, UNKNOWN, STALE, CLOCK_INVALID, DISABLED }
     public enum EndReason { RECOVERED, DISABLED, SUPERSEDED, RESOURCE_REMOVED }
-    public record Acknowledgement(String principal, Instant at) {
-        public Acknowledgement {
-            principal = AlertValidation.text(principal, "principal", 256);
-            Objects.requireNonNull(at, "at");
-        }
-    }
     public record Episode(long number, Instant firedAt, AlarmSeverity severity, Instant endedAt,
-            Instant recoveredAt, EndReason endReason, Acknowledgement acknowledgement) {
+            Instant recoveredAt, EndReason endReason) {
         public Episode {
             if (number <= 0) { throw new IllegalArgumentException("episode number must be positive"); }
             Objects.requireNonNull(firedAt, "firedAt");
