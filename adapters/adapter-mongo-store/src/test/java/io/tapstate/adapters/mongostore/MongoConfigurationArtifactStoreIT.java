@@ -15,6 +15,8 @@ import io.tapstate.spi.store.PipelineLayout;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
@@ -397,6 +399,82 @@ class MongoConfigurationArtifactStoreIT {
                     .containsExactlyInAnyOrder("configuration_version", "cluster_identity", "schema_migrations",
                             "cluster_keys", "storage_setup", "sources", "pipeline_drafts", "nest_dead_letters");
         });
+    }
+
+    @ParameterizedTest @EnumSource(RestoredKey.class)
+    void aNativeConfigurationSnapshotRequiresItsPairedKeyAfterRestore(RestoredKey restoredKey) {
+        String suffix = UUID.randomUUID().toString().replace("-", "");
+        try (var client = MongoClients.create(MONGO.getReplicaSetUrl())) {
+            var original = client.getDatabase("native_backup_" + suffix);
+            var restored = client.getDatabase("native_restore_" + suffix);
+            Resource expected = source("restored_source", "paired-source-secret");
+            var setup = new io.tapstate.spi.store.StorageSetupScope("cluster-a", "installation-a", "setup-a", 1);
+            try {
+                io.tapstate.spi.store.StorageBinding binding;
+                try (var domain = MongoConfigurationBootstrap.prepare(settings(configurationUri(original)),
+                        setup.clusterId(), setup.installationId(), setup.operationId(), setup.generation())) {
+                    binding = domain.bindings().commit(setup, io.tapstate.spi.store.StorageBinding.Mode.OP,
+                            new io.tapstate.spi.store.StorageBinding.Connection(io.tapstate.spi.store.StorageBinding.Connection.Kind.MONGODB,
+                                    "mongodb://paired-user:paired-cache-secret@cache.invalid/cache?tls=true", "cache", null),
+                            (io.tapstate.core.model.SourceResource) source("views", "paired-target-secret"));
+                    domain.artifacts().save(expected);
+                }
+                Document key = SystemCollections.CLUSTER_KEYS.on(original).find().first();
+                Document encryptedSource = SystemCollections.SOURCES.on(original).find(new Document("_id", expected.id())).first();
+                Document encryptedBinding = SystemCollections.STORAGE_BINDING.on(original).find().first();
+                assertThat(encryptedSource.toJson()).doesNotContain("paired-source-secret");
+                assertThat(encryptedBinding.toJson()).doesNotContain("paired-cache-secret");
+                restoreNativeConfiguration(original, restored);
+                if (restoredKey == RestoredKey.MISSING) SystemCollections.CLUSTER_KEYS.on(restored).deleteMany(new Document());
+                if (restoredKey == RestoredKey.WRONG) {
+                    byte[] wrong = new byte[32]; java.util.Arrays.fill(wrong, (byte) 7);
+                    assertThat(SourceConfigCipher.fingerprint(wrong)).isNotEqualTo(key.getString("keyId"));
+                    SystemCollections.CLUSTER_KEYS.on(restored).updateOne(new Document("_id", "cluster"),
+                            new Document("$set", new Document("keyId", SourceConfigCipher.fingerprint(wrong))
+                                    .append("material", Base64.getUrlEncoder().withoutPadding().encodeToString(wrong))));
+                }
+                Document retainedKey = SystemCollections.CLUSTER_KEYS.on(restored).find().first();
+                if (restoredKey == RestoredKey.PAIRED) {
+                    for (int boot = 0; boot < 2; boot++) {
+                        try (var domain = MongoConfigurationDomain.openExisting(settings(configurationUri(restored)))) {
+                            assertThat(domain.artifacts().get(expected.id())).contains(expected);
+                            assertThat(domain.bindings().load()).contains(binding);
+                        }
+                        assertThat(SystemCollections.CLUSTER_KEYS.on(restored).find().first()).isEqualTo(key);
+                    }
+                } else {
+                    assertThatThrownBy(() -> {
+                        try (var unexpected = MongoConfigurationDomain.openExisting(settings(configurationUri(restored)))) {
+                            assertThat(unexpected.clusterId()).isEqualTo(setup.clusterId());
+                        }
+                    })
+                            .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                                assertThat(failure.code()).isEqualTo(restoredKey == RestoredKey.MISSING
+                                        ? StoreError.SOURCE_CONFIG_KEYRING_INVALID : IoError.DOCUMENT_UNREADABLE);
+                                assertThat(failure.toString()).doesNotContain("paired-source-secret", "paired-cache-secret", "paired-target-secret");
+                            });
+                }
+                assertThat(SystemCollections.CLUSTER_KEYS.on(restored).find().first()).isEqualTo(retainedKey);
+                assertThat(SystemCollections.SOURCES.on(restored).find(new Document("_id", expected.id())).first()).isEqualTo(encryptedSource);
+                assertThat(SystemCollections.STORAGE_BINDING.on(restored).find().first()).isEqualTo(encryptedBinding);
+            } finally { restored.drop(); original.drop(); }
+        }
+    }
+
+    private enum RestoredKey { PAIRED, MISSING, WRONG }
+
+    /** Test-owned BSON and index restore; this is no general backup service or runtime recovery entry. */
+    private static void restoreNativeConfiguration(MongoDatabase original, MongoDatabase restored) {
+        for (String name : original.listCollectionNames()) {
+            restored.createCollection(name);
+            var from = original.getCollection(name);
+            var rows = from.find().into(new java.util.ArrayList<>());
+            if (!rows.isEmpty()) restored.getCollection(name).insertMany(rows.stream().map(Document::new).toList());
+            var indexes = from.listIndexes().into(new java.util.ArrayList<>()).stream()
+                    .filter(index -> !"_id_".equals(index.getString("name")))
+                    .map(index -> { var copy = new Document(index); copy.remove("v"); copy.remove("ns"); return copy; }).toList();
+            if (!indexes.isEmpty()) restored.runCommand(new Document("createIndexes", name).append("indexes", indexes));
+        }
     }
 
     @Test
