@@ -6,6 +6,7 @@ import com.mongodb.client.MongoDatabase;
 import io.tapstate.adapters.mongostore.MongoConnection;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
 import io.tapstate.adapters.mongostore.MongoAiProviderSettingsStore;
+import io.tapstate.adapters.mongostore.SourceConfigKeyringHandle;
 import io.tapstate.control.core.AiProviderService;
 import io.tapstate.control.core.AuditGate;
 import io.tapstate.spi.store.AiProviderSettingsStore;
@@ -21,6 +22,7 @@ import java.time.ZoneOffset;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.mock;
 
 class AiProviderSettingsWiringTest {
     @Test void assemblesTheEncryptedMongoStoreAndControlServiceFromTheirProductionFactories() throws Exception {
@@ -40,6 +42,7 @@ class AiProviderSettingsWiringTest {
                 "mongodb://localhost/tapstate", null, Duration.ofSeconds(1)));
         set(connection, "client", client);
         set(connection, "databaseName", "tapstate");
+        set(connection, "sourceConfigKeyring", mock(SourceConfigKeyringHandle.class));
 
         AiProviderSettingsStore store = new StoreConfiguration().aiProviderSettingsStore(connection);
         AuditStore audit = record -> { };
