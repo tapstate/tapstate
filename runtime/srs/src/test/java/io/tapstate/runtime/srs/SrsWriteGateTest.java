@@ -7,12 +7,15 @@ import com.hazelcast.config.SerializerConfig;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.core.event.Op;
+import io.tapstate.core.event.RowValueError;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.capture.SourcePosition;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import java.util.Map;
+import java.util.List;
 import java.util.OptionalLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -131,6 +134,23 @@ class SrsWriteGateTest {
     void rejectsANullItem() {
         SrsWriteGate gate = new SrsWriteGate(new SrsRingbuffer(hz.getRingbuffer("srs.gate.nullitem")));
         assertThatThrownBy(() -> gate.append(null, -1L)).isInstanceOf(NullPointerException.class);
+    }
+
+    @Test
+    void rejectsAnInvalidBatchBeforeAppendingItsValidPrefix() {
+        SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer("srs.gate.invalidkeys"));
+        SrsWriteGate gate = new SrsWriteGate(ring);
+        SrsItem invalid = new SrsItem(new SourcePosition("invalid"), Op.INSERT, 0,
+                null, Map.of("dict", Map.of(7, "number-key", "7", "text-key")), 0);
+        assertThatThrownBy(() -> gate.appendAll(List.of(insert("valid"), invalid), -1L))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(RowValueError.NON_STRING_MAP_KEY);
+                    assertThat(failure.args()).containsEntry("path", "$/after/dict");
+                });
+        assertThat(ring.tailSequence()).isEqualTo(-1L);
+        assertThatThrownBy(() -> gate.append(invalid, -1L)).isInstanceOf(TapstateException.class);
+        assertThat(ring.tailSequence()).isEqualTo(-1L);
+        assertThat(gate.append(insert("next-valid"), -1L)).hasValue(0L);
     }
 
     @Test

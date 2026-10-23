@@ -4,6 +4,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.RowValueError;
+import io.tapstate.core.common.TapstateException;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
@@ -30,6 +32,25 @@ import org.junit.jupiter.api.Test;
 class SnapshotBufferTest {
 
     private static final String PIPELINE = "orders_pipeline";
+
+    @Test
+    void rejectsInvalidKeysBeforeDirectOrBoundSnapshotAdmission() {
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        String ring = "srs.chain.invalidkeys";
+        Envelope invalid = Envelope.read(0, "orders", Map.of("dict", Map.of(7, "value")), null);
+        assertThatThrownBy(() -> buffer.append(PIPELINE, ring, invalid))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(RowValueError.NON_STRING_MAP_KEY);
+                    assertThat(failure.args()).containsEntry("path", "$/after/dict");
+                });
+        assertThat(buffer.drain(PIPELINE, ring)).isEmpty();
+        CaptureHandoff handoff = buffer.handoff(PIPELINE, ring);
+        assertThatThrownBy(() -> handoff.accept(invalid)).isInstanceOf(TapstateException.class);
+        assertThat(buffer.drain(PIPELINE, ring)).isEmpty();
+        Envelope valid = row("orders", 1);
+        handoff.accept(valid);
+        assertThat(buffer.drain(PIPELINE, ring)).containsExactly(valid);
+    }
 
     @Test
     @SuppressWarnings("unchecked")

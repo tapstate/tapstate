@@ -1,0 +1,84 @@
+## Linked issue
+
+Refs tapstate/tapstate#839
+
+## What changed
+
+A nested map containing Integer `7` and String `"7"` previously became a single BSON field, silently losing the first value. Row admission now rejects any non-String or null map key with `core.row-map-key-unsupported`, including the containing object's structural `path` and `keyType`, before encoding or accepting the row. The diagnostic never renders the rejected key's value.
+
+The shared check covers stored before/after images, Nest dead letters, CDC batches, snapshot handoffs, preview sampling, logical/Extended JSON rendering, and preview cache/materialization normalization. A batch with an invalid image reaches no Mongo write; a rejected CDC item advances neither its ring nor its source offset. Existing preview nesting and byte limits remain in effect. PDK conversion still preserves its input keys.
+
+The mixed-key regression retains its original input and method name and now requires the explicitly selected coded rejection. Legal string-keyed rows retain their BSON format and carrier metadata. This introduces no collection, migration, recovery, fencing, transaction, or retention change. Previously overwritten entries cannot be reconstructed from their stored images.
+
+## End-to-end case
+
+`AMixedMapKeyRowFailsBeforeDeliveryIT.aMixedKeyRowFailsWithItsDiagnosticWhileAnOrdinaryRowIsDelivered` drives the real in-process server through HTTP, with a real Mongo control/operator store and the harness's registered PDK connector. Its two parameterized scenarios prove that an ordinary row reaches the file target, while a row containing distinct Integer `7` and String `"7"` nested keys publishes `core.row-map-key-unsupported`, `path=$/after/dict`, and `keyType=java.lang.Integer`, reaches FAILED, and creates no target file.
+
+The missing declarative word is a seed value preserving Java map-key types: JSON and CSV cannot represent this Integer/String key pair. The connector's opt-in `mixed_map_keys` fixture constructs it before normal PDK conversion and snapshot handoff. The case does not call the validator directly, replace the dispatcher, or use a preselected failure. This witnesses the product with the harness connector; it does not claim acceptance against a shipped database connector.
+
+The existing boundary checks remain: `RowImagesTest.distinctNestedMapKeysSurviveTheStoredRowImage`, `RowImageAdmissionTest`, `CdcPhaseTest.invalidKeysDoNotAdvanceTheSourceReadOffset`, and snapshot/preview regressions verify precise errors, unchanged inputs, no Mongo write, and no ring/source-offset advancement.
+
+## Live verification scenario
+
+With JDK 21 and Maven configured, run from the repository root:
+
+```sh
+mvn -B -pl adapters/adapter-mongo-store -am -Dtest=RowImagesTest#distinctNestedMapKeysSurviveTheStoredRowImage -Dsurefire.failIfNoSpecifiedTests=false test
+```
+
+Expect exactly one passing test: the Integer/String collision input is refused with `core.row-map-key-unsupported`, `path=$/dict`, and `keyType=java.lang.Integer`, while both original input entries remain intact. No database or connector is needed. This automated scenario has been run locally; a separate human product observation is not claimed.
+
+## Documentation impact
+
+- [x] This change needs documentation follow-up (add the `docs-needed` label when publishing)
+- **Draft in this repository:** none; the English diagnostic and remediation are included in the message catalog.
+- **Public page it is headed for:** none selected; document the requirement for non-null String map keys at every row nesting level and the new diagnostic in the relevant ingestion troubleshooting page.
+
+### Release note
+
+**Kind:** fix
+
+Rows containing unsupported nested map keys are rejected with a precise diagnostic so that distinct keys can no longer silently overwrite each other in stored row images.
+
+## CI cost
+
+- **CI cost delta and lane placement:** no new lane. The two new scenarios use the existing E2E shards; the existing core-event, adapters, SRS, app, and architecture checks remain in their current lanes. Comparable baseline/current CI medians and signed delta have not been measured. The initial successful local focused E2E command took 24.533 seconds, with 10.83 seconds in the two scenarios; this is not a CI cost comparison.
+
+## Checks
+
+- [ ] `mvn verify` is green locally
+- [x] An end-to-end case covers this change, and is named above
+- [x] New or changed e2e assertions carry mutation evidence: the mutation applied, the red observed, and that only it went red
+
+Local validation: the accepted single-case command passes. The selected reactor run passed 165 tests with zero failures, errors, or skips, including error-code/catalog/golden and R1-R10 dependency gates. Independent read-only review found no remaining actionable issue after the preview nesting-boundary correction.
+
+Mutation evidence for the focused regression: restoring the original `String.valueOf` map-key coercion and removing row-key validation made the unchanged command fail with exactly one failed test because no coded rejection occurred. Restoring the repair made the same command pass again. This does not claim an external end-to-end mutation run.
+
+The focused E2E command is:
+
+```sh
+CI=true mvn -B -pl e2e -am -Dapi.version=1.44 -Dtest=E2eConnectorJarTest -Dsurefire.failIfNoSpecifiedTests=false -Dit.test=AMixedMapKeyRowFailsBeforeDeliveryIT -Dfailsafe.failIfNoSpecifiedTests=false verify
+```
+
+E2E mutation evidence: temporarily disabling the three shared `RowMapKeys.validate` entry points and restoring `String.valueOf` key coercion made this unchanged command fail. Exactly the mixed-key scenario failed because no failure was published within the existing one-minute bound; the ordinary-row scenario and all five connector-artifact checks passed. Production source was restored byte for byte after the mutation. The two E2E scenarios and five artifact checks pass with validation present, with no skipped tests. This is a Docker-backed local product run with the harness connector, not external connector acceptance.
+
+The shared storage check reports no declared storage-resource change. Full `mvn verify`, external database/connector acceptance, green published CI for this local repair, and formal PR readiness have not been claimed.
+
+
+---
+
+Refs #839
+
+**Issues filed while working this line** -- a live query, so it includes
+any filed after this body was written:
+https://github.com/issues?q=is%3Aissue+is%3Aopen+org%3Atapstate+%22Refs+tapstate%2Ftapstate%23839%22
+
+One a maintainer accepts is labelled `known-issue`: shipped with knowingly,
+to be improved later. The rest want a decision before this line closes out.
+
+Merging this does not close the execution issue for `issue-839`. That happens at
+the closeout, once **every** repository this workstream declares has merged.
+
+**Maintainer: run the closeout for `issue-839` after merging.** Whoever merges owes
+the closeout, because it is work in a repository the author may not have.
+

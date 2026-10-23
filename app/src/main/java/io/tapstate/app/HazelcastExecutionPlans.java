@@ -52,6 +52,11 @@ final class HazelcastExecutionPlans implements ExecutionPlans, ExecutionPlanReco
     }
 
     @Override
+    public void forget(ExecutionPlan expected) {
+        plans().remove(expected.pipelineId(), expected);
+    }
+
+    @Override
     public Map<String, ExecutionPlan> current(Collection<String> pipelineIds) {
         if (pipelineIds.isEmpty()) {
             return Map.of();

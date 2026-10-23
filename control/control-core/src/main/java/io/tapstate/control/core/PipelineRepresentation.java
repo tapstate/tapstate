@@ -209,7 +209,8 @@ public final class PipelineRepresentation {
                             "preserveNullAndEmptyArrays"), path + ".preserve_null_and_empty_arrays"),
                     textOrNull(value(payload, "element_key", "elementKey"), path + ".element_key"),
                     elementType(value(payload, "element_type", "elementType"),
-                            path + ".element_type"));
+                            path + ".element_type"),
+                    textOrNull(value(payload, "source_id_field", "sourceIdField"), path + ".source_id_field"));
             case "nest" -> new TransformBody.Nest(
                     textOrNull(value(payload, "primary_key", "primaryKey"), path + ".primary_key"),
                     enumValue(value(payload, "order"), NestOrder.values(), NestOrder::yaml, path + ".order"),
@@ -376,6 +377,7 @@ public final class PipelineRepresentation {
                 value.put("preserveNullAndEmptyArrays", unwind.preserveNullAndEmptyArrays());
                 value.put("elementKey", unwind.elementKey());
                 value.put("elementType", unwind.elementType());
+                value.put("sourceIdField", unwind.sourceIdField());
             }
             case TransformBody.Union ignored -> {
             }

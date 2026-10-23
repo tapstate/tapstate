@@ -348,6 +348,18 @@ class PipelineRepresentationTest {
                         .isEqualTo(new TransformBody.Unwind("items", "item_no", true, "sku", "json")));
     }
 
+    @Test
+    void structuredInputCannotPersistInvalidPreservedIdentityNames() {
+        for (String field : List.of("", "bad.name", "$reserved", "bad\0name")) {
+            Map<String, Object> step = Map.of("id", "expanded", "type", "unwind", "from", List.of("orders"),
+                    "path", "items", "includeArrayIndex", "position", "sourceIdField", field);
+            PipelineResource model = representation.toModel(new PipelineInput("orders_sync", null,
+                    new ArrayList<Object>(List.of("orders")), List.of(step), null, null, null, null), expanding());
+            assertThatThrownBy(() -> io.tapstate.core.dsl.UnwindRules.validate(List.of(model)))
+                    .isInstanceOf(io.tapstate.core.dsl.DslException.class);
+        }
+    }
+
     /** One source, one expansion, nothing else - the smallest artifact that carries one. */
     private static PipelineResource expanding() {
         return new PipelineResource(

@@ -121,7 +121,7 @@ class ADeferredStartOutlivesThePreviousFailedJobIT {
                     PipelineLifecycleService lifecycle = new PipelineLifecycleService(
                             new ArtifactQueryService(store.artifacts()), store.desired(),
                             new AuditGate(record -> { }, clock),
-                            id -> store.state().read(id).map(CheckpointDoc::epoch));
+                            store.state()::read);
                     ConvergenceDriver driver = new ConvergenceDriver(
                             new PipelineConverger(store.desired(), store.state(), actuator, clock), store.desired(),
                             new ObservationPublisher(store.state(), store.observations()), gate::businessEligible,

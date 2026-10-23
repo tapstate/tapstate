@@ -126,8 +126,7 @@ class AtlasPdkSourcePermissionsIT {
                     () -> Long.valueOf(2).equals(control.snapshotRowsRead(pipeline).get(TABLE)),
                     () -> String.valueOf(control.snapshotRowsRead(pipeline)));
             awaitSnapshotProgress(control, pipeline);
-            control.stop(pipeline, false);
-            awaitState(control, pipeline, PipelineState.STOPPED);
+            awaitState(control, pipeline, PipelineState.COMPLETED);
             runtime.assertAuthenticationBoundary();
         }
     }
@@ -177,8 +176,7 @@ class AtlasPdkSourcePermissionsIT {
                     () -> Long.valueOf(2).equals(control.snapshotRowsRead(snapshot).get(TABLE)),
                     () -> String.valueOf(control.snapshotRowsRead(snapshot)));
             awaitSnapshotProgress(control, snapshot);
-            control.stop(snapshot, false);
-            awaitState(control, snapshot, PipelineState.STOPPED);
+            awaitState(control, snapshot, PipelineState.COMPLETED);
 
             control.apply(workspace(source, "permission_cdc_target", cdc, fixture.sourceUri(), cdcTargetUri,
                     "snapshot_and_cdc"));

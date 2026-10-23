@@ -8,6 +8,9 @@
 #
 # Values are double-quoted single-line scalars; colons, apostrophes and backticks inside the quotes
 # are fine. Keep literal double-quotes out of values (use backticks for inline code).
+core.row-map-key-unsupported:
+  message: "Row object at `{path}` contains an unsupported map key of type `{keyType}`."
+  solution: "Use non-null string map keys at every nesting level. The row was refused without coercing its keys."
 cluster.membership-unreadable:
   message: "This member cannot read who is in the cluster right now."
   solution: "Its engine cannot answer for the cluster yet, which is what a member looks like while it is starting, while it is stopping, while the cluster is putting itself back together after a partition healed, and while it settles after another member has left. Ask another member, or read again in a moment."
@@ -1128,3 +1131,20 @@ start-check.clear-before-full-load:
   message: "Clear {target} before the full load, and set on_full_load: clear on {element}"
 start-check.keep-existing-rows:
   message: "Keep the rows already in {target} and start anyway"
+
+connector.target-identity-conflict:
+  message: "Target '{table}' cannot preserve source identity '{field}' as '{preserved}': {reason}."
+  solution: "Check the configured source identity field, the target generated identity and the complete logical matching key. Existing fields and business constraints are never overwritten."
+connector.target-identity-check-failed:
+  message: "Connector '{connector}' could not check identity constraints for target '{table}': {detail}."
+  solution: "Check target access and metadata permissions, then retry. An unavailable identity check does not authorize a write."
+
+start-check.target-identity-automatic:
+  message: "Target '{target}' on '{connection}' will preserve '{field}' as '{preserved}', generate a new target identity and match updates and deletes by '{key}'."
+  solution: "No additional transform is needed. Change source_id_field in the unwind settings to customize the preserved field name."
+start-check.target-identity-compatible:
+  message: "Target '{target}' on '{connection}' accepts the expanded key '{key}' without renaming the parent identity."
+  solution: "The current field names are retained."
+start-check.target-identity-refused:
+  message: "Target '{target}' on '{connection}' cannot safely preserve '{field}' as '{preserved}': {reason}."
+  solution: "Resolve the field collision or target identity constraints before starting. Source values and existing business constraints are not overwritten."
