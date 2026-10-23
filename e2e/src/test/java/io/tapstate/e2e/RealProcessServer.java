@@ -122,7 +122,12 @@ final class RealProcessServer implements ServerHandle {
     /** Starts an already prepared split-store installation with only its configuration URI. */
     static RealProcessServer startPrepared(String configurationUri, String listenAddress,
             IntFunction<List<String>> extraArguments) {
-        RealProcessServer server = launchingPrepared(configurationUri, listenAddress, extraArguments);
+        return startPrepared(configurationUri, listenAddress, null, extraArguments);
+    }
+
+    static RealProcessServer startPrepared(String configurationUri, String listenAddress, Path stagingDirectory,
+            IntFunction<List<String>> extraArguments) {
+        RealProcessServer server = launchingPrepared(configurationUri, listenAddress, stagingDirectory, extraArguments);
         try {
             server.awaitReady();
             return server;
@@ -135,8 +140,14 @@ final class RealProcessServer implements ServerHandle {
     /** Lets a fixture launch every seed before waiting for any member to finish joining. */
     static RealProcessServer launchingPrepared(String configurationUri, String listenAddress,
             IntFunction<List<String>> extraArguments) {
+        return launchingPrepared(configurationUri, listenAddress, null, extraArguments);
+    }
+
+    /** Keeps an explicitly supplied connector staging directory owned by the caller. */
+    static RealProcessServer launchingPrepared(String configurationUri, String listenAddress, Path stagingDirectory,
+            IntFunction<List<String>> extraArguments) {
         return launching(configurationUri, null, bootJar(), listenAddress,
-                List.of("-Xmx768m", "-XX:ActiveProcessorCount=2"), null, extraArguments);
+                List.of("-Xmx768m", "-XX:ActiveProcessorCount=2"), stagingDirectory, extraArguments);
     }
 
     /**
