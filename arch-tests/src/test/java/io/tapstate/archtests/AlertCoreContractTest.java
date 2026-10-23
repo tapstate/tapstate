@@ -25,6 +25,15 @@ class AlertCoreContractTest {
                 + "metric-input-max-facts=" + ObservationMetricInput.MAX_FACTS + "\n"
                 + "metric-input-max-points=" + ObservationMetricInput.MAX_POINTS + "\n"
                 + "metric-input-status=" + names(ObservationMetricInput.Status.values()) + "\n"
+                + fields("diagnostic-trace", AlarmDiagnostics.SafeTrace.class)
+                + fields("diagnostic-occurrence", AlarmDiagnostics.Occurrence.class)
+                + fields("diagnostic-capture", AlarmDiagnostics.Capture.class)
+                + fields("diagnostic-history", AlarmDiagnostics.History.class)
+                + "diagnostic-version=" + AlarmDiagnostics.CONTRACT_VERSION + "\n"
+                + "diagnostic-max-text-bytes=" + AlarmDiagnostics.MAX_TEXT_BYTES + "\n"
+                + "diagnostic-max-lines=" + AlarmDiagnostics.MAX_LINES + "\n"
+                + "diagnostic-max-exception-nodes=" + AlarmDiagnostics.MAX_EXCEPTION_NODES + "\n"
+                + "diagnostic-max-encoded-pair-bytes=" + AlarmDiagnostics.MAX_ENCODED_PAIR_BYTES + "\n"
                 + fields("delivery-capability-header", DeliveryCapabilityPolicy.Header.class)
                 + fields("delivery-capability-decision", DeliveryCapabilityPolicy.Decision.class)
                 + "delivery-capability-version=" + DeliveryCapabilityPolicy.CONTRACT_VERSION + "\n"
