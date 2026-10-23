@@ -55,6 +55,7 @@ import java.util.List;
         PipelineViewController.class,
         PipelineLayoutController.class,
         PipelineDraftController.class,
+        AiProviderController.class, PipelineAssistantController.class,
         PipelinePreviewController.class,
         SourceDraftController.class,
         DerivedSchemaController.class,

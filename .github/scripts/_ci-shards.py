@@ -92,6 +92,7 @@ def discover(root):
             # Comments and literals may contain source fixtures, including declarations.
             text = re.sub(r'/\*[\s\S]*?\*/|//[^\n]*|"""[\s\S]*?"""|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'',
                           ' ', source.read_text())
+            requires_cloud_release_inputs = bool(re.search(r'@RequiresCloudReleaseInputs\b', text))
             # JUnit does not instantiate abstract bases, even when their filenames match.
             if re.search(r'\babstract\s+class\s+' + re.escape(name) + r'\b', text):
                 continue
@@ -104,7 +105,10 @@ def discover(root):
             classname = (package.group(1) + '.' if package else '') + name
             for kind, selected in [('unit', unit), ('it', integration)]:
                 if selected:
-                    tests.append(dict(module=module, kind=kind, **{'class': classname}))
+                    test = dict(module=module, kind=kind, **{'class': classname})
+                    if requires_cloud_release_inputs:
+                        test['requires_cloud_release_inputs'] = True
+                    tests.append(test)
     return sorted(tests, key=key)
 
 
@@ -142,7 +146,9 @@ def make_plan(args, root):
     if args.inventory:
         groups = [(f'shard-{i+1}', ts, total) for i, (ts, total) in enumerate(balance(tests, args.count, hints))]
     else:
-        e2e = [t for t in tests if t['module'] == 'e2e' and t['kind'] == 'it']
+        # Cloud startup witnesses run in rest, the only shard that stages the locked public inputs.
+        e2e = [t for t in tests if t['module'] == 'e2e' and t['kind'] == 'it'
+               and not t.get('requires_cloud_release_inputs')]
         engine = [t for t in tests if t['module'] == 'runtime/engine']
         rest = [t for t in tests if t not in e2e and t not in engine]
         groups = [(f'e2e-{i+1}', ts, total) for i, (ts, total) in enumerate(balance(e2e, 2, hints))]

@@ -2,15 +2,20 @@ package io.tapstate.control.core;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.catchThrowableOfType;
 
 import io.tapstate.core.catalog.TapstateCatalog;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.common.TapstateType;
 import io.tapstate.core.dsl.DslError;
 import io.tapstate.core.dsl.DslException;
 import io.tapstate.core.model.Resource;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.DiscoveredSourceModel;
+import io.tapstate.spi.store.PipelineDraft;
+import io.tapstate.spi.store.PipelineDraftMutation;
+import io.tapstate.spi.store.PipelineDraftStore;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceModel;
@@ -190,6 +195,45 @@ class ApplyServiceRowExpressionTypeTest {
     }
 
     @Test
+    @DisplayName("an incomplete Builder destination still validates discovered row-expression types")
+    void previewCandidateValidatesDiscoveredSchemaWithAnIncompleteDestination() {
+        service.apply("tester", List.of(new ArtifactDraft("src_orders.tap.yml", SOURCE)));
+        discovered("src_orders", "orders", Map.of("amount", TapstateType.DECIMAL));
+
+        Instant now = FIXED_CLOCK.instant();
+        PipelineDraft candidate = new PipelineDraft("orders_out", 1, 1, PipelineDraft.Mode.WIZARD,
+                "Orders", "", null,
+                new PipelineDraft.Wizard(
+                        new PipelineDraft.Root("root", "src_orders", "orders", List.of(), List.of()),
+                        List.of(),
+                        List.of(new PipelineDraft.Transform("keep", "filter",
+                                Map.of("expr", "after.amount * 2 > 0"))),
+                        new PipelineDraft.Output("atlas", Map.of())),
+                null, null, null, now, now, "tester");
+        PipelineDraftService drafts = new PipelineDraftService(
+                new SingleDraftStore(candidate), null, service);
+
+        assertThatThrownBy(() -> drafts.previewCandidate("orders_out", candidate))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(PipelineDraftError.INVALID);
+                    assertThat(failure.getCause()).isInstanceOfSatisfying(DslException.class, diagnostic -> {
+                        assertThat(diagnostic.code()).isEqualTo(DslError.ROW_EXPRESSION_TYPE_UNSUPPORTED);
+                        assertThat(diagnostic.args()).containsEntry("column", "amount");
+                    });
+                });
+        assertThat(artifacts.get("orders_out")).isEmpty();
+
+        PipelineDraft valid = new PipelineDraft("orders_out", 1, 1, PipelineDraft.Mode.WIZARD,
+                "Orders", "", null,
+                new PipelineDraft.Wizard(
+                        new PipelineDraft.Root("root", "src_orders", "orders", List.of(), List.of()),
+                        List.of(), List.of(), new PipelineDraft.Output("atlas", Map.of())),
+                null, null, null, now, now, "tester");
+        PipelineDraftService validDrafts = new PipelineDraftService(new SingleDraftStore(valid), null, service);
+        assertThat(validDrafts.previewCandidate("orders_out", valid).serve()).isNull();
+    }
+
+    @Test
     void applyAcceptsAChoiceAfterDecimalColumnsAreReplacedByIntegers() {
         discovered("src_orders", "orders", Map.of("a", TapstateType.DECIMAL, "b", TapstateType.DECIMAL));
         String pipeline = """
@@ -353,6 +397,30 @@ class ApplyServiceRowExpressionTypeTest {
     }
 
     // ---- doubles -------------------------------------------------------------------------
+
+    private static final class SingleDraftStore implements PipelineDraftStore {
+        private final PipelineDraft draft;
+
+        SingleDraftStore(PipelineDraft draft) { this.draft = draft; }
+
+        @Override public Optional<PipelineDraft> get(String pipelineId) {
+            return draft.pipelineId().equals(pipelineId) ? Optional.of(draft) : Optional.empty();
+        }
+        @Override public List<PipelineDraft> list() { return List.of(draft); }
+        @Override public PipelineDraftMutation create(PipelineDraft ignored) {
+            throw new UnsupportedOperationException();
+        }
+        @Override public PipelineDraftMutation replace(String pipelineId, long expectedRevision,
+                PipelineDraft replacement) {
+            throw new UnsupportedOperationException();
+        }
+        @Override public PipelineDraftMutation delete(String pipelineId, long expectedRevision) {
+            throw new UnsupportedOperationException();
+        }
+        @Override public PipelineDraftMutation publish(PipelineDraft.Publication publication) {
+            throw new UnsupportedOperationException();
+        }
+    }
 
     private static final class InMemoryArtifactStore implements ArtifactStore {
         final Map<String, Resource> byId = new LinkedHashMap<>();

@@ -14,6 +14,8 @@ class ControlOperationsTest {
     void registersExactlyTheL1OperationSet() {
         assertThat(registry.ids())
                 .containsExactlyInAnyOrder(
+                        "ai-provider.get", "ai-provider.replace", "ai-provider.delete", "ai-provider.check",
+                        "pipeline-draft.assistant", "pipeline-draft.assistant-validate",
                         "system.version",
                         "artifact.apply",
                         "artifact.validate",
@@ -214,7 +216,7 @@ class ControlOperationsTest {
     void theRegistryOpensEveryUsableOperationOnCliAndKeepsTheRevealReservationClosed() {
         // The cluster context is REST-only. The reveal reservation stays unpublished until its
         // dedicated authorizer exists.
-        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(67);
+        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(73);
         assertThat(registry.all()).filteredOn(op -> !"source.reveal-config".equals(op.id())
                 && !"cluster.context".equals(op.id())).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
@@ -263,6 +265,8 @@ class ControlOperationsTest {
         assertThat(registry.exposedOn(Frontend.REST, Maturity.GA))
                 .extracting(Operation::id)
                 .containsExactlyInAnyOrder(
+                        "ai-provider.get", "ai-provider.replace", "ai-provider.delete", "ai-provider.check",
+                        "pipeline-draft.assistant", "pipeline-draft.assistant-validate",
                         "sample-source.list", "sample-source.install", "state-store.connect",
                         "cluster.context", "view.list",
                         "pipeline-draft.list", "pipeline-draft.get", "pipeline-draft.create",

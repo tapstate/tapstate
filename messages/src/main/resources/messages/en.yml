@@ -1100,6 +1100,18 @@ cli.auth-issuer-mismatch:
 actuation.unwind-parent-key-unresolved:
   message: "Cannot bind the parent key for step `{step}` and stream `{stream}`: {reason}."
   solution: "Discover a source primary key and keep its column names consistent across merged branches feeding unwind."
+control.ai-not-configured:
+  message: "Configure an AI provider in the Pipeline Builder before requesting a proposal."
+control.ai-provider-failed:
+  message: "The AI provider request failed. Check the provider settings and try again."
+control.ai-invalid-proposal:
+  message: "The AI response did not contain a complete valid Pipeline proposal."
+control.ai-overloaded:
+  message: "The AI assistant is busy. Try again shortly."
+
+control.ai-provider-auth-failed:
+  message: "The AI provider rejected this credential. Update the API key or its model permissions."
+
 start-check.target-empty:
   message: "{target} on {connection} is empty, so the full load starts from nothing."
 start-check.target-set-to-clear:
