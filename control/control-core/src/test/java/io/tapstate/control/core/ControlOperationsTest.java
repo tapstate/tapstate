@@ -14,7 +14,8 @@ class ControlOperationsTest {
     void registersExactlyTheL1OperationSet() {
         assertThat(registry.ids())
                 .containsExactlyInAnyOrder(
-                        "system.version",
+                        "storage.status", "storage.test", "storage.setup.commit", "storage.setup.status", "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status",
+                        "configuration.export", "configuration.import.preflight", "configuration.import.commit", "configuration.import.status", "system.version",
                         "artifact.apply",
                         "artifact.validate",
                         "artifact.get",
@@ -151,6 +152,7 @@ class ControlOperationsTest {
     void auditFlagMarksOnlyTheStateMutatingOperations() {
         for (String id :
                 List.of(
+                        "storage.setup.commit", "storage.recovery.plan", "storage.recovery.confirm", "configuration.export", "configuration.import.preflight", "configuration.import.commit",
                         "artifact.apply",
                         "artifact.delete",
                         "source.create",
@@ -174,7 +176,8 @@ class ControlOperationsTest {
             assertThat(registry.resolve(id).audited()).as(id).isTrue();
         }
         for (String id : List.of(
-                "system.version",
+                "storage.status", "storage.test", "storage.setup.status", "storage.recovery.status",
+                        "configuration.import.status", "system.version",
                 "artifact.get",
                 "artifact.list",
                 "artifact.validate",
@@ -214,7 +217,7 @@ class ControlOperationsTest {
     void theRegistryOpensEveryUsableOperationOnCliAndKeepsTheRevealReservationClosed() {
         // The cluster context is REST-only. The reveal reservation stays unpublished until its
         // dedicated authorizer exists.
-        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(67);
+        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(78);
         assertThat(registry.all()).filteredOn(op -> !"source.reveal-config".equals(op.id())
                 && !"cluster.context".equals(op.id())).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
@@ -245,7 +248,8 @@ class ControlOperationsTest {
         assertThat(registry.exposedOn(Frontend.MCP))
                 .extracting(Operation::id)
                 .containsExactlyInAnyOrder(
-                        "system.version",
+                        "storage.status", "storage.test", "storage.setup.commit", "storage.setup.status", "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status",
+                        "configuration.export", "configuration.import.preflight", "configuration.import.commit", "configuration.import.status", "system.version",
                         "connector.list", "connector.get",
                         "source.draft", "source.list",
                         "connection.test", "connection.test-result",
@@ -264,6 +268,8 @@ class ControlOperationsTest {
                 .extracting(Operation::id)
                 .containsExactlyInAnyOrder(
                         "sample-source.list", "sample-source.install", "state-store.connect",
+                        "storage.status", "storage.test", "storage.setup.commit", "storage.setup.status", "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status",
+                        "configuration.export", "configuration.import.preflight", "configuration.import.commit", "configuration.import.status",
                         "cluster.context", "view.list",
                         "pipeline-draft.list", "pipeline-draft.get", "pipeline-draft.create",
                         "pipeline-draft.replace", "pipeline-draft.delete", "pipeline-draft.preview",

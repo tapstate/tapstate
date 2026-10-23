@@ -9,6 +9,25 @@ import java.util.Map;
 public final class IdentityConnectorFixture {
     private IdentityConnectorFixture() { }
 
+    static PdkConnector guarded(String id, ConnectorRef ref, Map<String, Object> settings, Runnable active) {
+        var node = new io.tapstate.core.model.PipelineNode("flow", "sink");
+        var purpose = io.tapstate.core.model.PipelineNode.Purpose.SYNC;
+        var local = new io.tapstate.spi.store.RequiredNoteScope(
+                io.tapstate.spi.store.RequiredNoteOwner.forNode(1, node, purpose, 1), 1);
+        var global = new io.tapstate.spi.store.RequiredNoteScope(new io.tapstate.spi.store.RequiredNoteOwner(
+                1, ConnectorStateNamespace.GLOBAL, io.tapstate.spi.store.RequiredNoteOwner.Kind.GLOBAL, "cluster", 0), 1);
+        var store = (io.tapstate.spi.store.RequiredNoteStore) java.lang.reflect.Proxy.newProxyInstance(
+                io.tapstate.spi.store.RequiredNoteStore.class.getClassLoader(),
+                new Class<?>[]{io.tapstate.spi.store.RequiredNoteStore.class}, (proxy, method, args) -> switch (method.getName()) {
+                    case "guardedBy" -> proxy;
+                    case "origin" -> ConnectorNoteOrigin.capture(id, ref.contentHash(), settings);
+                    default -> throw new AssertionError("unexpected notes access: " + method.getName());
+                });
+        var scopes = ConnectorNoteScopes.of(store,
+                namespace -> namespace.equals(local.owner().namespace()) ? local : global, active);
+        return PdkConnector.open(id, ref, settings, node, null, null, scopes, purpose);
+    }
+
     public static ConnectorRef ref(Path directory) {
         Path jar = SyntheticJar.compileToJar(directory, "synthetic.IdentityConnector", """
                 package synthetic;
@@ -59,7 +78,7 @@ public final class IdentityConnectorFixture {
                     public int tableCount(TapConnectionContext c) { return 1; }
                 }
                 """);
-        return new ConnectorRef(List.of(jar), "synthetic.IdentityConnector", "2.0.8", null);
+        return new ConnectorRef(List.of(jar), "synthetic.IdentityConnector", "2.0.8", null, null, "a".repeat(64), false);
     }
 
     static Map<String, Object> postgresRow() {

@@ -60,7 +60,8 @@ final class InMemoryWorkloadClaimStore implements WorkloadClaimStore {
             return WorkloadClaimAttempt.refused(current);
         }
         long claimGeneration = current == null ? 1
-                : current.owner().equals(owner) ? current.claimGeneration() : current.claimGeneration() + 1;
+                : current.owner().equals(owner) && current.leaseUntil().isAfter(now)
+                        ? current.claimGeneration() : current.claimGeneration() + 1;
         long executionGeneration = current == null ? 0 : current.executionGeneration();
         WorkloadClaim acquired = new WorkloadClaim(
                 key, owner, claimGeneration, executionGeneration, topologyRevision, now.plus(ttl),

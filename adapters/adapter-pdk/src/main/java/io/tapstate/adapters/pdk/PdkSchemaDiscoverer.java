@@ -78,11 +78,18 @@ public final class PdkSchemaDiscoverer implements SchemaDiscoverer {
 
     @Override
     public SourceModel discover(ConnectionConfig config) {
+        return discover(config,true);
+    }
+
+    /** Explicit recovery preflight reads structure without starting potentially expensive row counts. */
+    public SourceModel discoverStructure(ConnectionConfig config) { return discover(config,false); }
+
+    private SourceModel discover(ConnectionConfig config,boolean countRows) {
         PdkConnector connector = PdkConnector.open(
                 config.connectorId(), provisioner.resolve(config.connectorId()), config.settings());
         try {
             List<TapTable> tables = drive(connector);
-            return toSourceModel(tables, counts(connector, tables));
+            return toSourceModel(tables, countRows?counts(connector,tables):Map.of());
         } finally {
             connector.stopQuietly();
             connector.close();
@@ -168,6 +175,9 @@ public final class PdkSchemaDiscoverer implements SchemaDiscoverer {
                     Map.of("connector", connector.connectorId(), "detail", detail(t)), t);
         }
     }
+
+    /** Normalizes the actual open session's metadata without launching a separate discovery or count. */
+    static SourceModel structuralModel(List<TapTable> tables) { return toSourceModel(tables, Map.of()); }
 
     private static SourceModel toSourceModel(List<TapTable> tables, Map<TapTable, Long> counts) {
         List<SourceTable> mapped = new ArrayList<>(tables.size());

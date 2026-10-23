@@ -594,6 +594,11 @@ final class Synthetic {
      * having first, with {@code writeAfterInterrupt}, tried to write a note, reporting under {@code lateWrite}
      * whether the write was taken.
      */
+    static Path originMutatingConnector(Path dir, String channel) {
+        return SyntheticJar.compileToJar(dir, "synthetic.OriginMutating",
+                source("OriginMutating", "((Runnable) System.getProperties().get(\"" + channel + "\")).run();", ""));
+    }
+
     static Path slotKeepingSource(Path dir, String channel) {
         String register = ""
                 + "functions.supportBatchRead((context, table, offset, size, consumer) -> {"
@@ -609,6 +614,7 @@ final class Synthetic {
                 + "  consumer.accept(evs, null);"
                 + "});"
                 + "functions.supportReleaseExternalFunction(context -> {"
+                + "  channel().put(\"releaseSettings\", new LinkedHashMap<>(context.getConnectionConfig()));"
                 + "  @SuppressWarnings(\"unchecked\") List<Object> released = (List<Object>) channel().get(\"released\");"
                 + "  released.add(String.valueOf(context.getStateMap().get(\"tapdata_pg_slot\")));"
                 + "  if (channel().containsKey(\"hang\")) {"
@@ -915,11 +921,20 @@ final class Synthetic {
     private static final String LIFECYCLE_WRITES = "functions.supportWriteRecord((c, e, t, r) -> { mark(\"write\");"
             + "  r.accept(new io.tapdata.pdk.apis.entity.WriteListResult<>((long) e.size(), 0L, 0L)); });";
 
+    static Path lifecycleSinkThatLosesAuthorityOnActivation(Path dir, Path trace, String channel) {
+        return lifecycleSink(dir, trace, "ActivationLosingSink", LIFECYCLE_WRITES, "mark(\"init\");",
+                "((java.util.concurrent.atomic.AtomicBoolean) System.getProperties().get(\"" + channel + "\")).set(false);");
+    }
+
     private static Path lifecycleSink(Path dir, Path trace, String simpleName, String register, String init) {
+        return lifecycleSink(dir, trace, simpleName, register, init, "");
+    }
+
+    private static Path lifecycleSink(Path dir, Path trace, String simpleName, String register, String init, String ctor) {
         String members = "private void mark(String value) throws Exception {"
                 + "java.nio.file.Files.writeString(java.nio.file.Path.of(\"" + trace + "\"), value + \"\\n\","
                 + "java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND); }";
-        String code = source(simpleName, "", register, members)
+        String code = source(simpleName, ctor, register, members)
                 .replace("public void init(TapConnectionContext c) {}",
                         "public void init(TapConnectionContext c) throws Throwable { " + init + " }")
                 .replace("public void stop(TapConnectionContext c) {}",
@@ -1279,6 +1294,13 @@ final class Synthetic {
         return SyntheticJar.compileToJar(dir, "synthetic.CountingDiscoverable",
                 discoverSource("CountingDiscoverable", ORDERS_TABLE,
                         "functions.supportBatchCount((context, table) -> 4200000L);"));
+    }
+
+    /** Structural recovery probes must never invoke this count callback. */
+    static Path countTracingDiscoverableSource(Path dir) {
+        return SyntheticJar.compileToJar(dir,"synthetic.TracingCount",
+                discoverSource("TracingCount",ORDERS_TABLE,"functions.supportBatchCount((context, table) -> {"
+                        + "java.nio.file.Files.writeString(java.nio.file.Path.of((String)context.getConnectionConfig().get(\"countTrace\")),\"counted\");return 7L;});"));
     }
 
     /** The two-table discoverSchema body the multi-table counting fixtures share. */

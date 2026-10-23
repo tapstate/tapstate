@@ -26,6 +26,8 @@ import org.junit.jupiter.params.provider.ValueSource;
 import tools.jackson.databind.json.JsonMapper;
 
 import java.io.PrintWriter;
+import java.io.IOException;
+import java.io.OutputStream;
 import java.io.UncheckedIOException;
 import java.io.StringWriter;
 import java.nio.charset.StandardCharsets;
@@ -69,6 +71,13 @@ class CloudConnectorSeedReadinessTest {
     private String eraseAfterLoad;
     private CloudConnectorSeedReadiness.DirectoryEntries directoryEntries = Files::list;
     private Set<String> functions = Set.of("batch_read_function", "stream_read_function");
+
+    @Test
+    void verifiesStoredReleaseBytesThroughTheStreamingPort() throws Exception {
+        stores.streamOnly = true;
+        gate().verifyRegistrations(outcomes);
+        assertThat(stores.streamReads).isGreaterThanOrEqualTo(IDS.size());
+    }
 
     @BeforeEach
     void prepareIndependentRelease() throws Exception {
@@ -430,6 +439,8 @@ class CloudConnectorSeedReadinessTest {
         final Map<String, byte[]> artifacts = new HashMap<>();
         final Map<String, ConnectorCatalogEntry> rows = new HashMap<>();
         final Map<String, byte[]> specs = new HashMap<>();
+        boolean streamOnly;
+        int streamReads;
 
         @Override public RegistrationOutcome register(String id, String version, RegistrationSource source, byte[] artifact) {
             String hash = ContentHash.of(artifact);
@@ -439,7 +450,17 @@ class CloudConnectorSeedReadinessTest {
             return new RegistrationOutcome(registration, true);
         }
         @Override public List<ConnectorRegistration> list() { return List.copyOf(registrations.values()); }
-        @Override public Optional<byte[]> artifact(String hash) { return Optional.ofNullable(artifacts.get(hash)); }
+        @Override public Optional<byte[]> artifact(String hash) {
+            if (streamOnly) throw new AssertionError("Release readiness must not materialize whole artifacts");
+            return Optional.ofNullable(artifacts.get(hash));
+        }
+        @Override public boolean copyArtifactTo(String hash, OutputStream target) throws IOException {
+            streamReads++;
+            byte[] bytes = artifacts.get(hash);
+            if (bytes == null) return false;
+            target.write(bytes);
+            return true;
+        }
         @Override public boolean hasArtifact(String hash) { return artifacts.containsKey(hash); }
         ConnectorCatalogStore catalog() {
             return new ConnectorCatalogStore() {

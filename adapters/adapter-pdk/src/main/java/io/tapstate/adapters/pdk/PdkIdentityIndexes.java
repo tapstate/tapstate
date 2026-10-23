@@ -139,6 +139,7 @@ final class PdkIdentityIndexes {
         List<Map<Object, Object>> rows = new ArrayList<>();
         java.util.concurrent.atomic.AtomicBoolean answered = new java.util.concurrent.atomic.AtomicBoolean();
         java.util.concurrent.atomic.AtomicReference<Throwable> failure = new java.util.concurrent.atomic.AtomicReference<>();
+        connector.requireActive();
         execute.execute(connector.context(), TapExecuteCommand.create().command(command)
                 .params(new LinkedHashMap<>(params)), result -> {
                     if (result == null) return;

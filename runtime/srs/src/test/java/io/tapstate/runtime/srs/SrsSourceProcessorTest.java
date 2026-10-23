@@ -90,6 +90,122 @@ class SrsSourceProcessorTest {
         }
     }
 
+    @Test void nativeRecoveryUsesTheSavedArrivalFloorBeforeTheRequestedFreshStart() throws Exception {
+        String ring = "srs.chain.native-floor", sink = "out-native-floor";
+        var rows = new java.util.TreeMap<Long,io.tapstate.spi.store.SrsLogRecord>();
+        var hot = new SrsRingbuffer(hz.getRingbuffer(ring));
+        for (int i=0;i<4;i++) {
+            hot.append(new SrsItem(new SourcePosition("w"+i),Op.INSERT,1,null,Map.of("id",i),0,null,1));
+            rows.put((long)i,new io.tapstate.spi.store.SrsLogRecord("w"+i,Op.INSERT,1,null,Map.of("id",i),0,1));
+        }
+        io.tapstate.spi.store.SrsLogStore log = new io.tapstate.spi.store.SrsLogStore() {
+            @Override public long largestSequence(String name) { return 3; }
+            @Override public java.util.Optional<io.tapstate.spi.store.SrsLogRecord> load(String name,long seq) { return java.util.Optional.ofNullable(rows.get(seq)); }
+            @Override public void store(String r,long q,io.tapstate.spi.store.SrsLogRecord value) { throw new AssertionError(); }
+            @Override public void storeAll(String r,long q,List<io.tapstate.spi.store.SrsLogRecord> value) { throw new AssertionError(); }
+            @Override public void trim(String r,long q) { throw new AssertionError(); }
+        };
+        hz.getUserContext().put(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY,log);
+        var cursor = new java.util.concurrent.atomic.AtomicLong(-1); hz.getUserContext().put("native-floor-read",cursor);
+        var out = hz.<String>getList(sink); var job = hz.getJet().newJob(projectedDag(ring,"orders",sink,1024,new NativeRecoveryPublisher(1)));
+        try {
+            long until = System.nanoTime()+TimeUnit.SECONDS.toNanos(10);
+            while(cursor.get()!=3 && !job.getFuture().isDone() && System.nanoTime()<until) Thread.sleep(10);
+            assertThat(cursor).hasValue(3); awaitSize(out,2);
+            assertThat(out).containsExactly("orders|w2|2|1:2","orders|w3|3|1:3");
+        } finally {
+            job.cancel(); hz.getUserContext().remove(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY); hz.getUserContext().remove("native-floor-read"); out.destroy();
+        }
+    }
+    @Test void aNativeReaderWithNoDurableLogRefusesBeforeAnyHotProjection() throws Exception {
+        String ring="srs.chain.native-unbound",sink="out-native-unbound"; fill(ring,1);
+        var out=hz.<String>getList(sink); var job=hz.getJet().newJob(projectedDag(ring,"orders",sink,1024,new NativeRecoveryPublisher(-1)));
+        try {
+            long until=System.nanoTime()+TimeUnit.SECONDS.toNanos(10);
+            while(out.isEmpty() && !job.getFuture().isDone() && System.nanoTime()<until) Thread.sleep(10);
+            assertThat(job.getFuture().isCompletedExceptionally()).isTrue();
+            assertThatThrownBy(() -> job.getFuture().join()).hasStackTraceContaining(CaptureError.SRS_NOT_RECOVERABLE.code());
+            assertThat(out).isEmpty();
+        } finally { if(!job.getFuture().isDone()) job.cancel(); out.destroy(); }
+    }
+
+    @Test void sharedConsumersCountOnlyTheirOwnReplayAndPrivateSnapshot() throws Exception {
+        String ring = "srs.chain.arrival-account", other = "srs.chain.other-arrivals";
+        fill(ring, 3); fill(other, 5);
+        var buffer = new SnapshotBuffer();
+        buffer.append("later-run", ring, snapshotRow(100));
+        hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
+        var first = hz.getJet().newJob(projectedDag(ring, "orders", "out-arrival-first", 1024,
+                SrsReadCursorPublisherFactory.NONE));
+        Job later = null;
+        try {
+            awaitSize(hz.getList("out-arrival-first"), 3);
+            var graph = new DAG();
+            var source = graph.newVertex("source", SrsSourceProcessor.metaSupplier("later-run", ring,
+                    "orders", StartFrom.earliest(), 1L, 1L, SrsReadCursorPublisherFactory.NONE, null,
+                    SourcePlacement.anyMember()));
+            var project = graph.newVertex("project", Processors.mapP(SrsSourceProcessorTest::describe)).localParallelism(1);
+            var sink = graph.newVertex("sink", SinkProcessors.writeListP("out-arrival-later")).localParallelism(1);
+            graph.edge(between(source, project)).edge(between(project, sink));
+            later = hz.getJet().newJob(graph, new com.hazelcast.jet.config.JobConfig().setName("arrival-later"));
+            awaitSize(hz.getList("out-arrival-later"), 2);
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15);
+            while (later.getMetrics().get("sourceRowsIn.i.orders").isEmpty() && System.nanoTime() < deadline) Thread.sleep(50);
+            assertThat(first.getMetrics().get("sourceRowsIn.i.orders").stream().mapToLong(value -> value.value()).sum()).isEqualTo(3);
+            assertThat(later.getMetrics().get("sourceRowsIn.i.orders").stream().mapToLong(value -> value.value()).sum()).isOne();
+            assertThat(later.getMetrics().get("sourceRowsIn.r.orders").stream().mapToLong(value -> value.value()).sum()).isOne();
+            assertThat(later.getMetrics().get("sourceBytesIn.orders").stream().mapToLong(value -> value.value()).sum()).isPositive();
+            assertThat(later.getMetrics().get("sourceCountingSince")).isNotEmpty();
+            assertThat(later.getMetrics().metrics()).doesNotContain("sourceRowsIn.i.other");
+            var reading = new io.tapstate.runtime.engine.Engine(hz).capturedRows("arrival-later");
+            assertThat(reading.rowsByTableAndOp()).containsExactly(Map.entry("orders", Map.of("i", 1L, "r", 1L)));
+            assertThat(reading.bytesByTable().get("orders")).isPositive();
+            assertThat(reading.countingSince()).isNotNull();
+        } finally {
+            first.cancel(); if (later != null) later.cancel();
+            hz.getUserContext().remove(SnapshotBuffer.USER_CONTEXT_KEY);
+            hz.getList("out-arrival-first").destroy(); hz.getList("out-arrival-later").destroy();
+        }
+    }
+    private record NativeRecoveryPublisher(long floor) implements SrsReadCursorPublisherFactory {
+        @Override public boolean requiresDurableLog() { return true; }
+        @Override public java.util.OptionalLong recoverySequence(HazelcastInstance member) { return java.util.OptionalLong.of(floor); }
+        @Override public LongConsumer resolve(HazelcastInstance member) {
+            return sequence -> { var counter=member.getUserContext().get("native-floor-read"); if(counter instanceof java.util.concurrent.atomic.AtomicLong value) value.set(sequence); };
+        }
+    }
+
+    static final String MODEL_CHECKS = "test.source.model.checks";
+    static final String MODEL_CURSOR = "test.source.model.cursor";
+    @Test
+    void modelVerifierMustRunBeforeAHotItemIsProjectedOrItsReadCursorAdvances() throws Exception {
+        String ring="srs.chain.model-rejection",sink="out-model-rejection";fill(ring,1);
+        var checks=new AtomicInteger();var cursor=new java.util.concurrent.atomic.AtomicLong(-1);
+        hz.getUserContext().put(MODEL_CHECKS,checks);hz.getUserContext().put(MODEL_CURSOR,cursor);
+        var out=hz.<String>getList(sink);Job job=hz.getJet().newJob(projectedDag(ring,"orders",sink,1024,new ModelVerifyingPublisher()));
+        try {
+            long deadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(10);
+            while(out.isEmpty()&&!job.getFuture().isDone()&&System.nanoTime()<deadline) Thread.sleep(10);
+            assertThat(checks.get()).as("the member model check ran before projection").isPositive();
+            assertThatThrownBy(() -> job.getFuture().get(10,TimeUnit.SECONDS)).hasStackTraceContaining("io.srs-event-model-unavailable");
+            assertThat(out).isEmpty();assertThat(cursor.get()).isEqualTo(-1);
+        } finally {
+            if(!job.getFuture().isDone())job.cancel();hz.getUserContext().remove(MODEL_CHECKS);hz.getUserContext().remove(MODEL_CURSOR);out.destroy();
+        }
+    }
+    record ModelVerifyingPublisher() implements SrsReadCursorPublisherFactory {
+        @Override public LongConsumer resolve(HazelcastInstance member) {
+            return sequence -> ((java.util.concurrent.atomic.AtomicLong)member.getUserContext().get(MODEL_CURSOR)).set(sequence);
+        }
+        @Override public SrsEventModelVerifier modelVerifier(HazelcastInstance member,String ring) {
+            return (item,sequence) -> {
+                ((AtomicInteger)member.getUserContext().get(MODEL_CHECKS)).incrementAndGet();
+                throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.SRS_EVENT_MODEL_UNAVAILABLE,
+                        Map.of("ring",ring,"epoch",String.valueOf(item.epoch()),"version",String.valueOf(item.schemaVer())),null);
+            };
+        }
+    }
+
     @Test
     void streams_changes_projected_to_envelopes_carrying_the_stream_name_and_source_position()
             throws InterruptedException {

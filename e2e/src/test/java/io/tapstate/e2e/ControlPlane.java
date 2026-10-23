@@ -154,6 +154,13 @@ final class ControlPlane {
         cloudCookie = false;
     }
 
+    /** Reads admission through the same native snapshot used by the application. */
+    Map<?, ?> storageStatus() {
+        var response = send(authed("/api/storage/status", "{}"));
+        expect(response, 200, "read native storage admission");
+        return (Map<?, ?>) JsonReader.parse(response.body());
+    }
+
     /** Redeems one code once; the real SDK and server create the local session. */
     String exchangeCloudCode(String code) {
         HttpResponse<String> response = send(get("/auth/exchange?code=" + urlSegment(code)));
@@ -340,6 +347,21 @@ final class ControlPlane {
     /** The ids the server holds - read back from the server, which is the truth, not from the files sent. */
     List<String> artifactIds() {
         HttpResponse<String> response = send(authedGet("/api/artifacts"));
+        return artifactIds(response);
+    }
+
+    /** A fault witness can wait through the driver's transaction retry window, preserving coded refusals. */
+    Optional<List<String>> artifactIdsIfConfigurationAvailable(Duration timeout) {
+        HttpResponse<String> response = send(authedGet("/api/artifacts", timeout));
+        if (response.statusCode() == 503
+                && Set.of(io.tapstate.spi.store.IoError.STORE_UNAVAILABLE.code(),
+                        io.tapstate.control.core.ControlError.STORAGE_UNAVAILABLE.code()).contains(codeOf(response.body()))) {
+            return Optional.empty();
+        }
+        return Optional.of(artifactIds(response));
+    }
+
+    private static List<String> artifactIds(HttpResponse<String> response) {
         expect(response, 200, "list artifacts");
         if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> map)
                 || !(map.get("artifacts") instanceof List<?> artifacts)) {
@@ -1285,6 +1307,12 @@ final class ControlPlane {
         }
         expect(send(authed("/api/pipelines/" + pipelineId + ":" + verb.id(), "")),
                 200, verb.id() + " " + pipelineId);
+    }
+
+    /** A refused admission must be a coded client response, never an accepted intent or server failure. */
+    Refusal startExpectingRefusal(String pipelineId) {
+        var response = send(authed("/api/pipelines/" + urlSegment(pipelineId) + ":start", ""));
+        return interpretRefusal(response.statusCode(), response.body(), "starting " + pipelineId);
     }
 
     /**
@@ -2237,7 +2265,7 @@ final class ControlPlane {
      */
     private HttpRequest authedDelete(String id, String expectedContentHash) {
         HttpRequest.Builder builder = authenticate(HttpRequest.newBuilder(baseUrl.resolve("/api/artifacts/" + urlSegment(id)))
-                .timeout(TIMEOUT)
+                .timeout(io.tapstate.control.client.HttpControlClient.DEFAULT_HEAVY_TIMEOUT)
                 .DELETE());
         if (expectedContentHash != null) {
             builder.header("If-Match", "\"" + expectedContentHash + "\"");
@@ -2246,8 +2274,12 @@ final class ControlPlane {
     }
 
     private HttpRequest authedGet(String path) {
+        return authedGet(path, TIMEOUT);
+    }
+
+    private HttpRequest authedGet(String path, Duration timeout) {
         return authenticate(HttpRequest.newBuilder(baseUrl.resolve(path))
-                .timeout(TIMEOUT)
+                .timeout(timeout)
                 .GET()).build();
     }
 

@@ -57,24 +57,26 @@ public final class SrsRingSource {
         Objects.requireNonNull(publisherFactory, "publisherFactory");
         return SourceBuilder
                 .stream("srs-source-" + ringName, ctx -> {
+                    var verifier = Objects.requireNonNull(publisherFactory.modelVerifier(ctx.hazelcastInstance(),ringName),"model verifier");
+                    Object persisted = ctx.hazelcastInstance().getUserContext().get(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY);
+                    if (!(persisted instanceof io.tapstate.spi.store.SrsLogStore) && publisherFactory.requiresDurableLog())
+                        throw new io.tapstate.core.common.TapstateException(CaptureError.SRS_NOT_RECOVERABLE,java.util.Map.of("chain",ringName),null);
                     Ringbuffer<SrsItem> rb = ctx.hazelcastInstance().getRingbuffer(ringName);
                     SrsRingbuffer ring = new SrsRingbuffer(rb);
-                    Object persisted = ctx.hazelcastInstance().getUserContext()
-                            .get(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY);
+                    SrsRingReader reader;
                     if (persisted instanceof io.tapstate.spi.store.SrsLogStore log) {
                         var cursor = publisherFactory.resolve(ctx.hazelcastInstance());
                         var recovery = publisherFactory.recoverySequence(ctx.hazelcastInstance());
-                        return recovery.isPresent()
+                        reader = recovery.isPresent()
                                 ? SrsRingReader.resumingAfter(ring, recovery.getAsLong(),
-                                        publisherFactory.confirmedPosition(ctx.hazelcastInstance()).orElse(null),
-                                        cursor, ringName, log)
-                                : SrsRingReader.from(ring, start, cursor, retention, ringName, log);
-                    }
-                    return SrsRingReader.from(
-                            ring, start, publisherFactory.resolve(ctx.hazelcastInstance()), retention);
+                                        publisherFactory.confirmedPosition(ctx.hazelcastInstance()).orElse(null),cursor,ringName,log)
+                                : SrsRingReader.from(ring,start,cursor,retention,ringName,log);
+                    } else reader = SrsRingReader.from(ring,start,publisherFactory.resolve(ctx.hazelcastInstance()),retention);
+                    return new CheckedReader(reader,verifier);
                 })
-                .fillBufferFn((SrsRingReader reader, SourceBuilder.SourceBuffer<SrsItem> buffer) ->
-                        reader.fill((item, seq) -> buffer.add(item), FILL_BATCH))
+                .fillBufferFn((CheckedReader state, SourceBuilder.SourceBuffer<SrsItem> buffer) ->
+                        state.reader().fill((item, seq) -> { state.verifier().verify(item,seq); buffer.add(item); }, FILL_BATCH))
                 .build();
     }
+    private record CheckedReader(SrsRingReader reader,SrsEventModelVerifier verifier) {}
 }

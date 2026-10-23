@@ -791,6 +791,20 @@ class PdkCapturePortTest {
                 .isNotNull();
     }
 
+    @Test void aStillRunningOriginalCdcSubscriptionRefusesCloseAndCanBeRetried(@TempDir Path dir) throws Exception {
+        Path jar=Synthetic.emittingSource(dir);var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
+        var port=new PdkCapturePort(provisioner(jar,"synthetic.EmittingSource",null));
+        var sub=port.cdc(config("t1"),CaptureStart.present(),(events,position) -> {
+            entered.countDown();
+            while(release.getCount()!=0)try {release.await();}catch(InterruptedException stopping) { }
+        });
+        try {
+            assertThat(entered.await(5,TimeUnit.SECONDS)).isTrue();
+            assertThatThrownBy(sub::close).isInstanceOfSatisfying(TapstateException.class,error -> assertThat(error.code()).isEqualTo(ConnectorError.CAPTURE_FAILED));
+        } finally {release.countDown();sub.close();}
+        assertThatCode(sub::close).doesNotThrowAnyException();
+    }
+
     @Test
     void cdcSubscriptionCloseIsIdempotent(@TempDir Path dir) throws Exception {
         // The Subscription contract promises idempotent close; a second close must be a no-op, not a

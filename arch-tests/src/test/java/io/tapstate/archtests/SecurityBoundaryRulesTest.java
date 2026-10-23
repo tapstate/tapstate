@@ -7,7 +7,12 @@ import com.tngtech.archunit.core.importer.ClassFileImporter;
 import com.tngtech.archunit.core.importer.ImportOption;
 import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.control.core.CredentialAuthenticator;
+import io.tapstate.control.core.CredentialVerifier;
 import io.tapstate.control.core.TapstatePrincipal;
+import io.tapstate.control.core.TokenService;
+import io.tapstate.control.core.TokenSigner;
+import io.tapstate.control.core.VerifiedToken;
+import io.tapstate.core.common.TapstateErrorCode;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -44,13 +49,15 @@ class SecurityBoundaryRulesTest {
         Set<String> types = authenticator.getDirectDependenciesFromSelf().stream()
                 .map(Dependency::getTargetClass)
                 .filter(type -> type.getPackageName().equals(CredentialAuthenticator.class.getPackageName()))
+                .filter(type -> !type.isAssignableTo(TapstateErrorCode.class))
                 .map(JavaClass::getName)
                 .collect(java.util.stream.Collectors.toCollection(TreeSet::new));
         types.add(authenticator.getName());
         types.add(TapstatePrincipal.class.getName());
         assertThat(types)
-                .as("the security boundary must derive at least one real credential authority type")
-                .isNotEmpty();
+                .as("the security boundary must retain the real credential verification and signing authorities")
+                .contains(CredentialVerifier.class.getName(), TokenService.class.getName(),
+                        TokenSigner.class.getName(), VerifiedToken.class.getName());
         return types;
     }
 

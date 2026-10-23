@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
-import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
+import io.tapstate.adapters.mongostore.MongoCacheDomain;
 import io.tapstate.adapters.pdk.PdkAdapter;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.SpringBootVersion;
@@ -51,10 +52,8 @@ class BootstrapTest {
 
     @Test
     void assemblyRootRecordsTheAdapterBridges() {
-        // The Mongo store bridge is engaged (StoreConfiguration wires a StorePort bean from MongoStorePort)
-        // and the PDK bridge is engaged through the control plane (the connector operations wired onto the
-        // PDK adapter). Both are referenced here only from the assembly root — the R7 exemption made real.
+        // Each bridge is explicitly owned by the production assembly.
         assertThat(Bootstrap.adapterBridges())
-                .containsExactly(PdkAdapter.class, MongoStorePort.class);
+                .containsExactly(PdkAdapter.class, MongoConfigurationDomain.class, MongoCacheDomain.class);
     }
 }

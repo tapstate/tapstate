@@ -36,6 +36,7 @@ import io.tapstate.runtime.srs.SrsCoordinator;
 import io.tapstate.spi.capture.CaptureConfig;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ClusterMembership;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
@@ -52,6 +53,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
@@ -75,7 +77,8 @@ class EngineLifecycleActuatorTest {
 
     @BeforeEach
     void startMember() {
-        Config config = new Config();
+        Config config = new Config().setClusterName("actuator-"+java.util.UUID.randomUUID());
+        config.getNetworkConfig().setPort(0).setPortAutoIncrement(false);
         config.getJetConfig().setEnabled(true).setCooperativeThreadCount(2);
         config.setProperty("hazelcast.phone.home.enabled", "false");
         config.setProperty("hazelcast.shutdownhook.enabled", "false");
@@ -403,6 +406,41 @@ class EngineLifecycleActuatorTest {
         assertThat(ownership.heldExecutionGeneration(PIPE)).as("the start took a run first").isEqualTo(1);
         assertThat(ownership.departure(PIPE, Duration.ofSeconds(90).toNanos()))
                 .isNotEqualTo(PipelineActuationOwnership.Departure.START_REFUSED);
+    }
+
+    @Test void theOriginalPassReceivesTheAdvancedClaimEvenWhenLaterPlanningFails() {
+        var events = new CopyOnWriteArrayList<String>();
+        var source = new RecordingDagSource(events);
+        source.planning = () -> { throw new TapstateException(ActuationError.NO_SAFE_PARALLELISM, Map.of(
+                "pipeline", PIPE, "node", "w", "requested", 1000, "members", 1, "candidates", "outside capacity"), null); };
+        var claims = new InMemoryWorkloadClaimStore();
+        var ownership = clusteredOwnership(claims, () -> 0L, "node-a");
+        var original = WorkloadClaimFence.from(ownership.permit(PIPE).claim());
+        var recorded = new AtomicReference<WorkloadClaimFence>();
+        var actuator = new EngineLifecycleActuator(new Engine(member), source, new RecordingCaptureCoordinator(events), teardown(), ownership);
+        assertThatThrownBy(() -> actuator.start(PIPE, original, recorded::set)).isInstanceOf(TapstateException.class);
+        assertThat(recorded.get()).isEqualTo(WorkloadClaimFence.from(claims.read(original.key()).orElseThrow().claim()));
+        assertThat(recorded.get().executionGeneration()).isEqualTo(original.executionGeneration() + 1);
+        assertThat(events).isEmpty();
+        assertThat(member.getJet().getJob(PIPE)).isNull();
+    }
+
+    @Test void aLateStartDoesNotAdoptTheNewClaimNowHeldUnderItsPipelineId() {
+        var claims = new InMemoryWorkloadClaimStore(); var nanos = new AtomicLong();
+        var ownership = clusteredOwnership(claims, nanos::get, "node-a");
+        var original = WorkloadClaimFence.from(ownership.permit(PIPE).claim());
+        claims.elapse(Duration.ofSeconds(31)); nanos.addAndGet(Duration.ofSeconds(10).toNanos());
+        assertThat(ownership.permit(PIPE).granted()).isFalse();
+        nanos.addAndGet(Duration.ofSeconds(10).toNanos());
+        var current = ownership.permit(PIPE).claim();
+        assertThat(current.claimGeneration()).isGreaterThan(original.claimGeneration());
+        var events = new CopyOnWriteArrayList<String>(); var recorded = new AtomicReference<WorkloadClaimFence>();
+        var actuator = new EngineLifecycleActuator(new Engine(member), new RecordingDagSource(events),
+                new RecordingCaptureCoordinator(events), teardown(), ownership);
+        actuator.start(PIPE, original, recorded::set);
+        assertThat(recorded.get()).isNull(); assertThat(events).isEmpty();
+        assertThat(claims.read(original.key()).orElseThrow().claim()).isEqualTo(current);
+        assertThat(member.getJet().getJob(PIPE)).isNull();
     }
 
     /** A start that plans its run does so before it opens the capture its topology is then built over. */

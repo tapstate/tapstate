@@ -13,6 +13,7 @@ import com.hazelcast.jet.core.metrics.MetricNames;
 import com.hazelcast.jet.core.metrics.MetricTags;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.HistogramBounds;
+import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.HistogramValue;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.StageReading;
@@ -63,6 +64,10 @@ public final class Engine {
      * enough that a processor which never shuts down is reported rather than waited on forever.
      */
     private static final Duration PREVIOUS_RUN_BUDGET = Duration.ofSeconds(30);
+
+    /** Reserved job metadata carrying the submitting caller's immutable complete execution identity. */
+    public static final String RUN_IDENTITY_ARGUMENT = "tapstate.execution-identity";
+    public static final String OPERATOR_MANIFEST_ARGUMENT = "tapstate.operator-manifest";
 
     private final HazelcastInstance member;
 
@@ -133,6 +138,131 @@ public final class Engine {
         return submitJob(pipelineId, dag).getId();
     }
 
+    /** Submits under one immutable execution identity, refusing an active same-name job from another run. */
+    public Run submitRun(String pipelineId, DAG dag, Map<String, String> stateDatabases, NestSettings settings,
+            java.io.Serializable originalIdentity) {
+        return submitRun(pipelineId, dag, stateDatabases, settings, originalIdentity, null);
+    }
+
+    /** New operator-state runs carry their original complete placement set in immutable job metadata. */
+    public Run submitRun(String pipelineId, DAG dag, Map<String, String> stateDatabases, NestSettings settings,
+            OperatorRunManifest original) {
+        Objects.requireNonNull(original, "original");
+        if (!original.pipelineId().equals(pipelineId)) throw new IllegalArgumentException("operator manifest belongs to another pipeline");
+        return submitRun(pipelineId, dag, stateDatabases, settings, original.executionIdentity(), original);
+    }
+
+    private Run submitRun(String pipelineId, DAG dag, Map<String, String> stateDatabases, NestSettings settings,
+            java.io.Serializable originalIdentity, OperatorRunManifest manifest) {
+        Objects.requireNonNull(originalIdentity, "originalIdentity");
+        refuseIfLost(pipelineId);
+        Job previous = jobNamed(pipelineId);
+        if (previous != null && !previous.getStatus().isTerminal() && previous.getStatus() != JobStatus.COMPLETING
+                && (!originalIdentity.equals(previous.getConfig().getArgument(RUN_IDENTITY_ARGUMENT))
+                || !Objects.equals(manifest, previous.getConfig().getArgument(OPERATOR_MANIFEST_ARGUMENT)))) throw runRefused(pipelineId);
+        configureNestState(stateDatabases, settings);
+        Job submitted = submitJob(pipelineId, dag, originalIdentity, manifest);
+        if (!originalIdentity.equals(submitted.getConfig().getArgument(RUN_IDENTITY_ARGUMENT))
+                || !Objects.equals(manifest, submitted.getConfig().getArgument(OPERATOR_MANIFEST_ARGUMENT))) throw runRefused(pipelineId);
+        JobFailureRegistry.of(member).attach(pipelineId, submitted.getId(), originalIdentity);
+        return new Run(pipelineId, originalIdentity, submitted, manifest);
+    }
+
+    /** Application bootstrap calls this after member startup; MapStore initialization never queries Jet. */
+    public List<OperatorRunManifest> operatorManifests() {
+        var originals = new ArrayList<OperatorRunManifest>();
+        for (Job job : member.getJet().getJobs()) {
+            if (job.getStatus().isTerminal() || job.getStatus() == JobStatus.COMPLETING) continue;
+            JobConfig config = job.getConfig();
+            if (config.getArgument(RUN_IDENTITY_ARGUMENT) == null && config.getArgument(OPERATOR_MANIFEST_ARGUMENT) == null) continue;
+            originals.add(requireOperatorManifest(job, config));
+        }
+        return List.copyOf(originals);
+    }
+
+    private static OperatorRunManifest requireOperatorManifest(Job job, JobConfig config) {
+        Object value = config.getArgument(OPERATOR_MANIFEST_ARGUMENT);
+        if (!(value instanceof OperatorRunManifest manifest) || !manifest.pipelineId().equals(job.getName())
+                || !manifest.executionIdentity().equals(config.getArgument(RUN_IDENTITY_ARGUMENT))) throw runRefused(String.valueOf(job.getName()));
+        return manifest;
+    }
+
+    /** The returned handle never resolves the Pipeline name again, even after another run replaces it. */
+    public Optional<Run> findRun(String pipelineId, java.io.Serializable originalIdentity) {
+        Objects.requireNonNull(originalIdentity, "originalIdentity");
+        Job job = jobNamed(pipelineId);
+        if (job == null) return Optional.empty();
+        JobConfig config = job.getConfig();
+        if (!originalIdentity.equals(config.getArgument(RUN_IDENTITY_ARGUMENT))) return Optional.empty();
+        OperatorRunManifest manifest = config.getArgument(OPERATOR_MANIFEST_ARGUMENT) == null
+                ? null : requireOperatorManifest(job, config);
+        return Optional.of(new Run(pipelineId, originalIdentity, job, manifest));
+    }
+
+    /** Captures one marked job and its original placements; later operations never resolve its name again. */
+    public Optional<Run> captureRun(String pipelineId) {
+        Job job = jobNamed(pipelineId);
+        if (job == null) return Optional.empty();
+        OperatorRunManifest original = requireOperatorManifest(job, job.getConfig());
+        return Optional.of(new Run(pipelineId, original.executionIdentity(), job, original));
+    }
+
+    /** A local, non-serializable handle for the one concrete job whose configuration was verified. */
+    public final class Run {
+        private final String pipelineId;
+        private final java.io.Serializable identity;
+        private final Job job;
+        private final OperatorRunManifest originalManifest;
+        private Run(String pipelineId, java.io.Serializable identity, Job job, OperatorRunManifest originalManifest) {
+            this.pipelineId = pipelineId; this.identity = identity; this.job = job;
+            this.originalManifest = originalManifest;
+        }
+        public long jobId() { return job.getId(); }
+        public OperatorRunManifest operatorManifest() {
+            if (originalManifest == null || !identity.equals(originalManifest.executionIdentity())
+                    || !originalManifest.equals(requireOperatorManifest(job, job.getConfig()))) throw runRefused(pipelineId);
+            return originalManifest;
+        }
+        public boolean isCarryingAJob() { return !isLost() && !job.getStatus().isTerminal(); }
+        public boolean completed() {
+            return !isLost() && job.getStatus() == JobStatus.COMPLETED
+                    && identity.equals(job.getConfig().getArgument(RUN_IDENTITY_ARGUMENT));
+        }
+        public void suspend() { requireLive(); job.suspend(); }
+        public void resume() { requireLive(); job.resume(); }
+        public void cancel() {
+            if (!isLost() && !job.getStatus().isTerminal()) job.cancel();
+            JobFailureRegistry.of(member).retireRun(pipelineId, job.getId(), identity);
+        }
+        public Optional<Throwable> failure() {
+            var lost = Engine.this.lost(pipelineId);
+            if (lost.isPresent()) return failures().get().filter(cause -> !ranOutOfMemory(cause)).or(() -> lost.map(Throwable.class::cast));
+            if (job.getStatus() != JobStatus.FAILED) return Optional.empty();
+            var recorded = failures().get();
+            if (recorded.isPresent()) return recorded;
+            try { job.getFuture().join(); return Optional.empty(); }
+            catch (CancellationException cancelled) { return Optional.empty(); }
+            catch (CompletionException failed) {
+                Throwable cause = failed.getCause() == null ? failed : failed.getCause();
+                return cause instanceof CancellationException ? Optional.empty() : Optional.of(cause);
+            }
+        }
+        public boolean awaitTerminal(Duration budget) { return !isLost() && awaitJob(job, budget); }
+        private JobFailureRegistry.Recorder failures() {
+            // A processor may attach after this handle was obtained. This is a read of the original pair only.
+            return JobFailureRegistry.of(member).existing(pipelineId, job.getId(), identity);
+        }
+        private void requireLive() {
+            refuseIfLost(pipelineId);
+            if (job.getStatus().isTerminal()) throw new TapstateException(EngineError.NO_SUCH_JOB, Map.of("pipeline", pipelineId), null);
+            if (!identity.equals(job.getConfig().getArgument(RUN_IDENTITY_ARGUMENT))) throw runRefused(pipelineId);
+        }
+    }
+
+    private static TapstateException runRefused(String pipelineId) {
+        return new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", pipelineId), null);
+    }
+
     /** Validates and pins placement before capture or graph construction performs a side effect. */
     public void configureNestState(Map<String, String> stateDatabases, NestSettings settings) {
         NestStatePlacement.applyTo(member, stateDatabases, settings);
@@ -165,8 +295,10 @@ public final class Engine {
      * no engine-side re-planning of a changed cluster, and a previous run that has to be over first -- is
      * carried here, so an overload cannot be added that quietly starts a run without any of it.
      */
-    private Job submitJob(String pipelineId, DAG dag) {
-        JobFailureRegistry.of(member).clear(pipelineId);
+    private Job submitJob(String pipelineId, DAG dag) { return submitJob(pipelineId, dag, null, null); }
+
+    private Job submitJob(String pipelineId, DAG dag, java.io.Serializable originalIdentity, OperatorRunManifest manifest) {
+        if (originalIdentity == null) JobFailureRegistry.of(member).clear(pipelineId);
         awaitPreviousRunOver(pipelineId);
         JobConfig config = new JobConfig()
                 .setName(pipelineId)
@@ -179,6 +311,8 @@ public final class Engine {
                 // members changed ends, and what starts in its place is submitted deliberately, once, by
                 // whoever holds the pipeline.
                 .setAutoScaling(false);
+        if (originalIdentity != null) config.setArgument(RUN_IDENTITY_ARGUMENT, originalIdentity);
+        if (manifest != null) config.setArgument(OPERATOR_MANIFEST_ARGUMENT, manifest);
         return member.getJet().newJobIfAbsent(dag, config);
     }
 
@@ -205,7 +339,7 @@ public final class Engine {
         if (previous == null || previous.getStatus() != JobStatus.COMPLETING) {
             return;
         }
-        if (!awaitTerminal(pipelineId, PREVIOUS_RUN_BUDGET)) {
+        if (!awaitJob(previous, PREVIOUS_RUN_BUDGET)) {
             throw new TapstateException(
                     EngineError.JOB_STILL_ENDING,
                     Map.of("pipeline", pipelineId, "seconds", PREVIOUS_RUN_BUDGET.toSeconds()), null);
@@ -292,6 +426,10 @@ public final class Engine {
         if (job == null) {
             return true;
         }
+        return awaitJob(job, budget);
+    }
+
+    private static boolean awaitJob(Job job, Duration budget) {
         try {
             job.getFuture().toCompletableFuture().get(budget.toMillis(), TimeUnit.MILLISECONDS);
             return true;
@@ -487,6 +625,12 @@ public final class Engine {
     public Map<String, Map<String, Long>> recordsDelivered(String pipelineId) {
         Job job = liveJob(pipelineId);
         return job == null ? Map.of() : deliveredRowsIn(job.getMetrics());
+    }
+
+    /** This job's own source-input counters, never a shared physical capture's account. */
+    public CaptureReading capturedRows(String pipelineId) {
+        Job job = liveJob(pipelineId);
+        return job == null ? CaptureReading.NONE : SourceArrivals.reading(job.getMetrics());
     }
 
     /**

@@ -708,9 +708,10 @@ class HazelcastMemberTest {
     @Test
     void embeddedMemberAndJetComeUpAndDownWithTheContext() {
         HazelcastInstance member;
-        try (ConfigurableApplicationContext context = new SpringApplicationBuilder(Bootstrap.class)
+        // Exercise the member-owning configuration directly, including its close lifecycle.
+        try (ConfigurableApplicationContext context = new SpringApplicationBuilder(HazelcastConfiguration.class)
                 .web(WebApplicationType.NONE)
-                .properties("tapstate.store.mongo.enabled=false",
+                .properties("tapstate.hz.member-port=0",
                         "tapstate.hz.jet.cooperative-thread-count=2",
                         "tapstate.cluster.id=local-single",
                         "tapstate.cluster.node-id=stable-single",

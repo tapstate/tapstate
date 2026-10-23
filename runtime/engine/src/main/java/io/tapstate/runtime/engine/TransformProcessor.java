@@ -52,7 +52,7 @@ public final class TransformProcessor extends AbstractProcessor implements Stage
     // Resolved at init from the running job — see reapSettled's counterpart in SinkProcessor and
     // JobFailureRegistry for why this is captured here rather than reconstructed after the job fails.
     private String pipelineId;
-    private JobFailureRegistry failureRegistry;
+    private JobFailureRegistry.Recorder failureRegistry;
 
     public TransformProcessor(TransformPort port) {
         this(port, null);
@@ -100,7 +100,7 @@ public final class TransformProcessor extends AbstractProcessor implements Stage
         this.timer = StageTimer.of(stage(), context);
         this.pipelineId = context.jobConfig().getName();
         HazelcastInstance instance = context.hazelcastInstance();
-        this.failureRegistry = instance != null ? JobFailureRegistry.of(instance) : null;
+        this.failureRegistry = instance != null ? JobFailureRegistry.of(instance).forJob(context.jobId(), context.jobConfig()) : null;
     }
 
     @Override
@@ -182,7 +182,7 @@ public final class TransformProcessor extends AbstractProcessor implements Stage
             // Recorded here, synchronously, before this rethrow ever reaches Jet's own tasklet
             // machinery — see SinkProcessor.reapSettled for why that matters.
             if (failureRegistry != null) {
-                failureRegistry.record(pipelineId, failure);
+                failureRegistry.record(failure);
             }
             throw failure;
         }

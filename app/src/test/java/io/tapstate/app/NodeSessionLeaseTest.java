@@ -1,9 +1,9 @@
 package io.tapstate.app;
 
-import io.tapstate.adapters.mongostore.SourceConfigKeyringSession;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimReading;
@@ -22,6 +22,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -41,36 +42,6 @@ class NodeSessionLeaseTest {
         lease.close();
 
         assertThat(store.released.get()).isTrue();
-    }
-
-    @Test
-    void aLiveNodeSessionRenewsAndReleasesItsKeyringAcknowledgement() throws Exception {
-        RecordingStore store = new RecordingStore(true);
-        RecordingKeyring keyring = new RecordingKeyring(false);
-        NodeSessionLease lease = new NodeSessionLease(
-                store, CLAIM, System.nanoTime(), Duration.ofSeconds(1), Duration.ofMillis(10), keyring,
-                () -> { });
-
-        assertThat(keyring.acknowledged.await(1, TimeUnit.SECONDS)).isTrue();
-        lease.close();
-
-        assertThat(keyring.acknowledgements).hasValueGreaterThanOrEqualTo(1);
-        assertThat(keyring.released.get()).isTrue();
-    }
-
-    @Test
-    void aKeyringEpochRefusalStopsTheMemberEvenWhenTheNodeClaimRenewed() throws Exception {
-        RecordingStore store = new RecordingStore(true);
-        RecordingKeyring keyring = new RecordingKeyring(true);
-        CountDownLatch memberStopped = new CountDownLatch(1);
-        NodeSessionLease lease = new NodeSessionLease(
-                store, CLAIM, System.nanoTime(), Duration.ofSeconds(1), Duration.ofMillis(10), keyring,
-                memberStopped::countDown);
-        try {
-            assertThat(memberStopped.await(1, TimeUnit.SECONDS)).isTrue();
-        } finally {
-            lease.close();
-        }
     }
 
     @Test
@@ -167,16 +138,44 @@ class NodeSessionLeaseTest {
     }
 
     @Test
+    void aPreparationCapturesOnlyAnActiveOriginalNodeFenceAndCannotRefreshItAfterLoss() throws Exception {
+        var now = new AtomicLong(); var stopped = new CountDownLatch(1);
+        var lease = new NodeSessionLease(new RecordingStore(true), CLAIM, 0, Duration.ofSeconds(30),
+                Duration.ofHours(1), stopped::countDown, now::get);
+        try {
+            assertThat(lease.currentFence()).contains(WorkloadClaimFence.from(CLAIM));
+            now.set(Duration.ofSeconds(30).toNanos());
+            assertThat(lease.currentFence()).isEmpty();
+            assertThat(stopped.await(1, TimeUnit.SECONDS)).isTrue();
+            now.set(0);
+            assertThat(lease.currentFence()).isEmpty();
+        } finally { lease.close(); }
+        assertThat(NodeSessionLease.inactive().currentFence()).isEmpty();
+    }
+
+    @Test
+    void aNodeFenceIsNotReturnedIfItsLocalDeadlineExpiresDuringCapture() throws Exception {
+        var checks = new AtomicInteger(); var stopped = new CountDownLatch(1);
+        var lease = new NodeSessionLease(new RecordingStore(true), CLAIM, 0, Duration.ofSeconds(30),
+                Duration.ofHours(1), stopped::countDown,
+                () -> checks.incrementAndGet() == 1 ? 0L : Duration.ofSeconds(30).toNanos());
+        try {
+            assertThat(lease.currentFence()).isEmpty();
+            assertThat(stopped.await(1, TimeUnit.SECONDS)).isTrue();
+        } finally { lease.close(); }
+    }
+
+    @Test
     void anExpiredLocalProofDoesNotAskTheStoreToCreateANewProof() throws Exception {
         RecordingStore store = new RecordingStore(true);
-        RecordingKeyring keyring = new RecordingKeyring(false);
+
         CountDownLatch stopped = new CountDownLatch(1);
         try (NodeSessionLease lease = new NodeSessionLease(store, CLAIM,
                 System.nanoTime() - Duration.ofSeconds(1).toNanos(), Duration.ofMillis(200),
-                Duration.ofMillis(50), keyring, stopped::countDown)) {
+                Duration.ofMillis(50), stopped::countDown)) {
             assertThat(stopped.await(1, TimeUnit.SECONDS)).isTrue();
             assertThat(store.renewed.getCount()).as("expired proof cannot be extended by a late store success").isEqualTo(1);
-            assertThat(keyring.acknowledgements).hasValue(0);
+
         }
     }
 
@@ -187,11 +186,11 @@ class NodeSessionLeaseTest {
             RecordingStore store = new RecordingStore(failure != FirstFailure.OWNER,
                     failure == FirstFailure.STORE ? new TapstateException(IoError.STORE_UNAVAILABLE,
                             Map.of("detail", "owned fixture store unavailable"), null) : null);
-            RecordingKeyring keyring = new RecordingKeyring(failure == FirstFailure.ACK);
+
             CountDownLatch stopped = new CountDownLatch(1);
             AtomicInteger stops = new AtomicInteger();
             try (NodeSessionLease lease = new NodeSessionLease(store, CLAIM, System.nanoTime(),
-                    Duration.ofSeconds(2), Duration.ofSeconds(1), keyring, () -> {
+                    Duration.ofSeconds(2), Duration.ofSeconds(1), () -> {
                         stops.incrementAndGet();
                         stopped.countDown();
                     })) {
@@ -203,19 +202,18 @@ class NodeSessionLeaseTest {
         }
     }
 
-    @ParameterizedTest
-    @EnumSource(HeldSuccess.class)
-    void aLateSuccessfulResponseCannotExtendAnAlreadyLapsedProof(HeldSuccess stage) throws Exception {
+    @Test
+    void aLateSuccessfulResponseCannotExtendAnAlreadyLapsedProof() throws Exception {
         Delay delay = new Delay();
-        RecordingStore store = new RecordingStore(true, null, stage == HeldSuccess.STORE ? delay : null);
-        RecordingKeyring keyring = new RecordingKeyring(false, stage == HeldSuccess.ACK ? delay : null);
+        RecordingStore store = new RecordingStore(true, null, delay);
+
         CountDownLatch stopped = new CountDownLatch(1);
         AtomicInteger stops = new AtomicInteger();
         Duration ttl = Duration.ofSeconds(2);
         long askedAt = System.nanoTime() - Duration.ofMillis(1500).toNanos();
         long originalDeadline = askedAt + ttl.toNanos();
         try (NodeSessionLease lease = new NodeSessionLease(store, CLAIM, askedAt, ttl,
-                Duration.ofMillis(1800), keyring, () -> {
+                Duration.ofMillis(1800), () -> {
                     stops.incrementAndGet();
                     stopped.countDown();
                 })) {
@@ -226,16 +224,11 @@ class NodeSessionLeaseTest {
             assertThat(stopped.await(300, TimeUnit.MILLISECONDS))
                     .as("a response after the prior proof expired must fail closed before publishing a new proof").isTrue();
             assertThat(stops).hasValue(1);
-            if (stage == HeldSuccess.STORE) {
-                assertThat(keyring.acknowledgements).as("an already-lapsed proof cannot publish an ACK").hasValue(0);
-            }
         } finally {
             delay.resume.countDown();
         }
         assertThat(stops).hasValue(1);
     }
-
-    private enum HeldSuccess { STORE, ACK }
 
     private static final class Delay {
         private final CountDownLatch entered = new CountDownLatch(1);
@@ -251,7 +244,7 @@ class NodeSessionLeaseTest {
         }
     }
 
-    private enum FirstFailure { OWNER, ACK, STORE }
+    private enum FirstFailure { OWNER, STORE }
 
     /** A store whose renewals hang until {@link #answer} lets them go, as a frozen store's do. */
     private static final class SilentStore implements WorkloadClaimStore {
@@ -365,37 +358,4 @@ class NodeSessionLeaseTest {
         }
     }
 
-    private static final class RecordingKeyring implements SourceConfigKeyringSession {
-        private final boolean refuse;
-        private final Delay delay;
-        private final CountDownLatch acknowledged = new CountDownLatch(1);
-        private final AtomicInteger acknowledgements = new AtomicInteger();
-        private final AtomicBoolean released = new AtomicBoolean();
-
-        private RecordingKeyring(boolean refuse) {
-            this(refuse, null);
-        }
-
-        private RecordingKeyring(boolean refuse, Delay delay) {
-            this.refuse = refuse;
-            this.delay = delay;
-        }
-
-        @Override
-        public void acknowledge(WorkloadClaim session, Duration ttl) {
-            acknowledgements.incrementAndGet();
-            if (delay != null) delay.block();
-            acknowledged.countDown();
-            if (refuse) {
-                throw new TapstateException(
-                        io.tapstate.adapters.mongostore.StoreError.SOURCE_CONFIG_KEYRING_NOT_READY,
-                        java.util.Map.of(), null);
-            }
-        }
-
-        @Override
-        public void release(WorkloadClaim session) {
-            released.set(true);
-        }
-    }
 }

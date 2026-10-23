@@ -15,6 +15,8 @@ import io.tapstate.spi.capture.FieldSchema;
 import io.tapstate.spi.capture.SourcePosition;
 import io.tapstate.spi.capture.SharedNotes;
 import io.tapstate.spi.capture.SnapshotSession;
+import io.tapstate.spi.capture.SnapshotPreparation;
+import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.capture.SnapshotOnlyCapture;
 import io.tapstate.spi.capture.Subscription;
 import io.tapstate.spi.store.KeyedStateStore;
@@ -69,7 +71,7 @@ import java.util.function.LongSupplier;
  * stream failure reaches the caller and the backpressure that bounds the stream belong to the runtime that
  * owns stream execution, not to this port.
  */
-public final class PdkCapturePort implements CapturePort, SnapshotSession.Provider, SnapshotOnlyCapture {
+public final class PdkCapturePort implements CapturePort, SnapshotSession.PreparedProvider, SnapshotOnlyCapture {
 
     private static final Logger LOG = LoggerFactory.getLogger(PdkCapturePort.class);
 
@@ -115,10 +117,46 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
 
     private final ConnectorProvisioner provisioner;
     private final KeyedStateStore stateStore;
+    private final ConnectorNoteScopes noteScopes;
     private final Duration preflightTimeout;
     private final long acknowledgeIntervalNanos;
     private final LongSupplier nanoClock;
     private final Duration releaseTimeout;
+    private final SnapshotPreparer snapshotPreparer;
+    private final StreamPreparer streamPreparer;
+
+    /** Accepts exact metadata from this open connector session before its first source row is read. */
+    @FunctionalInterface
+    public interface SnapshotPreparer {
+        void prepare(SnapshotPreparation request, SourcePosition sampledSeam, Map<String, SourceTable> actualTables);
+    }
+
+    /** Accepts exact metadata from this CDC connector session before its stream may begin. */
+    @FunctionalInterface
+    public interface StreamPreparer {
+        void prepare(Map<String, SourceTable> actualTables);
+    }
+
+    /** The returned port keeps both preparation owners and the same connector and note configuration. */
+    public PdkCapturePort withSnapshotPreparation(SnapshotPreparer prepare) {
+        return new PdkCapturePort(provisioner, stateStore, preflightTimeout, Duration.ofNanos(acknowledgeIntervalNanos),
+                nanoClock, releaseTimeout, noteScopes, Objects.requireNonNull(prepare, "prepare"), streamPreparer);
+    }
+
+
+    /** The host callback runs outside the connector loader and completes before CDC preflight succeeds. */
+    public PdkCapturePort withStreamPreparation(StreamPreparer prepare) {
+        return new PdkCapturePort(provisioner, stateStore, preflightTimeout, Duration.ofNanos(acknowledgeIntervalNanos),
+                nanoClock, releaseTimeout, noteScopes, snapshotPreparer, Objects.requireNonNull(prepare, "prepare"));
+    }
+
+    /** Configured capture notes use the configuration domain, independently of generic operator state. */
+    public static PdkCapturePort withRequiredNotes(ConnectorProvisioner provisioner, KeyedStateStore stateStore,
+            ConnectorNoteScopes noteScopes) {
+        return new PdkCapturePort(provisioner, stateStore, DEFAULT_PREFLIGHT_TIMEOUT,
+                DEFAULT_ACKNOWLEDGE_INTERVAL, System::nanoTime, DEFAULT_RELEASE_TIMEOUT,
+                Objects.requireNonNull(noteScopes, "noteScopes"));
+    }
 
     /** For the drives that keep nothing: no store, so nothing a connector writes is filed anywhere. */
     public PdkCapturePort(ConnectorProvisioner provisioner) {
@@ -147,7 +185,27 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
     /** As above, with how long a release waits for its connector -- for a case that cannot wait a minute. */
     PdkCapturePort(ConnectorProvisioner provisioner, KeyedStateStore stateStore, Duration preflightTimeout,
             Duration acknowledgeInterval, LongSupplier nanoClock, Duration releaseTimeout) {
+        this(provisioner, stateStore, preflightTimeout, acknowledgeInterval, nanoClock, releaseTimeout, null);
+    }
+
+    PdkCapturePort(ConnectorProvisioner provisioner, KeyedStateStore stateStore, Duration preflightTimeout,
+            Duration acknowledgeInterval, LongSupplier nanoClock, Duration releaseTimeout, ConnectorNoteScopes noteScopes) {
+        this(provisioner, stateStore, preflightTimeout, acknowledgeInterval, nanoClock, releaseTimeout, noteScopes, null);
+    }
+
+    private PdkCapturePort(ConnectorProvisioner provisioner, KeyedStateStore stateStore, Duration preflightTimeout,
+            Duration acknowledgeInterval, LongSupplier nanoClock, Duration releaseTimeout, ConnectorNoteScopes noteScopes,
+            SnapshotPreparer snapshotPreparer) {
+        this(provisioner,stateStore,preflightTimeout,acknowledgeInterval,nanoClock,releaseTimeout,noteScopes,snapshotPreparer,null);
+    }
+
+    private PdkCapturePort(ConnectorProvisioner provisioner, KeyedStateStore stateStore, Duration preflightTimeout,
+            Duration acknowledgeInterval, LongSupplier nanoClock, Duration releaseTimeout, ConnectorNoteScopes noteScopes,
+            SnapshotPreparer snapshotPreparer, StreamPreparer streamPreparer) {
+        this.streamPreparer = streamPreparer;
+        this.snapshotPreparer = snapshotPreparer;
         this.provisioner = provisioner;
+        this.noteScopes = noteScopes;
         this.stateStore = stateStore;
         this.preflightTimeout = requirePositive(preflightTimeout, "preflightTimeout");
         this.acknowledgeIntervalNanos = requirePositive(acknowledgeInterval, "acknowledgeInterval").toNanos();
@@ -196,11 +254,20 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
 
     /** One initialized connector serves every table of a chained snapshot round. */
     @Override
-    public SnapshotSession snapshotSession(CaptureConfig config) {
+    public SnapshotSession snapshotSession(CaptureConfig config) { return openSnapshotSession(config, null); }
+
+    @Override
+    public SnapshotSession snapshotSession(CaptureConfig config, SnapshotPreparation preparation) {
+        Objects.requireNonNull(preparation, "preparation");
+        if (snapshotPreparer == null) throw snapshotPreparationUnavailable(config, "no preparation owner is installed");
+        return openSnapshotSession(config, preparation);
+    }
+
+    private SnapshotSession openSnapshotSession(CaptureConfig config, SnapshotPreparation preparation) {
         PdkConnector connector = open(config);
         try {
             BatchReadFunction batch = requireFunction(connector.functions().getBatchReadFunction());
-            return new SharedSnapshotSession(connector, config, batch);
+            return new SharedSnapshotSession(connector, config, batch, preparation);
         } catch (RuntimeException | Error failure) {
             connector.close();
             throw failure;
@@ -212,65 +279,98 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
         private final PdkConnector connector;
         private final CaptureConfig config;
         private final BatchReadFunction batch;
+        private final SnapshotPreparation preparation;
         private final AtomicReference<PreparedSnapshot> prepared = new AtomicReference<>();
         private PdkCaptureBatch active;
         private volatile boolean closed;
+        private final CompletableFuture<Void> ending = new CompletableFuture<>();
 
-        private SharedSnapshotSession(PdkConnector connector, CaptureConfig config, BatchReadFunction batch) {
+        private SharedSnapshotSession(PdkConnector connector, CaptureConfig config, BatchReadFunction batch, SnapshotPreparation preparation) {
             this.connector = connector;
             this.config = config;
             this.batch = batch;
+            this.preparation = preparation;
         }
 
         @Override
         public CaptureBatch read(String table) {
-            if (closed) {
-                throw new java.util.concurrent.CancellationException("the snapshot session was closed");
+            if (preparation != null && !config.streams().isEmpty() && !config.streams().contains(table)) {
+                throw snapshotPreparationUnavailable(config, "the table is outside the prepared selection");
             }
-            PdkCaptureBatch opened = PdkCaptureBatch.start(connector,
-                    reading -> PdkCapturePort.read(connector, () -> {
+            PdkCaptureBatch opened = PdkCaptureBatch.unstarted(connector,
+                    reading -> {
                         PreparedSnapshot snapshot = prepared.get();
                         if (snapshot == null) {
-                            snapshot = prepareSnapshot(connector, config, true);
+                            snapshot = PdkCapturePort.read(connector, () -> prepareSnapshot(connector, config, true));
+                            if (preparation != null) {
+                                SourcePosition seam = snapshot.seam().orElseThrow(() -> snapshotPreparationUnavailable(config,
+                                        "the connector reported no stream position"));
+                                var selected = new ArrayList<TapTable>();
+                                for (String name : config.streams().isEmpty() ? snapshot.discovered().keySet() : config.streams()) {
+                                    TapTable actual = snapshot.discovered().get(name);
+                                    if (actual == null) throw snapshotPreparationUnavailable(config, "a selected table was not discovered");
+                                    selected.add(actual);
+                                }
+                                var actual = new LinkedHashMap<String, SourceTable>();
+                                for (SourceTable model : PdkSchemaDiscoverer.structuralModel(selected).tables()) actual.put(model.name(), model);
+                                if (!actual.containsKey(table)) throw snapshotPreparationUnavailable(config, "the table is outside the prepared selection");
+                                snapshotPreparer.prepare(preparation, seam, Map.copyOf(actual));
+                            }
                             prepared.set(snapshot);
                         }
+                        if (closed || reading.isClosed()) throw new CancellationException("the snapshot session was closed during preparation");
                         reading.seamSampled(snapshot.seam());
-                        readTable(connector, snapshot, table, batch, reading);
-                        return null;
-                    }),
+                        PreparedSnapshot ready = snapshot;
+                        PdkCapturePort.read(connector, () -> { readTable(connector, ready, table, batch, reading); return null; });
+                    },
                     "tapstate-snapshot-" + connector.connectorId(), false);
             synchronized (this) {
-                if (!closed) {
-                    active = opened;
-                    return opened;
+                if (closed) throw new CancellationException("the snapshot session was closed");
+                if (active != null && (!active.isClosed() || active.isReading())) {
+                    throw new IllegalStateException("close the previous snapshot table read before opening another");
                 }
+                active = opened;
+                opened.startReader();
             }
-            opened.close();
-            throw new java.util.concurrent.CancellationException("the snapshot session was closed");
+            try {
+                opened.awaitSeam();
+                if (closed) throw new CancellationException("the snapshot session was closed during preparation");
+                return opened;
+            } catch (RuntimeException | Error failure) {
+                if (!closed) try { close(); } catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
+                throw failure;
+            }
         }
 
         @Override
         public void close() {
-            PdkCaptureBatch reading;
             synchronized (this) {
-                if (closed) {
-                    return;
+                if (!closed) {
+                    closed = true; var reading = active;
+                    if (reading != null) reading.requestClose();
+                    var owner = new Thread(() -> {
+                        try {
+                            connector.stopQuietly();
+                            if (reading != null) { reading.awaitReader(); reading.close(); }
+                            connector.close(); ending.complete(null);
+                        } catch (RuntimeException | Error failure) { ending.completeExceptionally(failure); }
+                    }, "tapstate-snapshot-session-ending-" + connector.connectorId());
+                    owner.setDaemon(true); owner.start();
                 }
-                closed = true;
-                reading = active;
             }
-            if (reading != null) {
-                reading.requestClose();
-            }
-            connector.stopQuietly();
-            try {
-                if (reading != null) {
-                    reading.close();
-                }
-            } finally {
-                connector.close();
+            try { ending.get(SHUTDOWN_JOIN_MILLIS,TimeUnit.MILLISECONDS); }
+            catch (InterruptedException stopping) {
+                Thread.currentThread().interrupt();
+                throw new TapstateException(ConnectorError.CAPTURE_FAILED,Map.of("connector",connector.connectorId(),"detail","waiting for the original snapshot session to stop was interrupted"),stopping);
+            } catch (ExecutionException failed) {
+                if(failed.getCause() instanceof RuntimeException runtime)throw runtime;
+                if(failed.getCause() instanceof Error error)throw error;
+                throw new IllegalStateException("unexpected snapshot cleanup failure",failed.getCause());
+            } catch (TimeoutException stopping) {
+                throw new TapstateException(ConnectorError.CAPTURE_FAILED,Map.of("connector",connector.connectorId(),"detail","the original snapshot session is still ending; retry its close"),stopping);
             }
         }
+
     }
 
     /**
@@ -326,7 +426,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
         // Keep connector initialization and streamRead on the same worker, while waiting for LogMiner's
         // discovery-based preflight before returning a subscription. An unsupported table or column then
         // refuses the start instead of letting the pipeline report RUNNING before its tail fails.
-        CompletableFuture<Void> preflight = OracleLogMinerIdentifiers.appliesTo(config)
+        CompletableFuture<Void> preflight = OracleLogMinerIdentifiers.appliesTo(config) || streamPreparer != null
                 ? new CompletableFuture<>() : null;
         CdcDelivery delivery = new CdcDelivery();
         Acknowledgements acknowledgements = new Acknowledgements(connector, listener,
@@ -339,6 +439,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
         thread.start();
         awaitPreflight(preflight, connector, thread, delivery);
         return new Subscription() {
+            private final CompletableFuture<Void> ended = new CompletableFuture<>();
             @Override
             public void acknowledge(SourcePosition durable) {
                 acknowledgements.offer(durable);
@@ -346,18 +447,32 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
 
             @Override
             public void close() {
-                // Before anything else: a source may still deliver on its way down, and a delivery made
-                // after close must hand it nothing.
                 acknowledgements.close();
-                if (!delivery.cancel()) {
-                    return;
+                if (delivery.cancel()) {
+                    Thread cleanup = new Thread(() -> finishCdc(connector, thread, delivery, ended),
+                            "tapstate-cdc-ending-" + connector.connectorId());
+                    cleanup.setDaemon(true);
+                    cleanup.start();
                 }
-                shutDown(connector, thread, CDC_SHUTDOWN_GRACE_MILLIS);
+                try {
+                    ended.get(CDC_SHUTDOWN_GRACE_MILLIS + SHUTDOWN_JOIN_MILLIS, TimeUnit.MILLISECONDS);
+                } catch (TimeoutException waiting) {
+                    throw new TapstateException(ConnectorError.CAPTURE_FAILED, Map.of("connector", connector.connectorId(),
+                            "detail", "the original capture is still ending; retry its stop"), waiting);
+                } catch (InterruptedException stopping) {
+                    Thread.currentThread().interrupt();
+                    throw new TapstateException(ConnectorError.CAPTURE_FAILED, Map.of("connector", connector.connectorId(),
+                            "detail", "waiting for the original capture to stop was interrupted"), stopping);
+                } catch (ExecutionException failed) {
+                    if(failed.getCause() instanceof RuntimeException runtime)throw runtime;
+                    if(failed.getCause() instanceof Error error)throw error;
+                    throw new IllegalStateException("unexpected capture cleanup failure",failed.getCause());
+                }
             }
         };
     }
 
-    /** Waits until LogMiner's worker has accepted its discovered identifiers, cleaning up a refusal. */
+    /** Waits for configured source and host metadata preparation, cleaning up a refusal. */
     private void awaitPreflight(
             CompletableFuture<Void> preflight, PdkConnector connector, Thread thread, CdcDelivery delivery) {
         if (preflight == null) {
@@ -367,20 +482,22 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
             preflight.get(preflightTimeout.toNanos(), TimeUnit.NANOSECONDS);
         } catch (TimeoutException failure) {
             delivery.cancel();
-            shutDown(connector, thread, 0);
+            abortPreflight(connector, thread);
+            if (streamPreparer != null) throw new TapstateException(ConnectorError.CAPTURE_FAILED,
+                    Map.of("connector",connector.connectorId(),"detail","source metadata preparation timed out after " + preflightTimeout.toMillis() + "ms"),failure);
             throw new TapstateException(ConnectorError.LOGMINER_PREFLIGHT_TIMEOUT,
                     Map.of("connector", connector.connectorId(),
                             "timeout", preflightTimeout.toMillis() + "ms"), failure);
         } catch (InterruptedException failure) {
             delivery.cancel();
-            shutDown(connector, thread, 0);
+            abortPreflight(connector, thread);
             Thread.currentThread().interrupt();
             throw new TapstateException(ConnectorError.CAPTURE_FAILED,
                     Map.of("connector", connector.connectorId(),
                             "detail", "change-capture preflight was interrupted"), failure);
         } catch (ExecutionException failure) {
             delivery.cancel();
-            shutDown(connector, thread, 0);
+            abortPreflight(connector, thread);
             Throwable cause = failure.getCause();
             if (cause instanceof RuntimeException runtime) {
                 throw runtime;
@@ -392,17 +509,49 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
         }
     }
 
-    /** Lets a cancelled read release its cursor before stopping the client; aborts remain bounded. */
-    private static void shutDown(PdkConnector connector, Thread thread, long graceMillis) {
-        if (graceMillis > 0) {
-            joinQuietly(thread, graceMillis);
+    /** Keeps cleanup ownership until both plugin stop and the original worker have actually returned. */
+    private static void abortPreflight(PdkConnector connector, Thread worker) {
+        connector.cancelDrive();
+        worker.interrupt();
+        Thread cleanup = new Thread(() -> {
+            boolean interrupted = false;
+            try {
+                connector.stopQuietly();
+                while (worker.isAlive()) {
+                    try { worker.join(); }
+                    catch (InterruptedException ignored) { interrupted = true; }
+                }
+            } finally {
+                connector.close();
+                if (interrupted) Thread.currentThread().interrupt();
+            }
+        }, "tapstate-cdc-cleanup-" + connector.connectorId());
+        cleanup.setDaemon(true);
+        cleanup.start();
+        joinQuietly(cleanup, SHUTDOWN_JOIN_MILLIS);
+    }
+
+    /** The caller waits within its old budget; this original owner retains every still-running callback. */
+    private static void finishCdc(PdkConnector connector, Thread worker, CdcDelivery delivery, CompletableFuture<Void> ended) {
+        Throwable failure = null;
+        try {
+            joinQuietly(worker, CDC_SHUTDOWN_GRACE_MILLIS);
+            if (worker.isAlive()) worker.interrupt();
+            connector.stopQuietly();
+        } catch (RuntimeException | Error stopping) { failure = stopping; }
+        boolean interrupted = false;
+        while (worker.isAlive()) {
+            try { worker.join(); }
+            catch (InterruptedException stopping) { interrupted = true; }
         }
-        if (thread.isAlive()) {
-            thread.interrupt();
+        delivery.awaitDrained();
+        try { connector.close(); }
+        catch (RuntimeException | Error closing) {
+            if (failure == null) failure = closing;
+            else if (failure != closing) failure.addSuppressed(closing);
         }
-        connector.stopQuietly();
-        joinQuietly(thread, SHUTDOWN_JOIN_MILLIS);
-        connector.close();
+        if (failure == null) ended.complete(null); else ended.completeExceptionally(failure);
+        if (interrupted) Thread.currentThread().interrupt();
     }
 
     /** Cancels at the consumer boundary without interrupting the source cursor's cleanup. */
@@ -418,6 +567,16 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
             // Wake a listener blocked on downstream capacity, including connector-owned delivery threads.
             active.forEach(Thread::interrupt);
             return true;
+        }
+
+        void awaitDrained() {
+            boolean interrupted = false;
+            synchronized (this) {
+                while (!active.isEmpty()) {
+                    try { wait(); } catch (InterruptedException stopping) { interrupted = true; }
+                }
+            }
+            if (interrupted) Thread.currentThread().interrupt();
         }
 
         void accept(Runnable batch) {
@@ -436,6 +595,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
             } finally {
                 synchronized (this) {
                     active.remove(current);
+                    notifyAll();
                     if (closed) {
                         // Our listener wake-up must not prevent a connector's finally block doing I/O.
                         Thread.interrupted();
@@ -493,28 +653,59 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
      */
     @Override
     public Optional<TapstateException> release(CaptureConfig config) {
-        Objects.requireNonNull(config, "config");
-        if (stateStore == null || (config.node() == null && config.sharedNotes() == null)) {
+        return release(config, PipelineNode.Purpose.CAPTURE);
+    }
+
+    /** Release keeps the original connector purpose without changing its logical node identity. */
+    public Optional<TapstateException> release(CaptureConfig config, PipelineNode.Purpose purpose) {
+        Objects.requireNonNull(config, "config"); Objects.requireNonNull(purpose, "purpose");
+        if ((purpose != PipelineNode.Purpose.CAPTURE && stateStore != null)
+                || (purpose != PipelineNode.Purpose.CAPTURE && config.sharedNotes() != null)) {
+            throw new IllegalArgumentException("only capture notes may use a shared or legacy state store");
+        }
+        if ((stateStore == null && noteScopes == null) || (config.node() == null && config.sharedNotes() == null)) {
             // Nothing was kept anywhere a later drive could read it, so nothing was set up through it either.
             return Optional.empty();
         }
-        FencedStateStore notes = new FencedStateStore(stateStore);
+        FencedStateStore notes = stateStore == null ? null : new FencedStateStore(stateStore);
+        java.util.concurrent.atomic.AtomicBoolean releaseActive = new java.util.concurrent.atomic.AtomicBoolean(true);
+        ConnectorNoteScopes releaseScopes = noteScopes == null ? null : noteScopes.guardedBy(() -> {
+            if (!releaseActive.get()) {
+                throw new TapstateException(io.tapstate.spi.store.IoError.NOTE_SCOPE_UNAVAILABLE, Map.of(), null);
+            }
+        });
         AtomicReference<List<String>> named = new AtomicReference<>();
         CompletableFuture<Void> released = new CompletableFuture<>();
         Thread thread = new Thread(() -> {
             try {
-                PdkConnector connector = PdkConnector.open(config.connectorId(),
-                        provisioner.resolve(config.connectorId()), config.settings(), config.node(), notes,
-                        config.sharedNotes());
+                String connectorId = config.connectorId();
+                Map<String, Object> settings = config.settings();
+                ConnectorRef reference;
+                ConnectorNoteScopes connectorScopes = releaseScopes;
+                if (releaseScopes == null) {
+                    reference = provisioner.resolve(connectorId);
+                } else {
+                    String namespace = config.sharedNotes() == null ? ConnectorStateNamespace.of(config.node(), purpose)
+                            : ConnectorStateNamespace.ofShared(config.sharedNotes().sharedBy());
+                    var scope = releaseScopes.open(namespace);
+                    var origin = releaseScopes.store().origin(scope);
+                    connectorId = origin.connectorId();
+                    settings = ConnectorNoteOrigin.settings(origin);
+                    reference = provisioner.resolve(connectorId, origin.artifactHash());
+                    connectorScopes = BoundConnectorNoteScopes.pin(releaseScopes, scope);
+                }
+                PdkConnector connector = PdkConnector.open(connectorId, reference, settings, config.node(), notes,
+                        config.sharedNotes(), connectorScopes, purpose);
                 try {
                     List<String> names = namedOnTheSource(connector);
                     named.set(names);
                     ReleaseExternalFunction release = connector.functions().getReleaseExternalFunction();
                     if (release != null) {
                         LOG.info("connector {} is letting go of what it set up on its source to read changes ({})",
-                                config.connectorId(),
+                                connectorId,
                                 names.isEmpty() ? "nothing its notes name" : String.join(", ", names));
                         connector.underLoader(() -> {
+                            if (releaseScopes != null) releaseScopes.requireActive();
                             release.release(connector.context());
                             return null;
                         });
@@ -543,14 +734,18 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
                 throw fatal;
             }
         } catch (TimeoutException silent) {
-            notes.fence();
+            releaseActive.set(false);
+            if (notes != null) notes.fence();
             thread.interrupt();
             failure = new TimeoutException("the source did not answer within " + releaseTimeout.toMillis() + " ms");
         } catch (InterruptedException interrupted) {
-            notes.fence();
+            releaseActive.set(false);
+            if (notes != null) notes.fence();
             thread.interrupt();
             Thread.currentThread().interrupt();
             failure = interrupted;
+        } finally {
+            releaseActive.set(false);
         }
         List<String> left = named.get();
         return Optional.of(new TapstateException(ConnectorError.RELEASE_FAILED,
@@ -681,7 +876,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
 
     private PdkConnector open(CaptureConfig config, PipelineNode node, SharedNotes notes) {
         return PdkConnector.open(config.connectorId(), provisioner.resolve(config.connectorId()), config.settings(),
-                node, stateStore, notes);
+                node, stateStore, notes, node == null && notes == null ? null : noteScopes);
     }
 
     /**
@@ -712,6 +907,11 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
             readTable(connector, snapshot, stream, batch, reading);
         }
         return null;
+    }
+
+    private static TapstateException snapshotPreparationUnavailable(CaptureConfig config, String reason) {
+        return new TapstateException(ConnectorError.SNAPSHOT_PREPARATION_UNAVAILABLE,
+                Map.of("connector", config.connectorId(), "reason", reason), null);
     }
 
     private PreparedSnapshot prepareSnapshot(PdkConnector connector, CaptureConfig config, boolean sampleSeam)
@@ -849,22 +1049,41 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
             CaptureListener listener, StreamReadFunction stream, CompletableFuture<Void> preflight,
             Acknowledgements acknowledgements, CdcDelivery delivery) {
         try {
+            Map<String, TapTable> tables = connector.underLoader(() -> prepareStream(connector, config));
+            if (delivery.closed) return;
+            if (streamPreparer != null) {
+                try {
+                    var selected = new ArrayList<TapTable>();
+                    for (String name : config.streams().isEmpty() ? tables.keySet() : config.streams()) {
+                        TapTable actual = tables.get(name);
+                        if (actual == null) throw new TapstateException(ConnectorError.CAPTURE_FAILED,
+                                Map.of("connector",config.connectorId(),"detail","a selected stream table was not discovered"),null);
+                        selected.add(actual);
+                    }
+                    var actual = new LinkedHashMap<String,SourceTable>();
+                    for (SourceTable model : PdkSchemaDiscoverer.structuralModel(selected).tables()) actual.put(model.name(),model);
+                    streamPreparer.prepare(Map.copyOf(actual));
+                } catch (RuntimeException | Error hostFailure) {
+                    preflight.completeExceptionally(hostFailure);
+                    return;
+                }
+            }
+            if (delivery.closed) return;
+            if (preflight != null) preflight.complete(null);
             connector.underLoader(() -> {
+                if (delivery.closed) return null;
                 // streamRead is handed only stream names, so the connector reads each changed table's
                 // schema off the context's table map and its resume position off the offset argument -
                 // neither is assembled by open(). Discover-and-fill the tables onto the context the way the
                 // snapshot read does, and derive a current stream position, or the tail cannot decode a
                 // change (null table map) or even position (a null offset drives a schema-only recovery
                 // that has no stored offset to recover from).
-                Map<String, TapTable> tables = prepareStream(connector, config);
-                if (preflight != null) {
-                    preflight.complete(null);
-                }
                 // Resuming uses the position the caller recorded; every other start asks the connector to
                 // name one, which also keeps a null offset out of the connector -- that drives a
                 // schema-only recovery with no stored offset to recover from. Which position it names is
                 // the instant it is handed: none for the present, the caller's for an instant start.
                 Object startOffset = resumeAt != null ? resumeAt : startOffset(connector, startAt);
+                if (delivery.closed) return null;
                 if (listener instanceof CaptureStartedListener started) {
                     position(connector, startOffset).ifPresent(started::onStart);
                 }
@@ -882,6 +1101,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Provid
                     delivery.accept(() -> handOver(connector, declared, listener, events, offset));
                 });
                 Object readerOffset = readerOffset(connector, startOffset, resumeAt != null);
+                if (delivery.closed) return null;
                 stream.streamRead(connector.context(), config.streams(), readerOffset, BATCH_SIZE, consumer);
                 return null;
             });

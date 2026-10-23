@@ -45,6 +45,12 @@ public enum IoError implements TapstateErrorCode {
      */
     DOCUMENT_UNREADABLE("io.document-unreadable", Set.of("id", "field")),
 
+    /** A failed or losing upload cannot confirm cleanup of its own unpublished GridFS resource. */
+    CONNECTOR_ARTIFACT_CLEANUP_UNCONFIRMED("io.connector-artifact-cleanup-unconfirmed", Set.of("hash", "upload")),
+
+    /** An input value cannot be represented by the store without changing its value. */
+    DOCUMENT_INVALID("io.document-invalid", Set.of("id", "field")),
+
     /**
      * Re-discovery replaced a connection's schema during every permitted read attempt. The store
      * remains available, but the caller must retry after publication settles to read a coherent model.
@@ -66,8 +72,71 @@ public enum IoError implements TapstateErrorCode {
      */
     SINK_WRITER_PROGRESS_AMBIGUOUS("io.sink-writer-progress-ambiguous", Set.of("pipeline")),
 
+    /** A note command lost its captured key revision and must not overwrite the current value. */
+    NOTE_WRITE_CONFLICT("io.note-write-conflict", Set.of()),
+
+    /** A diagnostic command no longer owns its original configuration binding or state generation. */
+    REQUIRED_DEAD_LETTER_FENCED("io.required-dead-letter-fenced", Set.of()),
+
+    /** One source event cannot describe two different retained row, deletion or token facts. */
+    REQUIRED_DEAD_LETTER_CONFLICT("io.required-dead-letter-conflict", Set.of()),
+
+    /** The captured cache authentication generation is no longer current or ready. */
+    CACHE_AUTH_FENCED("io.cache-auth-fenced", Set.of()),
+
+    /** A lifecycle intent no longer owns its captured storage binding or stable Pipeline state generation. */
+    PIPELINE_INTENT_FENCED("io.pipeline-intent-fenced", Set.of()),
+
+    /** Issued first-state authority has incomplete or inconsistent CACHE history; no counters may be recreated. */
+    PIPELINE_STATE_REBUILD_REQUIRED("io.pipeline-state-rebuild-required", Set.of("pipeline")),
+
+    /** Missing canonical capture history requires explicitly confirmed Cluster cache recovery. */
+    CAPTURE_STATE_REBUILD_REQUIRED("io.capture-state-rebuild-required", Set.of("capture")),
+
+    /** The captured business incarnation is unavailable or no longer current. */
+    CACHE_BUSINESS_FENCED("io.cache-business-fenced", Set.of()),
+
+    /** An event cannot prove its exact ring, capture epoch and model version. */
+    SRS_EVENT_MODEL_UNAVAILABLE("io.srs-event-model-unavailable", Set.of("ring", "epoch", "version")),
+
+    /** A retained source consumer cannot prove its membership, stable state identity and cursor. */
+    SRS_CONSUMER_UNAVAILABLE("io.srs-consumer-unavailable", Set.of("chain")),
+
+    /** A source checkpoint cannot prove its original chain, table frontiers and exact model closure. */
+    SRS_CHECKPOINT_UNPROVEN("io.srs-checkpoint-unproven", Set.of("chain")),
+
+    /** An exact actual model is absent or cannot be used for the captured stream context. */
+    SRS_MODEL_UNAVAILABLE("io.srs-model-unavailable", Set.of("chain", "table", "version")),
+
+    /** Required retained models cannot safely fit in the existing chain history budget. */
+    SRS_MODEL_CAPACITY("io.srs-model-capacity", Set.of("chain", "bytes")),
+
+    /** An immutable model identity already names different structural content. */
+    SRS_MODEL_CONFLICT("io.srs-model-conflict", Set.of("chain", "table", "version")),
+
+    /** A connector must not reuse retained notes with another connection or artifact. */
+    NOTE_ORIGIN_MISMATCH("io.note-origin-mismatch", Set.of()),
+
+    /** A retained shared capture still depends on this private note scope. */
+    NOTE_REFERENCED("io.note-referenced", Set.of()),
+
+    /** Necessary connector notes cannot prove the captured namespace, owner or clear generation. */
+    NOTE_SCOPE_UNAVAILABLE("io.note-scope-unavailable", Set.of()),
+
     /** Legacy pipeline-level progress cannot establish this source node's confirmed recovery cursor. */
     SRS_PROGRESS_UNPROVEN("io.srs-progress-unproven", Set.of("pipeline")),
+
+    /** The private direct source cannot prove the retained progress and ordered pending batches. */
+    DIRECT_CHANNEL_UNAVAILABLE("io.direct-channel-unavailable", Set.of("channel")),
+
+    /** The requested private source/read contract cannot reuse the prepared physical state. */
+    PIPELINE_CAPTURE_IDENTITY_UNPROVEN("io.pipeline-capture-identity-unproven", Set.of("pipeline")),
+
+    /** A configuration import cannot satisfy its original scope, input or publication conditions. */
+    CONFIGURATION_IMPORT_REFUSED("io.configuration-import-refused", Set.of("reason")),
+
+    /** A bounded import budget is exhausted without discarding retained outcomes. */
+    CONFIGURATION_IMPORT_LIMIT("io.configuration-import-limit", Set.of("limit")),
 
     /**
      * A document a store operation had to write is larger than the store will accept. {@code id} is

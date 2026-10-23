@@ -180,6 +180,13 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
 
     @Override
     public synchronized void startCapture(String pipelineId, ArtifactStore artifactSnapshot) {
+        startOriginal(pipelineId,artifactSnapshot,source -> SourceDiscovery.model(storePort,source));
+    }
+    @Override public synchronized void startCapture(String pipelineId,ArtifactStore artifactSnapshot,SourceModelSnapshot sourceModels) {
+        Objects.requireNonNull(sourceModels,"sourceModels").requirePipeline(pipelineId);
+        startOriginal(pipelineId,artifactSnapshot,sourceModels::model);
+    }
+    private void startOriginal(String pipelineId,ArtifactStore artifactSnapshot,java.util.function.Function<SourceResource,SourceModel> modelInputs) {
         // Idempotent: a pipeline whose capture is already running is left running, so a repeated start does not
         // open a second capture behind the one already filling the ring.
         if (runsByPipeline.containsKey(pipelineId)) {
@@ -198,7 +205,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         // back is given back having opened nothing: a source opened first would otherwise read its whole
         // load again on every pass until the last one was ready.
         Map<CaptureId, CaptureOwnership.Permit> permits = new LinkedHashMap<>();
-        List<SourcePlan> plans = plan(pipelineId, pipeline, captured, snapshotEpoch, permits);
+        List<SourcePlan> plans = plan(pipelineId, pipeline, captured, snapshotEpoch, permits, modelInputs);
         List<PipelineRun> runs = new ArrayList<>();
         List<SnapshotOnChain> snapshotTables = new ArrayList<>();
         // Taken before the first source is opened, because the load is what these totals accumulate from
@@ -375,7 +382,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             PipelineResource pipeline,
             ArtifactStore captured,
             long snapshotEpoch,
-            Map<CaptureId, CaptureOwnership.Permit> permits) {
+            Map<CaptureId, CaptureOwnership.Permit> permits,
+            java.util.function.Function<SourceResource,SourceModel> modelInputs) {
         List<SourcePlan> plans = new ArrayList<>();
         try {
             for (SourceRef ref : pipeline.sources()) {
@@ -384,7 +392,7 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 // Read once and used twice: it decides which streams this run reads, and it carries the
                 // row count the last discovery took of each of them. Asking the store again for the second
                 // use would pay for a second read per source on every start.
-                SourceModel discovered = SourceDiscovery.model(storePort, source);
+                SourceModel discovered = modelInputs.apply(source);
                 Optional<SourceCaptureResolution> selected =
                         SourceCaptureResolution.forPipeline(pipeline, source, discovered);
                 if (selected.isEmpty()) {

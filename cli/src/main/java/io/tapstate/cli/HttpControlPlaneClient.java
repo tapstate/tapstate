@@ -42,6 +42,10 @@ import java.util.function.Supplier;
  * render outcomes without try/catch.
  */
 final class HttpControlPlaneClient implements ControlPlaneClient {
+    @Override public io.tapstate.control.client.ControlResponse storageOperation(URI baseUrl, String credential, String operation, Map<String,Object> input) {
+        return io.tapstate.control.client.StorageControlClient.execute(sharedClient, baseUrl, credential, operation, input);
+    }
+
 
     /**
      * The probe / connect budget: short enough that an unreachable seed does not stall the connect walk,
@@ -537,7 +541,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     public DeleteOutcome delete(URI baseUrl, String credential, String id, String expectedContentHash) {
         try {
             HttpRequest.Builder builder = authed(
-                    baseUrl, "/api/artifacts/" + urlSegment(id), credential);
+                    baseUrl, "/api/artifacts/" + urlSegment(id), credential, heavyTimeout);
             // Send no If-Match at all rather than an empty one when the caller supplied no precondition:
             // the server tells "you sent none" (428) apart from "yours is stale" (412), and an empty
             // header would turn the first into the second.

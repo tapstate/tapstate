@@ -1841,6 +1841,29 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         assertThat(coordinator.loadDelivered("p")).isTrue();
     }
 
+    @Test void captureUsesTheModelSnapshotChosenBeforeALaterDiscoveryExpandsTheSelection() {
+        var source = new SourceResource("orders_src",null,"mysql",Map.of("host","h"),SourceMode.CDC,
+                List.of(TableRef.regex(".*")),null,null);
+        var artifacts = new InMemoryArtifactStore(); artifacts.save(source); artifacts.save(pipeline("p","orders_src"));
+        var store = new InMemoryStorePort(artifacts);
+        store.schemas().save(new DiscoveredSourceModel(source.id(),"mysql",1,new SourceModel(List.of(new SourceTable("orders",List.of(),List.of(),List.of())))));
+        var snapshot = ReadOnlyArtifactSnapshot.capture(artifacts); var models = SourceModelSnapshot.capture("p",List.of(source),store.schemas());
+        store.schemas().save(new DiscoveredSourceModel(source.id(),"mysql",2,new SourceModel(List.of(new SourceTable("orders",List.of(),List.of(),List.of()),
+                new SourceTable("new_orders",List.of(),List.of(),List.of())))));
+        var srs = new SrsCoordinator(store.meta()); var opened = new AtomicReference<CaptureRunSpec>();
+        CaptureStarter starter = (spec,passthrough) -> {
+            opened.set(spec); var chain = spec.miningChainId();
+            srs.provisionSource(spec.sourceId(),chain,spec.config().streams(),spec.retention()); srs.attachConsumer(chain,spec.consumerId());
+            return new CaptureRun(Optional.of(chain),false,0L,Optional.empty(),Optional.of(() -> {}),new CaptureHealth());
+        };
+        var coordinator = new StoreBackedPipelineCaptureCoordinator(store,starter,srs,new SnapshotBuffer());
+        assertThatThrownBy(() -> coordinator.startCapture("foreign",snapshot,models)).isInstanceOf(TapstateException.class); assertThat(opened.get()).isNull();
+        coordinator.startCapture("p",snapshot,models);
+        assertThat(opened.get().config().streams()).containsExactly("orders");
+        assertThat(store.schemas().get(source.id()).orElseThrow().model().tables()).hasSize(2);
+        coordinator.stopCapture("p",false);
+    }
+
     // ---- fixtures --------------------------------------------------------------------------------
 
     private static SourceResource cdcSource(String id, String table, String srsKey) {

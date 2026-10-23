@@ -11,6 +11,20 @@ public interface ConnectorProvisioner {
     /** The ref for {@code connectorId}, or throws if the id resolves to no connector. */
     ConnectorRef resolve(String connectorId);
 
+    /** Internal retained-context resolution; never substitute the currently registered artifact. */
+    default ConnectorRef resolve(String connectorId, String contentHash) {
+        if (contentHash == null || !contentHash.matches("[a-f0-9]{64}")) {
+            throw new io.tapstate.core.common.TapstateException(ConnectorError.LOAD_FAILED,
+                    java.util.Map.of("connector", connectorId), null);
+        }
+        ConnectorRef ref = resolve(connectorId);
+        if (!java.util.Objects.equals(contentHash, ref.contentHash())) {
+            throw new io.tapstate.core.common.TapstateException(ConnectorError.LOAD_FAILED,
+                    java.util.Map.of("connector", connectorId), null);
+        }
+        return ref;
+    }
+
     /** A stable, non-secret version identity for cache keys; implementations may avoid loading the connector. */
     default String cacheIdentity(String connectorId) {
         ConnectorRef connector = resolve(connectorId);

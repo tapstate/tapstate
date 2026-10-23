@@ -1,6 +1,8 @@
 package io.tapstate.spi.capture;
 
 import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
 
 /**
  * One bounded snapshot round over several selected tables. Each table still has a batch of its own, so
@@ -13,6 +15,17 @@ public interface SnapshotSession extends AutoCloseable {
     /** An optional read-side capability; the existing capture port contract remains unchanged. */
     interface Provider {
         SnapshotSession snapshotSession(CaptureConfig config);
+    }
+
+    /** A session whose host must accept its actual metadata and seam before the connector reads rows. */
+    interface PreparedProvider extends Provider {
+        SnapshotSession snapshotSession(CaptureConfig config, SnapshotPreparation preparation);
+    }
+
+    /** No per-table fallback may start source reads when the caller requires preparation first. */
+    static Optional<SnapshotSession> openPrepared(CapturePort port, CaptureConfig config, SnapshotPreparation preparation) {
+        Objects.requireNonNull(port, "port"); Objects.requireNonNull(config, "config"); Objects.requireNonNull(preparation, "preparation");
+        return port instanceof PreparedProvider provider ? Optional.of(provider.snapshotSession(config, preparation)) : Optional.empty();
     }
 
     /**

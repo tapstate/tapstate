@@ -18,6 +18,7 @@ import io.tapstate.spi.store.ContentHash;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
@@ -41,6 +42,7 @@ import java.util.jar.Manifest;
 
 /** Verifies the immutable Cloud seed release before registration and refuses incomplete startup. */
 final class CloudConnectorSeedReadiness {
+    private static final org.slf4j.Logger LOG = org.slf4j.LoggerFactory.getLogger(CloudConnectorSeedReadiness.class);
 
     static final String LOCK_RESOURCE = "/META-INF/tapstate/connectors.lock.json";
     private static final List<String> IDS = List.of(
@@ -193,13 +195,47 @@ final class CloudConnectorSeedReadiness {
     }
 
     private void verifyStoredArtifact(Artifact artifact, boolean required) {
-        var bytes = readPort(artifact.id(), () -> registry.artifact(artifact.sha256()));
-        if (required && bytes.isEmpty()) {
+        var check = new StoredArtifactCheck(artifact);
+        boolean present;
+        try {
+            present = registry.copyArtifactTo(artifact.sha256(), check);
+        } catch (IOException | UncheckedIOException | TapstateException failure) {
+            LOG.warn("Stored connector verification failed [connector={}, error_code={}, exception_type={}].", artifact.id(),
+                    failure instanceof TapstateException coded ? coded.code().code() : BootError.CLOUD_CONNECTORS_INVALID.code(),
+                    failure.getClass().getSimpleName());
+            throw invalid(artifact.id(), check.overflow ? "stored-artifact-mismatched" : "registered-artifact-unavailable");
+        }
+        if (required && !present) {
             throw invalid(artifact.id(), "stored-artifact-unavailable");
         }
-        if (bytes.isPresent() && (bytes.get().length != artifact.bytes()
-                || !ContentHash.of(bytes.get()).equals(artifact.sha256()))) {
+        if (present && !check.matches()) {
             throw invalid(artifact.id(), "stored-artifact-mismatched");
+        }
+    }
+
+    /** Checks the locked release independently of the store, retaining no artifact bytes. */
+    private static final class StoredArtifactCheck extends OutputStream {
+        private final Artifact artifact;
+        private final MessageDigest digest;
+        private long count;
+        private boolean overflow;
+
+        private StoredArtifactCheck(Artifact artifact) {
+            this.artifact = artifact;
+            try { digest = MessageDigest.getInstance("SHA-256"); }
+            catch (NoSuchAlgorithmException invariant) { throw new IllegalStateException("The JVM does not provide SHA-256", invariant); }
+        }
+        @Override public void write(int value) throws IOException { write(new byte[]{(byte) value}, 0, 1); }
+        @Override public void write(byte[] bytes, int offset, int length) throws IOException {
+            java.util.Objects.checkFromIndexSize(offset, length, bytes.length);
+            if (length > artifact.bytes() - count) {
+                overflow = true;
+                throw new IOException("Artifact length exceeds the release lock");
+            }
+            digest.update(bytes, offset, length); count += length;
+        }
+        private boolean matches() {
+            return count == artifact.bytes() && HexFormat.of().formatHex(digest.digest()).equals(artifact.sha256());
         }
     }
 

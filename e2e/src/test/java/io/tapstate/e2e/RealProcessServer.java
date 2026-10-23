@@ -119,6 +119,37 @@ final class RealProcessServer implements ServerHandle {
         return healthy(launching(storeUri, bootJar(), listenAddress, extraArguments));
     }
 
+    /** Starts an already prepared split-store installation with only its configuration URI. */
+    static RealProcessServer startPrepared(String configurationUri, String listenAddress,
+            IntFunction<List<String>> extraArguments) {
+        return startPrepared(configurationUri, listenAddress, null, extraArguments);
+    }
+
+    static RealProcessServer startPrepared(String configurationUri, String listenAddress, Path stagingDirectory,
+            IntFunction<List<String>> extraArguments) {
+        RealProcessServer server = launchingPrepared(configurationUri, listenAddress, stagingDirectory, extraArguments);
+        try {
+            server.awaitReady();
+            return server;
+        } catch (RuntimeException | Error failure) {
+            server.close();
+            throw failure;
+        }
+    }
+
+    /** Lets a fixture launch every seed before waiting for any member to finish joining. */
+    static RealProcessServer launchingPrepared(String configurationUri, String listenAddress,
+            IntFunction<List<String>> extraArguments) {
+        return launchingPrepared(configurationUri, listenAddress, null, extraArguments);
+    }
+
+    /** Keeps an explicitly supplied connector staging directory owned by the caller. */
+    static RealProcessServer launchingPrepared(String configurationUri, String listenAddress, Path stagingDirectory,
+            IntFunction<List<String>> extraArguments) {
+        return launching(configurationUri, null, bootJar(), listenAddress,
+                List.of("-Xmx768m", "-XX:ActiveProcessorCount=2"), stagingDirectory, extraArguments);
+    }
+
     /**
      * The same, staging the connectors it resolves into {@code stagingDirectory} rather than a directory of this
      * launch's own, which it then leaves where it is when it ends; null for a directory of the launch's own.
@@ -389,13 +420,15 @@ final class RealProcessServer implements ServerHandle {
                 "--server.port=" + port,
                 "--tapstate.store.mongo.enabled=true",
                 "--tapstate.store.mongo.uri=" + storeUri,
-                "--" + ServerHandle.OPERATOR_STATE_DATABASE_SETTING + "=" + operatorStateDatabase,
                 "--tapstate.store.mongo.server-selection-timeout=5s",
                 // A staging directory of this launch's own unless a witness names one, for the same reason
                 // the other tier gets one: the cache is content-addressed and reused, so a shared one serves
                 // a stale connector.
                 "--" + ServerHandle.PLUGINS_DIRECTORY_SETTING + "=" + stagingDirectory,
                 "--" + ServerHandle.ALSO_ACCEPT_IDS_SETTING + "=" + E2eConnectorJar.CONNECTOR_ID));
+        if (operatorStateDatabase != null) {
+            command.add("--" + ServerHandle.OPERATOR_STATE_DATABASE_SETTING + "=" + operatorStateDatabase);
+        }
         // After the standing ones, and additional to them rather than replacing any: a repeated option
         // is joined with the earlier one by comma rather than winning over it, so anything a case needs
         // to set differently is a parameter above instead of an argument here.

@@ -1,13 +1,15 @@
 package io.tapstate.e2e;
 
-import com.mongodb.ConnectionString;
-import com.mongodb.client.MongoClient;
-import com.mongodb.client.MongoClients;
-import io.tapstate.adapters.mongostore.MongoObservationStore;
-import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.testsupport.DockerGate;
+import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
+import io.tapstate.adapters.mongostore.MongoConnectionSettings;
+import io.tapstate.adapters.mongostore.MongoCacheDomain;
+import io.tapstate.spi.store.WorkloadClaimFence;
+import org.junit.jupiter.api.io.TempDir;
+import java.nio.file.Path;
+import java.time.Duration;
 
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -36,7 +38,6 @@ class StatusDoesNotCallAnOrdinaryFrontierPauseStalledIT {
 
     private static final String USER = "e2e";
     private static final String PASSWORD = "e2e-password";
-    private static final String PIPELINE = "ordinary_frontier_pause";
 
     @BeforeAll
     static void requireDocker() {
@@ -44,21 +45,22 @@ class StatusDoesNotCallAnOrdinaryFrontierPauseStalledIT {
     }
 
     @Test
-    void millisecondScalePausesRemainAnUndiagnosedRunningPipeline() {
-        String storeUri = SharedMongo.replicaSetUrl("ordinary_frontier_pause");
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(storeUri)) {
-            ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin(USER, PASSWORD);
-            publishObservedPause(storeUri);
+    void millisecondScalePausesRemainAnUndiagnosedRunningPipeline(@TempDir Path directory) throws Exception {
+        try (PreparedNativeStore storage = PreparedNativeStore.create(USER, PASSWORD);
+                InProcessServer server = InProcessServer.startPrepared(storage)) {
+            var running = RunningPipeline.started(server, directory, storage);
+            String pipeline = running.pipelineId();
+            assertThat(server.stopPublishingObservations()).isEqualTo(1);
+            publishObservedPause(storage, pipeline);
 
             CliOnce.Run status = CliOnce.runWithPassword(PASSWORD,
-                    "-c", server.baseUrl().toString(), "-u", USER, "status", PIPELINE);
+                    "-c", server.baseUrl().toString(), "-u", USER, "status", pipeline);
 
             assertThat(status.exitCode())
                     .as("status must complete; stdout was:%n%s%nstderr was:%n%s", status.stdout(), status.stderr())
                     .isZero();
             assertThat(status.stdout())
-                    .contains(PIPELINE + "  running")
+                    .contains(pipeline + "  running")
                     .contains("kind       NO_MATCH")
                     .contains("read       metrics.frontierStalledMillis = {orders=196, shipments=9}")
                     .doesNotContain("FRONTIER_STALLED", "CHECK_TARGET");
@@ -66,26 +68,19 @@ class StatusDoesNotCallAnOrdinaryFrontierPauseStalledIT {
     }
 
     /** Stores the observed input through the same codec the running publisher uses. */
-    private static void publishObservedPause(String storeUri) {
-        ConnectionString connection = new ConnectionString(storeUri);
-        String database = connection.getDatabase();
-        if (database == null) {
-            throw new AssertionError("the store URL names no database: " + storeUri);
-        }
-        try (MongoClient client = MongoClients.create(connection)) {
-            MongoObservationStore observations = new MongoObservationStore(client.getDatabase(database)
-                    .getCollection(MongoStorePort.PIPELINE_OBSERVATION));
-            observations.save(new Observation(
-                    PIPELINE,
+    private static void publishObservedPause(PreparedNativeStore storage, String pipeline) {
+        try (var configuration = MongoConfigurationDomain.openExisting(
+                    new MongoConnectionSettings(storage.configurationUri(), null, Duration.ofSeconds(5)));
+                var cache = MongoCacheDomain.connect(configuration.bindings().load().orElseThrow().cache(),
+                        Duration.ofSeconds(5), "observation-fixture")) {
+            var business = configuration.bindings().cachePreparation().orElseThrow().businessScope();
+            var scope = configuration.intents().load(pipeline).orElseThrow().scope();
+            var claim = cache.workloadClaims(business).readPipeline(scope).orElseThrow().claim();
+            cache.pipelineObservations(scope, WorkloadClaimFence.from(claim), () -> {}).save(new Observation(
+                    pipeline,
                     PipelineState.RUNNING,
-                    Map.of(
-                            "recordCount", 11L,
-                            "frontierStalledMillis.shipments", 9L,
-                            "frontierStalledMillis.orders", 196L),
-                    Map.of(),
-                    Map.of(),
-                    null,
-                    Instant.now()));
+                    Map.of("recordCount", 11L, "frontierStalledMillis.shipments", 9L, "frontierStalledMillis.orders", 196L),
+                    Map.of(), Map.of(), null, Instant.now()));
         }
     }
 }

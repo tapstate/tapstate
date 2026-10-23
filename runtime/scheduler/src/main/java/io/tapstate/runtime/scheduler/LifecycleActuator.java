@@ -94,4 +94,8 @@ public interface LifecycleActuator {
      * without this query there is nothing left to notice that no job is carrying it.
      */
     boolean isCarryingAJob(String pipelineId);
+
+    /** Finishes the original terminal run's cleanup even when cancellation already made its job terminal. */
+    default void settleCompleted(String pipelineId) {if(isCarryingAJob(pipelineId))stop(pipelineId,false);}
+
 }

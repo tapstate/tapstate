@@ -1,0 +1,959 @@
+package io.tapstate.adapters.mongostore;
+
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.model.IndexOptions;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.dsl.DslParser;
+import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.canonical.CanonicalHash;
+import io.tapstate.spi.store.ArtifactMutation;
+import io.tapstate.spi.store.ArtifactWrite;
+import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.PipelineLayout;
+import io.tapstate.testsupport.RequiresDocker;
+import org.bson.Document;
+import org.junit.jupiter.api.Test;
+import org.testcontainers.containers.MongoDBContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.utility.DockerImageName;
+
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.Base64;
+import java.time.Duration;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+/** Real replica-set witnesses for the split configuration resource and revision transaction. */
+@RequiresDocker
+class MongoConfigurationArtifactStoreIT {
+    @Container
+    private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
+            .withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");
+    private static final DslParser PARSER = new DslParser();
+
+    @Test
+    void reusableAuthoringDefinitionsRetainTheirExistingStoreContract() {
+        List<Resource> definitions = List.of(
+                PARSER.parse("version: tapstate/v1\nkind: transform\nid: reusable_filter\ntype: filter\nexpr: \"true\"\n"),
+                PARSER.parse("version: tapstate/v1\nkind: view\nid: reusable_view\nprimary_key: id\n"),
+                PARSER.parse("version: tapstate/v1\nkind: serve\nid: reusable_serve\n"));
+        withStore((store, database) -> {
+            List<String> unsupported = new java.util.ArrayList<>();
+            for (Resource definition : definitions) {
+                try { store.save(definition); }
+                catch (IllegalArgumentException rejected) { unsupported.add(definition.kind()); }
+            }
+            assertThat(unsupported).as("existing reusable authoring kinds must survive the storage split").isEmpty();
+            assertThat(store.list()).containsExactlyInAnyOrderElementsOf(definitions);
+        });
+    }
+
+    @Test
+    void fiveAuthoringKindsCommitInOneRevisionAndRemainInIndependentCollections() {
+        withStore((store, database) -> {
+            var objects = List.of(source("src", "secret-sentinel"), pipeline("flow"), definition("transform", "filter_def"),
+                    definition("view", "view_def"), definition("serve", "serve_def"));
+            store.saveAll(objects);
+            assertThat(revision(database)).isEqualTo(1);
+            assertThat(store.list()).containsExactlyInAnyOrderElementsOf(objects);
+            for (Resource resource : objects) {
+                assertThat(store.get(resource.id())).contains(resource);
+                assertThat(store.listStored(resource.kind())).singleElement().satisfies(row -> {
+                    assertThat(row.id()).isEqualTo(resource.id());
+                    assertThat(row.contentHash()).isEqualTo(CanonicalHash.of(resource));
+                    assertThat(row.readable()).isTrue();
+                });
+            }
+            for (var table : List.of(SystemCollections.TRANSFORM_DEFINITIONS, SystemCollections.VIEW_DEFINITIONS, SystemCollections.SERVE_DEFINITIONS)) {
+                assertThat(table.on(database).countDocuments()).isEqualTo(1);
+            }
+            assertThat(SystemCollections.SOURCES.on(database).find().first().toJson()).doesNotContain("secret-sentinel");
+            assertThat(database.listCollectionNames().into(new java.util.ArrayList<>()))
+                    .doesNotContain("artifacts", "operator_state", "srs_meta");
+        });
+    }
+
+    @Test
+    void staleDefinitionDependenciesRejectTheWholeMixedConfigurationBatch() {
+        withStore((store, database) -> {
+            Resource original = definition("view", "reusable");
+            store.save(original);
+            Resource changed = PARSER.parse("version: tapstate/v1\nkind: view\nid: reusable\nprimary_key: changed\n");
+            store.replace(original.id(), CanonicalHash.of(original), changed);
+            var outcome = store.writeAll(List.of(ArtifactWrite.createOnly(source("fresh", "secret"))
+                    .guardedBy(Map.of(original.id(), CanonicalHash.of(original))),
+                    ArtifactWrite.createOnly(definition("serve", "new_serve"))));
+            assertThat(outcome.refusal()).isEqualTo(ArtifactMutation.VERSION_CONFLICT);
+            assertThat(store.get("fresh")).isEmpty();
+            assertThat(store.get("new_serve")).isEmpty();
+            assertThat(revision(database)).isEqualTo(2);
+        });
+    }
+
+    @Test
+    void aDefinitionWriteFaultRollsBackSourceAndOtherDefinitionSiblings() {
+        withStore((store, database) -> {
+            store.save(definition("view", "existing"));
+            SystemCollections.VIEW_DEFINITIONS.on(database).createIndex(new Document("kind", 1), new IndexOptions().unique(true));
+            assertThatThrownBy(() -> store.saveAll(List.of(source("fresh", "secret"), definition("transform", "new_transform"),
+                    definition("view", "new_view"), definition("serve", "new_serve"))))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(store.list()).containsExactly(definition("view", "existing"));
+            assertThat(revision(database)).isEqualTo(1);
+        });
+    }
+
+    @Test
+    void fiveClientsRacingDifferentKindsCannotPublishTheSameGlobalId() {
+        withStore((store, database) -> {
+            var candidates = List.of(source("same_id", "secret"), pipeline("same_id"), definition("transform", "same_id"),
+                    definition("view", "same_id"), definition("serve", "same_id"));
+            var clients = new java.util.ArrayList<MongoClient>();
+            CountDownLatch ready = new CountDownLatch(candidates.size());
+            CountDownLatch start = new CountDownLatch(1);
+            try (var executor = Executors.newFixedThreadPool(candidates.size())) {
+                try {
+                    var futures = new java.util.ArrayList<java.util.concurrent.Future<ArtifactMutation>>();
+                    for (Resource candidate : candidates) {
+                        MongoClient client = MongoClients.create(MONGO.getReplicaSetUrl());
+                        clients.add(client);
+                        var independent = new MongoConfigurationArtifactStore(client, client.getDatabase(database.getName()), new SourceConfigCipher(new byte[32]));
+                        futures.add(executor.submit(() -> {
+                            ready.countDown();
+                            if (!start.await(10, TimeUnit.SECONDS)) throw new AssertionError("start not released");
+                            return independent.create(candidate);
+                        }));
+                    }
+                    assertThat(ready.await(10, TimeUnit.SECONDS)).isTrue();
+                    start.countDown();
+                    var outcomes = new java.util.ArrayList<ArtifactMutation>();
+                    for (var future : futures) outcomes.add(future.get(20, TimeUnit.SECONDS));
+                    assertThat(outcomes).filteredOn(ArtifactMutation.CREATED::equals).hasSize(1);
+                    assertThat(outcomes).filteredOn(ArtifactMutation.ALREADY_EXISTS::equals).hasSize(4);
+                    assertThat(store.list()).hasSize(1);
+                    assertThat(revision(database)).isEqualTo(1);
+                } finally {
+                    start.countDown();
+                    clients.forEach(MongoClient::close);
+                }
+            }
+        });
+    }
+
+    @Test
+    void scopedDefinitionBrowseCannotSelectAnAmbiguousGlobalId() {
+        withStore((store, database) -> {
+            store.save(definition("view", "ambiguous"));
+            SystemCollections.TRANSFORM_DEFINITIONS.on(database).insertOne(MongoArtifactStore.toDocument(definition("transform", "ambiguous")));
+            assertThatThrownBy(() -> store.listStored("view")).isInstanceOfSatisfying(TapstateException.class,
+                    error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+            assertThatThrownBy(() -> store.get("ambiguous")).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(store::list).isInstanceOf(TapstateException.class);
+        });
+    }
+
+    @Test
+    void definitionBodiesCannotChangeTheirPhysicalKindIdOrDeclaredHash() {
+        withStore((store, database) -> {
+            Resource definition = definition("view", "damaged");
+            store.save(definition);
+            var views = SystemCollections.VIEW_DEFINITIONS.on(database);
+            Document original = views.find().first();
+            for (Document update : List.of(new Document("body", MongoArtifactStore.toDocument(definition("transform", "damaged")).get("body")),
+                    new Document("body.id", "another"), new Document("contentHash", "incorrect"))) {
+                views.replaceOne(new Document("_id", "damaged"), original);
+                views.updateOne(new Document("_id", "damaged"), new Document("$set", update));
+                assertThatThrownBy(() -> store.get("damaged")).isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+                assertThat(store.listStored("view")).singleElement().satisfies(row -> assertThat(row.readable()).isFalse());
+            }
+        });
+    }
+
+    @Test
+    void normalDefinitionChangesAndKindReplacementPreserveOneIdentityAndVersion() {
+        withStore((store, database) -> {
+            Resource transform = definition("transform", "definition");
+            Resource view = definition("view", "definition");
+            Resource serve = definition("serve", "definition");
+            assertThat(store.create(transform)).isEqualTo(ArtifactMutation.CREATED);
+            assertThat(store.create(view)).isEqualTo(ArtifactMutation.ALREADY_EXISTS);
+            assertThat(store.replace("definition", CanonicalHash.of(transform), view)).isEqualTo(ArtifactMutation.REPLACED);
+            assertThat(SystemCollections.TRANSFORM_DEFINITIONS.on(database).countDocuments()).isZero();
+            assertThat(store.replace("definition", CanonicalHash.of(view), serve)).isEqualTo(ArtifactMutation.REPLACED);
+            assertThat(SystemCollections.VIEW_DEFINITIONS.on(database).countDocuments()).isZero();
+            assertThat(store.delete("definition", CanonicalHash.of(serve))).isEqualTo(ArtifactMutation.DELETED);
+            assertThat(store.list()).isEmpty();
+            assertThat(revision(database)).isEqualTo(4);
+        });
+    }
+
+    @Test
+    void separateCollectionsRetainEncryptedSourcesAndCanonicalReads() {
+        withStore((store, database) -> {
+            Resource source = source("input", "private-sentinel");
+            Resource pipeline = pipeline("flow");
+            store.saveAll(List.of(source, pipeline));
+
+            assertThat(SystemCollections.SOURCES.on(database).countDocuments()).isEqualTo(1);
+            assertThat(SystemCollections.PIPELINES.on(database).countDocuments()).isEqualTo(1);
+            assertThat(SystemCollections.SOURCES.on(database).find().first().toJson())
+                    .doesNotContain("private-sentinel");
+            assertThat(store.get("input")).contains(source);
+            assertThat(store.get("flow")).contains(pipeline);
+            assertThat(store.list()).containsExactlyInAnyOrder(source, pipeline);
+            assertThat(store.listStored("source")).hasSize(1).allSatisfy(row -> {
+                assertThat(row.id()).isEqualTo("input");
+                assertThat(row.contentHash()).isEqualTo(CanonicalHash.of(source));
+            });
+            assertThat(store.listStored("pipeline")).hasSize(1);
+            assertThat(store.listStored("view")).isEmpty();
+            assertThat(revision(database)).isEqualTo(1);
+            assertThat(database.listCollectionNames().into(new java.util.ArrayList<>()))
+                    .containsExactlyInAnyOrder("sources", "pipelines", "configuration_version", "operator_generations");
+        });
+    }
+
+    @Test
+    void refusingASiblingRollsBackBothTablesAndTheRevision() {
+        withStore((store, database) -> {
+            Resource original = pipeline("existing");
+            store.save(original);
+            var refused = store.writeAll(List.of(ArtifactWrite.createOnly(source("fresh", "secret")),
+                    ArtifactWrite.createOnly(pipeline("existing"))));
+            assertThat(refused.appliedSuccessfully()).isFalse();
+            assertThat(refused.refusal()).isEqualTo(ArtifactMutation.ALREADY_EXISTS);
+            assertThat(store.get("fresh")).isEmpty();
+            assertThat(store.get("existing")).contains(original);
+            assertThat(revision(database)).isEqualTo(1);
+        });
+    }
+
+    @Test
+    void uniqueIndexFaultAbortsSiblingWritesRatherThanBecomingAnIdRefusal() {
+        withStore((store, database) -> {
+            store.save(pipeline("existing"));
+            SystemCollections.PIPELINES.on(database).createIndex(new Document("kind", 1),
+                    new IndexOptions().unique(true));
+            assertThatThrownBy(() -> store.writeAll(List.of(
+                    ArtifactWrite.createOnly(source("fresh", "secret")),
+                    ArtifactWrite.createOnly(pipeline("another")))))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            coded -> assertThat(coded.code()).isEqualTo(IoError.STORE_UNAVAILABLE));
+            assertThat(store.get("fresh")).isEmpty();
+            assertThat(store.get("another")).isEmpty();
+            assertThat(revision(database)).isEqualTo(1);
+        });
+    }
+
+    @Test
+    void aReadDependencyInTheOtherTableGuardsTheWholeTransaction() {
+        withStore((store, database) -> {
+            Resource original = source("input", "first");
+            store.save(original);
+            Resource replacement = source("input", "changed");
+            store.replace("input", CanonicalHash.of(original), replacement);
+
+            var result = store.writeAll(List.of(ArtifactWrite.createOnly(pipeline("flow"))
+                    .guardedBy(Map.of("input", CanonicalHash.of(original)))));
+            assertThat(result.refusal()).isEqualTo(ArtifactMutation.VERSION_CONFLICT);
+            assertThat(result.refusedId()).isEqualTo("input");
+            assertThat(store.get("flow")).isEmpty();
+            assertThat(revision(database)).isEqualTo(2);
+        });
+    }
+
+    @Test
+    void normalCreateReplaceDeleteAllContendOnConfigurationRevision() {
+        withStore((store, database) -> {
+            Resource original = source("flow", "original");
+            assertThat(store.create(original)).isEqualTo(ArtifactMutation.CREATED);
+            assertThat(revision(database)).isEqualTo(1);
+            assertThat(store.create(source("flow", "secret"))).isEqualTo(ArtifactMutation.ALREADY_EXISTS);
+            assertThat(revision(database)).isEqualTo(1);
+            Resource changed = source("flow", "new-kind");
+            assertThat(store.replace("flow", CanonicalHash.of(original), changed))
+                    .isEqualTo(ArtifactMutation.REPLACED);
+            assertThat(SystemCollections.PIPELINES.on(database).countDocuments()).isZero();
+            assertThat(SystemCollections.SOURCES.on(database).countDocuments()).isEqualTo(1);
+            assertThat(revision(database)).isEqualTo(2);
+            assertThat(store.delete("flow", CanonicalHash.of(original))).isEqualTo(ArtifactMutation.VERSION_CONFLICT);
+            assertThat(revision(database)).isEqualTo(2);
+            assertThat(store.delete("flow", CanonicalHash.of(changed))).isEqualTo(ArtifactMutation.DELETED);
+            assertThat(revision(database)).isEqualTo(3);
+            assertThat(store.delete("flow", CanonicalHash.of(changed))).isEqualTo(ArtifactMutation.NOT_FOUND);
+            assertThat(revision(database)).isEqualTo(3);
+        });
+    }
+
+    @Test
+    void distinctClientsRacingDifferentKindsHaveOnlyOneGlobalIdentityWinner() {
+        withStore((store, database) -> {
+            try (MongoClient otherClient = MongoClients.create(MONGO.getReplicaSetUrl());
+                    var executor = Executors.newFixedThreadPool(2)) {
+                var other = new MongoConfigurationArtifactStore(otherClient,
+                        otherClient.getDatabase(database.getName()), new SourceConfigCipher(new byte[32]));
+                for (int round = 0; round < 8; round++) {
+                    String id = "race_" + round;
+                    CountDownLatch ready = new CountDownLatch(2);
+                    CountDownLatch start = new CountDownLatch(1);
+                    var source = executor.submit(() -> {
+                        ready.countDown();
+                        if (!start.await(10, TimeUnit.SECONDS)) throw new AssertionError("start not released");
+                        return store.create(source(id, "secret"));
+                    });
+                    var pipeline = executor.submit(() -> {
+                        ready.countDown();
+                        if (!start.await(10, TimeUnit.SECONDS)) throw new AssertionError("start not released");
+                        return other.create(pipeline(id));
+                    });
+                    assertThat(ready.await(10, TimeUnit.SECONDS)).isTrue();
+                    start.countDown();
+                    assertThat(List.of(source.get(20, TimeUnit.SECONDS), pipeline.get(20, TimeUnit.SECONDS)))
+                            .containsExactlyInAnyOrder(ArtifactMutation.CREATED, ArtifactMutation.ALREADY_EXISTS);
+                    assertThat(SystemCollections.SOURCES.on(database).countDocuments(new Document("_id", id))
+                            + SystemCollections.PIPELINES.on(database).countDocuments(new Document("_id", id)))
+                            .isEqualTo(1);
+                }
+                assertThat(revision(database)).isEqualTo(8);
+            }
+        });
+    }
+
+    @Test
+    void ambiguousStoredIdentityIsCorruptionAndNeverSelectsOneTable() {
+        withStore((store, database) -> {
+            store.save(source("shared", "secret"));
+            SystemCollections.PIPELINES.on(database).insertOne(MongoArtifactStore.toDocument(pipeline("shared")));
+            assertThatThrownBy(() -> store.get("shared"))
+                    .isInstanceOfSatisfying(TapstateException.class, error -> {
+                        assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
+                        assertThat(error.args()).containsEntry("field", "identity");
+                    });
+            assertThatThrownBy(store::listStored).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> store.delete("shared", CanonicalHash.of(pipeline("shared"))))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(revision(database)).isEqualTo(1);
+        });
+    }
+
+    @Test
+    void anUninitializedOrInvalidVersionRefusesWritesWithoutRepairingIt() {
+        withStore((store, database) -> {
+            var versions = SystemCollections.CONFIGURATION_VERSION.on(database);
+            for (Object value : new Object[]{null, "0", -1L, Long.MAX_VALUE}) {
+                versions.deleteMany(new Document());
+                if (value != null) versions.insertOne(new Document("_id", ConfigurationVersion.ID)
+                        .append("revision", value));
+                assertThatThrownBy(() -> store.create(pipeline("forbidden")))
+                        .isInstanceOfSatisfying(TapstateException.class,
+                                error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+                assertThat(SystemCollections.PIPELINES.on(database).countDocuments()).isZero();
+                assertThat(versions.countDocuments()).isEqualTo(value == null ? 0 : 1);
+            }
+        });
+    }
+
+    @Test
+    void emptyWritesDoNotCreateOrTouchControlFacts() {
+        withStore((store, database) -> {
+            SystemCollections.CONFIGURATION_VERSION.on(database).deleteMany(new Document());
+            assertThat(store.writeAll(List.of()).appliedSuccessfully()).isTrue();
+            store.saveAll(List.of());
+            assertThat(store.saveAll(List.of(), Map.of("absent", "hash"))).isEmpty();
+            assertThat(SystemCollections.CONFIGURATION_VERSION.on(database).countDocuments()).isZero();
+        });
+    }
+
+    @Test
+    void theConfigurationDomainReopensWithTheSameKeyAndNoCacheResources() {
+        withStore((unused, database) -> {
+            installConfigFacts(database);
+            String uri = configurationUri(database);
+            Document key = SystemCollections.CLUSTER_KEYS.on(database).find().first();
+            Resource original = source("input", "durable-secret");
+            try (var domain = MongoConfigurationDomain.open(settings(uri), "cluster-a")) {
+                domain.artifacts().save(original);
+            }
+            try (var replacement = MongoConfigurationDomain.open(settings(uri), "cluster-a")) {
+                assertThat(replacement.artifacts().get("input")).contains(original);
+                assertThat(replacement.artifacts().create(source("next", "next-secret")))
+                        .isEqualTo(ArtifactMutation.CREATED);
+            }
+            Document reopened = SystemCollections.CLUSTER_KEYS.on(database).find().first();
+            assertThat(reopened.get("keyId")).isEqualTo(key.get("keyId"));
+            assertThat(reopened.get("material")).isEqualTo(key.get("material"));
+            assertThat(reopened.getLong("sourceWriteFence")).isEqualTo(2);
+            assertThat(SystemCollections.CLUSTER_KEYS.on(database).countDocuments()).isEqualTo(1);
+            assertThat(database.listCollectionNames().into(new java.util.ArrayList<>()))
+                    .containsExactlyInAnyOrder("configuration_version", "cluster_identity", "schema_migrations",
+                            "cluster_keys", "storage_setup", "sources", "pipeline_drafts", "nest_dead_letters");
+        });
+    }
+
+    @Test
+    void missingKeysAreNeverRegeneratedByOpenOrAnExistingWriter() {
+        withStore((unused, database) -> {
+            installConfigFacts(database);
+            String uri = configurationUri(database);
+            try (var domain = MongoConfigurationDomain.open(settings(uri), "cluster-a")) {
+                domain.artifacts().save(source("original", "secret"));
+                SystemCollections.CLUSTER_KEYS.on(database).deleteMany(new Document());
+                assertThatThrownBy(() -> domain.artifacts().save(source("forbidden", "secret")))
+                        .isInstanceOfSatisfying(TapstateException.class,
+                                error -> assertThat(error.code()).isEqualTo(StoreError.SOURCE_CONFIG_KEYRING_INVALID));
+                assertThat(revision(database)).isEqualTo(1);
+            }
+            assertThatThrownBy(() -> MongoConfigurationDomain.open(settings(uri), "cluster-a"))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(StoreError.SOURCE_CONFIG_KEYRING_INVALID));
+            assertThat(SystemCollections.CLUSTER_KEYS.on(database).countDocuments()).isZero();
+            assertThat(SystemCollections.SOURCES.on(database).countDocuments()).isEqualTo(1);
+        });
+    }
+
+    @Test
+    void aDifferentValidKeyDoesNotBecomeAnImplicitRotation() {
+        withStore((unused, database) -> {
+            installConfigFacts(database);
+            try (var domain = MongoConfigurationDomain.open(settings(configurationUri(database)), "cluster-a")) {
+                byte[] replacement = new byte[32];
+                java.util.Arrays.fill(replacement, (byte) 7);
+                SystemCollections.CLUSTER_KEYS.on(database).updateOne(new Document("_id", "cluster"),
+                        new Document("$set", new Document("keyId", SourceConfigCipher.fingerprint(replacement))
+                                .append("material", Base64.getUrlEncoder().withoutPadding().encodeToString(replacement))));
+                assertThatThrownBy(() -> domain.artifacts().create(source("forbidden", "secret")))
+                        .isInstanceOfSatisfying(TapstateException.class,
+                                error -> assertThat(error.code()).isEqualTo(StoreError.SOURCE_CONFIG_KEYRING_INVALID));
+                assertThat(revision(database)).isZero();
+                assertThat(SystemCollections.SOURCES.on(database).countDocuments()).isZero();
+            }
+        });
+    }
+
+    @Test
+    void legacyUnknownAndNewerLayoutsAreRefusedWithoutRunningOldMigrations() {
+        withStore((unused, database) -> {
+            installConfigFacts(database);
+            String uri = configurationUri(database);
+            var identity = SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database);
+            identity.updateOne(new Document("_id", "cluster"), new Document("$unset", new Document("layoutId", "")));
+            assertThatThrownBy(() -> MongoConfigurationDomain.open(settings(uri), "cluster-a"))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+            assertThat(identity.find().first()).doesNotContainKey("layoutId");
+            identity.updateOne(new Document("_id", "cluster"),
+                    new Document("$set", new Document("layoutId", MongoConfigurationDomain.LAYOUT)));
+            assertThatThrownBy(() -> MongoConfigurationDomain.open(settings(uri), "wrong-cluster"))
+                    .isInstanceOf(TapstateException.class);
+            SystemCollections.SCHEMA_MIGRATIONS.on(database).updateOne(new Document("_id", "config"),
+                    new Document("$set", new Document("installedVersion", 2)));
+            assertThatThrownBy(() -> MongoConfigurationDomain.open(settings(uri), "cluster-a"))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(MigrationError.DATA_NEWER_THAN_BINARY));
+            assertThat(database.listCollectionNames().into(new java.util.ArrayList<>()))
+                    .doesNotContain("system_meta", "workload_claims", "operator_state", "srs_meta");
+        });
+    }
+
+    @Test
+    void malformedKeyAndEncryptedSourceFailBeforeTheDomainIsExposed() {
+        withStore((store, database) -> {
+            installConfigFacts(database);
+            String uri = configurationUri(database);
+            var keys = SystemCollections.CLUSTER_KEYS.on(database);
+            keys.updateOne(new Document("_id", "cluster"),
+                    new Document("$set", new Document("material", "not-base64!")));
+            assertThatThrownBy(() -> MongoConfigurationDomain.open(settings(uri), "cluster-a"))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(StoreError.SOURCE_CONFIG_KEYRING_INVALID));
+            keys.updateOne(new Document("_id", "cluster"), new Document("$set", new Document("material",
+                    Base64.getUrlEncoder().withoutPadding().encodeToString(new byte[32]))));
+            store.save(source("damaged", "secret"));
+            SystemCollections.SOURCES.on(database).updateOne(new Document("_id", "damaged"),
+                    new Document("$set", new Document("body.config", "bad-envelope")));
+            assertThatThrownBy(() -> MongoConfigurationDomain.open(settings(uri), "cluster-a"))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+            assertThat(keys.countDocuments()).isEqualTo(1);
+        });
+    }
+
+    @Test
+    void concurrentBootstrapProcessesChooseOnePersistentKeyAndOneOperation() {
+        withStore((unused, database) -> {
+            SystemCollections.CONFIGURATION_VERSION.on(database).drop();
+            try (var executor = Executors.newFixedThreadPool(2)) {
+                CountDownLatch start = new CountDownLatch(1);
+                var first = executor.submit(() -> {
+                    if (!start.await(10, TimeUnit.SECONDS)) throw new AssertionError("start not released");
+                    return MongoConfigurationBootstrap.prepare(settings(configurationUri(database)),
+                            "cluster-a", "installation-a", "setup-a", 1);
+                });
+                var second = executor.submit(() -> {
+                    if (!start.await(10, TimeUnit.SECONDS)) throw new AssertionError("start not released");
+                    return MongoConfigurationBootstrap.prepare(settings(configurationUri(database)),
+                            "cluster-a", "installation-a", "setup-a", 1);
+                });
+                start.countDown();
+                try (var firstDomain = first.get(30, TimeUnit.SECONDS);
+                        var secondDomain = second.get(30, TimeUnit.SECONDS)) {
+                    Resource source = source("proof", "only-winning-key");
+                    firstDomain.artifacts().save(source);
+                    assertThat(secondDomain.artifacts().get("proof")).contains(source);
+                }
+            }
+            Document key = SystemCollections.CLUSTER_KEYS.on(database).find().first();
+            try (var retry = MongoConfigurationBootstrap.prepare(settings(configurationUri(database)),
+                    "cluster-a", "installation-a", "setup-a", 1)) {
+                assertThat(retry.artifacts().get("proof")).isPresent();
+                assertThat(SystemCollections.CLUSTER_KEYS.on(database).find().first()).isEqualTo(key);
+            }
+            assertThat(SystemCollections.CLUSTER_KEYS.on(database).countDocuments()).isEqualTo(1);
+            assertThat(SystemCollections.STORAGE_SETUP.on(database).find().first())
+                    .containsEntry("phase", MongoConfigurationBootstrap.PREPARED)
+                    .containsEntry("operationId", "setup-a").containsEntry("generation", 1L);
+            assertThat(database.listCollectionNames().into(new java.util.ArrayList<>()))
+                    .containsExactlyInAnyOrder("storage_setup", "cluster_identity", "cluster_keys",
+                            "schema_migrations", "configuration_version", "sources", "pdk_note_origins", "pdk_note_carries", "pipeline_drafts", "configuration_imports", "nest_dead_letters", "capture_preparations");
+            assertThat(SystemCollections.CAPTURE_PREPARATIONS.on(database).countDocuments()).isZero();
+            assertThat(SystemCollections.PDK_NOTE_ORIGINS.on(database).countDocuments()).isZero();
+            assertThat(SystemCollections.PDK_NOTE_CARRIES.on(database).countDocuments()).isZero();
+            for (var table : List.of(SystemCollections.PDK_NOTE_ORIGINS, SystemCollections.PDK_NOTE_CARRIES)) {
+                for (var index : table.indexes()) assertThat(IndexEnsure.existing(table.on(database), index)).isNotNull();
+            }
+        });
+    }
+
+    @Test
+    void bootstrapCannotResetAnotherOperationOrACompletedPhase() {
+        withStore((unused, database) -> {
+            SystemCollections.CONFIGURATION_VERSION.on(database).drop();
+            try (var domain = MongoConfigurationBootstrap.prepare(settings(configurationUri(database)),
+                    "cluster-a", "installation-a", "setup-a", 1)) {
+                domain.artifacts().save(source("original", "secret"));
+            }
+            Document key = SystemCollections.CLUSTER_KEYS.on(database).find().first();
+            for (String[] identity : List.of(new String[]{"cluster-b", "installation-a", "setup-a"},
+                    new String[]{"cluster-a", "installation-b", "setup-a"},
+                    new String[]{"cluster-a", "installation-a", "setup-b"})) {
+                assertThatThrownBy(() -> MongoConfigurationBootstrap.prepare(settings(configurationUri(database)),
+                        identity[0], identity[1], identity[2], 1))
+                        .isInstanceOfSatisfying(TapstateException.class,
+                                error -> assertThat(error.code()).isEqualTo(StoreError.INITIALIZATION_REFUSED));
+            }
+            assertThatThrownBy(() -> MongoConfigurationBootstrap.prepare(settings(configurationUri(database)),
+                    "cluster-a", "installation-a", "setup-a", 2)).isInstanceOf(TapstateException.class);
+            SystemCollections.STORAGE_SETUP.on(database).updateOne(new Document("_id", "cluster"),
+                    new Document("$set", new Document("phase", "COMPLETE")));
+            assertThatThrownBy(() -> MongoConfigurationBootstrap.prepare(settings(configurationUri(database)),
+                    "cluster-a", "installation-a", "setup-a", 1)).isInstanceOf(TapstateException.class);
+            assertThat(SystemCollections.CLUSTER_KEYS.on(database).find().first()).isEqualTo(key);
+            assertThat(revision(database)).isEqualTo(1);
+        });
+    }
+
+    @Test
+    void bootstrapDoesNotBrandAnOccupiedTargetOrRepairAMissingKey() {
+        withStore((unused, database) -> {
+            // Even one pre-existing control fact without the complete identity is an unknown target.
+            assertThatThrownBy(() -> MongoConfigurationBootstrap.prepare(settings(configurationUri(database)),
+                    "cluster-a", "installation-a", "setup-a", 1))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(StoreError.INITIALIZATION_REFUSED));
+            assertThat(SystemCollections.CLUSTER_KEYS.on(database).countDocuments()).isZero();
+            assertThat(SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database).countDocuments()).isZero();
+            SystemCollections.CONFIGURATION_VERSION.on(database).drop();
+            try (var ignored = MongoConfigurationBootstrap.prepare(settings(configurationUri(database)),
+                    "cluster-a", "installation-a", "setup-a", 1)) {
+                assertThat(SystemCollections.CLUSTER_KEYS.on(database).countDocuments()).isEqualTo(1);
+            }
+            SystemCollections.CLUSTER_KEYS.on(database).deleteMany(new Document());
+            assertThatThrownBy(() -> MongoConfigurationBootstrap.prepare(settings(configurationUri(database)),
+                    "cluster-a", "installation-a", "setup-a", 1))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(StoreError.SOURCE_CONFIG_KEYRING_INVALID));
+            assertThat(SystemCollections.CLUSTER_KEYS.on(database).countDocuments()).isZero();
+        });
+    }
+
+    @Test
+    void bootstrapNamespaceFailuresAreCodedAndDoNotWriteAnyFacts() {
+        withStore((unused, database) -> {
+            SystemCollections.CONFIGURATION_VERSION.on(database).drop();
+            try (MongoClient admin = MongoClients.create(MONGO.getReplicaSetUrl())) {
+                admin.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand")
+                        .append("mode", new Document("times", 1))
+                        .append("data", new Document("failCommands", List.of("listCollections"))
+                                .append("errorCode", 13)));
+                try {
+                    assertThatThrownBy(() -> MongoConfigurationBootstrap.prepare(settings(configurationUri(database)),
+                            "cluster-a", "installation-a", "setup-a", 1))
+                            .isInstanceOfSatisfying(TapstateException.class, coded -> {
+                                assertThat(coded.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+                                assertThat(coded.args()).containsExactlyEntriesOf(
+                                        Map.of("detail", "MongoCommandException code=13"));
+                                assertThat(coded.getCause()).isNull();
+                            });
+                } finally {
+                    admin.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand")
+                            .append("mode", "off"));
+                }
+            }
+            assertThat(database.listCollectionNames().into(new java.util.ArrayList<>())).isEmpty();
+        });
+    }
+
+    @Test
+    void layoutMutationsParticipateInTheSameConfigurationRevision() {
+        withStore((unused, database) -> {
+            installConfigFacts(database);
+            try (var domain = MongoConfigurationDomain.open(settings(configurationUri(database)), "cluster-a")) {
+                domain.artifacts().create(pipeline("flow"));
+                PipelineLayout layout = new PipelineLayout("flow",
+                        Map.of("step", new PipelineLayout.NodePosition(10, 20)),
+                        new PipelineLayout.Viewport(1, 2, 1));
+                domain.layouts().save(layout);
+                assertThat(domain.layouts().get("flow")).contains(layout);
+                assertThat(revision(database)).isEqualTo(2);
+                domain.layouts().delete("flow");
+                assertThat(domain.layouts().get("flow")).isEmpty();
+                assertThat(revision(database)).isEqualTo(3);
+            }
+        });
+    }
+
+    @Test
+    void aFailedLayoutWriteRollsBackTheConfigurationRevision() {
+        withStore((unused, database) -> {
+            installConfigFacts(database);
+            try (var domain = MongoConfigurationDomain.open(settings(configurationUri(database)), "cluster-a")) {
+                domain.artifacts().saveAll(List.of(pipeline("one"), pipeline("two")));
+                PipelineLayout first = new PipelineLayout("one", Map.of(), new PipelineLayout.Viewport(0, 0, 1));
+                domain.layouts().save(first);
+                SystemCollections.CONFIG_PIPELINE_LAYOUTS.on(database).createIndex(new Document("viewport.zoom", 1),
+                        new IndexOptions().unique(true));
+                assertThatThrownBy(() -> domain.layouts().save(new PipelineLayout("two", Map.of(),
+                        new PipelineLayout.Viewport(1, 1, 1))))
+                        .isInstanceOfSatisfying(TapstateException.class,
+                                error -> assertThat(error.code()).isEqualTo(IoError.STORE_UNAVAILABLE));
+                assertThat(revision(database)).isEqualTo(2);
+                assertThat(domain.layouts().get("one")).contains(first);
+                assertThat(domain.layouts().get("two")).isEmpty();
+            }
+        });
+    }
+
+    @Test
+    void configurationCommitReservesAllPrivateConnectorScopesWithThePipeline() {
+        withBound((domain, database) -> {
+            Resource pipeline = PARSER.parse("""
+                    version: tapstate/v1
+                    kind: pipeline
+                    id: flow
+                    source: shared
+                    view:
+                      id: shared
+                      from: shared.orders
+                      primary_key: id
+                    serve:
+                      from: shared
+                      sync:
+                        - id: sink
+                          source: shared
+                    """);
+            domain.artifacts().saveAll(List.of(source("shared", "secret"), pipeline));
+            assertThat(SystemCollections.PDK_NOTE_SCOPES.on(database).countDocuments(new Document("ownerId", "flow")))
+                    .as("all private scopes must commit with the authoring resource").isEqualTo(3);
+            for (var purpose : io.tapstate.core.model.PipelineNode.Purpose.values()) {
+                var node = new io.tapstate.core.model.PipelineNode("flow",
+                        purpose == io.tapstate.core.model.PipelineNode.Purpose.SYNC ? "sink" : "shared");
+                var owner = io.tapstate.spi.store.RequiredNoteOwner.forNode(1, node, purpose, 1);
+                assertThat(domain.requiredNotes().open(owner).generation()).isOne();
+            }
+        });
+    }
+
+    @Test
+    void updatingAReferencedServeDefinitionReservesNewSinksFromTheCommittedCandidate() {
+        withBound((domain, database) -> {
+            Resource pipeline = PARSER.parse("""
+                    version: tapstate/v1
+                    kind: pipeline
+                    id: flow
+                    source: src
+                    serve:
+                      use: reusable
+                      from: src.orders
+                    """);
+            Resource original = PARSER.parse("version: tapstate/v1\nkind: serve\nid: reusable\nsync: [{id: sink_a, source: target}]\n");
+            domain.artifacts().saveAll(List.of(pipeline, original, source("src", "secret"), source("target", "secret")));
+            Resource replacement = PARSER.parse("version: tapstate/v1\nkind: serve\nid: reusable\nsync: [{id: sink_a, source: target}, {id: sink_b, source: target}]\n");
+            domain.artifacts().replace(original.id(), CanonicalHash.of(original), replacement);
+            assertThat(SystemCollections.PDK_NOTE_SCOPES.on(database).countDocuments(new Document("ownerId", "flow")))
+                    .as("definition-only mutation includes stored Pipeline referrers").isEqualTo(3);
+            for (String id : List.of("sink_a", "sink_b")) {
+                var owner = io.tapstate.spi.store.RequiredNoteOwner.forNode(1,
+                        new io.tapstate.core.model.PipelineNode("flow", id),
+                        io.tapstate.core.model.PipelineNode.Purpose.SYNC, 1);
+                assertThat(domain.requiredNotes().open(owner).generation()).isOne();
+            }
+            assertThat(domain.artifacts().get("flow")).contains(pipeline);
+            assertThat(revision(database)).isEqualTo(3);
+        });
+    }
+
+    @Test
+    void aKnownScopeKeepsItsGenerationAndMissingFactsAreNeverRecreatedByAuthoring() {
+        withBound((domain, database) -> {
+            Resource pipeline = capturePipeline("flow");
+            domain.artifacts().saveAll(List.of(source("src", "secret"), pipeline));
+            var owner = io.tapstate.spi.store.RequiredNoteOwner.forNode(1,
+                    new io.tapstate.core.model.PipelineNode("flow", "src"),
+                    io.tapstate.core.model.PipelineNode.Purpose.CAPTURE, 1);
+            var original = domain.requiredNotes().open(owner);
+            var origin = new io.tapstate.spi.store.RequiredNoteOrigin("mongodb", "a".repeat(64), new byte[]{1});
+            domain.requiredNotes().prepareOrigin(original, origin);
+            var cleared = domain.requiredNotes().clear(original, false);
+            assertThat(domain.artifacts().replace("flow", CanonicalHash.of(pipeline), pipeline)).isEqualTo(ArtifactMutation.REPLACED);
+            assertThat(domain.requiredNotes().open(owner)).isEqualTo(cleared);
+            assertThat(domain.requiredNotes().origin(cleared)).isEqualTo(origin);
+            long before = revision(database);
+            SystemCollections.PDK_NOTE_SCOPES.on(database).deleteOne(new Document("ownerId", "flow"));
+            assertThatThrownBy(() -> domain.artifacts().replace("flow", CanonicalHash.of(pipeline), pipeline))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(IoError.NOTE_SCOPE_UNAVAILABLE));
+            assertThat(revision(database)).isEqualTo(before);
+            assertThat(SystemCollections.PDK_NOTE_SCOPES.on(database).countDocuments(new Document("ownerId", "flow"))).isZero();
+        });
+    }
+
+    @Test
+    void scopeInsertionFailureRollsBackResourcesMappingsAndTheConfigurationRevision() {
+        withBound((domain, database) -> {
+            SystemCollections.PDK_NOTE_SCOPES.on(database).createIndex(new Document("ownerId", 1),
+                    new IndexOptions().unique(true));
+            Resource pipeline = PARSER.parse("""
+                    version: tapstate/v1
+                    kind: pipeline
+                    id: flow
+                    source: shared
+                    view:
+                      id: shared
+                      from: shared.orders
+                      primary_key: id
+                    """);
+            long before = revision(database);
+            assertThatThrownBy(() -> domain.artifacts().saveAll(List.of(source("shared", "secret"), pipeline)))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(domain.artifacts().get("shared")).isEmpty();
+            assertThat(domain.artifacts().get("flow")).isEmpty();
+            assertThat(domain.pipelineStates().read("flow")).isEmpty();
+            assertThat(SystemCollections.PDK_NOTE_SCOPES.on(database).countDocuments(new Document("ownerId", "flow"))).isZero();
+            assertThat(revision(database)).isEqualTo(before);
+        });
+    }
+
+    @Test
+    void concurrentDefinitionUpdateAndPipelineCreationCannotMissEitherCommittedScopeSet() {
+        withBound((domain, database) -> {
+            Resource original = PARSER.parse("version: tapstate/v1\nkind: serve\nid: reusable\nsync: [{id: sink_a, source: target}]\n");
+            Resource replacement = PARSER.parse("version: tapstate/v1\nkind: serve\nid: reusable\nsync: [{id: sink_a, source: target}, {id: sink_b, source: target}]\n");
+            Resource first = servedPipeline("first");
+            Resource second = servedPipeline("second");
+            domain.artifacts().saveAll(List.of(source("src", "secret"), source("target", "secret"), original, first));
+            try (var other = MongoConfigurationDomain.open(settings(configurationUri(database)), "cluster-a");
+                    var executor = Executors.newFixedThreadPool(2)) {
+                CountDownLatch ready = new CountDownLatch(2);
+                CountDownLatch start = new CountDownLatch(1);
+                var changed = executor.submit(() -> {
+                    ready.countDown();
+                    if (!start.await(10, TimeUnit.SECONDS)) throw new AssertionError("start not released");
+                    return domain.artifacts().replace("reusable", CanonicalHash.of(original), replacement);
+                });
+                var created = executor.submit(() -> {
+                    ready.countDown();
+                    if (!start.await(10, TimeUnit.SECONDS)) throw new AssertionError("start not released");
+                    return other.artifacts().create(second);
+                });
+                assertThat(ready.await(10, TimeUnit.SECONDS)).isTrue();
+                start.countDown();
+                assertThat(changed.get(20, TimeUnit.SECONDS)).isEqualTo(ArtifactMutation.REPLACED);
+                assertThat(created.get(20, TimeUnit.SECONDS)).isEqualTo(ArtifactMutation.CREATED);
+            } catch (Exception failure) { throw new AssertionError(failure); }
+            for (String pipelineId : List.of("first", "second")) {
+                assertThat(SystemCollections.PDK_NOTE_SCOPES.on(database).countDocuments(new Document("ownerId", pipelineId)))
+                        .isEqualTo(3);
+                for (String sink : List.of("sink_a", "sink_b")) {
+                    var owner = io.tapstate.spi.store.RequiredNoteOwner.forNode(1,
+                            new io.tapstate.core.model.PipelineNode(pipelineId, sink),
+                            io.tapstate.core.model.PipelineNode.Purpose.SYNC, 1);
+                    assertThat(domain.requiredNotes().open(owner).generation()).isOne();
+                }
+            }
+            assertThat(revision(database)).isEqualTo(4);
+        });
+    }
+
+    @Test
+    void readdingARemovedNodeCannotRecreateAMissingScopeOverRetainedOriginOrNotes() {
+        withBound((domain, database) -> {
+            Resource original = capturePipeline("flow");
+            domain.artifacts().saveAll(List.of(source("src", "secret"), original));
+            var owner = io.tapstate.spi.store.RequiredNoteOwner.forNode(1,
+                    new io.tapstate.core.model.PipelineNode("flow", "src"),
+                    io.tapstate.core.model.PipelineNode.Purpose.CAPTURE, 1);
+            // Preserve an original context before simulating the control-record loss.
+            var old = domain.requiredNotes().initialize(owner);
+            domain.requiredNotes().prepareOrigin(old,
+                    new io.tapstate.spi.store.RequiredNoteOrigin("mongodb", "a".repeat(64), new byte[]{1}));
+            var current = domain.requiredNotes().clear(old, false);
+            domain.requiredNotes().compareAndSet(current, "identity", 0, new byte[]{2}, false);
+            Resource removed = pipeline("flow");
+            domain.artifacts().replace("flow", CanonicalHash.of(original), removed);
+            SystemCollections.PDK_NOTE_SCOPES.on(database).deleteOne(new Document("ownerId", "flow"));
+            long before = revision(database);
+            assertThatThrownBy(() -> domain.artifacts().replace("flow", CanonicalHash.of(removed), original))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(IoError.NOTE_SCOPE_UNAVAILABLE));
+            assertThat(revision(database)).isEqualTo(before);
+            assertThat(domain.artifacts().get("flow")).contains(removed);
+            assertThatThrownBy(() -> domain.requiredNotes().read(old, "identity"))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(IoError.NOTE_SCOPE_UNAVAILABLE));
+        });
+    }
+
+    @Test
+    void newPrivateScopesRequireTheExistingGlobalBindingScope() {
+        withBound((domain, database) -> {
+            SystemCollections.PDK_NOTE_SCOPES.on(database).deleteOne(new Document("ownerKind", "GLOBAL"));
+            long before = revision(database);
+            assertThatThrownBy(() -> domain.artifacts().saveAll(List.of(source("src", "secret"), capturePipeline("flow"))))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(IoError.NOTE_SCOPE_UNAVAILABLE));
+            assertThat(domain.artifacts().get("flow")).isEmpty();
+            assertThat(domain.artifacts().get("src")).isEmpty();
+            assertThat(SystemCollections.PDK_NOTE_SCOPES.on(database).countDocuments()).isZero();
+            assertThat(revision(database)).isEqualTo(before);
+        });
+    }
+
+    private static Resource capturePipeline(String id) {
+        return PARSER.parse("version: tapstate/v1\nkind: pipeline\nid: " + id + "\nsource: src\n");
+    }
+
+    private static Resource servedPipeline(String id) {
+        return PARSER.parse("version: tapstate/v1\nkind: pipeline\nid: " + id
+                + "\nsource: src\nserve: {use: reusable, from: src.orders}\n");
+    }
+
+    private static void withBound(BoundScenario scenario) {
+        try (MongoClient admin = MongoClients.create(MONGO.getReplicaSetUrl())) {
+            MongoDatabase database = admin.getDatabase("reserved_scopes_" + UUID.randomUUID().toString().replace("-", ""));
+            try (var domain = MongoConfigurationBootstrap.prepare(settings(configurationUri(database)),
+                    "cluster-a", "installation-a", "setup-a", 1)) {
+                domain.bindings().commit(new io.tapstate.spi.store.StorageSetupScope("cluster-a", "installation-a", "setup-a", 1),
+                        io.tapstate.spi.store.StorageBinding.Mode.OP,
+                        new io.tapstate.spi.store.StorageBinding.Connection(
+                                io.tapstate.spi.store.StorageBinding.Connection.Kind.MONGODB,
+                                "mongodb://cache.invalid/cache?tls=true", "cache", null),
+                        (io.tapstate.core.model.SourceResource) source("views", "secret"));
+                scenario.run(domain, database);
+            } finally { database.drop(); }
+        }
+    }
+
+    @FunctionalInterface
+    private interface BoundScenario { void run(MongoConfigurationDomain domain, MongoDatabase database); }
+
+    private static void installConfigFacts(MongoDatabase database) {
+        SystemCollections.STORAGE_SETUP.on(database).insertOne(new Document("_id", "cluster")
+                .append("clusterId", "cluster-a").append("installationId", "installation-a")
+                .append("operationId", "setup-a").append("generation", 1L).append("phase", MongoConfigurationBootstrap.PREPARED));
+        MongoStorageBindingStore.prepareIndex(database);
+        MongoConfigurationDraftStore.prepareIndexes(database);
+        MongoRequiredDeadLetterStore.prepareIndexes(database);
+        SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database).insertOne(new Document("_id", "cluster")
+                .append("clusterId", "cluster-a").append("layoutId", MongoConfigurationDomain.LAYOUT)
+                .append("bindingVersion", 0L));
+        SystemCollections.SCHEMA_MIGRATIONS.on(database).insertOne(new Document("_id", "config")
+                .append("installedVersion", 1));
+        byte[] key = new byte[32];
+        SystemCollections.CLUSTER_KEYS.on(database).insertOne(new Document("_id", "cluster")
+                .append("clusterId", "cluster-a").append("formatVersion", 1)
+                .append("keyId", SourceConfigCipher.fingerprint(key))
+                .append("material", Base64.getUrlEncoder().withoutPadding().encodeToString(key)));
+    }
+
+    private static String configurationUri(MongoDatabase database) {
+        return MONGO.getReplicaSetUrl(database.getName());
+    }
+
+    private static MongoConnectionSettings settings(String uri) {
+        return new MongoConnectionSettings(uri, null, Duration.ofSeconds(5));
+    }
+
+    private static long revision(MongoDatabase database) {
+        return SystemCollections.CONFIGURATION_VERSION.on(database).find().first().getLong("revision");
+    }
+
+    private static Resource source(String id, String secret) {
+        return PARSER.parse("""
+                version: tapstate/v1
+                kind: source
+                id: %s
+                connector: mongodb
+                config:
+                  password: %s
+                """.formatted(id, secret));
+    }
+
+    private static Resource definition(String kind, String id) {
+        String body = switch (kind) {
+            case "transform" -> "type: filter\nexpr: \"true\"\n";
+            case "view" -> "primary_key: id\n";
+            case "serve" -> "";
+            default -> throw new IllegalArgumentException("definition kind required");
+        };
+        return PARSER.parse("version: tapstate/v1\nkind: " + kind + "\nid: " + id + "\n" + body);
+    }
+
+    private static Resource pipeline(String id) {
+        return PARSER.parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: %s
+                source: []
+                """.formatted(id));
+    }
+
+    private static void withStore(Scenario scenario) {
+        try (MongoClient client = MongoClients.create(MONGO.getReplicaSetUrl())) {
+            MongoDatabase database = client.getDatabase("config_split_" + UUID.randomUUID().toString().replace("-", ""));
+            try {
+                SystemCollections.CONFIGURATION_VERSION.on(database).insertOne(
+                        new Document("_id", ConfigurationVersion.ID).append("revision", 0L));
+                scenario.run(new MongoConfigurationArtifactStore(client, database,
+                        new SourceConfigCipher(new byte[32])), database);
+            } catch (Exception error) {
+                throw new AssertionError(error);
+            } finally {
+                database.drop();
+            }
+        }
+    }
+
+    @FunctionalInterface
+    private interface Scenario {
+        void run(MongoConfigurationArtifactStore store, MongoDatabase database) throws Exception;
+    }
+}

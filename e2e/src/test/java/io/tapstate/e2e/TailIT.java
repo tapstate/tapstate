@@ -93,9 +93,10 @@ class TailIT {
     void reportsAChangeToARowNothingWasHoldingAndGivesTheInstanceBackAfterwards() {
         seed(SEEDED_ROWS);
 
-        try (ServerHandle server = InProcessServer.start(SharedMongo.replicaSetUrl("e2e_tail"))) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create(USER, PASSWORD);
+             ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin(USER, PASSWORD);
+            storage.loginAndAwaitBusiness(control);
             String connector = E2eConnectorJar.BROWSABLE_CONNECTOR_ID;
             control.registerConnector(connector, ConnectorJars.bytesFor(connector));
             control.apply(Map.of("src_rows.tap.yml", sourceYaml()));

@@ -45,9 +45,9 @@ class AnEngineLostToOutOfMemoryBreaksLivenessTest {
 
     @Test
     void theLivenessIsBrokenEvenWhenAnnouncingTheLossRunsOutOfMemoryToo() throws InterruptedException {
-        try (ConfigurableApplicationContext context = new SpringApplicationBuilder(Bootstrap.class)
+        try (ConfigurableApplicationContext context = new SpringApplicationBuilder(HazelcastConfiguration.class)
                 .web(WebApplicationType.NONE)
-                .properties("tapstate.store.mongo.enabled=false")
+                .properties("tapstate.hz.member-port=0", "tapstate.hz.jet.cooperative-thread-count=2")
                 .listeners(new RunsOutOfMemoryWhenABrokenLivenessIsAnnounced())
                 .run()) {
             HazelcastInstance member = context.getBean(HazelcastInstance.class);

@@ -3,7 +3,6 @@ package io.tapstate.app;
 import io.tapstate.adapters.mongostore.MongoConnection;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
 import io.tapstate.adapters.mongostore.MongoStorePort;
-import io.tapstate.adapters.mongostore.SourceConfigKeyringHandle;
 import io.tapstate.control.restapi.SystemDataVersion;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.NestDeadLetterStore;
@@ -45,11 +44,6 @@ class StoreConfiguration {
         // store is unreachable or is not a replica-set, rather than a bare driver stack trace.
         try {
             connection.verify();
-            if (cloud.cloud()) {
-                connection.verifyDeploymentDatabases(java.util.List.of(
-                        cloud.operatorStateDatabase(properties.getOperatorStateDatabase()),
-                        cloud.viewsDatabase("views")));
-            }
             return connection;
         } catch (RuntimeException | Error failure) {
             // Spring cannot destroy a connection whose factory failed before returning the bean.
@@ -71,15 +65,8 @@ class StoreConfiguration {
         // The one configured bound among the stores: how long a movement sample is kept. Written onto
         // the history's expiring index as the port comes up, so a changed retention is a changed index.
         return new MongoStorePort(
-                storeConnection, cloud.operatorStateDatabase(mongo.getOperatorStateDatabase()),
+                storeConnection, mongo.getOperatorStateDatabase(),
                 history.getRetention());
-    }
-
-    /** The process-local keyring view used by Source storage and the clustered node-session lease. */
-    @Bean
-    @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
-    SourceConfigKeyringHandle sourceConfigKeyring(MongoConnection storeConnection) {
-        return storeConnection.sourceConfigKeyring();
     }
 
     /** The deployment's default and per-Nest operator-state databases over the verified store client. */

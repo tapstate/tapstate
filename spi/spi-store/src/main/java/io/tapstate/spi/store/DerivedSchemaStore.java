@@ -40,6 +40,13 @@ public interface DerivedSchemaStore {
     /** The latest recorded derivation for a step, or empty where the step has never recorded one. */
     Optional<DerivedSchema> latest(String pipelineId, String stepId);
 
+    /** Reads the requested latest records, omitting missing steps; a failed read never returns a partial result. */
+    default Map<String, DerivedSchema> latestMany(String pipelineId, java.util.Set<String> stepIds) {
+        var captured = java.util.Set.copyOf(stepIds); var found = new java.util.LinkedHashMap<String, DerivedSchema>();
+        for (String step : captured) latest(pipelineId, step).ifPresent(record -> found.put(step, record));
+        return java.util.Collections.unmodifiableMap(found);
+    }
+
     /**
      * Records a derivation for a step. Appends a new version when {@code schema} differs from the
      * latest recorded one; when it is the same, updates that version's {@code derivedFrom} and

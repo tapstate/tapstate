@@ -467,14 +467,14 @@ class ControlPlaneConfiguration {
     @Bean
     ArtifactMutationService artifactMutationService(
             ArtifactStore artifactStore, StorePort storePort, AuditGate auditGate,
-            ObjectProvider<DataBrowserFollows> follows) {
+            ObjectProvider<DataBrowserFollows> follows, ObjectProvider<ArtifactMutationService.PipelineDeletion> pipelines) {
         // The removal takes the same artifact store bean apply writes through, so both paths see one
         // view of a resource. The dependent bookkeeping a removed pipeline owns is reclaimed straight
         // off the store port: those facets have no service in front of them.
         return new ArtifactMutationService(
                 artifactStore, storePort.desired(), storePort.state(), storePort.observations(),
                 storePort.layouts(), storePort.meta(), storePort.derivedSchemas(), storePort.rateHistory(),
-                auditGate, follows.getIfAvailable(() -> DataBrowserFollows.NONE));
+                auditGate, follows.getIfAvailable(() -> DataBrowserFollows.NONE), pipelines.getIfAvailable());
     }
 
     @Bean
@@ -727,7 +727,7 @@ class ControlPlaneConfiguration {
             PipelineObservationQueryService observations,
             StorePort storePort) {
         return new PipelineCatalogService(
-                artifacts, pipelineDrafts, storePort.desired(), observations);
+                artifacts, pipelineDrafts, storePort.desired(), observations,storePort::pipelineRecoveryRequired);
     }
 
     @Bean
@@ -804,9 +804,9 @@ class ControlPlaneConfiguration {
 
     @Bean
     PipelinePositionService pipelinePositionService(PipelineChains pipelineChains, StorePort storePort,
-            LivePipelines livePipelines, AuditGate auditGate) {
+            LivePipelines livePipelines, AuditGate auditGate, ObjectProvider<PipelinePositionService.WriteBack> nativeWrites) {
         return new PipelinePositionService(
-                pipelineChains, storePort.meta(), storePort.artifacts(), livePipelines, auditGate);
+                pipelineChains, storePort.meta(), storePort.artifacts(), livePipelines, auditGate, nativeWrites.getIfAvailable());
     }
 
     // ---- the node-local log tail: the sink, the appender that feeds it, and the read face over it ----

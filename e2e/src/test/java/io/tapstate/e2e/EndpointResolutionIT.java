@@ -58,10 +58,10 @@ class EndpointResolutionIT {
     void eachAliasReachesTheEndpointItsOwnResourceNames() {
         writeWorkspace();
 
-        try (ServerHandle server = InProcessServer.start(SharedMongo.replicaSetUrl("e2e_endpoints_store"));
+        try (var storage = PreparedNativeStore.create(); ServerHandle server = Tiers.IN_PROCESS.launch(storage);
                 Endpoints files = new FileEndpoints()) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             HttpTierBinding binding = new HttpTierBinding(
                     control, workspace, Map.of(E2eConnectorJar.CONNECTOR_ID, files), env());
             binding.applyResources(List.of("src_file.tap.yml", "tgt_file.tap.yml"));
@@ -111,10 +111,10 @@ class EndpointResolutionIT {
                 """);
 
         RecordingEndpoints jdbc = new RecordingEndpoints();
-        try (ServerHandle server = InProcessServer.start(SharedMongo.replicaSetUrl("e2e_endpoints_jdbc"));
+        try (var storage = PreparedNativeStore.create(); ServerHandle server = Tiers.IN_PROCESS.launch(storage);
                 Endpoints files = new FileEndpoints()) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             HttpTierBinding binding = new HttpTierBinding(
                     control,
                     workspace,

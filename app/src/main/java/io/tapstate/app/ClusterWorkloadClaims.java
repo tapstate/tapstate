@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import io.tapstate.spi.store.ClusterMembership;
+import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
@@ -33,6 +34,16 @@ final class ClusterWorkloadClaims {
         return Optional.of(store.acquire(key, owner, topologyRevision, ttl));
     }
 
+    Optional<WorkloadClaimAttempt> acquirePipeline(PipelineIntentScope scope, WorkloadOwner owner,
+            long topologyRevision, Duration ttl) {
+        return membership.businessEligible()
+                ? Optional.of(store.acquirePipeline(scope, owner, topologyRevision, ttl)) : Optional.empty();
+    }
+
+    Optional<WorkloadClaimReading> readPipeline(PipelineIntentScope scope) {
+        return membership.businessEligible() ? store.readPipeline(scope) : Optional.empty();
+    }
+
     /**
      * Renews a claim this member holds, while the cluster still lets it.
      *
@@ -60,6 +71,27 @@ final class ClusterWorkloadClaims {
             }
         }
         return store.renew(expected, ttl);
+    }
+
+    /** Keeps a scoped run's exact fence across joins; only a subsequent submission adopts the new topology. */
+    Optional<WorkloadClaim> renewScopedActuation(WorkloadClaim expected, Duration ttl) {
+        if (expected.key().type() != WorkloadClaimType.PIPELINE_ACTUATION)
+            throw new IllegalArgumentException("a scoped actuation renewal requires a Pipeline claim");
+        if (expected.executionGeneration() == 0) return renew(expected, ttl);
+        ClusterMembership current = membership.committed();
+        if (!membership.businessEligible() || current == null
+                || !current.clusterId().equals(expected.key().clusterId())
+                || current.revision() < expected.topologyRevision()) return Optional.empty();
+        return store.renew(expected, ttl);
+    }
+
+    /**
+     * Keeps an exact held SINGLE lifecycle claim while its engine is down, solely for control reporting.
+     * This cannot acquire a claim, advance an execution, or authorize a data-plane call. The store still
+     * requires the original live claim; an expired or replaced tenure is never recovered here.
+     */
+    Optional<WorkloadClaim> renewActuationControl(WorkloadClaim expected, Duration ttl) {
+        return membership.singleControlEligible(expected) ? store.renew(expected, ttl) : Optional.empty();
     }
 
     boolean release(WorkloadClaim expected) {

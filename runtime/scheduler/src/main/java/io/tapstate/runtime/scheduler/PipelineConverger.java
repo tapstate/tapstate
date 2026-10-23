@@ -7,6 +7,9 @@ import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.spi.store.DesiredStore;
+import io.tapstate.spi.store.PipelineIntentSnapshot;
+import io.tapstate.spi.store.IoError;
+import java.util.Map;
 import io.tapstate.spi.store.StateStore;
 
 import java.time.Clock;
@@ -14,6 +17,7 @@ import java.util.Collection;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Consumer;
+import java.util.function.BooleanSupplier;
 
 /**
  * Converges a pipeline's actual state toward its desired intent. It reads the desired target, seeds
@@ -34,7 +38,9 @@ public final class PipelineConverger {
     private final LifecycleActuator actuator;
     private final Clock clock;
     private final RebuildAdmission rebuilds;
+    private final boolean requirePreparedState;
     private final Consumer<String> beforeCompletion;
+    private final BooleanSupplier stillOriginalIntent;
 
     /** A converge loop that never rebuilds a failed run, which is every run on a single node. */
     public PipelineConverger(DesiredStore desired, StateStore state, LifecycleActuator actuator, Clock clock) {
@@ -51,12 +57,20 @@ public final class PipelineConverger {
     public PipelineConverger(
             DesiredStore desired, StateStore state, LifecycleActuator actuator, Clock clock,
             RebuildAdmission rebuilds, Consumer<String> beforeCompletion) {
+        this(desired, state, actuator, clock, rebuilds, false, beforeCompletion, () -> false);
+    }
+
+    private PipelineConverger(DesiredStore desired, StateStore state, LifecycleActuator actuator, Clock clock,
+            RebuildAdmission rebuilds, boolean requirePreparedState, Consumer<String> beforeCompletion,
+            BooleanSupplier stillOriginalIntent) {
+        this.requirePreparedState = requirePreparedState;
         this.desired = Objects.requireNonNull(desired, "desired");
         this.state = Objects.requireNonNull(state, "state");
         this.actuator = Objects.requireNonNull(actuator, "actuator");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.rebuilds = Objects.requireNonNull(rebuilds, "rebuilds");
         this.beforeCompletion = Objects.requireNonNull(beforeCompletion, "beforeCompletion");
+        this.stillOriginalIntent = Objects.requireNonNull(stillOriginalIntent, "stillOriginalIntent");
     }
 
     /** Tells the rebuild admission which pipelines are still desired, so it forgets the rest. */
@@ -66,7 +80,30 @@ public final class PipelineConverger {
 
     /** Drives the pipeline's actual state toward its current desired target, seeding it if new. */
     public ConvergeResult converge(String pipelineId) {
-        Optional<DesiredState> intent = desired.read(pipelineId);
+        return converge(pipelineId, desired.read(pipelineId));
+    }
+
+    /**
+     * Consumes one captured CONFIG intent and this pass's bound ports. Retries read only those ports;
+     * neither a newer intent nor another physical state can be adopted in the middle of this pass.
+     * Initial checkpoints belong to controlled preparation, never ordinary scoped convergence.
+     */
+    public ConvergeResult convergeScoped(PipelineIntentSnapshot intent, StateStore scopedState,
+            LifecycleActuator scopedActuator, RebuildAdmission scopedRebuilds) {
+        // Without a current CONFIG authority, this entry cannot publish a terminal completion.
+        return convergeScoped(intent, scopedState, scopedActuator, scopedRebuilds, ignored -> {}, () -> false);
+    }
+
+    /** Completion retains the final scoped reading and rejects a changed original CONFIG intent. */
+    public ConvergeResult convergeScoped(PipelineIntentSnapshot intent, StateStore scopedState,
+            LifecycleActuator scopedActuator, RebuildAdmission scopedRebuilds, Consumer<String> finalObservation,
+            BooleanSupplier currentIntent) {
+        Objects.requireNonNull(intent, "intent");
+        return new PipelineConverger(desired, scopedState, scopedActuator, clock, scopedRebuilds, true, finalObservation, currentIntent)
+                .converge(intent.scope().pipelineId(), Optional.ofNullable(intent.desired()));
+    }
+
+    private ConvergeResult converge(String pipelineId, Optional<DesiredState> intent) {
         if (intent.isEmpty()) {
             return ConvergeResult.nothingToDo();
         }
@@ -144,7 +181,8 @@ public final class PipelineConverger {
             // Save the final reading while capture is still present, then prove the run and intent again.
             beforeCompletion.accept(pipelineId);
             if (!actuator.completion(pipelineId).equals(completion)
-                    || desired.read(pipelineId).filter(intent::equals).isEmpty()) {
+                    || !(requirePreparedState ? stillOriginalIntent.getAsBoolean()
+                            : desired.read(pipelineId).filter(intent::equals).isPresent())) {
                 return ConvergeResult.superseded();
             }
             return completeRun(pipelineId, current, completion.orElseThrow());
@@ -233,6 +271,7 @@ public final class PipelineConverger {
             boolean purgeState, boolean rebuild, boolean evenIfAlreadyThere) {
         String targetJson = StateJson.of(target);
         if (current == null) {
+            if (requirePreparedState) throw missingCheckpoint(pipelineId);
             if (!seedIfAbsent) {
                 return ConvergeResult.nothingToDo();
             }
@@ -258,6 +297,7 @@ public final class PipelineConverger {
                 try {
                     actuate(pipelineId, from, target, purgeState, rebuild);
                 } catch (TapstateException refused) {
+                    if(target==PipelineState.COMPLETED)return ConvergeResult.failed(applied.next(),refused);
                     // The job side refused with a diagnosis. Record it the way a job that died is recorded,
                     // because to everyone reading the product they are the same event: the pipeline is not
                     // going to run, and here is why. Letting it escape instead leaves the pass to abort
@@ -351,6 +391,12 @@ public final class PipelineConverger {
 
     private CheckpointDoc requireCheckpoint(String pipelineId) {
         return state.read(pipelineId)
-                .orElseThrow(() -> new IllegalStateException("checkpoint vanished for pipeline " + pipelineId));
+                .orElseThrow(() -> missingCheckpoint(pipelineId));
+    }
+
+    private RuntimeException missingCheckpoint(String pipelineId) {
+        return requirePreparedState
+                ? new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", pipelineId, "field", "checkpoint"), null)
+                : new IllegalStateException("checkpoint vanished for pipeline " + pipelineId);
     }
 }
