@@ -42,6 +42,34 @@ class ThreeLayerObservationTest {
         assertThatThrownBy(() -> f.port.state().read("pipeline")).isInstanceOf(TapstateException.class);
     }
 
+    @ParameterizedTest @ValueSource(booleans = {false, true})
+    void anAbsentPipelineReportsUnknownWithoutOpeningRetainedCacheState(boolean retired) {
+        var f = new Fixture();
+        f.mapping.set(retired ? new PipelineStateMapping("pipeline", 1, PipelineStateMapping.Phase.RETIRED, "delete") : null);
+        when(f.artifacts.get("pipeline")).thenReturn(Optional.empty());
+        var query = new PipelineObservationQueryService(new ArtifactQueryService(f.artifacts), f.port.observations());
+        assertThatThrownBy(() -> query.status("pipeline")).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(LifecycleError.UNKNOWN_PIPELINE));
+        verifyNoInteractions(f.cache);
+    }
+
+    @ParameterizedTest @ValueSource(booleans = {false, true})
+    void anExistingPipelineWithMissingOrRetiredMappingStillRefuses(boolean retired) {
+        var f = new Fixture();
+        f.mapping.set(retired ? new PipelineStateMapping("pipeline", 1, PipelineStateMapping.Phase.RETIRED, "delete") : null);
+        assertThatThrownBy(() -> f.port.observations().read("pipeline")).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+        verifyNoInteractions(f.cache);
+    }
+
+    @Test void anUnavailableConfigurationCannotProveAnUnknownPipeline() {
+        var f = new Fixture(); f.mapping.set(null);
+        var failure = StorageRuntime.unavailable();
+        when(f.artifacts.get("pipeline")).thenThrow(failure);
+        assertThatThrownBy(() -> f.port.observations().read("pipeline")).isSameAs(failure);
+        verifyNoInteractions(f.cache);
+    }
+
     @Test void aCoherentOriginalGenerationStillReturnsItsObservedState() {
         var f = new Fixture();
         assertThat(f.port.observations().read("pipeline")).contains(f.observed);
@@ -119,6 +147,7 @@ class ThreeLayerObservationTest {
         final MongoCacheDomain cache = mock(MongoCacheDomain.class);
         final StorageRuntime.Bound bound = mock(StorageRuntime.Bound.class);
         final PipelineStateMappings mappings = mock(PipelineStateMappings.class);
+        final ArtifactStore artifacts = mock(ArtifactStore.class);
         final PipelineStatePreparations preparations = mock(PipelineStatePreparations.class);
         final CacheRecoveryStore recoveries = mock(CacheRecoveryStore.class);
         final ObservationStore observations = mock(ObservationStore.class);
@@ -129,10 +158,13 @@ class ThreeLayerObservationTest {
         final ThreeLayerStorePort port;
         Fixture() {
             when(configuration.pipelineStates()).thenReturn(mappings);
+            when(configuration.artifacts()).thenReturn(artifacts);
+            when(artifacts.get("pipeline")).thenReturn(Optional.of(
+                    new PipelineResource("pipeline", null, List.of(), null, null, null, null, null)));
             when(configuration.cacheRecoveries()).thenReturn(recoveries);
             when(recoveries.read("pipeline")).thenReturn(Optional.empty());
             when(configuration.preparations()).thenReturn(preparations);
-            when(mappings.read("pipeline")).thenAnswer(call -> Optional.of(mapping.get()));
+            when(mappings.read("pipeline")).thenAnswer(call -> Optional.ofNullable(mapping.get()));
             when(bound.cache()).thenReturn(cache);
             when(bound.preparation()).thenReturn(new CachePreparation("setup",
                     new CacheAuthScope("cluster", 1, StorageBinding.Mode.OP, "cache", 1)));

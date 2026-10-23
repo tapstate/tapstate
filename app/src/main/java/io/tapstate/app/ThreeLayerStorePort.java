@@ -150,7 +150,20 @@ final class ThreeLayerStorePort implements StorePort {
         return new ObservationStore() {
             @Override public Optional<Observation> read(String pipeline) {
                 if (control != null) return readObservation(pipeline, scope(pipeline));
-                var mapping = currentMapping(pipeline);
+                active();
+                var retained = configuration.pipelineStates().read(pipeline);
+                active();
+                if (retained.isPresent() && !pipeline.equals(retained.orElseThrow().pipelineId())) throw refused();
+                if (retained.isEmpty() || retained.orElseThrow().phase() == PipelineStateMapping.Phase.RETIRED) {
+                    // A retained deletion fence is not an observable run. Only CONFIG absence can
+                    // classify this as unknown; a live definition with a missing mapping stays fenced.
+                    boolean absent = configuration.artifacts().get(pipeline)
+                            .filter(io.tapstate.core.model.PipelineResource.class::isInstance).isEmpty();
+                    active();
+                    if (absent) return Optional.empty();
+                    throw refused();
+                }
+                var mapping = retained.orElseThrow();
                 if (mapping.phase() == PipelineStateMapping.Phase.REBUILDING) return Optional.empty();
                 var original = activeScope(pipeline, mapping);
                 try {
