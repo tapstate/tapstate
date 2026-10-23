@@ -99,6 +99,12 @@ final class StorageRoot implements AutoCloseable {
 
     Phase phase() { requireOpen(); return phase; }
     StorageRuntime runtime() { requireOpen(); return runtime; }
+    Optional<org.springframework.boot.availability.ApplicationAvailability> businessAvailability() {
+        StorageRuntime current = runtime;
+        if (closed || current == null) return Optional.empty();
+        var business = current.businessForLiveness().orElse(null);
+        return business instanceof NativeBusinessContext nativeBusiness ? nativeBusiness.availability() : Optional.empty();
+    }
     StorageAuthentication authentication() { requireOpen(); return authentication; }
     Optional<StorageBinding.Connection> configurationEndpoint() {
         requireOpen(); return runtime.configuration().isPresent() ? endpoint : Optional.empty();

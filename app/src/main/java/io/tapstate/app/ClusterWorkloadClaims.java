@@ -94,6 +94,16 @@ final class ClusterWorkloadClaims {
         return membership.singleControlEligible(expected) ? store.renew(expected, ttl) : Optional.empty();
     }
 
+    /** Read-only reporting proof for the exact retained SINGLE execution, never a business grant. */
+    Optional<WorkloadClaimReading> readActuationControl(PipelineIntentScope scope, WorkloadClaim expected) {
+        if (!membership.singleControlEligible(expected) || !scope.pipelineId().equals(expected.key().resourceId())
+                || !scope.clusterId().equals(expected.key().clusterId())) return Optional.empty();
+        var current = store.readPipeline(scope);
+        return membership.singleControlEligible(expected) ? current.filter(WorkloadClaimReading::leased)
+                .filter(value -> io.tapstate.spi.store.WorkloadClaimFence.from(value.claim())
+                        .equals(io.tapstate.spi.store.WorkloadClaimFence.from(expected))) : Optional.empty();
+    }
+
     boolean release(WorkloadClaim expected) {
         return store.release(expected);
     }

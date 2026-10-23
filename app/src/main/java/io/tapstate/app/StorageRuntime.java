@@ -25,7 +25,7 @@ final class StorageRuntime implements AutoCloseable {
     private final MongoConfigurationDomain configuration;
     private final Function<StorageBinding, MongoCacheDomain> connections;
     private Bound bound;
-    private AutoCloseable business;
+    private volatile AutoCloseable business;
     private volatile boolean closed;
     private boolean cleanupUnknown;
     private final Runnable ownerActive;
@@ -170,6 +170,12 @@ final class StorageRuntime implements AutoCloseable {
     synchronized boolean businessStarted() { return !closed && business instanceof Business actual && actual.available(); }
     synchronized Optional<Business> business() {
         requireOpen(); return business instanceof Business actual ? Optional.of(actual) : Optional.empty();
+    }
+
+    /** Liveness observes only the published owner and never waits for candidate startup or does IO. */
+    Optional<Business> businessForLiveness() {
+        AutoCloseable current = business;
+        return !closed && current instanceof Business actual ? Optional.of(actual) : Optional.empty();
     }
 
     private void verifyCompletedSetup(Bound original) {

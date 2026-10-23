@@ -40,6 +40,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
     private final MongoConfigurationDomain configuration;
     private final AtomicBoolean active = new AtomicBoolean();
     private GenericApplicationContext context;
+    private org.springframework.boot.availability.ApplicationAvailability availability;
     private ThreeLayerStorePort port;
     private NativeMemberStorage memberStorage;
     private RetiredPipelinePayloadCleanup payloadCleanup;
@@ -88,11 +89,16 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 if (cause instanceof io.tapstate.core.common.TapstateException coded) throw coded;
             throw failed;
         }
+        availability = context.getBean(EngineAvailability.class);
         memberStorage.admitted(context.getBean(NodeSessionLease.class));
         context.getBean(SeedSweepRunner.class).run(new DefaultApplicationArguments(new String[0]));
         var ordered = new ArrayList<>(context.getBeansOfType(HandlerMapping.class).values());
         AnnotationAwareOrderComparator.sort(ordered); handlers = List.copyOf(ordered);
         original.requireBusiness(); active.set(true);
+    }
+
+    Optional<org.springframework.boot.availability.ApplicationAvailability> availability() {
+        return active.get() ? Optional.ofNullable(availability) : Optional.empty();
     }
 
     private void preparePipeline(PipelineIntentScope scope) {
@@ -379,6 +385,12 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                     () -> node.active() && (cluster.getProfile() == ClusterProperties.Profile.SINGLE || membership.businessEligible()),
                     ownership, new ConvergenceDriver.ScopedPorts(owner.configuration.intents(), owner.original.cache(),
                             owner.memberStorage::requireNode, pass -> actuator.forPass(pass, ports), pass -> admission, admission::retain));
+        }
+        @Bean PipelineStatusDiagnostics nativePipelineStatusDiagnostics(NativeBusinessContext owner, Engine engine,
+                PipelineActuationOwnership ownership) {
+            return new NativePipelineStatusDiagnostics(owner.original.preparation().businessScope(),
+                    owner.configuration.intents(), owner.configuration.preparations(), engine, ownership, owner.active::get,
+                    owner.original.cache()::pipelineStates);
         }
         @Bean(initMethod = "start", destroyMethod = "")
         RetiredPipelinePayloadCleanup retiredPipelinePayloadCleanup(NativeBusinessContext owner, NodeSessionLease node) {

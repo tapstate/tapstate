@@ -996,6 +996,16 @@ public final class Engine {
     }
 
     /** Why this engine can no longer run {@code pipelineId}, as the coded failure; empty while its member runs. */
+    /** Diagnoses loss only for an exact job identity already proved before this member stopped. */
+    public Optional<Throwable> failureOfLostRun(String pipelineId, java.io.Serializable originalIdentity) {
+        Objects.requireNonNull(originalIdentity, "originalIdentity");
+        var lost = lost(pipelineId);
+        if (lost.isEmpty()) return Optional.empty();
+        return JobFailureRegistry.of(member).retainedRunFailure(pipelineId, originalIdentity)
+                .map(retained -> retained.cause() != null && !ranOutOfMemory(retained.cause())
+                        ? retained.cause() : lost.orElseThrow());
+    }
+
     public Optional<TapstateException> lost(String pipelineId) {
         return MemberOutOfMemory.of(member).map(error ->
                 new TapstateException(EngineError.OUT_OF_MEMORY, Map.of("pipeline", pipelineId), error));

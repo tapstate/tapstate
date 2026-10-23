@@ -102,7 +102,8 @@ public final class PipelineCatalogService {
         boolean hasArtifact = artifact != null;
         boolean needsRecovery=hasArtifact && recoveryRequired.test(id);
         PipelineStatus observation = hasArtifact ? observations.findStatus(id).orElse(null) : null;
-        PipelineState observed = observation == null ? null : observation.state();
+        PipelineState observed = observation == null ? null : observation.observedState();
+        PipelineState effective = observation == null ? null : observation.state();
         PipelineState target;
         try {
             target = hasArtifact ? desired.read(id).map(state -> state.targetState()).orElse(null) : null;
@@ -116,12 +117,16 @@ public final class PipelineCatalogService {
         boolean recoveryAtRest=needsRecovery && (observed==null || observed==PipelineState.NEW || observed==PipelineState.STOPPED);
         PipelineCatalogItem.DisplayState state = recoveryAtRest
                 ? observed==null?PipelineCatalogItem.DisplayState.UNAVAILABLE:PipelineCatalogItem.DisplayState.valueOf(observed.name())
-                : displayState(target, observed);
+                : displayState(target, effective);
 
         String description = draft != null ? draft.description() : descriptionOf(artifact);
         String mode = draft == null ? null : draft.mode().name().toLowerCase(java.util.Locale.ROOT);
         String name = draft != null && draft.name() != null && !draft.name().isBlank() ? draft.name() : id;
 
+        // The current failure and the later intent projection remain separate even if STOP arrived
+        // after diagnosis. Converting this item must not infer runtime truth from the UI transition.
+        PipelineCatalogItem.DisplayState runtimeState = observation != null && observed != effective
+                ? PipelineCatalogItem.DisplayState.valueOf(effective.name()) : state;
         return new PipelineCatalogItem(
                 id,
                 name,
@@ -132,7 +137,7 @@ public final class PipelineCatalogService {
                 artifact == null ? null : artifact.contentHash(),
                 hasArtifact,
                 new PipelineCatalogItem.Status(
-                        state,
+                        runtimeState,
                         recoveryAtRest?PipelineCatalogItem.UiState.RECOVERY_REQUIRED:hasArtifact ? PipelineCatalogItem.UiState.valueOf(state.name()) : PipelineCatalogItem.UiState.DRAFT,
                         target,
                         observed,

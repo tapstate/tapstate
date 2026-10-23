@@ -28,6 +28,9 @@ class StorageRootConfiguration {
     }
     @Bean CloudSdkBridge cloudSdkBridge(CloudRuntimeSettings cloud) { return cloud.cloud() ? new CloudSdkBridge(cloud) : null; }
     @Bean Clock clock() { return Clock.systemUTC(); }
+    @Bean StorageAvailability applicationAvailability(StorageRoot root) {
+        return new StorageAvailability(root::businessAvailability);
+    }
     @Bean TokenSecrets tokenSecrets() { return new RandomTokenSecrets(); }
     @Bean ControlPlaneConfiguration.SigningSecret signingSecret(ControlAuthProperties properties) {
         return new ControlPlaneConfiguration().signingSecret(properties);

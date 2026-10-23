@@ -86,6 +86,14 @@ public final class JobFailureRegistry {
         return answer.get();
     }
 
+    /** Reads only a slot attached while the concrete job was proved; never resolves or reattaches it. */
+    Optional<RetainedFailure> retainedRunFailure(String pipelineId, java.io.Serializable identity) {
+        Slot slot = failures.get(pipelineId);
+        return slot == null ? Optional.empty() : slot.retained(identity);
+    }
+
+    record RetainedFailure(Throwable cause) {}
+
     Recorder existing(String pipelineId, long jobId, java.io.Serializable identity) {
         Slot slot = failures.get(pipelineId);
         return slot != null && slot.matches(jobId, identity) ? new Recorder(this, pipelineId, slot) : Recorder.NONE;
@@ -154,6 +162,10 @@ public final class JobFailureRegistry {
         }
         synchronized boolean matches(long expectedJob, java.io.Serializable expectedIdentity) {
             return !retired && jobId == expectedJob && java.util.Objects.equals(identity, expectedIdentity);
+        }
+        synchronized Optional<RetainedFailure> retained(java.io.Serializable expectedIdentity) {
+            return !retired && jobId != 0 && identity != null && identity.equals(expectedIdentity)
+                    ? Optional.of(new RetainedFailure(cause)) : Optional.empty();
         }
         synchronized void record(Throwable failure) { if (!retired) cause = java.util.Objects.requireNonNull(failure, "failure"); }
         synchronized Optional<Throwable> get() { return retired ? Optional.empty() : Optional.ofNullable(cause); }

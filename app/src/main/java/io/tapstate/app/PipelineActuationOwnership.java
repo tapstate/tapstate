@@ -712,6 +712,48 @@ final class PipelineActuationOwnership {
         }
     }
 
+    /** One bounded read proof; it grants no mutation or engine operation. */
+    final class ReportingExecution {
+        private final PipelineIntentScope scope;
+        private final WorkloadClaim expected;
+        private final long askedAt;
+        private final long remainingNanos;
+        private ReportingExecution(PipelineIntentScope scope, WorkloadClaim expected, long askedAt, long remainingNanos) {
+            this.scope = scope; this.expected = expected; this.askedAt = askedAt; this.remainingNanos = remainingNanos;
+        }
+        ExecutionFence execution() { return new ExecutionFence(scope, WorkloadClaimFence.from(expected)); }
+        boolean current() {
+            synchronized (PipelineActuationOwnership.this) {
+                long elapsed = nanoTime.getAsLong() - askedAt;
+                Held state = held.get(scope.pipelineId());
+                return !closing && accepts(scope) && elapsed >= 0 && elapsed < remainingNanos
+                        && membership.singleControlEligible(expected) && state != null && scope.equals(state.scope)
+                        && state.claim != null && WorkloadClaimFence.from(state.claim).equals(WorkloadClaimFence.from(expected))
+                        && state.runExecutionGeneration == expected.executionGeneration()
+                        && Set.of(owner.nodeId()).equals(state.runMembers);
+            }
+        }
+    }
+
+    Optional<ReportingExecution> reportingExecution(PipelineIntentScope scope) {
+        WorkloadClaim expected;
+        synchronized (this) {
+            Held state = held.get(scope.pipelineId());
+            if (!fenced || businessScope == null || closing || !accepts(scope) || state == null
+                    || !scope.equals(state.scope) || state.claim == null || state.claim.executionGeneration() < 1
+                    || state.runExecutionGeneration != state.claim.executionGeneration()
+                    || !Set.of(owner.nodeId()).equals(state.runMembers)) return Optional.empty();
+            expected = state.claim;
+        }
+        long askedAt = nanoTime.getAsLong();
+        var reading = claims.readActuationControl(scope, expected);
+        if (reading.isEmpty()) return Optional.empty();
+        Duration remaining = reading.orElseThrow().leaseRemaining();
+        long budget = remaining.compareTo(ttl) < 0 ? remaining.toNanos() : ttl.toNanos();
+        var proof = new ReportingExecution(scope, expected, askedAt, budget);
+        return proof.current() ? Optional.of(proof) : Optional.empty();
+    }
+
     /** The execution generation the claim this member holds for {@code pipelineId} carries, or zero. */
     synchronized long heldExecutionGeneration(String pipelineId) {
         Held state = fenced ? held.get(pipelineId) : null;

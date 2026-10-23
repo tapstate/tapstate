@@ -21,6 +21,27 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class EngineRunHandleTest {
+    @Test void retainedFailureReadsNeedAnActuallyAttachedExactUnretiredJob() {
+        var first = new FakeJob(1, "run-a", JobStatus.RUNNING);
+        var fixture = new Fixture(first);
+        var registry = JobFailureRegistry.of(fixture.member);
+        assertThat(registry.retainedRunFailure("p", "run-a")).isEmpty();
+        registry.attach("p", 1, "run-a");
+        fixture.onJobLookup = () -> { throw new AssertionError("the stopped member cannot be queried"); };
+        assertThat(registry.retainedRunFailure("p", "run-a")).isPresent();
+        assertThat(registry.retainedRunFailure("p", "run-b")).isEmpty();
+        var cause = new IllegalArgumentException("original failure");
+        registry.existing("p", 1, "run-a").record(cause);
+        assertThat(registry.retainedRunFailure("p", "run-a").orElseThrow().cause()).isSameAs(cause);
+        fixture.named.set(new FakeJob(2, "run-b", JobStatus.RUNNING));
+        fixture.onJobLookup = () -> {};
+        registry.attach("p", 2, "run-b");
+        assertThat(registry.retainedRunFailure("p", "run-a")).isEmpty();
+        registry.retireRun("p", 2, "run-b");
+        assertThat(registry.retainedRunFailure("p", "run-b")).isEmpty();
+        assertThat(registry.retainedRunFailure("unknown", "run-b")).isEmpty();
+    }
+
     @Test void aCapturedHandleNeverControlsOrWaitsForTheReplacementUnderTheSameName() {
         var first = new FakeJob(1, "run-a", JobStatus.RUNNING); var second = new FakeJob(2, "run-b", JobStatus.RUNNING);
         var fixture = new Fixture(first);

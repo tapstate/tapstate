@@ -29,6 +29,31 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class PipelineCatalogServiceTest {
 
+    @Test void aStopReadAfterADiagnosisCannotDiscardItsEffectiveFailure() {
+        var artifacts = new ArtifactQueryService(artifactStore(List.of(pipeline("orders", null))));
+        var desired = new MemoryDesiredStore(); desired.save(intent("orders", PipelineState.RUNNING));
+        var observations = new MemoryObservationStore();
+        var at = Instant.parse("2026-10-23T00:00:00Z");
+        var stored = new Observation("orders", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(), null, at);
+        observations.save(stored);
+        var calls = new java.util.concurrent.atomic.AtomicInteger();
+        var failure = new io.tapstate.core.lifecycle.ObservationFailure("engine.out-of-memory", Map.of("pipeline", "orders"));
+        var query = new PipelineObservationQueryService(artifacts, observations,
+                io.tapstate.core.lifecycle.ExecutionPlans.NONE, List::of, (pipeline, state) -> {
+                    calls.incrementAndGet(); desired.save(intent("orders", PipelineState.STOPPED)); return Optional.of(failure);
+                });
+        var service = new PipelineCatalogService(artifacts, new PipelineDraftService(new MemoryDraftStore()), desired, query);
+        var item = service.find("orders").orElseThrow();
+        assertThat(item.status().displayState()).isEqualTo(PipelineCatalogItem.UiState.STOPPING);
+        assertThat(item.status().observedState()).isEqualTo(PipelineState.RUNNING);
+        assertThat(item.status().desiredState()).isEqualTo(PipelineState.STOPPED);
+        var status = query.findStatusWithPlan(item).orElseThrow();
+        assertThat(status.state()).isEqualTo(PipelineState.FAILED);
+        assertThat(status.observedState()).isEqualTo(PipelineState.RUNNING);
+        assertThat(status.observedAt()).isEqualTo(at); assertThat(status.failure()).isEqualTo(failure);
+        assertThat(calls).hasValue(1); assertThat(observations.read("orders")).contains(stored);
+    }
+
     @Test void aDraftWithoutAnArtifactDoesNotReadRuntimeStateFromAnAbsentOrRetiredScope() {
         var artifacts = new ArtifactQueryService(artifactStore(List.of()));
         var drafts = new MemoryDraftStore(); drafts.seed(draft("draft-only", "Draft", null, 1));

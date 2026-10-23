@@ -732,10 +732,11 @@ class ControlPlaneConfiguration {
 
     @Bean
     PipelineObservationQueryService pipelineObservationQueryService(
-            ArtifactQueryService artifactQueryService, StorePort storePort, ObjectProvider<HazelcastInstance> member) {
+            ArtifactQueryService artifactQueryService, StorePort storePort, ObjectProvider<HazelcastInstance> member,
+            ObjectProvider<io.tapstate.control.core.PipelineStatusDiagnostics> diagnostics) {
         HazelcastInstance engine = member.getIfAvailable();
         return new PipelineObservationQueryService(artifactQueryService, storePort.observations(),
-                executionPlans(engine), dataMembers(engine));
+                executionPlans(engine), dataMembers(engine), diagnostics.getIfAvailable(() -> io.tapstate.control.core.PipelineStatusDiagnostics.NONE));
     }
 
     @Bean

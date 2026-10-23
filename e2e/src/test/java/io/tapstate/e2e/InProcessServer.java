@@ -48,8 +48,14 @@ final class InProcessServer implements ServerHandle {
     }
 
     static InProcessServer startPrepared(PreparedNativeStore storage) {
-        return start(storage.configurationUri(), null, List.of("--tapstate.cluster.id=" + storage.clusterId(),
+        return startPrepared(storage, List.of());
+    }
+
+    static InProcessServer startPrepared(PreparedNativeStore storage, List<String> additionalArguments) {
+        var arguments = new java.util.ArrayList<>(List.of("--tapstate.cluster.id=" + storage.clusterId(),
                 "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2"));
+        arguments.addAll(additionalArguments);
+        return start(storage.configurationUri(), null, arguments);
     }
 
     /** Boots the assembly with an explicit operator-state database. */
