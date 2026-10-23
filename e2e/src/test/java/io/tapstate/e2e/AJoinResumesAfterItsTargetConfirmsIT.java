@@ -78,7 +78,7 @@ class AJoinResumesAfterItsTargetConfirmsIT {
         }
     }
 
-    private static void awaitJoined(FileEndpoints files, EndpointAddress destination, long sequence) {
+    static void awaitJoined(FileEndpoints files, EndpointAddress destination, long sequence) {
         Await.until("both orders to carry the current customer value", BOUND,
                 () -> files.count(destination, "orders") == 2
                         && List.of(10L, 11L).stream().allMatch(id -> files.fetch(destination, "orders", Map.of("id", id))
@@ -88,7 +88,7 @@ class AJoinResumesAfterItsTargetConfirmsIT {
                         + ", order 11=" + files.fetch(destination, "orders", Map.of("id", 11L)));
     }
 
-    private static Map<String, String> workspace(Path source, Path target) {
+    static Map<String, String> workspace(Path source, Path target) {
         Map<String, String> resources = new LinkedHashMap<>();
         resources.put("src.tap.yml", """
                 version: tapstate/v1
