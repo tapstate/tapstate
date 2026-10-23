@@ -81,7 +81,6 @@ class ManagedMongoStoreIsolationIT {
             var to = seedTransferRoot(admin, "to_" + suffix, sourceDb, "destination-admin", "destination-password");
             admin.getDatabase(sourceDb).getCollection("orders").insertMany(List.of(new Document("_id", 1).append("name", "first").append("quantity", 7),
                     new Document("_id", 2).append("name", "second").append("quantity", 19)));
-            admin.getDatabase(from.master()).getCollection("orders").insertOne(new Document("_id", 999).append("name", "source-only"));
             var sourceConfig = admin.getDatabase(from.config()); var destinationConfig = admin.getDatabase(to.config());
             String fromKey = sourceConfig.getCollection("cluster_keys").find().first().getString("keyId");
             String toKey = destinationConfig.getCollection("cluster_keys").find().first().getString("keyId");
@@ -102,6 +101,28 @@ class ManagedMongoStoreIsolationIT {
                 client.post().uri("/api/pipelines").body(Map.of("id", "portable_flow", "sources", List.of(Map.of("id", "portable_input", "srs", false)),
                         "settings", Map.of("readMode", "snapshot_only"), "serve", Map.of("id", "output", "from", "/.*/",
                                 "sync", List.of(Map.of("id", "copy", "source", "views", "onFullLoad", "clear"))))).retrieve().toBodilessEntity();
+                client.post().uri("/api/pipelines/portable_flow:start").retrieve().toBodilessEntity();
+                var sourceTarget = admin.getDatabase(from.master()).getCollection("orders");
+                var sourceRuntime = admin.getDatabase(from.cache());
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(60)).untilAsserted(() -> {
+                    assertThat(sourceTarget.countDocuments()).isEqualTo(2);
+                    assertThat(sourceTarget.find(new Document("_id", 1)).first().getString("name")).isEqualTo("first");
+                    assertThat(((Number)sourceTarget.find(new Document("_id", 2)).first().get("quantity")).longValue()).isEqualTo(19);
+                    var checkpoint = SystemCollections.CACHE_PIPELINE_STATE.on(sourceRuntime).find(new Document("_id", "portable_flow")).first();
+                    assertThat(checkpoint).isNotNull().containsEntry("stateJson", "COMPLETED");
+                    var configured = application.getBean(StorageRoot.class).runtime().requireConfiguration();
+                    var business = configured.bindings().cachePreparation().orElseThrow().businessScope();
+                    long generation = configured.pipelineStates().read("portable_flow").orElseThrow().stateGeneration();
+                    var scope = new PipelineIntentScope(business.clusterId(), business.bindingVersion(), business.cacheIncarnation(), "portable_flow", generation);
+                    assertThat(checkpoint.get("scope", Document.class)).isEqualTo(new Document("clusterId", scope.clusterId())
+                            .append("bindingVersion", scope.bindingVersion()).append("cacheIncarnation", scope.cacheIncarnation())
+                            .append("pipelineId", scope.pipelineId()).append("stateGeneration", scope.stateGeneration()));
+                    var intent = configured.intents().load("portable_flow").orElseThrow();
+                    assertThat(intent.scope()).isEqualTo(scope);
+                    assertThat(intent.desired().targetState()).isEqualTo(io.tapstate.core.lifecycle.PipelineState.RUNNING);
+                });
+                // The source now holds real run state and business rows; none belongs to the transfer.
+                sourceTarget.insertOne(new Document("_id", 999).append("name", "source-only"));
                 exported = client.post().uri("/api/configuration/export").body(Map.of("resourceIds", List.of("portable_flow", "secret_only"),
                         "usernames", List.of(from.username()), "transferKey", key)).retrieve().body(Map.class);
                 assertThat(exported.get("defaultSourceId")).isEqualTo("views");
@@ -132,7 +153,25 @@ class ManagedMongoStoreIsolationIT {
                 assertThat(originalCipher).contains(fromKey).doesNotContain(PASSWORD);
                 assertThat(destinationCipher).contains(toKey).doesNotContain(fromKey, PASSWORD).isNotEqualTo(originalCipher);
                 assertThat(admin.getDatabase(to.master()).getCollection("orders").countDocuments()).isZero();
-                assertThat(destinationConfig.getCollection("pipeline_desired").countDocuments()).isZero();
+                assertThat(SystemCollections.PIPELINE_INTENTS.on(destinationConfig).countDocuments()).isZero();
+                var destinationRuntime = admin.getDatabase(to.cache());
+                for (var table : List.of(SystemCollections.CACHE_PIPELINE_STATE, SystemCollections.CACHE_PIPELINE_OBSERVATION,
+                        SystemCollections.DIRECT_CHANNEL_OFFSETS, SystemCollections.DIRECT_BATCHES, SystemCollections.SRS_CONSUMERS,
+                        SystemCollections.CACHE_SRS_CONSUMER_OFFSETS)) {
+                    assertThat(table.on(destinationRuntime).countDocuments()).as("no imported run records in %s", table.collectionName()).isZero();
+                }
+                assertThat(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(destinationRuntime)
+                        .countDocuments(new Document("resourceType", "PIPELINE_ACTUATION"))).isZero();
+                try (var definitions = io.tapstate.adapters.mongostore.MongoConfigurationDomain.openExisting(
+                        new io.tapstate.adapters.mongostore.MongoConnectionSettings(uri(to.user(), to.config()), null, Duration.ofSeconds(5)))) {
+                    // Import creates a fresh CONFIG mapping, without carrying the source's prepared runtime.
+                    var preparation = definitions.preparations().read("portable_flow").orElseThrow();
+                    assertThat(preparation.phase()).isEqualTo(PipelinePreparation.Phase.UNASSIGNED);
+                    assertThat(preparation.scope()).isNull();
+                    assertThat(preparation.preparationId()).isNull();
+                    assertThat(preparation.issuerNode()).isNull();
+                }
+                assertThat(SystemCollections.CAPTURE_PREPARATIONS.on(destinationConfig).countDocuments()).isZero();
                 var importedClient = transferClient(application, from.username(), from.password());
                 var tested = importedClient.post().uri("/api/connections:test").body(Map.of("id", "portable_input", "connectorId", "mongodb", "settings", sourceSettings)).retrieve().body(Map.class);
                 assertThat(tested.get("outcome")).isEqualTo("PASSED");
@@ -162,7 +201,9 @@ class ManagedMongoStoreIsolationIT {
                 assertThat(client.post().uri("/api/configuration/import/commit").body(Map.of("importId", importId, "transfer", prepared,
                         "transferKey", key, "defaultSourceMapping", Map.of("views", "views"))).retrieve().body(Map.class)).isEqualTo(receipt);
                 assertThat(restarted.getBean(StorageRoot.class).runtime().business()).isEmpty();
-                assertThat(admin.getDatabase(to.cache()).listCollectionNames().into(new ArrayList<>())).doesNotContain("node_sessions", "pipeline_checkpoints");
+                assertThat(admin.getDatabase(to.cache()).listCollectionNames().into(new ArrayList<>())).doesNotContain(
+                        SystemCollections.CACHE_WORKLOAD_CLAIMS.collectionName(), SystemCollections.CACHE_PIPELINE_STATE.collectionName(),
+                        SystemCollections.CACHE_PIPELINE_OBSERVATION.collectionName());
             }
         }
     }
