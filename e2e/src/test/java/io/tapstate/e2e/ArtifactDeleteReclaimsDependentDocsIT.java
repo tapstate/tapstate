@@ -34,6 +34,17 @@ class ArtifactDeleteReclaimsDependentDocsIT {
     @EnumSource(Tiers.class)
     void removingAPipelineRetiresItsIntentAndCheckpointAndRemovesItsObservation(Tiers tier, @TempDir Path directory)
             throws Exception {
+        verifyDeletion(tier, directory, false);
+    }
+
+    @ParameterizedTest
+    @EnumSource(Tiers.class)
+    void aCompletedFullStopCanDeleteItsConfirmedSuccessorGeneration(Tiers tier, @TempDir Path directory)
+            throws Exception {
+        verifyDeletion(tier, directory, true);
+    }
+
+    private static void verifyDeletion(Tiers tier, Path directory, boolean purge) throws Exception {
         try (PreparedNativeStore storage = PreparedNativeStore.create();
                 ServerHandle server = tier.launch(storage);
                 MongoConfigurationDomain configuration = MongoConfigurationDomain.openExisting(
@@ -55,12 +66,30 @@ class ArtifactDeleteReclaimsDependentDocsIT {
                                 + " state=" + states.find(id).first() + " observation=" + observations.find(id).first());
                 assertThat(configuration.intents().pipelineIds()).contains(pipelineId);
 
-                // Deletion must retire this run's original scope, rather than an intervening full rebuild.
-                running.stopAndSettle(false);
+                var initialScope = states.find(id).first().get("scope", Document.class);
+                running.stopAndSettle(purge);
                 var before = configuration.intents().load(pipelineId).orElseThrow();
                 var checkpoint = states.find(id).first();
                 assertThat(before.deleted()).isFalse();
                 assertThat(checkpoint).isNotNull();
+                var published = configuration.pipelineStates().read(pipelineId).orElseThrow();
+                assertThat(published.phase()).isEqualTo(PipelineStateMapping.Phase.ACTIVE);
+                assertThat(published.stateGeneration()).isEqualTo(initialScope.getLong("stateGeneration") + (purge ? 1 : 0));
+                assertThat(before.desired().targetState()).isEqualTo(PipelineState.STOPPED);
+                assertThat(before.desired().purgeState()).isFalse();
+                var prepared = configuration.preparations().read(pipelineId).orElseThrow();
+                assertThat(prepared.phase()).isEqualTo(io.tapstate.spi.store.PipelinePreparation.Phase.COMPLETE);
+                assertThat(prepared.scope()).isEqualTo(before.scope());
+                assertThat(checkpoint.get("scope", Document.class).getLong("stateGeneration")).isEqualTo(published.stateGeneration());
+                if (purge) {
+                    var row = SystemCollections.OPERATOR_GENERATIONS.on(raw.getDatabase(storage.configurationDatabase())).find(id).first();
+                    var completed = row.get("stateRebuild", Document.class);
+                    assertThat(completed.get("originalScope")).isEqualTo(initialScope);
+                    assertThat(completed.get("targetScope")).isEqualTo(checkpoint.get("scope"));
+                    assertThat(completed.get("result", Document.class)).containsEntry("phase", "COMPLETE")
+                            .containsEntry("checkpointEpoch", checkpoint.getLong("epoch"));
+                }
+                assertThat(configuration.pipelineStates().read(pipelineId)).contains(published);
                 try {
                     control.deleteArtifact(pipelineId, control.contentHash(pipelineId));
                 } catch (RuntimeException | Error failure) {
