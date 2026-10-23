@@ -934,7 +934,14 @@ class ManagedMongoStoreIsolationIT {
             io.tapstate.control.restapi.LoginResponse old;
             try (var first = nativeRoot(uri(user, configDb))) { old = ordinaryLogin(first, true); }
             admin.getDatabase(cacheDb).drop();
+            verifyNewAuthenticationProcess(uri(user, configDb), original.clusterId(), false);
             try (var restarted = nativeRoot(uri(user, configDb))) {
+                assertThatThrownBy(() -> rootClient(restarted).post().uri("/auth/login")
+                        .body(Map.of("username", "admin", "password", "incorrect-recovery-password", "createSession", true))
+                        .retrieve().body(String.class))
+                        .isInstanceOfSatisfying(org.springframework.web.client.RestClientResponseException.class,
+                                failure -> assertThat(failure.getStatusCode().value()).isEqualTo(401));
+                assertThat(admin.getDatabase(cacheDb).getCollection("op_sessions").countDocuments()).isZero();
                 var fresh = ordinaryLogin(restarted, true);
                 var root = restarted.getBean(StorageRoot.class);
                 assertThat(root.phase()).isEqualTo(StorageRoot.Phase.AUTH_READY);
@@ -1096,6 +1103,7 @@ class ManagedMongoStoreIsolationIT {
             String old;
             try (var first = cloudRecoveryRoot(uri(user, configDb), sdk)) { old = exchangeCookie(first, "old"); }
             admin.getDatabase(cacheDb).drop();
+            verifyNewAuthenticationProcess(uri(user, configDb), original.clusterId(), true);
             try (var restarted = cloudRecoveryRoot(uri(user, configDb), sdk)) {
                 var root = restarted.getBean(StorageRoot.class);
                 assertThat(root.phase()).isEqualTo(StorageRoot.Phase.AUTH_READY);
@@ -1809,6 +1817,36 @@ class ManagedMongoStoreIsolationIT {
         }
     }
 
+    ConfigurableApplicationContext restartedAuthenticationRoot(String configurationUri,String cluster,boolean cloud) {
+        return cloud ? cloudRecoveryRoot(configurationUri,new RecoverySdk(cluster)) : nativeRoot(configurationUri);
+    }
+    private void verifyNewAuthenticationProcess(String configurationUri,String cluster,boolean cloud) {
+        Path request=work.resolve("auth-recovery-"+cloud+".json"),output=work.resolve("auth-recovery-"+cloud+".log");
+        Process process=null;
+        try {
+            Files.createFile(request,java.nio.file.attribute.PosixFilePermissions.asFileAttribute(java.nio.file.attribute.PosixFilePermissions.fromString("rw-------")));
+            Files.writeString(request,io.tapstate.core.common.JsonWriter.write(Map.of("configurationUri",configurationUri,"cluster",cluster,
+                    "cloud",cloud,"work",Files.createDirectory(work.resolve("auth-recovery-child-"+cloud)).toString())));
+            process=new ProcessBuilder(Path.of(System.getProperty("java.home"),"bin","java").toString(),"-Xmx512m","-XX:ActiveProcessorCount=2",
+                    "--add-opens=java.base/java.lang=ALL-UNNAMED","-cp",System.getProperty("surefire.test.class.path",System.getProperty("java.class.path")),
+                    AuthenticationRecoveryRestartProcess.class.getName(),request.toString()).redirectErrorStream(true).redirectOutput(output.toFile()).start();
+            assertThat(process.pid()).isNotEqualTo(ProcessHandle.current().pid());
+            assertThat(process.waitFor(60,TimeUnit.SECONDS)).as("the new auth-only process must finish within its startup bound").isTrue();
+            assertThat(process.exitValue()).as("new-process authentication recovery: %s",Files.readString(output)).isZero();
+            assertThat(Files.readString(output)).contains("AUTH_RECOVERY_PROCESS_VERIFIED "+process.pid()+" "+cloud);
+        } catch (java.io.IOException failure) { throw new java.io.UncheckedIOException(failure); }
+        catch (InterruptedException failure) { Thread.currentThread().interrupt(); throw new AssertionError(failure); }
+        finally {
+            if(process!=null && process.isAlive()) {
+                process.destroyForcibly();
+                try { assertThat(process.waitFor(5,TimeUnit.SECONDS)).as("the exact owned recovery process must stop").isTrue(); }
+                catch (InterruptedException failure) { Thread.currentThread().interrupt(); throw new AssertionError(failure); }
+            }
+            if(process==null || !process.isAlive()) {
+                try { Files.deleteIfExists(request); } catch (java.io.IOException failure) { throw new java.io.UncheckedIOException(failure); }
+            }
+        }
+    }
     private ConfigurableApplicationContext nativeRoot(String configurationUri) {return nativeRoot(configurationUri,work.resolve("no-seeds"));}
     private ConfigurableApplicationContext nativeRoot(String configurationUri, Path seeds, String... overrides) {
         return new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated()).run(
