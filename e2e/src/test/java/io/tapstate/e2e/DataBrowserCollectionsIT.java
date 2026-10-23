@@ -92,10 +92,11 @@ class DataBrowserCollectionsIT {
     void listsBothTheCollectionTheProductWroteAndTheOneItNeverHeardOf() {
         writeWorkspace();
 
-        try (ServerHandle server = InProcessServer.start(SharedMongo.replicaSetUrl("e2e_browser_collections"));
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage);
                 Endpoints files = new FileEndpoints()) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
 
             HttpTierBinding binding = new HttpTierBinding(
                     control, workspace, Map.of(E2eConnectorJar.CONNECTOR_ID, files), env());
