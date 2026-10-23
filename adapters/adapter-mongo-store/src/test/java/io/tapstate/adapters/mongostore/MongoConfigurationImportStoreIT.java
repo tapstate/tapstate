@@ -16,10 +16,15 @@ import io.tapstate.spi.store.ConfigurationImportStore.*;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
 import java.time.Duration;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
@@ -38,6 +43,7 @@ import static org.assertj.core.api.Assertions.*;
 /** Real CONFIG publication witnesses, without transport, connector or runtime-start acceptance. */
 @RequiresDocker
 class MongoConfigurationImportStoreIT {
+    @TempDir Path work;
     @Container private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
             .withCommand("--replSet","docker-rs","--setParameter","enableTestCommands=1");
     private static final StorageSetupScope SETUP = new StorageSetupScope("cluster","install","setup",1);
@@ -47,10 +53,10 @@ class MongoConfigurationImportStoreIT {
     private static SourceResource target(String id) { return new SourceResource(id,null,"mongodb",Map.of("uri","mongodb://master.invalid/master"),null,null,null,null); }
     private static PipelineResource pipeline(String source,String target) {
         return new PipelineResource("imported-pipeline",null,List.of(SourceRef.spec(source,true)),null,null,
-                new ServeBlock.Inline(null,FromRef.literal("orders"),List.of(new SyncElement("sync",target,null,null,null)),null,null),null,null);
+                new ServeBlock.Inline("serve",FromRef.literal("orders"),List.of(new SyncElement("sync",target,null,null,null)),null,null),null,null);
     }
     private static Payload small() { return new Payload(List.of(SOURCE),List.of(),List.of(),Map.of(),Map.of()); }
-    private static Payload complete() {
+    static Payload complete() {
         return new Payload(List.of(SOURCE,target("imported-target"),pipeline(SOURCE.id(),"imported-target")),
                 List.of(new User("imported-user","import-private-user-hash","admin")),
                 List.of(new PipelineLayout("imported-pipeline",Map.of("orders",new PipelineLayout.NodePosition(1,2)),null)),Map.of(),Map.of());
@@ -87,6 +93,114 @@ class MongoConfigurationImportStoreIT {
             assertRefused(() -> imports.commit(ticket,new Payload(List.of(changed),List.of(),List.of(),Map.of(),Map.of())),"input-mismatch");
         });
     }
+    @Test void aKilledFinalTransactionRollsBackAndFreshProcessesReuseItsOriginalOperation() {
+        withConfiguration(StorageBinding.Mode.OP,(domain,db) -> {
+            var payload = complete(); var imports = domain.imports();
+            var ticket = imports.preflight(scope(domain,StorageBinding.Mode.OP),payload).ticket();
+            long before = revision(db); String boot = "interrupted-import-"+UUID.randomUUID();
+            Path interruptedOutput = work.resolve("interrupted.log");
+            try (var adminClient = MongoClients.create(MONGO.getReplicaSetUrl())) {
+                var admin = adminClient.getDatabase("admin");
+                Process interrupted = importProcess(db,ticket.id(),boot,true,interruptedOutput);
+                try {
+                    awaitOutput(interrupted,interruptedOutput,"IMPORT_FINAL_TRANSACTION_READY");
+                    long entered = ((Number)admin.runCommand(new Document("configureFailPoint","failCommand")
+                            .append("mode",new Document("times",1)).append("data",new Document("failCommands",List.of("commitTransaction"))
+                                    .append("appName",MongoConnection.processTag(boot)).append("blockConnection",true).append("blockTimeMS",30000))).get("count")).longValue();
+                    interrupted.getOutputStream().write('\n'); interrupted.getOutputStream().close();
+                    admin.runCommand(new Document("waitForFailPoint","failCommand").append("timesEntered",entered+1).append("maxTimeMS",10000));
+                    var held = admin.runCommand(new Document("currentOp",1).append("$all",true)).getList("inprog",Document.class).stream()
+                            .filter(op -> MongoConnection.processTag(boot).equals(op.getString("appName")))
+                            .filter(op -> op.get("command") instanceof Document command && command.containsKey("commitTransaction"))
+                            .findFirst().orElseThrow();
+                    assertThat(held).containsKey("lsid");
+                    assertThat(held.get("command",Document.class)).containsEntry("autocommit",false);
+                    // The pre-execution failpoint has not checked the transaction's session out yet.
+                    var transactions = admin.aggregate(List.of(new Document("$currentOp",new Document("allUsers",false).append("idleSessions",true)),
+                            new Document("$match",new Document("appName",MongoConnection.processTag(boot))
+                                    .append("transaction",new Document("$exists",true))))).into(new ArrayList<>());
+                    assertThat(transactions).singleElement().satisfies(transaction -> {
+                        assertThat(transaction.get("lsid",Document.class).get("id")).isEqualTo(held.get("lsid",Document.class).get("id"));
+                        assertThat(transaction.get("transaction",Document.class).get("parameters",Document.class))
+                                .containsEntry("txnNumber",held.get("command",Document.class).get("txnNumber"));
+                    });
+                    assertUnpublished(domain,db,ticket,before);
+                    assertThat(interrupted.isAlive()).isTrue();
+                    interrupted.destroyForcibly(); assertThat(interrupted.waitFor(5,TimeUnit.SECONDS)).isTrue();
+                    assertThat(domain.endTransactionsLeftOpenBy(boot)).isOne();
+                    awaitNoTransaction(admin,held.get("lsid",Document.class));
+                    assertUnpublished(domain,db,ticket,before);
+                } finally {
+                    try { stopProcess(interrupted); }
+                    finally {
+                        try { domain.endTransactionsLeftOpenBy(boot); }
+                        finally { admin.runCommand(new Document("configureFailPoint","failCommand").append("mode","off")); }
+                    }
+                }
+            }
+            Path committedOutput = work.resolve("committed.log");
+            Process resumed = importProcess(db,ticket.id(),"resumed-import-"+UUID.randomUUID(),false,committedOutput);
+            try { awaitExit(resumed,committedOutput); } finally { stopProcess(resumed); }
+            var status = imports.find(ticket.scope(),ticket.id()).orElseThrow(); var receipt = status.receipt();
+            assertThat(status.phase()).isEqualTo(Phase.COMMITTED); assertThat(status.attempts()).isEqualTo(2);
+            assertThat(receipt.configurationRevision()).isEqualTo(before+1); assertThat(revision(db)).isEqualTo(before+1);
+            String result = "IMPORT_COMMITTED "+io.tapstate.core.common.JsonWriter.write(ConfigurationImportPayload.receiptTree(receipt));
+            assertThat(Files.readString(committedOutput)).contains(result);
+            for (var resource : payload.resources())
+                assertThat(domain.artifacts().get(resource.id()).map(CanonicalHash::of)).contains(CanonicalHash.of(resource));
+            assertThat(domain.users().find("imported-user")).contains(payload.users().getFirst());
+            assertThat(domain.layouts().get("imported-pipeline")).contains(payload.layouts().getFirst());
+            assertThat(SystemCollections.CONFIGURATION_IMPORTS.on(db).countDocuments()).isOne();
+            var operation = SystemCollections.CONFIGURATION_IMPORTS.on(db).find(new Document("_id",ticket.id())).first();
+            var changed = new SourceResource(SOURCE.id(),null,"mysql",Map.of("host","edited-after-recovery.invalid"),SourceMode.CDC,SOURCE.tables(),null,null);
+            domain.artifacts().save(changed); long editedRevision = revision(db);
+            Path replayedOutput = work.resolve("replayed.log");
+            Process replayed = importProcess(db,ticket.id(),"replayed-import-"+UUID.randomUUID(),false,replayedOutput);
+            try { awaitExit(replayed,replayedOutput); } finally { stopProcess(replayed); }
+            assertThat(Files.readString(replayedOutput)).contains(result);
+            assertThat(domain.artifacts().get(SOURCE.id())).contains(changed); assertThat(revision(db)).isEqualTo(editedRevision);
+            assertThat(SystemCollections.CONFIGURATION_IMPORTS.on(db).find(new Document("_id",ticket.id())).first()).isEqualTo(operation);
+        });
+    }
+    private static void assertUnpublished(MongoConfigurationDomain domain,MongoDatabase db,Ticket ticket,long expectedRevision) {
+        for (var resource : complete().resources()) assertThat(domain.artifacts().get(resource.id())).isEmpty();
+        assertThat(domain.users().find("imported-user")).isEmpty(); assertThat(domain.layouts().get("imported-pipeline")).isEmpty();
+        assertThat(revision(db)).isEqualTo(expectedRevision);
+        var row = SystemCollections.CONFIGURATION_IMPORTS.on(db).find(new Document("_id",ticket.id())).first();
+        assertThat(row).containsEntry("phase","COMMITTING").containsEntry("attempts",1).doesNotContainKeys("receipt","receiptHash");
+    }
+    private static Process importProcess(MongoDatabase db,String id,String boot,boolean pause,Path output) throws java.io.IOException {
+        return new ProcessBuilder(Path.of(System.getProperty("java.home"),"bin","java").toString(),"-Xmx128m","-cp",
+                System.getProperty("surefire.test.class.path",System.getProperty("java.class.path")),ConfigurationImportTransactionProcess.class.getName(),
+                MONGO.getReplicaSetUrl(db.getName()),id,boot,Boolean.toString(pause)).redirectErrorStream(true).redirectOutput(output.toFile()).start();
+    }
+    private static void awaitOutput(Process process,Path output,String marker) throws Exception {
+        long deadline = System.nanoTime()+Duration.ofSeconds(20).toNanos();
+        while (System.nanoTime() < deadline && process.isAlive()) {
+            if (Files.readString(output).contains(marker)) return;
+            TimeUnit.MILLISECONDS.sleep(100);
+        }
+        assertThat(Files.readString(output)).contains(marker); assertThat(process.isAlive()).isTrue();
+    }
+    private static void awaitExit(Process process,Path output) throws Exception {
+        assertThat(process.waitFor(20,TimeUnit.SECONDS)).as("worker output: %s",Files.readString(output)).isTrue();
+        assertThat(process.exitValue()).as("worker output: %s",Files.readString(output)).isZero();
+        assertThat(Files.readString(output)).contains("IMPORT_COMMITTED ");
+    }
+    private static void stopProcess(Process process) throws InterruptedException {
+        if (process.isAlive()) { process.destroyForcibly(); assertThat(process.waitFor(5,TimeUnit.SECONDS)).isTrue(); }
+    }
+    private static void awaitNoTransaction(MongoDatabase admin,Document session) throws InterruptedException {
+        long deadline = System.nanoTime()+Duration.ofSeconds(10).toNanos();
+        List<Document> remaining;
+        do {
+            remaining = admin.aggregate(List.of(new Document("$currentOp",new Document("allUsers",false).append("idleSessions",true)),
+                    new Document("$match",new Document("lsid",session).append("transaction",new Document("$exists",true))))).into(new ArrayList<>());
+            if (remaining.isEmpty()) return;
+            TimeUnit.MILLISECONDS.sleep(100);
+        } while (System.nanoTime() < deadline);
+        assertThat(remaining).isEmpty();
+    }
     @Test void aDestinationChangeAfterPreflightRefusesTheEntireImportWithoutAUserOrPartialDefinition() {
         withConfiguration(StorageBinding.Mode.OP,(domain,db) -> {
             var imports = domain.imports(); var ticket = imports.preflight(scope(domain,StorageBinding.Mode.OP),complete()).ticket();
@@ -95,6 +209,80 @@ class MongoConfigurationImportStoreIT {
             assertThat(domain.artifacts().get(SOURCE.id())).isEmpty(); assertThat(domain.users().find("imported-user")).isEmpty();
             assertThat(domain.layouts().get("imported-pipeline")).isEmpty(); assertThat(revision(db)).isEqualTo(revision);
             assertThat(imports.find(ticket.scope(),ticket.id()).orElseThrow().phase()).isEqualTo(Phase.ABORTED);
+        });
+    }
+    @ParameterizedTest
+    @ValueSource(strings = {"username","read-only-source"})
+    void anOrdinaryConfigurationWriterWinsTheRealVersionWriteAgainstAnInFlightImport(String mutation) {
+        withConfiguration(StorageBinding.Mode.OP,(domain,db) -> {
+            var target = target("existing-read-only-target"); domain.artifacts().save(target);
+            var payload = new Payload(List.of(SOURCE,pipeline(SOURCE.id(),target.id())),complete().users(),complete().layouts(),
+                    Map.of(target.id(),CanonicalHash.of(target)),Map.of());
+            var ticket = domain.imports().preflight(scope(domain,StorageBinding.Mode.OP),payload).ticket(); long before = revision(db);
+            String appName = "competing-import-"+UUID.randomUUID();
+            var sent = new java.util.concurrent.atomic.AtomicReference<org.bson.BsonDocument>();
+            var witness = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (event.getDatabaseName().equals(db.getName()) && event.getCommandName().equals("update")
+                            && SystemCollections.CONFIGURATION_VERSION.collectionName().equals(event.getCommand().getString("update").getValue()))
+                        sent.compareAndSet(null,event.getCommand().clone());
+                }
+            };
+            try (var adminClient = MongoClients.create(MONGO.getReplicaSetUrl());
+                 var observed = MongoClients.create(MongoClientSettings.builder().applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl(db.getName())))
+                         .applicationName(appName).addCommandListener(witness).build());
+                 var executor = Executors.newSingleThreadExecutor()) {
+                var admin = adminClient.getDatabase("admin"); var armed = new AtomicBoolean(); var ready = new CountDownLatch(1);
+                var count = new java.util.concurrent.atomic.AtomicLong();
+                var material = SystemCollections.CLUSTER_KEYS.on(db).find().first().getString("material");
+                var cipher = SourceConfigCipherProvider.fixed(new SourceConfigCipher(java.util.Base64.getUrlDecoder().decode(material)));
+                var observedDb = observed.getDatabase(db.getName());
+                var bindings = new MongoStorageBindingStore(observed,observedDb,cipher);
+                var artifacts = new MongoConfigurationArtifactStore(observed,observedDb,cipher);
+                var imports = new MongoConfigurationImportStore(observed,observedDb,"cluster",bindings,artifacts,() -> {
+                    if (armed.get()) return;
+                    var row = SystemCollections.CONFIGURATION_IMPORTS.on(db).find(new Document("_id",ticket.id())).first();
+                    if (row != null && "COMMITTING".equals(row.getString("phase")) && armed.compareAndSet(false,true)) {
+                        count.set(((Number)admin.runCommand(new Document("configureFailPoint","failCommand").append("mode",new Document("times",1))
+                                .append("data",new Document("failCommands",List.of("update")).append("namespace",db.getName()+".configuration_version")
+                                        .append("appName",appName).append("blockConnection",true).append("blockTimeMS",8000))).get("count")).longValue());
+                        ready.countDown();
+                    }
+                });
+                try {
+                    var commit = executor.submit(() -> {
+                        try { imports.commit(ticket,payload); return null; }
+                        catch (TapstateException refused) { return refused; }
+                    });
+                    assertThat(ready.await(10,TimeUnit.SECONDS)).isTrue();
+                    admin.runCommand(new Document("waitForFailPoint","failCommand").append("timesEntered",count.get()+1).append("maxTimeMS",5000));
+                    var held = admin.runCommand(new Document("currentOp",1).append("$all",true)).getList("inprog",Document.class).stream()
+                            .filter(op -> appName.equals(op.getString("appName")))
+                            .filter(op -> op.get("command") instanceof Document command && "configuration_version".equals(command.getString("update")))
+                            .findFirst().orElseThrow();
+                    assertThat(sent.get()).isNotNull();
+                    var command = held.get("command",Document.class).toBsonDocument(Document.class,MongoClientSettings.getDefaultCodecRegistry());
+                    assertThat(command).containsEntry("txnNumber",sent.get().get("txnNumber")).containsEntry("lsid",sent.get().get("lsid"));
+                    assertThat(sent.get().getArray("updates").getFirst().asDocument().getDocument("q"))
+                            .isEqualTo(new Document("_id",ConfigurationVersion.ID).append("revision",before)
+                                    .toBsonDocument(Document.class,MongoClientSettings.getDefaultCodecRegistry()));
+                    assertThat(commit.isDone()).isFalse();
+                    var ordinaryUser = new User("imported-user","ordinary-writer-hash","admin");
+                    var ordinarySource = new SourceResource(target.id(),null,"mongodb",Map.of("uri","mongodb://changed.invalid/master"),null,null,null,null);
+                    if (mutation.equals("username")) domain.users().save(ordinaryUser); else domain.artifacts().save(ordinarySource);
+                    assertThat(revision(db)).isEqualTo(before+1); assertThat(commit.isDone()).isFalse();
+                    var refused = commit.get(20,TimeUnit.SECONDS);
+                    assertThat(refused).isNotNull(); assertThat(refused.code()).isEqualTo(IoError.CONFIGURATION_IMPORT_REFUSED);
+                    assertThat(refused.args()).containsEntry("reason","destination-changed");
+                    assertThat(domain.artifacts().get(SOURCE.id())).isEmpty(); assertThat(domain.artifacts().get("imported-pipeline")).isEmpty();
+                    assertThat(domain.layouts().get("imported-pipeline")).isEmpty(); assertThat(revision(db)).isEqualTo(before+1);
+                    assertThat(domain.users().find("imported-user")).isEqualTo(mutation.equals("username") ? Optional.of(ordinaryUser) : Optional.empty());
+                    assertThat(domain.artifacts().get(target.id())).contains(mutation.equals("read-only-source") ? ordinarySource : target);
+                    var status = domain.imports().find(ticket.scope(),ticket.id()).orElseThrow();
+                    assertThat(status.phase()).isEqualTo(Phase.ABORTED); assertThat(status.receipt()).isNull();
+                    assertThat(SystemCollections.CONFIGURATION_IMPORTS.on(db).countDocuments()).isOne();
+                } finally { admin.runCommand(new Document("configureFailPoint","failCommand").append("mode","off")); }
+            }
         });
     }
     @Test void cloudRejectsAnyUserBeforeRegisteringOrWritingThePackage() {
