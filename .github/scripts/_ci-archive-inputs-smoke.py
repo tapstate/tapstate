@@ -620,6 +620,59 @@ def run(callback=None, source_case='package io.tapstate.fixture; class SampleTes
         print('CI archive input controls passed: ' + str(count))
 
 
+CLOUD_SOURCE_CASE = ('package io.tapstate.fixture; '
+                     '@RequiresCloudReleaseInputs class SampleTest { @Test void holds() {} }\n')
+
+
+def cloud_source_setup(root):
+    (root / 'fixture/src/test/java/io/tapstate/fixture/RequiresCloudReleaseInputs.java').write_text(
+        'package io.tapstate.fixture; '
+        '@java.lang.annotation.Retention(java.lang.annotation.RetentionPolicy.SOURCE) '
+        '@interface RequiresCloudReleaseInputs {}\n')
+
+
+def mark_cloud_plan(context):
+    plan = context['artifacts']['ci-shard-plan']['shards.json']
+    for test in plan['expected']:
+        test['requires_cloud_release_inputs'] = True
+    for worker in plan['shards']:
+        worker['tests'] = [dict(test, requires_cloud_release_inputs=True) for test in worker['tests']]
+        manifest = context['artifacts']['ci-test-results-' + worker['id']][worker['id'] + '/manifest.json']
+        manifest['tests'] = copy.deepcopy(worker['tests'])
+        if worker['id'] == 'rest':
+            context['manifest'] = manifest
+    context['reseal']()
+    return plan
+
+
+def cloud_marker_controls(context):
+    artifacts, project = context['artifacts'], context['project']
+    mark_cloud_plan(context)
+    check(project()['plan']['expected'][0]['requires_cloud_release_inputs'] is True,
+          'the original archive accepts the source-only Cloud input marker')
+    original = copy.deepcopy(artifacts)
+
+    def reset():
+        artifacts.clear()
+        artifacts.update(copy.deepcopy(original))
+        context['reseal']()
+        return artifacts['ci-shard-plan']['shards.json']
+
+    for value in (False, 1, 'true', None):
+        plan = reset()
+        plan['expected'][0]['requires_cloud_release_inputs'] = value
+        context['reseal']()
+        rejected(project, 'invalid Cloud input marker')
+    plan = reset()
+    plan['expected'][0]['unrelated_field'] = True
+    context['reseal']()
+    rejected(project, 'invalid planned test')
+    plan = reset()
+    plan['shards'][0]['tests'][0].pop('requires_cloud_release_inputs')
+    context['reseal']()
+    rejected(project, 'planned test metadata differs')
+
+
 def packaged_archive_controls(context):
     artifacts, project = context['artifacts'], context['project']
     answer = project()
@@ -656,6 +709,9 @@ def packaged_archive_controls(context):
 
 if __name__ == '__main__':
     run()
+    run(cloud_marker_controls, source_case=CLOUD_SOURCE_CASE, source_setup=cloud_source_setup,
+        only_callback=True)
+    print('CI Cloud marker archive controls passed:', count)
     run(packaged_archive_controls, test_jar=True, only_callback=True)
     print('CI packaged test archive controls passed:', count)
     run(lambda context: check(context['project']()['type'] == 'archived-input-readback',

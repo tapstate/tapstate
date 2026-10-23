@@ -114,6 +114,10 @@ public final class SourceConfigCipher {
         }
     }
 
+    ProviderSecretCipher providerSecrets() {
+        return new ProviderSecretCipher(activeKeyId, keys);
+    }
+
     String activeKeyId() {
         return activeKeyId;
     }

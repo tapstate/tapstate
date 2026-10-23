@@ -22,6 +22,11 @@ public enum ControlError implements TapstateErrorCode {
      * client-attributable input error, deliberately distinct from a service-layer invariant violation (a
      * programmer bug), which stays a bare crash rather than being laundered into a coded error.
      */
+    AI_NOT_CONFIGURED("control.ai-not-configured", Set.of()),
+    AI_PROVIDER_AUTH_FAILED("control.ai-provider-auth-failed", Set.of()),
+    AI_PROVIDER_FAILED("control.ai-provider-failed", Set.of()),
+    AI_INVALID_PROPOSAL("control.ai-invalid-proposal", Set.of()),
+    AI_OVERLOADED("control.ai-overloaded", Set.of()),
     MALFORMED_REQUEST("control.malformed-request", Set.of("reason")),
 
     /** A valid preview request could not enter the bounded candidate-compilation pool. */

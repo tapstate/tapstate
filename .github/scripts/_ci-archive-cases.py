@@ -179,8 +179,11 @@ def project(refs, root, request, include_test_observations=False):
         # Discover classes from the verified default reactor independently of
         # both the plan's union and the producer's expected-case hash document.
         require(plan['selection'] == 'default-reactor', 'case reader requires default reactor selection')
-        require(Counter(s.key(t) for t in s.discover(tree)) == Counter(s.key(t) for t in plan['expected']),
+        discovered = s.discover(tree)
+        require(Counter(s.key(t) for t in discovered) == Counter(s.key(t) for t in plan['expected']),
                 'source-discovered class cohort differs from archived plan')
+        require(s.cloud_input_metadata(discovered) == s.cloud_input_metadata(plan['expected']),
+                'source Cloud input metadata differs from archived plan')
         inv_path = data_root / 'source-inventory.json'
         inv, environment = source_inventory(tree, checkout, g.checksum(source_raw), 'ci', inv_path)
         statically_complete = inv['complete']

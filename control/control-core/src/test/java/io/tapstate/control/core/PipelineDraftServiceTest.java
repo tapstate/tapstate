@@ -181,6 +181,29 @@ class PipelineDraftServiceTest {
     }
 
     @Test
+    void previewCandidateValidatesCanonicalDslExpressionsAndPreservesTheCodedCause() {
+        PipelineDraft current = draft(4, "alice", null, null, null, NOW, NOW);
+        store.seed(current);
+        PipelineDraft candidate = new PipelineDraft("orders", 1, 99, PipelineDraft.Mode.WIZARD,
+                "Orders", "", null,
+                new PipelineDraft.Wizard(current.wizard().root(), List.of(),
+                        List.of(new PipelineDraft.Transform("assistant-filter", "filter",
+                                Map.of("expr", "afterr.region == 'US'"))), current.wizard().output()),
+                null, null, null, NOW, NOW, "alice");
+
+        assertThatThrownBy(() -> service.previewCandidate("orders", candidate))
+                .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(PipelineDraftError.INVALID);
+                    assertThat(failure.getCause()).isInstanceOfSatisfying(io.tapstate.core.dsl.DslException.class,
+                            diagnostic -> {
+                                assertThat(diagnostic.code().code()).isEqualTo("dsl.illegal-expression");
+                                assertThat(diagnostic.path()).isEqualTo("transforms[0].expr");
+                            });
+                });
+        assertThat(store.get("orders")).contains(current);
+    }
+
+    @Test
     void previewWrapsCompilerFailuresAsInvalidDrafts() {
         PipelineDraft incomplete = new PipelineDraft("orders", 1, 2, PipelineDraft.Mode.WIZARD,
                 "Orders", "", null,
@@ -192,6 +215,24 @@ class PipelineDraftServiceTest {
         assertThatThrownBy(() -> service.preview("orders", 2))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
                 .hasMessageContaining("wizard output is required for publication");
+    }
+
+    @Test
+    void previewReportsMissingWizardUnionInputsWithTheExistingInvalidDraftCode() {
+        PipelineDraft incompleteUnion = new PipelineDraft("orders", 1, 2, PipelineDraft.Mode.WIZARD,
+                "Orders", "", null,
+                new PipelineDraft.Wizard(new PipelineDraft.Root("root", "crm", "orders", List.of(), List.of()),
+                        List.of(), List.of(new PipelineDraft.Transform("merge", "union", Map.of())),
+                        new PipelineDraft.Output("atlas", Map.of("sourceId", "atlas", "table", "orders"))),
+                null, null, null, NOW, NOW, "alice");
+        store.seed(incompleteUnion);
+
+        assertThatThrownBy(() -> service.preview("orders", 2))
+                .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class, error -> {
+                    assertThat(error.code()).isEqualTo(PipelineDraftError.INVALID);
+                    assertThat(error.args()).containsEntry("reason",
+                            "wizard union requires at least one additional input");
+                });
     }
 
     @Test

@@ -216,4 +216,37 @@ with tempfile.TemporaryDirectory(prefix='ci-layout-controls-') as temporary:
     check(result.returncode == 0 and output.read_text() == 'prior=unchanged\nmatrix=' + expected + '\n',
           'successful workflow publication preserves existing outputs and the exact matrix JSON')
 
+    cloud = put('e2e/src/test/java/sample/CloudFixtureIT.java', 'package sample; class CloudFixtureIT {}')
+    independent[('e2e', 'it', 'sample.CloudFixtureIT')] += 1
+    unmarked = plan({'schema': 1, 'e2e_shards': 2, 'rest_modules': {}, 'new_test_seconds': 30})
+    cloud.write_text('package sample; @RequiresCloudReleaseInputs class CloudFixtureIT {}')
+    check(s.cohort(s.discover(root)) == unmarked['cohort_hash'],
+          'adding the input marker changes metadata without changing the source class cohort')
+    stale_marker = matrix(unmarked)
+    check(stale_marker.returncode != 0 and 'source Cloud input metadata differs' in stale_marker.stderr,
+          'matrix rejects changed source input metadata even when class identities remain equal')
+
+    # A source-marked IT can be the only residual class after module grouping.
+    selector = root / 'e2e/src/test/java/sample/SelectorTest.java'
+    selector_source = selector.read_bytes()
+    selector.unlink()
+    independent.pop(('e2e', 'unit', 'sample.SelectorTest'))
+    try:
+        cloud_only = plan({'schema': 1, 'e2e_shards': 2,
+                           'rest_modules': {'ordinary': ['app', 'core', 'arch-tests']},
+                           'new_test_seconds': 30})
+        residual = s.selected(cloud_only, 'rest')['tests']
+        check(len(residual) == 1 and residual[0]['class'] == 'sample.CloudFixtureIT'
+              and residual[0]['requires_cloud_release_inputs'] is True,
+              'the source-marked Cloud class remains selected exactly once in rest')
+        cloud_matrix = matrix()
+        check(cloud_matrix.returncode == 0, 'Cloud-only residual matrix succeeds: ' + cloud_matrix.stderr)
+        check(next(row for row in json.loads(cloud_matrix.stdout)['include'] if row['shard'] == 'rest')
+              ['prepare_cloud_inputs'], 'Cloud-only residual worker stages its source-declared locked inputs')
+    finally:
+        cloud.unlink()
+        selector.write_bytes(selector_source)
+        independent.pop(('e2e', 'it', 'sample.CloudFixtureIT'))
+        independent[('e2e', 'unit', 'sample.SelectorTest')] += 1
+
 print('CI source layout controls passed:', count)

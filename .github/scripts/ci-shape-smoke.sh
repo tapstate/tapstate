@@ -115,6 +115,13 @@ def check(workflows, contexts, inputs):
     assert 'ci-shard.sh run' in shards and 'ci-aggregate.sh pack' in shards
     assert 'install' in shards and '-DskipTests' in shards and 'RUNNER_TEMP/m2' in shards
     assert 'if-no-files-found: error' in shards, 'missing shard artifact must fail'
+    assert 'Prepare pinned public inputs for Cloud startup witnesses' in shards
+    assert 'if [ "$SHARD" = rest ]; then' in shards, 'the REST shard must prepare pinned Cloud inputs'
+    assert 'cloud_context_test = "io.tapstate.e2e.CloudClusterContextCarriesTheCurrentEgressAddressIT"' in shards
+    assert 'test["class"] == cloud_context_test for test in shard["tests"]' in shards, \
+        'any shard assigned the Cloud context test must prepare its pinned inputs'
+    assert 'prepare-test-inputs.py --output "$RUNNER_TEMP/cloud-test-release"' in shards
+    assert 'TAPSTATE_TEST_CLOUD_RELEASE_DIR=$RUNNER_TEMP/cloud-test-release' in shards
     namespace = {'m': 'http://maven.apache.org/POM/4.0.0'}
     reactor = ET.fromstring(inputs['pom.xml'])
     version = reactor.findtext('m:properties/m:cloud.sdk.version', namespaces=namespace)

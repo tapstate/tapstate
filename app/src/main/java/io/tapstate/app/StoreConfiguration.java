@@ -75,6 +75,12 @@ class StoreConfiguration {
                 history.getRetention());
     }
 
+    @Bean
+    @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
+    io.tapstate.spi.store.AiProviderSettingsStore aiProviderSettingsStore(MongoConnection connection) {
+        return connection.aiProviderSettings();
+    }
+
     /** The process-local keyring view used by Source storage and the clustered node-session lease. */
     @Bean
     @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)

@@ -155,8 +155,10 @@ def plan_read(value, checkout):
     expected, workers = value['expected'], value['shards']
     require(isinstance(expected, list) and expected and isinstance(workers, list) and workers, 'empty shard plan')
     for test in expected:
-        require(isinstance(test, dict) and set(test) in ({'module', 'kind', 'class'}, {'module', 'kind', 'class', 'example'}),
+        require(isinstance(test, dict) and {'module', 'kind', 'class'} <= set(test)
+                <= {'module', 'kind', 'class', 'example', 'requires_cloud_release_inputs'},
                 'invalid planned test')
+        shards.cloud_inputs_required(test)
         source.variants.path_name(test['module'])
         require(test['kind'] in ('unit', 'it') and isinstance(test['class'], str)
                 and re.fullmatch(r'[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*', test['class']), 'invalid planned class')
@@ -169,6 +171,11 @@ def plan_read(value, checkout):
             and len(ids) == len(set(ids)) and 'build' not in ids, 'invalid planned shard IDs')
     require(Counter(shards.key(t) for worker in workers for t in worker['tests']) == Counter(shards.key(t) for t in expected),
             'shard plan union differs')
+    worker_tests = [test for worker in workers for test in worker['tests']]
+    require(shards.cloud_input_metadata(worker_tests) == shards.cloud_input_metadata(expected),
+            'planned test metadata differs')
+    expected_by_key = {shards.key(test): test for test in expected}
+    require(all(test == expected_by_key[shards.key(test)] for test in worker_tests), 'planned test metadata differs')
     require(all(worker['required_exec'] == shards.execs(worker['tests']) for worker in workers), 'planned execs differ')
     return value
 

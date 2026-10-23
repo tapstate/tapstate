@@ -5,6 +5,7 @@ import io.tapstate.control.core.PipelineCatalogService;
 import io.tapstate.control.core.PipelineDraftService;
 import io.tapstate.control.core.PipelineObservationQueryService;
 import io.tapstate.control.core.PipelinePreviewService;
+import io.tapstate.control.core.OpenAiCompatibleClient;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.PipelineDraft;
@@ -26,7 +27,17 @@ class RestApiConfigurationTest {
         new RestApiConfiguration().apiWebMvc().configureAsyncSupport(configurer);
 
         assertThat(configurer.timeout())
-                .isEqualTo(PipelinePreviewService.DEADLINE.plusSeconds(15).toMillis());
+                .isEqualTo(Math.max(Math.max(PipelinePreviewService.DEADLINE.plusSeconds(15).toMillis(),
+                        OpenAiCompatibleClient.maximumProposalDuration().plusSeconds(15).toMillis()), 105000L));
+    }
+
+    @Test
+    void mvcAsyncResponseBudgetCoversProviderRetriesAndTheNonStreamingFallback() {
+        InspectableAsyncSupportConfigurer configurer = new InspectableAsyncSupportConfigurer();
+
+        new RestApiConfiguration().apiWebMvc().configureAsyncSupport(configurer);
+
+        assertThat(configurer.timeout()).isGreaterThanOrEqualTo(285000L);
     }
 
     @Test

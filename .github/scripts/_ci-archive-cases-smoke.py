@@ -355,7 +355,40 @@ def source_entry_controls():
     print('CI archive source-entry controls passed: 3')
 
 
+def cloud_source_controls(context):
+    fixture.mark_cloud_plan(context)
+    request, unused = prepare_cases(context)
+
+    def project():
+        return m.project(g.References(context['evidence']), context['work'], request,
+                         include_test_observations=True)
+
+    answer = project()
+    check(answer['source_case_subset_verified']
+          and answer['test_observations']['workers']['rest']['selected_tests'][0]
+          ['requires_cloud_release_inputs'] is True,
+          'a source-only input marker remains metadata on an executed source case')
+    plan = context['artifacts']['ci-shard-plan']['shards.json']
+    rows = plan['expected'] + [test for worker in plan['shards'] for test in worker['tests']]
+    rows += context['artifacts']['ci-test-results-rest']['rest/manifest.json']['tests']
+    for row in rows:
+        row.pop('requires_cloud_release_inputs', None)
+    context['reseal']()
+    request['archive_inputs'] = context['save']('input-request.json', context['request'])
+    rejected(project, 'source Cloud input metadata differs from archived plan')
+
+
+def foreign_cloud_marker_controls(context):
+    fixture.mark_cloud_plan(context)
+    request, unused = prepare_cases(context)
+    rejected(lambda: m.project(g.References(context['evidence']), context['work'], request),
+             'source Cloud input metadata differs from archived plan')
+
+
 if __name__ == '__main__':
+    fixture.run(cloud_source_controls, source_case=fixture.CLOUD_SOURCE_CASE,
+                source_setup=fixture.cloud_source_setup, only_callback=True)
+    fixture.run(foreign_cloud_marker_controls, only_callback=True)
     fixture.run(controls)
     fixture.run(controls, source_case='''package io.tapstate.fixture;
 class SampleTest {

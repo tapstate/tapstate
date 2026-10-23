@@ -44,6 +44,22 @@ def class_key(test):
     return test['module'], test['kind'], test['class']
 
 
+def cloud_inputs_required(test):
+    require('requires_cloud_release_inputs' not in test
+            or test['requires_cloud_release_inputs'] is True, 'invalid Cloud input marker')
+    return test.get('requires_cloud_release_inputs', False)
+
+
+def cloud_input_metadata(tests):
+    """Bind source-only routing metadata without inventing a runtime skip."""
+    values = {}
+    for test in tests:
+        identity, required = class_key(test), cloud_inputs_required(test)
+        require(identity not in values or values[identity] == required, 'inconsistent Cloud input metadata')
+        values[identity] = required
+    return values
+
+
 def cohort(tests):
     return hashlib.sha256(json.dumps(sorted(key(t) for t in tests)).encode()).hexdigest()
 
@@ -98,6 +114,7 @@ def discover(root):
             # Comments and literals may contain source fixtures, including declarations.
             text = re.sub(r'/\*[\s\S]*?\*/|//[^\n]*|"""[\s\S]*?"""|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'',
                           ' ', source.read_text())
+            requires_cloud_release_inputs = bool(re.search(r'@RequiresCloudReleaseInputs\b', text))
             # JUnit does not instantiate abstract bases, even when their filenames match.
             if re.search(r'\babstract\s+class\s+' + re.escape(name) + r'\b', text):
                 continue
@@ -110,7 +127,10 @@ def discover(root):
             classname = (package.group(1) + '.' if package else '') + name
             for kind, selected in [('unit', unit), ('it', integration)]:
                 if selected:
-                    tests.append(dict(module=module, kind=kind, **{'class': classname}))
+                    test = dict(module=module, kind=kind, **{'class': classname})
+                    if requires_cloud_release_inputs:
+                        test['requires_cloud_release_inputs'] = True
+                    tests.append(test)
     return sorted(tests, key=key)
 
 
@@ -217,7 +237,8 @@ def balance_classes(tests, count, hints, fallback):
 
 
 def default_groups(tests, hints, layout):
-    e2e = [t for t in tests if t['module'] == 'e2e' and t['kind'] == 'it']
+    e2e = [t for t in tests if t['module'] == 'e2e' and t['kind'] == 'it'
+           and not cloud_inputs_required(t)]
     engine = [t for t in tests if t['module'] == 'runtime/engine']
     rest = [t for t in tests if t not in e2e and t not in engine]
     fallback = layout['new_test_seconds']
@@ -262,7 +283,8 @@ def matrix(plan):
                 family = (test['module'], test['class'])
                 require(owners.setdefault(family, shard['id']) == shard['id'], 'App source class is split across shards')
     return {'include': [{'shard': shard['id'], 'prepare_cloud_inputs': any(
-        not (test['module'] == 'e2e' and test['kind'] == 'it') and test['module'] != 'runtime/engine'
+        cloud_inputs_required(test)
+        or (not (test['module'] == 'e2e' and test['kind'] == 'it') and test['module'] != 'runtime/engine')
         for test in shard['tests'])} for shard in plan['shards']]}
 
 
@@ -299,10 +321,15 @@ def load_plan(args, root):
     tests = plan['expected']
     require(plan['cohort_hash'] == cohort(tests), 'invalid cohort hash')
     require(len({key(t) for t in tests}) == len(tests), 'duplicate expected class')
+    discovered = discover(root)
+    source_metadata, planned_metadata = cloud_input_metadata(discovered), cloud_input_metadata(tests)
     if plan['selection'] == 'default-reactor':
-        require(cohort(discover(root)) == plan['cohort_hash'], 'source-selected cohort differs from plan')
+        require(cohort(discovered) == plan['cohort_hash'], 'source-selected cohort differs from plan')
+        require(source_metadata == planned_metadata, 'source Cloud input metadata differs from plan')
     else:
-        require(set(class_key(t) for t in tests) <= set(class_key(t) for t in discover(root)), 'inventory contains unselected source classes')
+        require(set(class_key(t) for t in tests) <= set(class_key(t) for t in discovered), 'inventory contains unselected source classes')
+        require(all(source_metadata.get(identity) == required for identity, required in planned_metadata.items()),
+                'source Cloud input metadata differs from plan')
         for test in tests:
             if 'example' in test:
                 example = safe_path(test['example'])
@@ -318,6 +345,8 @@ def load_plan(args, root):
         require(shard['required_exec'] == execs(shard['tests']), 'invalid required coverage manifest')
     actual = Counter(key(t) for s in plan['shards'] for t in s['tests'])
     require(actual == Counter(key(t) for t in tests), 'shard union differs from expected class set')
+    require(cloud_input_metadata([test for shard in plan['shards'] for test in shard['tests']]) == planned_metadata,
+            'worker Cloud input metadata differs from plan')
     if 'layout' in plan or 'layout_source' in plan:
         require('layout' in plan and 'layout_source' in plan, 'partial layout binding')
         layout, source = layout_config(args, root, plan['layout_source']['path'])
