@@ -128,6 +128,12 @@ final class TwoMemberCluster implements AutoCloseable {
                 Map.of(requireKnown(nodeId), stagingDirectory));
     }
 
+    /** Keeps the staged-failure scenario sequential while reusing one explicit native installation. */
+    static TwoMemberCluster startStaging(PreparedNativeStore storage, String nodeId, Path stagingDirectory) {
+        return start(storage.configurationUri(), storage.clusterId(), null, false, true,
+                Map.of(requireKnown(nodeId), stagingDirectory), storage);
+    }
+
     private static TwoMemberCluster start(String storeUri, String clusterId, Duration nodeSessionTtl,
             boolean concurrent, boolean existingAdministrator, Map<String, Path> stagingByNode) {
         return start(storeUri, clusterId, nodeSessionTtl, concurrent, existingAdministrator, stagingByNode, null);
