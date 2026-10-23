@@ -177,6 +177,8 @@ class ThreeLayerRestartContinuationIT {
         String cacheUri=CACHE.getReplicaSetUrl(cacheDb);
         cacheUri+=(cacheUri.contains("?")?"&":"?")+"socketTimeoutMS=1500&connectTimeoutMS=1500";
         String sourceUri=DATA.getReplicaSetUrl("cloud_source_"+suffix),targetUri=CACHE.getReplicaSetUrl("cloud_target_"+suffix);
+        String stoppedPipeline="native_stopped",stoppedTargetId="stopped_target";
+        String stoppedTargetUri=CACHE.getReplicaSetUrl("cloud_stopped_"+suffix);
         String targetId=StorageBinding.defaultSourceId(StorageBinding.Mode.CLOUD);
         String input=System.getProperty("tapstate.test.cloud-release-dir",System.getenv("TAPSTATE_TEST_CLOUD_RELEASE_DIR"));
         assertThat(input).as("the original locked Cloud release is required").isNotBlank();
@@ -192,12 +194,14 @@ class ThreeLayerRestartContinuationIT {
             }
             configuration.bindings().complete(setup);
         }
-        var source=EndpointAddress.uri(sourceUri);var target=EndpointAddress.uri(targetUri);
+        var source=EndpointAddress.uri(sourceUri);var target=EndpointAddress.uri(targetUri);var stoppedTarget=EndpointAddress.uri(stoppedTargetUri);
         try(var mongo=new MongoEndpoints();var cacheClient=MongoClients.create(CACHE.getReplicaSetUrl());
                 var configClient=MongoClients.create(configUri);var http=java.net.http.HttpClient.newHttpClient()) {
             mongo.seed(source,TABLE,SeedRows.generated(8));
             var configuration=configClient.getDatabase(configDb);var chains=cacheClient.getDatabase(cacheDb).getCollection("srs_chains");
+            var stoppedClaim=new Document("resourceType","PIPELINE_ACTUATION").append("resourceId",stoppedPipeline);
             Map<String,List<Document>> originalConfiguration;Map<Long,Long> beforeOutage;String acknowledged,originalCookie,claimsBefore;Document originalChain;
+            Map<Long,Long> stoppedRows;long stoppedExecution;
             boolean paused=false,configurationPaused=false;
             try {
                 var first=RealProcessServer.startCloudFixture(configUri,cluster,seeds);
@@ -205,11 +209,27 @@ class ThreeLayerRestartContinuationIT {
                     var control=cloudLogin(first);
                     var resources=resources(sourceUri,false,targetId);
                     resources.put(targetId+".tap.yml",control.artifact(targetId).orElseThrow().canonicalForm());
+                    resources.put(stoppedTargetId+".tap.yml","""
+                            version: tapstate/v1
+                            kind: source
+                            id: stopped_target
+                            connector: mongodb
+                            config: { isUri: true, uri: "%s" }
+                            """.formatted(stoppedTargetUri));
+                    resources.put(stoppedPipeline+".tap.yml",resources(sourceUri,false,stoppedTargetId).get("pipeline.tap.yml")
+                            .replace("id: native_resume","id: "+stoppedPipeline));
                     control.apply(resources);control.discoverSchema(SOURCE,"mongodb",Map.of("isUri",true,"uri",sourceUri));
                     control.lifecycle(PIPELINE,LifecycleVerb.START);awaitRows(mongo,source,target,"the Cloud snapshot before its customer instance outage");
                     String snapshotAck=Await.answered("the Cloud snapshot target confirmation",BOUND,() -> control.durablePosition(PIPELINE,TABLE));
                     mongo.update(source,TABLE,Map.of("id",1L),Map.of("seq",11L));awaitRows(mongo,source,target,"live Cloud CDC before the outage");
                     acknowledged=Await.answered("live Cloud CDC target confirmation",BOUND,() -> control.durablePosition(PIPELINE,TABLE).filter(value -> !value.equals(snapshotAck)));
+                    control.lifecycle(stoppedPipeline,LifecycleVerb.START);awaitRows(mongo,source,stoppedTarget,"the bystander's real snapshot before stopping");
+                    Await.answered("the bystander's target confirmation",BOUND,() -> control.durablePosition(stoppedPipeline,TABLE));
+                    control.stop(stoppedPipeline,false);
+                    Await.until("the bystander to stop before the customer outage",BOUND,
+                            () -> control.state(stoppedPipeline).filter(PipelineState.STOPPED::equals).isPresent(),() -> String.valueOf(control.state(stoppedPipeline)));
+                    stoppedExecution=cacheClient.getDatabase(cacheDb).getCollection("workload_claims").find(stoppedClaim).first().getLong("executionGeneration");
+                    stoppedRows=rows(mongo,stoppedTarget);
                     originalCookie=control.credential();beforeOutage=rows(mongo,target);originalConfiguration=cloudInstallationFacts(configuration);
                     assertThat(configuration.getCollection("users").countDocuments()).isZero();
                     assertThat(chains.countDocuments()).isOne();originalChain=chains.find().first();assertThat(originalChain.get("checkpoint",Document.class)).isNotEmpty();
@@ -221,6 +241,7 @@ class ThreeLayerRestartContinuationIT {
                     assertThat(first.isAlive()).isTrue();assertThat(cloudInstallationFacts(configuration)).isEqualTo(originalConfiguration);
                 }
                 assertThat(first.isAlive()).isFalse();
+                var replacementBoundary=java.time.Instant.now();
                 try(var blocked=RealProcessServer.startCloudFixture(configUri,cluster,seeds)) {
                     var entry=http.send(java.net.http.HttpRequest.newBuilder(blocked.baseUrl().resolve("/auth/storage-entry"))
                             .timeout(Duration.ofSeconds(30)).GET().build(),java.net.http.HttpResponse.BodyHandlers.ofString());
@@ -233,6 +254,7 @@ class ThreeLayerRestartContinuationIT {
                     CONFIG.getDockerClient().pauseContainerCmd(CONFIG.getContainerId()).exec();configurationPaused=true;
                     CACHE.getDockerClient().unpauseContainerCmd(CACHE.getContainerId()).exec();paused=false;
                     assertThat(rows(mongo,target)).isEqualTo(beforeOutage);
+                    assertThat(rows(mongo,stoppedTarget)).isEqualTo(stoppedRows);
                     assertThat(chains.find(new Document("_id",originalChain.get("_id"))).first()).containsEntry("checkpoint",originalChain.get("checkpoint"));
                     var originalNode=cacheClient.getDatabase(cacheDb).getCollection("workload_claims")
                             .find(new Document("resourceType","NODE_SESSION")).first();
@@ -265,6 +287,12 @@ class ThreeLayerRestartContinuationIT {
                             () -> control.durablePosition(PIPELINE,TABLE).filter(value -> !value.equals(acknowledged)));
                     mongo.insert(source,TABLE,List.of(Map.of("id",9L,"seq",999L)));awaitRows(mongo,source,target,"fresh Cloud CDC after customer storage returns");
                     Await.answered("fresh Cloud CDC confirmation",BOUND,() -> control.durablePosition(PIPELINE,TABLE).filter(value -> !value.equals(replay)));
+                    Await.answered("the new runtime to observe the retained stopped bystander",BOUND,
+                            () -> control.observedAt(stoppedPipeline).filter(at -> at.isAfter(replacementBoundary)));
+                    assertThat(control.state(stoppedPipeline)).contains(PipelineState.STOPPED);
+                    assertThat(cacheClient.getDatabase(cacheDb).getCollection("workload_claims").find(stoppedClaim).first()).containsEntry("executionGeneration",stoppedExecution);
+                    assertThat(rows(mongo,stoppedTarget)).isEqualTo(stoppedRows).hasSize(8).doesNotContainKey(9L);
+                    assertThat(configuration.getCollection("operator_generations").find(new Document("_id",stoppedPipeline)).first()).containsEntry("stateGeneration",1L);
                     assertThat(control.snapshotRowsRead(PIPELINE)).containsEntry(TABLE,0L);
                     assertThat(cloudInstallationFacts(configuration)).isEqualTo(originalConfiguration);
                     assertThat(configuration.getCollection("operator_generations").find(new Document("_id",PIPELINE)).first()).containsEntry("stateGeneration",1L);
