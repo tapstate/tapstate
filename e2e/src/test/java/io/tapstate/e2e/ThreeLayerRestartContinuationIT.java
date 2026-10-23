@@ -173,6 +173,7 @@ class ThreeLayerRestartContinuationIT {
         String suffix=UUID.randomUUID().toString().replace("-","");
         String cluster="cloud-outage-"+suffix,configDb="cloud_cfg_"+suffix,cacheDb="cloud_cache_"+suffix;
         String configUri=CONFIG.getReplicaSetUrl(configDb);
+        configUri+=(configUri.contains("?")?"&":"?")+"socketTimeoutMS=1500&connectTimeoutMS=1500";
         String cacheUri=CACHE.getReplicaSetUrl(cacheDb);
         cacheUri+=(cacheUri.contains("?")?"&":"?")+"socketTimeoutMS=1500&connectTimeoutMS=1500";
         String sourceUri=DATA.getReplicaSetUrl("cloud_source_"+suffix),targetUri=CACHE.getReplicaSetUrl("cloud_target_"+suffix);
@@ -197,7 +198,7 @@ class ThreeLayerRestartContinuationIT {
             mongo.seed(source,TABLE,SeedRows.generated(8));
             var configuration=configClient.getDatabase(configDb);var chains=cacheClient.getDatabase(cacheDb).getCollection("srs_chains");
             Map<String,List<Document>> originalConfiguration;Map<Long,Long> beforeOutage;String acknowledged,originalCookie,claimsBefore;Document originalChain;
-            boolean paused=false;
+            boolean paused=false,configurationPaused=false;
             try {
                 var first=RealProcessServer.startCloudFixture(configUri,cluster,seeds);
                 try(first) {
@@ -229,9 +230,24 @@ class ThreeLayerRestartContinuationIT {
                     assertThat(exchange.statusCode()).isEqualTo(503);
                     assertThat(Document.parse(exchange.body())).containsEntry("code",io.tapstate.control.core.ControlError.STORAGE_UNAVAILABLE.code());
                     assertThat(cloudInstallationFacts(configuration)).isEqualTo(originalConfiguration);
+                    CONFIG.getDockerClient().pauseContainerCmd(CONFIG.getContainerId()).exec();configurationPaused=true;
                     CACHE.getDockerClient().unpauseContainerCmd(CACHE.getContainerId()).exec();paused=false;
                     assertThat(rows(mongo,target)).isEqualTo(beforeOutage);
                     assertThat(chains.find(new Document("_id",originalChain.get("_id"))).first()).containsEntry("checkpoint",originalChain.get("checkpoint"));
+                    var originalNode=cacheClient.getDatabase(cacheDb).getCollection("workload_claims")
+                            .find(new Document("resourceType","NODE_SESSION")).first();
+                    assertThat(originalNode).isNotNull();
+                    var partial=http.send(java.net.http.HttpRequest.newBuilder(blocked.baseUrl().resolve("/api/storage/status"))
+                            .timeout(Duration.ofSeconds(30)).header("Cookie",originalCookie).header("Content-Type","application/json")
+                            .POST(java.net.http.HttpRequest.BodyPublishers.ofString("{}")).build(),java.net.http.HttpResponse.BodyHandlers.ofString());
+                    assertThat(partial.statusCode()).as("CACHE and MASTER alone cannot restore trusted CONFIG facts").isEqualTo(503);
+                    assertThat(Document.parse(partial.body())).containsEntry("code",io.tapstate.control.core.ControlError.STORAGE_UNAVAILABLE.code());
+                    assertThat(cacheClient.getDatabase(cacheDb).getCollection("workload_claims")
+                            .find(new Document("resourceType","NODE_SESSION")).first()).isEqualTo(originalNode);
+                    assertThat(rows(mongo,target)).isEqualTo(beforeOutage);
+                    assertThat(chains.find(new Document("_id",originalChain.get("_id"))).first()).containsEntry("checkpoint",originalChain.get("checkpoint"));
+                    CONFIG.getDockerClient().unpauseContainerCmd(CONFIG.getContainerId()).exec();configurationPaused=false;
+                    assertThat(cloudInstallationFacts(configuration)).isEqualTo(originalConfiguration);
                     String claimsAfter=claimLeaseReading(cacheClient.getDatabase(cacheDb));
                     var control=cloudLogin(blocked);
                     var oldSession=new ControlPlane(blocked.baseUrl());oldSession.useCloudSessionCookie(originalCookie);
@@ -254,7 +270,10 @@ class ThreeLayerRestartContinuationIT {
                     assertThat(configuration.getCollection("operator_generations").find(new Document("_id",PIPELINE)).first()).containsEntry("stateGeneration",1L);
                     assertThat(configuration.getCollection("users").countDocuments()).isZero();
                 }
-            } finally { if(paused)CACHE.getDockerClient().unpauseContainerCmd(CACHE.getContainerId()).exec(); }
+            } finally {
+                try { if(paused)CACHE.getDockerClient().unpauseContainerCmd(CACHE.getContainerId()).exec(); }
+                finally { if(configurationPaused)CONFIG.getDockerClient().unpauseContainerCmd(CONFIG.getContainerId()).exec(); }
+            }
         }
     }
 
