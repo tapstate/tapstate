@@ -113,7 +113,7 @@ class SharedMongoCaseIT {
                         .as("the actual %s body wrote to its registered case database", invocation.method()).isNotEmpty(),
                 () -> assertThat(remaining)
                         .as("teardown removed the actual database used by %s", invocation.method())
-                        .doesNotContain(physical, invocation.database()));
+                        .isNotEmpty().doesNotContain(physical, invocation.database()));
     }
 
     private record ScopedInvocation(Class<?> suite, String method, String database) { }
