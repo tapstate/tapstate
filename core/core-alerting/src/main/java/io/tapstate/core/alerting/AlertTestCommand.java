@@ -44,15 +44,28 @@ public final class AlertTestCommand {
             AlertValidation.require(revision > 0 && messageSettingsRevision > 0, "routeRevision", "must-be-positive");
         }
     }
-    public record Parameters(String channelType, String receiverIncarnation, long configurationRevision,
+    /** Only saved receivers carry a CAS baseline; a new candidate has no invented receiver identity. */
+    public record ExistingReceiver(String incarnation, long expectedRevision) {
+        public ExistingReceiver {
+            incarnation = AlertValidation.text(incarnation, "receiverIncarnation", 256);
+            AlertValidation.require(expectedRevision > 0, "receiverRevision", "must-be-positive");
+        }
+    }
+    /** The host validates the full candidate and computes its keyed digest; these values are not authorization. */
+    public record Candidate(String id, String digest) {
+        public Candidate {
+            id = AlertValidation.text(id, "candidateId", 256);
+            AlertValidation.require(digest != null && digest.matches("[0-9a-f]{64}"), "candidateDigest", "invalid-digest");
+        }
+    }
+    public record Parameters(String channelType, Candidate candidate, ExistingReceiver receiver,
             String targetId, String bindingId, Route route, String payloadSha256) {
         public Parameters {
             channelType = AlertValidation.text(channelType, "channelType", 64);
             AlertValidation.require(channelType.matches("[a-z][a-z0-9]*([.-][a-z0-9]+)*"), "channelType", "invalid-id");
-            receiverIncarnation = AlertValidation.text(receiverIncarnation, "receiverIncarnation", 256);
+            AlertValidation.require(candidate != null, "candidate", "required");
             targetId = AlertValidation.text(targetId, "targetId", 256);
             bindingId = AlertValidation.text(bindingId, "bindingId", 256);
-            AlertValidation.require(configurationRevision > 0, "configurationRevision", "must-be-positive");
             AlertValidation.require(payloadSha256 != null && payloadSha256.matches("[0-9a-f]{64}"), "payloadSha256", "invalid-digest");
         }
     }

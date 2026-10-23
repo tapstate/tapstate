@@ -4,4 +4,4 @@ admission-age-seconds=300
 future-skew-seconds=30
 actor-per-minute=3
 scope-per-minute=10
-retention-policy-version=1
+retention-policy-version=2

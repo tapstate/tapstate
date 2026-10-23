@@ -7,10 +7,10 @@ import java.util.Map;
 
 /** Frozen policy values only. The host supplies a verified deployment and commits the whole candidate. */
 public final class AlertRetentionPolicy {
-    public static final int POLICY_VERSION = 1;
+    public static final int POLICY_VERSION = 2;
     public enum Setting {
-        ACCEPTED_PAYLOAD, ACCEPTED_RESULT, FAILED_PAYLOAD, FAILED_RESULT, UNREAD_NOTIFICATION,
-        READ_NOTIFICATION, TEST_PAYLOAD, TEST_ACCEPTED_RESULT, TEST_FAILED_RESULT, ENDED_EPISODE, TRANSITION
+        ACCEPTED_PAYLOAD, ACCEPTED_RESULT, FAILED_PAYLOAD, FAILED_RESULT,
+        TEST_PAYLOAD, TEST_ACCEPTED_RESULT, TEST_FAILED_RESULT, ENDED_EPISODE, TRANSITION
     }
     public record Range(Duration defaultValue, Duration minimum, Duration maximum) { }
     private final Deployment deployment;
@@ -46,7 +46,6 @@ public final class AlertRetentionPolicy {
         }
         atMost(frozen, Setting.ACCEPTED_RESULT, Setting.FAILED_RESULT);
         atMost(frozen, Setting.FAILED_PAYLOAD, Setting.FAILED_RESULT);
-        atMost(frozen, Setting.READ_NOTIFICATION, Setting.UNREAD_NOTIFICATION);
         if (trustedDeployment == Deployment.ON_PREM) {
             atMost(frozen, Setting.ACCEPTED_PAYLOAD, Setting.FAILED_PAYLOAD);
             atMost(frozen, Setting.ACCEPTED_PAYLOAD, Setting.ACCEPTED_RESULT);
@@ -70,8 +69,6 @@ public final class AlertRetentionPolicy {
             put(ranges, Setting.ACCEPTED_RESULT, 10080, 360, 43200);
             put(ranges, Setting.FAILED_PAYLOAD, 4320, 360, 10080);
             put(ranges, Setting.FAILED_RESULT, 20160, 1440, 129600);
-            put(ranges, Setting.UNREAD_NOTIFICATION, 43200, 1440, 129600);
-            put(ranges, Setting.READ_NOTIFICATION, 4320, 60, 10080);
             put(ranges, Setting.TEST_PAYLOAD, 60, 5, 1440);
             put(ranges, Setting.TEST_ACCEPTED_RESULT, 1440, 60, 10080);
             put(ranges, Setting.TEST_FAILED_RESULT, 4320, 360, 10080);
@@ -81,8 +78,6 @@ public final class AlertRetentionPolicy {
             put(ranges, Setting.ACCEPTED_RESULT, 1440, 360, 2880);
             put(ranges, Setting.FAILED_PAYLOAD, 1440, 360, 1440);
             put(ranges, Setting.FAILED_RESULT, 4320, 1440, 10080);
-            put(ranges, Setting.UNREAD_NOTIFICATION, 4320, 1440, 10080);
-            put(ranges, Setting.READ_NOTIFICATION, 720, 60, 1440);
             put(ranges, Setting.ENDED_EPISODE, 10080, 1440, 10080);
             put(ranges, Setting.TRANSITION, 4320, 360, 10080);
         }

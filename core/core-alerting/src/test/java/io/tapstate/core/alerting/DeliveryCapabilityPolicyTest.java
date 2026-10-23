@@ -15,7 +15,6 @@ class DeliveryCapabilityPolicyTest {
     private static final Instant START = Instant.parse("2026-10-21T00:00:00Z");
     private static final Instant DEADLINE = START.plusSeconds(60);
     private static final Capability WEBHOOK = new Capability("webhook", 1, Family.OP_EXTERNAL);
-    private static final Capability IN_APP = new Capability("in-app", 1, Family.IN_APP);
     private static final Capability SDK = new Capability("cloud-sdk", 1, Family.CLOUD_SDK);
 
     @Test void unknownEnvelopeCannotTrustExpiryOrAnAllegedTerminalState() {
@@ -93,14 +92,14 @@ class DeliveryCapabilityPolicyTest {
     }
 
     @Test void trustedDeploymentPolicyStillAppliesBeforeAnAdapterCanResume() {
-        var policy = new DeliveryCapabilityPolicy(List.of(WEBHOOK, IN_APP, SDK), List.of(WEBHOOK, IN_APP, SDK));
+        var policy = new DeliveryCapabilityPolicy(List.of(WEBHOOK, SDK), List.of(WEBHOOK, SDK));
         assertThat(policy.assess(SCOPE, header(), false, Deployment.CLOUD_MANAGED, START))
                 .isEqualTo(new Decision(Disposition.STOPPED, Reason.CHANNEL_NOT_PERMITTED));
         assertThat(policy.assess(SCOPE, header(), false, Deployment.UNRESOLVED, START))
                 .isEqualTo(new Decision(Disposition.PAUSED, Reason.DEPLOYMENT_UNRESOLVED));
         for (var deployment : List.of(Deployment.ON_PREM, Deployment.CLOUD_MANAGED)) {
             assertThat(policy.assess(SCOPE, new Header(1, SCOPE, "delivery-2", "in-app", 1, DEADLINE), false,
-                    deployment, START).disposition()).isEqualTo(Disposition.COMPATIBLE);
+                    deployment, START)).isEqualTo(new Decision(Disposition.PAUSED, Reason.UNKNOWN_CHANNEL));
         }
         var sdk = new Header(1, SCOPE, "delivery-3", "cloud-sdk", 1, DEADLINE);
         assertThat(policy.assess(SCOPE, sdk, false, Deployment.ON_PREM, START).disposition()).isEqualTo(Disposition.STOPPED);
@@ -110,7 +109,7 @@ class DeliveryCapabilityPolicyTest {
     @Test void boundedStaticRegistrationRejectsDuplicatesAndInconsistentAvailableCapabilities() {
         assertThatThrownBy(() -> new DeliveryCapabilityPolicy(List.of(WEBHOOK, WEBHOOK), List.of()))
                 .isInstanceOf(TapstateException.class);
-        for (var capability : List.of(IN_APP, new Capability("webhook", 2, Family.OP_EXTERNAL),
+        for (var capability : List.of(SDK, new Capability("webhook", 2, Family.OP_EXTERNAL),
                 new Capability("webhook", 1, Family.CLOUD_SDK))) {
             assertThatThrownBy(() -> new DeliveryCapabilityPolicy(List.of(WEBHOOK), List.of(capability)))
                     .isInstanceOf(TapstateException.class);
