@@ -61,6 +61,14 @@ final class NativeSrsDocuments implements AutoCloseable {
                 .mapToLong(value -> value.get("sequence", Number.class).longValue()).findFirst().orElse(-1L);
     }
 
+    long largestSequence(String chain, String table) {
+        if (chain(chain) == null) return -1;
+        String ring = io.tapstate.runtime.srs.SrsRingbuffer.ringName(chain, table);
+        var bounds = SystemCollections.SRS_LOG_BOUNDS.on(database)
+                .find(new Document("_id", "srs-log-bounds:" + ring)).first();
+        return bounds == null ? -1 : bounds.getLong("largestSequence");
+    }
+
     private Document chainFilter(String chain) {
         return new Document("_id.cacheIncarnation", incarnation).append("_id.chain", chain);
     }
