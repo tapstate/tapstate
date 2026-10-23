@@ -416,8 +416,27 @@ final class PipelineActuationOwnership {
         Set<String> runMembers = planned == null ? Set.of() : plannedOver(planned);
         Optional<WorkloadClaim> advanced;
         try {
-            // At the claim's own topology revision, which is the committed one: a revision change refuses
-            // the renew above, so a claim still held is a claim granted under the current topology.
+            if (scope != null) {
+                if (planned == null || !membership.businessEligible()
+                        || planned.revision() < state.claim.topologyRevision()) return Execution.refused();
+                if (state.claim.topologyRevision() != planned.revision()) {
+                    var original = state.claim;
+                    var rebased = claims.acquirePipeline(scope, owner, planned.revision(), ttl);
+                    if (rebased.isEmpty() || !rebased.orElseThrow().acquired()) return Execution.refused();
+                    var actual = rebased.orElseThrow().claim();
+                    if (!actual.key().equals(original.key()) || !actual.owner().equals(original.owner())
+                            || actual.claimGeneration() != original.claimGeneration()
+                            || actual.executionGeneration() != original.executionGeneration()
+                            || actual.topologyRevision() != planned.revision()) {
+                        state.claim = null; return Execution.refused();
+                    }
+                    state.claim = actual;
+                }
+                if (!planned.equals(membership.committed()) || !membership.businessEligible()) {
+                    state.claim = null; return Execution.refused();
+                }
+            }
+            // Scoped running claims retain their original topology until the caller has stopped the old run.
             advanced = claims.advanceExecution(state.claim, state.claim.topologyRevision(), runMembers);
         } catch (RuntimeException unreachable) {
             advanced = Optional.empty();
@@ -427,6 +446,9 @@ final class PipelineActuationOwnership {
             return Execution.refused();
         }
         state.claim = advanced.get();
+        if (scope != null && (!planned.equals(membership.committed()) || !membership.businessEligible())) {
+            state.claim = null; return Execution.refused();
+        }
         state.failureObservedAtNanos = NEVER;
         state.visibilityRevisionAtDetectionWindow = NEVER;
         // What this run is planned over. Null rather than empty when nothing is committed -- which the
@@ -869,7 +891,8 @@ final class PipelineActuationOwnership {
         Optional<WorkloadClaim> renewed;
         try {
             renewed = membership.businessEligible()
-                    ? claims.renew(state.claim, ttl) : claims.renewActuationControl(state.claim, ttl);
+                    ? state.scope == null ? claims.renew(state.claim, ttl) : claims.renewScopedActuation(state.claim, ttl)
+                    : claims.renewActuationControl(state.claim, ttl);
         } catch (RuntimeException unreachable) {
             // The coordination store is the only thing that can say this member still owns the pipeline,
             // and it did not answer. Unproved is the same as lost here: the alternative is to keep driving

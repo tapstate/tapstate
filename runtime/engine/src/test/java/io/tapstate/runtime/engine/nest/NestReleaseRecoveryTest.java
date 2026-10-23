@@ -3,6 +3,7 @@ package io.tapstate.runtime.engine.nest;
 import com.hazelcast.jet.core.test.TestOutbox;
 import com.hazelcast.jet.core.test.TestProcessorContext;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.runtime.engine.StageTimer;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.NestReleaseStore;
 import java.io.ByteArrayOutputStream;
@@ -34,13 +35,19 @@ class NestReleaseRecoveryTest {
             calls.incrementAndGet(); return after == null ? page : List.of();
         });
         var out = new TestOutbox(1); source.init(out,new TestProcessorContext());
+        var timerField = NestReleaseRecovery.class.getDeclaredField("timer"); timerField.setAccessible(true);
+        var timer = (StageTimer) timerField.get(source);
         var emitted = new ArrayList<Object>();
         assertThat(source.complete()).isFalse(); assertThat(calls).hasValue(1);
+        assertThat(timer.value().count()).isEqualTo(1);
         out.drainQueueAndReset(0,emitted,false);
         assertThat(source.complete()).isFalse(); assertThat(calls).hasValue(1);
+        assertThat(timer.value().count()).isEqualTo(2);
         out.drainQueueAndReset(0,emitted,false);
         assertThat(source.complete()).isTrue(); out.drainQueueAndReset(0,emitted,false);
+        assertThat(timer.value().count()).isEqualTo(3);
         assertThat(source.complete()).isTrue(); assertThat(calls).hasValue(2);
+        assertThat(timer.value().count()).isEqualTo(3);
         assertThat(emitted.stream().map(value -> ((NestReleaseRecovery.Wake)value).key()).toList())
                 .containsExactly(List.of("A"),List.of("B"),List.of("C"));
     }

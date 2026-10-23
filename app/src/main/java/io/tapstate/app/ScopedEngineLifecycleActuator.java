@@ -126,7 +126,7 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         stopOriginal(); require();
         var execution = ownership.beginExecution(pass.scope(),command);
         if (!execution.allowed()) throw fenced();
-        pass.advanced(execution.claimFence()); command = execution.claimFence(); require();
+        pass.advancedSubmission(execution); command = execution.claimFence(); require();
         original = execution.fence(); manifest = prepared.operatorPlan().orElseThrow().bind(original);
         run = null; capture = boundCapture(original);
         boolean submissionAttempted = false;

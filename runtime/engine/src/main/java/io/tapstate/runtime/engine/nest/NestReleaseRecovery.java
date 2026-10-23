@@ -1,8 +1,10 @@
 package io.tapstate.runtime.engine.nest;
 
 import com.hazelcast.jet.core.AbstractProcessor;
+import com.hazelcast.jet.core.Processor;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.Staged;
+import io.tapstate.runtime.engine.StageTimer;
 import io.tapstate.spi.store.NestReleaseStore;
 import java.io.Serializable;
 import java.util.List;
@@ -19,6 +21,7 @@ final class NestReleaseRecovery extends AbstractProcessor implements Staged {
     private String after;
     private int next;
     private boolean done;
+    private StageTimer timer = StageTimer.none(Stage.NEST);
 
     NestReleaseRecovery(Function<String, List<NestReleaseStore.PendingKey>> pages) {
         this.pages = Objects.requireNonNull(pages, "pages");
@@ -26,11 +29,17 @@ final class NestReleaseRecovery extends AbstractProcessor implements Staged {
     @Override public Stage stage() { return Stage.NEST; }
     @Override public boolean isCooperative() { return false; }
 
+    @Override protected void init(Processor.Context context) {
+        timer = StageTimer.of(stage(), context);
+    }
+
     @Override public boolean complete() {
         if (done) return true;
         while (true) {
             while (next < page.size()) {
+                long started = timer.begin();
                 if (!tryEmit(new Wake(NestStateMapStore.releaseKey(page.get(next))))) return false;
+                timer.end(started);
                 next++;
             }
             page = List.copyOf(pages.apply(after)); next = 0;

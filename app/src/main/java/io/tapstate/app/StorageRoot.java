@@ -214,6 +214,7 @@ final class StorageRoot implements AutoCloseable {
                 runtime.startBusiness(original.orElseThrow(), assembly); phase = Phase.BUSINESS_READY;
             }
         } catch (TapstateException unavailable) {
+            if (unavailable.code() == BootError.NODE_ID_IN_USE) throw unavailable;
             if (phase != Phase.AUTH_READY) phase = Phase.CACHE_UNAVAILABLE;
         }
     }

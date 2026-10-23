@@ -187,6 +187,7 @@ class ScopedPipelineActuationOwnershipTest {
         var run = owner.beginExecution(FIRST,WorkloadClaimFence.from(permit.claim()));
         membership.install(new ClusterMembership("cluster-a",8,Set.of("node-a","node-b","node-c")));
         membership.canCommit(Set.of("node-a","node-b"));
+        raw.acquire(KEY, OWNER, 8, TTL);
         raw.elapse(RENEW); nanos.addAndGet(RENEW.toNanos());
         assertThat(owner.permit(FIRST).granted()).isFalse();
         raw.elapse(RENEW); nanos.addAndGet(RENEW.toNanos());
@@ -324,6 +325,7 @@ class ScopedPipelineActuationOwnershipTest {
             if (once.compareAndSet(false,true)) {
                 membership.install(new ClusterMembership("cluster-a",8,Set.of("node-a","node-b","node-c")));
                 membership.canCommit(Set.of("node-a","node-b"));
+                raw.acquire(KEY, OWNER, 8, TTL);
                 raw.elapse(RENEW); nanos.addAndGet(RENEW.toNanos()); assertThat(owner.permit(FIRST).granted()).isFalse();
                 raw.elapse(RENEW); nanos.addAndGet(RENEW.toNanos());
                 assertThat(owner.permit(FIRST).claim().topologyRevision()).isEqualTo(8);
@@ -338,6 +340,71 @@ class ScopedPipelineActuationOwnershipTest {
         var run = owner.beginExecution(FIRST,WorkloadClaimFence.from(permit.claim()));
         var changed = new WorkloadClaimFence(KEY,OWNER,run.claimFence().claimGeneration(),run.claimFence().executionGeneration(),8);
         assertThatThrownBy(() -> new PipelineActuationOwnership.Execution(true,run.fence(),8L,changed)).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test void aJoinRenewsTheRunningScopedClaimWithoutChangingItsFence() {
+        var owner = ownership(); var first = owner.permit(FIRST);
+        var run = owner.beginExecution(FIRST, WorkloadClaimFence.from(first.claim()));
+        membership.install(new ClusterMembership("cluster-a", 8, Set.of("node-a", "node-b", "node-c")));
+        membership.canCommit(Set.of("node-a", "node-b", "node-c"));
+        raw.elapse(RENEW); nanos.addAndGet(RENEW.toNanos()); owner.renewDue();
+        assertThat(owner.permit(FIRST).granted()).isTrue();
+        assertThat(WorkloadClaimFence.from(owner.permit(FIRST).claim())).isEqualTo(run.claimFence());
+        assertThat(owner.proveExecution(run.fence())).isTrue();
+        assertThat(acquisitions).hasValue(1);
+        var next = owner.beginExecution(FIRST, run.claimFence());
+        assertThat(next.allowed()).isTrue();
+        assertThat(next.claimFence().topologyRevision()).isEqualTo(8);
+        assertThat(next.claimFence().claimGeneration()).isEqualTo(run.claimFence().claimGeneration());
+        assertThat(next.claimFence().executionGeneration()).isEqualTo(run.claimFence().executionGeneration() + 1);
+        assertThat(owner.proveExecution(run.fence())).isFalse();
+        assertThat(owner.proveExecution(next.fence())).isTrue();
+    }
+
+    @Test void aRunningScopedClaimStillNeedsTheCommittedMajorityToRenew() {
+        var owner = ownership(); var first = owner.permit(FIRST);
+        owner.beginExecution(FIRST, WorkloadClaimFence.from(first.claim()));
+        membership.install(new ClusterMembership("cluster-a", 8, Set.of("node-a", "node-b", "node-c")));
+        membership.canCommit(Set.of("node-a"));
+        raw.elapse(RENEW); nanos.addAndGet(RENEW.toNanos()); owner.renewDue();
+        assertThat(owner.permit(FIRST).granted()).isFalse();
+        verify(store, never()).renew(any(), any());
+    }
+
+    @Test void aJoinRacingTheExplicitTopologyRebaseCannotSubmitAnExecution() {
+        var owner = ownership(); var first = owner.permit(FIRST);
+        var run = owner.beginExecution(FIRST, WorkloadClaimFence.from(first.claim()));
+        membership.install(new ClusterMembership("cluster-a", 8, Set.of("node-a", "node-b", "node-c")));
+        membership.canCommit(Set.of("node-a", "node-b", "node-c"));
+        when(store.acquirePipeline(FIRST, OWNER, 8, TTL)).thenAnswer(call -> {
+            var rebased = raw.acquire(KEY, OWNER, 8, TTL);
+            membership.install(new ClusterMembership("cluster-a", 9, Set.of("node-a", "node-b", "node-c", "node-d")));
+            membership.canCommit(Set.of("node-a", "node-b", "node-c", "node-d"));
+            return rebased;
+        });
+        assertThat(owner.beginExecution(FIRST, run.claimFence()).allowed()).isFalse();
+        assertThat(raw.read(KEY).orElseThrow().claim().executionGeneration()).isEqualTo(run.fence().executionGeneration());
+        assertThat(owner.proveExecution(run.fence())).isFalse();
+    }
+
+    @Test void aTopologyRebaseCannotAdoptANewTenureAfterTheOriginalLeaseExpires() {
+        var owner = ownership(); var first = owner.permit(FIRST);
+        var run = owner.beginExecution(FIRST, WorkloadClaimFence.from(first.claim()));
+        membership.install(new ClusterMembership("cluster-a", 8, Set.of("node-a", "node-b", "node-c")));
+        membership.canCommit(Set.of("node-a", "node-b", "node-c"));
+        raw.elapse(TTL);
+        assertThat(owner.beginExecution(FIRST, run.claimFence()).allowed()).isFalse();
+        assertThat(raw.read(KEY).orElseThrow().claim().executionGeneration()).isEqualTo(run.fence().executionGeneration());
+    }
+
+    @Test void aLaggedMembershipCannotRebaseTheDurableClaimBackwards() {
+        var owner = ownership(); var first = owner.permit(FIRST);
+        var run = owner.beginExecution(FIRST, WorkloadClaimFence.from(first.claim()));
+        membership.install(new ClusterMembership("cluster-a", 6, Set.of("node-a", "node-b", "node-c")));
+        membership.canCommit(Set.of("node-a", "node-b", "node-c"));
+        assertThat(owner.beginExecution(FIRST, run.claimFence()).allowed()).isFalse();
+        assertThat(WorkloadClaimFence.from(raw.read(KEY).orElseThrow().claim())).isEqualTo(run.claimFence());
+        assertThat(acquisitions).hasValue(1);
     }
 
     @Test void aScopedExecutionCannotCarryAnotherClaimsOwner() {

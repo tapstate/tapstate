@@ -108,6 +108,25 @@ class ScopedEngineLifecycleActuatorTest {
     private static OperatorRunManifest manifest(long execution) { return new OperatorRunManifest("p",new ExecutionFence(SCOPE,claim(execution)),List.of()); }
     private static TapstateException fenced() { return new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null); }
 
+    @Test void anExplicitStartAfterAJoinRetiresTheOldRunBeforeAdvancingItsPassToTheNewTopology() {
+        var oldGuard = pass.guardOriginal(claim(1));
+        var next = new WorkloadClaimFence(claim(2).key(), OWNER, 3, 2, 8);
+        when(previous.awaitTerminal(any())).thenAnswer(call -> { events.add("terminal"); return true; });
+        when(ownership.beginExecution(eq(SCOPE), any())).thenAnswer(call -> {
+            assertThat((WorkloadClaimFence) call.getArgument(1)).isEqualTo(claim(1));
+            assertThat(events).contains("terminal");
+            held.set(next);
+            return new PipelineActuationOwnership.Execution(true, new ExecutionFence(SCOPE, next), 8L, next);
+        });
+        actuator().start("p");
+        assertThat(pass.claim()).isEqualTo(next);
+        assertThatThrownBy(oldGuard::run).isInstanceOf(TapstateException.class);
+        assertThat(prepared).singleElement().satisfies(value ->
+                assertThat(value.executionIdentity()).isEqualTo(new ExecutionFence(SCOPE, next)));
+        verify(previous).cancel();
+        verify(engine).submitRun(eq("p"), any(), anyMap(), any(), any(OperatorRunManifest.class));
+    }
+
     @Test void targetAcknowledgementAloneCannotCompleteAStillRunningOriginalJob() {
         boundedCapture();
         assertThat(actuator().completed("p")).isFalse();

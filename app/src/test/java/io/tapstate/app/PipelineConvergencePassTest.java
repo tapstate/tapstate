@@ -186,6 +186,27 @@ class PipelineConvergencePassTest {
         assertThat(pass.claim()).isEqualTo(execution(1));
     }
 
+    @Test void aSubmissionCannotChangePhysicalScopeOwnerTenureOrMoveTopologyBackwards() {
+        var pass = new PipelineConvergencePass(INTENT, ORIGINAL, views, () -> {});
+        for (WorkloadClaimFence other : List.of(
+                new WorkloadClaimFence(KEY, new WorkloadOwner("node", "other"), 2, 1, 8),
+                new WorkloadClaimFence(KEY, OWNER, 3, 1, 8),
+                new WorkloadClaimFence(KEY, OWNER, 2, 1, 6),
+                new WorkloadClaimFence(KEY, OWNER, 2, 2, 8))) {
+            var submitted = new PipelineActuationOwnership.Execution(true, new ExecutionFence(SCOPE, other),
+                    other.topologyRevision(), other);
+            assertThatThrownBy(() -> pass.advancedSubmission(submitted)).isInstanceOf(IllegalStateException.class);
+            assertThat(pass.claim()).isSameAs(ORIGINAL);
+        }
+        var foreign = new PipelineIntentScope(SCOPE.clusterId(), SCOPE.bindingVersion(), SCOPE.cacheIncarnation(),
+                SCOPE.pipelineId(), SCOPE.stateGeneration() + 1);
+        var next = execution(1);
+        var submitted = new PipelineActuationOwnership.Execution(true, new ExecutionFence(foreign, next),
+                next.topologyRevision(), next);
+        assertThatThrownBy(() -> pass.advancedSubmission(submitted)).isInstanceOf(IllegalStateException.class);
+        assertThat(pass.claim()).isSameAs(ORIGINAL);
+    }
+
     @Test void ordinaryPassViewsCannotCreateDeleteOrWriteAnotherPipeline() {
         var pass = new PipelineConvergencePass(INTENT, ORIGINAL, views, () -> {});
         assertThatThrownBy(() -> pass.state().create("orders", StateJson.of(PipelineState.NEW), T0)).isInstanceOf(TapstateException.class);

@@ -47,9 +47,8 @@ class DuplicateStableNodeIdsCannotBothJoinIT {
 
     @Test
     void aSecondProcessClaimingATakenNodeIdIsRefusedAndTheClusterDoesNotGrow() {
-        String store = SharedMongo.replicaSetUrl("e2e_duplicate_node_ids");
-
-        try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-duplicate-node-ids")) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                TwoMemberCluster cluster = TwoMemberCluster.startPrepared(storage)) {
             List<String> before = cluster.awaitBothMembers();
             assertThat(before)
                     .describedAs("the premise: two members, each under its own id, before anything "

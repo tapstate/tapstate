@@ -180,11 +180,24 @@ final class PipelineConvergencePass {
 
     /** Called before any later start step may throw; no other pass or asynchronous DAG retains this object. */
     void advanced(WorkloadClaimFence actual) {
+        advance(actual, false);
+    }
+
+    /** Only a new submission, after the old run retires, may adopt a forward committed topology. */
+    void advancedSubmission(PipelineActuationOwnership.Execution execution) {
+        Objects.requireNonNull(execution, "execution");
+        if (!execution.allowed() || execution.fence() == null || !scope().equals(execution.fence().scope()))
+            throw new IllegalStateException("a submission must carry this pass's original physical scope");
+        advance(execution.claimFence(), true);
+    }
+
+    private void advance(WorkloadClaimFence actual, boolean submission) {
         Objects.requireNonNull(actual, "actual");
         WorkloadClaimFence before = claim.get();
         if (!before.key().equals(actual.key()) || !before.owner().equals(actual.owner())
                 || before.claimGeneration() != actual.claimGeneration()
-                || before.topologyRevision() != actual.topologyRevision()
+                || (submission ? before.topologyRevision() > actual.topologyRevision()
+                        : before.topologyRevision() != actual.topologyRevision())
                 || actual.executionGeneration() != Math.addExact(before.executionGeneration(), 1)
                 || !claim.compareAndSet(before, actual)) {
             throw new IllegalStateException("a convergence pass can advance only its exact original claim");

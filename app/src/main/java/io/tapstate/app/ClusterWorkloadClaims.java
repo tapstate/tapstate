@@ -73,6 +73,18 @@ final class ClusterWorkloadClaims {
         return store.renew(expected, ttl);
     }
 
+    /** Keeps a scoped run's exact fence across joins; only a subsequent submission adopts the new topology. */
+    Optional<WorkloadClaim> renewScopedActuation(WorkloadClaim expected, Duration ttl) {
+        if (expected.key().type() != WorkloadClaimType.PIPELINE_ACTUATION)
+            throw new IllegalArgumentException("a scoped actuation renewal requires a Pipeline claim");
+        if (expected.executionGeneration() == 0) return renew(expected, ttl);
+        ClusterMembership current = membership.committed();
+        if (!membership.businessEligible() || current == null
+                || !current.clusterId().equals(expected.key().clusterId())
+                || current.revision() < expected.topologyRevision()) return Optional.empty();
+        return store.renew(expected, ttl);
+    }
+
     /**
      * Keeps an exact held SINGLE lifecycle claim while its engine is down, solely for control reporting.
      * This cannot acquire a claim, advance an execution, or authorize a data-plane call. The store still

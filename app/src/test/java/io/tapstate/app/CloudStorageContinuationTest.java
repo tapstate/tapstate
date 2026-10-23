@@ -183,4 +183,29 @@ class CloudStorageContinuationTest {
             verify(f.cache, never()).prepareFirstAuth(any()); verify(f.cache, never()).prepareInitialBusiness(any(), any());
         }
     }
+
+    @Test void aDuplicateNodeIdentityFailsTheRetainedStartupAfterClosingItsCandidate() {
+        try (var f = new Fixture()) {
+            f.phase.set(StorageSetupStateStore.Phase.COMPLETE);
+            var business = f.business();
+            var refusal = new TapstateException(BootError.NODE_ID_IN_USE, Map.of("nodeId", "node-a"), null);
+            doThrow(refusal).when(business).start();
+            assertThat(catchThrowable(() -> f.root.loadExisting(ignored -> business))).isSameAs(refusal);
+            verify(business).close();
+            assertThat(f.root.runtime().business()).isEmpty();
+        }
+    }
+
+    @Test void aRecoverableStorageFailureKeepsFormalAuthenticationAvailable() {
+        try (var f = new Fixture()) {
+            f.phase.set(StorageSetupStateStore.Phase.COMPLETE);
+            var business = f.business();
+            doThrow(StorageRuntime.unavailable()).when(business).start();
+            assertThatCode(() -> f.root.loadExisting(ignored -> business)).doesNotThrowAnyException();
+            assertThat(f.root.phase()).isEqualTo(StorageRoot.Phase.AUTH_READY);
+            assertThat(f.root.runtime().business()).isEmpty();
+            verify(business).close();
+            assertThatCode(f.root.managedAuthentication().requireActive()::run).doesNotThrowAnyException();
+        }
+    }
 }
