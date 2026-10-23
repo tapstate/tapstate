@@ -1,6 +1,7 @@
 package io.tapstate.runtime.scheduler;
 
 import java.util.Optional;
+import io.tapstate.spi.store.WorkloadClaimFence;
 
 /**
  * Turns a converged lifecycle transition into the matching data-plane job operation. The converge
@@ -43,6 +44,34 @@ public interface LifecycleActuator {
      * a stop's own cancellation is not a failure and must not be reported as one.
      */
     Optional<Throwable> failure(String pipelineId);
+
+    /**
+     * Whether this exact bounded execution ended successfully, including every target write. A quiet
+     * stream, an absent job, and an earlier execution's terminal job never establish completion.
+     */
+    default boolean completed(String pipelineId) {
+        return false;
+    }
+
+    /** The exact successful execution and its store-side fence; null fence means an unfenced single node. */
+    record Completion(String executionId, WorkloadClaimFence fence) { }
+
+    default Optional<Completion> completion(String pipelineId) {
+        return completed(pipelineId) ? Optional.of(new Completion("unfenced", null)) : Optional.empty();
+    }
+
+    /** Releases a successful bounded run without cancelling a replacement that now shares its name. */
+    default void complete(String pipelineId) {
+        stop(pipelineId, false);
+    }
+
+    default void complete(String pipelineId, Completion completion) {
+        complete(pipelineId);
+    }
+
+    /** Retries cleanup still owed by a successful local submission; never cancels a newer run. */
+    default void retryCompletion(String pipelineId) {
+    }
 
     /**
      * Why nothing here can hold this pipeline's job any more, or empty while something can.

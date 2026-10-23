@@ -325,6 +325,7 @@ public final class CanonicalWriter {
                 b.scalar("preserve_null_and_empty_arrays", u.preserveNullAndEmptyArrays());
                 b.scalar("element_key", u.elementKey());
                 b.scalar("element_type", u.elementType());
+                b.scalar("source_id_field", u.sourceIdField());
             }
             case TransformBody.Union ignored -> {
             }

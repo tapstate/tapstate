@@ -298,7 +298,7 @@ final class TargetModelResolver {
         if (rename == null) {
             return target;
         }
-        return new TargetTable(TableRename.apply(target.name(), rename), target.fields(), target.indexes());
+        return new TargetTable(TableRename.apply(target.name(), rename), target.fields(), target.indexes(), target.unwindIdentity());
     }
 
     /**
@@ -341,7 +341,7 @@ final class TargetModelResolver {
             // that the source constrains it.
             indexes.add(new TargetIndex(resolvedKey, true, false));
         }
-        return new TargetTable(model.name(), fields, indexes);
+        return new TargetTable(model.name(), fields, indexes, model.unwindIdentity());
     }
 
     /** Applies one sync element's rename rules to every source table that can reach that sink. */
@@ -360,7 +360,7 @@ final class TargetModelResolver {
             String legacyName = rename == null || rename.map() == null || qualified == null
                     || rename.map().containsKey(target.name()) ? null : rename.map().get(qualified);
             renamed.put(sourceTable, legacyName == null ? rename(target, rename)
-                    : new TargetTable(legacyName, target.fields(), target.indexes()));
+                    : new TargetTable(legacyName, target.fields(), target.indexes(), target.unwindIdentity()));
         }
         return Collections.unmodifiableMap(renamed);
     }

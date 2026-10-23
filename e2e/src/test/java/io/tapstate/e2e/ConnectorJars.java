@@ -46,10 +46,14 @@ final class ConnectorJars {
         }
     }
 
+    /** The same exact artifact selection for adapter-level integration witnesses. */
+    static Path pathFor(String connectorId) {
+        return find(directory(), connectorId);
+    }
+
     /** The bytes of the jar whose file name identifies the connector id. */
     static byte[] bytesFor(String connectorId) {
-        Path directory = directory();
-        Path jar = find(directory, connectorId);
+        Path jar = pathFor(connectorId);
         try {
             return Files.readAllBytes(jar);
         } catch (IOException e) {

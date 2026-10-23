@@ -432,6 +432,14 @@ public class CsvConnector implements TapConnector {
     private List<TapEvent> snapshot(TapConnectionContext context, String table) {
         List<TapEvent> events = new ArrayList<>();
         for (Map<String, Object> row : rows(file(context, table))) {
+            // JSON and CSV cannot seed distinct Integer and String keys with the same text.
+            if (context.getConnectionConfig() != null
+                    && Boolean.TRUE.equals(context.getConnectionConfig().getObject("mixed_map_keys"))) {
+                Map<Object, Object> nested = new LinkedHashMap<>();
+                nested.put(7, "number-key");
+                nested.put("7", "text-key");
+                row.put("dict", nested);
+            }
             events.add(insert(table, row));
         }
         return events;

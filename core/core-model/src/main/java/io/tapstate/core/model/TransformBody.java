@@ -98,7 +98,22 @@ public sealed interface TransformBody {
                     + "column of the same name, which joins the parent key at the target.")
             String elementKey,
             @Doc("Declared type of the expanded column; absent leaves the connector to infer one.")
-            String elementType) implements TransformBody {
+            String elementType,
+            @Doc(value = "Field preserving the original parent identifier when the target requires a "
+                    + "separate generated row identity. Used only when identity adaptation is needed.",
+                    def = "_unwind_source_id")
+            String sourceIdField) implements TransformBody {
+        public static final String DEFAULT_SOURCE_ID_FIELD = "_unwind_source_id";
+
+        public Unwind(String path, String includeArrayIndex, Boolean preserveNullAndEmptyArrays,
+                String elementKey, String elementType) {
+            this(path, includeArrayIndex, preserveNullAndEmptyArrays, elementKey, elementType, null);
+        }
+
+        public String resolvedSourceIdField() {
+            return sourceIdField == null ? DEFAULT_SOURCE_ID_FIELD : sourceIdField;
+        }
+
         public Unwind {
             Objects.requireNonNull(path, "path");
         }

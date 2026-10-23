@@ -127,11 +127,15 @@ public final class PdkSinkPort implements SinkPort {
                 PdkTargetPreparation preparation = new PdkTargetPreparation(connector.connectorId(),
                         connector.context(), connector.functions(), config.onFullLoad(), config.fullLoad(),
                         config.node(), stateStore);
-                for (TargetTable target : targets.values()) {
+                Map<String, TargetIdentityPlan> identities = PdkTargetIdentityPlanner.assess(connector, config, targets);
+                identities.values().forEach(TargetIdentityProjection::requireUsable);
+                for (TargetIdentityPlan identity : identities.values()) {
+                    TargetTable target = identity.target();
                     TapTable table = TargetTapTable.build(target);
                     connector.resolveTargetTypes(table);
                     preparation.prepare(target, table);
                 }
+                PdkTargetIdentityPlanner.verifyPrepared(connector, config, targets, identities);
                 return null;
             });
         } catch (TapstateException e) {

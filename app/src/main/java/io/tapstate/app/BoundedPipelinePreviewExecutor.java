@@ -220,6 +220,73 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
             }
         }
 
+        private List<StoreBackedTargetIdentities.Resolved> assessIdentities(
+                PipelineResource selected, ReadOnlyArtifactSnapshot snapshot) {
+            List<StoreBackedTargetIdentities.Resolved> identities = new StoreBackedTargetIdentities(
+                    storePort, connectors, snapshot).resolve(selected, true);
+            if (!identities.isEmpty()) {
+                emit("identity.completed", Map.of("targets", identities.stream()
+                        .map(StoreBackedTargetIdentities::payload).toList()));
+                identities.forEach(identity -> io.tapstate.adapters.pdk.TargetIdentityProjection
+                        .requireUsable(identity.plan()));
+            }
+            return identities;
+        }
+
+        private record CleanupResult(Throwable failure, boolean retainLease) { }
+
+        private CleanupResult cleanupRun(Set<String> stateMaps, Throwable failure) {
+            Job active = job.get();
+            if (stopAndJoin(active)) {
+                boolean cleanupFailed = !cleanupJoinedState(stateMaps);
+                if (cleanupFailed && failure == null) failure = refused("temporary preview state could not be cleaned up");
+                return new CleanupResult(failure, cleanupFailed);
+            }
+            if (failure == null) failure = refused("the preview job did not stop before temporary state cleanup");
+            active.getFuture().whenComplete((ignored, jobFailure) -> cleanupAfterUnjoinedJob(stateMaps));
+            return new CleanupResult(failure, true);
+        }
+
+        private boolean stopAndJoin(Job active) {
+            if (active == null || active.getFuture().isDone()) return true;
+            active.cancel();
+            try {
+                active.getFuture().get(CANCEL_JOIN.toMillis(), TimeUnit.MILLISECONDS);
+                return true;
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return active.getFuture().isDone();
+            } catch (Exception stillEnding) {
+                return active.getFuture().isDone();
+            }
+        }
+
+        private boolean cleanupJoinedState(Set<String> stateMaps) {
+            boolean cleaned = cleanupTemporaryState(stateMaps);
+            try {
+                StatelessTransforms.finishPreviewJs(executionId);
+            } catch (RuntimeException cleanupFailure) {
+                LOG.warn("Could not close preview JavaScript contexts for {}", executionId, cleanupFailure);
+                cleaned = false;
+            }
+            return cleaned;
+        }
+
+        private Throwable observedFailure(Exception problem) {
+            Throwable observed = null;
+            if (!(problem instanceof InterruptedException) || !cancelled.get()) {
+                observed = problem;
+                if (!(problem instanceof TapstateException) && LOG.isWarnEnabled()) {
+                    LOG.warn("Preview run {} failed unexpectedly (exception types: {})",
+                            request.runId(), exceptionTypes(problem));
+                }
+            }
+            if (problem instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            return observed;
+        }
+
         private void execute() {
             synchronized (this) {
                 if (cancelled.get()) {
@@ -232,11 +299,11 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
             PipelineResource executionPipeline = null;
             Throwable failure = null;
             List<Map<String, Object>> documents = List.of();
+            List<Map<String, Object>> logicalDocuments = List.of();
             List<Map<String, Object>> trace = List.of();
             String resultFormat = PdkTargetPreviewRenderer.LOGICAL_JSON;
             PreviewSelectionPlanner.Sample sample = null;
             Set<String> stateMaps = Set.of();
-            boolean jobJoined = true;
             boolean retainLease = false;
             try {
                 checkActive();
@@ -249,6 +316,7 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
                 }
                 PipelineResource inlined = PipelineInlining.inline(original, snapshot);
                 PipelineResource selected = selectOutput(inlined, request.outputId());
+                List<StoreBackedTargetIdentities.Resolved> identities = assessIdentities(selected, snapshot);
                 executionPipeline = isolatedPipeline(pruneToOutput(selected));
                 StoreBackedDagSource dagSource = new StoreBackedDagSource(storePort, nestSettings, snapshot);
                 String sampleId = request.sampleId() == null ? request.runId() : request.sampleId();
@@ -289,60 +357,23 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
                 Job submitted = member.getJet().newJob(dag, config);
                 job.set(submitted);
                 waitForJob(submitted);
-                documents = readDocuments();
+                logicalDocuments = readLogicalDocuments();
+                documents = readDocuments(identities);
                 PdkTargetPreviewRenderer.Result rendered = targetPreviewRenderer.render(
                         selectedTarget(executionPipeline, snapshot), documents, this::checkActive);
                 documents = rendered.documents();
                 resultFormat = rendered.format();
-                if (EventJsonValues.encodedSize(documents, MAX_RESULT_BYTES) > MAX_RESULT_BYTES) {
+                if (EventJsonValues.encodedSize(documents, MAX_RESULT_BYTES)
+                        + EventJsonValues.encodedSize(logicalDocuments, MAX_RESULT_BYTES) > MAX_RESULT_BYTES) {
                     throw refused("the final preview result exceeds the 8 MiB response limit");
                 }
                 trace = readTrace(executionPipeline);
             } catch (Exception problem) {
-                if (!(problem instanceof InterruptedException) || !cancelled.get()) {
-                    failure = problem;
-                    if (!(problem instanceof TapstateException)) {
-                        LOG.warn("Preview run {} failed unexpectedly (exception types: {})",
-                                request.runId(), exceptionTypes(problem));
-                    }
-                }
-                if (problem instanceof InterruptedException) {
-                    Thread.currentThread().interrupt();
-                }
+                failure = observedFailure(problem);
             } finally {
-                Job active = job.get();
-                if (active != null && !active.getFuture().isDone()) {
-                    active.cancel();
-                    try {
-                        active.getFuture().get(CANCEL_JOIN.toMillis(), TimeUnit.MILLISECONDS);
-                    } catch (InterruptedException interrupted) {
-                        Thread.currentThread().interrupt();
-                        jobJoined = active.getFuture().isDone();
-                    } catch (Exception stillEnding) {
-                        jobJoined = active.getFuture().isDone();
-                    }
-                }
-                if (jobJoined) {
-                    boolean cleanupFailed = !cleanupTemporaryState(stateMaps);
-                    try {
-                        StatelessTransforms.finishPreviewJs(executionId);
-                    } catch (RuntimeException cleanupFailure) {
-                        LOG.warn("Could not close preview JavaScript contexts for {}",
-                                executionId, cleanupFailure);
-                        cleanupFailed = true;
-                    }
-                    if (cleanupFailed && failure == null) {
-                        failure = refused("temporary preview state could not be cleaned up");
-                    }
-                    retainLease = cleanupFailed;
-                } else {
-                    retainLease = true;
-                    if (failure == null) {
-                        failure = refused("the preview job did not stop before temporary state cleanup");
-                    }
-                    Set<String> cleanupMaps = stateMaps;
-                    active.getFuture().whenComplete((ignored, jobFailure) -> cleanupAfterUnjoinedJob(cleanupMaps));
-                }
+                CleanupResult cleanup = cleanupRun(stateMaps, failure);
+                failure = cleanup.failure();
+                retainLease = cleanup.retainLease();
             }
             try {
                 if (!retainLease) {
@@ -361,6 +392,7 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
                 emit("result.completed", Map.of(
                         "format", resultFormat,
                         "documents", documents,
+                        "logicalDocuments", logicalDocuments,
                         "complete", true,
                         "rowCount", documents.size(),
                         "rootRows", sample == null ? 0 : sample.rootRows(),
@@ -502,7 +534,19 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
             return String.join(" <- ", types);
         }
 
+        private List<Map<String, Object>> readLogicalDocuments() {
+            return readDocuments().stream().map(document -> {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> normalized = (Map<String, Object>) PreviewJsonValues.normalize(document);
+                return normalized;
+            }).toList();
+        }
+
         private List<Map<String, Object>> readDocuments() {
+            return readDocuments(List.of());
+        }
+
+        private List<Map<String, Object>> readDocuments(List<StoreBackedTargetIdentities.Resolved> identities) {
             IMap<String, String> results = member.getMap(resultMapName);
             List<Map.Entry<String, String>> entries = new ArrayList<>(results.entrySet());
             entries.sort(Map.Entry.comparingByKey());
@@ -512,7 +556,14 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
                 if (json == null) {
                     continue;
                 }
-                docs.add(Collections.unmodifiableMap(PreviewDocumentStorage.decode(json)));
+                Map<String, Object> document = PreviewDocumentStorage.decode(json);
+                var identity = identities.stream()
+                        .filter(candidate -> entry.getKey().startsWith(candidate.stream() + ":["))
+                        .max(Comparator.comparingInt(candidate -> candidate.stream().length())).orElse(null);
+                if (identity != null) {
+                    document = io.tapstate.adapters.pdk.TargetIdentityProjection.row(identity.plan(), document);
+                }
+                docs.add(Collections.unmodifiableMap(document));
             }
             return List.copyOf(docs);
         }
