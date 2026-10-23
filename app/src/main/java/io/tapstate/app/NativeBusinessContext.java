@@ -382,7 +382,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                         owner.memberStorage.requireNode(); if (!ownership.proveClaim(original.scope(), command)) throw ThreeLayerStorePort.refused();
                     }));
             return ConvergenceDriver.scoped(converger, observations, samples, export,
-                    () -> node.active() && (cluster.getProfile() == ClusterProperties.Profile.SINGLE || membership.businessEligible()),
+                    () -> owner.active.get() && node.active() && (cluster.getProfile() == ClusterProperties.Profile.SINGLE || membership.businessEligible()),
                     ownership, new ConvergenceDriver.ScopedPorts(owner.configuration.intents(), owner.original.cache(),
                             owner.memberStorage::requireNode, pass -> actuator.forPass(pass, ports), pass -> admission, admission::retain));
         }

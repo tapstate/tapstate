@@ -168,6 +168,121 @@ class ThreeLayerRestartContinuationIT {
         storageOutage(true);
     }
 
+    @Test @Timeout(300)
+    void aCloudCustomerInstanceOutageKeepsConfigurationAvailableAndResumesItsOriginalTargetAndPosition() throws Exception {
+        String suffix=UUID.randomUUID().toString().replace("-","");
+        String cluster="cloud-outage-"+suffix,configDb="cloud_cfg_"+suffix,cacheDb="cloud_cache_"+suffix;
+        String configUri=CONFIG.getReplicaSetUrl(configDb);
+        String cacheUri=CACHE.getReplicaSetUrl(cacheDb);
+        cacheUri+=(cacheUri.contains("?")?"&":"?")+"socketTimeoutMS=1500&connectTimeoutMS=1500";
+        String sourceUri=DATA.getReplicaSetUrl("cloud_source_"+suffix),targetUri=CACHE.getReplicaSetUrl("cloud_target_"+suffix);
+        String targetId=StorageBinding.defaultSourceId(StorageBinding.Mode.CLOUD);
+        String input=System.getProperty("tapstate.test.cloud-release-dir",System.getenv("TAPSTATE_TEST_CLOUD_RELEASE_DIR"));
+        assertThat(input).as("the original locked Cloud release is required").isNotBlank();
+        Path seeds=Path.of(input).resolve("connectors");
+        var setup=new StorageSetupScope(cluster,"installation","setup",1);
+        var binding=new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,cacheUri,cacheDb,null);
+        try(var configuration=io.tapstate.adapters.mongostore.MongoConfigurationBootstrap.prepare(
+                new MongoConnectionSettings(configUri,null,Duration.ofSeconds(5)),cluster,"installation","setup",1)) {
+            var target=new io.tapstate.core.model.SourceResource(targetId,null,"mongodb",Map.of("isUri",true,"uri",targetUri),null,null,null,null);
+            var initial=configuration.bindings().commitWithFirstCache(setup,StorageBinding.Mode.CLOUD,binding,target);
+            try(var cache=MongoCacheDomain.connect(binding,Duration.ofSeconds(5),"cloud-outage-fixture")) {
+                cache.prepareFirstAuth(initial.firstCreation().orElseThrow()); cache.prepareInitialBusiness(initial.preparation(),() -> {});
+            }
+            configuration.bindings().complete(setup);
+        }
+        var source=EndpointAddress.uri(sourceUri);var target=EndpointAddress.uri(targetUri);
+        try(var mongo=new MongoEndpoints();var cacheClient=MongoClients.create(CACHE.getReplicaSetUrl());
+                var configClient=MongoClients.create(configUri);var http=java.net.http.HttpClient.newHttpClient()) {
+            mongo.seed(source,TABLE,SeedRows.generated(8));
+            var configuration=configClient.getDatabase(configDb);var chains=cacheClient.getDatabase(cacheDb).getCollection("srs_chains");
+            Map<String,List<Document>> originalConfiguration;Map<Long,Long> beforeOutage;String acknowledged,originalCookie,claimsBefore;Document originalChain;
+            boolean paused=false;
+            try {
+                var first=RealProcessServer.startCloudFixture(configUri,cluster,seeds);
+                try(first) {
+                    var control=cloudLogin(first);
+                    var resources=resources(sourceUri,false,targetId);
+                    resources.put(targetId+".tap.yml",control.artifact(targetId).orElseThrow().canonicalForm());
+                    control.apply(resources);control.discoverSchema(SOURCE,"mongodb",Map.of("isUri",true,"uri",sourceUri));
+                    control.lifecycle(PIPELINE,LifecycleVerb.START);awaitRows(mongo,source,target,"the Cloud snapshot before its customer instance outage");
+                    String snapshotAck=Await.answered("the Cloud snapshot target confirmation",BOUND,() -> control.durablePosition(PIPELINE,TABLE));
+                    mongo.update(source,TABLE,Map.of("id",1L),Map.of("seq",11L));awaitRows(mongo,source,target,"live Cloud CDC before the outage");
+                    acknowledged=Await.answered("live Cloud CDC target confirmation",BOUND,() -> control.durablePosition(PIPELINE,TABLE).filter(value -> !value.equals(snapshotAck)));
+                    originalCookie=control.credential();beforeOutage=rows(mongo,target);originalConfiguration=cloudInstallationFacts(configuration);
+                    assertThat(configuration.getCollection("users").countDocuments()).isZero();
+                    assertThat(chains.countDocuments()).isOne();originalChain=chains.find().first();assertThat(originalChain.get("checkpoint",Document.class)).isNotEmpty();
+                    claimsBefore=claimLeaseReading(cacheClient.getDatabase(cacheDb));
+                    CACHE.getDockerClient().pauseContainerCmd(CACHE.getContainerId()).exec();paused=true;
+                    mongo.update(source,TABLE,Map.of("id",2L),Map.of("seq",222L));mongo.delete(source,TABLE,Map.of("id",3L));
+                    Await.until("the Cloud process to revoke its unavailable customer-cache node session",Duration.ofSeconds(45),
+                            () -> first.tail().contains("Node session lost:"),first::tail);
+                    assertThat(first.isAlive()).isTrue();assertThat(cloudInstallationFacts(configuration)).isEqualTo(originalConfiguration);
+                }
+                assertThat(first.isAlive()).isFalse();
+                try(var blocked=RealProcessServer.startCloudFixture(configUri,cluster,seeds)) {
+                    var entry=http.send(java.net.http.HttpRequest.newBuilder(blocked.baseUrl().resolve("/auth/storage-entry"))
+                            .timeout(Duration.ofSeconds(30)).GET().build(),java.net.http.HttpResponse.BodyHandlers.ofString());
+                    assertThat(entry.statusCode()).isEqualTo(200);assertThat(Document.parse(entry.body())).containsEntry("entry","UNAVAILABLE");
+                    var exchange=http.send(java.net.http.HttpRequest.newBuilder(blocked.baseUrl().resolve("/auth/exchange?code=unavailable-"+suffix))
+                            .timeout(Duration.ofSeconds(30)).GET().build(),java.net.http.HttpResponse.BodyHandlers.ofString());
+                    assertThat(exchange.statusCode()).isEqualTo(503);
+                    assertThat(Document.parse(exchange.body())).containsEntry("code",io.tapstate.control.core.ControlError.STORAGE_UNAVAILABLE.code());
+                    assertThat(cloudInstallationFacts(configuration)).isEqualTo(originalConfiguration);
+                    CACHE.getDockerClient().unpauseContainerCmd(CACHE.getContainerId()).exec();paused=false;
+                    assertThat(rows(mongo,target)).isEqualTo(beforeOutage);
+                    assertThat(chains.find(new Document("_id",originalChain.get("_id"))).first()).containsEntry("checkpoint",originalChain.get("checkpoint"));
+                    String claimsAfter=claimLeaseReading(cacheClient.getDatabase(cacheDb));
+                    var control=cloudLogin(blocked);
+                    var oldSession=new ControlPlane(blocked.baseUrl());oldSession.useCloudSessionCookie(originalCookie);
+                    assertThat(oldSession.storageStatus().get("clusterId")).isEqualTo(cluster);
+                    var reported=new java.util.concurrent.atomic.AtomicBoolean();
+                    Await.until("the retained Cloud running intent to resume",BOUND,() -> {
+                        var observed=control.state(PIPELINE);
+                        if(observed.filter(PipelineState.FAILED::equals).isPresent() && reported.compareAndSet(false,true))
+                            System.out.println("CLOUD_OUTAGE_FAILED before="+claimsBefore+" after="+claimsAfter+" failure="+control.failure(PIPELINE)+" logs="+control.logs(PIPELINE));
+                        return observed.filter(PipelineState.RUNNING::equals).isPresent();
+                    },
+                            () -> "state="+control.state(PIPELINE)+" failure="+control.failure(PIPELINE)+" logs="+control.logs(PIPELINE));
+                    awaitRows(mongo,source,target,"all customer-instance outage changes to resume from the retained Cloud position");
+                    String replay=Await.answered("the retained Cloud target position to advance",BOUND,
+                            () -> control.durablePosition(PIPELINE,TABLE).filter(value -> !value.equals(acknowledged)));
+                    mongo.insert(source,TABLE,List.of(Map.of("id",9L,"seq",999L)));awaitRows(mongo,source,target,"fresh Cloud CDC after customer storage returns");
+                    Await.answered("fresh Cloud CDC confirmation",BOUND,() -> control.durablePosition(PIPELINE,TABLE).filter(value -> !value.equals(replay)));
+                    assertThat(control.snapshotRowsRead(PIPELINE)).containsEntry(TABLE,0L);
+                    assertThat(cloudInstallationFacts(configuration)).isEqualTo(originalConfiguration);
+                    assertThat(configuration.getCollection("operator_generations").find(new Document("_id",PIPELINE)).first()).containsEntry("stateGeneration",1L);
+                    assertThat(configuration.getCollection("users").countDocuments()).isZero();
+                }
+            } finally { if(paused)CACHE.getDockerClient().unpauseContainerCmd(CACHE.getContainerId()).exec(); }
+        }
+    }
+
+    private static ControlPlane cloudLogin(RealProcessServer server) {
+        var control=new ControlPlane(server.baseUrl());control.exchangeCloudCode("outage-"+UUID.randomUUID());
+        Await.until("the native Cloud business runtime to be ready",BOUND,() -> "READY".equals(control.storageStatus().get("businessPhase")),
+                () -> String.valueOf(control.storageStatus()));
+        return control;
+    }
+    private static String claimLeaseReading(com.mongodb.client.MongoDatabase cache) {
+        return io.tapstate.adapters.mongostore.SystemCollections.CACHE_WORKLOAD_CLAIMS.on(cache).aggregate(List.of(
+                new Document("$match",new Document("resourceType",new Document("$in",List.of("NODE_SESSION","PIPELINE_ACTUATION","CAPTURE")))),
+                new Document("$project",new Document("_id",0).append("resourceType",1).append("resourceId",1).append("ownerBootId",1)
+                        .append("claimGeneration",1).append("leaseUntil",1).append("observedAt","$$NOW")
+                        .append("leased",new Document("$gt",List.of("$leaseUntil","$$NOW"))))))
+                .into(new java.util.ArrayList<>()).stream().map(Document::toJson).toList().toString();
+    }
+    private static Map<String,List<Document>> cloudInstallationFacts(com.mongodb.client.MongoDatabase configuration) {
+        var result=new LinkedHashMap<String,List<Document>>();
+        for(String name:List.of("cluster_keys","storage_binding","storage_setup","sources")) {
+            var facts=configuration.getCollection(name).find().sort(new Document("_id",1)).into(new java.util.ArrayList<>());
+            assertThat(facts).as(name).isNotEmpty();
+            if(name.equals("cluster_keys"))for(var fact:facts)assertThat(fact.remove("sourceWriteFence")).isInstanceOf(Long.class);
+            result.put(name,facts);
+        }
+        return result;
+    }
+
     private void storageOutage(boolean together) throws Exception {
         String suffix = UUID.randomUUID().toString().replace("-", "");
         String cluster = "outage-" + suffix, configDb = "outage_cfg_" + suffix, cacheDb = "outage_cache_" + suffix;
@@ -390,6 +505,9 @@ class ThreeLayerRestartContinuationIT {
     }
 
     private static Map<String, String> resources(String sourceUri,boolean bounded) {
+        return resources(sourceUri,bounded,"views");
+    }
+    private static Map<String,String> resources(String sourceUri,boolean bounded,String targetId) {
         var resources = new LinkedHashMap<String, String>();
         resources.put("input.tap.yml", """
                 version: tapstate/v1
@@ -409,9 +527,9 @@ class ThreeLayerRestartContinuationIT {
                 serve:
                   from: orders
                   sync:
-                    - source: views
+                    - source: %s
                       on_full_load: clear
-                """.formatted(!bounded,bounded?"snapshot_only":"snapshot_and_cdc"));
+                """.formatted(!bounded,bounded?"snapshot_only":"snapshot_and_cdc",targetId));
         return resources;
     }
 

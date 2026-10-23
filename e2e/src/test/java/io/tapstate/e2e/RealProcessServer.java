@@ -150,6 +150,19 @@ final class RealProcessServer implements ServerHandle {
                 List.of("-Xmx768m", "-XX:ActiveProcessorCount=2"), stagingDirectory, extraArguments);
     }
 
+    /** Real Cloud Bootstrap in a separate JVM; only its external SDK boundary is a fixture. */
+    static RealProcessServer startCloudFixture(String configurationUri,String cluster,Path seeds) {
+        var server=launching(configurationUri,null,bootJar(),LOOPBACK,
+                List.of("-Xmx768m","-XX:ActiveProcessorCount=2"),null,port -> List.of(
+                        "--tapstate.cloud.cluster-id="+cluster,"--tapstate.cluster.node-id=restart-node",
+                        "--tapstate.hz.member-port=0","--tapstate.hz.jet.cooperative-thread-count=2",
+                        "--tapstate.connectors.seed-dir="+seeds,"--logging.level.root=ERROR",
+                        "--logging.level.io.tapstate.app.ConvergenceDriver=WARN"),
+                io.tapstate.app.CloudConfiguredOutageProcess.class.getName());
+        try { server.awaitReady(STARTUP_BUDGET,"CLOUD_FIXTURE_APPLICATION_READY");return server; }
+        catch(RuntimeException|Error failure) { try { server.close(); } catch(RuntimeException|Error cleanup) { failure.addSuppressed(cleanup); } throw failure; }
+    }
+
     /**
      * The same, staging the connectors it resolves into {@code stagingDirectory} rather than a directory of this
      * launch's own, which it then leaves where it is when it ends; null for a directory of the launch's own.
@@ -294,6 +307,11 @@ final class RealProcessServer implements ServerHandle {
     private static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar,
             String listenAddress, List<String> jvmOptions, Path stagingDirectory,
             IntFunction<List<String>> extraArguments) {
+        return launching(storeUri,operatorStateDatabase,jar,listenAddress,jvmOptions,stagingDirectory,extraArguments,null);
+    }
+    private static RealProcessServer launching(String storeUri,String operatorStateDatabase,Path jar,
+            String listenAddress,List<String> jvmOptions,Path stagingDirectory,
+            IntFunction<List<String>> extraArguments,String fixtureMain) {
         int port = freePort();
         // The literal address, not the name: "localhost" resolves to both 127.0.0.1 and ::1, and the
         // launch below binds only the first.
@@ -303,7 +321,7 @@ final class RealProcessServer implements ServerHandle {
         boolean owned = stagingDirectory == null;
         Path staging = owned ? ServerHandle.privateStagingDirectory() : stagingDirectory;
         Process process = launch(jar, jvmOptions, port, listenAddress, storeUri, operatorStateDatabase,
-                workingDirectory, output, staging, extraArguments.apply(port));
+                workingDirectory, output, staging, extraArguments.apply(port),fixtureMain);
         return new RealProcessServer(process, baseUrl, output, staging, owned);
     }
 
@@ -366,6 +384,9 @@ final class RealProcessServer implements ServerHandle {
     }
 
     void awaitReady(Duration budget) {
+        awaitReady(budget,"Tapstate application is ready");
+    }
+    private void awaitReady(Duration budget,String marker) {
         ControlPlane control = new ControlPlane(baseUrl);
         Await.until("the process to complete application startup", budget, () -> {
             if (!process.isAlive()) {
@@ -373,7 +394,7 @@ final class RealProcessServer implements ServerHandle {
                         + " before application readiness; its output was:\n" + tail());
             }
             try {
-                return Files.readString(output).contains("Tapstate application is ready") && control.healthy();
+                return Files.readString(output).contains(marker) && control.healthy();
             } catch (IOException failure) {
                 throw new UncheckedIOException("could not read application readiness", failure);
             }
@@ -418,13 +439,14 @@ final class RealProcessServer implements ServerHandle {
 
     private static Process launch(Path jar, List<String> jvmOptions, int port, String listenAddress,
             String storeUri, String operatorStateDatabase, Path workingDirectory, Path output,
-            Path stagingDirectory, List<String> extraArguments) {
+            Path stagingDirectory, List<String> extraArguments,String fixtureMain) {
         List<String> command = new ArrayList<>();
         command.add(javaBinary());
         command.addAll(jvmOptions);
+        command.addAll(fixtureMain==null?List.of("-jar",jar.toString()):List.of(
+                "--add-opens=java.base/java.lang=ALL-UNNAMED","-cp",
+                System.getProperty("surefire.test.class.path",System.getProperty("java.class.path")),fixtureMain));
         command.addAll(List.of(
-                "-jar",
-                jar.toString(),
                 // The role the deliverable is documented to take; parsed by the product before Spring starts.
                 "--role=all",
                 // Bound to the loopback, which is where the probe and

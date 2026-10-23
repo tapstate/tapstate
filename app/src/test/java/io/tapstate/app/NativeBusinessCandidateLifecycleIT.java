@@ -39,6 +39,67 @@ class NativeBusinessCandidateLifecycleIT {
             .withCommand("--replSet","docker-rs","--setParameter","enableTestCommands=1");
     @TempDir Path work;
 
+    @org.junit.jupiter.api.Test
+    void nativeConvergenceCannotReadPipelineIntentsUntilItsCandidateFinishesStartup() {
+        var storage=NativeAppStorage.createOnPremWithAdmin(MONGO,"startup_gate","admin","candidate-password");
+        var candidate=new java.util.concurrent.atomic.AtomicReference<NativeBusinessContext>();
+        var reads=new AtomicInteger();var prematureReads=new AtomicInteger();var exercised=new AtomicInteger();
+        try(var observer=MongoClients.create(storage.configurationUri())) {
+            try(var application=new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated())
+                    .initializers(parent -> {
+                        var factory=new RootBeanDefinition(StorageBusinessFactory.class,() -> (StorageBusinessFactory)bound -> {
+                            var actual=new NativeBusinessContext(parent.getBean(StorageRoot.class),bound,parent);candidate.set(actual);return actual;
+                        });factory.setPrimary(true);
+                        ((BeanDefinitionRegistry)parent.getBeanFactory()).registerBeanDefinition("observedStartupCandidate",factory);
+                        parent.addApplicationListener((org.springframework.context.ApplicationListener<org.springframework.context.event.ContextRefreshedEvent>)event -> {
+                            if(event.getApplicationContext().getParent()!=parent)return;
+                            var child=(ConfigurableApplicationContext)event.getApplicationContext();
+                            var original=child.getBean(SeedSweepRunner.class);var held=org.mockito.Mockito.spy(original);
+                            org.mockito.Mockito.doAnswer(invocation -> {
+                                Object result=invocation.callRealMethod();
+                                var owner=candidate.get();
+                                var starting=(java.util.concurrent.atomic.AtomicBoolean)ReflectionTestUtils.getField(owner,"active");
+                                assertThat(starting.get()).isFalse();
+                                assertThat(child.getBean(NodeSessionLease.class).active()).isTrue();
+                                assertThat(((NativeMemberStorage)ReflectionTestUtils.getField(owner,"memberStorage")).nodeActive()).isTrue();
+                                await().atMost(Duration.ofSeconds(10)).until(child.getBean(ClusterMembershipGate.class)::businessEligible);
+                                var driver=child.getBean(ConvergenceDriver.class);
+                                var ports=(ConvergenceDriver.ScopedPorts)ReflectionTestUtils.getField(driver,"scoped");
+                                var intents=org.mockito.Mockito.spy(ports.intents());
+                                org.mockito.Mockito.doAnswer(read -> {
+                                    reads.incrementAndGet();if(!starting.get())prematureReads.incrementAndGet();return read.callRealMethod();
+                                }).when(intents).pipelineIds();
+                                ReflectionTestUtils.setField(driver,"scoped",new ConvergenceDriver.ScopedPorts(intents,ports.stores(),ports.requireActive(),
+                                        ports.actuators(),ports.rebuilds(),ports.retainRebuilds()));
+                                var cache=observer.getDatabase(storage.cacheDatabase());
+                                var workloads=SystemCollections.CACHE_WORKLOAD_CLAIMS.on(cache);
+                                var businessClaims=new Document("resourceType",new Document("$in",List.of("PIPELINE_ACTUATION","CAPTURE")));
+                                var claims=workloads.find(businessClaims).sort(new Document("_id",1)).into(new ArrayList<>());
+                                var checkpoints=SystemCollections.CACHE_PIPELINE_STATE.on(cache).find().sort(new Document("_id",1)).into(new ArrayList<>());
+                                driver.reconcile();driver.reconcile();
+                                assertThat(prematureReads.get()).as("actual convergence must not enumerate business work before native startup completes").isZero();
+                                assertThat(workloads.find(businessClaims).sort(new Document("_id",1)).into(new ArrayList<>())).isEqualTo(claims);
+                                assertThat(SystemCollections.CACHE_PIPELINE_STATE.on(cache).find().sort(new Document("_id",1)).into(new ArrayList<>())).isEqualTo(checkpoints);
+                                exercised.incrementAndGet();return result;
+                            }).when(held).run(org.mockito.ArgumentMatchers.any());
+                            var beans=(org.springframework.beans.factory.support.DefaultListableBeanFactory)child.getBeanFactory();
+                            beans.destroySingleton("seedSweepRunner");beans.registerSingleton("seedSweepRunner",held);
+                        });
+                    }).run("--server.address=127.0.0.1","--server.port=0","--logging.level.root=ERROR",
+                            "--tapstate.store.mongo.uri="+storage.configurationUri(),"--tapstate.hz.member-port=0",
+                            "--tapstate.hz.jet.cooperative-thread-count=2","--tapstate.connectors.seed-dir="+work.resolve("no-seeds"),
+                            "--tapstate.connectors.plugins-dir="+work.resolve("plugins"),"--tapstate.control.auth.jwt-secret=candidate-test-signing-key")) {
+                NativeAppStorage.awaitBusiness(application);assertThat(exercised.get()).isEqualTo(1);
+                assertThat(candidate.get().available()).isTrue();int before=reads.get();
+                NativeAppStorage.business(application).getBean(ConvergenceDriver.class).reconcile();
+                assertThat(reads.get()).as("the same real store is enumerated once the candidate has finished startup").isGreaterThan(before);
+                assertThat(prematureReads.get()).isZero();
+            } finally {
+                observer.getDatabase(storage.configurationDatabase()).drop();observer.getDatabase(storage.cacheDatabase()).drop();observer.getDatabase(storage.masterDatabase()).drop();
+            }
+        }
+    }
+
     @ParameterizedTest @ValueSource(booleans={false,true})
     void failedCandidatesStopTheirOwnResourcesAndUnknownCleanupQuarantinesFurtherAssembly(boolean unknownCleanup) {
         String suffix=UUID.randomUUID().toString().replace("-","");
