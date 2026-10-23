@@ -35,7 +35,9 @@ public class RestApiConfiguration {
     private static final Duration ASYNC_RESPONSE_BUFFER = Duration.ofSeconds(15);
 
     static long asyncRequestTimeoutMillis() {
-        return Math.max(PipelinePreviewService.DEADLINE.plus(ASYNC_RESPONSE_BUFFER).toMillis(), 105000L);
+        long previewBudget = PipelinePreviewService.DEADLINE.plus(ASYNC_RESPONSE_BUFFER).toMillis();
+        long assistantBudget = OpenAiCompatibleClient.maximumProposalDuration().plus(ASYNC_RESPONSE_BUFFER).toMillis();
+        return Math.max(Math.max(previewBudget, assistantBudget), 105000L);
     }
 
     @Bean

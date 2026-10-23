@@ -18,13 +18,14 @@ import java.util.Map;
 final class ProviderSecretCipher {
     private final String active;
     private final Map<String, SecretKeySpec> keys;
+    private final SecureRandom random = new SecureRandom();
     ProviderSecretCipher(String active, Map<String, SecretKeySpec> keys) {
         this.active = active;
         this.keys = Map.copyOf(keys);
     }
     String encrypt(String owner, String provider, String secret) {
         byte[] nonce = new byte[12];
-        new SecureRandom().nextBytes(nonce);
+        random.nextBytes(nonce);
         byte[] plain = secret.getBytes(StandardCharsets.UTF_8);
         try {
             Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");

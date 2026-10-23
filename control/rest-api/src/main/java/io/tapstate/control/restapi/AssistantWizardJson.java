@@ -1,5 +1,6 @@
 package io.tapstate.control.restapi;
 
+import io.tapstate.control.core.PipelineDraftCompiler;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.common.JsonWriter;
 import java.util.ArrayList;
@@ -35,18 +36,22 @@ final class AssistantWizardJson {
         requireList(root, "keys");
         requireList(root, "columns");
         validateTransforms(requireList(root, TRANSFORMS));
-        validateRelations(requireList(view, "relations"), 0);
+        validateRelations(requireList(view, "relations"), 0, new int[1]);
         validateTransforms(requireList(view, TRANSFORMS));
     }
-    private static void validateRelations(List<?> relations, int depth) {
-        if (depth > 32) throw new IllegalArgumentException("relation nesting is too deep");
+    private static void validateRelations(List<?> relations, int depth, int[] count) {
+        if (depth > PipelineDraftCompiler.MAX_WIZARD_RELATION_DEPTH && !relations.isEmpty()) {
+            throw new IllegalArgumentException("relation nesting is too deep");
+        }
+        count[0] += relations.size();
+        if (count[0] > PipelineDraftCompiler.MAX_WIZARD_RELATIONS) throw new IllegalArgumentException("too many relations");
         for (Object raw : relations) {
             Map<String, Object> relation = requireObject(raw);
             requireList(relation, "primaryKey");
             requireList(relation, ARRAY_KEY);
             if (relation.containsKey(CONDITIONS)) requireList(relation, CONDITIONS);
             validateTransforms(requireList(relation, TRANSFORMS));
-            validateRelations(requireList(relation, "children"), depth + 1);
+            validateRelations(requireList(relation, "children"), depth + 1, count);
         }
     }
     private static void validateTransforms(List<?> transforms) {
@@ -84,7 +89,11 @@ final class AssistantWizardJson {
         return value;
     }
     private static List<Map<String, Object>> readRelated(List<Map<String, Object>> rows, String parent, String table, int depth) {
-        if (depth > 32) throw new IllegalArgumentException("relation nesting is too deep");
+        if (depth > PipelineDraftCompiler.MAX_WIZARD_RELATION_DEPTH
+                && rows.stream().anyMatch(row -> parent.equals(row.get("parentId")))) {
+            throw new IllegalArgumentException("relation nesting is too deep");
+        }
+        if (rows.size() > PipelineDraftCompiler.MAX_WIZARD_RELATIONS) throw new IllegalArgumentException("too many relations");
         List<Map<String, Object>> result = new ArrayList<>();
         for (var row : rows) {
             if (!parent.equals(row.get("parentId"))) continue;
@@ -120,10 +129,13 @@ final class AssistantWizardJson {
                 OUTPUT, Map.of("kind", oldOutput.getOrDefault("kind", "atlas"), CONFIG, output));
     }
     private static void writeRelated(List<Object> nodes, String parent, List<Map<String, Object>> rows, int depth) {
-        if (depth > 32 || rows.size() > 100) throw new IllegalArgumentException("too many relations");
+        if (depth > PipelineDraftCompiler.MAX_WIZARD_RELATION_DEPTH && !nodes.isEmpty()) {
+            throw new IllegalArgumentException("relation nesting is too deep");
+        }
         for (Object raw : nodes) writeRelatedNode(object(raw), parent, rows, depth);
     }
     private static void writeRelatedNode(Map<String, Object> node, String parent, List<Map<String, Object>> rows, int depth) {
+        if (rows.size() >= PipelineDraftCompiler.MAX_WIZARD_RELATIONS) throw new IllegalArgumentException("too many relations");
         String type = text(node.get("type"));
         if (!List.of(FLATTEN, SUB_ARRAY, "sub_doc").contains(type)) throw new IllegalArgumentException("invalid relation kind");
         String id = candidateId(node.get("id"));
@@ -199,7 +211,7 @@ final class AssistantWizardJson {
     }
     private static Map<String, Object> writeTransform(Map<String, Object> step) {
         String type = text(step.get("type"));
-        if (!List.of("filter", "map", "unwind", "js").contains(type)) throw new IllegalArgumentException("unsupported transform kind");
+        if (!List.of("filter", "map", "unwind", "js", "union").contains(type)) throw new IllegalArgumentException("unsupported transform kind");
         Map<String, Object> config = object(object(step.get(CONFIG)).get(type));
         return Map.of("id", candidateId(step.get("id")), "type", type, FIELDS, writeTransformFields(type, config));
     }

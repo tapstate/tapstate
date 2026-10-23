@@ -53,6 +53,14 @@ class AssistantWizardJsonTest {
                 .containsExactly(Map.of("id", "script", "type", "js", "fields", Map.of("script", "return record;")),
                         Map.of("id", "expand", "type", "unwind", "fields", Map.of("path", "items")));
     }
+    @Test void roundTripsExistingUnionTransforms() {
+        List<Map<String, Object>> transforms = List.of(Map.of("id", "union-orders", "type", "union",
+                "fields", Map.of("from", List.of("online_orders", "store_orders"))));
+
+        assertThat(AssistantWizardJson.writeTransforms(AssistantWizardJson.readTransforms(transforms)))
+                .containsExactly(Map.of("id", "union-orders", "type", "union",
+                        "fields", Map.of("from", List.of("online_orders", "store_orders"))));
+    }
     @Test void mapTransformsRoundTripLiteralRenameComputeAndDeleteValues() {
         Map<String, Object> wizard = Map.of("root", Map.of("id", "root", "sourceId", "orders", "table", "orders", "key", List.of("id"), "preTransforms", List.of()),
                 "related", List.of(),
@@ -75,5 +83,49 @@ class AssistantWizardJsonTest {
         List<Map<String, Object>> unsupported = List.of(Map.of("id", "bad", "type", "sql", "config", Map.of()));
         assertThatThrownBy(() -> AssistantWizardJson.writeTransforms(unsupported))
                 .isInstanceOf(IllegalArgumentException.class);
+    }
+    @Test void matchesTheCompilerRelationDepthAndCountLimits() {
+        Map<String, Object> deepest = relation("relation-128", List.of());
+        for (int index = 127; index >= 0; index--) deepest = relation("relation-" + index, List.of(deepest));
+        Map<String, Object> maxDepth = deepest;
+        Map<String, Object> view = view(List.of(maxDepth));
+
+        assertThatCode(() -> AssistantWizardJson.validateViewShape(view)).doesNotThrowAnyException();
+        Map<String, Object> wire = AssistantWizardJson.wire(view, Map.of("output", Map.of("kind", "atlas", "config", Map.of())));
+        assertThat(AssistantWizardJson.list(AssistantWizardJson.view(wire).get("relations"))).hasSize(1);
+        assertThat(AssistantWizardJson.list(wire.get("related"))).hasSize(129);
+        assertThatThrownBy(() -> AssistantWizardJson.validateViewShape(view(List.of(
+                relation("too-deep", List.of(maxDepth))))))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> AssistantWizardJson.wire(
+                view(List.of(relation("too-deep", List.of(maxDepth)))),
+                Map.of("output", Map.of("kind", "atlas", "config", Map.of()))))
+                .isInstanceOf(IllegalArgumentException.class);
+
+        List<Map<String, Object>> tooMany = new java.util.ArrayList<>();
+        for (int index = 0; index < 512; index++) tooMany.add(relation("flat-" + index, List.of()));
+        Map<String, Object> flatWire = AssistantWizardJson.wire(view(tooMany),
+                Map.of("output", Map.of("kind", "atlas", "config", Map.of())));
+        assertThat(AssistantWizardJson.list(flatWire.get("related"))).hasSize(512);
+        tooMany.add(relation("flat-512", List.of()));
+        assertThatThrownBy(() -> AssistantWizardJson.wire(view(tooMany),
+                Map.of("output", Map.of("kind", "atlas", "config", Map.of()))))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    private static Map<String, Object> view(List<Map<String, Object>> relations) {
+        return Map.of("root", Map.of("source", "src", "table", "orders", "keys", List.of("id"),
+                        "columns", List.of(), "transforms", List.of()),
+                "relations", relations, "transforms", List.of(), "destinationSourceId", "",
+                "destinationTable", "", "destinationWriteMode", "upsert");
+    }
+
+    private static Map<String, Object> relation(String id, List<Map<String, Object>> children) {
+        return Map.ofEntries(Map.entry("id", id), Map.entry("source", "src"), Map.entry("table", "items"),
+                Map.entry("type", "sub_doc"), Map.entry("primaryKey", List.of("id")),
+                Map.entry("arrayKey", List.of()), Map.entry("targetField", id), Map.entry("key", "id"),
+                Map.entry("parentKey", "id"), Map.entry("parentTable", "orders"),
+                Map.entry("conditions", List.of(Map.of("childKey", "id", "parentKey", "id"))),
+                Map.entry("transforms", List.of()), Map.entry("children", children));
     }
 }

@@ -10,6 +10,7 @@ import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.ReplaceOptions;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.AiProviderSettingsStore;
 import org.bson.Document;
 import java.nio.charset.StandardCharsets;
@@ -26,19 +27,32 @@ public final class MongoAiProviderSettingsStore implements AiProviderSettingsSto
     private final MongoClient client;
     private final MongoCollection<Document> meta;
     private final SourceConfigKeyringStore keyrings;
+    private final SourceConfigCipherProvider cipherProvider;
     MongoAiProviderSettingsStore(MongoClient client, MongoDatabase database) {
+        this(client, database, new SourceConfigKeyringHandle(new SourceConfigKeyringStore(client, database)));
+    }
+    MongoAiProviderSettingsStore(MongoClient client, MongoDatabase database, SourceConfigCipherProvider cipherProvider) {
         this.client = client;
         this.meta = SystemCollections.SYSTEM_META.on(database)
                 .withReadPreference(ReadPreference.primary()).withReadConcern(ReadConcern.MAJORITY)
                 .withWriteConcern(WriteConcern.MAJORITY.withJournal(true));
         this.keyrings = new SourceConfigKeyringStore(client, database);
+        this.cipherProvider = Objects.requireNonNull(cipherProvider);
     }
     @Override public Optional<Settings> get(String owner) {
         Document record = StoreIo.call(() -> meta.find(new Document("_id", id(owner))).first());
         if (record == null) return Optional.empty();
         String provider = record.getString("providerId");
-        String secret = keyrings.loadExistingCipher().providerSecrets().decrypt(owner, context(record), record.getString("secret"));
+        String secret = decrypt(owner, context(record), record.getString("secret"));
         return Optional.of(new Settings(provider, record.getString("baseUrl"), record.getString("model"), secret));
+    }
+    private String decrypt(String owner, String context, String envelope) {
+        try {
+            return cipherProvider.current().providerSecrets().decrypt(owner, context, envelope);
+        } catch (TapstateException firstRead) {
+            if (firstRead.code() != IoError.DOCUMENT_UNREADABLE) throw firstRead;
+            return cipherProvider.refresh().providerSecrets().decrypt(owner, context, envelope);
+        }
     }
     @Override public void put(String owner, Settings settings) {
         StoreIo.call(() -> {

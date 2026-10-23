@@ -9,6 +9,7 @@ import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.AiProviderSettingsStore.Settings;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
 
@@ -19,6 +20,7 @@ import java.time.Duration;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.*;
 
@@ -45,10 +47,17 @@ class MongoAiProviderSettingsStoreTest {
                 .append("model", model).append("secret", encrypted);
         Fixture fixture = new Fixture(keyring, settings);
         MongoAiProviderSettingsStore store = new MongoAiProviderSettingsStore(fixture.client(), fixture.database());
+        long keyringReadsAfterHandleLoad = fixture.findFilters.stream()
+                .filter(filter -> filter.equals(new Document("_id", "source-config-keyring"))).count();
 
         assertThat(store.get(owner)).contains(new io.tapstate.spi.store.AiProviderSettingsStore.Settings(
                 "openai-compatible", baseUrl, model, secret));
+        assertThat(store.get(owner)).contains(new io.tapstate.spi.store.AiProviderSettingsStore.Settings(
+                "openai-compatible", baseUrl, model, secret));
         assertThat(store.get("org-b/cluster-b")).isEmpty();
+        assertThat(fixture.findFilters.stream()
+                .filter(filter -> filter.equals(new Document("_id", "source-config-keyring"))).count())
+                .isEqualTo(keyringReadsAfterHandleLoad);
         SourceConfigCipher loaded = new SourceConfigKeyringStore(fixture.client(), fixture.database()).loadOrCreateCipher();
         assertThat(loaded.activeKeyId()).isEqualTo(keyId);
         assertThat(loaded.providerSecrets().decrypt(owner, context, encrypted)).isEqualTo(secret);
@@ -84,6 +93,39 @@ class MongoAiProviderSettingsStoreTest {
         assertThatThrownBy(() -> store.get(owner)).isInstanceOf(TapstateException.class);
     }
 
+    @Test void refreshesCachedCipherWhenCredentialWasRotatedByAnotherKeyringHandle() throws Exception {
+        String owner = "org-a/cluster-a";
+        byte[] oldKey = new byte[32];
+        oldKey[0] = 11;
+        byte[] rotatedKey = new byte[32];
+        rotatedKey[0] = 12;
+        String baseUrl = "https://relay.example.com/v1";
+        String model = "model";
+        String secret = "sk-after-rotation";
+        String context = JsonWriter.write(List.of("openai-compatible", baseUrl, model));
+        SourceConfigCipher stale = new SourceConfigCipher(oldKey);
+        SourceConfigCipher refreshed = new SourceConfigCipher(rotatedKey);
+        String encrypted = refreshed.providerSecrets().encrypt(owner, context, secret);
+        Document record = new Document("_id", MongoAiProviderSettingsStore.id(owner))
+                .append("kind", MongoAiProviderSettingsStore.KIND).append("owner", owner)
+                .append("providerId", "openai-compatible").append("baseUrl", baseUrl)
+                .append("model", model).append("secret", encrypted);
+        Fixture fixture = new Fixture(new Document(), record);
+        AtomicInteger refreshes = new AtomicInteger();
+        SourceConfigCipherProvider ciphers = new SourceConfigCipherProvider() {
+            @Override public SourceConfigCipher current() { return stale; }
+            @Override public SourceConfigCipher refresh() {
+                refreshes.incrementAndGet();
+                return refreshed;
+            }
+        };
+        MongoAiProviderSettingsStore store = new MongoAiProviderSettingsStore(
+                fixture.client(), fixture.database(), ciphers);
+
+        assertThat(store.get(owner)).contains(new Settings("openai-compatible", baseUrl, model, secret));
+        assertThat(refreshes).hasValue(1);
+    }
+
     @Test void scopesRecordIdsAndIncludesEverySupportedSecretRecordShapeInRetirementFilter() throws Exception {
         String expected = "ai-provider:" + java.util.HexFormat.of().formatHex(
                 MessageDigest.getInstance("SHA-256").digest("org/cluster".getBytes(StandardCharsets.UTF_8)));
@@ -104,7 +146,24 @@ class MongoAiProviderSettingsStoreTest {
     }
 
     @Test void verifiedMongoConnectionExposesTheOwnerScopedProviderStore() throws Exception {
-        Fixture fixture = new Fixture(new Document(), new Document());
+        byte[] key = new byte[32];
+        key[0] = 3;
+        String keyId = SourceConfigCipher.fingerprint(key);
+        Document keyring = new Document("_id", "source-config-keyring")
+                .append("formatVersion", 1).append("epoch", 1L).append("activeKeyId", keyId)
+                .append("keys", List.of(new Document("id", keyId).append("state", "active")
+                        .append("material", Base64.getUrlEncoder().withoutPadding().encodeToString(key))));
+        String owner = "org-a/cluster-a";
+        String baseUrl = "https://relay.example.com/v1";
+        String model = "model";
+        String secret = "sk-wired-keyring";
+        String context = JsonWriter.write(List.of("openai-compatible", baseUrl, model));
+        String encrypted = new SourceConfigCipher(key).providerSecrets().encrypt(owner, context, secret);
+        Document providerSettings = new Document("_id", MongoAiProviderSettingsStore.id(owner))
+                .append("kind", MongoAiProviderSettingsStore.KIND).append("owner", owner)
+                .append("providerId", "openai-compatible").append("baseUrl", baseUrl)
+                .append("model", model).append("secret", encrypted);
+        Fixture fixture = new Fixture(keyring, providerSettings);
         MongoConnection connection = new MongoConnection(new MongoConnectionSettings(
                 "mongodb://localhost/tapstate", null, Duration.ofSeconds(1)));
         var clientField = MongoConnection.class.getDeclaredField("client");
@@ -113,8 +172,19 @@ class MongoAiProviderSettingsStoreTest {
         var databaseField = MongoConnection.class.getDeclaredField("databaseName");
         databaseField.setAccessible(true);
         databaseField.set(connection, "tapstate");
+        var keyringField = MongoConnection.class.getDeclaredField("sourceConfigKeyring");
+        keyringField.setAccessible(true);
+        keyringField.set(connection, new SourceConfigKeyringHandle(
+                new SourceConfigKeyringStore(fixture.client(), fixture.database())));
 
-        assertThat(connection.aiProviderSettings()).isInstanceOf(MongoAiProviderSettingsStore.class);
+        long verifiedKeyringReads = fixture.findFilters.stream()
+                .filter(filter -> filter.equals(new Document("_id", "source-config-keyring"))).count();
+        var store = connection.aiProviderSettings();
+        assertThat(store).isInstanceOf(MongoAiProviderSettingsStore.class);
+        assertThat(store.get(owner)).contains(new Settings("openai-compatible", baseUrl, model, secret));
+        assertThat(fixture.findFilters.stream()
+                .filter(filter -> filter.equals(new Document("_id", "source-config-keyring"))).count())
+                .isEqualTo(verifiedKeyringReads);
     }
 
     private static final class Fixture {

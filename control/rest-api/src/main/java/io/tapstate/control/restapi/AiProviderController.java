@@ -7,7 +7,7 @@ import io.tapstate.control.core.CloudAuthenticationService;
 import io.tapstate.control.core.ControlError;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.common.TapstateException;
-import io.tapstate.control.core.AiProviderSettings;
+import io.tapstate.spi.store.AiProviderSettingsStore.Settings;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.http.CacheControl;
@@ -15,10 +15,12 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.Semaphore;
 
 /** Builder credential setup; all reads expose metadata only. */
 @RestController
 class AiProviderController {
+    private static final Semaphore CHECK_CAPACITY = new Semaphore(2);
     private final ObjectProvider<AiProviderService> services;
     private final ObjectProvider<CloudAuthenticationService> cloud;
     private final AuthenticationMode mode;
@@ -31,7 +33,7 @@ class AiProviderController {
     }
     @Verb("ai-provider.get") @GetMapping("/ai-provider-settings")
     ResponseEntity<Map<String, Object>> get(HttpServletRequest request) {
-        AiProviderSettings settings = service().get(owner(request)).orElse(null);
+        Settings settings = service().get(owner(request)).orElse(null);
         Map<String, Object> result = new LinkedHashMap<>(); result.put("configured", settings != null);
         result.put("providerId", settings == null ? null : settings.providerId());
         result.put("baseUrl", settings == null ? null : settings.baseUrl());
@@ -39,7 +41,7 @@ class AiProviderController {
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(result);
     }
     @Verb("ai-provider.replace") @PutMapping("/ai-provider-settings")
-    ResponseEntity<Void> put(HttpServletRequest request, @RequestBody AiProviderSettings settings) {
+    ResponseEntity<Void> put(HttpServletRequest request, @RequestBody Settings settings) {
         service().put(owner(request), AuthenticatedCaller.subject(), settings);
         return ResponseEntity.noContent().cacheControl(CacheControl.noStore()).build();
     }
@@ -49,10 +51,15 @@ class AiProviderController {
         return ResponseEntity.noContent().cacheControl(CacheControl.noStore()).build();
     }
     @Verb("ai-provider.check") @PostMapping("/ai-provider-settings:check")
-    ResponseEntity<Map<String, Object>> check(HttpServletRequest request, @RequestBody AiProviderSettings settings) {
+    ResponseEntity<Map<String, Object>> check(HttpServletRequest request, @RequestBody Settings settings) {
         String scope = owner(request);
-        client.check(service().resolve(scope, settings));
-        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(Map.of("ok", true));
+        if (!CHECK_CAPACITY.tryAcquire()) throw AiProviderService.error(ControlError.AI_OVERLOADED);
+        try {
+            client.check(service().resolve(scope, settings));
+            return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(Map.of("ok", true));
+        } finally {
+            CHECK_CAPACITY.release();
+        }
     }
     String owner(HttpServletRequest request) {
         if (mode != AuthenticationMode.CLOUD) throw new TapstateException(ControlError.AUTH_MODE_UNAVAILABLE, Map.of("mode", "on-prem"), null);

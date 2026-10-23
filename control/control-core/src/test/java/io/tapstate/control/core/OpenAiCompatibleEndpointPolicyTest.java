@@ -1,6 +1,7 @@
 package io.tapstate.control.core;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.AiProviderSettingsStore.Settings;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.URI;
@@ -12,13 +13,13 @@ import static org.assertj.core.api.Assertions.*;
 
 class OpenAiCompatibleEndpointPolicyTest {
     @Test void acceptsUserConfiguredRelaysWithoutAProviderHostAllowlist() {
-        assertThat(AiProviderService.validated(new AiProviderSettings(
+        assertThat(AiProviderService.validated(new Settings(
                 "openai-compatible", "https://api.super-nb.me", "model", "sk-test")).baseUrl())
                 .isEqualTo("https://api.super-nb.me/v1");
-        assertThat(AiProviderService.validated(new AiProviderSettings(
+        assertThat(AiProviderService.validated(new Settings(
                 "openai-compatible", "https://relay.example.com:8443/openai/v1/", "model", "sk-test")).baseUrl())
                 .isEqualTo("https://relay.example.com:8443/openai/v1");
-        assertThat(AiProviderService.validated(new AiProviderSettings(
+        assertThat(AiProviderService.validated(new Settings(
                 "openai-compatible", "https://198.18.0.230/v1", "model", "sk-test")).baseUrl())
                 .isEqualTo("https://198.18.0.230/v1");
     }
@@ -63,7 +64,9 @@ class OpenAiCompatibleEndpointPolicyTest {
                 "169.254.1.1", "172.16.0.1", "172.31.255.254", "192.0.0.1", "192.0.2.1",
                 "192.88.99.1", "192.168.0.1", "198.18.0.1", "198.19.255.254", "198.51.100.1",
                 "203.0.113.1", "224.0.0.1", "240.0.0.1", "::", "::1", "fc00::1", "fdff::1",
-                "fe80::1", "febf::1", "ff02::1", "2001:db8::1")) {
+                "fe80::1", "febf::1", "ff02::1", "2001:db8::1", "2002:0a00:0001::",
+                "2001:0:0:0:0:0:f5ff:fffe", "::ffff:10.0.0.1", "64:ff9b::a00:1", "64:ff9b:1::1",
+                "2001:4860::5efe:a00:1")) {
             InetAddress resolved = InetAddress.getByName(address);
             assertThatThrownBy(() -> OpenAiCompatibleEndpointPolicy.requestUri("https://relay.example.com/v1",
                     host -> new InetAddress[] {resolved}))
@@ -73,6 +76,9 @@ class OpenAiCompatibleEndpointPolicyTest {
         }
         assertThat(OpenAiCompatibleEndpointPolicy.requestUri("https://relay.example.com/v1",
                 host -> new InetAddress[] {InetAddress.getByName("2606:4700:4700::1111")}))
+                .isEqualTo(URI.create("https://relay.example.com/v1/chat/completions"));
+        assertThat(OpenAiCompatibleEndpointPolicy.requestUri("https://relay.example.com/v1",
+                host -> new InetAddress[] {InetAddress.getByName("64:ff9b::808:808")}))
                 .isEqualTo(URI.create("https://relay.example.com/v1/chat/completions"));
     }
 
@@ -111,7 +117,7 @@ class OpenAiCompatibleEndpointPolicyTest {
     }
 
     @Test void rejectsAProviderBaseUrlThatIsNotAnHttpsUrl() {
-        assertThatThrownBy(() -> AiProviderService.validated(new AiProviderSettings(
+        assertThatThrownBy(() -> AiProviderService.validated(new Settings(
                 "openai-compatible", "http://relay.example.com/v1", "model", "sk-test")))
                 .isInstanceOfSatisfying(TapstateException.class,
                         error -> assertThat(error.code()).isEqualTo(ControlError.MALFORMED_REQUEST))

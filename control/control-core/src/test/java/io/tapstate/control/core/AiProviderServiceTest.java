@@ -19,7 +19,7 @@ class AiProviderServiceTest {
                 "https://api.openai.com.evil.example/v1")) {
             String expected = endpoint.equals("https://api.super-nb.me") ? endpoint + "/v1" : endpoint;
             assertThat(AiProviderService.validated(
-                    new AiProviderSettings("openai-compatible", endpoint, "model", "sk-test")).baseUrl())
+                    new Settings("openai-compatible", endpoint, "model", "sk-test")).baseUrl())
                     .isEqualTo(expected);
         }
     }
@@ -27,12 +27,12 @@ class AiProviderServiceTest {
     @Test void rejectsUnsafeEndpointShapesWithoutEchoingSecrets() {
         for (String endpoint : List.of("http://localhost/v1", "https://api.openai.com@evil.example/v1",
                 "https://api.openai.com/v1?secret=sk-test", "https://api.openai.com/v1#fragment")) {
-            assertThatThrownBy(() -> AiProviderService.validated(new AiProviderSettings("openai-compatible", endpoint, "model", "sk-test")))
+            assertThatThrownBy(() -> AiProviderService.validated(new Settings("openai-compatible", endpoint, "model", "sk-test")))
                     .isInstanceOf(TapstateException.class).hasMessageNotContaining("sk-test");
         }
-        assertThatThrownBy(() -> AiProviderService.validated(new AiProviderSettings("openai-compatible", null, "model", "key\r\nx: y")))
+        assertThatThrownBy(() -> AiProviderService.validated(new Settings("openai-compatible", null, "model", "key\r\nx: y")))
                 .isInstanceOf(TapstateException.class);
-        assertThat(AiProviderService.validated(new AiProviderSettings("openai-compatible", null, "model", "sk-test")).baseUrl())
+        assertThat(AiProviderService.validated(new Settings("openai-compatible", null, "model", "sk-test")).baseUrl())
                 .isEqualTo("https://api.openai.com/v1");
     }
     @Test void storageIdentityIsSeparateFromAuditActorAndHasNoCredentialDiagnostics() {
@@ -48,17 +48,17 @@ class AiProviderServiceTest {
             public List<AuditRecord> query(Instant since, int limit) { return events; }
         };
         var service = new AiProviderService(store, new AuditGate(audit, Clock.systemUTC()));
-        AiProviderSettings secret = new AiProviderSettings("openai-compatible", null, "model", "sk-secret");
+        Settings secret = new Settings("openai-compatible", null, "model", "sk-secret");
         service.put("org-a/cluster-a", "user-a", secret);
         assertThat(service.get("org-b/cluster-b")).isEmpty();
         assertThat(service.require("org-a/cluster-a").apiKey()).isEqualTo("sk-secret");
         assertThat(secret.toString()).doesNotContain("sk-secret");
         assertThat(events.toString()).contains("user-a").doesNotContain("sk-secret");
-        service.put("org-a/cluster-a", "user-b", new AiProviderSettings("openai-compatible", null, "updated-model", null));
+        service.put("org-a/cluster-a", "user-b", new Settings("openai-compatible", null, "updated-model", null));
         assertThat(service.require("org-a/cluster-a").model()).isEqualTo("updated-model");
-        assertThat(service.resolve("org-a/cluster-a", new AiProviderSettings("openai-compatible", null, "test-model", null)).apiKey()).isEqualTo("sk-secret");
+        assertThat(service.resolve("org-a/cluster-a", new Settings("openai-compatible", null, "test-model", null)).apiKey()).isEqualTo("sk-secret");
         assertThatThrownBy(() -> service.resolve("org-a/cluster-a",
-                new AiProviderSettings("openai-compatible", "https://api.deepseek.com/v1", "test-model", null)))
+                new Settings("openai-compatible", "https://api.deepseek.com/v1", "test-model", null)))
                 .isInstanceOfSatisfying(TapstateException.class, failure -> {
                     assertThat(failure.code()).isEqualTo(ControlError.MALFORMED_REQUEST);
                     assertThat(failure).hasMessageNotContaining("sk-secret");

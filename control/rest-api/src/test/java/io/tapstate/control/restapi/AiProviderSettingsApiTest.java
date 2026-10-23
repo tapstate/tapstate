@@ -2,7 +2,6 @@ package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.AiProviderClient;
 import io.tapstate.control.core.AiProviderService;
-import io.tapstate.control.core.AiProviderSettings;
 import io.tapstate.control.core.AuditGate;
 import io.tapstate.control.core.AuthenticationMode;
 import io.tapstate.control.core.CloudAuthenticationService;
@@ -15,6 +14,7 @@ import io.tapstate.control.core.TokenSecrets;
 import io.tapstate.control.core.VerifiedToken;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.AiProviderSettingsStore;
+import io.tapstate.spi.store.AiProviderSettingsStore.Settings;
 import io.tapstate.spi.store.AuditRecord;
 import io.tapstate.spi.store.AuditStore;
 import io.tapstate.spi.store.CloudSessionContext;
@@ -48,7 +48,7 @@ class AiProviderSettingsApiTest {
     private static final CloudSessionIdentity DEPLOYMENT =
             new CloudSessionIdentity("https://cloud.example", "org-a", "cluster-a");
 
-    @Test void settingsAreWorkspaceScopedWriteOnlyAndRotateWithoutForwardingTheOldKey() {
+    @Test void settingsAreWorkspaceScopedWriteOnlyAndRotateWithoutForwardingTheOldKey() throws Exception {
         var values = new HashMap<String, AiProviderSettingsStore.Settings>();
         AiProviderSettingsStore settings = new AiProviderSettingsStore() {
             @Override public Optional<Settings> get(String owner) { return Optional.ofNullable(values.get(owner)); }
@@ -60,10 +60,10 @@ class AiProviderSettingsApiTest {
             @Override public void record(AuditRecord record) { auditRecords.add(record); }
         };
         AiProviderService service = new AiProviderService(settings, new AuditGate(audit, Clock.fixed(NOW, ZoneOffset.UTC)));
-        AtomicReference<AiProviderSettings> checked = new AtomicReference<>();
+        AtomicReference<Settings> checked = new AtomicReference<>();
         AiProviderClient fake = new AiProviderClient() {
-            @Override public void check(AiProviderSettings value) { checked.set(value); }
-            @Override public Optional<Map<String, Object>> propose(AiProviderSettings ignored, List<Map<String, String>> messages,
+            @Override public void check(Settings value) { checked.set(value); }
+            @Override public Optional<Map<String, Object>> propose(Settings ignored, List<Map<String, String>> messages,
                     Map<String, Object> context, java.util.function.Consumer<String> text) {
                 throw new AssertionError("provider settings test must not request a proposal");
             }
@@ -95,19 +95,32 @@ class AiProviderSettingsApiTest {
             assertThatThrownBy(() -> controller.get(new MockHttpServletRequest("GET", "/ai-provider-settings")))
                     .isInstanceOfSatisfying(TapstateException.class,
                             failure -> assertThat(failure.code()).isEqualTo(ControlError.UNAUTHENTICATED));
-            controller.put(workspaceA, new AiProviderSettings("openai-compatible", null, "model-a", "sk-old-key"));
+            controller.put(workspaceA, new Settings("openai-compatible", null, "model-a", "sk-old-key"));
             var metadata = controller.get(workspaceA).getBody();
             assertThat(metadata).containsEntry("configured", true).containsEntry("model", "model-a")
                     .doesNotContainKey("apiKey");
             assertThat(controller.get(workspaceB).getBody()).containsEntry("configured", false);
 
-            controller.put(workspaceA, new AiProviderSettings("openai-compatible", null, "model-b", "sk-new-key"));
-            controller.check(workspaceA, new AiProviderSettings("openai-compatible", null, "model-b", null));
+            controller.put(workspaceA, new Settings("openai-compatible", null, "model-b", "sk-new-key"));
+            var capacityField = AiProviderController.class.getDeclaredField("CHECK_CAPACITY");
+            capacityField.setAccessible(true);
+            java.util.concurrent.Semaphore capacity = (java.util.concurrent.Semaphore) capacityField.get(null);
+            assertThat(capacity.tryAcquire(2)).isTrue();
+            try {
+                assertThatThrownBy(() -> controller.check(workspaceA,
+                        new Settings("openai-compatible", null, "model-b", null)))
+                        .isInstanceOfSatisfying(TapstateException.class,
+                                failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_OVERLOADED));
+                assertThat(checked).hasValue(null);
+            } finally {
+                capacity.release(2);
+            }
+            controller.check(workspaceA, new Settings("openai-compatible", null, "model-b", null));
             assertThat(checked.get().apiKey()).isEqualTo("sk-new-key");
             assertThat(service.require(owner("org-a", "cluster-a")).apiKey()).isEqualTo("sk-new-key");
 
             assertThatThrownBy(() -> controller.check(workspaceA,
-                    new AiProviderSettings("openai-compatible", "https://api.deepseek.com/v1", "model-b", null)))
+                    new Settings("openai-compatible", "https://api.deepseek.com/v1", "model-b", null)))
                     .isInstanceOfSatisfying(TapstateException.class,
                             failure -> {
                                 assertThat(failure.code()).isEqualTo(ControlError.MALFORMED_REQUEST);
@@ -115,7 +128,7 @@ class AiProviderSettingsApiTest {
                             });
             assertThat(checked.get().baseUrl()).isEqualTo("https://api.openai.com/v1");
             assertThatThrownBy(() -> controller.put(workspaceA,
-                    new AiProviderSettings("openai-compatible", "http://127.0.0.1/v1", "model-c", "sk-bad-key")))
+                    new Settings("openai-compatible", "http://127.0.0.1/v1", "model-c", "sk-bad-key")))
                     .isInstanceOfSatisfying(TapstateException.class,
                             failure -> assertThat(failure.code()).isEqualTo(ControlError.MALFORMED_REQUEST));
             assertThat(auditRecords.toString()).doesNotContain("sk-old-key", "sk-new-key", "sk-bad-key");

@@ -6,7 +6,9 @@ import io.tapstate.control.core.ControlError;
 import io.tapstate.control.core.PipelineDraftError;
 import io.tapstate.control.core.PipelineDraftService;
 import io.tapstate.control.core.SourceProjectionService;
+import io.tapstate.control.core.SourceError;
 import io.tapstate.control.core.SourceSchemaQueryService;
+import io.tapstate.control.core.SourceView;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.canonical.CanonicalWriter;
@@ -197,7 +199,13 @@ class PipelineAssistantController {
         result.put("currentWizard", AssistantWizardJson.view(wizard(base)));
         List<Map<String, Object>> inventory = new ArrayList<>();
         for (String sourceId : inputSources(base)) {
-            var source = sources.getObject().get(sourceId);
+            SourceView source;
+            try {
+                source = sources.getObject().get(sourceId);
+            } catch (TapstateException missing) {
+                if (missing.code() == SourceError.NOT_FOUND) continue;
+                throw missing;
+            }
             String connector = source.connector().toLowerCase(java.util.Locale.ROOT);
             if (!connector.contains("postgres") && !connector.contains("mysql")) continue;
             var schema = schemas.getObject().find(sourceId).orElse(null);
@@ -229,7 +237,10 @@ class PipelineAssistantController {
         }
         var beforeOutput = AssistantWizardJson.object(AssistantWizardJson.object(wizard(base).get("output")).get("config"));
         var output = AssistantWizardJson.object(AssistantWizardJson.object(candidate.get("output")).get("config"));
-        if (!Objects.equals(beforeOutput.get(SOURCE_ID), output.get(SOURCE_ID))) throw malformed("candidate may not change the selected destination Source");
+        if (!AssistantWizardJson.text(beforeOutput.get(SOURCE_ID))
+                .equals(AssistantWizardJson.text(output.get(SOURCE_ID)))) {
+            throw malformed("candidate may not change the selected destination Source");
+        }
     }
     private Set<String> inputSources(PipelineDraft draft) {
         Set<String> ids = new LinkedHashSet<>();

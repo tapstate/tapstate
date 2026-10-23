@@ -38,8 +38,8 @@ public final class PipelineDraftCompiler {
     private static final int MAX_GRAPH_NODES = 512;
     private static final int MAX_GRAPH_EDGES = 2048;
     private static final int MAX_GRAPH_DEPTH = 128;
-    private static final int MAX_WIZARD_RELATIONS = 512;
-    private static final int MAX_WIZARD_RELATION_DEPTH = 128;
+    public static final int MAX_WIZARD_RELATIONS = 512;
+    public static final int MAX_WIZARD_RELATION_DEPTH = 128;
 
     /** Compiles one complete or incomplete draft without persisting or mutating it. */
     public PipelineResource compile(PipelineDraft draft) {

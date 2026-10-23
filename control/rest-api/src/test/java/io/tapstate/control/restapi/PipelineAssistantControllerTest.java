@@ -4,7 +4,6 @@ import io.tapstate.control.core.PipelineDraftError;
 import io.tapstate.control.core.PipelineDraftService;
 import io.tapstate.control.core.AiProviderClient;
 import io.tapstate.control.core.AiProviderService;
-import io.tapstate.control.core.AiProviderSettings;
 import io.tapstate.control.core.AuditGate;
 import io.tapstate.control.core.AuthenticationMode;
 import io.tapstate.control.core.ControlError;
@@ -17,6 +16,7 @@ import io.tapstate.control.core.OpenAiCompatibleClient;
 import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.AiProviderSettingsStore;
+import io.tapstate.spi.store.AiProviderSettingsStore.Settings;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.PipelineDraft;
 import io.tapstate.spi.store.SchemaStore;
@@ -101,8 +101,8 @@ class PipelineAssistantControllerTest {
         beans.registerSingleton("schemas", new io.tapstate.control.core.SourceSchemaQueryService(artifacts, schemaStore));
         AtomicReference<Map<String, Object>> sentContext = new AtomicReference<>();
         AiProviderClient fake = new AiProviderClient() {
-            public void check(AiProviderSettings ignored) { }
-            public Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
+            public void check(Settings ignored) { }
+            public Optional<Map<String, Object>> propose(Settings settings, List<Map<String, String>> messages,
                     Map<String, Object> context, java.util.function.Consumer<String> text) {
                 sentContext.set(context);
                 text.accept("Connect a PostgreSQL or MySQL Source and discover its schema to draft a pipeline.");
@@ -138,6 +138,51 @@ class PipelineAssistantControllerTest {
 
     @Test void postgresProposalStreamUsesOnlyItsDiscoveredSchema() throws Exception {
         verifyValidatedStream("postgres");
+    }
+
+    @Test void conversationContinuesWhenADraftReferencesADeletedSource() throws Exception {
+        var store = new PipelineApiTest.FakePipelineDraftStore();
+        store.create(draft());
+        var artifacts = new PipelineApiTest.FakeArtifactStore();
+        SchemaStore schemaStore = new SchemaStore() {
+            public void save(DiscoveredSourceModel ignored) { throw new AssertionError("must not write schema"); }
+            public Optional<DiscoveredSourceModel> get(String id) { return Optional.empty(); }
+        };
+        var audit = new AuditGate(new PipelineApiTest.RecordingAuditStore(), Clock.systemUTC());
+        var services = new PipelineApiTest.TestApp();
+        var apply = new ApplyService(TapstateCatalog::load, artifacts, audit, schemaStore,
+                PlanAdvisories.none(), SchemaDerivation.none());
+        var sources = new SourceProjectionService(apply,
+                services.artifactQueryService(artifacts), services.artifactMutationService(artifacts, audit),
+                new SourceRepresentation(TapstateCatalog::load));
+        var schemas = new io.tapstate.control.core.SourceSchemaQueryService(artifacts, schemaStore);
+        var beans = new DefaultListableBeanFactory();
+        beans.registerSingleton("drafts", new PipelineDraftService(store));
+        beans.registerSingleton("sources", sources);
+        beans.registerSingleton("schemas", schemas);
+        AtomicReference<Map<String, Object>> sentContext = new AtomicReference<>();
+        AiProviderClient fake = new AiProviderClient() {
+            public void check(Settings ignored) { }
+            public Optional<Map<String, Object>> propose(Settings settings, List<Map<String, String>> messages,
+                    Map<String, Object> context, java.util.function.Consumer<String> text) {
+                sentContext.set(context);
+                text.accept("I can still help with the remaining pipeline settings.");
+                return Optional.empty();
+            }
+        };
+        var controller = new PipelineAssistantController(beans.getBeanProvider(PipelineDraftService.class),
+                beans.getBeanProvider(SourceProjectionService.class),
+                beans.getBeanProvider(io.tapstate.control.core.SourceSchemaQueryService.class),
+                providerController(fake), fake, JsonMapper.builder().build());
+
+        var response = controller.assistant("orders", Map.of("revision", 1,
+                "messages", List.of(Map.of("role", "user", "text", "How should I configure this pipeline?"))),
+                new MockHttpServletRequest("POST", "/pipelines/orders/draft:assistant"));
+        var output = new ByteArrayOutputStream();
+        response.getBody().writeTo(output);
+
+        assertThat(sentContext.get()).containsEntry("sources", List.of()).containsEntry("proposalEnabled", false);
+        assertThat(output.toString(StandardCharsets.UTF_8)).contains("I can still help", "finishReason");
     }
 
     private static void verifyValidatedStream(String connector) throws Exception {
@@ -188,8 +233,8 @@ class PipelineAssistantControllerTest {
         AtomicBoolean providerFailure = new AtomicBoolean();
         AtomicInteger providerCalls = new AtomicInteger();
         AiProviderClient fake = new AiProviderClient() {
-            public void check(AiProviderSettings ignored) { }
-            public Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
+            public void check(Settings ignored) { }
+            public Optional<Map<String, Object>> propose(Settings settings, List<Map<String, String>> messages,
                     Map<String, Object> context, java.util.function.Consumer<String> text) {
                 providerCalls.incrementAndGet();
                 sentContext.set(context);
@@ -458,6 +503,43 @@ class PipelineAssistantControllerTest {
         view.put("destinationSourceId", "unselected-destination");
         assertThat(controller.validate("orders", 1, view)).containsEntry("valid", false).doesNotContainKey("candidateWizard");
     }
+
+    @Test void candidateKeepsAnUnsetDestinationWhenStoredOutputHasNoSourceId() {
+        var store = new PipelineApiTest.FakePipelineDraftStore();
+        PipelineDraft configured = draft();
+        PipelineDraft unfinished = new PipelineDraft("unfinished", configured.schemaVersion(), 1,
+                configured.mode(), "Unfinished", null, configured.graph(),
+                new PipelineDraft.Wizard(configured.wizard().root(), List.of(), List.of(),
+                        new PipelineDraft.Output("atlas", Map.of())),
+                null, null, null, Instant.EPOCH, Instant.EPOCH, "author");
+        store.create(unfinished);
+        var artifacts = new PipelineApiTest.FakeArtifactStore();
+        artifacts.seed("version: tapstate/v1\nkind: source\nid: src\nconnector: mysql\nmode: cdc\nconfig: {}\n");
+        var schema = new DiscoveredSourceModel("src", "mysql", 1,
+                new io.tapstate.spi.store.SourceModel(List.of(new io.tapstate.spi.store.SourceTable("orders",
+                        List.of(new io.tapstate.spi.store.SourceField("id", "integer")), List.of("id"), List.of()))));
+        SchemaStore schemaStore = new SchemaStore() {
+            public void save(DiscoveredSourceModel ignored) { throw new AssertionError("must not write schema"); }
+            public Optional<DiscoveredSourceModel> get(String id) { return Optional.of(schema); }
+        };
+        var audit = new AuditGate(new PipelineApiTest.RecordingAuditStore(), Clock.systemUTC());
+        var services = new PipelineApiTest.TestApp();
+        var apply = new ApplyService(TapstateCatalog::load, artifacts, audit, schemaStore,
+                PlanAdvisories.none(), SchemaDerivation.none());
+        var beans = new DefaultListableBeanFactory();
+        beans.registerSingleton("drafts", new PipelineDraftService(store, services.artifactQueryService(artifacts), audit, apply));
+        beans.registerSingleton("schemas", new io.tapstate.control.core.SourceSchemaQueryService(artifacts, schemaStore));
+        var mapper = JsonMapper.builder().build();
+        var controller = new PipelineAssistantController(beans.getBeanProvider(PipelineDraftService.class),
+                beans.getBeanProvider(io.tapstate.control.core.SourceProjectionService.class),
+                beans.getBeanProvider(io.tapstate.control.core.SourceSchemaQueryService.class), null,
+                new OpenAiCompatibleClient(), mapper);
+        Map<String, Object> view = AssistantWizardJson.view(AssistantWizardJson.object(
+                PipelineDraftJson.write(mapper, unfinished).get("wizard")));
+
+        assertThat(controller.validate("unfinished", 1, view)).containsEntry("valid", true)
+                .containsKey("candidateWizard");
+    }
     @Test void unfinishedDestinationStillAllowsAFilterProposalWithoutSaving() {
         var store = new PipelineApiTest.FakePipelineDraftStore();
         var configured = draft();
@@ -531,8 +613,8 @@ class PipelineAssistantControllerTest {
         beans.registerSingleton("schemas", schemas);
         AtomicReference<Map<String, Object>> sentContext = new AtomicReference<>();
         AiProviderClient fake = new AiProviderClient() {
-            public void check(AiProviderSettings ignored) { }
-            public Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
+            public void check(Settings ignored) { }
+            public Optional<Map<String, Object>> propose(Settings settings, List<Map<String, String>> messages,
                     Map<String, Object> context, java.util.function.Consumer<String> text) {
                 sentContext.set(context);
                 text.accept("Choose a smaller schema selection to generate a proposal.");
@@ -582,8 +664,8 @@ class PipelineAssistantControllerTest {
         var beans = new DefaultListableBeanFactory();
         beans.registerSingleton("drafts", new PipelineDraftService(store));
         AiProviderClient fake = new AiProviderClient() {
-            public void check(AiProviderSettings ignored) { }
-            public Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
+            public void check(Settings ignored) { }
+            public Optional<Map<String, Object>> propose(Settings settings, List<Map<String, String>> messages,
                     Map<String, Object> context, java.util.function.Consumer<String> text) {
                 text.accept("The Builder is ready for a supported Source.");
                 return Optional.empty();

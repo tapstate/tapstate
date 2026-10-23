@@ -3,6 +3,7 @@ package io.tapstate.control.core;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.AiProviderSettingsStore.Settings;
 import java.io.BufferedReader;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -25,17 +26,23 @@ import java.util.function.Function;
 /** Bounded provider protocol adapter. Only text and complete tool arguments leave this boundary. */
 public final class OpenAiCompatibleClient implements AiProviderClient {
     private static final int MAX_BYTES = 524288;
+    private static final int STREAM_ATTEMPTS = 2;
+    private static final Duration DEFAULT_RESPONSE_TIMEOUT = Duration.ofSeconds(90);
     private static final System.Logger LOG = System.getLogger(OpenAiCompatibleClient.class.getName());
     private final HttpClient http;
     private final Function<String, URI> requestUriFactory;
     private final Duration responseTimeout;
 
     public OpenAiCompatibleClient() {
-        this(OpenAiCompatibleEndpointPolicy::requestUri, Duration.ofSeconds(90));
+        this(OpenAiCompatibleEndpointPolicy::requestUri, DEFAULT_RESPONSE_TIMEOUT);
     }
 
     OpenAiCompatibleClient(Function<String, URI> requestUriFactory) {
-        this(requestUriFactory, Duration.ofSeconds(90));
+        this(requestUriFactory, DEFAULT_RESPONSE_TIMEOUT);
+    }
+
+    public static Duration maximumProposalDuration() {
+        return DEFAULT_RESPONSE_TIMEOUT.multipliedBy(STREAM_ATTEMPTS + 1L);
     }
 
     OpenAiCompatibleClient(Function<String, URI> requestUriFactory, Duration responseTimeout) {
@@ -45,7 +52,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
                 .proxy(ProxySelector.getDefault())
                 .followRedirects(HttpClient.Redirect.NEVER).build();
     }
-    @Override public void check(AiProviderSettings settings) {
+    @Override public void check(Settings settings) {
         Map<String, Object> body = Map.of("model", settings.model(), "max_tokens", 1,
                 "messages", List.of(Map.of("role", "user", "content", "Reply OK.")));
         long deadline = System.nanoTime() + responseTimeout.toNanos();
@@ -65,7 +72,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
             throw failed();
         }
     }
-    @Override public Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
+    @Override public Optional<Map<String, Object>> propose(Settings settings, List<Map<String, String>> messages,
             Map<String, Object> context, Consumer<String> text) {
         boolean proposalEnabled = !Boolean.FALSE.equals(context.get("proposalEnabled"));
         List<Map<String, String>> prompt = new ArrayList<>();
@@ -144,13 +151,14 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         Map<String, Object> transform = schemaObject(Map.of(
                 "id", string,
                 "name", string,
-                "type", Map.of("type", "string", "enum", List.of("filter", "map", "unwind", "js")),
+                "type", Map.of("type", "string", "enum", List.of("filter", "map", "unwind", "js", "union")),
                 "enabled", Map.of("type", "boolean"),
                 "config", schemaObject(Map.of(
                         "map", mapConfig,
                         "filter", schemaObject(Map.of("expr", string), List.of("expr")),
                         "unwind", Map.of("type", "object"),
-                        "js", schemaObject(Map.of("script", string), List.of("script"))), List.of())),
+                        "js", schemaObject(Map.of("script", string), List.of("script")),
+                        "union", schemaObject(Map.of("from", schemaArray(string)), List.of("from"))), List.of())),
                 List.of("id", "name", "type", "enabled", "config"));
         Map<String, Object> root = schemaObject(Map.of(
                 "source", string,
@@ -183,9 +191,9 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
     }
 
     @SuppressWarnings("unchecked")
-    private Optional<Map<String, Object>> read(AiProviderSettings settings, Map<String, Object> body, Consumer<String> text,
+    private Optional<Map<String, Object>> read(Settings settings, Map<String, Object> body, Consumer<String> text,
             boolean proposalEnabled) {
-        for (int attempt = 0; attempt < 2; attempt++) {
+        for (int attempt = 0; attempt < STREAM_ATTEMPTS; attempt++) {
             long deadline = System.nanoTime() + responseTimeout.toNanos();
             boolean[] emitted = {false};
             try {
@@ -199,7 +207,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
                 }
             } catch (RetryableStreamException error) {
                 if (emitted[0]) throw failed();
-                if (attempt > 0) return readNonStreaming(settings, body, text, proposalEnabled);
+                if (attempt >= STREAM_ATTEMPTS - 1) return readNonStreaming(settings, body, text, proposalEnabled);
                 LOG.log(System.Logger.Level.WARNING, "Retrying AI provider after an empty upstream error stream");
             } catch (java.io.IOException | InterruptedException error) {
                 if (error instanceof InterruptedException) Thread.currentThread().interrupt();
@@ -209,7 +217,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         }
         throw failed();
     }
-    private Optional<Map<String, Object>> readNonStreaming(AiProviderSettings settings, Map<String, Object> body,
+    private Optional<Map<String, Object>> readNonStreaming(Settings settings, Map<String, Object> body,
             Consumer<String> text, boolean proposalEnabled) {
         Map<String, Object> fallback = new java.util.LinkedHashMap<>(body);
         fallback.put("stream", false);
@@ -244,15 +252,15 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
     private static Optional<Map<String, Object>> readEvents(InputStream input, Consumer<String> text, boolean proposalEnabled) throws java.io.IOException {
         BufferedReader reader = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8));
         StreamState state = new StreamState();
-        String line;
-        while ((line = boundedLine(reader)) != null) {
-            state.bytes += line.length();
+        BoundedLine line;
+        while ((line = boundedLine(reader, MAX_BYTES - state.bytes)) != null) {
+            state.bytes += line.bytes();
             if (state.bytes > MAX_BYTES || Thread.currentThread().isInterrupted()) {
                 LOG.log(System.Logger.Level.WARNING, "AI provider stream exceeded its limit or was interrupted");
                 throw failed();
             }
-            if (!line.startsWith("data:")) continue;
-            String data = line.substring(5).strip();
+            if (!line.value().startsWith("data:")) continue;
+            String data = line.value().substring(5).strip();
             if ("[DONE]".equals(data)) {
                 state.done = true;
                 break;
@@ -263,7 +271,9 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         if (!state.toolCallStarted) {
             return Optional.empty();
         }
-        if (!proposalEnabled || !"tool_calls".equals(state.finish) || !"propose_pipeline".equals(state.function)) throw invalid();
+        if (!proposalEnabled
+                || (state.finish != null && !List.of("tool_calls", "stop").contains(state.finish))
+                || !"propose_pipeline".equals(state.function)) throw invalid();
         return Optional.of(candidate(state.arguments.toString()));
     }
     private static void readChunk(String data, StreamState state, Consumer<String> text) {
@@ -337,15 +347,48 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         if (value instanceof List<?> items) return items.stream().anyMatch(item -> containsSecret(item, secret));
         return false;
     }
-    private static String boundedLine(BufferedReader reader) throws java.io.IOException {
+    private record BoundedLine(String value, int bytes) { }
+
+    private static BoundedLine boundedLine(BufferedReader reader, int remainingBytes) throws java.io.IOException {
         StringBuilder line = new StringBuilder();
+        int bytes = 0;
+        int pending = -2;
         int value;
-        while ((value = reader.read()) != -1) {
-            if (value == '\n') return line.toString();
-            if (value != '\r') line.append((char) value);
-            if (line.length() > MAX_BYTES) throw failed();
+        while ((value = pending == -2 ? reader.read() : pending) != -1) {
+            pending = -2;
+            if (value == '\n') {
+                bytes++;
+                if (bytes > remainingBytes) throw failed();
+                return new BoundedLine(line.toString(), bytes);
+            }
+            if (value == '\r') {
+                bytes++;
+            } else {
+                char character = (char) value;
+                if (Character.isHighSurrogate(character)) {
+                    int next = reader.read();
+                    line.append(character);
+                    if (next != -1 && Character.isLowSurrogate((char) next)) {
+                        line.append((char) next);
+                        bytes += 4;
+                    } else {
+                        bytes += 3;
+                        pending = next;
+                    }
+                } else {
+                    line.append(character);
+                    bytes += utf8Length(character);
+                }
+            }
+            if (bytes > remainingBytes) throw failed();
         }
-        return line.isEmpty() ? null : line.toString();
+        return line.isEmpty() && bytes == 0 ? null : new BoundedLine(line.toString(), bytes);
+    }
+
+    private static int utf8Length(char character) {
+        if (character <= 0x7f) return 1;
+        if (character <= 0x7ff) return 2;
+        return 3;
     }
     private static final class ResponseDeadline implements AutoCloseable {
         private final java.util.concurrent.ScheduledExecutorService timer = Executors.newSingleThreadScheduledExecutor(Thread.ofVirtual().factory());
@@ -356,7 +399,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         }
         @Override public void close() { scheduled.cancel(false); timer.shutdownNow(); }
     }
-    private HttpRequest request(AiProviderSettings settings, Map<String, Object> body) {
+    private HttpRequest request(Settings settings, Map<String, Object> body) {
         URI uri = requestUriFactory.apply(settings.baseUrl());
         return HttpRequest.newBuilder(uri)
                 .timeout(responseTimeout).header("Content-Type", "application/json")

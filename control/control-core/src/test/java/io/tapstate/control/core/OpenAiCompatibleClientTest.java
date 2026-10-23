@@ -4,6 +4,7 @@ import com.sun.net.httpserver.HttpServer;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.AiProviderSettingsStore.Settings;
 import org.junit.jupiter.api.Test;
 import java.net.InetSocketAddress;
 import java.net.URI;
@@ -50,6 +51,15 @@ class OpenAiCompatibleClientTest {
             assertThat(candidate).hasValueSatisfying(value -> assertThat(value).containsKey("root").doesNotContainKey("content"));
         });
     }
+    @Test void acceptsCompleteToolCallsWhenTheProviderReportsStopOrOmitsFinishReason() throws Exception {
+        String arguments = JsonWriter.write(Map.of("candidateWizard", Map.of("root", Map.of("table", "orders"))));
+        for (String finishReason : java.util.Arrays.asList("stop", null)) {
+            String stream = chunk(Map.of("tool_calls", List.of(Map.of("index", 0, "function", Map.of(
+                    "name", "propose_pipeline", "arguments", arguments)))), finishReason) + "data: [DONE]\n\n";
+            withServer(200, stream, settings -> assertThat(localClient().propose(settings, List.of(), Map.of(), ignored -> { }))
+                    .hasValueSatisfying(value -> assertThat(value).containsKey("root")));
+        }
+    }
     @Test void describesTheBuilderMapRuleForCopyingAField() throws Exception {
         String arguments = JsonWriter.write(Map.of("candidateWizard", Map.of("root", Map.of("transforms", List.of(
                 Map.of("id", "copy-name", "name", "map", "type", "map", "enabled", true,
@@ -68,7 +78,7 @@ class OpenAiCompatibleClientTest {
         });
         server.start();
         try {
-            var settings = new AiProviderSettings("openai-compatible", "http://127.0.0.1:" + server.getAddress().getPort(), "test", "sk-test");
+            var settings = new Settings("openai-compatible", "http://127.0.0.1:" + server.getAddress().getPort(), "test", "sk-test");
             String editRequest = "\u4fdd\u7559\u539f\u6709 Db \u5b57\u6bb5\uff0c\u5e76\u65b0\u589e name \u5b57\u6bb5\uff0c\u503c\u53d6\u81ea Db\uff1b\u5176\u4ed6\u914d\u7f6e\u4fdd\u6301\u4e0d\u53d8\u3002";
             var result = localClient().propose(settings, List.of(Map.of("role", "user",
                     "content", editRequest)),
@@ -84,7 +94,10 @@ class OpenAiCompatibleClientTest {
             Map<?, ?> rootSchema = (Map<?, ?>) ((Map<?, ?>) candidateSchema.get("properties")).get("root");
             Map<?, ?> transformSchema = (Map<?, ?>) ((Map<?, ?>) rootSchema.get("properties")).get("transforms");
             Map<?, ?> transformItem = (Map<?, ?>) transformSchema.get("items");
+            Map<?, ?> typeSchema = (Map<?, ?>) ((Map<?, ?>) transformItem.get("properties")).get("type");
+            assertThat(((List<?>) typeSchema.get("enum")).toString()).contains("union");
             Map<?, ?> configSchema = (Map<?, ?>) ((Map<?, ?>) transformItem.get("properties")).get("config");
+            assertThat(((Map<?, ?>) configSchema.get("properties")).get("union")).isNotNull();
             Map<?, ?> mapSchema = (Map<?, ?>) ((Map<?, ?>) configSchema.get("properties")).get("map");
             Map<?, ?> fieldsSchema = (Map<?, ?>) ((Map<?, ?>) mapSchema.get("properties")).get("fields");
             Map<?, ?> ruleSchema = (Map<?, ?>) ((Map<?, ?>) fieldsSchema.get("items")).get("properties");
@@ -109,7 +122,7 @@ class OpenAiCompatibleClientTest {
         });
         server.start();
         try {
-            var settings = new AiProviderSettings("openai-compatible", "http://127.0.0.1:" + server.getAddress().getPort(), "test", "sk-test");
+            var settings = new Settings("openai-compatible", "http://127.0.0.1:" + server.getAddress().getPort(), "test", "sk-test");
             String question = "\u5982\u4f55\u65b0\u589e name \u5b57\u6bb5\uff1f";
             var result = localClient().propose(settings, List.of(Map.of("role", "user", "content", question)),
                     Map.of("proposalEnabled", true, "currentWizard", Map.of()), ignored -> { });
@@ -143,7 +156,7 @@ class OpenAiCompatibleClientTest {
             String arguments = JsonWriter.write(Map.of("candidateWizard", candidate));
             String stream = chunk(Map.of("tool_calls", List.of(Map.of("index", 0, "function", Map.of("name", "propose_pipeline", "arguments", arguments)))), "tool_calls") + "data: [DONE]\n\n";
             withServer(200, stream, settings -> {
-                var escapedSettings = new AiProviderSettings(settings.providerId(), settings.baseUrl(), settings.model(), secret);
+                var escapedSettings = new Settings(settings.providerId(), settings.baseUrl(), settings.model(), secret);
                 assertThatThrownBy(() -> localClient().propose(escapedSettings, List.of(), Map.of(), ignored -> { }))
                         .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_INVALID_PROPOSAL))
                         .hasMessageNotContaining(secret);
@@ -181,7 +194,7 @@ class OpenAiCompatibleClientTest {
     }
 
     @Test void interruptedCheckAndProposalRestoreTheInterruptFlagAndReturnCodedFailures() throws Exception {
-        var settings = new AiProviderSettings("openai-compatible", "http://127.0.0.1:1", "test", "sk-test");
+        var settings = new Settings("openai-compatible", "http://127.0.0.1:1", "test", "sk-test");
         try {
             Thread.currentThread().interrupt();
             assertThatThrownBy(() -> localClient().check(settings))
@@ -240,7 +253,7 @@ class OpenAiCompatibleClientTest {
         });
         server.start();
         try {
-            var settings = new AiProviderSettings("openai-compatible",
+            var settings = new Settings("openai-compatible",
                     "http://127.0.0.1:" + server.getAddress().getPort(), "test", "sk-test");
             List<String> conversationalText = new ArrayList<>();
             Optional<Map<String, Object>> conversation = localClient().propose(settings,
@@ -290,7 +303,7 @@ class OpenAiCompatibleClientTest {
         });
         server.start();
         try {
-            var settings = new AiProviderSettings("openai-compatible",
+            var settings = new Settings("openai-compatible",
                     "http://127.0.0.1:" + server.getAddress().getPort(), "test", "sk-test");
             Throwable failure = catchThrowable(() -> localClient().propose(settings,
                     List.of(Map.of("role", "user", "content", "Add a filter")),
@@ -314,6 +327,13 @@ class OpenAiCompatibleClientTest {
         String oversized = chunk(Map.of("content", largeDelta), null)
                 + chunk(Map.of("content", largeDelta), null) + "data: [DONE]\n\n";
         withServer(200, oversized, settings -> assertThatThrownBy(() ->
+                localClient().propose(settings, List.of(), Map.of(), ignored -> { }))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_PROVIDER_FAILED)));
+
+        String oversizedUtf8Delta = "\u4e2d".repeat(180_000);
+        String oversizedUtf8 = chunk(Map.of("content", oversizedUtf8Delta), null) + "data: [DONE]\n\n";
+        withServer(200, oversizedUtf8, settings -> assertThatThrownBy(() ->
                 localClient().propose(settings, List.of(), Map.of(), ignored -> { }))
                 .isInstanceOfSatisfying(TapstateException.class,
                         failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_PROVIDER_FAILED)));
@@ -379,7 +399,7 @@ class OpenAiCompatibleClientTest {
         });
         server.start();
         try {
-            var settings = new AiProviderSettings("openai-compatible",
+            var settings = new Settings("openai-compatible",
                     "http://127.0.0.1:" + server.getAddress().getPort(), "test", "sk-test");
             long started = System.nanoTime();
             assertThatThrownBy(() -> new OpenAiCompatibleClient(
@@ -395,13 +415,14 @@ class OpenAiCompatibleClientTest {
         }
     }
     private static String chunk(Map<String, Object> delta, String reason) {
-        Map<String, Object> choice = new java.util.LinkedHashMap<>(); choice.put("delta", delta); choice.put("finish_reason", reason);
+        Map<String, Object> choice = new java.util.LinkedHashMap<>(); choice.put("delta", delta);
+        if (reason != null) choice.put("finish_reason", reason);
         return "data: " + JsonWriter.write(Map.of("choices", List.of(choice))) + "\n\n";
     }
     private static OpenAiCompatibleClient localClient() {
         return new OpenAiCompatibleClient(baseUrl -> URI.create(baseUrl + "/chat/completions"));
     }
-    private static void withServer(int status, String body, java.util.function.Consumer<AiProviderSettings> action) throws Exception {
+    private static void withServer(int status, String body, java.util.function.Consumer<Settings> action) throws Exception {
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/chat/completions", exchange -> {
             exchange.getRequestBody().readAllBytes();
@@ -410,7 +431,7 @@ class OpenAiCompatibleClientTest {
             try (var output = exchange.getResponseBody()) { output.write(response); }
         });
         server.start();
-        try { action.accept(new AiProviderSettings("openai-compatible", "http://127.0.0.1:" + server.getAddress().getPort(), "test", "sk-test")); }
+        try { action.accept(new Settings("openai-compatible", "http://127.0.0.1:" + server.getAddress().getPort(), "test", "sk-test")); }
         finally { server.stop(0); }
     }
 }
