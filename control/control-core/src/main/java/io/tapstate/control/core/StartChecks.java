@@ -11,7 +11,12 @@ public final class StartChecks {
     private StartChecks() {
     }
 
-    /** The registered checks, in display order. */
+    /** The registered checks with a target identity reader, in display order. */
+    public static List<StartCheck> registered(PipelineTargetIdentities identities) {
+        return List.of(new TargetNotEmptyCheck(), new UnwindTargetIdentityCheck(identities));
+    }
+
+    /** The basic checks for callers without target identity assessment. */
     public static List<StartCheck> registered() {
         return List.of(new TargetNotEmptyCheck());
     }

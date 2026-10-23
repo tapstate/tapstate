@@ -13,6 +13,17 @@ import org.junit.jupiter.api.Test;
 class WiringTest {
 
     @Test
+    void regexReferencesIncludeKnownTransformNodesAndTheirAncestors() {
+        Wiring wiring = wiring("""
+                transforms:
+                  - {id: base, from: orders, type: filter, expr: "true"}
+                  - {id: expanded, from: base, type: unwind, path: items, include_array_index: position}
+                """);
+        assertThat(wiring.nodesReaching(FromClause.list(FromRef.regex("^expanded$"))))
+                .containsExactly("expanded", "base");
+    }
+
+    @Test
     void aViewKeepsSharedBranchesSeparateAndTheirStepsInRowOrder() {
         Wiring wiring = wiring("""
                 transforms:

@@ -210,6 +210,15 @@ class AStableNodeRestartReplacesOnlyItsExpiredBootSessionIT {
                         .describedAs("out of the same cluster identity")
                         .isEqualTo(cluster0);
             } finally {
+                // Keep every attempted boot before cleanup, including the replacement's exit status.
+                // The cluster fixture retains only the original two members' process output.
+                var logs = new java.util.LinkedHashMap<String, java.nio.file.Path>();
+                for (int attempt = 0; attempt < restarts.size(); attempt++) {
+                    RealProcessServer process = restarts.get(attempt);
+                    String status = process.isAlive() ? "running" : "exit-" + process.exitValue();
+                    logs.put("node-a-restart-" + attempt + "-" + status, process.output());
+                }
+                FailureScene.writeMemberLogs(cluster0, logs);
                 restarts.forEach(RealProcessServer::close);
             }
         }
@@ -253,6 +262,10 @@ class AStableNodeRestartReplacesOnlyItsExpiredBootSessionIT {
         AtomicReference<String> refusal = new AtomicReference<>("it was not asked yet");
         Await.until("the readmitted member's own read face to answer", SERVING_BUDGET,
                 () -> {
+                    if (!member.isAlive()) {
+                        throw new AssertionError("the readmitted member exited with status " + member.exitValue()
+                                + " before its read face could serve; inspect the retained restart process log");
+                    }
                     try {
                         signedIn.set(cluster.signedInAt(member));
                         return true;

@@ -469,6 +469,43 @@ class StoreBackedDagSourceTargetModelTest {
     }
 
     @Test
+    void differentSourceIdentityNamesRemainIsolatedAfterUnion() {
+        InMemoryStorePort store = new InMemoryStorePort();
+        for (String id : List.of("a", "b")) {
+            String table = "orders_" + id;
+            store.artifacts().save(new SourceResource(id, null, "mysql", Map.of("host", "h"),
+                    SourceMode.CDC, List.of(TableRef.literal(table)), null, null));
+            store.schemas().save(discovered(id, "mysql", new SourceTable(table,
+                    List.of(new SourceField("id", "bigint", io.tapstate.core.common.TapstateType.INT64),
+                            new SourceField("items", "array", io.tapstate.core.common.TapstateType.JSON)),
+                    List.of("id"), List.of())));
+        }
+        store.artifacts().save(new SourceResource("dest", null, "postgres", Map.of("host", "h"), null, null, null, null));
+        var a = Step.inline("ua", FromClause.list(FromRef.literal("a.orders_a")),
+                new TransformBody.Unwind("items", "position", false, null, null, "original_a"), null);
+        var b = Step.inline("ub", FromClause.list(FromRef.literal("b.orders_b")),
+                new TransformBody.Unwind("items", "position", false, null, null, "original_b"), null);
+        var union = Step.inline("combined", FromClause.list(FromRef.literal("ua"), FromRef.literal("ub")),
+                new TransformBody.Union(), null);
+        store.artifacts().save(new PipelineResource("p", null, List.of(SourceRef.spec("a", true), SourceRef.spec("b", true)),
+                List.of(a, b, union), null, new ServeBlock.Inline(null, FromRef.literal("combined"),
+                        List.of(new SyncElement("out", "dest", null, null, null)), null, null), null, null));
+        OpenRingGenerations.forSources(store, "a", "b");
+        Map<String, TargetTable> bound = new LinkedHashMap<>();
+        var source = new StoreBackedDagSource(store, capturingMapBinder(bound));
+        assertThat(source.derivedNodesOf("p")).containsKeys("ua", "ub", "combined");
+        source.plannedDagFor("p", null);
+        assertThat(bound.values()).extracting(TargetTable::name).containsExactlyInAnyOrder("orders_a", "orders_b");
+        for (TargetTable target : bound.values()) {
+            assertThat(target.unwindIdentity().sourceIdField()).isEqualTo(target.name().replace("orders_", "original_"));
+            var facts = new io.tapstate.adapters.pdk.TargetIdentityFacts(true, false, List.of("id", "position"),
+                    java.util.Set.of(), java.util.Set.of("id", "position", "items"), List.of(List.of("id", "position")),
+                    java.util.Set.of(), false, true, false, false, java.util.Set.of("id", "position"));
+            assertThat(io.tapstate.adapters.pdk.TargetIdentityResolver.resolve(target, facts).status()).isEqualTo("not-required");
+        }
+    }
+
+    @Test
     void qualified_sync_renames_keep_same_table_sources_in_distinct_targets() {
         for (List<String> sourceIds : List.of(List.of("left", "right"), List.of("right", "left"))) {
             InMemoryStorePort store = new InMemoryStorePort();

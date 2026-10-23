@@ -1286,6 +1286,11 @@
         "element_type": {
           "description": "Declared type of the expanded column; absent leaves the connector to infer one.",
           "type": "string"
+        },
+        "source_id_field": {
+          "description": "Field preserving the original parent identifier when the target requires a separate generated row identity. Used only when identity adaptation is needed.",
+          "type": "string",
+          "default": "_unwind_source_id"
         }
       },
       "required": [
