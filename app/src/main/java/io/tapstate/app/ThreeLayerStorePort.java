@@ -59,8 +59,17 @@ final class ThreeLayerStorePort implements StorePort {
         active();
         if (pass != null) { pass.requirePipeline(pipeline); return pass.scope(); }
         if (control != null) { if (!control.scope().pipelineId().equals(pipeline)) throw refused(); return control.scope(); }
+        return activeScope(pipeline, currentMapping(pipeline));
+    }
+    private PipelineStateMapping currentMapping(String pipeline) {
+        active();
         var mapping = configuration.pipelineStates().read(pipeline).orElseThrow(ThreeLayerStorePort::refused);
-        if (mapping.phase() != PipelineStateMapping.Phase.ACTIVE) throw refused();
+        active();
+        if (!pipeline.equals(mapping.pipelineId())) throw refused();
+        return mapping;
+    }
+    private PipelineIntentScope activeScope(String pipeline, PipelineStateMapping mapping) {
+        if (!pipeline.equals(mapping.pipelineId()) || mapping.phase() != PipelineStateMapping.Phase.ACTIVE) throw refused();
         var cache = business();
         return new PipelineIntentScope(cache.clusterId(), cache.bindingVersion(), cache.cacheIncarnation(), pipeline, mapping.stateGeneration());
     }
@@ -70,17 +79,28 @@ final class ThreeLayerStorePort implements StorePort {
                 == PipelinePreparation.Phase.UNASSIGNED;
     }
     @Override public boolean pipelineRecoveryRequired(String pipeline) {
-        active();var summary=configuration.cacheRecoveries().read(pipeline);
-        if(summary.isEmpty())return false;
-        var original=scope(pipeline);if(!summary.orElseThrow().targetScope().equals(original))throw refused();
-        if(configuration.preparations().read(pipeline).orElseThrow(ThreeLayerStorePort::refused).phase()!=PipelinePreparation.Phase.COMPLETE)return true;
-        var pending=configuration.recoveryCommands().current(bound.preparation().authScope());
-        return pending.filter(plan -> plan.originalScope().equals(bound.preparation().authScope())
-                && plan.phase()!=StorageRecoveryCommands.Phase.COMPLETE
-                && plan.manifest().selection().extent()==StorageRecoveryCommands.Extent.PIPELINE
-                && plan.manifest().selection().pipelineIds().contains(pipeline)).isPresent()
-                && configuration.intents().load(pipeline).filter(intent -> !intent.deleted() && intent.scope().equals(original)
-                        && intent.desired().targetState()==PipelineState.STOPPED).isPresent();
+        var mapping = currentMapping(pipeline);
+        if (mapping.phase() == PipelineStateMapping.Phase.REBUILDING) return false;
+        var original = activeScope(pipeline, mapping);
+        var recoveries = configuration.cacheRecoveries();
+        var summary = recoveries.read(pipeline);
+        if (summary.isEmpty()) return false;
+        if (!summary.orElseThrow().targetScope().equals(original)) {
+            if (!mapping.equals(currentMapping(pipeline)) || !summary.equals(recoveries.read(pipeline))) return false;
+            throw refused();
+        }
+        var preparation = configuration.preparations().read(pipeline).orElseThrow(ThreeLayerStorePort::refused);
+        boolean required = preparation.phase() != PipelinePreparation.Phase.COMPLETE;
+        if (!required) {
+            var pending = configuration.recoveryCommands().current(bound.preparation().authScope());
+            required = pending.filter(plan -> plan.originalScope().equals(bound.preparation().authScope())
+                    && plan.phase() != StorageRecoveryCommands.Phase.COMPLETE
+                    && plan.manifest().selection().extent() == StorageRecoveryCommands.Extent.PIPELINE
+                    && plan.manifest().selection().pipelineIds().contains(pipeline)).isPresent()
+                    && configuration.intents().load(pipeline).filter(intent -> !intent.deleted() && intent.scope().equals(original)
+                            && intent.desired().targetState() == PipelineState.STOPPED).isPresent();
+        }
+        return mapping.equals(currentMapping(pipeline)) && summary.equals(recoveries.read(pipeline)) && required;
     }
 
     @Override public ArtifactStore artifacts() { active(); return configuration.artifacts(); }
@@ -129,15 +149,30 @@ final class ThreeLayerStorePort implements StorePort {
         if (pass != null) return pass.observations();
         return new ObservationStore() {
             @Override public Optional<Observation> read(String pipeline) {
-                var original = scope(pipeline);
-                var preparation=configuration.preparations().read(pipeline).orElseThrow(ThreeLayerStorePort::refused);
-                if(preparation.phase()!=PipelinePreparation.Phase.COMPLETE)return Optional.empty();
-                if(!original.equals(preparation.scope()))throw refused();
-                return bound.cache().pipelineObservations(original).read(pipeline);
+                if (control != null) return readObservation(pipeline, scope(pipeline));
+                var mapping = currentMapping(pipeline);
+                if (mapping.phase() == PipelineStateMapping.Phase.REBUILDING) return Optional.empty();
+                var original = activeScope(pipeline, mapping);
+                try {
+                    var observation = readObservation(pipeline, original);
+                    // A display read never carries an old observation across a concurrent state rebuild.
+                    return mapping.equals(currentMapping(pipeline)) ? observation : Optional.empty();
+                } catch (TapstateException failure) {
+                    boolean retiredScope = failure.code() == IoError.WORKLOAD_CLAIM_FENCED
+                            || failure.code() == IoError.CACHE_BUSINESS_FENCED;
+                    if (!retiredScope || mapping.equals(currentMapping(pipeline))) throw failure;
+                    return Optional.empty();
+                }
             }
             @Override public void save(Observation observation) { throw refused(); }
             @Override public void delete(String pipeline) { throw refused(); }
         };
+    }
+    private Optional<Observation> readObservation(String pipeline, PipelineIntentScope original) {
+        var preparation = configuration.preparations().read(pipeline).orElseThrow(ThreeLayerStorePort::refused);
+        if (preparation.phase() != PipelinePreparation.Phase.COMPLETE) return Optional.empty();
+        if (!original.equals(preparation.scope())) throw refused();
+        return bound.cache().pipelineObservations(original).read(pipeline);
     }
     @Override public DerivedSchemaStore derivedSchemas() {
         if (pass != null) return pass.derivedSchemas();
