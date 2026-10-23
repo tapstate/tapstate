@@ -255,6 +255,11 @@ final class TwoMemberCluster implements AutoCloseable {
                 true, prepared);
     }
 
+    /** Uses the same identity, discovery and quorum settings for a test-owned startup-failure process. */
+    List<String> joiningArguments(String nodeId,int httpPort,int memberPort) {
+        return arguments(clusterId,nodeId,memberPort,seeds,httpPort,bindAddress,nodeSessionTtl);
+    }
+
     /**
      * A control plane on a process this case launched into the cluster, signed in like the other two.
      *
