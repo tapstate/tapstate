@@ -692,8 +692,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                     connectorId = origin.connectorId();
                     settings = ConnectorNoteOrigin.settings(origin);
                     reference = provisioner.resolve(connectorId, origin.artifactHash());
-                    connectorScopes = ConnectorNoteScopes.of(releaseScopes.store(), requested ->
-                            requested.equals(namespace) ? scope : releaseScopes.open(requested), releaseScopes::requireActive);
+                    connectorScopes = BoundConnectorNoteScopes.pin(releaseScopes, scope);
                 }
                 PdkConnector connector = PdkConnector.open(connectorId, reference, settings, config.node(), notes,
                         config.sharedNotes(), connectorScopes, purpose);

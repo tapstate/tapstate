@@ -32,9 +32,11 @@ final class PipelinePrivateNoteRetirement {
     private static Release pdkRelease(ConnectorProvisioner connectors) {
         Objects.requireNonNull(connectors);
         return (retirement,config,purpose,clusterId,guard) -> {
-            var fixed=retirement.scope();var store=retirement.notes().guardedBy(guard);
+            var fixed=retirement.scope();var store=retirement.notes();
+            guard.run();
             var global=store.open(new RequiredNoteOwner(fixed.owner().bindingVersion(),"pdk.global-state",
                     RequiredNoteOwner.Kind.GLOBAL,clusterId,0));
+            guard.run();
             var scopes=ConnectorNoteScopes.of(store,namespace -> {
                 if(namespace.equals(fixed.owner().namespace()))return fixed;
                 if(namespace.equals(global.owner().namespace()))return global;
