@@ -36,19 +36,19 @@ class AMovedMultiSinkPositionCanRestartAfterItsLoadIT {
         Path source = Files.createDirectory(temporary.resolve("source"));
         Path firstTarget = Files.createDirectory(temporary.resolve("first-target"));
         Path secondTarget = Files.createDirectory(temporary.resolve("second-target"));
-        EndpointAddress sourceAddress = EndpointAddress.uri(source.toString());
         EndpointAddress firstAddress = EndpointAddress.uri(firstTarget.toString());
         EndpointAddress secondAddress = EndpointAddress.uri(secondTarget.toString());
         FileEndpoints files = new FileEndpoints();
-        files.seed(sourceAddress, TABLE, SeedRows.generated(1));
+        FileEndpoints.replaceTable(source.resolve(TABLE + ".csv"), "id,priority\n1,Low\n");
+        CdcRecoveryFixture.change(source, 1, TABLE, "1", "Low", "Low");
 
-        String store = SharedMongo.replicaSetUrl("moved_two_sink_position");
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(store);
-                StoreDocuments documents = StoreDocuments.at(store)) {
+        try (files; PreparedNativeStore storage = PreparedNativeStore.create();
+                NativeSrsDocuments documents = new NativeSrsDocuments(storage);
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID,
-                    Files.readAllBytes(E2eConnectorJar.buildInto(temporary)));
+                    CdcRecoveryFixture.connectorJar(E2eConnectorJar.buildInto(temporary)));
             control.apply(workspace(source, firstTarget, secondTarget));
             control.discoverSchema(SOURCE, E2eConnectorJar.CONNECTOR_ID, Map.of("uri", source.toString()));
             control.lifecycle(PIPELINE, LifecycleVerb.START);
@@ -60,47 +60,61 @@ class AMovedMultiSinkPositionCanRestartAfterItsLoadIT {
             });
             String chain = earlier.get("chainId");
             Await.until("both sinks to finish their load with per-writer accounting", () -> {
-                Document consumer = documents.consumerOffset(chain, CONSUMER);
-                return files.count(firstAddress, TABLE) == 1
-                        && files.count(secondAddress, TABLE) == 1
+                Document consumer = currentConsumer(documents, chain);
+                return files.countRows(firstAddress, TABLE) == 1
+                        && files.countRows(secondAddress, TABLE) == 1
                         && consumer != null
-                        && consumer.getList("snapshotCompletedTables", String.class, List.of()).contains(TABLE)
+                        && consumer.get("progress", Document.class).getList("snapshotCompletedTables", String.class, List.of()).contains(TABLE)
                         && consumer.get("writerRun") instanceof Document;
-            }, () -> String.valueOf(documents.consumerOffset(chain, CONSUMER))
+            }, () -> String.valueOf(currentConsumer(documents, chain))
                     + ", state=" + control.state(PIPELINE) + ", logs=" + control.logs(PIPELINE));
             earlier = control.resumePoint(PIPELINE);
             String token = earlier.get("token");
+            long originalGeneration = currentConsumer(documents, chain).getLong("stateGeneration");
 
-            // The file connector issues a token at the load seam, but none with its changes. A fresh
-            // load samples a newer seam, leaving the earlier product-issued token available to move to.
+            // The journal supplies a real CDC position after the next load. A newer snapshot seam
+            // alone would advance the sink acknowledgement without advancing the shared capture floor.
             control.stop(PIPELINE, true);
             awaitState(control, PipelineState.STOPPED);
-            files.cdc(sourceAddress, TABLE, CdcOp.INSERT, 1);
+            FileEndpoints.replaceTable(source.resolve(TABLE + ".csv"), "id,priority\n1,Low\n2,later\n");
+            CdcRecoveryFixture.change(source, 2, TABLE, "2", "", "later");
             control.lifecycle(PIPELINE, LifecycleVerb.START);
             awaitState(control, PipelineState.RUNNING);
             Await.until("both sinks to finish a load at a position beyond the saved point", () -> {
-                Document consumer = documents.consumerOffset(chain, CONSUMER);
-                return files.count(firstAddress, TABLE) == 2
-                        && files.count(secondAddress, TABLE) == 2
+                Document consumer = currentConsumer(documents, chain);
+                return files.countRows(firstAddress, TABLE) == 2
+                        && files.countRows(secondAddress, TABLE) == 2
                         && consumer != null
-                        && consumer.getList("snapshotCompletedTables", String.class, List.of()).contains(TABLE)
+                        && consumer.getLong("stateGeneration") > originalGeneration
+                        && consumer.get("progress", Document.class).getList("snapshotCompletedTables", String.class, List.of()).contains(TABLE)
                         && consumer.get("writerRun") instanceof Document
                         && !token.equals(control.resumePoint(PIPELINE).get("token"));
             },
                     () -> control.positionReading(PIPELINE) + ", consumer="
-                            + documents.consumerOffset(chain, CONSUMER)
-                            + ", first=" + files.count(firstAddress, TABLE)
-                            + ", second=" + files.count(secondAddress, TABLE));
+                            + currentConsumer(documents, chain)
+                            + ", first=" + files.countRows(firstAddress, TABLE)
+                            + ", second=" + files.countRows(secondAddress, TABLE));
 
+            long reloadedGeneration = currentConsumer(documents, chain).getLong("stateGeneration");
+            for (Path target : List.of(firstTarget, secondTarget)) {
+                assertThat(Files.readAllLines(target.resolve(TABLE + ".csv")))
+                        .containsExactlyInAnyOrder("id,priority", "1,Low", "2,later");
+            }
+            assertThat(CdcRecoveryFixture.streams(source).stream()
+                    .flatMap(path -> CdcRecoveryFixture.lines(path).stream()))
+                    .as("the source delivered the newer position rather than only sampling a snapshot seam")
+                    .anyMatch(line -> line.startsWith("BATCH 1 2 "));
             control.stop(PIPELINE, false);
             awaitState(control, PipelineState.STOPPED);
-            assertThat(documents.consumerOffset(chain, CONSUMER).get("writerRun"))
+            assertThat(currentConsumer(documents, chain).getLong("stateGeneration")).isEqualTo(reloadedGeneration);
+            assertThat(currentConsumer(documents, chain).get("writerRun"))
                     .as("the stopped pipeline retained progress recorded separately for its writers")
                     .isInstanceOf(Document.class);
             control.writeBackPosition(PIPELINE, chain, token);
             assertThat(control.resumePoint(PIPELINE)).containsEntry("token", token);
-            Document moved = documents.consumerOffset(chain, CONSUMER);
-            assertThat(moved.getList("snapshotCompletedTables", String.class))
+            Document moved = currentConsumer(documents, chain);
+            assertThat(moved.getLong("stateGeneration")).isEqualTo(reloadedGeneration);
+            assertThat(moved.get("progress", Document.class).getList("snapshotCompletedTables", String.class))
                     .as("moving the change position preserves the completed load")
                     .contains(TABLE);
 
@@ -114,6 +128,17 @@ class AMovedMultiSinkPositionCanRestartAfterItsLoadIT {
                             control.failureCode(PIPELINE), moved)
                     .contains(PipelineState.RUNNING);
         }
+    }
+
+    /** The current native membership and cursor must describe the same physical state generation. */
+    private static Document currentConsumer(NativeSrsDocuments documents, String chain) {
+        Document member = documents.pipelineMembership(PIPELINE, SOURCE);
+        if (member == null) return null;
+        assertThat(member.get("_id", Document.class).getString("chain")).isEqualTo(chain);
+        Document cursor = documents.consumerOffset(chain, CONSUMER);
+        if (cursor == null || !member.get("stateGeneration").equals(cursor.get("stateGeneration"))
+                || !member.get("revision").equals(cursor.get("membershipRevision"))) return null;
+        return cursor;
     }
 
     private static void awaitState(ControlPlane control, PipelineState expected) {
