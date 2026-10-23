@@ -493,6 +493,12 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         });
     }
 
+    /** Rolls back sessions tagged with this departed boot without requiring a healthy business cache. */
+    public int endTransactionsLeftOpenBy(String processId) {
+        businessActive();
+        return connection.endTransactionsLeftOpenBy(processId);
+    }
+
     public Duration rateRetention() { businessActive(); return rateRetention; }
 
     private void businessActive() { if (closed.get()) throw MongoCacheBusinessIdentity.businessFenced(); }

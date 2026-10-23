@@ -434,6 +434,12 @@ public final class MongoConfigurationDomain implements AutoCloseable {
 
     public ClusterIdentityStore clusterIdentity() { return security.clusterIdentity(); }
 
+    /** Rolls back sessions tagged with this departed boot on the original configuration server. */
+    public int endTransactionsLeftOpenBy(String processId) {
+        requireOpen();
+        return connection.endTransactionsLeftOpenBy(processId);
+    }
+
     @Override
     public void close() {
         closed.set(true);

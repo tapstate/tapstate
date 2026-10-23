@@ -985,6 +985,64 @@ class PipelineDirectPreparationIT {
     private static void assertCode(org.assertj.core.api.ThrowableAssert.ThrowingCallable action,io.tapstate.core.common.TapstateErrorCode expected) {
         assertThatThrownBy(action).isInstanceOfSatisfying(TapstateException.class,failure -> { assertThat(failure.code()).isEqualTo(expected); assertThat(failure.getCause()).isNull(); });
     }
+    @Test void departedBootCleanupReachesBothIndependentServersAndPreservesOtherBoots() {
+        withFixture(f -> {
+            String gone = UUID.randomUUID().toString(), other = UUID.randomUUID().toString();
+            long heldAt = System.nanoTime();
+            try (var configGone = heldProbe(CONFIG.getReplicaSetUrl(f.configDatabase.getName()), gone);
+                    var cacheGone = heldProbe(CACHE.getReplicaSetUrl(f.cacheDatabase.getName()), gone);
+                    var configOther = heldProbe(CONFIG.getReplicaSetUrl(f.configDatabase.getName()), other);
+                    var cacheOther = heldProbe(CACHE.getReplicaSetUrl(f.cacheDatabase.getName()), other)) {
+                assertThat(List.of(configGone, cacheGone, configOther, cacheOther)).allMatch(HeldProbe::held);
+                var bound = mock(StorageRuntime.Bound.class);
+                when(bound.cache()).thenReturn(f.cache);
+                var port = new ThreeLayerStorePort(f.configuration, bound, ignored -> {
+                    throw new AssertionError("departed transaction cleanup must not prepare a Pipeline");
+                });
+
+                assertThat(port.endTransactionsLeftOpenBy(gone)).isEqualTo(2);
+
+                assertThat(Duration.ofNanos(System.nanoTime() - heldAt)).isLessThan(Duration.ofSeconds(40));
+                assertThat(configGone.held()).isFalse();
+                assertThat(cacheGone.held()).isFalse();
+                assertThat(configOther.held()).isTrue();
+                assertThat(cacheOther.held()).isTrue();
+            }
+        });
+    }
+
+    private record HeldProbe(com.mongodb.client.MongoClient client, com.mongodb.client.ClientSession session) implements AutoCloseable {
+        boolean held() {
+            return client.getDatabase("admin").aggregate(List.of(
+                    new Document("$currentOp", new Document("allUsers", false).append("idleSessions", true)),
+                    new Document("$match", new Document("lsid.id", session.getServerSession().getIdentifier().get("id"))
+                            .append("transaction", new Document("$exists", true))))).first() != null;
+        }
+        @Override public void close() { try { session.close(); } finally { client.close(); } }
+    }
+
+    private static HeldProbe heldProbe(String uri, String boot) {
+        var connectionString = new com.mongodb.ConnectionString(uri);
+        var client = MongoClients.create(com.mongodb.MongoClientSettings.builder().applyConnectionString(connectionString)
+                .applicationName(MongoConnection.processTag(boot))
+                .applyToClusterSettings(builder -> builder.serverSelectionTimeout(5, java.util.concurrent.TimeUnit.SECONDS)).build());
+        com.mongodb.client.ClientSession session = null;
+        try {
+            var collection = client.getDatabase(connectionString.getDatabase()).getCollection("departure_probe");
+            String id = UUID.randomUUID().toString();
+            collection.insertOne(new Document("_id", id).append("value", 0));
+            session = client.startSession();
+            session.startTransaction();
+            assertThat(collection.updateOne(session, new Document("_id", id),
+                    new Document("$inc", new Document("value", 1))).getMatchedCount()).isOne();
+            return new HeldProbe(client, session);
+        } catch (RuntimeException | Error failure) {
+            try { if (session != null) session.close(); } catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
+            try { client.close(); } catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
+            throw failure;
+        }
+    }
+
     private static void withFixture(Scenario scenario) {
         String suffix = UUID.randomUUID().toString().replace("-",""); var configName = "direct_cfg_"+suffix; var cacheName = "direct_cache_"+suffix;
         try (var configClient = MongoClients.create(CONFIG.getReplicaSetUrl()); var cacheClient = MongoClients.create(CACHE.getReplicaSetUrl())) {

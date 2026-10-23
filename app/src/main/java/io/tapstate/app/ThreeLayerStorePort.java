@@ -116,6 +116,23 @@ final class ThreeLayerStorePort implements StorePort {
     @Override public ClusterMembershipStore clusterMembership() { active(); return bound.cache().clusterMembership(business()); }
     @Override public SrsLogStore srsLog() { active(); return bound.cache().srs(business(), this::active).log(); }
 
+    @Override public int endTransactionsLeftOpenBy(String processId) {
+        Objects.requireNonNull(processId, "processId");
+        // Rollback of a departed boot must remain possible while business readiness is unavailable.
+        bound.requireActive();
+        int ended = 0;
+        RuntimeException failure = null;
+        try { ended = bound.cache().endTransactionsLeftOpenBy(processId); }
+        catch (RuntimeException unavailable) { failure = unavailable; }
+        try { ended += configuration.endTransactionsLeftOpenBy(processId); }
+        catch (RuntimeException unavailable) {
+            if (failure == null) failure = unavailable;
+            else if (failure != unavailable) failure.addSuppressed(unavailable);
+        }
+        if (failure != null) throw failure;
+        return ended;
+    }
+
     @Override public DesiredStore desired() {
         return new DesiredStore() {
             @Override public void save(DesiredState desired) {
