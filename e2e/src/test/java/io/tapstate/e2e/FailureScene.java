@@ -48,6 +48,34 @@ final class FailureScene {
     private FailureScene() {
     }
 
+    /** Captures an owned server's blocked stacks before fixture shutdown can erase the cause. */
+    static void writeThreads(String runId, ServerHandle server) {
+        Path temporary = null;
+        Process diagnostic = null;
+        try {
+            Path command = Path.of(System.getProperty("java.home"), "bin", "jcmd");
+            if (!Files.isExecutable(command)) return;
+            long pid = server instanceof RealProcessServer real ? real.pid() : ProcessHandle.current().pid();
+            temporary = Files.createTempFile("tapstate-e2e-threads-", ".log");
+            diagnostic = new ProcessBuilder(command.toString(), Long.toString(pid), "Thread.print")
+                    .redirectErrorStream(true).redirectOutput(temporary.toFile()).start();
+            if (!diagnostic.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                diagnostic.destroyForcibly();
+                diagnostic.waitFor(1, java.util.concurrent.TimeUnit.SECONDS);
+            }
+            Path directory = MEMBER_LOGS.resolve(runId);
+            Files.createDirectories(directory);
+            Files.writeString(directory.resolve("threads.log"), scrubbed(Files.readString(temporary)));
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+        } catch (IOException | RuntimeException unavailable) {
+            System.err.println("could not capture owned server thread diagnostics: " + unavailable.getClass().getSimpleName());
+        } finally {
+            if (diagnostic != null && diagnostic.isAlive()) diagnostic.destroyForcibly();
+            if (temporary != null) try { Files.deleteIfExists(temporary); } catch (IOException ignored) { }
+        }
+    }
+
     /** One value from outside, with anything address-shaped taken out of it. */
     private static String scrubbed(Object value) {
         return value == null ? "null" : ADDRESS.matcher(value.toString()).replaceAll("<address elided>");

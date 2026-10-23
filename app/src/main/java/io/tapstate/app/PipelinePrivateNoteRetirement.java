@@ -91,23 +91,26 @@ final class PipelinePrivateNoteRetirement {
         operations.requirePending(original);guard.run();
     }
     /** Deletion has its own original lifecycle authority; a cache-only full never enters this path. */
-    void delete(PipelineRetirementPreparation original,PipelineRetirements lifecycle,Runnable guard) {
-        Objects.requireNonNull(original);Objects.requireNonNull(lifecycle);Objects.requireNonNull(guard);
+    void delete(PipelineRetirementPreparation original,PipelineRetirements lifecycle,Runnable guard,Runnable local) {
+        Objects.requireNonNull(original);Objects.requireNonNull(lifecycle);Objects.requireNonNull(guard);Objects.requireNonNull(local);
         guard.run();lifecycle.requirePending(original);var request=original.request();
-        for(var retirement:notes.guardedBy(guard).retirements(request.scope(),request.operationId())) {
-            lifecycle.requirePending(original);releaseOne(request.scope().clusterId(),retirement,guard);
+        for(var retirement:notes.guardedBy(local).retirements(request.scope(),request.operationId())) {
+            guard.run();lifecycle.requirePending(original);releaseOne(request.scope().clusterId(),retirement,guard,local);
         }
         lifecycle.requirePending(original);guard.run();
     }
 
     private void releaseOne(String clusterId,RequiredNoteRetirement retirement,Runnable guard) {
+        releaseOne(clusterId,retirement,guard,guard);
+    }
+    private void releaseOne(String clusterId,RequiredNoteRetirement retirement,Runnable guard,Runnable local) {
         guard.run();if(retirement.completed())return;var origin=retirement.origin();
         if(origin.isPresent()) {
             var owner=retirement.scope().owner();
             var purpose=java.util.Arrays.stream(PipelineNode.Purpose.values()).filter(owner::hasPurpose).findFirst().orElseThrow(PipelinePrivateNoteRetirement::unavailable);
             String prefix="pdk.state."+owner.ownerId()+"."+purpose.segment()+".";
             var config=new CaptureConfig(origin.orElseThrow().connectorId(),Map.of(),List.of(),new PipelineNode(owner.ownerId(),owner.namespace().substring(prefix.length())));
-            release.run(retirement,config,purpose,clusterId,guard).ifPresent(failure -> {throw failure;});guard.run();
+            release.run(retirement,config,purpose,clusterId,local).ifPresent(failure -> {throw failure;});guard.run();
         }
         retirement.completeAfterVerifiedRelease();guard.run();
     }

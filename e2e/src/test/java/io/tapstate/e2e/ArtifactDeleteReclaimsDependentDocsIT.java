@@ -55,12 +55,18 @@ class ArtifactDeleteReclaimsDependentDocsIT {
                                 + " state=" + states.find(id).first() + " observation=" + observations.find(id).first());
                 assertThat(configuration.intents().pipelineIds()).contains(pipelineId);
 
-                running.stopAndSettle();
+                // Deletion must retire this run's original scope, rather than an intervening full rebuild.
+                running.stopAndSettle(false);
                 var before = configuration.intents().load(pipelineId).orElseThrow();
                 var checkpoint = states.find(id).first();
                 assertThat(before.deleted()).isFalse();
                 assertThat(checkpoint).isNotNull();
-                control.deleteArtifact(pipelineId, control.contentHash(pipelineId));
+                try {
+                    control.deleteArtifact(pipelineId, control.contentHash(pipelineId));
+                } catch (RuntimeException | Error failure) {
+                    FailureScene.writeThreads(storage.clusterId(), server);
+                    throw failure;
+                }
 
                 assertThat(control.artifact(pipelineId)).isEmpty();
                 var tombstone = configuration.intents().load(pipelineId).orElseThrow();

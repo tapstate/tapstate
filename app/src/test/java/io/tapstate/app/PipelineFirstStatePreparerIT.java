@@ -436,7 +436,7 @@ class PipelineFirstStatePreparerIT {
                 return failed.get()?Optional.of(new TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE,Map.of(),null)):Optional.empty();
             });
             var coordinator=new PipelineDeletionCoordinator(f.configuration.retirements(),f.cache.pipelineRetirements(f.business(),ACTIVE),f.cache.srs(f.business(),ACTIVE).consumers(),notes,
-                    () -> f.node,ACTIVE,(original,manifest) -> new PipelineDeletionCoordinator.Isolated(original.cache(),ACTIVE));
+                    () -> f.node,ACTIVE,(original,manifest) -> new PipelineDeletionCoordinator.Isolated(original.cache(),ACTIVE,ACTIVE));
             assertThatThrownBy(() -> coordinator.delete(request,Optional.empty())).isInstanceOf(TapstateException.class);
             assertThat(f.configuration.pipelineStates().read("flow").orElseThrow().phase()).isEqualTo(io.tapstate.spi.store.PipelineStateMapping.Phase.RETIRING);
             var beforeLateRelease=f.claim();

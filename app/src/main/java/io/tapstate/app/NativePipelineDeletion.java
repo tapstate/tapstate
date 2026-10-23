@@ -138,7 +138,8 @@ final class NativePipelineDeletion implements ArtifactMutationService.PipelineDe
                     }
                     operators.requireRetired(scope,ceiling,proof); proof.run();
                 };
-                retired.run(); return new PipelineDeletionCoordinator.Isolated(isolated,retired);
+                retired.run(); return new PipelineDeletionCoordinator.Isolated(isolated,retired,
+                        () -> {active.run();control.requireHeld();active.run();});
             });
             try {
                 if (pending.isPresent()) coordinator.resume(scope,request.operationId(),manifest).orElseThrow(NativePipelineDeletion::fenced);
