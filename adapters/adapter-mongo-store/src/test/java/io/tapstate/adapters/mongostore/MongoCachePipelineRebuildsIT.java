@@ -43,6 +43,73 @@ class MongoCachePipelineRebuildsIT {
     private static final WorkloadOwner OWNER = new WorkloadOwner("node-a", "boot-a");
     private static MongoDBContainer mongo() { return new MongoDBContainer(DockerImageName.parse("mongo:7.0")); }
 
+    @Test void aPurgeWithPinnedModelsCanThenDeleteItsSuccessorWithoutTouchingAnotherPipeline() {
+        withFixture(f -> {
+            var originalClaim = f.advance("flow");
+            var models = f.domain.pipelineDerivedSchemas(f.scope, originalClaim, ACTIVE);
+            models.record("flow", "source.orders", Map.of("id", "bigint"), "statement", "sources", "derivation");
+            models.pin("flow", "source.orders", 0);
+            f.initial("other");
+            var otherScope = new PipelineIntentScope(f.scope.clusterId(), 1, f.scope.cacheIncarnation(), "other", 1);
+            f.domain.pipelineDerivedSchemas(otherScope, f.advance("other"), ACTIVE)
+                    .record("other", "source.orders", Map.of("id", "bigint"), "statement", "sources", "derivation");
+            var rows = SystemCollections.CACHE_DERIVED_SCHEMAS.on(f.cache);
+            var other = rows.find(new Document("_id", "other.source.orders")).first();
+            assertThat(other).isNotNull();
+            var intent = f.configuration.intents().load("flow").orElseThrow();
+            assertThat(f.configuration.intents().compareAndSet(f.scope, intent.intentRevision(),
+                    new DesiredState("flow", PipelineState.STOPPED, intent.desired().revision(), true))).isTrue();
+            var pending = f.pending(0);
+            var receipt = f.rebuilds().prepare(pending, f.node, TTL, AT);
+            var prepared = f.configuration.rebuilds().complete(receipt);
+            var pipeline = f.configuration.artifacts().get("flow").orElseThrow();
+            var deletion = f.configuration.retirements().begin(new PipelineRetirementRequest("delete-after-purge", prepared.scope(),
+                    CanonicalHash.of(pipeline), java.util.Optional.of(new PipelineRetirementRequest.CacheOriginal(receipt.claim(), receipt.checkpointEpoch()))));
+
+            var retired = f.domain.pipelineRetirements(f.business, ACTIVE).retire(deletion, f.node);
+            f.configuration.retirements().complete(retired);
+
+            assertThat(f.configuration.artifacts().get("flow")).isEmpty();
+            assertThat(rows.find(new Document("_id", "flow.source.orders")).first()).isNull();
+            assertThat(rows.find(new Document("_id", "other.source.orders")).first()).isEqualTo(other);
+        });
+    }
+
+    @Test void anUnreadableOriginalModelPreventsPurgeFromPublishingASuccessor() {
+        withFixture(f -> {
+            var models = f.domain.pipelineDerivedSchemas(f.scope, f.advance("flow"), ACTIVE);
+            models.record("flow", "source.orders", Map.of("id", "bigint"), "statement", "sources", "derivation");
+            SystemCollections.CACHE_DERIVED_SCHEMAS.on(f.cache).updateOne(new Document("_id", "flow.source.orders"),
+                    new Document("$set", new Document("pin", 4L)));
+            var pending = f.pending(0);
+            var before = f.snapshot();
+            var mapping = f.mapping();
+
+            assertCode(() -> f.rebuilds().prepare(pending, f.node, TTL, AT), IoError.DOCUMENT_UNREADABLE);
+
+            assertThat(f.snapshot()).isEqualTo(before);
+            assertThat(f.mapping()).isEqualTo(mapping);
+        });
+    }
+
+    @Test void aLateOldModelCannotBeAcceptedByTheOriginalRebuildRetry() {
+        withFixture(f -> {
+            var models = f.domain.pipelineDerivedSchemas(f.scope, f.advance("flow"), ACTIVE);
+            models.record("flow", "source.orders", Map.of("id", "bigint"), "statement", "sources", "derivation");
+            var rows = SystemCollections.CACHE_DERIVED_SCHEMAS.on(f.cache);
+            var previous = rows.find(new Document("_id", "flow.source.orders")).first();
+            var pending = f.pending(0);
+            f.rebuilds().prepare(pending, f.node, TTL, AT);
+            assertThat(rows.find(new Document("_id", "flow.source.orders")).first()).isNull();
+            rows.insertOne(previous);
+            var before = f.snapshot();
+
+            assertCode(() -> f.rebuilds().prepare(pending, f.node, TTL, AT), IoError.DOCUMENT_UNREADABLE);
+
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
     @Test void completedDeletionReusesTheSameIdWithoutResettingClaimOrCheckpointHistory() {
         withFixture(f -> {
             var running=f.advance("flow");var sourceScope=RequiredNoteOwner.forNode(1,new io.tapstate.core.model.PipelineNode("flow","source"),io.tapstate.core.model.PipelineNode.Purpose.CAPTURE,1);
@@ -629,6 +696,9 @@ class MongoCachePipelineRebuildsIT {
 
     @Test void lossAfterTheActualCacheCheckpointWriteRollsBackTheWholeReplacement() {
         withFixture(f -> {
+            var models = f.domain.pipelineDerivedSchemas(f.scope, f.advance("flow"), ACTIVE);
+            models.record("flow", "source.orders", Map.of("id", "bigint"), "statement", "sources", "derivation");
+            models.pin("flow", "source.orders", 0);
             var pending=f.pending(0);var before=f.snapshot();
             try(var witness=new MongoCommandWitness(CACHE.getReplicaSetUrl(),f.cache.getName(),"update","pipeline_state")) {
                 var store=new MongoCachePipelineRebuilds(witness.client,witness.database,f.business,witness::refuseAfterCommand,MongoRateHistoryStore.DEFAULT_RETENTION);

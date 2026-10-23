@@ -110,6 +110,7 @@ final class MongoCachePipelineRebuilds implements PipelineCacheRebuilds {
                                 claim.executionGeneration(), claim.topologyRevision());
                         long epoch = state.getLong("epoch") + 1, writeFence = state.getLong("runtimeWriteFence") + 1;
                         var receipt = new Receipt(this, original, currentNode, nextClaim, epoch, writeFence);
+                        new MongoCacheDerivedSchemaStore(access).retireInTransaction(session, false);
                         MongoOperatorInventory.retire(session, database, original);
                         Document expected = new Document(filter).append("pipelineScope", MongoPipelinePreparationFacts.scope(old))
                                 .append("pipelinePreparation", row.get("pipelinePreparation"));
@@ -159,6 +160,8 @@ final class MongoCachePipelineRebuilds implements PipelineCacheRebuilds {
             if (state.getLong("epoch").longValue() != epoch.longValue() || state.getLong("runtimeWriteFence").longValue() != writeFence.longValue()
                     || !StateJson.of(PipelineState.STOPPED).equals(state.get("stateJson"))) throw rebuild(target);
             requireEmptyPayloads(session, target);
+            new MongoCacheDerivedSchemaStore(new MongoCachePipelineAccess(client, database, target, null,
+                    () -> active(original), retention)).requireAbsentInTransaction(session);
             new MongoSrsConsumerStore(client, database, business, () -> active(original), new MongoCacheMetadataStructure(database, retention)::verifySrs)
                     .requireDetachedPipeline(session, original.request().originalScope());
             MongoOperatorInventory.requireInitial(session, database, target, original.preparationId());
