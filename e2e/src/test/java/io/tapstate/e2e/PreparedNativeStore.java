@@ -38,6 +38,10 @@ final class PreparedNativeStore implements AutoCloseable {
         return install("e2e-" + UUID.randomUUID(), "e2e", "e2e-password", null, server::uriForThisHost);
     }
 
+    static PreparedNativeStore createOn(org.testcontainers.containers.MongoDBContainer mongo) {
+        return install("e2e-" + UUID.randomUUID(), "e2e", "e2e-password", null, mongo::getReplicaSetUrl);
+    }
+
     static PreparedNativeStore create(String username, String password) {
         return create("e2e-" + UUID.randomUUID(), username, password);
     }
