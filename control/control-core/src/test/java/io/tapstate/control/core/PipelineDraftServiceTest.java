@@ -218,6 +218,24 @@ class PipelineDraftServiceTest {
     }
 
     @Test
+    void previewReportsMissingWizardUnionInputsWithTheExistingInvalidDraftCode() {
+        PipelineDraft incompleteUnion = new PipelineDraft("orders", 1, 2, PipelineDraft.Mode.WIZARD,
+                "Orders", "", null,
+                new PipelineDraft.Wizard(new PipelineDraft.Root("root", "crm", "orders", List.of(), List.of()),
+                        List.of(), List.of(new PipelineDraft.Transform("merge", "union", Map.of())),
+                        new PipelineDraft.Output("atlas", Map.of("sourceId", "atlas", "table", "orders"))),
+                null, null, null, NOW, NOW, "alice");
+        store.seed(incompleteUnion);
+
+        assertThatThrownBy(() -> service.preview("orders", 2))
+                .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class, error -> {
+                    assertThat(error.code()).isEqualTo(PipelineDraftError.INVALID);
+                    assertThat(error.args()).containsEntry("reason",
+                            "wizard union requires at least one additional input");
+                });
+    }
+
+    @Test
     void publishReturnsTheArtifactOnlyAfterTheStorePublishesIt() {
         PipelineDraft complete = draft(6, "alice", null, null, null, NOW, NOW);
         store.seed(complete);

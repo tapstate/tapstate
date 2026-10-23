@@ -60,7 +60,7 @@ class OpenAiCompatibleClientTest {
                     .hasValueSatisfying(value -> assertThat(value).containsKey("root")));
         }
     }
-    @Test void describesTheBuilderMapRuleForCopyingAField() throws Exception {
+    @Test void describesUnionAndMapRulesForBuilderProposals() throws Exception {
         String arguments = JsonWriter.write(Map.of("candidateWizard", Map.of("root", Map.of("transforms", List.of(
                 Map.of("id", "copy-name", "name", "map", "type", "map", "enabled", true,
                         "config", Map.of("map", Map.of("fields", List.of(Map.of("id", "name-rule",
@@ -95,9 +95,15 @@ class OpenAiCompatibleClientTest {
             Map<?, ?> transformSchema = (Map<?, ?>) ((Map<?, ?>) rootSchema.get("properties")).get("transforms");
             Map<?, ?> transformItem = (Map<?, ?>) transformSchema.get("items");
             Map<?, ?> typeSchema = (Map<?, ?>) ((Map<?, ?>) transformItem.get("properties")).get("type");
-            assertThat(((List<?>) typeSchema.get("enum")).toString()).doesNotContain("union");
+            assertThat(((List<?>) typeSchema.get("enum")).toString()).contains("union");
             Map<?, ?> configSchema = (Map<?, ?>) ((Map<?, ?>) transformItem.get("properties")).get("config");
-            assertThat(((Map<?, ?>) configSchema.get("properties")).get("union")).isNull();
+            Map<?, ?> unionSchema = (Map<?, ?>) ((Map<?, ?>) configSchema.get("properties")).get("union");
+            assertThat(unionSchema).isNotNull();
+            Map<?, ?> unionProperties = (Map<?, ?>) unionSchema.get("properties");
+            Map<?, ?> inputsSchema = (Map<?, ?>) unionProperties.get("from");
+            assertThat(inputsSchema.get("type")).isEqualTo("array");
+            assertThat(((Map<?, ?>) inputsSchema.get("items")).get("type")).isEqualTo("string");
+            assertThat(unionSchema.get("required")).isEqualTo(List.of("from"));
             Map<?, ?> mapSchema = (Map<?, ?>) ((Map<?, ?>) configSchema.get("properties")).get("map");
             Map<?, ?> fieldsSchema = (Map<?, ?>) ((Map<?, ?>) mapSchema.get("properties")).get("fields");
             Map<?, ?> ruleSchema = (Map<?, ?>) ((Map<?, ?>) fieldsSchema.get("items")).get("properties");

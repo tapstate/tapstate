@@ -66,12 +66,18 @@ public final class PipelineDraftCompiler {
         LinkedHashSet<String> sourceIds = new LinkedHashSet<>();
         sourceIds.add(root.sourceId());
         wizard.related().forEach(related -> sourceIds.add(related.sourceId()));
+        addUnionSources(root.preTransforms(), sourceIds);
+        wizard.related().forEach(related -> addUnionSources(related.preTransforms(), sourceIds));
+        addUnionSources(wizard.transforms(), sourceIds);
 
         LinkedHashMap<String, FromRef> aliases = new LinkedHashMap<>();
         List<Step> steps = new ArrayList<>();
         Map<String, String> outputAliases = new LinkedHashMap<>();
+        Map<String, Set<String>> branchInputs = new LinkedHashMap<>();
+        Set<String> rootInputs = new LinkedHashSet<>(Set.of(root.sourceId() + "." + root.table()));
         outputAliases.put(root.id(), compileBranch(root.id(), root.sourceId() + "." + root.table(),
-                root.preTransforms(), aliases, steps));
+                root.preTransforms(), aliases, steps, rootInputs));
+        branchInputs.put(root.id(), rootInputs);
 
         Map<String, List<PipelineDraft.Related>> children = new LinkedHashMap<>();
         for (PipelineDraft.Related related : wizard.related()) {
@@ -81,8 +87,11 @@ public final class PipelineDraftCompiler {
                 throw new IllegalArgumentException("related table parent does not exist: " + related.parentId());
             }
             children.computeIfAbsent(related.parentId(), ignored -> new ArrayList<>()).add(related);
+            Set<String> relatedInputs = new LinkedHashSet<>(Set.of(related.sourceId() + "." + related.table()));
             outputAliases.put(related.id(), compileBranch(related.id(),
-                    related.sourceId() + "." + related.table(), related.preTransforms(), aliases, steps));
+                    related.sourceId() + "." + related.table(), related.preTransforms(), aliases, steps,
+                    relatedInputs));
+            branchInputs.put(related.id(), relatedInputs);
         }
 
         String previous;
@@ -99,11 +108,13 @@ public final class PipelineDraftCompiler {
             steps.add(new Step.Inline(nestId, FromClause.aliases(aliases), nest, Map.of()));
             previous = nestId;
         }
+        Set<String> currentInputs = new LinkedHashSet<>();
+        branchInputs.values().forEach(currentInputs::addAll);
         for (PipelineDraft.Transform transform : wizard.transforms()) {
             if (isNoOpMap(transform)) {
                 continue;
             }
-            Step step = compileTransform(transform, previous);
+            Step step = compileTransform(transform, previous, currentInputs);
             steps.add(step);
             previous = step.id();
         }
@@ -221,7 +232,7 @@ public final class PipelineDraftCompiler {
     }
 
     private static String compileBranch(String owner, String source, List<PipelineDraft.Transform> transforms,
-            Map<String, FromRef> aliases, List<Step> steps) {
+            Map<String, FromRef> aliases, List<Step> steps, Set<String> currentInputs) {
         String previous = source;
         int index = 0;
         for (PipelineDraft.Transform transform : transforms) {
@@ -231,7 +242,8 @@ public final class PipelineDraftCompiler {
             }
             String stepId = transformIndex == 1 ? owner + "__pre"
                     : owner + "__pre__" + transformIndex + "__" + transform.id();
-            Step step = compileTransform(new PipelineDraft.Transform(stepId, transform.type(), transform.fields()), previous);
+            Step step = compileTransform(new PipelineDraft.Transform(stepId, transform.type(), transform.fields()),
+                    previous, currentInputs);
             steps.add(step);
             previous = stepId;
         }
@@ -287,7 +299,19 @@ public final class PipelineDraftCompiler {
         return result;
     }
 
-    private static Step compileTransform(PipelineDraft.Transform transform, String previous) {
+    private static Step compileTransform(PipelineDraft.Transform transform, String previous,
+            Set<String> currentInputs) {
+        if ("union".equals(transform.type())) {
+            List<String> additionalInputs = wizardUnionInputs(transform.fields());
+            if (additionalInputs.stream().anyMatch(currentInputs::contains)) {
+                throw new IllegalArgumentException("wizard union input duplicates an existing pipeline input");
+            }
+            List<FromRef> refs = new ArrayList<>();
+            refs.add(FromRef.literal(previous));
+            additionalInputs.stream().map(FromRef::literal).forEach(refs::add);
+            currentInputs.addAll(additionalInputs);
+            return Step.inline(transform.id(), new FromClause.Flow(refs), new TransformBody.Union(), Map.of());
+        }
         FromClause from = FromClause.list(FromRef.literal(previous));
         TransformBody body = switch (transform.type()) {
             case "map" -> new TransformBody.MapProjection(mapFields(transform.fields()));
@@ -296,6 +320,36 @@ public final class PipelineDraftCompiler {
             default -> throw new IllegalArgumentException("unsupported wizard transform: " + transform.type());
         };
         return Step.inline(transform.id(), from, body, Map.of());
+    }
+
+    private static void addUnionSources(List<PipelineDraft.Transform> transforms, Set<String> sourceIds) {
+        for (PipelineDraft.Transform transform : transforms) {
+            if ("union".equals(transform.type())) {
+                wizardUnionInputs(transform.fields()).forEach(input -> sourceIds.add(input.substring(0, input.indexOf('.'))));
+            }
+        }
+    }
+
+    private static List<String> wizardUnionInputs(Map<String, Object> fields) {
+        Object rawInputs = fields.get("from");
+        if (!(rawInputs instanceof List<?> values) || values.isEmpty()) {
+            throw new IllegalArgumentException("wizard union requires at least one additional input");
+        }
+        Set<String> unique = new LinkedHashSet<>();
+        for (Object value : values) {
+            if (!(value instanceof String input)) {
+                throw new IllegalArgumentException("wizard union input must be a source-qualified table reference");
+            }
+            int separator = input.indexOf('.');
+            if (separator < 1 || separator == input.length() - 1
+                    || input.substring(0, separator).isBlank() || input.substring(separator + 1).isBlank()) {
+                throw new IllegalArgumentException("wizard union input must be a source-qualified table reference");
+            }
+            if (!unique.add(input)) {
+                throw new IllegalArgumentException("wizard union inputs must be unique");
+            }
+        }
+        return List.copyOf(unique);
     }
 
     private static TransformBody wizardTransformBody(PipelineDraft.Transform transform) {

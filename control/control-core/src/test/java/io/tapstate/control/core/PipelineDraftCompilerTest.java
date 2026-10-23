@@ -806,7 +806,7 @@ class PipelineDraftCompilerTest {
         PipelineDraft template = wizardDraft();
         assertCompileFails(withWizard(template, template.wizard().root(), List.of(),
                 List.of(new PipelineDraft.Transform("step", "union", Map.of())), template.wizard().output()),
-                "unsupported wizard transform: union");
+                "wizard union requires at least one additional input");
         assertCompileFails(withWizard(template, template.wizard().root(), List.of(),
                 List.of(new PipelineDraft.Transform("step", "filter", Map.of())), template.wizard().output()),
                 "transform field must be non-blank: expr");
@@ -826,6 +826,42 @@ class PipelineDraftCompilerTest {
                 new PipelineDraft.Node("filter", "filter", null, null, Map.of("expr", "active"), Map.of())),
                 List.of(), new PipelineDraft.Viewport(0, 0, 1));
         assertCompileFails(dagDraft(noInput), "graph node requires an input: filter");
+    }
+
+    @Test
+    void compilesWizardUnionWithCurrentOutputAndAdditionalQualifiedInputs() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Transform union = new PipelineDraft.Transform("merge-orders", "union",
+                Map.of("from", List.of("warehouse.archive_orders", "crm.priority_orders")));
+
+        PipelineResource compiled = compiler.compile(withWizard(template, template.wizard().root(),
+                template.wizard().related(), List.of(union), template.wizard().output()));
+
+        Step.Inline compiledUnion = (Step.Inline) compiled.transforms().getLast();
+        assertThat(compiledUnion.body()).isEqualTo(new TransformBody.Union());
+        assertThat(((FromClause.Flow) compiledUnion.from()).refs()).containsExactly(
+                FromRef.literal("customer-orders__nest"),
+                FromRef.literal("warehouse.archive_orders"),
+                FromRef.literal("crm.priority_orders"));
+        assertThat(compiled.sources()).extracting(source -> source.id()).containsExactly("crm", "warehouse");
+        assertThat(((ServeBlock.Inline) compiled.serve()).from()).isEqualTo(
+                FromClause.list(FromRef.literal("merge-orders")));
+    }
+
+    @Test
+    void rejectsMalformedOrDuplicateWizardUnionInputs() {
+        PipelineDraft template = wizardDraft();
+        assertCompileFails(withWizard(template, template.wizard().root(), template.wizard().related(),
+                List.of(new PipelineDraft.Transform("merge", "union", Map.of("from", List.of("archive")))),
+                template.wizard().output()), "wizard union input must be a source-qualified table reference");
+        assertCompileFails(withWizard(template, template.wizard().root(), template.wizard().related(),
+                List.of(new PipelineDraft.Transform("merge", "union",
+                        Map.of("from", List.of("warehouse.archive", "warehouse.archive")))),
+                template.wizard().output()), "wizard union inputs must be unique");
+        assertCompileFails(withWizard(template, template.wizard().root(), template.wizard().related(),
+                List.of(new PipelineDraft.Transform("merge", "union",
+                        Map.of("from", List.of("crm.orders")))),
+                template.wizard().output()), "wizard union input duplicates an existing pipeline input");
     }
 
     @Test

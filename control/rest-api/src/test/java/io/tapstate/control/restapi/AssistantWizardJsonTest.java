@@ -53,14 +53,13 @@ class AssistantWizardJsonTest {
                 .containsExactly(Map.of("id", "script", "type", "js", "fields", Map.of("script", "return record;")),
                         Map.of("id", "expand", "type", "unwind", "fields", Map.of("path", "items")));
     }
-    @Test void rejectsUnionTransformsUnsupportedByWizardCompiler() {
+    @Test void roundTripsUnionInputReferencesForWizardCandidates() {
         List<Map<String, Object>> transforms = List.of(Map.of("id", "union-orders", "type", "union",
-                "fields", Map.of("from", List.of("online_orders", "store_orders"))));
+                "fields", Map.of("from", List.of("src.archive_orders"))));
 
         List<Map<String, Object>> candidate = AssistantWizardJson.readTransforms(transforms);
-        assertThatThrownBy(() -> AssistantWizardJson.writeTransforms(candidate))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessage("unsupported transform kind");
+        assertThat(AssistantWizardJson.writeTransforms(candidate)).containsExactly(Map.of(
+                "id", "union-orders", "type", "union", "fields", Map.of("from", List.of("src.archive_orders"))));
     }
     @Test void mapTransformsRoundTripLiteralRenameComputeAndDeleteValues() {
         Map<String, Object> wizard = Map.of("root", Map.of("id", "root", "sourceId", "orders", "table", "orders", "key", List.of("id"), "preTransforms", List.of()),

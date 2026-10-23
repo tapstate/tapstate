@@ -50,6 +50,8 @@ class PipelineAssistantController {
     private static final String FINISH_REASON = "finishReason";
     private static final String VALID = "valid";
     private static final String TRANSFORMS = "transforms";
+    private static final String PRE_TRANSFORMS = "preTransforms";
+    private static final String FIELDS = "fields";
     private static final String WIZARD = "wizard";
     private static final String NODE_ID = "nodeId";
     private static final String SOURCE_ID = "sourceId";
@@ -241,6 +243,57 @@ class PipelineAssistantController {
                 .equals(AssistantWizardJson.text(output.get(SOURCE_ID)))) {
             throw malformed("candidate may not change the selected destination Source");
         }
+        validateUnionInputs(base, candidate, allowed);
+    }
+
+    private void validateUnionInputs(PipelineDraft base, Map<String, Object> candidate, Set<String> allowed) {
+        List<Map<String, Object>> transforms = new ArrayList<>();
+        Map<String, Object> root = AssistantWizardJson.object(candidate.get("root"));
+        transforms.addAll(AssistantWizardJson.list(root.get(PRE_TRANSFORMS)).stream()
+                .map(AssistantWizardJson::object).toList());
+        for (Object rawRelation : AssistantWizardJson.list(candidate.get("related"))) {
+            Map<String, Object> relation = AssistantWizardJson.object(rawRelation);
+            transforms.addAll(AssistantWizardJson.list(relation.get(PRE_TRANSFORMS)).stream()
+                    .map(AssistantWizardJson::object).toList());
+        }
+        transforms.addAll(AssistantWizardJson.list(candidate.get(TRANSFORMS)).stream()
+                .map(AssistantWizardJson::object).toList());
+        for (Map<String, Object> transform : transforms) {
+            if (!"union".equals(transform.get("type"))) continue;
+            Map<String, Object> fields = AssistantWizardJson.object(transform.get(FIELDS));
+            Object rawInputs = fields.get("from");
+            if (!(rawInputs instanceof List<?> inputs) || inputs.isEmpty()) {
+                throw invalidUnionDraft(base, "wizard union requires at least one additional input");
+            }
+            for (Object rawInput : inputs) {
+                if (!(rawInput instanceof String input) || !input.equals(input.trim())) {
+                    throw invalidUnionDraft(base,
+                            "wizard union input must be a source-qualified table reference");
+                }
+                int separator = input.indexOf('.');
+                if (separator < 1 || separator == input.length() - 1
+                        || input.substring(0, separator).isBlank() || input.substring(separator + 1).isBlank()) {
+                    throw invalidUnionDraft(base,
+                            "wizard union input must be a source-qualified table reference");
+                }
+                String sourceId = input.substring(0, separator);
+                String tableName = input.substring(separator + 1);
+                if (!allowed.contains(sourceId)) {
+                    throw invalidUnionDraft(base,
+                            "wizard union input must reference a table in a selected Source schema");
+                }
+                var schema = schemas.getObject().find(sourceId).orElse(null);
+                if (schema == null || schema.tables().stream().noneMatch(table -> table.name().equals(tableName))) {
+                    throw invalidUnionDraft(base,
+                            "wizard union input must reference a table in a selected Source schema");
+                }
+            }
+        }
+    }
+
+    private static TapstateException invalidUnionDraft(PipelineDraft base, String reason) {
+        return new TapstateException(PipelineDraftError.INVALID,
+                Map.of("id", base.pipelineId(), "reason", reason), null);
     }
     private Set<String> inputSources(PipelineDraft draft) {
         Set<String> ids = new LinkedHashSet<>();
@@ -282,6 +335,15 @@ class PipelineAssistantController {
         for (String name : safeNames) {
             Object value = params.get(name);
             if (value instanceof String text && !text.isBlank() && text.length() <= 256) safe.put(name, text);
+        }
+        Object reason = params.get("reason");
+        if (reason instanceof String text && Set.of(
+                "wizard union requires at least one additional input",
+                "wizard union input must be a source-qualified table reference",
+                "wizard union inputs must be unique",
+                "wizard union input duplicates an existing pipeline input",
+                "wizard union input must reference a table in a selected Source schema").contains(text)) {
+            safe.put("reason", text);
         }
         return Map.copyOf(safe);
     }

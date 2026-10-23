@@ -57,6 +57,11 @@ final class AssistantWizardJson {
     private static void validateTransforms(List<?> transforms) {
         for (Object raw : transforms) {
             Map<String, Object> transform = requireObject(raw);
+            if ("union".equals(transform.get("type"))) {
+                Map<String, Object> config = requireObject(transform.get(CONFIG));
+                requireList(requireObject(config.get("union")), "from");
+                continue;
+            }
             if (!"map".equals(transform.get("type"))) continue;
             Map<String, Object> config = requireObject(transform.get(CONFIG));
             Map<String, Object> map = requireObject(config.get("map"));
@@ -211,7 +216,7 @@ final class AssistantWizardJson {
     }
     private static Map<String, Object> writeTransform(Map<String, Object> step) {
         String type = text(step.get("type"));
-        if (!List.of("filter", "map", "unwind", "js").contains(type)) throw new IllegalArgumentException("unsupported transform kind");
+        if (!List.of("filter", "map", "unwind", "js", "union").contains(type)) throw new IllegalArgumentException("unsupported transform kind");
         Map<String, Object> config = object(object(step.get(CONFIG)).get(type));
         return Map.of("id", candidateId(step.get("id")), "type", type, FIELDS, writeTransformFields(type, config));
     }

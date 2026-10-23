@@ -83,6 +83,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
                     + "Copy the complete currentWizard and change only the requested fields. Preserve existing IDs, root source, table, keys, relations, transforms, and an unfinished destination unless the user asks to change them. "
                     + "candidateWizard must use the complete Builder view shape: root, relations, transforms, destinationSourceId, destinationTable, and destinationWriteMode. "
                     + "For a map transform, config.map.fields is an array of {id, outputField, ruleType, value}; use ruleType rename and value $<sourceField> to copy a source field, and set passthroughUnlisted to true to keep every other field. "
+                    + "For a union transform, config.union.from is an array of additional source-qualified table references such as sourceId.table. Use only tables in the supplied schema inventory and do not repeat an input already present in currentWizard. "
                     + "For a root-table row filter, add a filter step to root.transforms with a valid expression using the named field and value. "
                     + "Use only the supplied PostgreSQL and MySQL source/table/field inventory. Never invent a missing field, value, table, or destination. "
                     + "If a necessary detail is missing, ask only for that detail instead of proposing a guess. "
@@ -148,16 +149,21 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
                 "fields", schemaArray(mapRule),
                 "passthroughUnlisted", Map.of("type", "boolean", "description", "Set true to preserve source fields without an explicit mapping rule.")),
                 List.of("fields", "passthroughUnlisted"));
+        Map<String, Object> unionConfig = schemaObject(Map.of(
+                "from", schemaArray(Map.of("type", "string",
+                        "description", "An additional sourceId.table reference from the supplied schema inventory."))),
+                List.of("from"));
         Map<String, Object> transform = schemaObject(Map.of(
                 "id", string,
                 "name", string,
-                "type", Map.of("type", "string", "enum", List.of("filter", "map", "unwind", "js")),
+                "type", Map.of("type", "string", "enum", List.of("filter", "map", "unwind", "js", "union")),
                 "enabled", Map.of("type", "boolean"),
                 "config", schemaObject(Map.of(
                         "map", mapConfig,
                         "filter", schemaObject(Map.of("expr", string), List.of("expr")),
                         "unwind", Map.of("type", "object"),
-                        "js", schemaObject(Map.of("script", string), List.of("script"))), List.of())),
+                        "js", schemaObject(Map.of("script", string), List.of("script")),
+                        "union", unionConfig), List.of())),
                 List.of("id", "name", "type", "enabled", "config"));
         Map<String, Object> root = schemaObject(Map.of(
                 "source", string,

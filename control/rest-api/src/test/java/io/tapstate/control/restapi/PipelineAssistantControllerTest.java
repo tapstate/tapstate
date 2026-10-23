@@ -197,7 +197,10 @@ class PipelineAssistantControllerTest {
         artifacts.seed("version: tapstate/v1\nkind: source\nid: dst\nconnector: mongodb\nconfig: {}\n");
         var schema = new DiscoveredSourceModel("src", connector, 1,
                 new io.tapstate.spi.store.SourceModel(List.of(new io.tapstate.spi.store.SourceTable("orders",
-                        List.of(new io.tapstate.spi.store.SourceField("id", "integer")), List.of("id"), List.of()))));
+                        List.of(new io.tapstate.spi.store.SourceField("id", "integer")), List.of("id"), List.of()),
+                        new io.tapstate.spi.store.SourceTable("archive_orders",
+                                List.of(new io.tapstate.spi.store.SourceField("id", "integer")),
+                                List.of("id"), List.of()))));
         SchemaStore schemaStore = new SchemaStore() {
             public void save(DiscoveredSourceModel ignored) { throw new AssertionError("must not write schema"); }
             public Optional<DiscoveredSourceModel> get(String id) { return Optional.of(schema); }
@@ -273,6 +276,33 @@ class PipelineAssistantControllerTest {
                 Files.write(fixture, output.toByteArray());
             }
         }
+
+        Map<String, Object> unionCandidate = new java.util.LinkedHashMap<>(candidate);
+        unionCandidate.put("transforms", List.of(Map.of("id", "merge-orders", "name", "union",
+                "type", "union", "enabled", true,
+                "config", Map.of("union", Map.of("from", List.of("src.archive_orders"))))));
+        Map<String, Object> unionResult = controller.validate("orders", 1, unionCandidate);
+        assertThat(unionResult).containsEntry("valid", true);
+        assertThat(AssistantWizardJson.object(unionResult.get("diff")).get("after").toString())
+                .contains("type: union", "src.archive_orders");
+        Map<String, Object> normalizedUnion = AssistantWizardJson.object(
+                AssistantWizardJson.list(AssistantWizardJson.object(unionResult.get("candidateWizard")).get("transforms"))
+                        .getFirst());
+        Map<String, Object> unionConfig = AssistantWizardJson.object(
+                AssistantWizardJson.object(normalizedUnion.get("config")).get("union"));
+        assertThat(AssistantWizardJson.list(unionConfig.get("from"))).containsExactly("src.archive_orders");
+        Map<String, Object> unavailableUnion = new java.util.LinkedHashMap<>(candidate);
+        unavailableUnion.put("transforms", List.of(Map.of("id", "merge-orders", "name", "union",
+                "type", "union", "enabled", true,
+                "config", Map.of("union", Map.of("from", List.of("src.missing_orders"))))));
+        Map<String, Object> unavailableResult = controller.validate("orders", 1, unavailableUnion);
+        assertThat(unavailableResult).containsEntry("valid", false);
+        List<?> unavailableDiagnostics = (List<?>) AssistantWizardJson.object(unavailableResult.get("validation"))
+                .get("diagnostics");
+        Map<String, Object> unavailableDiagnostic = AssistantWizardJson.object(unavailableDiagnostics.getFirst());
+        assertThat(unavailableDiagnostic).containsEntry("code", PipelineDraftError.INVALID.code());
+        assertThat(AssistantWizardJson.object(unavailableDiagnostic.get("params"))).containsEntry("reason",
+                "wizard union input must reference a table in a selected Source schema");
 
         if (missingTransformId) {
             for (boolean blankId : List.of(false, true)) {
