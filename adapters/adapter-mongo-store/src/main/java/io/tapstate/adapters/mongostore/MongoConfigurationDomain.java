@@ -213,6 +213,9 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         requireOpen();
         return new MongoStorageRecoveryCommands(connection.client(), connection.database(), bindings, artifacts, this::requireOpen);
     }
+    public io.tapstate.spi.store.SharedSrsRecoveryPreparations sharedRecoveryPreparations() {
+        requireOpen();return new MongoStorageRecoveryCommands(connection.client(),connection.database(),bindings,artifacts,this::requireOpen);
+    }
     public io.tapstate.spi.store.CacheRecoveryStore cacheRecoveries() {
         requireOpen();
         return new MongoCacheRecoveryStore(connection.client(), connection.database(), bindings, artifacts, clusterId, this::requireOpen);

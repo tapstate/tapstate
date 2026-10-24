@@ -180,6 +180,7 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         if(recovery!=null) {
             var pending=MongoStorageRecoveryCommands.pending(recovery);
             if(pending.filter(plan -> plan.phase()==io.tapstate.spi.store.StorageRecoveryCommands.Phase.RUNNING
+                    && plan.manifest().selection().extent()!=io.tapstate.spi.store.StorageRecoveryCommands.Extent.SHARED_SRS
                     && !java.util.Collections.disjoint(plan.manifest().definitionHashes().keySet(),changed)
                     && bindings.cachePreparationForTransaction(session).map(value -> value.authScope().equals(plan.originalScope())).orElse(false)).isPresent())
                 throw new TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null);

@@ -28,7 +28,7 @@ import java.util.function.Function;
 import org.bson.Document;
 
 /** A current recovery summary on the existing Cluster recovery authority, using CONFIG write competition. */
-final class MongoStorageRecoveryCommands implements StorageRecoveryCommands {
+final class MongoStorageRecoveryCommands implements StorageRecoveryCommands,io.tapstate.spi.store.SharedSrsRecoveryPreparations {
     private static final TransactionOptions TX = TransactionOptions.builder().readConcern(ReadConcern.SNAPSHOT)
             .writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
     private final MongoClient client;
@@ -40,7 +40,7 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands {
             MongoConfigurationArtifactStore artifacts, Runnable active) {
         this.client = client; this.database = database; this.bindings = bindings; this.artifacts = artifacts; this.active = active;
     }
-    @Override public StorageRecoveryCommands guardedBy(Runnable guard) {
+    @Override public MongoStorageRecoveryCommands guardedBy(Runnable guard) {
         Objects.requireNonNull(guard, "guard");
         return new MongoStorageRecoveryCommands(client, database, bindings, artifacts, () -> { active.run(); guard.run(); });
     }
@@ -109,6 +109,70 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands {
     @Override public Plan confirm(Plan original) { return transition(original, Phase.PLANNED, Phase.CONFIRMED, true); }
     @Override public Plan start(Plan confirmed) { return transition(confirmed, Phase.CONFIRMED, Phase.RUNNING, true); }
     @Override public Plan complete(Plan running) { return transition(running, Phase.RUNNING, Phase.COMPLETE, false); }
+    @Override public io.tapstate.spi.store.SharedSrsRecoveryPreparation reserve(Plan confirmed) {
+        Objects.requireNonNull(confirmed,"confirmed");
+        if(confirmed.manifest().selection().extent()!=Extent.SHARED_SRS || confirmed.phase()!=Phase.CONFIRMED && confirmed.phase()!=Phase.RUNNING)throw refused();
+        var result=transaction(session -> {
+            var row=root(session,confirmed.originalScope());var current=pending(row).orElseThrow(MongoStorageRecoveryCommands::refused);
+            if(!sameOriginal(current,confirmed))throw refused();
+            if(current.phase()==Phase.RUNNING)return sharedPending(session,current);
+            if(current.phase()!=Phase.CONFIRMED || confirmed.phase()!=Phase.CONFIRMED
+                    || revision(session)!=current.controlRevision()+current.phase().ordinal())throw refused();
+            requireManifest(session,current.manifest());
+            ConfigurationVersion.advance(session,SystemCollections.CONFIGURATION_VERSION.on(database));
+            captureOwner(current).reserveSharedRecovery(session,current);
+            var mappings=new MongoPipelineStateMappings(client,database);
+            var intents=new MongoPipelineIntentStore(client,database,current.originalScope().clusterId(),bindings);
+            for(var pipeline:current.manifest().sharedSrs().pipelines().values()) {
+                mappings.reserveSharedRecovery(session,pipeline.scope(),current.operationId());
+                intents.stopForSharedRecovery(session,pipeline.scope(),current.manifest().definitionHashes().get(pipeline.scope().pipelineId()));
+            }
+            var running=new Plan(current.operationId(),current.previousOperationId(),current.originalScope(),current.manifest(),current.planHash(),current.controlRevision(),Phase.RUNNING);
+            save(session,row,running);return sharedPending(session,running);
+        });
+        active.run();return result;
+    }
+    @Override public Optional<io.tapstate.spi.store.SharedSrsRecoveryPreparation> pending(CacheAuthScope original,String operationId) {
+        Objects.requireNonNull(original,"original");Objects.requireNonNull(operationId,"operationId");
+        return transaction(session -> {
+            var current=pending(root(session,original));
+            if(current.isEmpty() || !current.orElseThrow().originalScope().equals(original) || !current.orElseThrow().operationId().equals(operationId)
+                    || current.orElseThrow().phase()!=Phase.RUNNING || current.orElseThrow().manifest().selection().extent()!=Extent.SHARED_SRS)return Optional.empty();
+            return Optional.of(sharedPending(session,current.orElseThrow()));
+        });
+    }
+    private MongoCaptureStatePreparations captureOwner(Plan plan) {
+        return new MongoCaptureStatePreparations(client,database,plan.originalScope().clusterId(),bindings,artifacts,active);
+    }
+    private SharedPending sharedPending(ClientSession session,Plan running) {
+        if(running.phase()!=Phase.RUNNING || running.manifest().selection().extent()!=Extent.SHARED_SRS)throw refused();
+        var reservation=captureOwner(running).requireSharedReservation(session,running);
+        var mappings=new MongoPipelineStateMappings(client,database);
+        var intents=new MongoPipelineIntentStore(client,database,running.originalScope().clusterId(),bindings);
+        for(var pipeline:running.manifest().sharedSrs().pipelines().values()) {
+            mappings.requireSharedReservation(session,pipeline.scope(),running.operationId());intents.requireSharedStopped(session,pipeline.scope());
+        }
+        String target=MongoStorageBindingStore.targetFingerprint(bindings.loadForTransaction(session).orElseThrow(MongoStorageRecoveryCommands::refused).cache());
+        return new SharedPending(this,running,reservation.replacement(),target);
+    }
+    private void requireSharedPending(SharedPending original) {
+        transaction(session -> {
+            var current=pending(root(session,original.plan.originalScope())).orElseThrow(MongoStorageRecoveryCommands::refused);
+            if(current.phase()!=Phase.RUNNING || !sameOriginal(current,original.plan))throw refused();
+            var retained=sharedPending(session,current);
+            if(!retained.replacement.equals(original.replacement) || !retained.targetFingerprint.equals(original.targetFingerprint))throw refused();
+            return null;
+        });
+    }
+    private static final class SharedPending implements io.tapstate.spi.store.SharedSrsRecoveryPreparation {
+        private final MongoStorageRecoveryCommands owner;private final Plan plan;private final io.tapstate.spi.store.CapturePreparation replacement;private final String targetFingerprint;
+        private SharedPending(MongoStorageRecoveryCommands owner,Plan plan,io.tapstate.spi.store.CapturePreparation replacement,String targetFingerprint) {
+            this.owner=owner;this.plan=plan;this.replacement=replacement;this.targetFingerprint=targetFingerprint;
+        }
+        @Override public Plan plan(){return plan;}
+        @Override public io.tapstate.spi.store.CapturePreparation replacement(){return replacement;}
+        @Override public void requireCurrent(){owner.active.run();owner.requireSharedPending(this);owner.active.run();}
+    }
 
     record Transition(Plan plan, boolean won) {}
     Transition startInitialOp(Plan confirmed) {

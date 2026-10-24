@@ -86,6 +86,39 @@ public final class MongoPipelineStateMappings implements PipelineStateMappings {
         if (state.phase() != PipelineStateMapping.Phase.ACTIVE) throw retirementRequired(pipelineId);
     }
 
+    static void requireNoSharedReferences(ClientSession session,MongoDatabase database,String operation) {
+        var row=SystemCollections.OPERATOR_GENERATIONS.on(database).find(session,new Document("sharedRecovery.operationId",operation)).first();
+        if(row!=null) {
+            var retained=MongoPipelineSharedRecoveryFacts.read(row).orElseThrow(() -> unreadable("shared-recovery"));
+            throw MongoPipelineSharedRecoveryFacts.required(retained.originalScope().pipelineId());
+        }
+    }
+    void reserveSharedRecovery(ClientSession session,io.tapstate.spi.store.PipelineIntentScope scope,String operation) {
+        var row=requireSharedOriginal(session,scope);
+        MongoPipelineSharedRecoveryFacts.requireReady(session,database,row,scope);
+        long fence=row.getLong("noteWriteFence");if(fence>=Long.MAX_VALUE-1)throw retirementRequired(scope.pipelineId());
+        var marker=MongoPipelineSharedRecoveryFacts.encode(new MongoPipelineSharedRecoveryFacts.Pending(operation,scope));
+        if(mappings.updateOne(session,row,new Document("$set",new Document("sharedRecovery",marker)).append("$inc",new Document("noteWriteFence",1L))).getMatchedCount()!=1)
+            throw retirementRequired(scope.pipelineId());
+    }
+    void requireSharedReservation(ClientSession session,io.tapstate.spi.store.PipelineIntentScope scope,String operation) {
+        var row=requireSharedOriginal(session,scope);
+        var marker=MongoPipelineSharedRecoveryFacts.read(row).orElseThrow(() -> unreadable(scope.pipelineId()));
+        if(!marker.operationId().equals(operation) || !marker.originalScope().equals(scope))throw retirementRequired(scope.pipelineId());
+    }
+    private Document requireSharedOriginal(ClientSession session,io.tapstate.spi.store.PipelineIntentScope scope) {
+        if(!session.hasActiveTransaction())throw new IllegalStateException("shared recovery mapping requires its CONFIG transaction");
+        var row=mappings.find(session,new Document("_id",scope.pipelineId())).first();var state=decode(scope.pipelineId(),row);
+        if(state.phase()!=PipelineStateMapping.Phase.ACTIVE || state.stateGeneration()!=scope.stateGeneration()
+                || pipelines.find(session,new Document("_id",scope.pipelineId())).first()==null)throw retirementRequired(scope.pipelineId());
+        var prepared=MongoPipelinePreparationFacts.decode(scope.pipelineId(),row,scope.clusterId());
+        if(prepared.phase()!=io.tapstate.spi.store.PipelinePreparation.Phase.COMPLETE || !scope.equals(prepared.scope()))throw retirementRequired(scope.pipelineId());
+        MongoPipelineStateRebuilds.requireCompletedPrior(row,prepared);
+        if(row.containsKey("retirement"))MongoPipelineRetirementFacts.read(row).completed();
+        if(MongoCacheRecoveryFacts.read(row).filter(recovery -> !recovery.targetScope().equals(scope)).isPresent())throw retirementRequired(scope.pipelineId());
+        return row;
+    }
+
     /** Deletion and kind changes enter the explicit retirement command, never this ordinary authoring path. */
     void refuseRemoval(ClientSession session, String pipelineId) {
         decode(pipelineId, mappings.find(session, new Document("_id", pipelineId)).first());

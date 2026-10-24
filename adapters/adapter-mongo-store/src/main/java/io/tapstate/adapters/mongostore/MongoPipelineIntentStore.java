@@ -90,6 +90,19 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
         if (previous.isEmpty()) intents.insertOne(session, stopped);
         else if (intents.replaceOne(session, new Document("_id", target.pipelineId()).append("intentRevision", revision), stopped).getMatchedCount() != 1) throw fenced();
     }
+    void stopForSharedRecovery(ClientSession session,PipelineIntentScope scope,String pipelineHash) {
+        var current=loadInTransaction(session,scope.pipelineId()).orElseThrow(MongoPipelineIntentStore::fenced);
+        if(current.deleted() || !current.scope().equals(scope) || current.intentRevision()>=Long.MAX_VALUE-1
+                || pipelineHash==null || !pipelineHash.matches("[0-9a-f]{64}"))throw fenced();
+        var stopped=header(scope,current.intentRevision()+1,false).append("targetState",PipelineState.STOPPED.name())
+                .append("revision",pipelineHash).append("purgeState",false).append("assemblyRevision",null)
+                .append("reassemble",false).append("rebuiltAtStateEpoch",null);
+        if(intents.replaceOne(session,new Document("_id",scope.pipelineId()).append("intentRevision",current.intentRevision()),stopped).getMatchedCount()!=1)throw fenced();
+    }
+    void requireSharedStopped(ClientSession session,PipelineIntentScope scope) {
+        var current=loadInTransaction(session,scope.pipelineId()).orElseThrow(MongoPipelineIntentStore::fenced);
+        if(current.deleted() || !current.scope().equals(scope) || current.desired().targetState()!=PipelineState.STOPPED || current.desired().purgeState())throw fenced();
+    }
     @Override public Optional<PipelineIntentSnapshot> loadForActuation(String pipelineId) {
         requireId(pipelineId);
         return transaction(session -> {

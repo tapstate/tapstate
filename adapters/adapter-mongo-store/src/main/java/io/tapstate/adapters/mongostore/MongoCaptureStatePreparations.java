@@ -135,6 +135,39 @@ final class MongoCaptureStatePreparations implements CaptureStatePreparations {
         active.run();return issued.won()?new CaptureCreationResult.Issued(new Creation(issued.preparation(),request,issued.targetFingerprint(),issued.retention(),active)):new CaptureCreationResult.AlreadyIssued(issued.preparation());
     }
     private void requireScope(ClientSession session,CacheBusinessScope expected){var current=bindings.cachePreparationForTransaction(session).orElseThrow(MongoCaptureStatePreparations::fenced).businessScope();if(!cluster.equals(expected.clusterId()) || !expected.equals(current))throw fenced();}
+    MongoCapturePreparationFacts.Recovery reserveSharedRecovery(ClientSession session,StorageRecoveryCommands.Plan plan) {
+        var previous=plan.manifest().sharedSrs().previous();requireScope(session,previous.scope());
+        var table=SystemCollections.CAPTURE_PREPARATIONS.on(database);
+        var row=table.find(session,new Document("_id",MongoCapturePreparationFacts.id(previous.scope(),previous.captureId()))).first();
+        if(row==null || !previous.equals(MongoCapturePreparationFacts.available(row)))throw fenced();
+        requireSharedRecoveryOrigin(session,previous);
+        if(previous.replacement())MongoPipelineStateMappings.requireNoSharedReferences(session,database,previous.preparationId());
+        var recovery=sharedReservation(plan);
+        if(table.replaceOne(session,row,MongoCapturePreparationFacts.configurationRow(recovery)).getMatchedCount()!=1)throw fenced();
+        return recovery;
+    }
+    MongoCapturePreparationFacts.Recovery requireSharedReservation(ClientSession session,StorageRecoveryCommands.Plan plan) {
+        var expected=sharedReservation(plan);requireScope(session,expected.previous().scope());
+        var row=SystemCollections.CAPTURE_PREPARATIONS.on(database).find(session,
+                new Document("_id",MongoCapturePreparationFacts.id(expected.previous().scope(),expected.previous().captureId()))).first();
+        var actual=MongoCapturePreparationFacts.recovery(row).orElseThrow(MongoCaptureStatePreparations::fenced);
+        if(!expected.equals(actual))throw fenced();requireSharedRecoveryOrigin(session,expected.previous());return actual;
+    }
+    private void requireSharedRecoveryOrigin(ClientSession session,CapturePreparation previous) {
+        var owner=new RequiredNoteOwner(previous.scope().bindingVersion(),"pdk.chain."+previous.canonicalChainId(),RequiredNoteOwner.Kind.CHAIN,previous.canonicalChainId(),0);
+        if(artifacts.configurationNotes().inspectSharedOrigin(session,owner,true).isEmpty())
+            throw new TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE,Map.of(),null);
+    }
+    private static MongoCapturePreparationFacts.Recovery sharedReservation(StorageRecoveryCommands.Plan plan) {
+        if(plan.manifest().selection().extent()!=StorageRecoveryCommands.Extent.SHARED_SRS || plan.manifest().sharedSrs()==null)throw fenced();
+        var previous=plan.manifest().sharedSrs().previous();
+        try {
+            var replacement=new CapturePreparation(previous.scope(),CapturePreparation.Mode.SHARED_SRS,
+                    MongoCapturePreparationFacts.replacementChain(previous,plan.operationId()),previous.captureId(),previous.sourceIdentityHash(),plan.operationId(),
+                    previous.canonicalChainId(),previous.birthPreparationId());
+            return new MongoCapturePreparationFacts.Recovery(previous,replacement,plan.planHash(),MongoCapturePreparationFacts.RecoveryPhase.RESERVED);
+        }catch(IllegalArgumentException invalid){throw fenced();}
+    }
     /** CONFIG-only lookup of an existing reservation; it does not issue or consume any creation permission. */
     static MongoCapturePreparationFacts.Recovery currentRecoveryForOperation(ClientSession session,MongoDatabase database,
             CacheBusinessScope expected,String operation) {
