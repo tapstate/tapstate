@@ -635,7 +635,8 @@ final class StorageRoot implements AutoCloseable {
             business = StorageControlDispatcher.BusinessPhase.UNAVAILABLE;
         if (runtime.cleanupRequired()) business = StorageControlDispatcher.BusinessPhase.CLEANUP_REQUIRED;
         boolean formalRecovery = preparation.map(value -> value.authScope().authGeneration() > 1).orElse(false);
-        var pending = formalRecovery ? configuration.recoveryCommands().guardedBy(active).current(preparation.orElseThrow().authScope())
+        boolean recoveryAvailable=formalRecovery || admitted;
+        var pending = recoveryAvailable ? configuration.recoveryCommands().guardedBy(active).current(preparation.orElseThrow().authScope())
                 : Optional.<StorageRecoveryCommands.Plan>empty();
         var actions = new ArrayList<>(List.of("storage.status", "storage.setup.status"));
         if (caller.cacheScope().isPresent()) {
@@ -643,7 +644,7 @@ final class StorageRoot implements AutoCloseable {
             if (admitted) actions.addAll(List.of("configuration.import.preflight", "configuration.import.commit"));
         }
         if (!runtime.cleanupRequired()) {
-            if (formalRecovery) {
+            if (recoveryAvailable) {
                 actions.add("storage.recovery.status");
                 if (status.phase() == StorageSetupStateStore.Phase.COMPLETE || mode() == StorageBinding.Mode.CLOUD) {
                     actions.add("storage.recovery.plan");

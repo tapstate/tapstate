@@ -2,7 +2,7 @@ package io.tapstate.app;
 
 import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
-import io.tapstate.control.core.StorageSetupService;
+import io.tapstate.control.core.*;
 import io.tapstate.core.lifecycle.*;
 import io.tapstate.runtime.engine.Engine;
 import io.tapstate.spi.store.*;
@@ -48,6 +48,12 @@ class RecoveryContinuationOrderingTest {
             verifyNoInteractions(business,shared);return;
         }
         assertThat(root.phase()).isEqualTo(StorageRoot.Phase.BUSINESS_READY);verify(runtime).startBusiness(bound,assembly);
+        var bindings=mock(StorageBindingStore.class);when(configuration.bindings()).thenReturn(bindings);when(bindings.guardedBy(any())).thenReturn(bindings);
+        when(bindings.cachePreparation()).thenReturn(Optional.of(new CachePreparation("auth",auth)));when(setup.guardedBy(any())).thenReturn(setup);
+        when(commands.guardedBy(any())).thenReturn(commands);when(runtime.businessStarted()).thenReturn(true);
+        var caller=StorageControlAccess.ordinary(StorageBinding.Mode.OP,setup.load().scope(),auth,
+                TapstatePrincipal.humanJwt(new VerifiedToken("admin",Scope.ADMIN)),null,() -> {});
+        assertThat(root.snapshot(caller,() -> {}).allowedActions()).contains("storage.recovery.plan","storage.recovery.confirm","storage.recovery.status");
         verify(business,never()).sharedRecovery();assertThat(executor.queued.get()).isNotNull();executor.runQueued();
         if(availabilityFails) {
             assertThat(root.phase()).isEqualTo(StorageRoot.Phase.BUSINESS_READY);verify(business,never()).sharedRecovery();verifyNoInteractions(shared);

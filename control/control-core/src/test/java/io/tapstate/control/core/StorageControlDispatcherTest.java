@@ -33,6 +33,16 @@ class StorageControlDispatcherTest {
                 StorageSetupService.Layer.CACHE, StorageControlDispatcher.Health.AVAILABLE, StorageSetupService.Layer.MASTER, StorageControlDispatcher.Health.AVAILABLE), List.of("storage.recovery.plan"), false);
         final StorageRecoveryService recovery = new StorageRecoveryService(recoveries, new StorageRecoveryService.Inspector() {
             @Override public StorageRecoveryCommands.Manifest inspect(CacheAuthScope scope, StorageRecoveryCommands.Selection selection) {
+                if(selection.extent()==StorageRecoveryCommands.Extent.SHARED_SRS) {
+                    var business=new CacheBusinessScope(scope.clusterId(),scope.bindingVersion(),scope.cacheIncarnation());var owner=new WorkloadOwner("node","boot");
+                    var previous=new CapturePreparation(business,CapturePreparation.Mode.SHARED_SRS,selection.physicalChain(),"capture","mc-"+"a".repeat(64),UUID.randomUUID().toString(),selection.canonicalChain(),UUID.randomUUID().toString());
+                    var pipeline=new PipelineIntentScope(scope.clusterId(),scope.bindingVersion(),scope.cacheIncarnation(),"pipeline",1);
+                    var claim=new WorkloadClaimFence(new WorkloadClaimKey(scope.clusterId(),WorkloadClaimType.PIPELINE_ACTUATION,"pipeline"),owner,1,1,1);
+                    var snapshot=new SharedSrsRecoverySnapshot(previous,new WorkloadClaimFence(new WorkloadClaimKey(scope.clusterId(),WorkloadClaimType.CAPTURE,"capture"),owner,1,0,1),"a".repeat(64),
+                            List.of(new SrsConsumerMembership(new SrsConsumerContext(new SrsConsumerKey(selection.physicalChain(),"pipeline","source"),1),1,false,Set.of("orders"),claim)),
+                            Map.of("pipeline",new SharedSrsRecoverySnapshot.Pipeline(pipeline,claim)));
+                    return new StorageRecoveryCommands.Manifest(selection,Set.of("pipeline"),Map.of("pipeline","a".repeat(64)),"b".repeat(64),5,snapshot);
+                }
                 return new StorageRecoveryCommands.Manifest(selection, Set.of("pipeline"), Map.of("pipeline", "a".repeat(64)), "b".repeat(64), 5);
             }
             @Override public void requireCurrent(CacheAuthScope scope, StorageRecoveryCommands.Manifest original) {}
@@ -53,6 +63,26 @@ class StorageControlDispatcherTest {
         out.put("configuration", connection(value.configuration())); out.put("cache",connection(value.cache())); out.put("master",connection(value.master())); return out;
     }
     private static Map<String,Object> connection(StorageBinding.Connection value) { return Map.of("kind",value.kind().name(),"uri",value.uri(),"database",value.database()); }
+    @Test void sharedRecoveryCarriesTheExactOriginalPhysicalSelectionWithoutAcceptingBrowserInfluence() {
+        var f=new Fixture();var dispatcher=f.dispatcher();
+        var input=Map.<String,Object>of("scope","SHARED_SRS","pipelineIds",List.of(),"canonicalChain","canonical","physicalChain","old-physical");
+        var result=dispatcher.dispatch("storage.recovery.plan",f.admin(),input);
+        assertThat(result).containsEntry("canonicalChain","canonical").containsEntry("physicalChain","old-physical").containsEntry("affectedPipelineIds",List.of("pipeline"));
+        assertThat(f.recoveries.plan.manifest().selection()).isEqualTo(new StorageRecoveryCommands.Selection(StorageRecoveryCommands.Extent.SHARED_SRS,Set.of(),"canonical","old-physical"));
+        var query=dispatcher.dispatch("storage.recovery.status",f.admin(),Map.of("operationId",result.get("operationId")));
+        assertThat(query).containsEntry("physicalChain","old-physical");assertThat(JsonWriter.write(query)).doesNotContain("captureFence","sourceIdentityHash");
+    }
+    @Test void malformedSharedCoordinatesAndInventedAffectedPipelinesNeverReachPlanning() {
+        var f=new Fixture();var dispatcher=f.dispatcher();
+        var valid=Map.<String,Object>of("scope","SHARED_SRS","pipelineIds",List.of(),"canonicalChain","canonical","physicalChain","old-physical");
+        for(String field:List.of("canonicalChain","physicalChain")) {
+            var missing=new LinkedHashMap<>(valid);missing.remove(field);assertMalformed(() -> dispatcher.dispatch("storage.recovery.plan",f.admin(),missing));
+        }
+        var ids=new LinkedHashMap<>(valid);ids.put("pipelineIds",List.of("attacker"));assertMalformed(() -> dispatcher.dispatch("storage.recovery.plan",f.admin(),ids));
+        var invented=new LinkedHashMap<>(valid);invented.put("affectedPipelineIds",List.of());assertMalformed(() -> dispatcher.dispatch("storage.recovery.plan",f.admin(),invented));
+        var cluster=new LinkedHashMap<>(valid);cluster.put("scope","CLUSTER");assertMalformed(() -> dispatcher.dispatch("storage.recovery.plan",f.admin(),cluster));
+        assertThat(f.recoveries.plans).isZero();
+    }
     @Test void setupTestsCommitAndOriginalQueryUseTheSameServicesWithoutExposingConnections() {
         var f = new Fixture(); var dispatcher = f.dispatcher(); var access = f.owner(); var proofs = new LinkedHashMap<String,Object>();
         for (var layer : StorageSetupService.Layer.values()) {

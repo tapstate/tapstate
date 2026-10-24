@@ -105,10 +105,14 @@ public final class StorageControlDispatcher {
                 input.only("operationId"); originalSetup(input, caller); yield setup(available(setups).status(caller.setup(), active));
             }
             case "storage.recovery.plan" -> {
-                input.only("scope", "pipelineIds", "operationId", "previousOperationId");
+                input.only("scope", "pipelineIds", "canonicalChain", "physicalChain", "operationId", "previousOperationId");
                 var extent = input.enumeration("scope", StorageRecoveryCommands.Extent.class); var ids = input.ids("pipelineIds");
-                if ((extent == StorageRecoveryCommands.Extent.PIPELINE && ids.isEmpty()) || (extent == StorageRecoveryCommands.Extent.CLUSTER && !ids.isEmpty())) throw malformed();
-                yield recovery(available(recoveries).plan(caller.subject(), caller.cache(), active, new StorageRecoveryCommands.Selection(extent, ids),
+                if ((extent == StorageRecoveryCommands.Extent.PIPELINE && ids.isEmpty()) || (extent != StorageRecoveryCommands.Extent.PIPELINE && !ids.isEmpty())) throw malformed();
+                var selection=extent==StorageRecoveryCommands.Extent.SHARED_SRS
+                        ?new StorageRecoveryCommands.Selection(extent,ids,input.text("canonicalChain"),input.text("physicalChain"))
+                        :new StorageRecoveryCommands.Selection(extent,ids);
+                if(extent!=StorageRecoveryCommands.Extent.SHARED_SRS && (input.values.containsKey("canonicalChain") || input.values.containsKey("physicalChain")))throw malformed();
+                yield recovery(available(recoveries).plan(caller.subject(), caller.cache(), active, selection,
                         input.optionalUuid("operationId"), input.optionalUuid("previousOperationId")));
             }
             case "storage.recovery.confirm" -> {
@@ -189,6 +193,9 @@ public final class StorageControlDispatcher {
     private Map<String,Object> recovery(StorageRecoveryCommands.Plan plan) {
         var out = new LinkedHashMap<String,Object>(); out.put("operationId", plan.operationId()); out.put("previousOperationId", plan.previousOperationId());
         out.put("phase", plan.phase().name()); out.put("scope", plan.manifest().selection().extent().name());
+        if(plan.manifest().selection().extent()==StorageRecoveryCommands.Extent.SHARED_SRS) {
+            out.put("canonicalChain",plan.manifest().selection().canonicalChain());out.put("physicalChain",plan.manifest().selection().physicalChain());
+        }
         out.put("pipelineIds", new ArrayList<>(plan.manifest().selection().pipelineIds())); out.put("affectedPipelineIds", new ArrayList<>(plan.manifest().affectedPipelineIds()));
         out.put("definitionHashes", plan.manifest().definitionHashes()); out.put("dependencyHash", plan.manifest().dependencyHash());
         out.put("configurationRevision", plan.manifest().configurationRevision()); out.put("controlRevision", plan.controlRevision()); out.put("planHash", plan.planHash());
