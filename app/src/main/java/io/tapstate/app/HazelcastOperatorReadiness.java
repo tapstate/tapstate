@@ -282,7 +282,12 @@ final class HazelcastOperatorReadiness {
                 }
                 local.preview().original(original.scope(),original.operation(),original.hash(),original.revision());
                 return new Result(actual,null);
-            } catch(TapstateException refused){return new Result(actual,refused.code().code());}
+            } catch(TapstateException refused){
+                org.slf4j.LoggerFactory.getLogger(HazelcastOperatorReadiness.class).debug(
+                        "Shared recovery {} member action {} refused with {} at {}",original.operation(),action,
+                        refused.code().code(),java.util.Arrays.toString(refused.getStackTrace()));
+                return new Result(actual,refused.code().code());
+            }
         }
     }
     private static Identity identity(Member member) {
