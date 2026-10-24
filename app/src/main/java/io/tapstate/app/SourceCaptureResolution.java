@@ -51,6 +51,19 @@ record SourceCaptureResolution(
                 : Optional.of(withTables(source, tables).scopedTo(pipeline.id(), !direct));
     }
 
+    /** Current diagnostic reads use the actual attached scope; retained run handles keep their original namespace. */
+    static Optional<SourceCaptureResolution> forStoredPipeline(io.tapstate.spi.store.StorePort store,
+            PipelineResource pipeline,SourceResource source,SourceModel discovered) {
+        return forStoredPipeline(store,pipeline,source,discovered,true);
+    }
+
+    /** Describes a never-read chain without granting access to another consumer's progress. */
+    static Optional<SourceCaptureResolution> forStoredPipeline(io.tapstate.spi.store.StorePort store,
+            PipelineResource pipeline,SourceResource source,SourceModel discovered,boolean requireAttachment) {
+        return forPipeline(pipeline,source,discovered).flatMap(resolution -> store instanceof ThreeLayerStorePort nativeStore
+                ?nativeStore.sharedReading(pipeline,source,resolution,requireAttachment):Optional.of(resolution));
+    }
+
     /** Resolves the same recovery namespace as the corresponding capture run. */
     SourceCaptureResolution scopedTo(String pipelineId, boolean srsEnabled) {
         MiningChainId scoped = srsEnabled ? MiningChainId.resolve(config, srsKey)
@@ -70,7 +83,8 @@ record SourceCaptureResolution(
      * A start's load is judged from all of them, by the run and by the verb predicting it alike.
      */
     List<String> progressChainIds(String pipelineId) {
-        return Stream.of(chainId.value(), scopedTo(pipelineId, true).chainId().value()).distinct().toList();
+        return chainId.equals(MiningChainId.forChannel(config,srsKey,pipelineId,sourceId))
+                ?Stream.of(chainId.value(),scopedTo(pipelineId,true).chainId().value()).distinct().toList():List.of(chainId.value());
     }
 
     private static SourceCaptureResolution withTables(SourceResource source, List<String> tables) {

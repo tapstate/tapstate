@@ -55,6 +55,39 @@ final class ThreeLayerStorePort implements StorePort {
         if (control != null) control.active().run();
     }
     CacheBusinessScope business() { return bound.preparation().businessScope(); }
+    Runnable readingGuard(String pipeline) {
+        active();long revision=configuration.configurationRevision();var original=scope(pipeline);
+        return () -> {active();if(revision!=configuration.configurationRevision() || !original.equals(scope(pipeline)))throw refused();};
+    }
+    Optional<SourceCaptureResolution> sharedReading(io.tapstate.core.model.PipelineResource pipeline,
+            io.tapstate.core.model.SourceResource source,SourceCaptureResolution canonical,boolean requireAttachment) {
+        active();
+        if(pipeline.sources().stream().anyMatch(reference -> reference.id().equals(source.id())
+                && reference instanceof io.tapstate.core.model.SourceRef.Spec spec && !spec.srs())
+                || pipeline.settings()!=null && pipeline.settings().readMode()==io.tapstate.core.model.ReadMode.SNAPSHOT_ONLY)
+            return Optional.of(canonical);
+        var original=scope(pipeline.id());String capture=io.tapstate.core.model.canonical.SourceCaptureIdentity.sharedCapture(canonical.chainId().value());
+        var prepared=configuration.capturePreparations().read(business(),capture);
+        if(prepared.isEmpty()) {
+            // Necessary notes can predate this CACHE incarnation. Current CACHE controls, however,
+            // must never lose their original CONFIG preparation and then read as a fresh capture.
+            if(bound.cache().workloadClaims(business()).read(new WorkloadClaimKey(business().clusterId(),WorkloadClaimType.CAPTURE,capture)).isPresent()
+                    || bound.cache().srs(business(),this::active).chains().load(canonical.chainId().value()).isPresent())
+                throw new TapstateException(IoError.CAPTURE_STATE_REBUILD_REQUIRED,Map.of("capture",capture),null);
+            return requireAttachment?Optional.empty():Optional.of(canonical);
+        }
+        var fixed=prepared.orElseThrow();
+        if(fixed.mode()!=CapturePreparation.Mode.SHARED_SRS || !business().equals(fixed.scope()) || !capture.equals(fixed.captureId())
+                || !canonical.chainId().value().equals(fixed.canonicalChainId())
+                || !fixed.sourceIdentityHash().equals(io.tapstate.core.model.canonical.SourceCaptureIdentity.physical(source.connector(),source.config())))throw refused();
+        var topology=bound.cache().srs(business(),this::active).consumers().attached(fixed.chainId());
+        var reader=topology.consumers().stream().filter(member -> member.context().key().pipelineId().equals(pipeline.id())
+                && member.context().key().sourceId().equals(source.id())).findFirst();
+        active();if(!original.equals(scope(pipeline.id())))throw refused();
+        if(reader.isEmpty() && requireAttachment)return Optional.empty();
+        if(reader.isPresent() && reader.orElseThrow().context().stateGeneration()!=original.stateGeneration())throw refused();
+        return Optional.of(canonical.onPhysicalChain(fixed.canonicalChainId(),fixed.chainId()));
+    }
     PipelineIntentScope scope(String pipeline) {
         active();
         if (pass != null) { pass.requirePipeline(pipeline); return pass.scope(); }

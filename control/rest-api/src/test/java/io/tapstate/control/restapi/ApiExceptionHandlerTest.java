@@ -38,6 +38,13 @@ class ApiExceptionHandlerTest {
 
     private final ApiExceptionHandler handler = new ApiExceptionHandler(MessageCatalog.bundled());
 
+    @Test void aKnownPipelineRequiringAnExplicitStateRebuildIsAStateConflict() {
+        var response=handler.handle(new TapstateException(IoError.PIPELINE_STATE_REBUILD_REQUIRED,Map.of("pipeline","flow"),null));
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+        assertThat(response.getBody().code()).isEqualTo(IoError.PIPELINE_STATE_REBUILD_REQUIRED.code());
+        assertThat(response.getBody().params()).containsEntry("pipeline","flow");
+    }
+
     @Test
     void addedTablesExplainTheRequiredClearStateFullLoadAsAStateConflict() {
         var response = handler.handle(new TapstateException(IoError.PIPELINE_TABLE_SELECTION_REBUILD_REQUIRED,
