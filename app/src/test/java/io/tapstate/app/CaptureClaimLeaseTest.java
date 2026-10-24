@@ -18,6 +18,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -29,6 +30,69 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 class CaptureClaimLeaseTest {
+
+    @Test
+    void aDelayedLossCallbackCannotEndTheTenureStartedAfterTheOriginalPhysicalExit() throws Exception {
+        var raw=spy(new InMemoryWorkloadClaimStore());var gate=eligibleGate();
+        var ownership=spy(new CaptureOwnership("cluster-a",new WorkloadOwner("node-a","boot-a"),gate,
+                new ClusterWorkloadClaims(raw,gate),Duration.ofSeconds(30)));
+        var original=ownership.acquire(CAPTURE);
+        doReturn(Optional.empty()).when(ownership).renew(any());
+        var entered=new CountDownLatch(1);var resume=new CountDownLatch(1);
+        var lease=new CaptureClaimLease(ownership,original.claim(),Duration.ofHours(1));
+        lease.onLost(() -> {
+            entered.countDown();
+            try {assertThat(resume.await(3,TimeUnit.SECONDS)).isTrue();}
+            catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}
+            lease.closeAfterPhysicalExit();
+        });
+        try(var callers=Executors.newSingleThreadExecutor()) {
+            var loss=callers.submit(lease::renew);
+            try {
+                assertThat(entered.await(3,TimeUnit.SECONDS)).isTrue();
+                lease.closeAfterPhysicalExit();
+                assertThat(raw.read(original.claim().key()).orElseThrow().leased()).isFalse();
+                var replacement=ownership.acquire(CAPTURE);
+                assertThat(replacement.acquired()).isTrue();
+                assertThat(replacement.fence().claimGeneration()).isGreaterThan(original.fence().claimGeneration());
+                resume.countDown();loss.get(3,TimeUnit.SECONDS);
+                var live=raw.read(original.claim().key()).orElseThrow();assertThat(live.leased()).isTrue();
+                assertThat(io.tapstate.spi.store.WorkloadClaimFence.from(live.claim())).isEqualTo(replacement.fence());
+                verify(raw,times(1)).release(any());
+            } finally {resume.countDown();}
+        } finally {lease.close();}
+    }
+
+    @ParameterizedTest @ValueSource(strings={"not-committed","committed","replaced"})
+    void anUnknownReleaseAfterPhysicalExitRetriesOnlyTheOriginalTuple(String outcome) {
+        var raw=new InMemoryWorkloadClaimStore();var gate=eligibleGate();
+        var ownership=spy(new CaptureOwnership("cluster-a",new WorkloadOwner("node-a","boot-a"),gate,
+                new ClusterWorkloadClaims(raw,gate),Duration.ofSeconds(30)));
+        var original=ownership.acquire(CAPTURE);var attempts=new AtomicInteger();
+        doReturn(Optional.empty()).when(ownership).renew(any());
+        doAnswer(call -> {
+            if(attempts.incrementAndGet()==1) {
+                if(outcome.equals("committed"))call.callRealMethod();
+                throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);
+            }
+            return call.callRealMethod();
+        }).when(ownership).release(any());
+        try(var lease=new CaptureClaimLease(ownership,original.claim(),Duration.ofHours(1))) {
+            lease.onLost(lease::closeAfterPhysicalExit);lease.renew();
+            assertThat(raw.read(original.claim().key()).orElseThrow().leased()).isEqualTo(!outcome.equals("committed"));
+            var expected=original.fence();
+            if(outcome.equals("replaced")) {
+                assertThat(raw.release(original.claim())).isTrue();
+                expected=io.tapstate.spi.store.WorkloadClaimFence.from(raw.acquire(original.claim().key(),
+                        new WorkloadOwner("node-b","boot-b"),3,Duration.ofSeconds(30)).claim());
+            }
+            lease.closeAfterPhysicalExit();lease.closeAfterPhysicalExit();
+            var after=raw.read(original.claim().key()).orElseThrow();
+            assertThat(after.leased()).isEqualTo(outcome.equals("replaced"));
+            assertThat(io.tapstate.spi.store.WorkloadClaimFence.from(after.claim())).isEqualTo(expected);
+            assertThat(attempts).hasValue(2);
+        }
+    }
 
     @ParameterizedTest @ValueSource(booleans={false,true})
     void anExplicitCaptureEndRechecksTheOriginalTupleAfterAnUnknownRelease(boolean committed) {

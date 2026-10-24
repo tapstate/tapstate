@@ -386,7 +386,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         Owner(CapturePreparation prepared,WorkloadClaim initial) { this.prepared=prepared;this.initial=initial;this.fence=WorkloadClaimFence.from(initial); }
         void release() {
             if(physical!=null) {physical.close();physical=null;}
-            if(lease!=null)lease.close();else execution.ownership().release(initial);
+            if(lease!=null)lease.closeAfterPhysicalExit();else execution.ownership().release(initial);
         }
         void require() { active(); if(ended.get() || !fence.equals(execution.authorization().requireCapture(stores.scope(),fence)))throw refused(); }
     }
@@ -569,6 +569,8 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                 session.failure.compareAndSet(null,refused());if(source.run!=null)failure=cleanup(failure,() -> runtime.stopSnapshot(source.run));
             }
             rethrow(failure);
+            // An exited owner's release remains retryable even when its renewer closed on loss.
+            owner.release();
             for(var session:sessions.values())for(var source:session.sources.values())if(source.owner==owner && source.shared) {
                 source.owner=null;source.foreign=owner.fence;
             }

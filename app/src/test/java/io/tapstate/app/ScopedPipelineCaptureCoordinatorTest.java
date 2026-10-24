@@ -26,6 +26,45 @@ class ScopedPipelineCaptureCoordinatorTest {
     private static final WorkloadOwner OWNER=new WorkloadOwner("node","boot");
     private static final WorkloadClaimFence PIPELINE=new WorkloadClaimFence(new WorkloadClaimKey("cluster",WorkloadClaimType.PIPELINE_ACTUATION,"flow"),OWNER,2,3,1);
     private static final ExecutionFence ORIGINAL=new ExecutionFence(SCOPE,PIPELINE);
+    @Test void aLostCaptureReleasesItsOriginalClaimOnlyAfterItsPhysicalReaderClosed() {
+        try(var f=new Fixture(List.of("input"),1,ReadMode.SNAPSHOT_ONLY,Duration.ofMillis(100))) {
+            f.rowCount.set(32);var unavailable=new TapstateException(IoError.SRS_MODEL_UNAVAILABLE,
+                    Map.of("chain","mck-key","table","orders"),null);
+            var failRenewal=new AtomicBoolean();
+            doAnswer(call -> {
+                if(failRenewal.get())throw unavailable;
+                return Optional.of(call.getArgument(0));
+            }).when(f.ownership).renew(any());
+            doAnswer(call -> {assertThat(f.closedPorts).hasPositiveValue();return null;}).when(f.ownership).release(f.capture);
+            var run=f.coordinator.forRun(SCOPE,PIPELINE,ORIGINAL);run.startCapture("flow",f.snapshot(),f.models());
+            failRenewal.set(true);
+            verify(f.ownership,timeout(3000)).release(f.capture);
+            assertThat(f.closedPorts).hasPositiveValue();
+        }
+    }
+    @Test void aLostReadersFailedCloseKeepsTheOriginalReleaseForTheExplicitRetry() throws Exception {
+        try(var f=new Fixture(List.of("input"),1,ReadMode.SNAPSHOT_ONLY,Duration.ofMillis(100))) {
+            var originalCloseFailure=new IllegalStateException("original reader close pending");
+            f.rowCount.set(32);f.closeFailure.set(originalCloseFailure);
+            var failRenewal=new AtomicBoolean();var firstCloseReturned=new CountDownLatch(1);
+            var observedCloseFailure=new AtomicReference<Throwable>();
+            doAnswer(call -> {
+                try {return call.callRealMethod();}
+                catch(RuntimeException|Error failed){observedCloseFailure.set(failed);throw failed;}
+                finally {firstCloseReturned.countDown();}
+            }).when(f.runtime).stopSnapshot(any());
+            doAnswer(call -> {
+                if(failRenewal.get())throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);
+                return Optional.of(call.getArgument(0));
+            }).when(f.ownership).renew(any());
+            var run=f.coordinator.forRun(SCOPE,PIPELINE,ORIGINAL);run.startCapture("flow",f.snapshot(),f.models());
+            failRenewal.set(true);assertThat(firstCloseReturned.await(3,TimeUnit.SECONDS)).isTrue();
+            assertThat(observedCloseFailure.get()).isSameAs(originalCloseFailure);
+            verify(f.ownership,never()).release(f.capture);
+            f.closeFailure.set(null);f.coordinator.retireScope(SCOPE,PIPELINE);
+            verify(f.ownership).release(f.capture);
+        }
+    }
     @Test void anAbsentLocalOwnerDoesNotProveItsExactCaptureTenureEnded() {
         try(var f=new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
             var properties=new ClusterProperties();properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
@@ -376,7 +415,8 @@ class ScopedPipelineCaptureCoordinatorTest {
         Fixture() { this(List.of("input")); }
         Fixture(List<String> ids) { this(ids,8); }
         Fixture(List<String> ids,int capacity) { this(ids, capacity, ReadMode.SNAPSHOT_ONLY); }
-        Fixture(List<String> ids,int capacity,ReadMode mode) {
+        Fixture(List<String> ids,int capacity,ReadMode mode) {this(ids,capacity,mode,Duration.ofSeconds(10));}
+        Fixture(List<String> ids,int capacity,ReadMode mode,Duration renewal) {
             buffer=new SnapshotBuffer(capacity);
             for(String id:ids) {
                 var definition=new SourceResource(id,null,"fixture",Map.of("database","x"),SourceMode.CDC,List.of(TableRef.literal("orders")),new Srs("key",null,null,null,true),null);
@@ -411,7 +451,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             var node=new WorkloadClaimFence(new WorkloadClaimKey("cluster",WorkloadClaimType.NODE_SESSION,"node"),OWNER,1,0,1);
             coordinator=new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(BUSINESS,pipelines,sources,configuration,cache,notes,ignored -> false,
                             ScopedPipelineCaptureCoordinator.BoundedLoads.NONE,completedFull),
-                    new ScopedPipelineCaptureCoordinator.Execution(() -> Optional.of(node),authorization,ownership,Duration.ofSeconds(10),() -> {},Clock.systemUTC()),
+                    new ScopedPipelineCaptureCoordinator.Execution(() -> Optional.of(node),authorization,ownership,renewal,() -> {},Clock.systemUTC()),
                     runtime,buffer,connectors,(original,config,guard,preparation,stream) -> { guard.run(); opened.incrementAndGet(); return new Port(config.node().nodeId(),guard,closedPorts,readRows,rowCount.get(),closeFailure); });
             if (!bounded) streaming();
         }
