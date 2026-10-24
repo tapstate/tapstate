@@ -112,7 +112,7 @@
   ],
   "provenance": {
     "specPath": "connectors/elasticsearch-connector/src/main/resources/spec_elasticsearch.json",
-    "specContentHash": "ba4ba8141f22df97",
+    "specContentHash": "79427a69ce17bd1d",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {}

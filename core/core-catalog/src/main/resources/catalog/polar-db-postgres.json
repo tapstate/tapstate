@@ -329,7 +329,7 @@
   ],
   "provenance": {
     "specPath": "connectors/polar-db-postgres-connector/src/main/resources/polar-db-postgres-spec.json",
-    "specContentHash": "0d53e3066888e58f",
+    "specContentHash": "dd23fd0a1e9bccf3",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {
