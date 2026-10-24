@@ -15,6 +15,9 @@ import io.tapstate.runtime.engine.OperatorRunManifest;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.WorkloadClaimFence;
+import io.tapstate.spi.store.CacheAuthScope;
+import io.tapstate.spi.store.StorageBinding;
+import io.tapstate.spi.store.StorageRecoveryCommands;
 import io.tapstate.runtime.engine.OperatorMapBinding;
 import java.io.Serializable;
 import java.time.Duration;
@@ -31,6 +34,8 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.BiFunction;
+import java.util.function.Function;
 
 /** Prepares the same original operator run on the exact data members the candidate was planned for. */
 final class HazelcastOperatorReadiness {
@@ -38,9 +43,14 @@ final class HazelcastOperatorReadiness {
     private final HazelcastInstance member;
     private final Duration timeout;
     private static final String RETIREMENT_CONTEXT = "tapstate.pipeline-retirement";
+    private static final String SHARED_PREVIEW_CONTEXT = "tapstate.shared-srs-preview";
     private record LocalRetirement(ScopedPipelineCaptureCoordinator captures, Runnable active) {}
+    private record LocalSharedPreview(SharedSrsPreviewMember preview,ScopedPipelineCaptureCoordinator captures) {}
     static void bindRetirement(HazelcastInstance member, ScopedPipelineCaptureCoordinator captures, Runnable active) {
         if (member.getUserContext().putIfAbsent(RETIREMENT_CONTEXT, new LocalRetirement(captures, active)) != null) throw fenced();
+    }
+    static void bindSharedPreview(HazelcastInstance member,SharedSrsPreviewMember preview,ScopedPipelineCaptureCoordinator captures) {
+        if(member.getUserContext().putIfAbsent(SHARED_PREVIEW_CONTEXT,new LocalSharedPreview(preview,captures))!=null)throw fenced();
     }
 
     HazelcastOperatorReadiness(HazelcastInstance member,Duration timeout) {
@@ -126,6 +136,55 @@ final class HazelcastOperatorReadiness {
     void requireRetired(PipelineIntentScope scope, WorkloadClaimFence ceiling, Runnable active) {
         if (!collect(scope, ceiling, false, active).isEmpty()) throw fenced();
     }
+    /** All current data members must acknowledge this exact attempt; it is not business execution authority. */
+    SharedTicket freezeShared(StorageRecoveryCommands.Plan original,Runnable active) {
+        if(original==null || original.manifest().selection().extent()!=StorageRecoveryCommands.Extent.SHARED_SRS)throw fenced();
+        var ticket=new SharedTicket(original,sharedSnapshot(original.manifest().selection().canonicalChain()).identities());
+        ticket.call("FREEZE",active);ticket.requireHeld(original,active);return ticket;
+    }
+    final class SharedTicket {
+        private final StorageRecoveryCommands.Plan original;
+        private final SharedAttempt attempt;
+        private final Map<String,Identity> expected;
+        private volatile boolean captureStopped,tenuresEnded,endedVerified;
+        private SharedTicket(StorageRecoveryCommands.Plan original,Map<String,Identity> expected) {
+            if(original.manifest().selection().extent()!=StorageRecoveryCommands.Extent.SHARED_SRS || expected.isEmpty())throw fenced();
+            this.original=original;this.attempt=SharedAttempt.from(original);this.expected=Map.copyOf(expected);
+        }
+        void stopCapture(Runnable active){captureStopped=false;tenuresEnded=false;endedVerified=false;call("STOP_CAPTURE",active);captureStopped=true;}
+        void endOwnedTenures(Runnable active){if(!captureStopped)throw fenced();tenuresEnded=false;endedVerified=false;call("END_TENURES",active);tenuresEnded=true;}
+        void verifyEnded(Runnable active){requireStaged(original,active);endedVerified=false;call("VERIFY",active);endedVerified=true;}
+        void requireStaged(StorageRecoveryCommands.Plan selected,Runnable active){if(!captureStopped || !tenuresEnded)throw fenced();requireHeld(selected,active);}
+        void requireVerified(StorageRecoveryCommands.Plan selected,Runnable active){if(!endedVerified)throw fenced();requireStaged(selected,active);}
+        /** Local roster and receiver checks only, suitable for the original CONFIG guard. */
+        void requireHeld(StorageRecoveryCommands.Plan selected,Runnable active) {
+            active.run();
+            if(!original.operationId().equals(selected.operationId()) || !original.originalScope().equals(selected.originalScope())
+                    || !original.planHash().equals(selected.planHash()) || original.controlRevision()!=selected.controlRevision()
+                    || !original.manifest().equals(selected.manifest()))throw fenced();
+            if(!expected.equals(sharedSnapshot(capture()).identities()))throw sharedRefused(capture(),"cluster","membership-changed");
+            if(!(member.getUserContext().get(SHARED_PREVIEW_CONTEXT) instanceof LocalSharedPreview local))throw fenced();
+            local.preview().requireHeld(selected);active.run();
+            if(!expected.equals(sharedSnapshot(capture()).identities()))throw sharedRefused(capture(),"cluster","membership-changed");
+        }
+        private String capture(){return original.manifest().selection().canonicalChain();}
+        private void call(String action,Runnable active) {
+            try {
+                active.run();var before=sharedSnapshot(capture());
+                if(!expected.equals(before.identities()))throw sharedRefused(capture(),"cluster","membership-changed");
+                long deadline=System.nanoTime()+timeout.toNanos();
+                var replies=member.getExecutorService(EXECUTOR).submitToMembers(new SharedCall(attempt,action,expected),before.members().values());
+                for(var target:before.members().entrySet()) {
+                    active.run();var result=answer(replies.get(target.getValue()),deadline,reason -> sharedRefused(capture(),target.getKey(),reason));
+                    if(result==null || !expected.get(target.getKey()).equals(result.identity()))throw sharedRefused(capture(),target.getKey(),"identity-changed");
+                    if(result.refusalCode()!=null)throw sharedRefused(capture(),target.getKey(),result.refusalCode());
+                }
+                active.run();if(!expected.equals(sharedSnapshot(capture()).identities()))throw sharedRefused(capture(),"cluster","membership-changed");
+            } catch(HazelcastInstanceNotActiveException|TargetDisconnectedException|TargetNotMemberException|OperationTimeoutException unavailable) {
+                throw sharedRefused(capture(),"cluster","member-unavailable");
+            }
+        }
+    }
     private List<OperatorMapBinding> collect(PipelineIntentScope scope, WorkloadClaimFence ceiling, boolean stop, Runnable active) {
         try { return collectAvailable(scope,ceiling,stop,active); }
         catch (HazelcastInstanceNotActiveException | TargetDisconnectedException | TargetNotMemberException | OperationTimeoutException unavailable) {
@@ -152,28 +211,38 @@ final class HazelcastOperatorReadiness {
                         || !fence.operatorExecutionKey().equals(binding.executionKey()))) throw fenced();
     }
 
-    private Snapshot snapshot(String pipeline) {
+    private Snapshot snapshot(String pipeline) {return snapshot((node,reason) -> refused(pipeline,node,reason));}
+    private Snapshot sharedSnapshot(String capture) {
+        try{return snapshot((node,reason) -> sharedRefused(capture,node,reason));}
+        catch(HazelcastInstanceNotActiveException|TargetDisconnectedException|TargetNotMemberException|OperationTimeoutException unavailable) {
+            throw sharedRefused(capture,"cluster","member-unavailable");
+        }
+    }
+    private Snapshot snapshot(BiFunction<String,String,TapstateException> failure) {
         var members = new LinkedHashMap<String,Member>(); var identities = new LinkedHashMap<String,Identity>();
         for (var candidate : member.getCluster().getMembers()) {
             if (candidate.isLiteMember()) continue;
             Identity identity;
             try { identity = identity(candidate); }
-            catch (TapstateException missing) { throw refused(pipeline,ClusterMembershipGate.stableIdOf(candidate),"identity-missing"); }
-            if (members.putIfAbsent(identity.nodeId(),candidate) != null) throw refused(pipeline,identity.nodeId(),"identity-duplicate");
+            catch (TapstateException missing) { throw failure.apply(ClusterMembershipGate.stableIdOf(candidate),"identity-missing"); }
+            if (members.putIfAbsent(identity.nodeId(),candidate) != null) throw failure.apply(identity.nodeId(),"identity-duplicate");
             identities.put(identity.nodeId(),identity);
         }
         return new Snapshot(Map.copyOf(members),Map.copyOf(identities));
     }
     private <T> T answer(String pipeline,String target,Future<T> future,long deadline) {
-        if (future == null) throw refused(pipeline,target,"no-answer");
+        return answer(future,deadline,reason -> refused(pipeline,target,reason));
+    }
+    private <T> T answer(Future<T> future,long deadline,Function<String,TapstateException> failure) {
+        if (future == null) throw failure.apply("no-answer");
         try { return future.get(Math.max(0,deadline-System.nanoTime()),TimeUnit.NANOSECONDS); }
-        catch (TimeoutException slow) { throw refused(pipeline,target,"timeout"); }
-        catch (CancellationException cancelled) { throw refused(pipeline,target,"cancelled"); }
-        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw refused(pipeline,target,"interrupted"); }
+        catch (TimeoutException slow) { throw failure.apply("timeout"); }
+        catch (CancellationException cancelled) { throw failure.apply("cancelled"); }
+        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw failure.apply("interrupted"); }
         catch (ExecutionException failed) {
             Throwable cause = failed.getCause() == null ? failed : failed.getCause();
             if (cause instanceof MemberLeftException || cause instanceof HazelcastInstanceNotActiveException || cause instanceof TargetDisconnectedException
-                    || cause instanceof TargetNotMemberException || cause instanceof OperationTimeoutException) throw refused(pipeline,target,"member-unavailable");
+                    || cause instanceof TargetNotMemberException || cause instanceof OperationTimeoutException) throw failure.apply("member-unavailable");
             if (cause instanceof RuntimeException bug) throw bug;
             if (cause instanceof Error bug) throw bug;
             throw new IllegalStateException("unexpected member preparation failure",cause);
@@ -183,6 +252,39 @@ final class HazelcastOperatorReadiness {
     private record Snapshot(Map<String,Member> members,Map<String,Identity> identities) {}
     record Result(Identity identity,String refusalCode) implements Serializable {}
     record Collected(Identity identity, List<OperatorMapBinding> bindings, String refusalCode) implements Serializable {}
+    /** Original lookup coordinates only; no credentials, model payloads, grants or serialized enums. */
+    private record SharedAttempt(String cluster,long binding,String mode,String incarnation,long authGeneration,
+            String operation,String hash,long revision) implements Serializable {
+        static SharedAttempt from(StorageRecoveryCommands.Plan original) {
+            var scope=original.originalScope();return new SharedAttempt(scope.clusterId(),scope.bindingVersion(),scope.mode().name(),
+                    scope.cacheIncarnation(),scope.authGeneration(),original.operationId(),original.planHash(),original.controlRevision());
+        }
+        CacheAuthScope scope(){return new CacheAuthScope(cluster,binding,StorageBinding.Mode.valueOf(mode),incarnation,authGeneration);}
+    }
+    static final class SharedCall implements Callable<Result>,Serializable,HazelcastInstanceAware {
+        private final SharedAttempt original;private final String action;private final Map<String,Identity> expected;
+        private transient HazelcastInstance member;
+        private SharedCall(SharedAttempt original,String action,Map<String,Identity> expected){this.original=original;this.action=action;this.expected=Map.copyOf(expected);}
+        @Override public void setHazelcastInstance(HazelcastInstance member){this.member=member;}
+        @Override public Result call() {
+            Identity actual=null;
+            try {
+                actual=identity(member.getCluster().getLocalMember());
+                if(!actual.equals(expected.get(actual.nodeId())) || !(member.getUserContext().get(SHARED_PREVIEW_CONTEXT) instanceof LocalSharedPreview local))throw fenced();
+                var plan=local.preview().original(original.scope(),original.operation(),original.hash(),original.revision());
+                var shared=plan.manifest().sharedSrs();
+                switch(action) {
+                    case "FREEZE" -> local.preview().freeze(plan);
+                    case "STOP_CAPTURE" -> {local.preview().requireHeld(plan);local.captures().stopSharedLocally(shared.previous(),shared.captureFence());}
+                    case "END_TENURES" -> local.preview().endOwnedTenures(plan);
+                    case "VERIFY" -> {local.preview().requireEnded(plan);local.captures().requireSharedRetired(shared.previous(),shared.captureFence());}
+                    default -> throw new IllegalStateException("unknown shared preview action");
+                }
+                local.preview().original(original.scope(),original.operation(),original.hash(),original.revision());
+                return new Result(actual,null);
+            } catch(TapstateException refused){return new Result(actual,refused.code().code());}
+        }
+    }
     private static Identity identity(Member member) {
         String node = member.getAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE), boot = member.getAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE);
         if (node == null || node.isBlank() || boot == null || boot.isBlank() || member.getUuid() == null) throw fenced();
@@ -265,5 +367,8 @@ final class HazelcastOperatorReadiness {
     private static TapstateException fenced() { return new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null); }
     private static TapstateException refused(String pipeline,String target,String reason) {
         return new TapstateException(ActuationError.OPERATOR_STATE_UNAVAILABLE_ON_MEMBER,Map.of("pipeline",pipeline,"member",target,"reason",reason),null);
+    }
+    private static TapstateException sharedRefused(String capture,String target,String reason) {
+        return new TapstateException(ActuationError.SHARED_RECOVERY_MEMBER_UNAVAILABLE,Map.of("capture",capture,"member",target,"reason",reason),null);
     }
 }

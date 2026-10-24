@@ -21,6 +21,12 @@ public final class StorageRecoveryService {
         StorageRecoveryCommands.Manifest inspect(CacheAuthScope scope, StorageRecoveryCommands.Selection selection);
         /** Rechecks the original influence/capability closure before every CONFIG transaction attempt. */
         void requireCurrent(CacheAuthScope scope, StorageRecoveryCommands.Manifest original);
+        /** Planning may establish its durable attempt before local exclusion exists. */
+        default void requirePlanningCurrent(CacheAuthScope scope,StorageRecoveryCommands.Manifest original) {requireCurrent(scope,original);}
+        /** Finalizes only the same unconfirmed attempt after its runtime preflight, without starting recovery. */
+        default StorageRecoveryCommands.Plan prepared(StorageRecoveryCommands.Plan original,Runnable active) {return original;}
+        /** Resolves an optional audited continuation through the original store-issued cancellation authority. */
+        default Optional<java.util.function.Supplier<StorageRecoveryCommands.Plan>> replanning(StorageRecoveryCommands.Plan original,Runnable active) {return Optional.empty();}
         /** Optional live source probes run before CONFIG transactions; their retry guards remain store-only. */
         default void verifyExternal(CacheAuthScope scope,StorageRecoveryCommands.Manifest original) {}
         default Presentation present(StorageRecoveryCommands.Plan original) {return new Presentation(true,java.util.List.of(),null);}
@@ -51,15 +57,30 @@ public final class StorageRecoveryService {
         active.run();
         if (operationId != null) {
             var original = commands.guardedBy(active).find(scope, operationId).orElseThrow(StorageRecoveryService::conflict);
+            if(original.manifest().selection().extent()==StorageRecoveryCommands.Extent.SHARED_SRS && original.manifest().selection().equals(selection)) {
+                var continuation=inspector.replanning(original,active);
+                active.run();
+                if(continuation.isPresent())return audit.dispatch(ControlOperations.STORAGE_RECOVERY_PLAN,new AuditContext(subject,scope.clusterId()),() -> {
+                    active.run();var result=Objects.requireNonNull(continuation.orElseThrow().get());active.run();
+                    boolean unchanged=result.equals(original);
+                    boolean replanned=result.phase()==StorageRecoveryCommands.Phase.PLANNED && result.controlRevision()>original.controlRevision();
+                    boolean applied=result.phase()==StorageRecoveryCommands.Phase.COMPLETE && result.controlRevision()==original.controlRevision()
+                            && result.manifest().equals(original.manifest()) && result.planHash().equals(original.planHash());
+                    if(!sameOperation(original,result) || !original.manifest().selection().equals(result.manifest().selection())
+                            || !(unchanged || replanned || applied))
+                        throw new IllegalStateException("replanning changed its original recovery authority");
+                    return result.phase()==StorageRecoveryCommands.Phase.COMPLETE?result:prepare(result,active);
+                });
+            }
             if (original.phase() == StorageRecoveryCommands.Phase.RUNNING || original.phase() == StorageRecoveryCommands.Phase.COMPLETE) {
                 if (!original.manifest().selection().equals(selection)) throw conflict();
                 return original;
             }
         }
         var manifest = inspector.inspect(scope, selection);
-        Runnable current = () -> { active.run(); inspector.requireCurrent(scope, manifest); };
+        Runnable current = () -> { active.run(); inspector.requirePlanningCurrent(scope, manifest); };
         return audit.dispatch(ControlOperations.STORAGE_RECOVERY_PLAN, new AuditContext(subject, scope.clusterId()),
-                () -> commands.guardedBy(current).plan(scope, manifest, operationId, previousOperationId));
+                () -> prepare(commands.guardedBy(current).plan(scope, manifest, operationId, previousOperationId),active));
     }
     public StorageRecoveryCommands.Plan confirm(String subject, CacheAuthScope scope, Runnable active,
             String operationId, String planHash, long controlRevision, boolean explicitlyConfirmed) {
@@ -86,6 +107,17 @@ public final class StorageRecoveryService {
         return result;
     }
     public Presentation presentation(StorageRecoveryCommands.Plan original) {return inspector.present(original);}
+    private StorageRecoveryCommands.Plan prepare(StorageRecoveryCommands.Plan original,Runnable active) {
+        active.run();var result=Objects.requireNonNull(inspector.prepared(original,active));active.run();
+        if(!sameOperation(original,result) || !original.manifest().selection().equals(result.manifest().selection())
+                || !result.equals(original) && (result.phase()!=StorageRecoveryCommands.Phase.PLANNED || result.controlRevision()<=original.controlRevision()))
+            throw new IllegalStateException("runtime preflight changed its original recovery authority");
+        return result;
+    }
+    private static boolean sameOperation(StorageRecoveryCommands.Plan left,StorageRecoveryCommands.Plan right) {
+        return left.operationId().equals(right.operationId()) && Objects.equals(left.previousOperationId(),right.previousOperationId())
+                && left.originalScope().equals(right.originalScope());
+    }
     public Optional<StorageRecoveryCommands.Plan> status(CacheAuthScope scope, Runnable active, String originalId) {
         active.run();
         return commands.guardedBy(active).find(scope, originalId);

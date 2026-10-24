@@ -104,6 +104,11 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         active(); return sessions.keySet().stream().anyMatch(original -> original.scope().equals(scope));
     }
     /** Releases only the original local shared owner after all of its Pipeline sessions have ended. */
+    synchronized void stopSharedLocally(CapturePreparation original,WorkloadClaimFence fence) {
+        requireShared(original,fence);
+        // This stages parallel local shutdown; the separate all-member verification still proves the durable end.
+        if(owners.containsKey(original.captureId()))retireShared(original,fence);
+    }
     synchronized void retireShared(CapturePreparation original,WorkloadClaimFence fence) {
         requireShared(original,fence);
         var owner=owners.get(original.captureId());

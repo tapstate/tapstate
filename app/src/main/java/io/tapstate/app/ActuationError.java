@@ -236,7 +236,10 @@ enum ActuationError implements TapstateErrorCode {
 
     /** The original run cannot prepare its operator bindings on a required member. */
     OPERATOR_STATE_UNAVAILABLE_ON_MEMBER("actuation.operator-state-unavailable-on-member",
-            Set.of("pipeline","member","reason"));
+            Set.of("pipeline","member","reason")),
+
+    /** Every original data member must prove this shared recovery attempt before storage replacement. */
+    SHARED_RECOVERY_MEMBER_UNAVAILABLE("actuation.shared-recovery-member-unavailable",Set.of("capture","member","reason"));
 
     private final String code;
     private final Set<String> placeholders;

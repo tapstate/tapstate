@@ -21,6 +21,7 @@ actuation.parallelism-needs-a-key
 actuation.pipeline-not-found
 actuation.preview-refused
 actuation.schema-sync-while-running
+actuation.shared-recovery-member-unavailable
 actuation.source-schema-not-discovered
 actuation.source-table-ambiguous
 actuation.source-table-not-discovered

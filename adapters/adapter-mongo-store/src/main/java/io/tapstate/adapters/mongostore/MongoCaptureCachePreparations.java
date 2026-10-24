@@ -58,6 +58,26 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
         });
         admitted.requireCurrent().run();return result;
     }
+    @Override public Optional<SharedSrsRecoveryReceipt> applied(SharedSrsRecoveryPreparation original) {
+        var admitted=MongoStorageRecoveryCommands.requireSharedOriginal(original,targetFingerprint);requireScope(admitted.replacement());
+        var result=transaction(() -> {},session -> {
+            var structure=new MongoCacheMetadataStructure(database,retention);structure.verifySrs();
+            new MongoCacheBusinessIdentity(database,scope).requireReady(session);
+            var consumers=new MongoSrsConsumerStore(client,database,scope,active,structure::verifySrs);
+            var previous=admitted.plan().manifest().sharedSrs().previous();
+            var root=SystemCollections.SRS_CHAINS.on(database).find(session,new Document("_id",previous.chainId())).first();
+            if(root==null)throw history(previous);
+            var control=MongoSrsRecoveryControls.read(root);
+            if(control.filter(value -> value.phase()==MongoSrsRecoveryControls.Phase.RETIRED).isPresent()) {
+                verifyApplied(session,admitted,consumers);
+                return Optional.<SharedSrsRecoveryReceipt>of(new SharedReceipt(this,admitted,SharedSrsRecoveryReceipt.Outcome.RETIRED));
+            }
+            if(control.isEmpty())consumers.sharedRecoveryView(session,previous);
+            else consumers.cancelledSharedRecoveryView(session,previous,admitted.plan().operationId(),control.orElseThrow().planHash(),admitted.replacement().chainId());
+            requireEmptySharedNamespace(session,admitted.replacement());return Optional.<SharedSrsRecoveryReceipt>empty();
+        });
+        admitted.requireCurrent().run();return result;
+    }
     @Override public SharedSrsRecoveryReceipt cancel(SharedSrsRecoveryPreparation original,WorkloadClaimFence currentNode) {
         var admitted=MongoStorageRecoveryCommands.requireSharedCancellationAuthority(original,targetFingerprint);requireScope(admitted.replacement());requireSharedNode(currentNode);
         // Fix the CACHE attempt before CONFIG admission; a delayed old admission cannot undo a later cancellation.

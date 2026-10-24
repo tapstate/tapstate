@@ -40,6 +40,7 @@ class ScopedPipelineCaptureCoordinatorTest {
                     f.configuration,f.cache,f.notes),new ScopedPipelineCaptureCoordinator.Execution(() -> Optional.of(node),f.authorization,
                     ownership,Duration.ofSeconds(10),() -> {},Clock.systemUTC()),f.runtime,f.buffer,f.connectors,
                     (original,config,guard,preparation,stream) -> {throw new AssertionError("no capture may open");})) {
+                coordinator.stopSharedLocally(prepared,permit.fence());
                 assertThatThrownBy(() -> coordinator.retireShared(prepared,permit.fence())).isInstanceOf(TapstateException.class);
                 assertThatThrownBy(() -> coordinator.requireSharedRetired(prepared,permit.fence())).isInstanceOf(TapstateException.class);
                 assertThat(raw.read(permit.claim().key()).orElseThrow().leased()).isTrue();

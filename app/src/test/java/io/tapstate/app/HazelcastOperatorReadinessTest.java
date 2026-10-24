@@ -10,6 +10,8 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.runtime.engine.*;
 import io.tapstate.spi.store.*;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import java.io.*;
 import java.time.Duration;
 import java.util.*;
@@ -31,6 +33,116 @@ class HazelcastOperatorReadinessTest {
     private static OperatorRunManifest manifest(long execution) {
         var original = fence(execution);
         return new OperatorRunManifest("p",original,CAPACITIES.stream().map(c -> new OperatorMapBinding(c.placement(),original,original.operatorExecutionKey())).toList());
+    }
+
+    @Test void twoActualMembersAcknowledgeTheSameSharedAttemptBeforeEachSeparateRetirementStage() {
+        try(var f=new RealMembers()) {
+            var plan=sharedPlan();var left=sharedReceiver(plan);var right=sharedReceiver(plan);
+            var leftCaptures=mock(ScopedPipelineCaptureCoordinator.class);var rightCaptures=mock(ScopedPipelineCaptureCoordinator.class);
+            HazelcastOperatorReadiness.bindSharedPreview(f.a,left,leftCaptures);HazelcastOperatorReadiness.bindSharedPreview(f.b,right,rightCaptures);
+            var ticket=new HazelcastOperatorReadiness(f.a,Duration.ofSeconds(5)).freezeShared(plan,() -> {});
+            ticket.stopCapture(() -> {});ticket.endOwnedTenures(() -> {});ticket.verifyEnded(() -> {});ticket.requireHeld(plan,() -> {});
+            for(var pair:List.of(Map.entry(left,leftCaptures),Map.entry(right,rightCaptures))) {
+                var ordered=inOrder(pair.getKey(),pair.getValue());
+                ordered.verify(pair.getKey()).freeze(plan);
+                ordered.verify(pair.getValue()).stopSharedLocally(plan.manifest().sharedSrs().previous(),plan.manifest().sharedSrs().captureFence());
+                ordered.verify(pair.getKey()).endOwnedTenures(plan);
+                ordered.verify(pair.getKey()).requireEnded(plan);
+                ordered.verify(pair.getValue()).requireSharedRetired(plan.manifest().sharedSrs().previous(),plan.manifest().sharedSrs().captureFence());
+            }
+        }
+    }
+
+    @Test void oneActualMemberRefusingTheSharedFreezeCannotProduceAnAllMemberTicket() {
+        try(var f=new RealMembers()) {
+            var plan=sharedPlan();var left=sharedReceiver(plan);var right=sharedReceiver(plan);
+            var captures=mock(ScopedPipelineCaptureCoordinator.class);
+            doThrow(new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null)).when(right).freeze(plan);
+            HazelcastOperatorReadiness.bindSharedPreview(f.a,left,captures);HazelcastOperatorReadiness.bindSharedPreview(f.b,right,captures);
+            assertThatThrownBy(() -> new HazelcastOperatorReadiness(f.a,Duration.ofSeconds(5)).freezeShared(plan,() -> {}))
+                    .isInstanceOfSatisfying(TapstateException.class,failed -> {
+                        assertThat(failed.code()).isEqualTo(ActuationError.SHARED_RECOVERY_MEMBER_UNAVAILABLE);
+                        assertThat(failed.args()).containsEntry("member","b").containsEntry("reason",IoError.WORKLOAD_CLAIM_FENCED.code());
+                    });
+            verify(captures,never()).stopSharedLocally(any(),any());verify(left,never()).endOwnedTenures(any());verify(right,never()).endOwnedTenures(any());
+        }
+    }
+
+    @Test void anEngineReplacementInvalidatesTheOriginalSharedTicketBeforeAnotherRpc() {
+        var f=new MockMembers();var plan=sharedPlan();var receiver=sharedReceiver(plan);
+        HazelcastOperatorReadiness.bindSharedPreview(f.member,receiver,mock(ScopedPipelineCaptureCoordinator.class));
+        var ticket=f.readiness().freezeShared(plan,() -> {});
+        ticket.stopCapture(() -> {});
+        String encoded=new String(f.serializedTask.get(),java.nio.charset.StandardCharsets.ISO_8859_1);
+        assertThat(encoded).doesNotContain("StorageBinding$Mode","StorageRecoveryCommands$Plan","RequiredNoteOrigin");
+        f.members.set(new LinkedHashSet<>(List.of(f.a,member("b","boot-b",UUID.randomUUID()))));
+        var executor=f.member.getExecutorService(HazelcastOperatorReadiness.EXECUTOR);clearInvocations(executor,receiver);
+        assertThatThrownBy(() -> ticket.endOwnedTenures(() -> {})).isInstanceOf(TapstateException.class);
+        assertThatThrownBy(() -> ticket.requireHeld(plan,() -> {})).isInstanceOf(TapstateException.class);
+        verify(executor,never()).submitToMembers(any(HazelcastOperatorReadiness.SharedCall.class),anyCollection());
+        verify(receiver,never()).requireHeld(any());
+    }
+
+    @Test void aSharedFreezeAloneCannotStandInForTheSeparatePhysicalAndDurableEndStages() {
+        var f=new MockMembers();var plan=sharedPlan();var receiver=sharedReceiver(plan);
+        HazelcastOperatorReadiness.bindSharedPreview(f.member,receiver,mock(ScopedPipelineCaptureCoordinator.class));
+        var ticket=f.readiness().freezeShared(plan,() -> {});
+        assertThatThrownBy(() -> ticket.requireStaged(plan,() -> {})).isInstanceOf(TapstateException.class);
+        assertThatThrownBy(() -> ticket.endOwnedTenures(() -> {})).isInstanceOf(TapstateException.class);
+        assertThatThrownBy(() -> ticket.verifyEnded(() -> {})).isInstanceOf(TapstateException.class);
+        assertThat(f.dispatches).hasValue(1);
+        ticket.stopCapture(() -> {});assertThatThrownBy(() -> ticket.requireStaged(plan,() -> {})).isInstanceOf(TapstateException.class);
+        ticket.endOwnedTenures(() -> {});ticket.requireStaged(plan,() -> {});
+        assertThatThrownBy(() -> ticket.requireVerified(plan,() -> {})).isInstanceOf(TapstateException.class);
+        ticket.verifyEnded(() -> {});ticket.requireVerified(plan,() -> {});assertThat(f.dispatches).hasValue(4);
+    }
+
+    @Test void aMembershipChangeDuringTheSharedFreezeCannotBeAnAcknowledgedOriginalRoster() {
+        var f=new MockMembers();var plan=sharedPlan();var receiver=sharedReceiver(plan);
+        HazelcastOperatorReadiness.bindSharedPreview(f.member,receiver,mock(ScopedPipelineCaptureCoordinator.class));
+        f.dispatch=() -> f.members.set(new LinkedHashSet<>(List.of(f.a,member("b","boot-b",UUID.randomUUID()))));
+        assertThatThrownBy(() -> f.readiness().freezeShared(plan,() -> {})).isInstanceOfSatisfying(TapstateException.class,failed -> {
+            assertThat(failed.code()).isEqualTo(ActuationError.SHARED_RECOVERY_MEMBER_UNAVAILABLE);
+            assertThat(failed.args()).containsEntry("reason","membership-changed");
+        });
+        verify(receiver,never()).requireHeld(any());
+    }
+
+    @ParameterizedTest @ValueSource(strings={"no-answer","cancelled","timeout","identity"})
+    void anIncompleteOrWrongSharedReplyCannotBecomeATicket(String fault) throws Exception {
+        var f=new MockMembers();var plan=sharedPlan();var receiver=sharedReceiver(plan);
+        HazelcastOperatorReadiness.bindSharedPreview(f.member,receiver,mock(ScopedPipelineCaptureCoordinator.class));
+        switch(fault) {
+            case "no-answer" -> f.answers.remove(f.b);
+            case "cancelled" -> {var answer=new CompletableFuture<HazelcastOperatorReadiness.Result>();answer.cancel(false);f.answers.put(f.b,answer);}
+            case "timeout" -> {
+                Future<HazelcastOperatorReadiness.Result> answer=mock(Future.class);when(answer.get(anyLong(),eq(TimeUnit.NANOSECONDS))).thenThrow(new TimeoutException());f.answers.put(f.b,answer);
+            }
+            case "identity" -> f.answers.put(f.b,CompletableFuture.completedFuture(new HazelcastOperatorReadiness.Result(identity(member("b","boot-b",UUID.randomUUID())),null)));
+            default -> throw new AssertionError(fault);
+        }
+        assertThatThrownBy(() -> f.readiness().freezeShared(plan,() -> {})).isInstanceOfSatisfying(TapstateException.class,failed -> {
+            assertThat(failed.code()).isEqualTo(ActuationError.SHARED_RECOVERY_MEMBER_UNAVAILABLE);
+            assertThat(failed.args()).containsEntry("member","b").containsEntry("reason",fault.equals("identity")?"identity-changed":fault);
+        });
+        verify(receiver,never()).requireHeld(any());
+    }
+
+    private static SharedSrsPreviewMember sharedReceiver(StorageRecoveryCommands.Plan original) {
+        var receiver=mock(SharedSrsPreviewMember.class);
+        when(receiver.original(original.originalScope(),original.operationId(),original.planHash(),original.controlRevision())).thenReturn(original);return receiver;
+    }
+    private static StorageRecoveryCommands.Plan sharedPlan() {
+        var scope=new CacheBusinessScope("cluster",1,"cache");
+        var original=new CapturePreparation(scope,CapturePreparation.Mode.SHARED_SRS,"mck-shared","capture-shared","mc-"+"a".repeat(64),UUID.randomUUID().toString());
+        var pipeline=new WorkloadClaimFence(new WorkloadClaimKey("cluster",WorkloadClaimType.PIPELINE_ACTUATION,"p"),new WorkloadOwner("a","boot-a"),3,1,1);
+        var capture=new WorkloadClaimFence(new WorkloadClaimKey("cluster",WorkloadClaimType.CAPTURE,original.captureId()),new WorkloadOwner("a","boot-a"),1,0,1);
+        var context=new SrsConsumerContext(new SrsConsumerKey(original.chainId(),"p","input"),SCOPE.stateGeneration());
+        var observed=new SharedSrsRecoverySnapshot(original,capture,"c".repeat(64),List.of(new SrsConsumerMembership(context,1,false,Set.of("orders"),pipeline)),
+                Map.of("p",new SharedSrsRecoverySnapshot.Pipeline(SCOPE,pipeline)));
+        var manifest=new StorageRecoveryCommands.Manifest(new StorageRecoveryCommands.Selection(StorageRecoveryCommands.Extent.SHARED_SRS,Set.of(),original.canonicalChainId(),original.chainId()),
+                Set.of("p"),Map.of("p","a".repeat(64)),"b".repeat(64),10,observed);
+        return new StorageRecoveryCommands.Plan(UUID.randomUUID().toString(),null,new CacheAuthScope("cluster",1,StorageBinding.Mode.OP,"cache",1),manifest,"d".repeat(64),11,StorageRecoveryCommands.Phase.PLANNED);
     }
 
     @Test void twoActualMembersPrepareTheSameOriginalBindingsThroughTheirOwnRegistries() {
@@ -224,6 +336,7 @@ class HazelcastOperatorReadinessTest {
         final AtomicReference<byte[]> serializedTask = new AtomicReference<>(); Runnable dispatch = () -> {};
         MockMembers() {
             var cluster = mock(Cluster.class); when(member.getCluster()).thenReturn(cluster); when(cluster.getMembers()).thenAnswer(invocation -> members.get());
+            when(member.getUserContext()).thenReturn(new ConcurrentHashMap<>());
             var executor = mock(IExecutorService.class); when(member.getExecutorService(HazelcastOperatorReadiness.EXECUTOR)).thenReturn(executor);
             answers.put(a,CompletableFuture.completedFuture(new HazelcastOperatorReadiness.Result(identity(a),null)));
             answers.put(b,CompletableFuture.completedFuture(new HazelcastOperatorReadiness.Result(identity(b),null)));
@@ -233,6 +346,10 @@ class HazelcastOperatorReadinessTest {
             when(executor.submitToMembers(any(HazelcastOperatorReadiness.Install.class),anyCollection())).thenAnswer(invocation -> {
                 var bytes = new ByteArrayOutputStream(); try (var out = new ObjectOutputStream(bytes)) { out.writeObject(invocation.getArgument(0)); }
                 serializedTask.set(bytes.toByteArray()); dispatches.incrementAndGet(); dispatch.run(); return answers;
+            });
+            when(executor.submitToMembers(any(HazelcastOperatorReadiness.SharedCall.class),anyCollection())).thenAnswer(invocation -> {
+                var bytes=new ByteArrayOutputStream();try(var out=new ObjectOutputStream(bytes)){out.writeObject(invocation.getArgument(0));}
+                serializedTask.set(bytes.toByteArray());dispatches.incrementAndGet();dispatch.run();return answers;
             });
         }
         HazelcastOperatorReadiness readiness() { return new HazelcastOperatorReadiness(member,Duration.ofSeconds(1)); }

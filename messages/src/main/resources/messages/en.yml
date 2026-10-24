@@ -68,6 +68,9 @@ actuation.operator-state-unavailable-on-member:
 actuation.schema-sync-while-running:
   message: "Pipeline `{pipeline}` is {state} and has been asked to be {desired}, so the recorded model of what it produces cannot be re-copied from its sources right now."
   solution: "Stop the pipeline and wait until it is at rest, then retry the schema refresh. Pausing is not enough: a paused run retains its assembled model, and resuming an unchanged pipeline may reuse it."
+actuation.shared-recovery-member-unavailable:
+  message: "Shared capture {capture} recovery could not verify member {member} ({reason})."
+  solution: "Keep the original recovery scope and storage. Resolve the member or authority failure, then repeat preflight if the membership or original control facts changed. All affected old executions and source or target connections must be isolated before confirmation."
 actuation.view-key-missing:
   message: "View `{view}` declares no primary key."
   solution: "Give the view a primaryKey naming the column that identifies one record, so updates converge on it instead of appending a copy."

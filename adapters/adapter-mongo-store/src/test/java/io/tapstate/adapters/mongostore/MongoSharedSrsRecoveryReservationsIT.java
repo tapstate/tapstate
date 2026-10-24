@@ -36,6 +36,67 @@ class MongoSharedSrsRecoveryReservationsIT {
     private static final Duration TTL = Duration.ofMinutes(2);
     private static final StorageSetupScope SETUP = new StorageSetupScope("cluster-a", "install-a", "setup-a", 1);
 
+    @Test void appliedLookupCannotCreateOrCancelAnUnappliedOriginalAttempt() {
+        withFixture(f -> {
+            f.endAffectedTenures();var original=f.configuration.sharedRecoveryPreparations().reserve(f.confirmed());
+            var cache=rows(f.cache);var configuration=rows(f.config);
+            assertThat(f.domain.sharedSrsRecoveries(f.scope,ACTIVE).applied(original)).isEmpty();
+            assertThat(rows(f.cache)).isEqualTo(cache);assertThat(rows(f.config)).isEqualTo(configuration);
+            var cancelled=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).cancel(original,f.node);
+            assertThat(cancelled.outcome()).isEqualTo(SharedSrsRecoveryReceipt.Outcome.CANCELLED);
+            cache=rows(f.cache);configuration=rows(f.config);
+            assertThat(f.domain.sharedSrsRecoveries(f.scope,ACTIVE).applied(original)).isEmpty();
+            assertThat(rows(f.cache)).isEqualTo(cache);assertThat(rows(f.config)).isEqualTo(configuration);
+        });
+    }
+
+    @Test void appliedLookupReturnsTheExactRetiredReceiptWithoutRecheckingLaterAuthoring() {
+        withFixture(f -> {
+            f.endAffectedTenures();var original=f.configuration.sharedRecoveryPreparations().reserve(f.confirmed());
+            var committed=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).replace(original,f.node);f.changeSource();
+            var cache=rows(f.cache);var configuration=rows(f.config);
+            var loaded=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).applied(original).orElseThrow();
+            assertThat(loaded.outcome()).isEqualTo(SharedSrsRecoveryReceipt.Outcome.RETIRED);loaded.requireCurrent();
+            assertThat(loaded.preparation().replacement()).isEqualTo(committed.preparation().replacement());
+            assertThat(loaded.preparation().plan()).isEqualTo(committed.preparation().plan());
+            assertThat(rows(f.cache)).isEqualTo(cache);assertThat(rows(f.config)).isEqualTo(configuration);
+            assertThat(f.configuration.sharedRecoveryPreparations().complete(loaded).phase()).isEqualTo(Phase.COMPLETE);
+            assertThat(rows(f.cache)).isEqualTo(cache);
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"root","claim"})
+    void appliedLookupCannotRepairAnIncompleteOrConflictingRetiredResult(String fault) {
+        withFixture(f -> {
+            f.endAffectedTenures();var original=f.configuration.sharedRecoveryPreparations().reserve(f.confirmed());
+            f.domain.sharedSrsRecoveries(f.scope,ACTIVE).replace(original,f.node);
+            if(fault.equals("root"))assertThat(SystemCollections.SRS_CHAINS.on(f.cache).deleteOne(new Document("_id",original.replacement().chainId())).getDeletedCount()).isOne();
+            else {
+                var key=new WorkloadClaimKey(f.scope.clusterId(),WorkloadClaimType.CAPTURE,original.replacement().captureId());
+                assertThat(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.cache).updateOne(new Document("_id",MongoWorkloadClaimStore.id(key)),
+                        new Document("$set",new Document("capturePreparation.physicalChain","srs-recovery-"+"f".repeat(64)))).getMatchedCount()).isOne();
+            }
+            var cache=rows(f.cache);var configuration=rows(f.config);
+            assertThatThrownBy(() -> f.domain.sharedSrsRecoveries(f.scope,ACTIVE).applied(original)).isInstanceOf(TapstateException.class);
+            assertThat(rows(f.cache)).isEqualTo(cache);assertThat(rows(f.config)).isEqualTo(configuration);
+        });
+    }
+
+    @Test void copiedPreparationValuesCannotReadAStoreIssuedAppliedReceipt() {
+        withFixture(f -> {
+            f.endAffectedTenures();var original=f.configuration.sharedRecoveryPreparations().reserve(f.confirmed());
+            f.domain.sharedSrsRecoveries(f.scope,ACTIVE).replace(original,f.node);
+            var copied=new SharedSrsRecoveryPreparation() {
+                @Override public Plan plan(){return original.plan();}
+                @Override public CapturePreparation replacement(){return original.replacement();}
+                @Override public void requireCurrent(){}
+            };
+            var cache=rows(f.cache);var configuration=rows(f.config);
+            assertThatThrownBy(() -> f.domain.sharedSrsRecoveries(f.scope,ACTIVE).applied(copied)).isInstanceOf(TapstateException.class);
+            assertThat(rows(f.cache)).isEqualTo(cache);assertThat(rows(f.config)).isEqualTo(configuration);
+        });
+    }
+
     @Test void reservationPublishesOneFixedConfigScopeWithoutMutatingCacheOrUnrelatedPipeline() {
         withFixture(f -> {
             var confirmed = f.confirmed();

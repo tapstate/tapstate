@@ -29,6 +29,13 @@ final class SharedSrsPreviewMember implements AutoCloseable {
         this.active=Objects.requireNonNull(active);this.isolated=Objects.requireNonNull(isolated);
     }
 
+    synchronized StorageRecoveryCommands.Plan original(CacheAuthScope scope,String operation,String hash,long controlRevision) {
+        requireActive();if(!auth.equals(scope))throw fenced();
+        var plan=commands.find(auth,operation).orElseThrow(SharedSrsPreviewMember::fenced);
+        if(!plan.planHash().equals(hash) || plan.controlRevision()!=controlRevision)throw fenced();
+        return requireCurrent(plan);
+    }
+
     synchronized void freeze(StorageRecoveryCommands.Plan requested) {
         var current=requireCurrent(requested);
         if(current.controlRevision()<highestRevision)throw fenced();
