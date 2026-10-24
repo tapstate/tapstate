@@ -612,7 +612,7 @@ class MongoSharedSrsRecoveryReservationsIT {
         withFixture(f -> {
             f.endAffectedTenures();var reservation=f.configuration.sharedRecoveryPreparations().reserve(f.confirmed());
             var config=rows(f.config);var cache=rows(f.cache);var calls=new java.util.concurrent.atomic.AtomicInteger();
-            int failAt=cut.equals("before-commit")?3:4;
+            int failAt=cut.equals("before-commit")?7:8;
             var guarded=f.domain.sharedSrsRecoveries(f.scope,() -> {
                 if(calls.incrementAndGet()==failAt)throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);
             });
@@ -680,6 +680,261 @@ class MongoSharedSrsRecoveryReservationsIT {
                     new Document("$set",new Document("captureId","unknown")));
             else SystemCollections.SRS_CHAINS.on(f.cache).deleteOne(new Document("_id",f.previous.chainId()));
             assertCancellationRefusesWithoutMutation(f,reservation);
+        });
+    }
+
+    @Test void aVerifiedCancellationReplansTheSameOperationWhileKeepingItsOriginalReservedMapping() {
+        withFixture(f -> {
+            f.endAffectedTenures();var reservation=f.configuration.sharedRecoveryPreparations().reserve(f.confirmed());
+            var cancelled=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).cancel(reservation,f.node);
+            var manifest=f.manifest(cancelled.cancelledSnapshot());
+            var mapping=SystemCollections.CAPTURE_PREPARATIONS.on(f.config).find().first();
+            var oldA=f.mapping("a");var oldB=f.mapping("b");var intentA=f.intentRow("a");var intentB=f.intentRow("b");
+            var cache=rows(f.cache);long revision=f.configuration.configurationRevision();
+            var replanned=f.configuration.sharedRecoveryPreparations().replan(cancelled,manifest);
+            assertThat(replanned.operationId()).isEqualTo(reservation.plan().operationId());
+            assertThat(replanned.phase()).isEqualTo(Phase.PLANNED);assertThat(replanned.manifest()).isEqualTo(manifest);
+            assertThat(replanned.planHash()).isNotEqualTo(reservation.plan().planHash());
+            assertThat(replanned.controlRevision()).isEqualTo(revision+1);
+            assertThat(f.configuration.configurationRevision()).isEqualTo(revision+1);
+            assertThat(SystemCollections.CAPTURE_PREPARATIONS.on(f.config).find().first()).isEqualTo(mapping);
+            assertThat(mapping.get("currentRecovery",Document.class).getString("planHash")).isEqualTo(reservation.plan().planHash());
+            assertThat(f.mapping("a")).isEqualTo(oldA);assertThat(f.mapping("b")).isEqualTo(oldB);
+            assertThat(f.intentRow("a")).isEqualTo(intentA);assertThat(f.intentRow("b")).isEqualTo(intentB);
+            assertThat(rows(f.cache)).isEqualTo(cache);
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"original-members","late-member"})
+    void aReconfirmedCancellationRebindsOneIdentityAndCompletesOnlyItsFreshActualClosure(String members) {
+        withFixture(f -> {
+            f.endAffectedTenures();var original=f.configuration.sharedRecoveryPreparations().reserve(f.confirmed());
+            if(members.equals("late-member")) {
+                var context=new SrsConsumerContext(new SrsConsumerKey(f.previous.chainId(),"c","input"),1);
+                f.domain.srs(f.scope,ACTIVE).consumers().attach(context,0,Set.of("orders"),f.requests.get("c").originalPipeline()).orElseThrow();
+                var current=f.domain.workloadClaims(f.scope).readPipeline(f.requests.get("c").pipeline()).orElseThrow();
+                assertThat(f.domain.workloadClaims(f.scope).release(current.claim())).isTrue();
+            }
+            var cancelled=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).cancel(original,f.node);
+            var manifest=f.manifest(cancelled.cancelledSnapshot());
+            var replanned=f.configuration.sharedRecoveryPreparations().replan(cancelled,manifest);
+            var config=rows(f.config);var cache=rows(f.cache);
+            assertThat(f.configuration.sharedRecoveryPreparations().replan(cancelled,manifest)).isEqualTo(replanned);
+            assertThat(rows(f.config)).isEqualTo(config);assertThat(rows(f.cache)).isEqualTo(cache);
+            var confirmed=f.configuration.recoveryCommands().confirm(replanned);
+            var refresh=f.configuration.sharedRecoveryPreparations().reconfirmation(f.auth(),confirmed.operationId()).orElseThrow();
+            assertThat(refresh.replacement()).isEqualTo(original.replacement());
+            assertReplacementRefusesWithoutMutation(f,refresh);
+            var freshReceipt=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).cancel(refresh,f.node);
+            assertThat(freshReceipt.outcome()).isEqualTo(SharedSrsRecoveryReceipt.Outcome.CANCELLED);
+            var oldA=f.mapping("a");var oldB=f.mapping("b");long revision=f.configuration.configurationRevision();
+            var rebound=f.configuration.sharedRecoveryPreparations().reserve(confirmed,freshReceipt);
+            assertThat(rebound.plan().phase()).isEqualTo(Phase.RUNNING);assertThat(rebound.replacement()).isEqualTo(original.replacement());
+            assertThat(f.configuration.configurationRevision()).isEqualTo(revision+1);
+            var mapping=SystemCollections.CAPTURE_PREPARATIONS.on(f.config).find().first().get("currentRecovery",Document.class);
+            assertThat(mapping.getString("planHash")).isEqualTo(confirmed.planHash());assertThat(mapping.getString("phase")).isEqualTo("RESERVED");
+            assertThat(mapping.getString("physicalChain")).isEqualTo(original.replacement().chainId());
+            assertThat(f.mapping("a")).isEqualTo(oldA);assertThat(f.mapping("b")).isEqualTo(oldB);
+            if(members.equals("late-member")) {
+                assertThat(confirmed.manifest().affectedPipelineIds()).containsExactly("a","b","c");
+                assertThat(f.mapping("c").get("sharedRecovery",Document.class).getString("operationId")).isEqualTo(original.plan().operationId());
+                var stopped=f.configuration.intents().loadForActuation("c").orElseThrow();
+                assertThat(stopped.scope()).isEqualTo(f.requests.get("c").pipeline());assertThat(stopped.desired().targetState()).isEqualTo(PipelineState.STOPPED);
+            }
+            config=rows(f.config);cache=rows(f.cache);
+            assertThat(f.configuration.sharedRecoveryPreparations().reserve(confirmed,freshReceipt).replacement()).isEqualTo(rebound.replacement());
+            assertThat(rows(f.config)).isEqualTo(config);assertThat(rows(f.cache)).isEqualTo(cache);
+            var applied=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).replace(rebound,f.node);applied.requireCurrent();
+            assertThat(applied.outcome()).isEqualTo(SharedSrsRecoveryReceipt.Outcome.RETIRED);
+            var completed=f.configuration.sharedRecoveryPreparations().complete(applied);
+            assertThat(completed.operationId()).isEqualTo(original.plan().operationId());assertThat(completed.phase()).isEqualTo(Phase.COMPLETE);
+            assertThat(f.configuration.capturePreparations().read(f.scope,f.previous.captureId())).contains(original.replacement());
+        });
+    }
+
+    @Test void reopenedClientsReconstructTheOldReservedHashSeparatelyFromTheNewPlannedHash() {
+        withFixture(f -> {
+            f.endAffectedTenures();var original=f.configuration.sharedRecoveryPreparations().reserve(f.confirmed());
+            var cancelled=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).cancel(original,f.node);
+            var replanned=f.configuration.sharedRecoveryPreparations().replan(cancelled,f.manifest(cancelled.cancelledSnapshot()));
+            assertThat(replanned.planHash()).isNotEqualTo(original.plan().planHash());
+            var connection=new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,CACHE.getReplicaSetUrl(f.cache.getName()),f.cache.getName(),null);
+            try(var cfg=MongoConfigurationDomain.open(f.settings,"cluster-a");
+                    var cache=MongoCacheDomain.connect(connection,Duration.ofSeconds(5),"shared-reconfirmation-reopened-test")) {
+                var refresh=cfg.sharedRecoveryPreparations().reconfirmation(f.auth(),replanned.operationId()).orElseThrow();
+                assertThat(refresh.plan()).isEqualTo(replanned);assertThat(refresh.replacement()).isEqualTo(original.replacement());refresh.requireCurrent();
+                var beforeConfig=rows(f.config);var beforeCache=rows(f.cache);
+                var checked=cache.sharedSrsRecoveries(f.scope,ACTIVE).cancel(refresh,f.node);checked.requireCurrent();
+                assertThat(checked.outcome()).isEqualTo(SharedSrsRecoveryReceipt.Outcome.CANCELLED);
+                assertThat(rows(f.config)).isEqualTo(beforeConfig);assertThat(rows(f.cache)).isEqualTo(beforeCache);
+                var confirmed=cfg.recoveryCommands().confirm(replanned);
+                var confirmedHandle=cfg.sharedRecoveryPreparations().reconfirmation(f.auth(),confirmed.operationId()).orElseThrow();
+                var fresh=cache.sharedSrsRecoveries(f.scope,ACTIVE).cancel(confirmedHandle,f.node);
+                var running=cfg.sharedRecoveryPreparations().reserve(confirmed,fresh);
+                assertThat(running.replacement()).isEqualTo(original.replacement());
+                var applied=cache.sharedSrsRecoveries(f.scope,ACTIVE).replace(running,f.node);
+                assertThat(cfg.sharedRecoveryPreparations().complete(applied).phase()).isEqualTo(Phase.COMPLETE);
+            }
+        });
+    }
+
+    @Test void genericEntryPointsOldConfirmationsAndConflictingSelectionsCannotRetargetAReservedRetry() {
+        withFixture(f -> {
+            f.endAffectedTenures();var oldConfirmed=f.confirmed();var original=f.configuration.sharedRecoveryPreparations().reserve(oldConfirmed);
+            var cancelled=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).cancel(original,f.node);var manifest=f.manifest(cancelled.cancelledSnapshot());
+            var otherSelection=new Manifest(new Selection(Extent.CLUSTER,Set.of()),manifest.affectedPipelineIds(),manifest.definitionHashes(),
+                    manifest.dependencyHash(),manifest.configurationRevision());
+            var before=rows(f.config);var cache=rows(f.cache);
+            assertThatThrownBy(() -> f.configuration.sharedRecoveryPreparations().replan(cancelled,otherSelection)).isInstanceOf(TapstateException.class);
+            assertThat(rows(f.config)).isEqualTo(before);assertThat(rows(f.cache)).isEqualTo(cache);
+            var replanned=f.configuration.sharedRecoveryPreparations().replan(cancelled,manifest);
+            var current=f.manifest(manifest.sharedSrs());
+            before=rows(f.config);cache=rows(f.cache);
+            assertThatThrownBy(() -> f.configuration.recoveryCommands().plan(f.auth(),current,replanned.operationId(),null)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> f.configuration.sharedRecoveryPreparations().reserve(oldConfirmed)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> f.configuration.recoveryCommands().confirm(oldConfirmed)).isInstanceOf(TapstateException.class);
+            assertThat(rows(f.config)).isEqualTo(before);assertThat(rows(f.cache)).isEqualTo(cache);
+            var confirmed=f.configuration.recoveryCommands().confirm(replanned);before=rows(f.config);
+            assertThatThrownBy(() -> f.configuration.sharedRecoveryPreparations().reserve(confirmed)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> f.configuration.sharedRecoveryPreparations().reserve(confirmed,cancelled)).isInstanceOf(TapstateException.class);
+            assertThat(rows(f.config)).isEqualTo(before);assertThat(rows(f.cache)).isEqualTo(cache);
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"before-commit","after-commit"})
+    void replanAuthorizationCutsRollBackOrReplayTheExactNewPlan(String cut) {
+        withFixture(f -> {
+            f.endAffectedTenures();var original=f.configuration.sharedRecoveryPreparations().reserve(f.confirmed());
+            var cancelled=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).cancel(original,f.node);var manifest=f.manifest(cancelled.cancelledSnapshot());
+            var config=rows(f.config);var cache=rows(f.cache);long revision=f.configuration.configurationRevision();
+            var calls=new java.util.concurrent.atomic.AtomicInteger();int failAt=cut.equals("before-commit")?4:5;
+            var guarded=f.configuration.sharedRecoveryPreparations().guardedBy(() -> {
+                if(calls.incrementAndGet()==failAt)throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);
+            });
+            assertThatThrownBy(() -> guarded.replan(cancelled,manifest)).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+            if(cut.equals("before-commit"))assertThat(rows(f.config)).isEqualTo(config);
+            else {
+                var committed=rows(f.config);var retried=f.configuration.sharedRecoveryPreparations().replan(cancelled,manifest);
+                assertThat(retried.phase()).isEqualTo(Phase.PLANNED);assertThat(retried.operationId()).isEqualTo(original.plan().operationId());
+                assertThat(f.configuration.configurationRevision()).isEqualTo(revision+1);assertThat(rows(f.config)).isEqualTo(committed);
+            }
+            assertThat(rows(f.cache)).isEqualTo(cache);
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"before-commit","after-commit"})
+    void reconfirmedReserveAuthorizationCutsRollBackOrReplayTheSameFixedIdentity(String cut) {
+        withFixture(f -> {
+            f.endAffectedTenures();var original=f.configuration.sharedRecoveryPreparations().reserve(f.confirmed());
+            var cancelled=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).cancel(original,f.node);
+            var replanned=f.configuration.sharedRecoveryPreparations().replan(cancelled,f.manifest(cancelled.cancelledSnapshot()));
+            var confirmed=f.configuration.recoveryCommands().confirm(replanned);
+            var refresh=f.configuration.sharedRecoveryPreparations().reconfirmation(f.auth(),confirmed.operationId()).orElseThrow();
+            var fresh=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).cancel(refresh,f.node);
+            var config=rows(f.config);var cache=rows(f.cache);long revision=f.configuration.configurationRevision();
+            var calls=new java.util.concurrent.atomic.AtomicInteger();int failAt=cut.equals("before-commit")?4:5;
+            var guarded=f.configuration.sharedRecoveryPreparations().guardedBy(() -> {
+                if(calls.incrementAndGet()==failAt)throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);
+            });
+            assertThatThrownBy(() -> guarded.reserve(confirmed,fresh)).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+            if(cut.equals("before-commit"))assertThat(rows(f.config)).isEqualTo(config);
+            else {
+                var committed=rows(f.config);var retried=f.configuration.sharedRecoveryPreparations().reserve(confirmed,fresh);
+                assertThat(retried.replacement()).isEqualTo(original.replacement());assertThat(retried.plan().phase()).isEqualTo(Phase.RUNNING);
+                assertThat(f.configuration.configurationRevision()).isEqualTo(revision+1);assertThat(rows(f.config)).isEqualTo(committed);
+            }
+            assertThat(rows(f.cache)).isEqualTo(cache);
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"cache-first","config-after-proof"})
+    void aDelayedOldCancellationCannotReplaceTheCancellationHashOfALaterConfirmedAttempt(String boundary) {
+        withFixture(f -> {
+            f.endAffectedTenures();
+            var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
+            var configCalls=new java.util.concurrent.atomic.AtomicInteger();var cacheCalls=new java.util.concurrent.atomic.AtomicInteger();
+            Runnable pause=() -> {
+                entered.countDown();
+                try {assertThat(release.await(60,TimeUnit.SECONDS)).isTrue();}
+                catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}
+            };
+            var owner=f.configuration.sharedRecoveryPreparations().guardedBy(() -> {
+                if(boundary.equals("config-after-proof") && Thread.currentThread().getName().equals("late-shared-cancel")
+                        && configCalls.incrementAndGet()==4)pause.run();
+            });
+            var original=owner.reserve(f.confirmed());
+            var delayed=f.domain.sharedSrsRecoveries(f.scope,() -> {
+                if(boundary.equals("cache-first") && cacheCalls.incrementAndGet()==1)pause.run();
+            });
+            try(var threads=Executors.newSingleThreadExecutor(action -> new Thread(action,"late-shared-cancel"))) {
+                var late=threads.submit(() -> delayed.cancel(original,f.node));
+                try {
+                    assertThat(entered.await(20,TimeUnit.SECONDS)).isTrue();
+                    var mainOriginal=f.configuration.sharedRecoveryPreparations().pending(f.auth(),original.plan().operationId()).orElseThrow();
+                    var cancelled=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).cancel(mainOriginal,f.node);
+                    var first=f.configuration.sharedRecoveryPreparations().replan(cancelled,f.manifest(cancelled.cancelledSnapshot()));
+                    var confirmed=f.configuration.recoveryCommands().confirm(first);
+                    var refresh=f.configuration.sharedRecoveryPreparations().reconfirmation(f.auth(),confirmed.operationId()).orElseThrow();
+                    var fresh=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).cancel(refresh,f.node);
+                    var running=f.configuration.sharedRecoveryPreparations().reserve(confirmed,fresh);
+                    var nextCancelled=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).cancel(running,f.node);
+                    var second=f.configuration.sharedRecoveryPreparations().replan(nextCancelled,f.manifest(nextCancelled.cancelledSnapshot()));
+                    var config=rows(f.config);var cache=rows(f.cache);
+                    assertThat(f.chain(f.previous.chainId()).get("recoveryControl",Document.class).getString("planHash")).isEqualTo(first.planHash());
+                    release.countDown();
+                    try {late.get(20,TimeUnit.SECONDS);}
+                    catch(ExecutionException rejected){assertThat(rejected.getCause()).isInstanceOf(TapstateException.class);}
+                    assertThat(f.chain(f.previous.chainId()).get("recoveryControl",Document.class).getString("planHash")).isEqualTo(first.planHash());
+                    assertThat(f.configuration.recoveryCommands().find(f.auth(),second.operationId())).contains(second);
+                    assertThat(SystemCollections.CAPTURE_PREPARATIONS.on(f.config).find().first().get("currentRecovery",Document.class).getString("planHash"))
+                            .isEqualTo(first.planHash());
+                    assertThat(rows(f.config)).isEqualTo(config);assertThat(rows(f.cache)).isEqualTo(cache);
+                    var secondHandle=f.configuration.sharedRecoveryPreparations().reconfirmation(f.auth(),second.operationId()).orElseThrow();
+                    var restored=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).cancel(secondHandle,f.node);restored.requireCurrent();
+                    assertThat(restored.outcome()).isEqualTo(SharedSrsRecoveryReceipt.Outcome.CANCELLED);
+                    assertThat(rows(f.config)).isEqualTo(config);assertThat(rows(f.cache)).isEqualTo(cache);
+                } finally {release.countDown();}
+            }
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"planned","confirmed"})
+    void actualWholeCacheLossCanSupersedeAReservedSharedReconfirmationThroughTheExistingClusterRecovery(String phase) {
+        withFixture(f -> {
+            f.configuration.firstAdmin().create(f.configuration.firstAdmin().load().orElseThrow().scope(),new User("admin","fixture-hash","admin"));
+            f.endAffectedTenures();var original=f.configuration.sharedRecoveryPreparations().reserve(f.confirmed());
+            var cancelled=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).cancel(original,f.node);
+            var retry=f.configuration.sharedRecoveryPreparations().replan(cancelled,f.manifest(cancelled.cancelledSnapshot()));
+            if(phase.equals("confirmed"))retry=f.configuration.recoveryCommands().confirm(retry);
+            var previous=retry;var before=f.auth();
+            var connection=f.configuration.bindings().load().orElseThrow().cache();
+            // The loss and renewed authentication use production stores, with no seeded authentication facts.
+            f.cache.drop();
+            try(var recovered=MongoCacheDomain.connect(connection,Duration.ofSeconds(5),"shared-retry-whole-cache-loss")) {
+                f.configuration.prepareAuthenticationRecovery(recovered,ACTIVE);
+                var current=f.auth();assertThat(current.cacheIncarnation()).isNotEqualTo(before.cacheIncarnation());
+                assertThat(current.authGeneration()).isEqualTo(before.authGeneration()+1);
+                var changes=f.configuration.cacheRecoveries().inspectCluster(current);
+                var hashes=new TreeMap<String,String>();var pipelines=new TreeSet<String>();
+                for(var resource:f.configuration.artifacts().list()) {
+                    hashes.put(resource.id(),CanonicalHash.of(resource));if(resource instanceof PipelineResource)pipelines.add(resource.id());
+                }
+                var manifest=new Manifest(new Selection(Extent.CLUSTER,Set.of()),pipelines,hashes,
+                        CacheRecoveryStore.clusterDependencyHash(current,changes),f.configuration.configurationRevision());
+                var next=f.configuration.recoveryCommands().plan(current,manifest,null,previous.operationId());
+                assertThat(next.operationId()).isNotEqualTo(previous.operationId());assertThat(next.previousOperationId()).isEqualTo(previous.operationId());
+                assertThat(next.originalScope()).isEqualTo(current);assertThat(next.phase()).isEqualTo(Phase.PLANNED);
+                var confirmed=f.configuration.recoveryCommands().confirm(next);
+                var summaries=f.configuration.cacheRecoveries().stageCluster(confirmed);
+                assertThat(summaries).hasSize(3);
+                var running=f.configuration.recoveryCommands().current(current).orElseThrow();
+                f.configuration.prepareStoppedRecovery(recovered,running,ACTIVE);
+                assertThat(f.configuration.recoveryCommands().complete(running).phase()).isEqualTo(Phase.COMPLETE);
+                assertThat(recovered.loadBusinessScope(f.configuration.bindings().cachePreparation().orElseThrow().businessScope()).cacheIncarnation())
+                        .isEqualTo(current.cacheIncarnation());
+            }
         });
     }
 
@@ -783,13 +1038,15 @@ class MongoSharedSrsRecoveryReservationsIT {
             var running = claims.advanceExecution(held, 1, Set.of(OWNER.nodeId())).orElseThrow();
             return new CapturePreparationRequest(original, WorkloadClaimFence.from(running), node, "input", inputs);
         }
+        Manifest manifest(SharedSrsRecoverySnapshot observed) {
+            var hashes=new TreeMap<String,String>();
+            var ids=new TreeSet<>(observed.pipelines().keySet());ids.addAll(List.of("input","views"));
+            for(String id:ids)hashes.put(id,CanonicalHash.of(configuration.artifacts().get(id).orElseThrow()));
+            return new Manifest(new Selection(Extent.SHARED_SRS,Set.of(),previous.canonicalChainId(),previous.chainId()),
+                    observed.pipelines().keySet(),hashes,CanonicalHash.ofText(observed.controlHash()),configuration.configurationRevision(),observed);
+        }
         Plan planned() {
-            var observed = domain.srs(scope, ACTIVE).consumers().inspectSharedRecovery(previous);
-            var hashes = new TreeMap<String, String>();
-            for (String id : List.of("a", "b", "input", "views")) hashes.put(id, CanonicalHash.of(configuration.artifacts().get(id).orElseThrow()));
-            var manifest = new Manifest(new Selection(Extent.SHARED_SRS, Set.of(), previous.canonicalChainId(), previous.chainId()),
-                    observed.pipelines().keySet(), hashes, CanonicalHash.ofText(observed.controlHash()), configuration.configurationRevision(), observed);
-            return configuration.recoveryCommands().plan(auth(), manifest, null, null);
+            return configuration.recoveryCommands().plan(auth(),manifest(domain.srs(scope,ACTIVE).consumers().inspectSharedRecovery(previous)),null,null);
         }
         Plan confirmed() { return configuration.recoveryCommands().confirm(planned()); }
         Document mapping(String id) { return SystemCollections.OPERATOR_GENERATIONS.on(config).find(new Document("_id", id)).first(); }

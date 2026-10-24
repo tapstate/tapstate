@@ -157,6 +157,22 @@ final class MongoCaptureStatePreparations implements CaptureStatePreparations {
         if(SystemCollections.CAPTURE_PREPARATIONS.on(database).replaceOne(session,MongoCapturePreparationFacts.configurationRow(original),
                 MongoCapturePreparationFacts.configurationRow(ready)).getMatchedCount()!=1)throw fenced();
     }
+    boolean hasSharedRecoveryReservation(ClientSession session,String operation) {
+        return SystemCollections.CAPTURE_PREPARATIONS.on(database).find(session,new Document("currentRecovery.operationId",operation)).first()!=null;
+    }
+    MongoCapturePreparationFacts.Recovery requireSharedReconfirmation(ClientSession session,StorageRecoveryCommands.Plan plan) {
+        var expected=sharedReservation(plan);requireScope(session,expected.previous().scope());
+        var actual=currentRecoveryForOperation(session,database,expected.previous().scope(),plan.operationId());
+        if(actual.phase()!=MongoCapturePreparationFacts.RecoveryPhase.RESERVED || !actual.previous().equals(expected.previous())
+                || !actual.replacement().equals(expected.replacement()))throw fenced();
+        requireSharedRecoveryOrigin(session,actual.previous());return actual;
+    }
+    void rebindSharedRecovery(ClientSession session,StorageRecoveryCommands.Plan plan,MongoCapturePreparationFacts.Recovery original) {
+        var actual=requireSharedReconfirmation(session,plan);
+        if(!actual.equals(original))throw fenced();
+        if(SystemCollections.CAPTURE_PREPARATIONS.on(database).replaceOne(session,MongoCapturePreparationFacts.configurationRow(original),
+                MongoCapturePreparationFacts.configurationRow(sharedReservation(plan))).getMatchedCount()!=1)throw fenced();
+    }
     private void requireSharedRecoveryOrigin(ClientSession session,CapturePreparation previous) {
         var owner=new RequiredNoteOwner(previous.scope().bindingVersion(),"pdk.chain."+previous.canonicalChainId(),RequiredNoteOwner.Kind.CHAIN,previous.canonicalChainId(),0);
         if(artifacts.configurationNotes().inspectSharedOrigin(session,owner,true).isEmpty())

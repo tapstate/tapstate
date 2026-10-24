@@ -95,6 +95,8 @@ public final class MongoPipelineStateMappings implements PipelineStateMappings {
     }
     void reserveSharedRecovery(ClientSession session,io.tapstate.spi.store.PipelineIntentScope scope,String operation) {
         var row=requireSharedOriginal(session,scope);
+        var original=MongoPipelineSharedRecoveryFacts.read(row);
+        if(original.filter(marker -> marker.operationId().equals(operation) && marker.originalScope().equals(scope)).isPresent())return;
         MongoPipelineSharedRecoveryFacts.requireReady(session,database,row,scope);
         long fence=row.getLong("noteWriteFence");if(fence>=Long.MAX_VALUE-1)throw retirementRequired(scope.pipelineId());
         var marker=MongoPipelineSharedRecoveryFacts.encode(new MongoPipelineSharedRecoveryFacts.Pending(operation,scope));
@@ -105,6 +107,17 @@ public final class MongoPipelineStateMappings implements PipelineStateMappings {
         var row=requireSharedOriginal(session,scope);
         var marker=MongoPipelineSharedRecoveryFacts.read(row).orElseThrow(() -> unreadable(scope.pipelineId()));
         if(!marker.operationId().equals(operation) || !marker.originalScope().equals(scope))throw retirementRequired(scope.pipelineId());
+    }
+    java.util.List<io.tapstate.spi.store.PipelineIntentScope> sharedReservations(ClientSession session,io.tapstate.spi.store.CacheBusinessScope scope,String operation) {
+        var result=new java.util.ArrayList<io.tapstate.spi.store.PipelineIntentScope>();
+        for(var row:mappings.find(session,new Document("sharedRecovery.operationId",operation))) {
+            var marker=MongoPipelineSharedRecoveryFacts.read(row).orElseThrow(() -> unreadable("shared-recovery"));
+            var original=marker.originalScope();
+            if(!scope.clusterId().equals(original.clusterId()) || scope.bindingVersion()!=original.bindingVersion()
+                    || !scope.cacheIncarnation().equals(original.cacheIncarnation()))throw retirementRequired(original.pipelineId());
+            requireSharedReservation(session,original,operation);result.add(original);
+        }
+        return java.util.List.copyOf(result);
     }
     private Document requireSharedOriginal(ClientSession session,io.tapstate.spi.store.PipelineIntentScope scope) {
         if(!session.hasActiveTransaction())throw new IllegalStateException("shared recovery mapping requires its CONFIG transaction");

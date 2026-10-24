@@ -25,10 +25,11 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
             var root=roots.find(session,new Document("_id",previous.chainId())).first();
             if(root==null)throw history(previous);
             var isolation=MongoSrsRecoveryControls.read(root);
-            if(isolation.isPresent()) {
+            if(isolation.filter(control -> control.phase()==MongoSrsRecoveryControls.Phase.RETIRED).isPresent()) {
                 verifyApplied(session,admitted,consumers);return new SharedReceipt(this,admitted,SharedSrsRecoveryReceipt.Outcome.RETIRED);
             }
-            var observed=consumers.sharedRecoveryView(session,previous);
+            var observed=isolation.isEmpty()?consumers.sharedRecoveryView(session,previous)
+                    :consumers.cancelledSharedRecoveryView(session,previous,admitted.plan().operationId(),isolation.orElseThrow().planHash(),admitted.replacement().chainId());
             if(!observed.snapshot().equals(admitted.plan().manifest().sharedSrs()))throw history(previous);
             requireEmptySharedNamespace(session,admitted.replacement());
             new MongoCacheBusinessIdentity(database,scope).admitMetadataWrite(session);
@@ -58,7 +59,18 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
         admitted.requireCurrent().run();return result;
     }
     @Override public SharedSrsRecoveryReceipt cancel(SharedSrsRecoveryPreparation original,WorkloadClaimFence currentNode) {
-        var admitted=MongoStorageRecoveryCommands.requireSharedOriginal(original,targetFingerprint);requireScope(admitted.replacement());requireSharedNode(currentNode);
+        var admitted=MongoStorageRecoveryCommands.requireSharedCancellationAuthority(original,targetFingerprint);requireScope(admitted.replacement());requireSharedNode(currentNode);
+        // Fix the CACHE attempt before CONFIG admission; a delayed old admission cannot undo a later cancellation.
+        var boundary=transaction(() -> {},session -> {
+            var structure=new MongoCacheMetadataStructure(database,retention);structure.verifySrs();
+            new MongoCacheBusinessIdentity(database,scope).requireReady(session);
+            var previous=admitted.plan().manifest().sharedSrs().previous();
+            var root=SystemCollections.SRS_CHAINS.on(database).find(session,new Document("_id",previous.chainId())).first();
+            if(root==null)throw history(previous);
+            MongoSrsChainStore.controlState(root,scope,new MongoSrsModelContexts(database,scope));
+            return new Document(root);
+        });
+        admitted.requireCurrent().run();
         var result=transaction(() -> {},session -> {
             var structure=new MongoCacheMetadataStructure(database,retention);structure.verifySrs();
             new MongoCacheBusinessIdentity(database,scope).requireReady(session);
@@ -69,10 +81,20 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
             var control=MongoSrsRecoveryControls.read(root);
             if(control.isPresent()) {
                 if(control.orElseThrow().phase()==MongoSrsRecoveryControls.Phase.RETIRED) {
-                    verifyApplied(session,admitted,consumers);return new SharedReceipt(this,admitted,SharedSrsRecoveryReceipt.Outcome.RETIRED);
+                    if(!(admitted instanceof MongoStorageRecoveryCommands.SharedOriginal running))throw history(previous);
+                    verifyApplied(session,running,consumers);return new SharedReceipt(this,running,SharedSrsRecoveryReceipt.Outcome.RETIRED);
                 }
+                var observed=consumers.cancelledSharedRecoveryView(session,previous,admitted.plan().operationId(),control.orElseThrow().planHash(),admitted.replacement().chainId());
+                requireEmptySharedNamespace(session,admitted.replacement());
+                if(control.orElseThrow().planHash().equals(admitted.cancellationPlanHash()))
+                    return new SharedReceipt(this,admitted,SharedSrsRecoveryReceipt.Outcome.CANCELLED);
+                if(!(admitted instanceof MongoStorageRecoveryCommands.SharedOriginal) || !root.equals(boundary))throw history(previous);
+                new MongoCacheBusinessIdentity(database,scope).admitMetadataWrite(session);
+                MongoCachePipelinePreparations.proveNode(session,database,scope,currentNode);
+                consumers.cancelSharedRecovery(session,observed,admitted.plan(),admitted.replacement().chainId());
                 verifyCancelled(session,admitted,consumers);return new SharedReceipt(this,admitted,SharedSrsRecoveryReceipt.Outcome.CANCELLED);
             }
+            if(!(admitted instanceof MongoStorageRecoveryCommands.SharedOriginal) || !root.equals(boundary))throw history(previous);
             // Cancel the current typed controls, even when they no longer match the old preview.
             var current=consumers.sharedRecoveryView(session,previous);
             requireEmptySharedNamespace(session,admitted.replacement());
@@ -135,30 +157,53 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
             var structure=new MongoCacheMetadataStructure(database,retention);structure.verifySrs();
             new MongoCacheBusinessIdentity(database,scope).requireReady(session);
             var consumers=new MongoSrsConsumerStore(client,database,scope,active,structure::verifySrs);
-            if(receipt.outcome==SharedSrsRecoveryReceipt.Outcome.RETIRED)verifyApplied(session,receipt.original,consumers);
+            if(receipt.outcome==SharedSrsRecoveryReceipt.Outcome.RETIRED) {
+                if(!(receipt.original instanceof MongoStorageRecoveryCommands.SharedOriginal running))throw MongoCapturePreparationFacts.fenced();
+                verifyApplied(session,running,consumers);
+            }
             else verifyCancelled(session,receipt.original,consumers);
             return null;
         });
         receipt.original.requireCurrent().run();
     }
-    private MongoSrsConsumerStore.SharedView verifyCancelled(ClientSession session,MongoStorageRecoveryCommands.SharedOriginal original,MongoSrsConsumerStore consumers) {
+    private MongoSrsConsumerStore.SharedView verifyCancelled(ClientSession session,MongoStorageRecoveryCommands.SharedAuthority original,MongoSrsConsumerStore consumers) {
         requireEmptySharedNamespace(session,original.replacement());
         var plan=original.plan();
-        return consumers.cancelledSharedRecoveryView(session,plan.manifest().sharedSrs().previous(),plan.operationId(),plan.planHash(),original.replacement().chainId());
+        return consumers.cancelledSharedRecoveryView(session,plan.manifest().sharedSrs().previous(),plan.operationId(),original.cancellationPlanHash(),original.replacement().chainId());
+    }
+    private SharedSrsRecoverySnapshot cancelledSnapshot(SharedReceipt receipt) {
+        if(receipt.outcome!=SharedSrsRecoveryReceipt.Outcome.CANCELLED)throw MongoCapturePreparationFacts.fenced();
+        receipt.original.requireCurrent().run();
+        var result=transaction(() -> {},session -> {
+            var structure=new MongoCacheMetadataStructure(database,retention);structure.verifySrs();
+            new MongoCacheBusinessIdentity(database,scope).requireReady(session);
+            return verifyCancelled(session,receipt.original,new MongoSrsConsumerStore(client,database,scope,active,structure::verifySrs)).snapshot();
+        });
+        receipt.original.requireCurrent().run();return result;
     }
     private static final class SharedReceipt implements SharedSrsRecoveryReceipt {
-        private final MongoCaptureCachePreparations owner;private final MongoStorageRecoveryCommands.SharedOriginal original;private final Outcome outcome;
-        private SharedReceipt(MongoCaptureCachePreparations owner,MongoStorageRecoveryCommands.SharedOriginal original,Outcome outcome) {
+        private final MongoCaptureCachePreparations owner;private final MongoStorageRecoveryCommands.SharedAuthority original;private final Outcome outcome;
+        private SharedReceipt(MongoCaptureCachePreparations owner,MongoStorageRecoveryCommands.SharedAuthority original,Outcome outcome) {
             this.owner=owner;this.original=original;this.outcome=outcome;
         }
         @Override public SharedSrsRecoveryPreparation preparation(){return original.preparation();}
         @Override public Outcome outcome(){return outcome;}
         @Override public void requireCurrent(){owner.requireSharedReceipt(this);}
+        @Override public SharedSrsRecoverySnapshot cancelledSnapshot(){return owner.cancelledSnapshot(this);}
     }
     static MongoStorageRecoveryCommands.SharedOriginal requireAppliedSharedOriginal(SharedSrsRecoveryReceipt receipt) {
-        if(!(receipt instanceof SharedReceipt retained) || retained.outcome!=SharedSrsRecoveryReceipt.Outcome.RETIRED)
+        if(!(receipt instanceof SharedReceipt retained) || retained.outcome!=SharedSrsRecoveryReceipt.Outcome.RETIRED
+                || !(retained.original instanceof MongoStorageRecoveryCommands.SharedOriginal original))
             throw MongoCapturePreparationFacts.fenced();
+        return original;
+    }
+    static MongoStorageRecoveryCommands.SharedAuthority requireCancelledSharedAuthority(SharedSrsRecoveryReceipt receipt) {
+        if(!(receipt instanceof SharedReceipt retained) || retained.outcome!=SharedSrsRecoveryReceipt.Outcome.CANCELLED)throw MongoCapturePreparationFacts.fenced();
         return retained.original;
+    }
+    static SharedSrsRecoverySnapshot currentCancelledSnapshot(SharedSrsRecoveryReceipt receipt) {
+        requireCancelledSharedAuthority(receipt);
+        var retained=(SharedReceipt)receipt;return retained.owner.cancelledSnapshot(retained);
     }
     @Override public CaptureCacheState createFirst(FirstCaptureCreation invocation) {
         var original=MongoCaptureStatePreparations.consumeFirst(invocation,targetFingerprint);

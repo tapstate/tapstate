@@ -67,6 +67,13 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands,io.t
                 if(!verified.dependencyHash().equals(io.tapstate.spi.store.CacheRecoveryStore.clusterDependencyHash(current,changes)))
                     replaceStaleCluster=false;
             }
+            if(!replaceStaleCluster && previous!=null && previous.manifest().selection().extent()==Extent.SHARED_SRS
+                    && (previous.phase()==Phase.PLANNED || previous.phase()==Phase.CONFIRMED)
+                    && captureOwner(previous).hasSharedRecoveryReservation(session,previous.operationId())) {
+                if(previous.originalScope().equals(current) && previous.operationId().equals(operationId)
+                        && previousOperationId==null && previous.manifest().equals(verified))return previous;
+                throw refused();
+            }
             if (replaceEmptyInitialOp) MongoInitialOpRecovery.requireManifest(client, session, database, bindings, artifacts, current, verified, false);
             if (replaceStaleInitial) MongoInitialCloudRecovery.requireManifest(session, database, bindings, artifacts, current, verified);
             if (previous != null && !previous.originalScope().equals(current)
@@ -169,6 +176,115 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands,io.t
         });
         active.run();return result;
     }
+    @Override public Plan replan(io.tapstate.spi.store.SharedSrsRecoveryReceipt cancelled,Manifest verified) {
+        var original=MongoCaptureCachePreparations.requireCancelledSharedAuthority(cancelled);requireIssuer(original);
+        Objects.requireNonNull(verified,"verified");
+        if(verified.selection().extent()!=Extent.SHARED_SRS || !verified.selection().equals(original.plan().manifest().selection())
+                || !verified.sharedSrs().previous().equals(original.plan().manifest().sharedSrs().previous()))throw refused();
+        var replay=transaction(session -> {
+            var current=pending(root(session,original.plan().originalScope())).orElseThrow(MongoStorageRecoveryCommands::refused);
+            if(current.operationId().equals(original.plan().operationId()) && current.originalScope().equals(original.plan().originalScope())
+                    && Objects.equals(current.previousOperationId(),original.plan().previousOperationId()) && current.manifest().equals(verified)
+                    && (current.phase()==Phase.PLANNED || current.phase()==Phase.CONFIRMED)) {
+                var retry=sharedReconfirmation(session,current);
+                if(!retry.reservation.planHash().equals(original.cancellationPlanHash()) || !retry.replacement().equals(original.replacement()))throw refused();
+                return Optional.of(current);
+            }
+            requireSharedAuthority(session,original);return Optional.<Plan>empty();
+        });
+        if(replay.isPresent())return replay.orElseThrow();
+        if(!MongoCaptureCachePreparations.currentCancelledSnapshot(cancelled).equals(verified.sharedSrs()))throw refused();
+        var result=transaction(session -> {
+            var current=requireSharedAuthority(session,original);var row=root(session,current.originalScope());
+            requireManifest(session,verified);long revision=revision(session);
+            if(verified.configurationRevision()!=revision)throw refused();
+            ConfigurationVersion.advance(session,SystemCollections.CONFIGURATION_VERSION.on(database));
+            var next=new Plan(current.operationId(),current.previousOperationId(),current.originalScope(),verified,hash(verified),revision+1,Phase.PLANNED);
+            save(session,row,next);return next;
+        });
+        active.run();return result;
+    }
+    @Override public Optional<io.tapstate.spi.store.SharedSrsRecoveryPreparation> reconfirmation(CacheAuthScope original,String operationId) {
+        Objects.requireNonNull(original,"original");Objects.requireNonNull(operationId,"operationId");
+        return transaction(session -> {
+            var current=pending(root(session,original));
+            if(current.isEmpty() || !current.orElseThrow().operationId().equals(operationId)
+                    || !current.orElseThrow().originalScope().equals(original) || current.orElseThrow().manifest().selection().extent()!=Extent.SHARED_SRS
+                    || current.orElseThrow().phase()!=Phase.PLANNED && current.orElseThrow().phase()!=Phase.CONFIRMED)return Optional.empty();
+            return Optional.of(sharedReconfirmation(session,current.orElseThrow()));
+        });
+    }
+    @Override public io.tapstate.spi.store.SharedSrsRecoveryPreparation reserve(Plan confirmed,io.tapstate.spi.store.SharedSrsRecoveryReceipt cancelled) {
+        var authority=MongoCaptureCachePreparations.requireCancelledSharedAuthority(cancelled);requireIssuer(authority);
+        if(!(authority instanceof SharedReconfirmation original) || confirmed==null || confirmed.manifest().selection().extent()!=Extent.SHARED_SRS
+                || confirmed.phase()!=Phase.CONFIRMED || !sameOriginal(original.plan(),confirmed)
+                || original.plan().controlRevision()!=confirmed.controlRevision())throw refused();
+        var replay=transaction(session -> {
+            var current=requireSharedOperation(session,confirmed);
+            if(current.phase()==Phase.RUNNING)return Optional.of(sharedPending(session,current));
+            if(current.phase()!=Phase.CONFIRMED)throw refused();
+            requireSharedAuthority(session,original);return Optional.<SharedPending>empty();
+        });
+        if(replay.isPresent())return replay.orElseThrow();
+        if(!MongoCaptureCachePreparations.currentCancelledSnapshot(cancelled).equals(confirmed.manifest().sharedSrs()))throw refused();
+        var result=transaction(session -> {
+            var current=requireSharedAuthority(session,original);var row=root(session,current.originalScope());
+            if(current.phase()!=Phase.CONFIRMED || !sameOriginal(current,confirmed) || current.controlRevision()!=confirmed.controlRevision()
+                    || revision(session)!=current.controlRevision()+current.phase().ordinal())throw refused();
+            requireManifest(session,current.manifest());
+            ConfigurationVersion.advance(session,SystemCollections.CONFIGURATION_VERSION.on(database));
+            captureOwner(current).rebindSharedRecovery(session,current,original.reservation());
+            var mappings=new MongoPipelineStateMappings(client,database);
+            var intents=new MongoPipelineIntentStore(client,database,current.originalScope().clusterId(),bindings);
+            for(var pipeline:current.manifest().sharedSrs().pipelines().values()) {
+                mappings.reserveSharedRecovery(session,pipeline.scope(),current.operationId());
+                intents.stopForSharedRecovery(session,pipeline.scope(),current.manifest().definitionHashes().get(pipeline.scope().pipelineId()));
+            }
+            var running=new Plan(current.operationId(),current.previousOperationId(),current.originalScope(),current.manifest(),current.planHash(),current.controlRevision(),Phase.RUNNING);
+            save(session,row,running);return sharedPending(session,running);
+        });
+        active.run();return result;
+    }
+    private void requireIssuer(SharedAuthority original) {
+        MongoStorageRecoveryCommands owner;
+        if(original.preparation() instanceof SharedPending pending)owner=pending.owner;
+        else if(original.preparation() instanceof Reconfirmation retry)owner=retry.owner;
+        else throw refused();
+        if(owner.client!=client || !owner.database.getName().equals(database.getName()))throw refused();
+    }
+    private Plan requireSharedAuthority(ClientSession session,SharedAuthority original) {
+        var current=requireSharedOperation(session,original.plan());
+        if(current.phase()!=original.plan().phase())throw refused();
+        if(original instanceof SharedOriginal) {
+            var retained=sharedPending(session,current);
+            if(!retained.replacement.equals(original.replacement())
+                    || !retained.targetFingerprint.equals(((SharedPending)original.preparation()).targetFingerprint))throw refused();
+        } else if(original instanceof SharedReconfirmation retry) {
+            var retained=sharedReconfirmation(session,current);
+            if(!retained.reservation.equals(retry.reservation())
+                    || !retained.targetFingerprint.equals(((Reconfirmation)original.preparation()).targetFingerprint))throw refused();
+        } else throw refused();
+        return current;
+    }
+    private Reconfirmation sharedReconfirmation(ClientSession session,Plan plan) {
+        if(plan.manifest().selection().extent()!=Extent.SHARED_SRS || plan.phase()!=Phase.PLANNED && plan.phase()!=Phase.CONFIRMED)throw refused();
+        var reservation=captureOwner(plan).requireSharedReconfirmation(session,plan);
+        if(reservation.planHash().equals(plan.planHash()))throw refused();
+        var mappings=new MongoPipelineStateMappings(client,database);
+        var intents=new MongoPipelineIntentStore(client,database,plan.originalScope().clusterId(),bindings);
+        for(var scope:mappings.sharedReservations(session,reservation.previous().scope(),plan.operationId()))intents.requireSharedStopped(session,scope);
+        String target=MongoStorageBindingStore.targetFingerprint(bindings.loadForTransaction(session).orElseThrow(MongoStorageRecoveryCommands::refused).cache());
+        return new Reconfirmation(this,plan,reservation,target);
+    }
+    private void requireReconfirmation(Reconfirmation original) {
+        transaction(session -> {
+            var current=requireSharedOperation(session,original.plan);
+            if(current.phase()!=original.plan.phase())throw refused();
+            var retained=sharedReconfirmation(session,current);
+            if(!retained.reservation.equals(original.reservation) || !retained.targetFingerprint.equals(original.targetFingerprint))throw refused();
+            return null;
+        });
+    }
     private Plan requireSharedOperation(ClientSession session,Plan original) {
         return requireSharedOperation(root(session,original.originalScope()),original);
     }
@@ -210,11 +326,39 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands,io.t
         @Override public io.tapstate.spi.store.CapturePreparation replacement(){return replacement;}
         @Override public void requireCurrent(){owner.active.run();owner.requireSharedPending(this);owner.active.run();}
     }
+    sealed interface SharedAuthority permits SharedOriginal,SharedReconfirmation {
+        io.tapstate.spi.store.SharedSrsRecoveryPreparation preparation();Plan plan();
+        io.tapstate.spi.store.CapturePreparation replacement();Runnable requireCurrent();String cancellationPlanHash();
+    }
     record SharedOriginal(io.tapstate.spi.store.SharedSrsRecoveryPreparation preparation,Plan plan,
-            io.tapstate.spi.store.CapturePreparation replacement,Runnable requireCurrent) {}
+            io.tapstate.spi.store.CapturePreparation replacement,Runnable requireCurrent) implements SharedAuthority {
+        @Override public String cancellationPlanHash(){return plan.planHash();}
+    }
+    record SharedReconfirmation(io.tapstate.spi.store.SharedSrsRecoveryPreparation preparation,Plan plan,
+            MongoCapturePreparationFacts.Recovery reservation,Runnable requireCurrent) implements SharedAuthority {
+        @Override public io.tapstate.spi.store.CapturePreparation replacement(){return reservation.replacement();}
+        @Override public String cancellationPlanHash(){return reservation.planHash();}
+    }
+    private static final class Reconfirmation implements io.tapstate.spi.store.SharedSrsRecoveryPreparation {
+        private final MongoStorageRecoveryCommands owner;private final Plan plan;private final MongoCapturePreparationFacts.Recovery reservation;private final String targetFingerprint;
+        private Reconfirmation(MongoStorageRecoveryCommands owner,Plan plan,MongoCapturePreparationFacts.Recovery reservation,String targetFingerprint) {
+            this.owner=owner;this.plan=plan;this.reservation=reservation;this.targetFingerprint=targetFingerprint;
+        }
+        @Override public Plan plan(){return plan;}
+        @Override public io.tapstate.spi.store.CapturePreparation replacement(){return reservation.replacement();}
+        @Override public void requireCurrent(){owner.active.run();owner.requireReconfirmation(this);owner.active.run();}
+    }
     static SharedOriginal requireSharedOriginal(io.tapstate.spi.store.SharedSrsRecoveryPreparation original,String targetFingerprint) {
         if(!(original instanceof SharedPending retained) || !retained.targetFingerprint.equals(targetFingerprint))throw refused();
         retained.requireCurrent();return new SharedOriginal(retained,retained.plan,retained.replacement,retained::requireCurrent);
+    }
+    static SharedAuthority requireSharedCancellationAuthority(io.tapstate.spi.store.SharedSrsRecoveryPreparation original,String targetFingerprint) {
+        if(original instanceof SharedPending retained) {
+            if(!retained.targetFingerprint.equals(targetFingerprint))throw refused();
+            return new SharedOriginal(retained,retained.plan,retained.replacement,retained::requireCurrent);
+        }
+        if(!(original instanceof Reconfirmation retry) || !retry.targetFingerprint.equals(targetFingerprint))throw refused();
+        return new SharedReconfirmation(retry,retry.plan,retry.reservation,retry::requireCurrent);
     }
 
     record Transition(Plan plan, boolean won) {}
