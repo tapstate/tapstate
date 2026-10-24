@@ -35,6 +35,87 @@ class MongoCapturePreparationsIT {
     private static final Duration TTL=Duration.ofMinutes(2);
     private static final Instant AT=Instant.parse("2026-10-19T16:00:00Z");
 
+    @Test void aReservedPhysicalReplacementBlocksOrdinaryLookupAndReadyPreservesCanonicalNotesWithoutRecreatingCache() {
+        withFixture(CapturePreparation.Mode.SHARED_SRS,f -> {
+            var issued=f.issue(f.request);var birth=issued.preparation();
+            // The fixture creates the original domain before seeding only the approved CONFIG variants.
+            // It does not claim to execute the joint recovery protocol or grant its CACHE authority.
+            f.preparations().createFirst(issued);
+            var first=f.configuration.capturePreparations().read(f.scope,birth.captureId()).orElseThrow();
+            assertThat(first).isEqualTo(birth);
+            var before=f.snapshot();var notes=SystemCollections.PDK_NOTE_SCOPES.on(f.config).find().into(new ArrayList<>());
+            String operation=UUID.randomUUID().toString();
+            var replacement=replacement(birth,operation);
+            var reserved=new MongoCapturePreparationFacts.Recovery(birth,replacement,"a".repeat(64),MongoCapturePreparationFacts.RecoveryPhase.RESERVED);
+            var original=MongoCapturePreparationFacts.row(birth);var pending=MongoCapturePreparationFacts.configurationRow(reserved);
+            assertThat(f.controls().replaceOne(original,pending).getMatchedCount()).isEqualTo(1);
+            assertCode(() -> f.configuration.capturePreparations().read(f.scope,birth.captureId()),IoError.CAPTURE_STATE_REBUILD_REQUIRED);
+            assertCode(() -> f.configuration.capturePreparations().issueFirstCreate(f.request),IoError.CAPTURE_STATE_REBUILD_REQUIRED);
+            var source=(SourceResource)f.configuration.artifacts().get("input").orElseThrow();
+            assertCode(() -> f.configuration.capturePreparations().inspectSharedOrigin(f.scope,source.id(),CanonicalHash.of(source)),IoError.CAPTURE_STATE_REBUILD_REQUIRED);
+            assertThat(f.snapshot()).isEqualTo(before);
+            var ready=MongoCapturePreparationFacts.configurationRow(new MongoCapturePreparationFacts.Recovery(birth,replacement,
+                    reserved.planHash(),MongoCapturePreparationFacts.RecoveryPhase.READY));
+            assertThat(f.controls().replaceOne(pending,ready).getMatchedCount()).isEqualTo(1);
+            try(var reopened=MongoConfigurationDomain.open(f.settings,"cluster-a")) {
+                var preparations=reopened.capturePreparations();
+                assertThat(preparations.read(f.scope,birth.captureId())).contains(replacement);
+                assertThat(preparations.issueFirstCreate(f.request)).isEqualTo(new CaptureCreationResult.AlreadyIssued(replacement));
+                assertThat(preparations.inspectSharedHistory(replacement,source.id(),CanonicalHash.of(source)))
+                        .isEqualTo(new CaptureSharedHistory(replacement,true));
+            }
+            assertCode(() -> f.preparations().load(replacement),IoError.CAPTURE_STATE_REBUILD_REQUIRED);
+            assertThat(f.snapshot()).isEqualTo(before);
+            assertThat(SystemCollections.PDK_NOTE_SCOPES.on(f.config).find().into(new ArrayList<>())).isEqualTo(notes);
+            assertThat(f.controls().find().into(new ArrayList<>())).containsExactly(ready);
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"phase","predecessor","physical","hash","extra"})
+    void malformedPhysicalReplacementMappingsRefuseWithoutRepairingEitherDomain(String damage) {
+        withFixture(CapturePreparation.Mode.SHARED_SRS,f -> {
+            var birth=f.issue(f.request).preparation();var next=replacement(birth,UUID.randomUUID().toString());
+            var row=MongoCapturePreparationFacts.configurationRow(new MongoCapturePreparationFacts.Recovery(birth,next,
+                    "a".repeat(64),MongoCapturePreparationFacts.RecoveryPhase.READY));
+            var mapping=row.get("currentRecovery",Document.class);
+            switch(damage) {
+                case "phase" -> mapping.put("phase","UNKNOWN");
+                case "predecessor" -> mapping.put("previousPreparationId",next.preparationId());
+                case "physical" -> mapping.put("physicalChain",birth.chainId());
+                case "hash" -> mapping.put("planHash","unknown");
+                case "extra" -> mapping.put("extra",true);
+                default -> throw new AssertionError(damage);
+            }
+            assertThat(f.controls().replaceOne(MongoCapturePreparationFacts.row(birth),row).getMatchedCount()).isEqualTo(1);
+            var before=f.snapshot();
+            assertCode(() -> f.configuration.capturePreparations().read(f.scope,birth.captureId()),IoError.DOCUMENT_UNREADABLE);
+            assertCode(() -> f.configuration.capturePreparations().issueFirstCreate(f.request),IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.controls().find().into(new ArrayList<>())).containsExactly(row);assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
+    private static CapturePreparation replacement(CapturePreparation birth,String operation) {
+        return MongoCapturePreparationFacts.decode(new Document("formatVersion",2).append("original",MongoCapturePreparationFacts.row(birth))
+                .append("physicalChain",MongoCapturePreparationFacts.replacementChain(birth,operation)).append("preparationId",operation));
+    }
+
+    @Test void aPreviousIncarnationCannotHideTheCurrentReservedMappingFromOrdinaryOriginInspection() {
+        withFixture(CapturePreparation.Mode.SHARED_SRS,f -> {
+            var birth=f.issue(f.request).preparation();var original=MongoCapturePreparationFacts.row(birth);
+            var previous=new CapturePreparation(new CacheBusinessScope(f.scope.clusterId(),f.scope.bindingVersion(),"previous-cache"),
+                    birth.mode(),birth.chainId(),birth.captureId(),birth.sourceIdentityHash(),UUID.randomUUID().toString());
+            assertThat(f.controls().deleteOne(original).getDeletedCount()).isEqualTo(1);
+            f.controls().insertOne(MongoCapturePreparationFacts.row(previous));
+            var reserved=MongoCapturePreparationFacts.configurationRow(new MongoCapturePreparationFacts.Recovery(birth,
+                    replacement(birth,UUID.randomUUID().toString()),"b".repeat(64),MongoCapturePreparationFacts.RecoveryPhase.RESERVED));
+            f.controls().insertOne(reserved);
+            var source=(SourceResource)f.configuration.artifacts().get("input").orElseThrow();
+            var before=f.snapshot();var rows=f.controls().find().into(new ArrayList<>());
+            assertCode(() -> f.configuration.capturePreparations().inspectSharedOrigin(f.scope,source.id(),CanonicalHash.of(source)),IoError.CAPTURE_STATE_REBUILD_REQUIRED);
+            assertThat(f.controls().find().into(new ArrayList<>())).isEqualTo(rows);assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
     @Test void sharedHistoryInspectionExcludesTheExactCurrentIncarnationAndNeverReissuesCreation() {
         withFixture(CapturePreparation.Mode.SHARED_SRS, f -> {
             var original = f.issue(f.request).preparation();

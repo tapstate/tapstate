@@ -16,6 +16,7 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations {
     @Override public CaptureCacheState createFirst(FirstCaptureCreation invocation) {
         var original=MongoCaptureStatePreparations.consumeFirst(invocation,targetFingerprint);
         var preparation=original.preparation();var request=original.request();String ringRetention=original.retention();requireScope(preparation);
+        if(preparation.replacement())throw history(preparation);
         return transaction(original::requireActive,session -> {
             var structure=new MongoCacheMetadataStructure(database,retention);
             if(preparation.mode()==CapturePreparation.Mode.SHARED_SRS)structure.verifySrs();
@@ -56,7 +57,7 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations {
     }
     static CapturePreparation requirePreparation(Document row,WorkloadClaimKey key,CacheBusinessScope scope) {
         if(!(row.get("capturePreparation")instanceof Document marker))throw MongoCapturePreparationFacts.unreadable();
-        var preparation=MongoCapturePreparationFacts.decode(marker);
+        var preparation=MongoCapturePreparationFacts.annex(marker);
         if(!preparation.scope().equals(scope) || !preparation.captureId().equals(key.resourceId()) || !key.clusterId().equals(scope.clusterId()) || key.type()!=WorkloadClaimType.CAPTURE)throw MongoCapturePreparationFacts.fenced();return preparation;
     }
     private void requireNoPriorFacts(ClientSession session,CapturePreparation original) {
