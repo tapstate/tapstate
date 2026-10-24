@@ -121,6 +121,11 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
         @Override public Outcome outcome(){return outcome;}
         @Override public void requireCurrent(){owner.requireSharedReceipt(this);}
     }
+    static MongoStorageRecoveryCommands.SharedOriginal requireAppliedSharedOriginal(SharedSrsRecoveryReceipt receipt) {
+        if(!(receipt instanceof SharedReceipt retained) || retained.outcome!=SharedSrsRecoveryReceipt.Outcome.RETIRED)
+            throw MongoCapturePreparationFacts.fenced();
+        return retained.original;
+    }
     @Override public CaptureCacheState createFirst(FirstCaptureCreation invocation) {
         var original=MongoCaptureStatePreparations.consumeFirst(invocation,targetFingerprint);
         var preparation=original.preparation();var request=original.request();String ringRetention=original.retention();requireScope(preparation);

@@ -141,6 +141,43 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands,io.t
             return Optional.of(sharedPending(session,current.orElseThrow()));
         });
     }
+    @Override public Plan complete(io.tapstate.spi.store.SharedSrsRecoveryReceipt applied) {
+        var admitted=MongoCaptureCachePreparations.requireAppliedSharedOriginal(applied);
+        if(!(admitted.preparation() instanceof SharedPending original) || original.owner.client!=client
+                || !original.owner.database.getName().equals(database.getName()))throw refused();
+        var already=transaction(session -> {
+            var current=requireSharedOperation(session,original.plan);
+            if(current.phase()==Phase.COMPLETE)return Optional.of(current);
+            if(current.phase()!=Phase.RUNNING)throw refused();
+            return Optional.<Plan>empty();
+        });
+        if(already.isPresent())return already.orElseThrow();
+        // CACHE verification must stay outside the CONFIG transaction and its retry callback.
+        applied.requireCurrent();
+        var result=transaction(session -> {
+            var row=root(session,original.plan.originalScope());
+            var current=requireSharedOperation(row,original.plan);
+            if(current.phase()==Phase.COMPLETE)return current;
+            if(current.phase()!=Phase.RUNNING)throw refused();
+            var retained=sharedPending(session,current);
+            if(!retained.replacement.equals(original.replacement) || !retained.targetFingerprint.equals(original.targetFingerprint))throw refused();
+            ConfigurationVersion.advance(session,SystemCollections.CONFIGURATION_VERSION.on(database));
+            captureOwner(current).publishSharedRecovery(session,current);
+            var completed=new Plan(current.operationId(),current.previousOperationId(),current.originalScope(),current.manifest(),
+                    current.planHash(),current.controlRevision(),Phase.COMPLETE);
+            save(session,row,completed);return completed;
+        });
+        active.run();return result;
+    }
+    private Plan requireSharedOperation(ClientSession session,Plan original) {
+        return requireSharedOperation(root(session,original.originalScope()),original);
+    }
+    private static Plan requireSharedOperation(Document row,Plan original) {
+        var current=pending(row).orElseThrow(MongoStorageRecoveryCommands::refused);
+        if(current.manifest().selection().extent()!=Extent.SHARED_SRS || !sameOriginal(current,original)
+                || current.controlRevision()!=original.controlRevision())throw refused();
+        return current;
+    }
     private MongoCaptureStatePreparations captureOwner(Plan plan) {
         return new MongoCaptureStatePreparations(client,database,plan.originalScope().clusterId(),bindings,artifacts,active);
     }

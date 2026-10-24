@@ -148,10 +148,14 @@ final class MongoCaptureStatePreparations implements CaptureStatePreparations {
     }
     MongoCapturePreparationFacts.Recovery requireSharedReservation(ClientSession session,StorageRecoveryCommands.Plan plan) {
         var expected=sharedReservation(plan);requireScope(session,expected.previous().scope());
-        var row=SystemCollections.CAPTURE_PREPARATIONS.on(database).find(session,
-                new Document("_id",MongoCapturePreparationFacts.id(expected.previous().scope(),expected.previous().captureId()))).first();
-        var actual=MongoCapturePreparationFacts.recovery(row).orElseThrow(MongoCaptureStatePreparations::fenced);
+        var actual=currentRecoveryForOperation(session,database,expected.previous().scope(),plan.operationId());
         if(!expected.equals(actual))throw fenced();requireSharedRecoveryOrigin(session,expected.previous());return actual;
+    }
+    void publishSharedRecovery(ClientSession session,StorageRecoveryCommands.Plan plan) {
+        var original=requireSharedReservation(session,plan);
+        var ready=new MongoCapturePreparationFacts.Recovery(original.previous(),original.replacement(),original.planHash(),MongoCapturePreparationFacts.RecoveryPhase.READY);
+        if(SystemCollections.CAPTURE_PREPARATIONS.on(database).replaceOne(session,MongoCapturePreparationFacts.configurationRow(original),
+                MongoCapturePreparationFacts.configurationRow(ready)).getMatchedCount()!=1)throw fenced();
     }
     private void requireSharedRecoveryOrigin(ClientSession session,CapturePreparation previous) {
         var owner=new RequiredNoteOwner(previous.scope().bindingVersion(),"pdk.chain."+previous.canonicalChainId(),RequiredNoteOwner.Kind.CHAIN,previous.canonicalChainId(),0);

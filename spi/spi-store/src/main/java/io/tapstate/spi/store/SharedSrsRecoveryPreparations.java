@@ -7,4 +7,5 @@ public interface SharedSrsRecoveryPreparations {
     SharedSrsRecoveryPreparations guardedBy(Runnable requireActive);
     SharedSrsRecoveryPreparation reserve(StorageRecoveryCommands.Plan confirmed);
     Optional<SharedSrsRecoveryPreparation> pending(CacheAuthScope original,String operationId);
+    StorageRecoveryCommands.Plan complete(SharedSrsRecoveryReceipt applied);
 }

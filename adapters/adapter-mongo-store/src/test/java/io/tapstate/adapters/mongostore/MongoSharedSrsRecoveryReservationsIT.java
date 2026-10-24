@@ -395,6 +395,140 @@ class MongoSharedSrsRecoveryReservationsIT {
         });
     }
 
+    @Test void completionPublishesReadyAndCompleteAtomicallyWithoutChangingCacheOrPipelineScopes() {
+        withFixture(f -> {
+            f.endAffectedTenures();var reservation=f.configuration.sharedRecoveryPreparations().reserve(f.confirmed());
+            var receipt=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).replace(reservation,f.node);
+            var cache=rows(f.cache);var oldA=f.mapping("a");var oldB=f.mapping("b");var oldC=f.mapping("c");
+            var intentA=f.intentRow("a");var intentB=f.intentRow("b");var notes=notes(f.config);
+            long version=f.configuration.configurationRevision();
+            var completed=f.configuration.sharedRecoveryPreparations().complete(receipt);
+            assertThat(completed.phase()).isEqualTo(Phase.COMPLETE);
+            assertThat(completed.operationId()).isEqualTo(reservation.plan().operationId());
+            assertThat(completed.manifest()).isEqualTo(reservation.plan().manifest());
+            assertThat(completed.planHash()).isEqualTo(reservation.plan().planHash());
+            assertThat(f.configuration.configurationRevision()).isEqualTo(version+1);
+            assertThat(f.configuration.recoveryCommands().find(f.auth(),completed.operationId())).contains(completed);
+            assertThat(f.configuration.capturePreparations().read(f.scope,f.previous.captureId())).contains(reservation.replacement());
+            var mapping=SystemCollections.CAPTURE_PREPARATIONS.on(f.config).find().first().get("currentRecovery",Document.class);
+            assertThat(mapping.getString("phase")).isEqualTo("READY");
+            assertThat(f.mapping("a")).isEqualTo(oldA);assertThat(f.mapping("b")).isEqualTo(oldB);assertThat(f.mapping("c")).isEqualTo(oldC);
+            assertThat(f.intentRow("a")).isEqualTo(intentA);assertThat(f.intentRow("b")).isEqualTo(intentB);
+            assertThat(notes(f.config)).isEqualTo(notes);assertThat(rows(f.cache)).isEqualTo(cache);
+            var config=rows(f.config);
+            assertThat(f.configuration.sharedRecoveryPreparations().complete(receipt)).isEqualTo(completed);
+            assertThat(rows(f.config)).isEqualTo(config);assertThat(rows(f.cache)).isEqualTo(cache);
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"metadata","identity"})
+    void completionUsesTheFixedCommittedScopeAcrossAuthoringChangesAndReplaysWithoutWrites(String change) {
+        withFixture(f -> {
+            f.endAffectedTenures();var reservation=f.configuration.sharedRecoveryPreparations().reserve(f.confirmed());
+            var receipt=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).replace(reservation,f.node);
+            if(change.equals("metadata"))f.changeSource();else f.changeSourceIdentity();
+            var cache=rows(f.cache);long version=f.configuration.configurationRevision();
+            var completed=f.configuration.sharedRecoveryPreparations().complete(receipt);
+            assertThat(completed.phase()).isEqualTo(Phase.COMPLETE);assertThat(completed.manifest()).isEqualTo(reservation.plan().manifest());
+            assertThat(f.configuration.configurationRevision()).isEqualTo(version+1);
+            if(change.equals("metadata"))f.changeSourceIdentity();else f.changeSource();
+            var config=rows(f.config);
+            assertThat(f.configuration.sharedRecoveryPreparations().complete(receipt)).isEqualTo(completed);
+            assertThat(f.configuration.capturePreparations().read(f.scope,f.previous.captureId())).contains(reservation.replacement());
+            assertThat(rows(f.config)).isEqualTo(config);assertThat(rows(f.cache)).isEqualTo(cache);
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"hostile","cancelled"})
+    void aPublicReceiptCannotInvokeAccessorsOrPublishCompletion(String kind) {
+        withFixture(f -> {
+            var calls=new java.util.concurrent.atomic.AtomicInteger();
+            var fake=new SharedSrsRecoveryReceipt() {
+                public SharedSrsRecoveryPreparation preparation(){calls.incrementAndGet();throw new AssertionError("untrusted preparation accessed");}
+                public Outcome outcome(){calls.incrementAndGet();if(kind.equals("cancelled"))return Outcome.CANCELLED;throw new AssertionError("untrusted outcome accessed");}
+                public void requireCurrent(){calls.incrementAndGet();throw new AssertionError("untrusted receipt guard invoked");}
+            };
+            var config=rows(f.config);var cache=rows(f.cache);
+            assertThatThrownBy(() -> f.configuration.sharedRecoveryPreparations().complete(fake)).isInstanceOf(TapstateException.class);
+            assertThat(calls).hasValue(0);assertThat(rows(f.config)).isEqualTo(config);assertThat(rows(f.cache)).isEqualTo(cache);
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"before-commit","after-commit"})
+    void completionAuthorizationLossRollsBackOrRecognizesTheCommittedUnknownResult(String cut) {
+        withFixture(f -> {
+            f.endAffectedTenures();var reservation=f.configuration.sharedRecoveryPreparations().reserve(f.confirmed());
+            var receipt=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).replace(reservation,f.node);
+            var config=rows(f.config);var cache=rows(f.cache);long version=f.configuration.configurationRevision();
+            var calls=new java.util.concurrent.atomic.AtomicInteger();int failAt=cut.equals("before-commit")?4:5;
+            var guarded=f.configuration.sharedRecoveryPreparations().guardedBy(() -> {
+                if(calls.incrementAndGet()==failAt)throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);
+            });
+            assertThatThrownBy(() -> guarded.complete(receipt)).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+            if(cut.equals("before-commit")) {
+                assertThat(rows(f.config)).isEqualTo(config);assertThat(f.configuration.configurationRevision()).isEqualTo(version);
+                assertThat(f.configuration.recoveryCommands().find(f.auth(),reservation.plan().operationId()).orElseThrow().phase()).isEqualTo(Phase.RUNNING);
+            } else {
+                var committed=rows(f.config);
+                var result=f.configuration.sharedRecoveryPreparations().complete(receipt);
+                assertThat(result.phase()).isEqualTo(Phase.COMPLETE);assertThat(result.operationId()).isEqualTo(reservation.plan().operationId());
+                assertThat(f.configuration.configurationRevision()).isEqualTo(version+1);assertThat(rows(f.config)).isEqualTo(committed);
+            }
+            assertThat(rows(f.cache)).isEqualTo(cache);
+        });
+    }
+
+    @Test void reopenedClientsCompleteUsingTheirOwnFreshPendingHandleAndAppliedReceipt() {
+        withFixture(f -> {
+            f.endAffectedTenures();var reservation=f.configuration.sharedRecoveryPreparations().reserve(f.confirmed());
+            var oldReceipt=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).replace(reservation,f.node);
+            var config=rows(f.config);var cache=rows(f.cache);long version=f.configuration.configurationRevision();
+            var connection=new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,CACHE.getReplicaSetUrl(f.cache.getName()),f.cache.getName(),null);
+            try(var reopenedConfig=MongoConfigurationDomain.open(f.settings,"cluster-a");
+                    var reopenedCache=MongoCacheDomain.connect(connection,Duration.ofSeconds(5),"shared-completion-reopened-test")) {
+                assertThatThrownBy(() -> reopenedConfig.sharedRecoveryPreparations().complete(oldReceipt)).isInstanceOf(TapstateException.class);
+                assertThat(rows(f.config)).isEqualTo(config);assertThat(rows(f.cache)).isEqualTo(cache);
+                var pending=reopenedConfig.sharedRecoveryPreparations().pending(f.auth(),reservation.plan().operationId()).orElseThrow();
+                var freshReceipt=reopenedCache.sharedSrsRecoveries(f.scope,ACTIVE).replace(pending,f.node);
+                var completed=reopenedConfig.sharedRecoveryPreparations().complete(freshReceipt);
+                assertThat(completed.phase()).isEqualTo(Phase.COMPLETE);assertThat(completed.operationId()).isEqualTo(reservation.plan().operationId());
+                assertThat(reopenedConfig.capturePreparations().read(f.scope,f.previous.captureId())).contains(reservation.replacement());
+                var committed=rows(f.config);
+                assertThat(reopenedConfig.sharedRecoveryPreparations().complete(freshReceipt)).isEqualTo(completed);
+                assertThat(rows(f.config)).isEqualTo(committed);
+            }
+            assertThat(f.configuration.configurationRevision()).isEqualTo(version+1);assertThat(rows(f.cache)).isEqualTo(cache);
+        });
+    }
+
+    @Test void historicalCompletionReplayCannotRestoreAGateAfterAnExplicitStoreFullAdvancesThePipeline() {
+        withFixture(f -> {
+            f.endAffectedTenures();var reservation=f.configuration.sharedRecoveryPreparations().reserve(f.confirmed());
+            var receipt=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).replace(reservation,f.node);
+            var completed=f.configuration.sharedRecoveryPreparations().complete(receipt);
+            // This source-only full proves existing store lifecycle integration, not a native snapshot or target result.
+            var intent=f.configuration.intents().loadForActuation("a").orElseThrow();
+            assertThat(f.configuration.intents().compareAndSet(intent.scope(),intent.intentRevision(),
+                    new DesiredState("a",PipelineState.STOPPED,intent.desired().revision(),true))).isTrue();
+            var clearing=f.configuration.intents().loadForActuation("a").orElseThrow();
+            var target=new PipelineIntentScope(f.scope.clusterId(),f.scope.bindingVersion(),f.scope.cacheIncarnation(),"a",2);
+            var pipeline=(PipelineResource)f.configuration.artifacts().get("a").orElseThrow();
+            var source=(SourceResource)f.configuration.artifacts().get("input").orElseThrow();
+            var inputs=PipelinePreparationInputs.of(target,pipeline,Map.of("input",source),Map.of("input",Set.of("orders")));
+            var originalClaim=f.domain.workloadClaims(f.scope).readPipeline(clearing.scope()).orElseThrow().claim();
+            var request=new PipelineRebuildRequest("explicit-full-after-shared-replacement",clearing,WorkloadClaimFence.from(originalClaim),0,inputs);
+            var full=f.configuration.rebuilds().begin(request);
+            var cacheFull=f.domain.pipelineRebuilds(f.scope,ACTIVE).prepare(full,f.node,TTL,Instant.parse("2026-10-19T16:00:00Z"));
+            var rebuilt=f.configuration.rebuilds().complete(cacheFull);
+            assertThat(rebuilt.scope()).isEqualTo(target);assertThat(f.mapping("a")).doesNotContainKey("sharedRecovery");
+            assertThat(f.mapping("b")).containsKey("sharedRecovery");
+            var config=rows(f.config);var cache=rows(f.cache);
+            assertThat(f.configuration.sharedRecoveryPreparations().complete(receipt)).isEqualTo(completed);
+            assertThat(rows(f.config)).isEqualTo(config);assertThat(rows(f.cache)).isEqualTo(cache);
+        });
+    }
+
     private static void assertReplacementRefusesWithoutMutation(Fixture f,SharedSrsRecoveryPreparation original) {
         var cache=rows(f.cache);var config=rows(f.config);
         assertThatThrownBy(() -> f.domain.sharedSrsRecoveries(f.scope,ACTIVE).replace(original,f.node)).isInstanceOf(TapstateException.class);
@@ -500,6 +634,11 @@ class MongoSharedSrsRecoveryReservationsIT {
         Plan confirmed() { return configuration.recoveryCommands().confirm(planned()); }
         Document mapping(String id) { return SystemCollections.OPERATOR_GENERATIONS.on(config).find(new Document("_id", id)).first(); }
         Document intentRow(String id) { return SystemCollections.PIPELINE_INTENTS.on(config).find(new Document("_id", id)).first(); }
+        void changeSourceIdentity() {
+            var source=(SourceResource)configuration.artifacts().get("input").orElseThrow();
+            configuration.artifacts().save(new SourceResource(source.id(),source.metadata(),source.connector(),Map.of("host","different-server"),
+                    source.mode(),source.tables(),source.srs(),source.experimental()));
+        }
         void changeSource() {
             var source = (SourceResource) configuration.artifacts().get("input").orElseThrow();
             configuration.artifacts().save(new SourceResource(source.id(), new Metadata(Map.of(), "edited after reservation"), source.connector(),
