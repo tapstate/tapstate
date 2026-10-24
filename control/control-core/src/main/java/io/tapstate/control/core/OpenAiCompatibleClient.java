@@ -85,6 +85,8 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
                     + "For a concrete request to create or change the pipeline, return a proposal by calling propose_pipeline. "
                     + "Copy the complete currentWizard and change only the requested fields. Preserve existing IDs, root source, table, keys, relations, transforms, and an unfinished destination unless the user asks to change them. "
                     + "candidateWizard must use the complete Builder view shape: root, relations, transforms, destinationSourceId, destinationTable, and destinationWriteMode. "
+                    + "Each relation is a nested Builder relation node with id, source, table, type (flatten, sub_array, or sub_doc), primaryKey (child key fields), arrayKey (the array identity fields), conditions (one childKey/parentKey pair per join key), transforms, and children. "
+                    + "Use type sub_array for one-to-many relationships; put the complete composite relationship in conditions, pairing every child field with its parent field. Put further related tables in children under their actual parent relation. "
                     + "For a map transform, config.map.fields is an array of {id, outputField, ruleType, value}; use ruleType rename and value $<sourceField> to copy a source field, and set passthroughUnlisted to true to keep every other field. "
                     + "For a union transform, config.union.from is an array of additional source-qualified table references such as sourceId.table. Use only tables in the supplied schema inventory and do not repeat an input already present in currentWizard. "
                     + "For a root-table row filter, add a filter step to root.transforms with a valid expression using the named field and value. "
@@ -191,14 +193,45 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
                 "rowCount", string,
                 "columns", schemaArray(Map.of("type", "object")),
                 "transforms", schemaArray(transform)), List.of("source", "table", "keys", "columns", "transforms"));
+        Map<String, Object> condition = schemaObject(Map.of(
+                "childKey", Map.of("type", "string", "description", "Field on this related table."),
+                "parentKey", Map.of("type", "string", "description", "Matching field on the parent table."),
+                "parentTable", Map.of("type", "string", "description", "Parent table name."),
+                "operator", Map.of("type", "string", "enum", List.of("="))), List.of("childKey", "parentKey"));
+        Map<String, Object> relation = relationSchema(string, schemaArray(string), schemaArray(condition),
+                schemaArray(transform), 0);
         return schemaObject(Map.of(
                 "root", root,
-                "relations", schemaArray(Map.of("type", "object")),
+                "relations", schemaArray(relation),
                 "transforms", schemaArray(transform),
                 "destinationSourceId", string,
                 "destinationTable", string,
                 "destinationWriteMode", string),
                 List.of("root", "relations", "transforms", "destinationSourceId", "destinationTable", "destinationWriteMode"));
+    }
+
+    private static Map<String, Object> relationSchema(Map<String, Object> string, Map<String, Object> stringArray,
+            Map<String, Object> conditionArray, Map<String, Object> transformArray, int depth) {
+        Map<String, Object> properties = new java.util.LinkedHashMap<>();
+        properties.put("id", string);
+        properties.put("source", string);
+        properties.put("table", string);
+        properties.put("type", Map.of("type", "string", "enum", List.of("flatten", "sub_array", "sub_doc"),
+                "description", "Use sub_array for one-to-many relationships."));
+        properties.put("primaryKey", stringArray);
+        properties.put("arrayKey", stringArray);
+        properties.put("targetField", string);
+        properties.put("key", string);
+        properties.put("parentKey", string);
+        properties.put("conditions", conditionArray);
+        properties.put("transforms", transformArray);
+        if (depth >= 2) {
+            properties.put("children", schemaArray(Map.of("type", "object")));
+        } else {
+            properties.put("children", schemaArray(relationSchema(string, stringArray, conditionArray, transformArray, depth + 1)));
+        }
+        return schemaObject(properties, List.of("source", "table", "type", "primaryKey", "arrayKey",
+                "conditions", "transforms", "children"));
     }
 
     private static Map<String, Object> schemaObject(Map<String, Object> properties, List<String> required) {
