@@ -458,8 +458,8 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         if(closed.get())return false;
         if(owner.sessions.stream().anyMatch(original -> driving.get().test(original.pipelineId())))return true;
         if(owner.prepared.mode()!=CapturePreparation.Mode.SHARED_SRS)return false;
-        owner.require();var current=stores.sources().srs(stores.scope(),owner::require).consumers().attached(owner.prepared.chainId());
-        for(var member:current.consumers()) {
+        owner.require();
+        for(var member:retainedConsumers(owner)) {
             if(member.commandFence().owner().equals(owner.initial.owner()))continue;
             var scope=new PipelineIntentScope(stores.scope().clusterId(),stores.scope().bindingVersion(),stores.scope().cacheIncarnation(),member.context().key().pipelineId(),member.context().stateGeneration());
             var original=new ExecutionFence(scope,member.commandFence());
@@ -468,6 +468,17 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             var status=StateJson.parse(state.stateJson());if(status==PipelineState.RUNNING || status==PipelineState.PAUSED)return true;
         }
         return false;
+    }
+    private List<SrsConsumerMembership> retainedConsumers(Owner owner) {
+        var consumers=stores.sources().srs(stores.scope(),owner::require).consumers();
+        try { return consumers.attached(owner.prepared.chainId()).consumers(); }
+        catch(TapstateException unavailable) {
+            // Closing the original physical owner needs control identity, never reconstructed model bodies.
+            var observed=consumers.inspectSharedRecovery(owner.prepared);
+            owner.require();
+            if(!owner.prepared.equals(observed.previous()) || !owner.fence.equals(observed.captureFence()))throw refused();
+            return observed.consumers();
+        }
     }
     private void ensureTail(Owner owner) {
         owner.require();if(owner.config==null || owner.origin==null)throw refused();

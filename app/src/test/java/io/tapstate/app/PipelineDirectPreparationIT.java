@@ -81,6 +81,76 @@ class PipelineDirectPreparationIT {
             } finally {member.shutdown();}
         });
     }
+    @ParameterizedTest @ValueSource(booleans={false,true})
+    void stoppingTheOriginalLocalCaptureDoesNotNeedTheLostSharedModelBodies(boolean missingControls) {
+        withFixture(f -> {
+            f.configuration.artifacts().save(pipeline("input",true,ReadMode.SNAPSHOT_AND_CDC,"latest",null));
+            var models=SourceModelSnapshot.capture("flow",List.of(f.source()),f.cache.schemas(f.business(),ACTIVE));
+            f.preparer(f.configuration,f.cache).prepare(f.scope,f.inputs());var claims=f.cache.workloadClaims(f.business());
+            var fence=WorkloadClaimFence.from(claims.advanceExecution(claims.readPipeline(f.scope).orElseThrow().claim(),1,Set.of(OWNER.nodeId())).orElseThrow());
+            var stores=f.cache.srs(f.business(),ACTIVE);var member=sharedMember(stores.log());var ports=new CopyOnWriteArrayList<NativeSharedPort>();
+            try(var authorization=ExecutionAuthorization.scoped(f.business(),claims,Duration.ofSeconds(2),System::nanoTime,() -> true);
+                var runtime=new NativeSrsCaptureRunUnit(f.business(),stores,member);
+                var coordinator=new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(f.business(),f.cache,f.cache,
+                        f.configuration.capturePreparations(),f.cache.capturePreparations(f.business(),ACTIVE),f.configuration.requiredNotes()),
+                        new ScopedPipelineCaptureCoordinator.Execution(() -> Optional.of(f.node),authorization,cacheOwnership(f,OWNER),Duration.ofSeconds(10),ACTIVE,CLOCK),
+                        runtime,new SnapshotBuffer(8),fixtureProvisioner(),(fixed,config,guard,preparation,stream) -> {
+                            var port=new NativeSharedPort(config,guard,preparation,stream);ports.add(port);return port;
+                        })) {
+                var first=coordinator.forRun(f.scope,fence,new ExecutionFence(f.scope,fence));
+                first.startCapture("flow",ReadOnlyArtifactSnapshot.capture(f.configuration.artifacts()),models);awaitLoadedCounts(first);
+                var binding=first.captureBindings().logged().get("input");String chain=binding.run().miningChainId();
+                var physical=ports.stream().filter(port -> port.stream!=null).findFirst().orElseThrow();
+                physical.listener.get().onBatch(List.of(Envelope.insert(1,"orders",Map.of("id",2),null)),Optional.of(new SourcePosition("before-model-loss")));
+                assertThat(stores.chains().load(chain).orElseThrow().checkpoint()).isNotNull();
+                var prepared=f.configuration.capturePreparations().read(f.business(),io.tapstate.core.model.canonical.SourceCaptureIdentity.sharedCapture(chain)).orElseThrow();
+                var captureKey=new WorkloadClaimKey(f.business().clusterId(),WorkloadClaimType.CAPTURE,prepared.captureId());
+                synchronized(coordinator) {
+                    // Remove only these model bodies; all original control and private history remains authoritative.
+                    var bodies=f.cacheDatabase.getCollection("srs_models").find(new Document("_id.chain",chain)).into(new ArrayList<>());
+                    assertThat(bodies).hasSize(2);
+                    for(var body:bodies)assertThat(f.cacheDatabase.getCollection("srs_models").deleteOne(new Document("_id",body.get("_id"))).getDeletedCount()).isOne();
+                    assertThatThrownBy(() -> stores.chains().load(chain)).isInstanceOf(TapstateException.class);
+                    var observed=stores.consumers().inspectSharedRecovery(prepared);assertThat(observed.pipelines().keySet()).containsExactly("flow");
+                    var capture=claims.read(captureKey).orElseThrow();assertThat(capture.leased()).isTrue();
+                    if(missingControls) {
+                        var offsets=f.cacheDatabase.getCollection("srs_consumer_offsets");
+                        var offset=offsets.find(new Document("_id.chain",chain)).first();assertThat(offset).isNotNull();
+                        assertThat(offsets.deleteOne(new Document("_id",offset.get("_id"))).getDeletedCount()).isOne();
+                        assertThatThrownBy(() -> stores.consumers().inspectSharedRecovery(prepared)).isInstanceOf(TapstateException.class);
+                        var damaged=sharedCleanupControls(f);
+                        assertThatThrownBy(() -> first.stopCapture("flow",false)).isInstanceOf(TapstateException.class);
+                        assertThat(physical.closed).hasValue(0);assertThat(coordinator.hasScope(f.scope)).isTrue();
+                        var retainedClaim=claims.read(captureKey).orElseThrow();
+                        assertThat(retainedClaim.claim()).isEqualTo(capture.claim());assertThat(retainedClaim.leased()).isTrue();
+                        assertThat(sharedCleanupControls(f)).isEqualTo(damaged);
+                        return;
+                    }
+                    var before=sharedCleanupControls(f);
+                    first.stopCapture("flow",false);
+                    assertThat(physical.closed).hasValue(1);assertThat(first.isCapturing("flow")).isFalse();assertThat(coordinator.hasScope(f.scope)).isFalse();
+                    var ended=claims.read(captureKey).orElseThrow();assertThat(ended.leased()).isFalse();
+                    assertThat(WorkloadClaimFence.from(ended.claim())).isEqualTo(WorkloadClaimFence.from(capture.claim()));
+                    assertThat(ended.claim().executionNodeIds()).isEqualTo(capture.claim().executionNodeIds());
+                    assertThat(sharedCleanupControls(f)).isEqualTo(before);
+                    assertThat(f.cacheDatabase.getCollection("srs_models").countDocuments(new Document("_id.chain",chain))).isZero();
+                    assertThatThrownBy(() -> stores.chains().load(chain)).isInstanceOf(TapstateException.class);
+                    var retained=stores.consumers().inspectSharedRecovery(prepared);
+                    assertThat(retained.consumers()).isEqualTo(observed.consumers());assertThat(retained.captureFence()).isEqualTo(observed.captureFence());
+                }
+            } finally {member.shutdown();}
+        });
+    }
+
+    private static Map<String,List<Document>> sharedCleanupControls(Fixture f) {
+        var result=new TreeMap<String,List<Document>>();
+        for(String table:List.of("srs_chains","srs_model_contexts","srs_consumers","srs_consumer_offsets","srs_events","srs_log_bounds","pipeline_state"))
+            result.put("cache."+table,f.cacheDatabase.getCollection(table).find().sort(new Document("_id",1)).into(new ArrayList<>()));
+        for(String table:f.configDatabase.listCollectionNames())
+            result.put("config."+table,f.configDatabase.getCollection(table).find().sort(new Document("_id",1)).into(new ArrayList<>()));
+        return result;
+    }
+
     @Test void freshSharedCaptureRefusesPastTimeBeforeAllocatingAnEpoch() {
         withFixture(f -> {
             f.configuration.artifacts().save(pipeline("input",true,ReadMode.CDC_ONLY,CLOCK.instant().minusSeconds(1).toString(),null));
@@ -185,7 +255,8 @@ class PipelineDirectPreparationIT {
             assertThat(f.cacheDatabase.getCollection("direct_channel_offsets").countDocuments()).isZero();
         });
     }
-    @Test void aForeignSharedConsumerWidensTheOriginalTailAndTakesOverWithoutChangingItsReadFloor() {
+    @ParameterizedTest @ValueSource(strings={"healthy","RUNNING","PAUSED"})
+    void aForeignSharedConsumerWidensTheOriginalTailAndTakesOverWithoutChangingItsReadFloor(String retainedStatus) {
         withFixture(f -> {
             var firstSource=f.source();f.configuration.artifacts().save(new SourceResource(firstSource.id(),null,firstSource.connector(),firstSource.config(),firstSource.mode(),List.of(TableRef.literal("orders")),firstSource.srs(),null));
             f.configuration.artifacts().save(pipeline("input",true,ReadMode.CDC_ONLY,"latest",null));
@@ -233,6 +304,25 @@ class PipelineDirectPreparationIT {
                 long events=f.cacheDatabase.getCollection("srs_events").countDocuments();
                 assertCode(() -> firstPhysical.listener.get().onBatch(List.of(Envelope.insert(2,"orders",Map.of("id",99),null)),Optional.of(new SourcePosition("late-closed-tail"))),IoError.CACHE_BUSINESS_FENCED);
                 assertThat(f.cacheDatabase.getCollection("srs_events").countDocuments()).isEqualTo(events);
+                if(!retainedStatus.equals("healthy")) {
+                    synchronized(firstRoot) { synchronized(otherRoot) {
+                        status(f,otherScope,otherFence,retainedStatus);
+                        assertThat(f.cacheDatabase.getCollection("srs_models").deleteMany(new Document("_id.chain",chain)).getDeletedCount()).isPositive();
+                        assertThatThrownBy(() -> stores.chains().load(chain)).isInstanceOf(TapstateException.class);
+                        status(f,f.scope,firstFence,"STOPPED");
+                        // The remote consumer still needs this original physical owner even when model bodies are lost.
+                        var stopped=sharedCleanupControls(f);
+                        first.stopCapture("flow",false);
+                        assertThat(widened.closed).hasValue(0);assertThat(firstRoot.hasScope(f.scope)).isFalse();
+                        assertThat(sharedCleanupControls(f)).isEqualTo(stopped);
+                        var key=new WorkloadClaimKey("cluster",WorkloadClaimType.CAPTURE,
+                                io.tapstate.core.model.canonical.SourceCaptureIdentity.sharedCapture(chain));
+                        assertThat(claims.read(key).orElseThrow().leased()).isTrue();
+                        assertThat(stores.consumers().inspectSharedRecovery(f.configuration.capturePreparations()
+                                .read(f.business(),key.resourceId()).orElseThrow()).pipelines()).containsKeys("flow","other");
+                    } }
+                    return;
+                }
                 status(f,f.scope,firstFence,"STOPPED");first.stopCapture("flow",false);assertThat(widened.closed).hasValue(0);
                 widened.listener.get().onBatch(List.of(Envelope.insert(3,"quiet",Map.of("id",3),null)),Optional.of(new SourcePosition("quiet-two")));
                 assertThat(stores.consumers().progress(binding.run().context()).orElseThrow()).isEqualTo(progress);
