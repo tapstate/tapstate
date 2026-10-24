@@ -325,7 +325,13 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             var result=new ArrayList<SrsConsumerMembership>();var names=new java.util.TreeSet<String>();
             for(var row:SystemCollections.SRS_CONSUMERS.on(database).find(session,new Document("pipelineId",original.pipelineId())
                     .append("_id.cacheIncarnation",scope.cacheIncarnation())))names.add(records.membership(row).context().key().miningChainId());
-            for(String name:names)for(var member:view(session,name).members().values())if(member.context().key().pipelineId().equals(original.pipelineId())) {
+            // A missing scoped relation cannot hide a quarantined root's complete control receipt.
+            for(var row:SystemCollections.SRS_CHAINS.on(database).find(session,new Document("recoveryControl",new Document("$exists",true)))
+                    .projection(new Document("_id",1))) {
+                if(!(row.get("_id") instanceof String name) || name.isBlank())throw unreadableStructure();
+                names.add(name);
+            }
+            for(String name:names)for(var member:administrativeView(session,name).members().values())if(member.context().key().pipelineId().equals(original.pipelineId())) {
                 if(member.context().stateGeneration()>original.stateGeneration())throw MongoCachePipelinePreparations.rebuild(original);
                 if(member.context().stateGeneration()==original.stateGeneration())result.add(member);
             }
@@ -412,7 +418,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             }
         }
         for (String name : names) {
-            requireActive.run(); var retained = view(session, name);
+            requireActive.run(); var retained = administrativeView(session, name);
             for (var member : retained.members().values()) if (member.context().key().pipelineId().equals(original.pipelineId())
                     && (!member.detached() || member.context().stateGeneration() > original.stateGeneration()))
                 throw MongoCachePipelinePreparations.rebuild(original);
@@ -733,17 +739,33 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     }
 
     private record View(Document root, SrsChainState state, Map<String, SrsConsumerMembership> members,
-                        Map<String, MongoSrsConsumerRecords.Cursor> cursors) {}
+                        Map<String, MongoSrsConsumerRecords.Cursor> cursors, List<Document> membershipRows, List<Document> cursorRows) {}
 
     private View view(ClientSession session, String chain) {
         Document root = SystemCollections.SRS_CHAINS.on(database).find(session, new Document("_id", chain)).first();
         if (root == null) throw unavailable(chain);
         SrsChainState state = chains.state(session, root);
+        return relations(session,chain,root,state);
+    }
+    /** Isolated control receipts can prove old detached relationships, never model/event continuation. */
+    private View administrativeView(ClientSession session,String chain) {
+        var root=SystemCollections.SRS_CHAINS.on(database).find(session,new Document("_id",chain)).first();
+        if(root==null)throw unavailable(chain);
+        var isolation=MongoSrsRecoveryControls.read(root);
+        if(isolation.isEmpty())return relations(session,chain,root,chains.state(session,root));
+        var state=MongoSrsChainStore.controlState(root,scope,new MongoSrsModelContexts(database,scope));
+        var view=relations(session,chain,root,state);
+        MongoSrsRecoveryControls.verify(root,view.membershipRows(),view.cursorRows());
+        if(isolation.orElseThrow().phase()==MongoSrsRecoveryControls.Phase.RETIRED && (state.consumerCount()!=0 || !view.cursors().isEmpty()))throw unavailable(chain);
+        return view;
+    }
+    private View relations(ClientSession session,String chain,Document root,SrsChainState state) {
+        var membershipRows=new ArrayList<Document>();var cursorRows=new ArrayList<Document>();
         var members = new HashMap<String, SrsConsumerMembership>();
         long revisions = 0;
         try (var cursor = SystemCollections.SRS_CONSUMERS.on(database).find(session, records.chain(chain)).iterator()) {
             while (cursor.hasNext()) {
-                SrsConsumerMembership member = records.membership(cursor.next());
+                var row=cursor.next();SrsConsumerMembership member = records.membership(row);membershipRows.add(row);
                 if (!chain.equals(member.context().key().miningChainId()) || members.put(member.context().key().consumerId(), member) != null) throw unavailable(chain);
                 try { revisions = Math.addExact(revisions, member.revision()); }
                 catch (ArithmeticException invalid) { throw unavailable(chain); }
@@ -753,6 +775,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         try (var cursor = SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(database).find(session, records.chain(chain)).iterator()) {
             while (cursor.hasNext()) {
                 Document row = cursor.next();
+                cursorRows.add(row);
                 if (!(row.get("_id") instanceof Document id) || !(id.get("consumer") instanceof String consumer)) throw unavailable(chain);
                 SrsConsumerMembership member = members.get(consumer);
                 if (member == null || member.detached() || cursors.put(consumer, records.cursor(member, row)) != null) throw unavailable(chain);
@@ -760,7 +783,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         }
         long active = members.values().stream().filter(member -> !member.detached()).count();
         if (active != state.consumerCount() || cursors.size() != active || revisions != state.consumerRevision()) throw unavailable(chain);
-        return new View(root, state, members, cursors);
+        return new View(root, state, members, cursors,membershipRows,cursorRows);
     }
     private void prove(ClientSession session,SrsConsumerContext context,WorkloadClaimFence fence) {
         Objects.requireNonNull(fence,"originalPipelineFence");

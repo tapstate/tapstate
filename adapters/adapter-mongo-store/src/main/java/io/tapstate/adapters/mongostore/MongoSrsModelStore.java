@@ -192,7 +192,10 @@ public final class MongoSrsModelStore implements SrsModelStore {
         return transaction(session -> {
             requireBusiness(session);
             try {
-                var reference = eventReference(session, ring, expected.captureEpoch(), expected.modelVersion(), originalCapture, false);
+                if(originalCapture==null)throw eventUnavailable(ring,expected.captureEpoch(),expected.modelVersion());
+                if(originalCapture.key().type()!=WorkloadClaimType.CAPTURE || !scope.clusterId().equals(originalCapture.key().clusterId()))throw claimFenced();
+                var chain = requireChain(session, expected);
+                var reference = eventReference(session, ring, expected.captureEpoch(), expected.modelVersion(), originalCapture, false, chain);
                 if (!expected.equals(reference.model().key())) throw eventUnavailable(ring, expected.captureEpoch(), expected.modelVersion());
                 reference.range().requireAt(sequence, ring, expected.captureEpoch(), expected.modelVersion());
                 return reference.model();
@@ -390,6 +393,7 @@ public final class MongoSrsModelStore implements SrsModelStore {
     }
     private Document requireChain(Document chain, SrsModelKey key) {
         if (chain == null || !scope.cacheIncarnation().equals(chain.get("cacheIncarnation"))) throw unavailable(key);
+        MongoSrsRecoveryControls.requireOrdinary(chain);
         if (!key.miningChainId().equals(chain.get("_id"))) throw unavailable(key);
         if (!(chain.get("epoch") instanceof Long epoch) || epoch < 1 || !(chain.get("captureId") instanceof String capture) || capture.isBlank()
                 || !(chain.get("modelWriteFence") instanceof Long revision) || revision < 0 || revision == Long.MAX_VALUE) throw unreadable();
@@ -409,20 +413,31 @@ public final class MongoSrsModelStore implements SrsModelStore {
 
     /** An unseen ring may be inspected only when no published ordering anchor or retained data contradicts it. */
     void checkRing(ClientSession session, String ring) {
-        Document retained = SystemCollections.SRS_MODELS.on(database).find(session,
-                new Document("cacheIncarnation", scope.cacheIncarnation()).append("ringName", ring)).first();
         var control = contexts.firstOnRing(session, ring);
+        Document chain;
+        if (control != null) {
+            try { chain = requireChain(session, control.key()); }
+            catch (TapstateException missing) {
+                if (missing.code() == IoError.SRS_MODEL_UNAVAILABLE) throw eventUnavailable(ring, control.key().captureEpoch(), 0);
+                throw missing;
+            }
+        }
+        else {
+            chain = SystemCollections.SRS_CHAINS.on(database).find(session,
+                    new Document("cacheIncarnation", scope.cacheIncarnation()).append("modelContextHeads.ringName", ring)).first();
+            if (chain != null) MongoSrsRecoveryControls.requireOrdinary(chain);
+        }
+        Document retained = SystemCollections.SRS_MODELS.on(database).find(session,
+                new Document("cacheIncarnation", scope.cacheIncarnation()).append("ringName", ring)).projection(new Document("_id",1)).first();
         Document bounds = SystemCollections.SRS_LOG_BOUNDS.on(database).find(session, new Document("_id", MongoSrsLogStore.boundsId(ring))).first();
         if (control == null) {
-            Document known = SystemCollections.SRS_CHAINS.on(database).find(session,
-                    new Document("cacheIncarnation", scope.cacheIncarnation()).append("modelContextHeads.ringName", ring)).first();
-            if (known != null || retained != null || bounds != null
+            if (chain != null || retained != null || bounds != null
                     || SystemCollections.SRS_EVENTS.on(database).find(session, MongoSrsLogStore.ringRange(ring, Long.MAX_VALUE)).limit(1).first() != null) {
                 throw eventUnavailable(ring, 0, 0);
             }
         } else {
             if (bounds == null || retained == null) throw eventUnavailable(ring, control.key().captureEpoch(), 0);
-            try { contexts.requireAnchor(session, requireChain(session, control.key()), control); }
+            try { contexts.requireAnchor(session, chain, control); }
             catch (TapstateException missing) {
                 if (missing.code() == IoError.SRS_MODEL_UNAVAILABLE) throw eventUnavailable(ring, control.key().captureEpoch(), 0);
                 throw missing;
@@ -460,6 +475,9 @@ public final class MongoSrsModelStore implements SrsModelStore {
         return eventReference(session, ring, event.epoch(), event.schemaVer(), event.captureFence(), writing).range();
     }
     private ModelReference eventReference(ClientSession session, String ring, long epoch, long version, WorkloadClaimFence fence, boolean writing) {
+        return eventReference(session,ring,epoch,version,fence,writing,null);
+    }
+    private ModelReference eventReference(ClientSession session, String ring, long epoch, long version, WorkloadClaimFence fence, boolean writing,Document originalRoot) {
         if (version < 0 || epoch < 1 || fence == null) throw eventUnavailable(ring, epoch, version);
         if (fence.key().type() != WorkloadClaimType.CAPTURE || !scope.clusterId().equals(fence.key().clusterId())) throw claimFenced();
         var candidates = SystemCollections.SRS_MODELS.on(database).find(session, new Document("cacheIncarnation", scope.cacheIncarnation())
@@ -468,7 +486,7 @@ public final class MongoSrsModelStore implements SrsModelStore {
         if (candidates.isEmpty()) throw eventUnavailable(ring, epoch, version);
         if (candidates.size() != 1) throw unreadable();
         SrsModel model = decode(candidates.getFirst());
-        Document chain = requireChain(session, model.key());
+        Document chain = originalRoot==null?requireChain(session, model.key()):requireChain(originalRoot,model.key());
         var control = contexts.find(session, model.key());
         if (control == null) throw unavailable(model.key());
         contexts.requireAnchor(session, chain, control);

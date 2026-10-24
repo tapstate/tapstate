@@ -434,6 +434,96 @@ class MongoCachePipelineRebuildsIT {
     }
 
     /** Real CONFIG/CACHE grants and fences; source tokens are synthetic, without a connector invocation. */
+    @ParameterizedTest @ValueSource(strings={"CANCELLED","RETIRED"})
+    void quarantinedSharedPayloadsCannotBeReadOrMutatedThroughAnIntactSiblingTable(String phase) {
+        withFixture(true,f -> {
+            var shared=preparedSharedFull(f);
+            quarantine(f,shared,phase);
+            assertThat(SystemCollections.SRS_MODELS.on(f.cache).deleteMany(new Document("_id.chain",shared.chain).append("_id.table","orders")).getDeletedCount()).isEqualTo(1);
+            assertThat(SystemCollections.SRS_EVENTS.on(f.cache).deleteMany(MongoSrsLogStore.ringRange(shared.ring("orders"),Long.MAX_VALUE)).getDeletedCount()).isEqualTo(1);
+            var quiet=shared.checkpoint.tables().get("quiet").model();
+            var log=new MongoSrsLogStore(f.cacheClient,SystemCollections.SRS_EVENTS.on(f.cache),SystemCollections.SRS_LOG_BOUNDS.on(f.cache),
+                    SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.cache),shared.models);
+            var resources=java.util.List.of(SystemCollections.SRS_CHAINS,SystemCollections.SRS_MODELS,SystemCollections.SRS_MODEL_CONTEXTS,
+                    SystemCollections.SRS_CONSUMERS,SystemCollections.CACHE_SRS_CONSUMER_OFFSETS,SystemCollections.SRS_EVENTS,SystemCollections.SRS_LOG_BOUNDS);
+            var snapshot=resources.stream().map(resource -> resource.on(f.cache).find().into(new java.util.ArrayList<>())).toList();
+            assertCode(() -> shared.models.requireEvent(shared.checkpoint.tables().get("orders").model(),shared.ring("orders"),0,shared.capture),
+                    IoError.CAPTURE_STATE_REBUILD_REQUIRED);
+            assertCode(() -> shared.models.load(quiet),IoError.CAPTURE_STATE_REBUILD_REQUIRED);
+            assertCode(() -> shared.chains.load(shared.chain),IoError.CAPTURE_STATE_REBUILD_REQUIRED);
+            assertCode(() -> shared.consumers.attached(shared.chain),IoError.CAPTURE_STATE_REBUILD_REQUIRED);
+            assertCode(() -> log.load(shared.ring("quiet"),0),IoError.CAPTURE_STATE_REBUILD_REQUIRED);
+            assertCode(() -> shared.chains.openEpoch(shared.chain,2,shared.capture),IoError.CAPTURE_STATE_REBUILD_REQUIRED);
+            assertCode(() -> log.trim(shared.ring("quiet"),0,shared.capture),IoError.CAPTURE_STATE_REBUILD_REQUIRED);
+            var retained=shared.consumers.forPipeline(shared.run.scope());
+            assertThat(retained).hasSize(1);assertThat(retained.getFirst().detached()).isEqualTo(phase.equals("RETIRED"));
+            try(var session=f.cacheClient.startSession()) {
+                session.withTransaction(() -> {
+                    shared.consumers.requireDetachedPipeline(session,new PipelineIntentScope(f.business.clusterId(),f.business.bindingVersion(),
+                            f.business.cacheIncarnation(),"unrelated",1));return null;
+                });
+            }
+            if(phase.equals("RETIRED"))try(var session=f.cacheClient.startSession()) {
+                session.withTransaction(() -> {shared.consumers.requireDetachedPipeline(session,shared.run.scope());return null;});
+            }
+            else assertCode(() -> {
+                try(var session=f.cacheClient.startSession()) {
+                    session.withTransaction(() -> {shared.consumers.requireDetachedPipeline(session,shared.run.scope());return null;});
+                }
+            },IoError.PIPELINE_STATE_REBUILD_REQUIRED);
+            assertThat(resources.stream().map(resource -> resource.on(f.cache).find().into(new java.util.ArrayList<>())).toList()).isEqualTo(snapshot);
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"digest","missing-relation","unexpected-cursor","root"})
+    void anUnreadableQuarantineReceiptCannotProvePipelineAbsenceOrRetirement(String damage) {
+        withFixture(true,f -> {
+            var shared=preparedSharedFull(f);var filter=new MongoSrsConsumerRecords(f.business).chain(shared.chain);
+            var oldCursor=SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.cache).find(filter).first();
+            var held=quarantine(f,shared,"RETIRED");
+            SystemCollections.SRS_MODELS.on(f.cache).deleteMany(new Document("_id.chain",shared.chain).append("_id.table","orders"));
+            var altered=new Document(held);
+            switch(damage) {
+                case "digest" -> altered.put("recoveryControl",new Document(held.get("recoveryControl",Document.class)).append("controlHash","f".repeat(64)));
+                case "missing-relation" -> {
+                    assertThat(SystemCollections.SRS_CONSUMERS.on(f.cache).deleteMany(filter).getDeletedCount()).isEqualTo(1);
+                    altered.put("consumerRevision",0L);
+                }
+                case "unexpected-cursor" -> SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.cache).insertOne(oldCursor);
+                case "root" -> altered.put("epoch",held.getLong("epoch")+1);
+                default -> throw new AssertionError(damage);
+            }
+            assertThat(SystemCollections.SRS_CHAINS.on(f.cache).replaceOne(held,altered).getMatchedCount()).isEqualTo(1);
+            var before=f.snapshot();
+            assertThatThrownBy(() -> shared.consumers.forPipeline(shared.run.scope())).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> {
+                try(var session=f.cacheClient.startSession()) {
+                    session.withTransaction(() -> {
+                        shared.consumers.requireDetachedPipeline(session,new PipelineIntentScope(f.business.clusterId(),f.business.bindingVersion(),
+                                f.business.cacheIncarnation(),"unrelated",1));return null;
+                    });
+                }
+            }).isInstanceOf(TapstateException.class);
+            assertThat(f.snapshot()).isEqualTo(before);
+            assertThat(SystemCollections.SRS_CHAINS.on(f.cache).find(new Document("_id",shared.chain)).first()).isEqualTo(altered);
+        });
+    }
+
+    private static Document quarantine(Fixture f,SharedFull shared,String phase) {
+    if(phase.equals("RETIRED"))assertThat(shared.consumers.detach(shared.run.context(),shared.run.membershipRevision(),
+            shared.run.originalClaim()).orElseThrow().detached()).isTrue();
+    var chainRows=SystemCollections.SRS_CHAINS.on(f.cache);var before=chainRows.find(new Document("_id",shared.chain)).first();
+    var filter=new MongoSrsConsumerRecords(f.business).chain(shared.chain);
+    var memberships=SystemCollections.SRS_CONSUMERS.on(f.cache).find(filter).into(new java.util.ArrayList<>());
+    var cursors=SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.cache).find(filter).into(new java.util.ArrayList<>());
+    var birth=f.configuration.capturePreparations().read(f.business,shared.capture.key().resourceId()).orElseThrow();
+    String operation=java.util.UUID.randomUUID().toString();
+    var held=MongoSrsRecoveryControls.candidate(before,operation,"c".repeat(64),MongoCapturePreparationFacts.replacementChain(birth,operation),
+            MongoSrsRecoveryControls.Phase.valueOf(phase),memberships,cursors);
+    assertThat(chainRows.replaceOne(before,held).getMatchedCount()).isEqualTo(1);
+        return held;
+    }
+
     private static SharedFull preparedSharedFull(Fixture f) {
         var inputs = f.sharedInputs(f.scope);
         var originalClaim = f.advance("flow");

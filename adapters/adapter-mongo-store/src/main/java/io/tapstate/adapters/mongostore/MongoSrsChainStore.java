@@ -209,7 +209,8 @@ public final class MongoSrsChainStore implements SrsChainStore {
         return SystemCollections.SRS_CHAINS.on(database).find(session, new Document("_id", chain)).first();
     }
     Document requireRoot(ClientSession session, String chain) {
-        Document row = root(session, chain); if (row == null) throw unproven(chain); return row;
+        Document row = root(session, chain); if (row == null) throw unproven(chain);
+        MongoSrsRecoveryControls.requireOrdinary(row); return row;
     }
     private boolean hasRetainedFacts(ClientSession session, String chain) {
         for (var table : List.of(SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS, SystemCollections.SRS_CONSUMERS, SystemCollections.CACHE_SRS_CONSUMER_OFFSETS)) {
@@ -240,6 +241,14 @@ public final class MongoSrsChainStore implements SrsChainStore {
     }
     private SrsChainState decode(Document row) { return decode(row, scope, new MongoSrsModelContexts(database, scope)); }
     static SrsChainState decode(Document row, CacheBusinessScope scope, MongoSrsModelContexts contexts) {
+        var result=controlState(row,scope,contexts);
+        MongoSrsRecoveryControls.requireOrdinary(row);return result;
+    }
+    /** Typed control parsing does not validate or authorize a checkpoint's model/event payloads. */
+    static SrsChainState controlState(Document row, CacheBusinessScope scope, MongoSrsModelContexts contexts) {
+        return decodeOriginalControl(MongoSrsRecoveryControls.originalControlRoot(row),scope,contexts);
+    }
+    private static SrsChainState decodeOriginalControl(Document row, CacheBusinessScope scope, MongoSrsModelContexts contexts) {
         try {
             if (!row.keySet().equals(Set.of("_id", "formatVersion", "cacheIncarnation", "captureId", "captureFence", "retention", "epoch",
                     "requestedTables", "servingTables", "modelContextHeads", "modelWriteFence", "checkpointRevision", "checkpoint", "checkpointAt", "consumerCount", "consumerRevision", "resumeOverride"))

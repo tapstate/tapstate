@@ -855,10 +855,10 @@ class MongoSrsModelStoreIT {
             f.models().publish(model(0, table("original", null)), f.fence());
             models(f.database()).deleteMany(new Document());
             SystemCollections.SRS_LOG_BOUNDS.on(f.database()).deleteMany(new Document());
-            SystemCollections.SRS_CHAINS.on(f.database()).insertOne(new Document("_id", "chain-b").append("epoch", 8L)
-                    .append("cacheIncarnation", SCOPE.cacheIncarnation()).append("captureId", "capture-b").append("modelContextHeads", List.of()).append("modelWriteFence", 0L));
             var other = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database())).acquire(
                     new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.CAPTURE, "capture-b"), new WorkloadOwner("node-b", "boot-b"), 1, Duration.ofSeconds(30)).claim();
+            SystemCollections.SRS_CHAINS.on(f.database()).insertOne(MongoSrsChainStore.initialRow(SCOPE,"chain-b",null,WorkloadClaimFence.from(other))
+                    .append("epoch",8L));
             var stolen = new SrsModel(new SrsModelKey("chain-b", "orders", SCOPE.cacheIncarnation(), 8, 0), RING, table("replacement", null), 0);
             assertThatThrownBy(() -> f.models().publish(stolen, WorkloadClaimFence.from(other))).satisfies(MongoSrsModelStoreIT::unavailable);
             assertThat(models(f.database()).countDocuments()).isZero();
