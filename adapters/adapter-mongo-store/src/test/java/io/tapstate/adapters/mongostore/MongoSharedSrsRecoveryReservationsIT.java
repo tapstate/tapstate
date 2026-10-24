@@ -529,6 +529,166 @@ class MongoSharedSrsRecoveryReservationsIT {
         });
     }
 
+    @Test void cancellationExcludesTheOriginalAttemptWithoutChangingItsConfigOrCreatingReplacementHistory() {
+        withFixture(f -> {
+            f.endAffectedTenures();var reservation=f.configuration.sharedRecoveryPreparations().reserve(f.confirmed());
+            var config=rows(f.config);var cache=rows(f.cache);var originalRoot=f.chain(f.previous.chainId());
+            var cancelled=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).cancel(reservation,f.node);
+            assertThat(cancelled.outcome()).isEqualTo(SharedSrsRecoveryReceipt.Outcome.CANCELLED);
+            assertThat(cancelled.preparation().plan()).isEqualTo(reservation.plan());
+            assertThat(cancelled.preparation().replacement()).isEqualTo(reservation.replacement());cancelled.requireCurrent();
+            var root=f.chain(f.previous.chainId());var control=root.get("recoveryControl",Document.class);
+            assertThat(root.getInteger("formatVersion")).isEqualTo(2);
+            assertThat(control.getString("phase")).isEqualTo("CANCELLED");
+            assertThat(control.getString("operationId")).isEqualTo(reservation.plan().operationId());
+            assertThat(control.getString("planHash")).isEqualTo(reservation.plan().planHash());
+            assertThat(control.getString("replacementChain")).isEqualTo(reservation.replacement().chainId());
+            assertThat(control.getString("controlHash")).matches("[0-9a-f]{64}");
+            assertThat(root.getLong("modelWriteFence")).isEqualTo(originalRoot.getLong("modelWriteFence")+1);
+            var normalized=new Document(root);normalized.remove("recoveryControl");normalized.put("formatVersion",originalRoot.get("formatVersion"));
+            normalized.put("modelWriteFence",originalRoot.get("modelWriteFence"));assertThat(normalized).isEqualTo(originalRoot);
+            var after=rows(f.cache);
+            for(var entry:cache.entrySet()) {
+                if(entry.getKey().equals(SystemCollections.SRS_CHAINS.collectionName()) || entry.getKey().equals(SystemCollections.CACHE_IDENTITY.collectionName()))continue;
+                if(entry.getKey().equals(SystemCollections.CACHE_WORKLOAD_CLAIMS.collectionName())) {
+                    for(var before:entry.getValue()) {
+                        if(before.getString("resourceType").equals(WorkloadClaimType.NODE_SESSION.name()))continue;
+                        assertThat(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.cache).find(new Document("_id",before.get("_id"))).first()).isEqualTo(before);
+                    }
+                } else assertThat(after.get(entry.getKey())).isEqualTo(entry.getValue());
+            }
+            assertThat(f.chain(reservation.replacement().chainId())).isNull();assertThat(rows(f.config)).isEqualTo(config);
+            assertThatThrownBy(() -> f.domain.srs(f.scope,ACTIVE).chains().load(f.previous.chainId())).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> f.domain.sharedSrsRecoveries(f.scope,ACTIVE).replace(reservation,f.node)).isInstanceOf(TapstateException.class);
+            var replay=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).cancel(reservation,f.node);replay.requireCurrent();
+            assertThat(replay.outcome()).isEqualTo(SharedSrsRecoveryReceipt.Outcome.CANCELLED);
+            assertThat(replay.preparation().replacement()).isEqualTo(reservation.replacement());
+            assertThat(rows(f.cache)).isEqualTo(after);assertThat(rows(f.config)).isEqualTo(config);
+        });
+    }
+
+    @Test void cancellationRecognizesAnAlreadyAppliedReplacementAndAllowsItsOriginalCompletion() {
+        withFixture(f -> {
+            f.endAffectedTenures();var reservation=f.configuration.sharedRecoveryPreparations().reserve(f.confirmed());
+            f.domain.sharedSrsRecoveries(f.scope,ACTIVE).replace(reservation,f.node).requireCurrent();
+            var config=rows(f.config);var cache=rows(f.cache);
+            var result=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).cancel(reservation,f.node);result.requireCurrent();
+            assertThat(result.outcome()).isEqualTo(SharedSrsRecoveryReceipt.Outcome.RETIRED);
+            assertThat(rows(f.config)).isEqualTo(config);assertThat(rows(f.cache)).isEqualTo(cache);
+            assertThat(f.configuration.sharedRecoveryPreparations().complete(result).phase()).isEqualTo(Phase.COMPLETE);
+            assertThat(rows(f.cache)).isEqualTo(cache);
+        });
+    }
+
+    @Test void concurrentCancellationAndReplacementResolveOnlyAtTheOriginalRoot() {
+        withFixture(f -> {
+            f.endAffectedTenures();var reservation=f.configuration.sharedRecoveryPreparations().reserve(f.confirmed());
+            var config=rows(f.config);
+            try(var threads=Executors.newFixedThreadPool(2)) {
+                var start=new CountDownLatch(1);
+                var cancel=threads.submit(() -> {start.await();return f.domain.sharedSrsRecoveries(f.scope,ACTIVE).cancel(reservation,f.node);});
+                var replace=threads.submit(() -> {
+                    start.await();try {return Optional.of(f.domain.sharedSrsRecoveries(f.scope,ACTIVE).replace(reservation,f.node));}
+                    catch(TapstateException refused){return Optional.<SharedSrsRecoveryReceipt>empty();}
+                });
+                start.countDown();var cancelled=cancel.get(20,TimeUnit.SECONDS);var replaced=replace.get(20,TimeUnit.SECONDS);
+                cancelled.requireCurrent();String phase=f.chain(f.previous.chainId()).get("recoveryControl",Document.class).getString("phase");
+                assertThat(phase).isEqualTo(cancelled.outcome().name());
+                if(cancelled.outcome()==SharedSrsRecoveryReceipt.Outcome.CANCELLED) {
+                    assertThat(replaced).isEmpty();assertThat(f.chain(reservation.replacement().chainId())).isNull();
+                } else {
+                    assertThat(replaced).isPresent();assertThat(replaced.orElseThrow().outcome()).isEqualTo(SharedSrsRecoveryReceipt.Outcome.RETIRED);
+                    assertThat(f.chain(reservation.replacement().chainId())).isNotNull();
+                }
+                var committed=rows(f.cache);
+                assertThat(f.domain.sharedSrsRecoveries(f.scope,ACTIVE).cancel(reservation,f.node).outcome()).isEqualTo(cancelled.outcome());
+                assertThat(rows(f.cache)).isEqualTo(committed);assertThat(rows(f.config)).isEqualTo(config);
+            }
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"before-commit","after-commit"})
+    void cancellationAuthorizationCutsRollBackOrRetainTheSingleCancellation(String cut) {
+        withFixture(f -> {
+            f.endAffectedTenures();var reservation=f.configuration.sharedRecoveryPreparations().reserve(f.confirmed());
+            var config=rows(f.config);var cache=rows(f.cache);var calls=new java.util.concurrent.atomic.AtomicInteger();
+            int failAt=cut.equals("before-commit")?3:4;
+            var guarded=f.domain.sharedSrsRecoveries(f.scope,() -> {
+                if(calls.incrementAndGet()==failAt)throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);
+            });
+            assertThatThrownBy(() -> guarded.cancel(reservation,f.node)).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+            if(cut.equals("before-commit"))assertThat(rows(f.cache)).isEqualTo(cache);
+            else {
+                var committed=rows(f.cache);var replay=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).cancel(reservation,f.node);replay.requireCurrent();
+                assertThat(replay.outcome()).isEqualTo(SharedSrsRecoveryReceipt.Outcome.CANCELLED);assertThat(rows(f.cache)).isEqualTo(committed);
+            }
+            assertThat(rows(f.config)).isEqualTo(config);
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"claim","late-member"})
+    void cancellationUsesCurrentTypedControlsWhenTheOriginalPreviewHasBecomeStale(String changed) {
+        withFixture(f -> {
+            f.endAffectedTenures();var reservation=f.configuration.sharedRecoveryPreparations().reserve(f.confirmed());
+            var claims=f.domain.workloadClaims(f.scope);
+            if(changed.equals("claim")) {
+                var acquired=claims.acquirePipeline(f.requests.get("a").pipeline(),OWNER,1,TTL).claim();
+                var renewed=claims.renew(acquired,TTL).orElseThrow();assertThat(claims.release(renewed)).isTrue();
+            } else {
+                var context=new SrsConsumerContext(new SrsConsumerKey(f.previous.chainId(),"c","input"),1);
+                f.domain.srs(f.scope,ACTIVE).consumers().attach(context,0,Set.of("orders"),f.requests.get("c").originalPipeline()).orElseThrow();
+            }
+            var config=rows(f.config);var members=SystemCollections.SRS_CONSUMERS.on(f.cache).find().sort(new Document("_id",1)).into(new ArrayList<>());
+            var offsets=SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.cache).find().sort(new Document("_id",1)).into(new ArrayList<>());
+            var receipt=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).cancel(reservation,f.node);receipt.requireCurrent();
+            assertThat(receipt.outcome()).isEqualTo(SharedSrsRecoveryReceipt.Outcome.CANCELLED);
+            assertThat(SystemCollections.SRS_CONSUMERS.on(f.cache).find().sort(new Document("_id",1)).into(new ArrayList<>())).isEqualTo(members);
+            assertThat(SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.cache).find().sort(new Document("_id",1)).into(new ArrayList<>())).isEqualTo(offsets);
+            assertThat(f.chain(reservation.replacement().chainId())).isNull();assertThat(rows(f.config)).isEqualTo(config);
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"root","model","context","member","offset","event","bounds"})
+    void cancellationCannotDeleteOrAdoptAnOccupiedReplacementNamespace(String occupied) {
+        withFixture(f -> {
+            f.endAffectedTenures();var reservation=f.configuration.sharedRecoveryPreparations().reserve(f.confirmed());
+            String chain=reservation.replacement().chainId(),ring="srs."+chain+".orders";
+            var table=switch(occupied) {
+                case "root" -> SystemCollections.SRS_CHAINS;case "model" -> SystemCollections.SRS_MODELS;
+                case "context" -> SystemCollections.SRS_MODEL_CONTEXTS;case "member" -> SystemCollections.SRS_CONSUMERS;
+                case "offset" -> SystemCollections.CACHE_SRS_CONSUMER_OFFSETS;case "event" -> SystemCollections.SRS_EVENTS;
+                case "bounds" -> SystemCollections.SRS_LOG_BOUNDS;default -> throw new AssertionError(occupied);
+            };
+            Object id=switch(occupied) {
+                case "root" -> chain;case "event" -> new Document("ring",ring).append("seq",0L);
+                case "bounds" -> "srs-log-bounds:"+ring;default -> new Document("chain",chain);
+            };
+            table.on(f.cache).insertOne(new Document("_id",id).append("unknown",true));
+            assertCancellationRefusesWithoutMutation(f,reservation);
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"annex","root","missing-root"})
+    void cancellationRefusesMissingOrConflictingOriginalControlsWithoutRepair(String damage) {
+        withFixture(f -> {
+            f.endAffectedTenures();var reservation=f.configuration.sharedRecoveryPreparations().reserve(f.confirmed());
+            if(damage.equals("annex"))SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.cache).updateOne(
+                    new Document("_id",MongoWorkloadClaimStore.id(reservation.plan().manifest().sharedSrs().captureFence().key())),
+                    new Document("$set",new Document("capturePreparation","unknown")));
+            else if(damage.equals("root"))SystemCollections.SRS_CHAINS.on(f.cache).updateOne(new Document("_id",f.previous.chainId()),
+                    new Document("$set",new Document("captureId","unknown")));
+            else SystemCollections.SRS_CHAINS.on(f.cache).deleteOne(new Document("_id",f.previous.chainId()));
+            assertCancellationRefusesWithoutMutation(f,reservation);
+        });
+    }
+
+    private static void assertCancellationRefusesWithoutMutation(Fixture f,SharedSrsRecoveryPreparation original) {
+        var cache=rows(f.cache);var config=rows(f.config);
+        assertThatThrownBy(() -> f.domain.sharedSrsRecoveries(f.scope,ACTIVE).cancel(original,f.node)).isInstanceOf(TapstateException.class);
+        assertThat(rows(f.cache)).isEqualTo(cache);assertThat(rows(f.config)).isEqualTo(config);
+    }
+
     private static void assertReplacementRefusesWithoutMutation(Fixture f,SharedSrsRecoveryPreparation original) {
         var cache=rows(f.cache);var config=rows(f.config);
         assertThatThrownBy(() -> f.domain.sharedSrsRecoveries(f.scope,ACTIVE).replace(original,f.node)).isInstanceOf(TapstateException.class);

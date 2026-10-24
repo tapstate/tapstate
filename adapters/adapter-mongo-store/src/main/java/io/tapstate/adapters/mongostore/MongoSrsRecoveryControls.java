@@ -88,6 +88,14 @@ final class MongoSrsRecoveryControls {
     /** An observation fingerprint for a live root; it grants neither an isolation receipt nor a replacement permission. */
     static String snapshotHash(Document root,List<Document> memberships,List<Document> cursors,List<Document> claims,List<Document> bounds) {
         if(read(root).isPresent())throw unreadable();
+        return observationHash(root,memberships,cursors,claims,bounds);
+    }
+    static String cancelledSnapshotHash(Document root,List<Document> memberships,List<Document> cursors,List<Document> claims,List<Document> bounds) {
+        if(read(root).orElseThrow(MongoSrsRecoveryControls::unreadable).phase()!=Phase.CANCELLED)throw unreadable();
+        verify(root,memberships,cursors);
+        return observationHash(root,memberships,cursors,claims,bounds);
+    }
+    private static String observationHash(Document root,List<Document> memberships,List<Document> cursors,List<Document> claims,List<Document> bounds) {
         var payload=new TreeMap<String,Object>();
         payload.put("root",canonical(root));
         payload.put("memberships",canonical(sorted(memberships)));payload.put("cursors",canonical(sorted(cursors)));

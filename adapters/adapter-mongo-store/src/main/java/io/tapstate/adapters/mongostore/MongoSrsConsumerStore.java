@@ -82,13 +82,24 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     }
     record SharedView(Document root,SharedSrsRecoverySnapshot snapshot,List<Document> memberships,List<Document> cursors,List<Document> claims) {}
     SharedView sharedRecoveryView(ClientSession session,CapturePreparation previous) {
+        return sharedRecoveryView(session,previous,null);
+    }
+    SharedView cancelledSharedRecoveryView(ClientSession session,CapturePreparation previous,String operation,String planHash,String replacement) {
+        var root=SystemCollections.SRS_CHAINS.on(database).find(session,new Document("_id",previous.chainId())).first();
+        if(root==null)throw unavailable(previous.chainId());
+        var control=MongoSrsRecoveryControls.read(root).orElseThrow(() -> unavailable(previous.chainId()));
+        if(control.phase()!=MongoSrsRecoveryControls.Phase.CANCELLED || !control.operationId().equals(operation)
+                || !control.planHash().equals(planHash) || !control.replacementChain().equals(replacement))throw unavailable(previous.chainId());
+        return sharedRecoveryView(session,previous,control);
+    }
+    private SharedView sharedRecoveryView(ClientSession session,CapturePreparation previous,MongoSrsRecoveryControls.Control cancellation) {
         if(!session.hasActiveTransaction())throw new IllegalStateException("shared controls require their CACHE transaction");
         Objects.requireNonNull(previous,"previous");String chain=previous.chainId();
         if(previous.mode()!=CapturePreparation.Mode.SHARED_SRS || !scope.equals(previous.scope()))throw unavailable(chain);
             try {
                 var root=SystemCollections.SRS_CHAINS.on(database).find(session,new Document("_id",chain)).first();
                 if(root==null || !chain.equals(root.get("_id")) || !previous.captureId().equals(root.get("captureId"))
-                        || MongoSrsRecoveryControls.read(root).isPresent())throw unavailable(chain);
+                        || !MongoSrsRecoveryControls.read(root).equals(Optional.ofNullable(cancellation)))throw unavailable(chain);
                 var contexts=new MongoSrsModelContexts(database,scope);
                 var state=MongoSrsChainStore.controlState(root,scope,contexts);
                 var held=relations(session,chain,root,state);
@@ -121,10 +132,18 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                 var rings=contexts.heads(root).stream().map(head -> head.getString("ringName")).collect(java.util.stream.Collectors.toSet());
                 var bounds=MongoSrsLogStore.inspectRetainedBounds(session,database,rings);
                 requireRecoveryBounds(held,contexts,bounds.byRing());
-                String hash=MongoSrsRecoveryControls.snapshotHash(root,held.membershipRows(),held.cursorRows(),claims,bounds.rows());
+                String hash=cancellation==null?MongoSrsRecoveryControls.snapshotHash(root,held.membershipRows(),held.cursorRows(),claims,bounds.rows())
+                        :MongoSrsRecoveryControls.cancelledSnapshotHash(root,held.membershipRows(),held.cursorRows(),claims,bounds.rows());
                 return new SharedView(root,new SharedSrsRecoverySnapshot(previous,capture,hash,actual,pipelines),
                         held.membershipRows(),held.cursorRows(),List.copyOf(claims));
             }catch(IllegalArgumentException|NullPointerException|ClassCastException invalid){throw unavailable(chain);}
+    }
+
+    SharedView cancelSharedRecovery(ClientSession session,SharedView current,io.tapstate.spi.store.StorageRecoveryCommands.Plan plan,String replacement) {
+        var cancelled=MongoSrsRecoveryControls.candidate(current.root(),plan.operationId(),plan.planHash(),replacement,
+                MongoSrsRecoveryControls.Phase.CANCELLED,current.memberships(),current.cursors());
+        chains.replace(session,current.root(),cancelled);
+        return cancelledSharedRecoveryView(session,current.snapshot().previous(),plan.operationId(),plan.planHash(),replacement);
     }
 
     void retireSharedRecovery(ClientSession session,SharedView original,io.tapstate.spi.store.StorageRecoveryCommands.Plan plan,String replacement) {
