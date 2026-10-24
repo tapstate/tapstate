@@ -24,6 +24,12 @@ class SrsFreshFullReceiptTest {
         assertThat(new SrsFreshFullReceipt(chain(), progress).progress()).isEqualTo(progress);
     }
 
+    @Test void aPendingRequestCannotInterpretALostRealCheckpointAsUnusedHistory() {
+        assertThatThrownBy(() -> new SrsChainState("chain", "capture", null, 2, Set.of("orders"), Set.of("orders"),
+                0, null, null, 1, 1, new SourceResumeOverride("fixed-cut", 1, Instant.EPOCH), FULL))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {"pipeline", "source", "generation", "missing-floor", "advanced-read"})
     void aDifferentConsumerOrIncompleteInitialFloorCannotSubstituteForTheOriginalPublication(String damage) {

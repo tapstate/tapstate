@@ -38,7 +38,7 @@ public record SrsChainState(String miningChainId, String captureId, String reten
                     || checkpoint != null && checkpoint.position().order().epoch() > resumeOverride.fromEpoch()))) {
             throw new IllegalArgumentException("incoherent SRS chain control");
         }
-        if (pendingFreshFull != null && (resumeOverride == null || pendingFreshFull.snapshotEpoch() > epoch
+        if (pendingFreshFull != null && (checkpoint == null || resumeOverride == null || pendingFreshFull.snapshotEpoch() > epoch
                 || pendingFreshFull.snapshotEpoch() != resumeOverride.fromEpoch() + 1
                 || !pendingFreshFull.models().keySet().containsAll(requestedTables)
                 || pendingFreshFull.models().values().stream().anyMatch(key -> !miningChainId.equals(key.miningChainId()))))
