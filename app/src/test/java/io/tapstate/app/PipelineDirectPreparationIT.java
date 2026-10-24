@@ -264,9 +264,10 @@ class PipelineDirectPreparationIT {
         when(ownership.renew(any())).thenAnswer(call -> claims.renew(call.getArgument(0),TTL));when(ownership.ttl()).thenReturn(TTL);
         doAnswer(call -> {claims.release(call.getArgument(0));return null;}).when(ownership).release(any());return ownership;
     }
-    private static io.tapstate.adapters.pdk.ConnectorProvisioner fixtureProvisioner() {
-        var provisioner=mock(io.tapstate.adapters.pdk.ConnectorProvisioner.class);var ref=new io.tapstate.adapters.pdk.ConnectorRef(List.of(),"not.loaded","2.0.8",null,null,"c".repeat(64),false);
-        when(provisioner.resolve("mongodb")).thenReturn(ref);when(provisioner.resolve("mongodb","c".repeat(64))).thenReturn(ref);return provisioner;
+    private static io.tapstate.adapters.pdk.ConnectorProvisioner fixtureProvisioner() {return fixtureProvisioner("c".repeat(64));}
+    private static io.tapstate.adapters.pdk.ConnectorProvisioner fixtureProvisioner(String hash) {
+        var provisioner=mock(io.tapstate.adapters.pdk.ConnectorProvisioner.class);var ref=new io.tapstate.adapters.pdk.ConnectorRef(List.of(),"not.loaded","2.0.8",null,null,hash,false);
+        when(provisioner.resolve("mongodb")).thenReturn(ref);when(provisioner.resolve("mongodb",hash)).thenReturn(ref);return provisioner;
     }
     private static HazelcastInstance sharedMember(SrsLogStore log) {
         var config=new com.hazelcast.config.Config().setClusterName("scoped-shared-native-"+UUID.randomUUID());
@@ -285,15 +286,42 @@ class PipelineDirectPreparationIT {
         }
         assertThat(run.snapshotProgress(pipeline).byTable()).containsOnlyKeys("orders","quiet");
     }
-    @ParameterizedTest @ValueSource(strings={"stable","changed-after-planning","unknown-model"})
+    @ParameterizedTest @ValueSource(strings={"stable","changed-after-planning","unknown-model","replacement"})
     void anExplicitFullPublishesTheNewActualShapeBeforeRowsAndANewConsumerKeepsItsPendingCutAcrossAnotherEpoch(String mode) {
         withFixture(f -> {
-            boolean changesAfterPlanning=mode.equals("changed-after-planning");
+            boolean changesAfterPlanning=mode.equals("changed-after-planning"),replacement=mode.equals("replacement");
             f.configuration.artifacts().save(pipeline("input",true,ReadMode.SNAPSHOT_AND_CDC,"latest",null));
             f.preparer(f.configuration,f.cache).prepare(f.scope,f.inputs());var claims=f.cache.workloadClaims(f.business());
             assertThat(f.configuration.intents().compareAndSet(f.scope,0,new io.tapstate.core.lifecycle.DesiredState("flow",
                     io.tapstate.core.lifecycle.PipelineState.RUNNING,io.tapstate.core.model.canonical.CanonicalHash.of(f.pipeline()),false))).isTrue();
             var firstFence=WorkloadClaimFence.from(claims.advanceExecution(claims.readPipeline(f.scope).orElseThrow().claim(),1,Set.of(OWNER.nodeId())).orElseThrow());
+            var provisioner=fixtureProvisioner();CapturePreparation physicalPreparation=null;
+            if(replacement) {
+                // This empty retained pool tests physical handoff, not partial payload loss or a registered connector.
+                f.configuration.bindings().complete(new StorageSetupScope("cluster","installation","setup",1));
+                f.configuration.firstAdmin().create(f.configuration.firstAdmin().load().orElseThrow().scope(),new User("admin","fixture-hash","admin"));
+                byte[] fixtureBytes="native-physical-handoff-fixture".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                var registration=f.cache.connectors(f.business(),ACTIVE).register("mongodb","2.0.8",RegistrationSource.REGISTER,fixtureBytes).registration();
+                provisioner=fixtureProvisioner(registration.contentHash());
+                var request=new CapturePreparationRequest(f.scope,firstFence,f.node,"input",f.inputs());
+                var creation=((CaptureCreationResult.Issued)f.configuration.capturePreparations().issueFirstCreate(request)).creation();
+                var birth=f.cache.capturePreparations(f.business(),ACTIVE).createFirst(creation).preparation();
+                var config=new CaptureConfig(f.source().connector(),f.source().config(),List.of("orders","quiet"),new PipelineNode("flow","input"),new SharedNotes(birth.canonicalChainId(),List.of()));
+                ConfiguredCaptureRun.prepare(new ExecutionFence(f.scope,firstFence),config,f.configuration.requiredNotes(),provisioner,ACTIVE);
+                var observed=f.cache.srs(f.business(),ACTIVE).consumers().inspectSharedRecovery(birth);
+                assertThat(observed.consumers()).isEmpty();assertThat(observed.pipelines()).isEmpty();
+                var auth=f.configuration.bindings().cachePreparation().orElseThrow().authScope();
+                var manifest=new StorageRecoveryCommands.Manifest(new StorageRecoveryCommands.Selection(StorageRecoveryCommands.Extent.SHARED_SRS,Set.of(),birth.canonicalChainId(),birth.chainId()),
+                        Set.of(),Map.of("input",io.tapstate.core.model.canonical.CanonicalHash.of(f.source())),
+                        io.tapstate.core.model.canonical.CanonicalHash.ofText(observed.controlHash()),f.configuration.configurationRevision(),observed);
+                var confirmed=f.configuration.recoveryCommands().confirm(f.configuration.recoveryCommands().plan(auth,manifest,null,null));
+                var reservation=f.configuration.sharedRecoveryPreparations().reserve(confirmed);
+                var applied=f.cache.sharedSrsRecoveries(f.business(),ACTIVE).replace(reservation,f.node);
+                assertThat(f.configuration.sharedRecoveryPreparations().complete(applied).phase()).isEqualTo(StorageRecoveryCommands.Phase.COMPLETE);
+                physicalPreparation=reservation.replacement();
+                assertThat(f.configuration.capturePreparations().read(f.business(),birth.captureId())).contains(physicalPreparation);
+                assertThat(physicalPreparation.chainId()).isNotEqualTo(physicalPreparation.canonicalChainId());
+            }
             var oldTable=new SourceTable("orders",List.of(new SourceField("id","INT")),List.of("id"),List.of());
             var changedTable=new SourceTable("orders",List.of(new SourceField("id","INT"),new SourceField("note","string")),List.of("id"),List.of());
             var quiet=new SourceTable("quiet",List.of(new SourceField("id","INT")),List.of("id"),List.of());
@@ -305,7 +333,7 @@ class PipelineDirectPreparationIT {
                         f.configuration.capturePreparations(),f.cache.capturePreparations(f.business(),ACTIVE),f.configuration.requiredNotes(),ignored -> false,
                         ScopedPipelineCaptureCoordinator.BoundedLoads.NONE,f.configuration.rebuilds()::completedFull),
                         new ScopedPipelineCaptureCoordinator.Execution(() -> Optional.of(f.node),authorization,cacheOwnership(f,OWNER),Duration.ofSeconds(10),ACTIVE,CLOCK),
-                        runtime,new SnapshotBuffer(8),fixtureProvisioner(),(fixed,config,guard,preparation,stream) -> {
+                        runtime,new SnapshotBuffer(8),provisioner,(fixed,config,guard,preparation,stream) -> {
                             if(changesAfterPlanning && preparation!=null && actual.get().get("orders").fields().size()==2)
                                 actual.set(Map.of("orders",new SourceTable("orders",List.of(new SourceField("id","INT"),
                                         new SourceField("note","string"),new SourceField("late","string")),List.of("id"),List.of()),"quiet",quiet));
@@ -315,6 +343,10 @@ class PipelineDirectPreparationIT {
                 var first=coordinator.forRun(f.scope,firstFence,new ExecutionFence(f.scope,firstFence));
                 first.startCapture("flow",ReadOnlyArtifactSnapshot.capture(f.configuration.artifacts()),SourceModelSnapshot.capture("flow",List.of(f.source()),f.cache.schemas(f.business(),ACTIVE)));
                 awaitLoadedCounts(first);var original=first.captureBindings().logged().get("input");
+                if(replacement) {
+                    assertThat(original.run().miningChainId()).isEqualTo(physicalPreparation.chainId());
+                    assertThat(original.canonicalChainId()).isEqualTo(physicalPreparation.canonicalChainId());
+                }
                 var oldPhysical=ports.stream().filter(port -> port.stream!=null).findFirst().orElseThrow();
                 oldPhysical.listener.get().onBatch(List.of(Envelope.insert(1,"orders",Map.of("id",2),null)),Optional.of(new SourcePosition("before-change")));
                 var oldCheckpoint=stores.chains().load(original.run().miningChainId()).orElseThrow().checkpoint();
@@ -341,7 +373,7 @@ class PipelineDirectPreparationIT {
                     public Optional<DiscoveredSourceModel> get(String id){return Optional.empty();}
                 }:f.cache.schemas(f.business(),ACTIVE);
                 var frozenModels=SourceModelSnapshot.capture("flow",List.of(f.source()),planningSchemas);
-                if(!mode.equals("stable")) {
+                if(!mode.equals("stable") && !replacement) {
                     if(mode.equals("unknown-model"))assertThat(frozenModels.model(f.source())).isNull();
                     else assertThat(frozenModels.model(f.source()).tables().stream().filter(table -> table.name().equals("orders")).findFirst().orElseThrow().fields())
                             .extracting(SourceField::name).containsExactly("id","note");
@@ -358,6 +390,11 @@ class PipelineDirectPreparationIT {
                 }
                 next.startCapture("flow",ReadOnlyArtifactSnapshot.capture(f.configuration.artifacts()),frozenModels);
                 awaitLoadedCounts(next);var binding=next.captureBindings().logged().get("input");
+                if(replacement) {
+                    assertThat(binding.run().miningChainId()).isEqualTo(physicalPreparation.chainId());
+                    assertThat(binding.canonicalChainId()).isEqualTo(physicalPreparation.canonicalChainId());
+                    buildBoundedDag(f,provisioner,next.captureBindings());
+                }
                 var pending=stores.chains().load(binding.run().miningChainId()).orElseThrow();
                 var pin=stores.consumers().progress(binding.run().context()).orElseThrow().snapshot();
                 assertThat(pending.checkpoint()).isEqualTo(oldCheckpoint);assertThat(pending.pendingFreshFull()).isNotNull();
@@ -689,13 +726,16 @@ class PipelineDirectPreparationIT {
             }).when(observed).prepareTargets(anyList());
             return observed;
         }).when(views).sinkPreparations(any(),any(),any());
-        var pass=new PipelineConvergencePass(new PipelineIntentSnapshot(f.scope,1,new io.tapstate.core.lifecycle.DesiredState(
-                "flow",io.tapstate.core.lifecycle.PipelineState.RUNNING,io.tapstate.core.model.canonical.CanonicalHash.of(f.pipeline()))),
-                new WorkloadClaimFence(new WorkloadClaimKey("cluster",WorkloadClaimType.PIPELINE_ACTUATION,"flow"),OWNER,
+        var scope=bindings.original().scope();
+        var intent=f.configuration.intents().load(scope.pipelineId()).orElseGet(() -> new PipelineIntentSnapshot(scope,1,
+                new io.tapstate.core.lifecycle.DesiredState(scope.pipelineId(),io.tapstate.core.lifecycle.PipelineState.RUNNING,
+                        io.tapstate.core.model.canonical.CanonicalHash.of(f.pipeline()))));
+        var pass=new PipelineConvergencePass(intent,
+                new WorkloadClaimFence(new WorkloadClaimKey(scope.clusterId(),WorkloadClaimType.PIPELINE_ACTUATION,scope.pipelineId()),OWNER,
                         bindings.original().claimGeneration(),bindings.original().executionGeneration(),bindings.original().topologyRevision()),views,ACTIVE);
         var source=new StoreBackedDagSource(mixed,new StoreBackedDagSource.PdkSinkWriterBinder(f.configuration.requiredNotes(),provisioner));
         var prepared=source.prepareStart(pass,"cache");pass.bindCapture(pass.claim(),bindings);
-        prepared.plan().build(bindings.original());return inputs.get();
+        assertThat(prepared.plan().build(bindings.original()).dag()).isNotNull();return inputs.get();
     }
     private static void awaitLoadedCounts(PipelineCaptureCoordinator run) throws InterruptedException {
         long deadline=System.nanoTime()+Duration.ofSeconds(10).toNanos();
