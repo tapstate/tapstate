@@ -128,6 +128,7 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands {
     }
     private Transition transitionResult(Plan original, Phase from, Phase to, boolean requireRevision, MongoCacheRecoveryStore stoppedScopes) {
         Objects.requireNonNull(original, "original");
+        if(original.manifest().selection().extent()==Extent.SHARED_SRS && to!=Phase.CONFIRMED)throw refused();
         return transaction(session -> {
             Document root = root(session, original.originalScope());
             Plan current = pending(root).orElseThrow(MongoStorageRecoveryCommands::refused);
@@ -204,23 +205,31 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands {
         if (!root.containsKey("pendingRecovery")) return Optional.empty();
         try {
             Object value = root.get("pendingRecovery");
-            if (!(value instanceof Document row) || !row.keySet().equals(Set.of("formatVersion", "operationId", "previousOperationId", "scope", "selection",
-                    "affectedPipelineIds", "definitionHashes", "dependencyHash", "configurationRevision", "planHash", "controlRevision", "phase"))
-                    || !Integer.valueOf(1).equals(row.get("formatVersion"))) throw unreadable();
+            if (!(value instanceof Document row))throw unreadable();
+            boolean shared=Integer.valueOf(2).equals(row.get("formatVersion"));
+            var fields=new java.util.HashSet<>(Set.of("formatVersion", "operationId", "previousOperationId", "scope", "selection",
+                    "affectedPipelineIds", "definitionHashes", "dependencyHash", "configurationRevision", "planHash", "controlRevision", "phase"));
+            if(shared)fields.add("sharedSrs");
+            if(!row.keySet().equals(fields) || !shared && !Integer.valueOf(1).equals(row.get("formatVersion")))throw unreadable();
+            if(shared)MongoSharedSrsRecoveryFacts.requireSize(row);
             Document scope = row.get("scope", Document.class);
             if (scope == null || !scope.keySet().equals(Set.of("clusterId", "bindingVersion", "mode", "cacheIncarnation", "authGeneration"))) throw unreadable();
             var auth = new CacheAuthScope(scope.getString("clusterId"), scope.getLong("bindingVersion"),
                     io.tapstate.spi.store.StorageBinding.Mode.valueOf(scope.getString("mode")), scope.getString("cacheIncarnation"), scope.getLong("authGeneration"));
             if (!auth.clusterId().equals(root.get("clusterId")) || !Long.valueOf(auth.bindingVersion()).equals(root.get("bindingVersion"))) throw unreadable();
             Document selected = row.get("selection", Document.class);
-            if (selected == null || !selected.keySet().equals(Set.of("extent", "pipelineIds"))) throw unreadable();
-            var selection = new Selection(Extent.valueOf(selected.getString("extent")), strings(selected.get("pipelineIds")));
+            if (selected == null || !selected.keySet().equals(shared?Set.of("extent","pipelineIds","canonicalChain","physicalChain"):Set.of("extent", "pipelineIds"))) throw unreadable();
+            var extent=Extent.valueOf(selected.getString("extent"));
+            if(shared!=(extent==Extent.SHARED_SRS))throw unreadable();
+            var selection = new Selection(extent, strings(selected.get("pipelineIds")),shared?selected.getString("canonicalChain"):null,shared?selected.getString("physicalChain"):null);
             Document hashes = row.get("definitionHashes", Document.class);
             if (hashes == null || hashes.values().stream().anyMatch(hash -> !(hash instanceof String))) throw unreadable();
             var definitions = new TreeMap<String,String>(); hashes.forEach((key, hash) -> definitions.put(key, (String) hash));
-            var manifest = new Manifest(selection, strings(row.get("affectedPipelineIds")), definitions, row.getString("dependencyHash"), row.getLong("configurationRevision"));
+            var manifest = new Manifest(selection, strings(row.get("affectedPipelineIds")), definitions, row.getString("dependencyHash"), row.getLong("configurationRevision"),
+                    shared?MongoSharedSrsRecoveryFacts.decode(row.get("sharedSrs",Document.class)):null);
             var result = new Plan(row.getString("operationId"), row.getString("previousOperationId"), auth, manifest, row.getString("planHash"), row.getLong("controlRevision"), Phase.valueOf(row.getString("phase")));
             if (!result.planHash().equals(hash(manifest))) throw unreadable();
+            if(shared && !encode(result).equals(row))throw unreadable();
             return Optional.of(result);
         } catch (IllegalArgumentException | ClassCastException | NullPointerException invalid) { throw unreadable(); }
     }
@@ -229,23 +238,33 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands {
         var result = new TreeSet<String>(); list.forEach(value -> result.add((String) value));
         if (result.size() != list.size()) throw unreadable(); return result;
     }
-    private static Document encode(Plan plan) {
+    static Document encode(Plan plan) {
         var scope = plan.originalScope(); var manifest = plan.manifest();
-        return new Document("formatVersion", 1).append("operationId", plan.operationId()).append("previousOperationId", plan.previousOperationId())
+        boolean shared=manifest.selection().extent()==Extent.SHARED_SRS;
+        var selection=new Document("extent", manifest.selection().extent().name()).append("pipelineIds", new ArrayList<>(manifest.selection().pipelineIds()));
+        if(shared)selection.append("canonicalChain",manifest.selection().canonicalChain()).append("physicalChain",manifest.selection().physicalChain());
+        var result=new Document("formatVersion", shared?2:1).append("operationId", plan.operationId()).append("previousOperationId", plan.previousOperationId())
                 .append("scope", new Document("clusterId", scope.clusterId()).append("bindingVersion", scope.bindingVersion())
                         .append("mode", scope.mode().name()).append("cacheIncarnation", scope.cacheIncarnation()).append("authGeneration", scope.authGeneration()))
-                .append("selection", new Document("extent", manifest.selection().extent().name()).append("pipelineIds", new ArrayList<>(manifest.selection().pipelineIds())))
+                .append("selection", selection)
                 .append("affectedPipelineIds", new ArrayList<>(manifest.affectedPipelineIds())).append("definitionHashes", new Document(manifest.definitionHashes()))
                 .append("dependencyHash", manifest.dependencyHash()).append("configurationRevision", manifest.configurationRevision())
                 .append("planHash", plan.planHash()).append("controlRevision", plan.controlRevision()).append("phase", plan.phase().name());
+        if(shared) {
+            result.append("sharedSrs",MongoSharedSrsRecoveryFacts.encode(manifest.sharedSrs()));
+            MongoSharedSrsRecoveryFacts.requireSize(result);
+        }
+        return result;
     }
     private static String hash(Manifest manifest) {
+        if(manifest.selection().extent()==Extent.SHARED_SRS)return MongoSharedSrsRecoveryFacts.hash(manifest);
         return CanonicalHash.ofText(JsonWriter.write(List.of(manifest.selection().extent().name(), new ArrayList<>(manifest.selection().pipelineIds()),
                 new ArrayList<>(manifest.affectedPipelineIds()), manifest.definitionHashes(), manifest.dependencyHash(), manifest.configurationRevision())));
     }
     private static boolean sameClosure(Manifest a, Manifest b) {
         return a.selection().equals(b.selection()) && a.affectedPipelineIds().equals(b.affectedPipelineIds())
-                && a.definitionHashes().equals(b.definitionHashes()) && a.dependencyHash().equals(b.dependencyHash());
+                && a.definitionHashes().equals(b.definitionHashes()) && a.dependencyHash().equals(b.dependencyHash())
+                && Objects.equals(a.sharedSrs(),b.sharedSrs());
     }
     private static boolean sameOriginal(Plan a, Plan b) {
         return a.operationId().equals(b.operationId()) && Objects.equals(a.previousOperationId(), b.previousOperationId()) && a.originalScope().equals(b.originalScope())

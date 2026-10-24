@@ -158,6 +158,41 @@ class MongoStorageRecoveryCommandsIT {
             assertThat(SystemCollections.STORAGE_RECOVERY.on(f.database).countDocuments()).isEqualTo(1);
         });
     }
+    @Test void aRetainedSharedPlanCannotUseTheGenericStartOrCompletionAsReplacementAuthority() {
+        withConfiguration(f -> {
+            var auth=f.scope();var business=new CacheBusinessScope(auth.clusterId(),auth.bindingVersion(),auth.cacheIncarnation());
+            String chain=io.tapstate.core.model.canonical.SourceCaptureIdentity.resolve(SOURCE.connector(),SOURCE.config(),null);
+            String captureId=io.tapstate.core.model.canonical.SourceCaptureIdentity.sharedCapture(chain);
+            var preparation=new CapturePreparation(business,CapturePreparation.Mode.SHARED_SRS,chain,captureId,
+                    io.tapstate.core.model.canonical.SourceCaptureIdentity.physical(SOURCE.connector(),SOURCE.config()),UUID.randomUUID().toString());
+            var owner=new WorkloadOwner("node","boot");
+            var capture=new WorkloadClaimFence(new WorkloadClaimKey(auth.clusterId(),WorkloadClaimType.CAPTURE,captureId),owner,1,1,0);
+            var claim=new WorkloadClaimFence(new WorkloadClaimKey(auth.clusterId(),WorkloadClaimType.PIPELINE_ACTUATION,"a"),owner,1,1,0);
+            var scope=new PipelineIntentScope(auth.clusterId(),auth.bindingVersion(),auth.cacheIncarnation(),"a",1);
+            var member=new SrsConsumerMembership(new SrsConsumerContext(new SrsConsumerKey(chain,"a","source"),1),1,false,Set.of("orders"),claim);
+            var observed=new SharedSrsRecoverySnapshot(preparation,capture,"a".repeat(64),List.of(member),
+                    Map.of("a",new SharedSrsRecoverySnapshot.Pipeline(scope,claim)));
+            var selection=new Selection(Extent.SHARED_SRS,Set.of(),chain,chain);
+            var definitions=f.manifest(new Selection(Extent.PIPELINE,Set.of("a")),Set.of("a"),"a".repeat(64));
+            var manifest=new Manifest(selection,Set.of("a"),definitions.definitionHashes(),definitions.dependencyHash(),f.domain.configurationRevision(),observed);
+            var plan=new Plan(UUID.randomUUID().toString(),null,auth,manifest,MongoSharedSrsRecoveryFacts.hash(manifest),manifest.configurationRevision()+1,Phase.CONFIRMED);
+            // A seeded retained plan proves decoding and refusal only; it supplies no actual CACHE control or handle.
+            var table=SystemCollections.STORAGE_RECOVERY.on(f.database);
+            table.updateOne(new Document("_id","cluster"),new Document("$set",new Document("pendingRecovery",MongoStorageRecoveryCommands.encode(plan))));
+            var before=table.find().first();long revision=f.domain.configurationRevision();
+            assertThat(f.domain.recoveryCommands().find(auth,plan.operationId())).contains(plan);
+            try(var reopened=MongoConfigurationDomain.open(f.settings,"cluster")) {
+                assertThat(reopened.bindings().cachePreparation().orElseThrow().authScope()).isEqualTo(auth);
+                assertThat(reopened.recoveryCommands().find(auth,plan.operationId())).contains(plan);
+            }
+            assertThatThrownBy(() -> f.domain.recoveryCommands().start(plan)).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(IoError.CACHE_BUSINESS_FENCED));
+            var running=new Plan(plan.operationId(),plan.previousOperationId(),auth,manifest,plan.planHash(),plan.controlRevision(),Phase.RUNNING);
+            assertThatThrownBy(() -> f.domain.recoveryCommands().complete(running)).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(IoError.CACHE_BUSINESS_FENCED));
+            assertThat(table.find().first()).isEqualTo(before);assertThat(f.domain.configurationRevision()).isEqualTo(revision);
+        });
+    }
     private static void withConfiguration(Scenario scenario) {
         try (var admin = MongoClients.create(MONGO.getReplicaSetUrl())) {
             var db = admin.getDatabase("recovery_commands_" + UUID.randomUUID().toString().replace("-", ""));
