@@ -81,8 +81,8 @@ final class StorageAuthentication implements AutoCloseable {
         if (verified.isEmpty()) return Optional.empty();
         Optional<String> organization = cloud.cloud()
                 ? original.managed(budget).clusterContext(presented).map(CloudSessionContext::organizationId) : Optional.empty();
-        if (cloud.cloud() && organization.isEmpty()) return Optional.empty();
         original.requireActive(budget);
+        if (cloud.cloud() && organization.isEmpty()) return Optional.empty();
         VerifiedToken identity = verified.orElseThrow();
         return Optional.of(new CredentialAuthentication(identity, Optional.of(original.bound.preparation().authScope()),
                 organization, () -> {
@@ -173,7 +173,6 @@ final class StorageAuthentication implements AutoCloseable {
                     : TokenService.isMachineToken(presented)
                             ? new TokenService(configuration.tokens(budget), secrets, clock).authenticate(presented)
                             : signer.verify(presented);
-            if (result.isPresent()) bound.cache().loadAuthScope(bound.preparation().authScope(), budget);
             requireActive(budget); return result;
         }
         void requireActive() { requireActive(new MongoReadBudget(AUTHORIZATION_READ_BUDGET)); }

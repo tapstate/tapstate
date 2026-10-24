@@ -201,10 +201,10 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         return new MongoCacheCloudSessionStore(facts(scope), connection.database(), () -> verifyAuthPresence(scope.mode()));
     }
 
-    /** A credential verification uses the same deadline for scope, session and revocation checks. */
+    /** A request-owned view retains its scope and deadline; each operation checks structures and fences. */
     public CloudSessionStore cloudSessions(CacheAuthScope scope, MongoReadBudget budget) {
         if (scope.mode() != StorageBinding.Mode.CLOUD) throw MongoCacheIdentity.fenced();
-        loadAuthScope(scope, Objects.requireNonNull(budget));
+        Objects.requireNonNull(budget, "budget").requireRemaining();
         return new MongoCacheCloudSessionStore(facts(scope), connection.database(),
                 () -> verifyAuthPresence(scope.mode(), budget), budget);
     }
