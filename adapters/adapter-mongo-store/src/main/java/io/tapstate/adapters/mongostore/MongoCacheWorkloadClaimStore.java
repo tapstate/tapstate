@@ -174,6 +174,9 @@ final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
     }
 
     private PipelineIntentScope decodeScope(Document row, WorkloadClaimKey key) {
+        return preparedScope(row,key,scope);
+    }
+    static PipelineIntentScope preparedScope(Document row,WorkloadClaimKey key,CacheBusinessScope scope) {
         try {
             if (!(row.get("pipelineScope") instanceof Document value) || !(value.get("bindingVersion") instanceof Long binding)
                     || !(value.get("stateGeneration") instanceof Long generation)) throw unreadableScope();

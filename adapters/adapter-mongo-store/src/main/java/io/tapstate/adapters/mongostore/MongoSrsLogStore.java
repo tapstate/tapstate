@@ -326,6 +326,22 @@ public final class MongoSrsLogStore implements SrsLogStore {
 
     SrsLogBounds boundsInSession(ClientSession session, String ring) { return splitBounds(session, ring); }
 
+    /** Strict retained bounds only; absence is hashed as absence and never converted into an old high-water mark. */
+    record RetainedBounds(Map<String,SrsLogBounds> byRing,List<Document> rows) {
+        RetainedBounds {byRing=Map.copyOf(byRing);rows=List.copyOf(rows);}
+    }
+    static RetainedBounds inspectRetainedBounds(ClientSession session,com.mongodb.client.MongoDatabase database,java.util.Set<String> rings) {
+        var ids=rings.stream().collect(java.util.stream.Collectors.toMap(MongoSrsLogStore::boundsId,ring -> ring));
+        if(ids.isEmpty())return new RetainedBounds(Map.of(),List.of());
+        var rows=SystemCollections.SRS_LOG_BOUNDS.on(database).find(session,new Document("_id",new Document("$in",ids.keySet()))).into(new ArrayList<>());
+        var known=new java.util.HashMap<String,SrsLogBounds>();
+        for(var row:rows) {
+            String ring=ids.get(row.get("_id"));
+            if(ring==null || known.put(ring,decodeSplitBounds(row))!=null)throw unreadableSplit("bounds");
+        }
+        return new RetainedBounds(known,rows);
+    }
+
     Optional<SrsLogRecord> loadInSession(ClientSession session, String ring, long sequence) {
         return Optional.ofNullable(collection.find(session, new Document("_id", key(ring, sequence))).first())
                 .map(row -> checkedRecord(session, ring, row));

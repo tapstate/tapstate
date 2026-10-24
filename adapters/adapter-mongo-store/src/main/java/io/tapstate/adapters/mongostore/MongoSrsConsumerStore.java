@@ -24,6 +24,7 @@ import io.tapstate.spi.store.SrsConsumerKey;
 import io.tapstate.spi.store.SrsConsumerMembership;
 import io.tapstate.spi.store.SrsConsumerStore;
 import io.tapstate.spi.store.SrsConsumerTopology;
+import io.tapstate.spi.store.SharedSrsRecoverySnapshot;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.CapturePreparation;
@@ -74,6 +75,93 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     @Override public MongoSrsConsumerStore guardedBy(Runnable additional) {
         Objects.requireNonNull(additional, "requireActive");
         return new MongoSrsConsumerStore(client, database, scope, () -> { requireActive.run(); additional.run(); }, requireStructure);
+    }
+
+    @Override public SharedSrsRecoverySnapshot inspectSharedRecovery(CapturePreparation previous) {
+        Objects.requireNonNull(previous,"previous");String chain=previous.chainId();
+        if(previous.mode()!=CapturePreparation.Mode.SHARED_SRS || !scope.equals(previous.scope()))throw unavailable(chain);
+        return transaction(session -> {
+            try {
+                var root=SystemCollections.SRS_CHAINS.on(database).find(session,new Document("_id",chain)).first();
+                if(root==null || !chain.equals(root.get("_id")) || !previous.captureId().equals(root.get("captureId"))
+                        || MongoSrsRecoveryControls.read(root).isPresent())throw unavailable(chain);
+                var contexts=new MongoSrsModelContexts(database,scope);
+                var state=MongoSrsChainStore.controlState(root,scope,contexts);
+                var held=relations(session,chain,root,state);
+                requireRecoveryCoordinates(held,contexts);
+                var table=SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
+                var reader=new MongoWorkloadClaimStore(table).inStrictSession(session);
+                var captureKey=new io.tapstate.spi.store.WorkloadClaimKey(scope.clusterId(),WorkloadClaimType.CAPTURE,previous.captureId());
+                var captureRow=table.find(session,new Document("_id",MongoWorkloadClaimStore.id(captureKey))).first();
+                if(captureRow==null || !previous.equals(MongoCaptureCachePreparations.requirePreparation(captureRow,captureKey,scope))
+                        || !(captureRow.get("fencedChainWrites") instanceof Long writes) || writes<1 || writes>=Long.MAX_VALUE-1)throw unavailable(chain);
+                var capture=WorkloadClaimFence.from(reader.decodeStored(captureRow));
+                if(!MongoPositionFences.retained(WorkloadClaimDocuments.readCapture(root.get("captureFence",Document.class)),capture))throw unavailable(chain);
+                var claims=new ArrayList<Document>();claims.add(captureRow);
+                var pipelines=new java.util.TreeMap<String,SharedSrsRecoverySnapshot.Pipeline>();
+                var actual=held.members().values().stream().filter(member -> !member.detached())
+                        .sorted(Comparator.comparing(member -> member.context().key().consumerId())).toList();
+                for(var member:actual) {
+                    String pipeline=member.context().key().pipelineId();var retained=pipelines.get(pipeline);
+                    if(retained==null) {
+                        var key=new io.tapstate.spi.store.WorkloadClaimKey(scope.clusterId(),WorkloadClaimType.PIPELINE_ACTUATION,pipeline);
+                        var row=table.find(session,new Document("_id",MongoWorkloadClaimStore.id(key))).first();
+                        if(row==null)throw unavailable(chain);
+                        var physical=MongoCacheWorkloadClaimStore.preparedScope(row,key,scope);
+                        retained=new SharedSrsRecoverySnapshot.Pipeline(physical,WorkloadClaimFence.from(reader.decodeStored(row)));
+                        pipelines.put(pipeline,retained);claims.add(row);
+                    }
+                    if(retained.scope().stateGeneration()!=member.context().stateGeneration()
+                            || !MongoPositionFences.retained(member.commandFence(),retained.claim()))throw unavailable(chain);
+                }
+                var rings=contexts.heads(root).stream().map(head -> head.getString("ringName")).collect(java.util.stream.Collectors.toSet());
+                var bounds=MongoSrsLogStore.inspectRetainedBounds(session,database,rings);
+                requireRecoveryBounds(held,contexts,bounds.byRing());
+                String hash=MongoSrsRecoveryControls.snapshotHash(root,held.membershipRows(),held.cursorRows(),claims,bounds.rows());
+                return new SharedSrsRecoverySnapshot(previous,capture,hash,actual,pipelines);
+            }catch(IllegalArgumentException|NullPointerException|ClassCastException invalid){throw unavailable(chain);}
+        });
+    }
+
+    private void requireRecoveryCoordinates(View held,MongoSrsModelContexts contexts) {
+        String chain=held.state().miningChainId();long epoch=held.state().epoch();
+        var heads=new HashMap<String,Long>();
+        for(var head:contexts.heads(held.root())) {
+            long captureEpoch=head.get("contextId",Document.class).get("captureContext",Document.class).getLong("epoch");
+            if(captureEpoch>epoch)throw unavailable(chain);
+            heads.put(head.getString("table"),captureEpoch);
+        }
+        if(!heads.keySet().containsAll(held.state().servingTables()))throw unavailable(chain);
+        var checkpoint=held.state().checkpoint();
+        if(checkpoint!=null)for(var entry:checkpoint.tables().entrySet()) {
+            var key=entry.getValue().model();
+            if(!chain.equals(key.miningChainId()) || !scope.cacheIncarnation().equals(key.cacheIncarnation())
+                    || key.captureEpoch()!=checkpoint.position().order().epoch() || !heads.containsKey(entry.getKey())
+                    || heads.get(entry.getKey())<key.captureEpoch())throw unavailable(chain);
+        }
+        for(var cursor:held.cursors().values())if(cursor.snapshot()!=null)for(var key:cursor.snapshot().models().values())
+            requireRecoveryModelCoordinate(key,chain,epoch,heads);
+        if(held.state().pendingFreshFull()!=null)for(var key:held.state().pendingFreshFull().models().values())
+            requireRecoveryModelCoordinate(key,chain,epoch,heads);
+    }
+    private void requireRecoveryModelCoordinate(SrsModelKey key,String chain,long epoch,Map<String,Long> heads) {
+        if(!chain.equals(key.miningChainId()) || !scope.cacheIncarnation().equals(key.cacheIncarnation()) || key.captureEpoch()>epoch
+                || !heads.containsKey(key.table()) || heads.get(key.table())<key.captureEpoch())throw unavailable(chain);
+    }
+    private void requireRecoveryBounds(View held,MongoSrsModelContexts contexts,Map<String,io.tapstate.spi.store.SrsLogBounds> bounds) {
+        var rings=new HashMap<String,String>();contexts.heads(held.root()).forEach(head -> rings.put(head.getString("table"),head.getString("ringName")));
+        String chain=held.state().miningChainId();
+        if(held.state().checkpoint()!=null)held.state().checkpoint().tables().forEach((table,at) -> requireRecoveryBound(chain,table,at.sequence(),rings,bounds));
+        for(var cursor:held.cursors().values()) {
+            cursor.value().perTableSeq().forEach((table,sequence) -> requireRecoveryBound(chain,table,sequence,rings,bounds));
+            cursor.ringDoneThrough().forEach((table,sequence) -> requireRecoveryBound(chain,table,sequence,rings,bounds));
+        }
+    }
+    private void requireRecoveryBound(String chain,String table,long sequence,Map<String,String> rings,Map<String,io.tapstate.spi.store.SrsLogBounds> bounds) {
+        String ring=rings.get(table);
+        if(ring==null) {if(sequence>=0)throw unavailable(chain);return;}
+        var retained=bounds.get(ring);
+        if(retained!=null && sequence>retained.largestSequence())throw unavailable(chain);
     }
 
     @Override public SrsFreshFullPreparation inspectFreshFull(CompletedPipelineFull full, SrsConsumerRun original,

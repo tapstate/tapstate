@@ -8,6 +8,10 @@ import java.util.Set;
 /** Logged-capture membership is independent from each consumer's cursor and the source checkpoint. */
 public interface SrsConsumerStore {
     SrsConsumerStore guardedBy(Runnable requireActive);
+    /** Reads the complete original control closure without loading lost payloads or granting recovery authority. */
+    default SharedSrsRecoverySnapshot inspectSharedRecovery(CapturePreparation previous) {
+        throw new io.tapstate.core.common.TapstateException(IoError.SRS_CONSUMER_UNAVAILABLE,Map.of("chain",previous.chainId()),null);
+    }
     /** Loads coherent original-generation relations, including detach markers, for lifecycle retirement only. */
     default List<SrsConsumerMembership> forPipeline(PipelineIntentScope original) {
         throw new io.tapstate.core.common.TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null);

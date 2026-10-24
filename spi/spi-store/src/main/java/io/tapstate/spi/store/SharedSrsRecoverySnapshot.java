@@ -24,7 +24,7 @@ public record SharedSrsRecoverySnapshot(CapturePreparation previous, WorkloadCla
                 || !previous.scope().clusterId().equals(captureFence.key().clusterId())
                 || !previous.captureId().equals(captureFence.key().resourceId()) || !advanceable(captureFence)
                 || controlHash == null || !controlHash.matches("[0-9a-f]{64}")
-                || consumers == null || consumers.isEmpty() || pipelines == null || pipelines.isEmpty())
+                || consumers == null || pipelines == null)
             throw new IllegalArgumentException("invalid shared recovery control closure");
         var ordered = new TreeMap<String, Pipeline>();
         for (var entry : pipelines.entrySet()) {

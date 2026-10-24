@@ -85,6 +85,19 @@ final class MongoSrsRecoveryControls {
         if (!control.controlHash().equals(digest(root, memberships, cursors))) throw unreadable();
     }
 
+    /** An observation fingerprint for a live root; it grants neither an isolation receipt nor a replacement permission. */
+    static String snapshotHash(Document root,List<Document> memberships,List<Document> cursors,List<Document> claims,List<Document> bounds) {
+        if(read(root).isPresent())throw unreadable();
+        var payload=new TreeMap<String,Object>();
+        payload.put("root",canonical(root));
+        payload.put("memberships",canonical(sorted(memberships)));payload.put("cursors",canonical(sorted(cursors)));
+        payload.put("claims",sortedMetadata(claims));payload.put("bounds",sortedMetadata(bounds));
+        return CanonicalHash.ofText(JsonWriter.write(payload));
+    }
+    private static List<Object> sortedMetadata(List<Document> rows) {
+        return rows.stream().map(MongoSrsRecoveryControls::canonical).sorted(Comparator.comparing(JsonWriter::write)).toList();
+    }
+
     private static String digest(Document root, List<Document> memberships, List<Document> cursors) {
         var fixed = new Document(root);
         var control = new Document(root.get("recoveryControl", Document.class));

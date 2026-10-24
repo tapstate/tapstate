@@ -75,6 +75,11 @@ class SharedSrsRecoverySnapshotTest {
         assertInvalid(List.of(consumer), Map.of("a", pipeline("a", 1, BUSINESS), "b", pipeline("b", 1, BUSINESS)));
     }
 
+    @Test void anEmptyObservedClosureCarriesNoInventedPipelineOrConsumer() {
+        var observed=snapshot(List.of(),Map.of());
+        assertThat(observed.consumers()).isEmpty();assertThat(observed.pipelines()).isEmpty();
+    }
+
     @Test void oldPhysicalCoordinatesAndBothClaimClustersMustMatch() {
         var wrongChain = new SrsConsumerMembership(new SrsConsumerContext(new SrsConsumerKey("other", "a", "source"), 1),
                 1, false, Set.of("table"), claim("cluster", WorkloadClaimType.PIPELINE_ACTUATION, "a", 1));
