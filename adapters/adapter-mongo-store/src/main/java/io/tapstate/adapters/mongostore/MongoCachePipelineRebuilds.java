@@ -206,7 +206,34 @@ final class MongoCachePipelineRebuilds implements PipelineCacheRebuilds {
         try { return MongoPipelinePreparationFacts.scope(row.get("pipelineScope", Document.class)); }
         catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw rebuild(expected); }
     }
-    private static void requirePriorMarker(Document row, PipelineIntentScope scope, String preparationId, Document state) {
+    /** Checks historical birth facts without requiring the birth owner's lease or adopting another generation. */
+    static void requireCompletedTarget(ClientSession session, MongoDatabase database, PipelineIntentScope target,
+                                       CompletedPipelineFull full, Document row, Document state) {
+        var original = MongoPipelineStateRebuilds.originalFullCoordinates(full);
+        if (row == null || state == null || !target.equals(original.targetScope()) || !row.containsKey("pipelineRebuild")
+                || !target.equals(MongoPipelinePreparationFacts.scope(row.get("pipelineScope", Document.class)))
+                || !target.equals(MongoPipelinePreparationFacts.scope(state.get("scope", Document.class)))
+                || MongoCachePipelinePreparations.phase(row, target) != PipelineCachePreparations.Phase.PREPARED
+                || !original.preparationId().equals(row.get("pipelinePreparation", Document.class).get("preparationId"))) throw fenced();
+        requirePriorMarker(row, target, original.preparationId(), state);
+        var marker = row.get("pipelineRebuild", Document.class);
+        var claim = WorkloadClaimDocuments.readPipeline(marker.get("claim", Document.class));
+        var current = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database))
+                .inStrictSession(session).decodeStored(row);
+        if (!original.operationId().equals(marker.get("operationId")) || !original.confirmationHash().equals(marker.get("confirmationHash"))
+                || !original.originalScope().equals(MongoPipelinePreparationFacts.scope(marker.get("originalScope", Document.class)))
+                || !original.previousPreparationId().equals(marker.get("previousPreparationId"))
+                || !original.issuerNode().equals(WorkloadClaimDocuments.readNode(marker.get("issuerNode", Document.class)))
+                || original.checkpointEpoch() != marker.getLong("checkpointEpoch")
+                || claim.claimGeneration() != original.originalClaim().claimGeneration() + 1
+                || claim.executionGeneration() != original.originalClaim().executionGeneration()
+                || claim.topologyRevision() != original.originalClaim().topologyRevision()
+                || claim.topologyRevision() > current.topologyRevision()
+                || !MongoPipelineSourcePreparations.retained(session, database, target)
+                        .equals(MongoPipelineStateRebuilds.originalFullInputs(full))) throw fenced();
+    }
+
+    static void requirePriorMarker(Document row, PipelineIntentScope scope, String preparationId, Document state) {
         if (!row.containsKey("pipelineRebuild")) return;
         try {
             var marker = row.get("pipelineRebuild", Document.class);

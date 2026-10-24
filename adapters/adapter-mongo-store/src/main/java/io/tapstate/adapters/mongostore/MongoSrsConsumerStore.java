@@ -26,6 +26,15 @@ import io.tapstate.spi.store.SrsConsumerStore;
 import io.tapstate.spi.store.SrsConsumerTopology;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimType;
+import io.tapstate.spi.store.CapturePreparation;
+import io.tapstate.spi.store.CompletedPipelineFull;
+import io.tapstate.spi.store.SrsConsumerRun;
+import io.tapstate.spi.store.SrsFreshFull;
+import io.tapstate.spi.store.SrsFreshFullPreparation;
+import io.tapstate.spi.store.SrsFreshFullReceipt;
+import io.tapstate.spi.store.SrsModel;
+import io.tapstate.spi.store.SrsModelKey;
+import io.tapstate.spi.store.SourceTable;
 import org.bson.Document;
 
 import java.util.ArrayList;
@@ -65,6 +74,175 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     @Override public MongoSrsConsumerStore guardedBy(Runnable additional) {
         Objects.requireNonNull(additional, "requireActive");
         return new MongoSrsConsumerStore(client, database, scope, () -> { requireActive.run(); additional.run(); }, requireStructure);
+    }
+
+    @Override public SrsFreshFullPreparation inspectFreshFull(CompletedPipelineFull full, SrsConsumerRun original,
+            long expectedProgressRevision, WorkloadClaimFence node, WorkloadClaimFence capture) {
+        Objects.requireNonNull(original, "original"); requireRevision(expectedProgressRevision);
+        MongoPipelineStateRebuilds.originalFullInputs(full);
+        if (!scope.equals(original.cacheScope()) || !original.scope().equals(full.targetScope())) throw fenced();
+        var prepared = MongoPipelineStateRebuilds.originalFullCapture(full, original.sourceId(), original.miningChainId());
+        var result = transaction(session -> {
+            proveFreshFull(session, full, original, node, capture, prepared);
+            var held = view(session, original.miningChainId());
+            requireFreshFull(session, held, original, expectedProgressRevision, capture,
+                    MongoPipelineStateRebuilds.originalFullInputs(full));
+            return new FreshFull(full, original, expectedProgressRevision, node, capture, prepared, held);
+        });
+        if (!prepared.equals(MongoPipelineStateRebuilds.originalFullCapture(full, original.sourceId(), original.miningChainId())))
+            throw fullUnproven(original.miningChainId());
+        return result;
+    }
+
+    private void proveFreshFull(ClientSession session, CompletedPipelineFull full, SrsConsumerRun original,
+            WorkloadClaimFence node, WorkloadClaimFence capture, CapturePreparation prepared) {
+        new MongoCacheBusinessIdentity(database, scope).admitMetadataWrite(session);
+        MongoCachePipelinePreparations.proveNode(session, database, scope, node);
+        prove(session, original.context(), original.originalClaim()); chains.prove(session, capture);
+        var access = new MongoCachePipelineAccess(client, database, original.scope(), original.originalClaim(), requireActive);
+        var state = access.state(session);
+        var claim = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session,
+                new Document("_id", MongoWorkloadClaimStore.id(original.originalClaim().key()))).first();
+        MongoCachePipelineRebuilds.requireCompletedTarget(session, database, original.scope(), full, claim, state);
+        var captureRow = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session,
+                new Document("_id", MongoWorkloadClaimStore.id(capture.key()))).first();
+        if (captureRow == null || !prepared.equals(MongoCaptureCachePreparations.requirePreparation(captureRow, capture.key(), scope)))
+            throw fullUnproven(original.miningChainId());
+    }
+
+    private Own requireFullConsumer(View held, SrsConsumerRun original, WorkloadClaimFence capture) {
+        String chain = original.miningChainId();
+        if (!WorkloadClaimDocuments.readCapture(held.root().get("captureFence", Document.class)).equals(capture))
+            throw fullUnproven(chain);
+        var member = held.members().get(original.context().key().consumerId());
+        if (member == null || member.detached() || !member.context().equals(original.context())
+                || member.revision() != original.membershipRevision() || !member.commandFence().equals(original.originalClaim()))
+            throw fullUnproven(chain);
+        return new Own(member, held.cursors().get(original.context().key().consumerId()));
+    }
+
+    private void requireFreshFull(ClientSession session, View held, SrsConsumerRun original, long expectedRevision,
+            WorkloadClaimFence capture, io.tapstate.spi.store.PipelinePreparationInputs inputs) {
+        String chain = original.miningChainId(); var own = requireFullConsumer(held, original, capture); var state = held.state();
+        var cursor = own.cursor(); var progress = cursor.value(); var selected = inputs.selectedTables().get(original.sourceId());
+        if (state.checkpoint() == null || state.epoch() <= state.checkpoint().position().order().epoch()
+                || state.resumeOverride() != null || state.consumerCount() != 1
+                || held.members().values().stream().anyMatch(member -> !member.detached() && !member.context().equals(original.context()))
+                || !own.member().tables().equals(selected) || !selected.containsAll(state.servingTables())
+                || !state.requestedTables().equals(selected) || !state.checkpoint().tables().keySet().equals(selected)
+                || cursor.revision() != expectedRevision || cursor.revision() >= Long.MAX_VALUE - 1
+                || cursor.snapshot() != null || cursor.writerRun() != null || !cursor.ringDoneThrough().isEmpty()
+                || progress.sinkAcked() != null || !progress.sinkAckedByTable().isEmpty() || !progress.snapshotCompletedTables().isEmpty()
+                || progress.snapshotEpoch() != 0 || progress.cdcStartPosition() != null
+                || !progress.perTableSeq().keySet().equals(selected) || progress.perTableSeq().values().stream().anyMatch(value -> value != -1))
+            throw fullUnproven(chain);
+        var epoch = new Document("_id.chain", chain).append("_id.captureContext.epoch", state.epoch()).append("cacheIncarnation", scope.cacheIncarnation());
+        if (SystemCollections.SRS_MODELS.on(database).find(session, epoch).limit(1).first() != null
+                || SystemCollections.SRS_MODEL_CONTEXTS.on(database).find(session, epoch).limit(1).first() != null) throw fullUnproven(chain);
+    }
+
+    private static TapstateException fullUnproven(String chain) {
+        return new TapstateException(IoError.SRS_FULL_PREPARATION_UNPROVEN, Map.of("chain", chain), null);
+    }
+
+    private final class FreshFull implements SrsFreshFullPreparation {
+        private final CompletedPipelineFull full;
+        private final SrsConsumerRun original;
+        private final long progressRevision;
+        private final WorkloadClaimFence node, capture;
+        private final CapturePreparation prepared;
+        private final View before;
+        private SrsFreshFullReceipt proposed;
+        private Document proposedRoot;
+        private String fixedPosition;
+        private Map<String, SourceTable> fixedTables;
+        private java.time.Instant fixedAt;
+
+        FreshFull(CompletedPipelineFull full, SrsConsumerRun original, long progressRevision,
+                WorkloadClaimFence node, WorkloadClaimFence capture, CapturePreparation prepared, View before) {
+            this.full = full; this.original = original; this.progressRevision = progressRevision;
+            this.node = node; this.capture = capture; this.prepared = prepared; this.before = before;
+        }
+
+        @Override public SrsChainState originalChain() { return before.state(); }
+
+        @Override public synchronized SrsFreshFullReceipt publish(long snapshotEpoch, String sourcePosition,
+                Map<String, SourceTable> actualTables, java.time.Instant preparedAt) {
+            String chain = original.miningChainId(); var actual = Map.copyOf(actualTables);
+            if (snapshotEpoch != before.state().epoch() || sourcePosition == null || sourcePosition.isBlank()
+                    || !actual.keySet().equals(before.state().requestedTables())
+                    || actual.entrySet().stream().anyMatch(entry -> !entry.getKey().equals(entry.getValue().name()))) throw fullUnproven(chain);
+            var at = Objects.requireNonNull(preparedAt, "preparedAt").truncatedTo(java.time.temporal.ChronoUnit.MILLIS);
+            if (fixedPosition == null) { fixedPosition = sourcePosition; fixedTables = actual; fixedAt = at; }
+            else if (!fixedPosition.equals(sourcePosition) || !fixedTables.equals(actual)) throw fullUnproven(chain);
+            requireCaptureCurrent();
+            var result = transaction(session -> {
+                proveFreshFull(session, full, original, node, capture, prepared);
+                var held = view(session, chain);
+                if (proposed != null && held.root().equals(proposedRoot)) return retained(session, held, snapshotEpoch, sourcePosition, actual);
+                if (!held.root().equals(before.root())) throw fullUnproven(chain);
+                requireFreshFull(session, held, original, progressRevision, capture, MongoPipelineStateRebuilds.originalFullInputs(full));
+                var own = requireFullConsumer(held, original, capture);
+                var models = new MongoSrsModelStore(client, database, scope, requireActive, requireStructure);
+                var proposals = new java.util.TreeMap<String, SrsModel>();
+                var references = new java.util.TreeMap<String, SrsModelKey>();
+                var floors = new java.util.TreeMap<String, Long>();
+                for (var entry : new java.util.TreeMap<>(actual).entrySet()) {
+                    String table = entry.getKey();
+                    var previous = models.requireSnapshotReference(session, held.state().checkpoint().tables().get(table).model());
+                    var bounds = SystemCollections.SRS_LOG_BOUNDS.on(database).find(session,
+                            new Document("_id", MongoSrsLogStore.boundsId(previous.ringName()))).first();
+                    if (bounds == null || bounds.getLong("largestSequence") >= Long.MAX_VALUE - 1) throw fullUnproven(chain);
+                    long largest = bounds.getLong("largestSequence");
+                    var key = new SrsModelKey(chain, table, scope.cacheIncarnation(), snapshotEpoch, 0);
+                    proposals.put(table, new SrsModel(key, previous.ringName(), entry.getValue(), largest + 1));
+                    references.put(table, key); floors.put(table, largest);
+                }
+                var pending = new SrsFreshFull(full.origin(original.sourceId()), snapshotEpoch, references);
+                var request = MongoSrsSourceRequests.stored(new SourceResumeOverride(sourcePosition, snapshotEpoch - 1, fixedAt), pending);
+                // Each publication reloads the root in this same session, preserving the earlier table's head.
+                for (var proposal : proposals.values()) {
+                    models.publishInSession(session, proposal, capture); requireActive.run();
+                }
+                var snapshot = new SrsSnapshotPin(snapshotEpoch, sourcePosition, references);
+                var offset = new ConsumerOffset(original.context().key().consumerId(), floors, null, List.of(),
+                        sourcePosition, snapshotEpoch, Map.of(), io.tapstate.spi.store.ConsumerProgressKind.SRS);
+                var cursor = records.cursor(own.member(), offset, progressRevision + 1, snapshot, null, floors);
+                if (SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(database).replaceOne(session,
+                        new Document("_id", records.id(original.context().key())).append("membershipRevision", original.membershipRevision())
+                                .append("progressRevision", progressRevision), cursor).getMatchedCount() != 1) throw fullUnproven(chain);
+                var latest = chains.requireRoot(session, chain);
+                var replacement = new Document(latest).append("resumeOverride", request)
+                        .append("servingTables", actual.keySet().stream().sorted().toList());
+                chains.replace(session, latest, replacement);
+                proveFreshFull(session, full, original, node, capture, prepared);
+                var candidate = new SrsFreshFullReceipt(chains.state(session, replacement), new SrsConsumerProgress(original.context(),
+                        original.membershipRevision(), progressRevision + 1, offset, snapshot, null, floors));
+                // A candidate is never a commit receipt: a retry must prove its exact durable root and cursor.
+                proposed = candidate; proposedRoot = new Document(replacement);
+                return candidate;
+            });
+            requireCaptureCurrent();
+            return result;
+        }
+
+        private void requireCaptureCurrent() {
+            if (!prepared.equals(MongoPipelineStateRebuilds.originalFullCapture(full, original.sourceId(), original.miningChainId())))
+                throw fullUnproven(original.miningChainId());
+        }
+
+        private SrsFreshFullReceipt retained(ClientSession session, View held, long epoch, String position, Map<String, SourceTable> actual) {
+            String chain = original.miningChainId(); var own = requireFullConsumer(held, original, capture);
+            var current = new SrsConsumerProgress(original.context(), own.member().revision(), own.cursor().revision(), own.cursor().value(),
+                    own.cursor().snapshot(), own.cursor().writerRun(), own.cursor().ringDoneThrough());
+            if (!held.root().equals(proposedRoot) || !held.state().equals(proposed.chain()) || !current.equals(proposed.progress())
+                    || epoch != proposed.progress().snapshot().snapshotEpoch()
+                    || !position.equals(proposed.progress().snapshot().sourcePosition())) throw fullUnproven(chain);
+            var models = new MongoSrsModelStore(client, database, scope, requireActive, requireStructure);
+            for (var entry : proposed.progress().snapshot().models().entrySet())
+                if (!models.requireSnapshotReference(session, entry.getValue()).table().equals(actual.get(entry.getKey()))) throw fullUnproven(chain);
+            return proposed;
+        }
     }
 
     SourcePositionEdits positions(WorkloadClaimFence node, java.time.Duration retention) {
@@ -422,7 +600,26 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     }
     @Override public Optional<SrsConsumerMembership> detach(SrsConsumerContext context, long expectedRevision, WorkloadClaimFence fence) {
         Objects.requireNonNull(context, "context"); requireRevision(expectedRevision);
-        return transaction(session -> { prove(session,context,fence);return detachInTransaction(session,context,expectedRevision,fence); });
+        return transaction(session -> {
+            prove(session, context, fence);
+            var held = view(session, context.key().miningChainId());
+            var member = held.members().get(context.key().consumerId());
+            if (member != null && !member.detached() && member.context().equals(context)
+                    && held.cursors().get(context.key().consumerId()).snapshot() != null) {
+                var physical = new io.tapstate.spi.store.PipelineIntentScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation(),
+                        context.key().pipelineId(), context.stateGeneration());
+                var row = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session,
+                        new Document("_id", MongoWorkloadClaimStore.id(fence.key()))).first();
+                if (row != null && row.containsKey("pipelineRebuild")) {
+                    var access = new MongoCachePipelineAccess(client, database, physical, fence, requireActive);
+                    MongoCachePipelineRebuilds.requirePriorMarker(row, physical,
+                            row.get("pipelinePreparation", Document.class).getString("preparationId"), access.state(session));
+                    // Only the original explicit rebuild/retirement paths may discard this full's fixed pin.
+                    throw fullUnproven(context.key().miningChainId());
+                }
+            }
+            return detachInTransaction(session, context, expectedRevision, fence);
+        });
     }
     @Override public Optional<SrsConsumerMembership> detachForRebuild(io.tapstate.spi.store.PipelineRebuildPreparation original,
             SrsConsumerMembership membership,WorkloadClaimFence currentNode) {

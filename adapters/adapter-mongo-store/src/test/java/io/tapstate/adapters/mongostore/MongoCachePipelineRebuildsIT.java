@@ -45,6 +45,349 @@ class MongoCachePipelineRebuildsIT {
     private static final WorkloadOwner OWNER = new WorkloadOwner("node-a", "boot-a");
     private static MongoDBContainer mongo() { return new MongoDBContainer(DockerImageName.parse("mongo:7.0")); }
 
+    @Test void oneFreshFullTransactionPublishesBothModelsAndTheExactPinFloorsAndPendingRequest() {
+        withFixture(true, f -> {
+            var shared = preparedSharedFull(f);
+            var floors = new java.util.TreeMap<String, Long>();
+            for (String table : java.util.Set.of("orders", "quiet")) floors.put(table,
+                    SystemCollections.SRS_LOG_BOUNDS.on(f.cache).find(new Document("_id", MongoSrsLogStore.boundsId(shared.ring(table))))
+                            .first().getLong("largestSequence"));
+            var inspection = shared.consumers.inspectFreshFull(shared.full, shared.run, 0, f.node, shared.capture);
+            assertThat(inspection.originalChain().servingTables()).isEmpty();
+            var actual = Map.of("orders", table("orders", true), "quiet", table("quiet", false));
+            var receipt = inspection.publish(2, "fixed-new-cut", actual, AT);
+            assertThat(receipt.chain().checkpoint()).isEqualTo(shared.checkpoint);
+            assertThat(receipt.chain().checkpointRevision()).isOne();
+            assertThat(receipt.chain().servingTables()).containsExactlyInAnyOrder("orders", "quiet");
+            assertThat(receipt.chain().pendingFreshFull().origin()).isEqualTo(shared.full.origin("input"));
+            assertThat(receipt.chain().resumeOverride().token()).isEqualTo("fixed-new-cut");
+            assertThat(receipt.progress().snapshot().sourcePosition()).isEqualTo("fixed-new-cut");
+            assertThat(receipt.progress().snapshot().models()).hasSize(2);
+            assertThat(receipt.progress().ringDoneThrough()).isEqualTo(floors);
+            assertThat(receipt.progress().cursor().perTableSeq()).isEqualTo(floors);
+            assertThat(receipt.progress().cursor().sinkAcked()).isNull();
+            assertThat(receipt.progress().cursor().snapshotCompletedTables()).isEmpty();
+            assertThat(receipt.progress().writerRun()).isNull();
+            for (var entry : receipt.progress().snapshot().models().entrySet()) {
+                var model = shared.models.load(entry.getValue()).orElseThrow();
+                assertThat(model.table()).isEqualTo(actual.get(entry.getKey()));
+                assertThat(model.ddlSequence()).isEqualTo(floors.get(entry.getKey()) + 1);
+                var prior = new SrsModelKey(shared.chain, entry.getKey(), f.business.cacheIncarnation(), 1, 0);
+                assertThat(SystemCollections.SRS_MODEL_CONTEXTS.on(f.cache).find(new Document("_id", MongoSrsModelContexts.contextId(prior))).first()
+                        .get("nextContext", Document.class)).isEqualTo(MongoSrsModelContexts.contextId(entry.getValue()));
+            }
+            assertThat(SystemCollections.SRS_CHAINS.on(f.cache).find(new Document("_id", shared.chain)).first()
+                    .getList("modelContextHeads", Document.class)).hasSize(2);
+        });
+    }
+
+    @Test void anUnissuedFullObjectIsRejectedBeforeAnyOfItsAccessorsOrAnyCacheWrite() {
+        withFixture(true, f -> {
+            var shared = preparedSharedFull(f); var calls = new AtomicInteger(); var before = f.snapshot();
+            CompletedPipelineFull fake = new CompletedPipelineFull() {
+                public String operationId() { calls.incrementAndGet(); return shared.full.operationId(); }
+                public PipelineIntentScope targetScope() { calls.incrementAndGet(); return shared.full.targetScope(); }
+                public String preparationId() { calls.incrementAndGet(); return shared.full.preparationId(); }
+                public String confirmationHash() { calls.incrementAndGet(); return shared.full.confirmationHash(); }
+                public Map<String, String> sourceHashes() { calls.incrementAndGet(); return shared.full.sourceHashes(); }
+                public void requireCurrent() { calls.incrementAndGet(); }
+            };
+            assertCode(() -> shared.consumers.inspectFreshFull(fake, shared.run, 0, f.node, shared.capture), IoError.PIPELINE_INTENT_FENCED);
+            assertThat(calls).hasValue(0); assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
+    @Test void matchingDirectChannelsCannotSubstituteForTheOriginalCompleteCacheInputs() {
+        withFixture(true, f -> {
+            var shared = preparedSharedFull(f); var inputs = f.sharedInputs(shared.run.scope());
+            var changed = new PipelinePreparationInputs(inputs.pipelineHash(), Map.of("input", "f".repeat(64)),
+                    inputs.selectedTables(), inputs.directChannels());
+            assertThat(changed.sameRecovery(inputs)).isTrue();
+            f.claims().updateOne(new Document("_id", MongoWorkloadClaimStore.id(shared.run.originalClaim().key())),
+                    new Document("$set", new Document("pipelineSources", MongoPipelineSourcePreparations.encode(changed))));
+            var before = f.snapshot();
+            assertCode(() -> shared.consumers.inspectFreshFull(shared.full, shared.run, 0, f.node, shared.capture), IoError.WORKLOAD_CLAIM_FENCED);
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
+    @Test void anActuallyCommittedPublicationWithALostReplyReturnsOnlyItsOriginalReceiptOnRetry() {
+        withFixture(true, f -> {
+            var shared = preparedSharedFull(f); var armed = new java.util.concurrent.atomic.AtomicBoolean();
+            var lost = new AtomicInteger();
+            MongoClient uncertain = (MongoClient) java.lang.reflect.Proxy.newProxyInstance(MongoClient.class.getClassLoader(),
+                    new Class<?>[]{MongoClient.class}, (proxy, method, args) -> {
+                        var result = invokeActual(method, f.cacheClient, args);
+                        if (!method.getName().equals("startSession")) return result;
+                        var session = (com.mongodb.client.ClientSession) result;
+                        return java.lang.reflect.Proxy.newProxyInstance(com.mongodb.client.ClientSession.class.getClassLoader(),
+                                new Class<?>[]{com.mongodb.client.ClientSession.class}, (wrapped, operation, parameters) -> {
+                                    var value = invokeActual(operation, session, parameters);
+                                    if (operation.getName().equals("withTransaction") && armed.compareAndSet(true, false)) {
+                                        lost.incrementAndGet();
+                                        // The real server commit is complete before the adapter loses its result.
+                                        throw new com.mongodb.MongoException(91, "publication commit response unavailable");
+                                    }
+                                    return value;
+                                });
+                    });
+            var store = new MongoSrsConsumerStore(uncertain, f.cache, f.business);
+            var frozen = store.inspectFreshFull(shared.full, shared.run, 0, f.node, shared.capture);
+            var actual = Map.of("orders", table("orders", true), "quiet", table("quiet", false));
+            armed.set(true);
+            assertCode(() -> frozen.publish(2, "fixed-new-cut", actual, AT), IoError.STORE_UNAVAILABLE);
+            assertThat(lost).hasValue(1);
+            var pending = shared.chains.load(shared.chain).orElseThrow();
+            var progress = shared.consumers.progress(shared.run.context()).orElseThrow();
+            assertThat(pending.pendingFreshFull()).isNotNull(); assertThat(progress.snapshot()).isNotNull();
+            var before = f.snapshot();
+            var recovered = frozen.publish(2, "fixed-new-cut", actual, AT.plusSeconds(2));
+            assertThat(recovered).isEqualTo(new SrsFreshFullReceipt(pending, progress));
+            var expected = new java.util.TreeMap<>(before);
+            expected.put(SystemCollections.CACHE_WORKLOAD_CLAIMS.name(), before.get(SystemCollections.CACHE_WORKLOAD_CLAIMS.name()).stream().map(row -> {
+                var next = new Document(row);
+                String counter = switch (row.getString("resourceType")) {
+                    case "NODE_SESSION" -> "fencedPreparationWrites";
+                    case "PIPELINE_ACTUATION" -> "fencedConsumerWrites";
+                    case "CAPTURE" -> "fencedChainWrites";
+                    default -> throw new AssertionError(row.getString("resourceType"));
+                };
+                next.put(counter, next.getLong(counter) + 1); return next;
+            }).toList());
+            expected.put(SystemCollections.CACHE_PIPELINE_STATE.name(), before.get(SystemCollections.CACHE_PIPELINE_STATE.name()).stream().map(row -> {
+                var next = new Document(row); next.put("runtimeWriteFence", next.getLong("runtimeWriteFence") + 1); return next;
+            }).toList());
+            expected.put(SystemCollections.CACHE_IDENTITY.name(), before.get(SystemCollections.CACHE_IDENTITY.name()).stream().map(row -> {
+                var next = new Document(row); next.put("claimAdmissionFence", next.getLong("claimAdmissionFence") + 1); return next;
+            }).toList());
+            // Revalidation writes only these five existing fence counters; every business fact stays exact.
+            assertThat(f.snapshot()).isEqualTo(expected);
+            assertCode(() -> frozen.publish(2, "another-cut", actual, AT), IoError.SRS_FULL_PREPARATION_UNPROVEN);
+            assertThat(f.snapshot()).isEqualTo(expected);
+        });
+    }
+
+    private static Object invokeActual(java.lang.reflect.Method method, Object target, Object[] arguments) throws Throwable {
+        try { return method.invoke(target, arguments); }
+        catch (java.lang.reflect.InvocationTargetException failed) { throw failed.getCause(); }
+    }
+
+    @ParameterizedTest @ValueSource(strings = {"model", "context", "bounds", "partial-new-epoch", "capture-identity"})
+    void anIncompleteOrConflictingChainCannotBeReseededByTheFull(String damage) {
+        withFixture(true, f -> {
+            var shared = preparedSharedFull(f);
+            var old = new SrsModelKey(shared.chain, "quiet", f.business.cacheIncarnation(), 1, 0);
+            switch (damage) {
+                case "model" -> SystemCollections.SRS_MODELS.on(f.cache).deleteOne(new Document("_id", MongoSrsModelStore.key(old)));
+                case "context" -> SystemCollections.SRS_MODEL_CONTEXTS.on(f.cache).deleteOne(new Document("_id", MongoSrsModelContexts.contextId(old)));
+                case "bounds" -> SystemCollections.SRS_LOG_BOUNDS.on(f.cache).deleteOne(new Document("_id", MongoSrsLogStore.boundsId(shared.ring("quiet"))));
+                case "partial-new-epoch" -> shared.models.publish(new SrsModel(new SrsModelKey(shared.chain, "orders", f.business.cacheIncarnation(), 2, 0),
+                        shared.ring("orders"), table("orders", false), 1), shared.capture);
+                case "capture-identity" -> f.claims().updateOne(new Document("_id", MongoWorkloadClaimStore.id(shared.capture.key())),
+                        new Document("$set", new Document("capturePreparation.sourceIdentityHash", "mc-" + "f".repeat(64))));
+                default -> throw new AssertionError(damage);
+            }
+            var before = f.snapshot();
+            assertThatThrownBy(() -> shared.consumers.inspectFreshFull(shared.full, shared.run, 0, f.node, shared.capture))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
+    @Test void aNewStoppedUnleasedConsumerInvalidatesTheFrozenPublicationAndStillCountsForInspection() {
+        withFixture(true, f -> {
+            var shared = preparedSharedFull(f);
+            var frozen = shared.consumers.inspectFreshFull(shared.full, shared.run, 0, f.node, shared.capture);
+            f.initialSharedSource("other"); var fence = f.advance("other");
+            var other = new PipelineIntentScope(f.business.clusterId(), f.business.bindingVersion(), f.business.cacheIncarnation(), "other", 1);
+            assertThat(f.configuration.capturePreparations().issueFirstCreate(new CapturePreparationRequest(other, fence, f.node, "input", f.sharedInputs(other))))
+                    .isInstanceOf(CaptureCreationResult.AlreadyIssued.class);
+            shared.consumers.attach(new SrsConsumerContext(new SrsConsumerKey(shared.chain, "other", "input"), 1),
+                    0, java.util.Set.of("orders", "quiet"), fence).orElseThrow();
+            var intent = f.configuration.intents().load("other").orElseThrow();
+            assertThat(f.configuration.intents().compareAndSet(other, intent.intentRevision(),
+                    new DesiredState("other", PipelineState.STOPPED, intent.desired().revision(), false))).isTrue();
+            var claims = f.domain.workloadClaims(f.business);
+            assertThat(claims.release(claims.read(fence.key()).orElseThrow().claim())).isTrue();
+            var before = f.snapshot();
+            assertCode(() -> frozen.publish(2, "fixed-new-cut", Map.of("orders", table("orders", true), "quiet", table("quiet", false)), AT),
+                    IoError.SRS_FULL_PREPARATION_UNPROVEN);
+            assertCode(() -> shared.consumers.inspectFreshFull(shared.full, shared.run, 0, f.node, shared.capture), IoError.SRS_FULL_PREPARATION_UNPROVEN);
+            assertThat(f.snapshot()).isEqualTo(before);
+            assertThat(shared.consumers.attached(shared.chain).consumers()).hasSize(2);
+        });
+    }
+
+    @Test void aSecondTableBudgetFailureRollsBackTheFirstActualModelInsertAndBothHeads() {
+        withFixture(true, f -> {
+            var shared = preparedSharedFull(f); var inserted = new AtomicInteger();
+            var requests = java.util.concurrent.ConcurrentHashMap.<Integer>newKeySet();
+            var witness = new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    if (event.getDatabaseName().equals(f.cache.getName()) && event.getCommandName().equals("insert")
+                            && event.getCommand().getString("insert").getValue().equals(SystemCollections.SRS_MODELS.collectionName())) {
+                        var row = event.getCommand().getArray("documents").get(0).asDocument();
+                        if (row.getDocument("_id").getDocument("captureContext").getNumber("epoch").longValue() == 2) requests.add(event.getRequestId());
+                    }
+                }
+                @Override public void commandSucceeded(com.mongodb.event.CommandSucceededEvent event) {
+                    if (requests.remove(event.getRequestId())) inserted.incrementAndGet();
+                }
+            };
+            try (var observed = MongoClients.create(com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(CACHE.getReplicaSetUrl())).addCommandListener(witness).build())) {
+                var store = new MongoSrsConsumerStore(observed, observed.getDatabase(f.cache.getName()), f.business);
+                var frozen = store.inspectFreshFull(shared.full, shared.run, 0, f.node, shared.capture);
+                var huge = new SourceTable("quiet", List.of(new SourceField("id", "integer"),
+                        new SourceField("field_" + "x".repeat(1024 * 1024), "string")), List.of("id"), List.of());
+                var before = f.snapshot();
+                assertCode(() -> frozen.publish(2, "fixed-new-cut", Map.of("orders", table("orders", true), "quiet", huge), AT), IoError.SRS_MODEL_CAPACITY);
+                assertThat(inserted).hasValue(1); assertThat(f.snapshot()).isEqualTo(before);
+            }
+        });
+    }
+
+    @Test void pendingPublicationRetriesKeepTheirValuesAndOnlyARealCompleteBatchConsumesTheRequest() {
+        withFixture(true, f -> {
+            var shared = preparedSharedFull(f);
+            var frozen = shared.consumers.inspectFreshFull(shared.full, shared.run, 0, f.node, shared.capture);
+            var actual = Map.of("orders", table("orders", true), "quiet", table("quiet", false));
+            var published = frozen.publish(2, "fixed-new-cut", actual, AT);
+            assertThat(frozen.publish(2, "fixed-new-cut", actual, AT.plusSeconds(1))).isEqualTo(published);
+            var before = f.snapshot();
+            assertCode(() -> frozen.publish(2, "different-cut", actual, AT), IoError.SRS_FULL_PREPARATION_UNPROVEN);
+            assertThat(f.snapshot()).isEqualTo(before);
+            var initial = new java.util.TreeMap<String, SrsTableCheckpoint>();
+            published.progress().snapshot().models().forEach((name, key) -> initial.put(name,
+                    new SrsTableCheckpoint(key, published.progress().ringDoneThrough().get(name))));
+            var onStart = new SrsCaptureCheckpoint(new io.tapstate.core.event.ChainPosition(
+                    new io.tapstate.core.event.SourceOrder(2, io.tapstate.core.event.SourceOrder.SNAPSHOT_SEQ), "fixed-new-cut"), initial, true);
+            assertCode(() -> shared.chains.checkpoint(shared.chain, 1, onStart, shared.capture), IoError.SRS_CHECKPOINT_UNPROVEN);
+            assertThat(f.snapshot()).isEqualTo(before);
+            var log = new MongoSrsLogStore(f.cacheClient, SystemCollections.SRS_EVENTS.on(f.cache), SystemCollections.SRS_LOG_BOUNDS.on(f.cache),
+                    SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.cache), shared.models);
+            log.store(shared.ring("orders"), 1, new SrsLogRecord("actual-batch", io.tapstate.core.event.Op.UPDATE, 2, null,
+                    Map.of("id", 1, "note", "live"), 0, shared.capture, 2));
+            var complete = new java.util.TreeMap<>(initial);
+            complete.put("orders", new SrsTableCheckpoint(published.progress().snapshot().models().get("orders"), 1));
+            var batch = new SrsCaptureCheckpoint(new io.tapstate.core.event.ChainPosition(new io.tapstate.core.event.SourceOrder(2, 1), "actual-batch"), complete, true);
+            var saved = shared.chains.checkpoint(shared.chain, 1, batch, shared.capture).orElseThrow();
+            assertThat(saved.pendingFreshFull()).isNull(); assertThat(saved.resumeOverride()).isNull();
+            assertThat(saved.checkpoint()).isEqualTo(batch); assertThat(saved.checkpoint().positionEditsRestricted()).isTrue();
+            assertCode(() -> frozen.publish(2, "fixed-new-cut", actual, AT), IoError.SRS_FULL_PREPARATION_UNPROVEN);
+            shared.chains.openEpoch(shared.chain, 2, shared.capture).orElseThrow();
+            assertCode(() -> shared.consumers.inspectFreshFull(shared.full, shared.run,
+                    published.progress().revision(), f.node, shared.capture), IoError.SRS_FULL_PREPARATION_UNPROVEN);
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings = {"ordinary-pin", "pending-full", "consumed-full"})
+    void aPinnedFullCannotDiscardItsOriginalBindingThroughOrdinaryDetach(String phase) {
+        withFixture(true, f -> {
+            var shared = preparedSharedFull(f);
+            if (phase.equals("ordinary-pin")) {
+                var refs = new java.util.TreeMap<String, SrsModelKey>();
+                for (String name : List.of("orders", "quiet")) {
+                    var key = new SrsModelKey(shared.chain, name, f.business.cacheIncarnation(), 2, 0);
+                    shared.models.publish(new SrsModel(key, shared.ring(name), table(name, false), 1), shared.capture);
+                    refs.put(name, key);
+                }
+                assertThat(shared.chains.publishServingTables(shared.chain, 2, refs.keySet(), shared.capture)).isTrue();
+                assertThat(shared.consumers.pinSnapshot(shared.run.context(), shared.run.membershipRevision(), 0,
+                        new SrsSnapshotPin(2, "ordinary-cut", refs), shared.run.originalClaim())).isTrue();
+                assertThat(shared.chains.load(shared.chain).orElseThrow().checkpoint().positionEditsRestricted()).isFalse();
+            } else {
+                var frozen = shared.consumers.inspectFreshFull(shared.full, shared.run, 0, f.node, shared.capture);
+                var published = frozen.publish(2, "fixed-new-cut", Map.of("orders", table("orders", true), "quiet", table("quiet", false)), AT);
+                if (phase.equals("consumed-full")) {
+                    var log = new MongoSrsLogStore(f.cacheClient, SystemCollections.SRS_EVENTS.on(f.cache), SystemCollections.SRS_LOG_BOUNDS.on(f.cache),
+                            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.cache), shared.models);
+                    log.store(shared.ring("orders"), 1, new SrsLogRecord("actual-batch", io.tapstate.core.event.Op.UPDATE, 2, null,
+                            Map.of("id", 1, "note", "live"), 0, shared.capture, 2));
+                    var frontiers = new java.util.TreeMap<String, SrsTableCheckpoint>();
+                    published.progress().snapshot().models().forEach((name, key) -> frontiers.put(name,
+                            new SrsTableCheckpoint(key, name.equals("orders") ? 1 : published.progress().ringDoneThrough().get(name))));
+                    var checkpoint = new SrsCaptureCheckpoint(new io.tapstate.core.event.ChainPosition(
+                            new io.tapstate.core.event.SourceOrder(2, 1), "actual-batch"), frontiers, true);
+                    var current = shared.chains.checkpoint(shared.chain, 1, checkpoint, shared.capture).orElseThrow();
+                    assertThat(current.pendingFreshFull()).isNull();
+                    assertThat(current.checkpoint().positionEditsRestricted()).isTrue();
+                }
+            }
+            var before = f.snapshot();
+            assertCode(() -> shared.consumers.detach(shared.run.context(), shared.run.membershipRevision(), shared.run.originalClaim()),
+                    IoError.SRS_FULL_PREPARATION_UNPROVEN);
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
+    private static SourceTable table(String name, boolean changed) {
+        var fields = new ArrayList<SourceField>(); fields.add(new SourceField("id", "integer"));
+        if (changed) fields.add(new SourceField("note", "string"));
+        return new SourceTable(name, fields, List.of("id"), List.of());
+    }
+
+    /** Real CONFIG/CACHE grants and fences; source tokens are synthetic, without a connector invocation. */
+    private static SharedFull preparedSharedFull(Fixture f) {
+        var inputs = f.sharedInputs(f.scope);
+        var originalClaim = f.advance("flow");
+        var request = new CapturePreparationRequest(f.scope, originalClaim, f.node, "input", inputs);
+        var creation = ((CaptureCreationResult.Issued) f.configuration.capturePreparations().issueFirstCreate(request)).creation();
+        f.domain.capturePreparations(f.business, ACTIVE).createFirst(creation);
+        String chain = creation.preparation().chainId();
+        var claims = f.domain.workloadClaims(f.business);
+        var capture = WorkloadClaimFence.from(claims.acquire(new WorkloadClaimKey(f.scope.clusterId(), WorkloadClaimType.CAPTURE,
+                creation.preparation().captureId()), OWNER, 1, TTL).claim());
+        var chains = new MongoSrsChainStore(f.cacheClient, f.cache, f.business);
+        var models = new MongoSrsModelStore(f.cacheClient, f.cache, f.business);
+        var consumers = new MongoSrsConsumerStore(f.cacheClient, f.cache, f.business);
+        var log = new MongoSrsLogStore(f.cacheClient, SystemCollections.SRS_EVENTS.on(f.cache), SystemCollections.SRS_LOG_BOUNDS.on(f.cache),
+                SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.cache), models);
+        chains.requestTables(chain, java.util.Set.of("orders", "quiet"), capture);
+        assertThat(chains.openEpoch(chain, 0, capture)).hasValue(1);
+        var oldModels = new java.util.TreeMap<String, SrsModelKey>();
+        var frontiers = new java.util.TreeMap<String, SrsTableCheckpoint>();
+        for (String name : java.util.Set.of("orders", "quiet")) {
+            var key = new SrsModelKey(chain, name, f.business.cacheIncarnation(), 1, 0); String ring = "srs." + chain + "." + name;
+            models.publish(new SrsModel(key, ring, table(name, false), 0), capture);
+            log.store(ring, 0, new SrsLogRecord("old-cut", io.tapstate.core.event.Op.INSERT, 1, null, Map.of("id", 1), 0, capture, 1));
+            oldModels.put(name, key); frontiers.put(name, new SrsTableCheckpoint(key, 0));
+        }
+        assertThat(chains.publishServingTables(chain, 1, oldModels.keySet(), capture)).isTrue();
+        var checkpoint = new SrsCaptureCheckpoint(new io.tapstate.core.event.ChainPosition(new io.tapstate.core.event.SourceOrder(1, 1), "old-cut"), frontiers);
+        chains.checkpoint(chain, 0, checkpoint, capture).orElseThrow();
+        var oldContext = new SrsConsumerContext(new SrsConsumerKey(chain, "flow", "input"), 1);
+        var member = consumers.attach(oldContext, 0, oldModels.keySet(), originalClaim).orElseThrow();
+        consumers.pinSnapshot(oldContext, member.revision(), 0, new SrsSnapshotPin(1, "old-cut", oldModels), originalClaim);
+        var intent = f.configuration.intents().load("flow").orElseThrow();
+        assertThat(f.configuration.intents().compareAndSet(f.scope, intent.intentRevision(),
+                new DesiredState("flow", PipelineState.STOPPED, inputs.pipelineHash(), true))).isTrue();
+        var target = new PipelineIntentScope(f.scope.clusterId(), f.scope.bindingVersion(), f.scope.cacheIncarnation(), "flow", 2);
+        var targetInputs = f.sharedInputs(target);
+        var fullRequest = new PipelineRebuildRequest("shared-explicit-full", f.configuration.intents().load("flow").orElseThrow(),
+                originalClaim, 0, targetInputs);
+        var pending = f.configuration.rebuilds().begin(fullRequest);
+        var detached = consumers.detachForRebuild(pending, member, f.node).orElseThrow();
+        var receipt = f.rebuilds().prepare(pending, f.node, TTL, AT);
+        var prepared = f.configuration.rebuilds().complete(receipt);
+        var stopped = f.configuration.intents().load("flow").orElseThrow();
+        assertThat(f.configuration.intents().compareAndSet(target, stopped.intentRevision(),
+                new DesiredState("flow", PipelineState.RUNNING, targetInputs.pipelineHash(), false))).isTrue();
+        var owned = claims.acquirePipeline(target, OWNER, 1, TTL).claim();
+        var running = WorkloadClaimFence.from(claims.advanceExecution(owned, 1, java.util.Set.of(OWNER.nodeId())).orElseThrow());
+        var context = new SrsConsumerContext(new SrsConsumerKey(chain, "flow", "input"), 2);
+        var current = consumers.attach(context, detached.revision(), oldModels.keySet(), running).orElseThrow();
+        assertThat(chains.openEpoch(chain, 1, capture)).hasValue(2);
+        var full = f.configuration.rebuilds().completedFull(prepared.scope(), targetInputs, Map.of()).orElseThrow();
+        return new SharedFull(chain, capture, full, SrsConsumerRun.of(target, current), checkpoint, chains, models, consumers);
+    }
+
+    private record SharedFull(String chain, WorkloadClaimFence capture, CompletedPipelineFull full, SrsConsumerRun run,
+                              SrsCaptureCheckpoint checkpoint, MongoSrsChainStore chains, MongoSrsModelStore models,
+                              MongoSrsConsumerStore consumers) {
+        String ring(String table) { return "srs." + chain + "." + table; }
+    }
+
     @Test void aCompletedExplicitFullCanBeReadWithItsOriginalInputsAfterAControllerRestart() {
         withFixture(f -> {
             var request = modelFullRequest(f);
@@ -898,7 +1241,8 @@ class MongoCachePipelineRebuildsIT {
     private static void assertCode(Runnable action,io.tapstate.core.common.TapstateErrorCode expected) {
         assertThatThrownBy(action::run).isInstanceOfSatisfying(TapstateException.class,e -> assertThat(e.code()).isEqualTo(expected));
     }
-    private static void withFixture(Scenario scenario) {
+    private static void withFixture(Scenario scenario) { withFixture(false, scenario); }
+    private static void withFixture(boolean shared, Scenario scenario) {
         String suffix=UUID.randomUUID().toString().replace("-","");String configName="rebuild_cfg_"+suffix,cacheName="rebuild_cache_"+suffix;
         try(var configClient=MongoClients.create(CONFIG.getReplicaSetUrl());var cacheClient=MongoClients.create(CACHE.getReplicaSetUrl())) {
             var cfg=configClient.getDatabase(configName);var cache=cacheClient.getDatabase(cacheName);
@@ -918,12 +1262,34 @@ class MongoCachePipelineRebuildsIT {
                 SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(cache).insertOne(new Document("_id","business").append("installedVersion",1).append("phase","READY").append("epoch",1L).append("operationId","business-a"));
                 var node=WorkloadClaimFence.from(domain.workloadClaims(business).acquire(new WorkloadClaimKey("cluster-a",WorkloadClaimType.NODE_SESSION,OWNER.nodeId()),OWNER,0,TTL).claim());
                 var scope=new PipelineIntentScope(business.clusterId(),business.bindingVersion(),business.cacheIncarnation(),"flow",1);
-                var fixture=new Fixture(configuration,cfg,cacheClient,cache,domain,connection,business,scope,node);fixture.initial("flow");scenario.run(fixture);
+                var fixture=new Fixture(configuration,cfg,cacheClient,cache,domain,connection,business,scope,node);
+                if (shared) fixture.initialSharedSource(); else fixture.initial("flow");
+                scenario.run(fixture);
             } finally {cfg.drop();cache.drop();}
         } catch(RuntimeException|Error failure){throw failure;}catch(Exception failure){throw new AssertionError(failure);}
     }
     private record Fixture(MongoConfigurationDomain configuration,MongoDatabase config,MongoClient cacheClient,MongoDatabase cache,MongoCacheDomain domain,
             StorageBinding.Connection connection,CacheBusinessScope business,PipelineIntentScope scope,WorkloadClaimFence node) {
+        void initialSharedSource() { initialSharedSource("flow"); }
+        void initialSharedSource(String id) {
+            var source = new SourceResource("input", null, "mongodb", Map.of("uri", "mongodb://input.invalid/db"),
+                    io.tapstate.core.model.SourceMode.CDC, List.of(io.tapstate.core.model.TableRef.literal("orders"),
+                    io.tapstate.core.model.TableRef.literal("quiet")), null, null);
+            var pipeline = new io.tapstate.core.model.PipelineResource(id, null,
+                    List.of(io.tapstate.core.model.SourceRef.spec("input", true)), null, null, null, null, null);
+            configuration.artifacts().saveAll(List.of(source, pipeline));
+            var initial = new PipelineIntentScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation(), id, 1);
+            configuration.intents().compareAndSet(initial, 0, new DesiredState(id, PipelineState.RUNNING, CanonicalHash.of(pipeline), false));
+            var creation = ((FirstPipelineCreationResult.Issued) configuration.preparations().issueFirstCreate(initial, node, sharedInputs(initial))).creation();
+            var cache = domain.pipelinePreparations(business, ACTIVE);
+            configuration.preparations().complete(cache.seed(cache.reserveFirst(creation, TTL), configuration.preparations(), AT));
+        }
+        PipelinePreparationInputs sharedInputs(PipelineIntentScope original) {
+            var source = (SourceResource) configuration.artifacts().get("input").orElseThrow();
+            var pipeline = (io.tapstate.core.model.PipelineResource) configuration.artifacts().get(original.pipelineId()).orElseThrow();
+            return PipelinePreparationInputs.of(original, pipeline, Map.of(source.id(), source),
+                    Map.of(source.id(), java.util.Set.of("orders", "quiet")));
+        }
         void initial(String id) {
             var pipeline=new DslParser().parse("version: tapstate/v1\nkind: pipeline\nid: "+id+"\nsource: []\n");configuration.artifacts().create(pipeline);
             var initialScope=new PipelineIntentScope(scope.clusterId(),scope.bindingVersion(),scope.cacheIncarnation(),id,1);

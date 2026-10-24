@@ -134,54 +134,57 @@ public final class MongoSrsModelStore implements SrsModelStore {
     }
     @Override public SrsModel publish(SrsModel model, WorkloadClaimFence fence) {
         Objects.requireNonNull(model, "model"); Objects.requireNonNull(fence, "captureFence");
+        return transaction(session -> publishInSession(session, model, fence));
+    }
+    SrsModel publishInSession(ClientSession session, SrsModel model, WorkloadClaimFence fence) {
+        if (!session.hasActiveTransaction()) throw new IllegalStateException("model publication requires its original CACHE transaction");
+        Objects.requireNonNull(model, "model"); Objects.requireNonNull(fence, "captureFence");
         requireScope(model.key());
         if (fence.key().type() != WorkloadClaimType.CAPTURE || !scope.clusterId().equals(fence.key().clusterId())) throw claimFenced();
         Document captured = document(model);
         if (!decode(captured).equals(model)) throw unavailable(model.key());
-        return transaction(session -> {
-            requireBusiness(session);
-            Document chain = requireChain(session, model.key());
-            if (!Long.valueOf(model.key().captureEpoch()).equals(chain.get("epoch"))
-                    || !fence.key().resourceId().equals(chain.get("captureId"))) throw unavailable(model.key());
-            if (SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session, WorkloadClaimDocuments.live(fence), PROVE_CAPTURE)
-                    .getMatchedCount() != 1) throw claimFenced();
-            Document anchor = contexts.head(chain, model.key().table());
-            var control = contexts.find(session, model.key());
-            var models = SystemCollections.SRS_MODELS.on(database);
-            Document existing = models.find(session, new Document("_id", key(model.key()))).first();
-            if (control != null) {
-                contexts.requireAnchor(session, chain, control);
-                if (anchor == null || !control.id().equals(anchor.get("contextId")) || control.nextId() != null
-                        || !fence.equals(control.fence()) || !model.ringName().equals(control.ring())) throw unavailable(model.key());
-                requireRing(session, model, false);
-                SrsModel previous = requirePublishedHead(session, control);
-                if (existing != null) {
-                    if (!decode(existing).equals(model)) throw conflict(model.key());
-                    if (model.key().modelVersion() > control.publishedVersion()) throw unavailable(model.key());
-                    return model;
-                }
-                if (model.key().modelVersion() != control.publishedVersion() + 1 || model.ddlSequence() <= previous.ddlSequence()) throw unavailable(model.key());
-                SrsLogBounds observed = requireRing(session, model, false);
-                if (model.ddlSequence() <= observed.largestSequence()) throw unavailable(model.key());
-                contexts.replace(session, control, contexts.advance(control, model, captured.getString("contentHash")));
-            } else {
-                if (existing != null || model.key().modelVersion() != 0) throw unavailable(model.key());
-                MongoSrsModelContexts.Context previous = anchor == null ? null : contexts.require(session, anchor.get("contextId", Document.class));
-                if (previous != null) {
-                    contexts.requireAnchor(session, chain, previous); requirePublishedHead(session, previous);
-                    if (!previous.ring().equals(model.ringName()) || previous.key().captureEpoch() >= model.key().captureEpoch()) throw unavailable(model.key());
-                }
-                SrsLogBounds observed = requireRing(session, model, previous == null);
-                if (model.ddlSequence() <= observed.largestSequence()) throw unavailable(model.key());
-                var initial = contexts.initial(model, fence, captured.getString("contentHash"));
-                if (previous != null) contexts.replace(session, previous, contexts.close(previous, initial));
-                contexts.insert(session, initial);
-                contexts.setHead(session, chain, initial);
+        requireBusiness(session);
+        Document chain = requireChain(session, model.key());
+        if (!Long.valueOf(model.key().captureEpoch()).equals(chain.get("epoch"))
+                || !fence.key().resourceId().equals(chain.get("captureId"))) throw unavailable(model.key());
+        if (SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session, WorkloadClaimDocuments.live(fence), PROVE_CAPTURE)
+                .getMatchedCount() != 1) throw claimFenced();
+        Document anchor = contexts.head(chain, model.key().table());
+        var control = contexts.find(session, model.key());
+        var models = SystemCollections.SRS_MODELS.on(database);
+        Document existing = models.find(session, new Document("_id", key(model.key()))).first();
+        if (control != null) {
+            contexts.requireAnchor(session, chain, control);
+            if (anchor == null || !control.id().equals(anchor.get("contextId")) || control.nextId() != null
+                    || !fence.equals(control.fence()) || !model.ringName().equals(control.ring())) throw unavailable(model.key());
+            requireRing(session, model, false);
+            SrsModel previous = requirePublishedHead(session, control);
+            if (existing != null) {
+                if (!decode(existing).equals(model)) throw conflict(model.key());
+                if (model.key().modelVersion() > control.publishedVersion()) throw unavailable(model.key());
+                return model;
             }
-            requireBudget(session,model,captured);
-            models.insertOne(session, captured);
-            return model;
-        });
+            if (model.key().modelVersion() != control.publishedVersion() + 1 || model.ddlSequence() <= previous.ddlSequence()) throw unavailable(model.key());
+            SrsLogBounds observed = requireRing(session, model, false);
+            if (model.ddlSequence() <= observed.largestSequence()) throw unavailable(model.key());
+            contexts.replace(session, control, contexts.advance(control, model, captured.getString("contentHash")));
+        } else {
+            if (existing != null || model.key().modelVersion() != 0) throw unavailable(model.key());
+            MongoSrsModelContexts.Context previous = anchor == null ? null : contexts.require(session, anchor.get("contextId", Document.class));
+            if (previous != null) {
+                contexts.requireAnchor(session, chain, previous); requirePublishedHead(session, previous);
+                if (!previous.ring().equals(model.ringName()) || previous.key().captureEpoch() >= model.key().captureEpoch()) throw unavailable(model.key());
+            }
+            SrsLogBounds observed = requireRing(session, model, previous == null);
+            if (model.ddlSequence() <= observed.largestSequence()) throw unavailable(model.key());
+            var initial = contexts.initial(model, fence, captured.getString("contentHash"));
+            if (previous != null) contexts.replace(session, previous, contexts.close(previous, initial));
+            contexts.insert(session, initial);
+            contexts.setHead(session, chain, initial);
+        }
+        requireBudget(session,model,captured);
+        models.insertOne(session, captured);
+        return model;
     }
     @Override public SrsModel requireEvent(SrsModelKey expected, String ring, long sequence, WorkloadClaimFence originalCapture) {
         Objects.requireNonNull(expected, "expected"); requireScope(expected);

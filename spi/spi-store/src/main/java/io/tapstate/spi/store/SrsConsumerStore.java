@@ -18,6 +18,13 @@ public interface SrsConsumerStore {
     Optional<ConsumerOffset> cursor(SrsConsumerContext context);
     Optional<SrsConsumerProgress> progress(SrsConsumerContext context);
 
+    /** Freezes the original current view and one store-issued completed CONFIG full. */
+    default SrsFreshFullPreparation inspectFreshFull(CompletedPipelineFull full, SrsConsumerRun original, long expectedProgressRevision,
+            WorkloadClaimFence originalNode, WorkloadClaimFence originalCapture) {
+        throw new io.tapstate.core.common.TapstateException(IoError.SRS_CONSUMER_UNAVAILABLE,
+                Map.of("chain", original.miningChainId()), null);
+    }
+
     /**
      * Pins the original snapshot under one fixed membership, progress revision and Pipeline claim.
      * An identical held pin is success without returning or adopting a newer progress revision.

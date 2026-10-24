@@ -173,7 +173,7 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
         if (intent.deleted() || !target.equals(intent.scope()) || !inputs.pipelineHash().equals(intent.desired().revision())) throw fenced();
         preparations.verifyInputs(session, target, inputs);
         verifyDependencies(session, target.pipelineId(), inputs, dependencies);
-        return java.util.Optional.of(new Completed(this, target, prepared.preparationId(), annex, intent, inputs, dependencies));
+        return java.util.Optional.of(new Completed(this, target, prepared, annex, intent, inputs, dependencies));
     }
 
     /** Only this original adapter can issue a full handle; this accessor performs no CONFIG IO. */
@@ -182,10 +182,56 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
         return completed.inputs;
     }
 
+    record FullCoordinates(PipelineIntentScope originalScope, PipelineIntentScope targetScope, String operationId,
+                           String preparationId, String previousPreparationId, String confirmationHash,
+                           WorkloadClaimFence originalClaim, WorkloadClaimFence issuerNode, long checkpointEpoch) {}
+
+    /** Immutable original coordinates for CACHE comparison; this accessor performs no CONFIG IO. */
+    static FullCoordinates originalFullCoordinates(CompletedPipelineFull original) {
+        if (!(original instanceof Completed completed)) throw fenced();
+        try {
+            var annex = completed.annex; var old = MongoPipelinePreparationFacts.scope(annex.get("originalScope", Document.class));
+            var raw = annex.get("originalClaim", Document.class);
+            var claim = new WorkloadClaimFence(new WorkloadClaimKey(old.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, old.pipelineId()),
+                    new WorkloadOwner(raw.getString("nodeId"), raw.getString("bootId")), raw.getLong("claimGeneration"),
+                    raw.getLong("executionGeneration"), raw.getLong("topologyRevision"));
+            return new FullCoordinates(old, completed.targetScope, completed.operationId(), completed.preparationId(),
+                    annex.getString("previousPreparationId"), completed.confirmationHash(), claim, completed.prepared.issuerNode(),
+                    annex.get("result", Document.class).getLong("checkpointEpoch"));
+        } catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable(); }
+    }
+
     /** Call before and after CACHE work, never from its transaction callback. */
     static void requireOriginalCompletedFull(CompletedPipelineFull original) {
         if (!(original instanceof Completed completed)) throw fenced();
         completed.requireCurrent();
+    }
+
+    /** Uses original CONFIG ports outside CACHE work; a source/chain DTO alone grants no publication. */
+    static CapturePreparation originalFullCapture(CompletedPipelineFull original, String sourceId, String chain) {
+        if (!(original instanceof Completed completed)) throw fenced();
+        completed.requireCurrent();
+        String expectedHash = completed.inputs.sourceHashes().get(sourceId);
+        if (expectedHash == null) throw fenced();
+        var owner = completed.owner;
+        var source = owner.artifacts.get(sourceId).filter(io.tapstate.core.model.SourceResource.class::isInstance)
+                .map(io.tapstate.core.model.SourceResource.class::cast).orElseThrow(MongoPipelineStateRebuilds::fenced);
+        var pipeline = owner.artifacts.get(completed.targetScope.pipelineId()).filter(io.tapstate.core.model.PipelineResource.class::isInstance)
+                .map(io.tapstate.core.model.PipelineResource.class::cast).orElseThrow(MongoPipelineStateRebuilds::fenced);
+        if (!expectedHash.equals(CanonicalHash.of(source))
+                || pipeline.settings() != null && pipeline.settings().readMode() == io.tapstate.core.model.ReadMode.SNAPSHOT_ONLY
+                || pipeline.sources().stream().noneMatch(ref -> ref.id().equals(sourceId)
+                    && ref instanceof io.tapstate.core.model.SourceRef.Spec spec && spec.srs())) throw fenced();
+        String actual = io.tapstate.core.model.canonical.SourceCaptureIdentity.resolve(source.connector(), source.config(),
+                source.srs() == null ? null : source.srs().key());
+        if (!actual.equals(chain)) throw fenced();
+        var target = completed.targetScope;
+        var captures = new MongoCaptureStatePreparations(owner.client, owner.database, owner.clusterId, owner.bindings, owner.artifacts, owner.requireActive);
+        var prepared = captures.read(new CacheBusinessScope(target.clusterId(), target.bindingVersion(), target.cacheIncarnation()),
+                io.tapstate.core.model.canonical.SourceCaptureIdentity.sharedCapture(chain)).orElseThrow(MongoPipelineStateRebuilds::fenced);
+        captures.inspectSharedHistory(prepared, sourceId, expectedHash);
+        completed.requireCurrent();
+        return prepared;
     }
 
     private void requireCompleted(Completed original) {
@@ -193,15 +239,16 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
             var current = completedFullInTransaction(session, original.targetScope, original.inputs, original.dependencies)
                     .orElseThrow(MongoPipelineStateRebuilds::fenced);
             if (!current.annex.equals(original.annex) || !current.intent.equals(original.intent)
-                    || !current.preparationId.equals(original.preparationId)) throw fenced();
+                    || !current.prepared.equals(original.prepared)) throw fenced();
             return null;
         });
     }
 
-    private record Completed(MongoPipelineStateRebuilds owner, PipelineIntentScope targetScope, String preparationId,
+    private record Completed(MongoPipelineStateRebuilds owner, PipelineIntentScope targetScope, PipelinePreparation prepared,
                              Document annex, PipelineIntentSnapshot intent, PipelinePreparationInputs inputs,
                              Map<String, String> dependencies) implements CompletedPipelineFull {
         @Override public String operationId() { return annex.getString("operationId"); }
+        @Override public String preparationId() { return prepared.preparationId(); }
         @Override public String confirmationHash() { return annex.getString("confirmationHash"); }
         @Override public Map<String, String> sourceHashes() { return inputs.sourceHashes(); }
         @Override public void requireCurrent() { owner.requireCompleted(this); }
