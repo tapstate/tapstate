@@ -58,7 +58,9 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
             var previous = MongoPipelinePreparationFacts.decode(state.pipelineId(), mapping, clusterId);
             if (previous.phase() != PipelinePreparation.Phase.COMPLETE || !original.originalScope().equals(previous.scope())) throw fenced();
             requireCompletedPrior(mapping, previous);
-            var pending = new Pending(this, original, id, previous.preparationId(), hash);
+            int version = original.intent().desired().purgeState() ? 2 : 1;
+            var pending = new Pending(this, original, id, previous.preparationId(), hash, version,
+                    version == 2 ? inputClosureHash(original.inputs(), original.dependencyHashes()) : null);
             long fence = mapping.getLong("noteWriteFence");
             if (fence >= Long.MAX_VALUE - 2 || ConfigurationVersion.read(session, SystemCollections.CONFIGURATION_VERSION.on(database)) >= Long.MAX_VALUE - 2) throw fenced();
             ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database));
@@ -78,7 +80,7 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
             if(mapping==null)return java.util.Optional.empty();var state=MongoPipelineStateMappings.decode(pipelineId,mapping);
             if(state.phase()!=PipelineStateMapping.Phase.REBUILDING)return java.util.Optional.empty();
             try {
-                var annex=mapping.get("stateRebuild",Document.class);if(annex==null || !annex.keySet().equals(ANNEX))throw unreadable();
+                var annex=mapping.get("stateRebuild",Document.class);annexVersion(annex,false);
                 var original=intents.loadInTransaction(session,pipelineId).orElseThrow(MongoPipelineStateRebuilds::fenced);
                 var claim=annex.get("originalClaim",Document.class);
                 if(claim==null || !claim.keySet().equals(Set.of("clusterId","pipelineId","nodeId","bootId","claimGeneration","executionGeneration","topologyRevision"))
@@ -143,6 +145,68 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
         return transaction(session -> completedInTransaction(session, original));
     }
 
+    @Override public java.util.Optional<CompletedPipelineFull> completedFull(PipelineIntentScope target,
+            PipelinePreparationInputs inputs, Map<String, String> dependencyHashes) {
+        Objects.requireNonNull(target, "target"); Objects.requireNonNull(inputs, "inputs");
+        var dependencies = Map.copyOf(dependencyHashes);
+        return transaction(session -> completedFullInTransaction(session, target, inputs, dependencies)
+                .map(value -> (CompletedPipelineFull) value));
+    }
+
+    private java.util.Optional<Completed> completedFullInTransaction(ClientSession session, PipelineIntentScope target,
+            PipelinePreparationInputs inputs, Map<String, String> dependencies) {
+        var business = bindings.cachePreparationForTransaction(session).orElseThrow(MongoPipelineStateRebuilds::fenced).businessScope();
+        if (!clusterId.equals(target.clusterId()) || !business.equals(new CacheBusinessScope(target.clusterId(),
+                target.bindingVersion(), target.cacheIncarnation()))) throw fenced();
+        var mapping = SystemCollections.OPERATOR_GENERATIONS.on(database).find(session, new Document("_id", target.pipelineId())).first();
+        if (mapping == null) return java.util.Optional.empty();
+        var state = MongoPipelineStateMappings.decode(target.pipelineId(), mapping);
+        if (state.phase() != PipelineStateMapping.Phase.ACTIVE || state.stateGeneration() != target.stateGeneration()
+                || !mapping.containsKey("stateRebuild")) return java.util.Optional.empty();
+        var prepared = MongoPipelinePreparationFacts.decode(target.pipelineId(), mapping, clusterId);
+        requireCompletedPrior(mapping, prepared);
+        if (!target.equals(prepared.scope())) throw fenced();
+        var annex = mapping.get("stateRebuild", Document.class);
+        if (annexVersion(annex, true) == 1) return java.util.Optional.empty();
+        if (inputs.sourceHashes().isEmpty() || !inputClosureHash(inputs, dependencies).equals(annex.get("inputClosureHash"))) throw fenced();
+        var intent = intents.loadInTransaction(session, target.pipelineId()).orElseThrow(MongoPipelineStateRebuilds::fenced);
+        if (intent.deleted() || !target.equals(intent.scope()) || !inputs.pipelineHash().equals(intent.desired().revision())) throw fenced();
+        preparations.verifyInputs(session, target, inputs);
+        verifyDependencies(session, target.pipelineId(), inputs, dependencies);
+        return java.util.Optional.of(new Completed(this, target, prepared.preparationId(), annex, intent, inputs, dependencies));
+    }
+
+    /** Only this original adapter can issue a full handle; this accessor performs no CONFIG IO. */
+    static PipelinePreparationInputs originalFullInputs(CompletedPipelineFull original) {
+        if (!(original instanceof Completed completed)) throw fenced();
+        return completed.inputs;
+    }
+
+    /** Call before and after CACHE work, never from its transaction callback. */
+    static void requireOriginalCompletedFull(CompletedPipelineFull original) {
+        if (!(original instanceof Completed completed)) throw fenced();
+        completed.requireCurrent();
+    }
+
+    private void requireCompleted(Completed original) {
+        transaction(session -> {
+            var current = completedFullInTransaction(session, original.targetScope, original.inputs, original.dependencies)
+                    .orElseThrow(MongoPipelineStateRebuilds::fenced);
+            if (!current.annex.equals(original.annex) || !current.intent.equals(original.intent)
+                    || !current.preparationId.equals(original.preparationId)) throw fenced();
+            return null;
+        });
+    }
+
+    private record Completed(MongoPipelineStateRebuilds owner, PipelineIntentScope targetScope, String preparationId,
+                             Document annex, PipelineIntentSnapshot intent, PipelinePreparationInputs inputs,
+                             Map<String, String> dependencies) implements CompletedPipelineFull {
+        @Override public String operationId() { return annex.getString("operationId"); }
+        @Override public String confirmationHash() { return annex.getString("confirmationHash"); }
+        @Override public Map<String, String> sourceHashes() { return inputs.sourceHashes(); }
+        @Override public void requireCurrent() { owner.requireCompleted(this); }
+    }
+
     private java.util.Optional<PipelinePreparation> completedInTransaction(ClientSession session, PipelineRebuildRequest original) {
         var business = bindings.cachePreparationForTransaction(session).orElseThrow(MongoPipelineStateRebuilds::fenced).businessScope();
         var scope = original.originalScope();
@@ -155,7 +219,9 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
         if (!mapping.containsKey("stateRebuild")) throw unreadable();
         requireCompletedPrior(mapping, prepared);
         var annex = mapping.get("stateRebuild", Document.class);
-        var pending = new Pending(this, original, checkedId(annex.getString("preparationId")), checkedId(annex.getString("previousPreparationId")), confirmationHash(original));
+        int version = annexVersion(annex, true);
+        var pending = new Pending(this, original, checkedId(annex.getString("preparationId")), checkedId(annex.getString("previousPreparationId")),
+                confirmationHash(original), version, version == 2 ? inputClosureHash(original.inputs(), original.dependencyHashes()) : null);
         var result = new Document("phase", "COMPLETE").append("checkpointEpoch", original.originalStateEpoch() + 1).append("intentRevision", original.intent().intentRevision() + 1);
         if (!encode(pending).append("result", result).equals(annex)) throw fenced();
         return java.util.Optional.of(prepared);
@@ -169,9 +235,8 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
     static void requireCompletedPrior(Document mapping, PipelinePreparation prepared) {
         if (!mapping.containsKey("stateRebuild")) return;
         try {
-            var annex = mapping.get("stateRebuild", Document.class); var fields = new java.util.HashSet<>(ANNEX); fields.add("result");
-            if (annex == null || !fields.equals(annex.keySet()) || !Integer.valueOf(1).equals(annex.get("formatVersion"))
-                    || !prepared.preparationId().equals(checkedId(annex.getString("preparationId")))
+            var annex = mapping.get("stateRebuild", Document.class); annexVersion(annex, true);
+            if (!prepared.preparationId().equals(checkedId(annex.getString("preparationId")))
                     || !prepared.scope().equals(MongoPipelinePreparationFacts.scope(annex.get("targetScope", Document.class)))
                     || !mapping.getString("operationId").equals(annex.getString("operationId"))
                     || !(annex.get("confirmationHash") instanceof String hash) || !hash.matches("[0-9a-f]{64}")
@@ -223,7 +288,10 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
         return mapping;
     }
     private void verifyDependencies(ClientSession session, PipelineRebuildRequest original) {
-        var root = artifacts.getInTransaction(session, original.originalScope().pipelineId()).orElseThrow(MongoPipelineStateRebuilds::fenced);
+        verifyDependencies(session, original.originalScope().pipelineId(), original.inputs(), original.dependencyHashes());
+    }
+    private void verifyDependencies(ClientSession session, String pipelineId, PipelinePreparationInputs inputs, Map<String, String> dependencies) {
+        var root = artifacts.getInTransaction(session, pipelineId).orElseThrow(MongoPipelineStateRebuilds::fenced);
         var known = new java.util.HashMap<String, io.tapstate.core.model.Resource>(); known.put(root.id(), root);
         var queue = new java.util.ArrayDeque<io.tapstate.core.model.Resource>(); queue.add(root);
         var visited = new java.util.HashSet<String>(); var confirmed = new java.util.HashSet<String>();
@@ -236,8 +304,8 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
                     known.put(target.id(), target); queue.add(target);
                 }
                 if (!edge.kind().equals(target.kind())) throw fenced();
-                String actual = CanonicalHash.of(target), capture = original.inputs().sourceHashes().get(edge.id());
-                String dependency = original.dependencyHashes().get(edge.id());
+                String actual = CanonicalHash.of(target), capture = inputs.sourceHashes().get(edge.id());
+                String dependency = dependencies.get(edge.id());
                 if (capture == null ? !actual.equals(dependency) : !actual.equals(capture)) throw fenced();
                 if (dependency != null) {
                     if (!actual.equals(dependency)) throw fenced();
@@ -245,17 +313,18 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
                 }
             }
         }
-        if (!confirmed.equals(original.dependencyHashes().keySet())) throw fenced();
+        if (!confirmed.equals(dependencies.keySet())) throw fenced();
     }
 
     private Pending retained(PipelineRebuildRequest original, String hash, Document mapping) {
         var state = MongoPipelineStateMappings.decode(original.originalScope().pipelineId(), mapping);
         if (state.phase() != PipelineStateMapping.Phase.REBUILDING || !original.operationId().equals(state.operationId())) throw fenced();
         try {
-            if (!(mapping.get("stateRebuild") instanceof Document annex) || !annex.keySet().equals(ANNEX)
-                    || !Integer.valueOf(1).equals(annex.get("formatVersion"))
-                    || !(annex.get("intentRevision") instanceof Long) || !(annex.get("originalStateEpoch") instanceof Long)) throw unreadable();
-            var pending = new Pending(this, original, checkedId(annex.getString("preparationId")), checkedId(annex.getString("previousPreparationId")), hash);
+            if (!(mapping.get("stateRebuild") instanceof Document annex)) throw unreadable();
+            int version = annexVersion(annex, false);
+            if (!(annex.get("intentRevision") instanceof Long) || !(annex.get("originalStateEpoch") instanceof Long)) throw unreadable();
+            var pending = new Pending(this, original, checkedId(annex.getString("preparationId")), checkedId(annex.getString("previousPreparationId")),
+                    hash, version, version == 2 ? inputClosureHash(original.inputs(), original.dependencyHashes()) : null);
             if (!encode(pending).equals(annex)) throw fenced();
             var old = MongoPipelinePreparationFacts.decode(state.pipelineId(), mapping, clusterId);
             if (old.phase() != PipelinePreparation.Phase.COMPLETE || !old.scope().equals(original.originalScope())
@@ -269,12 +338,27 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
     }
     private static Document encode(Pending value) {
         var request = value.request;
-        return new Document("formatVersion", 1).append("operationId", request.operationId())
+        var encoded = new Document("formatVersion", value.formatVersion).append("operationId", request.operationId())
                 .append("originalScope", MongoPipelinePreparationFacts.scope(request.originalScope()))
                 .append("targetScope", MongoPipelinePreparationFacts.scope(request.targetScope())).append("preparationId", value.id)
                 .append("previousPreparationId", value.previous).append("intentRevision", request.intent().intentRevision())
                 .append("originalClaim", claim(request.originalClaim())).append("originalStateEpoch", request.originalStateEpoch())
                 .append("confirmationHash", value.hash);
+        if (value.formatVersion == 2) encoded.append("inputClosureHash", value.inputClosureHash);
+        return encoded;
+    }
+    private static int annexVersion(Document annex, boolean complete) {
+        if (annex == null || !(annex.get("formatVersion") instanceof Integer version) || (version != 1 && version != 2)) throw unreadable();
+        var fields = new java.util.HashSet<>(ANNEX);
+        if (complete) fields.add("result");
+        if (version == 2) fields.add("inputClosureHash");
+        if (!fields.equals(annex.keySet()) || version == 2 && (!(annex.get("inputClosureHash") instanceof String hash)
+                || !hash.matches("[0-9a-f]{64}"))) throw unreadable();
+        return version;
+    }
+    private static String inputClosureHash(PipelinePreparationInputs inputs, Map<String, String> dependencies) {
+        return CanonicalHash.ofText(JsonWriter.write(new Document("targetInputs", MongoPipelineSourcePreparations.encode(inputs))
+                .append("dependencyHashes", new java.util.TreeMap<>(dependencies))));
     }
     private static Document claim(WorkloadClaimFence claim) {
         return new Document("clusterId", claim.key().clusterId()).append("pipelineId", claim.key().resourceId())
@@ -293,7 +377,8 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
                 .append("dependencyHashes", new java.util.TreeMap<>(request.dependencyHashes()))
                 .append("targetInputs", MongoPipelineSourcePreparations.encode(request.inputs()))));
     }
-    private record Pending(MongoPipelineStateRebuilds owner, PipelineRebuildRequest request, String id, String previous, String hash)
+    private record Pending(MongoPipelineStateRebuilds owner, PipelineRebuildRequest request, String id, String previous, String hash,
+                           int formatVersion, String inputClosureHash)
             implements PipelineRebuildPreparation {
         @Override public String preparationId() { return id; }
         @Override public String previousPreparationId() { return previous; }

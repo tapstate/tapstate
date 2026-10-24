@@ -129,6 +129,17 @@
         "Current-scope preparation and CACHE incarnation replacement compete through the existing actual CONFIG version write; a late old-incarnation insertion cannot commit after scope replacement. Original first-creation rights are not reissued.",
         "No claim of detecting simultaneous erasure of every CONFIG fact and every corroborating note is made; trusted complete CONFIG is required. Identity changes outside the canonical domain do not inherit an old execution or position request."
       ]
+    },
+    "pending-full-input-proof": {
+      "goal": "Retain the exact original explicit clear-state full identity and its immutable authoring/input/dependency closure; later edits cannot reuse its model-handoff authority.",
+      "entry": "A newly confirmed explicit clear-state full writes strict stateRebuild formatVersion 2 in the original CONFIG begin transaction, after original intent, input and complete dependency verification; completedFull recognizes only the same still-current COMPLETE target.",
+      "prerequisites": [
+        "Strict version 2 is exactly the existing version 1 stateRebuild fields plus inputClosureHash, with the existing result added only on completion. inputClosureHash is the canonical hash of the exact existing encoded PipelinePreparationInputs and lexically sorted complete dependencyHashes map from the original confirmed request. It is written and retained with the original operation, preparation, scopes and confirmationHash in the same CONFIG transaction/CAS.",
+        "At first model handoff and its subsequent CONFIG guard, recompute the exact current input/dependency digest, verify all current referenced resources and canonical hashes, compare the original fixed digest, and require the original ACTIVE target, COMPLETE preparation, operation and strict completed result. Dependency IDs, hashes, input selections and direct-channel identities all contribute; equality grants no extra scope.",
+        "Existing version 1 pending/completed facts keep their strict original shapes and ordinary replay behavior. They cannot authorize this new model handoff; no migration, inference, missing-proof backfill or current-only substitute is allowed. A new explicit clear-state full is required to create version 2 proof.",
+        "Completed-full handles are minted and revalidated by the original CONFIG adapter; a caller-supplied origin/hash or arbitrary SPI implementation is not proof. CACHE separately checks the exact original rebuild marker, target and claims in its existing transaction, while CONFIG checks remain outside that transaction before and after it. There is no cross-domain atomicity promise.",
+        "All previously reviewed pending-full pin-first retry, model/cut, membership, size and monotonic position-edit restriction contracts remain unchanged. A retired/deleted origin, reused Pipeline ID, later full or changed preparation cannot reuse a prior proof."
+      ]
     }
   },
   "consistencyProfiles": {
@@ -1105,8 +1116,8 @@
     },
     {
       "id": "mongo.config.operator_generations",
-      "resourceVersion": 1,
-      "proposalVersion": 2,
+      "resourceVersion": 2,
+      "proposalVersion": 3,
       "kind": "COLLECTION",
       "layer": "CONFIG",
       "database": "CONFIG",
@@ -1120,11 +1131,12 @@
       "readers": [
         "io.tapstate.adapters.mongostore.MongoPipelineStateMappings"
       ],
-      "recovery": "pending-full-authority",
+      "recovery": "pending-full-input-proof",
       "consistency": "config",
-      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "growth": "One bounded stateRebuild annex per Pipeline; the strict version 2 variant adds one 64-character hexadecimal inputClosureHash. It replaces no prior scopes or confirmation facts, stores no schema bodies, secrets or unbounded history, and never backfills proof for version 1.",
       "evidence": [
-        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoPipelineStateMappingsIT.java"
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoPipelineStateMappingsIT.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCachePipelineRebuildsIT.java"
       ]
     },
     {

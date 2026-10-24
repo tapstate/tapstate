@@ -15,6 +15,8 @@ import io.tapstate.spi.store.*;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
@@ -42,6 +44,154 @@ class MongoCachePipelineRebuildsIT {
     private static final Instant AT = Instant.parse("2026-10-19T03:00:00Z");
     private static final WorkloadOwner OWNER = new WorkloadOwner("node-a", "boot-a");
     private static MongoDBContainer mongo() { return new MongoDBContainer(DockerImageName.parse("mongo:7.0")); }
+
+    @Test void aCompletedExplicitFullCanBeReadWithItsOriginalInputsAfterAControllerRestart() {
+        withFixture(f -> {
+            var request = modelFullRequest(f);
+            var pending = f.configuration.rebuilds().begin(request);
+            String digest = CanonicalHash.ofText(io.tapstate.core.common.JsonWriter.write(
+                    new Document("targetInputs", MongoPipelineSourcePreparations.encode(request.inputs()))
+                            .append("dependencyHashes", new java.util.TreeMap<>(request.dependencyHashes()))));
+            var beginning = f.mapping().get("stateRebuild", Document.class);
+            assertThat(beginning).containsEntry("formatVersion", 2).containsEntry("inputClosureHash", digest);
+            var receipt = f.rebuilds().prepare(pending, f.node, TTL, AT);
+            var prepared = f.configuration.rebuilds().complete(receipt);
+            var settings = new MongoConnectionSettings(CONFIG.getReplicaSetUrl(f.config.getName()), null, Duration.ofSeconds(5));
+            try (var reopened = MongoConfigurationDomain.open(settings, f.scope.clusterId())) {
+                var proof = reopened.rebuilds().completedFull(prepared.scope(), request.inputs(), request.dependencyHashes());
+                assertThat(proof).isPresent();
+                assertThat(proof.orElseThrow().targetScope()).isEqualTo(prepared.scope());
+                assertThat(proof.orElseThrow().operationId()).isEqualTo(request.operationId());
+                assertThat(proof.orElseThrow().preparationId()).isEqualTo(pending.preparationId());
+                assertThat(proof.orElseThrow().confirmationHash()).isEqualTo(pending.confirmationHash());
+                assertThat(proof.orElseThrow().sourceHashes()).isEqualTo(request.inputs().sourceHashes());
+                proof.orElseThrow().requireCurrent();
+                var intent = reopened.intents().load("flow").orElseThrow();
+                assertThat(reopened.intents().compareAndSet(prepared.scope(), intent.intentRevision(),
+                        new DesiredState("flow", PipelineState.RUNNING, request.inputs().pipelineHash(), false))).isTrue();
+                assertCode(proof.orElseThrow()::requireCurrent, IoError.PIPELINE_INTENT_FENCED);
+                reopened.rebuilds().completedFull(prepared.scope(), request.inputs(), request.dependencyHashes()).orElseThrow().requireCurrent();
+                assertThat(f.mapping().get("stateRebuild", Document.class).get("inputClosureHash")).isEqualTo(digest);
+            }
+            long version = f.version();
+            f.domain.close();
+            assertThat(f.configuration.rebuilds().complete(receipt)).isEqualTo(prepared);
+            assertThat(f.version()).isEqualTo(version);
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings = {"input", "target", "reusable_view", "reusable_serve"})
+    void theOriginalFullCannotAuthorizeAnUpdatedCurrentDependencyClosure(String changed) {
+        withFixture(f -> {
+            var request = modelFullRequest(f);
+            var pending = f.configuration.rebuilds().begin(request);
+            var prepared = f.configuration.rebuilds().complete(f.rebuilds().prepare(pending, f.node, TTL, AT));
+            var held = f.configuration.rebuilds().completedFull(prepared.scope(), request.inputs(), request.dependencyHashes()).orElseThrow();
+            if (changed.equals("input") || changed.equals("target")) {
+                var source = (SourceResource) f.configuration.artifacts().get(changed).orElseThrow();
+                f.configuration.artifacts().save(new SourceResource(source.id(), source.metadata(), source.connector(),
+                        Map.of("uri", "mongodb://changed.invalid/changed"), source.mode(), source.tables(), source.srs(), source.experimental()));
+            } else if (changed.equals("reusable_view")) {
+                f.configuration.artifacts().save(new io.tapstate.core.model.ViewResource(changed, null, "alternate_id", null, null));
+            } else {
+                f.configuration.artifacts().save(new io.tapstate.core.model.ServeResource(changed, null,
+                        List.of(new io.tapstate.core.model.SyncElement("changed_sink", "target", null, null, null)), null, null, null));
+            }
+            var currentSource = (SourceResource) f.configuration.artifacts().get("input").orElseThrow();
+            var pipeline = (io.tapstate.core.model.PipelineResource) f.configuration.artifacts().get("flow").orElseThrow();
+            var inputs = PipelinePreparationInputs.of(prepared.scope(), pipeline, Map.of(currentSource.id(), currentSource),
+                    request.inputs().selectedTables());
+            var dependencies = new java.util.HashMap<String, String>();
+            for (String id : request.dependencyHashes().keySet()) dependencies.put(id, CanonicalHash.of(f.configuration.artifacts().get(id).orElseThrow()));
+            var before = f.mapping(); var cache = f.snapshot(); long version = f.version();
+            assertCode(held::requireCurrent, IoError.PIPELINE_INTENT_FENCED);
+            assertCode(() -> f.configuration.rebuilds().completedFull(prepared.scope(), inputs, dependencies), IoError.PIPELINE_INTENT_FENCED);
+            assertThat(f.mapping()).isEqualTo(before); assertThat(f.snapshot()).isEqualTo(cache); assertThat(f.version()).isEqualTo(version);
+        });
+    }
+
+    @Test void aLegacyPendingFullRetainsItsOriginalShapeAcrossReopenCompletionAndLostReply() {
+        withFixture(f -> {
+            var request = modelFullRequest(f);
+            f.configuration.rebuilds().begin(request);
+            var legacy = new Document(f.mapping().get("stateRebuild", Document.class));
+            legacy.put("formatVersion", 1); legacy.remove("inputClosureHash");
+            SystemCollections.OPERATOR_GENERATIONS.on(f.config).updateOne(new Document("_id", "flow"),
+                    new Document("$set", new Document("stateRebuild", legacy)));
+            var settings = new MongoConnectionSettings(CONFIG.getReplicaSetUrl(f.config.getName()), null, Duration.ofSeconds(5));
+            PipelinePreparation prepared;
+            PipelineRebuildReceipt completedReceipt;
+            try (var reopened = MongoConfigurationDomain.open(settings, f.scope.clusterId())) {
+                var restored = reopened.rebuilds().pending("flow", request.inputs(), request.dependencyHashes()).orElseThrow();
+                var receipt = f.rebuilds().prepare(restored, f.node, TTL, AT);
+                completedReceipt = receipt;
+                prepared = reopened.rebuilds().complete(receipt);
+                assertThat(f.mapping().get("stateRebuild", Document.class)).containsEntry("formatVersion", 1).doesNotContainKey("inputClosureHash");
+                assertThat(reopened.rebuilds().completedFull(prepared.scope(), request.inputs(), request.dependencyHashes())).isEmpty();
+            }
+            var before = f.mapping(); long version = f.version(); f.domain.close();
+            assertThat(f.configuration.rebuilds().completed(request)).contains(prepared);
+            assertThat(f.configuration.rebuilds().completed(request)).contains(prepared);
+            assertThat(f.mapping()).isEqualTo(before); assertThat(f.version()).isEqualTo(version);
+            var intent = f.configuration.intents().load("flow").orElseThrow();
+            assertThat(f.configuration.intents().compareAndSet(prepared.scope(), intent.intentRevision(),
+                    new DesiredState("flow", PipelineState.STOPPED, request.inputs().pipelineHash(), true))).isTrue();
+            var next = new PipelineRebuildRequest("new-explicit-full", f.configuration.intents().load("flow").orElseThrow(),
+                    completedReceipt.claim(), completedReceipt.checkpointEpoch(),
+                    request.inputs(), request.dependencyHashes());
+            f.configuration.rebuilds().begin(next);
+            assertThat(f.mapping().get("stateRebuild", Document.class)).containsEntry("formatVersion", 2).containsKey("inputClosureHash");
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings = {"missing", "extra", "type", "hash", "version", "legacy-with-hash"})
+    void aMalformedVersionTwoFullCannotBeDowngradedOrRepaired(String damage) {
+        withFixture(f -> {
+            var request = modelFullRequest(f);
+            var pending = f.configuration.rebuilds().begin(request);
+            var prepared = f.configuration.rebuilds().complete(f.rebuilds().prepare(pending, f.node, TTL, AT));
+            var altered = new Document(f.mapping().get("stateRebuild", Document.class));
+            switch (damage) {
+                case "missing" -> altered.remove("inputClosureHash");
+                case "extra" -> altered.put("unknown", true);
+                case "type" -> altered.put("inputClosureHash", 7L);
+                case "hash" -> altered.put("inputClosureHash", "f".repeat(64));
+                case "version" -> altered.put("formatVersion", 3);
+                case "legacy-with-hash" -> altered.put("formatVersion", 1);
+                default -> throw new AssertionError(damage);
+            }
+            SystemCollections.OPERATOR_GENERATIONS.on(f.config).updateOne(new Document("_id", "flow"),
+                    new Document("$set", new Document("stateRebuild", altered)));
+            var before = f.mapping(); var cache = f.snapshot(); long version = f.version();
+            var expected = damage.equals("hash") ? IoError.PIPELINE_INTENT_FENCED : IoError.DOCUMENT_UNREADABLE;
+            assertCode(() -> f.configuration.rebuilds().completedFull(prepared.scope(), request.inputs(), request.dependencyHashes()), expected);
+            assertThat(f.mapping()).isEqualTo(before); assertThat(f.snapshot()).isEqualTo(cache); assertThat(f.version()).isEqualTo(version);
+        });
+    }
+
+    private static PipelineRebuildRequest modelFullRequest(Fixture f) {
+        var source = new SourceResource("input", null, "mongodb", Map.of("uri", "mongodb://input.invalid/db"),
+                io.tapstate.core.model.SourceMode.CDC, List.of(io.tapstate.core.model.TableRef.literal("orders")), null, null);
+        var target = new SourceResource("target", null, "mongodb", Map.of("uri", "mongodb://target.invalid/db"), null, null, null, null);
+        var view = new io.tapstate.core.model.ViewResource("reusable_view", null, "id", null, null);
+        var serve = new io.tapstate.core.model.ServeResource("reusable_serve", null,
+                List.of(new io.tapstate.core.model.SyncElement("sink", target.id(), null, null, null)), null, null, null);
+        var pipeline = new io.tapstate.core.model.PipelineResource("flow", null,
+                List.of(io.tapstate.core.model.SourceRef.spec(source.id(), true)), null,
+                new io.tapstate.core.model.ViewBlock.Use("materialized", view.id(), io.tapstate.core.model.FromRef.literal("orders")),
+                new io.tapstate.core.model.ServeBlock.Use(null, serve.id(), io.tapstate.core.model.FromRef.literal("materialized")), null, null);
+        f.configuration.artifacts().saveAll(List.of(source, target, view, serve, pipeline));
+        var old = f.configuration.intents().load("flow").orElseThrow();
+        assertThat(f.configuration.intents().compareAndSet(f.scope, old.intentRevision(),
+                new DesiredState("flow", PipelineState.STOPPED, CanonicalHash.of(pipeline), true))).isTrue();
+        var current = f.configuration.intents().load("flow").orElseThrow();
+        var successor = new PipelineIntentScope(f.scope.clusterId(), f.scope.bindingVersion(), f.scope.cacheIncarnation(), "flow", 2);
+        var inputs = PipelinePreparationInputs.of(successor, pipeline, Map.of(source.id(), source),
+                Map.of(source.id(), java.util.Set.of("orders")));
+        var claim = WorkloadClaimFence.from(f.domain.workloadClaims(f.business).readPipeline(f.scope).orElseThrow().claim());
+        return new PipelineRebuildRequest("model-full-original", current, claim, 0, inputs,
+                Map.of(target.id(), CanonicalHash.of(target), view.id(), CanonicalHash.of(view), serve.id(), CanonicalHash.of(serve)));
+    }
 
     @Test void aPurgeWithPinnedModelsCanThenDeleteItsSuccessorWithoutTouchingAnotherPipeline() {
         withFixture(f -> {

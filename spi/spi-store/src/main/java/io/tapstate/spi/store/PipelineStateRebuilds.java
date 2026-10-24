@@ -24,4 +24,10 @@ public interface PipelineStateRebuilds {
 
     /** Verify the exact existing pending operation and original current definitions; never creates facts. */
     void requirePending(PipelineRebuildPreparation original);
+
+    /** Reads only an existing completed full and its current exact authoring closure. */
+    default java.util.Optional<CompletedPipelineFull> completedFull(PipelineIntentScope target,
+            PipelinePreparationInputs inputs, java.util.Map<String,String> dependencies) {
+        return java.util.Optional.empty();
+    }
 }
