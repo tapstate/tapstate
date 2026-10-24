@@ -173,6 +173,12 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands,io.t
         @Override public io.tapstate.spi.store.CapturePreparation replacement(){return replacement;}
         @Override public void requireCurrent(){owner.active.run();owner.requireSharedPending(this);owner.active.run();}
     }
+    record SharedOriginal(io.tapstate.spi.store.SharedSrsRecoveryPreparation preparation,Plan plan,
+            io.tapstate.spi.store.CapturePreparation replacement,Runnable requireCurrent) {}
+    static SharedOriginal requireSharedOriginal(io.tapstate.spi.store.SharedSrsRecoveryPreparation original,String targetFingerprint) {
+        if(!(original instanceof SharedPending retained) || !retained.targetFingerprint.equals(targetFingerprint))throw refused();
+        retained.requireCurrent();return new SharedOriginal(retained,retained.plan,retained.replacement,retained::requireCurrent);
+    }
 
     record Transition(Plan plan, boolean won) {}
     Transition startInitialOp(Plan confirmed) {

@@ -9,10 +9,118 @@ import java.util.function.Function;
 import org.bson.Document;
 
 /** First canonical CAPTURE history and its optional SRS birth commit together under the original CACHE authority. */
-final class MongoCaptureCachePreparations implements CaptureCachePreparations {
+final class MongoCaptureCachePreparations implements CaptureCachePreparations,SharedSrsCacheRecoveries {
     private static final TransactionOptions TRANSACTION=TransactionOptions.builder().readConcern(ReadConcern.SNAPSHOT).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
     private final MongoClient client;private final MongoDatabase database;private final CacheBusinessScope scope;private final String targetFingerprint;private final Runnable active;private final Duration retention;
     MongoCaptureCachePreparations(MongoClient client,MongoDatabase database,CacheBusinessScope scope,String targetFingerprint,Runnable active,Duration retention){this.client=Objects.requireNonNull(client,"client");this.database=Objects.requireNonNull(database,"database");this.scope=Objects.requireNonNull(scope,"scope");this.targetFingerprint=Objects.requireNonNull(targetFingerprint,"targetFingerprint");this.active=Objects.requireNonNull(active,"active");this.retention=retention;}
+    @Override public SharedSrsRecoveryReceipt replace(SharedSrsRecoveryPreparation original,WorkloadClaimFence currentNode) {
+        var admitted=MongoStorageRecoveryCommands.requireSharedOriginal(original,targetFingerprint);requireScope(admitted.replacement());
+        requireSharedNode(currentNode);
+        var result=transaction(() -> {},session -> {
+            var structure=new MongoCacheMetadataStructure(database,retention);structure.verifySrs();
+            new MongoCacheBusinessIdentity(database,scope).requireReady(session);
+            var consumers=new MongoSrsConsumerStore(client,database,scope,active,structure::verifySrs);
+            var roots=SystemCollections.SRS_CHAINS.on(database);
+            var previous=admitted.plan().manifest().sharedSrs().previous();
+            var root=roots.find(session,new Document("_id",previous.chainId())).first();
+            if(root==null)throw history(previous);
+            var isolation=MongoSrsRecoveryControls.read(root);
+            if(isolation.isPresent()) {
+                verifyApplied(session,admitted,consumers);return new SharedReceipt(this,admitted,SharedSrsRecoveryReceipt.Outcome.RETIRED);
+            }
+            var observed=consumers.sharedRecoveryView(session,previous);
+            if(!observed.snapshot().equals(admitted.plan().manifest().sharedSrs()))throw history(previous);
+            requireEmptySharedNamespace(session,admitted.replacement());
+            new MongoCacheBusinessIdentity(database,scope).admitMetadataWrite(session);
+            Date now=MongoCachePipelinePreparations.proveNode(session,database,scope,currentNode);
+            for(var row:observed.claims())requireEnded(row,now);
+            var claims=SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
+            var originalCapture=observed.claims().getFirst();var before=observed.snapshot().captureFence();
+            if(before.claimGeneration()>=Long.MAX_VALUE-2)throw history(previous);
+            var next=new WorkloadClaimFence(before.key(),currentNode.owner(),before.claimGeneration()+1,before.executionGeneration(),
+                    Math.max(before.topologyRevision(),currentNode.topologyRevision()));
+            var replacement=new Document(originalCapture).append("ownerNodeId",next.owner().nodeId()).append("ownerBootId",next.owner().bootId())
+                    .append("claimGeneration",next.claimGeneration()).append("topologyRevision",next.topologyRevision()).append("leaseUntil",new Date(0))
+                    .append("capturePreparation",MongoCapturePreparationFacts.row(admitted.replacement()))
+                    .append("fencedChainWrites",originalCapture.getLong("fencedChainWrites")+1);
+            if(claims.replaceOne(session,originalCapture,replacement).getMatchedCount()!=1)throw history(previous);
+            for(int i=1;i<observed.claims().size();i++) {
+                var row=observed.claims().get(i);
+                if(!(row.get("fencedConsumerWrites") instanceof Long writes) || writes<1 || writes>=Long.MAX_VALUE-1)throw history(previous);
+                if(claims.updateOne(session,row,new Document("$set",new Document("leaseUntil",new Date(0)))
+                        .append("$inc",new Document("fencedConsumerWrites",1L))).getMatchedCount()!=1)throw history(previous);
+            }
+            consumers.retireSharedRecovery(session,observed,admitted.plan(),admitted.replacement().chainId());
+            roots.insertOne(session,MongoSrsChainStore.initialRow(scope,admitted.replacement().chainId(),observed.root().getString("retention"),next));
+            verifyApplied(session,admitted,consumers);
+            return new SharedReceipt(this,admitted,SharedSrsRecoveryReceipt.Outcome.RETIRED);
+        });
+        admitted.requireCurrent().run();return result;
+    }
+    @Override public SharedSrsRecoveryReceipt cancel(SharedSrsRecoveryPreparation original,WorkloadClaimFence currentNode) {throw MongoCapturePreparationFacts.fenced();}
+
+    private void requireSharedNode(WorkloadClaimFence node) {
+        if(node==null || node.key().type()!=WorkloadClaimType.NODE_SESSION || !scope.clusterId().equals(node.key().clusterId())
+                || !node.key().resourceId().equals(node.owner().nodeId()))throw MongoCapturePreparationFacts.fenced();
+    }
+    private void requireEmptySharedNamespace(ClientSession session,CapturePreparation replacement) {
+        if(SystemCollections.SRS_CHAINS.on(database).find(session,new Document("_id",replacement.chainId())).first()!=null)throw history(replacement);
+        requireEmptySharedPayloads(session,replacement);
+    }
+    private void requireEmptySharedPayloads(ClientSession session,CapturePreparation replacement) {
+        for(var table:List.of(SystemCollections.SRS_MODELS,SystemCollections.SRS_MODEL_CONTEXTS,SystemCollections.SRS_CONSUMERS,SystemCollections.CACHE_SRS_CONSUMER_OFFSETS))
+            if(table.on(database).find(session,new Document("_id.chain",replacement.chainId())).projection(new Document("_id",1)).first()!=null)throw history(replacement);
+        MongoSrsLogStore.requireEmptyPhysicalNamespace(session,database,replacement.chainId());
+    }
+    private static void requireEnded(Document row,Date now) {
+        if(!(row.get("leaseUntil") instanceof Date lease) || lease.after(now))throw MongoCapturePreparationFacts.fenced();
+    }
+    private void verifyApplied(ClientSession session,MongoStorageRecoveryCommands.SharedOriginal original,MongoSrsConsumerStore consumers) {
+        var plan=original.plan();var before=plan.manifest().sharedSrs();var replacement=original.replacement();
+        var retired=consumers.requireRetiredSharedRecovery(session,plan,replacement.chainId());
+        var claims=SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
+        var reader=new MongoWorkloadClaimStore(claims).inStrictSession(session);
+        var row=claims.find(session,new Document("_id",MongoWorkloadClaimStore.id(before.captureFence().key()))).first();
+        if(row==null || !replacement.equals(requirePreparation(row,before.captureFence().key(),scope))
+                || !(row.get("fencedChainWrites") instanceof Long writes) || writes<2 || writes==Long.MAX_VALUE)throw history(replacement);
+        var current=WorkloadClaimFence.from(reader.decodeStored(row));
+        var fresh=SystemCollections.SRS_CHAINS.on(database).find(session,new Document("_id",replacement.chainId())).first();
+        if(fresh==null)throw history(replacement);
+        MongoSrsChainStore.decode(fresh,scope,new MongoSrsModelContexts(database,scope));
+        var birth=WorkloadClaimDocuments.readCapture(fresh.get("captureFence",Document.class));
+        if(!birth.key().equals(before.captureFence().key()) || birth.claimGeneration()!=before.captureFence().claimGeneration()+1
+                || birth.executionGeneration()!=before.captureFence().executionGeneration() || birth.topologyRevision()<before.captureFence().topologyRevision()
+                || !MongoPositionFences.retained(birth,current)
+                || !MongoSrsChainStore.initialRow(scope,replacement.chainId(),retired.getString("retention"),birth).equals(fresh))throw history(replacement);
+        requireEmptySharedPayloads(session,replacement);
+        if(current.claimGeneration()==birth.claimGeneration() && (!birth.equals(current) || row.getDate("leaseUntil").getTime()!=0))throw history(replacement);
+        for(var pipeline:before.pipelines().values()) {
+            var held=claims.find(session,new Document("_id",MongoWorkloadClaimStore.id(pipeline.claim().key()))).first();
+            if(held==null || !pipeline.scope().equals(MongoCacheWorkloadClaimStore.preparedScope(held,pipeline.claim().key(),scope)))throw history(replacement);
+            var fence=WorkloadClaimFence.from(reader.decodeStored(held));
+            if(!MongoPositionFences.retained(pipeline.claim(),fence) || !(held.get("fencedConsumerWrites") instanceof Long consumerWrites)
+                    || consumerWrites<2 || consumerWrites==Long.MAX_VALUE)throw history(replacement);
+            if(fence.claimGeneration()==pipeline.claim().claimGeneration() && (!fence.equals(pipeline.claim()) || held.getDate("leaseUntil").getTime()!=0))throw history(replacement);
+        }
+    }
+    private void requireSharedReceipt(SharedReceipt receipt) {
+        receipt.original.requireCurrent().run();
+        transaction(() -> {},session -> {
+            var structure=new MongoCacheMetadataStructure(database,retention);structure.verifySrs();
+            new MongoCacheBusinessIdentity(database,scope).requireReady(session);
+            verifyApplied(session,receipt.original,new MongoSrsConsumerStore(client,database,scope,active,structure::verifySrs));return null;
+        });
+        receipt.original.requireCurrent().run();
+    }
+    private static final class SharedReceipt implements SharedSrsRecoveryReceipt {
+        private final MongoCaptureCachePreparations owner;private final MongoStorageRecoveryCommands.SharedOriginal original;private final Outcome outcome;
+        private SharedReceipt(MongoCaptureCachePreparations owner,MongoStorageRecoveryCommands.SharedOriginal original,Outcome outcome) {
+            this.owner=owner;this.original=original;this.outcome=outcome;
+        }
+        @Override public SharedSrsRecoveryPreparation preparation(){return original.preparation();}
+        @Override public Outcome outcome(){return outcome;}
+        @Override public void requireCurrent(){owner.requireSharedReceipt(this);}
+    }
     @Override public CaptureCacheState createFirst(FirstCaptureCreation invocation) {
         var original=MongoCaptureStatePreparations.consumeFirst(invocation,targetFingerprint);
         var preparation=original.preparation();var request=original.request();String ringRetention=original.retention();requireScope(preparation);

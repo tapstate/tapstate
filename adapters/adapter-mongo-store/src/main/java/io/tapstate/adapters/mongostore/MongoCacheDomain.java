@@ -213,6 +213,10 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     public io.tapstate.spi.store.CaptureCachePreparations capturePreparations(CacheBusinessScope scope,Runnable requireActive) {
         Objects.requireNonNull(requireActive,"requireActive");return new MongoCaptureCachePreparations(client,database,scope,targetFingerprint,() -> {businessActive();requireActive.run();},rateRetention);
     }
+    public io.tapstate.spi.store.SharedSrsCacheRecoveries sharedSrsRecoveries(CacheBusinessScope scope,Runnable requireActive) {
+        Objects.requireNonNull(requireActive,"requireActive");return new MongoCaptureCachePreparations(client,database,scope,targetFingerprint,
+                () -> {businessActive();requireActive.run();},rateRetention);
+    }
 
     public CacheBusinessScope loadBusinessScope(CacheBusinessScope expected) {
         businessActive();

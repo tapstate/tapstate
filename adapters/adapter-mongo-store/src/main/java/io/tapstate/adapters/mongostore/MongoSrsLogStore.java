@@ -442,6 +442,14 @@ public final class MongoSrsLogStore implements SrsLogStore {
     static String boundsId(String ring) {
         return BOUNDS_PREFIX + ring;
     }
+    /** The controlled physical chain owns the complete per-table ring prefix, including orphaned rows. */
+    static void requireEmptyPhysicalNamespace(ClientSession session,com.mongodb.client.MongoDatabase database,String chain) {
+        var rings=java.util.regex.Pattern.compile("^"+java.util.regex.Pattern.quote("srs."+chain+"."));
+        var bounds=java.util.regex.Pattern.compile("^"+java.util.regex.Pattern.quote(BOUNDS_PREFIX+"srs."+chain+"."));
+        if(SystemCollections.SRS_EVENTS.on(database).find(session,new Document("_id.ring",rings)).projection(new Document("_id",1)).first()!=null
+                || SystemCollections.SRS_LOG_BOUNDS.on(database).find(session,new Document("_id",bounds)).projection(new Document("_id",1)).first()!=null)
+            throw unreadableSplit("replacement-namespace");
+    }
 
     private static long sequenceOf(Document document) {
         Object id = document.get("_id");

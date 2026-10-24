@@ -78,9 +78,13 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     }
 
     @Override public SharedSrsRecoverySnapshot inspectSharedRecovery(CapturePreparation previous) {
+        return transaction(session -> sharedRecoveryView(session,previous).snapshot());
+    }
+    record SharedView(Document root,SharedSrsRecoverySnapshot snapshot,List<Document> memberships,List<Document> cursors,List<Document> claims) {}
+    SharedView sharedRecoveryView(ClientSession session,CapturePreparation previous) {
+        if(!session.hasActiveTransaction())throw new IllegalStateException("shared controls require their CACHE transaction");
         Objects.requireNonNull(previous,"previous");String chain=previous.chainId();
         if(previous.mode()!=CapturePreparation.Mode.SHARED_SRS || !scope.equals(previous.scope()))throw unavailable(chain);
-        return transaction(session -> {
             try {
                 var root=SystemCollections.SRS_CHAINS.on(database).find(session,new Document("_id",chain)).first();
                 if(root==null || !chain.equals(root.get("_id")) || !previous.captureId().equals(root.get("captureId"))
@@ -118,9 +122,45 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                 var bounds=MongoSrsLogStore.inspectRetainedBounds(session,database,rings);
                 requireRecoveryBounds(held,contexts,bounds.byRing());
                 String hash=MongoSrsRecoveryControls.snapshotHash(root,held.membershipRows(),held.cursorRows(),claims,bounds.rows());
-                return new SharedSrsRecoverySnapshot(previous,capture,hash,actual,pipelines);
+                return new SharedView(root,new SharedSrsRecoverySnapshot(previous,capture,hash,actual,pipelines),
+                        held.membershipRows(),held.cursorRows(),List.copyOf(claims));
             }catch(IllegalArgumentException|NullPointerException|ClassCastException invalid){throw unavailable(chain);}
-        });
+    }
+
+    void retireSharedRecovery(ClientSession session,SharedView original,io.tapstate.spi.store.StorageRecoveryCommands.Plan plan,String replacement) {
+        String chain=original.snapshot().previous().chainId();
+        if(!original.snapshot().equals(plan.manifest().sharedSrs()))throw unavailable(chain);
+        var after=new HashMap<String,Document>();
+        original.memberships().forEach(row -> after.put(row.get("_id",Document.class).getString("consumer"),row));
+        try {
+            for(var before:original.snapshot().consumers()) {
+                var current=original.snapshot().pipelines().get(before.context().key().pipelineId()).claim();
+                var detached=new SrsConsumerMembership(before.context(),Math.addExact(before.revision(),1),true,Set.of(),current);
+                writeMember(session,before,detached);after.put(detached.context().key().consumerId(),records.membership(detached));
+                var offset=original.cursors().stream().filter(row -> row.get("_id",Document.class).equals(records.id(before.context().key()))).findFirst().orElseThrow(() -> unavailable(chain));
+                if(SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(database).deleteOne(session,offset).getDeletedCount()!=1)throw unavailable(chain);
+            }
+            long revision=Math.addExact(original.root().getLong("consumerRevision"),original.snapshot().consumers().size());
+            if(revision>=Long.MAX_VALUE)throw unavailable(chain);
+            var stopped=new Document(original.root()).append("consumerCount",0L).append("consumerRevision",revision);
+            var retired=MongoSrsRecoveryControls.candidate(stopped,plan.operationId(),plan.planHash(),replacement,
+                    MongoSrsRecoveryControls.Phase.RETIRED,new ArrayList<>(after.values()),List.of());
+            chains.replace(session,original.root(),retired);
+        }catch(ArithmeticException|IllegalArgumentException invalid){throw unavailable(chain);}
+    }
+
+    Document requireRetiredSharedRecovery(ClientSession session,io.tapstate.spi.store.StorageRecoveryCommands.Plan plan,String replacement) {
+        var original=plan.manifest().sharedSrs();String chain=original.previous().chainId();
+        var held=administrativeView(session,chain);var control=MongoSrsRecoveryControls.read(held.root()).orElseThrow(() -> unavailable(chain));
+        if(control.phase()!=MongoSrsRecoveryControls.Phase.RETIRED || !control.operationId().equals(plan.operationId())
+                || !control.planHash().equals(plan.planHash()) || !control.replacementChain().equals(replacement)
+                || !held.state().captureId().equals(original.previous().captureId()))throw unavailable(chain);
+        for(var before:original.consumers()) {
+            var after=held.members().get(before.context().key().consumerId());
+            if(after==null || !after.detached() || !after.context().equals(before.context()) || after.revision()!=before.revision()+1
+                    || !after.commandFence().equals(original.pipelines().get(before.context().key().pipelineId()).claim()))throw unavailable(chain);
+        }
+        return held.root();
     }
 
     private void requireRecoveryCoordinates(View held,MongoSrsModelContexts contexts) {
