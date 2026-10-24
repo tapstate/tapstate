@@ -389,6 +389,18 @@ class AuthTest {
     }
 
     @Test
+    void publicBrandingAssetsReachStaticResourceHandlingWithoutAuthentication() {
+        for (String path : List.of("/favicon.ico", "/tapstate-mark.svg", "/tapstate-mark-light.svg")) {
+            HttpStatusCode status = client().get().uri(path)
+                    .accept(MediaType.IMAGE_PNG, MediaType.parseMediaType("image/svg+xml"), MediaType.ALL)
+                    .exchange((request, response) -> response.getStatusCode());
+
+            assertThat(status).as("anonymous GET %s should reach static resource handling", path)
+                    .isEqualTo(HttpStatus.NOT_FOUND);
+        }
+    }
+
+    @Test
     void theControlFaceUsesTwoStatelessSecurityChainsInsteadOfTheLegacyInterceptor() {
         assertThat(context.getBeansOfType(SecurityFilterChain.class)).hasSize(2);
     }
