@@ -96,7 +96,7 @@
   ],
   "provenance": {
     "specPath": "connectors/azure-cosmosdb-connector/src/main/resources/azure-cosmosdb-spec.json",
-    "specContentHash": "d27aaf7f1c60eb60",
+    "specContentHash": "e9b40fd2464b1a99",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {
