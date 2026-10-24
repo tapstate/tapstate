@@ -126,6 +126,83 @@ class ScopedPipelineActuationOwnershipTest {
         verify(store,never()).read(any());verify(store,never()).acquire(any(),any(),anyLong(),any());
     }
 
+    @ParameterizedTest @ValueSource(booleans={false,true})
+    void anEndedOriginalTupleCanBeHeldWithoutAcquiringAnotherTenure(boolean foreign) {
+        var original=raw.acquire(KEY,foreign?new WorkloadOwner("old-node","old-boot"):OWNER,1,TTL).claim();
+        assertThat(raw.release(original)).isTrue();var ended=raw.read(KEY).orElseThrow().claim();
+        var owner=ownership();int before=acquisitions.get();
+        try(var control=owner.retiredControl(FIRST,WorkloadClaimFence.from(ended))) {
+            control.requireHeld();control.endTenure();owner.renewDue();owner.retain(Set.of());
+            assertThat(control.claim()).isEqualTo(WorkloadClaimFence.from(ended));
+            assertThat(raw.read(KEY).orElseThrow().claim()).isEqualTo(ended);
+            assertThat(owner.permit(FIRST).granted()).isFalse();
+            assertThat(owner.beginExecution(FIRST,control.claim()).allowed()).isFalse();
+            assertThatThrownBy(control::requireActive).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> owner.enterPass(FIRST)).isInstanceOf(TapstateException.class);
+            assertThat(acquisitions).hasValue(before);
+            verify(store,never()).acquirePipeline(any(),any(),anyLong(),any());
+            verify(store,never()).release(any());verify(store,never()).renew(any(),any());
+            verify(store,never()).advanceExecution(any(),anyLong(),anySet());
+        }
+        assertThat(owner.permit(FIRST).claim().claimGeneration()).isEqualTo(ended.claimGeneration()+1);
+    }
+
+    @ParameterizedTest @ValueSource(strings={"live","scope","business","fence","type","resource","missing","member","control","pass","read-failed","unscoped"})
+    void anUnknownOrLiveTupleCannotBecomeARetiredLocalBarrier(String fault) throws Exception {
+        var original=raw.acquire(KEY,OWNER,1,TTL).claim();
+        if(!fault.equals("live"))assertThat(raw.release(original)).isTrue();
+        var owner=ownership();var selected=FIRST;var expected=WorkloadClaimFence.from(original);
+        AutoCloseable existing=null;
+        try {
+            switch(fault) {
+                case "scope" -> selected=scope(2);
+                case "business" -> selected=new PipelineIntentScope("other-cluster",3,"cache-a","orders",1);
+                case "fence" -> expected=new WorkloadClaimFence(KEY,OWNER,2,0,1);
+                case "type" -> expected=new WorkloadClaimFence(new WorkloadClaimKey("cluster-a",WorkloadClaimType.CAPTURE,"orders"),OWNER,1,0,1);
+                case "resource" -> expected=new WorkloadClaimFence(new WorkloadClaimKey("cluster-a",WorkloadClaimType.PIPELINE_ACTUATION,"other"),OWNER,1,0,1);
+                case "missing" -> when(store.readPipeline(FIRST)).thenReturn(java.util.Optional.empty());
+                case "member" -> membership.canCommit(Set.of("node-a"));
+                case "control" -> existing=owner.unpreparedControl(FIRST);
+                case "pass" -> existing=owner.enterPass(FIRST);
+                case "read-failed" -> doThrow(fenced()).when(store).readPipeline(FIRST);
+                case "unscoped" -> owner=PipelineActuationOwnership.single();
+                case "live" -> { }
+                default -> throw new AssertionError(fault);
+            }
+            var checkedOwner=owner;var checkedScope=selected;var checkedFence=expected;
+            var before=raw.read(KEY).orElseThrow().claim();
+            assertThatThrownBy(() -> checkedOwner.retiredControl(checkedScope,checkedFence)).isInstanceOf(TapstateException.class);
+            assertThat(raw.read(KEY).orElseThrow().claim()).isEqualTo(before);
+            assertThat(acquisitions).hasValue(0);
+            verify(store,never()).release(any());verify(store,never()).renew(any(),any());
+            if(existing==null && !fault.equals("member")) {
+                if(!fault.equals("unscoped"))try(var barrier=owner.unpreparedControl(FIRST)){barrier.requireHeld();}
+            }
+        } finally {if(existing!=null)existing.close();}
+    }
+
+    @Test void holdingAnEndedTupleRemovesOnlyItsMatchingLocalRenewer() {
+        var owner=ownership();var original=owner.permit(FIRST).claim();
+        assertThat(raw.release(original)).isTrue();var ended=raw.read(KEY).orElseThrow().claim();
+        try(var control=owner.retiredControl(FIRST,WorkloadClaimFence.from(ended))) {
+            nanos.addAndGet(RENEW.toNanos());owner.renewDue();control.requireHeld();
+            assertThat(raw.read(KEY).orElseThrow().claim()).isEqualTo(ended);
+            verify(store,never()).renew(any(),any());verify(store,never()).release(any());
+            assertThat(acquisitions).hasValue(1);
+        }
+    }
+
+    @Test void anEndedSuccessorCannotReplaceADifferentLocallyHeldTuple() {
+        var owner=ownership();var original=owner.permit(FIRST).claim();
+        assertThat(raw.release(original)).isTrue();
+        var successor=raw.acquire(KEY,new WorkloadOwner("other-node","other-boot"),1,TTL).claim();
+        assertThat(raw.release(successor)).isTrue();var ended=raw.read(KEY).orElseThrow().claim();
+        assertThatThrownBy(() -> owner.retiredControl(FIRST,WorkloadClaimFence.from(ended))).isInstanceOf(TapstateException.class);
+        assertThat(raw.read(KEY).orElseThrow().claim()).isEqualTo(ended);
+        assertThat(acquisitions).hasValue(1);verify(store,never()).release(any());
+        try(var control=owner.unpreparedControl(FIRST)){control.requireHeld();}
+    }
+
     @Test void anExpiredExactTenureCanEndAfterTheRenewerHasDroppedItsLocalHolder() {
         var owner=ownership();
         try(var control=owner.control(FIRST)) {

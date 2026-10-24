@@ -148,6 +148,23 @@ final class PipelineActuationOwnership {
         var command = new Control(scope, WorkloadClaimFence.from(admitted.claim()));
         controls.put(scope.pipelineId(), command); return command;
     }
+    /** Holds a proven ended tuple locally without acquiring another durable tenure or execution permission. */
+    synchronized Control retiredControl(PipelineIntentScope scope,WorkloadClaimFence original) {
+        if(closing || !fenced || !accepts(scope) || original==null || !membership.businessEligible()
+                || controls.containsKey(scope.pipelineId()) || passes.containsKey(scope.pipelineId())
+                || original.key().type()!=WorkloadClaimType.PIPELINE_ACTUATION
+                || !scope.clusterId().equals(original.key().clusterId()) || !scope.pipelineId().equals(original.key().resourceId()))
+            throw ThreeLayerStorePort.refused();
+        var local=held.get(scope.pipelineId());
+        if(local!=null && (!scope.equals(local.scope) || local.claim!=null && !original.equals(WorkloadClaimFence.from(local.claim))))
+            throw ThreeLayerStorePort.refused();
+        var observed=claims.readPipeline(scope).orElseThrow(ThreeLayerStorePort::refused);
+        if(observed.leased() || !original.equals(WorkloadClaimFence.from(observed.claim())) || !membership.businessEligible())
+            throw ThreeLayerStorePort.refused();
+        var command=new Control(scope,original);command.tenureEnded=true;
+        if(local!=null)held.remove(scope.pipelineId(),local);
+        controls.put(scope.pipelineId(),command);return command;
+    }
     synchronized Control unpreparedControl(PipelineIntentScope scope) {
         if (closing || !accepts(scope) || controls.containsKey(scope.pipelineId()) || passes.containsKey(scope.pipelineId()) || !membership.businessEligible()) throw ThreeLayerStorePort.refused();
         var command = new Control(scope, null); controls.put(scope.pipelineId(), command); return command;
