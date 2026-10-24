@@ -113,6 +113,7 @@ final class PipelineActuationOwnership {
                 requireHeld();
                 if(!fenced || businessScope==null || claim==null || !accepts(scope))throw ThreeLayerStorePort.refused();
                 if(tenureEnded)return;
+                if(!owner.equals(claim.owner()))throw ThreeLayerStorePort.refused();
                 var local=held.get(scope.pipelineId());
                 if(local!=null && (!scope.equals(local.scope) || local.claim!=null && !claim.equals(WorkloadClaimFence.from(local.claim))))
                     throw ThreeLayerStorePort.refused();
@@ -150,11 +151,7 @@ final class PipelineActuationOwnership {
     }
     /** Holds a proven ended tuple locally without acquiring another durable tenure or execution permission. */
     synchronized Control retiredControl(PipelineIntentScope scope,WorkloadClaimFence original) {
-        if(closing || !fenced || !accepts(scope) || original==null || !membership.businessEligible()
-                || controls.containsKey(scope.pipelineId()) || passes.containsKey(scope.pipelineId())
-                || original.key().type()!=WorkloadClaimType.PIPELINE_ACTUATION
-                || !scope.clusterId().equals(original.key().clusterId()) || !scope.pipelineId().equals(original.key().resourceId()))
-            throw ThreeLayerStorePort.refused();
+        requireFreeControl(scope,original);
         var local=held.get(scope.pipelineId());
         if(local!=null && (!scope.equals(local.scope) || local.claim!=null && !original.equals(WorkloadClaimFence.from(local.claim))))
             throw ThreeLayerStorePort.refused();
@@ -164,6 +161,18 @@ final class PipelineActuationOwnership {
         var command=new Control(scope,original);command.tenureEnded=true;
         if(local!=null)held.remove(scope.pipelineId(),local);
         controls.put(scope.pipelineId(),command);return command;
+    }
+    /** Blocks local acquisition and execution without adopting the transported tuple as a lease. */
+    synchronized Control freezeControl(PipelineIntentScope scope,WorkloadClaimFence original) {
+        requireFreeControl(scope,original);
+        var command=new Control(scope,original);controls.put(scope.pipelineId(),command);return command;
+    }
+    private void requireFreeControl(PipelineIntentScope scope,WorkloadClaimFence original) {
+        if(closing || !fenced || !accepts(scope) || original==null || !membership.businessEligible()
+                || controls.containsKey(scope.pipelineId()) || passes.containsKey(scope.pipelineId())
+                || original.key().type()!=WorkloadClaimType.PIPELINE_ACTUATION
+                || !scope.clusterId().equals(original.key().clusterId()) || !scope.pipelineId().equals(original.key().resourceId()))
+            throw ThreeLayerStorePort.refused();
     }
     synchronized Control unpreparedControl(PipelineIntentScope scope) {
         if (closing || !accepts(scope) || controls.containsKey(scope.pipelineId()) || passes.containsKey(scope.pipelineId()) || !membership.businessEligible()) throw ThreeLayerStorePort.refused();

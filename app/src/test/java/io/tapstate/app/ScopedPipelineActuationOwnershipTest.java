@@ -192,6 +192,44 @@ class ScopedPipelineActuationOwnershipTest {
         }
     }
 
+    @Test void freezingTheOriginalHolderKeepsItsRenewalUntilTheActualDrainEndsItsTenure() {
+        var owner=ownership();var permit=owner.permit(FIRST);var original=WorkloadClaimFence.from(permit.claim());
+        int readCount=reads.get();int acquireCount=acquisitions.get();
+        try(var control=owner.freezeControl(FIRST,original)) {
+            control.requireHeld();assertThat(reads).hasValue(readCount);assertThat(acquisitions).hasValue(acquireCount);
+            assertThat(owner.permit(FIRST).granted()).isFalse();assertThat(owner.beginExecution(FIRST,original).allowed()).isFalse();
+            assertThatThrownBy(() -> owner.enterPass(FIRST)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> owner.control(FIRST)).isInstanceOf(TapstateException.class);
+            raw.elapse(RENEW);nanos.addAndGet(RENEW.toNanos());owner.renewDue();
+            verify(store).renew(any(),any());assertThat(raw.read(KEY).orElseThrow().leased()).isTrue();
+            control.endTenure();control.requireHeld();assertThat(raw.read(KEY).orElseThrow().leased()).isFalse();
+            nanos.addAndGet(RENEW.toNanos());owner.renewDue();verify(store,times(1)).renew(any(),any());
+            assertThat(acquisitions).hasValue(acquireCount);
+        }
+    }
+
+    @Test void aForeignLiveTupleCanOnlyBlockLocalWorkAndCannotReleaseTheActualOwnersLease() {
+        var remote=raw.acquire(KEY,new WorkloadOwner("node-b","boot-b"),1,TTL).claim();var owner=ownership();
+        try(var control=owner.freezeControl(FIRST,WorkloadClaimFence.from(remote))) {
+            control.requireHeld();assertThat(owner.permit(FIRST).granted()).isFalse();
+            assertThatThrownBy(control::endTenure).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(control::requireActive).isInstanceOf(TapstateException.class);
+            owner.renewDue();assertThat(raw.read(KEY).orElseThrow().claim()).isEqualTo(remote);
+            assertThat(acquisitions).hasValue(0);verify(store,never()).release(any());verify(store,never()).renew(any(),any());
+        }
+        try(var pass=owner.enterPass(FIRST)){assertThat(pass).isNotNull();}
+    }
+
+    @Test void anInFlightLocalPassRefusesAFreezeWithoutTouchingItsClaim() {
+        var owner=ownership();var original=owner.permit(FIRST).claim();
+        try(var pass=owner.enterPass(FIRST)) {
+            var before=raw.read(KEY).orElseThrow().claim();int readCount=reads.get();int acquired=acquisitions.get();
+            assertThatThrownBy(() -> owner.freezeControl(FIRST,WorkloadClaimFence.from(original))).isInstanceOf(TapstateException.class);
+            assertThat(raw.read(KEY).orElseThrow().claim()).isEqualTo(before);
+            assertThat(reads).hasValue(readCount);assertThat(acquisitions).hasValue(acquired);verify(store,never()).release(any());
+        }
+    }
+
     @Test void anEndedSuccessorCannotReplaceADifferentLocallyHeldTuple() {
         var owner=ownership();var original=owner.permit(FIRST).claim();
         assertThat(raw.release(original)).isTrue();
