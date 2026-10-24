@@ -102,10 +102,13 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         }
         prompt.add(Map.of("role", "system", "content", guidance + " Current context: " + JsonWriter.write(context)));
         prompt.addAll(messages);
+        Map<String, Object> toolProperties = new java.util.LinkedHashMap<>();
+        toolProperties.put("explanation", Map.of("type", "string", "maxLength", 12000,
+                "description", "Briefly explain the intended changes in the user's language. Write this property first so the user can read it while the configuration is generated."));
+        toolProperties.put("candidateWizard", wizardSchema());
         Map<String, Object> tool = Map.of("type", "function", "function", Map.of("name", "propose_pipeline",
-                "description", "Propose a complete editable Builder wizard after briefly explaining the changes. For copied fields use a map rule with ruleType rename and value $<sourceField>; set passthroughUnlisted true to retain other fields.",
-                "parameters", Map.of("type", "object", "properties", Map.of("candidateWizard", wizardSchema()),
-                        "required", List.of("candidateWizard"))));
+                "description", "Propose a complete editable Builder wizard. Begin the arguments with explanation, then candidateWizard. For copied fields use a map rule with ruleType rename and value $<sourceField>; set passthroughUnlisted true to retain other fields.",
+                "parameters", schemaObject(toolProperties, List.of("explanation", "candidateWizard"))));
         Map<String, Object> requestBody = new java.util.LinkedHashMap<>();
         requestBody.put("model", settings.model());
         requestBody.put("messages", prompt);
@@ -141,7 +144,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         String request = messages.getLast().getOrDefault("content", "").toLowerCase(java.util.Locale.ROOT);
         boolean chineseEdit = request.matches("(?s).*(\\x{53ea}\\x{4fdd}\\x{7559}|\\x{4ec5}\\x{4fdd}\\x{7559}|\\x{4fdd}\\x{7559}|\\x{8fc7}\\x{6ee4}|\\x{7b5b}\\x{9009}|\\x{5220}\\x{9664}|\\x{79fb}\\x{9664}|\\x{6dfb}\\x{52a0}|\\x{65b0}\\x{589e}|\\x{4fee}\\x{6539}|\\x{8c03}\\x{6574}|\\x{751f}\\x{6210}|\\x{521b}\\x{5efa}).*?");
         boolean englishEdit = request.matches("(?s).*(keep|preserve|filter|remove|delete|add|change|modify|rename|create).*?");
-        boolean question = request.matches("(?s).*(\\x{600e}\\x{4e48}|\\x{5982}\\x{4f55}|\\x{4e3a}\\x{4ec0}\\x{4e48}|\\x{662f}\\x{5426}|\\x{80fd}\\x{5426}|\\x{4ec0}\\x{4e48}\\x{662f}|\\x{8bf4}\\x{660e}|\\x{89e3}\\x{91ca}|how\\s+(do|can|to)|why\\b|what\\s+(is|does)|should\\s+i\\b|do\\s+i\\b).*?");
+        boolean question = request.matches("(?s).*(\\x{600e}\\x{4e48}|\\x{5982}\\x{4f55}|\\x{4e3a}\\x{4ec0}\\x{4e48}|\\x{662f}\\x{5426}|\\x{80fd}\\x{5426}|\\x{4ec0}\\x{4e48}\\x{662f}|\\x{8bf4}\\x{660e}|\\x{89e3}\\x{91ca}|explain\\b|describe\\b|summarize\\b|how\\s+(do|can|to)|why\\b|what\\s+(is|does)|should\\s+i\\b|do\\s+i\\b).*?");
         return (chineseEdit || englishEdit) && !question;
     }
 
@@ -298,6 +301,10 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
                 Map<String, Object> function = object(object(calls.getFirst()).get("function"));
                 if (!"propose_pipeline".equals(function.get("name"))
                         || !(function.get("arguments") instanceof String arguments)) throw invalid();
+                if (object(JsonReader.parse(arguments)).get("explanation") instanceof String explanation && !explanation.isEmpty()) {
+                    if (hasText) text.accept("\n\n");
+                    text.accept(explanation);
+                }
                 return Optional.of(candidate(arguments));
             }
         } catch (java.io.IOException | InterruptedException error) {
@@ -351,12 +358,13 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         Map<String, Object> choice = object(choices.getFirst());
         if (choice.get("finish_reason") instanceof String reason) state.finish = reason;
         Map<String, Object> delta = object(choice.getOrDefault("delta", Map.of()));
-        if (delta.get("content") instanceof String content && !content.isEmpty()) text.accept(content);
+        if (delta.get("content") instanceof String content && !content.isEmpty())
+            emitText(state, text, content, TextChannel.CONTENT);
         if (delta.get("tool_calls") instanceof List<?> calls) {
-            for (Object raw : calls) appendToolCall(raw, state);
+            for (Object raw : calls) appendToolCall(raw, state, text);
         }
     }
-    private static void appendToolCall(Object raw, StreamState state) {
+    private static void appendToolCall(Object raw, StreamState state, Consumer<String> text) {
         state.toolCallStarted = true;
         Map<String, Object> call = object(raw);
         if (!(call.get("index") instanceof Number index) || index.intValue() != 0) {
@@ -365,7 +373,15 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         }
         Map<String, Object> function = object(call.getOrDefault("function", Map.of()));
         if (function.get("name") instanceof String name) state.function = name;
-        if (function.get("arguments") instanceof String arguments) state.arguments.append(arguments);
+        if (function.get("arguments") instanceof String arguments) {
+            state.arguments.append(arguments);
+            state.explanation.accept(arguments, delta -> emitText(state, text, delta, TextChannel.TOOL));
+        }
+    }
+    private static void emitText(StreamState state, Consumer<String> text, String delta, TextChannel channel) {
+        if (state.textChannel != null && state.textChannel != channel) text.accept("\n\n");
+        state.textChannel = channel;
+        text.accept(delta);
     }
     private static Map<String, Object> candidate(String arguments) {
         Object parsed = JsonReader.parse(arguments);
@@ -378,12 +394,15 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
     }
     private static final class StreamState {
         private final StringBuilder arguments = new StringBuilder();
+        private final ToolExplanationStream explanation = new ToolExplanationStream();
+        private TextChannel textChannel;
         private String function;
         private String finish;
         private int bytes;
         private boolean done;
         private boolean toolCallStarted;
     }
+    private enum TextChannel { CONTENT, TOOL }
     private static final class RetryableStreamException extends RuntimeException { }
     private static Map<String, Object> object(Object value) {
         if (!(value instanceof Map<?, ?> source)) throw invalid();

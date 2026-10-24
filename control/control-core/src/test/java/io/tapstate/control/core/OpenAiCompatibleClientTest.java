@@ -23,6 +23,64 @@ import java.time.Duration;
 import static org.assertj.core.api.Assertions.*;
 
 class OpenAiCompatibleClientTest {
+    @Test void streamsToolExplanationBeforeTheCandidateCompletes() throws Exception {
+        CountDownLatch visibleText = new CountDownLatch(1);
+        CountDownLatch releaseCandidate = new CountDownLatch(1);
+        StringBuffer text = new StringBuffer();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/chat/completions", exchange -> {
+            exchange.getRequestBody().readAllBytes();
+            exchange.sendResponseHeaders(200, 0);
+            try (var output = exchange.getResponseBody()) {
+                output.write(chunk(Map.of("content", "Inspecting selected schema."), null).getBytes(StandardCharsets.UTF_8));
+                String prefix = "{\"explanation\":\"First paragraph.\\nSecond ";
+                output.write(chunk(Map.of("tool_calls", List.of(Map.of("index", 0, "function", Map.of(
+                        "name", "propose_pipeline", "arguments", prefix)))), null).getBytes(StandardCharsets.UTF_8));
+                output.flush();
+                try { releaseCandidate.await(5, TimeUnit.SECONDS); }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
+                String suffix = "paragraph.\",\"candidateWizard\":{\"root\":{\"table\":\"orders\"}}}";
+                output.write((chunk(Map.of("tool_calls", List.of(Map.of("index", 0, "function", Map.of(
+                        "arguments", suffix)))), "tool_calls") + "data: [DONE]\n\n").getBytes(StandardCharsets.UTF_8));
+            }
+        });
+        server.start();
+        try (var executor = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
+            var settings = new AiProviderSettings("openai-compatible", "http://127.0.0.1:" + server.getAddress().getPort(), "test", "sk-test");
+            var result = executor.submit(() -> localClient().propose(settings,
+                    List.of(Map.of("role", "user", "content", "Add a filter")), Map.of(), delta -> {
+                        text.append(delta);
+                        if (text.toString().contains("First paragraph.\nSecond ")) visibleText.countDown();
+                    }));
+            try {
+                assertThat(visibleText.await(1, TimeUnit.SECONDS))
+                        .as("tool explanation must be visible while the provider still holds the candidate open").isTrue();
+                assertThat(result.isDone()).isFalse();
+            } finally { releaseCandidate.countDown(); }
+            assertThat(result.get(5, TimeUnit.SECONDS)).hasValueSatisfying(candidate -> assertThat(candidate).containsKey("root"));
+            assertThat(text.toString()).isEqualTo("Inspecting selected schema.\n\nFirst paragraph.\nSecond paragraph.");
+        } finally {
+            releaseCandidate.countDown();
+            server.stop(0);
+        }
+    }
+
+    @Test void streamsOnlyTheTopLevelExplanationAndDecodesSplitEscapes() throws Exception {
+        String arguments = "{\"candidateWizard\":{\"description\":\"not visible\",\"explanation\":\"nested decoy\"},"
+                + "\"explanation\":\"Quote: \\\"field\\\"\\n\\uD83D\\uDE80 sk-test\"}";
+        StringBuilder stream = new StringBuilder();
+        for (int index = 0; index < arguments.length(); index++) {
+            stream.append(chunk(Map.of("tool_calls", List.of(Map.of("index", 0, "function", Map.of(
+                    "name", "propose_pipeline", "arguments", arguments.substring(index, index + 1))))), null));
+        }
+        stream.append("data: [DONE]\n\n");
+        withServer(200, stream.toString(), settings -> {
+            StringBuilder text = new StringBuilder();
+            assertThat(localClient().propose(settings, List.of(), Map.of(), text::append)).isPresent();
+            assertThat(text.toString()).isEqualTo("Quote: \"field\"\n\uD83D\uDE80 [redacted]");
+        });
+    }
+
     @Test void returnsAPlainConversationWhenNoSchemaIsAvailable() throws Exception {
         String stream = chunk(Map.of("content", "Tell me which Source and table to choose."), null)
                 + "data: " + JsonWriter.write(Map.of("usage", Map.of("total_tokens", 12))) + "\n\n"
@@ -58,6 +116,9 @@ class OpenAiCompatibleClientTest {
             assertThat(received.get().containsKey("tools")).isTrue();
             assertThat(received.get().containsKey("tool_choice")).isFalse();
             assertThat(String.join("", text)).contains("Which input table");
+            localClient().propose(settings, List.of(Map.of("role", "user", "content", "Explain the pipeline. Do not propose or modify configuration.")),
+                    Map.of("proposalEnabled", true), ignored -> { });
+            assertThat(received.get().containsKey("tool_choice")).as("explanation requests must not force a proposal").isFalse();
             localClient().propose(settings, List.of(Map.of("role", "user", "content", "Create a pipeline")),
                     Map.of("proposalEnabled", false, "scopeSelectionRequired", true), ignored -> { });
             assertThat(received.get().containsKey("tools")).isFalse();
@@ -65,7 +126,7 @@ class OpenAiCompatibleClientTest {
     }
 
     @Test void acceptsOnlyCompletedToolArgumentsAndKeepsTextSeparate() throws Exception {
-        String arguments = JsonWriter.write(Map.of("candidateWizard", Map.of("root", Map.of("table", "orders"))));
+        String arguments = JsonWriter.write(Map.of("explanation", "I will preserve the existing fields.", "candidateWizard", Map.of("root", Map.of("table", "orders"))));
         String stream = chunk(Map.of("content", "Inspecting selected schema."), null)
                 + chunk(Map.of("tool_calls", List.of(Map.of("index", 0, "function", Map.of("name", "propose_pipeline", "arguments", arguments.substring(0, 15))))), null)
                 + chunk(Map.of("tool_calls", List.of(Map.of("index", 0, "function", Map.of("arguments", arguments.substring(15))))), "tool_calls")
@@ -73,7 +134,7 @@ class OpenAiCompatibleClientTest {
         withServer(200, stream, settings -> {
             List<String> text = new ArrayList<>();
             var candidate = localClient().propose(settings, List.of(Map.of("role", "user", "content", "Please propose")), Map.of(), text::add);
-            assertThat(String.join("", text)).isEqualTo("Inspecting selected schema.");
+            assertThat(String.join("", text)).isEqualTo("Inspecting selected schema.\n\nI will preserve the existing fields.");
             assertThat(candidate).hasValueSatisfying(value -> assertThat(value).containsKey("root").doesNotContainKey("content"));
         });
     }
