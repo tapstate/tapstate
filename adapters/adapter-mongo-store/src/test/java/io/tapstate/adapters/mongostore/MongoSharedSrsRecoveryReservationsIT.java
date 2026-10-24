@@ -529,6 +529,35 @@ class MongoSharedSrsRecoveryReservationsIT {
         });
     }
 
+    @ParameterizedTest @ValueSource(strings={"physical","canonical","foreign"})
+    void aCompletedFullResolvesItsCanonicalCaptureToOnlyTheCurrentPhysicalNamespace(String coordinate) {
+        withFixture(f -> {
+            f.endAffectedTenures();var reservation=f.configuration.sharedRecoveryPreparations().reserve(f.confirmed());
+            var receipt=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).replace(reservation,f.node);
+            f.configuration.sharedRecoveryPreparations().complete(receipt);
+            var intent=f.configuration.intents().loadForActuation("a").orElseThrow();
+            assertThat(f.configuration.intents().compareAndSet(intent.scope(),intent.intentRevision(),
+                    new DesiredState("a",PipelineState.STOPPED,intent.desired().revision(),true))).isTrue();
+            var clearing=f.configuration.intents().loadForActuation("a").orElseThrow();
+            var target=new PipelineIntentScope(f.scope.clusterId(),f.scope.bindingVersion(),f.scope.cacheIncarnation(),"a",2);
+            var pipeline=(PipelineResource)f.configuration.artifacts().get("a").orElseThrow();
+            var source=(SourceResource)f.configuration.artifacts().get("input").orElseThrow();
+            var inputs=PipelinePreparationInputs.of(target,pipeline,Map.of("input",source),Map.of("input",Set.of("orders")));
+            var dependencies=Map.of("input",CanonicalHash.of(source));
+            var claim=f.domain.workloadClaims(f.scope).readPipeline(clearing.scope()).orElseThrow().claim();
+            var pending=f.configuration.rebuilds().begin(new PipelineRebuildRequest("full-on-replacement",clearing,WorkloadClaimFence.from(claim),0,inputs,dependencies));
+            var applied=f.domain.pipelineRebuilds(f.scope,ACTIVE).prepare(pending,f.node,TTL,Instant.parse("2026-10-19T16:00:00Z"));
+            f.configuration.rebuilds().complete(applied);
+            var full=f.configuration.rebuilds().completedFull(target,inputs,dependencies).orElseThrow();
+            var config=rows(f.config);var cache=rows(f.cache);
+            if(coordinate.equals("physical"))assertThat(MongoPipelineStateRebuilds.originalFullCapture(full,"input",reservation.replacement().chainId()))
+                    .isEqualTo(reservation.replacement());
+            else assertThatThrownBy(() -> MongoPipelineStateRebuilds.originalFullCapture(full,"input",
+                    coordinate.equals("canonical")?f.previous.canonicalChainId():"another-physical-chain")).isInstanceOf(TapstateException.class);
+            assertThat(rows(f.config)).isEqualTo(config);assertThat(rows(f.cache)).isEqualTo(cache);
+        });
+    }
+
     @Test void cancellationExcludesTheOriginalAttemptWithoutChangingItsConfigOrCreatingReplacementHistory() {
         withFixture(f -> {
             f.endAffectedTenures();var reservation=f.configuration.sharedRecoveryPreparations().reserve(f.confirmed());

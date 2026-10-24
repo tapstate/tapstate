@@ -287,6 +287,40 @@ class StoreBackedDagSourceScopedModelTest {
                 .isInstanceOfSatisfying(TapstateException.class,error -> assertThat(error.code()).isEqualTo(IoError.PIPELINE_INTENT_FENCED));
     }
 
+    @Test void aScopedRecoveredSharedSourceBuildsFromItsPhysicalBindingWithoutLegacyProgress() {
+        var f=fixture(false);var guarded=org.mockito.Mockito.spy(f.store);
+        org.mockito.Mockito.doThrow(new AssertionError("scoped replacement cannot read legacy progress")).when(guarded).meta();
+        org.mockito.Mockito.doThrow(new AssertionError("scoped replacement cannot read legacy state")).when(guarded).keyedState();
+        var source=new StoreBackedDagSource(guarded,f.source.sinkWriterBinder());
+        var pass=f.pass(() -> {});var prepared=source.prepareStart(pass,"cache");
+        f.views.current.set(advance(1));pass.advanced(advance(1));
+        var artifact=(SourceResource)prepared.artifactSnapshot().orElseThrow().get("src").orElseThrow();
+        var resolution=SourceCaptureResolution.forPipeline(f.pipeline,artifact,prepared.sourceModels().orElseThrow().model(artifact)).orElseThrow();
+        String physical="srs-recovery-"+"b".repeat(64);
+        var context=new SrsConsumerContext(new SrsConsumerKey(physical,"p","src"),SCOPE.stateGeneration());
+        var member=new SrsConsumerMembership(context,1,false,java.util.Set.of("orders"),advance(1));
+        var binding=new PipelineCaptureBindings.LoggedSource(SrsConsumerRun.of(SCOPE,member),5,Map.of("orders",13L),resolution.chainId().value());
+        var original=new ExecutionFence(SCOPE,advance(1));
+        var captures=new PipelineCaptureBindings(original,Map.of("src",binding),false);pass.bindCapture(advance(1),captures);
+        assertThat(prepared.plan().build(original).dag()).isNotNull();
+        assertThat(captures.require("src",physical,"orders").snapshotEpoch()).isEqualTo(5);
+        assertThat(captures.require("src",physical,"orders").recoveryAfter()).containsExactly(Map.entry("orders",13L));
+        assertThat(captures.logged().get("src").canonicalChainId()).isEqualTo(resolution.chainId().value());
+        org.mockito.Mockito.verify(guarded,org.mockito.Mockito.never()).meta();
+        org.mockito.Mockito.verify(guarded,org.mockito.Mockito.never()).keyedState();
+    }
+
+    @Test void aScopedPhysicalBindingCannotClaimAnotherAuthoredCanonicalSource() {
+        var f=fixture(false);var pass=f.pass(() -> {});var prepared=f.source.prepareStart(pass,"cache");
+        f.views.current.set(advance(1));pass.advanced(advance(1));
+        var context=new SrsConsumerContext(new SrsConsumerKey("srs-recovery-"+"b".repeat(64),"p","src"),SCOPE.stateGeneration());
+        var member=new SrsConsumerMembership(context,1,false,java.util.Set.of("orders"),advance(1));
+        var binding=new PipelineCaptureBindings.LoggedSource(SrsConsumerRun.of(SCOPE,member),5,Map.of("orders",13L),"other-canonical");
+        var original=new ExecutionFence(SCOPE,advance(1));pass.bindCapture(advance(1),new PipelineCaptureBindings(original,Map.of("src",binding),false));
+        assertThatThrownBy(() -> prepared.plan().build(original)).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(IoError.PIPELINE_INTENT_FENCED));
+    }
+
     private static void bindCapturedSources(DagSource.StartPreparation prepared,PipelineConvergencePass pass) {
         var artifacts = prepared.artifactSnapshot().orElseThrow();
         var pipeline = (PipelineResource) artifacts.get(pass.scope().pipelineId()).orElseThrow();

@@ -774,20 +774,21 @@ final class StoreBackedDagSource implements DagSource {
         return new PlannedTopology(planned, fence -> {
             var original = operators == null ? null : operators.bind(fence);
             var capturedSources = original == null ? null : operators.pass().captureBindings(original.claim());
-            var scopedSources = capturedSources == null ? null : scopedSources(sourceVertices,capturedSources);
-            var scopedDirect = capturedSources == null ? null : scopedDirectSources(sourceVertices,capturedSources);
+            var runSources = capturedSources == null ? sourceVertices : physicalSources(sourceVertices,capturedSources);
+            var scopedSources = capturedSources == null ? null : scopedSources(runSources,capturedSources);
+            var scopedDirect = capturedSources == null ? null : scopedDirectSources(runSources,capturedSources);
             var targetPreparations=new ArrayList<io.tapstate.spi.store.SinkPreparationStore.Input>();
             NodeVertices drawn = new NodeVertices();
             DAG dag = PipelineDagBuilder.build(
                     builtPipeline,
-                    bindings(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, targets, viewTargets,
+                    bindings(pipeline, runSources, sourceKeyByTable, sourceKeysById, targets, viewTargets,
                             serveLanding,viewLanding,stepIds,frontier,compiledJoins,
                             capturedSources == null ? freshFullLoad : capturedSources.freshFullLoad(),fence,operators,capturedSources,scopedSources,scopedDirect,targetPreparations),
                     FencedSinkAckFactory.heldTo(scopedSources == null ? sinkAckFactory(pipeline,pipelineId,fence) :
-                            scopedSources.isEmpty() && scopedDirect.isEmpty() ? boundedLoads.apply(fence,snapshotEpochs(sourceVertices,capturedSources)) : new ScopedSrsSinkAckFactory(scopedSources,scopedDirect,runIdOf(fence)),fence),frontier,
+                            scopedSources.isEmpty() && scopedDirect.isEmpty() ? boundedLoads.apply(fence,snapshotEpochs(runSources,capturedSources)) : new ScopedSrsSinkAckFactory(scopedSources,scopedDirect,runIdOf(fence)),fence),frontier,
                     shape, drawn);
             if(original!=null)operators.pass().prepareSinkTargets(original.claim(),targetPreparations);
-            return new PlannedDag(dag, shape, planned, nodeBatches(pipeline, sourceVertices), drawn.byNode(),
+            return new PlannedDag(dag, shape, planned, nodeBatches(pipeline, runSources), drawn.byNode(),
                     drawn.feedingByNode());
         });
     }
@@ -3211,6 +3212,20 @@ final class StoreBackedDagSource implements DagSource {
             if(epochs.put(vertex.stream(),source.epoch())!=null)throw new TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null);
         }
         return Map.copyOf(epochs);
+    }
+
+    private static Map<String,SourceVertex> physicalSources(Map<String,SourceVertex> vertices,PipelineCaptureBindings bindings) {
+        var result=new LinkedHashMap<String,SourceVertex>();
+        vertices.forEach((key,vertex) -> {
+            var source=bindings.logged().get(vertex.sourceId());
+            if(source==null)result.put(key,vertex);
+            else {
+                var resolution=vertex.resolution().onPhysicalChain(source.canonicalChainId(),source.run().miningChainId());
+                bindings.require(vertex.sourceId(),resolution.chainId().value(),vertex.table());
+                result.put(key,new SourceVertex(vertex.pipelineId(),vertex.sourceId(),vertex.table(),resolution,vertex.stream()));
+            }
+        });
+        return java.util.Collections.unmodifiableMap(result);
     }
 
     private static Map<String,ScopedSrsSinkAckFactory.Source> scopedSources(Map<String,SourceVertex> vertices,PipelineCaptureBindings bindings) {

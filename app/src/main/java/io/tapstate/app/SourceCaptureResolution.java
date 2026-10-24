@@ -14,9 +14,8 @@ import java.util.stream.Stream;
 /**
  * How a pipeline-referenced source resolves into its capture/read ring identity: the connector config, the
  * selected tables, the srs key, and the mining-chain id that keys each per-table change ring. The
- * side that fills the ring (capture) and the side that reads it (the source vertex) each resolve the source
- * independently, so deriving this identity in one place is what guarantees they land on the same ring rather
- * than drifting apart.
+ * authoring identity is canonical. A scoped run replaces its stream namespace only after matching that
+ * canonical identity to its trusted capture preparation; its deferred readers consume the same binding.
  *
  * <p>An explicit {@code srs.key} keys the chain directly; otherwise it derives from the connector-and-settings
  * content hash. A pipeline reference with SRS disabled uses an independent recovery record keyed by its
@@ -57,6 +56,12 @@ record SourceCaptureResolution(
         MiningChainId scoped = srsEnabled ? MiningChainId.resolve(config, srsKey)
                 : MiningChainId.forChannel(config, srsKey, pipelineId, sourceId);
         return new SourceCaptureResolution(sourceId, config, tables, srsKey, scoped);
+    }
+
+    SourceCaptureResolution onPhysicalChain(String canonical,String physical) {
+        if(!chainId.value().equals(canonical) || physical==null || physical.isBlank())
+            throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.PIPELINE_INTENT_FENCED,java.util.Map.of(),null);
+        return new SourceCaptureResolution(sourceId,config,tables,srsKey,new MiningChainId(physical));
     }
 
     /**

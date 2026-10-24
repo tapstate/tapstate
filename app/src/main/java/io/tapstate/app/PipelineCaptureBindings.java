@@ -20,10 +20,14 @@ record PipelineCaptureBindings(ExecutionFence original,Map<String,LoggedSource> 
     PipelineCaptureBindings(ExecutionFence original,Map<String,LoggedSource> logged,boolean freshFullLoad) {
         this(original,logged,Map.of(),Map.of(),freshFullLoad);
     }
-    record LoggedSource(SrsConsumerRun run,long snapshotEpoch,Map<String,Long> recoveryAfter) {
+    record LoggedSource(SrsConsumerRun run,long snapshotEpoch,Map<String,Long> recoveryAfter,String canonicalChainId) {
+        LoggedSource(SrsConsumerRun run,long snapshotEpoch,Map<String,Long> recoveryAfter) {
+            this(run,snapshotEpoch,recoveryAfter,run.miningChainId());
+        }
         LoggedSource {
-            Objects.requireNonNull(run,"run"); recoveryAfter = Map.copyOf(recoveryAfter);
+            Objects.requireNonNull(run,"run");Objects.requireNonNull(canonicalChainId,"canonicalChainId"); recoveryAfter = Map.copyOf(recoveryAfter);
             if (snapshotEpoch < 1 || snapshotEpoch == Long.MAX_VALUE || recoveryAfter.isEmpty()
+                    || canonicalChainId.isBlank()
                     || recoveryAfter.entrySet().stream().anyMatch(e -> e.getKey().isBlank() || e.getValue() < -1 || e.getValue() == Long.MAX_VALUE))
                 throw new IllegalArgumentException("source binding requires original table recovery floors and snapshot order");
         }

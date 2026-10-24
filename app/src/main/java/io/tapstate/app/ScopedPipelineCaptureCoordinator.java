@@ -172,12 +172,13 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                 var selected=SourceCaptureResolution.forPipeline(pipeline,definition,frozenModel);
                 if(selected.isEmpty())continue;
                 boolean shared=!session.bounded && pipeline.sources().stream().anyMatch(ref -> ref.id().equals(definition.id()) && ref instanceof SourceRef.Spec spec && spec.srs());
-                var source=new Source(definition.id(),selected.orElseThrow(),shared,frozenModel); session.sources.put(source.id,source);
-                var request=new CapturePreparationRequest(run.original.scope(),claim(run.original),node,source.id,inputs);
+                var request=new CapturePreparationRequest(run.original.scope(),claim(run.original),node,definition.id(),inputs);
                 var issued=stores.configuration().issueFirstCreate(request);
                 var prepared=issued instanceof CaptureCreationResult.Issued first?stores.preparations().createFirst(first.creation()):
                         stores.preparations().load(((CaptureCreationResult.AlreadyIssued)issued).preparation());
                 if(prepared.preparation().mode()!=(session.bounded?CapturePreparation.Mode.SNAPSHOT_ONLY:shared?CapturePreparation.Mode.SHARED_SRS:CapturePreparation.Mode.DIRECT))throw refused();
+                var resolution=shared?selected.orElseThrow().onPhysicalChain(prepared.preparation().canonicalChainId(),prepared.preparation().chainId()):selected.orElseThrow();
+                var source=new Source(definition.id(),resolution,shared,frozenModel);session.sources.put(source.id,source);
                 source.prepared=prepared.preparation();source.owner=owner(session,source,prepared);
                 if(shared) {
                     var history=stores.configuration().inspectSharedHistory(source.prepared,source.id,inputs.sourceHashes().get(source.id));
@@ -233,7 +234,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                 }
                 if(source.owner!=null) {
                     if(source.owner.config==null){source.owner.origin=session.original;source.owner.config=source.selected.config().at(new PipelineNode(session.original.pipelineId(),source.id))
-                            .sharing(new SharedNotes(source.prepared.chainId(),List.of()));}
+                            .sharing(new SharedNotes(source.prepared.canonicalChainId(),List.of()));}
                     try { ensureTail(source.owner); }
                     catch(SrsBaselineModelMismatch mismatch) {
                         if(!session.snapshot || retained.snapshot()!=null || before.pendingFreshFull()!=null
@@ -270,7 +271,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                 }
                 waiting.remove(source.consumer.context().key());
                 long originalEpoch=progress.snapshot()!=null?progress.snapshot().snapshotEpoch():chain.pendingFreshFull()!=null?chain.pendingFreshFull().snapshotEpoch():chain.epoch();
-                logged.put(source.id,new PipelineCaptureBindings.LoggedSource(source.consumer,originalEpoch,progress.ringDoneThrough()));
+                logged.put(source.id,new PipelineCaptureBindings.LoggedSource(source.consumer,originalEpoch,progress.ringDoneThrough(),source.prepared.canonicalChainId()));
             }
             // The preparation mode belongs to the state generation; its READY receipt suppresses repeated target clearing.
             session.bindings=new PipelineCaptureBindings(run.original,logged,direct,snapshots,session.snapshot && !session.sources.isEmpty());
@@ -287,7 +288,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                 Runnable guard=source.shared?() -> requireSession(session):() -> { requireSession(session); originalOwner.require(); };source.guard=guard;
                 if(source.shared && !session.snapshot)continue;
                 var config=source.selected.config().at(new PipelineNode(run.original.pipelineId(),source.id));
-                if(source.shared)config=config.sharing(new SharedNotes(source.prepared.chainId(),List.of()));
+                if(source.shared)config=config.sharing(new SharedNotes(source.prepared.canonicalChainId(),List.of()));
                 var fixedConfig=config;
                 var notes=ConfiguredCaptureRun.prepare(run.original,config,stores.notes(),connectors,guard,stores.recoveryPinned().test(run.original.scope()));
                 CaptureHandoff output=new CaptureHandoff() {
@@ -314,7 +315,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                     if(source.freshFull==null)source.run=runtime.beginSnapshot(source.consumer,fixedConfig,firstEpoch,prepareSnapshot,output,guard);
                     else source.run=runtime.beginSnapshot(source.consumer,fixedConfig,firstEpoch,prepareSnapshot,output,guard,source.freshFull,session.began,receipt -> {
                         guard.run();startPreparedTail(source.owner,receipt.chain());guard.run();
-                        logged.put(source.id,new PipelineCaptureBindings.LoggedSource(source.consumer,receipt.progress().snapshot().snapshotEpoch(),receipt.progress().ringDoneThrough()));
+                        logged.put(source.id,new PipelineCaptureBindings.LoggedSource(source.consumer,receipt.progress().snapshot().snapshotEpoch(),receipt.progress().ringDoneThrough(),source.prepared.canonicalChainId()));
                     });
                 } else if(!session.bounded && session.snapshot) {
                     source.run=runtime.beginDirectSnapshot(config,source.direct,source.channels,preparation -> {
@@ -520,7 +521,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                 requireSession(session);
                 if(source.foreign!=null)try {execution.authorization().requireCapture(stores.scope(),source.foreign);continue;}catch(TapstateException expired) { /* Re-read this same prepared capture before any takeover. */ }
                 var prepared=stores.preparations().load(source.prepared);source.owner=owner(session,source,prepared);
-                if(source.owner!=null){source.owner.positionEditsRestricted|=source.positionEditsRestricted;source.owner.origin=session.original;source.owner.config=source.selected.config().at(new PipelineNode(session.original.pipelineId(),source.id)).sharing(new SharedNotes(source.prepared.chainId(),List.of()));ensureTail(source.owner);}
+                if(source.owner!=null){source.owner.positionEditsRestricted|=source.positionEditsRestricted;source.owner.origin=session.original;source.owner.config=source.selected.config().at(new PipelineNode(session.original.pipelineId(),source.id)).sharing(new SharedNotes(source.prepared.canonicalChainId(),List.of()));ensureTail(source.owner);}
             }catch(RuntimeException|Error failure){session.failure.compareAndSet(null,failure);}
         }
     }
