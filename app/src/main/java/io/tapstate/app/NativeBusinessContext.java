@@ -170,6 +170,9 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
     NativePipelineRecovery pipelineRecovery() {
         if(!available())throw StorageRuntime.unavailable();return context.getBean(NativePipelineRecovery.class);
     }
+    NativeSharedSrsRecovery sharedRecovery() {
+        if(!available())throw StorageRuntime.unavailable();return context.getBean(NativeSharedSrsRecovery.class);
+    }
     StorePort statusStore() { if (!available()) throw StorageRuntime.unavailable(); return port; }
     private boolean recoveryPinned(PipelineIntentScope scope) {
         original.requireBusiness();return configuration.cacheRecoveries().read(scope.pipelineId()).filter(value -> value.targetScope().equals(scope)).isPresent();
@@ -326,6 +329,16 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             return new NativePipelineDeletion(owner.configuration,owner.original.cache(),owner.original.preparation().businessScope(),
                     ownership,() -> node.currentFence().orElseThrow(ThreeLayerStorePort::refused),owner.memberStorage::requireNode,
                     engine,actuator,new HazelcastOperatorReadiness(member,Duration.ofSeconds(30)),plans,connectors);
+        }
+        @Bean(destroyMethod = "close") NativeSharedSrsRecovery nativeSharedSrsRecovery(NativeBusinessContext owner,
+                PipelineActuationOwnership ownership,NodeSessionLease node,Engine engine,EngineLifecycleActuator actuator,
+                PipelineCaptureCoordinator captures,HazelcastInstance member,HazelcastExecutionPlans plans,
+                ArtifactMutationService.PipelineDeletion deletion) {
+            if(!(captures instanceof ScopedPipelineCaptureCoordinator nativeCaptures))throw ThreeLayerStorePort.refused();
+            Runnable active=() -> {if(!owner.available())throw StorageRuntime.unavailable();owner.memberStorage.requireNode();};
+            return new NativeSharedSrsRecovery(owner.configuration,owner.original.cache(),owner.original.preparation().authScope(),
+                    ownership,() -> node.currentFence().orElseThrow(ThreeLayerStorePort::refused),active,engine,actuator,
+                    new HazelcastOperatorReadiness(member,Duration.ofSeconds(30)),plans,nativeCaptures,member);
         }
         @Bean PipelinePositionService.WriteBack nativeSourcePositions(NativeBusinessContext owner,
                 PipelineChains chains, LivePipelines live, AuditGate audit, PipelineActuationOwnership ownership,

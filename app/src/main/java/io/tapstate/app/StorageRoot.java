@@ -226,6 +226,7 @@ final class StorageRoot implements AutoCloseable {
             wakeRecovery();
             if (runtime.requireConfiguration().setupStates().load().phase() == StorageSetupStateStore.Phase.COMPLETE) {
                 runtime.startBusiness(original.orElseThrow(), assembly); phase = Phase.BUSINESS_READY;
+                wakeRecovery();
             }
         } catch (TapstateException unavailable) {
             if (unavailable.code() == BootError.NODE_ID_IN_USE) throw unavailable;
@@ -348,9 +349,23 @@ final class StorageRoot implements AutoCloseable {
         var configuration = runtime.requireConfiguration();
         return new StorageRecoveryService(configuration.recoveryCommands(), new StorageRecoveryService.Inspector() {
             @Override public StorageRecoveryCommands.Manifest inspect(CacheAuthScope scope, StorageRecoveryCommands.Selection selection) {
+                if(selection.extent()==StorageRecoveryCommands.Extent.SHARED_SRS)return sharedRecovery(scope).inspect(selection);
                 synchronized (StorageRoot.this) { return recoveryManifest(scope, selection, true); }
             }
+            @Override public void requirePlanningCurrent(CacheAuthScope scope,StorageRecoveryCommands.Manifest manifest) {
+                if(manifest.selection().extent()==StorageRecoveryCommands.Extent.SHARED_SRS)sharedRecovery(scope).requirePlanningCurrent(manifest);
+                else requireCurrent(scope,manifest);
+            }
+            @Override public StorageRecoveryCommands.Plan prepared(StorageRecoveryCommands.Plan original,Runnable active) {
+                return original.manifest().selection().extent()==StorageRecoveryCommands.Extent.SHARED_SRS
+                        ?sharedRecovery(original.originalScope()).prepared(original,active):original;
+            }
+            @Override public Optional<java.util.function.Supplier<StorageRecoveryCommands.Plan>> replanning(StorageRecoveryCommands.Plan original,Runnable active) {
+                return original.manifest().selection().extent()==StorageRecoveryCommands.Extent.SHARED_SRS
+                        ?sharedRecovery(original.originalScope()).replanning(original,active):Optional.empty();
+            }
             @Override public void requireCurrent(CacheAuthScope scope, StorageRecoveryCommands.Manifest manifest) {
+                if(manifest.selection().extent()==StorageRecoveryCommands.Extent.SHARED_SRS){sharedRecovery(scope).requireFinalized(manifest);return;}
                 synchronized (StorageRoot.this) {
                     var actual = manifest.selection().extent()==StorageRecoveryCommands.Extent.PIPELINE
                             ? pipelineRecovery(scope).inspectCurrent(manifest.selection()).manifest():recoveryManifest(scope, manifest.selection(), true);
@@ -363,6 +378,8 @@ final class StorageRoot implements AutoCloseable {
                     String failure=failedRecovery!=null && recoveryFailure!=null && failedRecovery.operationId().equals(original.operationId())
                             && failedRecovery.originalScope().equals(original.originalScope()) && failedRecovery.controlRevision()==original.controlRevision()
                             && original.phase()!=StorageRecoveryCommands.Phase.COMPLETE?recoveryFailure.code().code():null;
+                    if(original.manifest().selection().extent()==StorageRecoveryCommands.Extent.SHARED_SRS)
+                        return new StorageRecoveryService.Presentation(sharedRecovery(original.originalScope()).isCurrent(original),List.of(),failure);
                     if(original.manifest().selection().extent()!=StorageRecoveryCommands.Extent.PIPELINE)
                         return new StorageRecoveryService.Presentation(runtime.current().map(bound -> bound.preparation().authScope().equals(original.originalScope())).orElse(false),List.of(),failure);
                     try {
@@ -377,6 +394,7 @@ final class StorageRoot implements AutoCloseable {
                 }
             }
             @Override public void verifyExternal(CacheAuthScope scope,StorageRecoveryCommands.Manifest manifest) {
+                if(manifest.selection().extent()==StorageRecoveryCommands.Extent.SHARED_SRS){sharedRecovery(scope).verifyExternal(manifest,() -> {});return;}
                 synchronized(StorageRoot.this) {
                     if(manifest.selection().extent()!=StorageRecoveryCommands.Extent.PIPELINE)return;
                     var actual=pipelineRecovery(scope).verifyExternal(manifest.selection()).manifest();
@@ -400,6 +418,16 @@ final class StorageRoot implements AutoCloseable {
         requireRecoveryOwner(scope);
         if(!(runtime.business().orElseThrow(StorageRuntime::unavailable) instanceof NativeBusinessContext nativeBusiness))throw StorageRuntime.unavailable();
         return nativeBusiness.pipelineRecovery();
+    }
+
+    private synchronized NativeSharedSrsRecovery sharedRecovery(CacheAuthScope scope) {
+        return sharedBusiness(scope).sharedRecovery();
+    }
+
+    private synchronized NativeBusinessContext sharedBusiness(CacheAuthScope scope) {
+        requireRecoveryOwner(scope);
+        if(!(runtime.business().orElseThrow(StorageRuntime::unavailable) instanceof NativeBusinessContext nativeBusiness))throw StorageRuntime.unavailable();
+        return nativeBusiness;
     }
 
     private StorageRecoveryCommands.Manifest recoveryManifest(CacheAuthScope scope, StorageRecoveryCommands.Selection selection, boolean authOnly) {
@@ -435,29 +463,47 @@ final class StorageRoot implements AutoCloseable {
     private void wakeRecovery() {
         if (runtime.cleanupRequired() || runtime.current().isEmpty()) return;
         var scope = runtime.current().orElseThrow().preparation().authScope();
-        if (scope.authGeneration() < 2) return;
-        runtime.requireConfiguration().recoveryCommands().current(scope).filter(plan -> plan.originalScope().equals(scope)).ifPresent(plan -> scheduleRecovery(plan,false));
+        runtime.requireConfiguration().recoveryCommands().current(scope).filter(plan -> plan.originalScope().equals(scope)
+                && (scope.authGeneration()>=2 || plan.manifest().selection().extent()==StorageRecoveryCommands.Extent.SHARED_SRS))
+                .ifPresent(plan -> scheduleRecovery(plan,false));
     }
 
     private synchronized void scheduleRecovery(StorageRecoveryCommands.Plan original) {scheduleRecovery(original,true);}
     private synchronized void scheduleRecovery(StorageRecoveryCommands.Plan original,boolean explicitContinuation) {
         requireOpen();
         boolean pipeline=original.manifest().selection().extent()==StorageRecoveryCommands.Extent.PIPELINE;
+        boolean shared=original.manifest().selection().extent()==StorageRecoveryCommands.Extent.SHARED_SRS;
+        if(shared && runtime.business().isEmpty())return;
         if(pipeline && original.phase()==StorageRecoveryCommands.Phase.RUNNING && !explicitContinuation)return;
         if (original.phase()==StorageRecoveryCommands.Phase.COMPLETE) {
             requireRecoveryOwner(original.originalScope());
             if(runtime.requireConfiguration().recoveryCommands().find(original.originalScope(),original.operationId()).filter(original::equals).isEmpty())
                 throw StorageRuntime.unavailable();
-            resumeRetainedBusiness();return;
+            if(!shared)resumeRetainedBusiness();return;
         }
         if (original.phase() != StorageRecoveryCommands.Phase.CONFIRMED && original.phase() != StorageRecoveryCommands.Phase.RUNNING) return;
         requireRecoveryOwner(original.originalScope());
         if (recoveryQueued) return;
         long acceptedRevision=pipeline?pipelineRecovery(original.originalScope()).acceptedIntentRevision(original):-1;
+        NativeBusinessContext sharedRuntime=shared?sharedBusiness(original.originalScope()):null;
         if (recoveryWorker == null) recoveryWorker = java.util.concurrent.Executors.newSingleThreadExecutor(
                 Thread.ofPlatform().daemon(true).name("cache-recovery").factory());
         recoveryQueued = true; recoveryFailed = false; recoveryFailure = null;failedRecovery=null;
         recoveryWorker.execute(() -> {
+            if(shared) {
+                try {
+                    sharedRuntime.awaitAvailability();
+                    NativeSharedSrsRecovery recovery;
+                    synchronized(StorageRoot.this) {
+                        if(sharedBusiness(original.originalScope())!=sharedRuntime)throw StorageRuntime.unavailable();
+                        recovery=sharedRuntime.sharedRecovery();
+                    }
+                    recovery.run(original);
+                }
+                catch(TapstateException unavailable){synchronized(StorageRoot.this){recoveryFailure=unavailable;failedRecovery=original;}}
+                finally {synchronized(StorageRoot.this){recoveryQueued=false;}}
+                return;
+            }
             synchronized (StorageRoot.this) {
                 try {
                     if(pipeline)pipelineRecovery(original.originalScope()).start(original,explicitContinuation,acceptedRevision);

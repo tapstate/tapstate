@@ -11,6 +11,29 @@ import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class StorageRuntimeTest {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings={"SHARED_SRS","CLUSTER"})
+    void partialSharedRecoveryCanAssembleItsOwnerWhileWholeCacheRecoveryStillRequiresItsPublication(String kind) {
+        var config=configuration();var cache=mock(MongoCacheDomain.class);var business=mock(StorageRuntime.Business.class);
+        var auth=new CacheAuthScope("cluster",1,StorageBinding.Mode.OP,PREPARATION.authScope().cacheIncarnation(),2);
+        var preparation=new CachePreparation("recovered-auth",auth);when(config.bindings().cachePreparation()).thenReturn(Optional.of(preparation));
+        var commands=mock(StorageRecoveryCommands.class);when(config.recoveryCommands()).thenReturn(commands);
+        SharedSrsRecoverySnapshot shared=null;
+        if(kind.equals("SHARED_SRS")) {
+            var previous=new CapturePreparation(preparation.businessScope(),CapturePreparation.Mode.SHARED_SRS,"chain","capture","mc-"+"a".repeat(64),java.util.UUID.randomUUID().toString());
+            shared=new SharedSrsRecoverySnapshot(previous,new WorkloadClaimFence(new WorkloadClaimKey("cluster",WorkloadClaimType.CAPTURE,"capture"),new WorkloadOwner("node","boot"),1,0,1),"a".repeat(64),java.util.List.of(),java.util.Map.of());
+        }
+        var extent=StorageRecoveryCommands.Extent.valueOf(kind);
+        var selection=shared==null?new StorageRecoveryCommands.Selection(extent,java.util.Set.of()):new StorageRecoveryCommands.Selection(extent,java.util.Set.of(),"chain","chain");
+        var manifest=new StorageRecoveryCommands.Manifest(selection,java.util.Set.of(),java.util.Map.of(),"a".repeat(64),0,shared);
+        var plan=new StorageRecoveryCommands.Plan(java.util.UUID.randomUUID().toString(),null,auth,manifest,"b".repeat(64),1,StorageRecoveryCommands.Phase.RUNNING);
+        when(commands.current(auth)).thenReturn(Optional.of(plan));when(business.available()).thenReturn(true);
+        try(var runtime=new StorageRuntime(config,ignored -> cache)) {
+            var bound=runtime.loadBound().orElseThrow();bound.verifyAuthentication();
+            if(shared!=null) {runtime.startBusiness(bound,ignored -> business);assertThat(runtime.businessStarted()).isTrue();verify(business).start();}
+            else {assertThatThrownBy(() -> runtime.startBusiness(bound,ignored -> business)).isInstanceOf(TapstateException.class);verify(business,never()).start();}
+        }
+    }
     private static final StorageSetupScope SETUP = new StorageSetupScope("cluster", "installation", "original", 1);
     private static final StorageBinding BINDING = new StorageBinding(SETUP, StorageBinding.Mode.OP, 1, "views",
             new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB, "mongodb://cache/tapstate_cache", "tapstate_cache", null));

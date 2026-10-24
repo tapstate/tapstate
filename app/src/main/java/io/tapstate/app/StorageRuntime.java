@@ -164,7 +164,7 @@ final class StorageRuntime implements AutoCloseable {
                     || !running.originalScope().equals(original.preparation.authScope()) || pending.filter(running::equals).isEmpty()) throw unavailable();
         } else if (pending.filter(plan -> plan.originalScope().equals(original.preparation.authScope())
                 && plan.phase() != io.tapstate.spi.store.StorageRecoveryCommands.Phase.COMPLETE
-                && plan.manifest().selection().extent()!=io.tapstate.spi.store.StorageRecoveryCommands.Extent.PIPELINE).isPresent()) throw unavailable();
+                && plan.manifest().selection().extent()==io.tapstate.spi.store.StorageRecoveryCommands.Extent.CLUSTER).isPresent()) throw unavailable();
     }
 
     boolean businessStarted() { return !closed && business instanceof Business actual && actual.available(); }

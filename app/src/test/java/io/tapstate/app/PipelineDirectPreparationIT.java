@@ -81,6 +81,90 @@ class PipelineDirectPreparationIT {
             } finally {member.shutdown();}
         });
     }
+    @ParameterizedTest @ValueSource(strings={"complete","lost-d-reply","new-start"})
+    void nativeSharedRecoveryFinalizesTheEndedOriginalAndResumesItsExactAppliedReceipt(String mode) {
+        withFixture(f -> {
+            f.configuration.artifacts().save(pipeline("input",true,ReadMode.SNAPSHOT_AND_CDC,"latest",null));
+            var models=SourceModelSnapshot.capture("flow",List.of(f.source()),f.cache.schemas(f.business(),ACTIVE));
+            f.preparer(f.configuration,f.cache).prepare(f.scope,f.inputs());
+            f.configuration.bindings().complete(new StorageSetupScope("cluster","installation","setup",1));
+            f.configuration.firstAdmin().create(f.configuration.firstAdmin().load().orElseThrow().scope(),new User("admin","fixture-hash","admin"));
+            var claims=f.cache.workloadClaims(f.business());
+            var fence=WorkloadClaimFence.from(claims.advanceExecution(claims.readPipeline(f.scope).orElseThrow().claim(),1,Set.of(OWNER.nodeId())).orElseThrow());
+            var stores=f.cache.srs(f.business(),ACTIVE);var member=sharedMember(stores.log(),true);var ports=new CopyOnWriteArrayList<NativeSharedPort>();
+            var properties=new ClusterProperties();properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
+            var gate=new ClusterMembershipGate(properties);gate.install(new ClusterMembership("cluster",1,Set.of("node","node-b","fixture-third")));gate.canCommit(Set.of("node","node-b"));
+            var ownership=PipelineActuationOwnership.scoped(f.business(),OWNER,gate,new ClusterWorkloadClaims(claims,gate),TTL,Duration.ofSeconds(10),System::nanoTime);
+            var engine=mock(io.tapstate.runtime.engine.Engine.class);var actuator=mock(EngineLifecycleActuator.class);
+            var configuration=spy(f.configuration);
+            var failD=new java.util.concurrent.atomic.AtomicBoolean(mode.equals("lost-d-reply"));
+            doReturn(failingCompletion(f.configuration.sharedRecoveryPreparations(),failD)).when(configuration).sharedRecoveryPreparations();
+            try(var authorization=ExecutionAuthorization.scoped(f.business(),claims,Duration.ofSeconds(2),System::nanoTime,() -> true);
+                var runtime=new NativeSrsCaptureRunUnit(f.business(),stores,member);
+                var coordinator=new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(f.business(),f.cache,f.cache,
+                        f.configuration.capturePreparations(),f.cache.capturePreparations(f.business(),ACTIVE),f.configuration.requiredNotes()),
+                        new ScopedPipelineCaptureCoordinator.Execution(() -> Optional.of(f.node),authorization,cacheOwnership(f,OWNER),Duration.ofSeconds(10),ACTIVE,CLOCK),
+                        runtime,new SnapshotBuffer(8),fixtureProvisioner(),(fixed,config,guard,preparation,stream) -> {var port=new NativeSharedPort(config,guard,preparation,stream);ports.add(port);return port;});
+                var bindings=io.tapstate.runtime.engine.OperatorMapBindings.bindTo(member,(ignored,guard) -> {throw new AssertionError("no operator maps in this fixture");})) {
+                HazelcastOperatorReadiness.bindRetirement(member,coordinator,ACTIVE);
+                var run=coordinator.forRun(f.scope,fence,new ExecutionFence(f.scope,fence));
+                run.startCapture("flow",ReadOnlyArtifactSnapshot.capture(f.configuration.artifacts()),models);awaitLoadedCounts(run);
+                var chain=run.captureBindings().logged().get("input").run().miningChainId();
+                var stream=ports.stream().filter(port -> port.stream!=null).findFirst().orElseThrow();
+                stream.listener.get().onBatch(List.of(Envelope.insert(1,"orders",Map.of("id",2),null)),Optional.of(new SourcePosition("before-loss")));
+                status(f,f.scope,fence,"STOPPED");
+                assertThat(f.configuration.intents().compareAndSet(f.scope,0,new io.tapstate.core.lifecycle.DesiredState("flow",
+                        io.tapstate.core.lifecycle.PipelineState.STOPPED,io.tapstate.core.model.canonical.CanonicalHash.of(f.pipeline()),false))).isTrue();
+                var bodies=f.cacheDatabase.getCollection("srs_models").find(new Document("_id.chain",chain)).into(new ArrayList<>());
+                assertThat(bodies).hasSize(2);for(var body:bodies)f.cacheDatabase.getCollection("srs_models").deleteOne(new Document("_id",body.get("_id")));
+                var auth=f.configuration.bindings().cachePreparation().orElseThrow().authScope();
+                var selection=new StorageRecoveryCommands.Selection(StorageRecoveryCommands.Extent.SHARED_SRS,Set.of(),chain,chain);
+                try(var recovery=new NativeSharedSrsRecovery(configuration,f.cache,auth,ownership,() -> f.node,ACTIVE,engine,actuator,
+                        new HazelcastOperatorReadiness(member,Duration.ofSeconds(10)),mock(HazelcastExecutionPlans.class),coordinator,member)) {
+                    var manifest=recovery.inspect(selection);var h0=f.configuration.recoveryCommands().guardedBy(() -> recovery.requirePlanningCurrent(manifest)).plan(auth,manifest,null,null);
+                    assertThatThrownBy(() -> recovery.requireFinalized(h0.manifest())).isInstanceOf(TapstateException.class);
+                    var h1=recovery.prepared(h0,ACTIVE);assertThat(h1.operationId()).isEqualTo(h0.operationId());
+                    assertThat(h1.controlRevision()).isGreaterThan(h0.controlRevision());recovery.requireFinalized(h1.manifest());
+                    assertThat(coordinator.hasScope(f.scope)).isFalse();assertThat(stream.closed).hasValue(1);
+                    assertThat(claims.readPipeline(f.scope).orElseThrow().leased()).isFalse();
+                    if(mode.equals("new-start")) {
+                        var intent=f.configuration.intents().load("flow").orElseThrow();
+                        assertThat(f.configuration.intents().compareAndSet(f.scope,intent.intentRevision(),new io.tapstate.core.lifecycle.DesiredState("flow",
+                                io.tapstate.core.lifecycle.PipelineState.RUNNING,intent.desired().revision(),false))).isTrue();
+                        assertThatThrownBy(() -> recovery.verifyExternal(h1.manifest(),ACTIVE)).isInstanceOf(TapstateException.class);
+                        assertThat(f.configuration.recoveryCommands().find(auth,h1.operationId()).orElseThrow().phase()).isEqualTo(StorageRecoveryCommands.Phase.PLANNED);return;
+                    }
+                    var confirmed=f.configuration.recoveryCommands().guardedBy(() -> recovery.requireFinalized(h1.manifest())).confirm(h1);
+                    if(mode.equals("lost-d-reply")) {
+                        assertThatThrownBy(() -> recovery.run(confirmed)).isInstanceOf(TapstateException.class);
+                        assertThat(f.configuration.recoveryCommands().find(auth,h1.operationId()).orElseThrow().phase()).isEqualTo(StorageRecoveryCommands.Phase.RUNNING);
+                        failD.set(false);doThrow(new AssertionError("already applied result must precede any old-run inspection")).when(engine).captureRun(anyString());
+                        f.configuration.artifacts().save(source("input","later-authoring",null));
+                    }
+                    recovery.run(confirmed);
+                    var complete=f.configuration.recoveryCommands().find(auth,h1.operationId()).orElseThrow();assertThat(complete.phase()).isEqualTo(StorageRecoveryCommands.Phase.COMPLETE);
+                    var replacement=f.configuration.capturePreparations().read(f.business(),manifest.sharedSrs().previous().captureId()).orElseThrow();
+                    assertThat(replacement.chainId()).isNotEqualTo(chain);assertThat(replacement.canonicalChainId()).isEqualTo(chain);
+                    assertThat(f.configuration.pipelineStates().read("flow").orElseThrow().stateGeneration()).isEqualTo(f.scope.stateGeneration());
+                    assertThat(f.configuration.intents().load("flow").orElseThrow().desired().targetState()).isEqualTo(io.tapstate.core.lifecycle.PipelineState.STOPPED);
+                    assertThat(f.cacheDatabase.getCollection("srs_models").countDocuments(new Document("_id.chain",chain))).isZero();
+                }
+            } finally {member.shutdown();}
+        });
+    }
+
+    private static SharedSrsRecoveryPreparations failingCompletion(SharedSrsRecoveryPreparations original,java.util.concurrent.atomic.AtomicBoolean fail) {
+        return new SharedSrsRecoveryPreparations() {
+            @Override public SharedSrsRecoveryPreparations guardedBy(Runnable active){return failingCompletion(original.guardedBy(active),fail);}
+            @Override public SharedSrsRecoveryPreparation reserve(StorageRecoveryCommands.Plan plan){return original.reserve(plan);}
+            @Override public Optional<SharedSrsRecoveryPreparation> pending(CacheAuthScope scope,String id){return original.pending(scope,id);}
+            @Override public StorageRecoveryCommands.Plan complete(SharedSrsRecoveryReceipt receipt){if(fail.get())throw ThreeLayerStorePort.refused();return original.complete(receipt);}
+            @Override public StorageRecoveryCommands.Plan replan(SharedSrsRecoveryReceipt receipt,StorageRecoveryCommands.Manifest manifest){return original.replan(receipt,manifest);}
+            @Override public Optional<SharedSrsRecoveryPreparation> reconfirmation(CacheAuthScope scope,String id){return original.reconfirmation(scope,id);}
+            @Override public SharedSrsRecoveryPreparation reserve(StorageRecoveryCommands.Plan plan,SharedSrsRecoveryReceipt receipt){return original.reserve(plan,receipt);}
+        };
+    }
+
     @ParameterizedTest @ValueSource(booleans={false,true})
     void stoppingTheOriginalLocalCaptureDoesNotNeedTheLostSharedModelBodies(boolean missingControls) {
         withFixture(f -> {
@@ -394,8 +478,11 @@ class PipelineDirectPreparationIT {
         var provisioner=mock(io.tapstate.adapters.pdk.ConnectorProvisioner.class);var ref=new io.tapstate.adapters.pdk.ConnectorRef(List.of(),"not.loaded","2.0.8",null,null,hash,false);
         when(provisioner.resolve("mongodb")).thenReturn(ref);when(provisioner.resolve("mongodb",hash)).thenReturn(ref);return provisioner;
     }
-    private static HazelcastInstance sharedMember(SrsLogStore log) {
+    private static HazelcastInstance sharedMember(SrsLogStore log) {return sharedMember(log,false);}
+    private static HazelcastInstance sharedMember(SrsLogStore log,boolean recovery) {
         var config=new com.hazelcast.config.Config().setClusterName("scoped-shared-native-"+UUID.randomUUID());
+        if(recovery)config.getMemberAttributeConfig().setAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE,OWNER.nodeId())
+                .setAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE,OWNER.bootId());
         config.setProperty("hazelcast.phone.home.enabled","false");config.setProperty("hazelcast.shutdownhook.enabled","false");
         config.setProperty("hazelcast.operation.thread.count","2");config.setProperty("hazelcast.operation.generic.thread.count","2");
         config.getNetworkConfig().getInterfaces().setEnabled(true).addInterface("127.0.0.1");

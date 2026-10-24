@@ -40,6 +40,7 @@ class CloudStorageContinuationTest {
         Fixture() { this(false); }
         Fixture(boolean configurationUnavailable) {
             when(configuration.bindings()).thenReturn(bindings); when(configuration.setupStates()).thenReturn(states);
+            when(configuration.recoveryCommands()).thenReturn(mock(StorageRecoveryCommands.class));
             when(configuration.databaseName()).thenReturn("config");
             when(bindings.load()).thenReturn(Optional.of(CONNECTION)); when(bindings.cachePreparation()).thenReturn(Optional.of(PREPARATION));
             when(bindings.guardedBy(any())).thenReturn(bindings);
