@@ -35,6 +35,68 @@ class MongoCapturePreparationsIT {
     private static final Duration TTL=Duration.ofMinutes(2);
     private static final Instant AT=Instant.parse("2026-10-19T16:00:00Z");
 
+    @Test void sharedHistoryInspectionExcludesTheExactCurrentIncarnationAndNeverReissuesCreation() {
+        withFixture(CapturePreparation.Mode.SHARED_SRS, f -> {
+            var original = f.issue(f.request).preparation();
+            var source = (SourceResource) f.configuration.artifacts().get("input").orElseThrow();
+            var history = f.configuration.capturePreparations();
+            var before = f.snapshot();
+            assertThat(history.inspectSharedHistory(original, source.id(), CanonicalHash.of(source)))
+                    .isEqualTo(new CaptureSharedHistory(original, false));
+            var priorScope = new CacheBusinessScope(f.scope.clusterId(), f.scope.bindingVersion(), "previous-cache");
+            var prior = new CapturePreparation(priorScope, original.mode(), original.chainId(), original.captureId(),
+                    original.sourceIdentityHash(), UUID.randomUUID().toString());
+            f.controls().insertOne(MongoCapturePreparationFacts.row(prior));
+            try (var independent = MongoConfigurationDomain.open(f.settings, "cluster-a")) {
+                assertThat(independent.capturePreparations().inspectSharedHistory(original, source.id(), CanonicalHash.of(source)))
+                        .isEqualTo(new CaptureSharedHistory(original, true));
+            }
+            assertThat(f.snapshot()).isEqualTo(before);
+            assertThat(f.controls().countDocuments()).isEqualTo(2);
+            assertThat(history.issueFirstCreate(f.request)).isEqualTo(new CaptureCreationResult.AlreadyIssued(original));
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings = {"source", "preparation", "physical", "missing-current", "missing-notes"})
+    void sharedHistoryInspectionRefusesConflictingOrIncompleteFactsWithoutRepair(String damage) {
+        withFixture(CapturePreparation.Mode.SHARED_SRS, f -> {
+            var original = f.issue(f.request).preparation();
+            var source = (SourceResource) f.configuration.artifacts().get("input").orElseThrow();
+            var inspected = original;
+            String sourceHash = CanonicalHash.of(source);
+            switch (damage) {
+                case "source" -> sourceHash = "f".repeat(64);
+                case "preparation" -> inspected = new CapturePreparation(original.scope(), original.mode(), original.chainId(),
+                        original.captureId(), original.sourceIdentityHash(), UUID.randomUUID().toString());
+                case "physical" -> f.controls().insertOne(MongoCapturePreparationFacts.row(new CapturePreparation(
+                        new CacheBusinessScope(f.scope.clusterId(), f.scope.bindingVersion(), "previous-cache"),
+                        original.mode(), original.chainId(), original.captureId(), "mc-" + "f".repeat(64), UUID.randomUUID().toString())));
+                case "missing-current" -> f.controls().deleteOne(new Document("_id", MongoCapturePreparationFacts.id(original.scope(), original.captureId())));
+                case "missing-notes" -> SystemCollections.PDK_NOTE_SCOPES.on(f.config).deleteOne(new Document("ownerKind", "CHAIN"));
+                default -> throw new AssertionError(damage);
+            }
+            var fixed = inspected; var hash = sourceHash;
+            var rows = f.controls().find().into(new ArrayList<>()); var before = f.snapshot();
+            assertThatThrownBy(() -> f.configuration.capturePreparations().inspectSharedHistory(fixed, source.id(), hash))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(f.controls().find().into(new ArrayList<>())).isEqualTo(rows);
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
+    @Test void losingAllCaptureRowsCannotRelabelRetainedSharedNotesAsAFreshCreation() {
+        withFixture(CapturePreparation.Mode.SHARED_SRS, f -> {
+            f.issue(f.request);
+            var notes = SystemCollections.PDK_NOTE_SCOPES.on(f.config).find(new Document("ownerKind", "CHAIN")).first();
+            assertThat(notes).isNotNull(); f.controls().deleteMany(new Document());
+            var before = f.snapshot();
+            assertCode(() -> f.configuration.capturePreparations().issueFirstCreate(f.request), IoError.NOTE_SCOPE_UNAVAILABLE);
+            assertThat(f.controls().countDocuments()).isZero();
+            assertThat(SystemCollections.PDK_NOTE_SCOPES.on(f.config).find(new Document("ownerKind", "CHAIN")).first()).isEqualTo(notes);
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
     @ParameterizedTest @EnumSource(CapturePreparation.Mode.class)
     void firstCreationBindsModeAndOriginalScopeWhileSnapshotAndDirectCreateNoSrsRoot(CapturePreparation.Mode mode) {
         withFixture(mode,f -> {

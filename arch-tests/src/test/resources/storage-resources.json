@@ -88,6 +88,47 @@
         "Original CONFIG scope and one-time preparation authority are trusted.",
         "Authentication readiness does not authorize business creation; missing or conflicting facts remain refused."
       ]
+    },
+    "pending-full-authority": {
+      "goal": "Retain authoritative generations and recognize only the exact existing explicit clear-state full rebuild; never infer a new creation or handoff right.",
+      "entry": "Matching authoritative configuration backup, or the existing completed explicit clear-state full preparation for its still-current target scope.",
+      "prerequisites": [
+        "Original Cluster identity, binding, complete preparation, exact operation/preparation/confirmation hash and target scope are trusted; current source/artifact/input/dependency closure is verified before and after CACHE work, without claiming a cross-domain transaction.",
+        "Generation numbers, missing rows, ordinary start/resume and a previous different operation grant no handoff authority. A retained snapshot pin always selects its original resume path; absent or incomplete pinned state cannot be reseeded.",
+        "Existing complete rebuild facts, pin and actual checkpoint govern retry after first batch; retired/deleted origins and reused Pipeline IDs cannot reauthorize an old full operation."
+      ]
+    },
+    "pending-fresh-full": {
+      "goal": "Preserve actual source checkpoints and referenced models while permitting one fixed fresh snapshot baseline only for an existing explicit clear-state full operation.",
+      "entry": "Original restart/recovery entries remain. The additional path is the original explicit clear-state full preparation before any replacement snapshot pin or row has been published.",
+      "prerequisites": [
+        "The canonical chain, old checkpoint, membership, models and original capture preparation are complete. The old source reader and in-flight writes are safely isolated; current NODE/PIPELINE/CAPTURE fences are proved.",
+        "First publication requires no other non-detached consumer, including paused, stopped, completed or unleased references. The new exact selection must cover the entire serving/requested set. Unknown membership, unrelated override or changed input refuses.",
+        "A real existing fresh-snapshot preparation supplies exact table models and a nonempty new source cut before first row delivery. No capability or consistency proof is invented for a connector, and no PDK/JAR interface change or online DDL promise is added.",
+        "Only SRS resumeOverride has a strict pending variant: ordinary token/fromEpoch/editedAt/contentHash remain unchanged; pendingFreshFull adds formatVersion=1, origin(operationId,targetScope,preparationId,confirmationHash,sourceId), snapshotEpoch and table-to-SrsModelKey references. The hash covers the entire variant. DIRECT retains its ordinary strict decoder.",
+        "The combined BSON-encoded pending resumeOverride is at most 262144 bytes, including token, origins and model references; over-limit requests refuse before persistence. No schema body, URI or credential is copied.",
+        "One real CACHE client/session transaction competes on the original root and complete membership revisions and atomically publishes new models/context, current full-scope consumer pin, initial floors and the pending requested cut. Every new model ddlSequence must equal its observed ring largestSequence plus one; initial floor is ddlSequence minus one.",
+        "The old real checkpoint remains unchanged. The cut is a next-start request, never durableSourceRead, target ACK or snapshot completion. Stream onStart cannot checkpoint or consume this pending request.",
+        "A subsequent capture epoch reuses the fixed requested cut and exact model structure. No latest-catalog fallback, new sample cut or broad bypass of ordinary checkpoint/model validation is permitted.",
+        "Pending chain references survive origin consumer deletion and protect their models from GC. A later consumer attaches only with its own current preparation/claim; it inherits no origin execution authority. Its metadata, model and snapshot closure must be proved or it refuses.",
+        "Position editing refuses while the full request is pending. Its first real all-served checkpoint atomically records positionEditsRestricted=true in a strict SRS-only extended checkpoint variant. Every successor checkpoint monotonically preserves true. Thereafter arbitrary source tokens refuse unless exactly equal to the current actual checkpoint token; opaque tokens are never ordered or assumed model-compatible. Ordinary unchanged-model chains and DIRECT keep their original position-edit contracts.",
+        "At capture creation/reload, a typed non-authorizing CONFIG inspection of the exact canonical capture preparation/history identifies other CACHE incarnations. Trusted previous-incarnation history also requires the monotonic checkpoint marker, including ordinary onStart checkpoints before any batch. Missing or unknown required history refuses instead of defaulting to false. No auth generation is used to infer model history.",
+        "Only a real source batch with all served-table durable model frontiers can atomically publish the new checkpoint with positionEditsRestricted=true and clear the exact entire pending override. One monotonic checkpoint boolean remains; no permanent full-operation/model map or consumed history row is added.",
+        "After response loss or crash, existing snapshot pin wins; complete current-scope pin/model/floor and actual checkpoint closure are reused. Absence of a pending annex alone never grants resampling. One-sided, corrupt, missing or conflicting facts and newly changed models refuse.",
+        "Snapshot restart rereads only unfinished tables under the original pin/models/replay anchor. New sampled seams do not skip original CDC; unavailable source logs or SRS history refuse. Normal healthy unchanged-model fulls retain their original path.",
+        "Position restrictions are scoped to the same canonical capture identity. A different Pipeline using that identity, a restart or a full retry cannot lose them; Source physical identity changes remain subject to their original explicit-full and isolation contracts and do not inherit an old position request."
+      ]
+    },
+    "capture-history-position-policy": {
+      "goal": "Retain original capture preparation authority and conservatively identify model history outside the current CACHE incarnation without minting a new creation right.",
+      "entry": "Existing first capture preparation or load of its exact already-issued current preparation; the additional inspection is read-only and grants no CACHE insertion.",
+      "prerequisites": [
+        "Original CONFIG is complete and trusted. Inspection binds current CacheBusinessScope, canonical captureId, physical identity, SHARED_SRS chain and current preparationId; unknown or inconsistent rows refuse.",
+        "Use the existing indexed canonical capture history, explicitly excluding the current cache incarnation. At least one matching trusted previous incarnation conservatively requires restricted position editing; it does not prove a past model transition.",
+        "A negative query alone is not a fresh-history proof. Before new current-row creation the strict shared-note origin/namespace/carry consistency inspection must reject retained unaccounted facts. Existing current preparations are loaded and verified; AlreadyIssued and later consumer/writer paths cannot bypass inspection.",
+        "Current-scope preparation and CACHE incarnation replacement compete through the existing actual CONFIG version write; a late old-incarnation insertion cannot commit after scope replacement. Original first-creation rights are not reissued.",
+        "No claim of detecting simultaneous erasure of every CONFIG fact and every corroborating note is made; trusted complete CONFIG is required. Identity changes outside the canonical domain do not inherit an old execution or position request."
+      ]
     }
   },
   "consistencyProfiles": {
@@ -118,6 +159,10 @@
     "user-file": {
       "atomicDomain": "USER_FILES",
       "fencing": "Existing path/ownership checks and command-local locking/atomic replacement where supported; no cross-file/server transaction promise."
+    },
+    "pending-full-cache": {
+      "atomicDomain": "CACHE",
+      "fencing": "One actual CACHE transaction proves original NODE/PIPELINE/CAPTURE fences, exact chain epoch/checkpoint/root revisions and complete consumer membership, then publishes models/context, snapshot pin, exact initial floors and the SRS-only pending override variant together. Attach/detach/pin compete on the same chain root. A real all-served checkpoint atomically consumes the exact pending variant; onStart cannot consume it. CONFIG operation and input checks occur around this transaction and are not a cross-database transaction. The same first real checkpoint transaction writes the monotonic positionEditsRestricted marker; every later checkpoint carries it forward, so pending consumption opens no unsafe position-edit interval."
     }
   },
   "resources": [
@@ -1061,7 +1106,7 @@
     {
       "id": "mongo.config.operator_generations",
       "resourceVersion": 1,
-      "proposalVersion": 1,
+      "proposalVersion": 2,
       "kind": "COLLECTION",
       "layer": "CONFIG",
       "database": "CONFIG",
@@ -1075,7 +1120,7 @@
       "readers": [
         "io.tapstate.adapters.mongostore.MongoPipelineStateMappings"
       ],
-      "recovery": "configuration-backup",
+      "recovery": "pending-full-authority",
       "consistency": "config",
       "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
       "evidence": [
@@ -1612,24 +1657,24 @@
     },
     {
       "id": "mongo.cache.srs_chains",
-      "resourceVersion": 1,
-      "proposalVersion": 1,
+      "resourceVersion": 2,
+      "proposalVersion": 2,
       "kind": "COLLECTION",
       "layer": "CACHE",
       "database": "CACHE",
       "physicalNames": [
         "srs_chains"
       ],
-      "responsibility": "Capture chain membership and actual source checkpoint facts.",
+      "responsibility": "Capture chain membership, actual source checkpoints, one bounded pending explicit-full model baseline and its monotonic restriction against unproven source-position edits.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoSrsChainStore"
       ],
       "readers": [
         "io.tapstate.adapters.mongostore.MongoSrsChainStore"
       ],
-      "recovery": "runtime-state",
-      "consistency": "cache",
-      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "recovery": "pending-fresh-full",
+      "consistency": "pending-full-cache",
+      "growth": "Original retention remains; one chain-owned pending request with combined BSON size at most 262144 bytes, plus one new epoch model/context and existing consumer pin/floors. Models retain the original 1 MiB budget; one monotonic checkpoint boolean remains after consumption, without per-retry or permanent operation/model history. Capacity failure refuses rather than dropping required history.",
       "evidence": [
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoSrsChainStoreIT.java"
       ]
@@ -1637,7 +1682,7 @@
     {
       "id": "mongo.cache.srs_models",
       "resourceVersion": 1,
-      "proposalVersion": 1,
+      "proposalVersion": 2,
       "kind": "COLLECTION",
       "layer": "CACHE",
       "database": "CACHE",
@@ -1651,9 +1696,9 @@
       "readers": [
         "io.tapstate.adapters.mongostore.MongoSrsModelStore"
       ],
-      "recovery": "runtime-state",
-      "consistency": "cache",
-      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "recovery": "pending-fresh-full",
+      "consistency": "pending-full-cache",
+      "growth": "Original retention remains; one chain-owned pending request with combined BSON size at most 262144 bytes, plus one new epoch model/context and existing consumer pin/floors. Models retain the original 1 MiB budget; one monotonic checkpoint boolean remains after consumption, without per-retry or permanent operation/model history. Capacity failure refuses rather than dropping required history.",
       "evidence": [
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoSrsModelStoreIT.java"
       ]
@@ -1685,7 +1730,7 @@
     {
       "id": "mongo.cache.srs_model_contexts",
       "resourceVersion": 1,
-      "proposalVersion": 1,
+      "proposalVersion": 2,
       "kind": "COLLECTION",
       "layer": "CACHE",
       "database": "CACHE",
@@ -1699,9 +1744,9 @@
       "readers": [
         "io.tapstate.adapters.mongostore.MongoSrsModelStore"
       ],
-      "recovery": "runtime-state",
-      "consistency": "cache",
-      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "recovery": "pending-fresh-full",
+      "consistency": "pending-full-cache",
+      "growth": "Original retention remains; one chain-owned pending request with combined BSON size at most 262144 bytes, plus one new epoch model/context and existing consumer pin/floors. Models retain the original 1 MiB budget; one monotonic checkpoint boolean remains after consumption, without per-retry or permanent operation/model history. Capacity failure refuses rather than dropping required history.",
       "evidence": [
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoSrsModelStoreIT.java"
       ]
@@ -1733,7 +1778,7 @@
     {
       "id": "mongo.cache.srs_consumer_offsets",
       "resourceVersion": 1,
-      "proposalVersion": 1,
+      "proposalVersion": 2,
       "kind": "COLLECTION",
       "layer": "CACHE",
       "database": "CACHE",
@@ -1747,9 +1792,9 @@
       "readers": [
         "io.tapstate.adapters.mongostore.MongoSrsConsumerStore"
       ],
-      "recovery": "runtime-state",
-      "consistency": "cache",
-      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "recovery": "pending-fresh-full",
+      "consistency": "pending-full-cache",
+      "growth": "Original retention remains; one chain-owned pending request with combined BSON size at most 262144 bytes, plus one new epoch model/context and existing consumer pin/floors. Models retain the original 1 MiB budget; one monotonic checkpoint boolean remains after consumption, without per-retry or permanent operation/model history. Capacity failure refuses rather than dropping required history.",
       "evidence": [
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoSrsConsumerStoreIT.java"
       ]
@@ -2238,7 +2283,7 @@
     {
       "id": "mongo.config.capture_preparations",
       "resourceVersion": 1,
-      "proposalVersion": 1,
+      "proposalVersion": 2,
       "kind": "COLLECTION",
       "layer": "CONFIG",
       "database": "CONFIG",
@@ -2252,7 +2297,7 @@
       "readers": [
         "io.tapstate.adapters.mongostore.MongoCaptureStatePreparations"
       ],
-      "recovery": "configuration-backup",
+      "recovery": "capture-history-position-policy",
       "consistency": "config",
       "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
       "evidence": [

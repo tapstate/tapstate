@@ -111,6 +111,15 @@ public enum IoError implements TapstateErrorCode {
     /** Required retained models cannot safely fit in the existing chain history budget. */
     SRS_MODEL_CAPACITY("io.srs-model-capacity", Set.of("chain", "bytes")),
 
+    /** A pending full baseline exceeds its bounded control-record budget. */
+    SRS_FULL_PREPARATION_CAPACITY("io.srs-full-preparation-capacity", Set.of("chain", "bytes")),
+
+    /** The original explicit full preparation or its exact baseline cannot be proved. */
+    SRS_FULL_PREPARATION_UNPROVEN("io.srs-full-preparation-unproven", Set.of("chain")),
+
+    /** An arbitrary source token cannot prove compatibility with the retained model history. */
+    SRS_POSITION_MODEL_UNPROVEN("io.srs-position-model-unproven", Set.of("chain")),
+
     /** An immutable model identity already names different structural content. */
     SRS_MODEL_CONFLICT("io.srs-model-conflict", Set.of("chain", "table", "version")),
 

@@ -35,6 +35,72 @@ class MongoSrsChainStoreIT {
     private static final String ORDERS = "orders";
     private static final String QUIET = "quiet";
 
+    @ParameterizedTest @ValueSource(strings = {"cluster", "binding"})
+    void pendingFullOriginCannotReferToAnotherConfigurationScope(String coordinate) {
+        withBusiness(f -> {
+            prepare(f, Set.of(ORDERS));
+            f.chains().checkpoint(CHAIN, 0, checkpoint(1, SourceOrder.SNAPSHOT_SEQ, "old-cut", Map.of(ORDERS, -1L)), f.fence()).orElseThrow();
+            f.chains().openEpoch(CHAIN, 1, f.fence()).orElseThrow();
+            f.models().publish(model(ORDERS, 2, 0, 0), f.fence());
+            var wrong = new PipelineIntentScope(coordinate.equals("cluster") ? "different" : SCOPE.clusterId(),
+                    coordinate.equals("binding") ? 2 : SCOPE.bindingVersion(), SCOPE.cacheIncarnation(), "pipeline-a", 2);
+            var pending = new SrsFreshFull(new SrsFreshFullOrigin("operation", wrong, "preparation", "a".repeat(64), "source"),
+                    2, Map.of(ORDERS, key(ORDERS, 2, 0)));
+            var request = MongoSrsSourceRequests.stored(new SourceResumeOverride("fixed-cut", 1, java.time.Instant.EPOCH), pending);
+            SystemCollections.SRS_CHAINS.on(f.database()).updateOne(new Document("_id", CHAIN),
+                    new Document("$set", new Document("resumeOverride", request)));
+            Document before = root(f);
+            assertThatThrownBy(() -> f.chains().load(CHAIN)).satisfies(MongoSrsChainStoreIT::unreadable);
+            assertThat(root(f)).isEqualTo(before);
+        });
+    }
+
+    @Test
+    void pendingFreshFullStillRequiresEveryFixedModelBeforeAnyRealBatch() {
+        withBusiness(f -> {
+            prepare(f, Set.of(ORDERS, QUIET));
+            f.chains().checkpoint(CHAIN, 0, checkpoint(1, SourceOrder.SNAPSHOT_SEQ, "old-cut",
+                    Map.of(ORDERS, -1L, QUIET, -1L)), f.fence()).orElseThrow();
+            f.chains().openEpoch(CHAIN, 1, f.fence()).orElseThrow();
+            f.models().publish(model(ORDERS, 2, 0, 0), f.fence());
+            f.models().publish(model(QUIET, 2, 0, 0), f.fence());
+            var pending = new SrsFreshFull(new SrsFreshFullOrigin("full-operation",
+                    new PipelineIntentScope(SCOPE.clusterId(), SCOPE.bindingVersion(), SCOPE.cacheIncarnation(), "pipeline-a", 2),
+                    "preparation", "a".repeat(64), "source"), 2,
+                    Map.of(ORDERS, key(ORDERS, 2, 0), QUIET, key(QUIET, 2, 0)));
+            var request = MongoSrsSourceRequests.stored(new SourceResumeOverride("fixed-full-cut", 1, java.time.Instant.EPOCH), pending);
+            SystemCollections.SRS_CHAINS.on(f.database()).updateOne(new Document("_id", CHAIN),
+                    new Document("$set", new Document("resumeOverride", request)));
+            assertThat(f.chains().load(CHAIN).orElseThrow().pendingFreshFull()).isEqualTo(pending);
+            SystemCollections.SRS_MODELS.on(f.database()).deleteOne(new Document("_id", MongoSrsModelStore.key(key(QUIET, 2, 0))));
+            Document before = root(f);
+            assertThatThrownBy(() -> f.chains().load(CHAIN))
+                    .satisfies(failure -> code(failure, IoError.SRS_MODEL_UNAVAILABLE));
+            assertThat(root(f)).isEqualTo(before);
+        });
+    }
+
+    @Test
+    void aRestrictedCheckpointSurvivesRestartAndCannotBeDowngradedByTheNextWriter() {
+        withBusiness(f -> {
+            prepare(f, Set.of(ORDERS));
+            var initial = checkpoint(1, SourceOrder.SNAPSHOT_SEQ, "current-cut", Map.of(ORDERS, -1L));
+            var restricted = new SrsCaptureCheckpoint(initial.position(), initial.tables(), true);
+            var saved = f.chains().checkpoint(CHAIN, 0, restricted, f.fence()).orElseThrow();
+            assertThat(root(f).get("checkpoint", Document.class).keySet())
+                    .containsExactlyInAnyOrder("epoch", "sequence", "token", "tables", "positionEditsRestricted", "contentHash");
+            try (var other = MongoClients.create(MONGO.getReplicaSetUrl())) {
+                assertThat(new MongoSrsChainStore(other, other.getDatabase(f.database().getName()), SCOPE).load(CHAIN)).contains(saved);
+            }
+            var next = checkpoint(1, 1, "next-real-cut", Map.of(ORDERS, -1L));
+            Document before = root(f);
+            assertThatThrownBy(() -> f.chains().checkpoint(CHAIN, 1, next, f.fence())).satisfies(MongoSrsChainStoreIT::unproven);
+            assertThat(root(f)).isEqualTo(before);
+            assertThat(f.chains().checkpoint(CHAIN, 1, new SrsCaptureCheckpoint(next.position(), next.tables(), true), f.fence())
+                    .orElseThrow().checkpoint().positionEditsRestricted()).isTrue();
+        });
+    }
+
     @Test
     void aWideCurrentCheckpointReadsItsModelClosureInBatchesWithinTheOriginalTransaction() {
         withBusiness(f -> {

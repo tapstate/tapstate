@@ -11,4 +11,8 @@ public interface CaptureStatePreparations {
     default Optional<RequiredNoteOrigin> inspectSharedOrigin(CacheBusinessScope current,String sourceId,String sourceHash) {
         throw new io.tapstate.core.common.TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE,java.util.Map.of(),null);
     }
+    /** Inspects trusted history for the exact retained preparation without reissuing its creation right. */
+    default CaptureSharedHistory inspectSharedHistory(CapturePreparation original, String sourceId, String sourceHash) {
+        throw new io.tapstate.core.common.TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE, java.util.Map.of(), null);
+    }
 }

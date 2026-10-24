@@ -1100,6 +1100,37 @@ class MongoSrsConsumerStoreIT {
         }
     }
 
+    @Test void theExactRestrictedCheckpointDoesNotRevokeReadersOrClearTheirProgress() {
+        withBusiness(f -> {
+            var refs = publishSnapshotModels(f, Set.of("orders"));
+            f.chains().requestTables(CHAIN, Set.of("orders"), f.captureFence());
+            f.chains().publishServingTables(CHAIN, 1, Set.of("orders"), f.captureFence());
+            var checkpoint = new io.tapstate.spi.store.SrsCaptureCheckpoint(new ChainPosition(SourceOrder.snapshotRow(1), "original"),
+                    Map.of("orders", new io.tapstate.spi.store.SrsTableCheckpoint(refs.get("orders"), -1)), true);
+            f.chains().checkpoint(CHAIN, 0, checkpoint, f.captureFence()).orElseThrow();
+            f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            f.consumers().attach(B, 0, Set.of("orders"), f.fenceB()).orElseThrow();
+            f.consumers().pinSnapshot(A, 1, 0, new SrsSnapshotPin(1, "original", refs), f.fenceA());
+            f.consumers().beginWriterRun(A, 1, "original-run", Map.of("orders", List.of("writer")), f.fenceA());
+            f.consumers().advanceWriter(A, 1, "original-run", "orders", "writer", point(1, 3, "t3"), f.fenceA());
+            var before = f.consumers().progress(A).orElseThrow();
+            var claims = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()));
+            var node = claims.acquire(new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.NODE_SESSION, "node-edit"),
+                    new WorkloadOwner("node-edit", "boot-edit"), 1, Duration.ofSeconds(30)).claim();
+            SystemCollections.CACHE_IDENTITY.on(f.database()).updateOne(new Document(), new Document("$set", new Document("claimAdmissionFence", 0L)));
+            var readers = Map.of(positionScope(A), f.fenceA(), positionScope(B), f.fenceB());
+            var edit = f.consumers().positions(WorkloadClaimFence.from(node), java.time.Duration.ofDays(7));
+            assertThatThrownBy(() -> edit.rewrite(List.of(positionMove(f, "unknown", f.captureFence())), readers, java.time.Instant.now()))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(IoError.SRS_POSITION_MODEL_UNPROVEN));
+            edit.rewrite(List.of(positionMove(f, "original", f.captureFence())), readers, java.time.Instant.now());
+            assertThat(f.chains().load(CHAIN).orElseThrow().resumeOverride()).isNull();
+            assertThat(f.consumers().progress(A)).contains(before);
+            assertThat(claims.read(f.pipelineA().key()).orElseThrow().leased()).isTrue();
+            assertThat(claims.read(f.pipelineB().key()).orElseThrow().leased()).isTrue();
+        });
+    }
+
     @Test void positionEditsPreserveTruthFenceOldWritersAndAllowANewEditAfterReacquisition() {
         withBusiness(f -> {
             var refs = publishSnapshotModels(f, Set.of("orders"));

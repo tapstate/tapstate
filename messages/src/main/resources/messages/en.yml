@@ -1280,3 +1280,13 @@ start-check.target-identity-compatible:
 start-check.target-identity-refused:
   message: "Target '{target}' on '{connection}' cannot safely preserve '{field}' as '{preserved}': {reason}."
   solution: "Resolve the field collision or target identity constraints before starting. Source values and existing business constraints are not overwritten."
+
+io.srs-full-preparation-capacity:
+  message: "The pending full baseline for chain {chain} exceeds its {bytes}-byte control budget."
+  solution: "Reduce the selected model references or source token size before retrying the same explicit full. Keep all required existing history intact."
+io.srs-full-preparation-unproven:
+  message: "The original clear-state full baseline for chain {chain} cannot be verified."
+  solution: "Keep the original preparation, snapshot pin, model and progress facts. Retry only the same verified full operation; do not create a replacement from missing history."
+io.srs-position-model-unproven:
+  message: "The requested source position for chain {chain} cannot prove compatibility with its model history."
+  solution: "Arbitrary position editing is unavailable after model handoff or replacement-cache history. Stop, clear the task state and explicitly rerun a full load instead."

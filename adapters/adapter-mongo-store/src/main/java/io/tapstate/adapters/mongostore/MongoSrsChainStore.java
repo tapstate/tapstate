@@ -143,6 +143,17 @@ public final class MongoSrsChainStore implements SrsChainStore {
             if (checkpoint.equals(held.checkpoint())) return Optional.of(held);
             if (expectedRevision >= Long.MAX_VALUE - 1 || !held.servingTables().equals(checkpoint.tables().keySet())
                     || !held.servingTables().containsAll(held.requestedTables())) throw unproven(chain);
+            if ((held.pendingFreshFull() != null || held.checkpoint() != null && held.checkpoint().positionEditsRestricted())
+                    && !checkpoint.positionEditsRestricted()) throw unproven(chain);
+            if (held.pendingFreshFull() != null) {
+                if (checkpoint.position().order().seq() < 1
+                        || !checkpoint.tables().keySet().equals(held.pendingFreshFull().models().keySet())) throw unproven(chain);
+                for (var entry : checkpoint.tables().entrySet()) {
+                    var baseline = models.requireReference(session, held.pendingFreshFull().models().get(entry.getKey())).model();
+                    var actual = models.requireReference(session, entry.getValue().model()).model();
+                    if (!baseline.table().equals(actual.table())) throw unproven(chain);
+                }
+            }
             if (held.checkpoint() != null) {
                 if (checkpoint.position().order().compareTo(held.checkpoint().position().order()) <= 0) throw unproven(chain);
                 for (var before : held.checkpoint().tables().entrySet()) {
@@ -190,6 +201,8 @@ public final class MongoSrsChainStore implements SrsChainStore {
     SrsChainState state(ClientSession session, Document row) {
         SrsChainState state = decode(row);
         if (state.checkpoint() != null) validateCheckpoint(session, row, state.checkpoint(), null, false);
+        if (state.pendingFreshFull() != null)
+            models.requireSnapshotReferences(session, Set.copyOf(state.pendingFreshFull().models().values()));
         return state;
     }
     private Document root(ClientSession session, String chain) {
@@ -241,10 +254,16 @@ public final class MongoSrsChainStore implements SrsChainStore {
             if (epoch == 0 && (!heads.isEmpty() || !tableSet(row.get("servingTables")).isEmpty())) throw unreadable();
             SrsCaptureCheckpoint checkpoint = row.get("checkpoint") == null ? null : checkpointFrom(row.get("checkpoint", Document.class));
             if (row.get("checkpointAt") != null && !(row.get("checkpointAt") instanceof Date)) throw unreadable();
+            var request = MongoSrsSourceRequests.read(row.get("resumeOverride"));
+            if (request.full() != null) {
+                var target = request.full().origin().targetScope();
+                if (!scope.equals(new CacheBusinessScope(target.clusterId(), target.bindingVersion(), target.cacheIncarnation())))
+                    throw unreadable();
+            }
             return new SrsChainState(row.getString("_id"), row.getString("captureId"), row.getString("retention"), epoch,
                     tableSet(row.get("requestedTables")), tableSet(row.get("servingTables")), revision, checkpoint,
                     row.getDate("checkpointAt") == null ? null : row.getDate("checkpointAt").toInstant(), consumerCount, consumerRevision,
-                    MongoResumeOverrides.read(row.get("resumeOverride")));
+                    request.request(), request.full());
         } catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable(); }
     }
     private static Document checkpointDocument(SrsCaptureCheckpoint checkpoint) {
@@ -254,10 +273,14 @@ public final class MongoSrsChainStore implements SrsChainStore {
             positions.add(new Document("table", table).append("model", MongoSrsModelStore.key(at.model())).append("sequence", at.sequence()));
         }
         Document row = new Document("epoch", order.epoch()).append("sequence", order.seq()).append("token", checkpoint.position().token()).append("tables", positions);
+        if (checkpoint.positionEditsRestricted()) row.append("positionEditsRestricted", true);
         return row.append("contentHash", CanonicalHash.ofText(row.toJson()));
     }
     private static SrsCaptureCheckpoint checkpointFrom(Document row) {
-        if (!row.keySet().equals(Set.of("epoch", "sequence", "token", "tables", "contentHash")) || !(row.get("epoch") instanceof Long epoch)
+        boolean restricted = row.containsKey("positionEditsRestricted");
+        if (!(restricted ? row.keySet().equals(Set.of("epoch", "sequence", "token", "tables", "contentHash", "positionEditsRestricted"))
+                && Boolean.TRUE.equals(row.get("positionEditsRestricted"))
+                : row.keySet().equals(Set.of("epoch", "sequence", "token", "tables", "contentHash"))) || !(row.get("epoch") instanceof Long epoch)
                 || !(row.get("sequence") instanceof Long sequence) || !(row.get("token") instanceof String token)
                 || !(row.get("tables") instanceof List<?> entries)) throw unreadable();
         var positions = new LinkedHashMap<String, SrsTableCheckpoint>();
@@ -267,7 +290,7 @@ public final class MongoSrsChainStore implements SrsChainStore {
             var position = new SrsTableCheckpoint(MongoSrsModelStore.readKey(entry.get("model", Document.class)), at);
             if (positions.put(table, position) != null) throw unreadable();
         }
-        var result = new SrsCaptureCheckpoint(new ChainPosition(new SourceOrder(epoch, sequence), token), positions);
+        var result = new SrsCaptureCheckpoint(new ChainPosition(new SourceOrder(epoch, sequence), token), positions, restricted);
         if (!checkpointDocument(result).equals(row)) throw unreadable();
         return result;
     }

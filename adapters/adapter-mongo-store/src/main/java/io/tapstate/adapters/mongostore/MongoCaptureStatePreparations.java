@@ -39,6 +39,41 @@ final class MongoCaptureStatePreparations implements CaptureStatePreparations {
             return artifacts.configurationNotes().inspectSharedOrigin(session,new RequiredNoteOwner(scope.bindingVersion(),"pdk.chain."+chain,RequiredNoteOwner.Kind.CHAIN,chain,0),prior!=null);
         });
     }
+    @Override public CaptureSharedHistory inspectSharedHistory(CapturePreparation original, String sourceId, String sourceHash) {
+        Objects.requireNonNull(original, "original");
+        if (original.mode() != CapturePreparation.Mode.SHARED_SRS) throw fenced();
+        return transaction(session -> {
+            requireScope(session, original.scope());
+            var source = artifacts.getInTransaction(session, sourceId).filter(SourceResource.class::isInstance)
+                    .map(SourceResource.class::cast).orElseThrow(MongoCaptureStatePreparations::fenced);
+            String chain = SourceCaptureIdentity.resolve(source.connector(), source.config(), source.srs() == null ? null : source.srs().key());
+            if (!CanonicalHash.of(source).equals(sourceHash) || !chain.equals(original.chainId())
+                    || !SourceCaptureIdentity.sharedCapture(chain).equals(original.captureId())
+                    || !SourceCaptureIdentity.physical(source.connector(), source.config()).equals(original.sourceIdentityHash())) throw fenced();
+            var table = SystemCollections.CAPTURE_PREPARATIONS.on(database);
+            var current = MongoCapturePreparationFacts.decode(table.find(session,
+                    new Document("_id", MongoCapturePreparationFacts.id(original.scope(), original.captureId()))).first());
+            if (!current.equals(original)) throw fenced();
+            boolean historical = false;
+            var filter = new Document("_id.clusterId", original.scope().clusterId())
+                    .append("_id.bindingVersion", original.scope().bindingVersion())
+                    .append("_id.capture", OperatorStateText.encode(original.captureId()))
+                    .append("_id.cacheIncarnation", new Document("$ne", original.scope().cacheIncarnation()));
+            try (var rows = table.find(session, filter).batchSize(64).iterator()) {
+                while (rows.hasNext()) {
+                    var prior = MongoCapturePreparationFacts.decode(rows.next());
+                    if (prior.mode() != original.mode() || !prior.chainId().equals(chain)
+                            || !prior.captureId().equals(original.captureId())
+                            || !prior.sourceIdentityHash().equals(original.sourceIdentityHash())) throw fenced();
+                    historical = true;
+                }
+            }
+            // A retained current record owns this already-reserved namespace. No inspection repairs it.
+            artifacts.configurationNotes().inspectSharedOrigin(session, new RequiredNoteOwner(original.scope().bindingVersion(),
+                    "pdk.chain." + chain, RequiredNoteOwner.Kind.CHAIN, chain, 0), true);
+            return new CaptureSharedHistory(current, historical);
+        });
+    }
     @Override public CaptureCreationResult issueFirstCreate(CapturePreparationRequest request) {
         Objects.requireNonNull(request,"request");String operation=UUID.randomUUID().toString();
         var issued=transaction(session -> {
@@ -79,8 +114,11 @@ final class MongoCaptureStatePreparations implements CaptureStatePreparations {
                         .append("_id.capture",OperatorStateText.encode(capture))).first();
                 if(prior!=null) {
                     var previous=MongoCapturePreparationFacts.decode(prior);
-                    if(previous.mode()!=mode || !previous.chainId().equals(chain))throw MongoCapturePreparationFacts.unreadable();
+                    if(previous.mode()!=mode || !previous.chainId().equals(chain)
+                            || !previous.sourceIdentityHash().equals(preparation.sourceIdentityHash()))throw MongoCapturePreparationFacts.unreadable();
                 }
+                artifacts.configurationNotes().inspectSharedOrigin(session,new RequiredNoteOwner(scope.bindingVersion(),
+                        "pdk.chain."+chain,RequiredNoteOwner.Kind.CHAIN,chain,0),prior!=null);
                 // Necessary notes survive CACHE replacement; a prior incarnation forbids scope repair.
                 artifacts.prepareSharedCaptureNotes(session,scope.bindingVersion(),chain,prior!=null);
             }

@@ -284,9 +284,12 @@ io.sink-writer-progress-ambiguous
 io.srs-checkpoint-unproven
 io.srs-consumer-unavailable
 io.srs-event-model-unavailable
+io.srs-full-preparation-capacity
+io.srs-full-preparation-unproven
 io.srs-model-capacity
 io.srs-model-conflict
 io.srs-model-unavailable
+io.srs-position-model-unproven
 io.srs-progress-unproven
 io.store-unauthorized
 io.store-unavailable

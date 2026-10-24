@@ -84,6 +84,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                     access.proveConsumerClaim(session); access.updateState(session, state, new Document(), false);
                 }
                 var selected = new java.util.HashSet<String>();
+                boolean changed = false;
                 for (var move : fixed) {
                     requireActive.run();
                     if (move instanceof SourcePositionEdits.Logged logged) {
@@ -91,6 +92,11 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                         if (!selected.add(chain)) throw unavailable(chain);
                         var held = view(session, chain);
                         if (!held.state().equals(logged.original()) || held.state().checkpoint() == null) throw unavailable(chain);
+                        if (held.state().pendingFreshFull() != null || held.state().checkpoint().positionEditsRestricted()
+                                && !held.state().checkpoint().position().token().equals(logged.token()))
+                            throw new TapstateException(IoError.SRS_POSITION_MODEL_UNPROVEN, Map.of("chain", chain), null);
+                        if (held.state().checkpoint().positionEditsRestricted()) continue;
+                        changed = true;
                         chains.prove(session, logged.capture()); chains.requireCapture(held.root(), logged.capture());
                         var attached = new java.util.HashSet<SrsConsumerContext>();
                         for (var member : held.members().values()) {
@@ -111,6 +117,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                         var next = new Document(held.root()).append("resumeOverride", MongoResumeOverrides.stored(new SourceResumeOverride(logged.token(), held.state().epoch(), at)));
                         chains.replace(session, held.root(), next);
                     } else if (move instanceof SourcePositionEdits.Direct direct) {
+                        changed = true;
                         String channel = direct.original().context().channelId();
                         if (!selected.add(channel)) throw fenced();
                         new MongoCacheMetadataStructure(database, retention).verifyDirect();
@@ -121,6 +128,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                     }
                 }
                 requireActive.run(); MongoCachePipelinePreparations.proveNode(session, database, scope, node);
+                if (!changed) return null;
                 // End the original tenures in this same transaction: a delayed writer cannot recreate its old run roster.
                 for (var reader : originals.entrySet()) {
                     var filter = WorkloadClaimDocuments.live(reader.getValue()).append("pipelineScope", MongoPipelinePreparationFacts.scope(reader.getKey()))

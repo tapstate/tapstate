@@ -64,9 +64,11 @@ public final class MongoSrsModelStore implements SrsModelStore {
             var pinned=consumers.retainedModels(session,chainId);
             var chain=SystemCollections.SRS_CHAINS.on(database).find(session,new Document("_id",chainId)).first();
             if(chain==null || !scope.cacheIncarnation().equals(chain.get("cacheIncarnation")) || !fence.key().resourceId().equals(chain.get("captureId")))throw claimFenced();
-            var checkpoint=MongoSrsChainStore.decode(chain,scope,contexts).checkpoint();
+            var state=MongoSrsChainStore.decode(chain,scope,contexts);
+            var checkpoint=state.checkpoint();
             if(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session,WorkloadClaimDocuments.live(fence),PROVE_CAPTURE).getMatchedCount()!=1)throw claimFenced();
             var protectedKeys=new java.util.HashSet<>(pinned);
+            if(state.pendingFreshFull()!=null)protectedKeys.addAll(state.pendingFreshFull().models().values());
             if(checkpoint!=null)checkpoint.tables().values().forEach(value -> protectedKeys.add(value.model()));
             long deleted=0;
             try(var rows=SystemCollections.SRS_MODEL_CONTEXTS.on(database).find(session,new Document("_id.chain",chainId)

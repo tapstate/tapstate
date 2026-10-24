@@ -6,7 +6,11 @@ import java.util.Map;
 import java.util.Objects;
 
 /** A source batch position and every served table's captured durable frontier form one checkpoint. */
-public record SrsCaptureCheckpoint(ChainPosition position, Map<String, SrsTableCheckpoint> tables) {
+public record SrsCaptureCheckpoint(ChainPosition position, Map<String, SrsTableCheckpoint> tables,
+                                   boolean positionEditsRestricted) {
+    public SrsCaptureCheckpoint(ChainPosition position, Map<String, SrsTableCheckpoint> tables) {
+        this(position, tables, false);
+    }
     public SrsCaptureCheckpoint {
         Objects.requireNonNull(position, "position");
         SourceOrder order = Objects.requireNonNull(position.order(), "order");

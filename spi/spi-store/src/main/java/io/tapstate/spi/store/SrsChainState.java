@@ -8,7 +8,14 @@ import java.util.Set;
 public record SrsChainState(String miningChainId, String captureId, String retention, long epoch,
                             Set<String> requestedTables, Set<String> servingTables,
                             long checkpointRevision, SrsCaptureCheckpoint checkpoint, Instant checkpointAt, long consumerCount, long consumerRevision,
-                            SourceResumeOverride resumeOverride) {
+                            SourceResumeOverride resumeOverride, SrsFreshFull pendingFreshFull) {
+    public SrsChainState(String miningChainId, String captureId, String retention, long epoch,
+                         Set<String> requestedTables, Set<String> servingTables, long checkpointRevision,
+                         SrsCaptureCheckpoint checkpoint, Instant checkpointAt, long consumerCount, long consumerRevision,
+                         SourceResumeOverride resumeOverride) {
+        this(miningChainId, captureId, retention, epoch, requestedTables, servingTables, checkpointRevision,
+                checkpoint, checkpointAt, consumerCount, consumerRevision, resumeOverride, null);
+    }
     public SrsChainState(String miningChainId, String captureId, String retention, long epoch,
                          Set<String> requestedTables, Set<String> servingTables, long checkpointRevision,
                          SrsCaptureCheckpoint checkpoint, Instant checkpointAt, long consumerCount, long consumerRevision) {
@@ -31,6 +38,11 @@ public record SrsChainState(String miningChainId, String captureId, String reten
                     || checkpoint != null && checkpoint.position().order().epoch() > resumeOverride.fromEpoch()))) {
             throw new IllegalArgumentException("incoherent SRS chain control");
         }
+        if (pendingFreshFull != null && (resumeOverride == null || pendingFreshFull.snapshotEpoch() > epoch
+                || pendingFreshFull.snapshotEpoch() != resumeOverride.fromEpoch() + 1
+                || !pendingFreshFull.models().keySet().containsAll(requestedTables)
+                || pendingFreshFull.models().values().stream().anyMatch(key -> !miningChainId.equals(key.miningChainId()))))
+            throw new IllegalArgumentException("incoherent pending full baseline");
     }
     public String resumeToken() { return resumeOverride != null ? resumeOverride.token() : checkpoint == null ? null : checkpoint.position().token(); }
 }
