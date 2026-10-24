@@ -103,6 +103,25 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     synchronized boolean hasScope(PipelineIntentScope scope) {
         active(); return sessions.keySet().stream().anyMatch(original -> original.scope().equals(scope));
     }
+    /** Releases only the original local shared owner after all of its Pipeline sessions have ended. */
+    synchronized void retireShared(CapturePreparation original,WorkloadClaimFence fence) {
+        requireShared(original,fence);
+        var owner=owners.get(original.captureId());
+        if(owner==null){execution.ownership().requireEnded(fence);return;}
+        if(!original.equals(owner.prepared) || !fence.equals(owner.fence) || !owner.sessions.isEmpty()
+                || !owner.ended.get() && needed(owner))throw refused();
+        owner.ended.set(true);owner.release();execution.ownership().endTenure(fence);owners.remove(original.captureId(),owner);
+    }
+    synchronized void requireSharedRetired(CapturePreparation original,WorkloadClaimFence fence) {
+        requireShared(original,fence);if(owners.containsKey(original.captureId()))throw refused();
+        execution.ownership().requireEnded(fence);
+    }
+    private void requireShared(CapturePreparation original,WorkloadClaimFence fence) {
+        active();
+        if(original==null || original.mode()!=CapturePreparation.Mode.SHARED_SRS || !stores.scope().equals(original.scope())
+                || fence==null || fence.key().type()!=WorkloadClaimType.CAPTURE || !original.scope().clusterId().equals(fence.key().clusterId())
+                || !original.captureId().equals(fence.key().resourceId()))throw refused();
+    }
     static void requireNotLater(ExecutionFence original, WorkloadClaimFence ceiling) {
         if (!original.pipelineId().equals(ceiling.key().resourceId()) || original.scope() == null
                 || !original.scope().clusterId().equals(ceiling.key().clusterId())

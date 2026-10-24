@@ -127,6 +127,8 @@ class PipelineDirectPreparationIT {
                         return;
                     }
                     var before=sharedCleanupControls(f);
+                    assertThatThrownBy(() -> coordinator.retireShared(prepared,observed.captureFence())).isInstanceOf(TapstateException.class);
+                    assertThatThrownBy(() -> coordinator.requireSharedRetired(prepared,observed.captureFence())).isInstanceOf(TapstateException.class);
                     first.stopCapture("flow",false);
                     assertThat(physical.closed).hasValue(1);assertThat(first.isCapturing("flow")).isFalse();assertThat(coordinator.hasScope(f.scope)).isFalse();
                     var ended=claims.read(captureKey).orElseThrow();assertThat(ended.leased()).isFalse();
@@ -137,6 +139,8 @@ class PipelineDirectPreparationIT {
                     assertThatThrownBy(() -> stores.chains().load(chain)).isInstanceOf(TapstateException.class);
                     var retained=stores.consumers().inspectSharedRecovery(prepared);
                     assertThat(retained.consumers()).isEqualTo(observed.consumers());assertThat(retained.captureFence()).isEqualTo(observed.captureFence());
+                    coordinator.retireShared(prepared,retained.captureFence());coordinator.requireSharedRetired(prepared,observed.captureFence());
+                    assertThat(physical.closed).hasValue(1);
                 }
             } finally {member.shutdown();}
         });
@@ -255,7 +259,7 @@ class PipelineDirectPreparationIT {
             assertThat(f.cacheDatabase.getCollection("direct_channel_offsets").countDocuments()).isZero();
         });
     }
-    @ParameterizedTest @ValueSource(strings={"healthy","RUNNING","PAUSED"})
+    @ParameterizedTest @ValueSource(strings={"healthy","RUNNING","PAUSED","release-before","release-after"})
     void aForeignSharedConsumerWidensTheOriginalTailAndTakesOverWithoutChangingItsReadFloor(String retainedStatus) {
         withFixture(f -> {
             var firstSource=f.source();f.configuration.artifacts().save(new SourceResource(firstSource.id(),null,firstSource.connector(),firstSource.config(),firstSource.mode(),List.of(TableRef.literal("orders")),firstSource.srs(),null));
@@ -275,13 +279,14 @@ class PipelineDirectPreparationIT {
             var otherFence=WorkloadClaimFence.from(claims.advanceExecution(claims.readPipeline(otherScope).orElseThrow().claim(),1,Set.of(otherOwner.nodeId())).orElseThrow());
             status(f,f.scope,firstFence,"RUNNING");status(f,otherScope,otherFence,"RUNNING");
             var stores=f.cache.srs(f.business(),ACTIVE);var member=sharedMember(stores.log());
+            var firstOwnership=cacheOwnership(f,OWNER);
             var firstPorts=new CopyOnWriteArrayList<NativeSharedPort>();var otherPorts=new CopyOnWriteArrayList<NativeSharedPort>();
             try(var firstAuthorization=ExecutionAuthorization.scoped(f.business(),claims,Duration.ofSeconds(2),System::nanoTime,() -> true);
                 var otherAuthorization=ExecutionAuthorization.scoped(f.business(),claims,Duration.ofSeconds(2),System::nanoTime,() -> true);
                 var firstRuntime=new NativeSrsCaptureRunUnit(f.business(),stores,member);var otherRuntime=new NativeSrsCaptureRunUnit(f.business(),stores,member);
                 var firstRoot=new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(f.business(),f.cache,f.cache,
                         f.configuration.capturePreparations(),f.cache.capturePreparations(f.business(),ACTIVE),f.configuration.requiredNotes()),
-                        new ScopedPipelineCaptureCoordinator.Execution(() -> Optional.of(f.node),firstAuthorization,cacheOwnership(f,OWNER),Duration.ofSeconds(10),ACTIVE,CLOCK),
+                        new ScopedPipelineCaptureCoordinator.Execution(() -> Optional.of(f.node),firstAuthorization,firstOwnership,Duration.ofSeconds(10),ACTIVE,CLOCK),
                         firstRuntime,new SnapshotBuffer(8),fixtureProvisioner(),(fixed,config,guard,preparation,stream) -> {var port=new NativeSharedPort(config,guard,preparation,stream);firstPorts.add(port);return port;});
                 var otherRoot=new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(f.business(),f.cache,f.cache,
                         f.configuration.capturePreparations(),f.cache.capturePreparations(f.business(),ACTIVE),f.configuration.requiredNotes()),
@@ -306,7 +311,7 @@ class PipelineDirectPreparationIT {
                 assertThat(f.cacheDatabase.getCollection("srs_events").countDocuments()).isEqualTo(events);
                 if(!retainedStatus.equals("healthy")) {
                     synchronized(firstRoot) { synchronized(otherRoot) {
-                        status(f,otherScope,otherFence,retainedStatus);
+                        status(f,otherScope,otherFence,retainedStatus.equals("PAUSED")?"PAUSED":"RUNNING");
                         assertThat(f.cacheDatabase.getCollection("srs_models").deleteMany(new Document("_id.chain",chain)).getDeletedCount()).isPositive();
                         assertThatThrownBy(() -> stores.chains().load(chain)).isInstanceOf(TapstateException.class);
                         status(f,f.scope,firstFence,"STOPPED");
@@ -318,8 +323,38 @@ class PipelineDirectPreparationIT {
                         var key=new WorkloadClaimKey("cluster",WorkloadClaimType.CAPTURE,
                                 io.tapstate.core.model.canonical.SourceCaptureIdentity.sharedCapture(chain));
                         assertThat(claims.read(key).orElseThrow().leased()).isTrue();
-                        assertThat(stores.consumers().inspectSharedRecovery(f.configuration.capturePreparations()
-                                .read(f.business(),key.resourceId()).orElseThrow()).pipelines()).containsKeys("flow","other");
+                        var prepared=f.configuration.capturePreparations().read(f.business(),key.resourceId()).orElseThrow();
+                        var retained=stores.consumers().inspectSharedRecovery(prepared);
+                        assertThat(retained.pipelines()).containsKeys("flow","other");
+                        assertThatThrownBy(() -> firstRoot.retireShared(prepared,retained.captureFence())).isInstanceOf(TapstateException.class);
+                        assertThatThrownBy(() -> firstRoot.requireSharedRetired(prepared,retained.captureFence())).isInstanceOf(TapstateException.class);
+                        assertThat(widened.closed).hasValue(0);assertThat(sharedCleanupControls(f)).isEqualTo(stopped);
+                        status(f,otherScope,otherFence,"STOPPED");other.stopCapture("other",false);
+                        var beforeRetirement=sharedCleanupControls(f);
+                        var wrong=new WorkloadClaimFence(key,retained.captureFence().owner(),retained.captureFence().claimGeneration()+1,
+                                retained.captureFence().executionGeneration(),retained.captureFence().topologyRevision());
+                        assertThatThrownBy(() -> firstRoot.retireShared(prepared,wrong)).isInstanceOf(TapstateException.class);
+                        assertThat(widened.closed).hasValue(0);
+                        if(retainedStatus.startsWith("release-")) {
+                            var attempts=new java.util.concurrent.atomic.AtomicInteger();
+                            var unavailable=new TapstateException(IoError.STORE_UNAVAILABLE,Map.of("detail","release response unavailable"),null);
+                            doAnswer(call -> {
+                                if(attempts.incrementAndGet()==1) {
+                                    if(retainedStatus.equals("release-after"))call.callRealMethod();
+                                    throw unavailable;
+                                }
+                                return call.callRealMethod();
+                            }).when(firstOwnership).release(any());
+                            assertThatThrownBy(() -> firstRoot.retireShared(prepared,retained.captureFence())).isSameAs(unavailable);
+                            assertThatThrownBy(() -> firstRoot.requireSharedRetired(prepared,retained.captureFence())).isInstanceOf(TapstateException.class);
+                            assertThat(widened.closed).hasValue(1);
+                            assertThat(claims.read(key).orElseThrow().leased()).isEqualTo(retainedStatus.equals("release-before"));
+                            assertThat(sharedCleanupControls(f)).isEqualTo(beforeRetirement);
+                        }
+                        firstRoot.retireShared(prepared,retained.captureFence());firstRoot.requireSharedRetired(prepared,retained.captureFence());
+                        assertThat(widened.closed).hasValue(1);var ended=claims.read(key).orElseThrow();assertThat(ended.leased()).isFalse();
+                        assertThat(WorkloadClaimFence.from(ended.claim())).isEqualTo(retained.captureFence());
+                        assertThat(sharedCleanupControls(f)).isEqualTo(beforeRetirement);
                     } }
                     return;
                 }
@@ -348,11 +383,11 @@ class PipelineDirectPreparationIT {
         assertThat(ready.getAsBoolean()).isTrue();
     }
     private static CaptureOwnership cacheOwnership(Fixture f,WorkloadOwner owner) {
-        var claims=f.cache.workloadClaims(f.business());var ownership=mock(CaptureOwnership.class);
-        when(ownership.acquire(any())).thenAnswer(call -> {var id=call.getArgument(0,CaptureId.class);
-            var attempt=claims.acquire(new WorkloadClaimKey("cluster",WorkloadClaimType.CAPTURE,id.value()),owner,1,TTL);return attempt.acquired()?new CaptureOwnership.Permit(true,attempt.claim()):CaptureOwnership.Permit.denied();});
-        when(ownership.renew(any())).thenAnswer(call -> claims.renew(call.getArgument(0),TTL));when(ownership.ttl()).thenReturn(TTL);
-        doAnswer(call -> {claims.release(call.getArgument(0));return null;}).when(ownership).release(any());return ownership;
+        var properties=new ClusterProperties();properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
+        var gate=new ClusterMembershipGate(properties);
+        gate.install(new ClusterMembership("cluster",1,Set.of("node","node-b","fixture-third")));
+        gate.canCommit(Set.of("node","node-b"));
+        return spy(new CaptureOwnership("cluster",owner,gate,new ClusterWorkloadClaims(f.cache.workloadClaims(f.business()),gate),TTL));
     }
     private static io.tapstate.adapters.pdk.ConnectorProvisioner fixtureProvisioner() {return fixtureProvisioner("c".repeat(64));}
     private static io.tapstate.adapters.pdk.ConnectorProvisioner fixtureProvisioner(String hash) {

@@ -26,6 +26,29 @@ class ScopedPipelineCaptureCoordinatorTest {
     private static final WorkloadOwner OWNER=new WorkloadOwner("node","boot");
     private static final WorkloadClaimFence PIPELINE=new WorkloadClaimFence(new WorkloadClaimKey("cluster",WorkloadClaimType.PIPELINE_ACTUATION,"flow"),OWNER,2,3,1);
     private static final ExecutionFence ORIGINAL=new ExecutionFence(SCOPE,PIPELINE);
+    @Test void anAbsentLocalOwnerDoesNotProveItsExactCaptureTenureEnded() {
+        try(var f=new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var properties=new ClusterProperties();properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
+            var gate=new ClusterMembershipGate(properties);gate.install(new ClusterMembership("cluster",1,Set.of("node","node-b","node-c")));
+            gate.canCommit(Set.of("node","node-b"));var raw=new InMemoryWorkloadClaimStore();
+            var ownership=new CaptureOwnership("cluster",OWNER,gate,new ClusterWorkloadClaims(raw,gate),Duration.ofSeconds(60));
+            var permit=ownership.acquire(new CaptureId("mck-key"));
+            var prepared=new CapturePreparation(BUSINESS,CapturePreparation.Mode.SHARED_SRS,"mck-key","mck-key",
+                    SourceCaptureIdentity.physical(f.source.connector(),f.source.config()),UUID.randomUUID().toString());
+            var node=new WorkloadClaimFence(new WorkloadClaimKey("cluster",WorkloadClaimType.NODE_SESSION,"node"),OWNER,1,0,1);
+            try(var coordinator=new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(BUSINESS,f.pipelines,f.sources,
+                    f.configuration,f.cache,f.notes),new ScopedPipelineCaptureCoordinator.Execution(() -> Optional.of(node),f.authorization,
+                    ownership,Duration.ofSeconds(10),() -> {},Clock.systemUTC()),f.runtime,f.buffer,f.connectors,
+                    (original,config,guard,preparation,stream) -> {throw new AssertionError("no capture may open");})) {
+                assertThatThrownBy(() -> coordinator.retireShared(prepared,permit.fence())).isInstanceOf(TapstateException.class);
+                assertThatThrownBy(() -> coordinator.requireSharedRetired(prepared,permit.fence())).isInstanceOf(TapstateException.class);
+                assertThat(raw.read(permit.claim().key()).orElseThrow().leased()).isTrue();
+                assertThat(raw.release(permit.claim())).isTrue();
+                coordinator.retireShared(prepared,permit.fence());coordinator.requireSharedRetired(prepared,permit.fence());
+                assertThat(raw.read(permit.claim().key()).orElseThrow().claim().claimGeneration()).isEqualTo(permit.claim().claimGeneration());
+            }
+        }
+    }
     @Test void failedOriginalCaptureProofReleasesOnlyTheLeaseTakenByThisStart() {
         try(var f=new Fixture()) {
             when(f.authorization.requireCapture(any(),any())).thenThrow(new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null));

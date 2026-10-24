@@ -26,6 +26,9 @@ final class CaptureClaimLease implements AutoCloseable {
     private final AtomicReference<WorkloadClaim> current;
     private final ScheduledExecutorService renewer;
     private final AtomicBoolean closed = new AtomicBoolean();
+    private final Object closeRelease = new Object();
+    /** An explicit close retries its original release until the call acknowledges completion. */
+    private boolean closeReleasePending;
     /** What losing the claim stops; null until the capture it guards is open. Guarded by this. */
     private Runnable lost;
     /** Whether the claim was lost while nothing was bound to answer for it yet. Guarded by this. */
@@ -155,14 +158,12 @@ final class CaptureClaimLease implements AutoCloseable {
 
     @Override
     public void close() {
-        if (!closed.compareAndSet(false, true)) {
-            return;
-        }
-        if (renewer != null) {
-            renewer.shutdownNow();
-        }
-        if (ownership != null) {
+        synchronized(closeRelease) {
+            if(closed.compareAndSet(false,true))closeReleasePending=ownership!=null;
+            if(!closeReleasePending)return;
+            if(renewer!=null)renewer.shutdownNow();
             ownership.release(current.get());
+            closeReleasePending=false;
         }
     }
 }
