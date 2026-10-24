@@ -44,6 +44,33 @@ class SrsSnapshotPreparationTest {
         }
         assertThat(f.pinned).isEqualTo(saved); assertThat(f.headReads).isZero(); assertThat(f.exactReads).isOne();
     }
+
+    @Test void aNewConsumerUsesTheRetiredOriginsPendingModelsAndCutWithOnlyItsOwnPinAuthority() {
+        var f=new Fixture();var references=new TreeMap<String,SrsModelKey>();var prior=new TreeMap<String,SrsTableCheckpoint>();
+        for(String table:List.of("orders","quiet")) {
+            var key=new SrsModelKey("chain",table,"cache",2,2);references.put(table,key);
+            f.exactModels.put(key,new SrsModel(key,"ring-"+table,table(table),41));
+            prior.put(table,new SrsTableCheckpoint(model(table,2).key(),0));
+        }
+        var checkpoint=new SrsCaptureCheckpoint(new io.tapstate.core.event.ChainPosition(new SourceOrder(1,1),"old-cut"),prior);
+        var original=new SrsFreshFullOrigin("retired-origin-full",new PipelineIntentScope("cluster",1,"cache","retired-origin",2),
+                UUID.randomUUID().toString(),"a".repeat(64),"original-source");
+        f.pendingChain=new SrsChainState("chain","capture",null,7,references.keySet(),references.keySet(),1,checkpoint,java.time.Instant.EPOCH,1,4,
+                new SourceResumeOverride("fixed-pending-cut",1,java.time.Instant.EPOCH),new SrsFreshFull(original,2,references));
+        var floors=Map.of("orders",40L,"quiet",40L);
+        var cursor=new ConsumerOffset(RUN.context().key().consumerId(),floors,null,List.of(),null,0,Map.of(),ConsumerProgressKind.SRS);
+        f.original=new SrsConsumerProgress(RUN.context(),RUN.membershipRevision(),4,cursor,null,null,floors);f.forbidHeads=true;
+        var owner=f.owner();
+        assertThat(owner.request().snapshotEpoch()).isEqualTo(2);
+        assertThat(owner.request().replayAnchor()).isEqualTo(new SourcePosition("fixed-pending-cut"));
+        try(var load=SnapshotPhase.openPrepared(new Port(f,owner),config(),owner)) {
+            assertThat(load.tailSeam()).isEqualTo("fixed-pending-cut");
+            assertThat(f.pinned.models()).isEqualTo(references);assertThat(f.pinned.snapshotEpoch()).isEqualTo(2);
+            var rows=new ArrayList<Envelope>();load.read(rows::add,ignored -> {});
+            assertThat(rows).hasSize(2).allSatisfy(row -> assertThat(row.position().order()).isEqualTo(SourceOrder.snapshotRow(2)));
+        }
+        assertThat(f.pinCalls).isOne();assertThat(f.headReads).isZero();assertThat(f.exactReads).isEqualTo(2);
+    }
     @Test void sourceSchemaMismatchAndMissingPublishedModelsPreventEveryRowRead() {
         var wrong = new Fixture(); wrong.actual.put("orders",new SourceTable("orders",List.of(new SourceField("changed","string")),List.of(),List.of()));
         var owner = wrong.owner();
@@ -192,6 +219,7 @@ class SrsSnapshotPreparationTest {
         final Map<String,SourceTable> actual = new HashMap<>(Map.of("orders",table("orders"),"quiet",table("quiet")));
         final AtomicBoolean active = new AtomicBoolean(true); int pinCalls,progressReads,headReads,exactReads,sourceReads,closedSessions;
         long currentRevision = 4; boolean published = true,forbidHeads,nativeRings; SrsSnapshotPin pinned; SrsConsumerProgress original = progress(null,List.of());
+        SrsChainState pendingChain;final Map<SrsModelKey,SrsModel> exactModels=new HashMap<>();
         SrsConsumerProgress progress(SrsSnapshotPin snapshot,List<String> complete) {
             var cursor = new ConsumerOffset(RUN.context().key().consumerId(),Map.of("orders",-1L,"quiet",-1L),null,complete,
                     snapshot == null ? null : snapshot.sourcePosition(),snapshot == null ? 0 : snapshot.snapshotEpoch(),Map.of(),ConsumerProgressKind.SRS);
@@ -211,7 +239,7 @@ class SrsSnapshotPreparationTest {
             if (forbidHeads) throw new AssertionError("a saved reference must not consult current heads"); headReads++;
             if (!published) return Optional.empty(); var answer = new HashMap<String,SrsModel>(); rings.forEach((table,ring) -> answer.put(table,nativeRings ? new SrsModel(model(table,2).key(),SrsRingbuffer.ringName("chain",table),table(table),0) : model(table,2))); return Optional.of(answer);
         }
-        @Override public Optional<SrsModel> load(SrsModelKey key) { exactReads++; assertThat(key.modelVersion()).isEqualTo(2); return Optional.of(model(key.table(),2)); }
+        @Override public Optional<SrsModel> load(SrsModelKey key) { exactReads++; if(exactModels.containsKey(key))return Optional.of(exactModels.get(key));assertThat(key.modelVersion()).isEqualTo(2); return Optional.of(model(key.table(),2)); }
         @Override public SrsModel requireEvent(SrsModelKey key,String ring,long sequence,WorkloadClaimFence fence) { throw new AssertionError("snapshot pinning must not resolve an event range"); }
         @Override public SrsModel publish(SrsModel model,WorkloadClaimFence fence) { throw new AssertionError("Pipeline pin cannot publish a model"); }
         @Override public Optional<SrsConsumerMembership> find(SrsConsumerKey key) { throw new AssertionError(); }
@@ -225,7 +253,11 @@ class SrsSnapshotPreparationTest {
         @Override public Optional<SrsConsumerMembership> attach(SrsConsumerContext context,long revision,Set<String> tables,WorkloadClaimFence fence) { throw new AssertionError(); }
         @Override public Optional<SrsConsumerMembership> detach(SrsConsumerContext context,long revision,WorkloadClaimFence fence) { throw new AssertionError(); }
         @Override public SrsChainState prepare(String chain,String retention,WorkloadClaimFence fence) { throw new AssertionError(); }
-        @Override public Optional<SrsChainState> load(String chain) { throw new AssertionError(); }
+        @Override public Optional<SrsChainState> load(String chain) {
+            assertThat(chain).isEqualTo(RUN.miningChainId());
+            if(pendingChain!=null)return Optional.of(pendingChain);
+            return Optional.of(new SrsChainState(chain,"capture",null,7,Set.of("orders","quiet"),Set.of("orders","quiet"),0,null,null,1,4));
+        }
         @Override public SrsChainState requestTables(String chain,Set<String> tables,WorkloadClaimFence fence) { throw new AssertionError(); }
         @Override public OptionalLong openEpoch(String chain,long epoch,WorkloadClaimFence fence) { throw new AssertionError(); }
         @Override public boolean publishServingTables(String chain,long epoch,Set<String> tables,WorkloadClaimFence fence) { throw new AssertionError(); }

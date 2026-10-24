@@ -56,6 +56,9 @@ record PipelineCaptureBindings(ExecutionFence original,Map<String,LoggedSource> 
     }
     String bufferKey(String sourceId) {
         if (!logged.containsKey(sourceId) && !direct.containsKey(sourceId) && !snapshots.containsKey(sourceId)) throw refused();
+        return bufferKey(original,sourceId);
+    }
+    static String bufferKey(ExecutionFence original,String sourceId) {
         return "capture-"+original.operatorExecutionKey()+"-"+io.tapstate.core.model.canonical.CanonicalHash.ofText(sourceId);
     }
     private static TapstateException refused() { return new TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null); }

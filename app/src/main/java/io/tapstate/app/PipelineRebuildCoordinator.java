@@ -1,7 +1,6 @@
 package io.tapstate.app;
 
 import io.tapstate.core.common.TapstateException;
-import io.tapstate.core.dsl.ReferenceGraph;
 import io.tapstate.core.model.*;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.runtime.engine.OperatorRunManifest;
@@ -78,16 +77,8 @@ final class PipelineRebuildCoordinator {
         var successor=new PipelineIntentScope(original.clusterId(),original.bindingVersion(),original.cacheIncarnation(),original.pipelineId(),Math.addExact(original.stateGeneration(),1));
         var models=SourceModelSnapshot.capture(original.pipelineId(),definitions.values(),stores.schemas());
         var inputs=models.preparationInputs(successor,authored,expanded,definitions);
-        var dependencies=new HashMap<String,String>();var queue=new ArrayDeque<Resource>();var visited=new HashSet<String>();queue.add(authored);
-        while(!queue.isEmpty()) {
-            var resource=queue.remove();if(!visited.add(resource.id()))continue;
-            for(var edge:ReferenceGraph.declaredReferences(resource)) {
-                var required=snapshot.get(edge.id()).orElseThrow(PipelineRebuildCoordinator::fenced);
-                if(!edge.kind().equals(required.kind()))throw fenced();queue.add(required);
-                if(!inputs.sourceHashes().containsKey(required.id()))dependencies.put(required.id(),CanonicalHash.of(required));
-            }
-        }
-        requireActiveNode.run();return new Closure(inputs,Map.copyOf(dependencies));
+        var dependencies=PipelineInputClosure.dependencyHashes(snapshot,authored,inputs);
+        requireActiveNode.run();return new Closure(inputs,dependencies);
     }
     private static TapstateException fenced(){return new TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null);}
 }

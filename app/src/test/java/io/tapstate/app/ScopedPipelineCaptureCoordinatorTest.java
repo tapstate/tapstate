@@ -228,6 +228,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             var prepared=new CapturePreparation(BUSINESS,bounded?CapturePreparation.Mode.SNAPSHOT_ONLY:CapturePreparation.Mode.SHARED_SRS,"mck-key",id,SourceCaptureIdentity.physical(source.connector(),source.config()),UUID.randomUUID().toString());
             capture=new WorkloadClaim(new WorkloadClaimKey("cluster",WorkloadClaimType.CAPTURE,id),bounded?OWNER:new WorkloadOwner("remote","remote-boot"),1,0,1,Instant.now().plusSeconds(60));
             when(configuration.issueFirstCreate(any())).thenReturn(new CaptureCreationResult.AlreadyIssued(prepared));
+            if (!bounded) when(configuration.inspectSharedHistory(eq(prepared),anyString(),anyString())).thenReturn(new CaptureSharedHistory(prepared,false));
             var cached = new CaptureCacheState(prepared, WorkloadClaimFence.from(capture),
                     bounded ? Optional.empty() : Optional.of(streamingChain()));
             when(cache.load(prepared)).thenReturn(cached);

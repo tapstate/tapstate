@@ -327,6 +327,82 @@ class MongoCachePipelineRebuildsIT {
         return new SourceTable(name, fields, List.of("id"), List.of());
     }
 
+    @Test void theActualPendingBsonBudgetRefusesBeforeAnyModelOrCursorPublication() {
+        withFixture(true,f -> {
+            var shared=preparedSharedFull(f);var frozen=shared.consumers.inspectFreshFull(shared.full,shared.run,0,f.node,shared.capture);
+            var before=f.snapshot();var mapping=f.mapping();long version=f.version();
+            assertCode(() -> frozen.publish(2,"x".repeat(SrsFreshFull.MAX_ENCODED_REQUEST_BYTES),
+                    Map.of("orders",table("orders",true),"quiet",table("quiet",false)),AT),IoError.SRS_FULL_PREPARATION_CAPACITY);
+            assertThat(f.snapshot()).isEqualTo(before);assertThat(f.mapping()).isEqualTo(mapping);assertThat(f.version()).isEqualTo(version);
+        });
+    }
+
+    @Test void anExplicitSuccessorFullCanRetireTheProtectedPinWithoutReauthorizingTheOldFull() {
+        withFixture(true,f -> {
+            var shared=preparedSharedFull(f);var frozen=shared.consumers.inspectFreshFull(shared.full,shared.run,0,f.node,shared.capture);
+            var published=frozen.publish(2,"fixed-new-cut",Map.of("orders",table("orders",true),"quiet",table("quiet",false)),AT);
+            var current=f.configuration.intents().load("flow").orElseThrow();
+            assertThat(f.configuration.intents().compareAndSet(shared.run.scope(),current.intentRevision(),
+                    new DesiredState("flow",PipelineState.STOPPED,current.desired().revision(),true))).isTrue();
+            var next=new PipelineIntentScope(f.business.clusterId(),f.business.bindingVersion(),f.business.cacheIncarnation(),"flow",3);
+            var request=new PipelineRebuildRequest("next-explicit-full",f.configuration.intents().load("flow").orElseThrow(),
+                    shared.run.originalClaim(),f.state().getLong("epoch"),f.sharedInputs(next));
+            var original=f.configuration.rebuilds().begin(request);
+            assertCode(shared.full::requireCurrent,IoError.PIPELINE_INTENT_FENCED);
+            var member=shared.consumers.find(shared.run.context().key()).orElseThrow();
+            var detached=shared.consumers.detachForRebuild(original,member,f.node).orElseThrow();
+            assertThat(detached.detached()).isTrue();assertThat(shared.consumers.progress(shared.run.context())).isEmpty();
+            var prepared=f.configuration.rebuilds().complete(f.rebuilds().prepare(original,f.node,TTL,AT));
+            assertThat(prepared.scope()).isEqualTo(next);
+            assertThat(f.configuration.rebuilds().completedFull(next,request.inputs(),Map.of())).isPresent();
+            assertThat(shared.chains.load(shared.chain).orElseThrow().pendingFreshFull()).isEqualTo(published.chain().pendingFreshFull());
+        });
+    }
+
+    @Test void deletingTheOriginBeforeARealBatchKeepsPendingModelsThroughGcAndAnotherConsumersOwnPreparation() {
+        withFixture(true,f -> {
+            var shared=preparedSharedFull(f);var frozen=shared.consumers.inspectFreshFull(shared.full,shared.run,0,f.node,shared.capture);
+            var actual=Map.of("orders",table("orders",true),"quiet",table("quiet",false));
+            var published=frozen.publish(2,"fixed-new-cut",actual,AT);var pin=published.progress().snapshot();
+            var originalCache=new PipelineRetirementRequest.CacheOriginal(shared.run.originalClaim(),f.state().getLong("epoch"));
+            var definition=f.configuration.artifacts().get("flow").orElseThrow();
+            var retirement=f.configuration.retirements().begin(new PipelineRetirementRequest("delete-pending-origin",shared.run.scope(),
+                    CanonicalHash.of(definition),java.util.Optional.of(originalCache)));
+            shared.consumers.detachForRetirement(retirement,shared.consumers.find(shared.run.context().key()).orElseThrow(),
+                    f.node,java.util.Optional.of(originalCache)).orElseThrow();
+            for(var notes:f.configuration.requiredNotes().retirements(shared.run.scope(),retirement.request().operationId())) {
+                assertThat(notes.origin()).isEmpty();notes.completeAfterVerifiedRelease();
+            }
+            f.configuration.retirements().complete(f.domain.pipelineRetirements(f.business,ACTIVE).retire(retirement,f.node));
+            assertThat(f.configuration.artifacts().get("flow")).isEmpty();assertThat(shared.consumers.progress(shared.run.context())).isEmpty();
+            assertCode(shared.full::requireCurrent,IoError.PIPELINE_INTENT_FENCED);
+            assertThat(shared.chains.openEpoch(shared.chain,2,shared.capture)).hasValue(3);
+            for(String name:List.of("orders","quiet"))shared.models.publishInitial(
+                    new SrsModelKey(shared.chain,name,f.business.cacheIncarnation(),3,0),shared.ring(name),actual.get(name),shared.capture);
+            var log=new MongoSrsLogStore(f.cacheClient,SystemCollections.SRS_EVENTS.on(f.cache),SystemCollections.SRS_LOG_BOUNDS.on(f.cache),
+                    SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.cache),shared.models);
+            for(String name:List.of("orders","quiet"))log.trim(shared.ring(name),0,shared.capture);
+            assertThat(shared.models.reclaim(shared.chain,shared.capture)).isZero();
+            pin.models().values().forEach(key -> assertThat(shared.models.load(key)).isPresent());
+            var pending=shared.chains.load(shared.chain).orElseThrow();
+            assertThat(pending.checkpoint()).isEqualTo(shared.checkpoint);assertThat(pending.pendingFreshFull()).isEqualTo(published.chain().pendingFreshFull());
+            assertThat(pending.consumerCount()).isZero();
+            f.initialSharedSource("other");var otherClaim=f.advance("other");
+            var other=new PipelineIntentScope(f.business.clusterId(),f.business.bindingVersion(),f.business.cacheIncarnation(),"other",1);
+            assertThat(f.configuration.capturePreparations().issueFirstCreate(new CapturePreparationRequest(other,otherClaim,f.node,"input",f.sharedInputs(other))))
+                    .isInstanceOf(CaptureCreationResult.AlreadyIssued.class);
+            var context=new SrsConsumerContext(new SrsConsumerKey(shared.chain,"other","input"),1);
+            var member=shared.consumers.attach(context,0,pin.models().keySet(),otherClaim).orElseThrow();
+            assertThat(shared.consumers.startReadingAfter(context,member.revision(),0,published.progress().ringDoneThrough(),otherClaim)).isTrue();
+            var before=f.snapshot();
+            assertCode(() -> shared.consumers.pinSnapshot(context,member.revision(),1,pin,shared.run.originalClaim()),IoError.WORKLOAD_CLAIM_FENCED);
+            assertThat(f.snapshot()).isEqualTo(before);
+            assertThat(shared.consumers.pinSnapshot(context,member.revision(),1,pin,otherClaim)).isTrue();
+            assertThat(shared.consumers.progress(context).orElseThrow().snapshot()).isEqualTo(pin);
+            assertThat(shared.chains.load(shared.chain).orElseThrow().pendingFreshFull()).isEqualTo(pending.pendingFreshFull());
+        });
+    }
+
     /** Real CONFIG/CACHE grants and fences; source tokens are synthetic, without a connector invocation. */
     private static SharedFull preparedSharedFull(Fixture f) {
         var inputs = f.sharedInputs(f.scope);

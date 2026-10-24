@@ -127,6 +127,59 @@ class SrsCaptureWriterTest {
         assertThatThrownBy(() -> writer.start(f.port(writer, new AtomicReference<>(), true), f.config(), CaptureStart.present(), new CaptureHealth()))
                 .satisfies(error -> code(error, IoError.SRS_CHECKPOINT_UNPROVEN));
     }
+
+    @Test void anIntactCompleteBaselineMismatchIsTypedBeforeAnyNewEpochModelIsPublished() {
+        var f = new Fixture(); var refs = new TreeMap<String, SrsTableCheckpoint>();
+        for (String name : f.actual.keySet()) {
+            var key = new SrsModelKey(f.chain, name, "cache", 1, 0);
+            var old = name.equals("orders") ? new SourceTable(name, List.of(new SourceField("old", "string")), List.of(), List.of()) : f.actual.get(name);
+            f.published.put(key, new SrsModel(key, f.ring(name), old, 0)); refs.put(name, new SrsTableCheckpoint(key, -1));
+        }
+        f.opened = f.state(1, new SrsCaptureCheckpoint(new ChainPosition(new SourceOrder(1, 1), "old-cut"), refs));
+        var before = Map.copyOf(f.published);
+        assertThatThrownBy(() -> f.writer().prepare(f.actual)).isInstanceOfSatisfying(SrsBaselineModelMismatch.class,
+                failure -> assertThat(failure.chainId()).isEqualTo(f.chain));
+        assertThat(f.published).isEqualTo(before); assertThat(f.saved).isEmpty();
+    }
+
+    @Test void aPendingFullUsesItsFixedModelsAndCannotCheckpointAtStreamOnStart() {
+        var f = new Fixture(); var oldRefs = new TreeMap<String, SrsTableCheckpoint>(); var newRefs = new TreeMap<String, SrsModelKey>();
+        for (String name : f.actual.keySet()) {
+            var old = new SrsModelKey(f.chain, name, "cache", 1, 0);
+            f.published.put(old, new SrsModel(old, f.ring(name), new SourceTable(name,
+                    List.of(new SourceField("previous", "string")), List.of(), List.of()), 0));
+            oldRefs.put(name, new SrsTableCheckpoint(old, -1));
+            var current = new SrsModelKey(f.chain, name, "cache", 2, 0);
+            f.published.put(current, new SrsModel(current, f.ring(name), f.actual.get(name), 0)); newRefs.put(name, current);
+        }
+        var checkpoint = new SrsCaptureCheckpoint(new ChainPosition(new SourceOrder(1, 1), "old-cut"), oldRefs);
+        var full = new SrsFreshFull(new SrsFreshFullOrigin("explicit-full", new PipelineIntentScope("cluster", 1, "cache", "flow", 2),
+                UUID.randomUUID().toString(), "f".repeat(64), "input"), 2, newRefs);
+        f.opened = new SrsChainState(f.chain, "capture", null, 2, f.actual.keySet(), f.actual.keySet(), 1, checkpoint, Instant.EPOCH, 1, 1,
+                new SourceResumeOverride("fixed-new-cut", 1, Instant.EPOCH), full);
+        var writer = f.writer(); var callback = new AtomicReference<CaptureListener>();
+        try (var source = writer.start(f.port(writer, callback, true), f.config(), CaptureStart.resume(new SourcePosition("fixed-new-cut")), new CaptureHealth())) {
+            assertThat(f.saved).isEmpty();
+            callback.get().onBatch(List.of(Envelope.insert(1, "orders", Map.of("id", 1), null)), Optional.of(new SourcePosition("actual-batch")));
+            assertThat(f.saved).hasSize(1); assertThat(f.saved.getFirst().positionEditsRestricted()).isTrue();
+            assertThat(f.saved.getFirst().position().token()).isEqualTo("actual-batch");
+            assertThat(f.saved.getFirst().tables()).containsKeys("orders", "quiet");
+            assertThat(f.opened.checkpoint()).isEqualTo(checkpoint);
+        }
+    }
+
+    @Test void aLaterWriterPreservesThePersistedPositionRestrictionInItsExpectedCheckpoint() {
+        var f = new Fixture(); var refs = new TreeMap<String, SrsTableCheckpoint>();
+        for (String name : f.actual.keySet()) {
+            var key = new SrsModelKey(f.chain, name, "cache", 1, 0);
+            f.published.put(key, new SrsModel(key, f.ring(name), f.actual.get(name), 0)); refs.put(name, new SrsTableCheckpoint(key, -1));
+        }
+        f.opened = f.state(1, new SrsCaptureCheckpoint(new ChainPosition(new SourceOrder(1, 1), "old-cut"), refs, true));
+        var writer = f.writer();
+        try (var source = writer.start(f.port(writer, new AtomicReference<>(), true), f.config(), CaptureStart.resume(new SourcePosition("old-cut")), new CaptureHealth())) {
+            assertThat(f.saved).hasSize(1); assertThat(f.saved.getFirst().positionEditsRestricted()).isTrue();
+        }
+    }
     @Test void resumedIntroductionUsesDurableHighwaterAndKeepsTheExactOldSourceToken() {
         var f = new Fixture(); var refs = new LinkedHashMap<String, SrsTableCheckpoint>();
         for (String name : f.actual.keySet()) {
@@ -192,6 +245,30 @@ class SrsCaptureWriterTest {
         try (var source = writer.start(f.port(writer,new AtomicReference<>(),true),f.config(),CaptureStart.resume(new SourcePosition("requested")),new CaptureHealth())) {
             assertThat(f.saved).hasSize(1); assertThat(f.saved.getFirst().position()).isEqualTo(new ChainPosition(SourceOrder.snapshotRow(2),"requested"));
             assertThat(f.opened.checkpoint()).isEqualTo(checkpoint);
+        }
+    }
+
+    @Test void aFailedTailRetainsItsOriginalPortCloseUntilCleanupIsProvedEvenAfterGuardLoss() {
+        var f=new Fixture();var released=new AtomicBoolean();var closes=new java.util.concurrent.atomic.AtomicInteger();
+        Runnable owner=() -> {if(!f.active.get())throw new TapstateException(IoError.CACHE_BUSINESS_FENCED,Map.of(),null);};
+        var mismatch=new SrsBaselineModelMismatch(f.chain,"orders");
+        class Opening implements CapturePort,AutoCloseable {
+            public Subscription cdc(CaptureConfig config,CaptureStart start,CaptureListener listener){throw mismatch;}
+            public CaptureBatch snapshot(CaptureConfig config){throw new AssertionError();}
+            public ConnectionReport testConnection(CaptureConfig config){throw new AssertionError();}
+            public DiscoveredSchema discoverSchema(CaptureConfig config){throw new AssertionError();}
+            public void close(){closes.incrementAndGet();if(!released.get())throw new TapstateException(CaptureError.STILL_ENDING,Map.of("captureId","capture"),null);}
+        }
+        try(var unit=new NativeSrsCaptureRunUnit(SCOPE,new SrsStores(f.chains,f.models,SHARED_LOG,unusedConsumers),member)) {
+            try {
+                assertThatThrownBy(() -> unit.startTail(SCOPE,f.opened,FENCE,f.config(),CaptureStart.present(),writer -> new Opening(),owner)).isSameAs(mismatch);
+                assertThat(closes).hasValue(1);assertThat(mismatch.getSuppressed()).singleElement().isInstanceOf(TapstateException.class);
+                f.active.set(false);
+                assertThatThrownBy(() -> unit.stopOpenings(owner)).isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(CaptureError.STILL_ENDING));
+                assertThat(closes).hasValue(2);
+            } finally {released.set(true);unit.stopOpenings(owner);}
+            assertThat(closes).hasValue(3);unit.stopOpenings(owner);assertThat(closes).hasValue(3);
         }
     }
 

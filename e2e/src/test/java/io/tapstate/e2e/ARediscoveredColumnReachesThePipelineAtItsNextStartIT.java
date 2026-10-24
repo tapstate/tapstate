@@ -84,10 +84,10 @@ class ARediscoveredColumnReachesThePipelineAtItsNextStartIT {
     void aColumnThatAppearsInTheSourceIsInTheTargetTheNextRunCreates() {
         writeOrders("id,amount\n1,12\n");
 
-        try (ServerHandle server =
-                InProcessServer.start(SharedMongo.replicaSetUrl("e2e_copy_follows_the_source"))) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = InProcessServer.startPrepared(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID, read(connectorJar));
             control.apply(Map.of(
                     "src_file.tap.yml", source(),

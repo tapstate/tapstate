@@ -33,6 +33,7 @@ public final class SrsCaptureWriter implements AutoCloseable {
     private final SrsLogStore log;
     private final HazelcastInstance member;
     private final Runnable guard;
+    private final boolean positionEditsRestricted;
     private final AtomicBoolean closed = new AtomicBoolean();
     private final java.util.Set<Subscription> sourceHandles = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private final AtomicBoolean started = new AtomicBoolean();
@@ -46,11 +47,17 @@ public final class SrsCaptureWriter implements AutoCloseable {
     /** The caller has already allocated this epoch and published its immutable serving selection. */
     public SrsCaptureWriter(CacheBusinessScope scope, SrsChainState opened, WorkloadClaimFence originalCapture,
                             SrsStores stores, HazelcastInstance member, Runnable requireActive) {
+        this(scope, opened, originalCapture, stores, member, requireActive, false);
+    }
+    public SrsCaptureWriter(CacheBusinessScope scope, SrsChainState opened, WorkloadClaimFence originalCapture,
+                            SrsStores stores, HazelcastInstance member, Runnable requireActive, boolean priorCacheHistory) {
         this.scope = Objects.requireNonNull(scope, "scope");
         this.opened = Objects.requireNonNull(opened, "opened");
         this.fence = Objects.requireNonNull(originalCapture, "originalCapture");
         this.member = Objects.requireNonNull(member, "member");
         this.guard = Objects.requireNonNull(requireActive, "requireActive");
+        this.positionEditsRestricted = priorCacheHistory || opened.pendingFreshFull() != null
+                || opened.checkpoint() != null && opened.checkpoint().positionEditsRestricted();
         Objects.requireNonNull(stores, "stores");
         if (opened.epoch() < 1 || opened.servingTables().isEmpty()
                 || !opened.servingTables().containsAll(opened.requestedTables())
@@ -88,10 +95,12 @@ public final class SrsCaptureWriter implements AutoCloseable {
                 || (completeSelection && !actual.keySet().equals(opened.servingTables()))) throw unproven();
         // Validate the entire retained baseline before publishing any new model. Current discovery cannot
         // describe a different schema's unread source history after a restart.
+        String mismatch = null;
         for (var entry : actual.entrySet()) {
             String table = entry.getKey();
             SrsTableCheckpoint prior = opened.checkpoint() == null ? null : opened.checkpoint().tables().get(table);
-            if (prior != null && !models.require(prior.model()).table().equals(entry.getValue())) throw unavailable(table);
+            var baseline = opened.pendingFreshFull() == null ? prior == null ? null : prior.model() : opened.pendingFreshFull().models().get(table);
+            if (baseline != null && !models.require(baseline).table().equals(entry.getValue())) mismatch = table;
             SrsModel held = published.get(table);
             if (held != null && !held.table().equals(entry.getValue())) throw unavailable(table);
             String ring = SrsRingbuffer.ringName(opened.miningChainId(), table);
@@ -101,6 +110,12 @@ public final class SrsCaptureWriter implements AutoCloseable {
                     || !factory.backs(log) || configuration.getInMemoryFormat() != InMemoryFormat.OBJECT) {
                 throw new TapstateException(CaptureError.SRS_NOT_RECOVERABLE, Map.of("chain", opened.miningChainId()), null);
             }
+        }
+        if (mismatch != null) {
+            if (completeSelection && opened.pendingFreshFull() == null && published.isEmpty() && opened.checkpoint() != null
+                    && opened.checkpoint().tables().keySet().equals(actual.keySet()))
+                throw new SrsBaselineModelMismatch(opened.miningChainId(), mismatch);
+            throw unavailable(mismatch);
         }
         for (var entry : actual.entrySet()) {
             String table = entry.getKey();
@@ -169,6 +184,7 @@ public final class SrsCaptureWriter implements AutoCloseable {
 
     private synchronized void began(SourcePosition position) {
         ready();
+        if (opened.pendingFreshFull() != null) return;
         if (opened.checkpoint() == null || opened.checkpoint().position().order().epoch() != opened.epoch()) {
             checkpoint(new ChainPosition(SourceOrder.snapshotRow(opened.epoch()), position.token()));
         }
@@ -205,7 +221,7 @@ public final class SrsCaptureWriter implements AutoCloseable {
 
     private void checkpoint(ChainPosition position) {
         requireActive();
-        var expected = new SrsCaptureCheckpoint(position, Map.copyOf(frontiers));
+        var expected = new SrsCaptureCheckpoint(position, Map.copyOf(frontiers), positionEditsRestricted);
         SrsChainState saved = chains.checkpoint(opened.miningChainId(), revision, expected, fence).orElseThrow(this::unproven);
         if (!expected.equals(saved.checkpoint()) || saved.checkpointRevision() != revision + 1) throw unproven();
         requireActive();
