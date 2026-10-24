@@ -520,15 +520,17 @@ final class PdkConnector implements AutoCloseable {
 
     /** Stops the connector, swallowing failures — used on the cleanup path where the real error already won. */
     void stopQuietly() {
-        stopped = true;
         try {
-            underLoaderForCleanup(() -> {
-                connector.stop(context);
-                return null;
-            });
+            stopForCleanup();
         } catch (Throwable ignore) {
             // best-effort cleanup: a stop failure must not mask the outcome that is already being returned or thrown
         }
+    }
+
+    /** Recovery cannot treat a plugin stop failure as proof that its original source resources ended. */
+    void stopForCleanup() throws Throwable {
+        stopped = true;
+        underLoaderForCleanup(() -> { connector.stop(context); return null; });
     }
 
     /**

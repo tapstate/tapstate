@@ -95,6 +95,29 @@ final class Synthetic {
                 source("BlockingDiscoverySource", "", register, members, discovery, "stopped = true;"));
     }
 
+    /** The real plugin stop waits on a host-owned gate, independently of its completed metadata worker. */
+    static Path gatedStopSource(Path dir, String channel) {
+        String register = "functions.supportBatchRead((context,table,offset,size,consumer) -> {});"
+                + "functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
+                + "  throw new AssertionError(\"stream read must not start after a host refusal\"); });";
+        String discovery = "TapTable table = new TapTable(\"t1\");table.add(new TapField(\"id\", \"int\"));s.accept(List.of(table));";
+        String stop = "((java.util.concurrent.CountDownLatch)System.getProperties().get(\"" + channel + ".entered\")).countDown();"
+                + "boolean interrupted=false;for(;;)try{((java.util.concurrent.CountDownLatch)System.getProperties().get(\"" + channel + ".release\")).await();break;}"
+                + "catch(InterruptedException ignored){interrupted=true;}"
+                + "((java.util.concurrent.CountDownLatch)System.getProperties().get(\"" + channel + ".ended\")).countDown();"
+                + "if(interrupted)Thread.currentThread().interrupt();";
+        return SyntheticJar.compileToJar(dir, "synthetic.GatedStopSource", source("GatedStopSource", "", register, "", discovery, stop));
+    }
+
+    /** A transient failure belongs to the original plugin instance; a second stop on it succeeds. */
+    static Path retryingStopSource(Path dir, String channel) {
+        String register = "functions.supportStreamRead((context,tables,offset,size,consumer) -> {throw new AssertionError();});";
+        String discovery = "TapTable table=new TapTable(\"t1\");table.add(new TapField(\"id\",\"int\"));s.accept(List.of(table));";
+        String stop = "if(((java.util.concurrent.atomic.AtomicInteger)System.getProperties().get(\""+channel+"\")).incrementAndGet()==1)"
+                + "throw new IllegalStateException(\"synthetic transient stop failure\");";
+        return SyntheticJar.compileToJar(dir,"synthetic.RetryingStopSource",source("RetryingStopSource","",register,"",discovery,stop));
+    }
+
     /** A stream source whose discovered table and column names are supplied by the caller. */
     static Path namedStreamSource(Path dir, String table, String column) {
         String register = "functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
