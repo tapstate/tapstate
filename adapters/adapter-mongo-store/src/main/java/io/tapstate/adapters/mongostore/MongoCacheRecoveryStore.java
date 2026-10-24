@@ -110,6 +110,7 @@ final class MongoCacheRecoveryStore implements CacheRecoveryStore {
                     .append("operationId", running.operationId()).append("noteWriteFence", row.getLong("noteWriteFence") + 1)
                     .append("cachePreparation", new Document("phase", "UNASSIGNED")).append("cacheRecovery", MongoCacheRecoveryFacts.encode(summary));
             replacement.remove("stateRebuild");
+            MongoPipelineSharedRecoveryFacts.removeOnVerifiedReplacement(row,replacement,summary.previousScope());
             intents().rebindStopped(session, summary, running.manifest().definitionHashes().get(id));
             if (table.replaceOne(session, row, replacement).getMatchedCount() != 1) throw MongoCacheRecoveryFacts.refused();
             result.add(summary);

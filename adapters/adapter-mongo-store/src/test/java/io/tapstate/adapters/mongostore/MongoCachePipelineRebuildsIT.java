@@ -524,6 +524,204 @@ class MongoCachePipelineRebuildsIT {
         return held;
     }
 
+    @Test void aSharedLossScopeGateRejectsOrdinaryStartWithoutChangingItsGenerationOrPrivateFacts() {
+        withFixture(f -> {
+            var original=f.configuration.intents().load("flow").orElseThrow();
+            assertThat(f.configuration.intents().compareAndSet(f.scope,original.intentRevision(),
+                    new DesiredState("flow",PipelineState.STOPPED,original.desired().revision(),false))).isTrue();
+            var marker=new Document("formatVersion",1).append("operationId",java.util.UUID.randomUUID().toString())
+                    .append("originalScope",MongoPipelinePreparationFacts.scope(f.scope));
+            SystemCollections.OPERATOR_GENERATIONS.on(f.config).updateOne(new Document("_id","flow"),
+                    new Document("$set",new Document("sharedRecovery",marker)));
+            var stopped=f.configuration.intents().load("flow").orElseThrow();
+            var before=f.snapshot();var mapping=f.mapping();long version=f.version();
+            assertCode(() -> f.configuration.intents().compareAndSet(f.scope,stopped.intentRevision(),
+                    new DesiredState("flow",PipelineState.RUNNING,stopped.desired().revision(),false)),IoError.PIPELINE_STATE_REBUILD_REQUIRED);
+            assertThat(f.configuration.intents().load("flow")).contains(stopped);
+            assertThat(f.mapping()).isEqualTo(mapping);assertThat(f.snapshot()).isEqualTo(before);assertThat(f.version()).isEqualTo(version);
+        });
+    }
+
+    @Test void reservedSharedRecoveryBlocksFullAndRetirementEvenAfterTheSourceReferenceWasRemoved() {
+        withFixture(f -> {
+            var intent=f.configuration.intents().load("flow").orElseThrow();
+            assertThat(f.configuration.intents().compareAndSet(f.scope,intent.intentRevision(),
+                    new DesiredState("flow",PipelineState.STOPPED,intent.desired().revision(),true))).isTrue();
+            var marker=seedSharedGate(f,f.scope,MongoCapturePreparationFacts.RecoveryPhase.RESERVED);
+            var before=f.snapshot();var mapping=f.mapping();long version=f.version();
+            assertThat(f.configuration.intents().loadForActuation("flow")).isEmpty();
+            assertCode(() -> f.pending(0),IoError.PIPELINE_STATE_REBUILD_REQUIRED);
+            var pipeline=f.configuration.artifacts().get("flow").orElseThrow();
+            var original=f.domain.workloadClaims(f.business).readPipeline(f.scope).orElseThrow().claim();
+            var deletion=new PipelineRetirementRequest("delete-while-reserved",f.scope,CanonicalHash.of(pipeline),
+                    java.util.Optional.of(new PipelineRetirementRequest.CacheOriginal(WorkloadClaimFence.from(original),0)));
+            assertCode(() -> f.configuration.retirements().begin(deletion),IoError.PIPELINE_STATE_REBUILD_REQUIRED);
+            assertThat(f.snapshot()).isEqualTo(before);assertThat(f.mapping()).isEqualTo(mapping);assertThat(f.version()).isEqualTo(version);
+            var stopped=f.configuration.intents().load("flow").orElseThrow();
+            assertThat(f.configuration.intents().compareAndSet(f.scope,stopped.intentRevision(),
+                    new DesiredState("flow",PipelineState.STOPPED,stopped.desired().revision(),false))).isTrue();
+            assertThat(f.mapping().get("sharedRecovery")).isEqualTo(marker);
+            var stopping=f.configuration.intents().loadForActuation("flow").orElseThrow();
+            assertThat(stopping.scope()).isEqualTo(f.scope);
+            assertThat(stopping.desired().targetState()).isEqualTo(PipelineState.STOPPED);
+            assertThat(stopping.desired().purgeState()).isFalse();
+        });
+    }
+
+    @Test void readySharedRecoveryAllowsOnlyAnExplicitClearingStopAndItsCarriedStart() {
+        withFixture(f -> {
+            var intent=f.configuration.intents().load("flow").orElseThrow();
+            assertThat(f.configuration.intents().compareAndSet(f.scope,intent.intentRevision(),
+                    new DesiredState("flow",PipelineState.STOPPED,intent.desired().revision(),false))).isTrue();
+            var marker=seedSharedGate(f,f.scope,MongoCapturePreparationFacts.RecoveryPhase.READY);
+            var stopped=f.configuration.intents().load("flow").orElseThrow();
+            assertCode(() -> f.configuration.intents().compareAndSet(f.scope,stopped.intentRevision(),
+                    new DesiredState("flow",PipelineState.RUNNING,stopped.desired().revision(),true)),IoError.PIPELINE_STATE_REBUILD_REQUIRED);
+            assertThat(f.configuration.intents().compareAndSet(f.scope,stopped.intentRevision(),
+                    new DesiredState("flow",PipelineState.STOPPED,stopped.desired().revision(),true))).isTrue();
+            var clearing=f.configuration.intents().load("flow").orElseThrow();
+            assertThat(f.configuration.intents().compareAndSet(f.scope,clearing.intentRevision(),
+                    new DesiredState("flow",PipelineState.RUNNING,clearing.desired().revision(),true))).isTrue();
+            assertThat(f.configuration.intents().loadForActuation("flow").orElseThrow().desired().purgeState()).isTrue();
+            SystemCollections.PIPELINE_INTENTS.on(f.config).updateOne(new Document("_id","flow"),
+                    new Document("$set",new Document("purgeState",false)));
+            assertThat(f.configuration.intents().loadForActuation("flow")).isEmpty();
+            assertThat(f.mapping().get("sharedRecovery")).isEqualTo(marker);assertThat(f.mapping().getLong("stateGeneration")).isEqualTo(1);
+        });
+    }
+
+    @Test void onlyTheWinningClearFullConsumesItsOldGateAndAReplyReplayCannotClearANewerGate() {
+        withFixture(f -> {
+            var first=modelFullRequest(f);var pending=f.configuration.rebuilds().begin(first);
+            var receipt=f.rebuilds().prepare(pending,f.node,TTL,AT);var prepared=f.configuration.rebuilds().complete(receipt);
+            var full=f.configuration.rebuilds().completedFull(prepared.scope(),first.inputs(),first.dependencyHashes()).orElseThrow();
+            var marker=seedSharedGate(f,prepared.scope(),MongoCapturePreparationFacts.RecoveryPhase.READY);
+            assertThat(f.configuration.rebuilds().completedFull(prepared.scope(),first.inputs(),first.dependencyHashes())).isEmpty();
+            assertThatThrownBy(full::requireCurrent).isInstanceOf(TapstateException.class);
+            assertThat(f.configuration.rebuilds().complete(receipt)).isEqualTo(prepared);
+            assertThat(f.mapping().get("sharedRecovery")).isEqualTo(marker);
+            var intent=f.configuration.intents().load("flow").orElseThrow();
+            assertThat(f.configuration.intents().compareAndSet(prepared.scope(),intent.intentRevision(),
+                    new DesiredState("flow",PipelineState.STOPPED,intent.desired().revision(),true))).isTrue();
+            var clearing=f.configuration.intents().load("flow").orElseThrow();
+            var claim=f.domain.workloadClaims(f.business).readPipeline(prepared.scope()).orElseThrow().claim();
+            var second=new PipelineRebuildRequest("clear-after-shared-loss",clearing,WorkloadClaimFence.from(claim),
+                    f.state().getLong("epoch"),first.inputs(),first.dependencyHashes());
+            var next=f.configuration.rebuilds().begin(second);var nextReceipt=f.rebuilds().prepare(next,f.node,TTL,AT);
+            var result=f.configuration.rebuilds().complete(nextReceipt);
+            assertThat(result.stateGeneration()).isEqualTo(3);assertThat(f.mapping()).doesNotContainKey("sharedRecovery");
+            var newer=seedSharedGate(f,result.scope(),MongoCapturePreparationFacts.RecoveryPhase.RESERVED);
+            assertThat(f.configuration.rebuilds().complete(nextReceipt)).isEqualTo(result);
+            assertThat(f.mapping().get("sharedRecovery")).isEqualTo(newer);
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"null","extra","version","type","generation","business","operation"})
+    void anUnreadableSharedScopeGateNeverBecomesAnUngatedPipeline(String damage) {
+        withFixture(f -> {
+            var marker=seedSharedGate(f,f.scope,MongoCapturePreparationFacts.RecoveryPhase.READY);
+            Object altered=new Document(marker);
+            switch(damage) {
+                case "null" -> altered=null;
+                case "extra" -> ((Document)altered).put("extra",true);
+                case "version" -> ((Document)altered).put("formatVersion",2);
+                case "type" -> ((Document)altered).put("formatVersion",1L);
+                case "generation" -> ((Document)altered).put("originalScope",MongoPipelinePreparationFacts.scope(new PipelineIntentScope(
+                        f.scope.clusterId(),f.scope.bindingVersion(),f.scope.cacheIncarnation(),"flow",2)));
+                case "business" -> ((Document)altered).put("originalScope",MongoPipelinePreparationFacts.scope(new PipelineIntentScope(
+                        "other-cluster",f.scope.bindingVersion(),f.scope.cacheIncarnation(),"flow",1)));
+                case "operation" -> ((Document)altered).put("operationId","unknown");
+                default -> throw new AssertionError(damage);
+            }
+            SystemCollections.OPERATOR_GENERATIONS.on(f.config).updateOne(new Document("_id","flow"),new Document("$set",new Document("sharedRecovery",altered)));
+            var before=f.mapping();var cache=f.snapshot();long version=f.version();
+            assertCode(() -> f.configuration.pipelineStates().read("flow"),IoError.DOCUMENT_UNREADABLE);
+            assertCode(() -> f.configuration.intents().loadForActuation("flow"),IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.mapping()).isEqualTo(before);assertThat(f.snapshot()).isEqualTo(cache);assertThat(f.version()).isEqualTo(version);
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"missing","duplicate","scope","reserved"})
+    void sharedReadinessNeedsOneExactMatchingConfigurationMapping(String damage) {
+        withFixture(f -> {
+            var intent=f.configuration.intents().load("flow").orElseThrow();
+            assertThat(f.configuration.intents().compareAndSet(f.scope,intent.intentRevision(),
+                    new DesiredState("flow",PipelineState.STOPPED,intent.desired().revision(),false))).isTrue();
+            var marker=seedSharedGate(f,f.scope,MongoCapturePreparationFacts.RecoveryPhase.READY);
+            var table=SystemCollections.CAPTURE_PREPARATIONS.on(f.config);
+            var row=table.find(new Document("currentRecovery.operationId",marker.getString("operationId"))).first();
+            switch(damage) {
+                case "missing" -> table.deleteOne(row);
+                case "duplicate" -> table.insertOne(new Document(row).append("_id",new Document("duplicate",true)));
+                case "reserved" -> table.updateOne(row,new Document("$set",new Document("currentRecovery.phase","RESERVED")));
+                case "scope" -> {
+                    var original=MongoCapturePreparationFacts.recovery(row).orElseThrow().previous().birth();
+                    var other=new CapturePreparation(new CacheBusinessScope(f.business.clusterId(),f.business.bindingVersion(),"another-cache"),
+                            original.mode(),original.chainId(),original.captureId(),original.sourceIdentityHash(),original.preparationId());
+                    String operation=marker.getString("operationId");
+                    var replacement=new CapturePreparation(other.scope(),other.mode(),MongoCapturePreparationFacts.replacementChain(other,operation),
+                            other.captureId(),other.sourceIdentityHash(),operation,other.canonicalChainId(),other.birthPreparationId());
+                    table.deleteOne(row);table.insertOne(MongoCapturePreparationFacts.configurationRow(new MongoCapturePreparationFacts.Recovery(other,replacement,
+                            "d".repeat(64),MongoCapturePreparationFacts.RecoveryPhase.READY)));
+                }
+                default -> throw new AssertionError(damage);
+            }
+            var stopped=f.configuration.intents().load("flow").orElseThrow();var before=f.mapping();long version=f.version();
+            var expected=damage.equals("reserved")?IoError.PIPELINE_STATE_REBUILD_REQUIRED:IoError.DOCUMENT_UNREADABLE;
+            assertCode(() -> f.configuration.intents().compareAndSet(f.scope,stopped.intentRevision(),
+                    new DesiredState("flow",PipelineState.STOPPED,stopped.desired().revision(),true)),expected);
+            assertThat(f.mapping()).isEqualTo(before);assertThat(f.version()).isEqualTo(version);
+            assertThat(f.configuration.intents().load("flow")).contains(stopped);
+        });
+    }
+
+    @Test void verifiedDeletionRecreateRemovesOnlyTheRetiredScopeGateAndOldRepliesKeepTheNewGate() {
+        withFixture(f -> {
+            seedSharedGate(f,f.scope,MongoCapturePreparationFacts.RecoveryPhase.READY);
+            var pipeline=f.configuration.artifacts().get("flow").orElseThrow();
+            var claim=f.domain.workloadClaims(f.business).readPipeline(f.scope).orElseThrow().claim();
+            var deletion=new PipelineRetirementRequest("delete-shared-gated-scope",f.scope,CanonicalHash.of(pipeline),
+                    java.util.Optional.of(new PipelineRetirementRequest.CacheOriginal(WorkloadClaimFence.from(claim),0)));
+            var pending=f.configuration.retirements().begin(deletion);
+            var receipt=f.domain.pipelineRetirements(f.business,ACTIVE).retire(pending,f.node);
+            var retired=f.configuration.retirements().complete(receipt);
+            assertThat(f.mapping()).containsKey("sharedRecovery");
+            assertThat(f.configuration.artifacts().create(pipeline)).isEqualTo(ArtifactMutation.CREATED);
+            assertThat(f.mapping()).doesNotContainKey("sharedRecovery");
+            var next=new PipelineIntentScope(f.scope.clusterId(),f.scope.bindingVersion(),f.scope.cacheIncarnation(),"flow",2);
+            var first=((FirstPipelineCreationResult.Issued)f.configuration.preparations().issueFirstCreate(next,f.node)).creation();
+            var cache=f.domain.pipelinePreparations(f.business,ACTIVE);var reservation=cache.reserveFirst(first,TTL);
+            f.configuration.preparations().complete(cache.seed(reservation,f.configuration.preparations(),AT));
+            var tombstone=f.configuration.intents().load("flow").orElseThrow();
+            assertThat(f.configuration.intents().compareAndSet(next,tombstone.intentRevision(),
+                    new DesiredState("flow",PipelineState.STOPPED,CanonicalHash.of(pipeline),false))).isTrue();
+            var newGate=seedSharedGate(f,next,MongoCapturePreparationFacts.RecoveryPhase.RESERVED);
+            assertThat(f.configuration.retirements().complete(receipt)).isEqualTo(retired);
+            assertThat(f.mapping().get("sharedRecovery")).isEqualTo(newGate);
+            assertThat(f.configuration.pipelineStates().read("flow").orElseThrow().stateGeneration()).isEqualTo(2);
+        });
+    }
+
+    /** Seeds only CONFIG readiness controls; it neither executes a joint recovery nor creates its CACHE authority. */
+    private static Document seedSharedGate(Fixture f,PipelineIntentScope scope,MongoCapturePreparationFacts.RecoveryPhase phase) {
+        var settings=Map.<String,Object>of("uri","mongodb://former-input.invalid/db");
+        String canonical=io.tapstate.core.model.canonical.SourceCaptureIdentity.resolve("mongodb",settings,null);
+        String capture=io.tapstate.core.model.canonical.SourceCaptureIdentity.sharedCapture(canonical);
+        var table=SystemCollections.CAPTURE_PREPARATIONS.on(f.config);
+        var old=table.find(new Document("_id",MongoCapturePreparationFacts.id(f.business,capture))).first();
+        var previous=old==null?new CapturePreparation(f.business,CapturePreparation.Mode.SHARED_SRS,canonical,capture,
+                io.tapstate.core.model.canonical.SourceCaptureIdentity.physical("mongodb",settings),java.util.UUID.randomUUID().toString()):MongoCapturePreparationFacts.decode(old);
+        String operation=java.util.UUID.randomUUID().toString();
+        var replacement=new CapturePreparation(f.business,CapturePreparation.Mode.SHARED_SRS,MongoCapturePreparationFacts.replacementChain(previous,operation),
+                capture,previous.sourceIdentityHash(),operation,previous.canonicalChainId(),previous.birthPreparationId());
+        var row=MongoCapturePreparationFacts.configurationRow(new MongoCapturePreparationFacts.Recovery(previous,replacement,"d".repeat(64),phase));
+        if(old==null)table.insertOne(row);else assertThat(table.replaceOne(old,row).getMatchedCount()).isEqualTo(1);
+        var marker=MongoPipelineSharedRecoveryFacts.encode(new MongoPipelineSharedRecoveryFacts.Pending(operation,scope));
+        assertThat(SystemCollections.OPERATOR_GENERATIONS.on(f.config).updateOne(new Document("_id",scope.pipelineId()),
+                new Document("$set",new Document("sharedRecovery",marker))).getMatchedCount()).isEqualTo(1);
+        return marker;
+    }
+
     private static SharedFull preparedSharedFull(Fixture f) {
         var inputs = f.sharedInputs(f.scope);
         var originalClaim = f.advance("flow");

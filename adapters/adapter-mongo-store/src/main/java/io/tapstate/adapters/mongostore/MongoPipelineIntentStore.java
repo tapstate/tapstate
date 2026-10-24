@@ -105,6 +105,12 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
             var prepared = MongoPipelinePreparationFacts.decode(pipelineId, mapping, clusterId);
             if (prepared.phase() != io.tapstate.spi.store.PipelinePreparation.Phase.COMPLETE) return Optional.empty();
             if (!snapshot.scope().equals(prepared.scope())) throw fenced();
+            var shared=MongoPipelineSharedRecoveryFacts.read(mapping);
+            if(shared.isPresent()) {
+                if(snapshot.desired().targetState()==PipelineState.STOPPED && !snapshot.desired().purgeState())return Optional.of(snapshot);
+                if(!MongoPipelineSharedRecoveryFacts.ready(session,database,shared.orElseThrow()))return Optional.empty();
+                if(snapshot.desired().targetState()!=PipelineState.STOPPED && !snapshot.desired().purgeState())return Optional.empty();
+            }
             return Optional.of(snapshot);
         });
     }
@@ -145,6 +151,7 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
             long revision = held == null ? 0 : held.intentRevision();
             if (revision != expected) return false;
             Document generation = requireScope(session, scope);
+            MongoPipelineSharedRecoveryFacts.requireIntent(session,database,generation,scope,held,desired);
             var recovery=MongoCacheRecoveryFacts.read(generation);
             if(permission!=null) {
                 permission.fence(session,client,database);

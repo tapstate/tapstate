@@ -68,6 +68,7 @@ public final class MongoPipelineStateMappings implements PipelineStateMappings {
                 .append("noteWriteFence",prior.getLong("noteWriteFence")+1).append("cachePreparation",new Document("phase","UNASSIGNED"));
         replacement.remove("stateRebuild");
         replacement.remove("cacheRecovery");
+        MongoPipelineSharedRecoveryFacts.removeOnVerifiedReplacement(prior,replacement,result.scope());
         if(mappings.replaceOne(session,new Document("_id",pipelineId).append("stateGeneration",state.stateGeneration()).append("phase","RETIRED")
                 .append("noteWriteFence",prior.get("noteWriteFence")).append("retirement",prior.get("retirement")),replacement).getMatchedCount()!=1)throw retirementRequired(pipelineId);
     }
@@ -96,6 +97,7 @@ public final class MongoPipelineStateMappings implements PipelineStateMappings {
             if (document == null || !(document.get("stateGeneration") instanceof Long generation)
                     || !(document.get("noteWriteFence") instanceof Long fence) || fence < 0 || fence == Long.MAX_VALUE) throw unreadable(pipelineId);
             MongoCacheRecoveryFacts.read(document);
+            MongoPipelineSharedRecoveryFacts.read(document);
             return new PipelineStateMapping(pipelineId, generation,
                     PipelineStateMapping.Phase.valueOf(document.getString("phase")), document.getString("operationId"));
         } catch (NullPointerException | IllegalArgumentException | ClassCastException invalid) {

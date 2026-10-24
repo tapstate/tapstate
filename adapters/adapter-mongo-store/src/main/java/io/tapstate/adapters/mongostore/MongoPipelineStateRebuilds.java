@@ -130,10 +130,11 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
             if (SystemCollections.OPERATOR_GENERATIONS.on(database).updateOne(session,
                     new Document("_id", target.pipelineId()).append("stateGeneration", pending.request.originalScope().stateGeneration())
                             .append("phase", "REBUILDING").append("operationId", pending.request.operationId()).append("stateRebuild", encode(pending))
+                            .append("sharedRecovery",mapping.containsKey("sharedRecovery")?mapping.get("sharedRecovery"):new Document("$exists",false))
                             .append("noteWriteFence", writeFence),
                     new Document("$set", new Document("stateGeneration", target.stateGeneration()).append("phase", "ACTIVE")
                             .append("cachePreparation", MongoPipelinePreparationFacts.encode(result)).append("stateRebuild", annex))
-                            .append("$unset", new Document("cacheRecovery", ""))
+                            .append("$unset", new Document("cacheRecovery", "").append("sharedRecovery",""))
                             .append("$inc", new Document("noteWriteFence", 1L))).getMatchedCount() != 1)
                 throw new IllegalStateException("original rebuild changed within one CONFIG snapshot");
             return result;
@@ -161,6 +162,7 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
         var mapping = SystemCollections.OPERATOR_GENERATIONS.on(database).find(session, new Document("_id", target.pipelineId())).first();
         if (mapping == null) return java.util.Optional.empty();
         var state = MongoPipelineStateMappings.decode(target.pipelineId(), mapping);
+        if(MongoPipelineSharedRecoveryFacts.read(mapping).isPresent())return java.util.Optional.empty();
         if (state.phase() != PipelineStateMapping.Phase.ACTIVE || state.stateGeneration() != target.stateGeneration()
                 || !mapping.containsKey("stateRebuild")) return java.util.Optional.empty();
         var prepared = MongoPipelinePreparationFacts.decode(target.pipelineId(), mapping, clusterId);
@@ -332,6 +334,9 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
         var mapping = SystemCollections.OPERATOR_GENERATIONS.on(database).find(session, new Document("_id", scope.pipelineId())).first();
         var state = MongoPipelineStateMappings.decode(scope.pipelineId(), mapping);
         if (state.stateGeneration() != scope.stateGeneration()) throw fenced();
+        if(MongoPipelineSharedRecoveryFacts.read(mapping).isPresent() && !original.intent().desired().purgeState())
+            throw MongoPipelineSharedRecoveryFacts.required(scope.pipelineId());
+        MongoPipelineSharedRecoveryFacts.requireReady(session,database,mapping,scope);
         return mapping;
     }
     private void verifyDependencies(ClientSession session, PipelineRebuildRequest original) {

@@ -135,6 +135,17 @@ final class MongoCaptureStatePreparations implements CaptureStatePreparations {
         active.run();return issued.won()?new CaptureCreationResult.Issued(new Creation(issued.preparation(),request,issued.targetFingerprint(),issued.retention(),active)):new CaptureCreationResult.AlreadyIssued(issued.preparation());
     }
     private void requireScope(ClientSession session,CacheBusinessScope expected){var current=bindings.cachePreparationForTransaction(session).orElseThrow(MongoCaptureStatePreparations::fenced).businessScope();if(!cluster.equals(expected.clusterId()) || !expected.equals(current))throw fenced();}
+    /** CONFIG-only lookup of an existing reservation; it does not issue or consume any creation permission. */
+    static MongoCapturePreparationFacts.Recovery currentRecoveryForOperation(ClientSession session,MongoDatabase database,
+            CacheBusinessScope expected,String operation) {
+        if(!session.hasActiveTransaction())throw new IllegalStateException("capture recovery lookup requires its CONFIG transaction");
+        var rows=SystemCollections.CAPTURE_PREPARATIONS.on(database).find(session,new Document("currentRecovery.operationId",operation))
+                .limit(2).into(new ArrayList<>());
+        if(rows.size()!=1)throw MongoCapturePreparationFacts.unreadable();
+        var retained=MongoCapturePreparationFacts.recovery(rows.getFirst()).orElseThrow(MongoCapturePreparationFacts::unreadable);
+        if(!expected.equals(retained.replacement().scope()) || !operation.equals(retained.replacement().preparationId()))throw MongoCapturePreparationFacts.unreadable();
+        return retained;
+    }
     private <T>T transaction(Function<ClientSession,T> action) {
         return StoreIo.call(() -> {
             try {

@@ -36,6 +36,7 @@ final class MongoPipelineRetirements implements PipelineRetirements {
             var state=MongoPipelineStateMappings.decode(original.scope().pipelineId(),row);
             if(state.phase()==PipelineStateMapping.Phase.RETIRING)return retained(session,original,row);
             if(state.phase()!=PipelineStateMapping.Phase.ACTIVE || state.stateGeneration()!=original.scope().stateGeneration())throw fenced();
+            MongoPipelineSharedRecoveryFacts.requireReady(session,database,row,original.scope());
             if(row.containsKey("retirement") && MongoPipelineRetirementFacts.read(row).request().operationId().equals(original.operationId()))throw fenced();
             requireDefinition(session,original);var preparation=MongoPipelinePreparationFacts.decode(state.pipelineId(),row,cluster);
             Optional<PipelineRetiredState> predecessor=Optional.empty();
@@ -120,6 +121,7 @@ final class MongoPipelineRetirements implements PipelineRetirements {
     }
     private Pending retained(ClientSession session,PipelineRetirementRequest original,Document row) {
         var state=MongoPipelineStateMappings.decode(original.scope().pipelineId(),row);var fact=MongoPipelineRetirementFacts.read(row);
+        MongoPipelineSharedRecoveryFacts.requireReady(session,database,row,original.scope());
         if(state.phase()!=PipelineStateMapping.Phase.RETIRING || state.stateGeneration()!=original.scope().stateGeneration()
                 || !original.operationId().equals(state.operationId()) || !original.equals(fact.request()) || !fact.phase().equals("RETIRING"))throw fenced();
         requireDefinition(session,original);var tokens=notes.retirementScopes(session,original.scope(),original.operationId());

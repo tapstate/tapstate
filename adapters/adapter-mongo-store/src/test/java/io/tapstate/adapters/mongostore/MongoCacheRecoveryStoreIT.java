@@ -72,6 +72,35 @@ class MongoCacheRecoveryStoreIT {
             }
         });
     }
+    @Test void wholeCacheReplacementConsumesTheExactPreparedOldSharedScopeGate() {
+        fixture(f -> {
+            var business=f.domain.bindings().cachePreparation().orElseThrow().businessScope();
+            var scope=new PipelineIntentScope(business.clusterId(),business.bindingVersion(),business.cacheIncarnation(),"a",1);
+            try(var cache=MongoCacheDomain.connect(f.binding.cache(),Duration.ofSeconds(5),"shared-before-loss")) {
+                var node=WorkloadClaimFence.from(cache.workloadClaims(business).acquire(NODE.key(),NODE.owner(),1,Duration.ofSeconds(30)).claim());
+                var issued=(FirstPipelineCreationResult.Issued)f.domain.preparations().issueFirstCreate(scope,node,inputs(scope));
+                var preparation=cache.pipelinePreparations(business,ACTIVE);var reserved=preparation.reserveFirst(issued.creation(),Duration.ofSeconds(30));
+                assertThat(f.domain.preparations().complete(preparation.seed(reserved,f.domain.preparations(),java.time.Instant.now())).scope()).isEqualTo(scope);
+            }
+            var marker=MongoPipelineSharedRecoveryFacts.encode(new MongoPipelineSharedRecoveryFacts.Pending(UUID.randomUUID().toString(),scope));
+            assertThat(SystemCollections.OPERATOR_GENERATIONS.on(f.config).updateOne(new Document("_id","a"),
+                    new Document("$set",new Document("sharedRecovery",marker))).getMatchedCount()).isOne();
+            assertThat(f.domain.pipelineStates().read("a").orElseThrow().stateGeneration()).isOne();
+        },f -> {
+            var before=SystemCollections.OPERATOR_GENERATIONS.on(f.config).find(new Document("_id","a")).first();
+            assertThat(before).containsKey("sharedRecovery");
+            var confirmed=f.confirmed();var summaries=f.domain.cacheRecoveries().stageCluster(confirmed);
+            var replacement=SystemCollections.OPERATOR_GENERATIONS.on(f.config).find(new Document("_id","a")).first();
+            assertThat(replacement).doesNotContainKey("sharedRecovery");
+            assertThat(f.domain.pipelineStates().read("a").orElseThrow().stateGeneration()).isEqualTo(2);
+            var summary=summaries.stream().filter(value -> value.targetScope().pipelineId().equals("a")).findFirst().orElseThrow();
+            assertThat(summary.previousScope()).isEqualTo(MongoPipelineSharedRecoveryFacts.read(before).orElseThrow().originalScope());
+            assertThat(f.domain.intents().load("a").orElseThrow().scope()).isEqualTo(summary.targetScope());
+            assertThat(f.domain.intents().loadForActuation("a")).isEmpty();
+            assertThat(f.domain.cacheRecoveries().stageCluster(confirmed)).isEqualTo(summaries);
+            assertThat(SystemCollections.OPERATOR_GENERATIONS.on(f.config).find(new Document("_id","a")).first()).isEqualTo(replacement);
+        });
+    }
     @Test void unconfirmedOrChangedDefinitionsCannotPartiallyPublishMappings() {
         fixture(f -> {
             var planned = f.domain.recoveryCommands().plan(f.current(), f.manifest(), null, null);
@@ -411,6 +440,9 @@ class MongoCacheRecoveryStoreIT {
         }
     }
     private static void fixture(Scenario scenario) {
+        fixture(null,scenario);
+    }
+    private static void fixture(Scenario beforeLoss,Scenario scenario) {
         String suffix = UUID.randomUUID().toString().replace("-", "");
         try (var admin = MongoClients.create(MONGO.getReplicaSetUrl())) {
             var config = admin.getDatabase("recovery_config_" + suffix); var cache = admin.getDatabase("recovery_cache_" + suffix);
@@ -431,6 +463,7 @@ class MongoCacheRecoveryStoreIT {
                     assertThat(domain.intents().compareAndSet(scope, 0, new DesiredState(id, id.equals("a") ? PipelineState.RUNNING : PipelineState.STOPPED,
                             CanonicalHash.of(pipeline(id)), false, null, false, null))).isTrue();
                 }
+                if(beforeLoss!=null)beforeLoss.run(new Fixture(domain,settings,config,cache,committed.binding(),previous));
                 cache.drop();
                 try (var auth = MongoCacheDomain.connect(endpoint, Duration.ofSeconds(5), "recovery-auth")) { domain.prepareAuthenticationRecovery(auth, ACTIVE); }
                 scenario.run(new Fixture(domain, settings, config, cache, committed.binding(), previous));
