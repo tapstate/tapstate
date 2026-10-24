@@ -11,6 +11,8 @@ import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Duration;
 import java.util.Map;
@@ -25,6 +27,10 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anySet;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -53,6 +59,7 @@ class ScopedPipelineActuationOwnershipTest {
         when(store.advanceExecution(any(), anyLong(), anySet())).thenAnswer(call ->
                 raw.advanceExecution(call.getArgument(0), call.getArgument(1), call.getArgument(2)));
         when(store.renew(any(), any())).thenAnswer(call -> raw.renew(call.getArgument(0), call.getArgument(1)));
+        when(store.release(any())).thenAnswer(call -> raw.release(call.getArgument(0)));
         when(store.readPipeline(any())).thenAnswer(call -> {
             reads.incrementAndGet();
             if (!call.getArgument(0).equals(current.get())) throw fenced();
@@ -87,6 +94,123 @@ class ScopedPipelineActuationOwnershipTest {
         }
         assertThat(owner.permit(FIRST).granted()).isTrue();
         assertThat(owner.beginExecution(FIRST, original).allowed()).isTrue();
+    }
+
+    @Test void endingTheExactActuationTenureKeepsTheLocalControlBarrierUntilClose() {
+        var owner=ownership();var permit=owner.permit(FIRST);
+        var run=owner.beginExecution(FIRST,WorkloadClaimFence.from(permit.claim()));
+        var original=raw.read(KEY).orElseThrow().claim();
+        try(var control=owner.control(FIRST)) {
+            assertThat(control.claim()).isEqualTo(run.claimFence());
+            assertThat(raw.read(KEY).orElseThrow().leased()).isTrue();
+            control.endTenure();control.requireHeld();
+            var ended=raw.read(KEY).orElseThrow();
+            assertThat(ended.leased()).isFalse();
+            assertThat(WorkloadClaimFence.from(ended.claim())).isEqualTo(run.claimFence());
+            assertThat(ended.claim().contextExecutionGeneration()).isEqualTo(original.contextExecutionGeneration());
+            assertThat(ended.claim().executionNodeIds()).isEqualTo(original.executionNodeIds());
+            assertThat(owner.permit(FIRST).granted()).isFalse();
+            assertThat(owner.beginExecution(FIRST,run.claimFence()).allowed()).isFalse();
+            assertThatThrownBy(() -> owner.control(FIRST)).isInstanceOf(TapstateException.class);
+            control.endTenure();assertThat(raw.read(KEY).orElseThrow().claim()).isEqualTo(ended.claim());
+            raw.elapse(RENEW);nanos.addAndGet(RENEW.toNanos());owner.renewDue();
+            control.requireHeld();verify(store,never()).renew(any(),any());
+            assertThat(raw.read(KEY).orElseThrow().claim()).isEqualTo(ended.claim());
+        }
+        var next=owner.permit(FIRST);
+        assertThat(next.granted()).isTrue();assertThat(next.claim().claimGeneration()).isEqualTo(original.claimGeneration()+1);
+        assertThat(next.claim().executionGeneration()).isEqualTo(original.executionGeneration());
+        assertThat(next.claim().executionNodeIds()).isEqualTo(original.executionNodeIds());
+        assertThat(owner.beginExecution(FIRST,WorkloadClaimFence.from(next.claim())).allowed()).isTrue();
+        assertThat(raw.read(KEY).orElseThrow().claim().executionGeneration()).isEqualTo(original.executionGeneration()+1);
+        verify(store,never()).read(any());verify(store,never()).acquire(any(),any(),anyLong(),any());
+    }
+
+    @Test void anExpiredExactTenureCanEndAfterTheRenewerHasDroppedItsLocalHolder() {
+        var owner=ownership();
+        try(var control=owner.control(FIRST)) {
+            var original=raw.read(KEY).orElseThrow().claim();
+            raw.elapse(TTL);nanos.addAndGet(TTL.toNanos());owner.renewDue();
+            assertThat(raw.read(KEY).orElseThrow().leased()).isFalse();
+            control.endTenure();control.requireHeld();
+            assertThat(raw.read(KEY).orElseThrow().claim()).isEqualTo(original);
+            int readCount=reads.get();control.endTenure();assertThat(reads).hasValue(readCount);
+            verify(store,never()).release(any());
+            assertThat(owner.permit(FIRST).granted()).isFalse();
+        }
+        assertThat(owner.permit(FIRST).claim().claimGeneration()).isEqualTo(2);
+    }
+
+    @ParameterizedTest @ValueSource(strings={"scope-changed","later-owner","missing-scoped-claim","closed-control","unprepared","business-lost","release-refused","release-failed"})
+    void endingATenureCannotAdoptUnknownOrChangedAuthority(String fault) {
+        var owner=ownership();
+        var control=fault.equals("unprepared")?owner.unpreparedControl(FIRST):owner.control(FIRST);
+        try(control) {
+            switch(fault) {
+                case "scope-changed" -> current.set(scope(2));
+                case "later-owner" -> {
+                    assertThat(raw.release(raw.read(KEY).orElseThrow().claim())).isTrue();
+                    assertThat(raw.acquire(KEY,new WorkloadOwner("node-b","boot-b"),7,TTL).acquired()).isTrue();
+                }
+                case "missing-scoped-claim" -> when(store.readPipeline(FIRST)).thenReturn(java.util.Optional.empty());
+                case "closed-control" -> control.close();
+                case "business-lost" -> membership.canCommit(Set.of("node-a"));
+                case "release-refused" -> doReturn(false).when(store).release(any());
+                case "release-failed" -> doThrow(fenced()).when(store).release(any());
+                case "unprepared" -> { }
+                default -> throw new AssertionError(fault);
+            }
+            var before=raw.read(KEY).map(io.tapstate.spi.store.WorkloadClaimReading::claim);
+            assertThatThrownBy(control::endTenure).isInstanceOf(TapstateException.class);
+            assertThat(raw.read(KEY).map(io.tapstate.spi.store.WorkloadClaimReading::claim)).isEqualTo(before);
+            if(!fault.startsWith("release-"))verify(store,never()).release(any());
+            verify(store,never()).read(any());verify(store,never()).acquire(any(),any(),anyLong(),any());
+            if(fault.equals("later-owner"))assertThat(raw.read(KEY).orElseThrow().claim().owner()).isEqualTo(new WorkloadOwner("node-b","boot-b"));
+        }
+    }
+
+    @Test void aLostReleaseResponseResumesTheAlreadyEndedExactTenureWithoutAnotherWrite() {
+        assertUnknownEndTenureResult(true);
+    }
+
+    @Test void aFailedPostreleaseReadResumesTheAlreadyEndedExactTenureWithoutAnotherWrite() {
+        assertUnknownEndTenureResult(false);
+    }
+
+    private void assertUnknownEndTenureResult(boolean loseReleaseResponse) {
+        var owner=ownership();var permit=owner.permit(FIRST);
+        var run=owner.beginExecution(FIRST,WorkloadClaimFence.from(permit.claim()));
+        var original=raw.read(KEY).orElseThrow().claim();
+        var committed=new java.util.concurrent.atomic.AtomicBoolean();var failedRead=new java.util.concurrent.atomic.AtomicBoolean();
+        var failure=fenced();var releases=new AtomicInteger();
+        doAnswer(call -> {
+            releases.incrementAndGet();assertThat(raw.release(call.getArgument(0))).isTrue();committed.set(true);
+            if(loseReleaseResponse)throw failure;return true;
+        }).when(store).release(any());
+        doAnswer(call -> {
+            reads.incrementAndGet();if(!call.getArgument(0).equals(current.get()))throw fenced();
+            if(!loseReleaseResponse && committed.get() && failedRead.compareAndSet(false,true))throw failure;
+            return raw.read(KEY);
+        }).when(store).readPipeline(FIRST);
+        try(var control=owner.control(FIRST)) {
+            assertThatThrownBy(control::endTenure).isSameAs(failure);control.requireHeld();
+            var ended=raw.read(KEY).orElseThrow();assertThat(ended.leased()).isFalse();
+            var expected=new io.tapstate.spi.store.WorkloadClaim(original.key(),original.owner(),original.claimGeneration(),original.executionGeneration(),
+                    original.topologyRevision(),ended.claim().leaseUntil(),original.contextExecutionGeneration(),original.executionClaimGeneration(),
+                    original.executionNodeIds(),original.failureClaimGeneration(),original.failureAfterMemberLoss());
+            assertThat(ended.claim()).isEqualTo(expected);assertThat(control.claim()).isEqualTo(run.claimFence());
+            assertThat(owner.permit(FIRST).granted()).isFalse();assertThat(owner.beginExecution(FIRST,run.claimFence()).allowed()).isFalse();
+            assertThatThrownBy(() -> owner.control(FIRST)).isInstanceOf(TapstateException.class);
+            control.endTenure();control.requireHeld();control.endTenure();
+            assertThat(raw.read(KEY).orElseThrow().claim()).isEqualTo(ended.claim());assertThat(releases).hasValue(1);
+            verify(store,times(1)).release(any());verify(store,never()).read(any());
+        }
+        var next=owner.permit(FIRST);assertThat(next.granted()).isTrue();
+        assertThat(next.claim().claimGeneration()).isEqualTo(original.claimGeneration()+1);
+        assertThat(next.claim().executionGeneration()).isEqualTo(original.executionGeneration());
+        assertThat(next.claim().contextExecutionGeneration()).isEqualTo(original.contextExecutionGeneration());
+        assertThat(next.claim().executionNodeIds()).isEqualTo(original.executionNodeIds());
+        assertThat(releases).hasValue(1);verify(store,never()).acquire(any(),any(),anyLong(),any());
     }
 
     @Test void completedPositionReleaseToleratesTheRenewerAlreadyDroppingItsClaim() {

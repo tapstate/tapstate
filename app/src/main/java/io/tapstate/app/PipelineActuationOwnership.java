@@ -84,6 +84,7 @@ final class PipelineActuationOwnership {
     final class Control implements AutoCloseable {
         private final PipelineIntentScope scope;
         private final WorkloadClaimFence claim;
+        private boolean tenureEnded;
         private Control(PipelineIntentScope scope, WorkloadClaimFence claim) { this.scope = scope; this.claim = claim; }
         WorkloadClaimFence claim() { return claim; }
         void requireHeld() {
@@ -104,6 +105,24 @@ final class PipelineActuationOwnership {
             synchronized (PipelineActuationOwnership.this) {
                 requireHeld(); var old = held.get(scope.pipelineId());
                 if (old != null && old.scope.equals(scope) && (old.claim == null || WorkloadClaimFence.from(old.claim).equals(claim))) held.remove(scope.pipelineId());
+            }
+        }
+        /** Ends this exact durable tenure while retaining the local exclusion against new passes. */
+        void endTenure() {
+            synchronized (PipelineActuationOwnership.this) {
+                requireHeld();
+                if(!fenced || businessScope==null || claim==null || !accepts(scope))throw ThreeLayerStorePort.refused();
+                if(tenureEnded)return;
+                var local=held.get(scope.pipelineId());
+                if(local!=null && (!scope.equals(local.scope) || local.claim!=null && !claim.equals(WorkloadClaimFence.from(local.claim))))
+                    throw ThreeLayerStorePort.refused();
+                var before=claims.readPipeline(scope).orElseThrow(ThreeLayerStorePort::refused);
+                if(!claim.equals(WorkloadClaimFence.from(before.claim())))throw ThreeLayerStorePort.refused();
+                if(before.leased() && !claims.release(before.claim()))throw ThreeLayerStorePort.refused();
+                var after=claims.readPipeline(scope).orElseThrow(ThreeLayerStorePort::refused);
+                if(after.leased() || !claim.equals(WorkloadClaimFence.from(after.claim())))throw ThreeLayerStorePort.refused();
+                if(local!=null)held.remove(scope.pipelineId(),local);
+                tenureEnded=true;
             }
         }
         @Override public void close() {
