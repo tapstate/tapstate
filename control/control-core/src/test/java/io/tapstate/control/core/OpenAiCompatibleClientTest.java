@@ -139,6 +139,14 @@ class OpenAiCompatibleClientTest {
                     .map(item -> (Map<?, ?>) item).filter(item -> "system".equals(item.get("role")))
                     .map(item -> (String) item.get("content")).findFirst().orElseThrow();
             assertThat(systemPrompt).contains("passthroughUnlisted", "ruleType", "$<sourceField>");
+            assertThat(systemPrompt).contains("Bundled DSL semantics", "CEL boolean predicate",
+                    "A rename consumes its source name", "ctx.emit(record)", "explicit alias map");
+            assertThat(systemPrompt).contains("function process(record, ctx)", "record.after",
+                    "top-level return", "deletes", "DDL", "Return the complete record", "ctx.emit(record)");
+            Map<?, ?> jsSchema = (Map<?, ?>) ((Map<?, ?>) configSchema.get("properties")).get("js");
+            Map<?, ?> scriptSchema = (Map<?, ?>) ((Map<?, ?>) jsSchema.get("properties")).get("script");
+            assertThat((String) scriptSchema.get("description"))
+                    .contains("function process(record, ctx)", "record.after", "new Date().toISOString()");
             assertThat(submitted.get().containsKey("tool_choice")).isTrue();
         } finally { server.stop(0); }
     }
