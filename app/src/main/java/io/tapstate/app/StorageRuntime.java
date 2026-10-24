@@ -27,7 +27,7 @@ final class StorageRuntime implements AutoCloseable {
     private Bound bound;
     private volatile AutoCloseable business;
     private volatile boolean closed;
-    private boolean cleanupUnknown;
+    private volatile boolean cleanupUnknown;
     private final Runnable ownerActive;
 
     StorageRuntime(MongoConfigurationDomain configuration, Function<StorageBinding, MongoCacheDomain> connections) {
@@ -39,11 +39,11 @@ final class StorageRuntime implements AutoCloseable {
         this.ownerActive = Objects.requireNonNull(ownerActive, "ownerActive");
     }
 
-    synchronized Optional<MongoConfigurationDomain> configuration() {
+    Optional<MongoConfigurationDomain> configuration() {
         requireOpen(); return Optional.ofNullable(configuration);
     }
 
-    synchronized MongoConfigurationDomain requireConfiguration() {
+    MongoConfigurationDomain requireConfiguration() {
         return configuration().orElseThrow(StorageRuntime::unavailable);
     }
 
@@ -77,7 +77,7 @@ final class StorageRuntime implements AutoCloseable {
     }
 
     synchronized Optional<Bound> current() { requireOpen(); return Optional.ofNullable(bound); }
-    synchronized boolean cleanupRequired() { return cleanupUnknown; }
+    boolean cleanupRequired() { return cleanupUnknown; }
 
     /** Retires this process's original owners before loading a newly published authentication scope. */
     synchronized Bound restoreAuthentication() {
@@ -167,7 +167,7 @@ final class StorageRuntime implements AutoCloseable {
                 && plan.manifest().selection().extent()!=io.tapstate.spi.store.StorageRecoveryCommands.Extent.PIPELINE).isPresent()) throw unavailable();
     }
 
-    synchronized boolean businessStarted() { return !closed && business instanceof Business actual && actual.available(); }
+    boolean businessStarted() { return !closed && business instanceof Business actual && actual.available(); }
     synchronized Optional<Business> business() {
         requireOpen(); return business instanceof Business actual ? Optional.of(actual) : Optional.empty();
     }

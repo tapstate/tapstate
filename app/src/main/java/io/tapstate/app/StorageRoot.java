@@ -23,6 +23,10 @@ final class StorageRoot implements AutoCloseable {
     private final byte[] authenticationKey;
     private volatile Phase phase;
     private volatile boolean closed;
+    private volatile boolean closeRequested;
+    private final Object authenticationContinuationLock = new Object();
+    private java.util.concurrent.ExecutorService authenticationWorker;
+    private java.util.concurrent.CompletableFuture<Void> pendingAuthentication;
     private FirstCacheCreation attemptedCreation;
     private Function<StorageRuntime.Bound, ? extends StorageRuntime.Business> retainedAssembly;
     private java.util.function.Supplier<StorageSetupService.DefaultTarget> retainedTarget;
@@ -134,12 +138,16 @@ final class StorageRoot implements AutoCloseable {
     /** Continues only the original committed setup. No request owns or closes the retained CACHE client. */
     synchronized void continueCloudSetup(StorageBindingCommit committed, StorageSetupService.DefaultTarget target,
             Function<StorageRuntime.Bound, ? extends StorageRuntime.Business> assembly) {
+        continueCloudSetup(committed, target, assembly, true);
+    }
+    private void continueCloudSetup(StorageBindingCommit committed, StorageSetupService.DefaultTarget target,
+            Function<StorageRuntime.Bound, ? extends StorageRuntime.Business> assembly, boolean startBusiness) {
         requireOpen();
         if (!cloud.cloud() || committed.binding().mode() != StorageBinding.Mode.CLOUD || runtime.cleanupRequired())
             throw StorageRuntime.unavailable();
         var original = prepareInitialSetup(committed, target);
         authentication.install(original); phase = Phase.AUTH_READY;
-        runtime.startBusiness(original, assembly); phase = Phase.BUSINESS_READY;
+        if (startBusiness) { runtime.startBusiness(original, assembly); phase = Phase.BUSINESS_READY; }
     }
 
     /** OP prepares its original storage but keeps authentication and business behind a controlled restart. */
@@ -225,34 +233,95 @@ final class StorageRoot implements AutoCloseable {
         }
     }
 
-    synchronized LocalAuthenticationContext localAuthentication() {
-        requireOpen();
-        if (runtime.configuration().isEmpty()) throw StorageRuntime.unavailable();
-        LocalAuthenticationContext context;
-        try { context = authentication.local(); }
-        catch (TapstateException unavailable) {
-            if (unavailable.code() != ControlError.STORAGE_UNAVAILABLE) throw unavailable;
-            restoreAuthentication(); context = authentication.local();
-        }
-        resumeRetainedBusiness();wakeRecovery();return context;
+    LocalAuthenticationContext localAuthentication() {
+        return authenticationContext((owner, budget) -> owner.local(budget));
     }
 
-    synchronized ManagedAuthenticationContext managedAuthentication() {
+    ManagedAuthenticationContext managedAuthentication() {
+        return authenticationContext((owner, budget) -> owner.managed(budget));
+    }
+
+    /** Valid sessions never join business startup; a missing owner waits only within this request's allowance. */
+    private <T> T authenticationContext(java.util.function.BiFunction<StorageAuthentication, MongoReadBudget, T> select) {
         requireOpen();
-        if (runtime.configuration().isEmpty()) loadConfiguration();
-        if (runtime.configuration().isEmpty()) throw StorageRuntime.unavailable();
-        if (cloud.cloud() && runtime.requireConfiguration().setupStates().load().phase() != StorageSetupStateStore.Phase.COMPLETE)
-            continueIncompleteCloud();
-        ManagedAuthenticationContext context;
-        try { context = authentication.managed(); }
+        long deadline = System.nanoTime() + StorageAuthentication.AUTHORIZATION_READ_BUDGET.toNanos();
+        var budget = new MongoReadBudget(StorageAuthentication.AUTHORIZATION_READ_BUDGET);
+        T result;
+        try { result = selectAuthentication(select, budget); }
         catch (TapstateException unavailable) {
             if (unavailable.code() != ControlError.STORAGE_UNAVAILABLE) throw unavailable;
-            restoreAuthentication(); context = authentication.managed();
+            var pending = continueAuthentication();
+            try { pending.get(Math.max(0, deadline - System.nanoTime()), java.util.concurrent.TimeUnit.NANOSECONDS); }
+            catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt(); throw StorageRuntime.unavailable();
+            } catch (java.util.concurrent.TimeoutException timeout) { throw StorageRuntime.unavailable(); }
+            catch (java.util.concurrent.ExecutionException failed) {
+                if (failed.getCause() instanceof RuntimeException failure) throw failure;
+                if (failed.getCause() instanceof Error failure) throw failure;
+                throw new IllegalStateException("authentication continuation failed", failed.getCause());
+            }
+            result = selectAuthentication(select, budget);
         }
-        resumeRetainedBusiness(); wakeRecovery(); return context;
+        if (System.nanoTime() >= deadline) throw StorageRuntime.unavailable();
+        continueAuthentication();
+        return result;
+    }
+
+    private <T> T selectAuthentication(java.util.function.BiFunction<StorageAuthentication, MongoReadBudget, T> select,
+            MongoReadBudget budget) {
+        requireOpen();
+        StorageAuthentication original = authentication;
+        T result = select.apply(original, budget);
+        requireOpen();
+        if (authentication != original) throw StorageRuntime.unavailable();
+        return result;
+    }
+
+    private java.util.concurrent.CompletableFuture<Void> continueAuthentication() {
+        synchronized (authenticationContinuationLock) {
+            requireOpen();
+            if (pendingAuthentication != null) return pendingAuthentication;
+            var pending = new java.util.concurrent.CompletableFuture<Void>();
+            pendingAuthentication = pending;
+            if (authenticationWorker == null) authenticationWorker = java.util.concurrent.Executors.newSingleThreadExecutor(task -> {
+                var worker = new Thread(task, "storage-authentication-continuation"); worker.setDaemon(true); return worker;
+            });
+            authenticationWorker.execute(() -> {
+                try {
+                    synchronized (StorageRoot.this) {
+                        requireOpen();
+                        if (cloud.cloud() && runtime.configuration().isEmpty()) loadConfiguration();
+                        if (runtime.configuration().isEmpty()) throw StorageRuntime.unavailable();
+                        if (cloud.cloud() && runtime.requireConfiguration().setupStates().load().phase() != StorageSetupStateStore.Phase.COMPLETE)
+                            continueIncompleteCloud(false);
+                        try {
+                            if (cloud.cloud()) authentication.managed(); else authentication.local();
+                        } catch (TapstateException unavailable) {
+                            if (unavailable.code() != ControlError.STORAGE_UNAVAILABLE) throw unavailable;
+                            restoreAuthentication();
+                        }
+                        requireOpen();
+                        // Complete before starting business while retaining one coalesced continuation through its cleanup.
+                        pending.complete(null);
+                        resumeRetainedBusiness(); wakeRecovery();
+                    }
+                } catch (RuntimeException | Error failure) {
+                    pending.completeExceptionally(failure);
+                    if (!(failure instanceof TapstateException)) throw failure;
+                } finally {
+                    synchronized (authenticationContinuationLock) {
+                        if (pendingAuthentication == pending) pendingAuthentication = null;
+                    }
+                }
+            });
+            return pending;
+        }
     }
 
     private void continueIncompleteCloud() {
+        continueIncompleteCloud(true);
+    }
+    private void continueIncompleteCloud(boolean startBusiness) {
         phase = Phase.SETUP_REQUIRED;
         if (retainedAssembly == null) return;
         var bound = runtime.loadBound();
@@ -262,7 +331,7 @@ final class StorageRoot implements AutoCloseable {
             var committed = setupInvocation != null && setupInvocation.binding().equals(original.binding())
                     && setupInvocation.preparation().equals(original.preparation()) ? setupInvocation
                     : new StorageBindingCommit(original.binding(), original.preparation(), Optional.empty());
-            try { continueCloudSetup(committed, retainedTarget.get(), retainedAssembly); return; }
+            try { continueCloudSetup(committed, retainedTarget.get(), retainedAssembly, startBusiness); return; }
             catch (TapstateException unavailable) { /* The original invocation is retained; never manufacture another. */ }
             if (committed.firstCreation().isPresent() && attemptedCreation != committed.firstCreation().orElseThrow()) return;
         }
@@ -547,17 +616,24 @@ final class StorageRoot implements AutoCloseable {
                 actions, false);
     }
 
-    private void requireOpen() { if (closed) throw StorageRuntime.unavailable(); installationActive.run(); }
+    private void requireOpen() { if (closeRequested || closed) throw StorageRuntime.unavailable(); installationActive.run(); }
     private static String readCa(String path) {
         if (path == null || path.isBlank()) return null;
         try { return java.nio.file.Files.readString(java.nio.file.Path.of(path)); }
         catch (java.io.IOException invalid) { throw StorageRuntime.unavailable(); }
     }
-    @Override public synchronized void close() {
-        if (closed) return; closed = true;
-        if (recoveryWorker != null) recoveryWorker.shutdownNow();
-        if (initialization != null) initialization.close();
-        try { authentication.close(); runtime.close(); }
-        finally { java.util.Arrays.fill(authenticationKey, (byte)0); }
+    @Override public void close() {
+        closeRequested = true;
+        synchronized (authenticationContinuationLock) {
+            if (pendingAuthentication != null) pendingAuthentication.completeExceptionally(StorageRuntime.unavailable());
+            if (authenticationWorker != null) authenticationWorker.shutdownNow();
+        }
+        synchronized (this) {
+            if (closed) return; closed = true;
+            if (recoveryWorker != null) recoveryWorker.shutdownNow();
+            if (initialization != null) initialization.close();
+            try { authentication.close(); runtime.close(); }
+            finally { java.util.Arrays.fill(authenticationKey, (byte)0); }
+        }
     }
 }

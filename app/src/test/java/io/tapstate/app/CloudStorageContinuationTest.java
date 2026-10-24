@@ -58,12 +58,27 @@ class CloudStorageContinuationTest {
             cloud.setClusterId("cluster"); cloud.setAtlasUri("mongodb://config/config");
             root = new StorageRoot(new MongoProperties(), CloudRuntimeSettings.resolve(cloud), bridge,
                     BootId.fresh(), new MetricsHistoryProperties(), new RandomTokenSecrets(), Clock.systemUTC(), new byte[32]);
+            // Static client boundaries are thread-local in this unit fixture; real async ownership has Mongo coverage.
+            org.springframework.test.util.ReflectionTestUtils.setField(root, "authenticationWorker", new InlineExecutor());
         }
         StorageRuntime.Business business() {
             var value = mock(StorageRuntime.Business.class); when(value.available()).thenReturn(true); return value;
         }
         void continueWith(StorageRuntime.Business business) { root.continueCloudSetup(committed, target, ignored -> business); }
         @Override public void close() { try { root.close(); } finally { caches.close(); configurations.close(); } }
+    }
+
+    private static final class InlineExecutor extends java.util.concurrent.AbstractExecutorService {
+        private boolean closed;
+        @Override public void execute(Runnable task) {
+            if (closed) throw new java.util.concurrent.RejectedExecutionException();
+            task.run();
+        }
+        @Override public void shutdown() { closed = true; }
+        @Override public List<Runnable> shutdownNow() { shutdown(); return List.of(); }
+        @Override public boolean isShutdown() { return closed; }
+        @Override public boolean isTerminated() { return closed; }
+        @Override public boolean awaitTermination(long timeout, java.util.concurrent.TimeUnit unit) { return closed; }
     }
 
     @Test void completionUsesSavedTrustClosesTemporaryAuthenticationAndStartsOnlyOneBusinessOwner() {

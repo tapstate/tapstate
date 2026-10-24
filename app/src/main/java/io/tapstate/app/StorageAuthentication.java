@@ -15,7 +15,7 @@ import java.util.concurrent.atomic.AtomicReference;
 /** Publishes a formal authentication owner independently from Hazelcast, claims and business readiness. */
 final class StorageAuthentication implements AutoCloseable {
     // Store operations also have a five-second cap, leaving time for transaction abort before HTTP expires.
-    private static final Duration AUTHORIZATION_READ_BUDGET = Duration.ofSeconds(10);
+    static final Duration AUTHORIZATION_READ_BUDGET = Duration.ofSeconds(10);
     private final MongoConfigurationDomain configuration;
     private final CloudRuntimeSettings cloud;
     private final CloudSdkBridge bridge;
@@ -59,17 +59,23 @@ final class StorageAuthentication implements AutoCloseable {
     }
 
     LocalAuthenticationContext local() {
+        return local(new MongoReadBudget(AUTHORIZATION_READ_BUDGET));
+    }
+    LocalAuthenticationContext local(MongoReadBudget budget) {
         Epoch original = selected();
         if (cloud.cloud()) throw new TapstateException(ControlError.AUTH_MODE_UNAVAILABLE, Map.of("mode", "cloud"), null);
-        original.requireActive(); return original.local;
+        original.requireActive(budget); return original.local;
     }
     ManagedAuthenticationContext managed() {
+        return managed(new MongoReadBudget(AUTHORIZATION_READ_BUDGET));
+    }
+    ManagedAuthenticationContext managed(MongoReadBudget budget) {
         if (!cloud.cloud()) throw new TapstateException(ControlError.AUTH_MODE_UNAVAILABLE, Map.of("mode", "on_prem"), null);
         if (current.get() == null && bootstrap != null && bootstrap.incomplete()) {
             bootstrap.requireActive(); return new ManagedAuthenticationContext(bootstrap.managed, bootstrap::requireActive);
         }
         Epoch original = selected();
-        original.requireActive(); return new ManagedAuthenticationContext(original.managed, original::requireActive);
+        original.requireActive(budget); return new ManagedAuthenticationContext(original.managed, original::requireActive);
     }
     CredentialAuthenticator credentials() { return CredentialAuthenticator.scoped(this::authenticate); }
 
