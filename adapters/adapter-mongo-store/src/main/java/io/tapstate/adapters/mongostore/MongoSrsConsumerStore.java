@@ -356,6 +356,12 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             var cursor = held.cursors().get(member.context().key().consumerId());
             safe = Math.min(safe,cursor.ringDoneThrough().getOrDefault(table,-1L));
         }
+        var pending=held.state().pendingFreshFull();
+        if(pending!=null && pending.models().containsKey(table)) {
+            var model=new MongoSrsModelStore(client,database,scope,requireActive,requireStructure)
+                    .requireSnapshotReference(session,pending.models().get(table));
+            safe=Math.min(safe,model.ddlSequence()-1);
+        }
         if (safe >= 0) chains.replace(session,held.root(),new Document(held.root()));
         requireActive.run(); return safe;
     }

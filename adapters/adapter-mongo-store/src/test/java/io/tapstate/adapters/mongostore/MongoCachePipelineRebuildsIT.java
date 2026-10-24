@@ -337,6 +337,36 @@ class MongoCachePipelineRebuildsIT {
         });
     }
 
+    @Test void aPendingFullKeepsItsLogFloorWhenTheCurrentConsumerConfirmsNewerTokenlessRows() {
+        withFixture(true,f -> {
+            var shared=preparedSharedFull(f);var frozen=shared.consumers.inspectFreshFull(shared.full,shared.run,0,f.node,shared.capture);
+            var published=frozen.publish(2,"fixed-new-cut",Map.of("orders",table("orders",true),"quiet",table("quiet",false)),AT);
+            var log=new MongoSrsLogStore(f.cacheClient,SystemCollections.SRS_EVENTS.on(f.cache),SystemCollections.SRS_LOG_BOUNDS.on(f.cache),
+                    SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.cache),shared.models);
+            for(long sequence=1;sequence<=2;sequence++)log.store(shared.ring("orders"),sequence,
+                    new SrsLogRecord(null,io.tapstate.core.event.Op.INSERT,sequence,null,Map.of("id",sequence,"note","live"),0,shared.capture,2));
+            assertThat(shared.consumers.advanceReadSequence(shared.run.context(),shared.run.membershipRevision(),"orders",2,shared.run.originalClaim())).isTrue();
+            assertThat(shared.consumers.beginWriterRun(shared.run.context(),shared.run.membershipRevision(),"current-writers",
+                    Map.of("orders",List.of("sink"),"quiet",List.of("sink")),shared.run.originalClaim())).isTrue();
+            assertThat(shared.consumers.advanceWriter(shared.run.context(),shared.run.membershipRevision(),"current-writers","orders","sink",
+                    new WriterProgress(new io.tapstate.core.event.SourceOrder(2,2),null),shared.run.originalClaim())).isTrue();
+            assertThat(shared.consumers.progress(shared.run.context()).orElseThrow().ringDoneThrough()).containsEntry("orders",2L);
+            assertThat(shared.chains.load(shared.chain).orElseThrow().checkpoint()).isEqualTo(shared.checkpoint);
+            log.trim(shared.ring("orders"),2,shared.capture);
+            assertThat(log.bounds(shared.ring("orders")).trimmedThrough()).isEqualTo(0);
+            assertThat(log.load(shared.ring("orders"),1)).isPresent();assertThat(log.load(shared.ring("orders"),2)).isPresent();
+            assertThat(shared.chains.load(shared.chain).orElseThrow().pendingFreshFull()).isEqualTo(published.chain().pendingFreshFull());
+            var tables=new java.util.TreeMap<String,SrsTableCheckpoint>();
+            published.progress().snapshot().models().forEach((name,key) -> tables.put(name,
+                    new SrsTableCheckpoint(key,name.equals("orders")?2:published.progress().ringDoneThrough().get(name))));
+            var complete=new SrsCaptureCheckpoint(new io.tapstate.core.event.ChainPosition(new io.tapstate.core.event.SourceOrder(2,1),"actual-complete-batch"),tables,true);
+            assertThat(shared.chains.checkpoint(shared.chain,1,complete,shared.capture).orElseThrow().pendingFreshFull()).isNull();
+            log.trim(shared.ring("orders"),2,shared.capture);
+            assertThat(log.bounds(shared.ring("orders")).trimmedThrough()).isEqualTo(2);
+            assertThat(log.load(shared.ring("orders"),1)).isEmpty();assertThat(log.load(shared.ring("orders"),2)).isEmpty();
+        });
+    }
+
     @Test void anExplicitSuccessorFullCanRetireTheProtectedPinWithoutReauthorizingTheOldFull() {
         withFixture(true,f -> {
             var shared=preparedSharedFull(f);var frozen=shared.consumers.inspectFreshFull(shared.full,shared.run,0,f.node,shared.capture);
