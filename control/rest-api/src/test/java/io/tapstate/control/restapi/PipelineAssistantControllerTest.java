@@ -77,6 +77,21 @@ class PipelineAssistantControllerTest {
     }
 
     @Test void blankBuilderCanHaveAUsefulAssistantConversationWithoutConfiguredSources() throws Exception {
+        verifyBlankContext(false, 0);
+    }
+    @Test void blankBuilderIncludesDiscoveredSourcesBeforeAnInputTableIsSelected() throws Exception {
+        verifyBlankContext(true, 2);
+    }
+    @Test void blankBuilderRequestsSelectionWhenThereAreTooManySources() throws Exception {
+        verifyBlankContext(true, 4);
+    }
+    @Test void blankBuilderRequestsSelectionWhenThereAreTooManyTables() throws Exception {
+        verifyBlankContext(true, 1, 41);
+    }
+    private void verifyBlankContext(boolean discovered, int sourceCount) throws Exception {
+        verifyBlankContext(discovered, sourceCount, 1);
+    }
+    private void verifyBlankContext(boolean discovered, int sourceCount, int tableCount) throws Exception {
         PipelineDraft configured = draft();
         PipelineDraft blank = new PipelineDraft("blank", 1, 1, PipelineDraft.Mode.WIZARD, "Blank", null, null,
                 new PipelineDraft.Wizard(null, List.of(), List.of(), configured.wizard().output()),
@@ -84,9 +99,16 @@ class PipelineAssistantControllerTest {
         var store = new PipelineApiTest.FakePipelineDraftStore();
         store.create(blank);
         var artifacts = new PipelineApiTest.FakeArtifactStore();
+        artifacts.seed("version: tapstate/v1\nkind: source\nid: dst\nconnector: mongodb\nconfig: {}\n");
+        for (int i = 0; i < sourceCount; i++) artifacts.seed("version: tapstate/v1\nkind: source\nid: src" + i + "\nconnector: mysql\nmode: cdc\nconfig: {}\n");
         var schemaStore = new SchemaStore() {
             public void save(DiscoveredSourceModel ignored) { throw new AssertionError("must not write schema"); }
-            public Optional<DiscoveredSourceModel> get(String id) { return Optional.empty(); }
+            public Optional<DiscoveredSourceModel> get(String id) {
+                return discovered ? Optional.of(new DiscoveredSourceModel(id, "mysql", 1,
+                        new io.tapstate.spi.store.SourceModel(java.util.stream.IntStream.range(0, tableCount)
+                        .mapToObj(i -> new io.tapstate.spi.store.SourceTable(i == 0 ? "orders" : "orders_" + i,
+                        List.of(new io.tapstate.spi.store.SourceField("id", "integer")), List.of("id"), List.of())).toList()))) : Optional.empty();
+            }
         };
         var audit = new AuditGate(new PipelineApiTest.RecordingAuditStore(), Clock.systemUTC());
         var services = new PipelineApiTest.TestApp();
@@ -96,7 +118,7 @@ class PipelineAssistantControllerTest {
                 services.artifactQueryService(artifacts), services.artifactMutationService(artifacts, audit),
                 new SourceRepresentation(TapstateCatalog::load));
         var beans = new DefaultListableBeanFactory();
-        beans.registerSingleton("drafts", new PipelineDraftService(store));
+        beans.registerSingleton("drafts", new PipelineDraftService(store, services.artifactQueryService(artifacts), audit, apply));
         beans.registerSingleton("sources", sources);
         beans.registerSingleton("schemas", new io.tapstate.control.core.SourceSchemaQueryService(artifacts, schemaStore));
         AtomicReference<Map<String, Object>> sentContext = new AtomicReference<>();
@@ -120,11 +142,21 @@ class PipelineAssistantControllerTest {
         response.getBody().writeTo(output);
         String stream = output.toString(StandardCharsets.UTF_8);
 
-        assertThat(sentContext.get()).containsKey("currentWizard").containsEntry("sources", List.of())
-                .containsEntry("proposalEnabled", false);
+        assertThat(sentContext.get()).containsKey("currentWizard")
+                .containsEntry("proposalEnabled", discovered && sourceCount <= 3 && sourceCount * tableCount <= 40);
+        if (sourceCount > 3 || sourceCount * tableCount > 40) assertThat(sentContext.get()).containsEntry("scopeSelectionRequired", true);
+        else assertThat((List<?>) sentContext.get().get("sources")).hasSize(sourceCount);
         assertThat(stream).contains("Connect a PostgreSQL or MySQL Source", "data-status", "complete",
                 "\"finishReason\":\"stop\"")
                 .doesNotContain("data-proposal", "control.malformed-request", "\\\"type\\\":\\\"error\\\"");
+        if (sourceCount == 2 && tableCount == 1) {
+            var candidate = AssistantWizardJson.view(AssistantWizardJson.object(
+                    PipelineDraftJson.write(JsonMapper.builder().build(), configured).get("wizard")));
+            var root = new java.util.LinkedHashMap<>(AssistantWizardJson.object(candidate.get("root")));
+            root.put("source", "src0");
+            candidate.put("root", root);
+            assertThat(controller.validate("blank", 1, candidate)).containsEntry("valid", true);
+        }
         assertThat(store.get("blank")).contains(blank);
     }
 

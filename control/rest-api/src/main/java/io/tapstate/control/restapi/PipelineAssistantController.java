@@ -199,6 +199,8 @@ class PipelineAssistantController {
     private Map<String, Object> context(PipelineDraft base) {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("currentWizard", AssistantWizardJson.view(wizard(base)));
+        boolean inputSelectionPending = selectedInputSources(base).isEmpty();
+        result.put("inputSelectionPending", inputSelectionPending);
         List<Map<String, Object>> inventory = new ArrayList<>();
         for (String sourceId : inputSources(base)) {
             SourceView source;
@@ -219,6 +221,16 @@ class PipelineAssistantController {
         }
         result.put("sources", inventory);
         result.put("proposalEnabled", !inventory.isEmpty());
+        int tableCount = inventory.stream().mapToInt(source -> ((List<?>) source.get("tables")).size()).sum();
+        if (inputSelectionPending && (inventory.size() > 3 || tableCount > 40)) {
+            result.put("availableSources", inventory.stream().limit(30).map(source -> Map.of(
+                    SOURCE_ID, source.get(SOURCE_ID), "tableCount", ((List<?>) source.get("tables")).size(),
+                    "tables", ((List<?>) source.get("tables")).stream().limit(20)
+                            .map(table -> ((Map<?, ?>) table).get("name")).toList())).toList());
+            result.put("sources", List.of());
+            result.put("proposalEnabled", false);
+            result.put("scopeSelectionRequired", true);
+        }
         if (JsonWriter.write(result).length() > 120000) {
             result.put("sources", List.of());
             result.put("proposalEnabled", false);
@@ -228,6 +240,9 @@ class PipelineAssistantController {
         return result;
     }
     private void enforceScope(PipelineDraft base, Map<String, Object> candidate) {
+        if (selectedInputSources(base).isEmpty() && !Boolean.TRUE.equals(context(base).get("proposalEnabled"))) {
+            throw malformed("select an input Source and table before proposing a pipeline for a large schema");
+        }
         Set<String> allowed = inputSources(base);
         List<Map<String, Object>> inputs = new ArrayList<>(); inputs.add(AssistantWizardJson.object(candidate.get("root")));
         inputs.addAll(AssistantWizardJson.list(candidate.get("related")).stream().map(AssistantWizardJson::object).toList());
@@ -296,6 +311,21 @@ class PipelineAssistantController {
                 Map.of("id", base.pipelineId(), "reason", reason), null);
     }
     private Set<String> inputSources(PipelineDraft draft) {
+        Set<String> selected = selectedInputSources(draft);
+        if (!selected.isEmpty()) return selected;
+        Set<String> available = new LinkedHashSet<>();
+        SourceProjectionService projection = sources.getIfAvailable();
+        SourceSchemaQueryService schemaQuery = schemas.getIfAvailable();
+        if (projection == null || schemaQuery == null) return available;
+        for (SourceView source : projection.list()) {
+            String connector = source.connector().toLowerCase(java.util.Locale.ROOT);
+            if (!connector.contains("postgres") && !connector.contains("mysql")) continue;
+            var schema = schemaQuery.find(source.id()).orElse(null);
+            if (schema != null && !schema.tables().isEmpty()) available.add(source.id());
+        }
+        return available;
+    }
+    private Set<String> selectedInputSources(PipelineDraft draft) {
         Set<String> ids = new LinkedHashSet<>();
         if (draft.wizard().root() != null && draft.wizard().root().sourceId() != null && !draft.wizard().root().sourceId().isBlank()) ids.add(draft.wizard().root().sourceId());
         for (var related : draft.wizard().related()) if (related.sourceId() != null && !related.sourceId().isBlank()) ids.add(related.sourceId());

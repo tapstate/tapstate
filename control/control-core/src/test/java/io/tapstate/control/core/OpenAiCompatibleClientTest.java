@@ -38,6 +38,32 @@ class OpenAiCompatibleClientTest {
         });
     }
 
+    @Test void blankInputCanAskForClarificationInsteadOfForcingAProposal() throws Exception {
+        var received = new java.util.concurrent.atomic.AtomicReference<Map<?, ?>>();
+        var server = com.sun.net.httpserver.HttpServer.create(new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/chat/completions", exchange -> {
+            received.set((Map<?, ?>) JsonReader.parse(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8)));
+            byte[] bytes = (chunk(Map.of("content", "Which input table should anchor the output?"), "stop")
+                    + "data: [DONE]\n\n").getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, bytes.length);
+            try (var output = exchange.getResponseBody()) { output.write(bytes); }
+        });
+        server.start();
+        try {
+            var settings = new AiProviderSettings("openai-compatible", "http://127.0.0.1:" + server.getAddress().getPort(), "test", "sk-test");
+            List<String> text = new ArrayList<>();
+            var result = localClient().propose(settings, List.of(Map.of("role", "user", "content", "Create a pipeline")),
+                    Map.of("proposalEnabled", true, "inputSelectionPending", true), text::add);
+            assertThat(result).isEmpty();
+            assertThat(received.get().containsKey("tools")).isTrue();
+            assertThat(received.get().containsKey("tool_choice")).isFalse();
+            assertThat(String.join("", text)).contains("Which input table");
+            localClient().propose(settings, List.of(Map.of("role", "user", "content", "Create a pipeline")),
+                    Map.of("proposalEnabled", false, "scopeSelectionRequired", true), ignored -> { });
+            assertThat(received.get().containsKey("tools")).isFalse();
+        } finally { server.stop(0); }
+    }
+
     @Test void acceptsOnlyCompletedToolArgumentsAndKeepsTextSeparate() throws Exception {
         String arguments = JsonWriter.write(Map.of("candidateWizard", Map.of("root", Map.of("table", "orders"))));
         String stream = chunk(Map.of("content", "Inspecting selected schema."), null)
