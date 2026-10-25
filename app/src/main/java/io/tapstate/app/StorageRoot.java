@@ -382,9 +382,16 @@ final class StorageRoot implements AutoCloseable {
                 }
             }
             @Override public StorageRecoveryService.Presentation present(StorageRecoveryCommands.Plan original) {
+                requireOpen();
                 if (original.manifest().selection().extent() == StorageRecoveryCommands.Extent.CLUSTER)
                     return new StorageRecoveryService.Presentation(runtime.boundForObservation()
                             .map(bound -> bound.preparation().authScope().equals(original.originalScope())).orElse(false), List.of(), recoveryFailureCode(original));
+                if (runtime.businessForLiveness().isEmpty()) {
+                    requireOpen();
+                    if (original.manifest().selection().extent() == StorageRecoveryCommands.Extent.PIPELINE)
+                        return new StorageRecoveryService.Presentation(false, List.of(), recoveryFailureCode(original));
+                    throw StorageRuntime.unavailable();
+                }
                 synchronized(StorageRoot.this) {
                     String failure = recoveryFailureCode(original);
                     if(original.manifest().selection().extent()==StorageRecoveryCommands.Extent.SHARED_SRS)
