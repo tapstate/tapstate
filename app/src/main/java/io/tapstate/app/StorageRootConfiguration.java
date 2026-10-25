@@ -166,9 +166,11 @@ class StorageRootConfiguration {
     }
     @Bean io.tapstate.control.restapi.RuntimeHttpHandlers runtimeHttpHandlers(StorageRoot root) {
         return request -> {
-            var business = root.runtime().business();
-            return business.isPresent() && business.orElseThrow() instanceof io.tapstate.control.restapi.RuntimeHttpHandlers handlers
+            var business = root.runtime().businessForLiveness();
+            var selected = business.isPresent() && business.orElseThrow() instanceof io.tapstate.control.restapi.RuntimeHttpHandlers handlers
                     ? handlers.handlerFor(request) : null;
+            root.requireActive();
+            return selected;
         };
     }
     @Bean StorageControlDispatcher storageControlDispatcher(OperationRegistry operations, ObjectProvider<StorageSetupService> setups,

@@ -85,6 +85,9 @@ class StorageAuthenticationDuringStartupIT {
                     service.confirm("fixture", scope, proof.requireActive(), planned.operationId(), planned.planHash(), planned.controlRevision(), true);
                     scheduled.set(true);
                     assertThat(entered.await(10, TimeUnit.SECONDS)).isTrue();
+                    assertThat(executor.submit(() -> new StorageRootConfiguration().runtimeHttpHandlers(root)
+                            .handlerFor(new org.springframework.mock.web.MockHttpServletRequest("GET", "/")))
+                            .get(2, TimeUnit.SECONDS)).isNull();
                     var current = executor.submit(() -> {
                         var result = service.status(scope, proof.requireActive(), planned.operationId()).orElseThrow();
                         assertThat(result.phase()).isEqualTo(io.tapstate.spi.store.StorageRecoveryCommands.Phase.RUNNING);
