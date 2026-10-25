@@ -337,7 +337,7 @@ public final class PipelineDraftCompiler {
         }
         Set<String> unique = new LinkedHashSet<>();
         for (Object value : values) {
-            if (!(value instanceof String input)) {
+            if (!(value instanceof String input) || !input.equals(input.trim())) {
                 throw new IllegalArgumentException("wizard union input must be a source-qualified table reference");
             }
             int separator = input.indexOf('.');
