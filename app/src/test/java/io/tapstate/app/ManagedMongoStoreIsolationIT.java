@@ -1014,7 +1014,7 @@ class ManagedMongoStoreIsolationIT {
                 post.apply("/api/storage/recovery/confirm",Map.of("operationId",planned.get("operationId"),"planHash",planned.get("planHash"),
                         "controlRevision",planned.get("controlRevision"),"confirmed",true));
                 org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(35)).untilAsserted(() -> {
-                    var failed=(TapstateException)org.springframework.test.util.ReflectionTestUtils.getField(root,"recoveryFailure");
+                    var failed=root.recoveryFailure().orElse(null);
                     if(failed!=null)throw failed;
                     assertThat(post.apply("/api/storage/recovery/status",Map.of("operationId",planned.get("operationId"))).get("phase")).isEqualTo("COMPLETE");
                     assertThat(root.runtime().businessStarted()).isTrue();
@@ -1055,7 +1055,7 @@ class ManagedMongoStoreIsolationIT {
                 assertThat((List<?>)full.get("targetPolicies")).hasSize(1);
                 post.apply("/api/storage/recovery/confirm",Map.of("operationId",full.get("operationId"),"planHash",full.get("planHash"),"controlRevision",full.get("controlRevision"),"confirmed",true));
                 org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(60)).untilAsserted(() -> {
-                    var failed=(TapstateException)org.springframework.test.util.ReflectionTestUtils.getField(root,"recoveryFailure");if(failed!=null)throw failed;
+                    var failed=root.recoveryFailure().orElse(null);if(failed!=null)throw failed;
                     assertThat(post.apply("/api/storage/recovery/status",Map.of("operationId",full.get("operationId"))).get("phase")).isEqualTo("COMPLETE");
                     var business=(NativeBusinessContext)root.runtime().business().orElseThrow();
                     assertThat(io.tapstate.core.lifecycle.StateJson.parse(business.statusStore().state().read("a").orElseThrow().stateJson())).isEqualTo(io.tapstate.core.lifecycle.PipelineState.COMPLETED);

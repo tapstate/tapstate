@@ -24,7 +24,7 @@ final class StorageRuntime implements AutoCloseable {
     }
     private final MongoConfigurationDomain configuration;
     private final Function<StorageBinding, MongoCacheDomain> connections;
-    private Bound bound;
+    private volatile Bound bound;
     private volatile AutoCloseable business;
     private volatile boolean closed;
     private volatile boolean cleanupUnknown;
@@ -77,6 +77,10 @@ final class StorageRuntime implements AutoCloseable {
     }
 
     synchronized Optional<Bound> current() { requireOpen(); return Optional.ofNullable(bound); }
+    /** Read-only progress compares a published identity without joining candidate startup. */
+    Optional<Bound> boundForObservation() {
+        requireOpen(); var original = bound; requireOpen(); return Optional.ofNullable(original);
+    }
     boolean cleanupRequired() { return cleanupUnknown; }
 
     /** Retires this process's original owners before loading a newly published authentication scope. */

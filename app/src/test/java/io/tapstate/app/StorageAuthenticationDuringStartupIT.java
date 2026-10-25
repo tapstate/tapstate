@@ -28,6 +28,87 @@ import org.testcontainers.utility.DockerImageName;
 class StorageAuthenticationDuringStartupIT {
     @ParameterizedTest
     @EnumSource(StorageBinding.Mode.class)
+    void theOriginalRecoveryResultIsReadableWhileItsBusinessOwnerIsStarting(StorageBinding.Mode mode) throws Exception {
+        try (var mongo = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))) {
+            mongo.start();
+            var stored = NativeAppStorage.create(mongo, "recovery_during_start", mode, "cluster-" + UUID.randomUUID());
+            try (var client = com.mongodb.client.MongoClients.create(stored.cacheUri())) {
+                client.getDatabase(stored.cacheDatabase()).drop();
+            }
+            var mongoProperties = new MongoProperties(); mongoProperties.setUri(stored.configurationUri());
+            var properties = new CloudProperties();
+            if (mode == StorageBinding.Mode.CLOUD) {
+                properties.setBaseUrl("https://cloud.example"); properties.setClusterId(stored.clusterId());
+                properties.setAtlasUri(stored.configurationUri()); properties.setToken("fixture-runtime-token");
+            }
+            var cloud = CloudRuntimeSettings.resolve(properties); var clock = Clock.systemUTC();
+            var entered = new CountDownLatch(1); var release = new CountDownLatch(1);
+            var scheduled = new java.util.concurrent.atomic.AtomicBoolean();
+            var executor = Executors.newFixedThreadPool(2);
+            try (var root = new StorageRoot(mongoProperties, cloud,
+                    mode == StorageBinding.Mode.CLOUD ? new CloudSdkBridge(cloud, new Provider(stored.clusterId(), clock)) : null,
+                    BootId.fresh(), new MetricsHistoryProperties(), new RandomTokenSecrets(), clock, new byte[32])) {
+                try {
+                    root.loadExisting(ignored -> new StorageRuntime.Business() {
+                        @Override public void start() {
+                            entered.countDown();
+                            try { if (!release.await(20, TimeUnit.SECONDS)) throw new AssertionError("recovery gate was not released"); }
+                            catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new AssertionError(interrupted); }
+                        }
+                        @Override public void close() {}
+                    }, () -> org.mockito.Mockito.mock(io.tapstate.control.core.StorageSetupService.DefaultTarget.class));
+                    String credential = mode == StorageBinding.Mode.CLOUD
+                            ? root.managedAuthentication().service().exchangeCode("fresh", "cluster.example").token()
+                            : root.localAuthentication().login().login(NativeAppStorage.USERNAME, NativeAppStorage.PASSWORD);
+                    var proof = root.authentication().credentials().authenticateContext(credential).orElseThrow();
+                    var scope = proof.storageScope().orElseThrow();
+                    var service = root.recoveryService(clock);
+                    var planned = service.plan("fixture", scope, proof.requireActive(), new io.tapstate.spi.store.StorageRecoveryCommands.Selection(
+                            io.tapstate.spi.store.StorageRecoveryCommands.Extent.CLUSTER, java.util.Set.of()), null, null);
+                    var monitorEntered = new CountDownLatch(1); var monitorRelease = new CountDownLatch(1);
+                    var holding = executor.submit(() -> {
+                        synchronized (root) {
+                            monitorEntered.countDown();
+                            try { if (!monitorRelease.await(20, TimeUnit.SECONDS)) throw new AssertionError("monitor gate was not released"); }
+                            catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new AssertionError(interrupted); }
+                        }
+                    });
+                    try {
+                        assertThat(monitorEntered.await(10, TimeUnit.SECONDS)).isTrue();
+                        assertThat(executor.submit(() -> service.presentation(planned)).get(2, TimeUnit.SECONDS).current()).isTrue();
+                    } finally {
+                        monitorRelease.countDown(); holding.get(10, TimeUnit.SECONDS);
+                    }
+                    service.confirm("fixture", scope, proof.requireActive(), planned.operationId(), planned.planHash(), planned.controlRevision(), true);
+                    scheduled.set(true);
+                    assertThat(entered.await(10, TimeUnit.SECONDS)).isTrue();
+                    var current = executor.submit(() -> {
+                        var result = service.status(scope, proof.requireActive(), planned.operationId()).orElseThrow();
+                        assertThat(result.phase()).isEqualTo(io.tapstate.spi.store.StorageRecoveryCommands.Phase.RUNNING);
+                        assertThat(service.presentation(result).current()).isTrue();
+                        return result;
+                    }).get(2, TimeUnit.SECONDS);
+                    assertThat(current.operationId()).isEqualTo(planned.operationId());
+                    assertThat(release.getCount()).isEqualTo(1);
+                    if (mode == StorageBinding.Mode.CLOUD) {
+                        var status = new StagedCloudRuntimeConfiguration().cloudRuntimeStatusProvider(cloud, root, clock);
+                        executor.submit(() -> assertThatThrownBy(status::snapshot).isInstanceOfSatisfying(TapstateException.class,
+                                failure -> assertThat(failure.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE)))
+                                .get(2, TimeUnit.SECONDS);
+                    }
+                } finally {
+                    release.countDown();
+                    if (scheduled.get()) org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(10)).untilAsserted(() ->
+                            assertThat(root.runtime().businessStarted()).isTrue());
+                }
+            } finally {
+                executor.shutdown(); assertThat(executor.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(StorageBinding.Mode.class)
     void originalFormalLoginFinishesWhileBusinessStartupRemainsBlocked(StorageBinding.Mode mode) throws Exception {
         duringStartup(mode, false, false);
     }

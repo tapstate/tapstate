@@ -57,7 +57,7 @@ class RecoveryContinuationOrderingTest {
         verify(business,never()).sharedRecovery();assertThat(executor.queued.get()).isNotNull();executor.runQueued();
         if(availabilityFails) {
             assertThat(root.phase()).isEqualTo(StorageRoot.Phase.BUSINESS_READY);verify(business,never()).sharedRecovery();verifyNoInteractions(shared);
-            assertThat(ReflectionTestUtils.getField(root,"recoveryFailure")).isInstanceOf(io.tapstate.core.common.TapstateException.class);return;
+            assertThat(root.recoveryFailure().orElse(null)).isInstanceOf(io.tapstate.core.common.TapstateException.class);return;
         }
         verify(shared).run(plan);
         var order=inOrder(runtime,business);order.verify(runtime).startBusiness(bound,assembly);
@@ -100,7 +100,7 @@ class RecoveryContinuationOrderingTest {
         executor.runQueued();
         verify(intents,never()).startRecovered(any(),anyLong(),anyString());
         verify(preparer,never()).prepareRecovered(any(),any(),any());
-        assertThat(ReflectionTestUtils.getField(root,"recoveryFailure")).isInstanceOf(io.tapstate.core.common.TapstateException.class);
+        assertThat(root.recoveryFailure().orElse(null)).isInstanceOf(io.tapstate.core.common.TapstateException.class);
     }
     private static final class ManualExecutor extends AbstractExecutorService {
         final AtomicReference<Runnable> queued=new AtomicReference<>();

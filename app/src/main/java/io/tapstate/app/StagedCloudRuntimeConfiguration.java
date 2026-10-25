@@ -20,10 +20,11 @@ class StagedCloudRuntimeConfiguration {
         Instant started = clock.instant();
         return () -> {
             var runtime = root.runtime();
-            var original = runtime.business().orElse(null);
+            var original = runtime.businessForLiveness().orElse(null);
             if (original instanceof NativeBusinessContext business && business.available()) {
                 var projection = new StoreBackedCloudRuntimeStatusProvider(business.statusStore(), RuntimeVersion.current(), clock, started).snapshot();
-                if (!business.available() || runtime.business().orElse(null) != original) throw StorageRuntime.unavailable();
+                if (!business.available() || runtime.businessForLiveness().orElse(null) != original) throw StorageRuntime.unavailable();
+                root.requireActive();
                 return projection;
             }
             var configuration = runtime.requireConfiguration();
