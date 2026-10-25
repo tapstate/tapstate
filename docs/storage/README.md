@@ -287,7 +287,8 @@ drop, deletion of a claim or administrator record, manual generation edits, or a
 ## Transfer selected configuration
 
 Use **Transfer configuration** in Settings with ordinary administrator authorization and admitted
-storage. This moves selected definitions; it is not a backup of the installation or runtime state.
+storage. The section is collapsed by default; select its heading to open the controls.
+This moves selected definitions; it is not a backup of the installation or runtime state.
 
 1. Generate an independent random 32-byte key encoded as unpadded base64url (43 characters).
    Keep it securely and separately from the exported file; the server does not retain or return it.
