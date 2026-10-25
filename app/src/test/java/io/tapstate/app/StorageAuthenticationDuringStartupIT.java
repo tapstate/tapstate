@@ -75,6 +75,9 @@ class StorageAuthenticationDuringStartupIT {
                     });
                     try {
                         assertThat(monitorEntered.await(10, TimeUnit.SECONDS)).isTrue();
+                        var observedService = executor.submit(() -> root.recoveryService(clock)).get(2, TimeUnit.SECONDS);
+                        assertThat(observedService.status(scope, proof.requireActive(), planned.operationId()).orElseThrow()
+                                .operationId()).isEqualTo(planned.operationId());
                         assertThat(executor.submit(() -> service.presentation(planned)).get(2, TimeUnit.SECONDS).current()).isTrue();
                     } finally {
                         monitorRelease.countDown(); holding.get(10, TimeUnit.SECONDS);

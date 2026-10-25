@@ -352,7 +352,8 @@ final class StorageRoot implements AutoCloseable {
         } catch (TapstateException unavailable) { phase = Phase.CACHE_UNAVAILABLE; }
     }
 
-    synchronized StorageRecoveryService recoveryService(Clock clock) {
+    StorageRecoveryService recoveryService(Clock clock) {
+        requireOpen();
         var configuration = runtime.requireConfiguration();
         return new StorageRecoveryService(configuration.recoveryCommands(), new StorageRecoveryService.Inspector() {
             @Override public StorageRecoveryCommands.Manifest inspect(CacheAuthScope scope, StorageRecoveryCommands.Selection selection) {

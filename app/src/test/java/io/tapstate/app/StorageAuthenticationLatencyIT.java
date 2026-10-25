@@ -71,6 +71,23 @@ class StorageAuthenticationLatencyIT {
     }
 
     @Test
+    void healthyCloudAuthenticationDoesNotRepeatAuthorityBetweenItsSessionReads() {
+        withCloud(Change.NONE, fixture -> {
+            var admin = fixture.raw.getDatabase("admin");
+            String namespace = fixture.cacheDatabase + "." + SystemCollections.CACHE_IDENTITY.collectionName();
+            admin.runCommand(new Document("configureFailPoint", "failCommand")
+                    .append("mode", "alwaysOn").append("data", new Document("failCommands", List.of("find"))
+                            .append("namespace", namespace).append("blockConnection", true).append("blockTimeMS", 2300)));
+            try {
+                var proof = fixture.authentication.credentials().authenticateContext(fixture.cookie).orElseThrow();
+                assertThat(proof.organizationId()).contains("organization");
+            } finally {
+                admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
+            }
+        });
+    }
+
+    @Test
     void healthyCloudRevalidationDoesNotRepeatAdjacentAuthorityChecks() {
         withCloud(Change.NONE, fixture -> {
             var proof = fixture.authentication.credentials().authenticateContext(fixture.cookie).orElseThrow();

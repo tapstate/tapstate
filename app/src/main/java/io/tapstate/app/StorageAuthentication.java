@@ -83,10 +83,25 @@ final class StorageAuthentication implements AutoCloseable {
         if (current.get() == null && bootstrap != null) return bootstrap.authenticate(presented);
         var budget = new MongoReadBudget(AUTHORIZATION_READ_BUDGET);
         Epoch original = selected();
-        Optional<VerifiedToken> verified = original.authenticate(presented, budget);
+        Optional<VerifiedToken> verified;
+        if (cloud.cloud()) {
+            original.requireActive(budget);
+            verified = original.managed(budget).authenticate(presented);
+            // The context read below rechecks the durable session; retain the local owner fence here.
+            original.requireLocallyActive();
+        } else {
+            verified = original.authenticate(presented, budget);
+        }
         if (verified.isEmpty()) return Optional.empty();
-        Optional<String> organization = cloud.cloud()
-                ? original.managed(budget).clusterContext(presented).map(CloudSessionContext::organizationId) : Optional.empty();
+        Optional<String> organization = Optional.empty();
+        if (cloud.cloud()) {
+            try {
+                organization = original.managed(budget).clusterContext(presented).map(CloudSessionContext::organizationId);
+            } catch (TapstateException failure) {
+                if (failure.code() == IoError.CACHE_AUTH_FENCED) throw StorageRuntime.unavailable();
+                throw failure;
+            }
+        }
         original.requireActive(budget);
         if (cloud.cloud() && organization.isEmpty()) return Optional.empty();
         VerifiedToken identity = verified.orElseThrow();
@@ -181,13 +196,15 @@ final class StorageAuthentication implements AutoCloseable {
         }
         void requireActive() { requireActive(new MongoReadBudget(AUTHORIZATION_READ_BUDGET)); }
         void requireActive(MongoReadBudget budget) {
-            bound.requireAuthentication();
-            if (closed || current.get() != this) throw unauthenticated();
+            requireLocallyActive();
             try {
                 configuration.requireAuthenticationPublished(bound.preparation(), budget);
                 bound.cache().loadAuthScope(bound.preparation().authScope(), budget);
             }
             catch (TapstateException unavailable) { throw StorageRuntime.unavailable(); }
+            requireLocallyActive();
+        }
+        void requireLocallyActive() {
             bound.requireAuthentication();
             if (closed || current.get() != this) throw unauthenticated();
         }
