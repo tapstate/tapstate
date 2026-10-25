@@ -8,9 +8,12 @@ import io.tapstate.spi.store.*;
 import java.time.Clock;
 import java.util.*;
 import java.util.function.Function;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /** CONFIG-first production ownership. Reads cannot turn an unavailable existing installation into a new one. */
 final class StorageRoot implements AutoCloseable {
+    private static final Logger LOG = LoggerFactory.getLogger(StorageRoot.class);
     enum Phase { CONFIGURATION_REQUIRED, CONFIGURATION_UNAVAILABLE, SETUP_REQUIRED, CACHE_UNAVAILABLE, AUTH_READY, BUSINESS_READY }
     private final CloudRuntimeSettings cloud;
     private volatile StorageRuntime runtime;
@@ -230,6 +233,7 @@ final class StorageRoot implements AutoCloseable {
             }
         } catch (TapstateException unavailable) {
             if (unavailable.code() == BootError.NODE_ID_IN_USE) throw unavailable;
+            LOG.warn("Retained storage startup failed [{}]", unavailable.code().code());
             if (phase != Phase.AUTH_READY) phase = Phase.CACHE_UNAVAILABLE;
         }
     }

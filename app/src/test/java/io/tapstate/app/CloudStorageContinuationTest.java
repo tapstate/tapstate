@@ -1,5 +1,8 @@
 package io.tapstate.app;
 
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import io.tapstate.adapters.mongostore.*;
 import io.tapstate.control.core.*;
 import io.tapstate.core.common.TapstateException;
@@ -10,6 +13,7 @@ import java.util.*;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.mockito.MockedStatic;
+import org.slf4j.LoggerFactory;
 import static org.assertj.core.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
@@ -80,6 +84,33 @@ class CloudStorageContinuationTest {
         @Override public boolean isShutdown() { return closed; }
         @Override public boolean isTerminated() { return closed; }
         @Override public boolean awaitTermination(long timeout, java.util.concurrent.TimeUnit unit) { return closed; }
+    }
+
+    @Test void retainedBusinessStartupFailureIsDiagnosableWithoutExposingSensitiveDetails() {
+        try (var f = new Fixture()) {
+            f.phase.set(StorageSetupStateStore.Phase.COMPLETE);
+            Logger logger = (Logger) LoggerFactory.getLogger(StorageRoot.class);
+            var previousLevel = logger.getLevel();
+            ListAppender<ILoggingEvent> events = new ListAppender<>();
+            events.setContext(logger.getLoggerContext()); events.start();
+            logger.setLevel(ch.qos.logback.classic.Level.WARN); logger.addAppender(events);
+            try {
+                f.root.loadExisting(ignored -> {
+                    throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                            Map.of("reason", "business-param-secret-sentinel"),
+                            new IllegalArgumentException("business-cause-secret-sentinel"));
+                });
+                assertThat(f.root.phase()).isEqualTo(StorageRoot.Phase.AUTH_READY);
+                assertThat(f.root.runtime().businessStarted()).isFalse();
+                assertThat(events.list).singleElement().satisfies(event -> {
+                    assertThat(event.getFormattedMessage()).contains(ControlError.MALFORMED_REQUEST.code())
+                            .doesNotContain("secret-sentinel");
+                    assertThat(event.getThrowableProxy()).isNull();
+                });
+            } finally {
+                logger.detachAppender(events); events.stop(); logger.setLevel(previousLevel);
+            }
+        }
     }
 
     @Test void completionUsesSavedTrustClosesTemporaryAuthenticationAndStartsOnlyOneBusinessOwner() {
