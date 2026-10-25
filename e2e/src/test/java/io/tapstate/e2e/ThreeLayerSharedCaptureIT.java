@@ -39,6 +39,163 @@ class ThreeLayerSharedCaptureIT {
 
     @BeforeAll static void requireConnector() { RealConnectorGate.require("mongodb"); }
 
+    @Test @Timeout(300)
+    void everyMemberEndsTheOriginalSharedTenuresWithoutResettingTheUnrelatedReaderOrLosingAQuietTable() throws Exception {
+        String suffix=UUID.randomUUID().toString().replace("-","");String clusterId="shared-members-"+suffix;
+        String configDb="members_cfg_"+suffix,cacheDb="members_cache_"+suffix,configUri=CONFIG.getReplicaSetUrl(configDb);
+        String sourceUri=DATA.getReplicaSetUrl("members_source_"+suffix),secondUri=DATA.getReplicaSetUrl("members_second_"+suffix);
+        String aUri=DATA.getReplicaSetUrl("members_a_"+suffix),bUri=DATA.getReplicaSetUrl("members_b_"+suffix),cUri=DATA.getReplicaSetUrl("members_c_"+suffix);
+        NativeMongoStorageFixture.prepare(configUri,new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,
+                CACHE.getReplicaSetUrl(cacheDb),cacheDb,null),aUri,clusterId);
+        var nodes=List.of("shared-a","shared-b","shared-c");var source=EndpointAddress.uri(sourceUri);var second=EndpointAddress.uri(secondUri);
+        var a=EndpointAddress.uri(aUri);var b=EndpointAddress.uri(bUri);var c=EndpointAddress.uri(cUri);
+        try(var mongo=new MongoEndpoints();var cacheClient=MongoClients.create(CACHE.getReplicaSetUrl());var configClient=MongoClients.create(CONFIG.getReplicaSetUrl());
+                var cluster=PartitionableCluster.startPrepared(configUri,clusterId,nodes,NativeMongoStorageFixture.USER,NativeMongoStorageFixture.PASSWORD,
+                        List.of("--tapstate.hz.jet.cooperative-thread-count=2","--SDK_STATUS_SENDER_ENABLED=false",
+                                "--logging.level.io.tapstate.app.HazelcastOperatorReadiness=DEBUG","--logging.level.io.tapstate.app.PipelineActuationOwnership=DEBUG",
+                                "--tapstate.connectors.seed-dir="+work.resolve("no-member-seeds")))) {
+            for(String node:nodes) {
+                Await.until(node+" to admit the original native business storage",BOUND,
+                        () -> "READY".equals(cluster.member(node).storageStatus().get("businessPhase")),() -> String.valueOf(cluster.member(node).storageStatus()));
+                assertThat(cluster.awaitExactly(node,3,BOUND)).containsExactlyInAnyOrderElementsOf(nodes);
+            }
+            var beforeRoster=cluster.member(nodes.getFirst()).clusterMembers();assertThat(beforeRoster).hasSize(3);
+            assertThat(beforeRoster).extracting(ClusterMemberFacts::bootId).doesNotHaveDuplicates().allSatisfy(value -> assertThat(value).isNotBlank());
+            assertThat(beforeRoster).extracting(ClusterMemberFacts::memberUuid).doesNotHaveDuplicates().allSatisfy(value -> assertThat(value).isNotBlank());
+            for(String node:nodes)assertThat(cluster.member(node).clusterMembers()).containsExactlyInAnyOrderElementsOf(beforeRoster);
+            mongo.seed(source,"orders",SeedRows.generated(8));mongo.seed(source,"quiet",SeedRows.generated(1));mongo.seed(second,"items",SeedRows.generated(5));
+            var control=cluster.member(nodes.getFirst());control.registerConnector("mongodb",ConnectorJars.bytesFor("mongodb"));
+            var resources=new LinkedHashMap<String,String>();resources.put("views.tap.yml",control.artifact("views").orElseThrow().canonicalForm());
+            resources.put("input.tap.yml",source("input",sourceUri,"orders, quiet"));resources.put("second.tap.yml",source("second",secondUri,"items"));
+            resources.put("target_b.tap.yml",target("target_b",bUri));resources.put("target_c.tap.yml",target("target_c",cUri));
+            resources.put("reader_a.tap.yml",pipeline("reader_a",List.of("input","second"),"views",List.of("orders","quiet","items")));
+            resources.put("reader_b.tap.yml",pipeline("reader_b",List.of("input"),"target_b",List.of("orders","quiet")));
+            resources.put("reader_c.tap.yml",pipeline("reader_c",List.of("second"),"target_c",List.of("items")));
+            control.apply(resources);control.discoverSchema("input","mongodb",Map.of("isUri",true,"uri",sourceUri));
+            control.discoverSchema("second","mongodb",Map.of("isUri",true,"uri",secondUri));
+            control.lifecycle("reader_c",LifecycleVerb.START);awaitRows(mongo,second,c,"items",BOUND);
+            control.lifecycle("reader_a",LifecycleVerb.START);awaitRows(mongo,source,a,BOUND);awaitRows(mongo,source,a,"quiet",BOUND);awaitRows(mongo,second,a,"items",BOUND);
+            control.lifecycle("reader_b",LifecycleVerb.START);awaitRows(mongo,source,b,BOUND);awaitRows(mongo,source,b,"quiet",BOUND);
+            var cache=cacheClient.getDatabase(cacheDb);var config=configClient.getDatabase(configDb);
+            String canonical=membership(cache,"reader_b","input").get("_id",Document.class).getString("chain");
+            String keptChain=membership(cache,"reader_c","second").get("_id",Document.class).getString("chain");
+            var keptRoot=cache.getCollection("srs_chains").find(new Document("_id",keptChain)).first();
+            var keptModels=cache.getCollection("srs_models").find(new Document("_id.chain",keptChain)).sort(new Document("_id",1)).into(new ArrayList<>());
+            var cMember=membership(cache,"reader_c","second");var cOffset=offset(cache,keptChain,"reader_c","second");
+            long cExecution=Await.answered("C's original multi-member execution",BOUND,() -> control.executionGenerationOf("reader_c"));
+            for(String id:List.of("reader_a","reader_b")) {
+                control.stop(id,false);Await.until(id+" to stop across the original members",BOUND,
+                        () -> control.state(id).filter(PipelineState.STOPPED::equals).isPresent(),() -> control.failureCode(id).toString());
+            }
+            var remoteClaim=cache.getCollection("workload_claims").find(new Document("resourceType","PIPELINE_ACTUATION").append("resourceId","reader_a")
+                    .append("$expr",new Document("$gt",List.of("$leaseUntil","$$NOW")))).first();assertThat(remoteClaim).isNotNull();
+            String originalOwner=remoteClaim.getString("ownerNodeId");assertThat(nodes).contains(originalOwner);
+            String requester=nodes.stream().filter(node -> !node.equals(originalOwner)).findFirst().orElseThrow();
+            var recovery=cluster.member(requester);assertThat(requester).isNotEqualTo(originalOwner);
+            var lost=cache.getCollection("srs_models").find(new Document("_id.chain",canonical)).into(new ArrayList<>());assertThat(lost).isNotEmpty();
+            for(var model:lost)assertThat(cache.getCollection("srs_models").deleteOne(new Document("_id",model.get("_id"))).getDeletedCount()).isOne();
+            Map<?,?> preview;
+            try {preview=explicitSharedPreview(recovery,canonical);}
+            catch(RuntimeException|Error failed){captureDiagnostic(config,cache,canonical);throw failed;}
+            assertThat(preview.get("affectedPipelineIds")).isEqualTo(List.of("reader_a","reader_b"));assertThat(preview.get("preflightCurrent")).isEqualTo(true);
+            var beforeConfirmation=storage(recovery,"status",Map.of("operationId",preview.get("operationId")));
+            assertThat(beforeConfirmation.get("phase")).isEqualTo("PLANNED");
+            assertThat(beforeConfirmation.get("controlRevision")).isEqualTo(preview.get("controlRevision"));
+            assertThat(beforeConfirmation.get("planHash")).isEqualTo(preview.get("planHash"));
+            assertThat(config.getCollection("capture_preparations").countDocuments(new Document("currentRecovery.operationId",preview.get("operationId")))).isZero();
+            assertThat(config.getCollection("operator_generations").countDocuments(new Document("sharedRecovery.operationId",preview.get("operationId")))).isZero();
+            assertThat(cache.getCollection("srs_chains").find(new Document("_id",canonical)).first()).doesNotContainKey("recoveryControl");
+            var ended=cache.getCollection("workload_claims").find(new Document("_id",remoteClaim.get("_id"))).first();assertThat(ended).isNotNull();
+            for(String field:List.of("clusterId","resourceType","resourceId","ownerNodeId","ownerBootId","claimGeneration","executionGeneration","topologyRevision"))
+                assertThat(ended.get(field)).as("the exact remotely ended tenure's %s",field).isEqualTo(remoteClaim.get(field));
+            assertThat(ended.getDate("leaseUntil")).isBefore(remoteClaim.getDate("leaseUntil"));
+            assertThat(cache.getCollection("workload_claims").find(new Document("_id",remoteClaim.get("_id"))
+                    .append("$expr",new Document("$gt",List.of(remoteClaim.getDate("leaseUntil"),"$$NOW"))))).isNotEmpty();
+            assertThat(cache.getCollection("workload_claims").find(new Document("_id",remoteClaim.get("_id"))
+                    .append("$expr",new Document("$gt",List.of("$leaseUntil","$$NOW")))).first()).isNull();
+            mongo.update(second,"items",Map.of("id",2L),Map.of("seq",222L));awaitRows(mongo,second,c,"items",BOUND);
+            storage(recovery,"confirm",Map.of("operationId",preview.get("operationId"),"planHash",preview.get("planHash"),
+                    "controlRevision",preview.get("controlRevision"),"confirmed",true));
+            Await.until("every original member's verified shared recovery to complete",BOUND,() -> {
+                var status=storage(recovery,"status",Map.of("operationId",preview.get("operationId")));
+                if(status.get("executionErrorCode")!=null)throw new AssertionError("multi-member shared recovery failed: "+status);
+                return "COMPLETE".equals(status.get("phase"));
+            },() -> String.valueOf(storage(recovery,"status",Map.of("operationId",preview.get("operationId")))));
+            var mapping=config.getCollection("capture_preparations").find(new Document("currentRecovery.operationId",preview.get("operationId"))).first();assertThat(mapping).isNotNull();
+            var replacement=mapping.get("currentRecovery",Document.class);String physical=replacement.getString("physicalChain");
+            assertThat(physical).isNotBlank().isNotEqualTo(canonical);assertThat(replacement).containsEntry("phase","READY");
+            assertThat(cache.getCollection("srs_chains").find(new Document("_id",canonical)).first().get("recoveryControl",Document.class))
+                    .containsEntry("operationId",preview.get("operationId")).containsEntry("phase","RETIRED").containsEntry("replacementChain",physical);
+            for(String id:List.of("reader_a","reader_b")) {
+                assertThat(control.state(id)).contains(PipelineState.STOPPED);
+                assertThat(config.getCollection("operator_generations").find(new Document("_id",id)).first()).containsEntry("stateGeneration",1L);
+                assertThat(control.startExpectingRefusal(id).code()).isEqualTo(io.tapstate.spi.store.IoError.PIPELINE_STATE_REBUILD_REQUIRED.code());
+            }
+            kept(cache,keptChain,keptRoot,keptModels,cMember,cOffset);assertThat(control.executionGenerationOf("reader_c")).contains(cExecution);
+            for(String id:List.of("reader_a","reader_b")) {
+                control.stop(id,true);Await.until(id+" to finish its separately confirmed multi-member full preparation",BOUND,() -> {
+                    var row=config.getCollection("operator_generations").find(new Document("_id",id)).first();return row!=null && Long.valueOf(2).equals(row.get("stateGeneration"))
+                            && "ACTIVE".equals(row.getString("phase")) && control.state(id).filter(PipelineState.STOPPED::equals).isPresent();
+                },() -> String.valueOf(config.getCollection("operator_generations").find(new Document("_id",id)).first()));
+                // Remove this fixture's old quiet row so an unexecuted new full cannot borrow its value.
+                mongo.seed(id.equals("reader_a")?a:b,"quiet",List.of());
+                control.lifecycle(id,LifecycleVerb.START);awaitRows(mongo,source,id.equals("reader_a")?a:b,BOUND);
+                awaitRows(mongo,source,id.equals("reader_a")?a:b,"quiet",BOUND);
+                assertThat(membership(cache,id,"input").get("_id",Document.class)).containsEntry("chain",physical);
+                Await.until(id+" to durably confirm the new generation's real quiet snapshot",BOUND,() -> {
+                    var count=cache.getCollection("snapshot_counts").find(new Document("_id.scope.pipelineId",id).append("_id.scope.stateGeneration",2L)
+                            .append("_id.source",java.util.Base64.getUrlEncoder().withoutPadding().encodeToString("input".getBytes(java.nio.charset.StandardCharsets.UTF_16BE)))
+                            .append("_id.table",java.util.Base64.getUrlEncoder().withoutPadding().encodeToString("quiet".getBytes(java.nio.charset.StandardCharsets.UTF_16BE)))).first();
+                    var cursor=offset(cache,physical,id,"input");var progress=cursor.get("progress",Document.class);
+                    return count!=null && Long.valueOf(1).equals(count.get("rows")) && count.getLong("snapshotEpoch").equals(progress.getLong("snapshotEpoch"))
+                            && Long.valueOf(2).equals(cursor.get("stateGeneration")) && progress.getList("snapshotCompletedTables",String.class).contains("quiet");
+                },() -> "the new quiet snapshot is not yet durably confirmed");
+                mongo.update(second,"items",Map.of("id",3L),Map.of("seq",id.equals("reader_a")?333L:334L));
+                awaitRows(mongo,second,c,"items",BOUND);awaitRows(mongo,second,a,"items",BOUND);
+                assertThat(config.getCollection("capture_preparations").find(new Document("currentRecovery.operationId",preview.get("operationId"))).first()
+                        .get("currentRecovery",Document.class)).isEqualTo(replacement);
+                kept(cache,keptChain,keptRoot,keptModels,cMember,cOffset);assertThat(control.executionGenerationOf("reader_c")).contains(cExecution);
+            }
+            var quietPin=offset(cache,physical,"reader_a","input").get("snapshot",Document.class);assertThat(quietPin).isNotNull();
+            var quietModel=quietPin.getList("models",Document.class).stream().filter(value -> "quiet".equals(value.getString("table"))).findFirst().orElseThrow().get("model",Document.class);
+            assertThat(cache.getCollection("srs_models").find(new Document("_id",quietModel)).first()).isNotNull();
+            mongo.update(source,"orders",Map.of("id",4L),Map.of("seq",404L));awaitRows(mongo,source,a,BOUND);awaitRows(mongo,source,b,BOUND);
+            Await.until("the quiet table's exact model to remain in the replacement checkpoint",BOUND,() -> {
+                var root=cache.getCollection("srs_chains").find(new Document("_id",physical)).first();
+                return root!=null && root.get("checkpoint") instanceof Document checkpoint
+                        && checkpoint.getList("tables",Document.class).stream().anyMatch(value -> "quiet".equals(value.getString("table")) && quietModel.equals(value.get("model")));
+            },() -> "the replacement checkpoint does not yet reference the quiet model");
+            String capture=io.tapstate.core.model.canonical.SourceCaptureIdentity.sharedCapture(canonical);
+            String captureOwner=Await.answered("the actual recovered shared capture owner",BOUND,() -> Optional.ofNullable(control.captureOwnersOf("reader_a").get(capture)));
+            var priorBoot=cluster.member(captureOwner).clusterMembers().stream().filter(member -> member.nodeId().equals(captureOwner)).findFirst().orElseThrow();
+            restartClaimDiagnostic(cache,clusterId,"before-original-owner-restart");
+            cluster.restart(captureOwner);
+            for(String node:nodes) {
+                Await.until(node+" to admit business after the capture owner replacement",BOUND,
+                        () -> "READY".equals(cluster.member(node).storageStatus().get("businessPhase")),() -> String.valueOf(cluster.member(node).storageStatus()));
+                assertThat(cluster.awaitExactly(node,3,BOUND)).containsExactlyInAnyOrderElementsOf(nodes);
+            }
+            var nextBoot=cluster.member(captureOwner).clusterMembers().stream().filter(member -> member.nodeId().equals(captureOwner)).findFirst().orElseThrow();
+            assertThat(nextBoot.bootId()).isNotEqualTo(priorBoot.bootId());assertThat(nextBoot.memberUuid()).isNotEqualTo(priorBoot.memberUuid());
+            restartClaimDiagnostic(cache,clusterId,"after-new-boot-ready");
+            var current=cluster.member(requester);mongo.update(source,"orders",Map.of("id",3L),Map.of("seq",303L));
+            mongo.update(second,"items",Map.of("id",4L),Map.of("seq",444L));
+            try {
+                awaitRows(mongo,source,a,BOUND);awaitRows(mongo,source,b,BOUND);awaitRows(mongo,source,a,"quiet",BOUND);awaitRows(mongo,source,b,"quiet",BOUND);
+                awaitRows(mongo,second,a,"items",BOUND);awaitRows(mongo,second,c,"items",BOUND);
+            } finally {restartClaimDiagnostic(cache,clusterId,"after-original-cdc-wait");}
+            assertThat(offset(cache,physical,"reader_a","input").get("snapshot")).isEqualTo(quietPin);
+            assertThat(cache.getCollection("srs_models").find(new Document("_id",quietModel)).first()).isNotNull();
+            assertThat(offset(cache,keptChain,"reader_c","second").get("snapshot")).isEqualTo(cOffset.get("snapshot"));
+            for(String id:List.of("reader_a","reader_b"))assertThat(membership(cache,id,"input").get("_id",Document.class)).containsEntry("chain",physical);
+            assertThat(config.getCollection("capture_preparations").find(new Document("currentRecovery.operationId",preview.get("operationId"))).first()
+                    .get("currentRecovery",Document.class)).isEqualTo(replacement);
+            assertThat(config.getCollection("operator_generations").find(new Document("_id","reader_c")).first()).containsEntry("stateGeneration",1L);
+            for(String id:List.of("reader_a","reader_b","reader_c"))Await.until(id+" to continue after the original owner replacement",BOUND,
+                    () -> current.state(id).filter(PipelineState.RUNNING::equals).isPresent(),() -> current.failureCode(id).toString());
+        }
+    }
+
     @Test @Timeout(180)
     void aRealMongoColumnUsesTheNewModelOnlyAfterAnExplicitClearStateFullLoad() throws Exception {
         Duration columnBound=Duration.ofSeconds(60);String suffix=UUID.randomUUID().toString().replace("-","");
@@ -266,6 +423,38 @@ class ThreeLayerSharedCaptureIT {
     }
     private static Map<?,?> storage(ControlPlane control,String action,Map<String,?> request) {
         return (Map<?,?>)io.tapstate.core.common.JsonReader.parse(control.sourceRequest("POST","/api/storage/recovery/"+action,request,null,200).body());
+    }
+    private static Map<?,?> explicitSharedPreview(ControlPlane control,String canonical) {
+        var request=Map.<String,Object>of("scope","SHARED_SRS","pipelineIds",List.of(),"canonicalChain",canonical,"physicalChain",canonical);
+        var response=control.sourceResponse("POST","/api/storage/recovery/plan",request,null);
+        var result=(Map<?,?>)io.tapstate.core.common.JsonReader.parse(response.body());
+        if(response.statusCode()==200) {
+            assertThat(result.get("phase")).isEqualTo("PLANNED");return result;
+        }
+        assertThat(response.statusCode()).isEqualTo(500);
+        assertThat(result.get("code")).isEqualTo("actuation.shared-recovery-member-unavailable");
+        assertThat(((Map<?,?>)result.get("params")).get("reason")).isEqualTo("io.workload-claim-fenced");
+        var operation=control.storageStatus().get("operationId");assertThat(operation).isInstanceOf(String.class);
+        var original=storage(control,"status",Map.of("operationId",operation));
+        assertThat(original.get("phase")).isEqualTo("PLANNED");assertThat(original.get("preflightCurrent")).isEqualTo(false);
+        assertThat(original.get("canonicalChain")).isEqualTo(canonical);assertThat(original.get("physicalChain")).isEqualTo(canonical);
+        // A separate explicit preflight uses the saved operation; it neither confirms nor replaces it.
+        var recheck=new LinkedHashMap<>(request);recheck.put("operationId",operation);
+        var refreshed=storage(control,"plan",recheck);
+        assertThat(refreshed.get("phase")).isEqualTo("PLANNED");
+        assertThat(refreshed.get("operationId")).isEqualTo(operation);
+        assertThat(((Number)refreshed.get("controlRevision")).longValue()).isGreaterThan(((Number)original.get("controlRevision")).longValue());
+        assertThat(refreshed.get("planHash")).isNotEqualTo(original.get("planHash"));
+        return refreshed;
+    }
+    private static void restartClaimDiagnostic(MongoDatabase cache,String cluster,String phase) {
+        var fields=new Document("_id",0);
+        for(String field:List.of("clusterId","resourceType","resourceId","ownerNodeId","ownerBootId","claimGeneration","executionGeneration","topologyRevision","leaseUntil"))fields.append(field,1);
+        fields.append("serverNow","$$NOW").append("remainingMillis",new Document("$subtract",List.of("$leaseUntil","$$NOW")))
+                .append("observedLeased",new Document("$gt",List.of("$leaseUntil","$$NOW")));
+        var rows=cache.getCollection("workload_claims").aggregate(List.of(new Document("$match",new Document("clusterId",cluster)
+                .append("resourceType",new Document("$in",List.of("CAPTURE","PIPELINE_ACTUATION")))),new Document("$project",fields))).into(new ArrayList<>());
+        System.err.println("SHARED_RESTART_CLAIMS "+new Document("phase",phase).append("claims",rows).toJson());
     }
     private static void captureDiagnostic(MongoDatabase config,MongoDatabase cache,String canonical) {
         var root=config.getCollection("storage_recovery").find(new Document("_id","cluster")).first();

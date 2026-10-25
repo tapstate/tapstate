@@ -2319,14 +2319,19 @@ final class ControlPlane {
 
     /** The typed Source wire, including its caller-visible ETag precondition. */
     HttpResponse<String> sourceRequest(String method, String path, Map<String, ?> body, String etag, int status) {
+        HttpResponse<String> response = sourceResponse(method,path,body,etag);
+        expect(response, status, method + " " + path);
+        return response;
+    }
+
+    /** Leaves an explicitly tested alternative outcome to the calling witness's own assertions. */
+    HttpResponse<String> sourceResponse(String method,String path,Map<String,?> body,String etag) {
         HttpRequest.Builder request = authenticate(HttpRequest.newBuilder(baseUrl.resolve(path)).timeout(TIMEOUT))
                 .header("Content-Type", "application/json");
         if (etag != null) request.header("If-Match", etag);
         request.method(method, body == null ? HttpRequest.BodyPublishers.noBody()
                 : HttpRequest.BodyPublishers.ofString(JsonWriter.write(body), StandardCharsets.UTF_8));
-        HttpResponse<String> response = send(request.build());
-        expect(response, status, method + " " + path);
-        return response;
+        return send(request.build());
     }
 
     /**
