@@ -411,6 +411,24 @@ public final class MongoSrsModelStore implements SrsModelStore {
 
     void checkDomain(ClientSession session) { requireActive.run(); requireBusiness(session); }
 
+    /** Proves only the original ring's isolated control and ordering anchor, without model payload IO. */
+    boolean isolatedRingForInitialization(ClientSession session,String ring) {
+        var context=contexts.firstOnRing(session,ring);
+        var chain=SystemCollections.SRS_CHAINS.on(database).find(session,context==null
+                ? new Document("cacheIncarnation",scope.cacheIncarnation()).append("modelContextHeads.ringName",ring)
+                : new Document("_id",context.key().miningChainId())).first();
+        if(chain==null) {
+            if(context!=null)throw eventUnavailable(ring,context.key().captureEpoch(),0);
+            return false;
+        }
+        if(MongoSrsRecoveryControls.read(chain).isEmpty())return false;
+        if(context==null)throw eventUnavailable(ring,0,0);
+        var original=new MongoSrsConsumerStore(client,database,scope,requireActive,requireStructure)
+                .isolatedRootForRingInitialization(session,context.key().miningChainId());
+        contexts.requireAnchor(session,original,context);
+        return true;
+    }
+
     /** An unseen ring may be inspected only when no published ordering anchor or retained data contradicts it. */
     void checkRing(ClientSession session, String ring) {
         var control = contexts.firstOnRing(session, ring);

@@ -906,6 +906,16 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         if(isolation.orElseThrow().phase()==MongoSrsRecoveryControls.Phase.RETIRED && (state.consumerCount()!=0 || !view.cursors().isEmpty()))throw unavailable(chain);
         return view;
     }
+    /** Read-only infrastructure inspection; the caller keeps this session's original domain guard. */
+    Document isolatedRootForRingInitialization(ClientSession session,String chain) {
+        var view=administrativeView(session,chain);
+        if(MongoSrsRecoveryControls.read(view.root()).isEmpty())throw unavailable(chain);
+        var contexts=new MongoSrsModelContexts(database,scope);
+        requireRecoveryCoordinates(view,contexts);
+        var rings=contexts.heads(view.root()).stream().map(head -> head.getString("ringName")).collect(java.util.stream.Collectors.toSet());
+        requireRecoveryBounds(view,contexts,MongoSrsLogStore.inspectRetainedBounds(session,database,rings).byRing());
+        return view.root();
+    }
     private View relations(ClientSession session,String chain,Document root,SrsChainState state) {
         var membershipRows=new ArrayList<Document>();var cursorRows=new ArrayList<Document>();
         var members = new HashMap<String, SrsConsumerMembership>();

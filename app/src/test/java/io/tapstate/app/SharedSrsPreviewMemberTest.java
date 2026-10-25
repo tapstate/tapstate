@@ -19,6 +19,21 @@ class SharedSrsPreviewMemberTest {
     private static final WorkloadOwner OWNER=new WorkloadOwner("a","boot-a"),PEER=new WorkloadOwner("b","boot-b");
     private static final Duration TTL=Duration.ofSeconds(60);
 
+    @Test void theSameDurableAttemptCanFreezeAfterTheOriginalLocalPassHasClosed() {
+        try(var f=new Fixture(OWNER)) {
+            var plan=f.current.get();var original=f.raw.read(f.original.key()).orElseThrow().claim();
+            try(var pass=f.ownership.enterPass(SCOPE)) {
+                clearInvocations(f.claims);
+                assertThatThrownBy(() -> f.member.freeze(plan)).isInstanceOf(TapstateException.class);
+                verify(f.claims,never()).release(any());verify(f.claims,never()).acquire(any(),any(),anyLong(),any());
+                assertThat(f.raw.read(f.original.key()).orElseThrow().claim()).isEqualTo(original);
+            }
+            f.member.freeze(plan);f.member.requireHeld(plan);f.member.endOwnedTenures(plan);f.member.requireEnded(plan);
+            var ended=f.raw.read(f.original.key()).orElseThrow();assertThat(ended.leased()).isFalse();
+            assertThat(WorkloadClaimFence.from(ended.claim())).isEqualTo(f.fence);
+        }
+    }
+
     @Test void theDurableAttemptHoldsOnlyItsActualScopeUntilItsOriginalOwnerEndsTheTenure() {
         try(var f=new Fixture(OWNER)) {
             var plan=f.current.get();f.member.freeze(plan);

@@ -54,6 +54,17 @@ public interface SrsLogStore {
     }
 
     /**
+     * Supplies only numbering metadata while the ring infrastructure initializes or migrates a ring.
+     * An adapter may inspect a quarantined ring's original, verified control receipt and existing
+     * bounds here without granting access to its records. Missing or untrusted quarantine metadata
+     * must fail rather than inventing an empty ring or redirecting to a replacement namespace.
+     * Ordinary reads, writes and retention still enforce their own original access checks.
+     */
+    default SrsLogBounds ringInitializationBounds(String ring) {
+        return bounds(ring);
+    }
+
+    /**
      * Reads at most {@code maxSize} consecutive sequence positions beginning at {@code firstSeq}, returning
      * each record under its actual sequence key. Missing positions stay missing so a caller can diagnose a
      * gap. The compatibility implementation uses exact reads; durable adapters can serve the same bounded

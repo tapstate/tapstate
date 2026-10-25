@@ -83,6 +83,12 @@ class PipelineDirectPreparationIT {
     }
     @ParameterizedTest @ValueSource(strings={"complete","lost-d-reply","new-start"})
     void nativeSharedRecoveryFinalizesTheEndedOriginalAndResumesItsExactAppliedReceipt(String mode) {
+        nativeSharedRecoveryCase(mode);
+    }
+    @Test void aQuarantinedSharedRingReopensAtItsActualHighWatermarkWithoutRestoringBusinessAccess() {
+        nativeSharedRecoveryCase("ring-reopen");
+    }
+    private void nativeSharedRecoveryCase(String mode) {
         withFixture(f -> {
             f.configuration.artifacts().save(pipeline("input",true,ReadMode.SNAPSHOT_AND_CDC,"latest",null));
             var models=SourceModelSnapshot.capture("flow",List.of(f.source()),f.cache.schemas(f.business(),ACTIVE));
@@ -112,6 +118,9 @@ class PipelineDirectPreparationIT {
                 var chain=run.captureBindings().logged().get("input").run().miningChainId();
                 var stream=ports.stream().filter(port -> port.stream!=null).findFirst().orElseThrow();
                 stream.listener.get().onBatch(List.of(Envelope.insert(1,"orders",Map.of("id",2),null)),Optional.of(new SourcePosition("before-loss")));
+                if(mode.equals("ring-reopen"))stream.listener.get().onBatch(List.of(Envelope.insert(2,"orders",Map.of("id",3),null),
+                        Envelope.insert(3,"orders",Map.of("id",4),null)),Optional.of(new SourcePosition("retained-old-high-watermark")));
+                String oldRing=SrsRingbuffer.ringName(chain,"orders");long oldHigh=stores.log().largestSequence(oldRing);
                 status(f,f.scope,fence,"STOPPED");
                 assertThat(f.configuration.intents().compareAndSet(f.scope,0,new io.tapstate.core.lifecycle.DesiredState("flow",
                         io.tapstate.core.lifecycle.PipelineState.STOPPED,io.tapstate.core.model.canonical.CanonicalHash.of(f.pipeline()),false))).isTrue();
@@ -148,9 +157,65 @@ class PipelineDirectPreparationIT {
                     assertThat(f.configuration.pipelineStates().read("flow").orElseThrow().stateGeneration()).isEqualTo(f.scope.stateGeneration());
                     assertThat(f.configuration.intents().load("flow").orElseThrow().desired().targetState()).isEqualTo(io.tapstate.core.lifecycle.PipelineState.STOPPED);
                     assertThat(f.cacheDatabase.getCollection("srs_models").countDocuments(new Document("_id.chain",chain))).isZero();
+                    if(mode.equals("ring-reopen")) {
+                        assertThat(oldHigh).isEqualTo(2);coordinator.close();runtime.close();member.shutdown();
+                        var before=sharedRecoveryCacheRows(f.cacheDatabase);
+                        var reopened=sharedMember(stores.log());
+                        try {
+                            assertThat(reopened.getRingbuffer(oldRing).tailSequence()).isEqualTo(oldHigh);
+                            String quiet=SrsRingbuffer.ringName(chain,"quiet");
+                            assertThat(f.cacheDatabase.getCollection("srs_log_bounds").find(new Document("_id","srs-log-bounds:"+quiet)).first())
+                                    .containsEntry("largestSequence",-1L);
+                            assertThat(reopened.getRingbuffer(quiet).tailSequence()).isEqualTo(-1);
+                            assertThatThrownBy(() -> stores.log().largestSequence(oldRing)).isInstanceOf(TapstateException.class);
+                            assertThatThrownBy(() -> stores.log().bounds(oldRing)).isInstanceOf(TapstateException.class);
+                            assertThatThrownBy(() -> stores.log().load(oldRing,0)).isInstanceOf(TapstateException.class);
+                            assertThatThrownBy(() -> stores.log().readBatch(oldRing,0,1)).isInstanceOf(TapstateException.class);
+                            assertThat(reopened.getRingbuffer(SrsRingbuffer.ringName(replacement.chainId(),"orders")).tailSequence()).isEqualTo(-1);
+                            assertThat(sharedRecoveryCacheRows(f.cacheDatabase)).isEqualTo(before);
+                            var bounds=f.cacheDatabase.getCollection("srs_log_bounds");
+                            var boundsKey=new Document("_id","srs-log-bounds:"+oldRing);var originalBounds=bounds.find(boundsKey).first();
+                            try {
+                                bounds.replaceOne(boundsKey,new Document(originalBounds).append("largestSequence",1L));
+                                assertThatThrownBy(() -> stores.log().ringInitializationBounds(oldRing)).isInstanceOf(TapstateException.class);
+                                bounds.deleteOne(boundsKey);
+                                assertThatThrownBy(() -> stores.log().ringInitializationBounds(oldRing)).isInstanceOf(TapstateException.class);
+                                bounds.insertOne(new Document(originalBounds).append("largestSequence",2));
+                                assertThatThrownBy(() -> stores.log().ringInitializationBounds(oldRing)).isInstanceOf(TapstateException.class);
+                            } finally {bounds.replaceOne(boundsKey,originalBounds,new com.mongodb.client.model.ReplaceOptions().upsert(true));}
+                            var roots=f.cacheDatabase.getCollection("srs_chains");var rootKey=new Document("_id",chain);var originalRoot=roots.find(rootKey).first();
+                            try {
+                                roots.updateOne(rootKey,new Document("$set",new Document("recoveryControl.controlHash","0".repeat(64))));
+                                assertThatThrownBy(() -> stores.log().ringInitializationBounds(oldRing)).isInstanceOf(TapstateException.class);
+                                roots.replaceOne(rootKey,new Document(originalRoot).append("cacheIncarnation","foreign-cache"));
+                                assertThatThrownBy(() -> stores.log().ringInitializationBounds(oldRing)).isInstanceOf(TapstateException.class);
+                            } finally {roots.replaceOne(rootKey,originalRoot);}
+                            var contexts=f.cacheDatabase.getCollection("srs_model_contexts");
+                            var context=contexts.find(new Document("ringName",oldRing)).first();var contextKey=new Document("_id",context.get("_id"));
+                            try {
+                                contexts.deleteOne(contextKey);
+                                assertThatThrownBy(() -> stores.log().ringInitializationBounds(oldRing)).isInstanceOf(TapstateException.class);
+                            } finally {contexts.insertOne(context);}
+                            var consumers=f.cacheDatabase.getCollection("srs_consumers");
+                            var consumer=consumers.find(new Document("_id.chain",chain)).first();var consumerKey=new Document("_id",consumer.get("_id"));
+                            try {
+                                consumers.deleteOne(consumerKey);
+                                assertThatThrownBy(() -> stores.log().ringInitializationBounds(oldRing)).isInstanceOf(TapstateException.class);
+                            } finally {consumers.insertOne(consumer);}
+                            assertThat(stores.log().ringInitializationBounds(oldRing).largestSequence()).isEqualTo(oldHigh);
+                            assertThat(sharedRecoveryCacheRows(f.cacheDatabase)).isEqualTo(before);
+                        } finally {reopened.shutdown();}
+                    }
                 }
             } finally {member.shutdown();}
         });
+    }
+
+    private static Map<String,List<Document>> sharedRecoveryCacheRows(MongoDatabase database) {
+        var rows=new TreeMap<String,List<Document>>();
+        for(String name:List.of("workload_claims","srs_chains","srs_models","srs_model_contexts","srs_consumers","srs_consumer_offsets","srs_events","srs_log_bounds"))
+            rows.put(name,database.getCollection(name).find().sort(new Document("_id",1)).into(new ArrayList<>()));
+        return rows;
     }
 
     private static SharedSrsRecoveryPreparations failingCompletion(SharedSrsRecoveryPreparations original,java.util.concurrent.atomic.AtomicBoolean fail) {

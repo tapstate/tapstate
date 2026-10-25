@@ -55,6 +55,7 @@ import org.springframework.context.event.EventListener;
  * run independent.
  */
 final class PipelineActuationOwnership {
+    private static final System.Logger LOG=System.getLogger(PipelineActuationOwnership.class.getName());
 
     /** Whether this member may drive the pipeline, and the claim that says so ({@code null} only in an explicit fixture). */
     record Permit(boolean granted, WorkloadClaim claim) {
@@ -168,11 +169,20 @@ final class PipelineActuationOwnership {
         var command=new Control(scope,original);controls.put(scope.pipelineId(),command);return command;
     }
     private void requireFreeControl(PipelineIntentScope scope,WorkloadClaimFence original) {
-        if(closing || !fenced || !accepts(scope) || original==null || !membership.businessEligible()
-                || controls.containsKey(scope.pipelineId()) || passes.containsKey(scope.pipelineId())
-                || original.key().type()!=WorkloadClaimType.PIPELINE_ACTUATION
-                || !scope.clusterId().equals(original.key().clusterId()) || !scope.pipelineId().equals(original.key().resourceId()))
-            throw ThreeLayerStorePort.refused();
+        String reason;
+        if(closing)reason="closing";
+        else if(!fenced)reason="unfenced";
+        else if(!accepts(scope))reason="scope-mismatch";
+        else if(original==null)reason="missing-original-claim";
+        else if(!membership.businessEligible())reason="membership-ineligible";
+        else if(controls.containsKey(scope.pipelineId()))reason="control-busy";
+        else if(passes.containsKey(scope.pipelineId()))reason="pass-active";
+        else if(original.key().type()!=WorkloadClaimType.PIPELINE_ACTUATION)reason="claim-kind";
+        else if(!scope.clusterId().equals(original.key().clusterId()))reason="claim-cluster";
+        else if(!scope.pipelineId().equals(original.key().resourceId()))reason="claim-resource";
+        else return;
+        LOG.log(System.Logger.Level.DEBUG,"Native control admission for {0} refused: {1}",scope==null?"<missing>":scope.pipelineId(),reason);
+        throw ThreeLayerStorePort.refused();
     }
     synchronized Control unpreparedControl(PipelineIntentScope scope) {
         if (closing || !accepts(scope) || controls.containsKey(scope.pipelineId()) || passes.containsKey(scope.pipelineId()) || !membership.businessEligible()) throw ThreeLayerStorePort.refused();

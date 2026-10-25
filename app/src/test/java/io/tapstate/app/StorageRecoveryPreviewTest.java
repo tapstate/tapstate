@@ -16,6 +16,34 @@ import static org.mockito.Mockito.*;
 class StorageRecoveryPreviewTest {
     private static final CacheAuthScope AUTH=new CacheAuthScope("cluster",1,StorageBinding.Mode.OP,"cache",1);
 
+    @Test void anExplicitRepreviewContinuesTheSavedProvisionalOperationAfterMemberAdmissionWasBusy() {
+        var f=new Fixture();var busy=new TapstateException(ActuationError.SHARED_RECOVERY_MEMBER_UNAVAILABLE,
+                Map.of("capture",f.manifest.sharedSrs().previous().captureId(),"member","node","reason",IoError.WORKLOAD_CLAIM_FENCED.code()),null);
+        f.finish=original -> {throw busy;};
+        assertThatThrownBy(() -> f.service.plan("admin",AUTH,f.active,f.manifest.selection(),null,null)).isSameAs(busy);
+        var provisional=f.current.get();assertThat(provisional).isNotNull();
+        assertThat(f.service.status(AUTH,f.active,provisional.operationId())).contains(provisional);
+        assertThat(provisional.phase()).isEqualTo(StorageRecoveryCommands.Phase.PLANNED);
+        assertThatThrownBy(() -> f.service.confirm("admin",AUTH,f.active,provisional.operationId(),provisional.planHash(),provisional.controlRevision(),true))
+                .isInstanceOf(TapstateException.class);
+        verify(f.commands,never()).confirm(any());verify(f.commands,never()).start(any());assertThat(f.published).hasValue(0);
+        f.finish=original -> {
+            assertThat(original.operationId()).isEqualTo(provisional.operationId());
+            assertThat(original.manifest().selection()).isEqualTo(provisional.manifest().selection());
+            var finalized=f.plan(original.operationId(),original.manifest().configurationRevision()+1,"e".repeat(64),StorageRecoveryCommands.Phase.PLANNED);
+            f.current.set(finalized);f.finalized=true;return finalized;
+        };
+        var finalized=f.service.plan("admin",AUTH,f.active,provisional.manifest().selection(),provisional.operationId(),null);
+        assertThat(finalized.operationId()).isEqualTo(provisional.operationId());assertThat(finalized.controlRevision()).isGreaterThan(provisional.controlRevision());
+        assertThat(finalized.manifest().sharedSrs().previous()).isEqualTo(provisional.manifest().sharedSrs().previous());
+        verify(f.commands).plan(eq(AUTH),any(),eq(provisional.operationId()),isNull());
+        assertThatThrownBy(() -> f.service.confirm("admin",AUTH,f.active,provisional.operationId(),provisional.planHash(),provisional.controlRevision(),true))
+                .isInstanceOf(TapstateException.class);
+        verify(f.commands,never()).confirm(any());verify(f.commands,never()).start(any());assertThat(f.published).hasValue(0);
+        f.service.confirm("admin",AUTH,f.active,finalized.operationId(),finalized.planHash(),finalized.controlRevision(),true);
+        assertThat(f.published).hasValue(1);verify(f.commands,never()).start(any());
+    }
+
     @Test void theReadableInitialPlanCannotBeConfirmedBeforeRuntimePreflightFinalizesItsExactResult() {
         var f=new Fixture();var attempted=new AtomicBoolean();
         f.finish=original -> {

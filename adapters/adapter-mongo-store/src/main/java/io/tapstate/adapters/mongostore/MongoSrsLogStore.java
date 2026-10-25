@@ -208,6 +208,18 @@ public final class MongoSrsLogStore implements SrsLogStore {
     }
 
     @Override
+    public SrsLogBounds ringInitializationBounds(String ring) {
+        Objects.requireNonNull(ring,"ring");
+        if(!split || models==null)return bounds(ring);
+        return transaction(null,session -> {
+            if(!models.isolatedRingForInitialization(session,ring))return splitBounds(session,ring);
+            var stored=boundsCollection.find(session,new Document("_id",boundsId(ring))).first();
+            if(stored==null)throw unreadableSplit("bounds");
+            return decodeSplitBounds(stored);
+        });
+    }
+
+    @Override
     public SrsLogBounds bounds(String ring) {
         Objects.requireNonNull(ring, "ring");
         if (split) return transaction(null, session -> splitBounds(session, ring));
