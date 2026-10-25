@@ -41,6 +41,24 @@ class StorageAuthenticationLatencyIT {
     enum Change { NONE, AUTH_GENERATION, REVOCATION, EPOCH }
 
     @Test
+    void healthyCloudRevalidationDoesNotRepeatAdjacentAuthorityChecks() {
+        withCloud(Change.NONE, fixture -> {
+            var proof = fixture.authentication.credentials().authenticateContext(fixture.cookie).orElseThrow();
+            var admin = fixture.raw.getDatabase("admin");
+            String namespace = fixture.cacheDatabase + "." + SystemCollections.CACHE_IDENTITY.collectionName();
+            admin.runCommand(new Document("configureFailPoint", "failCommand")
+                    .append("mode", "alwaysOn").append("data", new Document("failCommands", List.of("find"))
+                            .append("namespace", namespace).append("blockConnection", true).append("blockTimeMS", 2300)));
+            try {
+                proof.requireActive().run();
+            } finally {
+                admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
+            }
+            assertThat(fixture.identity().getLong("authGeneration")).isEqualTo(fixture.scope.authGeneration());
+        });
+    }
+
+    @Test
     void healthyCloudSessionReadsRetainTheirDeadlineWithSlowRoundTrips() {
         withCloud(Change.NONE, fixture -> {
             var admin = fixture.raw.getDatabase("admin");
@@ -61,6 +79,32 @@ class StorageAuthenticationLatencyIT {
                 assertThat(after - before).isGreaterThanOrEqualTo(2);
             }
             assertThat(fixture.identity().getLong("authGeneration")).isEqualTo(fixture.scope.authGeneration());
+        });
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = Change.class, names = {"AUTH_GENERATION", "EPOCH"})
+    void anIssuedProofCannotRevalidateAfterItsAuthorityChanges(Change change) {
+        withCloud(change, fixture -> {
+            var proof = fixture.authentication.credentials().authenticateContext(fixture.cookie).orElseThrow();
+            fixture.arm();
+            assertThatThrownBy(() -> proof.requireActive().run())
+                    .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(
+                            change == Change.AUTH_GENERATION ? ControlError.STORAGE_UNAVAILABLE : ControlError.UNAUTHENTICATED));
+            assertThat(fixture.changed).isTrue();
+        });
+    }
+
+    @Test
+    void anIssuedProofCannotRevalidateAfterItsSessionIsRevoked() {
+        withCloud(Change.NONE, fixture -> {
+            var proof = fixture.authentication.credentials().authenticateContext(fixture.cookie).orElseThrow();
+            fixture.authentication.managed().service().invalidateJwt("jti");
+            assertThat(SystemCollections.CLOUD_REVOCATIONS.on(fixture.raw.getDatabase(fixture.cacheDatabase))
+                    .countDocuments()).isEqualTo(1);
+            assertThatThrownBy(() -> proof.requireActive().run())
+                    .isInstanceOfSatisfying(TapstateException.class, failure ->
+                            assertThat(failure.code()).isEqualTo(ControlError.UNAUTHENTICATED));
         });
     }
 

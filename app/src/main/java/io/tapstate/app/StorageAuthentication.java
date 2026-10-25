@@ -82,7 +82,7 @@ final class StorageAuthentication implements AutoCloseable {
     private Optional<CredentialAuthentication> authenticate(String presented) {
         if (current.get() == null && bootstrap != null) return bootstrap.authenticate(presented);
         var budget = new MongoReadBudget(AUTHORIZATION_READ_BUDGET);
-        Epoch original = selected(); original.requireActive(budget);
+        Epoch original = selected();
         Optional<VerifiedToken> verified = original.authenticate(presented, budget);
         if (verified.isEmpty()) return Optional.empty();
         Optional<String> organization = cloud.cloud()
@@ -94,9 +94,7 @@ final class StorageAuthentication implements AutoCloseable {
                 organization, () -> {
                     // Revalidation is a later IO operation, not the lifetime of the original request.
                     var revalidation = new MongoReadBudget(AUTHORIZATION_READ_BUDGET);
-                    original.requireActive(revalidation);
                     if (original.authenticate(presented, revalidation).filter(identity::equals).isEmpty()) throw unauthenticated();
-                    original.requireActive(revalidation);
                 }));
     }
 
