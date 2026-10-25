@@ -611,8 +611,9 @@ final class StorageRoot implements AutoCloseable {
 
     StorageControlDispatcher.Snapshot snapshot(StorageControlAccess caller, Runnable active) {
         requireOpen(); active.run();
-        var configuration = runtime.requireConfiguration(); var status = configuration.setupStates().guardedBy(active).load();
-        var preparation = configuration.bindings().guardedBy(active).cachePreparation();
+        // Guard the complete read-only projection; no intermediate result leaves this method.
+        var configuration = runtime.requireConfiguration(); var status = configuration.setupStates().load();
+        var preparation = configuration.bindings().cachePreparation();
         boolean admitted = phase == Phase.BUSINESS_READY && runtime.businessStarted();
         var health = new EnumMap<StorageSetupService.Layer,StorageControlDispatcher.Health>(StorageSetupService.Layer.class);
         health.put(StorageSetupService.Layer.CONFIG, StorageControlDispatcher.Health.AVAILABLE);
@@ -640,7 +641,7 @@ final class StorageRoot implements AutoCloseable {
         if (runtime.cleanupRequired()) business = StorageControlDispatcher.BusinessPhase.CLEANUP_REQUIRED;
         boolean formalRecovery = preparation.map(value -> value.authScope().authGeneration() > 1).orElse(false);
         boolean recoveryAvailable=formalRecovery || admitted;
-        var pending = recoveryAvailable ? configuration.recoveryCommands().guardedBy(active).current(preparation.orElseThrow().authScope())
+        var pending = recoveryAvailable ? configuration.recoveryCommands().current(preparation.orElseThrow().authScope())
                 : Optional.<StorageRecoveryCommands.Plan>empty();
         var actions = new ArrayList<>(List.of("storage.status", "storage.setup.status"));
         if (caller.cacheScope().isPresent()) {
@@ -659,11 +660,12 @@ final class StorageRoot implements AutoCloseable {
                 actions.add("storage.test"); actions.add("storage.setup.commit");
             }
         }
+        long revision = configuration.configurationRevision();
         active.run();
         return new StorageControlDispatcher.Snapshot(mode(), status.scope().clusterId(), pending.map(StorageRecoveryCommands.Plan::operationId)
                 .orElseGet(() -> awaitingRebuild ? preparation.orElseThrow().operationId() : status.scope().operationId()),
                 status.scope().generation(), status.bindingVersion(), preparation.map(value -> value.authScope().authGeneration()).orElse(0L),
-                configuration.configurationRevision(), status.phase().name(), business, health,
+                revision, status.phase().name(), business, health,
                 actions, false);
     }
 

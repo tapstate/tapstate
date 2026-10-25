@@ -41,6 +41,36 @@ class StorageAuthenticationLatencyIT {
     enum Change { NONE, AUTH_GENERATION, REVOCATION, EPOCH }
 
     @Test
+    void aReadOnlyStorageSnapshotDoesNotRepeatAuthorizationForEachConfigurationRead() {
+        withCloud(Change.NONE, fixture -> {
+            try (var root = new StorageRoot(new MongoProperties(), fixture.cloud, fixture.bridge, BootId.fresh(),
+                    new MetricsHistoryProperties(), new RandomTokenSecrets(), Clock.systemUTC(), new byte[32])) {
+                root.loadExisting(ignored -> { throw StorageRuntime.unavailable(); });
+                assertThat(root.phase()).isEqualTo(StorageRoot.Phase.AUTH_READY);
+                var proof = root.authentication().credentials().authenticateContext(fixture.cookie).orElseThrow();
+                var setup = root.runtime().requireConfiguration().setupStates().load().scope();
+                var caller = io.tapstate.control.core.StorageControlAccess.ordinary(StorageBinding.Mode.CLOUD,
+                        setup, fixture.scope, io.tapstate.control.core.TapstatePrincipal.cloudSession(proof.token()),
+                        "organization", proof.requireActive());
+                var admin = fixture.raw.getDatabase("admin");
+                admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "alwaysOn")
+                        .append("data", new Document("failCommands", List.of("find"))
+                                .append("namespace", fixture.cacheDatabase + "." + SystemCollections.CACHE_IDENTITY.collectionName())
+                                .append("blockConnection", true).append("blockTimeMS", 600)));
+                try {
+                    org.junit.jupiter.api.Assertions.assertTimeout(Duration.ofSeconds(8), () -> {
+                        var snapshot = root.snapshot(caller, proof.requireActive());
+                        assertThat(snapshot.clusterId()).isEqualTo(fixture.scope.clusterId());
+                        assertThat(snapshot.businessPhase()).isEqualTo(io.tapstate.control.core.StorageControlDispatcher.BusinessPhase.AUTH_READY);
+                    });
+                } finally {
+                    admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
+                }
+            }
+        });
+    }
+
+    @Test
     void healthyCloudRevalidationDoesNotRepeatAdjacentAuthorityChecks() {
         withCloud(Change.NONE, fixture -> {
             var proof = fixture.authentication.credentials().authenticateContext(fixture.cookie).orElseThrow();
@@ -55,6 +85,40 @@ class StorageAuthenticationLatencyIT {
                 admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
             }
             assertThat(fixture.identity().getLong("authGeneration")).isEqualTo(fixture.scope.authGeneration());
+        });
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = Change.class, names = {"AUTH_GENERATION", "REVOCATION", "EPOCH"})
+    void aReadOnlySnapshotCannotPublishAfterItsOriginalAuthorityChanges(Change change) {
+        withCloud(Change.NONE, fixture -> {
+            try (var root = new StorageRoot(new MongoProperties(), fixture.cloud, fixture.bridge, BootId.fresh(),
+                    new MetricsHistoryProperties(), new RandomTokenSecrets(), Clock.systemUTC(), new byte[32])) {
+                root.loadExisting(ignored -> { throw StorageRuntime.unavailable(); });
+                var proof = root.authentication().credentials().authenticateContext(fixture.cookie).orElseThrow();
+                var setup = root.runtime().requireConfiguration().setupStates().load().scope();
+                var caller = io.tapstate.control.core.StorageControlAccess.ordinary(StorageBinding.Mode.CLOUD,
+                        setup, fixture.scope, io.tapstate.control.core.TapstatePrincipal.cloudSession(proof.token()),
+                        "organization", proof.requireActive());
+                var checked = new AtomicBoolean();
+                Runnable active = () -> {
+                    if (checked.getAndSet(true)) {
+                        switch (change) {
+                            case AUTH_GENERATION -> SystemCollections.CACHE_IDENTITY.on(fixture.raw.getDatabase(fixture.cacheDatabase))
+                                    .updateOne(new Document("_id", fixture.identity().get("_id")),
+                                            new Document("$set", new Document("authGeneration", fixture.scope.authGeneration() + 1)));
+                            case REVOCATION -> root.managedAuthentication().service().invalidateJwt("jti");
+                            case EPOCH -> root.authentication().invalidateFormal();
+                            case NONE -> throw new AssertionError("a change is required");
+                        }
+                    }
+                    proof.requireActive().run();
+                };
+                assertThatThrownBy(() -> root.snapshot(caller, active)).isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(change == Change.AUTH_GENERATION
+                                ? ControlError.STORAGE_UNAVAILABLE : ControlError.UNAUTHENTICATED));
+                assertThat(checked).isTrue();
+            }
         });
     }
 
@@ -159,14 +223,15 @@ class StorageAuthenticationLatencyIT {
                 properties.setBaseUrl("https://cloud.example"); properties.setClusterId(cluster);
                 properties.setAtlasUri(mongo.getReplicaSetUrl("configuration")); properties.setToken("fixture-runtime-token");
                 var cloud = CloudRuntimeSettings.resolve(properties);
+                var bridge = new CloudSdkBridge(cloud, new Provider(cluster, clock));
                 var fixtureReference = new AtomicReference<Fixture>();
                 try (var runtime = new StorageRuntime(configuration,
                         selected -> MongoCacheDomain.connect(selected.cache(), Duration.ofSeconds(5), "authentication-latency"),
                         () -> { var fixture = fixtureReference.get(); if (fixture != null) fixture.afterRead(); });
                      var authentication = new StorageAuthentication(configuration, cloud,
-                             new CloudSdkBridge(cloud, new Provider(cluster, clock)), new RandomTokenSecrets(), clock, new byte[32])) {
+                             bridge, new RandomTokenSecrets(), clock, new byte[32])) {
                     var bound = runtime.loadBound().orElseThrow(); authentication.install(bound);
-                    var fixture = new Fixture(raw, cacheDatabase, authentication, initial.preparation().authScope(), change, now);
+                    var fixture = new Fixture(raw, cacheDatabase, authentication, initial.preparation().authScope(), change, now, cloud, bridge);
                     fixtureReference.set(fixture);
                     fixture.cookie = authentication.managed().service().exchangeCode("fresh", "cluster.example").token();
                     scenario.accept(fixture);
@@ -181,15 +246,18 @@ class StorageAuthenticationLatencyIT {
         final StorageAuthentication authentication;
         final CacheAuthScope scope;
         final Change change;
+        final CloudRuntimeSettings cloud;
+        final CloudSdkBridge bridge;
         final AtomicReference<Instant> now;
         final AtomicBoolean changed = new AtomicBoolean();
         String cookie;
         boolean armed;
         long previousUse;
         Fixture(MongoClient raw, String cacheDatabase, StorageAuthentication authentication,
-                CacheAuthScope scope, Change change, AtomicReference<Instant> now) {
+                CacheAuthScope scope, Change change, AtomicReference<Instant> now, CloudRuntimeSettings cloud, CloudSdkBridge bridge) {
             this.raw = raw; this.cacheDatabase = cacheDatabase; this.authentication = authentication;
             this.scope = scope; this.change = change; this.now = now;
+            this.cloud = cloud; this.bridge = bridge;
         }
         Document identity() { return SystemCollections.CACHE_IDENTITY.on(raw.getDatabase(cacheDatabase)).find().first(); }
         Document session() { return SystemCollections.CLOUD_SESSIONS.on(raw.getDatabase(cacheDatabase)).find().first(); }
