@@ -61,6 +61,7 @@ public record PipelineCatalogItem(
     /** Authoring-aware UI projection carried separately from the existing catalog state vocabulary. */
     public enum UiState {
         DRAFT,
+        NOT_STARTED,
         NEW,
         STARTING,
         RUNNING,

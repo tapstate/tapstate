@@ -59,7 +59,7 @@ public final class PipelineCatalogService {
                         value.publishedDraftRevision(), value.publishedArtifactHash(), value.createdAt(),
                         value.updatedAt(), value.updatedBy()))
                 .orElse(null);
-        return artifact == null && draft == null ? Optional.empty() : Optional.of(toItem(id, draft, artifact));
+        return artifact == null && draft == null ? Optional.empty() : Optional.of(toItem(id, draft, artifact, true));
     }
 
     /** Returns only the requested catalog window; per-pipeline status reads happen after this slice. */
@@ -87,19 +87,20 @@ public final class PipelineCatalogService {
         List<String> pageIds = new ArrayList<>(ids).subList(offset, end);
         List<PipelineCatalogItem> items = new ArrayList<>(pageIds.size());
         for (String id : pageIds) {
-            items.add(toItem(id, draftById.get(id), artifactById.get(id)));
+            items.add(toItem(id, draftById.get(id), artifactById.get(id), false));
         }
         return List.copyOf(items);
     }
 
-    private PipelineCatalogItem toItem(String id, PipelineDraftSummary draft, ArtifactSummary artifact) {
+    private PipelineCatalogItem toItem(String id, PipelineDraftSummary draft, ArtifactSummary artifact,
+            boolean requireReadableIntent) {
         PipelineStatus observation = observations.findStatus(id).orElse(null);
         PipelineState observed = observation == null ? null : observation.state();
         PipelineState target;
         try {
             target = desired.read(id).map(state -> state.targetState()).orElse(null);
         } catch (TapstateException unreadable) {
-            if (unreadable.code() != IoError.DOCUMENT_UNREADABLE) {
+            if (requireReadableIntent || unreadable.code() != IoError.DOCUMENT_UNREADABLE) {
                 throw unreadable;
             }
             LOG.log(Level.WARNING, "Ignoring unreadable desired state for Pipeline {0}", id);
@@ -123,7 +124,11 @@ public final class PipelineCatalogService {
                 hasArtifact,
                 new PipelineCatalogItem.Status(
                         state,
-                        hasArtifact ? PipelineCatalogItem.UiState.valueOf(state.name()) : PipelineCatalogItem.UiState.DRAFT,
+                        hasArtifact
+                                ? state == PipelineCatalogItem.DisplayState.NEW
+                                        ? PipelineCatalogItem.UiState.NOT_STARTED
+                                        : PipelineCatalogItem.UiState.valueOf(state.name())
+                                : PipelineCatalogItem.UiState.DRAFT,
                         target,
                         observed,
                         observation == null ? null : observation.failure(),

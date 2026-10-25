@@ -47,7 +47,9 @@ record PipelineStatusResponse(
     static PipelineStatusResponse of(PipelineStatus status, MessageCatalog catalog, Clock clock) {
         Instant observedAt = status.observedAt();
         return new PipelineStatusResponse(status.pipelineId(),
-                status.state(), PipelineCatalogItem.UiState.valueOf(status.state().name()),
+                status.state(), status.state() == PipelineState.NEW
+                        ? PipelineCatalogItem.UiState.NOT_STARTED
+                        : PipelineCatalogItem.UiState.valueOf(status.state().name()),
                 failure(status.failure(), catalog), observedAt,
                 observedAt == null ? null
                         : Math.max(0, Duration.between(observedAt, clock.instant()).toMillis()),

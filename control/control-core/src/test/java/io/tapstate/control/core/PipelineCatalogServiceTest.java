@@ -117,8 +117,12 @@ class PipelineCatalogServiceTest {
         assertThat(byId.get("corrupt-intent").status().state()).isEqualTo(PipelineCatalogItem.DisplayState.NEW);
         assertThat(byId.get("new").status().state()).isEqualTo(PipelineCatalogItem.DisplayState.NEW);
         assertThat(byId.get("new").hasArtifact()).isTrue();
-        assertThat(byId.get("new").status().displayState()).isEqualTo(PipelineCatalogItem.UiState.NEW);
+        assertThat(byId.get("new").status().displayState().name()).isEqualTo("NOT_STARTED");
         assertThat(service.find("new")).contains(byId.get("new"));
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> service.find("corrupt-intent"))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(error -> assertThat(((TapstateException) error).code())
+                        .isEqualTo(IoError.DOCUMENT_UNREADABLE));
         assertThat(service.list(0, 2)).extracting(PipelineCatalogItem::id)
                 .containsExactly("artifact-stop", "completed-running-intent");
     }
