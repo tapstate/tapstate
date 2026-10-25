@@ -1518,6 +1518,45 @@ class ManagedMongoStoreIsolationIT {
                     assertDenied(limited, cacheDb); assertDenied(limited, masterDb);
                     assertDenied(limited, configDb + "_operator"); assertDenied(limited, configDb + "_views");
                 }
+                // A real CACHE authorization failure cannot reopen the closed bootstrap owner.
+                var bindingBeforeOutage = configuration.bindings().load().orElseThrow();
+                var sourceBeforeOutage = configuration.artifacts().get("atlas-store").orElseThrow();
+                var setupBeforeOutage = configuration.setupStates().load();
+                admin.getDatabase("admin").runCommand(new Document("updateUser", customerUser)
+                        .append("roles", List.of(new Document("role", "readWrite").append("db", masterDb))));
+                try {
+                    assertThatThrownBy(() -> cloudPost(application, fresh, "/api/storage/status", Map.of()))
+                            .isInstanceOfSatisfying(org.springframework.web.client.RestClientResponseException.class, failure -> {
+                                assertThat(failure.getStatusCode().value()).isEqualTo(503);
+                                assertThat(failure.getResponseBodyAsString()).contains("control.storage-unavailable");
+                            });
+                    rootClient(application).get().uri("/auth/exchange?code=cache-outage").exchange((outageRequest, response) -> {
+                        assertThat(response.getStatusCode().value()).isEqualTo(503);
+                        assertThat(response.getHeaders().getFirst("Set-Cookie")).isNull();
+                        assertThat(response.bodyTo(String.class)).contains("control.storage-unavailable");
+                        return null;
+                    });
+                    assertThat(sdk.consumed).doesNotContain("cache-outage");
+                    assertThatThrownBy(() -> oldContext.service().exchangeCode("late-during-cache-outage", "127.0.0.1"))
+                            .isInstanceOfSatisfying(TapstateException.class,
+                                    failure -> assertThat(failure.code()).isEqualTo(io.tapstate.control.core.ControlError.UNAUTHENTICATED));
+                    assertThat(sdk.consumed).contains("late-during-cache-outage");
+                    assertThat(configuration.setupStates().load().phase()).isEqualTo(StorageSetupStateStore.Phase.COMPLETE);
+                    assertThat(admin.getDatabase(configDb).getCollection("sources").countDocuments()).isOne();
+                    assertThat(admin.getDatabase(configDb).getCollection("storage_binding").countDocuments()).isOne();
+                } finally {
+                    admin.getDatabase("admin").runCommand(new Document("updateUser", customerUser).append("roles",
+                            List.of(cacheDb, masterDb).stream().map(database ->
+                                    new Document("role", "readWrite").append("db", database)).toList()));
+                }
+                assertCloudStatus(application, temporary, 401);
+                String afterOutage = exchangeCookie(application, "after-cache-outage");
+                assertThat(cloudPost(application, afterOutage, "/api/storage/status", Map.of()))
+                        .containsEntry("setupPhase", "COMPLETE");
+                assertThat(root.runtime().current().orElseThrow().preparation().authScope().authGeneration()).isEqualTo(1);
+                assertThat(configuration.bindings().load().orElseThrow().equals(bindingBeforeOutage)).isTrue();
+                assertThat(configuration.artifacts().get("atlas-store").orElseThrow().equals(sourceBeforeOutage)).isTrue();
+                assertThat(configuration.setupStates().load()).isEqualTo(setupBeforeOutage);
                 var owner = (NativeBusinessContext)root.runtime().business().orElseThrow();
                 var child = (org.springframework.context.ConfigurableApplicationContext)org.springframework.test.util.ReflectionTestUtils.getField(owner, "context");
                 var member = child.getBean(com.hazelcast.core.HazelcastInstance.class);
@@ -1625,7 +1664,9 @@ class ManagedMongoStoreIsolationIT {
         int failCompletionResponses;
         RecoverySdk(String cluster) { this.cluster = cluster; }
         @Override public CloudSdkBridge.ExchangeResult exchange(String code) {
-            if (!List.of("old", "blocked", "fresh", "late", "restarted").contains(code) || !consumed.add(code)) throw new CloudSdkBridge.ProviderFailure();
+            if (!List.of("old", "blocked", "fresh", "late", "restarted", "cache-outage", "late-during-cache-outage",
+                    "after-cache-outage").contains(code)
+                    || !consumed.add(code)) throw new CloudSdkBridge.ProviderFailure();
             return new CloudSdkBridge.ExchangeResult(code, "organization", cluster, "Fixture", "Cluster", "local");
         }
         @Override public io.tapstate.cloud.sdk.client.ClusterEgressAddress currentEgressAddress() {
