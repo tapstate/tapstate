@@ -152,6 +152,142 @@ class SrsSnapshotPreparationTest {
         }
     }
 
+    @Test void aCompletedNativeLoadRetainsItsPendingCloseWithoutFailingOrReadingAgain() throws Exception {
+        var f = new Fixture(); f.nativeRings = true;
+        var completion = new java.util.concurrent.CompletableFuture<Void>();
+        var closing = new java.util.concurrent.CountDownLatch(1);
+        var rows = new java.util.concurrent.CopyOnWriteArrayList<Envelope>();
+        var loaded = new java.util.concurrent.CopyOnWriteArrayList<String>();
+        Runnable ownerGuard = () -> { if (!f.active.get()) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null); };
+        try (var unit = new NativeSrsCaptureRunUnit(RUN.cacheScope(),new SrsStores(f,f,f,f),unusedMember())) {
+            var run = unit.beginSnapshot(RUN,config(),7,owner -> {
+                var port = new Port(f,owner); port.closeCompletion = completion; port.closeEntered = closing; return port;
+            },new CaptureHandoff() {
+                @Override public void accept(Envelope row) { rows.add(row); }
+                @Override public void loaded(String table) { loaded.add(table); }
+            },ownerGuard);
+            try {
+                assertThat(closing.await(3,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                assertThat(run.awaitLoaded(java.time.Duration.ofMillis(100))).isFalse();
+                assertThat(run.failure()).isEmpty();
+                assertThat(rows).hasSize(2);
+                assertThat(loaded).containsExactly("orders","quiet");
+                assertThat(pendingCloseCount(unit)).isOne();
+                completion.complete(null);
+                assertThat(run.awaitLoaded(java.time.Duration.ofSeconds(3))).isTrue();
+                assertThat(run.failure()).isEmpty();
+                assertThat(rows).hasSize(2);
+                assertThat(loaded).containsExactly("orders","quiet");
+                assertThat(f.sourceReads).isEqualTo(2); assertThat(f.pinCalls).isOne();
+                assertThat(f.closedSessions).isEqualTo(2);
+                assertThat(pendingCloseCount(unit)).isZero();
+                assertThat(run.cdcSubscription()).isEmpty();
+                unit.stopOpenings(ownerGuard);
+            } finally { completion.complete(null); unit.stopSnapshot(run); }
+        }
+    }
+
+    private static int pendingCloseCount(NativeSrsCaptureRunUnit unit) throws ReflectiveOperationException {
+        var field = NativeSrsCaptureRunUnit.class.getDeclaredField("pendingCloses"); field.setAccessible(true);
+        return ((Map<?,?>)field.get(unit)).size();
+    }
+
+    @Test void closeCompletionBeforeRegistrationFinishesTheSameNativeLoad() throws Exception {
+        var f = new Fixture(); f.nativeRings = true;
+        var completion = new java.util.concurrent.CompletableFuture<Void>();
+        var rows = new java.util.concurrent.CopyOnWriteArrayList<Envelope>();
+        try (var unit = new NativeSrsCaptureRunUnit(RUN.cacheScope(),new SrsStores(f,f,f,f),unusedMember())) {
+            var run = unit.beginSnapshot(RUN,config(),7,owner -> {
+                var port = new Port(f,owner); port.closeCompletion = completion;
+                port.beforePendingClose = () -> completion.complete(null); return port;
+            },CaptureHandoff.of(rows::add),() -> {});
+            assertThat(run.awaitLoaded(java.time.Duration.ofSeconds(3))).isTrue();
+            assertThat(run.failure()).isEmpty(); assertThat(rows).hasSize(2);
+            assertThat(f.closedSessions).isEqualTo(2); assertThat(f.sourceReads).isEqualTo(2);
+            assertThat(pendingCloseCount(unit)).isZero();
+        }
+    }
+
+    @Test void anExceptionalOriginalCloseRemainsAFailureAndRetainsItsOwner() throws Exception {
+        var f = new Fixture(); f.nativeRings = true;
+        var completion = new java.util.concurrent.CompletableFuture<Void>();
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var portRef = new java.util.concurrent.atomic.AtomicReference<Port>();
+        var failure = new IllegalStateException("original source cleanup failed");
+        Runnable ownerGuard = () -> {};
+        try (var unit = new NativeSrsCaptureRunUnit(RUN.cacheScope(),new SrsStores(f,f,f,f),unusedMember())) {
+            var run = unit.beginSnapshot(RUN,config(),7,owner -> {
+                var port = new Port(f,owner); port.closeCompletion = completion; port.closeEntered = entered;
+                portRef.set(port); return port;
+            },CaptureHandoff.of(row -> {}),ownerGuard);
+            try {
+                assertThat(entered.await(3,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                assertThat(run.awaitLoaded(java.time.Duration.ofMillis(100))).isFalse();
+                completion.completeExceptionally(failure);
+                assertThat(run.awaitLoaded(java.time.Duration.ofSeconds(3))).isTrue();
+                assertThat(run.failure()).containsSame(failure);
+                assertThat(pendingCloseCount(unit)).isOne();
+                assertThatThrownBy(() -> unit.stopOpenings(ownerGuard)).isSameAs(failure);
+                assertThat(f.sourceReads).isEqualTo(2); assertThat(f.pinCalls).isOne();
+            } finally {
+                // Release only the in-memory test fixture after checking that the failed close stayed owned.
+                portRef.get().closeCompletion = null; unit.stopOpenings(ownerGuard);
+            }
+        }
+    }
+
+    @Test void cancellingAPendingCompletedSnapshotCannotReplayRowsOrLoseItsClose() throws Exception {
+        var f = new Fixture(); f.nativeRings = true;
+        var completion = new java.util.concurrent.CompletableFuture<Void>();
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var rows = new java.util.concurrent.CopyOnWriteArrayList<Envelope>();
+        var loaded = new java.util.concurrent.CopyOnWriteArrayList<String>();
+        Runnable ownerGuard = () -> {};
+        try (var unit = new NativeSrsCaptureRunUnit(RUN.cacheScope(),new SrsStores(f,f,f,f),unusedMember())) {
+            var run = unit.beginSnapshot(RUN,config(),7,owner -> {
+                var port = new Port(f,owner); port.closeCompletion = completion; port.closeEntered = entered; return port;
+            },new CaptureHandoff() {
+                @Override public void accept(Envelope row) { rows.add(row); }
+                @Override public void loaded(String table) { loaded.add(table); }
+            },ownerGuard);
+            try {
+                assertThat(entered.await(3,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                assertThat(run.awaitLoaded(java.time.Duration.ofMillis(100))).isFalse();
+                assertThatThrownBy(() -> unit.stopSnapshot(run)).isInstanceOf(SnapshotSession.PendingClose.class);
+                assertThat(pendingCloseCount(unit)).isOne();
+                assertThat(run.awaitLoaded(java.time.Duration.ofMillis(100))).isFalse();
+                completion.complete(null);
+                assertThat(run.awaitLoaded(java.time.Duration.ofSeconds(3))).isTrue();
+                assertThat(run.failure()).isEmpty(); assertThat(rows).hasSize(2);
+                assertThat(loaded).containsExactly("orders","quiet");
+                assertThat(f.sourceReads).isEqualTo(2); assertThat(f.pinCalls).isOne();
+                assertThat(run.cdcSubscription()).isEmpty();
+                unit.stopOpenings(ownerGuard); assertThat(pendingCloseCount(unit)).isZero();
+            } finally { completion.complete(null); unit.stopSnapshot(run); }
+        }
+    }
+
+    @Test void aReadFailureIsNotReplacedByItsPendingCleanup() throws Exception {
+        var f = new Fixture(); f.nativeRings = true;
+        var completion = new java.util.concurrent.CompletableFuture<Void>();
+        var failure = new IllegalStateException("original snapshot read failed");
+        var loaded = new java.util.concurrent.CopyOnWriteArrayList<String>();
+        Runnable ownerGuard = () -> {};
+        try (var unit = new NativeSrsCaptureRunUnit(RUN.cacheScope(),new SrsStores(f,f,f,f),unusedMember())) {
+            var run = unit.beginSnapshot(RUN,config(),7,owner -> {
+                var port = new Port(f,owner); port.closeCompletion = completion; port.readFailure = failure; return port;
+            },new CaptureHandoff() {
+                @Override public void accept(Envelope row) { }
+                @Override public void loaded(String table) { loaded.add(table); }
+            },ownerGuard);
+            try {
+                assertThat(run.awaitLoaded(java.time.Duration.ofSeconds(3))).isTrue();
+                assertThat(run.failure()).containsSame(failure);
+                assertThat(loaded).containsExactly("orders"); assertThat(pendingCloseCount(unit)).isOne();
+            } finally { completion.complete(null); unit.stopOpenings(ownerGuard); }
+        }
+    }
+
     @Test void revocationAfterOneTableCannotOpenTheNextTableOrReadAnotherRow() {
         var f = new Fixture(); var owner = f.owner();
         try (var load = SnapshotPhase.openPrepared(new Port(f,owner),config(),owner)) {
@@ -192,6 +328,10 @@ class SrsSnapshotPreparationTest {
     }
     private static final class Port extends PlainPort implements SnapshotSession.PreparedProvider {
         final Fixture f; final SrsSnapshotPreparation owner; List<String> selected; boolean prepared,skipPreparation,failBatchClose; RuntimeException sameFailure,sessionFailure;
+        java.util.concurrent.CompletableFuture<Void> closeCompletion;
+        java.util.concurrent.CountDownLatch closeEntered;
+        Runnable beforePendingClose;
+        RuntimeException readFailure;
         Port(Fixture f,SrsSnapshotPreparation owner) { this.f = f; this.owner = owner; }
         @Override public SnapshotSession snapshotSession(CaptureConfig config) { throw new AssertionError("prepared session required"); }
         @Override public SnapshotSession snapshotSession(CaptureConfig config,SnapshotPreparation request) {
@@ -206,12 +346,29 @@ class SrsSnapshotPreparationTest {
                     var rows = List.of(Envelope.read(1,table,Map.of("id",1),Map.of())).iterator();
                     return new CaptureBatch() {
                         @Override public Optional<SourcePosition> seam() { if (sameFailure != null) throw sameFailure; return Optional.of(new SourcePosition("sampled-seam")); }
-                        @Override public boolean hasNext() { return rows.hasNext(); }
+                        @Override public boolean hasNext() { if (readFailure != null && table.equals("quiet")) throw readFailure; return rows.hasNext(); }
                         @Override public Envelope next() { return rows.next(); }
                         @Override public void close() { if (sameFailure != null) throw sameFailure; if (failBatchClose) throw new IllegalStateException("fixture batch cleanup failed"); }
                     };
                 }
-                @Override public void close() { f.closedSessions++; if (sessionFailure != null) throw sessionFailure; }
+                @Override public void close() {
+                    f.closedSessions++;
+                    if (closeEntered != null) closeEntered.countDown();
+                    if (closeCompletion != null) {
+                        if (!closeCompletion.isDone()) {
+                            if (beforePendingClose != null) beforePendingClose.run();
+                            throw new SnapshotSession.PendingClose(CaptureError.STILL_ENDING,
+                                    Map.of("captureId","fixture"),new java.util.concurrent.TimeoutException(),closeCompletion);
+                        }
+                        try { closeCompletion.join(); }
+                        catch (java.util.concurrent.CompletionException failed) {
+                            if (failed.getCause() instanceof RuntimeException runtime) throw runtime;
+                            if (failed.getCause() instanceof Error error) throw error;
+                            throw new IllegalStateException("unexpected fixture close failure",failed.getCause());
+                        }
+                    }
+                    if (sessionFailure != null) throw sessionFailure;
+                }
             };
         }
     }

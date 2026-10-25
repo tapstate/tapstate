@@ -1,8 +1,13 @@
 package io.tapstate.spi.capture;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CompletionStage;
+
+import io.tapstate.core.common.TapstateErrorCode;
+import io.tapstate.core.common.TapstateException;
 
 /**
  * One bounded snapshot round over several selected tables. Each table still has a batch of its own, so
@@ -11,6 +16,23 @@ import java.util.Optional;
  */
 @FunctionalInterface
 public interface SnapshotSession extends AutoCloseable {
+
+    /** A bounded close returned while its original attempt still runs; completion permits retrying only that close. */
+    final class PendingClose extends TapstateException {
+        private final transient CompletionStage<Void> completion;
+
+        public PendingClose(TapstateErrorCode code, Map<String, Object> args, Throwable cause,
+                CompletionStage<Void> completion) {
+            super(code, args, cause);
+            this.completion = Objects.requireNonNull(completion).toCompletableFuture().minimalCompletionStage();
+        }
+
+        /** A process-local notification, never authority to reopen a source or report it closed. */
+        public CompletionStage<Void> completion() {
+            if (completion == null) throw new IllegalStateException("A pending snapshot close cannot cross a process boundary");
+            return completion;
+        }
+    }
 
     /** An optional read-side capability; the existing capture port contract remains unchanged. */
     interface Provider {

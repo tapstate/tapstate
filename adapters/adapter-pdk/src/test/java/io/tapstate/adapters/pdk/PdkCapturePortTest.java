@@ -829,7 +829,8 @@ class PdkCapturePortTest {
         var port=new PdkCapturePort(id -> {provisions.incrementAndGet();return ref;}).withStreamPreparation(actual -> {throw original;});
         try {
             assertThatThrownBy(() -> port.cdc(config("t1"),CaptureStart.present(),(events,position) -> {}))
-                    .isInstanceOfSatisfying(TapstateException.class,failure -> assertThat(failure.code()).isEqualTo(ConnectorError.CAPTURE_FAILED));
+                    .isSameAs(original).satisfies(failure -> assertThat(failure.getSuppressed()).singleElement()
+                            .isInstanceOfSatisfying(TapstateException.class,cleanup -> assertThat(cleanup.code()).isEqualTo(ConnectorError.CAPTURE_FAILED)));
             assertThat(entered.await(5,TimeUnit.SECONDS)).isTrue();assertThat(ended.getCount()).isOne();
             assertThatThrownBy(() -> port.cdc(config("t1"),CaptureStart.present(),(events,position) -> {}))
                     .isInstanceOfSatisfying(TapstateException.class,failure -> assertThat(failure.code()).isEqualTo(ConnectorError.CAPTURE_FAILED));
@@ -861,7 +862,11 @@ class PdkCapturePortTest {
         var unexpected=new AtomicReference<SnapshotSession>();
         try {
             assertThatThrownBy(() -> port.cdc(config("t1"),CaptureStart.present(),(events,position) -> {}))
-                    .isInstanceOfSatisfying(TapstateException.class,failure -> assertThat(failure.code()).isEqualTo(ConnectorError.CAPTURE_FAILED));
+                    .isInstanceOfSatisfying(TapstateException.class,failure -> {
+                        assertThat(failure.code()).isEqualTo(io.tapstate.spi.store.IoError.SRS_MODEL_UNAVAILABLE);
+                        assertThat(failure.getSuppressed()).singleElement().isInstanceOfSatisfying(TapstateException.class,
+                                cleanup -> assertThat(cleanup.code()).isEqualTo(ConnectorError.CAPTURE_FAILED));
+                    });
             var clone=port.withSnapshotPreparation((request,seam,actual) -> {});
             assertThatThrownBy(() -> unexpected.set(clone.snapshotSession(config("t1"),new io.tapstate.spi.capture.SnapshotPreparation(1,null))))
                     .isInstanceOfSatisfying(TapstateException.class,failure -> assertThat(failure.code()).isEqualTo(ConnectorError.CAPTURE_FAILED));
@@ -883,7 +888,11 @@ class PdkCapturePortTest {
         });
         try {
             assertThatThrownBy(() -> port.cdc(config("t1"),CaptureStart.present(),(events,position) -> {}))
-                    .isInstanceOfSatisfying(TapstateException.class,failure -> assertThat(failure.code()).isEqualTo(ConnectorError.CAPTURE_FAILED));
+                    .isInstanceOfSatisfying(TapstateException.class,failure -> {
+                        assertThat(failure.code()).isEqualTo(io.tapstate.spi.store.IoError.SRS_MODEL_UNAVAILABLE);
+                        assertThat(failure.getSuppressed()).singleElement().isInstanceOfSatisfying(TapstateException.class,
+                                cleanup -> assertThat(cleanup.code()).isEqualTo(ConnectorError.CAPTURE_FAILED));
+                    });
             assertThat(stops).hasValue(1);assertThat(provisions).hasValue(1);
             assertThatCode(() -> ((AutoCloseable)(Object)port).close()).doesNotThrowAnyException();
             assertThat(stops).hasValue(2);assertThat(provisions).hasValue(1);

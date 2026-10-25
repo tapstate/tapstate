@@ -79,6 +79,10 @@ Future privately deployed Cloud environments are not supported by these instruct
 platform-supplied Configuration URI retains its platform authentication policy; the restrictions
 above apply to the user's Atlas setup inputs.
 
+After storage setup, choose **MongoDB Atlas** when adding an Atlas data source. Its connection
+checks and capture path handle Atlas-specific service restrictions. Give the ordinary Source
+its own ID; the default application target keeps its system-managed identity.
+
 ## Install OP and create its first administrator
 
 Use the same OS account for the installation command and server. Keep the installation directory

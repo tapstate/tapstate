@@ -64,7 +64,15 @@ class PdkSnapshotPreparationTest {
             var close=executor.submit(session::close);
             try {
                 assertThat(entered.await(3,TimeUnit.SECONDS)).isTrue();
-                assertThatThrownBy(() -> close.get(3,TimeUnit.SECONDS)).isInstanceOf(java.util.concurrent.ExecutionException.class).hasCauseInstanceOf(TapstateException.class);
+                var failure = org.assertj.core.api.Assertions.catchThrowable(() -> close.get(3,TimeUnit.SECONDS));
+                assertThat(failure).isInstanceOf(java.util.concurrent.ExecutionException.class)
+                        .hasCauseInstanceOf(SnapshotSession.PendingClose.class);
+                var pending = (SnapshotSession.PendingClose)failure.getCause();
+                assertThat(pending.code()).isEqualTo(ConnectorError.CAPTURE_FAILED);
+                assertThat(pending.completion().toCompletableFuture()).isNotDone();
+                pending.completion().toCompletableFuture().complete(null);
+                assertThat(pending.completion().toCompletableFuture()).isNotDone();
+                assertThat(exited.getCount()).isOne();
             } finally {release.countDown();assertThat(exited.await(3,TimeUnit.SECONDS)).isTrue();}
         }
         session.close();assertThat(counter("stops")).hasValue(1);
@@ -163,10 +171,12 @@ class PdkSnapshotPreparationTest {
             try {
                 assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
                 assertThatThrownBy(() -> opened.get(5, TimeUnit.SECONDS)).hasCause(refused);
+                assertThat(refused.getSuppressed()).singleElement().isInstanceOf(TapstateException.class);
                 assertThat(exited.getCount()).as("cleanup remains pending until its own stop returns").isOne();
                 assertThat(counter("streams")).hasValue(0);
             } finally { release.countDown(); assertThat(exited.await(5, TimeUnit.SECONDS)).isTrue(); }
         }
+        port.close();
         assertThat(counter("stops")).hasValue(1);
     }
 

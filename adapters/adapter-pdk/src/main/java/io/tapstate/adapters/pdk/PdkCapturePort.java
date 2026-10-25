@@ -414,7 +414,9 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                 if(failed.getCause() instanceof Error error)throw error;
                 throw new IllegalStateException("unexpected snapshot cleanup failure",failed.getCause());
             } catch (TimeoutException stopping) {
-                throw new TapstateException(ConnectorError.CAPTURE_FAILED,Map.of("connector",connector.connectorId(),"detail","the original snapshot session is still ending; retry its close"),stopping);
+                throw new SnapshotSession.PendingClose(ConnectorError.CAPTURE_FAILED,
+                        Map.of("connector",connector.connectorId(),"detail","the original snapshot session is still ending; retry its close"),
+                        stopping, ending);
             }
         }
 
@@ -529,23 +531,25 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
             preflight.get(preflightTimeout.toNanos(), TimeUnit.NANOSECONDS);
         } catch (TimeoutException failure) {
             delivery.cancel();
-            abortPreflight(connector, thread, delivery);
-            if (streamPreparer != null) throw new TapstateException(ConnectorError.CAPTURE_FAILED,
-                    Map.of("connector",connector.connectorId(),"detail","source metadata preparation timed out after " + preflightTimeout.toMillis() + "ms"),failure);
-            throw new TapstateException(ConnectorError.LOGMINER_PREFLIGHT_TIMEOUT,
+            var original = streamPreparer != null ? new TapstateException(ConnectorError.CAPTURE_FAILED,
+                    Map.of("connector",connector.connectorId(),"detail","source metadata preparation timed out after " + preflightTimeout.toMillis() + "ms"),failure)
+                    : new TapstateException(ConnectorError.LOGMINER_PREFLIGHT_TIMEOUT,
                     Map.of("connector", connector.connectorId(),
                             "timeout", preflightTimeout.toMillis() + "ms"), failure);
+            abortPreflightAfter(original, connector, thread, delivery);
+            throw original;
         } catch (InterruptedException failure) {
             delivery.cancel();
-            abortPreflight(connector, thread, delivery);
-            Thread.currentThread().interrupt();
-            throw new TapstateException(ConnectorError.CAPTURE_FAILED,
+            var original = new TapstateException(ConnectorError.CAPTURE_FAILED,
                     Map.of("connector", connector.connectorId(),
                             "detail", "change-capture preflight was interrupted"), failure);
+            try { abortPreflightAfter(original, connector, thread, delivery); }
+            finally { Thread.currentThread().interrupt(); }
+            throw original;
         } catch (ExecutionException failure) {
             delivery.cancel();
-            abortPreflight(connector, thread, delivery);
             Throwable cause = failure.getCause();
+            abortPreflightAfter(cause, connector, thread, delivery);
             if (cause instanceof RuntimeException runtime) {
                 throw runtime;
             }
@@ -553,6 +557,16 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                 throw error;
             }
             throw new IllegalStateException(cause);
+        }
+    }
+
+    private void abortPreflightAfter(Throwable original, PdkConnector connector, Thread worker, CdcDelivery delivery) {
+        try { abortPreflight(connector, worker, delivery); }
+        catch (VirtualMachineError fatal) {
+            if (fatal != original) fatal.addSuppressed(original);
+            throw fatal;
+        } catch (RuntimeException | Error cleanup) {
+            if (cleanup != original) original.addSuppressed(cleanup);
         }
     }
 

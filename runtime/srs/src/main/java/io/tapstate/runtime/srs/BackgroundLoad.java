@@ -2,6 +2,7 @@ package io.tapstate.runtime.srs;
 
 import io.tapstate.core.event.Envelope;
 import io.tapstate.spi.capture.Subscription;
+import io.tapstate.spi.capture.SnapshotSession;
 
 import java.time.Duration;
 import java.util.Map;
@@ -167,6 +168,7 @@ final class BackgroundLoad {
     }
 
     private void run() {
+        boolean normalCompletion = false;
         try {
             readLoad();
             synchronized (this) {
@@ -186,6 +188,7 @@ final class BackgroundLoad {
             synchronized (this) {
                 keep = !cancelled;
                 opened = subscription.orElse(null);
+                normalCompletion = keep && !loadLetGo;
             }
             if (!keep) {
                 // Abandoned while the tail was opening: nobody is left to close it but this thread.
@@ -199,9 +202,30 @@ final class BackgroundLoad {
                 health.fail(failure);
             }
         } finally {
+            boolean deferred = false;
             try { load.close(); }
+            catch (SnapshotSession.PendingClose pending) {
+                if (normalCompletion && !isCancelled() && pending.getSuppressed().length == 0)
+                    deferred = finishWhenClosed(pending);
+                else if (!isCancelled()) health.fail(pending);
+            }
             catch (RuntimeException | Error failure) { if (!isCancelled()) health.fail(failure); }
-            finally { finished.countDown(); }
+            finally { if (!deferred) finished.countDown(); }
+        }
+    }
+
+    /** Observe the original cleanup attempt without another worker, read, tail or ownership transition. */
+    private boolean finishWhenClosed(SnapshotSession.PendingClose pending) {
+        try {
+            pending.completion().whenComplete((ignored, outcome) -> {
+                try { load.close(); }
+                catch (RuntimeException | Error failure) { if (!isCancelled()) health.fail(failure); }
+                finally { finished.countDown(); }
+            });
+            return true;
+        } catch (RuntimeException | Error failure) {
+            if (!isCancelled()) health.fail(failure);
+            return false;
         }
     }
 
