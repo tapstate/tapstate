@@ -7,6 +7,7 @@ import io.tapstate.control.core.PipelineDraftError;
 import io.tapstate.control.core.PipelineDraftService;
 import io.tapstate.control.core.SourceProjectionService;
 import io.tapstate.control.core.SourceError;
+import io.tapstate.control.core.SchemaReport;
 import io.tapstate.control.core.SourceSchemaQueryService;
 import io.tapstate.control.core.SourceView;
 import io.tapstate.core.common.JsonWriter;
@@ -35,6 +36,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Semaphore;
@@ -56,6 +58,14 @@ class PipelineAssistantController {
     private static final String NODE_ID = "nodeId";
     private static final String SOURCE_ID = "sourceId";
     private static final String ERROR_TEXT = "errorText";
+    private static final String SOURCES = "sources";
+    private static final String TABLES = "tables";
+    private static final String PROPOSAL_ENABLED = "proposalEnabled";
+    private static final int MAX_AUTO_SOURCES = 3;
+    private static final int MAX_AUTO_TABLES = 40;
+    private static final int MAX_AVAILABLE_SOURCES = 30;
+    private static final int MAX_AVAILABLE_TABLES = 20;
+    private static final int MAX_CONTEXT_LENGTH = 120000;
     private static final Semaphore CAPACITY = new Semaphore(4);
     private final ObjectProvider<PipelineDraftService> drafts;
     private final ObjectProvider<SourceProjectionService> sources;
@@ -78,9 +88,6 @@ class PipelineAssistantController {
         long revision = revision(body.get("revision"));
         PipelineDraft base = current(id, revision);
         List<Map<String, String>> messages = messages(body.get("messages"));
-        Map<String, Object> context = context(base);
-        Map<String, Object> focus = focus(base, body.get("focus"));
-        if (!focus.isEmpty()) context.put("focus", focus);
         StreamingResponseBody stream = output -> {
             AssistantStream streamEvents = new AssistantStream(output);
             if (!CAPACITY.tryAcquire()) {
@@ -101,6 +108,9 @@ class PipelineAssistantController {
             try {
                 streamEvents.event(Map.of("type", "start", "messageId", UUID.randomUUID().toString()));
                 streamEvents.status("connecting");
+                Map<String, Object> context = context(base);
+                Map<String, Object> focus = focus(base, body.get("focus"));
+                if (!focus.isEmpty()) context.put("focus", focus);
                 streamEvents.event(Map.of("type", "text-start", "id", textId));
                 streamEvents.status("streaming");
                 var candidate = client.propose(settings, messages, context,
@@ -113,7 +123,7 @@ class PipelineAssistantController {
                     return;
                 }
                 streamEvents.status("validating");
-                Map<String, Object> validated = validate(id, revision, candidate.orElseThrow());
+                Map<String, Object> validated = validate(base, id, revision, candidate.orElseThrow(), context);
                 if (!Boolean.TRUE.equals(validated.get(VALID))) {
                     List<Map<String, Object>> diagnostics = diagnostics(validated);
                     String code = diagnostics.isEmpty()
@@ -149,6 +159,10 @@ class PipelineAssistantController {
     }
     Map<String, Object> validate(String id, long revision, Map<String, Object> view) {
         PipelineDraft base = current(id, revision);
+        return validate(base, id, revision, view, null);
+    }
+    private Map<String, Object> validate(PipelineDraft base, String id, long revision,
+            Map<String, Object> view, Map<String, Object> scopeContext) {
         try {
             if (!view.keySet().containsAll(Set.of("root", "relations", TRANSFORMS, "destinationTable", "destinationSourceId", "destinationWriteMode"))) {
                 throw new IllegalArgumentException("candidateWizard is incomplete");
@@ -156,7 +170,7 @@ class PipelineAssistantController {
             AssistantWizardJson.validateViewShape(view);
             Map<String, Object> before = wizard(base);
             Map<String, Object> wire = AssistantWizardJson.wire(view, before);
-            enforceScope(base, wire);
+            enforceScope(base, wire, scopeContext == null ? context(base) : scopeContext);
             Map<String, Object> input = new LinkedHashMap<>(PipelineDraftJson.write(json, base));
             input.put(WIZARD, wire);
             PipelineDraft candidate = PipelineDraftJson.read(json, input, id, revision, base.updatedBy());
@@ -199,43 +213,116 @@ class PipelineAssistantController {
     private Map<String, Object> context(PipelineDraft base) {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("currentWizard", AssistantWizardJson.view(wizard(base)));
-        List<Map<String, Object>> inventory = new ArrayList<>();
-        for (String sourceId : inputSources(base)) {
-            SourceView source;
-            try {
-                source = sources.getObject().get(sourceId);
-            } catch (TapstateException missing) {
-                if (missing.code() == SourceError.NOT_FOUND) continue;
-                throw missing;
-            }
-            String connector = source.connector().toLowerCase(java.util.Locale.ROOT);
-            if (!connector.contains("postgres") && !connector.contains("mysql")) continue;
-            var schema = schemas.getObject().find(sourceId).orElse(null);
-            if (schema == null) continue;
-            List<Map<String, Object>> tables = schema.tables().stream().map(table -> Map.<String, Object>of(
-                    "name", table.name(), "primaryKey", table.primaryKey(), "fields", table.fields().stream()
-                            .map(field -> Map.of("name", field.name(), "type", field.type() == null ? "unknown" : field.type())).toList())).toList();
-            inventory.add(Map.of(SOURCE_ID, sourceId, "connector", source.connector(), "tables", tables));
+        SelectedInputScope selection = selectedInputScope(base);
+        boolean inputSelectionPending = !selection.rootTableSelected();
+        result.put("inputSelectionPending", inputSelectionPending);
+        Set<String> sourceIds = inputSources(selection);
+        if (selection.sourceIds().isEmpty() && sourceIds.size() > MAX_AUTO_SOURCES) {
+            requireSourceSelection(result, sourceIds);
+            omitOversizedSchema(result, List.of());
+            return result;
         }
-        result.put("sources", inventory);
-        result.put("proposalEnabled", !inventory.isEmpty());
-        if (JsonWriter.write(result).length() > 120000) {
-            result.put("sources", List.of());
-            result.put("proposalEnabled", false);
-            result.put("schemaUnavailable", "selected schema is too large to include");
-            if (JsonWriter.write(result).length() > 120000) throw malformed("pipeline context is too large for the assistant");
+        List<SourceSchemaInventory> discovered = discoverSchemas(sourceIds);
+        long tableCount = discovered.stream().mapToLong(source -> source.schema().tables().size()).sum();
+        long selectedTableCount = selection.tables().values().stream().mapToLong(Set::size).sum();
+        if (selectedTableCount > MAX_AUTO_TABLES
+                || (inputSelectionPending && tableCount > MAX_AUTO_TABLES)) {
+            requireSourceSelection(result, discovered);
+            omitOversizedSchema(result, discovered);
+            return result;
         }
+        boolean selectedOnly = tableCount > MAX_AUTO_TABLES;
+        List<Map<String, Object>> inventory = sourceInventory(discovered, selection.tables(), selectedOnly);
+        result.put(SOURCES, inventory);
+        result.put(PROPOSAL_ENABLED, !inventory.isEmpty());
+        if (JsonWriter.write(result).length() > MAX_CONTEXT_LENGTH && !selection.tables().isEmpty()) {
+            inventory = sourceInventory(discovered, selection.tables(), true);
+            result.put(SOURCES, inventory);
+            result.put(PROPOSAL_ENABLED, !inventory.isEmpty());
+        }
+        omitOversizedSchema(result, discovered);
         return result;
     }
-    private void enforceScope(PipelineDraft base, Map<String, Object> candidate) {
-        Set<String> allowed = inputSources(base);
+
+    private record SourceSchemaInventory(String sourceId, String connector, SchemaReport schema) { }
+
+    private record SelectedInputScope(Set<String> sourceIds, Map<String, Set<String>> tables,
+            boolean rootTableSelected) { }
+
+    private List<SourceSchemaInventory> discoverSchemas(Set<String> sourceIds) {
+        List<SourceSchemaInventory> discovered = new ArrayList<>();
+        if (schemas.getIfAvailable() == null) return discovered;
+        for (String sourceId : sourceIds) {
+            var schema = findSchemaIfSourceExists(sourceId).orElse(null);
+            if (schema == null || schema.tables().isEmpty()) continue;
+            String connector = schema.connectorId().toLowerCase(java.util.Locale.ROOT);
+            if (!connector.contains("postgres") && !connector.contains("mysql")) continue;
+            discovered.add(new SourceSchemaInventory(sourceId, schema.connectorId(), schema));
+        }
+        return discovered;
+    }
+
+    private static List<Map<String, Object>> sourceInventory(List<SourceSchemaInventory> discovered,
+            Map<String, Set<String>> selectedTables, boolean selectedOnly) {
+        List<Map<String, Object>> inventory = new ArrayList<>();
+        for (SourceSchemaInventory source : discovered) {
+            List<SchemaReport.Table> tables = source.schema().tables();
+            if (selectedOnly) {
+                Set<String> selected = selectedTables.getOrDefault(source.sourceId(), Set.of());
+                tables = tables.stream().filter(table -> selected.contains(table.name())).toList();
+            }
+            if (tables.isEmpty()) continue;
+            List<Map<String, Object>> tableInventory = tables.stream().map(table -> Map.<String, Object>of(
+                    "name", table.name(), "primaryKey", table.primaryKey(), "fields", table.fields().stream()
+                            .map(field -> Map.of("name", field.name(), "type", field.type() == null ? "unknown" : field.type())).toList())).toList();
+            inventory.add(Map.of(SOURCE_ID, source.sourceId(), "connector", source.connector(), TABLES, tableInventory));
+        }
+        return inventory;
+    }
+
+    private static void requireSourceSelection(Map<String, Object> context, Set<String> sourceIds) {
+        context.put("availableSources", sourceIds.stream().limit(MAX_AVAILABLE_SOURCES)
+                .map(sourceId -> Map.of(SOURCE_ID, sourceId)).toList());
+        disableProposalForScopeSelection(context);
+    }
+
+    private static void requireSourceSelection(Map<String, Object> context, List<SourceSchemaInventory> discovered) {
+        context.put("availableSources", discovered.stream().limit(MAX_AVAILABLE_SOURCES).map(source -> Map.of(
+                SOURCE_ID, source.sourceId(), "tableCount", source.schema().tables().size(),
+                TABLES, source.schema().tables().stream().limit(MAX_AVAILABLE_TABLES)
+                        .map(SchemaReport.Table::name).toList())).toList());
+        disableProposalForScopeSelection(context);
+    }
+
+    private static void disableProposalForScopeSelection(Map<String, Object> context) {
+        context.put(SOURCES, List.of());
+        context.put(PROPOSAL_ENABLED, false);
+        context.put("scopeSelectionRequired", true);
+    }
+
+    private static void omitOversizedSchema(Map<String, Object> context, List<SourceSchemaInventory> discovered) {
+        if (JsonWriter.write(context).length() <= MAX_CONTEXT_LENGTH) return;
+        context.put(SOURCES, List.of());
+        context.put(PROPOSAL_ENABLED, false);
+        context.put("schemaUnavailable", "selected schema is too large to include");
+        if (!context.containsKey("availableSources")) requireSourceSelection(context, discovered);
+        if (JsonWriter.write(context).length() > MAX_CONTEXT_LENGTH) {
+            throw malformed("pipeline context is too large for the assistant");
+        }
+    }
+    private void enforceScope(PipelineDraft base, Map<String, Object> candidate, Map<String, Object> scopeContext) {
+        if (!Boolean.TRUE.equals(scopeContext.get(PROPOSAL_ENABLED))) {
+            throw malformed("select an input Source and table before proposing a pipeline for a large schema");
+        }
+        Map<String, Set<String>> allowedTables = sourceTables(scopeContext);
         List<Map<String, Object>> inputs = new ArrayList<>(); inputs.add(AssistantWizardJson.object(candidate.get("root")));
         inputs.addAll(AssistantWizardJson.list(candidate.get("related")).stream().map(AssistantWizardJson::object).toList());
         for (var input : inputs) {
             String source = AssistantWizardJson.text(input.get(SOURCE_ID));
-            if (!allowed.contains(source)) throw malformed("candidate references an unselected Source");
-            var schema = schemas.getObject().find(source).orElseThrow(() -> malformed("selected Source has no discovered schema"));
-            if (schema.tables().stream().noneMatch(table -> table.name().equals(input.get("table")))) throw malformed("candidate references an unknown table");
+            if (!allowedTables.containsKey(source)) throw malformed("candidate references an unselected Source");
+            if (!allowedTables.get(source).contains(AssistantWizardJson.text(input.get("table")))) {
+                throw malformed("candidate references an unknown table");
+            }
         }
         var beforeOutput = AssistantWizardJson.object(AssistantWizardJson.object(wizard(base).get("output")).get("config"));
         var output = AssistantWizardJson.object(AssistantWizardJson.object(candidate.get("output")).get("config"));
@@ -243,10 +330,26 @@ class PipelineAssistantController {
                 .equals(AssistantWizardJson.text(output.get(SOURCE_ID)))) {
             throw malformed("candidate may not change the selected destination Source");
         }
-        validateUnionInputs(base, candidate, allowed);
+        validateUnionInputs(base, candidate, allowedTables);
     }
 
-    private void validateUnionInputs(PipelineDraft base, Map<String, Object> candidate, Set<String> allowed) {
+    private static Map<String, Set<String>> sourceTables(Map<String, Object> context) {
+        Map<String, Set<String>> result = new LinkedHashMap<>();
+        for (Object rawSource : AssistantWizardJson.list(context.get(SOURCES))) {
+            Map<String, Object> source = AssistantWizardJson.object(rawSource);
+            String sourceId = AssistantWizardJson.text(source.get(SOURCE_ID));
+            if (sourceId.isBlank()) continue;
+            Set<String> tableNames = result.computeIfAbsent(sourceId, ignored -> new LinkedHashSet<>());
+            for (Object rawTable : AssistantWizardJson.list(source.get(TABLES))) {
+                String tableName = AssistantWizardJson.text(AssistantWizardJson.object(rawTable).get("name"));
+                if (!tableName.isBlank()) tableNames.add(tableName);
+            }
+        }
+        return result;
+    }
+
+    private void validateUnionInputs(PipelineDraft base, Map<String, Object> candidate,
+            Map<String, Set<String>> allowedTables) {
         List<Map<String, Object>> transforms = new ArrayList<>();
         Map<String, Object> root = AssistantWizardJson.object(candidate.get("root"));
         transforms.addAll(AssistantWizardJson.list(root.get(PRE_TRANSFORMS)).stream()
@@ -278,12 +381,11 @@ class PipelineAssistantController {
                 }
                 String sourceId = input.substring(0, separator);
                 String tableName = input.substring(separator + 1);
-                if (!allowed.contains(sourceId)) {
+                if (!allowedTables.containsKey(sourceId)) {
                     throw invalidUnionDraft(base,
                             "wizard union input must reference a table in a selected Source schema");
                 }
-                var schema = schemas.getObject().find(sourceId).orElse(null);
-                if (schema == null || schema.tables().stream().noneMatch(table -> table.name().equals(tableName))) {
+                if (!allowedTables.get(sourceId).contains(tableName)) {
                     throw invalidUnionDraft(base,
                             "wizard union input must reference a table in a selected Source schema");
                 }
@@ -295,11 +397,73 @@ class PipelineAssistantController {
         return new TapstateException(PipelineDraftError.INVALID,
                 Map.of("id", base.pipelineId(), "reason", reason), null);
     }
-    private Set<String> inputSources(PipelineDraft draft) {
-        Set<String> ids = new LinkedHashSet<>();
-        if (draft.wizard().root() != null && draft.wizard().root().sourceId() != null && !draft.wizard().root().sourceId().isBlank()) ids.add(draft.wizard().root().sourceId());
-        for (var related : draft.wizard().related()) if (related.sourceId() != null && !related.sourceId().isBlank()) ids.add(related.sourceId());
-        return ids;
+    private Set<String> inputSources(SelectedInputScope selection) {
+        if (!selection.sourceIds().isEmpty()) return selection.sourceIds();
+        Set<String> available = new LinkedHashSet<>();
+        SourceProjectionService projection = sources.getIfAvailable();
+        if (projection == null) return available;
+        for (SourceView source : projection.list()) {
+            String connector = source.connector().toLowerCase(java.util.Locale.ROOT);
+            if (!connector.contains("postgres") && !connector.contains("mysql")) continue;
+            available.add(source.id());
+            if (available.size() == MAX_AVAILABLE_SOURCES) break;
+        }
+        return available;
+    }
+    private Optional<SchemaReport> findSchemaIfSourceExists(String sourceId) {
+        try {
+            return schemas.getObject().find(sourceId);
+        } catch (TapstateException missing) {
+            if (missing.code() == SourceError.NOT_FOUND) return Optional.empty();
+            throw missing;
+        }
+    }
+    private static SelectedInputScope selectedInputScope(PipelineDraft draft) {
+        Set<String> sourceIds = new LinkedHashSet<>();
+        Map<String, Set<String>> tables = new LinkedHashMap<>();
+        boolean rootTableSelected = false;
+        PipelineDraft.Root root = draft.wizard().root();
+        if (root != null) {
+            addSelectedInput(root.sourceId(), root.table(), sourceIds, tables);
+            rootTableSelected = hasText(root.sourceId()) && hasText(root.table());
+            addUnionTables(root.preTransforms(), sourceIds, tables);
+        }
+        for (var related : draft.wizard().related()) {
+            addSelectedInput(related.sourceId(), related.table(), sourceIds, tables);
+            addUnionTables(related.preTransforms(), sourceIds, tables);
+        }
+        addUnionTables(draft.wizard().transforms(), sourceIds, tables);
+        return new SelectedInputScope(sourceIds, tables, rootTableSelected);
+    }
+
+    private static void addSelectedInput(String sourceId, String tableName,
+            Set<String> sourceIds, Map<String, Set<String>> tables) {
+        if (!hasText(sourceId)) return;
+        sourceIds.add(sourceId);
+        if (hasText(tableName)) tables.computeIfAbsent(sourceId, ignored -> new LinkedHashSet<>()).add(tableName);
+    }
+
+    private static boolean hasText(String value) {
+        return value != null && !value.isBlank();
+    }
+
+    private static void addUnionTables(List<PipelineDraft.Transform> transforms,
+            Set<String> sourceIds, Map<String, Set<String>> tables) {
+        for (PipelineDraft.Transform transform : transforms) {
+            if (!"union".equals(transform.type())) continue;
+            Object rawInputs = transform.fields().get("from");
+            if (!(rawInputs instanceof List<?> inputs)) continue;
+            for (Object rawInput : inputs) {
+                if (!(rawInput instanceof String input) || !input.equals(input.trim())) continue;
+                int separator = input.indexOf('.');
+                if (separator < 1 || separator == input.length() - 1) continue;
+                String sourceId = input.substring(0, separator);
+                String tableName = input.substring(separator + 1);
+                if (!sourceId.isBlank() && !tableName.isBlank()) {
+                    addSelectedInput(sourceId, tableName, sourceIds, tables);
+                }
+            }
+        }
     }
     private PipelineDraft current(String id, long revision) {
         PipelineDraft draft = service().find(id).orElseThrow(() -> new TapstateException(PipelineDraftError.NOT_FOUND, Map.of("id", id), null));
