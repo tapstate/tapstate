@@ -127,6 +127,19 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
         return Optional.ofNullable(renewed).map(this::read);
     }
 
+    /** Starts the owning transaction with the exact live-lease write, then validates its original facts. */
+    Optional<WorkloadClaim> renewBeforeReads(WorkloadClaim expected, Duration ttl) {
+        Objects.requireNonNull(expected, "expected"); positive(ttl);
+        if (session == null || !strict) throw new IllegalStateException("renewal-first requires a strict caller transaction");
+        var update = List.of(new Document("$set", new Document("leaseUntil", leaseUntil(ttl))));
+        var before = collection.findOneAndUpdate(session, liveExpected(expected, expected.topologyRevision()), update,
+                new FindOneAndUpdateOptions().returnDocument(ReturnDocument.BEFORE));
+        if (before == null) { validateExisting(expected.key()); return Optional.empty(); }
+        // Validate the preimage: reading only the renewed document could silently repair a corrupt lease.
+        read(before);
+        return Optional.of(read(collection.find(session, new Document("_id", id(expected.key()))).first()));
+    }
+
     @Override
     public boolean release(WorkloadClaim expected) {
         Objects.requireNonNull(expected, "expected");

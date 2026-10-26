@@ -77,10 +77,14 @@ final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
     }
     @Override public Optional<WorkloadClaim> renew(WorkloadClaim expected, Duration ttl) {
         requireKey(Objects.requireNonNull(expected, "expected").key());
-        return transaction(false, (store, session) -> {
-            validateMutationScope(session, store, expected);
-            return store.renew(expected, ttl);
-        });
+        return transaction(false, null, (store, session) -> {
+            var renewed = store.renewBeforeReads(expected, ttl);
+            if (renewed.isPresent()) {
+                var retained = storedScope(session, expected.key());
+                if (retained != null) validateState(session, retained);
+            } else validateMutationScope(session, store, expected);
+            return renewed;
+        }, true);
     }
     @Override public boolean release(WorkloadClaim expected) {
         requireKey(Objects.requireNonNull(expected, "expected").key());
@@ -157,10 +161,14 @@ final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
             var claim = current.get().claim();
             if (claim.owner().equals(expected.owner()) && claim.claimGeneration() == expected.claimGeneration()
                     && claim.executionGeneration() == expected.executionGeneration()) {
-                var access = new MongoCachePipelineAccess(client, database, retained, null, requireActive);
-                access.verifyStateStructure(); access.state(session);
+                validateState(session, retained);
             }
         }
+    }
+
+    private void validateState(ClientSession session, PipelineIntentScope retained) {
+        var access = new MongoCachePipelineAccess(client, database, retained, null, requireActive);
+        access.verifyStateStructure(); access.state(session);
     }
 
     private PipelineIntentScope storedScope(ClientSession session, WorkloadClaimKey key) {
@@ -201,6 +209,11 @@ final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
     }
 
     private <T> T transaction(boolean admission, PipelineIntentScope pipeline, BiFunction<MongoWorkloadClaimStore, ClientSession, T> operation) {
+        return transaction(admission, pipeline, operation, false);
+    }
+
+    private <T> T transaction(boolean admission, PipelineIntentScope pipeline,
+            BiFunction<MongoWorkloadClaimStore, ClientSession, T> operation, boolean renewalFirst) {
         return StoreIo.call(() -> {
             try {
                 requireActive.run();
@@ -209,7 +222,9 @@ final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
                         return session.withTransaction(() -> {
                             requireActive.run();
                             var identity = new MongoCacheBusinessIdentity(database, scope);
-                            if (admission) identity.admitClaim(session); else identity.requireAdmissionState(session);
+                            if (!renewalFirst) {
+                                if (admission) identity.admitClaim(session); else identity.requireAdmissionState(session);
+                            }
                             requireCollection(database);
                             var store = raw.inStrictSession(session);
                             if (pipeline != null) {
@@ -220,6 +235,9 @@ final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
                                 if (admission) access.updateState(session, current, new Document(), false);
                             }
                             T result = operation.apply(store, session);
+                            // A renewal must see the latest lease before any read pins the transaction snapshot.
+                            // Domain validation remains in this transaction and rolls the lease back on failure.
+                            if (renewalFirst) identity.requireAdmissionState(session);
                             requireActive.run();
                             return result;
                         }, TRANSACTION);

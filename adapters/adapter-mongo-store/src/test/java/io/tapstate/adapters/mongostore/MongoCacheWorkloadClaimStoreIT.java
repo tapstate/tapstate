@@ -54,6 +54,97 @@ class MongoCacheWorkloadClaimStoreIT {
     private static final Duration TTL = Duration.ofSeconds(30);
     private static final Runnable ACTIVE = () -> {};
 
+    @Test void renewalDoesNotMistakeAnOldSnapshotForAnExpiredSameTenure() {
+        withBusiness(f -> {
+            String name = "held-renewal-" + UUID.randomUUID();
+            try (var observed = MongoClients.create(MongoClientSettings.builder()
+                    .applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl()))
+                    .applicationName(name).build());
+                    var workers = Executors.newSingleThreadExecutor()) {
+                observed.getDatabase("admin").runCommand(new Document("ping", 1));
+                var store = new MongoCacheWorkloadClaimStore(observed,
+                        observed.getDatabase(f.database().getName()), SCOPE, ACTIVE);
+                var claims = f.domain().workloadClaims(SCOPE);
+                var original = claims.acquirePipeline(PIPELINE, OWNER, 1, Duration.ofSeconds(2)).claim();
+                var admin = f.admin().getDatabase("admin");
+                long count = ((Number) admin.runCommand(new Document("configureFailPoint", "failCommand")
+                        .append("mode", new Document("times", 1))
+                        .append("data", new Document("failCommands", List.of("findAndModify"))
+                                .append("appName", name).append("blockConnection", true)
+                                .append("blockTimeMS", 4000))).get("count")).longValue();
+                try {
+                    var pending = workers.submit(() -> store.renew(original, TTL));
+                    admin.runCommand(new Document("waitForFailPoint", "failCommand")
+                            .append("timesEntered", count + 1).append("maxTimeMS", 2000));
+                    var extended = claims.renew(original, TTL).orElseThrow();
+                    assertThat(extended.leaseUntil()).isAfter(original.leaseUntil());
+                    var result = pending.get(10, TimeUnit.SECONDS);
+                    assertThat(result).as("the same tenure was renewed before its original lease expired").isPresent();
+                    var renewed = result.orElseThrow();
+                    assertThat(renewed.claimGeneration()).isEqualTo(original.claimGeneration());
+                    assertThat(renewed.executionGeneration()).isEqualTo(original.executionGeneration());
+                    assertThat(renewed.owner()).isEqualTo(original.owner());
+                    assertThat(claimScope(f.database())).isEqualTo(header(PIPELINE));
+                } finally {
+                    admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
+                }
+            }
+        });
+    }
+
+    @Test void anExpiredNewLeaseCannotSkipTheMatchedTenuresMissingCheckpoint() {
+        withBusiness(f -> {
+            String name = "held-renewal-proof-" + UUID.randomUUID();
+            try (var observed = MongoClients.create(MongoClientSettings.builder()
+                    .applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl()))
+                    .applicationName(name).build())) {
+                observed.getDatabase("admin").runCommand(new Document("ping", 1));
+                var original = f.domain().workloadClaims(SCOPE).acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
+                SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).deleteOne(new Document("_id", "orders"));
+                var before = snapshot(f.database());
+                var admin = f.admin().getDatabase("admin");
+                admin.runCommand(new Document("configureFailPoint", "failCommand")
+                        .append("mode", new Document("times", 1))
+                        .append("data", new Document("failCommands", List.of("find"))
+                                .append("namespace", f.database().getName() + ".workload_claims")
+                                .append("appName", name).append("blockConnection", true).append("blockTimeMS", 2000)));
+                try {
+                    var store = new MongoCacheWorkloadClaimStore(observed, observed.getDatabase(f.database().getName()), SCOPE, ACTIVE);
+                    assertThatThrownBy(() -> store.renew(original, Duration.ofMillis(250)))
+                            .isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+                    assertThat(snapshot(f.database())).isEqualTo(before);
+                } finally {
+                    admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
+                }
+            }
+        });
+    }
+
+    @Test void renewalRollsBackWhenTheBusinessSchemaProofIsMissing() {
+        withBusiness(f -> {
+            var claims = f.domain().workloadClaims(SCOPE);
+            var original = claims.acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
+            SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(f.database()).deleteMany(new Document());
+            var before = snapshot(f.database());
+            assertThatThrownBy(() -> claims.renew(original, TTL))
+                    .isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+            assertThat(snapshot(f.database())).isEqualTo(before);
+        });
+    }
+
+    @Test void renewalCannotRepairACorruptLeaseThatItsAtomicPredicateWouldMatch() {
+        withBusiness(f -> {
+            var claims = f.domain().workloadClaims(SCOPE);
+            var original = claims.acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(new Document(),
+                    new Document("$set", new Document("leaseUntil", new org.bson.types.MaxKey())));
+            var before = snapshot(f.database());
+            assertThatThrownBy(() -> claims.renew(original, TTL))
+                    .isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+            assertThat(snapshot(f.database())).isEqualTo(before);
+        });
+    }
+
     @Test void lostCaptureHistoryCannotBeReissuedAsTheSameOriginalFence() {
         withBusiness(f -> {
             var claims=f.domain().workloadClaims(SCOPE);
