@@ -23,7 +23,14 @@ public final class StorageControlDispatcher {
     public interface Snapshots { Snapshot load(StorageControlAccess caller, Runnable requireActive); }
     public record Snapshot(StorageBinding.Mode mode, String clusterId, String operationId, long setupGeneration,
             long bindingVersion, long authGeneration, long stateVersion, String setupPhase, BusinessPhase businessPhase,
-            Map<StorageSetupService.Layer,Health> health, List<String> allowedActions, boolean restartRequired) {
+            Map<StorageSetupService.Layer,Health> health, List<String> allowedActions, boolean restartRequired,
+            DefaultSourceVerification.Verification applicationDataVerification) {
+        public Snapshot(StorageBinding.Mode mode, String clusterId, String operationId, long setupGeneration,
+                long bindingVersion, long authGeneration, long stateVersion, String setupPhase, BusinessPhase businessPhase,
+                Map<StorageSetupService.Layer,Health> health, List<String> allowedActions, boolean restartRequired) {
+            this(mode, clusterId, operationId, setupGeneration, bindingVersion, authGeneration, stateVersion, setupPhase,
+                    businessPhase, health, allowedActions, restartRequired, DefaultSourceVerification.Verification.unknown());
+        }
         public Snapshot {
             Objects.requireNonNull(mode, "mode"); Objects.requireNonNull(businessPhase, "businessPhase");
             if (clusterId == null || clusterId.isBlank() || operationId == null || operationId.isBlank()
@@ -31,8 +38,9 @@ public final class StorageControlDispatcher {
                     || !Set.of("LOCAL_SETUP", "CONFIG_PREPARED", "STORAGE_BOUND", "COMPLETE").contains(setupPhase))
                 throw new IllegalArgumentException("invalid storage snapshot");
             health = Map.copyOf(health); allowedActions = List.copyOf(allowedActions);
+            Objects.requireNonNull(applicationDataVerification, "applicationDataVerification");
             if (health.size() != StorageSetupService.Layer.values().length || allowedActions.stream().anyMatch(
-                    action -> !StorageOperationSchemas.STEMS.containsKey(action) && !Set.of("login", "restart", "first-admin").contains(action)))
+                    action -> !StorageOperationSchemas.STEMS.containsKey(action) && !Set.of("login", "restart", "first-admin", "connection.test").contains(action)))
                 throw new IllegalArgumentException("invalid storage snapshot actions or health");
         }
     }
@@ -184,6 +192,11 @@ public final class StorageControlDispatcher {
         out.put("authGeneration", value.authGeneration()); out.put("stateVersion", value.stateVersion()); out.put("setupPhase", value.setupPhase());
         out.put("businessPhase", value.businessPhase().name()); var health = new LinkedHashMap<String,Object>();
         value.health().forEach((layer, state) -> health.put(layer.name(), state.name())); out.put("health", health);
+        var verification = value.applicationDataVerification(); var checked = new LinkedHashMap<String,Object>();
+        checked.put("status", verification.status().name());
+        checked.put("checkedAt", verification.checkedAt() == null ? null : verification.checkedAt().toString());
+        checked.put("validUntil", verification.validUntil() == null ? null : verification.validUntil().toString());
+        out.put("applicationDataVerification", checked);
         out.put("allowedActions", value.allowedActions()); out.put("restartRequired", value.restartRequired()); return out;
     }
     private static Map<String,Object> setup(StorageSetupService.Status value) {

@@ -608,8 +608,10 @@ class ControlPlaneConfiguration {
     @Bean
     ConnectionTestService connectionTestService(
             ConnectionProbe probe, ConnectionTestResultStore resultStore, AuditGate auditGate,
-            ConnectorConfigValidator configValidator, SourceConnectionResolver sourceConnections) {
-        return new ConnectionTestService(probe, resultStore, auditGate, configValidator, sourceConnections);
+            ConnectorConfigValidator configValidator, SourceConnectionResolver sourceConnections,
+            org.springframework.beans.factory.ObjectProvider<ConnectionTestService.Observer> observers) {
+        return new ConnectionTestService(probe, resultStore, auditGate, configValidator, sourceConnections,
+                observers.getIfAvailable(() -> ignored -> ConnectionTestService.Attempt.NONE));
     }
 
     @Bean

@@ -643,7 +643,13 @@ final class StorageRoot implements AutoCloseable {
             case CACHE_UNAVAILABLE -> StorageControlDispatcher.Health.UNAVAILABLE;
             default -> StorageControlDispatcher.Health.UNKNOWN;
         });
-        health.put(StorageSetupService.Layer.MASTER, StorageControlDispatcher.Health.UNKNOWN);
+        var masterVerification = admitted && runtime.business().orElse(null) instanceof NativeBusinessContext businessOwner
+                ? businessOwner.applicationDataVerification() : DefaultSourceVerification.Verification.unknown();
+        health.put(StorageSetupService.Layer.MASTER, switch (masterVerification.status()) {
+            case PASSED -> StorageControlDispatcher.Health.AVAILABLE;
+            case FAILED -> StorageControlDispatcher.Health.UNAVAILABLE;
+            default -> StorageControlDispatcher.Health.UNKNOWN;
+        });
         var business = switch (phase) {
             case BUSINESS_READY -> admitted ? StorageControlDispatcher.BusinessPhase.READY : StorageControlDispatcher.BusinessPhase.AUTH_READY;
             case AUTH_READY -> StorageControlDispatcher.BusinessPhase.AUTH_READY;
@@ -665,6 +671,7 @@ final class StorageRoot implements AutoCloseable {
         var pending = recoveryAvailable ? configuration.recoveryCommands().current(preparation.orElseThrow().authScope())
                 : Optional.<StorageRecoveryCommands.Plan>empty();
         var actions = new ArrayList<>(List.of("storage.status", "storage.setup.status"));
+        if (admitted && caller.canTestConnections()) actions.add("connection.test");
         if (caller.cacheScope().isPresent()) {
             actions.addAll(List.of("configuration.export", "configuration.import.status"));
             if (admitted) actions.addAll(List.of("configuration.import.preflight", "configuration.import.commit"));
@@ -687,7 +694,7 @@ final class StorageRoot implements AutoCloseable {
                 .orElseGet(() -> awaitingRebuild ? preparation.orElseThrow().operationId() : status.scope().operationId()),
                 status.scope().generation(), status.bindingVersion(), preparation.map(value -> value.authScope().authGeneration()).orElse(0L),
                 revision, status.phase().name(), business, health,
-                actions, false);
+                actions, false, masterVerification);
     }
 
     private void requireOpen() { if (closeRequested || closed) throw StorageRuntime.unavailable(); installationActive.run(); }

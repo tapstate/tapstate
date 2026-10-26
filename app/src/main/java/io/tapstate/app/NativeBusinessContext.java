@@ -64,6 +64,13 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         port = new ThreeLayerStorePort(configuration, original, this::preparePipeline);
         beans.registerSingleton("storePort", port);
         beans.registerSingleton("storageBindingStore", configuration.bindings());
+        beans.registerSingleton("defaultSourceVerification", new DefaultSourceVerification(() -> {
+            original.requireBusiness();
+            var binding = configuration.bindings().load().orElseThrow(StorageRuntime::unavailable);
+            if (!binding.equals(original.binding())) return Optional.empty();
+            return configuration.artifacts().get(binding.defaultSourceId())
+                    .filter(SourceResource.class::isInstance).map(SourceResource.class::cast);
+        }, port.connectionTestResults(), parent.getBean(Clock.class)));
         var overrides = new LinkedHashMap<String,Object>();
         overrides.put("tokenStore", configuration.tokens());
         overrides.put("auditStore", configuration.audit());
@@ -174,6 +181,10 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         if(!available())throw StorageRuntime.unavailable();return context.getBean(NativeSharedSrsRecovery.class);
     }
     StorePort statusStore() { if (!available()) throw StorageRuntime.unavailable(); return port; }
+    DefaultSourceVerification.Verification applicationDataVerification() {
+        return available() ? context.getBean(DefaultSourceVerification.class).snapshot()
+                : DefaultSourceVerification.Verification.unknown();
+    }
     private boolean recoveryPinned(PipelineIntentScope scope) {
         original.requireBusiness();return configuration.cacheRecoveries().read(scope.pipelineId()).filter(value -> value.targetScope().equals(scope)).isPresent();
     }

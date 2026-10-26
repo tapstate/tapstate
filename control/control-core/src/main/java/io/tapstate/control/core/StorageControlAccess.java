@@ -82,6 +82,10 @@ public final class StorageControlAccess {
         if (cache == null) throw new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), null);
         return cache;
     }
+    /** Presentation only; the connection operation still enforces its own authenticated write guard. */
+    public boolean canTestConnections() {
+        return permission == null && cache != null && principal != null && principal.permits(Scope.WRITE);
+    }
     public ConfigurationImportStore.Scope importScope() {
         var current = cache();
         return new ConfigurationImportStore.Scope(current.clusterId(), current.bindingVersion(), mode, organizationId);

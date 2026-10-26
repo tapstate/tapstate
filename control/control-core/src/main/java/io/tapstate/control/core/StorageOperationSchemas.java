@@ -63,6 +63,9 @@ final class StorageOperationSchemas {
         snapshot.put("setupPhase", choice("LOCAL_SETUP", "CONFIG_PREPARED", "STORAGE_BOUND", "COMPLETE"));
         snapshot.put("businessPhase", choice("NOT_CONFIGURED", "PREPARING", "RESTART_REQUIRED", "FIRST_ADMIN_REQUIRED", "AUTH_READY", "READY", "UNAVAILABLE", "AWAITING_REBUILD_CONFIRMATION", "RECOVERING", "CLEANUP_REQUIRED"));
         snapshot.put("health", health); snapshot.put("allowedActions", Map.of("type", "array", "items", text())); snapshot.put("restartRequired", Map.of("type", "boolean"));
+        var nullableTime = Map.<String,Object>of("anyOf", List.of(Map.of("type", "string", "format", "date-time"), Map.of("type", "null")));
+        snapshot.put("applicationDataVerification", object(List.of("status", "checkedAt", "validUntil"), Map.of(
+                "status", choice("UNKNOWN", "CHECKING", "PASSED", "FAILED", "EXPIRED"), "checkedAt", nullableTime, "validUntil", nullableTime)));
         defs.put("StorageStatusResult", object(List.copyOf(snapshot.keySet()), snapshot));
         var recovery = new LinkedHashMap<String,Object>();
         recovery.put("operationId", text()); recovery.put("previousOperationId", Map.of("anyOf", List.of(text(), Map.of("type", "null"))));

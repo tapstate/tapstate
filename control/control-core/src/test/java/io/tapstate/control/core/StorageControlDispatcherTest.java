@@ -83,6 +83,19 @@ class StorageControlDispatcherTest {
         var cluster=new LinkedHashMap<>(valid);cluster.put("scope","CLUSTER");assertMalformed(() -> dispatcher.dispatch("storage.recovery.plan",f.admin(),cluster));
         assertThat(f.recoveries.plans).isZero();
     }
+    @Test void statusProjectsTheActualVerificationTimesWithoutConnectionSettings() {
+        var f = new Fixture(); var old = f.snapshot;
+        var checked = java.time.Instant.parse("2026-10-26T01:00:00Z");
+        f.snapshot = new StorageControlDispatcher.Snapshot(old.mode(), old.clusterId(), old.operationId(), old.setupGeneration(),
+                old.bindingVersion(), old.authGeneration(), old.stateVersion(), old.setupPhase(), old.businessPhase(), old.health(),
+                old.allowedActions(), old.restartRequired(), new DefaultSourceVerification.Verification(
+                        DefaultSourceVerification.Status.PASSED, checked, checked.plusSeconds(600)));
+        var result = f.dispatcher().dispatch("storage.status", f.admin(), Map.of());
+        assertThat(result.get("applicationDataVerification")).isEqualTo(Map.of("status", "PASSED", "checkedAt",
+                "2026-10-26T01:00:00Z", "validUntil", "2026-10-26T01:10:00Z"));
+        assertThat(JsonWriter.write(result)).doesNotContain("sentinel-secret", "mongodb://");
+    }
+
     @Test void setupTestsCommitAndOriginalQueryUseTheSameServicesWithoutExposingConnections() {
         var f = new Fixture(); var dispatcher = f.dispatcher(); var access = f.owner(); var proofs = new LinkedHashMap<String,Object>();
         for (var layer : StorageSetupService.Layer.values()) {
