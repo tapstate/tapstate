@@ -16,6 +16,10 @@ final class InstalledConnectorTests {
     private final StorageSetupService.DefaultTarget target;
 
     InstalledConnectorTests(ConnectorPluginProperties properties, Clock clock) {
+        this(properties, clock, null);
+    }
+
+    InstalledConnectorTests(ConnectorPluginProperties properties, Clock clock, Set<String> selectedFileNames) {
         var registrations = new LinkedHashMap<String,ConnectorRegistration>();
         var artifacts = new LinkedHashMap<String,byte[]>();
         ConnectorRegistry registry = new ConnectorRegistry() {
@@ -59,7 +63,9 @@ final class InstalledConnectorTests {
         var provisioner = new RegistryConnectorProvisioner(registry, introspector, properties.getPluginsDir());
         var registrar = new ConnectorArtifactRegistrar(registry, introspector, new PdkCapabilityDeriver(provisioner),
                 catalog, specs, properties.getAlsoAcceptIds());
-        new SeedConnectorSweep(registrar).sweep(properties.getSeedDir());
+        var sweep = new SeedConnectorSweep(registrar);
+        if (selectedFileNames == null) sweep.sweep(properties.getSeedDir());
+        else sweep.sweep(properties.getSeedDir(), selectedFileNames);
         target = new RegisteredMongoDefaultTarget(registry,
                 new ConnectorCatalogView(TapstateCatalog.load(), catalog, specs, registry), provisioner, clock);
     }

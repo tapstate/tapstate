@@ -561,10 +561,12 @@ class ControlPlaneConfiguration {
     @Bean
     SeedSweepRunner seedSweepRunner(
             SeedConnectorSweep sweep, ConnectorPluginProperties properties, CloudRuntimeSettings cloud,
-            ConnectorRegistry registry, ConnectorCatalogStore catalog, ConnectorSpecStore specs, CapabilityDeriver deriver) {
+            ConnectorRegistry registry, ConnectorCatalogStore catalog, ConnectorSpecStore specs, CapabilityDeriver deriver,
+            org.springframework.core.env.Environment environment) {
         var readiness = cloud.cloud()
                 ? CloudConnectorSeedReadiness.checkedRelease(
-                        properties.getSeedDir(), properties.getPluginsDir(), registry, catalog, specs, deriver)
+                        properties.getSeedDir(), properties.getPluginsDir(), registry, catalog, specs, deriver,
+                        "true".equals(environment.getProperty(WebDistribution.DEVELOPMENT_CONFIRMATION_PROPERTY)))
                 : null;
         return new SeedSweepRunner(sweep, properties.getSeedDir(), readiness);
     }

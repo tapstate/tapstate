@@ -45,6 +45,7 @@ final class CloudConnectorSeedReadiness {
     private static final org.slf4j.Logger LOG = org.slf4j.LoggerFactory.getLogger(CloudConnectorSeedReadiness.class);
 
     static final String LOCK_RESOURCE = "/META-INF/tapstate/connectors.lock.json";
+    static final String LOCAL_SELECTION_RESOURCE = "/META-INF/tapstate/local-storage-acceptance.json";
     private static final List<String> IDS = List.of(
             "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2");
     private static final Set<String> LICENSES = Set.of("MICROSOFT-MIT-LICENSE.txt", "ORACLE-FREE-USE-TERMS.txt");
@@ -63,19 +64,88 @@ final class CloudConnectorSeedReadiness {
     private final ConnectorSpecStore specs;
     private final CapabilityDeriver deriver;
     private final List<Artifact> artifacts;
+    private final List<Artifact> releaseArtifacts;
     private final Map<String, String> specHashes = new HashMap<>();
 
     static CloudConnectorSeedReadiness checkedRelease(
             Path seedDir, Path pluginsDir, ConnectorRegistry registry, ConnectorCatalogStore catalog,
             ConnectorSpecStore specs, CapabilityDeriver deriver) {
+        return checkedRelease(seedDir, pluginsDir, registry, catalog, specs, deriver, false);
+    }
+
+    static CloudConnectorSeedReadiness checkedRelease(
+            Path seedDir, Path pluginsDir, ConnectorRegistry registry, ConnectorCatalogStore catalog,
+            ConnectorSpecStore specs, CapabilityDeriver deriver, boolean confirmedDevelopment) {
         try (InputStream input = CloudConnectorSeedReadiness.class.getResourceAsStream(LOCK_RESOURCE)) {
             if (input == null) {
                 throw invalid("release", "embedded-lock-missing");
             }
-            return new CloudConnectorSeedReadiness(
-                    seedDir, pluginsDir, boundedBytes(input, MAX_LOCK_BYTES), registry, catalog, specs, deriver);
+            byte[] trusted = boundedBytes(input, MAX_LOCK_BYTES);
+            Set<String> selected = bundledSelection(trusted, confirmedDevelopment);
+            if (selected.size() != IDS.size()) LOG.info("Local storage acceptance selects {} from the locked release; full connector coverage is not asserted.", selected);
+            return new CloudConnectorSeedReadiness(seedDir, pluginsDir, trusted, registry, catalog, specs, deriver,
+                    Files::list, selected);
         } catch (IOException failure) {
             throw invalid("release", "embedded-lock-unreadable");
+        }
+    }
+
+    /** A reduced selection is an explicit development-build input, never an editable runtime list. */
+    private static Set<String> bundledSelection(byte[] trustedLock, boolean confirmedDevelopment) throws IOException {
+        try (InputStream input = CloudConnectorSeedReadiness.class.getResourceAsStream(LOCAL_SELECTION_RESOURCE)) {
+            if (input == null) return Set.copyOf(IDS);
+            var distribution = WebDistribution.bundled();
+            return localSelection(trustedLock, boundedBytes(input, 4096),
+                    distribution.localDevelopment() && distribution.profile() == WebDistribution.Profile.CLOUD,
+                    confirmedDevelopment);
+        }
+    }
+
+    /** Rejects an acceptance-only artifact in a release deployment before opening storage clients. */
+    static void validateLocalSelection(WebDistribution distribution, boolean confirmedDevelopment) {
+        try (InputStream receipt = CloudConnectorSeedReadiness.class.getResourceAsStream(LOCAL_SELECTION_RESOURCE)) {
+            if (receipt == null) return;
+            try (InputStream lock = CloudConnectorSeedReadiness.class.getResourceAsStream(LOCK_RESOURCE)) {
+                if (lock == null) throw invalid("release", "embedded-lock-missing");
+                localSelection(boundedBytes(lock, MAX_LOCK_BYTES), boundedBytes(receipt, 4096),
+                        distribution.localDevelopment() && distribution.profile() == WebDistribution.Profile.CLOUD,
+                        confirmedDevelopment);
+            }
+        } catch (IOException failure) {
+            throw invalid("release", "local-selection-invalid");
+        }
+    }
+
+    static Set<String> localSelection(byte[] trustedLock, byte[] receipt, boolean localCloud, boolean confirmedDevelopment) {
+        if (!localCloud || !confirmedDevelopment) throw invalid("release", "local-selection-not-allowed");
+        JsonNode selected = parse(receipt, "release", "local-selection-invalid");
+        if (!keys(selected).equals(Set.of("schemaVersion", "releaseLockSha256", "connectorId"))
+                || !selected.path("schemaVersion").isInt() || selected.path("schemaVersion").intValue() != 1
+                || !ContentHash.of(trustedLock).equals(selected.path("releaseLockSha256").asString(""))
+                || !"mongodb-atlas".equals(selected.path("connectorId").asString("")))
+            throw invalid("release", "local-selection-invalid");
+        return Set.of("mongodb-atlas");
+    }
+
+    Set<String> selectedFileNames() {
+        return artifacts.stream().map(artifact -> artifact.id() + "-connector.jar").collect(java.util.stream.Collectors.toUnmodifiableSet());
+    }
+
+    boolean reducedSelection() { return artifacts.size() != releaseArtifacts.size(); }
+
+    static Set<String> localSelectionFileNames(boolean confirmedDevelopment) {
+        try (InputStream receipt = CloudConnectorSeedReadiness.class.getResourceAsStream(LOCAL_SELECTION_RESOURCE)) {
+            if (receipt == null) return null;
+            try (InputStream lock = CloudConnectorSeedReadiness.class.getResourceAsStream(LOCK_RESOURCE)) {
+                if (lock == null) throw invalid("release", "embedded-lock-missing");
+                var distribution = WebDistribution.bundled();
+                Set<String> selected = localSelection(boundedBytes(lock, MAX_LOCK_BYTES), boundedBytes(receipt, 4096),
+                        distribution.localDevelopment() && distribution.profile() == WebDistribution.Profile.CLOUD,
+                        confirmedDevelopment);
+                return selected.stream().map(id -> id + "-connector.jar").collect(java.util.stream.Collectors.toUnmodifiableSet());
+            }
+        } catch (IOException failure) {
+            throw invalid("release", "local-selection-invalid");
         }
     }
 
@@ -89,6 +159,12 @@ final class CloudConnectorSeedReadiness {
     CloudConnectorSeedReadiness(
             Path seedDir, Path pluginsDir, byte[] trustedLock, ConnectorRegistry registry, ConnectorCatalogStore catalog,
             ConnectorSpecStore specs, CapabilityDeriver deriver, DirectoryEntries directoryEntries) {
+        this(seedDir, pluginsDir, trustedLock, registry, catalog, specs, deriver, directoryEntries, Set.copyOf(IDS));
+    }
+
+    CloudConnectorSeedReadiness(
+            Path seedDir, Path pluginsDir, byte[] trustedLock, ConnectorRegistry registry, ConnectorCatalogStore catalog,
+            ConnectorSpecStore specs, CapabilityDeriver deriver, DirectoryEntries directoryEntries, Set<String> selectedIds) {
         this.seedDir = seedDir.toAbsolutePath().normalize();
         this.pluginsDir = pluginsDir.toAbsolutePath().normalize();
         this.registry = registry;
@@ -100,7 +176,10 @@ final class CloudConnectorSeedReadiness {
                 || !lock.path("schemaVersion").isInt() || lock.path("schemaVersion").intValue() != 2) {
             throw invalid("release", "lock-invalid");
         }
-        artifacts = readArtifacts(lock.path("connectors"));
+        releaseArtifacts = readArtifacts(lock.path("connectors"));
+        if (!selectedIds.equals(Set.copyOf(IDS)) && !selectedIds.equals(Set.of("mongodb-atlas")))
+            throw invalid("release", "local-selection-invalid");
+        artifacts = releaseArtifacts.stream().filter(artifact -> selectedIds.contains(artifact.id())).toList();
         // The runtime lock must be the same checked-in bytes embedded in this server, not a second
         // editable list that can authorize a replaced JAR. No fourth Cloud startup setting is needed.
         Path release = this.seedDir.resolveSibling("release");
@@ -111,12 +190,14 @@ final class CloudConnectorSeedReadiness {
                 throw invalid("release", "lock-missing-or-mismatched");
             }
             verifyInventory(directoryEntries);
-            for (Artifact artifact : artifacts) {
+            for (Artifact artifact : releaseArtifacts) {
                 Path jar = this.seedDir.resolve(artifact.id() + "-connector.jar");
                 verifyBytes(jar, artifact.bytes(), artifact.sha256(), artifact.id());
                 specHashes.put(artifact.id(), verifyJar(jar, artifact));
-                verifyStoredArtifact(artifact, false);
-                verifyCache(artifact, false);
+                if (selectedIds.contains(artifact.id())) {
+                    verifyStoredArtifact(artifact, false);
+                    verifyCache(artifact, false);
+                }
             }
             verifyLicenses(lock.path("licenseFiles"), release.resolve("licenses"));
         } catch (IOException | UncheckedIOException failure) {
@@ -183,7 +264,7 @@ final class CloudConnectorSeedReadiness {
             throw invalid("release", "seed-directory-missing");
         }
         Set<String> expected = new HashSet<>();
-        artifacts.forEach(artifact -> expected.add(artifact.id() + "-connector.jar"));
+        releaseArtifacts.forEach(artifact -> expected.add(artifact.id() + "-connector.jar"));
         Set<String> actual = new HashSet<>();
         try (var entries = directoryEntries.list(seedDir)) {
             entries.filter(path -> path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".jar"))

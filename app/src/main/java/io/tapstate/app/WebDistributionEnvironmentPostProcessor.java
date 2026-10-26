@@ -35,7 +35,9 @@ public final class WebDistributionEnvironmentPostProcessor implements Environmen
                 .bind("tapstate.cloud", Bindable.of(CloudProperties.class))
                 .orElseGet(CloudProperties::new);
         CloudRuntimeSettings settings = CloudRuntimeSettings.resolve(properties, environment.getProperty("CLUSTER_ID"));
-        distribution.get().validate(settings,
-                "true".equals(environment.getProperty(WebDistribution.DEVELOPMENT_CONFIRMATION_PROPERTY)));
+        var bundled = distribution.get();
+        boolean confirmed = "true".equals(environment.getProperty(WebDistribution.DEVELOPMENT_CONFIRMATION_PROPERTY));
+        bundled.validate(settings, confirmed);
+        CloudConnectorSeedReadiness.validateLocalSelection(bundled, confirmed);
     }
 }

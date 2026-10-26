@@ -115,8 +115,10 @@ class StorageRootConfiguration {
         };
     }
     @Bean @org.springframework.context.annotation.Lazy
-    InstalledConnectorTests installedConnectorTests(ConnectorPluginProperties properties, Clock clock) {
-        return new InstalledConnectorTests(properties, clock);
+    InstalledConnectorTests installedConnectorTests(ConnectorPluginProperties properties, Clock clock,
+            org.springframework.core.env.Environment environment) {
+        return new InstalledConnectorTests(properties, clock, CloudConnectorSeedReadiness.localSelectionFileNames(
+                "true".equals(environment.getProperty(WebDistribution.DEVELOPMENT_CONFIRMATION_PROPERTY))));
     }
     @Bean @org.springframework.context.annotation.Lazy
     StorageSetupService.DefaultTarget storageDefaultTarget(ObjectProvider<InstalledConnectorTests> connectors) {

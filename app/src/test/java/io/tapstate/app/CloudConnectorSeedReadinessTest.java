@@ -71,6 +71,63 @@ class CloudConnectorSeedReadinessTest {
     private String eraseAfterLoad;
     private CloudConnectorSeedReadiness.DirectoryEntries directoryEntries = Files::list;
     private Set<String> functions = Set.of("batch_read_function", "stream_read_function");
+    private Set<String> selection = Set.copyOf(IDS);
+
+    @Test
+    void localStorageAcceptanceReadsAndLoadsOnlyItsLockedMongoArtifact() throws Exception {
+        selection = CloudConnectorSeedReadiness.localSelection(lockBytes(), selectionReceipt("mongodb-atlas"), true, true);
+        String atlasHash = (String) entry("mongodb-atlas").get("sha256");
+        stores.artifacts.keySet().retainAll(Set.of(atlasHash));
+        var gate = gate();
+        assertThat(gate.selectedFileNames()).containsExactly("mongodb-atlas-connector.jar");
+        gate.verifyRegistrations(outcomes.stream().filter(outcome ->
+                outcome.artifact().getFileName().toString().equals("mongodb-atlas-connector.jar")).toList());
+        assertThat(loaded).containsExactly("mongodb-atlas");
+        assertThat(stores.streamHashes).containsOnly(atlasHash);
+    }
+
+    @Test
+    void localStorageAcceptanceStillRejectsMissingSelectedRemoteBytes() throws Exception {
+        selection = CloudConnectorSeedReadiness.localSelection(lockBytes(), selectionReceipt("mongodb-atlas"), true, true);
+        var gate = gate();
+        stores.artifacts.remove(entry("mongodb-atlas").get("sha256"));
+        refused(() -> gate.verifyRegistrations(outcomes.stream().filter(outcome ->
+                outcome.artifact().getFileName().toString().equals("mongodb-atlas-connector.jar")).toList()), "registered-artifact-unavailable");
+    }
+
+    @Test
+    void localStorageAcceptanceCannotBeEnabledForAReleaseOrWithoutDevelopmentConfirmation() {
+        refused(() -> CloudConnectorSeedReadiness.localSelection(lockBytes(), selectionReceipt("mongodb-atlas"), false, true), "local-selection-not-allowed");
+        refused(() -> CloudConnectorSeedReadiness.localSelection(lockBytes(), selectionReceipt("mongodb-atlas"), true, false), "local-selection-not-allowed");
+    }
+
+    @Test
+    void localStorageAcceptanceIsBoundToTheOriginalLockAndSingleSupportedIdentity() {
+        refused(() -> CloudConnectorSeedReadiness.localSelection(lockBytes(), selectionReceipt("mongodb"), true, true), "local-selection-invalid");
+        byte[] receipt = selectionReceipt("mongodb-atlas");
+        entry("mongodb-atlas").put("upstreamRevision", "b".repeat(40));
+        refused(() -> CloudConnectorSeedReadiness.localSelection(lockBytes(), receipt, true, true), "local-selection-invalid");
+    }
+
+    private byte[] selectionReceipt(String connector) {
+        return JSON.writeValueAsBytes(Map.of("schemaVersion", 1, "releaseLockSha256", ContentHash.of(lockBytes()), "connectorId", connector));
+    }
+
+    @Test
+    void aNewUnexpectedSeedAfterPreflightStillInvalidatesNormalReleaseStartup() throws Exception {
+        var gate = gate();
+        Files.writeString(seeds.resolve("unexpected.jar"), "late artifact");
+        var registrar = org.mockito.Mockito.mock(ConnectorArtifactRegistrar.class);
+        org.mockito.Mockito.when(registrar.register(org.mockito.ArgumentMatchers.any(Path.class),
+                org.mockito.ArgumentMatchers.eq(RegistrationSource.SEED))).thenAnswer(call -> {
+            Path file = call.getArgument(0);
+            return outcomes.stream().filter(outcome -> outcome.artifact().equals(file))
+                    .map(outcome -> ((SeedOutcome.Seeded) outcome).outcome()).findFirst()
+                    .orElseGet(() -> new RegistrationOutcome(new ConnectorRegistration("unexpected", "e".repeat(64), VERSION, RegistrationSource.SEED), true));
+        });
+        refused(() -> new SeedSweepRunner(new SeedConnectorSweep(registrar), seeds, gate)
+                .run(new org.springframework.boot.DefaultApplicationArguments()), "registration-incomplete");
+    }
 
     @Test
     void verifiesStoredReleaseBytesThroughTheStreamingPort() throws Exception {
@@ -369,7 +426,7 @@ class CloudConnectorSeedReadinessTest {
             return new ConnectorCapabilities(functions);
         };
         return new CloudConnectorSeedReadiness(seeds, directory.resolve("plugins"), trusted,
-                stores, stores.catalog(), stores.specStore(), deriver, directoryEntries);
+                stores, stores.catalog(), stores.specStore(), deriver, directoryEntries, selection);
     }
 
     private byte[] lockBytes() {
@@ -441,6 +498,7 @@ class CloudConnectorSeedReadinessTest {
         final Map<String, byte[]> specs = new HashMap<>();
         boolean streamOnly;
         int streamReads;
+        final List<String> streamHashes = new ArrayList<>();
 
         @Override public RegistrationOutcome register(String id, String version, RegistrationSource source, byte[] artifact) {
             String hash = ContentHash.of(artifact);
@@ -456,6 +514,7 @@ class CloudConnectorSeedReadinessTest {
         }
         @Override public boolean copyArtifactTo(String hash, OutputStream target) throws IOException {
             streamReads++;
+            streamHashes.add(hash);
             byte[] bytes = artifacts.get(hash);
             if (bytes == null) return false;
             target.write(bytes);

@@ -38,7 +38,8 @@ final class SeedSweepRunner implements ApplicationRunner {
     public void run(ApplicationArguments args) {
         List<SeedOutcome> outcomes;
         try {
-            outcomes = sweep.sweep(seedDir);
+            outcomes = cloudReadiness == null || !cloudReadiness.reducedSelection() ? sweep.sweep(seedDir)
+                    : sweep.sweep(seedDir, cloudReadiness.selectedFileNames());
         } catch (UncheckedIOException failure) {
             if (cloudReadiness != null) {
                 throw CloudConnectorSeedReadiness.sweepUnavailable();

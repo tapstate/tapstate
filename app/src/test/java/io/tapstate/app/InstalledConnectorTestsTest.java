@@ -20,6 +20,32 @@ import static org.assertj.core.api.Assertions.*;
 
 /** Drives an actual isolated test JAR through installed registration and testing, without a CACHE or member. */
 class InstalledConnectorTestsTest {
+    @Test void selectedSetupArtifactDoesNotLoadOtherConnectorTypes(@TempDir Path work) throws Exception {
+        Path trace = work.resolve("atlas-tests");
+        Path atlas = SyntheticSinkJars.registeredStorageProbe(work.resolve("atlas-build"), trace,
+                "mongodb-atlas", "mongodb://fixture/accepted");
+        Path mysql = SyntheticSinkJars.registeredStorageProbe(work.resolve("mysql-build"), work.resolve("mysql-tests"),
+                "mysql", "mysql://fixture/");
+        Path seeds = Files.createDirectory(work.resolve("seeds"));
+        Files.copy(atlas, seeds.resolve("mongodb-atlas-connector.jar"));
+        Files.copy(mysql, seeds.resolve("mysql-connector.jar"));
+        var properties = new ConnectorPluginProperties();
+        properties.setSeedDir(seeds); properties.setPluginsDir(work.resolve("plugins"));
+
+        var target = new InstalledConnectorTests(properties, java.time.Clock.systemUTC(),
+                java.util.Set.of("mongodb-atlas-connector.jar")).target();
+        var accepted = new StorageBinding.Connection(StorageBinding.Connection.Kind.ATLAS,
+                "mongodb://fixture/accepted", "accepted", null);
+        target.test(accepted, target.definition(accepted, "views"), target.identity(accepted));
+
+        assertThat(trace).hasContent("mongodb://fixture/accepted\n");
+        try (var staged = Files.list(properties.getPluginsDir())) {
+            assertThat(staged.filter(path -> path.toString().endsWith(".jar")).map(path -> path.getFileName().toString()).toList())
+                    .containsExactly(ContentHash.of(Files.readAllBytes(atlas)) + ".jar");
+        }
+        assertThat(work.resolve("mysql-tests")).doesNotExist();
+    }
+
     @Test void installedRegistrationAvoidsAnExtraWholeArtifactTransferCopy(@TempDir Path work) throws Exception {
         Path artifact = SyntheticSinkJars.registeredStorageProbe(work.resolve("build"), work.resolve("trace"));
         Path seeds = Files.createDirectory(work.resolve("seeds"));
