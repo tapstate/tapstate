@@ -4,6 +4,9 @@ import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.PipelineState;
 
 import java.time.Instant;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Objects;
 
 /** One list-facing Pipeline projection, joined from its saved authoring document and applied artifact. */
@@ -31,16 +34,26 @@ public record PipelineCatalogItem(
             PipelineState desiredState,
             PipelineState observedState,
             ObservationFailure failure,
-            Instant observedAt) {
+            Instant observedAt,
+            IntentReadFailure intentReadFailure) {
 
-        public Status {
-            Objects.requireNonNull(state, "state");
-            Objects.requireNonNull(displayState, "displayState");
+        public Status(DisplayState state, UiState displayState, PipelineState desiredState,
+                PipelineState observedState, ObservationFailure failure, Instant observedAt) {
+            this(state, displayState, desiredState, observedState, failure, observedAt, null);
         }
 
         public Status(DisplayState state, PipelineState desiredState, PipelineState observedState,
                 ObservationFailure failure, Instant observedAt) {
-            this(state, UiState.valueOf(state.name()), desiredState, observedState, failure, observedAt);
+            this(state, UiState.of(state, true), desiredState, observedState, failure, observedAt, null);
+        }
+    }
+
+    /** A coded failure to read lifecycle intent, carried separately from runtime observation facts. */
+    public record IntentReadFailure(String code, Map<String, Object> params) {
+        public IntentReadFailure {
+            Objects.requireNonNull(code, "code");
+            params = params == null ? Map.of()
+                    : Collections.unmodifiableMap(new LinkedHashMap<>(params));
         }
     }
 
@@ -72,6 +85,20 @@ public record PipelineCatalogItem(
         STOPPED,
         COMPLETED,
         FAILED,
-        UNAVAILABLE
+        UNAVAILABLE;
+
+        /** Projects internal lifecycle state into the authoring-facing status vocabulary. */
+        public static UiState of(DisplayState state, boolean hasArtifact) {
+            if (!hasArtifact) {
+                return DRAFT;
+            }
+            if (state == null || state == DisplayState.UNAVAILABLE) {
+                return null;
+            }
+            if (state == DisplayState.NEW) {
+                return NOT_STARTED;
+            }
+            return valueOf(state.name());
+        }
     }
 }

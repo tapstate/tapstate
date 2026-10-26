@@ -45,7 +45,7 @@ public class PipelineStreamConfiguration {
 
     static Predicate<String> knownPipeline(PipelineCatalogService pipelines) {
         Objects.requireNonNull(pipelines, "pipelines");
-        return id -> pipelines.find(id).isPresent();
+        return pipelines::containsDefinition;
     }
 
     /**

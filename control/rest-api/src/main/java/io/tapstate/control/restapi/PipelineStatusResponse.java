@@ -31,7 +31,8 @@ record PipelineStatusResponse(
         PipelineState observedState,
         boolean hasArtifact,
         ExecutionPlanResponse plan,
-        List<String> awaitingRebalance) {
+        List<String> awaitingRebalance,
+        Failure intentReadFailure) {
 
     /**
      * A coded failure as a client reads it: the canonical code string, its named arguments sorted for a stable
@@ -46,15 +47,12 @@ record PipelineStatusResponse(
 
     static PipelineStatusResponse of(PipelineStatus status, MessageCatalog catalog, Clock clock) {
         Instant observedAt = status.observedAt();
-        return new PipelineStatusResponse(status.pipelineId(),
-                status.state(), status.state() == PipelineState.NEW
-                        ? PipelineCatalogItem.UiState.NOT_STARTED
-                        : PipelineCatalogItem.UiState.valueOf(status.state().name()),
+        return new PipelineStatusResponse(status.pipelineId(), status.state(), null,
                 failure(status.failure(), catalog), observedAt,
                 observedAt == null ? null
                         : Math.max(0, Duration.between(observedAt, clock.instant()).toMillis()),
-                null, status.state(), true, ExecutionPlanResponse.of(status.plan()),
-                status.awaitingRebalance().isEmpty() ? null : status.awaitingRebalance());
+                null, status.state(), false, ExecutionPlanResponse.of(status.plan()),
+                status.awaitingRebalance().isEmpty() ? null : status.awaitingRebalance(), null);
     }
 
     static PipelineStatusResponse of(
@@ -67,7 +65,8 @@ record PipelineStatusResponse(
                         : Math.max(0, Duration.between(observedAt, Clock.systemUTC().instant()).toMillis()),
                 status.desiredState(), runtime.state(), item.hasArtifact(),
                 ExecutionPlanResponse.of(runtime.plan()),
-                runtime.awaitingRebalance().isEmpty() ? null : runtime.awaitingRebalance());
+                runtime.awaitingRebalance().isEmpty() ? null : runtime.awaitingRebalance(),
+                intentReadFailure(status.intentReadFailure(), catalog));
     }
 
     static PipelineStatusResponse of(PipelineCatalogItem item, MessageCatalog catalog) {
@@ -82,7 +81,17 @@ record PipelineStatusResponse(
         return new PipelineStatusResponse(item.id(), state, status.displayState(),
                 failure(status.failure(), catalog), observedAt, observedAt == null ? null
                         : Math.max(0, Duration.between(observedAt, clock.instant()).toMillis()),
-                status.desiredState(), status.observedState(), item.hasArtifact(), null, null);
+                status.desiredState(), status.observedState(), item.hasArtifact(), null, null,
+                intentReadFailure(status.intentReadFailure(), catalog));
+    }
+
+    private static Failure intentReadFailure(
+            PipelineCatalogItem.IntentReadFailure failure, MessageCatalog catalog) {
+        if (failure == null) {
+            return null;
+        }
+        Map<String, Object> params = new TreeMap<>(failure.params());
+        return new Failure(failure.code(), params, catalog.render(failure.code(), params).message());
     }
 
     private static Failure failure(ObservationFailure failure, MessageCatalog catalog) {
