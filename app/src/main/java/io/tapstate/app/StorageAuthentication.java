@@ -25,11 +25,19 @@ final class StorageAuthentication implements AutoCloseable {
     private final CloudClusterEgressAddressProvider egressAddresses;
     private final byte[] signingKey;
     private final AtomicReference<Epoch> current = new AtomicReference<>();
+    private final PendingAuthenticationCohorts<Optional<CredentialAuthentication>> pending;
     private final Bootstrap bootstrap;
     private volatile boolean closed;
 
     StorageAuthentication(MongoConfigurationDomain configuration, CloudRuntimeSettings cloud, CloudSdkBridge bridge,
             TokenSecrets secrets, Clock clock, byte[] signingKey) {
+        this(configuration, cloud, bridge, secrets, clock, signingKey, new PendingAuthenticationCohorts<>());
+    }
+
+    StorageAuthentication(MongoConfigurationDomain configuration, CloudRuntimeSettings cloud, CloudSdkBridge bridge,
+            TokenSecrets secrets, Clock clock, byte[] signingKey,
+            PendingAuthenticationCohorts<Optional<CredentialAuthentication>> pending) {
+        this.pending = Objects.requireNonNull(pending);
         this.configuration = configuration; this.cloud = Objects.requireNonNull(cloud);
         this.bridge = bridge; this.secrets = Objects.requireNonNull(secrets); this.clock = Objects.requireNonNull(clock);
         this.egressAddresses = bridge == null ? (organizationId, clusterId) -> Optional.empty()
@@ -56,6 +64,7 @@ final class StorageAuthentication implements AutoCloseable {
 
     synchronized void invalidateFormal() {
         current.set(null);
+        pending.invalidate();
         if (bootstrap != null) bootstrap.sessions.close();
     }
 
@@ -82,8 +91,15 @@ final class StorageAuthentication implements AutoCloseable {
 
     private Optional<CredentialAuthentication> authenticate(String presented) {
         if (current.get() == null && bootstrap != null) return bootstrap.authenticate(presented);
+        long deadline = System.nanoTime() + AUTHORIZATION_READ_BUDGET.toNanos();
         var budget = new MongoReadBudget(AUTHORIZATION_READ_BUDGET);
         Epoch original = selected();
+        if (cloud.cloud()) return pending.validate(original, presented, deadline,
+                () -> authenticate(original, presented, budget), original::requireLocallyActive);
+        return authenticate(original, presented, budget);
+    }
+
+    private Optional<CredentialAuthentication> authenticate(Epoch original, String presented, MongoReadBudget budget) {
         Optional<VerifiedToken> verified;
         Optional<String> organization = Optional.empty();
         if (cloud.cloud()) {
@@ -216,6 +232,7 @@ final class StorageAuthentication implements AutoCloseable {
 
     @Override public synchronized void close() {
         closed = true; current.set(null);
+        pending.close();
         if (bootstrap != null) bootstrap.sessions.close();
         java.util.Arrays.fill(signingKey, (byte)0);
     }

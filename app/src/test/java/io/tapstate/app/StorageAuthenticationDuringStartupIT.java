@@ -26,6 +26,44 @@ import org.testcontainers.utility.DockerImageName;
 /** Formal authentication must not wait for the business owner's startup monitor. */
 @RequiresDocker
 class StorageAuthenticationDuringStartupIT {
+    @org.junit.jupiter.api.Test
+    void concurrentFormalCloudRequestsStillObserveDurableRevocation() throws Exception {
+        try (var mongo = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))) {
+            mongo.start();
+            var stored = NativeAppStorage.create(mongo, "concurrent_auth", StorageBinding.Mode.CLOUD, "cluster-" + UUID.randomUUID());
+            var mongoProperties = new MongoProperties(); mongoProperties.setUri(stored.configurationUri());
+            var properties = new CloudProperties();
+            properties.setBaseUrl("https://cloud.example"); properties.setClusterId(stored.clusterId());
+            properties.setAtlasUri(stored.configurationUri()); properties.setToken("fixture-runtime-token");
+            var cloud = CloudRuntimeSettings.resolve(properties); var clock = Clock.systemUTC();
+            try (var root = new StorageRoot(mongoProperties, cloud, new CloudSdkBridge(cloud, new Provider(stored.clusterId(), clock)),
+                    BootId.fresh(), new MetricsHistoryProperties(), new RandomTokenSecrets(), clock, new byte[32]);
+                    var executor = Executors.newFixedThreadPool(6)) {
+                root.loadExisting(ignored -> new StorageRuntime.Business() {
+                    @Override public void start() {}
+                    @Override public void close() {}
+                });
+                String cookie = root.managedAuthentication().service().exchangeCode("fresh", "cluster.example").token();
+                var ready = new CountDownLatch(6); var start = new CountDownLatch(1);
+                var requests = new java.util.ArrayList<java.util.concurrent.Future<CredentialAuthentication>>();
+                for (int i = 0; i < 6; i++) requests.add(executor.submit(() -> {
+                    ready.countDown(); assertThat(start.await(5, TimeUnit.SECONDS)).isTrue();
+                    return root.authentication().credentials().authenticateContext(cookie).orElseThrow();
+                }));
+                assertThat(ready.await(5, TimeUnit.SECONDS)).isTrue(); start.countDown();
+                for (var request : requests) {
+                    var proof = request.get(10, TimeUnit.SECONDS);
+                    assertThat(proof.organizationId()).contains("organization");
+                    assertThat(proof.storageScope()).contains(stored.preparation().authScope());
+                }
+                root.managedAuthentication().service().invalidateJwt("jti");
+                assertThat(root.authentication().credentials().authenticateContext(cookie)).isEmpty();
+                for (var request : requests) assertThatThrownBy(request.get().requireActive()::run)
+                        .isInstanceOf(TapstateException.class);
+            }
+        }
+    }
+
     @ParameterizedTest
     @EnumSource(StorageBinding.Mode.class)
     void theOriginalRecoveryResultIsReadableWhileItsBusinessOwnerIsStarting(StorageBinding.Mode mode) throws Exception {
