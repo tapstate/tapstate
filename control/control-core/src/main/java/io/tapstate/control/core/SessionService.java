@@ -68,6 +68,30 @@ public final class SessionService {
                 .orElse(false);
     }
 
+    /** Revokes a browser session or confirms that the matching session is already inactive. */
+    public LogoutResult logoutForBrowser(String presented, String expectedIssuer) {
+        requireText(expectedIssuer, "expectedIssuer");
+        Optional<ParsedSessionToken> parsed = parse(presented);
+        if (parsed.isEmpty()) return LogoutResult.INVALID;
+        ParsedSessionToken token = parsed.get();
+        Instant now = clock.instant();
+        if (sessions.revoke(token.sessionId(), secrets.hash(token.secret()), expectedIssuer, now)) {
+            return LogoutResult.REVOKED;
+        }
+        return sessions.find(token.sessionId())
+                .filter(record -> secrets.matches(token.secret(), record.secretHash()))
+                .filter(record -> record.revoked() || !record.idleExpiresAt().isAfter(now)
+                        || !record.absoluteExpiresAt().isAfter(now))
+                .map(record -> LogoutResult.INACTIVE)
+                .orElse(LogoutResult.INVALID);
+    }
+
+    public enum LogoutResult {
+        REVOKED,
+        INACTIVE,
+        INVALID
+    }
+
     public static boolean isSessionToken(String presented) {
         return presented != null && presented.startsWith(TOKEN_PREFIX);
     }
