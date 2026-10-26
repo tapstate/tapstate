@@ -92,21 +92,33 @@ public final class PipelineCatalogService {
         return List.copyOf(items);
     }
 
+    /** Checks only authoring and artifact stores; status-watch admission must not read desired intent. */
+    public boolean containsDefinition(String id) {
+        Objects.requireNonNull(id, "id");
+        boolean hasArtifact = artifacts.getResource(id)
+                .filter(stored -> stored.resource() instanceof PipelineResource)
+                .isPresent();
+        return hasArtifact || drafts.find(id).isPresent();
+    }
+
     private PipelineCatalogItem toItem(String id, PipelineDraftSummary draft, ArtifactSummary artifact) {
         PipelineStatus observation = observations.findStatus(id).orElse(null);
         PipelineState observed = observation == null ? null : observation.state();
         PipelineState target;
+        PipelineCatalogItem.IntentReadFailure intentReadFailure = null;
         try {
             target = desired.read(id).map(state -> state.targetState()).orElse(null);
         } catch (TapstateException unreadable) {
             if (unreadable.code() != IoError.DOCUMENT_UNREADABLE) {
                 throw unreadable;
             }
-            LOG.log(Level.WARNING, "Ignoring unreadable desired state for Pipeline {0}", id);
+            LOG.log(Level.WARNING, "Unable to read desired state for Pipeline {0}", id);
             target = null;
+            intentReadFailure = new PipelineCatalogItem.IntentReadFailure(
+                    unreadable.code().code(), unreadable.args());
         }
         boolean hasArtifact = artifact != null;
-        PipelineCatalogItem.DisplayState state = displayState(target, observed);
+        PipelineCatalogItem.DisplayState state = displayState(target, observed, intentReadFailure == null);
 
         String description = draft != null ? draft.description() : descriptionOf(artifact);
         String mode = draft == null ? null : draft.mode().name().toLowerCase(java.util.Locale.ROOT);
@@ -123,11 +135,12 @@ public final class PipelineCatalogService {
                 hasArtifact,
                 new PipelineCatalogItem.Status(
                         state,
-                        hasArtifact ? PipelineCatalogItem.UiState.valueOf(state.name()) : PipelineCatalogItem.UiState.DRAFT,
+                        PipelineCatalogItem.UiState.of(state, hasArtifact),
                         target,
                         observed,
                         observation == null ? null : observation.failure(),
-                        observation == null ? null : observation.observedAt()));
+                        observation == null ? null : observation.observedAt(),
+                        intentReadFailure));
     }
 
     private static String descriptionOf(ArtifactSummary artifact) {
@@ -142,7 +155,7 @@ public final class PipelineCatalogService {
     }
 
     private static PipelineCatalogItem.DisplayState displayState(
-            PipelineState desired, PipelineState observed) {
+            PipelineState desired, PipelineState observed, boolean intentReadable) {
         if (desired == PipelineState.STOPPED && observed != PipelineState.STOPPED) {
             return PipelineCatalogItem.DisplayState.STOPPING;
         }
@@ -173,8 +186,9 @@ public final class PipelineCatalogService {
                 case COMPLETED -> PipelineCatalogItem.DisplayState.COMPLETED;
             };
         }
-        // An applied Pipeline with no desired intent or observation has never been started yet.
-        // Keep it actionable as NEW; UNAVAILABLE is not a substitute for a missing observation.
+        if (!intentReadable) {
+            return null;
+        }
         return PipelineCatalogItem.DisplayState.NEW;
     }
 }
