@@ -17,6 +17,24 @@ import static org.mockito.Mockito.*;
 class OnPremInstallationTest {
     @TempDir Path directory;
 
+    @Test void localAuthorizationGenerationIsNotReportedAsADurableConfigurationRevision() {
+        var files = InstallationFiles.initialize(directory.resolve("local-revision"));
+        var states = new InstallationSetupStates(files, Optional::empty);
+        states.rotate(files.stage().scope(), StorageSetupStateStore.Purpose.SETUP);
+        states.rotate(files.stage().scope(), StorageSetupStateStore.Purpose.SETUP);
+        var root = mock(StorageRoot.class); var runtime = mock(StorageRuntime.class);
+        when(root.mode()).thenReturn(StorageBinding.Mode.OP);
+        when(root.runtime()).thenReturn(runtime); when(runtime.configuration()).thenReturn(Optional.empty());
+        try (var installation = new OnPremInstallation(root, files, new MongoProperties(),
+                mock(StorageSetupService.DefaultTarget.class), Clock.systemUTC())) {
+            var snapshot = installation.snapshot(mock(io.tapstate.control.core.StorageControlAccess.class), () -> {});
+            assertThat(snapshot.setupGeneration()).isGreaterThan(1);
+            assertThat(snapshot.stateVersion()).as("CONFIG does not exist until the initial handoff").isZero();
+            assertThat(snapshot.bindingVersion()).isZero();
+            assertThat(snapshot.setupPhase()).isEqualTo("LOCAL_SETUP");
+        }
+    }
+
     @Test void losingInstallationOwnershipFencesTheRootAndPreviouslyRetainedRuntimeViews() {
         var active = new java.util.concurrent.atomic.AtomicBoolean(true);
         var mongo = new MongoProperties(); mongo.setUri(null);

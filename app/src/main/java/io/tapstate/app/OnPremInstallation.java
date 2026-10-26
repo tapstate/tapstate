@@ -302,7 +302,7 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
                             : List.of("storage.status", "storage.test", "storage.setup.commit", "storage.setup.status"), restart);
         }
         return new StorageControlDispatcher.Snapshot(StorageBinding.Mode.OP, state.scope().clusterId(), state.scope().operationId(),
-                state.scope().generation(), 0, 0, state.scope().generation(), state.phase().name(), StorageControlDispatcher.BusinessPhase.NOT_CONFIGURED,
+                state.scope().generation(), 0, 0, 0, state.phase().name(), StorageControlDispatcher.BusinessPhase.NOT_CONFIGURED,
                 Map.of(StorageSetupService.Layer.CONFIG, StorageControlDispatcher.Health.UNKNOWN, StorageSetupService.Layer.CACHE, StorageControlDispatcher.Health.UNKNOWN,
                         StorageSetupService.Layer.MASTER, StorageControlDispatcher.Health.UNKNOWN), List.of("storage.status", "storage.test", "storage.setup.commit", "storage.setup.status"), false);
     }
