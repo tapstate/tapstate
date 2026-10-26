@@ -63,7 +63,16 @@ public interface NotificationChannel extends AutoCloseable {
         if (!valid) { throw new TapstateException(AlertError.INVALID_CONFIGURATION, Map.of("field", field, "reason", "invalid-frozen-request"), null); }
     }
     /** Only bounded protocol metadata crosses the port; no raw response, credentials or server prose. */
-    record Result(Outcome outcome, Action action, Instant retryAfter, Phase phase, int protocolStatus, String implementation) {
+    record Receipt(String remoteId, String requestId) {
+        public Receipt {
+            Destination.validateIdentity(remoteId, "remoteId");
+            if (requestId != null) { Destination.validateIdentity(requestId, "requestId"); }
+        }
+    }
+    record Result(Outcome outcome, Action action, Instant retryAfter, Phase phase, int protocolStatus, String implementation, Receipt receipt) {
+        public Result(Outcome outcome, Action action, Instant retryAfter, Phase phase, int protocolStatus, String implementation) {
+            this(outcome, action, retryAfter, phase, protocolStatus, implementation, null);
+        }
         public String diagnosticCode() {
             if (outcome == Outcome.ACCEPTED) { return null; }
             return (outcome == Outcome.UNKNOWN ? AlertError.CHANNEL_RESULT_UNKNOWN
@@ -74,6 +83,7 @@ public interface NotificationChannel extends AutoCloseable {
         }
         public Result {
             Objects.requireNonNull(outcome, "outcome"); Objects.requireNonNull(action, "action"); Objects.requireNonNull(phase, "phase");
+            if (receipt != null && outcome != Outcome.ACCEPTED) { throw new IllegalArgumentException("receipt requires accepted evidence"); }
             if (outcome == Outcome.ACCEPTED && action != Action.STOP) { throw new IllegalArgumentException("accepted result cannot retry"); }
             if (protocolStatus < 0 || protocolStatus > 999) { throw new IllegalArgumentException("invalid protocol status"); }
             if (implementation == null || !implementation.matches("[a-z][a-z0-9-]{0,63}")) { throw new IllegalArgumentException("invalid implementation marker"); }
