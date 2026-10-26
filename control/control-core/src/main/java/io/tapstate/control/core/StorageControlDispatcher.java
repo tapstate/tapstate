@@ -19,7 +19,7 @@ public final class StorageControlDispatcher {
     public enum BusinessPhase { NOT_CONFIGURED, PREPARING, RESTART_REQUIRED, FIRST_ADMIN_REQUIRED, AUTH_READY,
         READY, UNAVAILABLE, AWAITING_REBUILD_CONFIRMATION, RECOVERING, CLEANUP_REQUIRED }
     public enum Health { UNKNOWN, AVAILABLE, UNAVAILABLE, AUTH_READY }
-    /** Supplied by the selected server assembly; reads never initialize storage or start recovery. */
+    /** Read-only assembly projection; the dispatcher checks the original caller before and after loading and mapping. */
     public interface Snapshots { Snapshot load(StorageControlAccess caller, Runnable requireActive); }
     public record Snapshot(StorageBinding.Mode mode, String clusterId, String operationId, long setupGeneration,
             long bindingVersion, long authGeneration, long stateVersion, String setupPhase, BusinessPhase businessPhase,
@@ -89,7 +89,7 @@ public final class StorageControlDispatcher {
         var input = new Input(body);
         Map<String,Object> result = switch (operationId) {
             case "storage.status" -> {
-                input.only(); var snapshot = snapshots.load(caller, active); active.run();
+                input.only(); var snapshot = snapshots.load(caller, active);
                 if (snapshot.mode() != caller.mode() || !snapshot.clusterId().equals(caller.setup().clusterId())
                         || snapshot.setupGeneration() != caller.setup().generation()) throw conflict();
                 caller.cacheScope().ifPresent(scope -> {

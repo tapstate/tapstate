@@ -12,6 +12,22 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.*;
 
 class StorageRootConfigurationTest {
+    @Test void installationSnapshotsStillUseTheInstallationAuthorizationPath() {
+        var root = mock(StorageRoot.class);
+        var installation = mock(OnPremInstallation.class);
+        var provider = mock(org.springframework.beans.factory.ObjectProvider.class);
+        when(provider.getIfAvailable()).thenReturn(installation);
+        var caller = mock(io.tapstate.control.core.StorageControlAccess.class);
+        when(caller.cacheScope()).thenReturn(Optional.empty());
+        Runnable active = () -> { throw new TapstateException(ControlError.BOOTSTRAP_FORBIDDEN, java.util.Map.of(), null); };
+        when(installation.snapshot(caller, active)).thenAnswer(call -> {
+            call.<Runnable>getArgument(1).run(); throw new AssertionError("rejected installation returned a snapshot");
+        });
+        assertThatThrownBy(() -> new StorageRootConfiguration().storageSnapshots(root, provider).load(caller, active))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(ControlError.BOOTSTRAP_FORBIDDEN));
+        verify(root, never()).snapshotProjection(any());
+    }
+
     @Test void theRootSnapshotIncludesTheCurrentBusinessVerification() {
         var root = root();
         var cloud = mock(CloudRuntimeSettings.class);

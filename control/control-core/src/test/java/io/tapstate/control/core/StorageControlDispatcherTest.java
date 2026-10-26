@@ -63,6 +63,34 @@ class StorageControlDispatcherTest {
         out.put("configuration", connection(value.configuration())); out.put("cache",connection(value.cache())); out.put("master",connection(value.master())); return out;
     }
     private static Map<String,Object> connection(StorageBinding.Connection value) { return Map.of("kind",value.kind().name(),"uri",value.uri(),"database",value.database()); }
+    @Test void statusEnclosesTheEntireProjectionInTwoOriginalAuthorizationChecks() {
+        var f = new Fixture(); var checks = new AtomicInteger();
+        var caller = StorageControlAccess.ordinary(StorageBinding.Mode.OP, SCOPE,
+                new CacheAuthScope(SCOPE.clusterId(), 1, StorageBinding.Mode.OP, "incarnation", 1),
+                TapstatePrincipal.humanJwt(new VerifiedToken("admin", Scope.ADMIN)), null, checks::incrementAndGet);
+        var dispatcher = new StorageControlDispatcher(ControlOperations.registry(), f.setup.service(), f.recovery, f.imports.service,
+                (ignored, active) -> { assertThat(checks).hasValue(1); return f.snapshot; });
+        assertThat(dispatcher.dispatch("storage.status", caller, Map.of())).containsEntry("businessPhase", "READY");
+        assertThat(checks).hasValue(2);
+    }
+
+    @Test void aRevocationOrStorageFenceAfterProjectionPreventsReturningItsCapturedValues() {
+        for (var code : List.of(ControlError.UNAUTHENTICATED, ControlError.STORAGE_UNAVAILABLE)) {
+            var f = new Fixture(); var checks = new AtomicInteger(); var revoked = new java.util.concurrent.atomic.AtomicBoolean();
+            var caller = StorageControlAccess.ordinary(StorageBinding.Mode.OP, SCOPE,
+                    new CacheAuthScope(SCOPE.clusterId(), 1, StorageBinding.Mode.OP, "incarnation", 1),
+                    TapstatePrincipal.humanJwt(new VerifiedToken("admin", Scope.ADMIN)), null, () -> {
+                        checks.incrementAndGet();
+                        if (revoked.get()) throw new TapstateException(code, Map.of(), null);
+                    });
+            var dispatcher = new StorageControlDispatcher(ControlOperations.registry(), f.setup.service(), f.recovery, f.imports.service,
+                    (ignored, active) -> { var captured = f.snapshot; revoked.set(true); return captured; });
+            assertThatThrownBy(() -> dispatcher.dispatch("storage.status", caller, Map.of()))
+                    .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(code));
+            assertThat(checks).hasValue(2);
+        }
+    }
+
     @Test void sharedRecoveryCarriesTheExactOriginalPhysicalSelectionWithoutAcceptingBrowserInfluence() {
         var f=new Fixture();var dispatcher=f.dispatcher();
         var input=Map.<String,Object>of("scope","SHARED_SRS","pipelineIds",List.of(),"canonicalChain","canonical","physicalChain","old-physical");

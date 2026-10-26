@@ -82,7 +82,7 @@ class StorageRootConfiguration {
     @Bean StorageControlDispatcher.Snapshots storageSnapshots(StorageRoot root, ObjectProvider<OnPremInstallation> installations) {
         return (caller, active) -> {
             var installation = installations.getIfAvailable();
-            return installation != null && (caller.cacheScope().isEmpty() || caller.initialInstallationRecovery()) ? installation.snapshot(caller, active) : root.snapshot(caller, active);
+            return installation != null && (caller.cacheScope().isEmpty() || caller.initialInstallationRecovery()) ? installation.snapshot(caller, active) : root.snapshotProjection(caller);
         };
     }
     @Bean io.tapstate.control.restapi.StorageEntryStatus storageEntryStatus(StorageRoot root, ObjectProvider<OnPremInstallation> installations) {

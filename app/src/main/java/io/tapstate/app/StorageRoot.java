@@ -631,7 +631,14 @@ final class StorageRoot implements AutoCloseable {
 
     StorageControlDispatcher.Snapshot snapshot(StorageControlAccess caller, Runnable active) {
         requireOpen(); active.run();
-        // Guard the complete read-only projection; no intermediate result leaves this method.
+        var result = snapshotProjection(caller);
+        active.run(); return result;
+    }
+
+    /** Read-only payload for the dispatcher's enclosing original-credential checks. */
+    StorageControlDispatcher.Snapshot snapshotProjection(StorageControlAccess caller) {
+        requireOpen();
+        // No intermediate value leaves the enclosing credential boundary.
         var configuration = runtime.requireConfiguration(); var status = configuration.setupStates().load();
         var preparation = configuration.bindings().cachePreparation();
         boolean admitted = phase == Phase.BUSINESS_READY && runtime.businessStarted();
@@ -689,7 +696,7 @@ final class StorageRoot implements AutoCloseable {
             }
         }
         long revision = configuration.configurationRevision();
-        active.run();
+        requireOpen();
         return new StorageControlDispatcher.Snapshot(mode(), status.scope().clusterId(), pending.map(StorageRecoveryCommands.Plan::operationId)
                 .orElseGet(() -> awaitingRebuild ? preparation.orElseThrow().operationId() : status.scope().operationId()),
                 status.scope().generation(), status.bindingVersion(), preparation.map(value -> value.authScope().authGeneration()).orElse(0L),

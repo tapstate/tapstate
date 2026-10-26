@@ -116,15 +116,22 @@ final class StorageAuthentication implements AutoCloseable {
         } else {
             verified = original.authenticate(presented, budget);
         }
+        // A vanished session must not hide a concurrent scope or structure failure as a bad cookie.
+        if (cloud.cloud() || verified.isPresent()) original.requireActive(budget);
         if (verified.isEmpty()) return Optional.empty();
-        original.requireActive(budget);
         if (cloud.cloud() && organization.isEmpty()) return Optional.empty();
         VerifiedToken identity = verified.orElseThrow();
         return Optional.of(new CredentialAuthentication(identity, Optional.of(original.bound.preparation().authScope()),
                 organization, () -> {
                     // Revalidation is a later IO operation, not the lifetime of the original request.
+                    long deadline = System.nanoTime() + AUTHORIZATION_READ_BUDGET.toNanos();
                     var revalidation = new MongoReadBudget(AUTHORIZATION_READ_BUDGET);
-                    if (original.authenticate(presented, revalidation).filter(identity::equals).isEmpty()) throw unauthenticated();
+                    var checked = cloud.cloud()
+                            ? pending.validate(original, presented, deadline,
+                                    () -> authenticate(original, presented, revalidation), original::requireLocallyActive)
+                                    .map(CredentialAuthentication::token)
+                            : original.authenticate(presented, revalidation);
+                    if (checked.filter(identity::equals).isEmpty()) throw unauthenticated();
                 }));
     }
 

@@ -56,6 +56,24 @@ class StorageAuthenticationDuringStartupIT {
                     assertThat(proof.organizationId()).contains("organization");
                     assertThat(proof.storageScope()).contains(stored.preparation().authScope());
                 }
+                var proof = requests.getFirst().get();
+                var caller = StorageControlAccess.ordinary(StorageBinding.Mode.CLOUD,
+                        () -> root.runtime().requireConfiguration().setupStates().load().scope(),
+                        TapstatePrincipal.cloudSession(proof.token()), proof);
+                var installations = org.mockito.Mockito.mock(org.springframework.beans.factory.ObjectProvider.class);
+                var snapshots = new StorageRootConfiguration().storageSnapshots(root, installations);
+                var dispatcher = StorageControlDispatcher.staged(io.tapstate.control.core.ControlOperations.registry(),
+                        () -> null, () -> null, () -> null, snapshots);
+                try (var client = com.mongodb.client.MongoClients.create(stored.cacheUri())) {
+                    var identity = io.tapstate.adapters.mongostore.SystemCollections.CACHE_IDENTITY.on(client.getDatabase(stored.cacheDatabase()));
+                    long before = identity.find(new org.bson.Document("_id", "cluster")).first().getLong("authWriteFence");
+                    assertThat(dispatcher.dispatch("storage.status", caller, java.util.Map.of())).containsEntry("businessPhase", "READY");
+                    long after = identity.find(new org.bson.Document("_id", "cluster")).first().getLong("authWriteFence");
+                    assertThat(after - before).as("one original authorization before and after the complete read-only projection").isEqualTo(2);
+                }
+                var directGuards = new AtomicInteger();
+                root.snapshot(caller, directGuards::incrementAndGet);
+                assertThat(directGuards).hasValue(2);
                 root.managedAuthentication().service().invalidateJwt("jti");
                 assertThat(root.authentication().credentials().authenticateContext(cookie)).isEmpty();
                 for (var request : requests) assertThatThrownBy(request.get().requireActive()::run)

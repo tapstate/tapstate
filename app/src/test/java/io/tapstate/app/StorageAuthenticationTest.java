@@ -52,13 +52,31 @@ class StorageAuthenticationTest {
             assertThat(ready.await(5, TimeUnit.SECONDS)).isTrue(); start.countDown();
             for (var request : requests) assertThat(request.get(5, TimeUnit.SECONDS).organizationId()).contains("organization");
             verify(sessions, times(1)).authenticate(eq(identity), eq("jti"), anyString(), any(), any());
+            var checks = new ArrayList<Future<?>>();
+            for (var request : requests) checks.add(executor.submit(() -> { request.get().requireActive().run(); return null; }));
+            for (var check : checks) check.get(5, TimeUnit.SECONDS);
+            verify(sessions, times(2)).authenticate(eq(identity), eq("jti"), anyString(), any(), any());
+            var mixed = new ArrayList<Future<?>>();
+            for (int i = 0; i < 3; i++) mixed.add(executor.submit(() -> authentication.credentials().authenticateContext(cookie).orElseThrow()));
+            for (int i = 0; i < 3; i++) mixed.add(executor.submit(() -> { requests.getFirst().get().requireActive().run(); return null; }));
+            for (var check : mixed) check.get(5, TimeUnit.SECONDS);
+            verify(sessions, times(3)).authenticate(eq(identity), eq("jti"), anyString(), any(), any());
+            when(sessions.authenticate(eq(identity), eq("jti"), anyString(), any(), any()))
+                    .thenReturn(Optional.of(new CloudSessionRecord(identity, "jti", "hash", "different-user", "WRITE", false,
+                            clock.instant(), clock.instant(), clock.instant().plusSeconds(600), context)));
+            var changed = new ArrayList<Future<?>>();
+            for (var request : requests) changed.add(executor.submit(() -> { request.get().requireActive().run(); return null; }));
+            for (var check : changed) assertThatThrownBy(() -> check.get(5, TimeUnit.SECONDS))
+                    .isInstanceOf(ExecutionException.class).cause().isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(ControlError.UNAUTHENTICATED));
+            verify(sessions, times(4)).authenticate(eq(identity), eq("jti"), anyString(), any(), any());
             // A subsequent request must observe durable revocation, even for the identical cookie.
             when(sessions.authenticate(eq(identity), eq("jti"), anyString(), any(), any())).thenReturn(Optional.empty());
             // Fill a new cohort without relying on scheduler timing or a completed result cache.
             var revoked = new ArrayList<Future<java.util.Optional<CredentialAuthentication>>>();
             for (int i = 0; i < 6; i++) revoked.add(executor.submit(() -> authentication.credentials().authenticateContext(cookie)));
             for (var request : revoked) assertThat(request.get(5, TimeUnit.SECONDS)).isEmpty();
-            verify(sessions, times(2)).authenticate(eq(identity), eq("jti"), anyString(), any(), any());
+            verify(sessions, times(5)).authenticate(eq(identity), eq("jti"), anyString(), any(), any());
         }
     }
 
@@ -95,9 +113,11 @@ class StorageAuthenticationTest {
             assertThat(proof.storageScope()).contains(scope);
             verify(sessions, times(1)).authenticate(eq(identity), eq("jti"), anyString(), any(), any());
             verify(configuration, times(2)).requireAuthenticationPublished(eq(preparation), any(io.tapstate.adapters.mongostore.MongoReadBudget.class));
-            doThrow(StorageRuntime.unavailable()).when(configuration)
+            when(sessions.authenticate(eq(identity), eq("jti"), anyString(), any(), any())).thenReturn(Optional.empty());
+            doNothing().doThrow(StorageRuntime.unavailable()).when(configuration)
                     .requireAuthenticationPublished(eq(preparation), any(io.tapstate.adapters.mongostore.MongoReadBudget.class));
-            assertThatThrownBy(proof.requireActive()::run).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(proof.requireActive()::run).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE));
         }
     }
 
