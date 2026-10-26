@@ -18,6 +18,11 @@ class CloudAuthModeBoundaryTest {
         AuthController controller = new AuthController(
                 null, null, null, null, beans.getBeanProvider(AuthenticationMode.class));
 
+        BrowserAuthController browser = new BrowserAuthController(null, null, null,
+                beans.getBeanProvider(AuthenticationMode.class));
+        assertUnavailable(() -> browser.login(null, null));
+        assertUnavailable(() -> browser.session(null));
+        assertUnavailable(() -> browser.logout(null));
         assertUnavailable(() -> controller.login(null));
         assertUnavailable(() -> controller.session(null));
         assertThatThrownBy(() -> controller.logout(null))

@@ -175,6 +175,55 @@ class AuthTest {
         return context.getBean(TokenService.class).create(scope);
     }
 
+    @Test
+    void browserSessionRestoresIndependentTabsWithoutExposingTheLongCredential() {
+        seedUser("alice", "s3cret", "admin");
+        String origin = "http://127.0.0.1:" + port;
+        ResponseEntity<String> login = client().post().uri("/auth/browser/login")
+                .header("Origin", origin).header("X-Tapstate-Browser-Request", "1")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body("{\"username\":\"alice\",\"password\":\"s3cret\"}")
+                .retrieve().toEntity(String.class);
+        String cookie = login.getHeaders().getFirst(HttpHeaders.SET_COOKIE);
+        assertThat(cookie).contains("tapstate-op-session=tss_", "HttpOnly", "SameSite=Lax", "Path=/");
+        assertThat(login.getHeaders().getCacheControl()).isEqualTo("no-store");
+        assertThat(login.getBody()).contains("\"principal\":\"alice\"", "accessExpiresAt", "sessionId")
+                .doesNotContain("sessionToken", "tss_");
+        String credentialCookie = cookie.split(";", 2)[0];
+        for (int tab = 0; tab < 2; tab++) {
+            ResponseEntity<String> resumed = client().post().uri("/auth/browser/session")
+                    .header("Origin", origin).header("X-Tapstate-Browser-Request", "1")
+                    .header(HttpHeaders.COOKIE, credentialCookie).retrieve().toEntity(String.class);
+            assertThat(resumed.getBody()).contains("\"principal\":\"alice\"");
+            assertThat(resumed.getHeaders().getFirst(HttpHeaders.SET_COOKIE)).isNull();
+        }
+        assertThat((int) client().get().uri("/api/artifacts").header(HttpHeaders.COOKIE, credentialCookie)
+                .exchange((request, response) -> response.getStatusCode().value())).isEqualTo(401);
+        client().post().uri("/auth/browser/logout").header("Origin", origin)
+                .header("X-Tapstate-Browser-Request", "1").header(HttpHeaders.COOKIE, credentialCookie)
+                .retrieve().toBodilessEntity();
+        assertThat((int) client().post().uri("/auth/browser/session").header("Origin", origin)
+                .header("X-Tapstate-Browser-Request", "1").header(HttpHeaders.COOKIE, credentialCookie)
+                .exchange((request, response) -> response.getStatusCode().value())).isEqualTo(401);
+    }
+
+    @Test
+    void browserAuthenticationRejectsCsrfAndNeverClearsCookiesOnExchangeFailure() {
+        for (String path : List.of("login", "session", "logout")) {
+            for (String origin : List.of("null", "https://evil.example", "http://127.0.0.1:" + port + "/bad")) {
+                ResponseEntity<String> denied = client().post().uri("/auth/browser/" + path)
+                        .header("Origin", origin).header("X-Tapstate-Browser-Request", "1")
+                        .contentType(MediaType.APPLICATION_JSON).body("{}")
+                        .exchange((request, response) -> new ResponseEntity<>("", response.getHeaders(), response.getStatusCode()));
+                assertThat(denied.getStatusCode().value()).isEqualTo(401);
+                assertThat(denied.getHeaders().getFirst(HttpHeaders.SET_COOKIE)).isNull();
+            }
+            assertThat((int) client().post().uri("/auth/browser/" + path)
+                    .contentType(MediaType.APPLICATION_JSON).body("{}")
+                    .exchange((request, response) -> response.getStatusCode().value())).isEqualTo(401);
+        }
+    }
+
     // ---- an unauthenticated caller cannot reach a verb ----
 
     @Test
@@ -724,6 +773,7 @@ class AuthTest {
                 "/version",
                 AuthWire.DISCOVERY_PATH,
                 "/auth/login",
+                "/auth/browser/login", "/auth/browser/session", "/auth/browser/logout",
                 AuthWire.SESSION_PATH,
                 AuthWire.LOGOUT_PATH,
                 CloudAuthController.EXCHANGE_PATH,
