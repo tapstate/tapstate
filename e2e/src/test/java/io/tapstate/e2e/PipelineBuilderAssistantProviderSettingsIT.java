@@ -53,6 +53,49 @@ class PipelineBuilderAssistantProviderSettingsIT {
         }
     }
 
+    @Test
+    void aBlankDraftCanValidateAnInputFromADiscoveredSourceWithoutSavingIt() throws Exception {
+        String database = "ts_plan_ai_discovery_" + UUID.randomUUID().toString().replace("-", "");
+        String storeUri = SharedMongo.replicaSetUrl(database);
+        try (AtlasRuntime runtime = new AtlasRuntime(AtlasRuntime.Mode.CLOUD, storeUri);
+                ServerHandle server = runtime.launch(Tiers.REAL_PROCESS);
+                var connection = new io.tapstate.adapters.mongostore.MongoConnection(
+                        new io.tapstate.adapters.mongostore.MongoConnectionSettings(storeUri, null, java.time.Duration.ofSeconds(5)))) {
+            ControlPlane control = runtime.control(server, true);
+            connection.verify();
+            var store = new io.tapstate.adapters.mongostore.MongoStorePort(connection, database + "_operator");
+            store.artifacts().save(new io.tapstate.core.model.SourceResource("orders_src", null, "mysql",
+                    Map.of(), io.tapstate.core.model.SourceMode.CDC, null, null, null));
+            store.artifacts().save(new io.tapstate.core.model.SourceResource("destination", null, "mongodb",
+                    Map.of(), null, null, null, null));
+            store.schemas().save(new io.tapstate.spi.store.DiscoveredSourceModel("orders_src", "mysql", 1,
+                    new io.tapstate.spi.store.SourceModel(java.util.List.of(new io.tapstate.spi.store.SourceTable("orders",
+                            java.util.List.of(new io.tapstate.spi.store.SourceField("id", "integer")),
+                            java.util.List.of("id"), java.util.List.of())))));
+            Map<String, Object> wizard = new LinkedHashMap<>();
+            wizard.put("root", null);
+            wizard.put("related", java.util.List.of());
+            wizard.put("transforms", java.util.List.of());
+            wizard.put("output", Map.of("kind", "atlas", "config", Map.of("sourceId", "destination", "table", "orders", "writeMode", "upsert")));
+            control.createPipelineDraft("blank_auto", Map.of("pipelineId", "blank_auto", "mode", "wizard", "name", "Blank", "wizard", wizard));
+            Map<String, Object> candidate = Map.of(
+                    "root", Map.of("source", "orders_src", "table", "orders", "primaryKey", "id", "keys", java.util.List.of("id"),
+                            "columns", java.util.List.of(), "transforms", java.util.List.of()),
+                    "relations", java.util.List.of(), "transforms", java.util.List.of(),
+                    "destinationSourceId", "destination", "destinationTable", "orders", "destinationWriteMode", "upsert");
+            HttpRequest request = HttpRequest.newBuilder(server.baseUrl().resolve("/api/pipelines/blank_auto/draft:assistant-validate"))
+                    .header("Cookie", control.credential()).header("Origin", server.baseUrl().toString())
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(JsonWriter.write(Map.of("revision", 1, "candidateWizard", candidate))))
+                    .build();
+            HttpResponse<String> validated = HttpClient.newHttpClient().send(request, HttpResponse.BodyHandlers.ofString());
+            assertThat(validated.statusCode()).isEqualTo(200);
+            assertThat(object(validated.body())).containsEntry("valid", true);
+            assertThat(store.drafts().get("blank_auto").orElseThrow().wizard().root()).isNull();
+            runtime.assertAuthenticationBoundary();
+        }
+    }
+
     private static HttpResponse<String> providerSettings(HttpClient client, ServerHandle server,
             ControlPlane control, String method, String body) throws Exception {
         HttpRequest.Builder request = HttpRequest.newBuilder(server.baseUrl().resolve("/api/ai-provider-settings"))

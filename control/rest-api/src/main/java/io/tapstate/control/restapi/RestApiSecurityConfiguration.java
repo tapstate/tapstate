@@ -99,7 +99,8 @@ class RestApiSecurityConfiguration {
                         .requestMatchers("/healthz", "/version", AuthWire.DISCOVERY_PATH, AuthWire.LOGIN_PATH,
                                 AuthWire.SESSION_PATH, AuthWire.LOGOUT_PATH, CloudAuthController.EXCHANGE_PATH,
                                 CloudAuthController.INVALIDATE_PATH, "/auth/bootstrap", "/connector-icons/*",
-                                "/index.html", "/assets/**", "/error").permitAll()
+                                "/index.html", "/assets/**", "/favicon.ico", "/tapstate-mark.svg",
+                                "/tapstate-mark-light.svg", "/error").permitAll()
                         .requestMatchers(SpaNavigationRequest::matches).permitAll()
                         .anyRequest().denyAll());
         return http.build();
