@@ -59,6 +59,52 @@ class MongoSrsModelStoreIT {
     private static final String CHAIN = "chain-a";
     private static final String RING = "srs.chain-a.orders";
 
+    @Test void reclamationDoesNotLockTheChainWhileWaitingForTheCaptureClaim() {
+        withBusiness(f -> {
+            f.models().publishInitial(key(0), RING, table("id", null), f.fence());
+            var atClaim = new CountDownLatch(1);
+            var allowClaim = new CountDownLatch(1);
+            var firstClaim = new AtomicBoolean();
+            var chainWrites = new AtomicInteger();
+            CommandListener listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (!event.getCommandName().equals("update")) return;
+                    String collection = event.getCommand().getString("update").getValue();
+                    if (collection.equals(SystemCollections.SRS_CHAINS.collectionName())) chainWrites.incrementAndGet();
+                    if (collection.equals(SystemCollections.CACHE_WORKLOAD_CLAIMS.collectionName())
+                            && firstClaim.compareAndSet(false, true)) {
+                        atClaim.countDown();
+                        try {
+                            if (!allowClaim.await(5, TimeUnit.SECONDS)) throw new AssertionError("claim gate was not released");
+                        } catch (InterruptedException interrupted) {
+                            Thread.currentThread().interrupt(); throw new AssertionError(interrupted);
+                        }
+                    }
+                }
+            };
+            try (var observed = MongoClients.create(MongoClientSettings.builder()
+                    .applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(listener).build());
+                    var blocker = f.client().startSession();
+                    var worker = Executors.newSingleThreadExecutor()) {
+                blocker.startTransaction();
+                SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(blocker,
+                        new Document("_id", claim(f.database()).get("_id")),
+                        new Document("$inc", new Document("fencedChainWrites", 1L)));
+                var models = new MongoSrsModelStore(observed, observed.getDatabase(f.database().getName()), SCOPE);
+                var reclaim = worker.submit(() -> models.reclaim(CHAIN, f.fence()));
+                try {
+                    assertThat(atClaim.await(3, TimeUnit.SECONDS)).isTrue();
+                    assertThat(chainWrites).as("no chain write may precede admission on a contended capture claim").hasValue(0);
+                } finally {
+                    blocker.abortTransaction(); allowClaim.countDown();
+                }
+                assertThat(reclaim.get(10, TimeUnit.SECONDS)).isZero();
+                assertThat(f.models().load(key(0))).isPresent();
+            }
+        });
+    }
+
     @Test void closedModelBodiesWaitForRetainedEventsAndTheOriginalCheckpoint() {
         withBusiness(f -> {
             var first=f.models().publishInitial(key(0),RING,table("id",null),f.fence());var log=modelLog(f);

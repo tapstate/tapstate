@@ -17,6 +17,7 @@ import java.util.function.*;
 
 /** Native source owners retain the original Pipeline, capture and physical handoff identities. */
 final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinator,AutoCloseable {
+    private static final org.slf4j.Logger LOG = org.slf4j.LoggerFactory.getLogger(ScopedPipelineCaptureCoordinator.class);
     interface BoundedLoads {
         boolean complete(ExecutionFence original);
         void forget(ExecutionFence original);
@@ -544,7 +545,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     private synchronized void maintain() {
         if(closed.get())return;
         for(var owner:List.copyOf(owners.values()))if(owner.prepared.mode()==CapturePreparation.Mode.SHARED_SRS && !owner.ended.get()) {
-            try {owner.require();if(owner.physical!=null)owner.physical.tail.health().failure().ifPresent(failure -> {throwFailure(failure);});ensureTail(owner);runtime.retain(stores.scope(),owner.prepared.chainId(),owner.fence,owner::require);}
+            try {owner.require();if(owner.physical!=null)owner.physical.tail.health().failure().ifPresent(failure -> {throwFailure(failure);});ensureTail(owner);retain(owner);}
             catch(RuntimeException|Error failure) {
                 for(var session:sessions.values())if(session.sources.values().stream().anyMatch(source -> source.owner==owner))session.failure.compareAndSet(null,failure);
                 owner.ended.set(true);try {owner.release();owners.remove(owner.prepared.captureId(),owner);}
@@ -558,6 +559,15 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                 var prepared=stores.preparations().load(source.prepared);source.owner=owner(session,source,prepared);
                 if(source.owner!=null){source.owner.positionEditsRestricted|=source.positionEditsRestricted;source.owner.origin=session.original;source.owner.config=source.selected.config().at(new PipelineNode(session.original.pipelineId(),source.id)).sharing(new SharedNotes(source.prepared.canonicalChainId(),List.of()));ensureTail(source.owner);}
             }catch(RuntimeException|Error failure){session.failure.compareAndSet(null,failure);}
+        }
+    }
+    private void retain(Owner owner) {
+        try { runtime.retain(stores.scope(),owner.prepared.chainId(),owner.fence,owner::require); }
+        catch (TapstateException unavailable) {
+            if (unavailable.code()!=IoError.STORE_UNAVAILABLE) throw unavailable;
+            // Cleanup can retry from current confirmed floors; capture and ownership failures remain fatal.
+            owner.require();
+            LOG.warn("Retention for capture {} was deferred [{}]",owner.prepared.captureId(),unavailable.code().code());
         }
     }
     private static void throwFailure(Throwable failure){if(failure instanceof RuntimeException runtime)throw runtime;if(failure instanceof Error error)throw error;throw new IllegalStateException("capture failed",failure);}

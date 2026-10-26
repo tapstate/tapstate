@@ -230,6 +230,90 @@ class ScopedPipelineCaptureCoordinatorTest {
         }
     }
 
+    @Test void unavailableRetentionRetriesWithoutEndingTheOriginalCapture() {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var held = ownedShared(f);
+            var temporary = new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "controlled conflict"), null);
+            doThrow(temporary).doNothing().when(f.runtime).retain(any(), anyString(), any(), any());
+            verify(f.runtime, timeout(4000).atLeast(2)).retain(eq(BUSINESS), eq(held.chain()), eq(WorkloadClaimFence.from(held.claim())), any());
+            assertThat(held.run().captureFailure("flow")).isEmpty();
+            verify(f.ownership, never()).release(held.claim());
+            verify(held.tail(), never()).close();
+            verify(f.runtime, times(1)).startTail(any(), any(), any(), any(), any(), any(), any(), anyBoolean());
+        }
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(value = IoError.class,
+            names = {"WORKLOAD_CLAIM_FENCED", "CACHE_BUSINESS_FENCED", "DOCUMENT_UNREADABLE"})
+    void retentionFencesAndCorruptStateStillEndTheCapture(IoError code) {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var held = ownedShared(f);
+            var failure = new TapstateException(code, Map.of(), null);
+            doThrow(failure).when(f.runtime).retain(any(), anyString(), any(), any());
+            verify(f.ownership, timeout(3000)).release(held.claim());
+            assertThat(held.run().captureFailure("flow")).contains(failure);
+            verify(held.tail()).close();
+        }
+    }
+
+    @Test void unavailableRetentionCannotHideOwnershipLostDuringTheAttempt() {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var held = ownedShared(f);
+            var fenced = new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+            doAnswer(call -> {
+                when(f.authorization.requireCapture(any(), any())).thenThrow(fenced);
+                throw new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "controlled conflict"), null);
+            }).when(f.runtime).retain(any(), anyString(), any(), any());
+            verify(f.ownership, timeout(3000)).release(held.claim());
+            assertThat(held.run().captureFailure("flow")).contains(fenced);
+        }
+    }
+
+    private record OwnedShared(PipelineCaptureCoordinator run, WorkloadClaim claim,
+            NativeSrsCaptureRunUnit.Tail tail, String chain) { }
+
+    private static OwnedShared ownedShared(Fixture f) {
+        String canonical="mck-key",physical="srs-recovery-"+"b".repeat(64),operation=UUID.randomUUID().toString();
+        String captureId=SourceCaptureIdentity.sharedCapture(canonical);
+        var prepared=new CapturePreparation(BUSINESS,CapturePreparation.Mode.SHARED_SRS,physical,captureId,
+                SourceCaptureIdentity.physical(f.source.connector(),f.source.config()),operation,canonical,UUID.randomUUID().toString());
+        var capture=new WorkloadClaim(new WorkloadClaimKey("cluster",WorkloadClaimType.CAPTURE,captureId),OWNER,4,2,1,Instant.now().plusSeconds(60));
+        var context=new SrsConsumerContext(new SrsConsumerKey(physical,"flow","input"),7);
+        var membership=new SrsConsumerMembership(context,1,false,Set.of("orders"),PIPELINE);
+        var chains=mock(SrsChainStore.class);var models=mock(SrsModelStore.class);var consumers=mock(SrsConsumerStore.class);
+        var chain=new AtomicReference<>(new SrsChainState(physical,captureId,"1h",0,Set.of("orders"),Set.of(),0,null,null,1,1));
+        var cursor=new ConsumerOffset(context.key().consumerId(),Map.of("orders",-1L),null,List.of(),null,0,Map.of(),ConsumerProgressKind.SRS);
+        var progress=new AtomicReference<>(new SrsConsumerProgress(context,1,0,cursor,null));
+        when(f.configuration.issueFirstCreate(any())).thenReturn(new CaptureCreationResult.AlreadyIssued(prepared));
+        when(f.configuration.inspectSharedHistory(eq(prepared),anyString(),anyString())).thenReturn(new CaptureSharedHistory(prepared,true));
+        when(f.cache.load(prepared)).thenReturn(new CaptureCacheState(prepared,WorkloadClaimFence.from(capture),Optional.of(chain.get())));
+        when(f.ownership.acquire(any())).thenReturn(new CaptureOwnership.Permit(true,capture));
+        when(consumers.find(context.key())).thenReturn(Optional.of(membership));
+        when(consumers.progress(context)).thenAnswer(ignored -> Optional.of(progress.get()));
+        when(consumers.attached(physical)).thenReturn(new SrsConsumerTopology(BUSINESS,physical,1,List.of(membership)));
+        when(consumers.startReadingAfter(eq(context),eq(1L),eq(0L),anyMap(),eq(PIPELINE))).thenAnswer(call -> {
+            progress.set(new SrsConsumerProgress(context,1,1,cursor,null,null,call.getArgument(3)));return true;
+        });
+        when(chains.load(physical)).thenAnswer(ignored -> Optional.of(chain.get()));
+        when(chains.requestTables(eq(physical),anySet(),any())).thenAnswer(ignored -> chain.get());
+        when(chains.openEpoch(eq(physical),eq(0L),any())).thenAnswer(ignored -> {
+            chain.set(new SrsChainState(physical,captureId,"1h",1,Set.of("orders"),Set.of("orders"),0,null,null,1,1));
+            return OptionalLong.of(1);
+        });
+        when(chains.publishServingTables(eq(physical),eq(1L),anySet(),any())).thenReturn(true);
+        var model=new SrsModel(new SrsModelKey(physical,"orders","cache",1,0),SrsRingbuffer.ringName(physical,"orders"),
+                new SourceTable("orders",List.of(),List.of(),List.of()),0);
+        when(models.publishedForNewSnapshot(anyString(),anyMap())).thenReturn(Optional.of(Map.of("orders",model)));
+        when(f.sources.srs(any(),any())).thenReturn(new SrsStores(chains,models,mock(SrsLogStore.class),consumers));
+        doReturn(-1L).when(f.runtime).initialReadAfter(any(),anyString(),anyString(),any(),anyString(),any());
+        doNothing().when(f.runtime).retain(any(),anyString(),any(),any());
+        var tail=mock(NativeSrsCaptureRunUnit.Tail.class);when(tail.health()).thenReturn(new CaptureHealth());
+        doReturn(tail).when(f.runtime).startTail(any(),any(),any(),any(),any(),any(),any(),anyBoolean());
+        var run=f.coordinator.forRun(SCOPE,PIPELINE,ORIGINAL);run.startCapture("flow",f.snapshot(),f.models());
+        return new OwnedShared(run, capture, tail, physical);
+    }
+
     @Test void aTrustedReplacementUsesPhysicalRingsWhileKeepingCanonicalCaptureNotesAndHistory() {
         try(var f=new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
             String canonical="mck-key",physical="srs-recovery-"+"b".repeat(64),operation=UUID.randomUUID().toString();
