@@ -344,6 +344,8 @@ final class TwoMemberCluster implements AutoCloseable {
                 "--tapstate.control.advertise-url=http://" + bindAddress + ":" + httpPort,
                 "--tapstate.hz.bind-address=" + bindAddress,
                 "--tapstate.hz.member-port=" + memberPort,
+                // Keep discovery dials outside the runners' ephemeral range used for future HTTP listeners.
+                "--tapstate.hz.outbound-member-ports=20000-29999",
                 "--tapstate.hz.discovery.mode=tcp-ip",
                 "--tapstate.hz.discovery.tcp-ip.seeds=" + seeds));
         if (nodeSessionTtl != null) {
