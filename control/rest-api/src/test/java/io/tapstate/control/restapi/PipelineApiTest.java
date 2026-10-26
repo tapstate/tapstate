@@ -403,7 +403,7 @@ class PipelineApiTest {
         assertThat(afterPublish.get("hasArtifact")).isEqualTo(true);
         assertThat(afterPublish.get("contentHash")).isEqualTo(published.getBody().get("artifactHash"));
         assertThat(((Map<?, ?>) afterPublish.get("status")).get("state")).isEqualTo("NEW");
-        assertThat(((Map<?, ?>) afterPublish.get("status")).get("displayState")).isEqualTo("NEW");
+        assertThat(((Map<?, ?>) afterPublish.get("status")).get("displayState")).isEqualTo("NOT_STARTED");
         assertThat(context.getBean(PipelineCatalogService.class).find("draft-p1").orElseThrow().hasArtifact())
                 .isTrue();
 
