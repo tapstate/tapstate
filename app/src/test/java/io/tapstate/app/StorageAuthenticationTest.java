@@ -12,6 +12,45 @@ import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class StorageAuthenticationTest {
+    @Test void formalCloudIdentityAndOrganizationUseOneDurableSessionValidation() {
+        var properties = new CloudProperties();
+        properties.setBaseUrl("https://cloud.example"); properties.setClusterId("cluster");
+        properties.setAtlasUri("mongodb://localhost/config"); properties.setToken("test-runtime-token");
+        var cloud = CloudRuntimeSettings.resolve(properties);
+        var clock = Clock.fixed(Instant.parse("2026-10-26T09:00:00Z"), ZoneOffset.UTC);
+        var configuration = mock(MongoConfigurationDomain.class);
+        var states = mock(StorageSetupStateStore.class);
+        when(configuration.setupStates()).thenReturn(states);
+        when(states.load()).thenReturn(new StorageSetupStateStore.Status(
+                new StorageSetupScope("cluster", "installation", "operation", 1), StorageSetupStateStore.Phase.COMPLETE, 1));
+        var cache = mock(io.tapstate.adapters.mongostore.MongoCacheDomain.class);
+        var bound = mock(StorageRuntime.Bound.class);
+        var scope = new CacheAuthScope("cluster", 1, StorageBinding.Mode.CLOUD, "incarnation", 1);
+        var preparation = new CachePreparation("operation", scope);
+        when(bound.preparation()).thenReturn(preparation); when(bound.cache()).thenReturn(cache);
+        var sessions = mock(CloudSessionStore.class);
+        when(cache.cloudSessions(scope)).thenReturn(sessions);
+        when(cache.cloudSessions(eq(scope), any(io.tapstate.adapters.mongostore.MongoReadBudget.class))).thenReturn(sessions);
+        var identity = new CloudSessionIdentity("https://cloud.example", CloudSdkBridge.DEPLOYMENT_ORGANIZATION, "cluster");
+        var context = new CloudSessionContext("organization", "cluster", "Org", "Cluster", "region");
+        when(sessions.authenticate(eq(identity), eq("jti"), anyString(), any(), any()))
+                .thenReturn(Optional.of(new CloudSessionRecord(identity, "jti", "hash", "user", "WRITE", false,
+                        clock.instant(), clock.instant(), clock.instant().plusSeconds(600), context)));
+        try (var authentication = new StorageAuthentication(configuration, cloud, mock(CloudSdkBridge.class),
+                new RandomTokenSecrets(), clock, new byte[32])) {
+            authentication.install(bound);
+            String cookie = "tcs_" + Base64.getUrlEncoder().withoutPadding().encodeToString("jti".getBytes(java.nio.charset.StandardCharsets.UTF_8)) + ".secret";
+            var proof = authentication.credentials().authenticateContext(cookie).orElseThrow();
+            assertThat(proof.organizationId()).contains("organization");
+            assertThat(proof.storageScope()).contains(scope);
+            verify(sessions, times(1)).authenticate(eq(identity), eq("jti"), anyString(), any(), any());
+            verify(configuration, times(2)).requireAuthenticationPublished(eq(preparation), any(io.tapstate.adapters.mongostore.MongoReadBudget.class));
+            doThrow(StorageRuntime.unavailable()).when(configuration)
+                    .requireAuthenticationPublished(eq(preparation), any(io.tapstate.adapters.mongostore.MongoReadBudget.class));
+            assertThatThrownBy(proof.requireActive()::run).isInstanceOf(TapstateException.class);
+        }
+    }
+
     @Test void cloudSetupUsesTheOriginalSdkFlowAndCompletedSetupCannotReopenTemporaryAuthentication() {
         var properties = new CloudProperties();
         properties.setBaseUrl("https://cloud.example"); properties.setClusterId("cluster");

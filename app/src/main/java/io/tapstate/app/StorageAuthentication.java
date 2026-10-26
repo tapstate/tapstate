@@ -14,6 +14,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 /** Publishes a formal authentication owner independently from Hazelcast, claims and business readiness. */
 final class StorageAuthentication implements AutoCloseable {
+    private static final org.slf4j.Logger LOG = org.slf4j.LoggerFactory.getLogger(StorageAuthentication.class);
     // Store operations also have a five-second cap, leaving time for transaction abort before HTTP expires.
     static final Duration AUTHORIZATION_READ_BUDGET = Duration.ofSeconds(10);
     private final MongoConfigurationDomain configuration;
@@ -84,24 +85,22 @@ final class StorageAuthentication implements AutoCloseable {
         var budget = new MongoReadBudget(AUTHORIZATION_READ_BUDGET);
         Epoch original = selected();
         Optional<VerifiedToken> verified;
+        Optional<String> organization = Optional.empty();
         if (cloud.cloud()) {
             original.requireActive(budget);
-            verified = original.managed(budget).authenticate(presented);
-            // The context read below rechecks the durable session; retain the local owner fence here.
+            try {
+                var authenticated = original.managed(budget).authenticateWithContext(presented);
+                verified = authenticated.map(AuthenticatedCloudSession::identity);
+                organization = authenticated.map(value -> value.clusterContext().organizationId());
+            } catch (TapstateException failure) {
+                if (failure.code() == IoError.CACHE_AUTH_FENCED) throw StorageRuntime.unavailable();
+                throw failure;
+            }
             original.requireLocallyActive();
         } else {
             verified = original.authenticate(presented, budget);
         }
         if (verified.isEmpty()) return Optional.empty();
-        Optional<String> organization = Optional.empty();
-        if (cloud.cloud()) {
-            try {
-                organization = original.managed(budget).clusterContext(presented).map(CloudSessionContext::organizationId);
-            } catch (TapstateException failure) {
-                if (failure.code() == IoError.CACHE_AUTH_FENCED) throw StorageRuntime.unavailable();
-                throw failure;
-            }
-        }
         original.requireActive(budget);
         if (cloud.cloud() && organization.isEmpty()) return Optional.empty();
         VerifiedToken identity = verified.orElseThrow();
@@ -197,11 +196,16 @@ final class StorageAuthentication implements AutoCloseable {
         void requireActive() { requireActive(new MongoReadBudget(AUTHORIZATION_READ_BUDGET)); }
         void requireActive(MongoReadBudget budget) {
             requireLocallyActive();
+            String stage = "configuration-publication";
             try {
                 configuration.requireAuthenticationPublished(bound.preparation(), budget);
+                stage = "cache-authentication-scope";
                 bound.cache().loadAuthScope(bound.preparation().authScope(), budget);
             }
-            catch (TapstateException unavailable) { throw StorageRuntime.unavailable(); }
+            catch (TapstateException unavailable) {
+                LOG.warn("Storage authentication check failed [stage={}, error_code={}]", stage, unavailable.code().code());
+                throw StorageRuntime.unavailable();
+            }
             requireLocallyActive();
         }
         void requireLocallyActive() {

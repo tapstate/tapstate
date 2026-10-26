@@ -95,6 +95,13 @@ public final class CloudSessionService {
         return authenticatedRecord(cookie).map(CloudSessionRecord::clusterContext).filter(Objects::nonNull);
     }
 
+    /** One store transaction validates both projections; the result is never cached across requests. */
+    public Optional<AuthenticatedCloudSession> authenticateWithContext(String cookie) {
+        return authenticatedRecord(cookie).filter(record -> record.clusterContext() != null)
+                .map(record -> new AuthenticatedCloudSession(
+                        new VerifiedToken(record.userId(), scopeOf(record.scope())), record.clusterContext()));
+    }
+
     private Optional<CloudSessionRecord> authenticatedRecord(String cookie) {
         return parse(cookie).flatMap(parsed -> {
             var now = clock.instant();
