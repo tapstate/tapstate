@@ -888,6 +888,41 @@ class PipelineDraftCompilerTest {
     }
 
     @Test
+    void rejectsWizardUnionInputWithWhitespacePaddedSource() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Transform union = new PipelineDraft.Transform("merge", "union",
+                Map.of("from", List.of(" crm.extra")));
+        PipelineDraft draft = withWizard(template, template.wizard().root(), List.of(),
+                List.of(union), template.wizard().output());
+
+        assertCompileFails(draft, "wizard union input must be a source-qualified table reference");
+    }
+
+    @Test
+    void rejectsWhitespacePaddedUnionInputsAcrossWizardBranchesAndIncompleteCandidates() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Root root = template.wizard().root();
+        PipelineDraft.Related related = template.wizard().related().getFirst();
+        for (String input : List.of("crm.extra ", "\tcrm.extra", "crm.extra\t")) {
+            PipelineDraft.Transform union = new PipelineDraft.Transform("merge", "union",
+                    Map.of("from", List.of(input)));
+            PipelineDraft.Root rootWithUnion = new PipelineDraft.Root(root.id(), root.sourceId(),
+                    root.table(), root.key(), List.of(union));
+            PipelineDraft.Related relatedWithUnion = new PipelineDraft.Related(related.id(), related.parentId(),
+                    related.sourceId(), related.table(), related.relation(), List.of(union));
+            for (PipelineDraft draft : List.of(
+                    withWizard(template, rootWithUnion, List.of(), List.of(), null),
+                    withWizard(template, root, List.of(relatedWithUnion), List.of(), null),
+                    withWizard(template, root, List.of(), List.of(union), null))) {
+                assertCompileFails(draft, "wizard union input must be a source-qualified table reference");
+                assertThatThrownBy(() -> compiler.compileCandidate(draft))
+                        .isInstanceOf(IllegalArgumentException.class)
+                        .hasMessage("wizard union input must be a source-qualified table reference");
+            }
+        }
+    }
+
+    @Test
     void rejectsAdditionalUnionInputsRepeatedAcrossBranchesAndLaterTransforms() {
         PipelineDraft template = wizardDraft();
         PipelineDraft.Wizard wizard = template.wizard();
