@@ -11,20 +11,20 @@
 #
 #   1. machine   work out the version -> write it into all six places that pin it -> build and smoke
 #                four native CLI binaries -> build both server image architectures into a local
-#                archive, pushing nothing -> check the release is complete -> create a DRAFT release,
-#                which is private and creates no tag
-#   2. person    the run pauses on an environment with required reviewers. Read the draft on the
-#                Releases page, edit the body if it needs it, then Approve or Reject in Actions
+#                archive -> pass every gate -> build and push the pinned Cloud dev candidate and
+#                create a DRAFT release, which is private and creates no tag
+#   2. person    validate the Cloud dev image by digest, then read the draft on the Releases page,
+#                edit the body if it needs it, and Approve or Reject in Actions
 #   3. machine   publish the draft, which creates the tag -> push the image archive -> point the
 #                floating "latest" marker here, but only if this release is ahead of every other
 #
-# The three irreversible acts -- creating the tag, publishing, pushing the image -- are all in step 3,
+# The production acts -- creating the tag, publishing, pushing the release image -- are all in step 3,
 # all after the pause, and all done by the machine. A person judges; a person does not operate. Moving
 # a tag by hand used to be a step in this process, and it was the one step nothing checked.
 #
-# Reject, or let the approval time out, and nothing is left behind: the draft is deleted, no tag was
-# ever created, no image was ever pushed, and the version number is unspent -- the next dispatch works
-# out the same one. That is also how a rehearsal is done now. There used to be a `dry_run` input for
+# Reject, or let the approval time out, and the draft and release pins are retired: no release tag or
+# production image is published, and the version number is unspent. The dev image and dev catalog
+# entry remain for diagnosis. There used to be a `dry_run` input for
 # it, which had the property that the rehearsal did not go down the same code path as the real thing;
 # the part it could never rehearse was the release body.
 #
@@ -232,7 +232,7 @@ jobs:
             echo "The freeze is over: the default branch is free to carry on, and nothing merged from here is in this release."
             echo "The expensive half runs next, against \`ws/release-${{ steps.next.outputs.version }}\`, and the default branch is not part of it."
             echo
-            echo "If this attempt does not publish, everything it created is retired and nothing is carried forward."
+            echo "If this attempt does not publish, its release pins and draft are retired; dev validation artifacts remain."
             echo "A fix goes to the default branch, and the next attempt starts from there."
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -1103,6 +1103,21 @@ jobs:
             echo "| 7 | satellite token reaches every satellite | this job |"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  cloud-dev:
+    # Reuse the dev build, but never resolve a second version or a moving source ref.
+    # The version job already checked that the selected product commit belongs to main's history.
+    # Distribution completeness is checked in draft, beyond the checks in the gates job.
+    needs: [version, gates, draft]
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/cloud-cluster-dev.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+      source-sha: ${{ needs.version.outputs.sha }}
+      web-sha: ${{ needs.version.outputs.web_sha }}
+    secrets: inherit
+
   draft:
     needs: [version, cli-native, server-image, gates]
     runs-on: ubuntu-latest
@@ -1202,10 +1217,11 @@ jobs:
             echo "### Draft ${{ needs.version.outputs.tag }} is ready for review"
             echo
             echo "[Read it here](${{ steps.create.outputs.url }}), edit the body if it needs editing,"
-            echo "then come back to this run and Approve or Reject."
+            echo "Validate the Cloud dev candidate by the digest in the cloud-dev job summary,"
+            echo "then come back to this run and Approve or Reject. Approval waits for Cloud dev publication and registration."
             echo
-            echo "Reject and nothing is left: the draft is deleted, no tag exists, no image was pushed,"
-            echo "and the next dispatch works out ${{ needs.version.outputs.tag }} again."
+            echo "Reject deletes the draft and release pins; no release tag or production image is published."
+            echo "Dev validation artifacts remain; the next dispatch works out ${{ needs.version.outputs.tag }} again."
           } >> "$GITHUB_STEP_SUMMARY"
 
   approve:
@@ -1217,7 +1233,7 @@ jobs:
     # switching it on deadlocks a release nobody else is around for. It must also not carry a
     # deployment branch policy limiting it to the default branch: a release can legitimately be built
     # from an older line's branch, and the policy would refuse exactly those.
-    needs: [version, draft]
+    needs: [version, draft, cloud-dev]
     runs-on: ubuntu-latest
     environment: release
     steps:
@@ -1225,7 +1241,7 @@ jobs:
       # naming it then runs straight through. That failure is invisible in every direction: the YAML
       # says `environment: release`, the run is green, the release goes out, and nothing anywhere
       # reports that the review step did not happen. So the pause checks that it was a pause. Refusing
-      # here still costs nothing -- the draft is deleted, no tag was created, no image was pushed.
+      # here still prevents production publication; the dev candidate remains available for diagnosis.
       - name: the pause has to be a real pause
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1234,7 +1250,7 @@ jobs:
             --jq '[.protection_rules[]? | select(.type == "required_reviewers")] | length' 2>/dev/null || echo 0)"
           if [ "${reviewers:-0}" -lt 1 ]; then
             echo "the 'release' environment has no required reviewers, so this run never paused for one." >&2
-            echo "nothing was published. Add reviewers under Settings > Environments > release, then dispatch again." >&2
+            echo "no production release was published. Add reviewers under Settings > Environments > release, then dispatch again." >&2
             exit 1
           fi
           echo "Approved ${{ needs.version.outputs.tag }}."
@@ -1625,7 +1641,7 @@ jobs:
     # Guarded on the version output rather than on the pin job's result: a pin that failed part way
     # through creating four refs is exactly the case with orphans to clear, and its job result is
     # `failure`. The output exists as soon as the version was computed, which is before any ref.
-    needs: [version, draft, publish, satellites, cloud-ghcr, roadmap, write-back]
+    needs: [version, cloud-dev, draft, approve, publish, satellites, cloud-ghcr, roadmap, write-back]
     if: >-
       always()
       && needs.version.outputs.version != ''
@@ -1659,7 +1675,7 @@ jobs:
             exit 0
           fi
           gh api -X DELETE "repos/${{ github.repository }}/releases/${{ needs.draft.outputs.id }}"
-          echo "Deleted the unpublished draft ${{ needs.version.outputs.tag }}. No tag was created, no image was pushed." >> "$GITHUB_STEP_SUMMARY"
+          echo "Deleted the unpublished draft ${{ needs.version.outputs.tag }}. Dev validation artifacts are retained." >> "$GITHUB_STEP_SUMMARY"
 
       # The third thing an abandoned attempt leaves behind, and the one nothing used to collect. The
       # design enumerated two endings after the approval -- everything goes out, or nothing is left
