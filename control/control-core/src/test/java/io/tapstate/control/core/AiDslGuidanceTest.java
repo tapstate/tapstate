@@ -14,7 +14,7 @@ class AiDslGuidanceTest {
                 new String(resource("manifest.json"), StandardCharsets.UTF_8));
         assertThat((String) manifest.get("revision")).matches("[0-9a-f]{40}");
         Map<?, ?> files = (Map<?, ?>) manifest.get("files");
-        assertThat(files.size()).isEqualTo(4);
+        assertThat(files).hasSize(4);
         for (var entry : files.entrySet()) {
             String actual = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
                     .digest(resource((String) entry.getKey())));

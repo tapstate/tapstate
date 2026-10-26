@@ -10,6 +10,7 @@ import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -97,10 +98,11 @@ class OpenAiCompatibleClientTest {
     }
 
     @Test void blankInputCanAskForClarificationInsteadOfForcingAProposal() throws Exception {
-        var received = new java.util.concurrent.atomic.AtomicReference<Map<?, ?>>();
+        var received = new java.util.concurrent.atomic.AtomicReference<Map<Object, Object>>();
         var server = com.sun.net.httpserver.HttpServer.create(new java.net.InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/chat/completions", exchange -> {
-            received.set((Map<?, ?>) JsonReader.parse(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8)));
+            received.set(new LinkedHashMap<>((Map<?, ?>) JsonReader.parse(
+                    new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8))));
             byte[] bytes = (chunk(Map.of("content", "Which input table should anchor the output?"), "stop")
                     + "data: [DONE]\n\n").getBytes(StandardCharsets.UTF_8);
             exchange.sendResponseHeaders(200, bytes.length);
@@ -113,15 +115,14 @@ class OpenAiCompatibleClientTest {
             var result = localClient().propose(settings, List.of(Map.of("role", "user", "content", "Create a pipeline")),
                     Map.of("proposalEnabled", true, "inputSelectionPending", true), text::add);
             assertThat(result).isEmpty();
-            assertThat(received.get().containsKey("tools")).isTrue();
-            assertThat(received.get().containsKey("tool_choice")).isFalse();
+            assertThat(received.get()).containsKey("tools").doesNotContainKey("tool_choice");
             assertThat(String.join("", text)).contains("Which input table");
             localClient().propose(settings, List.of(Map.of("role", "user", "content", "Explain the pipeline. Do not propose or modify configuration.")),
                     Map.of("proposalEnabled", true), ignored -> { });
-            assertThat(received.get().containsKey("tool_choice")).as("explanation requests must not force a proposal").isFalse();
+            assertThat(received.get()).as("explanation requests must not force a proposal").doesNotContainKey("tool_choice");
             localClient().propose(settings, List.of(Map.of("role", "user", "content", "Create a pipeline")),
                     Map.of("proposalEnabled", false, "scopeSelectionRequired", true), ignored -> { });
-            assertThat(received.get().containsKey("tools")).isFalse();
+            assertThat(received.get()).doesNotContainKey("tools");
         } finally { server.stop(0); }
     }
 
@@ -155,10 +156,11 @@ class OpenAiCompatibleClientTest {
                                 "passthroughUnlisted", true))))))));
         String stream = chunk(Map.of("tool_calls", List.of(Map.of("index", 0, "function", Map.of(
                 "name", "propose_pipeline", "arguments", arguments)))), "tool_calls") + "data: [DONE]\n\n";
-        AtomicReference<Map<?, ?>> submitted = new AtomicReference<>();
+        AtomicReference<Map<Object, Object>> submitted = new AtomicReference<>();
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/chat/completions", exchange -> {
-            submitted.set((Map<?, ?>) JsonReader.parse(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8)));
+            submitted.set(new LinkedHashMap<>((Map<?, ?>) JsonReader.parse(
+                    new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8))));
             byte[] response = stream.getBytes(StandardCharsets.UTF_8);
             exchange.sendResponseHeaders(200, response.length);
             try (var output = exchange.getResponseBody()) { output.write(response); }
@@ -208,15 +210,16 @@ class OpenAiCompatibleClientTest {
             Map<?, ?> scriptSchema = (Map<?, ?>) ((Map<?, ?>) jsSchema.get("properties")).get("script");
             assertThat((String) scriptSchema.get("description"))
                     .contains("function process(record, ctx)", "record.after", "new Date().toISOString()");
-            assertThat(submitted.get().containsKey("tool_choice")).isTrue();
+            assertThat(submitted.get()).containsKey("tool_choice");
         } finally { server.stop(0); }
     }
     @Test void keepsHowToQuestionsConversationalEvenWhenTheyMentionAnEdit() throws Exception {
         String stream = chunk(Map.of("content", "Use a map transform to add a field."), null) + "data: [DONE]\n\n";
-        AtomicReference<Map<?, ?>> submitted = new AtomicReference<>();
+        AtomicReference<Map<Object, Object>> submitted = new AtomicReference<>();
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/chat/completions", exchange -> {
-            submitted.set((Map<?, ?>) JsonReader.parse(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8)));
+            submitted.set(new LinkedHashMap<>((Map<?, ?>) JsonReader.parse(
+                    new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8))));
             byte[] response = stream.getBytes(StandardCharsets.UTF_8);
             exchange.sendResponseHeaders(200, response.length);
             try (var output = exchange.getResponseBody()) { output.write(response); }
@@ -229,8 +232,7 @@ class OpenAiCompatibleClientTest {
                     Map.of("proposalEnabled", true, "currentWizard", Map.of()), ignored -> { });
 
             assertThat(result).isEmpty();
-            assertThat(submitted.get().containsKey("tools")).isTrue();
-            assertThat(submitted.get().containsKey("tool_choice")).isFalse();
+            assertThat(submitted.get()).containsKey("tools").doesNotContainKey("tool_choice");
         } finally { server.stop(0); }
     }
     @Test void keepsAnEmptyToolCandidatePresentForServerValidation() throws Exception {

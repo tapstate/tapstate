@@ -15,7 +15,9 @@ import io.tapstate.control.core.SchemaDerivation;
 import io.tapstate.control.core.OpenAiCompatibleClient;
 import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.model.Resource;
 import io.tapstate.spi.store.AiProviderSettingsStore;
+import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.control.core.AiProviderSettings;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.PipelineDraft;
@@ -88,26 +90,175 @@ class PipelineAssistantControllerTest {
     @Test void blankBuilderRequestsSelectionWhenThereAreTooManyTables() throws Exception {
         verifyBlankContext(true, 1, 41);
     }
+    @Test void selectingATableRecoversFromALargeSingleSourceCatalog() throws Exception {
+        verifyBlankContext(true, 1, 41, "orders_40");
+    }
+    @Test void blankDraftContinuesWhenASourceDisappearsDuringDiscovery() throws Exception {
+        PipelineDraft configured = draft();
+        PipelineDraft blank = new PipelineDraft("blank", 1, 1, PipelineDraft.Mode.WIZARD, "Blank", null, null,
+                new PipelineDraft.Wizard(null, List.of(), List.of(), configured.wizard().output()),
+                null, null, null, Instant.EPOCH, Instant.EPOCH, "author");
+        var drafts = new PipelineApiTest.FakePipelineDraftStore();
+        drafts.create(blank);
+        var listed = new PipelineApiTest.FakeArtifactStore();
+        listed.seed("version: tapstate/v1\nkind: source\nid: src0\nconnector: mysql\nmode: cdc\nconfig: {}\n");
+        listed.seed("version: tapstate/v1\nkind: source\nid: src1\nconnector: mysql\nmode: cdc\nconfig: {}\n");
+        AtomicInteger src1Reads = new AtomicInteger();
+        ArtifactStore disappearingSource = new ArtifactStore() {
+            public void saveAll(List<Resource> resources) { throw new AssertionError("must not write artifacts"); }
+            public Optional<Resource> get(String id) {
+                return id.equals("src1") && src1Reads.incrementAndGet() > 1 ? Optional.empty() : listed.get(id);
+            }
+            public List<Resource> list() { return listed.list(); }
+        };
+        var schema = new DiscoveredSourceModel("src0", "mysql", 1,
+                new io.tapstate.spi.store.SourceModel(List.of(new io.tapstate.spi.store.SourceTable("orders",
+                        List.of(new io.tapstate.spi.store.SourceField("id", "integer")), List.of("id"), List.of()))));
+        SchemaStore schemaStore = new SchemaStore() {
+            public void save(DiscoveredSourceModel ignored) { throw new AssertionError("must not write schema"); }
+            public Optional<DiscoveredSourceModel> get(String id) {
+                return id.equals("src0") ? Optional.of(schema) : Optional.empty();
+            }
+        };
+        var audit = new AuditGate(new PipelineApiTest.RecordingAuditStore(), Clock.systemUTC());
+        var services = new PipelineApiTest.TestApp();
+        var apply = new ApplyService(TapstateCatalog::load, disappearingSource, audit, schemaStore,
+                PlanAdvisories.none(), SchemaDerivation.none());
+        var sourceProjection = new SourceProjectionService(apply,
+                services.artifactQueryService(disappearingSource),
+                services.artifactMutationService(disappearingSource, audit),
+                new SourceRepresentation(TapstateCatalog::load));
+        var beans = new DefaultListableBeanFactory();
+        beans.registerSingleton("drafts", new PipelineDraftService(drafts,
+                services.artifactQueryService(disappearingSource), audit, apply));
+        beans.registerSingleton("sources", sourceProjection);
+        beans.registerSingleton("schemas", new io.tapstate.control.core.SourceSchemaQueryService(disappearingSource, schemaStore));
+        AtomicReference<Map<String, Object>> sentContext = new AtomicReference<>();
+        AiProviderClient fake = new AiProviderClient() {
+            public void check(AiProviderSettings ignored) { }
+            public Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
+                    Map<String, Object> context, java.util.function.Consumer<String> text) {
+                sentContext.set(context);
+                text.accept("I can continue with the Source that remains.");
+                return Optional.empty();
+            }
+        };
+        var controller = new PipelineAssistantController(beans.getBeanProvider(PipelineDraftService.class),
+                beans.getBeanProvider(SourceProjectionService.class),
+                beans.getBeanProvider(io.tapstate.control.core.SourceSchemaQueryService.class),
+                providerController(fake), fake, JsonMapper.builder().build());
+
+        var response = controller.assistant("blank", Map.of("revision", 1,
+                "messages", List.of(Map.of("role", "user", "text", "How do I start?"))),
+                new MockHttpServletRequest("POST", "/pipelines/blank/draft:assistant"));
+        var output = new ByteArrayOutputStream();
+        response.getBody().writeTo(output);
+
+        List<?> availableSources = (List<?>) sentContext.get().get("sources");
+        assertThat(availableSources).hasSize(1);
+        assertThat(AssistantWizardJson.object(availableSources.getFirst())).containsEntry("sourceId", "src0");
+        assertThat(sentContext.get()).containsEntry("proposalEnabled", true);
+        assertThat(output.toString(StandardCharsets.UTF_8)).contains("I can continue with the Source that remains.",
+                "finishReason").doesNotContain(ControlError.AI_PROVIDER_FAILED.code());
+        assertThat(drafts.get("blank")).contains(blank);
+    }
+    @Test void persistedCrossSourceUnionRemainsInAssistantValidationScope() throws Exception {
+        PipelineDraft base = new PipelineDraft("union", 1, 1, PipelineDraft.Mode.WIZARD, "Union", null, null,
+                new PipelineDraft.Wizard(new PipelineDraft.Root("root", "src0", "orders", List.of("id"), List.of()),
+                        List.of(), List.of(new PipelineDraft.Transform("merge", "union",
+                                Map.of("from", List.of("src1.archive_orders")))),
+                        new PipelineDraft.Output("atlas", Map.of("sourceId", "dst", "table", "orders", "writeMode", "upsert"))),
+                null, null, null, Instant.EPOCH, Instant.EPOCH, "author");
+        var drafts = new PipelineApiTest.FakePipelineDraftStore();
+        drafts.create(base);
+        var artifacts = new PipelineApiTest.FakeArtifactStore();
+        artifacts.seed("version: tapstate/v1\nkind: source\nid: src0\nconnector: mysql\nmode: cdc\nconfig: {}\n");
+        artifacts.seed("version: tapstate/v1\nkind: source\nid: src1\nconnector: mysql\nmode: cdc\nconfig: {}\n");
+        artifacts.seed("version: tapstate/v1\nkind: source\nid: dst\nconnector: mongodb\nconfig: {}\n");
+        Map<String, DiscoveredSourceModel> discovered = Map.of(
+                "src0", new DiscoveredSourceModel("src0", "mysql", 1,
+                        new io.tapstate.spi.store.SourceModel(List.of(new io.tapstate.spi.store.SourceTable("orders",
+                                List.of(new io.tapstate.spi.store.SourceField("id", "integer")), List.of("id"), List.of())))),
+                "src1", new DiscoveredSourceModel("src1", "mysql", 1,
+                        new io.tapstate.spi.store.SourceModel(List.of(new io.tapstate.spi.store.SourceTable("archive_orders",
+                                List.of(new io.tapstate.spi.store.SourceField("id", "integer")), List.of("id"), List.of())))));
+        SchemaStore schemaStore = new SchemaStore() {
+            public void save(DiscoveredSourceModel ignored) { throw new AssertionError("must not write schema"); }
+            public Optional<DiscoveredSourceModel> get(String id) { return Optional.ofNullable(discovered.get(id)); }
+        };
+        var audit = new AuditGate(new PipelineApiTest.RecordingAuditStore(), Clock.systemUTC());
+        var services = new PipelineApiTest.TestApp();
+        var apply = new ApplyService(TapstateCatalog::load, artifacts, audit, schemaStore,
+                PlanAdvisories.none(), SchemaDerivation.none());
+        var beans = new DefaultListableBeanFactory();
+        beans.registerSingleton("drafts", new PipelineDraftService(drafts,
+                services.artifactQueryService(artifacts), audit, apply));
+        beans.registerSingleton("sources", new SourceProjectionService(apply,
+                services.artifactQueryService(artifacts), services.artifactMutationService(artifacts, audit),
+                new SourceRepresentation(TapstateCatalog::load)));
+        beans.registerSingleton("schemas", new io.tapstate.control.core.SourceSchemaQueryService(artifacts, schemaStore));
+        AtomicReference<Map<String, Object>> sentContext = new AtomicReference<>();
+        AiProviderClient fake = new AiProviderClient() {
+            public void check(AiProviderSettings ignored) { }
+            public Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
+                    Map<String, Object> context, java.util.function.Consumer<String> text) {
+                sentContext.set(context);
+                text.accept("I will preserve the existing cross-Source union.");
+                return Optional.empty();
+            }
+        };
+        var mapper = JsonMapper.builder().build();
+        var controller = new PipelineAssistantController(beans.getBeanProvider(PipelineDraftService.class),
+                beans.getBeanProvider(SourceProjectionService.class),
+                beans.getBeanProvider(io.tapstate.control.core.SourceSchemaQueryService.class),
+                providerController(fake), fake, mapper);
+
+        var response = controller.assistant("union", Map.of("revision", 1,
+                "messages", List.of(Map.of("role", "user", "text", "Add a filter to orders"))),
+                new MockHttpServletRequest("POST", "/pipelines/union/draft:assistant"));
+        response.getBody().writeTo(new ByteArrayOutputStream());
+        Map<String, Object> candidate = AssistantWizardJson.view(
+                AssistantWizardJson.object(PipelineDraftJson.write(mapper, base).get("wizard")));
+
+        assertThat(controller.validate("union", 1, candidate)).containsEntry("valid", true);
+        List<?> availableSources = (List<?>) sentContext.get().get("sources");
+        assertThat(availableSources).extracting(source -> AssistantWizardJson.text(
+                AssistantWizardJson.object(source).get("sourceId"))).containsExactly("src0", "src1");
+        assertThat(drafts.get("union")).contains(base);
+    }
     private void verifyBlankContext(boolean discovered, int sourceCount) throws Exception {
         verifyBlankContext(discovered, sourceCount, 1);
     }
     private void verifyBlankContext(boolean discovered, int sourceCount, int tableCount) throws Exception {
+        verifyBlankContext(discovered, sourceCount, tableCount, null);
+    }
+    private void verifyBlankContext(boolean discovered, int sourceCount, int tableCount, String selectedTable) throws Exception {
         PipelineDraft configured = draft();
+        PipelineDraft.Root selectedRoot = selectedTable == null ? null
+                : new PipelineDraft.Root("root", "src0", selectedTable, List.of("id"), List.of());
         PipelineDraft blank = new PipelineDraft("blank", 1, 1, PipelineDraft.Mode.WIZARD, "Blank", null, null,
-                new PipelineDraft.Wizard(null, List.of(), List.of(), configured.wizard().output()),
+                new PipelineDraft.Wizard(selectedRoot, List.of(), List.of(), configured.wizard().output()),
                 null, null, null, Instant.EPOCH, Instant.EPOCH, "author");
         var store = new PipelineApiTest.FakePipelineDraftStore();
         store.create(blank);
         var artifacts = new PipelineApiTest.FakeArtifactStore();
         artifacts.seed("version: tapstate/v1\nkind: source\nid: dst\nconnector: mongodb\nconfig: {}\n");
         for (int i = 0; i < sourceCount; i++) artifacts.seed("version: tapstate/v1\nkind: source\nid: src" + i + "\nconnector: mysql\nmode: cdc\nconfig: {}\n");
+        AtomicInteger schemaReads = new AtomicInteger();
         var schemaStore = new SchemaStore() {
             public void save(DiscoveredSourceModel ignored) { throw new AssertionError("must not write schema"); }
             public Optional<DiscoveredSourceModel> get(String id) {
+                schemaReads.incrementAndGet();
                 return discovered ? Optional.of(new DiscoveredSourceModel(id, "mysql", 1,
                         new io.tapstate.spi.store.SourceModel(java.util.stream.IntStream.range(0, tableCount)
-                        .mapToObj(i -> new io.tapstate.spi.store.SourceTable(i == 0 ? "orders" : "orders_" + i,
-                        List.of(new io.tapstate.spi.store.SourceField("id", "integer")), List.of("id"), List.of())).toList()))) : Optional.empty();
+                        .mapToObj(i -> {
+                            String tableName = i == 0 ? "orders" : "orders_" + i;
+                            List<io.tapstate.spi.store.SourceField> fields = selectedTable != null && !tableName.equals(selectedTable)
+                                    ? java.util.stream.IntStream.range(0, 100).mapToObj(field ->
+                                            new io.tapstate.spi.store.SourceField("field_" + "x".repeat(60) + field, "string")).toList()
+                                    : List.of(new io.tapstate.spi.store.SourceField("id", "integer"));
+                            return new io.tapstate.spi.store.SourceTable(tableName, fields, List.of("id"), List.of());
+                        }).toList()))) : Optional.empty();
             }
         };
         var audit = new AuditGate(new PipelineApiTest.RecordingAuditStore(), Clock.systemUTC());
@@ -142,10 +293,21 @@ class PipelineAssistantControllerTest {
         response.getBody().writeTo(output);
         String stream = output.toString(StandardCharsets.UTF_8);
 
-        assertThat(sentContext.get()).containsKey("currentWizard")
-                .containsEntry("proposalEnabled", discovered && sourceCount <= 3 && sourceCount * tableCount <= 40);
-        if (sourceCount > 3 || sourceCount * tableCount > 40) assertThat(sentContext.get()).containsEntry("scopeSelectionRequired", true);
-        else assertThat((List<?>) sentContext.get().get("sources")).hasSize(sourceCount);
+        if (selectedTable == null) {
+            assertThat(sentContext.get()).containsKey("currentWizard")
+                    .containsEntry("proposalEnabled", discovered && sourceCount <= 3 && sourceCount * tableCount <= 40);
+            if (sourceCount > 3 || sourceCount * tableCount > 40) assertThat(sentContext.get()).containsEntry("scopeSelectionRequired", true);
+            else assertThat((List<?>) sentContext.get().get("sources")).hasSize(sourceCount);
+        } else {
+            assertThat(sentContext.get()).containsEntry("inputSelectionPending", false)
+                    .containsEntry("proposalEnabled", true).doesNotContainKey("scopeSelectionRequired");
+            List<?> selectedSources = (List<?>) sentContext.get().get("sources");
+            assertThat(selectedSources).hasSize(1);
+            List<?> selectedTables = (List<?>) AssistantWizardJson.object(selectedSources.getFirst()).get("tables");
+            assertThat(selectedTables).hasSize(1);
+            assertThat(AssistantWizardJson.object(selectedTables.getFirst())).containsEntry("name", selectedTable);
+        }
+        assertThat(schemaReads.get()).isEqualTo(sourceCount > 3 ? 0 : discovered ? sourceCount : 0);
         assertThat(stream).contains("Connect a PostgreSQL or MySQL Source", "data-status", "complete",
                 "\"finishReason\":\"stop\"")
                 .doesNotContain("data-proposal", "control.malformed-request", "\\\"type\\\":\\\"error\\\"");
@@ -723,8 +885,29 @@ class PipelineAssistantControllerTest {
                         Map.of("sourceId", "", "table", "", "writeMode", "upsert"))),
                 null, null, null, Instant.EPOCH, Instant.EPOCH, "author");
         store.create(blank);
+        var artifacts = new PipelineApiTest.FakeArtifactStore();
+        artifacts.seed("version: tapstate/v1\nkind: source\nid: src\nconnector: mysql\nmode: cdc\nconfig: {}\n");
+        AtomicInteger schemaReads = new AtomicInteger();
+        var schema = new DiscoveredSourceModel("src", "mysql", 1,
+                new io.tapstate.spi.store.SourceModel(List.of(new io.tapstate.spi.store.SourceTable("orders",
+                        List.of(new io.tapstate.spi.store.SourceField("id", "integer")), List.of("id"), List.of()))));
+        SchemaStore schemaStore = new SchemaStore() {
+            public void save(DiscoveredSourceModel ignored) { throw new AssertionError("must not write schema"); }
+            public Optional<DiscoveredSourceModel> get(String id) {
+                schemaReads.incrementAndGet();
+                return Optional.of(schema);
+            }
+        };
+        var audit = new AuditGate(new PipelineApiTest.RecordingAuditStore(), Clock.systemUTC());
+        var services = new PipelineApiTest.TestApp();
+        var apply = new ApplyService(TapstateCatalog::load, artifacts, audit, schemaStore,
+                PlanAdvisories.none(), SchemaDerivation.none());
         var beans = new DefaultListableBeanFactory();
         beans.registerSingleton("drafts", new PipelineDraftService(store));
+        beans.registerSingleton("sources", new SourceProjectionService(apply,
+                services.artifactQueryService(artifacts), services.artifactMutationService(artifacts, audit),
+                new SourceRepresentation(TapstateCatalog::load)));
+        beans.registerSingleton("schemas", new io.tapstate.control.core.SourceSchemaQueryService(artifacts, schemaStore));
         AiProviderClient fake = new AiProviderClient() {
             public void check(AiProviderSettings ignored) { }
             public Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
@@ -738,6 +921,7 @@ class PipelineAssistantControllerTest {
                 beans.getBeanProvider(io.tapstate.control.core.SourceProjectionService.class),
                 beans.getBeanProvider(io.tapstate.control.core.SourceSchemaQueryService.class), providerController(fake),
                 fake, JsonMapper.builder().build());
+        assertThat(schemaReads).hasValue(0);
         var capacityField = PipelineAssistantController.class.getDeclaredField("CAPACITY");
         capacityField.setAccessible(true);
         java.util.concurrent.Semaphore capacity = (java.util.concurrent.Semaphore) capacityField.get(null);
@@ -746,11 +930,13 @@ class PipelineAssistantControllerTest {
             MockHttpServletRequest request = new MockHttpServletRequest("POST", "/pipelines/blank/draft:assistant");
             var response = controller.assistant("blank", Map.of("revision", 1,
                     "messages", List.of(Map.of("role", "user", "text", "How do I start?"))), request);
+            assertThat(schemaReads).hasValue(0);
             var output = new ByteArrayOutputStream();
             response.getBody().writeTo(output);
             String stream = output.toString(StandardCharsets.UTF_8);
             assertThat(stream).contains(ControlError.AI_OVERLOADED.code(), "\"finishReason\":\"error\"", "[DONE]")
                     .doesNotContain("data-proposal");
+            assertThat(schemaReads).hasValue(0);
             assertThat(capacity.availablePermits()).isZero();
         } finally {
             capacity.release(4);
