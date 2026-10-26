@@ -379,6 +379,91 @@ class PipelineAssistantControllerTest {
         assertThat(output.toString(StandardCharsets.UTF_8)).contains("I can still help", "finishReason");
     }
 
+    @Test void crossBranchDuplicateUnionCannotBecomeAProposalWithOrWithoutADestination() throws Exception {
+        for (boolean unfinished : List.of(false, true)) {
+            PipelineDraft configured = draft();
+            PipelineDraft.Related archive = new PipelineDraft.Related("archive", "root", "src", "archive_orders",
+                    new PipelineDraft.Relation(List.of(new PipelineDraft.FieldPair("id", "id")),
+                            PipelineDraft.Shape.OBJECT, "archive", List.of()), List.of());
+            PipelineDraft base = new PipelineDraft(configured.pipelineId(), 1, 1, PipelineDraft.Mode.WIZARD,
+                    configured.name(), null, null, new PipelineDraft.Wizard(configured.wizard().root(),
+                            List.of(archive), List.of(), unfinished
+                                    ? new PipelineDraft.Output("atlas", Map.of()) : configured.wizard().output()),
+                    null, null, null, Instant.EPOCH, Instant.EPOCH, "author");
+            var store = new PipelineApiTest.FakePipelineDraftStore();
+            store.create(base);
+            var artifacts = new PipelineApiTest.FakeArtifactStore();
+            artifacts.seed("version: tapstate/v1\nkind: source\nid: src\nconnector: mysql\nmode: cdc\nconfig: {}\n");
+            artifacts.seed("version: tapstate/v1\nkind: source\nid: dst\nconnector: mongodb\nconfig: {}\n");
+            var schema = new DiscoveredSourceModel("src", "mysql", 1, new io.tapstate.spi.store.SourceModel(
+                    List.of("orders", "archive_orders", "extra_orders").stream()
+                            .map(table -> new io.tapstate.spi.store.SourceTable(table,
+                                    List.of(new io.tapstate.spi.store.SourceField("id", "integer")),
+                                    List.of("id"), List.of())).toList()));
+            SchemaStore schemaStore = new SchemaStore() {
+                public void save(DiscoveredSourceModel ignored) { throw new AssertionError("must not write schema"); }
+                public Optional<DiscoveredSourceModel> get(String id) {
+                    return "src".equals(id) ? Optional.of(schema) : Optional.empty();
+                }
+            };
+            var audit = new AuditGate(new PipelineApiTest.RecordingAuditStore(), Clock.systemUTC());
+            var services = new PipelineApiTest.TestApp();
+            var apply = new ApplyService(TapstateCatalog::load, artifacts, audit, schemaStore,
+                    PlanAdvisories.none(), SchemaDerivation.none());
+            var beans = new DefaultListableBeanFactory();
+            beans.registerSingleton("drafts", new PipelineDraftService(store,
+                    services.artifactQueryService(artifacts), audit, apply));
+            beans.registerSingleton("sources", new SourceProjectionService(apply,
+                    services.artifactQueryService(artifacts), services.artifactMutationService(artifacts, audit),
+                    new SourceRepresentation(TapstateCatalog::load)));
+            beans.registerSingleton("schemas", new io.tapstate.control.core.SourceSchemaQueryService(artifacts, schemaStore));
+            var mapper = JsonMapper.builder().build();
+            Map<String, Object> candidate = AssistantWizardJson.view(
+                    AssistantWizardJson.object(PipelineDraftJson.write(mapper, base).get("wizard")));
+            AiProviderClient fake = new AiProviderClient() {
+                public void check(AiProviderSettings ignored) { }
+                public Optional<Map<String, Object>> propose(AiProviderSettings settings,
+                        List<Map<String, String>> messages, Map<String, Object> context,
+                        java.util.function.Consumer<String> text) {
+                    return Optional.of(candidate);
+                }
+            };
+            var controller = new PipelineAssistantController(beans.getBeanProvider(PipelineDraftService.class),
+                    beans.getBeanProvider(SourceProjectionService.class),
+                    beans.getBeanProvider(io.tapstate.control.core.SourceSchemaQueryService.class),
+                    providerController(fake), fake, mapper);
+            Map<String, Object> root = new java.util.LinkedHashMap<>(AssistantWizardJson.object(candidate.get("root")));
+            candidate.put("root", root);
+            for (String input : List.of("src.extra_orders", "src.archive_orders")) {
+                root.put("transforms", List.of(Map.of("id", "merge", "name", "union", "type", "union",
+                        "enabled", true, "config", Map.of("union", Map.of("from", List.of(input))))));
+                Map<String, Object> result = controller.validate("orders", 1, candidate);
+                if (input.equals("src.extra_orders")) {
+                    assertThat(result).as("distinct input with unfinished destination %s", unfinished)
+                            .containsEntry("valid", true).containsKey("candidateWizard");
+                    continue;
+                }
+                assertThat(result).containsEntry("valid", false).doesNotContainKey("candidateWizard");
+                List<?> diagnostics = (List<?>) AssistantWizardJson.object(result.get("validation")).get("diagnostics");
+                assertThat(diagnostics).hasSize(1);
+                Map<String, Object> diagnostic = AssistantWizardJson.object(diagnostics.getFirst());
+                assertThat(diagnostic).containsEntry("code", PipelineDraftError.INVALID.code());
+                assertThat(AssistantWizardJson.object(diagnostic.get("params"))).containsEntry("reason",
+                        "wizard union input duplicates an existing pipeline input");
+            }
+            var output = new ByteArrayOutputStream();
+            controller.assistant("orders", Map.of("revision", 1,
+                    "messages", List.of(Map.of("role", "user", "text", "Merge archive orders"))),
+                    new MockHttpServletRequest("POST", "/pipelines/orders/draft:assistant"))
+                    .getBody().writeTo(output);
+            assertThat(output.toString(StandardCharsets.UTF_8))
+                    .contains(PipelineDraftError.INVALID.code(), "wizard union input duplicates an existing pipeline input",
+                            "\"finishReason\":\"error\"", "[DONE]")
+                    .doesNotContain("data-proposal");
+            assertThat(store.get("orders")).contains(base);
+        }
+    }
+
     private static void verifyValidatedStream(String connector) throws Exception {
         verifyValidatedStream(connector, false);
     }
