@@ -163,14 +163,29 @@ def check(workflows, contexts, inputs):
         'the Cloud context test class named by CI must still exist at its declared package'
     cloud_dev = jobs(workflows['cloud-cluster-dev.yml']).get('image', '')
     assert cloud_dev, 'the Cloud dev image job must exist'
+    assert '  workflow_call:' in workflows['cloud-cluster-dev.yml'], \
+        'release must be able to call the Cloud dev build'
+    assert 'ref: ${{ inputs.source-sha || github.ref }}' in cloud_dev \
+        and 'ref: ${{ inputs.web-sha || github.ref_name }}' in cloud_dev, \
+        'release calls must build their frozen source commits'
+    assert cloud_dev.count('RELEASE_VERSION: ${{ inputs.version }}') == 2 \
+        and 'echo "version=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"' in cloud_dev, \
+        'release calls must retain the selected release version'
+    assert 'environment: cloud-ghcr-dev' in cloud_dev \
+        and 'secrets.CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_DEV' in cloud_dev \
+        and 'secrets.CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_PROD' not in cloud_dev, \
+        'dev validation must use its own environment and registration token'
     assert "github.repository == 'tapstate/tapstate'" in cloud_dev \
         and "github.ref_type == 'branch'" in cloud_dev, 'Cloud dev image dispatch must exclude tag refs'
     assert '.github/scripts/next-version.sh "$BUMP" origin/main' in cloud_dev, \
         'Cloud dev version calculation must use the tagged main history'
     assert '--dev-source-sha "$SOURCE_SHA"' in cloud_dev, \
         'feature builds must publish under a source-specific dev tag'
-    assert "if: github.ref == 'refs/heads/main'" in cloud_dev and 'DEV_BRANCH: main' in cloud_dev, \
-        'only main may register the image in the dev version catalog'
+    assert cloud_dev.count("if: inputs.version != '' || github.ref == 'refs/heads/main'") == 2 \
+        and 'DEV_BRANCH: main' in cloud_dev, \
+        'only main builds and pinned release candidates may register in the dev catalog'
+    assert 'if [[ -z "$RELEASE_VERSION" && "$GITHUB_REF" != refs/heads/main ]]; then' in cloud_dev, \
+        'pinned releases retain the canonical dev tag even when dispatched from an allowed branch'
     sonar = ci.get('sonarqube', '')
     sonar_name = '    name: sonarqube'
     assert sonar_name in sonar.splitlines(), 'sonarqube must keep its exact name on analysis events'
@@ -291,6 +306,14 @@ else:
     raise AssertionError('renaming the Cloud context integration test escaped CI-shape validation')
 for original, replacement in [
     ('&& github.ref_type == \'branch\'', ''),
+    ('  workflow_call:', '  unused_call:'),
+    ('inputs.source-sha || github.ref', 'github.ref'),
+    ('inputs.web-sha || github.ref_name', 'github.ref_name'),
+    ('RELEASE_VERSION: ${{ inputs.version }}', 'RELEASE_VERSION: ""'),
+    ('environment: cloud-ghcr-dev', 'environment: cloud-ghcr-release'),
+    ('secrets.CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_DEV', 'secrets.CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_PROD'),
+    ("inputs.version != '' || github.ref == 'refs/heads/main'", "github.ref == 'refs/heads/main'"),
+    ('-z "$RELEASE_VERSION" && "$GITHUB_REF"', '"$GITHUB_REF"'),
     ('.github/scripts/next-version.sh "$BUMP" origin/main', '.github/scripts/next-version.sh "$BUMP" HEAD'),
     ('--dev-source-sha "$SOURCE_SHA"', ''),
     ('DEV_BRANCH: main', 'DEV_BRANCH: ${{ github.ref_name }}'),
