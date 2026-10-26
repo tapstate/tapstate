@@ -19,7 +19,7 @@ class BrowserSessionsResumeAcrossIndependentClientsIT {
 
     @Test
     void independentClientsResumeUntilTheSharedSessionIsRevoked() throws Exception {
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(SharedMongo.replicaSetUrl("e2e_browser_auth"))) {
+        try (ServerHandle server = Tiers.REAL_PROCESS.launch(SharedMongo.replicaSetUrl("e2e_browser_auth"))) {
             new ControlPlane(server.baseUrl()).bootstrapAndLogin("browser-admin", "browser-password");
             String origin = server.baseUrl().toString().replaceAll("/$", "");
             HttpClient first = HttpClient.newHttpClient();
