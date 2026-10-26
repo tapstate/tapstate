@@ -51,7 +51,7 @@ final class BrowserAuthController {
         String issuer = identity.identityView().issuer();
         var session = sessions.create(grant.principal(), grant.scope(), issuer);
         return ResponseEntity.ok().header(HttpHeaders.CACHE_CONTROL, "no-store")
-                .header(HttpHeaders.SET_COOKIE, cookie(request, session.token(), false))
+                .header(HttpHeaders.SET_COOKIE, loginCookies(request, session.token()))
                 .body(grant(grant, issuer, session.token()));
     }
 
@@ -118,6 +118,14 @@ final class BrowserAuthController {
         }
         if (found == null || !found.matches("tss_[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+")) throw refused();
         return found;
+    }
+
+    private static String[] loginCookies(HttpServletRequest request, String token) {
+        String active = cookie(request, token, false);
+        if (!request.isSecure()) return new String[] { active };
+        String retired = ResponseCookie.from(LOOPBACK_COOKIE, "").httpOnly(true).secure(true)
+                .sameSite("Lax").path("/").maxAge(0).build().toString();
+        return new String[] { active, retired };
     }
 
     private static String cookieName(HttpServletRequest request) {

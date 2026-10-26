@@ -208,6 +208,22 @@ class AuthTest {
     }
 
     @Test
+    void secureLoginClearsAnEarlierLoopbackCookieAlias() {
+        seedUser("alice", "s3cret", "admin");
+        var request = new org.springframework.mock.web.MockHttpServletRequest("POST", "/auth/browser/login");
+        request.setSecure(true);
+        request.setScheme("https");
+        request.setServerName("localhost");
+        request.setServerPort(443);
+        request.addHeader("Origin", "https://localhost");
+        request.addHeader("X-Tapstate-Browser-Request", "1");
+        request.setCookies(new jakarta.servlet.http.Cookie("tapstate-op-session", "tss_old.secret"));
+        var response = context.getBean(BrowserAuthController.class).login(request, new LoginRequest("alice", "s3cret"));
+        assertThat(response.getHeaders().get(HttpHeaders.SET_COOKIE)).hasSize(2)
+                .anySatisfy(value -> assertThat(value).contains("tapstate-op-session=", "Max-Age=0"));
+    }
+
+    @Test
     void browserAuthenticationRejectsCsrfAndNeverClearsCookiesOnExchangeFailure() {
         for (String path : List.of("login", "session", "logout")) {
             for (String origin : List.of("null", "https://evil.example", "http://127.0.0.1:" + port + "/bad")) {
