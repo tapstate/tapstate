@@ -20,6 +20,7 @@ public final class SessionService {
     public static final Duration ABSOLUTE_TTL = Duration.ofDays(90);
 
     private static final String TOKEN_PREFIX = "tss_";
+    private static final String EXPECTED_ISSUER_FIELD = "expectedIssuer";
     private static final char SEPARATOR = '.';
 
     private final SessionStore sessions;
@@ -51,7 +52,7 @@ public final class SessionService {
     }
 
     public Optional<AccessTokenGrant> exchange(String presented, String expectedIssuer) {
-        requireText(expectedIssuer, "expectedIssuer");
+        requireText(expectedIssuer, EXPECTED_ISSUER_FIELD);
         return parse(presented).flatMap(parsed -> {
             Instant now = clock.instant();
             Optional<SessionRecord> touched = sessions.exchange(
@@ -61,7 +62,7 @@ public final class SessionService {
     }
 
     public boolean logout(String presented, String expectedIssuer) {
-        requireText(expectedIssuer, "expectedIssuer");
+        requireText(expectedIssuer, EXPECTED_ISSUER_FIELD);
         return parse(presented)
                 .map(parsed -> sessions.revoke(parsed.sessionId(), secrets.hash(parsed.secret()),
                         expectedIssuer, clock.instant()))
@@ -70,7 +71,7 @@ public final class SessionService {
 
     /** Revokes a browser session or confirms that the matching session is already inactive. */
     public LogoutResult logoutForBrowser(String presented, String expectedIssuer) {
-        requireText(expectedIssuer, "expectedIssuer");
+        requireText(expectedIssuer, EXPECTED_ISSUER_FIELD);
         Optional<ParsedSessionToken> parsed = parse(presented);
         if (parsed.isEmpty()) return LogoutResult.INVALID;
         ParsedSessionToken token = parsed.get();
@@ -79,10 +80,10 @@ public final class SessionService {
             return LogoutResult.REVOKED;
         }
         return sessions.find(token.sessionId())
-                .filter(record -> secrets.matches(token.secret(), record.secretHash()))
-                .filter(record -> record.revoked() || !record.idleExpiresAt().isAfter(now)
-                        || !record.absoluteExpiresAt().isAfter(now))
-                .map(record -> LogoutResult.INACTIVE)
+                .filter(sessionRecord -> secrets.matches(token.secret(), sessionRecord.secretHash()))
+                .filter(sessionRecord -> sessionRecord.revoked() || !sessionRecord.idleExpiresAt().isAfter(now)
+                        || !sessionRecord.absoluteExpiresAt().isAfter(now))
+                .map(sessionRecord -> LogoutResult.INACTIVE)
                 .orElse(LogoutResult.INVALID);
     }
 

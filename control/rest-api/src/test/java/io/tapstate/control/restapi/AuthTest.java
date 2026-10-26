@@ -146,7 +146,8 @@ class AuthTest {
 
     @BeforeAll
     static void startServer() {
-        context = new SpringApplicationBuilder(TestApp.class).properties("server.port=0").run();
+        context = new SpringApplicationBuilder(TestApp.class)
+                .properties("server.port=0", "tapstate.browser-auth.trusted-proxies=127.0.0.1").run();
         port = ((WebServerApplicationContext) context).getWebServer().getPort();
     }
 
@@ -205,6 +206,71 @@ class AuthTest {
         assertThat((int) client().post().uri("/auth/browser/session").header("Origin", origin)
                 .header("X-Tapstate-Browser-Request", "1").header(HttpHeaders.COOKIE, credentialCookie)
                 .exchange((request, response) -> response.getStatusCode().value())).isEqualTo(401);
+    }
+
+    @Test
+    void trustedHttpsProxyRestoresThePublicOriginAndIssuesASecureCookie() {
+        seedUser("alice", "s3cret", "admin");
+        ResponseEntity<String> login = client().post().uri("/auth/browser/login")
+                .header("Origin", "https://console.example")
+                .header("X-Tapstate-Browser-Request", "1")
+                .header("X-Forwarded-Proto", "https")
+                .header("X-Forwarded-Host", "console.example")
+                .header("X-Forwarded-Port", "443")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body("{\"username\":\"alice\",\"password\":\"s3cret\"}")
+                .exchange((request, response) -> new ResponseEntity<>(response.bodyTo(String.class),
+                        response.getHeaders(), response.getStatusCode()));
+
+        assertThat(login.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(login.getHeaders().getFirst(HttpHeaders.SET_COOKIE))
+                .contains("__Host-tapstate-op-session=tss_", "Secure", "HttpOnly", "Path=/");
+    }
+
+    @Test
+    void browserLogoutDoesNotClearACookieForAnActiveSessionFromAnotherIssuer() {
+        seedUser("alice", "s3cret", "admin");
+        String origin = "http://127.0.0.1:" + port;
+        ResponseEntity<String> login = client().post().uri("/auth/browser/login")
+                .header("Origin", origin).header("X-Tapstate-Browser-Request", "1")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body("{\"username\":\"alice\",\"password\":\"s3cret\"}")
+                .retrieve().toEntity(String.class);
+        String credentialCookie = login.getHeaders().getFirst(HttpHeaders.SET_COOKIE).split(";", 2)[0];
+        String session = credentialCookie.substring(credentialCookie.indexOf('=') + 1);
+        String sessionId = session.substring(4, session.indexOf('.'));
+        context.getBean(FakeSessionStore.class).replaceIssuer(sessionId, "urn:other-cluster");
+
+        ResponseEntity<String> logout = client().post().uri("/auth/browser/logout")
+                .header("Origin", origin).header("X-Tapstate-Browser-Request", "1")
+                .header(HttpHeaders.COOKIE, credentialCookie)
+                .exchange((request, response) -> new ResponseEntity<>("", response.getHeaders(), response.getStatusCode()));
+
+        assertThat(logout.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(logout.getHeaders().getFirst(HttpHeaders.SET_COOKIE)).isNull();
+    }
+
+    @Test
+    void browserLogoutClearsACookieForAnExpiredMatchingSession() {
+        seedUser("alice", "s3cret", "admin");
+        String origin = "http://127.0.0.1:" + port;
+        ResponseEntity<String> login = client().post().uri("/auth/browser/login")
+                .header("Origin", origin).header("X-Tapstate-Browser-Request", "1")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body("{\"username\":\"alice\",\"password\":\"s3cret\"}")
+                .retrieve().toEntity(String.class);
+        String credentialCookie = login.getHeaders().getFirst(HttpHeaders.SET_COOKIE).split(";", 2)[0];
+        String session = credentialCookie.substring(credentialCookie.indexOf('=') + 1);
+        String sessionId = session.substring(4, session.indexOf('.'));
+        context.getBean(FakeSessionStore.class).expire(sessionId);
+
+        ResponseEntity<String> logout = client().post().uri("/auth/browser/logout")
+                .header("Origin", origin).header("X-Tapstate-Browser-Request", "1")
+                .header(HttpHeaders.COOKIE, credentialCookie)
+                .exchange((request, response) -> new ResponseEntity<>("", response.getHeaders(), response.getStatusCode()));
+
+        assertThat(logout.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(logout.getHeaders().getFirst(HttpHeaders.SET_COOKIE)).contains("Max-Age=0");
     }
 
     @Test
@@ -1372,6 +1438,13 @@ class AuthTest {
             byId.put(id, new SessionRecord(record.sessionId(), record.secretHash(), record.principal(),
                     record.scope(), issuer, record.revoked(), record.createdAt(), record.lastUsedAt(),
                     record.idleExpiresAt(), record.absoluteExpiresAt()));
+        }
+
+        synchronized void expire(String id) {
+            SessionRecord record = byId.get(id);
+            byId.put(id, new SessionRecord(record.sessionId(), record.secretHash(), record.principal(),
+                    record.scope(), record.issuer(), record.revoked(), record.createdAt(), record.lastUsedAt(),
+                    NOW.minusSeconds(1), record.absoluteExpiresAt()));
         }
 
         @Override

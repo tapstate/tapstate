@@ -1,6 +1,7 @@
 package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.AuthenticationMode;
+import io.tapstate.control.core.ControlError;
 import io.tapstate.core.common.TapstateException;
 import jakarta.servlet.http.Cookie;
 import org.junit.jupiter.api.Test;
@@ -8,6 +9,7 @@ import org.springframework.beans.factory.support.DefaultListableBeanFactory;
 import org.springframework.mock.web.MockHttpServletRequest;
 
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.assertThat;
 
 class BrowserAuthSecurityTest {
     private final BrowserAuthController controller = new BrowserAuthController(null, null, null,
@@ -45,6 +47,23 @@ class BrowserAuthSecurityTest {
         plainRemote.removeHeader("Origin");
         plainRemote.addHeader("Origin", "http://console.example");
         refused(plainRemote);
+    }
+
+    @Test
+    void remotePeerCannotUseALoopbackHostToReachBrowserAuthenticationOverHttp() {
+        MockHttpServletRequest spoofedLoopback = new MockHttpServletRequest("POST", "/auth/browser/session");
+        spoofedLoopback.setSecure(false);
+        spoofedLoopback.setScheme("http");
+        spoofedLoopback.setServerName("localhost");
+        spoofedLoopback.setServerPort(8080);
+        spoofedLoopback.setRemoteAddr("203.0.113.9");
+        spoofedLoopback.addHeader("Origin", "http://localhost:8080");
+        spoofedLoopback.addHeader("X-Tapstate-Browser-Request", "1");
+        spoofedLoopback.setCookies(new Cookie("tapstate-op-session", "tss_id.secret"));
+
+        assertThatThrownBy(() -> controller.session(spoofedLoopback))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(ControlError.UNAUTHENTICATED));
     }
 
     private MockHttpServletRequest request() {

@@ -34,6 +34,9 @@ import java.util.Set;
 final class BrowserAuthController {
     private static final String HTTPS_COOKIE = "__Host-tapstate-op-session";
     private static final String LOOPBACK_COOKIE = "tapstate-op-session";
+    private static final String HTTP_SCHEME = "http";
+    private static final String HTTPS_SCHEME = "https";
+    private static final String NO_STORE = "no-store";
     private final LoginService login;
     private final SessionService sessions;
     private final ClusterIdentityService identity;
@@ -63,7 +66,7 @@ final class BrowserAuthController {
         AccessTokenGrant grant = login.loginGrant(credentials.username(), credentials.password());
         String issuer = identity.identityView().issuer();
         var session = sessions.create(grant.principal(), grant.scope(), issuer);
-        return ResponseEntity.ok().header(HttpHeaders.CACHE_CONTROL, "no-store")
+        return ResponseEntity.ok().header(HttpHeaders.CACHE_CONTROL, NO_STORE)
                 .header(HttpHeaders.SET_COOKIE, loginCookies(browser.secure(), session.token()))
                 .body(grant(grant, issuer, session.token()));
     }
@@ -74,7 +77,7 @@ final class BrowserAuthController {
         String token = readCookie(request, browser.secure());
         String issuer = identity.identityView().issuer();
         AccessTokenGrant grant = sessions.exchange(token, issuer).orElseThrow(BrowserAuthController::refused);
-        return ResponseEntity.ok().header(HttpHeaders.CACHE_CONTROL, "no-store")
+        return ResponseEntity.ok().header(HttpHeaders.CACHE_CONTROL, NO_STORE)
                 .body(grant(grant, issuer, token));
     }
 
@@ -84,7 +87,7 @@ final class BrowserAuthController {
         String token = readCookie(request, browser.secure());
         SessionService.LogoutResult result = sessions.logoutForBrowser(token, identity.identityView().issuer());
         if (result == SessionService.LogoutResult.INVALID) throw refused();
-        return ResponseEntity.noContent().header(HttpHeaders.CACHE_CONTROL, "no-store")
+        return ResponseEntity.noContent().header(HttpHeaders.CACHE_CONTROL, NO_STORE)
                 .header(HttpHeaders.SET_COOKIE, cookie(browser.secure(), "", true)).build();
     }
 
@@ -104,16 +107,20 @@ final class BrowserAuthController {
         if (origins.size() != 1) throw refused();
         try {
             URI origin = URI.create(origins.getFirst());
-            int port = origin.getPort() < 0 ? ("https".equalsIgnoreCase(origin.getScheme()) ? 443 : 80) : origin.getPort();
             if (origin.getUserInfo() != null || origin.getHost() == null || origin.getRawQuery() != null
                     || origin.getRawFragment() != null || !origin.getRawPath().isEmpty()
                     || !browser.scheme().equalsIgnoreCase(origin.getScheme())
                     || !browser.host().equalsIgnoreCase(origin.getHost())
-                    || browser.port() != port) throw refused();
+                    || browser.port() != originPort(origin)) throw refused();
         } catch (IllegalArgumentException malformed) {
             throw refused();
         }
         return browser;
+    }
+
+    private static int originPort(URI origin) {
+        if (origin.getPort() >= 0) return origin.getPort();
+        return HTTPS_SCHEME.equalsIgnoreCase(origin.getScheme()) ? 443 : 80;
     }
 
     private static boolean isLoopback(String host) {
@@ -122,36 +129,46 @@ final class BrowserAuthController {
 
     private BrowserRequest browserRequest(HttpServletRequest request) {
         String scheme = request.getScheme();
-        String host = request.getServerName();
-        int port = request.getServerPort();
-        boolean secure = request.isSecure() && "https".equalsIgnoreCase(scheme);
-        if (trustedProxyAddresses.contains(request.getRemoteAddr())) {
-            String forwardedProto = singleForwardedHeader(request, "X-Forwarded-Proto");
-            String forwardedHost = singleForwardedHeader(request, "X-Forwarded-Host");
-            String forwardedPort = singleForwardedHeader(request, "X-Forwarded-Port");
-            int hostPort = -1;
-            if (forwardedProto != null) {
-                if (!"https".equalsIgnoreCase(forwardedProto) && !"http".equalsIgnoreCase(forwardedProto)) {
-                    throw refused();
-                }
-                scheme = forwardedProto.toLowerCase(Locale.ROOT);
-                secure = "https".equals(scheme);
-            }
-            if (forwardedHost != null) {
-                HostAndPort authority = parseAuthority(scheme, forwardedHost);
-                host = authority.host();
-                hostPort = authority.port();
-                if (hostPort > 0) port = hostPort;
-            }
-            if (forwardedPort != null) {
-                int parsedPort = parsePort(forwardedPort);
-                if (hostPort > 0 && hostPort != parsedPort) throw refused();
-                port = parsedPort;
-            } else if (forwardedProto != null && hostPort < 0) {
-                port = defaultPort(scheme);
-            }
-        }
+        BrowserRequest direct = new BrowserRequest(scheme, request.getServerName(), request.getServerPort(),
+                request.isSecure() && HTTPS_SCHEME.equalsIgnoreCase(scheme));
+        return trustedProxyAddresses.contains(request.getRemoteAddr())
+                ? forwardedBrowserRequest(request, direct) : direct;
+    }
+
+    private static BrowserRequest forwardedBrowserRequest(HttpServletRequest request, BrowserRequest direct) {
+        String forwardedProto = singleForwardedHeader(request, "X-Forwarded-Proto");
+        String forwardedHost = singleForwardedHeader(request, "X-Forwarded-Host");
+        String forwardedPort = singleForwardedHeader(request, "X-Forwarded-Port");
+        String scheme = forwardedScheme(forwardedProto, direct.scheme());
+        HostAndPort authority = forwardedAuthority(scheme, forwardedHost);
+        String host = authority == null ? direct.host() : authority.host();
+        int port = forwardedPort(forwardedPort, authority, forwardedProto, scheme, direct.port());
+        boolean secure = forwardedProto == null ? direct.secure() : HTTPS_SCHEME.equals(scheme);
         return new BrowserRequest(scheme, host, port, secure);
+    }
+
+    private static String forwardedScheme(String forwardedProto, String directScheme) {
+        if (forwardedProto == null) return directScheme;
+        if (!HTTPS_SCHEME.equalsIgnoreCase(forwardedProto) && !HTTP_SCHEME.equalsIgnoreCase(forwardedProto)) {
+            throw refused();
+        }
+        return forwardedProto.toLowerCase(Locale.ROOT);
+    }
+
+    private static HostAndPort forwardedAuthority(String scheme, String forwardedHost) {
+        return forwardedHost == null ? null : parseAuthority(scheme, forwardedHost);
+    }
+
+    private static int forwardedPort(
+            String forwardedPort, HostAndPort authority, String forwardedProto, String scheme, int directPort) {
+        int authorityPort = authority == null ? -1 : authority.port();
+        if (forwardedPort != null) {
+            int parsedPort = parsePort(forwardedPort);
+            if (authorityPort > 0 && authorityPort != parsedPort) throw refused();
+            return parsedPort;
+        }
+        if (authorityPort > 0) return authorityPort;
+        return forwardedProto == null ? directPort : defaultPort(scheme);
     }
 
     private static String singleForwardedHeader(HttpServletRequest request, String name) {
@@ -183,29 +200,36 @@ final class BrowserAuthController {
     }
 
     private static int defaultPort(String scheme) {
-        return "https".equalsIgnoreCase(scheme) ? 443 : 80;
+        return HTTPS_SCHEME.equalsIgnoreCase(scheme) ? 443 : 80;
     }
 
     private static boolean isLoopbackAddress(String value) {
         if (value == null) return false;
         String address = value;
         if (address.startsWith("[") && address.endsWith("]")) address = address.substring(1, address.length() - 1);
+        return address.contains(":") ? isIpv6Loopback(address) : isIpv4Loopback(address);
+    }
+
+    private static boolean isIpv4Loopback(String address) {
+        String[] parts = address.split("\\.", -1);
+        if (parts.length != 4 || ipv4Octet(parts[0]) != 127) return false;
+        for (int i = 1; i < parts.length; i++) {
+            if (ipv4Octet(parts[i]) < 0) return false;
+        }
+        return true;
+    }
+
+    private static int ipv4Octet(String value) {
+        if (!value.matches("\\d{1,3}")) return -1;
+        int octet = Integer.parseInt(value);
+        return octet > 255 ? -1 : octet;
+    }
+
+    private static boolean isIpv6Loopback(String address) {
+        if (!address.matches("[0-9A-Fa-f:.]+")) return false;
         try {
-            if (!address.contains(":")) {
-                String[] parts = address.split("\\.", -1);
-                if (parts.length != 4) return false;
-                byte[] bytes = new byte[4];
-                for (int i = 0; i < parts.length; i++) {
-                    if (parts[i].isEmpty() || !parts[i].matches("[0-9]{1,3}")) return false;
-                    int octet = Integer.parseInt(parts[i]);
-                    if (octet > 255) return false;
-                    bytes[i] = (byte) octet;
-                }
-                return InetAddress.getByAddress(bytes).isLoopbackAddress();
-            }
-            if (!address.matches("[0-9A-Fa-f:.]+")) return false;
             return InetAddress.getByName(address).isLoopbackAddress();
-        } catch (UnknownHostException | NumberFormatException malformed) {
+        } catch (UnknownHostException malformed) {
             return false;
         }
     }
