@@ -70,28 +70,29 @@ public final class PipelineDraftCompiler {
         wizard.related().forEach(related -> addUnionSources(related.preTransforms(), sourceIds));
         addUnionSources(wizard.transforms(), sourceIds);
 
-        LinkedHashMap<String, FromRef> aliases = new LinkedHashMap<>();
-        List<Step> steps = new ArrayList<>();
-        Map<String, String> outputAliases = new LinkedHashMap<>();
-        Map<String, Set<String>> branchInputs = new LinkedHashMap<>();
-        Set<String> rootInputs = new LinkedHashSet<>(Set.of(root.sourceId() + "." + root.table()));
-        outputAliases.put(root.id(), compileBranch(root.id(), root.sourceId() + "." + root.table(),
-                root.preTransforms(), aliases, steps, rootInputs));
-        branchInputs.put(root.id(), rootInputs);
-
-        Map<String, List<PipelineDraft.Related>> children = new LinkedHashMap<>();
+        Set<String> currentInputs = new LinkedHashSet<>();
+        currentInputs.add(root.sourceId() + "." + root.table());
         for (PipelineDraft.Related related : wizard.related()) {
             requiredText(related.sourceId(), "related source");
             requiredText(related.table(), "related table");
+            currentInputs.add(related.sourceId() + "." + related.table());
+        }
+
+        LinkedHashMap<String, FromRef> aliases = new LinkedHashMap<>();
+        List<Step> steps = new ArrayList<>();
+        Map<String, String> outputAliases = new LinkedHashMap<>();
+        outputAliases.put(root.id(), compileBranch(root.id(), root.sourceId() + "." + root.table(),
+                root.preTransforms(), aliases, steps, currentInputs));
+
+        Map<String, List<PipelineDraft.Related>> children = new LinkedHashMap<>();
+        for (PipelineDraft.Related related : wizard.related()) {
             if (!related.parentId().equals(root.id()) && !containsRelated(wizard.related(), related.parentId())) {
                 throw new IllegalArgumentException("related table parent does not exist: " + related.parentId());
             }
             children.computeIfAbsent(related.parentId(), ignored -> new ArrayList<>()).add(related);
-            Set<String> relatedInputs = new LinkedHashSet<>(Set.of(related.sourceId() + "." + related.table()));
             outputAliases.put(related.id(), compileBranch(related.id(),
                     related.sourceId() + "." + related.table(), related.preTransforms(), aliases, steps,
-                    relatedInputs));
-            branchInputs.put(related.id(), relatedInputs);
+                    currentInputs));
         }
 
         String previous;
@@ -108,8 +109,6 @@ public final class PipelineDraftCompiler {
             steps.add(new Step.Inline(nestId, FromClause.aliases(aliases), nest, Map.of()));
             previous = nestId;
         }
-        Set<String> currentInputs = new LinkedHashSet<>();
-        branchInputs.values().forEach(currentInputs::addAll);
         for (PipelineDraft.Transform transform : wizard.transforms()) {
             if (isNoOpMap(transform)) {
                 continue;
@@ -337,7 +336,7 @@ public final class PipelineDraftCompiler {
         }
         Set<String> unique = new LinkedHashSet<>();
         for (Object value : values) {
-            if (!(value instanceof String input)) {
+            if (!(value instanceof String input) || !input.equals(input.trim())) {
                 throw new IllegalArgumentException("wizard union input must be a source-qualified table reference");
             }
             int separator = input.indexOf('.');
