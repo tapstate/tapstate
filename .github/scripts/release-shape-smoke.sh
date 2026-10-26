@@ -412,5 +412,12 @@ else
   bad "every output read from another job is one that job declares" "undeclared:${missing}"
 fi
 
+if python3 "$here/release-cloud-dev-gates-test.py"; then
+  ok "the actual distribution-completeness check blocks Cloud dev publication"
+else
+  bad "the actual distribution-completeness check blocks Cloud dev publication" \
+      "the release dependency graph or one of its negative controls failed"
+fi
+
 printf '\n%s passed, %s failed\n' "$passed" "$failed"
 [ "$failed" = 0 ]

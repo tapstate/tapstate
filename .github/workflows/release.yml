@@ -1106,7 +1106,8 @@ jobs:
   cloud-dev:
     # Reuse the dev build, but never resolve a second version or a moving source ref.
     # The version job already checked that the selected product commit belongs to main's history.
-    needs: [version, gates]
+    # Distribution completeness is checked in draft, beyond the checks in the gates job.
+    needs: [version, gates, draft]
     permissions:
       contents: read
       packages: write
