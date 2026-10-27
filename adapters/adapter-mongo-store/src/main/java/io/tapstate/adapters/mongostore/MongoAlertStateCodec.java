@@ -43,11 +43,27 @@ final class MongoAlertStateCodec {
                 .append("qualifier", key.qualifier());
     }
 
-    private static Document binding(AlertRule rule) {
+    static Document binding(AlertRule rule) {
         return new Document("ruleRevision", rule.revision()).append("generation", rule.generation())
                 .append("producerIncarnation", rule.producerIncarnation()).append("triggerNanos", rule.triggerFor().toNanos())
                 .append("resolveNanos", rule.resolveFor().toNanos()).append("maxAgeNanos", rule.maxAge().toNanos())
                 .append("maxGapNanos", rule.maxGap().toNanos());
+    }
+
+    static AlertRule readBinding(AlarmKey key, Document rule) {
+        require(rule.keySet().equals(BINDING_FIELDS));
+        return new AlertRule(key, number(rule, "ruleRevision", 1), number(rule, "generation", 1),
+                text(rule, "producerIncarnation", 256), Duration.ofNanos(number(rule, "triggerNanos", 0)),
+                Duration.ofNanos(number(rule, "resolveNanos", 0)), Duration.ofNanos(number(rule, "maxAgeNanos", 1)),
+                Duration.ofNanos(number(rule, "maxGapNanos", 1)));
+    }
+
+    static AlarmKey readKey(Document value) {
+        require(value.keySet().equals(KEY_FIELDS));
+        var key = new AlarmKey(new AlarmKey.Scope(text(value, "authorityId", 256), text(value, "clusterId", 256)),
+                new AlarmKey.Resource(text(value, "resourceKind", 64), text(value, "resourceId", 256), text(value, "resourceIncarnation", 256)),
+                text(value, "typeId", 128), text(value, "qualifier", 256));
+        sameKey(key, value); return key;
     }
 
     static Document head(AlertSnapshot snapshot, long recordRevision) {
@@ -86,10 +102,7 @@ final class MongoAlertStateCodec {
             require(rule.keySet().equals(BINDING_FIELDS));
             long revision = number(head, "recordRevision", 1);
             require(revision < Long.MAX_VALUE);
-            AlertRule binding = new AlertRule(expected, number(rule, "ruleRevision", 1), number(rule, "generation", 1),
-                    text(rule, "producerIncarnation", 256), Duration.ofNanos(number(rule, "triggerNanos", 0)),
-                    Duration.ofNanos(number(rule, "resolveNanos", 0)), Duration.ofNanos(number(rule, "maxAgeNanos", 1)),
-                    Duration.ofNanos(number(rule, "maxGapNanos", 1)));
+            AlertRule binding = readBinding(expected, rule);
             long sequence = number(head, "episodeSequence", 0);
             AlertSnapshot.Episode current = null;
             if (head.get("episodeNumber") != null) {

@@ -12,7 +12,12 @@ import org.bson.Document;
 final class MongoAlertReceiverCodec {
     private MongoAlertReceiverCodec() { }
     static Document body(AlertReceiver receiver) {
-        Document transport = switch (receiver.transport()) {
+        Document credentials = credentials(receiver.credentials());
+        return new Document("name", receiver.name()).append("enabled", receiver.enabled()).append("bindingRevision", receiver.bindingRevision())
+                .append("transport", transport(receiver.transport())).append("credentials", credentials);
+    }
+    static Document transport(Transport value) {
+        return switch (value) {
             case Email email -> new Document("channelType", "email").append("host", email.host()).append("port", email.port())
                     .append("encryption", email.encryption().name()).append("authentication", email.authentication().name())
                     .append("username", email.username()).append("from", email.from()).append("recipients", email.recipients()).append("trust", email.trust().name());
@@ -20,16 +25,19 @@ final class MongoAlertReceiverCodec {
                     .append("endpointDigest", webhook.endpointDigest()).append("authentication", webhook.authentication().name())
                     .append("principal", webhook.principal()).append("trust", webhook.trust().name());
         };
-        Document credentials = receiver.credentials() == null ? null : new Document("credentialId", receiver.credentials().credentialId())
-                .append("authenticationIdentity", receiver.credentials().authenticationIdentity());
-        return new Document("name", receiver.name()).append("enabled", receiver.enabled()).append("bindingRevision", receiver.bindingRevision())
-                .append("transport", transport).append("credentials", credentials);
+    }
+    static Document credentials(CredentialReference value) {
+        return value == null ? null : new Document("credentialId", value.credentialId()).append("authenticationIdentity", value.authenticationIdentity());
     }
     static AlertReceiver read(Header header, Document body) {
         fields(body, Set.of("name", "enabled", "bindingRevision", "transport", "credentials"));
         require(body.get("enabled") instanceof Boolean && body.get("bindingRevision") instanceof Long);
-        Document t = document(body.get("transport"));
-        Transport transport = switch (text(t, "channelType")) {
+        Transport transport = readTransport(document(body.get("transport")));
+        return new AlertReceiver(header, text(body, "name"), body.getBoolean("enabled"), body.getLong("bindingRevision"), transport,
+                body.get("credentials") == null ? null : readCredentials(header.identity(), document(body.get("credentials"))));
+    }
+    static Transport readTransport(Document t) {
+        return switch (text(t, "channelType")) {
             case "email" -> {
                 fields(t, Set.of("channelType", "host", "port", "encryption", "authentication", "username", "from", "recipients", "trust"));
                 require(t.get("port") instanceof Integer && t.get("recipients") instanceof java.util.List<?>);
@@ -45,12 +53,10 @@ final class MongoAlertReceiverCodec {
             }
             default -> throw new IllegalArgumentException("unknown receiver transport");
         };
-        CredentialReference reference = null;
-        if (body.get("credentials") != null) {
-            Document c = document(body.get("credentials")); fields(c, Set.of("credentialId", "authenticationIdentity"));
-            reference = new CredentialReference(header.identity(), text(c, "credentialId"), text(c, "authenticationIdentity"));
-        }
-        return new AlertReceiver(header, text(body, "name"), body.getBoolean("enabled"), body.getLong("bindingRevision"), transport, reference);
+    }
+    static CredentialReference readCredentials(io.tapstate.core.alerting.AlertConfiguration.Identity identity, Document value) {
+        fields(value, Set.of("credentialId", "authenticationIdentity"));
+        return new CredentialReference(identity, text(value, "credentialId"), text(value, "authenticationIdentity"));
     }
     private static String text(Document doc, String name) { require(doc.get(name) instanceof String); return doc.getString(name); }
     private static String nullableText(Document doc, String name) { return doc.get(name) == null ? null : text(doc, name); }

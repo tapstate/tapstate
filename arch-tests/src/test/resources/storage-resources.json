@@ -622,6 +622,61 @@
         "Exact authenticated management edit for explicit format-1 enrollment",
         "Matching route/intent backup and reference closure for restoration"
       ]
+    },
+    "alert-query-r1-alert_instances": {
+      "goal": "Preserve original generation, current episode pointer, continuity and accepted frontier; new samples cannot recreate history. Original trusted CONFIG scope, paired configuration backup and keyring, supported schema/record versions and identity/structure validation; missing necessary history refuses reopening rather than seeding an empty ledger. Normal first preparation and reopening use the existing validated storage identity path. CACHE loss cannot restart alarm identities or erase budgets; backup restoration does not retract external unknown effects.",
+      "entry": "Validate and reopen the original CONFIG bundle, or restore its paired backup through that same validated entry. Never replay expired external work or reconstruct missing necessary facts from new samples. Query capability 3 is prepared only by new installation or explicit controlled same-version maintenance with old alert writers quiescent. Register one bounded original query preparation operation/phase/cursor in the existing alerting component before creating indexes on existing collections. Index DDL runs outside document transactions; after exact index verification, publish installedVersion 3 and READY with a CONFIG compare-and-set. An interrupted/unknown build resumes only that original operation and reconciles exact declared index names/options. Marker 3 never substitutes for missing indexes or per-record format capabilities; ordinary reads perform no migration or repair. Preserve original installation operation, authority preparation operation, configuration revision/alert counter, Source slot/cursor/UUIDs, paired key and global installedVersion.",
+      "prerequisites": [
+        "Original trusted CONFIG identity and paired keyring",
+        "Supported schema and record capabilities",
+        "Original backup and resource-reference closure when restoration is required",
+        "Required producer, authorization and grant-ordering proof",
+        "Supported original component 1/2 or exact original query-preparation operation, complete declared namespace and paired backup."
+      ]
+    },
+    "alert-query-r1-alert_episodes": {
+      "goal": "Restore original firing, ending, recovery and occurrence identity. A missing original Throwable is not reconstructed from latest logs. Original trusted CONFIG scope, paired configuration backup and keyring, supported schema/record versions and identity/structure validation; missing necessary history refuses reopening rather than seeding an empty ledger. Normal first preparation and reopening use the existing validated storage identity path. CACHE loss cannot restart alarm identities or erase budgets; backup restoration does not retract external unknown effects.",
+      "entry": "Validate and reopen the original CONFIG bundle, or restore its paired backup through that same validated entry. Never replay expired external work or reconstruct missing necessary facts from new samples. Query capability 3 is prepared only by new installation or explicit controlled same-version maintenance with old alert writers quiescent. Register one bounded original query preparation operation/phase/cursor in the existing alerting component before creating indexes on existing collections. Index DDL runs outside document transactions; after exact index verification, publish installedVersion 3 and READY with a CONFIG compare-and-set. An interrupted/unknown build resumes only that original operation and reconciles exact declared index names/options. Marker 3 never substitutes for missing indexes or per-record format capabilities; ordinary reads perform no migration or repair. Preserve original installation operation, authority preparation operation, configuration revision/alert counter, Source slot/cursor/UUIDs, paired key and global installedVersion.",
+      "prerequisites": [
+        "Original trusted CONFIG identity and paired keyring",
+        "Supported schema and record capabilities",
+        "Original backup and resource-reference closure when restoration is required",
+        "Required producer, authorization and grant-ordering proof",
+        "Supported original component 1/2 or exact original query-preparation operation, complete declared namespace and paired backup."
+      ]
+    },
+    "alert-query-r1-alert_notification_schedules": {
+      "goal": "Restore original round, unresolved references, unique successor and target eligibility; remaining intents cannot reconstruct deleted planning facts. Original trusted CONFIG scope, paired configuration backup and keyring, supported schema/record versions and identity/structure validation; missing necessary history refuses reopening rather than seeding an empty ledger. Normal first preparation and reopening use the existing validated storage identity path. CACHE loss cannot restart alarm identities or erase budgets; backup restoration does not retract external unknown effects.",
+      "entry": "Validate and reopen the original CONFIG bundle, or restore its paired backup through that same validated entry. Never replay expired external work or reconstruct missing necessary facts from new samples. Query capability 3 is prepared only by new installation or explicit controlled same-version maintenance with old alert writers quiescent. Register one bounded original query preparation operation/phase/cursor in the existing alerting component before creating indexes on existing collections. Index DDL runs outside document transactions; after exact index verification, publish installedVersion 3 and READY with a CONFIG compare-and-set. An interrupted/unknown build resumes only that original operation and reconciles exact declared index names/options. Marker 3 never substitutes for missing indexes or per-record format capabilities; ordinary reads perform no migration or repair. Preserve original installation operation, authority preparation operation, configuration revision/alert counter, Source slot/cursor/UUIDs, paired key and global installedVersion.",
+      "prerequisites": [
+        "Original trusted CONFIG identity and paired keyring",
+        "Supported schema and record capabilities",
+        "Original backup and resource-reference closure when restoration is required",
+        "Required producer, authorization and grant-ordering proof",
+        "Supported original component 1/2 or exact original query-preparation operation, complete declared namespace and paired backup."
+      ]
+    },
+    "alert-query-r1-alert_delivery_intents": {
+      "goal": "Restore original target, content, attempts, remaining budget, unknown results, command identity and sealed candidate. Never replace missing or expired candidate credentials with current saved values. Original trusted CONFIG scope, paired configuration backup and keyring, supported schema/record versions and identity/structure validation; missing necessary history refuses reopening rather than seeding an empty ledger. Normal first preparation and reopening use the existing validated storage identity path. CACHE loss cannot restart alarm identities or erase budgets; backup restoration does not retract external unknown effects.",
+      "entry": "Validate and reopen the original CONFIG bundle, or restore its paired backup through that same validated entry. Never replay expired external work or reconstruct missing necessary facts from new samples. Query capability 3 is prepared only by new installation or explicit controlled same-version maintenance with old alert writers quiescent. Register one bounded original query preparation operation/phase/cursor in the existing alerting component before creating indexes on existing collections. Index DDL runs outside document transactions; after exact index verification, publish installedVersion 3 and READY with a CONFIG compare-and-set. An interrupted/unknown build resumes only that original operation and reconciles exact declared index names/options. Marker 3 never substitutes for missing indexes or per-record format capabilities; ordinary reads perform no migration or repair. Preserve original installation operation, authority preparation operation, configuration revision/alert counter, Source slot/cursor/UUIDs, paired key and global installedVersion.",
+      "prerequisites": [
+        "Original trusted CONFIG identity and paired keyring",
+        "Supported schema and record capabilities",
+        "Original backup and resource-reference closure when restoration is required",
+        "Required producer, authorization and grant-ordering proof",
+        "Supported original component 1/2 or exact original query-preparation operation, complete declared namespace and paired backup."
+      ]
+    },
+    "alert-query-r1-mongo-config-schema_migrations": {
+      "goal": "Restore the exact original Source identity preparation operation and bounded cursor together with the Source headers it published. A READY marker cannot stand in for missing per-Source facts; Source headers cannot substitute for a lost preparation operation.",
+      "entry": "Resume only the original controlled maintenance operation against the same CONFIG/key identity. Existing feature absence with unmarked partial headers is refused. Preserve installedVersion, alerting and other feature metadata; normal facet access performs no migration. Alert contention first preparation keeps the original alert installation operation, records one authority preparation operation, and atomically publishes marker version 2 with the configuration singleton counter. Existing version-2 loss/corruption is not reenrolled by ordinary reads or preparation retries. Query capability 3 is prepared only by new installation or explicit controlled same-version maintenance with old alert writers quiescent. Register one bounded original query preparation operation/phase/cursor in the existing alerting component before creating indexes on existing collections. Index DDL runs outside document transactions; after exact index verification, publish installedVersion 3 and READY with a CONFIG compare-and-set. An interrupted/unknown build resumes only that original operation and reconciles exact declared index names/options. Marker 3 never substitutes for missing indexes or per-record format capabilities; ordinary reads perform no migration or repair. Preserve original installation operation, authority preparation operation, configuration revision/alert counter, Source slot/cursor/UUIDs, paired key and global installedVersion.",
+      "prerequisites": [
+        "Original CONFIG identity, layout and paired persistent key",
+        "Original operation and fixed bounded phase/cursor/count when resuming",
+        "Old writers quiescent and controlled same-version deployment for first enrollment",
+        "Matching Source/header and schema aggregate backup for restoration",
+        "Supported original component 1/2 or exact original query-preparation operation, complete declared namespace and paired backup."
+      ]
     }
   },
   "consistencyProfiles": {
@@ -728,6 +783,26 @@
     "alert-route-binding-r1": {
       "atomicDomain": "CONFIG",
       "fencing": "The existing route row keeps its authoring revision and gains one monotonic semantic binding revision. Changes to enabled state, match, channel/receiver identities, grouping or inhibition advance the semantic revision (including change-away-and-back); name and message text/settings-only edits do not. Original header retirement and receiver/key checks remain mandatory. Same actual CONFIG session checks the current route identity/binding and competes through the original configuration singleton with grants and corresponding local writes. Pure content equality cannot restore revoked old work; template-only changes preserve frozen original payload. No CACHE/remote IAM atomicity or fabricated permission version is claimed."
+    },
+    "alert-query-r1-alert_instances": {
+      "atomicDomain": "CONFIG",
+      "fencing": "Original AlarmKey, input and evaluation generation, owner fence and CAS; state, episode, transition and required external planning commit together. Only one actual CONFIG client/session transaction. Protected writes compete on their original scope, identity and version; never claim a CONFIG/CACHE or remote Cloud IAM transaction. Existing authorization must prove a consumable revocation-ordering/local grant boundary before new operations; otherwise refuse, without copied Cloud accounts or invented revisions. Network and external secret IO stay outside the transaction. Query preparation serializes its original operation/phase/cursor and final capability marker through the existing CONFIG schema aggregate; it does not claim index DDL is in a document transaction. Same-session protected alert writes still use the existing configuration singleton and original actor/resource/key fences."
+    },
+    "alert-query-r1-alert_episodes": {
+      "atomicDomain": "CONFIG",
+      "fencing": "Original AlarmKey, episode and CAS; current input generation binds capture atomically to the original occurrence. Diagnostic updates never change lifecycle or a newer episode. Only one actual CONFIG client/session transaction. Protected writes compete on their original scope, identity and version; never claim a CONFIG/CACHE or remote Cloud IAM transaction. Existing authorization must prove a consumable revocation-ordering/local grant boundary before new operations; otherwise refuse, without copied Cloud accounts or invented revisions. Network and external secret IO stay outside the transaction. Query preparation serializes its original operation/phase/cursor and final capability marker through the existing CONFIG schema aggregate; it does not claim index DDL is in a document transaction. Same-session protected alert writes still use the existing configuration singleton and original actor/resource/key fences."
+    },
+    "alert-query-r1-alert_notification_schedules": {
+      "atomicDomain": "CONFIG",
+      "fencing": "Progress and unique external intent commit together under original owner/version. Partial group invalidation and summary handoff remain atomic. Only one actual CONFIG client/session transaction. Protected writes compete on their original scope, identity and version; never claim a CONFIG/CACHE or remote Cloud IAM transaction. Existing authorization must prove a consumable revocation-ordering/local grant boundary before new operations; otherwise refuse, without copied Cloud accounts or invented revisions. Network and external secret IO stay outside the transaction. Query preparation serializes its original operation/phase/cursor and final capability marker through the existing CONFIG schema aggregate; it does not claim index DDL is in a document transaction. Same-session protected alert writes still use the existing configuration singleton and original actor/resource/key fences."
+    },
+    "alert-query-r1-alert_delivery_intents": {
+      "atomicDomain": "CONFIG",
+      "fencing": "Original complete delivery or test key, owner/attempt fences, and same-domain schedule, revocation, target-limit and quota writes. No external call inside a transaction. Only one actual CONFIG client/session transaction. Protected writes compete on their original scope, identity and version; never claim a CONFIG/CACHE or remote Cloud IAM transaction. Existing authorization must prove a consumable revocation-ordering/local grant boundary before new operations; otherwise refuse, without copied Cloud accounts or invented revisions. Network and external secret IO stay outside the transaction. Query preparation serializes its original operation/phase/cursor and final capability marker through the existing CONFIG schema aggregate; it does not claim index DDL is in a document transaction. Same-session protected alert writes still use the existing configuration singleton and original actor/resource/key fences."
+    },
+    "alert-query-r1-mongo-config-schema_migrations": {
+      "atomicDomain": "CONFIG",
+      "fencing": "Controlled first enrollment, preparation phase/cursor and Source writes serialize through the original CONFIG client/session and configuration_version. Each transaction publishes one Source header with its original operation cursor. Unknown commits read the same operation/header; existing UUIDs are never reallocated. Old writers must be stopped before first enrollment; no cross-client or remote maintenance atomicity is claimed. The alert version-1 to version-2 upgrade conditionally changes only its bounded component slot and the original configuration_version singleton in one actual CONFIG transaction; preserve all Source preparation and other component facts, and reconcile unknown commits by the original operation. Query preparation serializes its original operation/phase/cursor and final capability marker through the existing CONFIG schema aggregate; it does not claim index DDL is in a document transaction. Same-session protected alert writes still use the existing configuration singleton and original actor/resource/key fences."
     }
   },
   "resources": [
@@ -1504,8 +1579,8 @@
     },
     {
       "id": "mongo.config.schema_migrations",
-      "resourceVersion": 2,
-      "proposalVersion": 3,
+      "resourceVersion": 3,
+      "proposalVersion": 4,
       "kind": "COLLECTION",
       "layer": "CONFIG",
       "database": "CONFIG",
@@ -1519,9 +1594,9 @@
       "readers": [
         "io.tapstate.adapters.mongostore.MongoConfigurationDomain"
       ],
-      "recovery": "source-and-alert-preparation-v2",
-      "consistency": "source-and-alert-preparation-v2",
-      "growth": "One existing bounded CONFIG schema aggregate. Add one fixed Source-identity preparation slot of at most 2 KiB for original operation, identity/key binding, phase, cursor and count; preserve global version, alerting and other feature facts. No per-Source preparation log or per-operation history. Upgrade only the existing alerting component marker to version 2, retaining its original installation operation and adding one fixed authorityPreparationOperationId. Its entire alerting marker stays within 2 KiB. Initialize configuration_version.alertWriteFence and publish that marker in one actual CONFIG transaction. Preserve global installedVersion, the Source preparation slot/cursor/UUIDs and all other feature facts; no preparation history.",
+      "recovery": "alert-query-r1-mongo-config-schema_migrations",
+      "consistency": "alert-query-r1-mongo-config-schema_migrations",
+      "growth": "One existing bounded CONFIG schema aggregate. Add one fixed Source-identity preparation slot of at most 2 KiB for original operation, identity/key binding, phase, cursor and count; preserve global version, alerting and other feature facts. No per-Source preparation log or per-operation history. Upgrade only the existing alerting component marker to version 2, retaining its original installation operation and adding one fixed authorityPreparationOperationId. Its entire alerting marker stays within 2 KiB. Initialize configuration_version.alertWriteFence and publish that marker in one actual CONFIG transaction. Preserve global installedVersion, the Source preparation slot/cursor/UUIDs and all other feature facts; no preparation history. Only the existing alerting component slot gains queryPreparation={operationId,phase,nextIndex,indexContractVersion:1}; exactly one current operation, phase PREPARING/READY and cursor 0..5, at most 2 KiB for the entire alerting marker. No preparation history. Complete capability 3 requires the exact five additional ascending non-unique indexes, with no TTL/partial filter/collation. PREPARING is unavailable for query-dependent operations; unsupported old/new record formats remain explicit and are not defaulted or backfilled. Unmarked extra/partial query indexes are refused rather than silently adopted. Index preparation changes no business row, payload, ciphertext, source identity, storage cursor or alert counter; version 1 first authority enrollment retains the already-approved counter preparation semantics. Existing version 2 counters are never reset.",
       "evidence": [
         "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java",
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStorageSchemaIT.java",
@@ -3336,8 +3411,8 @@
     },
     {
       "id": "alert_instances",
-      "resourceVersion": 1,
-      "proposalVersion": 3,
+      "resourceVersion": 2,
+      "proposalVersion": 4,
       "kind": "COLLECTION",
       "layer": "CONFIG",
       "database": "CONFIG",
@@ -3353,9 +3428,9 @@
         "alert-evaluator",
         "alert-center-query"
       ],
-      "recovery": "alert_instances",
-      "consistency": "alert_instances",
-      "growth": "One head per rule-matched resource; no raw telemetry stream; current active count and highest five are authorized read-only queries. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL.",
+      "recovery": "alert-query-r1-alert_instances",
+      "consistency": "alert-query-r1-alert_instances",
+      "growth": "One head per rule-matched resource; no raw telemetry stream; current active count and highest five are authorized read-only queries. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL. Add derived query projection fields of at most 192 BSON bytes per existing row, within its original encoded-row and per-scope budgets. Add ascending non-unique index alert_query_active on _id.authorityId,_id.clusterId,formatVersion,status,severityRank,recentSecondOrder,recentNanoOrder,_id. Index logical key growth is bounded by two encoded original identity keys plus 256 bytes per entry; actual B-tree/storage overhead is deployment-dependent and is not claimed to be inside the 512 MiB logical-record threshold. No raw observations, count cache, new table, TTL or unbounded history. Record facts keep nanosecond precision; sort seconds/nanos use a fixed descending-time projection and nextCheckAt uses rounded-up BSON Date.",
       "evidence": [
         "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertLifecycleTest.java",
         "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java",
@@ -3366,8 +3441,8 @@
     },
     {
       "id": "alert_episodes",
-      "resourceVersion": 1,
-      "proposalVersion": 3,
+      "resourceVersion": 2,
+      "proposalVersion": 4,
       "kind": "COLLECTION",
       "layer": "CONFIG",
       "database": "CONFIG",
@@ -3384,9 +3459,9 @@
         "alert-center-query",
         "alert-recovery-planner"
       ],
-      "recovery": "alert_episodes",
-      "consistency": "alert_episodes",
-      "growth": "Active episodes protected; ended default OP thirty days and Cloud seven days. No personal read or acknowledgement fields. At most first/latest captures, one shared slot for the same occurrence; each text at most 16 KiB UTF-8, 256 lines and eight total exception nodes; both plus metadata at most 36 KiB per episode. Bound traversal before rendering; redact registered secrets and authentication/URI data before persistence; unproven messages omitted. Preserve safe line breaks, tabs, frames and chains with explicit truncation. No complete business rows or connection strings. After ending, traces expire no later than OP seven days or Cloud one day and never after episode expiry; retain pruned status without rebuilding old text. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL.",
+      "recovery": "alert-query-r1-alert_episodes",
+      "consistency": "alert-query-r1-alert_episodes",
+      "growth": "Active episodes protected; ended default OP thirty days and Cloud seven days. No personal read or acknowledgement fields. At most first/latest captures, one shared slot for the same occurrence; each text at most 16 KiB UTF-8, 256 lines and eight total exception nodes; both plus metadata at most 36 KiB per episode. Bound traversal before rendering; redact registered secrets and authentication/URI data before persistence; unproven messages omitted. Preserve safe line breaks, tabs, frames and chains with explicit truncation. No complete business rows or connection strings. After ending, traces expire no later than OP seven days or Cloud one day and never after episode expiry; retain pruned status without rebuilding old text. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL. Add derived query projection fields of at most 64 BSON bytes per existing row, within its original encoded-row and per-scope budgets. Add ascending non-unique index alert_query_ended on _id.alarm.authorityId,_id.alarm.clusterId,formatVersion,endReason,endedSecondOrder,endedNanoOrder,_id. Index logical key growth is bounded by two encoded original identity keys plus 256 bytes per entry; actual B-tree/storage overhead is deployment-dependent and is not claimed to be inside the 512 MiB logical-record threshold. No raw observations, count cache, new table, TTL or unbounded history. Record facts keep nanosecond precision; sort seconds/nanos use a fixed descending-time projection and nextCheckAt uses rounded-up BSON Date.",
       "evidence": [
         "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertLifecycleTest.java",
         "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java",
@@ -3427,8 +3502,8 @@
     },
     {
       "id": "alert_notification_schedules",
-      "resourceVersion": 1,
-      "proposalVersion": 3,
+      "resourceVersion": 2,
+      "proposalVersion": 4,
       "kind": "COLLECTION",
       "layer": "CONFIG",
       "database": "CONFIG",
@@ -3445,9 +3520,9 @@
         "alert-planner",
         "alert-recovery-planner"
       ],
-      "recovery": "alert_notification_schedules",
-      "consistency": "alert_notification_schedules",
-      "growth": "Active subject by route and single semantic target; fixed or bounded summaries and references; no accumulated reminder debt or in-app delivery schedule. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL.",
+      "recovery": "alert-query-r1-alert_notification_schedules",
+      "consistency": "alert-query-r1-alert_notification_schedules",
+      "growth": "Active subject by route and single semantic target; fixed or bounded summaries and references; no accumulated reminder debt or in-app delivery schedule. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL. Add derived query projection fields of at most 32 BSON bytes per existing row, within its original encoded-row and per-scope budgets. Add ascending non-unique index alert_query_schedule_due on _id.authorityId,_id.clusterId,formatVersion,nextCheckAt,_id. Index logical key growth is bounded by two encoded original identity keys plus 256 bytes per entry; actual B-tree/storage overhead is deployment-dependent and is not claimed to be inside the 512 MiB logical-record threshold. No raw observations, count cache, new table, TTL or unbounded history. Record facts keep nanosecond precision; sort seconds/nanos use a fixed descending-time projection and nextCheckAt uses rounded-up BSON Date.",
       "evidence": [
         "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertLifecycleTest.java",
         "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java",
@@ -3456,8 +3531,8 @@
     },
     {
       "id": "alert_delivery_intents",
-      "resourceVersion": 1,
-      "proposalVersion": 3,
+      "resourceVersion": 2,
+      "proposalVersion": 4,
       "kind": "COLLECTION",
       "layer": "CONFIG",
       "database": "CONFIG",
@@ -3476,13 +3551,16 @@
         "alert-sender",
         "alert-delivery-query"
       ],
-      "recovery": "alert_delivery_intents",
-      "consistency": "alert_delivery_intents",
-      "growth": "At most 512 KiB encoded per intent including reserved lawful result space; embedded attempts at most thirty and 4 KiB each, protocol diagnostic at most 2 KiB. Email at most 256 KiB and webhook 64 KiB. Formal delivery deadline at most twenty-four hours; explicit tests and local Cloud SDK placeholder at most one attempt. Tests have a fixed five-minute deadline. A current candidate fixes bounded transport, target, authentication identity/material, payload and optional original receiver/CAS baseline; new receivers need no saved identity. Keyed digest is purpose-separated from the original cluster key. Seal candidate credentials with existing encryption and AAD bound to scope, complete command/candidate and purpose; at most 16 KiB ciphertext, no plaintext/log/browser-persistence/temp-file/extra secret store. Preparation occurs outside the transaction and original receiver/credential/authorization baseline competes at admission. At terminal state or original deadline deny new decrypt/use; after original in-flight work settles, normal available rated operation targets physical pruning within five minutes of eligibility. Outage or backlog remains expired, visible and bounded-recoverable, not a hard physical deletion guarantee. Keep command digest/result after credential pruning so replay cannot send again. Pre-reserve lawful evidence space; never delete unknown or dedup facts to admit new work. No in-app intent. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL.",
+      "recovery": "alert-query-r1-alert_delivery_intents",
+      "consistency": "alert-query-r1-alert_delivery_intents",
+      "growth": "At most 512 KiB encoded per intent including reserved lawful result space; embedded attempts at most thirty and 4 KiB each, protocol diagnostic at most 2 KiB. Email at most 256 KiB and webhook 64 KiB. Formal delivery deadline at most twenty-four hours; explicit tests and local Cloud SDK placeholder at most one attempt. Tests have a fixed five-minute deadline. A current candidate fixes bounded transport, target, authentication identity/material, payload and optional original receiver/CAS baseline; new receivers need no saved identity. Keyed digest is purpose-separated from the original cluster key. Seal candidate credentials with existing encryption and AAD bound to scope, complete command/candidate and purpose; at most 16 KiB ciphertext, no plaintext/log/browser-persistence/temp-file/extra secret store. Preparation occurs outside the transaction and original receiver/credential/authorization baseline competes at admission. At terminal state or original deadline deny new decrypt/use; after original in-flight work settles, normal available rated operation targets physical pruning within five minutes of eligibility. Outage or backlog remains expired, visible and bounded-recoverable, not a hard physical deletion guarantee. Keep command digest/result after credential pruning so replay cannot send again. Pre-reserve lawful evidence space; never delete unknown or dedup facts to admit new work. No in-app intent. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL. Add derived query projection fields of at most 32 BSON bytes per existing row, within its original encoded-row and per-scope budgets. Add ascending non-unique index alert_query_delivery_due on _id.authorityId,_id.clusterId,formatVersion,nextCheckAt,_id. Also add ascending non-unique index alert_query_test_window on _id.authorityId,_id.clusterId,_id.purpose,quotaMinute to detect necessary accepted test facts before creating a missing quota head. Index logical key growth is bounded by two encoded original identity keys plus 256 bytes per entry; actual B-tree/storage overhead is deployment-dependent and is not claimed to be inside the 512 MiB logical-record threshold. No raw observations, count cache, new table, TTL or unbounded history. Record facts keep nanosecond precision; sort seconds/nanos use a fixed descending-time projection and nextCheckAt uses rounded-up BSON Date.",
       "evidence": [
         "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertLifecycleTest.java",
         "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java",
-        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStorageSchemaIT.java"
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStorageSchemaIT.java",
+        "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertIntentTest.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertDeliveryCodecTest.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertDeliveryStoreIT.java"
       ]
     },
     {

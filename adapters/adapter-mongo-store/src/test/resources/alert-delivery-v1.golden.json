@@ -1,0 +1,80 @@
+{
+  "_id": {
+    "authorityId": "org-a",
+    "clusterId": "cluster-a",
+    "purpose": "business",
+    "deliveryId": "delivery-21ec8cec5475e22c8d3e52e9851dd2c74688ed368682f7b82f21e0fd425939a6"
+  },
+  "formatVersion": 1,
+  "recordRevision": {"$numberLong": "1"},
+  "channelType": "email",
+  "channelVersion": 1,
+  "deadline": "2026-10-28T00:00:00.123456789Z",
+  "quotaMinute": null,
+  "cleanupAt": {"$date": "2026-11-11T00:00:00.124Z"},
+  "frozen": {
+    "identity": {
+      "purpose": "business",
+      "key": {
+        "notification": {
+          "authorityId": "org-a", "clusterId": "cluster-a",
+          "subjectId": "episode-062350457e1762745ed61236ffab235237ebb059a2a9e9aba9a276d95fd2f352",
+          "subjectIncarnation": "1",
+          "routeId": "route-a", "routeIncarnation": "11111111-1111-4111-8111-111111111111",
+          "kind": "FAULT", "round": {"$numberLong": "1"}
+        },
+        "channelType": "email", "receiverIncarnation": "11111111-1111-4111-8111-111111111111", "targetId": "a@example.test"
+      }
+    },
+    "channel": {"type": "email", "version": 1, "family": "OP_EXTERNAL"},
+    "route": {
+      "kind": "configured",
+      "identity": {"authorityId": "org-a", "clusterId": "cluster-a", "id": "route-a", "kind": "SUBSCRIPTION", "incarnation": "11111111-1111-4111-8111-111111111111"},
+      "bindingRevision": {"$numberLong": "1"}
+    },
+    "target": {
+      "kind": "receiver",
+      "identity": {"authorityId": "org-a", "clusterId": "cluster-a", "id": "receiver-a", "kind": "RECEIVER", "incarnation": "11111111-1111-4111-8111-111111111111"},
+      "bindingRevision": {"$numberLong": "1"},
+      "transport": {"channelType": "email", "host": "smtp.example.test", "port": 465, "encryption": "IMPLICIT_TLS", "authentication": "NONE", "username": null, "from": "alerts@example.test", "recipients": ["a@example.test"], "trust": "SYSTEM"},
+      "credentials": null
+    },
+    "content": {
+      "contentType": "message/rfc822",
+      "payloadSha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+      "renderingFailed": false,
+      "template": {"id": "fault", "version": 1, "settingsRevision": {"$numberLong": "1"}, "language": "en", "settings": {"titlePrefix": "", "titleSuffix": "", "messageNote": "", "footerText": ""}}
+    },
+    "members": [{
+      "alarm": {"authorityId": "org-a", "clusterId": "cluster-a", "resourceKind": "pipeline", "resourceId": "orders", "resourceIncarnation": "pipeline-1", "typeId": "pipeline.failed", "qualifier": "rule-a"},
+      "evaluationBinding": {"ruleRevision": {"$numberLong": "1"}, "generation": {"$numberLong": "1"}, "producerIncarnation": "producer-a", "triggerNanos": {"$numberLong": "0"}, "resolveNanos": {"$numberLong": "0"}, "maxAgeNanos": {"$numberLong": "30000000000"}, "maxGapNanos": {"$numberLong": "30000000000"}},
+      "episode": {"$numberLong": "1"},
+      "ruleIdentity": {"authorityId": "org-a", "clusterId": "cluster-a", "id": "rule-a", "kind": "RULE", "incarnation": "11111111-1111-4111-8111-111111111111"},
+      "sourceBindingRevision": {"$numberLong": "0"}
+    }],
+    "retry": {
+      "attemptsPerCycle": 5, "maximumManualCycles": 2,
+      "delaysNanos": [{"$numberLong": "1800000000000"}, {"$numberLong": "3600000000000"}, {"$numberLong": "7200000000000"}, {"$numberLong": "14400000000000"}],
+      "maximumAgeNanos": {"$numberLong": "86400000000000"}, "attemptTimeoutNanos": {"$numberLong": "60000000000"}
+    },
+    "retention": {
+      "policyVersion": 2, "deployment": "ON_PREM",
+      "valuesNanos": {
+        "ACCEPTED_PAYLOAD": {"$numberLong": "86400000000000"}, "ACCEPTED_RESULT": {"$numberLong": "604800000000000"},
+        "FAILED_PAYLOAD": {"$numberLong": "259200000000000"}, "FAILED_RESULT": {"$numberLong": "1209600000000000"},
+        "TEST_PAYLOAD": {"$numberLong": "3600000000000"}, "TEST_ACCEPTED_RESULT": {"$numberLong": "86400000000000"},
+        "TEST_FAILED_RESULT": {"$numberLong": "259200000000000"}, "ENDED_EPISODE": {"$numberLong": "2592000000000000"}, "TRANSITION": {"$numberLong": "1209600000000000"}
+      }
+    },
+    "createdAt": "2026-10-27T00:00:00.123456789Z", "deadline": "2026-10-28T00:00:00.123456789Z"
+  },
+  "state": {
+    "owner": {"generation": {"$numberLong": "0"}, "ownerId": null, "leaseUntil": null},
+    "manualCycles": 0, "permitsStopped": false, "stopReason": null,
+    "nextAttemptAt": "2026-10-27T00:00:00.123456789Z", "attemptsConsumed": 0, "attempts": [], "summary": "NOT_ATTEMPTED",
+    "retained": {"payloadUntil": "2026-10-31T00:00:00.123456789Z", "resultUntil": "2026-11-11T00:00:00.123456789Z", "acceptedAt": null, "stoppedAt": null},
+    "payload": {"$binary": {"base64": "aGVsbG8=", "subType": "00"}},
+    "candidate": null, "payloadPrunedAt": null, "candidatePrunedAt": null, "detailsPrunedAt": null,
+    "permitsStoppedAt": null, "lastAttemptEnd": null, "cycleStarts": [0], "acceptedReceipt": null
+  }
+}

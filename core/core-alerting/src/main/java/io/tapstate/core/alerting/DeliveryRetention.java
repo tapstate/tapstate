@@ -28,6 +28,31 @@ public final class DeliveryRetention {
     public Instant acceptedAt() { return acceptedAt; }
     public Instant stoppedAt() { return stoppedAt; }
 
+    /** Restores the frozen upper bounds, including earlier cutoffs retained from past evidence merges. */
+    public static DeliveryRetention restore(AlertRetentionPolicy policy, Kind kind, Instant createdAt, Instant deadline,
+            Instant payloadUntil, Instant resultUntil, Instant acceptedAt, Instant stoppedAt) {
+        DeliveryRetention initial = begin(policy, kind, createdAt, deadline);
+        AlertValidation.require(payloadUntil != null && resultUntil != null && !payloadUntil.isBefore(createdAt)
+                && resultUntil.isAfter(createdAt) && !payloadUntil.isAfter(resultUntil)
+                && !payloadUntil.isAfter(initial.payloadUntil) && !resultUntil.isAfter(initial.resultUntil),
+                "retentionBounds", "outside-frozen-upper-bounds");
+        AlertValidation.require(stoppedAt == null || !stoppedAt.isBefore(createdAt) && !stoppedAt.isAfter(deadline),
+                "stoppedAt", "outside-original-lifetime");
+        if (acceptedAt != null) {
+            AlertValidation.require(!acceptedAt.isBefore(createdAt) && acceptedAt.isBefore(resultUntil), "acceptedAt", "outside-result-window");
+            Instant acceptedPayload = kind == Kind.CHANNEL_TEST ? initial.payloadUntil : add(acceptedAt, policy.acceptedPayload());
+            Duration success = policy.duration(kind == Kind.CHANNEL_TEST ? TEST_ACCEPTED_RESULT : ACCEPTED_RESULT);
+            AlertValidation.require(!payloadUntil.isAfter(acceptedPayload)
+                    && !resultUntil.isAfter(max(add(acceptedAt, success), deadline)), "retentionBounds", "accepted-upper-bound-expanded");
+        } else if (stoppedAt != null) {
+            Instant stoppedPayload = kind == Kind.CHANNEL_TEST ? initial.payloadUntil : add(stoppedAt, policy.duration(FAILED_PAYLOAD));
+            Duration failed = policy.duration(kind == Kind.CHANNEL_TEST ? TEST_FAILED_RESULT : FAILED_RESULT);
+            AlertValidation.require(!payloadUntil.isAfter(stoppedPayload)
+                    && !resultUntil.isAfter(max(add(stoppedAt, failed), deadline)), "retentionBounds", "stopped-upper-bound-expanded");
+        }
+        return new DeliveryRetention(policy, kind, createdAt, deadline, payloadUntil, resultUntil, acceptedAt, stoppedAt);
+    }
+
     public static DeliveryRetention begin(AlertRetentionPolicy policy, Kind kind, Instant createdAt, Instant deadline) {
         Objects.requireNonNull(policy, "policy"); Objects.requireNonNull(kind, "kind");
         Objects.requireNonNull(createdAt, "createdAt"); Objects.requireNonNull(deadline, "deadline");

@@ -36,6 +36,16 @@ public final class DeliveryAttempt {
     public Instant endedAt() { return endedAt; }
     public boolean pending() { return endedAt == null; }
 
+    /** Reconstructs exact stored evidence; it neither grants a request nor replaces its original cutoff. */
+    public static DeliveryAttempt restore(Permit permit, Outcome outcome, Instant endedAt) {
+        Objects.requireNonNull(permit, "permit"); Objects.requireNonNull(outcome, "outcome");
+        AlertValidation.require(outcome != Outcome.NOT_ATTEMPTED && (endedAt != null || outcome == Outcome.UNKNOWN),
+                "attemptEvidence", "invalid-pending-or-permitted-outcome");
+        AlertValidation.require(endedAt == null || !endedAt.isBefore(permit.grantedAt()) && !endedAt.isAfter(permit.deadline()),
+                "attemptEnd", "outside-original-permit-window");
+        return new DeliveryAttempt(permit, outcome, endedAt);
+    }
+
     /** This returns a candidate only; the host must atomically consume the next ordinal and persist this exact permit before sending. */
     public static Optional<DeliveryAttempt> grant(AlarmKey.Scope scope, String deliveryId, String attemptId, int ordinal,
             long ownerGeneration, String ownerId, ChannelRetryPolicy policy, Instant createdAt, Instant originalDeadline, Instant grantedAt) {

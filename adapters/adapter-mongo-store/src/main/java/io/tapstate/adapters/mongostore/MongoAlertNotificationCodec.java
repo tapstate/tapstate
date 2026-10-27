@@ -91,7 +91,7 @@ final class MongoAlertNotificationCodec {
         try { return value.plusSeconds(3600); }
         catch (ArithmeticException | java.time.DateTimeException overflow) { throw invalid("cleanupAt"); }
     }
-    private static Date cleanup(Instant value) {
+    static Date cleanup(Instant value) {
         try {
             long millis = value.toEpochMilli();
             return new Date(value.getNano() % 1_000_000 == 0 ? millis : Math.incrementExact(millis));

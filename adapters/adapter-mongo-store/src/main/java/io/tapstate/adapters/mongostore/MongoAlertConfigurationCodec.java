@@ -177,10 +177,10 @@ final class MongoAlertConfigurationCodec {
         }
         return new Match(readResources(doc(match, "resources")), strings(match, "typeIds", 16), severities);
     }
-    private static Document identity(Identity value) {
+    static Document identity(Identity value) {
         return key(value.scope(), value.id()).append("kind", value.kind().name()).append("incarnation", value.incarnation());
     }
-    private static Identity readIdentity(Document value) {
+    static Identity readIdentity(Document value) {
         fields(value, Set.of("authorityId", "clusterId", "id", "kind", "incarnation"));
         return new Identity(enumeration(Kind.values(), text(value, "kind")),
                 new AlarmKey.Scope(text(value, "authorityId"), text(value, "clusterId")), text(value, "id"), text(value, "incarnation"));
