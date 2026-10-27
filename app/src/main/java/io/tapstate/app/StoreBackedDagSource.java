@@ -1765,13 +1765,25 @@ final class StoreBackedDagSource implements DagSource {
         long snapshotEpoch = snapshotOnly
                 ? SnapshotRunOrder.current(storePort.keyedState(), pipeline.id())
                 : 0L;
+        Map<String, Long> sourceEpochs = new LinkedHashMap<>();
+        sourceVertices.values().forEach(vertex -> sourceEpochs.put(vertex.stream(), snapshotOnly ? snapshotEpoch
+                : sourceContextEpoch(vertex.resolution().chainId().value(), vertex.consumerId(), vertex.table())));
+        Map<String, Long> snapshotEpochs = new LinkedHashMap<>();
+        if (readModeOf(pipeline) != ReadMode.CDC_ONLY) {
+            sourceEpochs.forEach((chain, epoch) -> {
+                if (epoch > 0) {
+                    snapshotEpochs.put(chain, epoch);
+                }
+            });
+        }
         Map<String, Step.Inline> stepsById = inlineStepsById(pipeline);
         Map<String, String> sourceIdByTable = sourceIdByTable(sourceVertices);
         StartFrom freshStart = freshRingStart(pipeline);
         Map<String, StoreBackedSinkAckFactory.SourceProgress> progress = progressByTable(pipeline);
         return new DagBindings(
                 key -> sourceVertex(sourceVertices.get(key), axes, snapshotOnly, snapshotEpoch, freshStart,
-                        progress.get(sourceVertices.get(key).stream()).kind() == ConsumerProgressKind.DIRECT_SOURCE),
+                        progress.get(sourceVertices.get(key).stream()).kind() == ConsumerProgressKind.DIRECT_SOURCE,
+                        sourceEpochs.get(sourceVertices.get(key).stream())),
                 step -> transformBinding(step, stepsById, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds),
                 element -> FencedSinkWriterFactory.heldTo(
                         sinkWriter(pipeline, element, targets, serveStreams, sourceIdByTable, freshFullLoad), fence),
@@ -1780,7 +1792,7 @@ final class StoreBackedDagSource implements DagSource {
                 view -> FencedSinkWriterFactory.heldTo(
                         viewSink(pipeline, view, viewTargets, viewStreams, sourceStreamsById(sourceVertices),
                                 freshFullLoad), fence),
-                nestBinding(pipeline, sourceTablesByName(sourceVertices)),
+                nestBinding(pipeline, sourceTablesByName(sourceVertices)).withSnapshotEpochs(snapshotEpochs),
                 joinBinding(compiledJoins));
     }
 
@@ -2983,7 +2995,7 @@ final class StoreBackedDagSource implements DagSource {
      */
     private ProcessorMetaSupplier sourceVertex(
             SourceVertex vertex, ChainAxes axes, boolean snapshotOnly, long snapshotEpoch, StartFrom freshStart,
-            boolean direct) {
+            boolean direct, long sourceEpoch) {
         if (vertex == null) {
             throw new IllegalStateException("source vertex binding is missing");
         }
@@ -3000,7 +3012,7 @@ final class StoreBackedDagSource implements DagSource {
         if (direct) {
             return SrsSourceProcessor.directMetaSupplier(vertex.pipelineId(),
                     vertex.resolution().ringName(vertex.table()), vertex.stream(),
-                    sourceContextEpoch(vertex.resolution().chainId().value(), vertex.consumerId(), vertex.table()),
+                    sourceEpoch,
                     order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement);
         }
         // Where in the ring this run starts. Not the head as such: a ring outlives the runs that read it, so
@@ -3013,8 +3025,7 @@ final class StoreBackedDagSource implements DagSource {
                 .get(vertex.table());
         return SrsSourceProcessor.metaSupplier(
                 vertex.pipelineId(), vertex.resolution().ringName(vertex.table()), vertex.stream(), freshStart,
-                doneThrough, sourceContextEpoch(
-                        vertex.resolution().chainId().value(), vertex.consumerId(), vertex.table()),
+                doneThrough, sourceEpoch,
                 CaptureRunUnit.readCursorPublisher(
                         vertex.resolution().chainId().value(), vertex.consumerId(), vertex.table()),
                 order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement,
