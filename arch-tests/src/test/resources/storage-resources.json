@@ -3064,7 +3064,33 @@
       "growth": "One bounded report per actual run, with pending-history mirrors counted in the same per-task/per-mode retention (default 10, range 1..100). Admission identity <=8 KiB per report. Actual total bytes and active/unknown records remain accounted; cleanup cannot reopen birth rights.",
       "evidence": [
         "spi/spi-store/src/test/java/io/tapstate/spi/store/ValidationResultStoreContractTest.java",
-        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationAdmissionStoreIT.java"
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationAdmissionStoreIT.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationResultStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.validation_differences",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "validation_differences"
+      ],
+      "responsibility": "Complete atomic root observations for an original report, including typed physical identity, bounded findings/samples and latest repair or read-only annotations.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoValidationResultStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoValidationResultStore"
+      ],
+      "recovery": "validation-configuration",
+      "consistency": "validation-config",
+      "growth": "Bounded root payload and total bytes; active Pipeline problem roots share the 1000 limit. Same root is replaced by a newer complete observation, never appended per field/probe. Original report retention and seven-day consistent/repaired detail retention bound payloads; late writes do not recreate reports.",
+      "evidence": [
+        "spi/spi-store/src/test/java/io/tapstate/spi/store/ValidationResultStoreContractTest.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationResultStoreIT.java"
       ]
     }
   ]

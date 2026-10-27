@@ -71,7 +71,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
             if (existing != null) throw unreadable("unexpected-report-before-birth");
             var report = new Document("_id", reportId(start.run())).append("formatVersion", 1)
                     .append("admission", identity(start)).append("openVersion", start.sequence()).append("closed", false)
-                    .append("publicationRevision", 0L);
+                    .append("publicationRevision", 0L).append("rootCount", 0L).append("resultBytes", 0L);
             bounded(report, 8 * 1024);
             changePhase(session, task, start, mode, "BORN");
             reports.insertOne(session, report);
@@ -81,7 +81,10 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
 
     @Override public Closure close(Start start) {
         requireStart(start);
-        return transaction(session -> {
+        return transaction(session -> closeInTransaction(session, start));
+    }
+
+    Closure closeInTransaction(ClientSession session, Start start) {
             var task = task(session, start); if (task == null) return Closure.STALE;
             var mode = mode(task, start.run().mode()); var held = matching(mode, start);
             if (held == null) return Closure.STALE;
@@ -97,7 +100,12 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
             }
             changePhase(session, task, start, mode, "CLOSED");
             return Closure.CLOSED;
-        });
+    }
+
+    boolean bornInTransaction(ClientSession session, Start start) {
+        var task = task(session, start); if (task == null) return false;
+        var held = matching(mode(task, start.run().mode()), start);
+        return held != null && phase(held).equals("BORN");
     }
 
     private Document task(ClientSession session, Start start) {
@@ -139,7 +147,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
             throw unreadable("permission");
         phase(held); return held;
     }
-    private static Start decodeIdentity(Document value) {
+    static Start decodeIdentity(Document value) {
         try {
             if (!value.keySet().equals(Set.of("taskGeneration", "configurationRevision", "sequence", "commandId", "run", "mode", "specHash",
                     "keyMappingRevision", "comparisonRulesVersion", "owner"))) throw unreadable("permission-identity");
@@ -184,7 +192,9 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
     private static void requireReport(Document report, Start start) {
         if (report == null || !reportId(start.run()).equals(report.get("_id")) || !Integer.valueOf(1).equals(report.get("formatVersion"))
                 || !identity(start).equals(report.get("admission")) || !Long.valueOf(start.sequence()).equals(report.get("openVersion"))
-                || !(report.get("closed") instanceof Boolean) || !(report.get("publicationRevision") instanceof Long revision) || revision < 0)
+                || !(report.get("closed") instanceof Boolean) || !(report.get("publicationRevision") instanceof Long revision) || revision < 0
+                || !(report.get("rootCount") instanceof Long roots) || roots < 0
+                || !(report.get("resultBytes") instanceof Long bytes) || bytes < 0)
             throw unreadable("original-report");
     }
     private void requireStart(Start start) {
@@ -192,9 +202,11 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         if (!clusterId.equals(start.task().clusterId())) throw new TapstateException(ValidationError.INVALID_CONTRACT, Map.of("field", "start.clusterId"), null);
         bounded(identity(start), 8 * 1024);
     }
-    private <T> T transaction(Function<ClientSession, T> work) {
+    void checkActive() { requireActive.run(); }
+    <T> T transaction(Function<ClientSession, T> work) { return transaction(() -> {}, work); }
+    <T> T transaction(Runnable verifyAdditionalStructures, Function<ClientSession, T> work) {
         return StoreIo.call(() -> {
-            requireActive.run(); verifyStructures();
+            requireActive.run(); verifyStructures(); verifyAdditionalStructures.run();
             try (var session = client.startSession()) {
                 return session.withTransaction(() -> { requireActive.run(); var result = work.apply(session); requireActive.run(); return result; }, TRANSACTION);
             }

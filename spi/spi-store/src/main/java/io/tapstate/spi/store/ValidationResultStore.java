@@ -44,6 +44,8 @@ public interface ValidationResultStore {
      * Caller seals local work, waits for known CONFIG closure, then records dependent terminal/retire
      * facts through the CACHE fence. A failed/unknown seal keeps that gate closed. Report terminal
      * mirroring uses only known CACHE facts and cannot reopen this epoch. No cross-domain transaction.
+     * CLOSED_OR_EXPIRED does not prove closure of an unborn report: cancel a pending birth through
+     * the original ValidationReportAdmission command, not an assumed successful seal of a missing row.
      */
     Seal seal(Report report);
 
