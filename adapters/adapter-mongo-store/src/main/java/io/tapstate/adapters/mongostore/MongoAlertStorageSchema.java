@@ -23,11 +23,14 @@ import org.bson.Document;
 
 /** One fixed feature-version fact in the existing CONFIG schema aggregate, independent of other features. */
 final class MongoAlertStorageSchema {
-    static final int VERSION = 1;
+    static final int VERSION = 2;
+    static final int LEGACY_VERSION = 1;
     static final String FIELD = "alerting";
     static final List<SystemCollections> COLLECTIONS = Stream.of(MongoAlertConfigurationStore.COLLECTIONS,
             MongoAlertStateStore.COLLECTIONS, MongoAlertNotificationStore.COLLECTIONS).flatMap(List::stream).toList();
-    private static final Set<String> MARKER_FIELDS = Set.of("installedVersion", "clusterId", "layoutId", "keyId", "operationId");
+    private static final Set<String> LEGACY_FIELDS = Set.of("installedVersion", "clusterId", "layoutId", "keyId", "operationId");
+    private static final Set<String> MARKER_FIELDS = Set.of("installedVersion", "clusterId", "layoutId", "keyId", "operationId",
+            "authorityPreparationOperationId");
     private final MongoClient client;
     private final MongoDatabase database;
     private final String clusterId;
@@ -51,7 +54,7 @@ final class MongoAlertStorageSchema {
                 if (!structures(budget).isEmpty()) { throw unreadable("unmarked-collections"); }
                 requireActive.run(); budget.remainingMillis(); return 0;
             }
-            verify(budget); requireActive.run(); budget.remainingMillis(); return VERSION;
+            verify(budget); requireActive.run(); budget.remainingMillis(); return (Integer) marker.get("installedVersion");
         });
     }
 
@@ -62,33 +65,46 @@ final class MongoAlertStorageSchema {
         return StoreIo.call(() -> {
             requireActive.run();
             Document existing = budget.transaction(client, session -> marker(session, budget));
-            if (existing != null) { verify(budget); requireActive.run(); return VERSION; }
-            if (!structures(budget).isEmpty()) { throw unreadable("unmarked-collections"); }
+            if (existing != null) {
+                verify(budget);
+                if (Integer.valueOf(VERSION).equals(existing.get("installedVersion"))) { requireActive.run(); return VERSION; }
+            } else if (!structures(budget).isEmpty()) { throw unreadable("unmarked-collections"); }
             try (var session = client.startSession()) {
                 session.withTransaction(() -> {
                     requireActive.run();
-                    if (marker(session, budget) != null) { return null; }
+                    Document original = marker(session, budget);
+                    if (original != null && Integer.valueOf(VERSION).equals(original.get("installedVersion"))) { return null; }
                     var schemas = SystemCollections.SCHEMA_MIGRATIONS.on(database);
-                    var filter = new Document("_id", "config").append(FIELD, new Document("$exists", false));
+                    var filter = new Document("_id", "config").append(FIELD,
+                            original == null ? new Document("$exists", false) : original);
+                    Document installed = original == null ? initialMarker(clusterId, keyId, operationId)
+                            : new Document(original).append("installedVersion", VERSION)
+                                    .append("authorityPreparationOperationId", operationId);
+                    if (MongoAlertConfigurationCodec.size(installed) > 2048) { throw unreadable("marker-size"); }
+                    ConfigurationVersion.prepareAlertFence(session, SystemCollections.CONFIGURATION_VERSION.on(database));
                     if (schemas.updateOne(session, filter, new Document("$set",
-                            new Document(FIELD, initialMarker(clusterId, keyId, operationId)))).getMatchedCount() != 1) {
+                            new Document(FIELD, installed))).getModifiedCount() != 1) {
                         throw unreadable("preparation-fence");
                     }
-                    prepareCollections(session, database);
+                    if (original == null) { prepareCollections(session, database); }
                     requireActive.run(); budget.remainingMillis(); return null;
                 }, TransactionOptions.builder().readConcern(ReadConcern.LOCAL)
                         .writeConcern(WriteConcern.MAJORITY.withJournal(true))
                         .timeout(budget.remainingMillis(), TimeUnit.MILLISECONDS).build());
             }
             // Never return a preparation receipt for a partial or vanished namespace set.
-            verify(budget); requireActive.run(); budget.remainingMillis(); return VERSION;
+            // A lost commit reply is reconciled by rereading the committed operation and counter together.
+            int installed = load(budget); requireActive.run(); budget.remainingMillis(); return installed;
         });
     }
 
     static Document initialMarker(String clusterId, String keyId, String operationId) {
         requireOperation(operationId);
-        return new Document("installedVersion", VERSION).append("clusterId", clusterId)
-                .append("layoutId", MongoConfigurationDomain.LAYOUT).append("keyId", keyId).append("operationId", operationId);
+        Document result = new Document("installedVersion", VERSION).append("clusterId", clusterId)
+                .append("layoutId", MongoConfigurationDomain.LAYOUT).append("keyId", keyId).append("operationId", operationId)
+                .append("authorityPreparationOperationId", operationId);
+        if (MongoAlertConfigurationCodec.size(result) > 2048) { throw unreadable("marker-size"); }
+        return result;
     }
 
     static void prepareCollections(ClientSession session, MongoDatabase database) {
@@ -112,13 +128,28 @@ final class MongoAlertStorageSchema {
         Document schema = SystemCollections.SCHEMA_MIGRATIONS.on(reads).find(session, new Document("_id", "config")).first();
         if (schema == null || !(schema.get("installedVersion") instanceof Integer installed)
                 || installed < 1 || installed > MongoConfigurationDomain.SCHEMA_VERSION) { throw unreadable("config-version"); }
-        if (!schema.containsKey(FIELD)) { return null; }
-        if (!(schema.get(FIELD) instanceof Document value) || !value.keySet().equals(MARKER_FIELDS)
-                || !Integer.valueOf(VERSION).equals(value.get("installedVersion"))
+        Document counter = SystemCollections.CONFIGURATION_VERSION.on(reads)
+                .find(session, new Document("_id", ConfigurationVersion.ID)).first();
+        return verifyAuthorityState(schema, counter, clusterId, keyId);
+    }
+
+    /** Load-only validation also runs on ordinary CONFIG reopen; it never reenrolls missing facts. */
+    static Document verifyAuthorityState(Document schema, Document counter, String clusterId, String keyId) {
+        if (!schema.containsKey(FIELD)) { ConfigurationVersion.validateAlertState(counter, false); return null; }
+        if (!(schema.get(FIELD) instanceof Document value)
+                || !(value.get("installedVersion") instanceof Integer installed)
+                || installed != LEGACY_VERSION && installed != VERSION
+                || !value.keySet().equals(installed == LEGACY_VERSION ? LEGACY_FIELDS : MARKER_FIELDS)
                 || !clusterId.equals(value.get("clusterId")) || !keyId.equals(value.get("keyId"))
                 || !MongoConfigurationDomain.LAYOUT.equals(value.get("layoutId"))
                 || !(value.get("operationId") instanceof String operation)) { throw unreadable("feature-version"); }
         requireStoredOperation(operation);
+        if (installed == VERSION) {
+            if (!(value.get("authorityPreparationOperationId") instanceof String authority)) { throw unreadable("authority-operation"); }
+            requireStoredOperation(authority);
+        }
+        ConfigurationVersion.validateAlertState(counter, installed == VERSION);
+        if (MongoAlertConfigurationCodec.size(value) > 2048) { throw unreadable("marker-size"); }
         return value;
     }
 

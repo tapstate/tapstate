@@ -37,6 +37,8 @@ class MongoAlertReceiverStoreIT {
             }
             SystemCollections.SCHEMA_MIGRATIONS.on(f.database).updateOne(new Document("_id", "config"),
                     new Document("$unset", new Document("alerting", "")));
+            SystemCollections.CONFIGURATION_VERSION.on(f.database).updateOne(new Document("_id", ConfigurationVersion.ID),
+                    new Document("$unset", new Document(ConfigurationVersion.ALERT_FENCE, "")));
             try (var reopened = MongoConfigurationDomain.openExisting(f.settings); var input = material(PASSWORD)) {
                 assertThat(reopened.alertSchemaVersion()).isZero();
                 assertThatThrownBy(() -> {

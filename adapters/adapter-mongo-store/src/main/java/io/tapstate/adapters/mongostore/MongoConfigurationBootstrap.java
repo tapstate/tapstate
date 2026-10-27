@@ -102,7 +102,7 @@ public final class MongoConfigurationBootstrap {
                                             .append(MongoSourceIdentitySchema.FIELD, MongoSourceIdentitySchema.initial(
                                                     clusterId, SourceConfigCipher.fingerprint(key), operationId)));
                             SystemCollections.CONFIGURATION_VERSION.on(database).insertOne(session,
-                                    new Document("_id", ConfigurationVersion.ID).append("revision", 0L));
+                                    ConfigurationVersion.initial());
                             return null;
                         }, TRANSACTION);
                         break;

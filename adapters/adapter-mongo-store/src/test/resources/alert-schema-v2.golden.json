@@ -1,0 +1,8 @@
+{
+  "installedVersion": 2,
+  "clusterId": "cluster-a",
+  "layoutId": "three-layer-v1",
+  "keyId": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "operationId": "schema-op-a",
+  "authorityPreparationOperationId": "schema-op-a"
+}

@@ -192,7 +192,7 @@ class MongoAlertConfigurationStoreIT {
             var database = client.getDatabase("alert_configuration_" + UUID.randomUUID().toString().replace("-", ""));
             var settings = new MongoConnectionSettings(MONGO.getReplicaSetUrl(database.getName()), null, Duration.ofSeconds(5));
             try (var domain = MongoConfigurationBootstrap.prepare(settings, SCOPE.clusterId(), "installation-a", "setup-a", 1)) {
-                assertThat(domain.alertSchemaVersion()).isEqualTo(1);
+                assertThat(domain.alertSchemaVersion()).isEqualTo(MongoAlertStorageSchema.VERSION);
                 action.accept(new Fixture(client, database, new MongoAlertConfigurationStore(database, SCOPE, BuiltinAlarmTypes.catalog(), () -> {})));
             } finally { database.drop(); }
         }

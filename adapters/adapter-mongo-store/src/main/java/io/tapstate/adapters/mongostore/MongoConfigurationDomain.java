@@ -53,15 +53,14 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         this.connection = connection;
         this.clusterId = clusterId;
         MongoDatabase database = connection.database();
-        Document identity = StoreIo.call(() -> durable(SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database))
-                .find(new Document("_id", "cluster")).first());
+        OpeningFacts facts = openingFacts(connection.client(), database);
+        Document identity = facts.identity();
         if (identity == null || !clusterId.equals(identity.get("clusterId"))
                 || !LAYOUT.equals(identity.get("layoutId"))
                 || !(identity.get("bindingVersion") instanceof Long binding) || binding < 0) {
             throw unreadable("cluster", "identity");
         }
-        Document schema = StoreIo.call(() -> durable(SystemCollections.SCHEMA_MIGRATIONS.on(database))
-                .find(new Document("_id", "config")).first());
+        Document schema = facts.schema();
         if (schema == null || !(schema.get("installedVersion") instanceof Integer installed) || installed < 1) {
             throw unreadable("config", "installedVersion");
         }
@@ -70,13 +69,13 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                     Map.of("installed", String.valueOf(installed), "supported", String.valueOf(SCHEMA_VERSION)), null);
         }
         this.installedSchemaVersion = installed;
-        Document version = StoreIo.call(() -> durable(SystemCollections.CONFIGURATION_VERSION.on(database))
-                .find(new Document("_id", ConfigurationVersion.ID)).first());
+        Document version = facts.version();
         if (version == null || !(version.get("revision") instanceof Long revision)
                 || revision < 0 || revision == Long.MAX_VALUE) {
             throw unreadable(ConfigurationVersion.ID, "revision");
         }
-        PersistentKey key = new PersistentKey(database, clusterId);
+        PersistentKey key = new PersistentKey(database, clusterId, facts.key());
+        MongoAlertStorageSchema.verifyAuthorityState(schema, version, clusterId, key.current().activeKeyId());
         this.configurationKey = key;
         this.artifacts = new MongoConfigurationArtifactStore(connection.client(), database, key);
         this.requiredNotes = new MongoRequiredNoteStore(connection.client(), database, key);
@@ -96,6 +95,16 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         this.drafts = new MongoConfigurationDraftStore(connection.client(), database, key, artifacts);
         drafts.verify();
         new MongoRequiredDeadLetterStore(connection.client(), database, clusterId).verify();
+    }
+
+    record OpeningFacts(Document identity, Document schema, Document version, Document key) { }
+
+    static OpeningFacts openingFacts(com.mongodb.client.MongoClient client, MongoDatabase database) {
+        return new MongoReadBudget(java.time.Duration.ofSeconds(5)).transaction(client, session -> new OpeningFacts(
+                SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database).find(session, new Document("_id", "cluster")).first(),
+                SystemCollections.SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "config")).first(),
+                SystemCollections.CONFIGURATION_VERSION.on(database).find(session, new Document("_id", ConfigurationVersion.ID)).first(),
+                SystemCollections.CLUSTER_KEYS.on(database).find(session, new Document("_id", "cluster")).first()));
     }
 
     /** The caller supplies the trusted Cluster identity from its deployment or installation context. */
@@ -513,10 +522,10 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         private final String clusterId;
         private final SourceConfigCipher cipher;
 
-        private PersistentKey(MongoDatabase database, String clusterId) {
+        private PersistentKey(MongoDatabase database, String clusterId, Document original) {
             this.keys = durable(SystemCollections.CLUSTER_KEYS.on(database));
             this.clusterId = clusterId;
-            this.cipher = StoreIo.call(() -> decode(keys.find(new Document("_id", "cluster")).first()));
+            this.cipher = decode(original);
         }
 
         @Override
