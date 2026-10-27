@@ -51,15 +51,17 @@ class MongoCloudSessionStoreTest {
         assertThat(legacy.clusterContext().clusterId()).isEqualTo("cluster-one");
         assertThat(legacy.secretHash()).isEqualTo(session.secretHash());
 
+        storedContext.put("userEmail", "   ");
         storedContext.put("ec2PublicIp", "");
         storedContext.put("egressAddressStatus", "   ");
         var blankOptionalFields = MongoCloudSessionStore.toRecord(document).orElseThrow();
+        assertThat(blankOptionalFields.clusterContext().userEmail()).isNull();
         assertThat(blankOptionalFields.clusterContext().ec2PublicIp()).isNull();
         assertThat(blankOptionalFields.clusterContext().egressAddressStatus()).isNull();
     }
 
     @Test
-    void onlyMinimalLoginFactsAndTheCookieHashRoundTrip() {
+    void loginWithoutContextStoresNoEmailOrRawCredentials() {
         CloudSessionRecord record = record();
         Document raw = MongoCloudSessionStore.toDocument(record);
 

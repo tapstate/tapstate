@@ -53,7 +53,7 @@ class CloudClusterContextCarriesTheCurrentEgressAddressIT {
             new CloudSessionIdentity(CLOUD_URL, ORGANIZATION, CLUSTER);
     private static final CloudSessionContext LOGIN_CONTEXT = new CloudSessionContext(
             ORGANIZATION, CLUSTER, "Workspace organization", "Workspace cluster", "workspace-region",
-            "198.51.100.1", "DYNAMIC", "user@example.test");
+            "198.51.100.1", "DYNAMIC", "untrusted@example.test");
     private static final CloudClusterEgressAddress CURRENT_ADDRESS = new CloudClusterEgressAddress(
             ORGANIZATION, CLUSTER, "203.0.113.42", "STABLE");
     private static final CloudSessionContext LOGIN_CONTEXT_WITHOUT_ADDRESS = new CloudSessionContext(

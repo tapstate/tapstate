@@ -225,6 +225,16 @@ class CloudAuthenticationServiceTest {
     }
 
     @Test
+    void sessionCreationStoresOnlyVerifiedEmailEvenForDirectCallers() {
+        CloudSessionContext context = new CloudSessionContext("org-a", "cluster-a", "Organization", "Cluster",
+                "us-east-1", null, null, "untrusted@example.test");
+        CloudLoginIdentity identity = new CloudLoginIdentity(DEPLOYMENT, "stable-user-a", "org-a", "cluster-a",
+                "jti-direct", Scope.WRITE, NOW.plusSeconds(900), "verified@example.test");
+        String cookie = sessions.create(identity, context).orElseThrow().token();
+        assertThat(sessions.clusterContext(cookie).orElseThrow().userEmail()).isEqualTo("verified@example.test");
+    }
+
+    @Test
     void aRejectedOnlineValidationNeverCreatesALocalSession() {
         CloudAuthenticationService authentication = new CloudAuthenticationService((code, cluster) -> "jwt",
                 (jwt, target, audience) -> Optional.empty(), sessions);

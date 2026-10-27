@@ -2,7 +2,7 @@ package io.tapstate.spi.store;
 
 import java.util.Objects;
 
-/** Display context returned by a verified Cloud code exchange and bound to one local session. */
+/** Display context bound to one local session; email is supplied by the verified login identity. */
 public record CloudSessionContext(
         String organizationId, String clusterId, String organizationName, String clusterName, String region,
         String ec2PublicIp, String egressAddressStatus, String userEmail) {

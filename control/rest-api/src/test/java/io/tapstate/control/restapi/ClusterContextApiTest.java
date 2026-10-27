@@ -80,7 +80,7 @@ class ClusterContextApiTest {
             assertThat(body.get("organizationName")).isEqualTo(DISPLAY.organizationName());
             assertThat(body.get("clusterName")).isEqualTo(DISPLAY.clusterName());
             assertThat(body.get("region")).isEqualTo(DISPLAY.region());
-            assertThat(body).containsEntry("userEmail", includeEgress ? "user@example.test" : null);
+            assertThat(body).containsEntry("userEmail", "user@example.test");
             if (includeEgress) {
                 assertThat(body).containsEntry("ec2PublicIp", CURRENT_ADDRESS.ec2PublicIp());
                 assertThat(body).containsEntry("egressAddressStatus", CURRENT_ADDRESS.egressAddressStatus());
@@ -134,7 +134,7 @@ class ClusterContextApiTest {
             };
             CloudSessionContext sessionContext = includeEgress ? DISPLAY : new CloudSessionContext(
                     DISPLAY.organizationId(), DISPLAY.clusterId(), DISPLAY.organizationName(), DISPLAY.clusterName(),
-                    DISPLAY.region());
+                    DISPLAY.region(), null, null, DISPLAY.userEmail());
             CloudSessionService sessions = new CloudSessionService(
                     new ContextStore(sessionContext), IDENTITY, secrets, Clock.fixed(NOW, ZoneOffset.UTC));
             CloudClusterEgressAddressProvider addressProvider = includeEgress
