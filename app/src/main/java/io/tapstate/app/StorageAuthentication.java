@@ -110,7 +110,8 @@ final class StorageAuthentication implements AutoCloseable {
                 verified = authenticated.map(AuthenticatedCloudSession::identity);
                 organization = authenticated.map(value -> value.clusterContext().organizationId());
             } catch (TapstateException failure) {
-                if (failure.code() == IoError.CACHE_AUTH_FENCED) throw StorageRuntime.unavailable();
+                if (failure.code() == IoError.CACHE_AUTH_FENCED || failure.code() == IoError.STORE_UNAVAILABLE)
+                    throw StorageRuntime.unavailable();
                 throw failure;
             }
             original.requireLocallyActive();
