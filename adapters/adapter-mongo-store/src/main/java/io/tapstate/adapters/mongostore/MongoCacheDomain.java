@@ -247,6 +247,11 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         return new MongoCacheBusinessPreparation(client, database, original, rateRetention, active).prepare();
     }
 
+    MongoValidationCachePreparations validationPreparations(CacheBusinessScope expected) {
+        loadBusinessScope(expected);
+        return new MongoValidationCachePreparations(client, database, expected, targetFingerprint, this::businessActive);
+    }
+
     /** The claims share this exact cache client, original scope and owner lifecycle. */
     public WorkloadClaimStore workloadClaims(CacheBusinessScope expected) {
         loadBusinessScope(expected);

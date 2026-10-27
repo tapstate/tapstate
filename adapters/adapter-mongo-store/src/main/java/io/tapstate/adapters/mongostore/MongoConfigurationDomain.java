@@ -420,6 +420,11 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         return new MongoConfigurationImportStore(connection.client(),connection.database(),clusterId,bindings,artifacts,this::requireOpen);
     }
 
+    MongoValidationPreparations validationPreparations() {
+        requireOpen();
+        return new MongoValidationPreparations(connection.client(), connection.database(), clusterId, bindings, artifacts, this::requireOpen);
+    }
+
     public PipelineDraftStore drafts() { return drafts; }
 
     public io.tapstate.spi.store.RequiredDeadLetterStore requiredDeadLetters() {
