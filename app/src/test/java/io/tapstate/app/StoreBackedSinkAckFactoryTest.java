@@ -64,6 +64,60 @@ class StoreBackedSinkAckFactoryTest {
     private static final String OTHER_WRITER = "serve.t#0";
 
     @Test
+    void logsOnlyConfirmedSnapshotAndBoundedCdcProgressWithPipelineAttribution() {
+        InMemorySrsMetaStore backing = new InMemorySrsMetaStore();
+        backing.create("mc-orders", null);
+        backing.setCdcStart("mc-orders", "pipe-1", "private-offset", 1L);
+        SrsMetaStore store = mock(SrsMetaStore.class, AdditionalAnswers.delegatesTo(backing));
+        AtomicBoolean refuse = new AtomicBoolean(true);
+        doAnswer(invocation -> !refuse.getAndSet(false) && (boolean) invokeOn(backing, invocation))
+                .when(store).markSnapshotComplete(anyString(), anyString(), anyString(), any(WorkloadClaimFence.class));
+        WorkloadClaimFence fence = new WorkloadClaimFence(
+                new WorkloadClaimKey("cluster", WorkloadClaimType.PIPELINE_ACTUATION, "pipe-1"),
+                new WorkloadOwner("node-a", "boot-a"), 1, 1, 0);
+        SinkAck ack = soleWriter(memberWith(store), Map.of("orders", "mc-orders"), "pipe-1");
+        var logger = (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(StoreBackedSinkAckFactory.class);
+        var written = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>() {
+            @Override
+            protected void append(ch.qos.logback.classic.spi.ILoggingEvent event) {
+                event.prepareForDeferredProcessing();
+                super.append(event);
+            }
+        };
+        written.start();
+        logger.addAppender(written);
+        String key = PipelineLogAppender.PIPELINE_ID_MDC_KEY;
+        String previous = org.slf4j.MDC.get(key);
+        org.slf4j.MDC.put(key, "outer-pipeline");
+        try {
+            ChainPosition snapshot = new ChainPosition(SourceOrder.snapshotRow(1), null);
+            ack.advance("orders", snapshot, fence);
+            assertThat(written.list).isEmpty();
+            ack.advance("orders", snapshot, fence);
+            ack.advance("orders", snapshot, fence);
+            assertThat(written.list).extracting(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage)
+                    .containsExactly("Snapshot finished for table orders (target writes confirmed)");
+            for (int i = 1; i <= 100; i++) {
+                ack.advance("orders", at(i, "private-offset-" + i), fence);
+            }
+            assertThat(written.list).hasSize(4);
+            assertThat(written.list.get(1).getFormattedMessage()).contains("epoch 1, seq 1; 1 updates");
+            assertThat(written.list.get(2).getFormattedMessage()).contains("epoch 1, seq 10; 10 updates");
+            assertThat(written.list.get(3).getFormattedMessage()).contains("epoch 1, seq 100; 100 updates");
+            assertThat(written.list).allSatisfy(event -> {
+                assertThat(event.getFormattedMessage()).doesNotContain("private-offset");
+                assertThat(event.getMDCPropertyMap()).containsEntry(key, "pipe-1");
+            });
+            assertThat(org.slf4j.MDC.get(key)).isEqualTo("outer-pipeline");
+        } finally {
+            if (previous == null) org.slf4j.MDC.remove(key);
+            else org.slf4j.MDC.put(key, previous);
+            logger.detachAppender(written);
+            written.stop();
+        }
+    }
+
+    @Test
     void qualifiedStreamsKeepIndependentProgressUnderTheirPhysicalTableNames() {
         InMemorySrsMetaStore store = new InMemorySrsMetaStore();
         store.create("mc-left", null);

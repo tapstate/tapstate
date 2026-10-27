@@ -24,6 +24,13 @@ public final class MongoUriUserInfo {
         return uri.substring(0, userInfo.start()) + REDACTED + uri.substring(userInfo.end());
     }
 
+    /** Log spans can contain diagnostic at-signs after the authority; preserve that text verbatim. */
+    static String redactAuthority(String text) {
+        UserInfo userInfo = find(text);
+        return userInfo == null ? text
+                : text.substring(0, userInfo.start()) + REDACTED + text.substring(userInfo.end());
+    }
+
     /** Whether a request is carrying the display marker in place of connection credentials. */
     public static boolean isRedactedDisplay(String uri) {
         Objects.requireNonNull(uri, "uri");

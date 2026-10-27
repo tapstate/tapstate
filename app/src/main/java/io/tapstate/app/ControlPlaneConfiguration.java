@@ -830,7 +830,8 @@ class ControlPlaneConfiguration {
 
     @Bean
     SecretRedactor secretRedactor() {
-        return new SecretRedactor();
+        return RedactingLogConverter.redactor(
+                (ch.qos.logback.classic.LoggerContext) org.slf4j.LoggerFactory.getILoggerFactory());
     }
 
     @Bean

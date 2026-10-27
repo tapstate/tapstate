@@ -629,6 +629,8 @@ class CloudExternalConfigStartupIT {
         if (entry == Entry.MIGRATE) command.addAll(List.of("migrate", "--list"));
         command.addAll(List.of("--server.address=127.0.0.1", "--server.port=0",
                 "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2",
+                // The handshake gate waits for the driver's INFO server-selection diagnostic.
+                "--logging.level.org.mongodb.driver.cluster=INFO",
                 "--tapstate.connectors.plugins-dir=" + work.resolve("plugins"),
                 "--tapstate.store.mongo.uri=" + onPremUri,
                 "--tapstate.store.mongo.operator-state-database=" + operatorDatabase));
