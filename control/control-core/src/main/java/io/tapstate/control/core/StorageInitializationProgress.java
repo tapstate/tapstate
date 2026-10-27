@@ -53,13 +53,21 @@ public final class StorageInitializationProgress {
 
     /** Completed prefixes must come from the original durable binding/setup phase, never a browser hint. */
     public synchronized void begin(StorageSetupScope original, int completedPrefix, boolean restored) {
+        begin(original, completedPrefix, restored, Map.of());
+    }
+
+    /** Seed display evidence only after the original candidate's current test stamps have been verified. */
+    public synchronized void begin(StorageSetupScope original, int completedPrefix, boolean restored,
+            Map<StorageSetupService.Layer, Instant> verifiedChecks) {
         Objects.requireNonNull(original);
+        verifiedChecks = Map.copyOf(verifiedChecks);
         if (completedPrefix < 0 || completedPrefix > 2) throw new IllegalArgumentException("invalid initialization prefix");
         boolean same = original.equals(scope);
         if (same && (state == State.RUNNING || state == State.COMPLETE)) return;
         long now = ticker.getAsLong();
         if (!same) started = now;
         if (!same || completedPrefix == 0) checks.clear();
+        checks.putAll(verifiedChecks);
         var previous = new EnumMap<>(timings);
         timings.clear();
         for (Stage stage : Stage.values()) {

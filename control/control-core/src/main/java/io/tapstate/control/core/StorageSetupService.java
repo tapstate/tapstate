@@ -61,7 +61,7 @@ public final class StorageSetupService {
     public record Status(StorageBinding.Mode mode, String clusterId, String operationId, long generation,
             StorageSetupStateStore.Phase setupPhase, long bindingVersion) {}
     private record Prepared(Candidate candidate, SourceResource target, ConnectorIdentity connector, String hash) {}
-    private record Tested(StorageSetupScope scope, String hash, String token, Instant expiresAt) {}
+    private record Tested(StorageSetupScope scope, String hash, String token, Instant checkedAt, Instant expiresAt) {}
 
     private final StorageBinding.Mode mode;
     private final StorageBindingStore bindings;
@@ -140,8 +140,9 @@ public final class StorageSetupService {
         if (!prepared.connector().equals(target.identity(prepared.candidate().master()))) throw testsRequired();
         if (tests.values().stream().anyMatch(test -> !test.scope().equals(expected) || !test.hash().equals(prepared.hash()))) tests.clear();
         String stamp = UUID.randomUUID().toString();
-        Instant expires = clock.instant().plus(TEST_LIFETIME);
-        tests.put(layer, new Tested(expected, prepared.hash(), stamp, expires));
+        Instant checkedAt = clock.instant();
+        Instant expires = checkedAt.plus(TEST_LIFETIME);
+        tests.put(layer, new Tested(expected, prepared.hash(), stamp, checkedAt, expires));
         return new TestResult(layer, stamp, expires, layer == Layer.MASTER
                 ? List.of("transactional-crud", "index-permissions", "registered-connector")
                 : List.of("transactional-crud", "index-permissions"));
@@ -172,10 +173,15 @@ public final class StorageSetupService {
         requireInstalledConfiguration(prepared.candidate().configuration());
         var guarded = bindings.guardedBy(active);
         Optional<StorageBinding> previous = guarded.load();
-        if (progress != null) progress.begin(expected, previous.isPresent() ? 1 : 0, false);
+        if (progress != null && previous.isPresent()) progress.begin(expected, 1, false);
         if (previous.isEmpty()) {
             requireSetup(expected, active);
             requireTests(expected, prepared, stamps);
+            if (progress != null) {
+                var verifiedChecks = new EnumMap<Layer, Instant>(Layer.class);
+                for (Layer layer : Layer.values()) verifiedChecks.put(layer, tests.get(layer).checkedAt());
+                progress.begin(expected, 0, false, verifiedChecks);
+            }
             for (Layer layer : Layer.values()) {
                 try {
                     probe.test(prepared.candidate().connection(layer));
