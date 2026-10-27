@@ -9,8 +9,12 @@ final class AuthWire {
     static final String LOGIN_PATH = "/auth/login";
     static final String SESSION_PATH = "/auth/session";
     static final String LOGOUT_PATH = "/auth/logout";
+    // These paths are part of the browser authentication wire contract, not deployment configuration.
+    @SuppressWarnings("java:S1075")
     static final String BROWSER_LOGIN_PATH = "/auth/browser/login";
+    @SuppressWarnings("java:S1075")
     static final String BROWSER_SESSION_PATH = "/auth/browser/session";
+    @SuppressWarnings("java:S1075")
     static final String BROWSER_LOGOUT_PATH = "/auth/browser/logout";
     static final String DISCOVERY_PATH = "/.well-known/tapstate";
     static final int LOGOUT_SUCCESS_STATUS = 204;

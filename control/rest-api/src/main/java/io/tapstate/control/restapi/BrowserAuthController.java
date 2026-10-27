@@ -152,6 +152,8 @@ final class BrowserAuthController {
     }
 
     private static boolean isLoopback(String host) {
+        // Host is client-controlled: unlike the servlet peer address, it must never trigger DNS resolution.
+        // Accept only localhost or a numeric literal, even if another name resolves to loopback.
         return "localhost".equalsIgnoreCase(host) || isLoopbackAddress(host);
     }
 
