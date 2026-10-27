@@ -113,6 +113,10 @@ class StorageAuthenticationTest {
             assertThat(proof.storageScope()).contains(scope);
             verify(sessions, times(1)).authenticate(eq(identity), eq("jti"), anyString(), any(), any());
             verify(configuration, times(2)).requireAuthenticationPublished(eq(preparation), any(io.tapstate.adapters.mongostore.MongoReadBudget.class));
+            when(sessions.authenticate(eq(identity), eq("jti"), anyString(), any(), any()))
+                    .thenThrow(new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "timeout"), null));
+            assertThatThrownBy(proof.requireActive()::run).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE));
             when(sessions.authenticate(eq(identity), eq("jti"), anyString(), any(), any())).thenReturn(Optional.empty());
             doNothing().doThrow(StorageRuntime.unavailable()).when(configuration)
                     .requireAuthenticationPublished(eq(preparation), any(io.tapstate.adapters.mongostore.MongoReadBudget.class));
