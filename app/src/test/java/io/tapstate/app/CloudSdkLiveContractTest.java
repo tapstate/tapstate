@@ -365,6 +365,7 @@ class CloudSdkLiveContractTest {
                 String exchanged = result.jwt();
                 assertThat(bridge.validate(exchanged, deployment, audience)).hasValueSatisfying(login -> {
                     assertThat(login.userId()).isEqualTo("stable-user-one");
+                    assertThat(login.userEmail()).isEqualTo("user@example.test");
                     assertThat(login.jwtId()).isEqualTo("jwt-one");
                 });
                 assertThat(exchangeSecret.get()).isEqualTo(TOKEN);
