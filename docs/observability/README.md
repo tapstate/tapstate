@@ -34,14 +34,23 @@ pipeline. The history and explanation responses, including coded errors, carry
 
 The status response keeps `state` tied to runtime observation. Before the first observation, a known
 pipeline returns `state: "NEW"` and omits `observedState`, `observedAt`, and `observedAgeMillis`;
-`desiredState` carries the requested lifecycle target and `displayState` may say `STARTING`, `PAUSING`, or
-another in-progress presentation. When an observation exists, `state`, `observedState`, and `observedAt`
-come from the same catalog snapshot, and `observedAgeMillis` is calculated from that observation time. A
-saved draft also has a status response, with `displayState: "DRAFT"` and `hasArtifact: false`. The status
-watch sends observed state changes only. It stays open without frames while a known pipeline or saved draft
-has no observation, and closes an id that is not known with `lifecycle.unknown-pipeline`. Reads that need
-runtime data, such as metrics, snapshot, and explain, continue to return `monitor.no-observation` until the
-first observation is published.
+`desiredState` carries the requested lifecycle target and `displayState` carries the authoring-facing
+lifecycle projection. An applied artifact that has never been started reports `displayState: "NOT_STARTED"`;
+when a start or resume is in progress, it can report `STARTING` or `RESUMING`. When an observation exists,
+`state`, `observedState`, and `observedAt` come from the same observation, and `observedAgeMillis` is
+calculated from that observation time. A saved draft reports `displayState: "DRAFT"` and `hasArtifact: false`.
+
+A failure to read the desired lifecycle document is returned separately as `intentReadFailure`, with a coded
+`code`, named `params`, and rendered `message`. Any runtime observation already read remains available in
+`state`, `observedState`, and `observedAt`. If neither desired intent nor an observation can be read, the
+response omits `displayState`; clients should keep this read failure separate from the lifecycle label and
+should not infer a fallback state. A status read for a leftover runtime observation without a current draft or
+artifact reports `hasArtifact: false` and omits `displayState`.
+
+The status watch sends observed state changes only. It stays open without frames while a known pipeline or
+saved draft has no observation, and closes an id that is not known with `lifecycle.unknown-pipeline`. Reads
+that need runtime data, such as metrics, snapshot, and explain, continue to return `monitor.no-observation`
+until the first observation is published.
 
 The snapshot read shows progress for the pipeline's initial load. A replacement run keeps a table's
 confirmed progress even when it skips reading that table again. Once the target confirms the load,
