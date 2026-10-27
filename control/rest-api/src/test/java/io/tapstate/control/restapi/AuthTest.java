@@ -126,7 +126,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * The authentication and authorization matrix over the {@code /api} verb surface, exercised end to end
  * through a real embedded server (booted programmatically so the module stays on the reactor's JUnit
  * line). It proves Spring Security guards every verb, the two credential mechanisms both authenticate,
- * the grade check refuses an under-scoped caller, and the two pre-authentication entry points (login and
+ * the grade check refuses an under-scoped caller, and the pre-authentication entry points (login and
  * the zero-user bootstrap) live outside the guard and self-guard. The stores and the crypto are in-memory
  * fakes; the control-core services and the wiring are real.
  */
@@ -146,7 +146,10 @@ class AuthTest {
 
     @BeforeAll
     static void startServer() {
-        context = new SpringApplicationBuilder(TestApp.class).properties("server.port=0").run();
+        context = new SpringApplicationBuilder(TestApp.class)
+                .properties("server.port=0", "tapstate.browser-auth.trusted-proxies=127.0.0.1",
+                        "tapstate.browser-auth.public-origins=https://console.example,https://localhost",
+                        "tapstate.browser-auth.allow-insecure-loopback=true").run();
         port = ((WebServerApplicationContext) context).getWebServer().getPort();
     }
 
@@ -173,6 +176,199 @@ class AuthTest {
     /** Mints a machine token of the given grade through the real token service and returns the bearer string. */
     private String machineToken(Scope scope) {
         return context.getBean(TokenService.class).create(scope);
+    }
+
+    @Test
+    void browserSessionRestoresIndependentTabsWithoutExposingTheLongCredential() {
+        seedUser("alice", "s3cret", "admin");
+        String origin = "http://127.0.0.1:" + port;
+        ResponseEntity<String> login = client().post().uri(AuthWire.BROWSER_LOGIN_PATH)
+                .header("Origin", origin).header("X-Tapstate-Browser-Request", "1")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body("{\"username\":\"alice\",\"password\":\"s3cret\"}")
+                .retrieve().toEntity(String.class);
+        String cookie = login.getHeaders().getFirst(HttpHeaders.SET_COOKIE);
+        assertThat(cookie).contains("tapstate-op-session=tss_", "HttpOnly", "SameSite=Lax", "Path=/");
+        assertThat(login.getHeaders().getCacheControl()).isEqualTo("no-store");
+        assertThat(login.getBody()).contains("\"principal\":\"alice\"", "accessExpiresAt", "sessionId")
+                .doesNotContain("sessionToken", "tss_");
+        String credentialCookie = cookie.split(";", 2)[0];
+        for (int tab = 0; tab < 2; tab++) {
+            ResponseEntity<String> resumed = client().post().uri(AuthWire.BROWSER_SESSION_PATH)
+                    .header("Origin", origin).header("X-Tapstate-Browser-Request", "1")
+                    .header(HttpHeaders.COOKIE, credentialCookie).retrieve().toEntity(String.class);
+            assertThat(resumed.getBody()).contains("\"principal\":\"alice\"");
+            assertThat(resumed.getHeaders().getFirst(HttpHeaders.SET_COOKIE)).isNull();
+        }
+        assertThat((int) client().get().uri("/api/artifacts").header(HttpHeaders.COOKIE, credentialCookie)
+                .exchange((request, response) -> response.getStatusCode().value())).isEqualTo(401);
+        client().post().uri(AuthWire.BROWSER_LOGOUT_PATH).header("Origin", origin)
+                .header("X-Tapstate-Browser-Request", "1").header(HttpHeaders.COOKIE, credentialCookie)
+                .retrieve().toBodilessEntity();
+        assertThat((int) client().post().uri(AuthWire.BROWSER_SESSION_PATH).header("Origin", origin)
+                .header("X-Tapstate-Browser-Request", "1").header(HttpHeaders.COOKIE, credentialCookie)
+                .exchange((request, response) -> response.getStatusCode().value())).isEqualTo(401);
+    }
+
+    @Test
+    void trustedHttpsProxyRestoresThePublicOriginAndIssuesASecureCookie() {
+        seedUser("alice", "s3cret", "admin");
+        ResponseEntity<String> login = client().post().uri(AuthWire.BROWSER_LOGIN_PATH)
+                .header("Origin", "https://console.example")
+                .header("X-Tapstate-Browser-Request", "1")
+                .header("X-Forwarded-Proto", "https")
+                .header("X-Forwarded-Host", "console.example")
+                .header("X-Forwarded-Port", "443")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body("{\"username\":\"alice\",\"password\":\"s3cret\"}")
+                .exchange((request, response) -> new ResponseEntity<>(response.bodyTo(String.class),
+                        response.getHeaders(), response.getStatusCode()));
+
+        assertThat(login.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(login.getHeaders().getFirst(HttpHeaders.SET_COOKIE))
+                .contains("__Host-tapstate-op-session=tss_", "Secure", "HttpOnly", "Path=/");
+    }
+
+    @Test
+    void trustedProxyCannotAuthorizeAnUnlistedPublicOrigin() {
+        seedUser("alice", "s3cret", "admin");
+        ResponseEntity<String> login = client().post().uri(AuthWire.BROWSER_LOGIN_PATH)
+                .header("Origin", "https://internal.example").header("X-Tapstate-Browser-Request", "1")
+                .header("X-Forwarded-Proto", "https").header("X-Forwarded-Host", "internal.example")
+                .header("X-Forwarded-Port", "443").contentType(MediaType.APPLICATION_JSON)
+                .body("{\"username\":\"alice\",\"password\":\"s3cret\"}")
+                .exchange((request, response) -> new ResponseEntity<>("", response.getHeaders(), response.getStatusCode()));
+        assertThat(login.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(login.getHeaders().getFirst(HttpHeaders.SET_COOKIE)).isNull();
+    }
+
+    @Test
+    void trustedProxyRejectsMalformedForwardedAuthoritiesAndPorts() {
+        seedUser("alice", "s3cret", "admin");
+        for (String[] headers : List.of(
+                new String[] {"ftp", "console.example", "443"},
+                new String[] {"https", "user@console.example", "443"},
+                new String[] {"https", "console.example?query", "443"},
+                new String[] {"https", "console.example#fragment", "443"},
+                new String[] {"https", "console.example:8443", "443"},
+                new String[] {"https", "console.example", "not-a-port"})) {
+            ResponseEntity<String> login = client().post().uri(AuthWire.BROWSER_LOGIN_PATH)
+                    .header("Origin", "https://console.example").header("X-Tapstate-Browser-Request", "1")
+                    .header("X-Forwarded-Proto", headers[0]).header("X-Forwarded-Host", headers[1])
+                    .header("X-Forwarded-Port", headers[2]).contentType(MediaType.APPLICATION_JSON)
+                    .body("{\"username\":\"alice\",\"password\":\"s3cret\"}")
+                    .exchange((request, response) -> new ResponseEntity<>("", response.getHeaders(), response.getStatusCode()));
+            assertThat(login.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+            assertThat(login.getHeaders().getFirst(HttpHeaders.SET_COOKIE)).isNull();
+        }
+    }
+
+    @Test
+    void secureSessionIgnoresAnObsoleteLoopbackCookieAlias() {
+        seedUser("alice", "s3cret", "admin");
+        ResponseEntity<String> login = client().post().uri(AuthWire.BROWSER_LOGIN_PATH)
+                .header("Origin", "https://console.example").header("X-Tapstate-Browser-Request", "1")
+                .header("X-Forwarded-Proto", "https").header("X-Forwarded-Host", "console.example")
+                .header("X-Forwarded-Port", "443").contentType(MediaType.APPLICATION_JSON)
+                .body("{\"username\":\"alice\",\"password\":\"s3cret\"}")
+                .retrieve().toEntity(String.class);
+        String secureCookie = login.getHeaders().getFirst(HttpHeaders.SET_COOKIE).split(";", 2)[0];
+        ResponseEntity<String> resumed = client().post().uri(AuthWire.BROWSER_SESSION_PATH)
+                .header("Origin", "https://console.example").header("X-Tapstate-Browser-Request", "1")
+                .header("X-Forwarded-Proto", "https").header("X-Forwarded-Host", "console.example")
+                .header("X-Forwarded-Port", "443")
+                .header(HttpHeaders.COOKIE, secureCookie + "; tapstate-op-session=tss_old.secret")
+                .exchange((request, response) -> new ResponseEntity<>(response.bodyTo(String.class),
+                        response.getHeaders(), response.getStatusCode()));
+        assertThat(resumed.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(resumed.getBody()).contains("\"principal\":\"alice\"");
+        assertThat(resumed.getHeaders().getFirst(HttpHeaders.SET_COOKIE)).isNull();
+        ResponseEntity<String> logout = client().post().uri(AuthWire.BROWSER_LOGOUT_PATH)
+                .header("Origin", "https://console.example").header("X-Tapstate-Browser-Request", "1")
+                .header("X-Forwarded-Proto", "https").header("X-Forwarded-Host", "console.example")
+                .header("X-Forwarded-Port", "443")
+                .header(HttpHeaders.COOKIE, secureCookie + "; tapstate-op-session=tss_old.secret")
+                .exchange((request, response) -> new ResponseEntity<>("", response.getHeaders(), response.getStatusCode()));
+        assertThat(logout.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+    }
+
+    @Test
+    void browserLogoutDoesNotClearACookieForAnActiveSessionFromAnotherIssuer() {
+        seedUser("alice", "s3cret", "admin");
+        String origin = "http://127.0.0.1:" + port;
+        ResponseEntity<String> login = client().post().uri(AuthWire.BROWSER_LOGIN_PATH)
+                .header("Origin", origin).header("X-Tapstate-Browser-Request", "1")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body("{\"username\":\"alice\",\"password\":\"s3cret\"}")
+                .retrieve().toEntity(String.class);
+        String credentialCookie = login.getHeaders().getFirst(HttpHeaders.SET_COOKIE).split(";", 2)[0];
+        String session = credentialCookie.substring(credentialCookie.indexOf('=') + 1);
+        String sessionId = session.substring(4, session.indexOf('.'));
+        context.getBean(FakeSessionStore.class).replaceIssuer(sessionId, "urn:other-cluster");
+
+        ResponseEntity<String> logout = client().post().uri(AuthWire.BROWSER_LOGOUT_PATH)
+                .header("Origin", origin).header("X-Tapstate-Browser-Request", "1")
+                .header(HttpHeaders.COOKIE, credentialCookie)
+                .exchange((request, response) -> new ResponseEntity<>("", response.getHeaders(), response.getStatusCode()));
+
+        assertThat(logout.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+        assertThat(logout.getHeaders().getFirst(HttpHeaders.SET_COOKIE)).isNull();
+    }
+
+    @Test
+    void browserLogoutClearsACookieForAnExpiredMatchingSession() {
+        seedUser("alice", "s3cret", "admin");
+        String origin = "http://127.0.0.1:" + port;
+        ResponseEntity<String> login = client().post().uri(AuthWire.BROWSER_LOGIN_PATH)
+                .header("Origin", origin).header("X-Tapstate-Browser-Request", "1")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body("{\"username\":\"alice\",\"password\":\"s3cret\"}")
+                .retrieve().toEntity(String.class);
+        String credentialCookie = login.getHeaders().getFirst(HttpHeaders.SET_COOKIE).split(";", 2)[0];
+        String session = credentialCookie.substring(credentialCookie.indexOf('=') + 1);
+        String sessionId = session.substring(4, session.indexOf('.'));
+        context.getBean(FakeSessionStore.class).expire(sessionId);
+
+        ResponseEntity<String> logout = client().post().uri(AuthWire.BROWSER_LOGOUT_PATH)
+                .header("Origin", origin).header("X-Tapstate-Browser-Request", "1")
+                .header(HttpHeaders.COOKIE, credentialCookie)
+                .exchange((request, response) -> new ResponseEntity<>("", response.getHeaders(), response.getStatusCode()));
+
+        assertThat(logout.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(logout.getHeaders().getFirst(HttpHeaders.SET_COOKIE)).contains("Max-Age=0");
+    }
+
+    @Test
+    void secureLoginClearsAnEarlierLoopbackCookieAlias() {
+        seedUser("alice", "s3cret", "admin");
+        var request = new org.springframework.mock.web.MockHttpServletRequest("POST", AuthWire.BROWSER_LOGIN_PATH);
+        request.setSecure(true);
+        request.setScheme("https");
+        request.setServerName("localhost");
+        request.setServerPort(443);
+        request.addHeader("Origin", "https://localhost");
+        request.addHeader("X-Tapstate-Browser-Request", "1");
+        request.setCookies(new jakarta.servlet.http.Cookie("tapstate-op-session", "tss_old.secret"));
+        var response = context.getBean(BrowserAuthController.class).login(request, new LoginRequest("alice", "s3cret"));
+        assertThat(response.getHeaders().get(HttpHeaders.SET_COOKIE)).hasSize(2)
+                .anySatisfy(value -> assertThat(value).contains("tapstate-op-session=", "Max-Age=0"));
+    }
+
+    @Test
+    void browserAuthenticationRejectsCsrfAndNeverClearsCookiesOnExchangeFailure() {
+        for (String path : List.of(AuthWire.BROWSER_LOGIN_PATH, AuthWire.BROWSER_SESSION_PATH, AuthWire.BROWSER_LOGOUT_PATH)) {
+            for (String origin : List.of("null", "https://evil.example", "http://127.0.0.1:" + port + "/bad")) {
+                ResponseEntity<String> denied = client().post().uri(path)
+                        .header("Origin", origin).header("X-Tapstate-Browser-Request", "1")
+                        .contentType(MediaType.APPLICATION_JSON).body("{}")
+                        .exchange((request, response) -> new ResponseEntity<>("", response.getHeaders(), response.getStatusCode()));
+                assertThat(denied.getStatusCode().value()).isEqualTo(401);
+                assertThat(denied.getHeaders().getFirst(HttpHeaders.SET_COOKIE)).isNull();
+            }
+            assertThat((int) client().post().uri(path)
+                    .contentType(MediaType.APPLICATION_JSON).body("{}")
+                    .exchange((request, response) -> response.getStatusCode().value())).isEqualTo(401);
+        }
     }
 
     // ---- an unauthenticated caller cannot reach a verb ----
@@ -715,7 +911,7 @@ class AuthTest {
     void theOnlyEndpointsOutsideTheApiPrefixAreTheProbeAndThePreAuthEntryPoints() {
         // /api is the authenticated boundary (the API security chain guards /api/**). Everything reachable
         // anonymously must therefore be an intentional carve-out: the liveness probe, version and issuer
-        // discovery, the two pre-auth entry points, and the framework's own error endpoint (which renders only the
+        // discovery, the pre-authentication entry points, and the framework's own error endpoint (which renders only the
         // current request's error, no application data). A future plain @Controller added at the root would
         // escape both the verb-derivation gate and the interceptor — this pins the anonymous surface to
         // exactly that set.
@@ -724,6 +920,7 @@ class AuthTest {
                 "/version",
                 AuthWire.DISCOVERY_PATH,
                 "/auth/login",
+                AuthWire.BROWSER_LOGIN_PATH, AuthWire.BROWSER_SESSION_PATH, AuthWire.BROWSER_LOGOUT_PATH,
                 AuthWire.SESSION_PATH,
                 AuthWire.LOGOUT_PATH,
                 CloudAuthController.EXCHANGE_PATH,
@@ -1308,6 +1505,13 @@ class AuthTest {
                     record.idleExpiresAt(), record.absoluteExpiresAt()));
         }
 
+        synchronized void expire(String id) {
+            SessionRecord record = byId.get(id);
+            byId.put(id, new SessionRecord(record.sessionId(), record.secretHash(), record.principal(),
+                    record.scope(), record.issuer(), record.revoked(), record.createdAt(), record.lastUsedAt(),
+                    NOW.minusSeconds(1), record.absoluteExpiresAt()));
+        }
+
         @Override
         public synchronized void save(SessionRecord record) {
             byId.put(record.sessionId(), record);
@@ -1342,6 +1546,16 @@ class AuthTest {
             byId.put(sessionId, new SessionRecord(record.sessionId(), record.secretHash(), record.principal(),
                     record.scope(), record.issuer(), true, record.createdAt(), record.lastUsedAt(),
                     record.idleExpiresAt(), record.absoluteExpiresAt()));
+            return true;
+        }
+
+        @Override
+        public synchronized boolean revokeBrowserSession(String sessionId, String secretHash, String issuer) {
+            SessionRecord current = byId.get(sessionId);
+            if (current == null || !current.secretHash().equals(secretHash) || !current.issuer().equals(issuer)) return false;
+            byId.put(sessionId, new SessionRecord(current.sessionId(), current.secretHash(), current.principal(),
+                    current.scope(), current.issuer(), true, current.createdAt(), current.lastUsedAt(),
+                    current.idleExpiresAt(), current.absoluteExpiresAt()));
             return true;
         }
 
