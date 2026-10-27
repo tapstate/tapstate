@@ -440,6 +440,158 @@ class MongoValidationSchemaIT {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"complete", "schema-preparing", "schema-ready"})
+    void explicitClusterReplacementClosesOldRightsAndOnlyCompletesANewValidationScope(String interruption) {
+        try (var f = new Fixture(1)) {
+            f.configuration.bindings().complete(new StorageSetupScope("cluster", "installation", "setup", 1));
+            f.configuration.firstAdmin().create(f.configuration.firstAdmin().load().orElseThrow().scope(), new User("admin", "fixture-hash", "admin"));
+            var started = f.startValidation(1, true); var run = started.runs().getFirst();
+            var preparations = f.configuration.validationPreparations(); var original = preparations.issue("flow0", f.scope);
+            var old = preparations.read("flow0"); var admissions = f.configuration.validationAdmissions(original);
+            f.cacheDb.drop();
+            try (var target = MongoCacheDomain.connect(f.endpoint, Duration.ofSeconds(5), "validation-explicit-recovery")) {
+                var auth = f.configuration.prepareAuthenticationRecovery(target, () -> {});
+                assertThat(auth.businessScope()).isNotEqualTo(f.scope);
+                assertThat(preparations.read("flow0")).isEqualTo(old);
+                assertThatThrownBy(() -> admissions.open(run.admission())).isInstanceOf(TapstateException.class);
+                var hashes = new TreeMap<String, String>();
+                f.configuration.artifacts().list().forEach(resource -> hashes.put(resource.id(), io.tapstate.core.model.canonical.CanonicalHash.of(resource)));
+                var manifest = new StorageRecoveryCommands.Manifest(new StorageRecoveryCommands.Selection(StorageRecoveryCommands.Extent.CLUSTER, Set.of()),
+                        Set.of("flow0"), hashes, CacheRecoveryStore.clusterDependencyHash(auth.authScope(), f.configuration.cacheRecoveries().inspectCluster(auth.authScope())),
+                        f.configuration.configurationRevision());
+                var commands = f.configuration.recoveryCommands(); var confirmed = commands.confirm(commands.plan(auth.authScope(), manifest, null, null));
+                f.configuration.cacheRecoveries().stageCluster(confirmed);
+                var running = commands.current(auth.authScope()).orElseThrow();
+                assertThat(preparations.read("flow0").closingOperationId()).isEqualTo(UUID.fromString(running.operationId()));
+                assertThatThrownBy(() -> commands.complete(running)).isInstanceOf(TapstateException.class);
+                if (!interruption.equals("complete")) {
+                    target.prepareConfirmedInitialBusiness(new CachePreparation(running.operationId(), auth.authScope()), () -> {});
+                    if (interruption.equals("schema-preparing")) {
+                        new MongoCacheIdentity(f.cacheClient, f.cacheDb, auth.authScope())
+                                .beginValidationSchema(auth.businessScope(), running.operationId(), () -> {});
+                        assertThat(f.cacheSchema().get("validation", Document.class)).containsEntry("phase", "PREPARING");
+                    } else target.prepareValidationSchema(new CachePreparation(running.operationId(), auth.authScope()), running.operationId());
+                    try (var reopened = MongoConfigurationDomain.open(f.settings, "cluster");
+                            var resumedCache = MongoCacheDomain.connect(f.endpoint, Duration.ofSeconds(5), "validation-recovery-resume")) {
+                        assertThatCode(() -> reopened.prepareStoppedRecovery(resumedCache, running, () -> {})).doesNotThrowAnyException();
+                    }
+                } else f.configuration.prepareStoppedRecovery(target, running, () -> {});
+                assertThat(SystemCollections.VALIDATION_TASKS.on(f.configDb).find().first()).containsEntry("closed", true);
+                assertThat(SystemCollections.VALIDATION_REPORTS.on(f.configDb).find().first()).containsEntry("closed", true);
+                assertThatThrownBy(() -> preparations.issue("flow0", auth.businessScope())).isInstanceOf(TapstateException.class);
+                assertThat(commands.complete(running).phase()).isEqualTo(StorageRecoveryCommands.Phase.COMPLETE);
+                var replacement = preparations.read("flow0");
+                assertThat(replacement.phase()).isEqualTo(MongoValidationPreparationFacts.Phase.UNASSIGNED);
+                assertThat(replacement.generation()).isNotEqualTo(old.generation());
+                assertThat(replacement.previous()).isNull();
+                assertThat(SystemCollections.VALIDATION_RUNS.on(f.cacheDb).countDocuments()).isZero();
+                assertThat(f.configuration.preparations().read("flow0").orElseThrow().phase()).isEqualTo(PipelinePreparation.Phase.UNASSIGNED);
+                assertThatThrownBy(() -> original.requireComplete()).isInstanceOf(TapstateException.class);
+                var next = preparations.issue("flow0", auth.businessScope());
+                var node = target.workloadClaims(auth.businessScope()).acquire(f.nodeKey(), f.nodeOwner(), 1, TTL).claim();
+                preparations.complete(next, target.validationPreparations(auth.businessScope()).prepare(next, WorkloadClaimFence.from(node)));
+                assertThat(preparations.read("flow0").phase()).isEqualTo(MongoValidationPreparationFacts.Phase.COMPLETE);
+                assertThat(commands.complete(running).phase()).isEqualTo(StorageRecoveryCommands.Phase.COMPLETE);
+                assertThat(preparations.read("flow0").generation()).isEqualTo(replacement.generation());
+            }
+        }
+    }
+
+    @Test void emptyInitialCloudRecoveryPreparesTheNewValidationSchemaBeforeCompletion() {
+        try (var f = new Fixture(0, StorageBinding.Mode.CLOUD)) {
+            f.upgrade(); f.cacheDb.drop();
+            try (var target = MongoCacheDomain.connect(f.endpoint, Duration.ofSeconds(5), "validation-empty-cloud-recovery")) {
+                var auth = f.configuration.prepareAuthenticationRecovery(target, () -> {});
+                var source = f.configuration.initialCloudRecoverySource(auth.authScope());
+                var manifest = new StorageRecoveryCommands.Manifest(new StorageRecoveryCommands.Selection(StorageRecoveryCommands.Extent.CLUSTER, Set.of()),
+                        Set.of(), Map.of(source.id(), io.tapstate.core.model.canonical.CanonicalHash.of(source)),
+                        CacheRecoveryStore.clusterDependencyHash(auth.authScope(), List.of()), f.configuration.configurationRevision());
+                var commands = f.configuration.recoveryCommands(); var running = commands.start(commands.confirm(commands.plan(auth.authScope(), manifest, null, null)));
+                f.configuration.prepareInitialCloudRecovery(target, running, () -> {});
+                assertThatCode(() -> commands.complete(running)).doesNotThrowAnyException();
+                assertThat(MongoValidationSchema.scope(f.configSchema().get("validation", Document.class))).isEqualTo(auth.businessScope());
+                assertThat(f.cacheSchema().getInteger("installedVersion")).isEqualTo(2);
+                assertThat(SystemCollections.VALIDATION_RUNS.on(f.cacheDb).countDocuments()).isZero();
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void aSecondCacheLossRequiresItsOwnConfirmedReplacementAndCannotCompleteTheOldOne(boolean prepared) {
+        try (var f = new Fixture(1)) {
+            f.configuration.bindings().complete(new StorageSetupScope("cluster", "installation", "setup", 1));
+            f.configuration.firstAdmin().create(f.configuration.firstAdmin().load().orElseThrow().scope(), new User("admin", "fixture-hash", "admin"));
+            var started = f.startValidation(1, true); var oldGeneration = f.configuration.validationPreparations().read("flow0").generation();
+            f.cacheDb.drop();
+            try (var firstCache = MongoCacheDomain.connect(f.endpoint, Duration.ofSeconds(5), "validation-first-loss")) {
+                var firstAuth = f.configuration.prepareAuthenticationRecovery(firstCache, () -> {});
+                var commands = f.configuration.recoveryCommands();
+                var first = commands.confirm(commands.plan(firstAuth.authScope(), f.recoveryManifest(firstAuth.authScope()), null, null));
+                f.configuration.cacheRecoveries().stageCluster(first); first = commands.current(firstAuth.authScope()).orElseThrow();
+                if (prepared) f.configuration.prepareStoppedRecovery(firstCache, first, () -> {});
+                f.cacheDb.drop();
+                try (var nextCache = MongoCacheDomain.connect(f.endpoint, Duration.ofSeconds(5), "validation-second-loss")) {
+                    var nextAuth = f.configuration.prepareAuthenticationRecovery(nextCache, () -> {}); var obsolete = first;
+                    var next = commands.confirm(commands.plan(nextAuth.authScope(), f.recoveryManifest(nextAuth.authScope()), null, first.operationId()));
+                    f.configuration.cacheRecoveries().stageCluster(next); next = commands.current(nextAuth.authScope()).orElseThrow();
+                    var before = SystemCollections.OPERATOR_GENERATIONS.on(f.configDb).find().first();
+                    assertThatThrownBy(() -> commands.complete(obsolete)).isInstanceOf(TapstateException.class);
+                    assertThat(SystemCollections.OPERATOR_GENERATIONS.on(f.configDb).find().first()).isEqualTo(before);
+                    f.configuration.prepareStoppedRecovery(nextCache, next, () -> {}); commands.complete(next);
+                    var current = f.configuration.validationPreparations().read("flow0");
+                    assertThat(current.phase()).isEqualTo(MongoValidationPreparationFacts.Phase.UNASSIGNED);
+                    assertThat(current.generation()).isNotEqualTo(oldGeneration); assertThat(current.previous()).isNull();
+                    assertThat(SystemCollections.VALIDATION_REPORTS.on(f.configDb).find().first()).containsEntry("closed", true);
+                    var permission = f.configuration.validationPreparations().issue("flow0", nextAuth.businessScope());
+                    var node = nextCache.workloadClaims(nextAuth.businessScope()).acquire(f.nodeKey(), f.nodeOwner(), 1, TTL).claim();
+                    f.configuration.validationPreparations().complete(permission, nextCache.validationPreparations(nextAuth.businessScope()).prepare(permission, WorkloadClaimFence.from(node)));
+                    assertThat(SystemCollections.VALIDATION_RUNS.on(f.cacheDb).countDocuments(new Document("kind", "run"))).isZero();
+                    assertThat(started.runs()).hasSize(1);
+                }
+            }
+        }
+    }
+
+    @Test void concurrentClientsContinueTheSameReplacementAndCompleteOneNewGeneration() throws Exception {
+        try (var f = new Fixture(1); var workers = Executors.newFixedThreadPool(2)) {
+            f.configuration.bindings().complete(new StorageSetupScope("cluster", "installation", "setup", 1));
+            f.configuration.firstAdmin().create(f.configuration.firstAdmin().load().orElseThrow().scope(), new User("admin", "fixture-hash", "admin"));
+            f.startValidation(1, true); f.cacheDb.drop();
+            try (var cache = MongoCacheDomain.connect(f.endpoint, Duration.ofSeconds(5), "validation-recovery-concurrent")) {
+                var auth = f.configuration.prepareAuthenticationRecovery(cache, () -> {}); var commands = f.configuration.recoveryCommands();
+                f.configuration.cacheRecoveries().stageCluster(commands.confirm(commands.plan(auth.authScope(), f.recoveryManifest(auth.authScope()), null, null)));
+                var running = commands.current(auth.authScope()).orElseThrow();
+                try (var other = MongoConfigurationDomain.open(f.settings, "cluster");
+                        var otherCache = MongoCacheDomain.connect(f.endpoint, Duration.ofSeconds(5), "validation-recovery-other")) {
+                    var gate = new CountDownLatch(1);
+                    var first = workers.submit(() -> { gate.await(); return attemptRecovery(f.configuration, cache, running); });
+                    var second = workers.submit(() -> { gate.await(); return attemptRecovery(other, otherCache, running); }); gate.countDown();
+                    assertThat(List.of(first.get(20, TimeUnit.SECONDS), second.get(20, TimeUnit.SECONDS))).contains(true);
+                    f.configuration.prepareStoppedRecovery(cache, running, () -> {});
+                    other.prepareStoppedRecovery(otherCache, running, () -> {});
+                    var marker = f.configSchema();
+                    assertThat(commands.complete(running)).isEqualTo(other.recoveryCommands().complete(running));
+                    var completed = f.configuration.validationPreparations().read("flow0");
+                    assertThat(completed.phase()).isEqualTo(MongoValidationPreparationFacts.Phase.UNASSIGNED);
+                    assertThat(f.configSchema()).isEqualTo(marker);
+                    assertThat(commands.complete(running).phase()).isEqualTo(StorageRecoveryCommands.Phase.COMPLETE);
+                    assertThat(other.validationPreparations().read("flow0")).isEqualTo(completed);
+                    assertThat(SystemCollections.VALIDATION_REPORTS.on(f.configDb).countDocuments(new Document("closed", true))).isOne();
+                }
+            }
+        }
+    }
+
+    private static boolean attemptRecovery(MongoConfigurationDomain configuration, MongoCacheDomain cache, StorageRecoveryCommands.Plan running) {
+        try { configuration.prepareStoppedRecovery(cache, running, () -> {}); return true; }
+        catch (TapstateException inProgress) {
+            assertThat(inProgress.code()).isIn(IoError.CACHE_BUSINESS_FENCED, IoError.WORKLOAD_CLAIM_FENCED, StoreError.INITIALIZATION_REFUSED);
+            return false;
+        }
+    }
+
     private static final class Fixture implements AutoCloseable {
         final MongoClient configClient = MongoClients.create(CONFIG.getReplicaSetUrl()), cacheClient = MongoClients.create(CACHE.getReplicaSetUrl());
         final String suffix = UUID.randomUUID().toString().replace("-", "");
@@ -449,14 +601,17 @@ class MongoValidationSchemaIT {
         final MongoConfigurationDomain configuration = MongoConfigurationBootstrap.prepare(settings, "cluster", "installation", "setup", 1);
         final MongoCacheDomain cache;
         final CacheBusinessScope scope;
-        Fixture(int pipelines) {
-            var master = new SourceResource("views", null, "mongodb", Map.of("uri", "mongodb://business.invalid/master"), null, null, null, null);
-            var binding = configuration.bindings().commitWithFirstCache(new StorageSetupScope("cluster", "installation", "setup", 1), StorageBinding.Mode.OP, endpoint, master);
+        Fixture(int pipelines) { this(pipelines, StorageBinding.Mode.OP); }
+        Fixture(int pipelines, StorageBinding.Mode mode) {
+            var master = new SourceResource(StorageBinding.defaultSourceId(mode), null, mode == StorageBinding.Mode.CLOUD ? "mongodb-atlas" : "mongodb",
+                    Map.of("uri", "mongodb://business.invalid/master"), null, null, null, null);
+            var binding = configuration.bindings().commitWithFirstCache(new StorageSetupScope("cluster", "installation", "setup", 1), mode, endpoint, master);
             scope = binding.preparation().businessScope();
             cache = MongoCacheDomain.connect(endpoint, Duration.ofSeconds(5), "validation-schema-fixture");
             cache.prepareFirstAuth(binding.firstCreation().orElseThrow());
             cache.prepareInitialBusiness(binding.preparation(), () -> {});
-            configuration.artifacts().create(new SourceResource("input", null, "mongodb", Map.of("uri", "mongodb://business.invalid/source"), null, null, null, null));
+            if (mode == StorageBinding.Mode.OP || pipelines > 0)
+                configuration.artifacts().create(new SourceResource("input", null, "mongodb", Map.of("uri", "mongodb://business.invalid/source"), null, null, null, null));
             for (int index = 0; index < pipelines; index++) addPipeline("flow" + index);
         }
         void addPipeline(String id) { configuration.artifacts().create(new DslParser().parse("version: tapstate/v1\nkind: pipeline\nid: " + id + "\nsource: [input]\n")); }
@@ -474,6 +629,12 @@ class MongoValidationSchemaIT {
         WorkloadClaim node(String id) {
             return cache.workloadClaims(scope).acquire(new WorkloadClaimKey("cluster", WorkloadClaimType.NODE_SESSION, id),
                     new WorkloadOwner(id, "boot"), 1, TTL).claim();
+        }
+        StorageRecoveryCommands.Manifest recoveryManifest(CacheAuthScope scope) {
+            var hashes = new TreeMap<String, String>();
+            configuration.artifacts().list().forEach(resource -> hashes.put(resource.id(), io.tapstate.core.model.canonical.CanonicalHash.of(resource)));
+            return new StorageRecoveryCommands.Manifest(new StorageRecoveryCommands.Selection(StorageRecoveryCommands.Extent.CLUSTER, Set.of()), Set.of("flow0"), hashes,
+                    CacheRecoveryStore.clusterDependencyHash(scope, configuration.cacheRecoveries().inspectCluster(scope)), configuration.configurationRevision());
         }
         record Started(WorkloadClaim node, WorkloadClaim owner, List<ValidationControlStore.Run> runs) {}
         Started startValidation(int count, boolean born) {

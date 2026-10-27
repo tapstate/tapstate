@@ -35,16 +35,26 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
     private final MongoCollection<Document> tasks;
     private final MongoCollection<Document> reports;
     private final MongoValidationPreparations.Authority validation;
+    private final MongoCacheRecoveryStore.ValidationClosure recovery;
 
     MongoValidationAdmissionStore(MongoClient client, MongoDatabase database, String clusterId, Runnable requireActive) {
         this(client, database, clusterId, requireActive, null);
     }
     MongoValidationAdmissionStore(MongoClient client, MongoDatabase database, String clusterId, Runnable requireActive,
             MongoValidationPreparations.Authority validation) {
+        this(client, database, clusterId, requireActive, validation, null);
+    }
+    private MongoValidationAdmissionStore(MongoClient client, MongoDatabase database, String clusterId, Runnable requireActive,
+            MongoValidationPreparations.Authority validation, MongoCacheRecoveryStore.ValidationClosure recovery) {
         this.client = Objects.requireNonNull(client); this.database = Objects.requireNonNull(database);
         this.clusterId = Objects.requireNonNull(clusterId); this.requireActive = Objects.requireNonNull(requireActive);
         tasks = SystemCollections.VALIDATION_TASKS.on(database); reports = SystemCollections.VALIDATION_REPORTS.on(database);
         this.validation = validation;
+        this.recovery = recovery;
+    }
+    static MongoValidationAdmissionStore forRecovery(MongoClient client, MongoDatabase database, String clusterId, Runnable requireActive,
+            MongoCacheRecoveryStore.ValidationClosure original) {
+        return new MongoValidationAdmissionStore(client, database, clusterId, requireActive, null, Objects.requireNonNull(original));
     }
 
     @Override public Reservation reserve(Start start) {
@@ -128,7 +138,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         if (!Integer.valueOf(1).equals(task.get("formatVersion")) || !(task.get("revision") instanceof Long revision) || revision < 1
                 || !(task.get("taskGeneration") instanceof String generation) || !(task.get("modes") instanceof Document modes)
                 || !modes.keySet().equals(Set.of("full", "incremental")) || task.containsKey("closed") && !(task.get("closed") instanceof Boolean)
-                || validation != null && !(task.get("closed") instanceof Boolean)) throw unreadable("task");
+                || (validation != null || recovery != null) && !(task.get("closed") instanceof Boolean)) throw unreadable("task");
         try {
             if (!java.util.UUID.fromString(generation).toString().equals(generation)) throw unreadable("task-generation");
         } catch (IllegalArgumentException invalid) { throw unreadable("task-generation"); }
@@ -147,7 +157,8 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
     }
 
     boolean closePipelineInTransaction(ClientSession session, String pipeline, int maximum) {
-        if (validation == null || !validation.closing() || !validation.pipelineId().equals(pipeline)) throw unreadable("pipeline-closure");
+        if (maximum < 1 || maximum > 20 || !(validation != null && validation.closing() && validation.pipelineId().equals(pipeline)
+                || recovery != null && recovery.pipeline().equals(pipeline))) throw unreadable("pipeline-closure");
         var filter = new Document("_id.clusterId", clusterId).append("_id.pipelineId", pipeline).append("$or", java.util.List.of(
                 new Document("closed", new Document("$ne", true)), new Document("modes.full.permission.phase", new Document("$in", java.util.List.of("OPEN", "BORN"))),
                 new Document("modes.incremental.permission.phase", new Document("$in", java.util.List.of("OPEN", "BORN")))));
@@ -256,8 +267,10 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         bounded(identity(start), 8 * 1024);
     }
     void checkActive() { requireActive.run(); }
-    boolean closing() { return validation != null && validation.closing(); }
-    void requirePipeline(String pipeline) { if (validation != null && !validation.pipelineId().equals(pipeline)) throw unreadable("pipeline"); }
+    boolean closing() { return validation != null && validation.closing() || recovery != null; }
+    void requirePipeline(String pipeline) {
+        if (validation != null && !validation.pipelineId().equals(pipeline) || recovery != null && !recovery.pipeline().equals(pipeline)) throw unreadable("pipeline");
+    }
     <T> T transaction(Function<ClientSession, T> work) { return transaction(() -> {}, work); }
     <T> T transaction(Runnable verifyAdditionalStructures, Function<ClientSession, T> work) {
         return transaction(false, verifyAdditionalStructures, work);
@@ -268,6 +281,10 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
             try (var session = client.startSession()) {
                 return session.withTransaction(() -> {
                     requireActive.run(); if (validation != null) validation.enter(client, database, session, admission);
+                    if (recovery != null) {
+                        if (admission) throw unreadable("recovery-admission");
+                        recovery.require(client, database, session);
+                    }
                     var result = work.apply(session); requireActive.run(); return result;
                 }, TRANSACTION);
             }

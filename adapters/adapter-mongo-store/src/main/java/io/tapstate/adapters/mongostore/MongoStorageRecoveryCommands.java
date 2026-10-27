@@ -379,6 +379,11 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands,io.t
     }
     private Transition transitionResult(Plan original, Phase from, Phase to, boolean requireRevision, MongoCacheRecoveryStore stoppedScopes) {
         Objects.requireNonNull(original, "original");
+        boolean validationReplacement = to == Phase.COMPLETE && original.manifest().selection().extent() == Extent.CLUSTER
+                && original.originalScope().authGeneration() > 1;
+        var validationGenerations = new java.util.HashMap<String, UUID>();
+        if (validationReplacement)
+            original.manifest().affectedPipelineIds().forEach(id -> validationGenerations.put(id, UUID.randomUUID()));
         if(original.manifest().selection().extent()==Extent.SHARED_SRS && to!=Phase.CONFIRMED)throw refused();
         return transaction(session -> {
             Document root = root(session, original.originalScope());
@@ -392,6 +397,8 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands,io.t
             ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database));
             Plan result = new Plan(current.operationId(), current.previousOperationId(), current.originalScope(), current.manifest(), current.planHash(), current.controlRevision(), to);
             if (stoppedScopes != null) stoppedScopes.publishInTransaction(session, result);
+            if (validationReplacement)
+                MongoValidationPreparations.completeCacheReplacement(session, database, current.originalScope().clusterId(), current, validationGenerations);
             save(session, root, result);
             return new Transition(result, true);
         });

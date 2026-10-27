@@ -120,4 +120,17 @@ class MongoInitialOpRecoveryIT {
             assertThat(raw.getDatabase(f.configName).getCollection("storage_recovery").find().first().containsKey("pendingRecovery")).isFalse();
         }
     }
+
+    @Test void schemaUpgradeDuringInitialSetupDoesNotRequireACacheIncarnationReplacement() {
+        try (var f = new Fixture()) {
+            var commands = f.configuration.recoveryCommands();
+            var invocation = f.configuration.startInitialOpRecovery(commands.confirm(f.plan(null)), () -> {});
+            f.configuration.prepareInitialOpRecovery(f.cache, invocation, () -> {});
+            try (var upgrade = MongoConfigurationDomain.prepareValidationSchema(f.settings, f.setup.clusterId(), UUID.randomUUID())) {
+                upgrade.prepareCache(f.cache); assertThat(upgrade.advance(20).ready()).isTrue();
+            }
+            assertThatCode(() -> commands.complete(invocation.plan())).doesNotThrowAnyException();
+            assertThat(f.configuration.bindings().cachePreparation().orElseThrow().authScope()).isEqualTo(f.binding.preparation().authScope());
+        }
+    }
 }

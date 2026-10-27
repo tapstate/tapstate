@@ -72,23 +72,7 @@ final class MongoCacheIdentity {
 
     /** Offline business-schema preparation retains the original authentication and CACHE identities. */
     void prepareValidationSchema(io.tapstate.spi.store.CacheBusinessScope business, String operation, Runnable active) {
-        var currentScope = new io.tapstate.spi.store.CacheBusinessScope(expected.clusterId(), expected.bindingVersion(), expected.cacheIncarnation());
-        if (!currentScope.equals(business)) throw refused();
-        transaction(session -> {
-            active.run(); requireReady(session);
-            var row = schemas.find(session, new Document("_id", "business")).first();
-            if (row != null && Integer.valueOf(1).equals(row.get("installedVersion")) && !row.containsKey("validation")) {
-                new MongoCacheBusinessIdentity(database, business).requireAdmissionState(session);
-                fence(session);
-                requireStoppedClaims(session, business);
-                MongoValidationSchema.requireAbsent(database, MongoValidationSchema.CACHE);
-                if (SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session, new Document("_id.clusterId", business.clusterId())
-                        .append("_id.resourceType", io.tapstate.spi.store.WorkloadClaimType.VALIDATION.name())).limit(1).first() != null) throw refused();
-                if (schemas.updateOne(session, row, new Document("$set", new Document("installedVersion", 2)
-                        .append("validation", MongoValidationSchema.marker(operation, PREPARING, 0, business)))).getMatchedCount() != 1) throw refused();
-            } else requireValidationOperation(row, business, operation);
-            active.run(); return null;
-        });
+        beginValidationSchema(business, operation, active);
         StoreIo.run(() -> {
             try (var session = client.startSession()) {
                 session.withTransaction(() -> {
@@ -107,6 +91,27 @@ final class MongoCacheIdentity {
             }
         });
         MongoValidationSchema.requireReady(database, false);
+    }
+
+    /** The retained first transaction is also the continuation boundary after an interrupted upgrade. */
+    void beginValidationSchema(io.tapstate.spi.store.CacheBusinessScope business, String operation, Runnable active) {
+        var currentScope = new io.tapstate.spi.store.CacheBusinessScope(expected.clusterId(), expected.bindingVersion(), expected.cacheIncarnation());
+        if (!currentScope.equals(business)) throw refused();
+        transaction(session -> {
+            active.run(); requireReady(session);
+            var row = schemas.find(session, new Document("_id", "business")).first();
+            if (row != null && Integer.valueOf(1).equals(row.get("installedVersion")) && !row.containsKey("validation")) {
+                new MongoCacheBusinessIdentity(database, business).requireAdmissionState(session);
+                fence(session);
+                requireStoppedClaims(session, business);
+                MongoValidationSchema.requireAbsent(database, MongoValidationSchema.CACHE);
+                if (SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session, new Document("_id.clusterId", business.clusterId())
+                        .append("_id.resourceType", io.tapstate.spi.store.WorkloadClaimType.VALIDATION.name())).limit(1).first() != null) throw refused();
+                if (schemas.updateOne(session, row, new Document("$set", new Document("installedVersion", 2)
+                        .append("validation", MongoValidationSchema.marker(operation, PREPARING, 0, business)))).getMatchedCount() != 1) throw refused();
+            } else requireValidationOperation(row, business, operation);
+            active.run(); return null;
+        });
     }
 
     private static Document requireValidationOperation(Document row, io.tapstate.spi.store.CacheBusinessScope scope, String operation) {

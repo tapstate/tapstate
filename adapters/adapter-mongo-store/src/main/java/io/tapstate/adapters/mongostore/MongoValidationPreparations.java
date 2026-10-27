@@ -175,18 +175,59 @@ final class MongoValidationPreparations {
         if (SystemCollections.VALIDATION_TASKS.on(database).find(session, unfinishedReports(cluster, pipeline)).limit(1).first() != null) throw fenced();
     }
 
-    private static Document unfinishedReports(String cluster, String pipeline) {
-        return new Document("_id.clusterId", cluster).append("_id.pipelineId", pipeline)
+    static Document unfinishedReports(String cluster, String pipeline) {
+        var filter = new Document("_id.clusterId", cluster);
+        if (pipeline != null) filter.append("_id.pipelineId", pipeline);
+        return filter
                 .append("$or", List.of(new Document("closed", new Document("$ne", true)),
                         new Document("modes.full.permission.phase", new Document("$in", List.of("OPEN", "BORN"))),
                         new Document("modes.incremental.permission.phase", new Document("$in", List.of("OPEN", "BORN")))));
     }
 
-    private static boolean validationEnabled(com.mongodb.client.ClientSession session, MongoDatabase database, String cluster) {
+    static boolean validationEnabled(com.mongodb.client.ClientSession session, MongoDatabase database, String cluster) {
         var schema = SystemCollections.SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "config")).first();
         if (schema != null && Integer.valueOf(1).equals(schema.get("installedVersion")) && !schema.containsKey("validation")) return false;
         var marker = MongoValidationSchema.requireVersionTwo(schema, "READY");
         if (!cluster.equals(MongoValidationSchema.scope(marker).clusterId())) throw unreadable(); return true;
+    }
+
+    static void beginCacheReplacement(com.mongodb.client.ClientSession session, MongoDatabase database, String cluster,
+            Document original, Document replacement, io.tapstate.spi.store.StorageRecoveryCommands.Plan running) {
+        if (!validationEnabled(session, database, cluster)) return;
+        String pipeline = original.getString("_id"); var state = decode(original.get("validationPreparation", Document.class), cluster, pipeline);
+        var target = new CacheBusinessScope(cluster, running.originalScope().bindingVersion(), running.originalScope().cacheIncarnation());
+        if (state.subject() != null && state.subject().scope().equals(target)
+                || state.previous() != null && state.previous().subject().scope().equals(target)) throw fenced();
+        replacement.put("validationPreparation", encode(state.change(state.phase(), state.subject(), UUID.fromString(running.operationId()), state.previous())));
+    }
+
+    /** The original whole-CACHE replacement is the authority; no missing-CACHE observation grants it. */
+    static void requireCacheReplacement(com.mongodb.client.ClientSession session, MongoDatabase database, String cluster, String pipeline,
+            io.tapstate.spi.store.StorageRecoveryCommands.Plan running) {
+        if (running.phase() != io.tapstate.spi.store.StorageRecoveryCommands.Phase.RUNNING
+                || running.manifest().selection().extent() != io.tapstate.spi.store.StorageRecoveryCommands.Extent.CLUSTER
+                || !running.manifest().affectedPipelineIds().contains(pipeline) || !validationEnabled(session, database, cluster)) throw fenced();
+        var row = SystemCollections.OPERATOR_GENERATIONS.on(database).find(session, new Document("_id", pipeline)).first();
+        var summary = MongoCacheRecoveryFacts.read(row).orElseThrow(MongoValidationPreparations::fenced);
+        var state = decode(row.get("validationPreparation", Document.class), cluster, pipeline);
+        if (!summary.recoveryId().equals(running.operationId()) || !summary.targetScope().cacheIncarnation().equals(running.originalScope().cacheIncarnation())
+                || !Objects.equals(state.closingOperationId(), UUID.fromString(running.operationId()))) throw fenced();
+    }
+
+    static void completeCacheReplacement(com.mongodb.client.ClientSession session, MongoDatabase database, String cluster,
+            io.tapstate.spi.store.StorageRecoveryCommands.Plan running, Map<String, UUID> generations) {
+        if (!validationEnabled(session, database, cluster)) return;
+        var marker = MongoValidationSchema.requireVersionTwo(SystemCollections.SCHEMA_MIGRATIONS.on(database)
+                .find(session, new Document("_id", "config")).first(), "READY");
+        var target = new CacheBusinessScope(cluster, running.originalScope().bindingVersion(), running.originalScope().cacheIncarnation());
+        if (!target.equals(MongoValidationSchema.scope(marker)) || !running.operationId().equals(marker.get("operationId"))) throw fenced();
+        for (String pipeline : running.manifest().affectedPipelineIds()) {
+            requireCacheReplacement(session, database, cluster, pipeline, running);
+            if (SystemCollections.VALIDATION_TASKS.on(database).find(session, unfinishedReports(cluster, pipeline)).limit(1).first() != null) throw fenced();
+            var rows = SystemCollections.OPERATOR_GENERATIONS.on(database); var row = rows.find(session, new Document("_id", pipeline)).first();
+            var next = new State(Objects.requireNonNull(generations.get(pipeline)), 0, Phase.UNASSIGNED, null, null, null);
+            if (rows.updateOne(session, row, new Document("$set", new Document("validationPreparation", encode(next)))).getMatchedCount() != 1) throw fenced();
+        }
     }
 
     Permission issue(String pipeline, CacheBusinessScope expected) {

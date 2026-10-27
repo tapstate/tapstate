@@ -298,6 +298,15 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         facts(original.authScope()).prepareValidationSchema(original.businessScope(), operation, this::businessActive);
     }
 
+    /** Explicit original recovery only; ordinary business admission still refuses partial schemas. */
+    void resumeValidationSchema(io.tapstate.spi.store.CachePreparation original, String operation) {
+        businessActive();
+        var schema = StoreIo.call(() -> SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).find(new Document("_id", "business")).first());
+        if (schema != null && Integer.valueOf(2).equals(schema.get("installedVersion"))
+                && schema.get("validation") instanceof Document marker && "PREPARING".equals(marker.get("phase")))
+            prepareValidationSchema(original, operation);
+    }
+
     void verifyValidationMaintenance(io.tapstate.spi.store.CachePreparation original, String operation, boolean configurationComplete) {
         businessActive();
         new MongoCacheMetadataStructure(database, rateRetention).verifyBusiness();
