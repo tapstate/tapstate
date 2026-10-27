@@ -811,7 +811,14 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
             // what gets it drawn and sent again.
             Touched document = touched(word.key(), touched);
             document.ts = Math.max(document.ts, word.ts());
-            document.assembly.absorb(word.positions());
+            Map<String, ChainPosition> positions = word.positions();
+            if (word.onlyIfWaiting() && bounds != null) {
+                // A delayed registration can name an already-emitted version of a root that now waits
+                // for a different row. Keep the wake, but do not turn its passed positions into new holds.
+                positions = new LinkedHashMap<>(positions);
+                positions.entrySet().removeIf(entry -> bounds.hasPassed(entry.getKey(), entry.getValue().order()));
+            }
+            document.assembly.absorb(positions);
             return;
         }
         if (edge.isCascade()) {

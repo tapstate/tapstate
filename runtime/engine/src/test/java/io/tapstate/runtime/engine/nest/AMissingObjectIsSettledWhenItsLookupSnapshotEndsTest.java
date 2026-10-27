@@ -167,6 +167,47 @@ class AMissingObjectIsSettledWhenItsLookupSnapshotEndsTest {
     }
 
     @Test
+    void aDelayedRegistrationAfterRetargetingCannotLowerTheSnapshotHold() throws Exception {
+        Fixture f = new Fixture(Map.of("customers", 1L));
+        f.customer(1, SourceOrder.snapshotRow(1));
+        SourceOrder first = new SourceOrder(1, 1);
+        SourceOrder second = new SourceOrder(1, 2);
+        Envelope original = Envelope.insert(1L, "orders", row("order_id", 1, "cust_ref", 1), null)
+                .withOrder(first).withPositions(Map.of("orders", new ChainPosition(first, null)));
+        feed(f.assembler, 0, original);
+        f.collect();
+        assertThat(f.documents).hasSize(1);
+        assertThat(f.latest().get(1)).containsEntry("customer", customerRow(1));
+        f.bound("orders", first);
+
+        Envelope updated = Envelope.update(2L, "orders", original.after(), row("order_id", 1, "cust_ref", 2), null)
+                .withOrder(second).withPositions(Map.of("orders", new ChainPosition(second, null)));
+        feed(f.assembler, 0, updated);
+        f.collect();
+        assertThat(f.documents).hasSize(1);
+
+        feed(f.lookup, LookupProcessor.REGISTRATIONS, original);
+        f.route();
+        feed(f.lookup, LookupProcessor.REGISTRATIONS, updated);
+        f.route();
+        f.bound("orders", second);
+        assertThat(f.documents).hasSize(1);
+        assertThat(f.emitted.stream().filter(Watermark.class::isInstance).map(Watermark.class::cast)
+                .filter(w -> w.key() == f.axes.axisOf("orders")).map(Watermark::timestamp).toList())
+                .containsExactly(FrontierOrders.pack("orders", first));
+
+        f.customer(2, SourceOrder.snapshotRow(1));
+        assertThat(f.documents).hasSize(2);
+        assertThat(f.latest().get(1)).containsEntry("cust_ref", 2).containsEntry("customer", customerRow(2));
+        assertThat(f.documents.getLast().positions()).containsEntry("orders", new ChainPosition(second, null));
+        f.bound("orders", second);
+        f.bound("orders", new SourceOrder(1, 3));
+        assertThat(f.emitted.stream().filter(Watermark.class::isInstance).map(Watermark.class::cast)
+                .filter(w -> w.key() == f.axes.axisOf("orders")).map(Watermark::timestamp).toList())
+                .contains(FrontierOrders.pack("orders", second), FrontierOrders.pack("orders", new SourceOrder(1, 3)));
+    }
+
+    @Test
     void withoutSnapshotEligibilityACdcBoundDoesNotInventAbsence() throws Exception {
         Fixture f = new Fixture(Map.of());
         f.order(25, 25, new SourceOrder(1, 1));
@@ -313,8 +354,12 @@ class AMissingObjectIsSettledWhenItsLookupSnapshotEndsTest {
         }
 
         private void boundary(String chain, long epoch) {
+            bound(chain, SourceOrder.snapshotRow(epoch));
+        }
+
+        private void bound(String chain, SourceOrder order) {
             int ordinal = chain.equals("orders") ? 0 : customers.touchOrdinal();
-            Watermark bound = new Watermark(FrontierOrders.pack(chain, SourceOrder.snapshotRow(epoch)), axes.axisOf(chain));
+            Watermark bound = new Watermark(FrontierOrders.pack(chain, order), axes.axisOf(chain));
             for (int attempt = 0; attempt < 10_000; attempt++) {
                 boolean accepted = assembler.tryProcessWatermark(ordinal, bound);
                 collect();
