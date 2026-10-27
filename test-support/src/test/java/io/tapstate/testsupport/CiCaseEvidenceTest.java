@@ -111,6 +111,60 @@ class CiCaseEvidenceTest {
     }
 
     @Test
+    void unmodifiableMapsAreObservedOnlyThroughTheirKnownBackingImplementation() {
+        Map<String, Object> backing = new LinkedHashMap<>();
+        backing.put("source", "target");
+        Map<String, Object> wrapped = Collections.unmodifiableMap(backing);
+        assertThat(CiCaseEvidence.canonical(wrapped).stable()).isTrue();
+        assertThat(CiCaseEvidence.canonical(wrapped).json()).isEqualTo(CiCaseEvidence.canonical(backing).json());
+        assertThat(CiCaseEvidence.canonical(Collections.unmodifiableMap(Map.of())).json()).isEqualTo("[\"map\",[]]");
+        String original = CiCaseEvidence.canonical(wrapped).json();
+        backing.put("source", "changed");
+        assertThat(CiCaseEvidence.canonical(wrapped).json()).isNotEqualTo(original);
+
+        backing.put("cycle", wrapped);
+        assertThat(CiCaseEvidence.canonical(wrapped).stable()).isFalse();
+        assertThat(CiCaseEvidence.canonical(wrapped).reason()).isEqualTo("cycle");
+
+        Object nested = Map.of();
+        for (int i = 0; i < 40; i++) {
+            Map<String, Object> level = new LinkedHashMap<>();
+            level.put("next", nested);
+            nested = Collections.unmodifiableMap(level);
+        }
+        assertThat(CiCaseEvidence.canonical(nested).stable()).isFalse();
+        assertThat(CiCaseEvidence.canonical(nested).reason()).isEqualTo("size-limit");
+
+        Map<Integer, Integer> large = new LinkedHashMap<>();
+        for (int i = 0; i < 4097; i++) {
+            large.put(i, i);
+        }
+        assertThat(CiCaseEvidence.canonical(Collections.unmodifiableMap(large)).reason()).isEqualTo("size-limit");
+    }
+
+    @Test
+    void unmodifiableMapsDoNotDelegateToSubclassesOfKnownImplementations() {
+        AtomicInteger calls = new AtomicInteger();
+        Map<String, Object> custom = new LinkedHashMap<>() {
+            @Override
+            public int size() {
+                calls.incrementAndGet();
+                throw new AssertionError("custom map size was called");
+            }
+
+            @Override
+            public Set<Map.Entry<String, Object>> entrySet() {
+                calls.incrementAndGet();
+                throw new AssertionError("custom map entrySet was called");
+            }
+        };
+        CiCaseEvidence.Canonical result = CiCaseEvidence.canonical(Collections.unmodifiableMap(custom));
+        assertThat(result.stable()).isFalse();
+        assertThat(result.reason()).isEqualTo("unsupported-collection-implementation");
+        assertThat(calls).hasValue(0);
+    }
+
+    @Test
     void metadataErrorsCannotReplaceTheOriginalInvocationOrItsThrowable() throws Exception {
         Method method = method("fixture", Object.class);
         ExtensionContext brokenMetadata = (ExtensionContext) Proxy.newProxyInstance(ExtensionContext.class.getClassLoader(),

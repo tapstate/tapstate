@@ -30,6 +30,53 @@ receipt = module('receipt_regression', HERE / '_ci-receipt.py')
 
 
 class SourceIdentityTests(unittest.TestCase):
+    def test_rename_specs_have_distinct_independent_source_identities(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = root / 'core/src/main/java/io/tapstate/core/model'
+            model.mkdir(parents=True)
+            for name in ('RenameSpec', 'RenameCase'):
+                original = HERE.parent.parent / 'core/core-model/src/main/java/io/tapstate/core/model' / (name + '.java')
+                (model / original.name).write_text(original.read_text())
+            declaration = '''
+                @ParameterizedTest @MethodSource("renames") void renamed(RenameSpec rename, String name) {}
+                static Stream<Arguments> renames() {
+                    return Stream.of(
+                        Arguments.of(null, "ACC_COMPOSITE"),
+                        Arguments.of(new RenameSpec(null, RenameCase.LOWER, "Raw_", "_v1"), "Raw_acc_composite_v1"),
+                        Arguments.of(new RenameSpec(Map.of("ACC_COMPOSITE", "chosen"), RenameCase.UPPER,
+                            "ignored_", "_ignored"), "chosen"),
+                        Arguments.of(new RenameSpec(Map.of(), null, null, "_archive"), "ACC_COMPOSITE_archive"),
+                        Arguments.of(new RenameSpec(null, RenameCase.PASCAL, null, null), "AccComposite"));
+                }
+            '''
+            preamble = 'import io.tapstate.core.model.RenameSpec; import io.tapstate.core.model.RenameCase;'
+            _, inv = self.inventory(root, declaration, preamble=preamble)
+            self.assertTrue(inv['complete'], inv['unresolved'])
+            string = lambda value: ['null'] if value is None else ['java.lang.String', value]
+            enum = lambda value: ['null'] if value is None else ['enum', 'io.tapstate.core.model.RenameCase', value]
+            record = lambda mapping, case, prefix, suffix: ['record', 'io.tapstate.core.model.RenameSpec', [
+                ['map', mapping], ['caseMode', enum(case)], ['prefix', string(prefix)], ['suffix', string(suffix)]]]
+            arguments = [
+                [['null'], string('ACC_COMPOSITE')],
+                [record(['null'], 'LOWER', 'Raw_', '_v1'), string('Raw_acc_composite_v1')],
+                [record(['map', [[string('ACC_COMPOSITE'), string('chosen')]]], 'UPPER', 'ignored_', '_ignored'), string('chosen')],
+                [record(['map', []], None, None, '_archive'), string('ACC_COMPOSITE_archive')],
+                [record(['null'], 'PASCAL', None, None), string('AccComposite')]]
+            self.assertEqual(inv['methods'][0]['argument_digests'], list(map(evidence.argument_digest, arguments)))
+            self.assertEqual(len(set(inv['methods'][0]['argument_digests'])), 5)
+            self.assertIn('core/src/main/java/io/tapstate/core/model/RenameSpec.java', inv['sources'])
+
+            # A changed constructor or a foreign same-named record has no approved identity contract.
+            definition = model / 'RenameSpec.java'
+            definition.write_text(definition.read_text().replace('new LinkedHashMap<>(map)', 'map'))
+            _, changed = self.inventory(root, declaration, preamble=preamble)
+            self.assertFalse(changed['complete'])
+            self.assertIn('RenameSpec source constructor contract changed', str(changed['unresolved']))
+            _, foreign = self.inventory(root, declaration + '\nrecord RenameSpec(Object map, Object mode, String prefix, String suffix) {}',
+                                        preamble='import io.tapstate.core.model.RenameCase;')
+            self.assertFalse(foreign['complete'])
+
     def test_text_block_escape_atoms_are_consumed_left_to_right(self):
         for raw, expected in [(r'C:\\temp', 'C:\\temp'), (r'\\n', '\\n'),
                               (r'\\r', '\\r'), (r'\\"', '\\"'), (r'\\\\', '\\\\'),
