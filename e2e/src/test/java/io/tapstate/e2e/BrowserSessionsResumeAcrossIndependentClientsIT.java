@@ -10,7 +10,7 @@ import java.net.http.HttpResponse;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** The pipeline vocabulary has no cookie, browser session exchange, or revocation operation. */
+/** The declarative e2e vocabulary cannot express cookie transport, exchange and revocation. */
 class BrowserSessionsResumeAcrossIndependentClientsIT {
     @BeforeAll
     static void requireDocker() {
@@ -19,7 +19,8 @@ class BrowserSessionsResumeAcrossIndependentClientsIT {
 
     @Test
     void independentClientsResumeUntilTheSharedSessionIsRevoked() throws Exception {
-        try (ServerHandle server = Tiers.REAL_PROCESS.launch(SharedMongo.replicaSetUrl("e2e_browser_auth"))) {
+        try (ServerHandle server = RealProcessServer.start(SharedMongo.replicaSetUrl("e2e_browser_auth"),
+                java.util.List.of("--tapstate.browser-auth.allow-insecure-loopback=true"))) {
             new ControlPlane(server.baseUrl()).bootstrapAndLogin("browser-admin", "browser-password");
             String origin = server.baseUrl().toString().replaceAll("/$", "");
             HttpClient first = HttpClient.newHttpClient();

@@ -2,10 +2,10 @@ package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.AccessTokenGrant;
 import io.tapstate.control.core.AuthenticationMode;
+import io.tapstate.control.core.CallerOrigin;
 import io.tapstate.control.core.ClusterIdentityService;
 import io.tapstate.control.core.ControlError;
 import io.tapstate.control.core.LoginService;
-import io.tapstate.control.core.Scope;
 import io.tapstate.control.core.SessionService;
 import io.tapstate.core.common.TapstateException;
 import jakarta.servlet.http.Cookie;
@@ -42,6 +42,8 @@ final class BrowserAuthController {
     private final ClusterIdentityService identity;
     private final AuthenticationMode mode;
     private Set<String> trustedProxyAddresses = Set.of();
+    private Set<URI> publicOrigins = Set.of();
+    private boolean insecureLoopbackEnabled;
 
     BrowserAuthController(LoginService login, SessionService sessions, ClusterIdentityService identity,
             ObjectProvider<AuthenticationMode> modes) {
@@ -58,7 +60,18 @@ final class BrowserAuthController {
                 .collect(java.util.stream.Collectors.toUnmodifiableSet());
     }
 
-    @PostMapping(value = "/auth/browser/login", consumes = "application/json")
+    @Value("${tapstate.browser-auth.public-origins:}")
+    void publicOrigins(String origins) {
+        publicOrigins = Arrays.stream(origins.split(",")).map(String::trim).filter(value -> !value.isEmpty())
+                .map(BrowserAuthController::configuredOrigin).collect(java.util.stream.Collectors.toUnmodifiableSet());
+    }
+
+    @Value("${tapstate.browser-auth.allow-insecure-loopback:false}")
+    void insecureLoopbackEnabled(boolean enabled) {
+        insecureLoopbackEnabled = enabled;
+    }
+
+    @PostMapping(value = AuthWire.BROWSER_LOGIN_PATH, consumes = "application/json")
     ResponseEntity<BrowserGrant> login(HttpServletRequest request, @RequestBody LoginRequest credentials) {
         BrowserRequest browser = guard(request);
         MalformedRequest.requireText(credentials.username(), "a `username` is required");
@@ -71,7 +84,7 @@ final class BrowserAuthController {
                 .body(grant(grant, issuer, session.token()));
     }
 
-    @PostMapping("/auth/browser/session")
+    @PostMapping(AuthWire.BROWSER_SESSION_PATH)
     ResponseEntity<BrowserGrant> session(HttpServletRequest request) {
         BrowserRequest browser = guard(request);
         String token = readCookie(request, browser.secure());
@@ -81,7 +94,7 @@ final class BrowserAuthController {
                 .body(grant(grant, issuer, token));
     }
 
-    @PostMapping("/auth/browser/logout")
+    @PostMapping(AuthWire.BROWSER_LOGOUT_PATH)
     ResponseEntity<Void> logout(HttpServletRequest request) {
         BrowserRequest browser = guard(request);
         String token = readCookie(request, browser.secure());
@@ -92,35 +105,50 @@ final class BrowserAuthController {
     }
 
     private BrowserRequest guard(HttpServletRequest request) {
-        if (mode != AuthenticationMode.ON_PREM) {
-            throw new TapstateException(ControlError.AUTH_MODE_UNAVAILABLE, Map.of("mode", "cloud"), null);
-        }
+        AuthSupport.requireOnPrem(mode);
         if (request.getHeaders(HttpHeaders.AUTHORIZATION).hasMoreElements()
                 || !Collections.list(request.getHeaders("X-Tapstate-Browser-Request")).equals(List.of("1"))) {
             throw refused();
         }
+        if (request.getRemoteAddr() == null || request.getRemoteAddr().isBlank()) throw refused();
         BrowserRequest browser = browserRequest(request);
-        if (!browser.secure() && !(isLoopback(browser.host()) && isLoopbackAddress(request.getRemoteAddr()))) {
+        if (!browser.secure() && !(insecureLoopbackEnabled && isLoopback(browser.host())
+                && CallerOrigins.classify(request.getRemoteAddr()) == CallerOrigin.LOOPBACK)) {
             throw refused();
         }
         List<String> origins = Collections.list(request.getHeaders(HttpHeaders.ORIGIN));
         if (origins.size() != 1) throw refused();
-        try {
-            URI origin = URI.create(origins.getFirst());
-            if (origin.getUserInfo() != null || origin.getHost() == null || origin.getRawQuery() != null
-                    || origin.getRawFragment() != null || !origin.getRawPath().isEmpty()
-                    || !browser.scheme().equalsIgnoreCase(origin.getScheme())
-                    || !browser.host().equalsIgnoreCase(origin.getHost())
-                    || browser.port() != originPort(origin)) throw refused();
-        } catch (IllegalArgumentException malformed) {
+        if (!SameOrigin.matches(origins.getFirst(), browser.scheme(), browser.host(), browser.port(), false)) {
             throw refused();
         }
+        if (browser.secure() && !publicOrigins.contains(normalizedOrigin(URI.create(origins.getFirst())))) throw refused();
         return browser;
     }
 
     private static int originPort(URI origin) {
         if (origin.getPort() >= 0) return origin.getPort();
         return HTTPS_SCHEME.equalsIgnoreCase(origin.getScheme()) ? 443 : 80;
+    }
+
+    private static URI configuredOrigin(String value) {
+        try {
+            URI origin = URI.create(value);
+            if (!HTTPS_SCHEME.equalsIgnoreCase(origin.getScheme()) || origin.getHost() == null
+                    || origin.getUserInfo() != null || origin.getRawQuery() != null || origin.getRawFragment() != null
+                    || !origin.getRawPath().isEmpty() || originPort(origin) < 1 || originPort(origin) > 65535) {
+                throw new IllegalArgumentException("invalid browser public origin");
+            }
+            return normalizedOrigin(origin);
+        } catch (IllegalArgumentException invalid) {
+            throw new TapstateException(ControlError.BROWSER_AUTH_CONFIG_INVALID, Map.of(), null);
+        }
+    }
+
+    private static URI normalizedOrigin(URI origin) {
+        String host = origin.getHost().toLowerCase(Locale.ROOT);
+        if (host.contains(":") && !host.startsWith("[")) host = "[" + host + "]";
+        return URI.create(HTTPS_SCHEME + "://" + host
+                + ":" + originPort(origin));
     }
 
     private static boolean isLoopback(String host) {
@@ -131,7 +159,7 @@ final class BrowserAuthController {
         String scheme = request.getScheme();
         BrowserRequest direct = new BrowserRequest(scheme, request.getServerName(), request.getServerPort(),
                 request.isSecure() && HTTPS_SCHEME.equalsIgnoreCase(scheme));
-        return trustedProxyAddresses.contains(request.getRemoteAddr())
+        return request.getRemoteAddr() != null && trustedProxyAddresses.contains(request.getRemoteAddr())
                 ? forwardedBrowserRequest(request, direct) : direct;
     }
 
@@ -239,8 +267,8 @@ final class BrowserAuthController {
         String found = null;
         if (cookies != null) {
             for (Cookie cookie : cookies) {
-                if (HTTPS_COOKIE.equals(cookie.getName()) || LOOPBACK_COOKIE.equals(cookie.getName())) {
-                    if (found != null || !cookieName(secure).equals(cookie.getName())) throw refused();
+                if (cookieName(secure).equals(cookie.getName())) {
+                    if (found != null) throw refused();
                     found = cookie.getValue();
                 }
             }
@@ -270,8 +298,7 @@ final class BrowserAuthController {
 
     private static BrowserGrant grant(AccessTokenGrant grant, String issuer, String session) {
         return new BrowserGrant(grant.token(), grant.expiresAt().toString(), issuer, grant.principal(),
-                Arrays.stream(Scope.values()).filter(grant.scope()::permits)
-                        .map(scope -> scope.name().toLowerCase(java.util.Locale.ROOT)).toList(),
+                AuthSupport.scopesFor(grant.scope()),
                 session.substring(4, session.indexOf('.')));
     }
 

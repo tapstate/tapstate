@@ -15,6 +15,10 @@ class BrowserAuthSecurityTest {
     private final BrowserAuthController controller = new BrowserAuthController(null, null, null,
             new DefaultListableBeanFactory().getBeanProvider(AuthenticationMode.class));
 
+    {
+        controller.publicOrigins("https://console.example");
+    }
+
     @Test
     void untrustedTransportOriginsHeadersAndCookiesAreRefusedBeforeAuthorityAccess() {
         for (String origin : new String[] {"null", "https://other.example", "https://console.example/path",
@@ -51,7 +55,7 @@ class BrowserAuthSecurityTest {
 
     @Test
     void remotePeerCannotUseALoopbackHostToReachBrowserAuthenticationOverHttp() {
-        MockHttpServletRequest spoofedLoopback = new MockHttpServletRequest("POST", "/auth/browser/session");
+        MockHttpServletRequest spoofedLoopback = new MockHttpServletRequest("POST", AuthWire.BROWSER_SESSION_PATH);
         spoofedLoopback.setSecure(false);
         spoofedLoopback.setScheme("http");
         spoofedLoopback.setServerName("localhost");
@@ -66,8 +70,56 @@ class BrowserAuthSecurityTest {
                         error -> assertThat(error.code()).isEqualTo(ControlError.UNAUTHENTICATED));
     }
 
+    @Test
+    void missingPeerAddressFailsClosedWithoutAnInternalError() {
+        MockHttpServletRequest request = request();
+        request.setRemoteAddr(null);
+        assertThatThrownBy(() -> controller.session(request))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(ControlError.UNAUTHENTICATED));
+    }
+
+    @Test
+    void untrustedPeerCannotAssertAForwardedHttpsOrigin() {
+        MockHttpServletRequest request = request();
+        request.setSecure(false);
+        request.setScheme("http");
+        request.setServerPort(8080);
+        request.setRemoteAddr("203.0.113.9");
+        request.addHeader("X-Forwarded-Proto", "https");
+        request.addHeader("X-Forwarded-Host", "console.example");
+        request.addHeader("X-Forwarded-Port", "443");
+        request.setCookies(new Cookie("__Host-tapstate-op-session", "tss_id.secret"));
+        assertThatThrownBy(() -> controller.session(request))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(ControlError.UNAUTHENTICATED));
+    }
+
+    @Test
+    void plaintextLoopbackIsDisabledUnlessExplicitlyEnabled() {
+        MockHttpServletRequest request = new MockHttpServletRequest("POST", AuthWire.BROWSER_SESSION_PATH);
+        request.setSecure(false);
+        request.setScheme("http");
+        request.setServerName("127.0.0.1");
+        request.setServerPort(8080);
+        request.setRemoteAddr("127.0.0.1");
+        request.addHeader("Origin", "http://127.0.0.1:8080");
+        request.addHeader("X-Tapstate-Browser-Request", "1");
+        request.setCookies(new Cookie("tapstate-op-session", "tss_id.secret"));
+        assertThatThrownBy(() -> controller.session(request))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(ControlError.UNAUTHENTICATED));
+    }
+
+    @Test
+    void invalidPublicOriginConfigurationIsCodedAndRejected() {
+        assertThatThrownBy(() -> controller.publicOrigins("http://console.example/path"))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(ControlError.BROWSER_AUTH_CONFIG_INVALID));
+    }
+
     private MockHttpServletRequest request() {
-        MockHttpServletRequest request = new MockHttpServletRequest("POST", "/auth/browser/session");
+        MockHttpServletRequest request = new MockHttpServletRequest("POST", AuthWire.BROWSER_SESSION_PATH);
         request.setSecure(true);
         request.setScheme("https");
         request.setServerName("console.example");

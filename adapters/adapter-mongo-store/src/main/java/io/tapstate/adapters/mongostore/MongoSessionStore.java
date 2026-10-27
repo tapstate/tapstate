@@ -78,6 +78,16 @@ public final class MongoSessionStore implements SessionStore {
         return revoked != null;
     }
 
+    @Override
+    public boolean revokeBrowserSession(String sessionId, String secretHash, String issuer) {
+        Objects.requireNonNull(sessionId, "sessionId");
+        Objects.requireNonNull(secretHash, "secretHash");
+        Objects.requireNonNull(issuer, "issuer");
+        Bson filter = Filters.and(Filters.eq("_id", sessionId), Filters.eq("secretHash", secretHash),
+                Filters.eq("issuer", issuer));
+        return StoreIo.call(() -> collection.findOneAndUpdate(filter, Updates.set("revoked", true), RETURN_AFTER)) != null;
+    }
+
     static Document toDocument(SessionRecord record) {
         return new Document("_id", record.sessionId())
                 .append("secretHash", record.secretHash())

@@ -85,6 +85,24 @@ class MongoSessionStoreIT {
         });
     }
 
+    @Test
+    void browserLogoutAtomicallyRevokesMatchingExpiredCredentials() throws Exception {
+        withCollection(collection -> {
+            MongoSessionStore store = new MongoSessionStore(collection);
+            SessionRecord existing = record();
+            store.save(new SessionRecord(existing.sessionId(), existing.secretHash(), existing.principal(),
+                    existing.scope(), existing.issuer(), false, existing.createdAt(), existing.lastUsedAt(),
+                    CREATED.minusSeconds(1), existing.absoluteExpiresAt()));
+            assertThat(store.revokeBrowserSession("s01", "wrong", existing.issuer())).isFalse();
+            assertThat(store.revokeBrowserSession("s01", existing.secretHash(), "urn:other")).isFalse();
+            assertThat(store.revokeBrowserSession("s01", existing.secretHash(), existing.issuer())).isTrue();
+            assertThat(store.find("s01")).get().extracting(SessionRecord::revoked).isEqualTo(true);
+            assertThat(store.revokeBrowserSession("s01", existing.secretHash(), existing.issuer())).isTrue();
+            assertThat(store.exchange("s01", existing.secretHash(), existing.issuer(), CREATED,
+                    CREATED.plusSeconds(60))).isEmpty();
+        });
+    }
+
     private static SessionRecord record() {
         return new SessionRecord("s01", "sha256-fixture", "admin", "ADMIN",
                 "urn:tapstate:cluster:01J5FIXTURE", false, CREATED, CREATED,

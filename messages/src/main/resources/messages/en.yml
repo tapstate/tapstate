@@ -700,6 +700,9 @@ control.auth-failed:
 control.auth-mode-unavailable:
   message: "The `{mode}` deployment does not expose this authentication flow."
   solution: "Use the authentication entry point for the selected deployment mode."
+control.browser-auth-config-invalid:
+  message: "The browser authentication public-origin configuration is invalid."
+  solution: "Configure absolute HTTPS origins without paths, queries, fragments, or credentials."
 control.cloud-auth-unavailable:
   message: "Managed Cloud authentication is not available."
   solution: "Install the SDK exchange/online-validation and trusted deployment bindings, then enter from Cloud again."
