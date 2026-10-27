@@ -90,7 +90,7 @@ final class MongoValidationControlStore implements ValidationControlStore {
 
     @Override public Mutation transition(Transition command) {
         Objects.requireNonNull(command); var run = command.run();
-        if (command.next() == ValidationRunState.RUNNING || command.next().terminal()) requireAdmission(run, command.next().terminal());
+        requireTransitionAdmission(command);
         var changed = transaction(run.identity().owner(), command.next() == ValidationRunState.RUNNING, session -> {
             var control = control(session, run.identity().owner().pipelineId()); var row = row(session, run);
             if (row == null || row.getBoolean("retired") || !current(control, run) || !slot(control, run)) return Mutation.STALE;
@@ -101,8 +101,14 @@ final class MongoValidationControlStore implements ValidationControlStore {
             updateRun(session, run, row, new Document("state", command.next().name()));
             return Mutation.APPLIED;
         });
-        if (command.next() == ValidationRunState.RUNNING || command.next().terminal()) requireAdmission(run, command.next().terminal());
+        requireTransitionAdmission(command);
         return changed;
+    }
+
+    private void requireTransitionAdmission(Transition command) {
+        if (command.next() == ValidationRunState.RUNNING) {
+            if (validation != null) validation.requireBornStart(command.run().admission());
+        } else if (command.next().terminal()) requireAdmission(command.run(), true);
     }
 
     @Override public Mutation latchProblemLimit(Run run) {

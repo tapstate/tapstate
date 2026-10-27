@@ -672,6 +672,46 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                 this::requireOpen, new MongoValidationPreparations.Authority(original));
     }
 
+    /** Independent preparation only. The caller authenticates its command and supplies a pure local lifecycle guard. */
+    public ValidationAccess prepareValidationAccess(String pipeline, io.tapstate.spi.store.CacheBusinessScope expected,
+            MongoCacheDomain cache, io.tapstate.spi.store.WorkloadClaimFence node, Runnable local) {
+        Objects.requireNonNull(local).run(); requireOpen(); Objects.requireNonNull(expected); Objects.requireNonNull(cache);
+        if (node == null || node.key().type() != io.tapstate.spi.store.WorkloadClaimType.NODE_SESSION
+                || !expected.clusterId().equals(node.key().clusterId())) throw MongoValidationPreparations.fenced();
+        cache.requireRecoveryTarget(bindings.load().orElseThrow(MongoCachePipelineAccess::fenced));
+        var cachePreparation = cache.validationPreparations(expected, local);
+        var configuration = validationPreparations().guardedBy(local); var original = configuration.issue(pipeline, expected);
+        var completed = configuration.complete(original, cachePreparation.prepare(original, node));
+        local.run(); requireOpen(); return new ValidationAccess(this, cache, completed, local);
+    }
+
+    /** Fixed native preparation, not a renewable owner grant. Each caller still proves its exact owner/run. */
+    public static final class ValidationAccess {
+        private final MongoConfigurationDomain configuration;
+        private final MongoCacheDomain cache;
+        private final MongoValidationPreparations.Permission original;
+        private final Runnable local;
+        private ValidationAccess(MongoConfigurationDomain configuration, MongoCacheDomain cache,
+                MongoValidationPreparations.Permission original, Runnable local) {
+            this.configuration = configuration; this.cache = cache; this.original = original; this.local = local;
+        }
+        public String pipelineId() { return original.subject().pipelineId(); }
+        public io.tapstate.spi.store.CacheBusinessScope scope() { return original.subject().scope(); }
+        public java.util.UUID generation() { return original.subject().generation(); }
+        public java.util.UUID preparationId() { return original.subject().preparationId(); }
+        public void requireCurrent() { configuration.requireOpen(); local.run(); original.requireComplete(); }
+        public io.tapstate.spi.store.WorkloadClaimStore claims() { requireCurrent(); return cache.validationClaims(original, local); }
+        public io.tapstate.spi.store.ValidationControlStore control() { requireCurrent(); return cache.validationControl(original, local); }
+        public io.tapstate.spi.store.ValidationReportAdmission admissions() {
+            requireCurrent(); return new MongoValidationAdmissionStore(configuration.connection.client(), configuration.connection.database(), configuration.clusterId,
+                    () -> { configuration.requireOpen(); local.run(); }, new MongoValidationPreparations.Authority(original));
+        }
+        public io.tapstate.spi.store.ValidationResultStore results() {
+            requireCurrent(); return new MongoValidationResultStore(configuration.connection.client(), configuration.connection.database(), configuration.clusterId,
+                    () -> { configuration.requireOpen(); local.run(); }, new MongoValidationPreparations.Authority(original));
+        }
+    }
+
     /** Bounded metadata retirement for an original native deletion. No production preparation or business IO. */
     public boolean retireValidation(io.tapstate.spi.store.PipelineRetirementPreparation original, MongoCacheDomain cache,
             io.tapstate.spi.store.WorkloadClaimFence node, Runnable local) {

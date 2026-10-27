@@ -259,9 +259,16 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     WorkloadClaimStore validationClaims(MongoValidationPreparations.Permission original) {
         return validationClaims(new MongoValidationPreparations.Authority(original));
     }
+    WorkloadClaimStore validationClaims(MongoValidationPreparations.Permission original, Runnable local) {
+        return validationClaims(new MongoValidationPreparations.Authority(original), local);
+    }
 
     io.tapstate.spi.store.ValidationControlStore validationControl(MongoValidationPreparations.Permission original) {
         return validationControl(new MongoValidationPreparations.Authority(original));
+    }
+    io.tapstate.spi.store.ValidationControlStore validationControl(MongoValidationPreparations.Permission original, Runnable local) {
+        var authority = new MongoValidationPreparations.Authority(original); requireValidationPreparation(authority);
+        return new MongoValidationControlStore(client, database, authority.subject().scope(), () -> { businessActive(); local.run(); }, authority);
     }
 
     WorkloadClaimStore validationClaims(MongoValidationPreparations.Closing original) {
@@ -277,8 +284,12 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     }
 
     private WorkloadClaimStore validationClaims(MongoValidationPreparations.Authority original) {
+        return validationClaims(original, () -> {});
+    }
+    private WorkloadClaimStore validationClaims(MongoValidationPreparations.Authority original, Runnable local) {
+        Objects.requireNonNull(local);
         requireValidationPreparation(original);
-        return new MongoCacheWorkloadClaimStore(client, database, original.subject().scope(), this::businessActive, original);
+        return new MongoCacheWorkloadClaimStore(client, database, original.subject().scope(), () -> { businessActive(); local.run(); }, original);
     }
 
     private io.tapstate.spi.store.ValidationControlStore validationControl(MongoValidationPreparations.Authority original) {

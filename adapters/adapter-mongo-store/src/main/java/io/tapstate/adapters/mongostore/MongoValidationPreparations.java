@@ -108,10 +108,18 @@ final class MongoValidationPreparations {
             if (admission) owner.replace(session, row, state.change(state.phase(), state.subject(), state.closingOperationId(), state.previous()));
         }
         void requireStart(io.tapstate.spi.store.ValidationReportAdmission.Start start, boolean closed) {
+            requireStart(start, closed, false);
+        }
+        void requireBornStart(io.tapstate.spi.store.ValidationReportAdmission.Start start) { requireStart(start, false, true); }
+        private void requireStart(io.tapstate.spi.store.ValidationReportAdmission.Start start, boolean closed, boolean born) {
             if (start == null || !pipelineId().equals(start.task().pipelineId()) || !owner().clusterId.equals(start.task().clusterId())) throw fenced();
             var owner = owner();
             var store = new MongoValidationAdmissionStore(owner.client, owner.database, owner.clusterId, owner.active, this);
-            store.transaction(session -> { store.requireOriginalInTransaction(session, start, closed); return null; });
+            store.transaction(session -> {
+                if (born) store.requireBornInTransaction(session, start);
+                else store.requireOriginalInTransaction(session, start, closed);
+                return null;
+            });
         }
     }
 

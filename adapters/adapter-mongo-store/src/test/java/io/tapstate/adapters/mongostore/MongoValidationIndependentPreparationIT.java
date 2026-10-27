@@ -342,6 +342,32 @@ class MongoValidationIndependentPreparationIT {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void nativeRunningRequiresAnActuallyBornOpenOriginalReport(boolean lostReport) {
+        try (var f = new Fixture()) {
+            var complete = f.complete(); var claims = f.cacheDomain.validationClaims(complete);
+            var acquired = claims.acquire(ValidationClaims.key("cluster", PIPELINE), f.nodeA.owner(), 1, TTL).claim();
+            var executing = claims.advanceExecution(acquired, 1, Set.of(f.nodeA.owner().nodeId())).orElseThrow();
+            var run = f.run(executing, "task", ValidationMode.FULL, "run", 1);
+            var control = f.cacheDomain.validationControl(complete); assertThat(control.join(run)).isEqualTo(Join.JOINED);
+            if (lostReport) {
+                f.openReport(run);
+                SystemCollections.VALIDATION_REPORTS.on(f.configDb).deleteOne(new Document("_id", MongoValidationAdmissionStore.reportId(run.identity())));
+            }
+            var before = f.controls().find(new Document("_id", MongoValidationControlStore.runId(run))).first();
+            var ledger = f.control();
+            var running = new Transition(run, ValidationRunState.STARTING, ValidationRunState.RUNNING);
+            assertThatThrownBy(() -> control.transition(running)).isInstanceOf(TapstateException.class);
+            assertThat(f.controls().find(new Document("_id", MongoValidationControlStore.runId(run))).first()).isEqualTo(before);
+            assertThat(f.control()).isEqualTo(ledger);
+            if (!lostReport) {
+                f.openReport(run); assertThat(control.transition(running)).isEqualTo(Mutation.APPLIED);
+                assertThat(control.transition(running)).isEqualTo(Mutation.ALREADY_APPLIED);
+            }
+        }
+    }
+
     @Test void closingAuthorityDrainsOriginalRunsAndReportsButCannotAdmitNewWork() {
         try (var f = new Fixture()) {
             var complete = f.complete(); var claims = f.cacheDomain.validationClaims(complete);
@@ -418,6 +444,38 @@ class MongoValidationIndependentPreparationIT {
                 } finally { release.countDown(); }
                 assertThatThrownBy(() -> pending.get(10, TimeUnit.SECONDS)).hasCauseInstanceOf(TapstateException.class);
                 assertThat(f.controls().countDocuments(new Document("_id.kind", "run"))).isZero();
+            }
+        }
+    }
+
+    @Test void reportClosureAfterTheRunningPrecheckCannotAcknowledgeBusinessReadiness() throws Exception {
+        try (var f = new Fixture(); var worker = Executors.newSingleThreadExecutor()) {
+            var complete = f.complete(); var claims = f.cacheDomain.validationClaims(complete);
+            var claim = claims.acquire(ValidationClaims.key("cluster", PIPELINE), f.nodeA.owner(), 1, TTL).claim();
+            claim = claims.advanceExecution(claim, 1, Set.of(f.nodeA.owner().nodeId())).orElseThrow();
+            var run = f.run(claim, "task", ValidationMode.FULL, "run", 1); f.openReport(run);
+            var current = f.cacheDomain.validationControl(complete); assertThat(current.join(run)).isEqualTo(Join.JOINED);
+            var entered = new CountDownLatch(1); var release = new CountDownLatch(1); var once = new AtomicBoolean();
+            try (var observed = MongoClients.create(MongoClientSettings.builder().applyConnectionString(new ConnectionString(CACHE.getReplicaSetUrl()))
+                    .addCommandListener(new CommandListener() {
+                        @Override public void commandStarted(CommandStartedEvent event) {
+                            if (event.getCommandName().equals("update") && event.getCommand().getString("update").getValue().equals("workload_claims")
+                                    && once.compareAndSet(false, true)) { entered.countDown(); await(release); }
+                        }
+                    }).build())) {
+                var delayed = new MongoValidationControlStore(observed, observed.getDatabase(f.cacheDb.getName()), f.scope, () -> {},
+                        new MongoValidationPreparations.Authority(complete));
+                var pending = worker.submit(() -> delayed.transition(new Transition(run, ValidationRunState.STARTING, ValidationRunState.RUNNING)));
+                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+                try { assertThat(f.admissions().close(run.admission())).isEqualTo(ValidationReportAdmission.Closure.CLOSED); }
+                finally { release.countDown(); }
+                assertThatThrownBy(() -> pending.get(10, TimeUnit.SECONDS)).hasCauseInstanceOf(TapstateException.class);
+                // The independent CACHE commit is now known, but its failed CONFIG post-check never acknowledged readiness.
+                assertThat(f.controls().find(new Document("_id", MongoValidationControlStore.runId(run))).first()).containsEntry("state", "RUNNING");
+                assertThat(current.transition(new Transition(run, ValidationRunState.RUNNING, ValidationRunState.FAILED))).isEqualTo(Mutation.APPLIED);
+                assertThat(current.retire(new Retirement(run, run.report(), ValidationRunState.FAILED))).isEqualTo(Mutation.APPLIED);
+                assertThat(f.control().get("slots", Document.class)).isEmpty();
+                assertThat(f.admissions().open(run.admission())).isEqualTo(ValidationReportAdmission.Birth.CLOSED);
             }
         }
     }

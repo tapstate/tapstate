@@ -592,6 +592,89 @@ class MongoValidationSchemaIT {
         }
     }
 
+    @Test void publicNativeValidationAccessKeepsSeparateOriginalStoresAndNoProductionPreparation() {
+        try (var f = new Fixture(1)) {
+            f.upgrade(); var before = f.productionFacts(); var node = f.node("node");
+            var access = f.configuration.prepareValidationAccess("flow0", f.scope, f.cache, WorkloadClaimFence.from(node), () -> {});
+            var replay = f.configuration.prepareValidationAccess("flow0", f.scope, f.cache, WorkloadClaimFence.from(node), () -> {});
+            assertThat(replay.generation()).isEqualTo(access.generation()); assertThat(replay.preparationId()).isEqualTo(access.preparationId());
+            assertThat(access.scope()).isEqualTo(f.scope); assertThat(access.pipelineId()).isEqualTo("flow0");
+            var claims = access.claims(); var held = claims.acquire(ValidationClaims.key("cluster", "flow0"), node.owner(), 1, TTL).claim();
+            var executing = claims.advanceExecution(held, 1, Set.of(node.owner().nodeId())).orElseThrow();
+            var run = f.reserveRun(f.configuration, f.configuration.validationPreparations().issue("flow0", f.scope), executing, "task", "run");
+            var controls = access.control(); assertThat(controls.join(run)).isEqualTo(ValidationControlStore.Join.JOINED);
+            assertThat(access.admissions().open(run.admission())).isEqualTo(ValidationReportAdmission.Birth.CREATED);
+            assertThat(controls.transition(new ValidationControlStore.Transition(run, io.tapstate.core.validation.ValidationRunState.STARTING,
+                    io.tapstate.core.validation.ValidationRunState.RUNNING))).isEqualTo(ValidationControlStore.Mutation.APPLIED);
+            assertThat(access.results().seal(run.report())).isEqualTo(ValidationResultStore.Seal.SEALED);
+            assertThat(controls.transition(new ValidationControlStore.Transition(run, io.tapstate.core.validation.ValidationRunState.RUNNING,
+                    io.tapstate.core.validation.ValidationRunState.COMPLETED))).isEqualTo(ValidationControlStore.Mutation.APPLIED);
+            assertThat(controls.retire(new ValidationControlStore.Retirement(run, run.report(), io.tapstate.core.validation.ValidationRunState.COMPLETED)))
+                    .isEqualTo(ValidationControlStore.Mutation.APPLIED);
+            assertThat(f.productionFacts()).isEqualTo(before);
+            assertThat(SystemCollections.CACHE_PIPELINE_STATE.on(f.cacheDb).countDocuments()).isZero();
+            assertThat(SystemCollections.CACHE_SOURCE_SCHEMAS.on(f.cacheDb).countDocuments()).isZero();
+        }
+    }
+
+    @Test void publicNativeValidationAccessRejectsAnotherCacheBeforeIssuingItsFirstPreparation() {
+        try (var f = new Fixture(1); var wrong = new Fixture(0)) {
+            f.upgrade(); var node = f.node("node"); var before = f.configuration.validationPreparations().read("flow0");
+            assertThatThrownBy(() -> f.configuration.prepareValidationAccess("flow0", f.scope, wrong.cache, WorkloadClaimFence.from(node), () -> {}))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(f.configuration.validationPreparations().read("flow0")).isEqualTo(before);
+            assertThat(SystemCollections.VALIDATION_RUNS.on(f.cacheDb).countDocuments()).isZero();
+        }
+    }
+
+    @Test void publicNativeValidationAccessRetainsTheOriginalLifecycleAndDoesNotFollowAReplacement() {
+        try (var f = new Fixture(1)) {
+            f.upgrade(); var node = f.node("node"); var active = new java.util.concurrent.atomic.AtomicBoolean(true);
+            Runnable local = () -> { if (!active.get()) throw new IllegalStateException("local validation context closed"); };
+            var access = f.configuration.prepareValidationAccess("flow0", f.scope, f.cache, WorkloadClaimFence.from(node), local);
+            var claims = access.claims(); active.set(false);
+            assertThatThrownBy(access::requireCurrent).isInstanceOf(IllegalStateException.class);
+            assertThatThrownBy(() -> claims.acquire(ValidationClaims.key("cluster", "flow0"), node.owner(), 1, TTL)).isInstanceOf(IllegalStateException.class);
+            active.set(true); var definition = f.configuration.artifacts().get("flow0").orElseThrow(); var deletion = f.beginRetirement();
+            assertThat(f.configuration.retireValidation(deletion, f.cache, WorkloadClaimFence.from(node), () -> {})).isTrue();
+            f.completeRetirement(deletion, node); f.configuration.artifacts().create(definition);
+            var current = f.configuration.prepareValidationAccess("flow0", f.scope, f.cache, WorkloadClaimFence.from(node), () -> {});
+            assertThat(current.generation()).isNotEqualTo(access.generation());
+            assertThatThrownBy(access::requireCurrent).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> claims.acquire(ValidationClaims.key("cluster", "flow0"), node.owner(), 1, TTL)).isInstanceOf(TapstateException.class);
+        }
+    }
+
+    @Test void retainedPublicStoresRejectLocalClosureAndForeignPipelineCommandsWithoutWrites() {
+        try (var f = new Fixture(1)) {
+            f.upgrade(); var node = f.node("node"); var live = new java.util.concurrent.atomic.AtomicBoolean(true);
+            var access = f.configuration.prepareValidationAccess("flow0", f.scope, f.cache, WorkloadClaimFence.from(node),
+                    () -> { if (!live.get()) throw new IllegalStateException("local validation context closed"); });
+            var claims = access.claims(); var control = access.control(); var admissions = access.admissions(); var results = access.results();
+            var acquired = claims.acquire(ValidationClaims.key("cluster", "flow0"), node.owner(), 1, TTL).claim();
+            var executing = claims.advanceExecution(acquired, 1, Set.of(node.owner().nodeId())).orElseThrow();
+            var run = f.reserveRun(f.configuration, f.configuration.validationPreparations().issue("flow0", f.scope), executing, "task", "run");
+            var foreignOwner = new io.tapstate.core.validation.ValidationOwner("cluster", "foreign", node.owner().nodeId(), node.owner().bootId(),
+                    executing.claimGeneration(), executing.executionGeneration(), executing.topologyRevision());
+            var foreignIdentity = new io.tapstate.core.validation.ValidationRunIdentity(foreignOwner, "task", "foreign", io.tapstate.core.validation.ValidationMode.FULL, "spec", 1, "rules");
+            var foreignStart = new ValidationReportAdmission.Start(new ValidationReportAdmission.Task("cluster", "foreign", "task", UUID.randomUUID()),
+                    1, 1, UUID.randomUUID().toString(), foreignIdentity);
+            var before = SystemCollections.VALIDATION_RUNS.on(f.cacheDb).find().into(new ArrayList<>());
+            assertThatThrownBy(() -> admissions.reserve(foreignStart)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> admissions.open(foreignStart)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> admissions.close(foreignStart)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> control.join(new ValidationControlStore.Run(foreignIdentity, 1, foreignStart))).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> results.seal(foreignStart.report())).isInstanceOf(TapstateException.class);
+            live.set(false);
+            assertThatThrownBy(() -> claims.renew(executing, TTL)).isInstanceOf(IllegalStateException.class);
+            assertThatThrownBy(() -> control.join(run)).isInstanceOf(IllegalStateException.class);
+            assertThatThrownBy(() -> admissions.open(run.admission())).isInstanceOf(IllegalStateException.class);
+            assertThatThrownBy(() -> results.seal(run.report())).isInstanceOf(IllegalStateException.class);
+            assertThat(SystemCollections.VALIDATION_RUNS.on(f.cacheDb).find().into(new ArrayList<>())).isEqualTo(before);
+            assertThat(SystemCollections.VALIDATION_REPORTS.on(f.configDb).countDocuments()).isZero();
+        }
+    }
+
     private static final class Fixture implements AutoCloseable {
         final MongoClient configClient = MongoClients.create(CONFIG.getReplicaSetUrl()), cacheClient = MongoClients.create(CACHE.getReplicaSetUrl());
         final String suffix = UUID.randomUUID().toString().replace("-", "");

@@ -192,6 +192,14 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         } else if (Boolean.TRUE.equals(task.get("closed")) || held == null || !identity(start).equals(held.get("identity"))
                 || !Set.of("OPEN", "BORN").contains(phase(held))) throw unreadable("original-permission");
     }
+    void requireBornInTransaction(ClientSession session, Start start) {
+        requireOriginalInTransaction(session, start, false);
+        var task = task(session, start); var held = matching(mode(task, start.run().mode()), start);
+        if (held == null || !phase(held).equals("BORN")) throw unreadable("original-report-birth");
+        var report = reports.find(session, new Document("_id", reportId(start.run()))).first();
+        requireReport(report, start);
+        if (report.getBoolean("closed")) throw unreadable("original-report-closed");
+    }
     private static Document mode(Document task, ValidationMode mode) {
         var modes = task.get("modes", Document.class);
         var value = modes.get(modeName(mode));
