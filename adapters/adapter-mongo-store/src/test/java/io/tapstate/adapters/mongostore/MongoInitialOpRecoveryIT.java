@@ -97,6 +97,12 @@ class MongoInitialOpRecoveryIT {
             var commands = f.configuration.recoveryCommands();
             var invocation = f.configuration.startInitialOpRecovery(commands.confirm(f.plan(null)), () -> {});
             f.configuration.prepareInitialOpRecovery(f.cache, invocation, () -> {});
+            try (var ready = MongoConfigurationDomain.openExisting(f.settings); var raw = MongoClients.create(MONGO.getReplicaSetUrl())) {
+                assertThat(ready.schemaVersion()).isEqualTo(2);
+                assertThat(raw.getDatabase(f.cacheName).getCollection("schema_migrations").find(new Document("_id", "business")).first().getInteger("installedVersion"))
+                        .isEqualTo(2);
+                assertThat(raw.getDatabase(f.cacheName).listCollectionNames()).contains("validation_runs");
+            }
             var completed = commands.complete(invocation.plan());
             assertThat(f.configuration.setupStates().load().phase()).isEqualTo(StorageSetupStateStore.Phase.STORAGE_BOUND);
             try (var reopened = MongoConfigurationDomain.openExisting(f.settings)) {
@@ -107,6 +113,40 @@ class MongoInitialOpRecoveryIT {
                 assertThatThrownBy(() -> reopened.initialOpRecoverySource(f.binding.preparation().authScope(), false)).isInstanceOf(TapstateException.class);
                 reopened.prepareInitialOpRecovery(f.cache, retained, () -> {});
             }
+        }
+    }
+
+    @Test void completedInitialRecoveryRequiresConsistentConfigurationSchemaIdentity() {
+        try (var f = new Fixture(); var raw = MongoClients.create(MONGO.getReplicaSetUrl())) {
+            var commands = f.configuration.recoveryCommands();
+            var invocation = f.configuration.startInitialOpRecovery(commands.confirm(f.plan(null)), () -> {});
+            f.configuration.prepareInitialOpRecovery(f.cache, invocation, () -> {});
+            var retained = f.configuration.startInitialOpRecovery(commands.complete(invocation.plan()), () -> {});
+            var schemas = raw.getDatabase(f.configName).getCollection("schema_migrations"); var key = new Document("_id", "config");
+            var original = schemas.find(key).first();
+            schemas.updateOne(key, new Document("$set", new Document("validation.scope.cacheIncarnation", "another-cache")));
+            assertThatThrownBy(() -> f.configuration.prepareInitialOpRecovery(f.cache, retained, () -> {})).isInstanceOf(TapstateException.class);
+            schemas.replaceOne(key, original);
+            schemas.updateOne(key, new Document("$set", new Document("installedVersion", 1)));
+            assertThatThrownBy(() -> f.configuration.prepareInitialOpRecovery(f.cache, retained, () -> {})).isInstanceOf(TapstateException.class);
+            schemas.replaceOne(key, original);
+            schemas.updateOne(key, new Document("$set", new Document("validation.initializedPipelines", 1L)));
+            assertThatThrownBy(() -> f.configuration.prepareInitialOpRecovery(f.cache, retained, () -> {})).isInstanceOf(TapstateException.class);
+        }
+    }
+
+    @Test void completedInitialRecoveryNeverRecreatesMissingValidationFacts() {
+        try (var f = new Fixture(); var raw = MongoClients.create(MONGO.getReplicaSetUrl())) {
+            var commands = f.configuration.recoveryCommands();
+            var invocation = f.configuration.startInitialOpRecovery(commands.confirm(f.plan(null)), () -> {});
+            f.configuration.prepareInitialOpRecovery(f.cache, invocation, () -> {});
+            var completed = commands.complete(invocation.plan());
+            var retained = f.configuration.startInitialOpRecovery(completed, () -> {});
+            raw.getDatabase(f.cacheName).getCollection("validation_runs").drop();
+            assertThatThrownBy(() -> f.configuration.prepareInitialOpRecovery(f.cache, retained, () -> {})).isInstanceOf(TapstateException.class);
+            assertThat(raw.getDatabase(f.cacheName).listCollectionNames()).doesNotContain("validation_runs");
+            raw.getDatabase(f.configName).getCollection("schema_migrations").deleteOne(new Document("_id", "config"));
+            assertThatThrownBy(() -> f.configuration.prepareInitialOpRecovery(f.cache, retained, () -> {})).isInstanceOf(TapstateException.class);
         }
     }
 
@@ -121,12 +161,12 @@ class MongoInitialOpRecoveryIT {
         }
     }
 
-    @Test void schemaUpgradeDuringInitialSetupDoesNotRequireACacheIncarnationReplacement() {
+    @Test void schemaTwoPreparedDuringInitialRecoveryDoesNotRequireACacheIncarnationReplacement() {
         try (var f = new Fixture()) {
             var commands = f.configuration.recoveryCommands();
             var invocation = f.configuration.startInitialOpRecovery(commands.confirm(f.plan(null)), () -> {});
             f.configuration.prepareInitialOpRecovery(f.cache, invocation, () -> {});
-            try (var upgrade = MongoConfigurationDomain.prepareValidationSchema(f.settings, f.setup.clusterId(), UUID.randomUUID())) {
+            try (var upgrade = MongoConfigurationDomain.resumeValidationSchema(f.settings, f.setup.clusterId(), UUID.fromString(invocation.plan().operationId()))) {
                 upgrade.prepareCache(f.cache); assertThat(upgrade.advance(20).ready()).isTrue();
             }
             assertThatCode(() -> commands.complete(invocation.plan())).doesNotThrowAnyException();

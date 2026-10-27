@@ -272,6 +272,9 @@ class ManagedMongoStoreIsolationIT {
                 var committed = management.post().uri("/api/storage/setup/commit").body(Map.of("operationId", setup.scope().operationId(),
                         "generation", setup.scope().generation(), "candidate", candidate, "testStamps", stamps)).retrieve().body(Map.class);
                 assertThat(committed.get("setupPhase")).isEqualTo("COMPLETE");
+                assertThat(admin.getDatabase(configDb).getCollection("schema_migrations").find(new Document("_id", "config")).first().getInteger("installedVersion")).isEqualTo(2);
+                assertThat(admin.getDatabase(cacheDb).getCollection("schema_migrations").find(new Document("_id", "business")).first().getInteger("installedVersion")).isEqualTo(2);
+                assertThat(admin.getDatabase(cacheDb).listCollectionNames()).contains("validation_runs");
                 assertThat(process.publicClient().get().uri("/auth/storage-entry").retrieve().body(Map.class))
                         .containsExactlyInAnyOrderEntriesOf(Map.of("mode", "OP", "entry", "RESTART_REQUIRED", "management", false));
                 assertThat(files.stage().handoff()).isEqualTo(InstallationFiles.Handoff.RESTART_REQUIRED);
@@ -523,6 +526,9 @@ class ManagedMongoStoreIsolationIT {
                 var completed = management.post().uri("/api/storage/recovery/confirm").body(confirm).retrieve().body(Map.class);
                 assertThat(completed.get("phase")).isEqualTo("COMPLETE");
                 assertThat(files.stage().handoff()).isEqualTo(InstallationFiles.Handoff.RESTART_REQUIRED);
+                assertThat(admin.getDatabase(config).getCollection("schema_migrations").find(new Document("_id", "config")).first().getInteger("installedVersion")).isEqualTo(2);
+                assertThat(admin.getDatabase(cache).getCollection("schema_migrations").find(new Document("_id", "business")).first().getInteger("installedVersion")).isEqualTo(2);
+                assertThat(admin.getDatabase(cache).listCollectionNames()).contains("validation_runs");
                 assertThat(files.capability()).isEmpty();
                 var identity = admin.getDatabase(cache).getCollection("cache_identity").find().first();
                 assertThat(identity.getString("authPreparationId")).isEqualTo(planned.get("operationId"));
@@ -1495,6 +1501,9 @@ class ManagedMongoStoreIsolationIT {
                     } finally { deliverGrant.countDown(); }
                 }
                 assertThat(configuration.setupStates().load().phase()).isEqualTo(StorageSetupStateStore.Phase.COMPLETE);
+                assertThat(admin.getDatabase(configDb).getCollection("schema_migrations").find(new Document("_id", "config")).first().getInteger("installedVersion")).isEqualTo(2);
+                assertThat(admin.getDatabase(cacheDb).getCollection("schema_migrations").find(new Document("_id", "business")).first().getInteger("installedVersion")).isEqualTo(2);
+                assertThat(admin.getDatabase(cacheDb).listCollectionNames()).contains("validation_runs");
                 assertThat(admin.getDatabase(cacheDb).getCollection("cloud_sessions").countDocuments()).isZero();
                 assertCloudStatus(application, temporary, 401);
                 assertThatThrownBy(() -> oldContext.service().exchangeCode("late", "127.0.0.1")).isInstanceOf(TapstateException.class);

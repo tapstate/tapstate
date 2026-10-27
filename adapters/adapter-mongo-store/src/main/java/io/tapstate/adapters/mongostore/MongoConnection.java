@@ -77,6 +77,9 @@ public final class MongoConnection implements AutoCloseable {
         this(settings, null, null, false, false);
     }
 
+    /** A separate explicit maintenance owner uses the same verified CONFIG endpoint. */
+    MongoConnectionSettings configurationSettings() { return settings; }
+
     /** A configuration domain preserves deployment authentication and verifies peers whenever TLS is enabled. */
     public static MongoConnection forConfiguration(MongoConnectionSettings settings) {
         return new MongoConnection(settings, null, null, true, false);

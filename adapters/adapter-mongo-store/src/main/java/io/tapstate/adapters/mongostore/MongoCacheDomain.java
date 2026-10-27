@@ -149,12 +149,14 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     public CacheAuthScope prepareFirstAuth(io.tapstate.spi.store.FirstCacheCreation invocation) {
         var original = MongoStorageBindingStore.consumeFirst(invocation, targetFingerprint);
         var preparation = original.preparation();
-        Runnable active = () -> { businessActive(); original.requireActive(); };
-        active.run();
+        Runnable active = () -> { businessActive(); MongoStorageBindingStore.requireFirstLocal(original); };
+        original.requireActive(); active.run();
         boolean emptyTarget = StoreIo.call(() -> { try (var names = database.listCollectionNames().iterator()) { return !names.hasNext(); } });
         var facts = facts(preparation.authScope());
         facts.beginFirstPreparation(preparation.operationId(), emptyTarget, active);
-        return finishAuth(facts, preparation.authScope(), preparation.operationId(), active);
+        original.requireActive();
+        var result = finishAuth(facts, preparation.authScope(), preparation.operationId(), active);
+        original.requireActive(); active.run(); return result;
     }
 
     /** A controlled continuation may complete retained facts but never recreate a missing identity. */
@@ -322,6 +324,12 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         businessActive();
         new MongoCacheMetadataStructure(database, rateRetention).verifyBusiness();
         facts(original.authScope()).verifyValidationMaintenance(original.businessScope(), operation, configurationComplete);
+    }
+
+    void verifyValidationReady(io.tapstate.spi.store.CachePreparation original, String operation) {
+        verifyValidationMaintenance(original, operation, true);
+        StoreIo.run(() -> MongoValidationSchema.requireReady(database, false));
+        businessActive();
     }
 
     /** The claims share this exact cache client, original scope and owner lifecycle. */

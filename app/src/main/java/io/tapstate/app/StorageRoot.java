@@ -231,9 +231,15 @@ final class StorageRoot implements AutoCloseable {
             if (committed.firstCreation().isPresent() && attemptedCreation != committed.firstCreation().orElseThrow()) {
                 attemptedCreation = committed.firstCreation().orElseThrow();
                 original.cache().prepareFirstAuth(attemptedCreation);
-            } else original.cache().resumeInitialAuth(committed.preparation(), active);
+            } else original.cache().resumeInitialAuth(committed.preparation(), () -> {
+                requireOpen(); original.requireActive();
+                if (runtime.current().orElseThrow(StorageRuntime::unavailable) != original) throw StorageRuntime.unavailable();
+            });
             original.verifyAuthentication();
-            original.cache().prepareInitialBusiness(committed.preparation(), active);
+            configuration.prepareInitialValidationSchema(committed.preparation(), original.cache(), () -> {
+                requireOpen(); original.requireActive();
+                if (runtime.current().orElseThrow(StorageRuntime::unavailable) != original) throw StorageRuntime.unavailable();
+            });
             original.verifyBusiness(); active.run();
             var currentSetup = configuration.setupStates().load().scope();
             if (!currentSetup.clusterId().equals(committed.binding().setup().clusterId())
@@ -242,6 +248,11 @@ final class StorageRoot implements AutoCloseable {
             configuration.bindings().guardedBy(active).complete(currentSetup);
         }
         active.run();
+        configuration.prepareInitialValidationSchema(committed.preparation(), original.cache(), () -> {
+            requireOpen(); original.requireActive();
+            if (runtime.current().orElseThrow(StorageRuntime::unavailable) != original) throw StorageRuntime.unavailable();
+        });
+        original.verifyBusiness(); active.run();
         return original;
     }
 

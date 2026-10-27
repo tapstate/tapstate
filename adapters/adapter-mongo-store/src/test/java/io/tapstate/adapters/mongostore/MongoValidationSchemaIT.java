@@ -29,6 +29,61 @@ class MongoValidationSchemaIT {
     @Container static final MongoDBContainer CACHE = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
     static final Duration TTL = Duration.ofSeconds(30);
 
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(StorageBinding.Mode.class)
+    void originalEmptyInstallationPublishesBothSchemaHalvesBeforeBusinessAndReplaysWithoutRepair(StorageBinding.Mode mode) {
+        try (var f = new Fixture(0, mode)) {
+            var original = f.configuration.bindings().cachePreparation().orElseThrow();
+            var completed = f.configuration.prepareInitialValidationSchema(original, f.cache, () -> {});
+            assertThat(completed.ready()).isTrue(); assertThat(completed.initializedPipelines()).isZero();
+            assertThat(f.configSchema().getInteger("installedVersion")).isEqualTo(2); assertThat(f.cacheSchema().getInteger("installedVersion")).isEqualTo(2);
+            assertThat(f.configSchema().get("validation", Document.class).getString("operationId")).isEqualTo(completed.operationId());
+            assertThat(f.cacheSchema().get("validation", Document.class).getString("operationId")).isEqualTo(completed.operationId());
+            long revision = f.configuration.configurationRevision();
+            assertThat(f.configuration.prepareInitialValidationSchema(original, f.cache, () -> {})).isEqualTo(completed);
+            assertThat(f.configuration.configurationRevision()).isEqualTo(revision);
+            try (var ordinary = MongoConfigurationDomain.open(f.settings, "cluster")) { assertThat(ordinary.schemaVersion()).isEqualTo(2); }
+            SystemCollections.VALIDATION_RUNS.on(f.cacheDb).drop();
+            assertThatThrownBy(() -> f.configuration.prepareInitialValidationSchema(original, f.cache, () -> {})).isInstanceOf(TapstateException.class);
+            assertThat(f.cacheDb.listCollectionNames()).doesNotContain("validation_runs");
+        }
+    }
+
+    @Test void anInterruptedInitialCacheHalfKeepsConfigurationLoadableAndOnlyTheSameOperationContinues() {
+        for (boolean complete : List.of(false, true)) try (var f = new Fixture(0)) {
+            var original = f.configuration.bindings().cachePreparation().orElseThrow();
+            var operation = MongoConfigurationDomain.initialValidationSchemaOperation(original);
+            if (complete) f.cache.prepareValidationSchema(original, operation.toString());
+            else new MongoCacheIdentity(f.cacheClient, f.cacheDb, original.authScope()).beginValidationSchema(f.scope, operation.toString(), () -> {});
+            assertThat(f.configSchema().getInteger("installedVersion")).isEqualTo(1);
+            try (var reopened = MongoConfigurationDomain.open(f.settings, "cluster")) {
+                assertThat(reopened.schemaVersion()).isEqualTo(1);
+                assertThat(reopened.prepareInitialValidationSchema(original, f.cache, () -> {}).ready()).isTrue();
+            }
+            assertThat(f.configSchema().get("validation", Document.class).getString("operationId")).isEqualTo(operation.toString());
+        }
+        try (var f = new Fixture(0)) {
+            var original = f.configuration.bindings().cachePreparation().orElseThrow();
+            f.cache.prepareValidationSchema(original, UUID.randomUUID().toString());
+            assertThatThrownBy(() -> f.configuration.prepareInitialValidationSchema(original, f.cache, () -> {})).isInstanceOf(TapstateException.class);
+            assertThat(f.configSchema().getInteger("installedVersion")).isEqualTo(1);
+        }
+    }
+
+    @Test void initialPreparationRefusesExistingPipelinesAndLiveWorkersBeforePublishingNewSchema() {
+        try (var f = new Fixture(1)) {
+            var original = f.configuration.bindings().cachePreparation().orElseThrow(); var before = f.configSchema(); var cacheBefore = f.cacheSchema();
+            assertThatThrownBy(() -> f.configuration.prepareInitialValidationSchema(original, f.cache, () -> {})).isInstanceOf(TapstateException.class);
+            assertThat(f.configSchema()).isEqualTo(before); assertThat(f.cacheSchema()).isEqualTo(cacheBefore);
+        }
+        try (var f = new Fixture(0)) {
+            var original = f.configuration.bindings().cachePreparation().orElseThrow(); var before = f.configSchema(); var cacheBefore = f.cacheSchema();
+            f.cache.workloadClaims(f.scope).acquire(f.nodeKey(), f.nodeOwner(), 1, TTL);
+            assertThatThrownBy(() -> f.configuration.prepareInitialValidationSchema(original, f.cache, () -> {})).isInstanceOf(TapstateException.class);
+            assertThat(f.configSchema()).isEqualTo(before); assertThat(f.cacheSchema()).isEqualTo(cacheBefore);
+        }
+    }
+
     @Test void versionOneOrdinaryOpenKeepsSynchronizationAvailableAndNeverCreatesValidationResources() {
         try (var f = new Fixture(1); var reopened = MongoConfigurationDomain.open(f.settings, "cluster")) {
             assertThat(reopened.schemaVersion()).isEqualTo(1);

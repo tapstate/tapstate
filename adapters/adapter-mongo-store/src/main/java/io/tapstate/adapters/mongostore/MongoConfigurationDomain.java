@@ -142,6 +142,33 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         return ValidationSchemaPreparation.open(settings, clusterId, operation, false);
     }
 
+    /**
+     * Installer-owned continuation before the first business runtime. An existing version-one
+     * installation is never upgraded here: the initial transition requires no Pipeline mappings and
+     * no live CACHE workers. Replays bind the same initial operation and verify retained resources;
+     * they cannot reconstruct a missing version-two collection. Ordinary open never calls this.
+     * local is a pure, nonblocking lifecycle guard, not another store or network callback.
+     */
+    public ValidationSchemaStatus prepareInitialValidationSchema(io.tapstate.spi.store.CachePreparation original,
+            MongoCacheDomain cache, Runnable local) {
+        requireOpen(); Objects.requireNonNull(original); Objects.requireNonNull(cache); Objects.requireNonNull(local).run();
+        if (original.authScope().authGeneration() != 1 || !clusterId.equals(original.authScope().clusterId())) throw MongoValidationSchema.refused();
+        bindings.requireOriginalInitialPreparation(original);
+        var operation = initialValidationSchemaOperation(original);
+        try (var preparation = ValidationSchemaPreparation.open(connection.configurationSettings(), clusterId, operation, true, original,
+                () -> { requireOpen(); local.run(); })) {
+            var result = preparation.prepareInitial(cache);
+            if (!result.ready() || result.initializedPipelines() != 0) throw MongoValidationSchema.refused();
+            bindings.requireOriginalInitialPreparation(original); local.run(); return result;
+        }
+    }
+
+    static java.util.UUID initialValidationSchemaOperation(io.tapstate.spi.store.CachePreparation original) {
+        var coordinates = new Document("kind", "initial-validation-schema-v1").append("operationId", original.operationId())
+                .append("scope", MongoValidationControlStore.scope(original.businessScope()));
+        return java.util.UUID.nameUUIDFromBytes(coordinates.toJson().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    }
+
     /** CONFIG progress only; CACHE preparation remains an independently verified operation. */
     public record ValidationSchemaStatus(String operationId, boolean ready, long initializedPipelines) {}
 
@@ -156,21 +183,37 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         private final MongoStorageBindingStore bindings;
         private final io.tapstate.spi.store.CacheBusinessScope scope;
         private final java.time.Duration timeout;
+        private final io.tapstate.spi.store.CachePreparation initial;
+        private final Runnable local;
+        private final io.tapstate.spi.store.StorageRecoveryCommands.Plan initialRecovery;
         private volatile boolean closed;
 
-        private ValidationSchemaPreparation(MongoConnection connection, String clusterId, java.util.UUID operation, java.time.Duration timeout) {
+        private ValidationSchemaPreparation(MongoConnection connection, String clusterId, java.util.UUID operation, java.time.Duration timeout,
+                io.tapstate.spi.store.CachePreparation initial, Runnable local, io.tapstate.spi.store.StorageRecoveryCommands.Plan initialRecovery) {
             this.connection = connection; this.database = connection.database(); this.clusterId = clusterId; this.operation = operation;
             this.bindings = new MongoStorageBindingStore(connection.client(), database, new PersistentKey(database, clusterId));
             this.scope = bindings.cachePreparation().orElseThrow(MongoValidationSchema::refused).businessScope();
             this.timeout = timeout;
+            this.initial = initial; this.local = local;
+            this.initialRecovery = initialRecovery;
         }
 
         private static ValidationSchemaPreparation open(MongoConnectionSettings settings, String clusterId, java.util.UUID operation, boolean first) {
+            return open(settings, clusterId, operation, first, null, () -> {});
+        }
+        private static ValidationSchemaPreparation open(MongoConnectionSettings settings, String clusterId, java.util.UUID operation, boolean first,
+                io.tapstate.spi.store.CachePreparation initial, Runnable local) {
+            return open(settings, clusterId, operation, first, initial, local, null);
+        }
+        private static ValidationSchemaPreparation open(MongoConnectionSettings settings, String clusterId, java.util.UUID operation, boolean first,
+                io.tapstate.spi.store.CachePreparation initial, Runnable local, io.tapstate.spi.store.StorageRecoveryCommands.Plan recovery) {
             Objects.requireNonNull(clusterId); Objects.requireNonNull(operation);
             var connection = MongoConnection.forConfiguration(settings);
             try {
-                connection.verifyConnectivity(); var handle = new ValidationSchemaPreparation(connection, clusterId, operation, settings.serverSelectionTimeout());
-                handle.verifyOffline(); handle.begin(first); return handle;
+                local.run(); connection.verifyConnectivity(); var handle = new ValidationSchemaPreparation(connection, clusterId, operation, settings.serverSelectionTimeout(), initial, local, recovery);
+                if (initial == null) { handle.verifyOffline(); handle.begin(first); }
+                else handle.initialConfiguration();
+                return handle;
             } catch (RuntimeException | Error failure) { connection.close(); throw failure; }
         }
 
@@ -200,6 +243,62 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                 return null;
             });
             MongoValidationSchema.verify(database, MongoValidationSchema.CONFIG);
+        }
+
+        private ValidationSchemaStatus initialConfiguration() {
+            return transaction(session -> {
+                requireOriginal(session);
+                var row = SystemCollections.SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "config")).first();
+                if (row != null && Integer.valueOf(1).equals(row.get("installedVersion")) && !row.containsKey("validation")) {
+                    if (SystemCollections.OPERATOR_GENERATIONS.on(database).find(session).projection(new Document("_id", 1)).limit(1).first() != null)
+                        throw MongoValidationSchema.refused();
+                    MongoValidationSchema.requireAbsent(database, MongoValidationSchema.CONFIG);
+                    return null;
+                }
+                var marker = MongoValidationSchema.requireVersionTwo(row, "READY");
+                if (!scope.equals(MongoValidationSchema.scope(marker)) || marker.getLong("initializedPipelines") != 0) throw MongoValidationSchema.refused();
+                return new ValidationSchemaStatus(marker.getString("operationId"), true, 0);
+            });
+        }
+
+        private ValidationSchemaStatus prepareInitial(MongoCacheDomain cache) {
+            var retained = initialConfiguration();
+            cache.requireRecoveryTarget(bindings.load().orElseThrow(MongoValidationSchema::refused));
+            if (retained != null) {
+                // A completed explicit recovery may have replaced the CACHE schema operation. This
+                // path only verifies that published result; it never adopts or creates missing facts.
+                MongoValidationSchema.requireReady(database, true);
+                cache.verifyValidationReady(initial, retained.operationId());
+                cache.verifyBusinessReady(scope); local.run(); return retained;
+            }
+            cache.resumeValidationSchema(initial, operation.toString());
+            try { cache.verifyBusinessReady(scope); }
+            catch (TapstateException notReady) {
+                // Original controlled creation still arbitrates birth and refuses lost READY facts.
+                // A failed read is not the authority to initialize a replacement.
+                cache.prepareInitialBusiness(initial, local);
+            }
+            verifyOffline(); cache.prepareValidationSchema(initial, operation.toString());
+            var result = transaction(session -> {
+                requireOriginal(session);
+                var schemas = SystemCollections.SCHEMA_MIGRATIONS.on(database);
+                var row = schemas.find(session, new Document("_id", "config")).first();
+                if (row != null && Integer.valueOf(1).equals(row.get("installedVersion")) && !row.containsKey("validation")) {
+                    ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database));
+                    if (SystemCollections.OPERATOR_GENERATIONS.on(database).find(session).projection(new Document("_id", 1)).limit(1).first() != null)
+                        throw MongoValidationSchema.refused();
+                    MongoValidationSchema.requireAbsent(database, MongoValidationSchema.CONFIG);
+                    MongoValidationSchema.create(session, database, MongoValidationSchema.CONFIG);
+                    var marker = MongoValidationSchema.marker(operation.toString(), "READY", 0, scope);
+                    if (schemas.updateOne(session, row, new Document("$set", new Document("installedVersion", 2).append("validation", marker))).getMatchedCount() != 1)
+                        throw MongoValidationSchema.refused();
+                    return status(marker);
+                }
+                var marker = requireOperation(row);
+                if (!"READY".equals(marker.get("phase")) || marker.getLong("initializedPipelines") != 0) throw MongoValidationSchema.refused();
+                return status(marker);
+            });
+            MongoValidationSchema.requireReady(database, true); cache.verifyBusinessReady(scope); local.run(); return result;
         }
 
         /** Bounded original-operation progress; missing markers cannot be silently counted as unprocessed. */
@@ -283,6 +382,13 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         }
 
         private void requireOriginal(com.mongodb.client.ClientSession session) {
+            if (initialRecovery != null) {
+                var row = SystemCollections.STORAGE_RECOVERY.on(database).find(session, new Document("_id", "cluster")).first();
+                if (row == null || MongoStorageRecoveryCommands.pending(row).filter(initialRecovery::equals).isEmpty()) throw MongoCachePipelineAccess.fenced();
+                MongoInitialOpRecovery.requireManifest(connection.client(), session, database, bindings,
+                        new MongoConfigurationArtifactStore(connection.client(), database, new PersistentKey(database, clusterId)),
+                        initialRecovery.originalScope(), initialRecovery.manifest(), true);
+            } else if (initial != null) bindings.requireOriginalInitialPreparation(session, initial);
             var identity = SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database).find(session, new Document("_id", "cluster")).first();
             if (identity == null || !clusterId.equals(identity.get("clusterId")) || !LAYOUT.equals(identity.get("layoutId"))
                     || !bindings.cachePreparationForTransaction(session).map(value -> scope.equals(value.businessScope())).orElse(false)) throw MongoValidationSchema.refused();
@@ -295,7 +401,11 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         private <T> T transaction(java.util.function.Function<com.mongodb.client.ClientSession, T> action) {
             if (closed) throw MongoValidationSchema.refused();
             return StoreIo.call(() -> { try (var session = connection.client().startSession()) {
-                return session.withTransaction(() -> { if (closed) throw MongoValidationSchema.refused(); return action.apply(session); }, TRANSACTION);
+                local.run();
+                var answer = session.withTransaction(() -> {
+                    if (closed) throw MongoValidationSchema.refused(); local.run(); var result = action.apply(session); local.run(); return result;
+                }, TRANSACTION);
+                local.run(); return answer;
             } });
         }
 
@@ -437,12 +547,35 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         Runnable original = () -> requireInitialOpOperation(running, active);
         original.run(); cache.requireRecoveryTarget(bindings.load().orElseThrow(MongoCachePipelineAccess::fenced));
         var preparation = new io.tapstate.spi.store.CachePreparation(running.operationId(), running.originalScope());
+        Runnable local = () -> { requireOpen(); active.run(); };
         if (running.phase() == io.tapstate.spi.store.StorageRecoveryCommands.Phase.RUNNING) {
-            if (invocation.first && invocation.attempted.compareAndSet(false, true)) cache.prepareAuth(preparation.authScope(), preparation.operationId(), original);
-            else cache.resumeInitialAuth(preparation, original);
-            cache.prepareConfirmedInitialBusiness(preparation, original);
+            if (invocation.first && invocation.attempted.compareAndSet(false, true)) cache.prepareAuth(preparation.authScope(), preparation.operationId(), local);
+            else cache.resumeInitialAuth(preparation, local);
+            original.run(); cache.resumeValidationSchema(preparation, running.operationId());
+            cache.prepareConfirmedInitialBusiness(preparation, local); original.run();
+            boolean enabled = StoreIo.call(() -> { try (var session = connection.client().startSession()) {
+                return session.withTransaction(() -> {
+                    requireInitialOpOperation(session, running);
+                    return MongoValidationPreparations.validationEnabled(session, connection.database(), clusterId);
+                });
+            } });
+            if (enabled) {
+                cache.prepareValidationSchema(preparation, running.operationId()); original.run();
+                publishInitialOpValidationSchema(running, local);
+            } else {
+                try (var schema = ValidationSchemaPreparation.open(connection.configurationSettings(), clusterId, java.util.UUID.fromString(running.operationId()),
+                        true, preparation, local, running)) {
+                    schema.prepareInitial(cache);
+                }
+            }
         } else if (running.phase() == io.tapstate.spi.store.StorageRecoveryCommands.Phase.COMPLETE) {
             cache.verifyInitialRecovery(preparation);
+            var receipt = initialOpValidationReceipt(running);
+            if (receipt != null) {
+                MongoValidationSchema.requireReady(connection.database(), true);
+                cache.verifyValidationReady(preparation, receipt.operationId());
+            }
+            if (!Objects.equals(receipt, initialOpValidationReceipt(running))) throw MongoCachePipelineAccess.fenced();
         } else throw MongoCachePipelineAccess.fenced();
         original.run();
     }
@@ -454,10 +587,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         StoreIo.run(() -> {
             try (var session = connection.client().startSession()) {
                 session.withTransaction(() -> {
-                    var row = SystemCollections.STORAGE_RECOVERY.on(connection.database()).find(session, new Document("_id", "cluster")).first();
-                    if (row == null || MongoStorageRecoveryCommands.pending(row).filter(original::equals).isEmpty()) throw MongoCachePipelineAccess.fenced();
-                    MongoInitialOpRecovery.requireManifest(connection.client(), session, connection.database(), bindings, artifacts,
-                            original.originalScope(), original.manifest(), true);
+                    requireInitialOpOperation(session, original);
                     return null;
                 });
             }
@@ -476,6 +606,46 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                 });
             }
         });
+    }
+
+    private void requireInitialOpOperation(com.mongodb.client.ClientSession session, io.tapstate.spi.store.StorageRecoveryCommands.Plan original) {
+        var row = SystemCollections.STORAGE_RECOVERY.on(connection.database()).find(session, new Document("_id", "cluster")).first();
+        if (row == null || MongoStorageRecoveryCommands.pending(row).filter(original::equals).isEmpty()) throw MongoCachePipelineAccess.fenced();
+        MongoInitialOpRecovery.requireManifest(connection.client(), session, connection.database(), bindings, artifacts,
+                original.originalScope(), original.manifest(), true);
+    }
+
+    private ValidationSchemaStatus initialOpValidationReceipt(io.tapstate.spi.store.StorageRecoveryCommands.Plan original) {
+        return StoreIo.call(() -> { try (var session = connection.client().startSession()) {
+            return session.withTransaction(() -> {
+                requireInitialOpOperation(session, original);
+                var row = SystemCollections.SCHEMA_MIGRATIONS.on(connection.database()).find(session, new Document("_id", "config")).first();
+                if (row != null && Integer.valueOf(1).equals(row.get("installedVersion")) && !row.containsKey("validation")) return null;
+                var marker = MongoValidationSchema.requireVersionTwo(row, "READY");
+                var scope = new io.tapstate.spi.store.CacheBusinessScope(clusterId, original.originalScope().bindingVersion(), original.originalScope().cacheIncarnation());
+                if (!scope.equals(MongoValidationSchema.scope(marker)) || marker.getLong("initializedPipelines") != 0) throw MongoValidationSchema.refused();
+                return new ValidationSchemaStatus(marker.getString("operationId"), true, 0);
+            });
+        } });
+    }
+
+    private void publishInitialOpValidationSchema(io.tapstate.spi.store.StorageRecoveryCommands.Plan original, Runnable local) {
+        StoreIo.run(() -> { try (var session = connection.client().startSession()) {
+            session.withTransaction(() -> {
+                requireOpen(); local.run(); requireInitialOpOperation(session, original);
+                var schemas = SystemCollections.SCHEMA_MIGRATIONS.on(connection.database());
+                var previous = schemas.find(session, new Document("_id", "config")).first();
+                var marker = MongoValidationSchema.requireVersionTwo(previous, "READY");
+                var scope = new io.tapstate.spi.store.CacheBusinessScope(clusterId, original.originalScope().bindingVersion(), original.originalScope().cacheIncarnation());
+                if (!scope.equals(MongoValidationSchema.scope(marker)) || marker.getLong("initializedPipelines") != 0) throw MongoValidationSchema.refused();
+                if (!original.operationId().equals(marker.get("operationId"))) {
+                    ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(connection.database()));
+                    if (schemas.updateOne(session, previous, new Document("$set", new Document("validation",
+                            MongoValidationSchema.marker(original.operationId(), "READY", 0, scope)))).getMatchedCount() != 1) throw MongoValidationSchema.refused();
+                }
+                requireOpen(); local.run(); return null;
+            });
+        } });
     }
 
     /** Prepares only the business domain after atomic all-stopped publication and caller-proven old-writer isolation. */
