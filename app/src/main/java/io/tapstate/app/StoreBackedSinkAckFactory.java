@@ -483,6 +483,11 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
                 logProgress("Snapshot finished for table {} (target writes confirmed)", table);
             }
             landed.put(chain, now);
+            logCdcProgress(chain, table, now, before);
+            return true;
+        }
+
+        private void logCdcProgress(String chain, String table, Landed now, Landed before) {
             if (now.resumableAt() != null && !isSnapshotOf(now.resumableAt())
                     && (before == null || now.durableThrough().compareTo(before.durableThrough()) > 0)) {
                 long updates = loggedUpdates.merge(chain, 1L, Long::sum);
@@ -495,7 +500,6 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
                             table, now.durableThrough().epoch(), now.durableThrough().seq(), updates, writerId);
                 }
             }
-            return true;
         }
 
         private void logProgress(String message, Object... args) {

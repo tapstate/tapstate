@@ -32,7 +32,13 @@ final class MongoLogSanitizer {
     private static int nextUri(String text, int from) {
         int plain = text.indexOf("mongodb://", from);
         int srv = text.indexOf("mongodb+srv://", from);
-        return plain < 0 ? srv : srv < 0 ? plain : Math.min(plain, srv);
+        if (plain < 0) {
+            return srv;
+        }
+        if (srv < 0) {
+            return plain;
+        }
+        return Math.min(plain, srv);
     }
 
     private static String hideBlock(String text, String startMarker, String endMarker) {

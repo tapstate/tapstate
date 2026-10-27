@@ -59,11 +59,9 @@ class SnapshotReadLoggingTest {
         logger.addAppender(written);
         try {
             PdkCapturePort port = port(Synthetic.throwingReadSource(scratch()), "synthetic.ThrowingRead");
-            assertThatThrownBy(() -> {
-                try (CaptureBatch batch = port.snapshotOnly(config())) {
-                    while (batch.hasNext()) batch.next();
-                }
-            }).isInstanceOf(TapstateException.class);
+            try (CaptureBatch batch = port.snapshotOnly(config())) {
+                assertThatThrownBy(batch::hasNext).isInstanceOf(TapstateException.class);
+            }
             assertThat(written.list).extracting(ILoggingEvent::getFormattedMessage)
                     .containsExactly("Snapshot read started for table t1");
         } finally {

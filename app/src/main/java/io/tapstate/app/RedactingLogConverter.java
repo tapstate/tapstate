@@ -9,9 +9,10 @@ import io.tapstate.core.logging.SecretRedactor;
 public final class RedactingLogConverter extends CompositeConverter<ILoggingEvent> {
 
     private static final String REDACTOR_KEY = RedactingLogConverter.class.getName() + ".redactor";
+    private static final Object REDACTOR_LOCK = new Object();
 
     static SecretRedactor redactor(Context context) {
-        synchronized (context) {
+        synchronized (REDACTOR_LOCK) {
             Object registered = context.getObject(REDACTOR_KEY);
             if (registered instanceof SecretRedactor redactor) {
                 return redactor;
