@@ -156,6 +156,13 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                 configurationKey.refresh(budget).activeKeyId(), this::requireOpen).prepare(operationId, budget);
     }
 
+    /** Load-only maintenance status; an unfinished operation is never presented as query capability 3. */
+    public java.util.Optional<io.tapstate.spi.store.AlertQueryPreparation> alertQueryPreparation() {
+        var budget = new MongoReadBudget(java.time.Duration.ofSeconds(5)); requireOpen();
+        return new MongoAlertStorageSchema(connection.client(), connection.database(), clusterId,
+                configurationKey.refresh(budget).activeKeyId(), this::requireOpen).progress(budget);
+    }
+
     /** Adapter-private composition only; production management requires the complete authorization coordinator. */
     MongoAlertConfigurationStore alertDefinitions(io.tapstate.core.alerting.AlarmKey.Scope scope,
             io.tapstate.core.alerting.AlarmTypeCatalog catalog) {

@@ -21,7 +21,7 @@ final class MongoAlertDeliveryCodec {
     private static final int METADATA_RESERVATION = 4096;
     private static final String MAX_RECEIPT_TEXT = new String(Character.toChars(0x1f680)).repeat(256);
     private static final Set<String> FIELDS = Set.of("_id", "formatVersion", "recordRevision", "channelType", "channelVersion",
-            "deadline", "quotaMinute", "cleanupAt", "frozen", "state");
+            "deadline", "quotaMinute", "cleanupAt", "nextCheckAt", "frozen", "state");
     record Stored(long recordRevision, AlertIntent.Record value) { }
     private MongoAlertDeliveryCodec() { }
 
@@ -36,7 +36,7 @@ final class MongoAlertDeliveryCodec {
                 .append("recordRevision", revision).append("channelType", frozen.channel().typeId()).append("channelVersion", frozen.channel().version())
                 .append("deadline", time(frozen.deadline())).append("quotaMinute", frozen.identity() instanceof Test test
                         ? time(AlertTestQuota.minute(test.command().acceptedAt())) : null)
-                .append("cleanupAt", MongoAlertNotificationCodec.cleanup(state.retained().resultUntil()))
+                .append("cleanupAt", MongoAlertQueryProjection.intentCleanup(value)).append("nextCheckAt", MongoAlertQueryProjection.intentCheck(value))
                 .append("frozen", frozen(frozen)).append("state", state(state));
         budget(encoded, frozen.retry().maximumTotalAttempts()); return encoded;
     }
@@ -51,7 +51,8 @@ final class MongoAlertDeliveryCodec {
             require(frozen.deadline().equals(instant(row, "deadline", false)));
             require(Objects.equals(row.get("quotaMinute"), expected instanceof Test test ? time(AlertTestQuota.minute(test.command().acceptedAt())) : null));
             var value = new AlertIntent.Record(frozen, readState(frozen, doc(row, "state")));
-            require(MongoAlertNotificationCodec.cleanup(value.state().retained().resultUntil()).equals(row.get("cleanupAt")));
+            require(MongoAlertQueryProjection.intentCleanup(value).equals(row.get("cleanupAt"))
+                    && Objects.equals(MongoAlertQueryProjection.intentCheck(value), row.get("nextCheckAt")));
             budget(row, frozen.retry().maximumTotalAttempts()); return new Stored(revision, value);
         } catch (IllegalArgumentException | NullPointerException | ArithmeticException | java.time.DateTimeException | TapstateException invalid) {
             throw unreadable("format-or-identity");

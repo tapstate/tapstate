@@ -31,7 +31,7 @@ class MongoAlertDeliveryCodecTest {
                 .isEqualTo(new MongoAlertDeliveryCodec.Stored(1, original));
         assertThat(actual.getLong("recordRevision")).isOne();
         assertThat(actual.get("frozen", Document.class).getString("createdAt")).isEqualTo(AT.toString());
-        assertThat(actual.getDate("cleanupAt").toInstant()).isEqualTo(AT.plusSeconds(15 * 86400).plusNanos(543211).truncatedTo(java.time.temporal.ChronoUnit.MILLIS));
+        assertThat(actual.getDate("cleanupAt").toInstant()).isEqualTo(AT.plusSeconds(86400).plusNanos(543211).truncatedTo(java.time.temporal.ChronoUnit.MILLIS));
     }
 
     @Test void pendingLateAcceptedAndSdkReceiptRoundTripWithoutResettingTheOriginalDeadline() {

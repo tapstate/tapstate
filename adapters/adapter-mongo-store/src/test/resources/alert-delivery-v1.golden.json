@@ -11,7 +11,8 @@
   "channelVersion": 1,
   "deadline": "2026-10-28T00:00:00.123456789Z",
   "quotaMinute": null,
-  "cleanupAt": {"$date": "2026-11-11T00:00:00.124Z"},
+  "cleanupAt": {"$date": "2026-10-28T00:00:00.124Z"},
+  "nextCheckAt": {"$date": "2026-10-27T00:00:00.124Z"},
   "frozen": {
     "identity": {
       "purpose": "business",

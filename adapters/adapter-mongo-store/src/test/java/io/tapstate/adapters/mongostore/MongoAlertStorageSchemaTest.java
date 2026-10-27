@@ -9,9 +9,19 @@ class MongoAlertStorageSchemaTest {
     @Test void componentVersionFactMatchesItsAuthoredGoldenWithoutASeparateGlobalVersion() throws Exception {
         Document actual = MongoAlertStorageSchema.initialMarker("cluster-a",
                 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "schema-op-a");
-        try (var input = getClass().getResourceAsStream("/alert-schema-v2.golden.json")) {
+        try (var input = getClass().getResourceAsStream("/alert-schema-v3.golden.json")) {
             assertThat(input).isNotNull();
             assertThat(actual).isEqualTo(Document.parse(new String(input.readAllBytes(), StandardCharsets.UTF_8)));
+        }
+    }
+
+    @Test void authorityVersionTwoGoldenRemainsReadableWithoutAQueryPreparationOrCounterReset() throws Exception {
+        try (var input = getClass().getResourceAsStream("/alert-schema-v2.golden.json")) {
+            Document marker = Document.parse(new String(input.readAllBytes(), StandardCharsets.UTF_8));
+            Document counter = ConfigurationVersion.initial(); counter.put(ConfigurationVersion.ALERT_FENCE, 100L);
+            assertThat(MongoAlertStorageSchema.verifyAuthorityState(new Document("installedVersion", 1).append("alerting", marker), counter,
+                    "cluster-a", marker.getString("keyId"))).isEqualTo(marker).doesNotContainKey("queryPreparation");
+            assertThat(counter.getLong(ConfigurationVersion.ALERT_FENCE)).isEqualTo(100L);
         }
     }
 

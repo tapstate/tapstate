@@ -51,6 +51,13 @@ final class MongoAlertStateStore {
         }
     }
 
+    /** Controlled feature preparation only; existing populated collections receive indexes outside document transactions. */
+    static void prepareQueryIndex(MongoDatabase database, SystemCollections collection, SystemCollections.IndexSpec index) {
+        if (!COLLECTIONS.contains(collection) || !index.indexName().startsWith("alert_query_")) { throw new IllegalArgumentException("undeclared state query index"); }
+        Document keys = new Document(); index.keys().forEach(key -> keys.append(key, 1));
+        collection.on(database).createIndex(keys, new com.mongodb.client.model.IndexOptions().name(index.indexName()).unique(false));
+    }
+
     Optional<MongoAlertStateCodec.State> load(ClientSession session, AlarmKey key) {
         requireContext(session, key);
         Document head = heads.find(session, new Document("_id", MongoAlertStateCodec.key(key))).first();

@@ -23,7 +23,8 @@ import org.bson.Document;
 
 /** One fixed feature-version fact in the existing CONFIG schema aggregate, independent of other features. */
 final class MongoAlertStorageSchema {
-    static final int VERSION = 2;
+    static final int VERSION = 3;
+    static final int AUTHORITY_VERSION = 2;
     static final int LEGACY_VERSION = 1;
     static final String FIELD = "alerting";
     static final List<SystemCollections> COLLECTIONS = Stream.of(MongoAlertConfigurationStore.COLLECTIONS,
@@ -31,6 +32,14 @@ final class MongoAlertStorageSchema {
     private static final Set<String> LEGACY_FIELDS = Set.of("installedVersion", "clusterId", "layoutId", "keyId", "operationId");
     private static final Set<String> MARKER_FIELDS = Set.of("installedVersion", "clusterId", "layoutId", "keyId", "operationId",
             "authorityPreparationOperationId");
+    private static final Set<String> QUERY_FIELDS = Set.of("installedVersion", "clusterId", "layoutId", "keyId", "operationId",
+            "authorityPreparationOperationId", "queryPreparation");
+    private static final String QUERY = "queryPreparation";
+    private enum Structures { LEGACY, PREPARING, READY }
+    record QueryIndex(SystemCollections collection, SystemCollections.IndexSpec index) { }
+    static final List<QueryIndex> QUERY_INDEXES = List.of(query(SystemCollections.ALERT_INSTANCES, "alert_query_active"),
+            query(SystemCollections.ALERT_EPISODES, "alert_query_ended"), query(SystemCollections.ALERT_NOTIFICATION_SCHEDULES, "alert_query_schedule_due"),
+            query(SystemCollections.ALERT_DELIVERY_INTENTS, "alert_query_delivery_due"), query(SystemCollections.ALERT_DELIVERY_INTENTS, "alert_query_test_window"));
     private final MongoClient client;
     private final MongoDatabase database;
     private final String clusterId;
@@ -49,12 +58,21 @@ final class MongoAlertStorageSchema {
         Objects.requireNonNull(budget, "budget");
         return StoreIo.call(() -> {
             requireActive.run();
-            Document marker = budget.transaction(client, session -> marker(session, budget));
-            if (marker == null) {
-                if (!structures(budget).isEmpty()) { throw unreadable("unmarked-collections"); }
-                requireActive.run(); budget.remainingMillis(); return 0;
-            }
-            verify(budget); requireActive.run(); budget.remainingMillis(); return (Integer) marker.get("installedVersion");
+            Document marker = verifiedMarker(budget);
+            requireActive.run(); budget.remainingMillis(); return marker == null ? 0 : marker.getInteger("installedVersion");
+        });
+    }
+
+    java.util.Optional<io.tapstate.spi.store.AlertQueryPreparation> progress(MongoReadBudget budget) {
+        return StoreIo.call(() -> {
+            requireActive.run(); Document marker = verifiedMarker(budget);
+            if (marker == null || !marker.containsKey(QUERY)) { return java.util.Optional.empty(); }
+            Document query = marker.get(QUERY, Document.class);
+            var result = new io.tapstate.spi.store.AlertQueryPreparation(marker.getInteger("installedVersion"), query.getString("operationId"),
+                    "READY".equals(query.getString("phase")) ? io.tapstate.spi.store.AlertQueryPreparation.Phase.READY
+                            : io.tapstate.spi.store.AlertQueryPreparation.Phase.PREPARING,
+                    query.getInteger("nextIndex"), query.getInteger("indexContractVersion"));
+            requireActive.run(); budget.remainingMillis(); return java.util.Optional.of(result);
         });
     }
 
@@ -64,24 +82,30 @@ final class MongoAlertStorageSchema {
         Objects.requireNonNull(budget, "budget");
         return StoreIo.call(() -> {
             requireActive.run();
-            Document existing = budget.transaction(client, session -> marker(session, budget));
-            if (existing != null) {
-                verify(budget);
-                if (Integer.valueOf(VERSION).equals(existing.get("installedVersion"))) { requireActive.run(); return VERSION; }
-            } else if (!structures(budget).isEmpty()) { throw unreadable("unmarked-collections"); }
+            Document existing = verifiedMarker(budget);
+            if (existing != null && Integer.valueOf(VERSION).equals(existing.get("installedVersion"))) { return VERSION; }
             try (var session = client.startSession()) {
                 session.withTransaction(() -> {
                     requireActive.run();
                     Document original = marker(session, budget);
                     if (original != null && Integer.valueOf(VERSION).equals(original.get("installedVersion"))) { return null; }
+                    if (original != null && original.containsKey(QUERY)) { requireQueryOperation(original, operationId); return null; }
                     var schemas = SystemCollections.SCHEMA_MIGRATIONS.on(database);
                     var filter = new Document("_id", "config").append(FIELD,
                             original == null ? new Document("$exists", false) : original);
-                    Document installed = original == null ? initialMarker(clusterId, keyId, operationId)
-                            : new Document(original).append("installedVersion", VERSION)
-                                    .append("authorityPreparationOperationId", operationId);
+                    Document installed;
+                    if (original == null) { installed = initialMarker(clusterId, keyId, operationId); }
+                    else {
+                        installed = new Document(original).append("installedVersion", AUTHORITY_VERSION)
+                                .append(QUERY, queryProgress(operationId, "PREPARING", 0));
+                        if (Integer.valueOf(LEGACY_VERSION).equals(original.get("installedVersion"))) {
+                            installed.append("authorityPreparationOperationId", operationId);
+                        }
+                    }
                     if (MongoAlertConfigurationCodec.size(installed) > 2048) { throw unreadable("marker-size"); }
-                    ConfigurationVersion.prepareAlertFence(session, SystemCollections.CONFIGURATION_VERSION.on(database));
+                    if (original == null || Integer.valueOf(LEGACY_VERSION).equals(original.get("installedVersion"))) {
+                        ConfigurationVersion.prepareAlertFence(session, SystemCollections.CONFIGURATION_VERSION.on(database));
+                    }
                     if (schemas.updateOne(session, filter, new Document("$set",
                             new Document(FIELD, installed))).getModifiedCount() != 1) {
                         throw unreadable("preparation-fence");
@@ -92,8 +116,7 @@ final class MongoAlertStorageSchema {
                         .writeConcern(WriteConcern.MAJORITY.withJournal(true))
                         .timeout(budget.remainingMillis(), TimeUnit.MILLISECONDS).build());
             }
-            // Never return a preparation receipt for a partial or vanished namespace set.
-            // A lost commit reply is reconciled by rereading the committed operation and counter together.
+            prepareQueries(operationId, budget);
             int installed = load(budget); requireActive.run(); budget.remainingMillis(); return installed;
         });
     }
@@ -102,9 +125,75 @@ final class MongoAlertStorageSchema {
         requireOperation(operationId);
         Document result = new Document("installedVersion", VERSION).append("clusterId", clusterId)
                 .append("layoutId", MongoConfigurationDomain.LAYOUT).append("keyId", keyId).append("operationId", operationId)
-                .append("authorityPreparationOperationId", operationId);
+                .append("authorityPreparationOperationId", operationId).append(QUERY, queryProgress(operationId, "READY", QUERY_INDEXES.size()));
         if (MongoAlertConfigurationCodec.size(result) > 2048) { throw unreadable("marker-size"); }
         return result;
+    }
+
+    private static QueryIndex query(SystemCollections collection, String name) {
+        return new QueryIndex(collection, collection.indexes().stream().filter(index -> index.indexName().equals(name)).findFirst().orElseThrow());
+    }
+    private static Document queryProgress(String operation, String phase, int next) {
+        return new Document("operationId", operation).append("phase", phase).append("nextIndex", next).append("indexContractVersion", 1);
+    }
+    private static void requireQueryOperation(Document marker, String expected) {
+        if (!expected.equals(marker.get(QUERY, Document.class).getString("operationId"))) { throw unreadable("query-operation"); }
+    }
+
+    private void prepareQueries(String operation, MongoReadBudget budget) {
+        for (int step = 0; step <= QUERY_INDEXES.size(); step++) {
+            Document current = budget.transaction(client, session -> marker(session, budget));
+            if (current == null) { throw unreadable("missing-query-operation"); }
+            if (Integer.valueOf(VERSION).equals(current.get("installedVersion"))) { return; }
+            requireQueryOperation(current, operation);
+            int cursor = current.get(QUERY, Document.class).getInteger("nextIndex");
+            verify(budget, Structures.PREPARING);
+            if (cursor == QUERY_INDEXES.size()) {
+                verify(budget, Structures.READY);
+                advanceQuery(operation, cursor, true, budget); return;
+            }
+            QueryIndex next = QUERY_INDEXES.get(cursor);
+            MongoDatabase ddl = budget.database(database).withWriteConcern(WriteConcern.MAJORITY.withJournal(true));
+            requireActive.run();
+            if (MongoAlertStateStore.COLLECTIONS.contains(next.collection())) {
+                MongoAlertStateStore.prepareQueryIndex(ddl, next.collection(), next.index());
+            } else { MongoAlertNotificationStore.prepareQueryIndex(ddl, next.collection(), next.index()); }
+            requireActive.run(); budget.remainingMillis();
+            advanceQuery(operation, cursor, false, budget);
+        }
+        throw unreadable("query-progress");
+    }
+
+    private void advanceQuery(String operation, int cursor, boolean ready, MongoReadBudget budget) {
+        budget.transaction(client, session -> {
+            Document original = marker(session, budget);
+            if (original == null) { throw unreadable("missing-query-operation"); }
+            if (Integer.valueOf(VERSION).equals(original.get("installedVersion"))) { return null; }
+            requireQueryOperation(original, operation);
+            int current = original.get(QUERY, Document.class).getInteger("nextIndex");
+            if (current > cursor) { return null; }
+            if (current != cursor || ready && cursor != QUERY_INDEXES.size()) { throw unreadable("query-progress"); }
+            Document updated = new Document(original).append(QUERY, queryProgress(operation, ready ? "READY" : "PREPARING", ready ? cursor : cursor + 1));
+            if (ready) { updated.put("installedVersion", VERSION); }
+            if (MongoAlertConfigurationCodec.size(updated) > 2048) { throw unreadable("marker-size"); }
+            if (SystemCollections.SCHEMA_MIGRATIONS.on(database).updateOne(session, new Document("_id", "config").append(FIELD, original),
+                    new Document("$set", new Document(FIELD, updated))).getModifiedCount() != 1) { throw unreadable("query-progress-fence"); }
+            return null;
+        });
+    }
+
+    private Document verifiedMarker(MongoReadBudget budget) {
+        Document original = budget.transaction(client, session -> marker(session, budget));
+        try { verifyMarkerStructures(original, budget); return original; }
+        catch (TapstateException changed) {
+            Document refreshed = budget.transaction(client, session -> marker(session, budget));
+            if (Objects.equals(original, refreshed)) { throw changed; }
+            verifyMarkerStructures(refreshed, budget); return refreshed;
+        }
+    }
+    private void verifyMarkerStructures(Document marker, MongoReadBudget budget) {
+        if (marker == null) { if (!structures(budget).isEmpty()) { throw unreadable("unmarked-collections"); } return; }
+        verify(budget, marker.getInteger("installedVersion") == VERSION ? Structures.READY : marker.containsKey(QUERY) ? Structures.PREPARING : Structures.LEGACY);
     }
 
     static void prepareCollections(ClientSession session, MongoDatabase database) {
@@ -138,17 +227,25 @@ final class MongoAlertStorageSchema {
         if (!schema.containsKey(FIELD)) { ConfigurationVersion.validateAlertState(counter, false); return null; }
         if (!(schema.get(FIELD) instanceof Document value)
                 || !(value.get("installedVersion") instanceof Integer installed)
-                || installed != LEGACY_VERSION && installed != VERSION
-                || !value.keySet().equals(installed == LEGACY_VERSION ? LEGACY_FIELDS : MARKER_FIELDS)
+                || installed != LEGACY_VERSION && installed != AUTHORITY_VERSION && installed != VERSION
+                || !value.keySet().equals(installed == LEGACY_VERSION ? LEGACY_FIELDS : value.containsKey(QUERY) ? QUERY_FIELDS : MARKER_FIELDS)
                 || !clusterId.equals(value.get("clusterId")) || !keyId.equals(value.get("keyId"))
                 || !MongoConfigurationDomain.LAYOUT.equals(value.get("layoutId"))
                 || !(value.get("operationId") instanceof String operation)) { throw unreadable("feature-version"); }
         requireStoredOperation(operation);
-        if (installed == VERSION) {
+        if (installed >= AUTHORITY_VERSION) {
             if (!(value.get("authorityPreparationOperationId") instanceof String authority)) { throw unreadable("authority-operation"); }
             requireStoredOperation(authority);
         }
-        ConfigurationVersion.validateAlertState(counter, installed == VERSION);
+        if (value.containsKey(QUERY)) {
+            if (!(value.get(QUERY) instanceof Document query) || !query.keySet().equals(Set.of("operationId", "phase", "nextIndex", "indexContractVersion"))
+                    || !(query.get("operationId") instanceof String id) || !(query.get("nextIndex") instanceof Integer next)
+                    || next < 0 || next > QUERY_INDEXES.size() || !Integer.valueOf(1).equals(query.get("indexContractVersion"))
+                    || !(installed == VERSION ? "READY".equals(query.get("phase")) && next == QUERY_INDEXES.size()
+                            : installed == AUTHORITY_VERSION && "PREPARING".equals(query.get("phase")))) { throw unreadable("query-preparation"); }
+            requireStoredOperation(id);
+        } else if (installed == VERSION) { throw unreadable("query-preparation"); }
+        ConfigurationVersion.validateAlertState(counter, installed >= AUTHORITY_VERSION);
         if (MongoAlertConfigurationCodec.size(value) > 2048) { throw unreadable("marker-size"); }
         return value;
     }
@@ -168,7 +265,7 @@ final class MongoAlertStorageSchema {
         return found;
     }
 
-    private void verify(MongoReadBudget budget) {
+    private void verify(MongoReadBudget budget, Structures mode) {
         Map<String, Document> found = structures(budget);
         for (SystemCollections collection : COLLECTIONS) {
             Document row = found.get(collection.collectionName());
@@ -187,22 +284,28 @@ final class MongoAlertStorageSchema {
                     }
                 }
             }
-            var expectedNames = new HashSet<String>();
-            expectedNames.add("_id_");
-            collection.indexes().forEach(index -> expectedNames.add(index.indexName()));
-            if (!indexes.keySet().equals(expectedNames)) { throw unreadable("index-structure"); }
+            var expectedNames = new HashSet<String>(); var legacyNames = new HashSet<String>();
+            expectedNames.add("_id_"); legacyNames.add("_id_");
+            collection.indexes().forEach(index -> {
+                expectedNames.add(index.indexName()); if (!index.indexName().startsWith("alert_query_")) { legacyNames.add(index.indexName()); }
+            });
+            if (mode == Structures.READY ? !indexes.keySet().equals(expectedNames)
+                    : mode == Structures.LEGACY ? !indexes.keySet().equals(legacyNames)
+                    : !indexes.keySet().containsAll(legacyNames) || !expectedNames.containsAll(indexes.keySet())) { throw unreadable("index-structure"); }
             if (!(indexes.get("_id_").get("key") instanceof Document primary)
                     || !primary.keySet().equals(Set.of("_id")) || !(primary.get("_id") instanceof Number order)
                     || order.doubleValue() != 1) { throw unreadable("index-structure"); }
             for (SystemCollections.IndexSpec expected : collection.indexes()) {
                 Document index = indexes.get(expected.indexName());
+                if (mode != Structures.READY && expected.indexName().startsWith("alert_query_") && index == null) { continue; }
                 if (index == null || !(index.get("key") instanceof Document keys)
                         || !new ArrayList<>(keys.keySet()).equals(expected.keys())
                         || keys.values().stream().anyMatch(value -> !(value instanceof Number n) || n.doubleValue() != 1)
                         || index.get("unique") != null && !(index.get("unique") instanceof Boolean)
                         || Boolean.TRUE.equals(index.get("unique")) != expected.unique()
                         || index.containsKey("partialFilterExpression") || index.containsKey("collation")
-                        || Boolean.TRUE.equals(index.get("sparse"))) { throw unreadable("index-structure"); }
+                        || Boolean.TRUE.equals(index.get("sparse"))
+                        || mode == Structures.READY && (index.containsKey("buildUUID") || Boolean.FALSE.equals(index.get("ready")))) { throw unreadable("index-structure"); }
             }
         }
     }

@@ -55,6 +55,13 @@ final class MongoAlertNotificationStore {
         }
     }
 
+    /** Controlled feature preparation only; no data mutation or grant is implied by an index build. */
+    static void prepareQueryIndex(MongoDatabase database, SystemCollections collection, SystemCollections.IndexSpec index) {
+        if (!COLLECTIONS.contains(collection) || !index.indexName().startsWith("alert_query_")) { throw new IllegalArgumentException("undeclared notification query index"); }
+        Document keys = new Document(); index.keys().forEach(key -> keys.append(key, 1));
+        collection.on(database).createIndex(keys, new com.mongodb.client.model.IndexOptions().name(index.indexName()).unique(false));
+    }
+
     Optional<MongoAlertNotificationCodec.Quota> quota(ClientSession session, Instant minute) {
         context(session, scope);
         Document row = SystemCollections.ALERT_TEST_QUOTAS.on(configuration)

@@ -94,10 +94,10 @@ alert_rules | config | MongoAlertConfigurationStore | migrated | 2 | _id.authori
 alert_receivers | config | MongoAlertConfigurationStore | migrated | 2 | _id.authorityId+_id.clusterId+cleanupAt+_id
 alert_subscriptions | config | MongoAlertConfigurationStore | migrated | 2 | _id.authorityId+_id.clusterId+cleanupAt+_id
 alert_silences | config | MongoAlertConfigurationStore | migrated | 2 | _id.authorityId+_id.clusterId+cleanupAt+_id
-alert_instances | config | MongoAlertStateStore | migrated | 2 | _id.authorityId+_id.clusterId+cleanupAt+_id
-alert_episodes | config | MongoAlertStateStore | migrated | 2 | _id.alarm.authorityId+_id.alarm.clusterId+cleanupAt+_id, _id.alarm
+alert_instances | config | MongoAlertStateStore | migrated | 2 | _id.authorityId+_id.clusterId+cleanupAt+_id, _id.authorityId+_id.clusterId+formatVersion+status+severityRank+recentSecondOrder+recentNanoOrder+_id
+alert_episodes | config | MongoAlertStateStore | migrated | 2 | _id.alarm.authorityId+_id.alarm.clusterId+cleanupAt+_id, _id.alarm, _id.alarm.authorityId+_id.alarm.clusterId+formatVersion+endReason+endedSecondOrder+endedNanoOrder+_id
 alert_transitions | config | MongoAlertStateStore | migrated | 2 | _id.alarm.authorityId+_id.alarm.clusterId+cleanupAt+_id, _id.alarm
-alert_notification_schedules | config | MongoAlertNotificationStore | migrated | 2 | _id.authorityId+_id.clusterId+cleanupAt+_id
-alert_delivery_intents | config | MongoAlertNotificationStore | migrated | 2 | _id.authorityId+_id.clusterId+cleanupAt+_id
+alert_notification_schedules | config | MongoAlertNotificationStore | migrated | 2 | _id.authorityId+_id.clusterId+cleanupAt+_id, _id.authorityId+_id.clusterId+formatVersion+nextCheckAt+_id
+alert_delivery_intents | config | MongoAlertNotificationStore | migrated | 2 | _id.authorityId+_id.clusterId+cleanupAt+_id, _id.authorityId+_id.clusterId+formatVersion+nextCheckAt+_id, _id.authorityId+_id.clusterId+_id.purpose+quotaMinute
 alert_target_limits | config | MongoAlertNotificationStore | migrated | 2 | _id.authorityId+_id.clusterId+cleanupAt+_id
 alert_test_quotas | config | MongoAlertNotificationStore | migrated | 2 | _id.authorityId+_id.clusterId+cleanupAt+_id
