@@ -17,9 +17,10 @@ import java.util.concurrent.FutureTask;
 import java.util.concurrent.RunnableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.catchThrowableOfType;
 
 class StartCheckSchedulingTest {
     private final StartChecksBench bench = new StartChecksBench();
@@ -69,15 +70,8 @@ class StartCheckSchedulingTest {
     @Test
     void aCheckReportsItsRemainingWaitInsteadOfTheWholeBudget() {
         bench.artifacts.put(StartChecksBench.pipeline(null));
-        var executor = new TimingOutExecutor();
-        AtomicInteger reads = new AtomicInteger();
-        Clock advancing = new Clock() {
-            @Override public ZoneId getZone() { return ZoneOffset.UTC; }
-            @Override public Clock withZone(ZoneId zone) { return this; }
-            @Override public Instant instant() {
-                return StartChecksBench.CLOCK.instant().plusMillis(reads.getAndIncrement() == 0 ? 0 : 1700);
-            }
-        };
+        var advancing = new MutableClock();
+        var executor = new TimingOutExecutor(() -> advancing.advance(Duration.ofMillis(1700)));
 
         StartEvaluation evaluated = bench.evaluator(executor, advancing).evaluate("pl", bench.stored("pl"),
                 bench.hash("pl"), Optional.empty(), StartIntent.START);
@@ -87,16 +81,88 @@ class StartCheckSchedulingTest {
                 assertThat((String) finding.params().get("reason")).contains("100 ms").doesNotContain("1800 ms"));
     }
 
+    @Test
+    void pipelinesKnownNotToUnwindNeverQueueAnIdentityCheck() {
+        bench.checks.add(new UnwindTargetIdentityCheck(new PipelineTargetIdentities() {
+            @Override public boolean relevant(io.tapstate.core.model.PipelineResource definition) {
+                throw new AssertionError("irrelevant identity checks must not read metadata");
+            }
+            @Override public List<Assessment> assess(io.tapstate.core.model.PipelineResource definition, boolean fullLoad) {
+                throw new AssertionError("irrelevant identity checks must not assess targets");
+            }
+        }));
+        for (String transforms : List.of("", "transforms: []\n",
+                "transforms: [{id: filtered, type: filter, from: orders, expr: \"op != 'd'\"}]\n")) {
+            bench.artifacts.put(StartChecksBench.pipeline("clear").replace("serve:", transforms + "serve:"));
+            var clock = new MutableClock();
+            var executor = new TimingOutExecutor(() -> clock.advance(StartCheckEvaluator.BUDGET));
+
+            StartEvaluation evaluated = bench.evaluator(executor, clock).evaluate("pl", bench.stored("pl"),
+                    bench.hash("pl"), Optional.empty(), StartIntent.START);
+
+            assertThat(executor.submissions).as("transforms: %s", transforms).isEqualTo(1);
+            assertThat(evaluated.outcome(java.util.Set.of())).isEqualTo(StartCheckReport.Outcome.READY);
+            assertThat(evaluated.findings()).singleElement().satisfies(finding -> {
+                assertThat(finding.check()).isEqualTo(TargetNotEmptyCheck.ID);
+                assertThat(finding.evaluation()).isEqualTo(StartFinding.Evaluation.UNAVAILABLE);
+                assertThat(finding.params()).containsEntry("reason", "it did not answer during the remaining 0 ms wait");
+            });
+        }
+    }
+
+    @Test
+    void unwindAndSharedTransformsStillBlockWhenTheirChecksCannotRun() {
+        bench.checks.add(new UnwindTargetIdentityCheck((definition, fullLoad) -> {
+            throw new AssertionError("the executor leaves checks queued");
+        }));
+        for (String transform : List.of(
+                "{id: expanded, type: unwind, from: orders, path: items, include_array_index: position}",
+                "{id: expanded, use: shared, from: orders}")) {
+            bench.artifacts.put(StartChecksBench.pipeline("clear")
+                    .replace("serve:", "transforms: [" + transform + "]\nserve:")
+                    .replace("from: orders\n  sync:", "from: expanded\n  sync:"));
+            var executor = new TimingOutExecutor();
+            var service = new PipelineStartService(bench.lifecycle,
+                    bench.evaluator(executor, StartChecksBench.CLOCK), bench.apply);
+
+            StartRefusal refused = catchThrowableOfType(StartRefusal.class,
+                    () -> service.start("alice", "pl", List.of(), null));
+
+            assertThat(executor.submissions).isEqualTo(2);
+            assertThat(executor.waitMillis).isEqualTo(StartCheckEvaluator.BUDGET.toMillis());
+            assertThat(refused.code()).isEqualTo(io.tapstate.core.lifecycle.LifecycleError.START_BLOCKED);
+            assertThat(refused.report().findings()).anySatisfy(finding -> {
+                assertThat(finding.check()).isEqualTo(UnwindTargetIdentityCheck.CHECK_ID);
+                assertThat(finding.behavior()).isEqualTo(StartFinding.Behavior.BLOCK);
+                assertThat(finding.evaluation()).isEqualTo(StartFinding.Evaluation.UNAVAILABLE);
+            });
+            assertThat(bench.desiredById).isEmpty();
+            assertThat(bench.audit).isEmpty();
+        }
+    }
+
+    private static final class MutableClock extends Clock {
+        private final AtomicReference<Instant> now = new AtomicReference<>(StartChecksBench.CLOCK.instant());
+        void advance(Duration elapsed) { now.updateAndGet(instant -> instant.plus(elapsed)); }
+        @Override public ZoneId getZone() { return ZoneOffset.UTC; }
+        @Override public Clock withZone(ZoneId zone) { return this; }
+        @Override public Instant instant() { return now.get(); }
+    }
+
     /** Exercises deadline reporting without scheduling work or sleeping. */
     private static final class TimingOutExecutor extends AbstractExecutorService {
         long waitMillis;
+        int submissions;
+        private final Runnable onSubmit;
         private boolean shutdown;
+        TimingOutExecutor() { this(() -> { }); }
+        TimingOutExecutor(Runnable onSubmit) { this.onSubmit = onSubmit; }
         @Override public void shutdown() { shutdown = true; }
         @Override public List<Runnable> shutdownNow() { shutdown = true; return List.of(); }
         @Override public boolean isShutdown() { return shutdown; }
         @Override public boolean isTerminated() { return shutdown; }
         @Override public boolean awaitTermination(long timeout, TimeUnit unit) { return shutdown; }
-        @Override public void execute(Runnable task) { }
+        @Override public void execute(Runnable task) { submissions++; onSubmit.run(); }
         @Override protected <T> RunnableFuture<T> newTaskFor(Callable<T> callable) {
             return new FutureTask<>(callable) {
                 @Override public T get(long timeout, TimeUnit unit) throws TimeoutException {

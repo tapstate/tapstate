@@ -1,5 +1,7 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.model.PipelineResource;
+
 import java.util.List;
 
 /**
@@ -19,6 +21,14 @@ public interface StartCheck {
 
     /** Stable lower-kebab id; part of the external contract, never renamed. */
     String id();
+
+    /**
+     * Whether the definition alone might need this check. Must not perform I/O; return false only
+     * when irrelevance is certain, so unrelated checks never wait for an executor or consume budget.
+     */
+    default boolean mayApply(PipelineResource definition) {
+        return true;
+    }
 
     /**
      * The findings for the start the context describes, one per subject; empty when this check has
