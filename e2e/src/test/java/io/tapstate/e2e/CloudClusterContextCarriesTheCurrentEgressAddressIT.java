@@ -176,7 +176,7 @@ class CloudClusterContextCarriesTheCurrentEgressAddressIT {
                 if (!DEPLOYMENT.equals(deployment)) return Optional.empty();
                 if (JWT.equals(jwt)) {
                     return Optional.of(new CloudLoginIdentity(DEPLOYMENT, "context-user", ORGANIZATION, CLUSTER,
-                            JTI, Scope.WRITE, Instant.now(clock).plusSeconds(300)));
+                            JTI, Scope.WRITE, Instant.now(clock).plusSeconds(300), "user@example.test"));
                 }
                 if (JWT_WITHOUT_ADDRESS.equals(jwt)) {
                     return Optional.of(new CloudLoginIdentity(DEPLOYMENT, "context-user", ORGANIZATION, CLUSTER,

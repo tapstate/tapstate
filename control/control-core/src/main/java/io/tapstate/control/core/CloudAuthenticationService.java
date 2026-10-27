@@ -62,6 +62,11 @@ public final class CloudAuthenticationService {
                 || !sessions.identity().clusterId().equals(context.clusterId()))) {
             throw unauthenticated();
         }
+        if (context != null) {
+            context = new CloudSessionContext(context.organizationId(), context.clusterId(), context.organizationName(),
+                    context.clusterName(), context.region(), context.ec2PublicIp(), context.egressAddressStatus(),
+                    login.userEmail());
+        }
         observer.entering(CloudAuthenticationObserver.Stage.SESSION_CREATE);
         return sessions.create(login, context).orElseThrow(CloudAuthenticationService::unauthenticated);
     }

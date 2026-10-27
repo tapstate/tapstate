@@ -191,6 +191,40 @@ class CloudAuthenticationServiceTest {
     }
 
     @Test
+    void unverifiedExchangeEmailIsNotStoredWhenTheVerifiedIdentityHasNoEmail() {
+        CloudSessionContext context = new CloudSessionContext("org-a", "cluster-a", "Organization", "Cluster",
+                "us-east-1", null, null, "other@example.test");
+        CloudCodeExchanger exchanger = new CloudCodeExchanger() {
+            @Override public String exchange(String code, String cluster) { return "jwt"; }
+            @Override public CloudCodeExchangeResult exchangeWithContext(String code, String cluster) {
+                return new CloudCodeExchangeResult("jwt", context);
+            }
+        };
+        CloudAuthenticationService authentication = new CloudAuthenticationService(exchanger,
+                (jwt, target, audience) -> Optional.of(new CloudLoginIdentity(DEPLOYMENT, "stable-user-a", "org-a",
+                        "cluster-a", "jti-a", Scope.WRITE, NOW.plusSeconds(900))), sessions);
+        String cookie = authentication.exchangeCode("code", AUDIENCE).token();
+        assertThat(authentication.clusterContext(cookie).orElseThrow().userEmail()).isNull();
+    }
+
+    @Test
+    void verifiedEmailOverridesMismatchedExchangeEmail() {
+        CloudSessionContext context = new CloudSessionContext("org-a", "cluster-a", "Organization", "Cluster",
+                "us-east-1", null, null, "other@example.test");
+        CloudCodeExchanger exchanger = new CloudCodeExchanger() {
+            @Override public String exchange(String code, String cluster) { return "jwt"; }
+            @Override public CloudCodeExchangeResult exchangeWithContext(String code, String cluster) {
+                return new CloudCodeExchangeResult("jwt", context);
+            }
+        };
+        CloudAuthenticationService authentication = new CloudAuthenticationService(exchanger,
+                (jwt, target, audience) -> Optional.of(new CloudLoginIdentity(DEPLOYMENT, "stable-user-a", "org-a",
+                        "cluster-a", "jti-a", Scope.WRITE, NOW.plusSeconds(900), "verified@example.test")), sessions);
+        String cookie = authentication.exchangeCode("code", AUDIENCE).token();
+        assertThat(authentication.clusterContext(cookie).orElseThrow().userEmail()).isEqualTo("verified@example.test");
+    }
+
+    @Test
     void aRejectedOnlineValidationNeverCreatesALocalSession() {
         CloudAuthenticationService authentication = new CloudAuthenticationService((code, cluster) -> "jwt",
                 (jwt, target, audience) -> Optional.empty(), sessions);

@@ -105,7 +105,7 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
             }
             return Optional.of(new CloudLoginIdentity(
                     expectedDeployment, claims.userId(), claims.organizationId(), claims.clusterId(),
-                    claims.jwtId(), scope, claims.expiresAt()));
+                    claims.jwtId(), scope, claims.expiresAt(), claims.userEmail()));
         } catch (ProviderFailure unavailable) {
             return Optional.empty();
         } catch (IllegalArgumentException invalid) {
@@ -274,7 +274,11 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
     }
 
     record VerifiedClaims(String userId, String organizationId, String clusterId, String jwtId,
-            Instant expiresAt, String issuer, String audience, List<String> scopes) {
+            Instant expiresAt, String issuer, String audience, List<String> scopes, String userEmail) {
+        VerifiedClaims(String userId, String organizationId, String clusterId, String jwtId,
+                Instant expiresAt, String issuer, String audience, List<String> scopes) {
+            this(userId, organizationId, clusterId, jwtId, expiresAt, issuer, audience, scopes, null);
+        }
         VerifiedClaims {
             Objects.requireNonNull(expiresAt, "expiresAt");
             scopes = scopes == null ? null : List.copyOf(scopes);
@@ -337,7 +341,7 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
                 var verified = sdk.verifyJwt(jwt);
                 return new VerifiedClaims(
                         verified.userId(), verified.orgId(), verified.clusterId(), verified.jti(),
-                        verified.expiresAt(), verified.issuer(), verified.audience(), verified.scope());
+                        verified.expiresAt(), verified.issuer(), verified.audience(), verified.scope(), verified.userEmail());
             } catch (JwtVerificationException failure) {
                 String kind = failure.getKind();
                 String reason = switch (kind == null ? "" : kind) {
