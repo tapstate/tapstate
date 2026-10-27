@@ -75,7 +75,7 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '21.0.13'
+          java-version: '21.0.13+9.0.LTS'
           cache: maven
       - uses: actions/download-artifact@v4
         with:
@@ -235,7 +235,7 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '21.0.13'
+          java-version: '21.0.13+9.0.LTS'
           cache: maven
       - name: Check secret availability
         id: guard

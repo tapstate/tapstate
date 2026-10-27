@@ -54,7 +54,7 @@ def check(workflows, contexts, inputs):
         'matrix IDs must come from the actual emitted plan'
     build = ci.get('build', '')
     assert build, 'required check build must exist'
-    assert "java-version: '21.0.13'" in build and "java-version: '21.0.13'" in ci.get('test-shards', ''), \
+    assert "java-version: '21.0.13+9.0.LTS'" in build and "java-version: '21.0.13+9.0.LTS'" in ci.get('test-shards', ''), \
         'aggregate and test shards must use the same exact Java version'
     assert not re.search(r'^\s+matrix:', build, re.M), 'build must not be a matrix'
     assert not re.search(r'^    name:', build, re.M), 'build must retain its check name'
