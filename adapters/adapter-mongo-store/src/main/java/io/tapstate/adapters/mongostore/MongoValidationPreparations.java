@@ -208,8 +208,15 @@ final class MongoValidationPreparations {
                 new Document("$set", new Document("validationPreparation", encode(next)))).getMatchedCount() != 1) throw fenced();
     }
     private <T> T transaction(Function<ClientSession, T> work) {
-        return StoreIo.call(() -> { active.run(); try (var session = client.startSession()) {
-            return session.withTransaction(() -> { active.run(); var result = work.apply(session); active.run(); return result; }, TRANSACTION);
+        return StoreIo.call(() -> { active.run(); MongoValidationSchema.requireReady(database, true); try (var session = client.startSession()) {
+            var committed = session.withTransaction(() -> {
+                active.run();
+                var schema = MongoValidationSchema.requireVersionTwo(SystemCollections.SCHEMA_MIGRATIONS.on(database)
+                        .find(session, new Document("_id", "config")).first(), "READY");
+                if (!clusterId.equals(MongoValidationSchema.scope(schema).clusterId())) throw unreadable();
+                var result = work.apply(session); active.run(); return result;
+            }, TRANSACTION);
+            MongoValidationSchema.requireReady(database, true); active.run(); return committed;
         } });
     }
     static TapstateException fenced() { return new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null); }

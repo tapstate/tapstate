@@ -489,14 +489,19 @@ class MongoValidationIndependentPreparationIT {
             try (var session = configClient.startSession()) {
                 for (var table : List.of(SystemCollections.VALIDATION_TASKS, SystemCollections.VALIDATION_REPORTS, SystemCollections.VALIDATION_DIFFERENCES)) table.prepareCollectionOn(configDb, session);
             }
+            for (var table : MongoValidationSchema.CONFIG) for (var index : table.indexes()) IndexEnsure.ensure(configDb, table.on(configDb), index);
+            SystemCollections.SCHEMA_MIGRATIONS.on(configDb).updateOne(new Document("_id", "config"), new Document("$set", new Document("installedVersion", 2)
+                    .append("validation", MongoValidationSchema.marker("fixture", "READY", 1, scope))));
             cacheDomain = MongoCacheDomain.connect(cacheConnection, Duration.ofSeconds(5), "validation-independent-fixture");
             cacheDomain.prepareAuth(new CacheAuthScope("cluster", 1, StorageBinding.Mode.OP, scope.cacheIncarnation(), 1), "auth", () -> {});
             try (var session = cacheClient.startSession()) {
                 for (var table : List.of(SystemCollections.CACHE_WORKLOAD_CLAIMS, SystemCollections.VALIDATION_RUNS)) table.prepareCollectionOn(cacheDb, session);
             }
+            for (var index : SystemCollections.VALIDATION_RUNS.indexes()) IndexEnsure.ensure(cacheDb, SystemCollections.VALIDATION_RUNS.on(cacheDb), index);
             SystemCollections.CACHE_IDENTITY.on(cacheDb).updateOne(new Document("_id", "cluster"), new Document("$set", new Document("businessPhase", "READY")
                     .append("businessPreparationId", "business").append("claimAdmissionFence", 0L)));
-            SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(cacheDb).insertOne(new Document("_id", "business").append("installedVersion", 1).append("phase", "READY").append("epoch", 1L).append("operationId", "business"));
+            SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(cacheDb).insertOne(new Document("_id", "business").append("installedVersion", 2).append("phase", "READY")
+                    .append("epoch", 1L).append("operationId", "business").append("validation", MongoValidationSchema.marker("fixture", "READY", 0, scope)));
             nodeA = node("a"); nodeB = node("b");
             config = configuration.validationPreparations(); cache = cacheDomain.validationPreparations(scope);
         }

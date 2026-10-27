@@ -184,6 +184,7 @@ final class MongoValidationControlStore implements ValidationControlStore {
         if (validation != null) {
             if (!validation.subject().pipelineId().equals(owner.pipelineId())) throw fenced();
             validation.require(admission);
+            MongoValidationSchema.requireReady(database, false);
         }
     }
 

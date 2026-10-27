@@ -290,7 +290,9 @@ final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
         if (validation != null && !key.equals(io.tapstate.spi.store.ValidationClaims.key(scope.clusterId(), validation.subject().pipelineId()))) throw claimFenced();
     }
 
-    private void requireValidationAuthority() { if (validation != null) validation.require(false); }
+    private void requireValidationAuthority() {
+        if (validation != null) { validation.require(false); MongoValidationSchema.requireReady(database, false); }
+    }
 
     static void requireCollection(MongoDatabase database) {
         var table = SystemCollections.CACHE_WORKLOAD_CLAIMS;

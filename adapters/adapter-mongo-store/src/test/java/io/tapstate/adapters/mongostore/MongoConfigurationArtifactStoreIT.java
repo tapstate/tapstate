@@ -220,7 +220,7 @@ class MongoConfigurationArtifactStoreIT {
             assertThat(store.listStored("view")).isEmpty();
             assertThat(revision(database)).isEqualTo(1);
             assertThat(database.listCollectionNames().into(new java.util.ArrayList<>()))
-                    .containsExactlyInAnyOrder("sources", "pipelines", "configuration_version", "operator_generations");
+                    .containsExactlyInAnyOrder("sources", "pipelines", "configuration_version", "operator_generations", "schema_migrations");
         });
     }
 
@@ -533,7 +533,7 @@ class MongoConfigurationArtifactStoreIT {
             assertThatThrownBy(() -> MongoConfigurationDomain.open(settings(uri), "wrong-cluster"))
                     .isInstanceOf(TapstateException.class);
             SystemCollections.SCHEMA_MIGRATIONS.on(database).updateOne(new Document("_id", "config"),
-                    new Document("$set", new Document("installedVersion", 2)));
+                    new Document("$set", new Document("installedVersion", MongoConfigurationDomain.SCHEMA_VERSION + 1)));
             assertThatThrownBy(() -> MongoConfigurationDomain.open(settings(uri), "cluster-a"))
                     .isInstanceOfSatisfying(TapstateException.class,
                             error -> assertThat(error.code()).isEqualTo(MigrationError.DATA_NEWER_THAN_BINARY));
@@ -569,6 +569,7 @@ class MongoConfigurationArtifactStoreIT {
     void concurrentBootstrapProcessesChooseOnePersistentKeyAndOneOperation() {
         withStore((unused, database) -> {
             SystemCollections.CONFIGURATION_VERSION.on(database).drop();
+            SystemCollections.SCHEMA_MIGRATIONS.on(database).drop();
             try (var executor = Executors.newFixedThreadPool(2)) {
                 CountDownLatch start = new CountDownLatch(1);
                 var first = executor.submit(() -> {
@@ -615,6 +616,7 @@ class MongoConfigurationArtifactStoreIT {
     void bootstrapCannotResetAnotherOperationOrACompletedPhase() {
         withStore((unused, database) -> {
             SystemCollections.CONFIGURATION_VERSION.on(database).drop();
+            SystemCollections.SCHEMA_MIGRATIONS.on(database).drop();
             try (var domain = MongoConfigurationBootstrap.prepare(settings(configurationUri(database)),
                     "cluster-a", "installation-a", "setup-a", 1)) {
                 domain.artifacts().save(source("original", "secret"));
@@ -650,6 +652,7 @@ class MongoConfigurationArtifactStoreIT {
             assertThat(SystemCollections.CLUSTER_KEYS.on(database).countDocuments()).isZero();
             assertThat(SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database).countDocuments()).isZero();
             SystemCollections.CONFIGURATION_VERSION.on(database).drop();
+            SystemCollections.SCHEMA_MIGRATIONS.on(database).drop();
             try (var ignored = MongoConfigurationBootstrap.prepare(settings(configurationUri(database)),
                     "cluster-a", "installation-a", "setup-a", 1)) {
                 assertThat(SystemCollections.CLUSTER_KEYS.on(database).countDocuments()).isEqualTo(1);
@@ -667,6 +670,7 @@ class MongoConfigurationArtifactStoreIT {
     void bootstrapNamespaceFailuresAreCodedAndDoNotWriteAnyFacts() {
         withStore((unused, database) -> {
             SystemCollections.CONFIGURATION_VERSION.on(database).drop();
+            SystemCollections.SCHEMA_MIGRATIONS.on(database).drop();
             try (MongoClient admin = MongoClients.create(MONGO.getReplicaSetUrl())) {
                 admin.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand")
                         .append("mode", new Document("times", 1))
@@ -963,8 +967,8 @@ class MongoConfigurationArtifactStoreIT {
         SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database).insertOne(new Document("_id", "cluster")
                 .append("clusterId", "cluster-a").append("layoutId", MongoConfigurationDomain.LAYOUT)
                 .append("bindingVersion", 0L));
-        SystemCollections.SCHEMA_MIGRATIONS.on(database).insertOne(new Document("_id", "config")
-                .append("installedVersion", 1));
+        assertThat(SystemCollections.SCHEMA_MIGRATIONS.on(database).find(new Document("_id", "config")).first())
+                .isEqualTo(new Document("_id", "config").append("installedVersion", 1));
         byte[] key = new byte[32];
         SystemCollections.CLUSTER_KEYS.on(database).insertOne(new Document("_id", "cluster")
                 .append("clusterId", "cluster-a").append("formatVersion", 1)
@@ -1020,6 +1024,7 @@ class MongoConfigurationArtifactStoreIT {
             try {
                 SystemCollections.CONFIGURATION_VERSION.on(database).insertOne(
                         new Document("_id", ConfigurationVersion.ID).append("revision", 0L));
+                SystemCollections.SCHEMA_MIGRATIONS.on(database).insertOne(new Document("_id", "config").append("installedVersion", 1));
                 scenario.run(new MongoConfigurationArtifactStore(client, database,
                         new SourceConfigCipher(new byte[32])), database);
             } catch (Exception error) {

@@ -232,23 +232,24 @@ final class MongoValidationCachePreparations {
     }
     private <T> T mutate(WorkloadClaimFence node, Function<ClientSession, T> work) {
         return StoreIo.call(() -> {
-            active.run(); MongoValidationControlStore.requireCollection(database);
+            active.run(); MongoValidationSchema.requireReady(database, false);
             try (var session = client.startSession()) {
-                return session.withTransaction(() -> {
+                var committed = session.withTransaction(() -> {
                     active.run(); MongoCachePipelinePreparations.proveNode(session, database, scope, node);
                     new MongoCacheBusinessIdentity(database, scope).admitMetadataWrite(session);
                     var result = work.apply(session); active.run(); return result;
                 }, TRANSACTION);
+                MongoValidationSchema.requireReady(database, false); active.run(); return committed;
             }
         });
     }
     private <T> T read(Function<ClientSession, T> work) {
         return StoreIo.call(() -> {
-            active.run(); MongoValidationControlStore.requireCollection(database);
-            try (var session = client.startSession()) { return session.withTransaction(() -> {
+            active.run(); MongoValidationSchema.requireReady(database, false);
+            try (var session = client.startSession()) { var committed = session.withTransaction(() -> {
                 active.run(); new MongoCacheBusinessIdentity(database, scope).requireAdmissionState(session);
                 var result = work.apply(session); active.run(); return result;
-            }, TRANSACTION); }
+            }, TRANSACTION); MongoValidationSchema.requireReady(database, false); active.run(); return committed; }
         });
     }
     private void requireTarget(StorageBinding binding, Subject subject) {

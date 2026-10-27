@@ -249,6 +249,7 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
 
     MongoValidationCachePreparations validationPreparations(CacheBusinessScope expected) {
         loadBusinessScope(expected);
+        StoreIo.run(() -> MongoValidationSchema.requireReady(database, false));
         return new MongoValidationCachePreparations(client, database, expected, targetFingerprint, this::businessActive);
     }
 
@@ -282,6 +283,18 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         Objects.requireNonNull(original, "original").require(false);
         if (!targetFingerprint.equals(MongoStorageBindingStore.targetFingerprint(original.binding().cache()))) throw MongoCacheIdentity.fenced();
         loadBusinessScope(original.subject().scope());
+        StoreIo.run(() -> MongoValidationSchema.requireReady(database, false));
+    }
+
+    void prepareValidationSchema(io.tapstate.spi.store.CachePreparation original, String operation) {
+        businessActive();
+        facts(original.authScope()).prepareValidationSchema(original.businessScope(), operation, this::businessActive);
+    }
+
+    void verifyValidationMaintenance(io.tapstate.spi.store.CachePreparation original, String operation, boolean configurationComplete) {
+        businessActive();
+        new MongoCacheMetadataStructure(database, rateRetention).verifyBusiness();
+        facts(original.authScope()).verifyValidationMaintenance(original.businessScope(), operation, configurationComplete);
     }
 
     /** The claims share this exact cache client, original scope and owner lifecycle. */

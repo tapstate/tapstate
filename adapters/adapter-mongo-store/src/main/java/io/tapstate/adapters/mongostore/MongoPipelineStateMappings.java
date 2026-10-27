@@ -52,10 +52,13 @@ public final class MongoPipelineStateMappings implements PipelineStateMappings {
 
     void create(ClientSession session,String pipelineId) { create(session,pipelineId,() -> null); }
     void create(ClientSession session,String pipelineId,java.util.function.Supplier<io.tapstate.spi.store.CacheBusinessScope> currentBusiness) {
+        var validationSchema = validationSchema(session);
         var prior=mappings.find(session,new Document("_id",pipelineId)).first();
         if(prior==null) {
-            mappings.insertOne(session,new Document("_id",pipelineId).append("stateGeneration",1L).append("phase","ACTIVE").append("operationId",null)
-                    .append("noteWriteFence",0L).append("cachePreparation",new Document("phase","UNASSIGNED")));return;
+            var initial = new Document("_id",pipelineId).append("stateGeneration",1L).append("phase","ACTIVE").append("operationId",null)
+                    .append("noteWriteFence",0L).append("cachePreparation",new Document("phase","UNASSIGNED"));
+            if (validationSchema != null) initial.append("validationPreparation", MongoValidationPreparationFacts.initial());
+            mappings.insertOne(session, initial);return;
         }
         var state=decode(pipelineId,prior);if(state.phase()!=PipelineStateMapping.Phase.RETIRED)throw retirementRequired(pipelineId);
         var result=MongoPipelineRetirementFacts.read(prior).completed();
@@ -66,6 +69,13 @@ public final class MongoPipelineStateMappings implements PipelineStateMappings {
         MongoPipelineIntentStore.recreate(session,database,result.scope(),next);
         var replacement=new Document(prior).append("stateGeneration",next.stateGeneration()).append("phase","ACTIVE")
                 .append("noteWriteFence",prior.getLong("noteWriteFence")+1).append("cachePreparation",new Document("phase","UNASSIGNED"));
+        if (validationSchema != null) {
+            if (!(prior.get("validationPreparation") instanceof Document value)) throw MongoValidationSchema.unreadable("pipeline-marker");
+            var previous = MongoValidationPreparationFacts.decode(value, MongoValidationSchema.scope(validationSchema).clusterId(), pipelineId);
+            if (previous.phase() != MongoValidationPreparationFacts.Phase.CLOSED) throw retirementRequired(pipelineId);
+            replacement.put("validationPreparation", MongoValidationPreparationFacts.encode(new MongoValidationPreparationFacts.State(
+                    java.util.UUID.randomUUID(), 0, MongoValidationPreparationFacts.Phase.UNASSIGNED, null, null, previous.previous())));
+        }
         replacement.remove("stateRebuild");
         replacement.remove("cacheRecovery");
         MongoPipelineSharedRecoveryFacts.removeOnVerifiedReplacement(prior,replacement,result.scope());
@@ -82,8 +92,21 @@ public final class MongoPipelineStateMappings implements PipelineStateMappings {
     }
 
     void requireActive(ClientSession session, String pipelineId) {
+        var schema = validationSchema(session);
+        if (schema != null) {
+            var row = mappings.find(session, new Document("_id", pipelineId)).first();
+            if (row == null || !(row.get("validationPreparation") instanceof Document value)) throw MongoValidationSchema.unreadable("pipeline-marker");
+            MongoValidationPreparationFacts.decode(value, MongoValidationSchema.scope(schema).clusterId(), pipelineId);
+        }
         PipelineStateMapping state = decode(pipelineId, mappings.find(session, new Document("_id", pipelineId)).first());
         if (state.phase() != PipelineStateMapping.Phase.ACTIVE) throw retirementRequired(pipelineId);
+    }
+
+    private Document validationSchema(ClientSession session) {
+        var row = SystemCollections.SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "config")).first();
+        if (row == null) throw MongoValidationSchema.unreadable("version");
+        if (Integer.valueOf(1).equals(row.get("installedVersion")) && !row.containsKey("validation")) return null;
+        return MongoValidationSchema.requireVersionTwo(row, "READY");
     }
 
     static void requireNoSharedReferences(ClientSession session,MongoDatabase database,String operation) {

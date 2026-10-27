@@ -30,18 +30,93 @@ final class MongoCacheIdentity {
     private static final TransactionOptions PREPARATION = TransactionOptions.builder()
             .readConcern(ReadConcern.LOCAL).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
     private final MongoClient client;
+    private final MongoDatabase database;
     private final MongoCollection<Document> identity;
     private final MongoCollection<Document> schemas;
     private final CacheAuthScope expected;
 
     MongoCacheIdentity(MongoClient client, MongoDatabase database, CacheAuthScope expected) {
         this.client = Objects.requireNonNull(client, "client");
+        this.database = Objects.requireNonNull(database, "database");
         this.identity = SystemCollections.CACHE_IDENTITY.on(database);
         this.schemas = SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database);
         this.expected = Objects.requireNonNull(expected, "expected");
     }
 
     CacheAuthScope scope() { return expected; }
+
+    void verifyValidationMaintenance(io.tapstate.spi.store.CacheBusinessScope business, String operation, boolean configurationComplete) {
+        transaction(session -> {
+            requireReady(session); new MongoCacheBusinessIdentity(database, business).requireValidationPreparation(session, operation);
+            var row = schemas.find(session, new Document("_id", "business")).first();
+            if (Integer.valueOf(2).equals(row.get("installedVersion"))) {
+                var marker = requireValidationOperation(row, business, operation);
+                if (configurationComplete && READY.equals(marker.get("phase"))) return null;
+            } else {
+                MongoValidationSchema.requireAbsent(database, MongoValidationSchema.CACHE);
+                if (SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session, new Document("_id.clusterId", business.clusterId())
+                        .append("_id.resourceType", io.tapstate.spi.store.WorkloadClaimType.VALIDATION.name()))
+                        .projection(new Document("_id", 0).append("found", new Document("$literal", true))).limit(1).first() != null) throw refused();
+            }
+            requireStoppedClaims(session, business); return null;
+        });
+    }
+
+    private void requireStoppedClaims(ClientSession session, io.tapstate.spi.store.CacheBusinessScope business) {
+        var unsafe = new Document("_id.clusterId", business.clusterId()).append("$or", java.util.List.of(
+                new Document("leaseUntil", new Document("$not", new Document("$type", "date"))),
+                new Document("$expr", new Document("$gt", java.util.List.of("$leaseUntil", "$$NOW")))));
+        if (SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session, unsafe)
+                .projection(new Document("_id", 0).append("unsafe", new Document("$literal", true))).limit(1).first() != null) throw refused();
+    }
+
+    /** Offline business-schema preparation retains the original authentication and CACHE identities. */
+    void prepareValidationSchema(io.tapstate.spi.store.CacheBusinessScope business, String operation, Runnable active) {
+        var currentScope = new io.tapstate.spi.store.CacheBusinessScope(expected.clusterId(), expected.bindingVersion(), expected.cacheIncarnation());
+        if (!currentScope.equals(business)) throw refused();
+        transaction(session -> {
+            active.run(); requireReady(session);
+            var row = schemas.find(session, new Document("_id", "business")).first();
+            if (row != null && Integer.valueOf(1).equals(row.get("installedVersion")) && !row.containsKey("validation")) {
+                new MongoCacheBusinessIdentity(database, business).requireAdmissionState(session);
+                fence(session);
+                requireStoppedClaims(session, business);
+                MongoValidationSchema.requireAbsent(database, MongoValidationSchema.CACHE);
+                if (SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session, new Document("_id.clusterId", business.clusterId())
+                        .append("_id.resourceType", io.tapstate.spi.store.WorkloadClaimType.VALIDATION.name())).limit(1).first() != null) throw refused();
+                if (schemas.updateOne(session, row, new Document("$set", new Document("installedVersion", 2)
+                        .append("validation", MongoValidationSchema.marker(operation, PREPARING, 0, business)))).getMatchedCount() != 1) throw refused();
+            } else requireValidationOperation(row, business, operation);
+            active.run(); return null;
+        });
+        StoreIo.run(() -> {
+            try (var session = client.startSession()) {
+                session.withTransaction(() -> {
+                    active.run(); requireReady(session);
+                    var row = schemas.find(session, new Document("_id", "business")).first();
+                    var marker = requireValidationOperation(row, business, operation);
+                    if (READY.equals(marker.get("phase"))) return null;
+                    fence(session);
+                    MongoValidationSchema.requireAbsent(database, MongoValidationSchema.CACHE);
+                    MongoValidationSchema.create(session, database, MongoValidationSchema.CACHE);
+                    if (schemas.updateOne(session, new Document("_id", "business").append("installedVersion", 2).append("validation", marker),
+                            new Document("$set", new Document("validation", MongoValidationSchema.marker(operation, READY, 0, business)))).getMatchedCount() != 1)
+                        throw refused();
+                    active.run(); return null;
+                }, PREPARATION);
+            }
+        });
+        MongoValidationSchema.requireReady(database, false);
+    }
+
+    private static Document requireValidationOperation(Document row, io.tapstate.spi.store.CacheBusinessScope scope, String operation) {
+        if (row == null || !Integer.valueOf(2).equals(row.get("installedVersion")) || !(row.get("validation") instanceof Document value))
+            throw MongoValidationSchema.unreadable("version");
+        var marker = MongoValidationSchema.validateMarker(value);
+        if (!operation.equals(marker.get("operationId")) || !scope.equals(MongoValidationSchema.scope(marker)) || marker.getLong("initializedPipelines") != 0)
+            throw refused();
+        return marker;
+    }
     <T> T transaction(Function<ClientSession, T> operation) {
         return StoreIo.call(() -> rawTransaction(operation));
     }

@@ -95,7 +95,7 @@ public final class MongoConfigurationBootstrap {
                                             .append("formatVersion", 1).append("keyId", SourceConfigCipher.fingerprint(key))
                                             .append("material", Base64.getUrlEncoder().withoutPadding().encodeToString(key)));
                             SystemCollections.SCHEMA_MIGRATIONS.on(database).insertOne(session,
-                                    new Document("_id", "config").append("installedVersion", MongoConfigurationDomain.SCHEMA_VERSION));
+                                    new Document("_id", "config").append("installedVersion", 1));
                             SystemCollections.CONFIGURATION_VERSION.on(database).insertOne(session,
                                     new Document("_id", ConfigurationVersion.ID).append("revision", 0L));
                             return null;
