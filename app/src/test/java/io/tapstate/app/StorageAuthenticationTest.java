@@ -13,6 +13,38 @@ import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class StorageAuthenticationTest {
+    @Test void formalMachineEvidenceRetainsTheVerifiedRecordAndHasAPureLocalGuard() {
+        withOpAuthentication(f -> {
+            var record = new TokenRecord("machine", "ADMIN", f.secrets.hash("test-secret"), false, f.clock.instant());
+            when(f.tokens.find("machine")).thenReturn(Optional.of(record));
+            var proof = f.authentication.credentials().authenticateContext("cyxt_machine.test-secret").orElseThrow();
+            var evidence = proof.evidence().orElseThrow();
+            assertThat(evidence.type()).isEqualTo(CredentialType.MACHINE_TOKEN);
+            assertThat(evidence.configurationTokenBinding()).contains(record.authenticationBinding());
+            clearInvocations(f.configuration, f.cache, f.tokens);
+            evidence.requireLocallyActive().run();
+            verifyNoInteractions(f.configuration, f.cache, f.tokens);
+            f.authentication.invalidateFormal();
+            assertThatThrownBy(evidence.requireLocallyActive()::run).isInstanceOf(TapstateException.class);
+        });
+    }
+
+    @Test void formalHumanEvidenceKeepsSignedExpiryWithoutConsultingAConfigTokenOrCacheRow() {
+        withOpAuthentication(f -> {
+            String jwt = new HmacTokenSigner(new byte[32], HmacTokenSigner.DEFAULT_TTL, f.clock, f.scope).issue("machine-looking-username", Scope.ADMIN);
+            var proof = f.authentication.credentials().authenticateContext(jwt).orElseThrow();
+            var evidence = proof.evidence().orElseThrow();
+            assertThat(evidence.type()).isEqualTo(CredentialType.HUMAN_JWT);
+            assertThat(evidence.configurationTokenBinding()).isEmpty();
+            clearInvocations(f.configuration, f.cache, f.tokens);
+            evidence.requireLocallyActive().run();
+            verifyNoInteractions(f.configuration, f.cache, f.tokens);
+            f.now.set(f.clock.instant().plusSeconds(16 * 60));
+            assertThatThrownBy(evidence.requireLocallyActive()::run).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(ControlError.UNAUTHENTICATED));
+            verifyNoInteractions(f.configuration, f.cache, f.tokens);
+        });
+    }
     @Test void simultaneousCloudRequestsValidateOneFrozenCohort() throws Exception {
         var properties = new CloudProperties();
         properties.setBaseUrl("https://cloud.example"); properties.setClusterId("cluster");
@@ -113,6 +145,12 @@ class StorageAuthenticationTest {
             assertThat(proof.storageScope()).contains(scope);
             verify(sessions, times(1)).authenticate(eq(identity), eq("jti"), anyString(), any(), any());
             verify(configuration, times(2)).requireAuthenticationPublished(eq(preparation), any(io.tapstate.adapters.mongostore.MongoReadBudget.class));
+            var evidence = proof.evidence().orElseThrow();
+            assertThat(evidence.type()).isEqualTo(CredentialType.CLOUD_SESSION);
+            assertThat(evidence.configurationTokenBinding()).isEmpty();
+            clearInvocations(configuration, cache, sessions);
+            evidence.requireLocallyActive().run();
+            verifyNoInteractions(configuration, cache, sessions);
             when(sessions.authenticate(eq(identity), eq("jti"), anyString(), any(), any())).thenReturn(Optional.empty());
             doNothing().doThrow(StorageRuntime.unavailable()).when(configuration)
                     .requireAuthenticationPublished(eq(preparation), any(io.tapstate.adapters.mongostore.MongoReadBudget.class));
@@ -164,6 +202,35 @@ class StorageAuthenticationTest {
             assertThatThrownBy(() -> original.service().invalidateJwt("jti")).isInstanceOf(TapstateException.class);
             verify(configuration, never()).users();
             verify(configuration, never()).tokens();
+        }
+    }
+
+    private record OpFixture(StorageAuthentication authentication, MongoConfigurationDomain configuration,
+            io.tapstate.adapters.mongostore.MongoCacheDomain cache, TokenStore tokens, TokenSecrets secrets,
+            CacheAuthScope scope, Clock clock, AtomicReference<Instant> now) { }
+
+    private static void withOpAuthentication(java.util.function.Consumer<OpFixture> action) {
+        var now = new AtomicReference<>(Instant.parse("2026-10-27T00:00:00Z"));
+        Clock clock = new Clock() {
+            @Override public ZoneId getZone() { return ZoneOffset.UTC; }
+            @Override public Clock withZone(ZoneId zone) { return this; }
+            @Override public Instant instant() { return now.get(); }
+        };
+        var configuration = mock(MongoConfigurationDomain.class);
+        var cache = mock(io.tapstate.adapters.mongostore.MongoCacheDomain.class);
+        var scope = new CacheAuthScope("cluster", 1, StorageBinding.Mode.OP, "incarnation", 1);
+        var bound = mock(StorageRuntime.Bound.class);
+        when(bound.preparation()).thenReturn(new CachePreparation("operation", scope));
+        when(bound.cache()).thenReturn(cache);
+        when(configuration.users()).thenReturn(mock(UserStore.class));
+        when(configuration.clusterIdentity()).thenReturn(mock(ClusterIdentityStore.class));
+        when(cache.sessions(scope)).thenReturn(mock(SessionStore.class));
+        var tokens = mock(TokenStore.class);
+        when(configuration.tokens(any(io.tapstate.adapters.mongostore.MongoReadBudget.class))).thenReturn(tokens);
+        var secrets = new RandomTokenSecrets();
+        try (var authentication = new StorageAuthentication(configuration, CloudRuntimeSettings.resolve(new CloudProperties()), null, secrets, clock, new byte[32])) {
+            authentication.install(bound);
+            action.accept(new OpFixture(authentication, configuration, cache, tokens, secrets, scope, clock, now));
         }
     }
 }

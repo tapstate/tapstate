@@ -28,6 +28,21 @@ public record TokenRecord(String tokenId, String scope, String secretHash, boole
         }
     }
 
+    /** Binds the exact record used during authentication, without carrying its secret hash onward. */
+    public String authenticationBinding() {
+        try {
+            var digest = java.security.MessageDigest.getInstance("SHA-256");
+            for (String field : java.util.List.of("machine-token-record-v1", tokenId, scope, secretHash, createdAt.toString())) {
+                byte[] value = field.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                digest.update(java.nio.ByteBuffer.allocate(Integer.BYTES).putInt(value.length).array());
+                digest.update(value);
+            }
+            return java.util.HexFormat.of().formatHex(digest.digest());
+        } catch (java.security.NoSuchAlgorithmException unavailable) {
+            throw new IllegalStateException("SHA-256 is required for authenticated token bindings", unavailable);
+        }
+    }
+
     private static void requireText(String value, String field) {
         if (value == null || value.isBlank()) {
             throw new IllegalArgumentException("token record " + field + " must be non-blank");

@@ -101,6 +101,7 @@ final class StorageAuthentication implements AutoCloseable {
 
     private Optional<CredentialAuthentication> authenticate(Epoch original, String presented, MongoReadBudget budget) {
         Optional<VerifiedToken> verified;
+        Optional<CredentialEvidence> evidence;
         Optional<String> organization = Optional.empty();
         if (cloud.cloud()) {
             original.requireActive(budget);
@@ -113,8 +114,16 @@ final class StorageAuthentication implements AutoCloseable {
                 throw failure;
             }
             original.requireLocallyActive();
+            evidence = verified.map(ignored -> new CredentialEvidence(CredentialType.CLOUD_SESSION,
+                    Optional.empty(), original::requireLocallyActive));
         } else {
-            verified = original.authenticate(presented, budget);
+            var authenticated = original.authenticateTagged(presented, budget);
+            verified = authenticated.map(AuthenticatedIdentity::identity);
+            evidence = authenticated.map(value -> new CredentialEvidence(value.type(), value.configurationBinding(), () -> {
+                original.requireLocallyActive();
+                if (value.type() == CredentialType.HUMAN_JWT
+                        && original.signer.verify(presented).filter(value.identity()::equals).isEmpty()) throw unauthenticated();
+            }));
         }
         // A vanished session must not hide a concurrent scope or structure failure as a bad cookie.
         if (cloud.cloud() || verified.isPresent()) original.requireActive(budget);
@@ -132,7 +141,7 @@ final class StorageAuthentication implements AutoCloseable {
                                     .map(CredentialAuthentication::token)
                             : original.authenticate(presented, revalidation);
                     if (checked.filter(identity::equals).isEmpty()) throw unauthenticated();
-                }));
+                }, evidence));
     }
 
     private final class Bootstrap {
@@ -177,6 +186,8 @@ final class StorageAuthentication implements AutoCloseable {
         Epoch selected = current.get(); if (selected == null) throw StorageRuntime.unavailable(); return selected;
     }
 
+    private record AuthenticatedIdentity(VerifiedToken identity, CredentialType type, Optional<String> configurationBinding) { }
+
     private final class Epoch {
         final StorageRuntime.Bound bound;
         final LocalAuthenticationContext local;
@@ -209,11 +220,16 @@ final class StorageAuthentication implements AutoCloseable {
                             managed.identity(), secrets, clock, observer), observer, egressAddresses);
         }
         Optional<VerifiedToken> authenticate(String presented, MongoReadBudget budget) {
+            return authenticateTagged(presented, budget).map(AuthenticatedIdentity::identity);
+        }
+        Optional<AuthenticatedIdentity> authenticateTagged(String presented, MongoReadBudget budget) {
             requireActive(budget);
-            Optional<VerifiedToken> result = cloud.cloud() ? managed(budget).authenticate(presented)
+            Optional<AuthenticatedIdentity> result = cloud.cloud() ? managed(budget).authenticate(presented)
+                    .map(identity -> new AuthenticatedIdentity(identity, CredentialType.CLOUD_SESSION, Optional.empty()))
                     : TokenService.isMachineToken(presented)
-                            ? new TokenService(configuration.tokens(budget), secrets, clock).authenticate(presented)
-                            : signer.verify(presented);
+                            ? new TokenService(configuration.tokens(budget), secrets, clock).authenticateBound(presented)
+                                    .map(value -> new AuthenticatedIdentity(value.identity(), CredentialType.MACHINE_TOKEN, Optional.of(value.configurationBinding())))
+                            : signer.verify(presented).map(identity -> new AuthenticatedIdentity(identity, CredentialType.HUMAN_JWT, Optional.empty()));
             requireActive(budget); return result;
         }
         void requireActive() { requireActive(new MongoReadBudget(AUTHORIZATION_READ_BUDGET)); }
