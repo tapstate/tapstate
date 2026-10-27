@@ -592,6 +592,26 @@
         "Old writers quiescent and controlled same-version deployment for first enrollment",
         "Matching Source/header and schema aggregate backup for restoration"
       ]
+    },
+    "alert-config-contention-v1": {
+      "goal": "Restore the original authoring revision and supported alert contention capability with the same CONFIG identity. The alert counter is a write-contention token, never a fabricated permission version or substitute for original intent/attempt facts.",
+      "entry": "Open the original validated CONFIG and paired key. Initialize the counter only during new installation or explicit controlled same-version alert component preparation from supported version 1 to 2. A missing row, unsupported marker, partial enrollment, or missing/malformed counter after a version-2 marker refuses normal reopening; restore the paired backup rather than seeding an empty aggregate.",
+      "prerequisites": [
+        "Original CONFIG identity, layout and paired persistent key",
+        "Supported complete eleven-resource alert namespace and original marker operation",
+        "Controlled same-version maintenance with old alert writers quiescent for explicit upgrade",
+        "Matching original configuration revision, marker and necessary alert ledger backup"
+      ]
+    },
+    "source-and-alert-preparation-v2": {
+      "goal": "Restore the exact original Source identity preparation operation and bounded cursor together with the Source headers it published. A READY marker cannot stand in for missing per-Source facts; Source headers cannot substitute for a lost preparation operation.",
+      "entry": "Resume only the original controlled maintenance operation against the same CONFIG/key identity. Existing feature absence with unmarked partial headers is refused. Preserve installedVersion, alerting and other feature metadata; normal facet access performs no migration. Alert contention first preparation keeps the original alert installation operation, records one authority preparation operation, and atomically publishes marker version 2 with the configuration singleton counter. Existing version-2 loss/corruption is not reenrolled by ordinary reads or preparation retries.",
+      "prerequisites": [
+        "Original CONFIG identity, layout and paired persistent key",
+        "Original operation and fixed bounded phase/cursor/count when resuming",
+        "Old writers quiescent and controlled same-version deployment for first enrollment",
+        "Matching Source/header and schema aggregate backup for restoration"
+      ]
     }
   },
   "consistencyProfiles": {
@@ -686,6 +706,14 @@
     "source-identity-preparation-v1": {
       "atomicDomain": "CONFIG",
       "fencing": "Controlled first enrollment, preparation phase/cursor and Source writes serialize through the original CONFIG client/session and configuration_version. Each transaction publishes one Source header with its original operation cursor. Unknown commits read the same operation/header; existing UUIDs are never reallocated. Old writers must be stopped before first enrollment; no cross-client or remote maintenance atomicity is claimed."
+    },
+    "alert-config-contention-v1": {
+      "atomicDomain": "CONFIG",
+      "fencing": "Existing configuration and CONFIG token/user mutations keep advancing the original revision. Alert state/planning/permission transactions instead conditionally increment alertWriteFence on that same singleton row in their actual CONFIG client/session. All protected actor/resource/route/silence checks and corresponding local mutations share that transaction; only an actual modified row establishes contention. Do not claim this CONFIG row serializes CACHE session revocation or remote Cloud IAM; external authentication/Secret/network IO stays outside retried callbacks."
+    },
+    "source-and-alert-preparation-v2": {
+      "atomicDomain": "CONFIG",
+      "fencing": "Controlled first enrollment, preparation phase/cursor and Source writes serialize through the original CONFIG client/session and configuration_version. Each transaction publishes one Source header with its original operation cursor. Unknown commits read the same operation/header; existing UUIDs are never reallocated. Old writers must be stopped before first enrollment; no cross-client or remote maintenance atomicity is claimed. The alert version-1 to version-2 upgrade conditionally changes only its bounded component slot and the original configuration_version singleton in one actual CONFIG transaction; preserve all Source preparation and other component facts, and reconcile unknown commits by the original operation."
     }
   },
   "resources": [
@@ -1388,24 +1416,26 @@
     },
     {
       "id": "mongo.config.configuration_version",
-      "resourceVersion": 1,
-      "proposalVersion": 1,
+      "resourceVersion": 2,
+      "proposalVersion": 2,
       "kind": "COLLECTION",
       "layer": "CONFIG",
       "database": "CONFIG",
       "physicalNames": [
         "configuration_version"
       ],
-      "responsibility": "Configuration-wide authoring/import concurrency revision.",
+      "responsibility": "One CONFIG-wide write-contention aggregate with an authoring/import revision and an independent bounded alert write fence.",
       "writers": [
-        "io.tapstate.adapters.mongostore.MongoConfigurationArtifactStore"
+        "io.tapstate.adapters.mongostore.MongoConfigurationArtifactStore",
+        "io.tapstate.adapters.mongostore.ConfigurationVersion"
       ],
       "readers": [
-        "io.tapstate.adapters.mongostore.MongoConfigurationArtifactStore"
+        "io.tapstate.adapters.mongostore.MongoConfigurationArtifactStore",
+        "io.tapstate.adapters.mongostore.ConfigurationVersion"
       ],
-      "recovery": "configuration-backup",
-      "consistency": "config",
-      "growth": "One bounded aggregate per Cluster/domain; no event or lease history.",
+      "recovery": "alert-config-contention-v1",
+      "consistency": "alert-config-contention-v1",
+      "growth": "Exactly one existing configuration aggregate. Preserve the original Int64 authoring revision and add alertWriteFence:Int64, initially zero and monotonically advanced without changing revision for pure alert acceptance/planning/permission transactions. The added BSON field is 25 bytes including its name/type/value; the fixed aggregate is bounded at 256 bytes. No grant, event, actor, lease or per-operation history.",
       "evidence": [
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoConfigurationArtifactStoreIT.java"
       ]
@@ -1460,8 +1490,8 @@
     },
     {
       "id": "mongo.config.schema_migrations",
-      "resourceVersion": 1,
-      "proposalVersion": 2,
+      "resourceVersion": 2,
+      "proposalVersion": 3,
       "kind": "COLLECTION",
       "layer": "CONFIG",
       "database": "CONFIG",
@@ -1475,9 +1505,9 @@
       "readers": [
         "io.tapstate.adapters.mongostore.MongoConfigurationDomain"
       ],
-      "recovery": "source-identity-preparation-v1",
-      "consistency": "source-identity-preparation-v1",
-      "growth": "One existing bounded CONFIG schema aggregate. Add one fixed Source-identity preparation slot of at most 2 KiB for original operation, identity/key binding, phase, cursor and count; preserve global version, alerting and other feature facts. No per-Source preparation log or per-operation history.",
+      "recovery": "source-and-alert-preparation-v2",
+      "consistency": "source-and-alert-preparation-v2",
+      "growth": "One existing bounded CONFIG schema aggregate. Add one fixed Source-identity preparation slot of at most 2 KiB for original operation, identity/key binding, phase, cursor and count; preserve global version, alerting and other feature facts. No per-Source preparation log or per-operation history. Upgrade only the existing alerting component marker to version 2, retaining its original installation operation and adding one fixed authorityPreparationOperationId. Its entire alerting marker stays within 2 KiB. Initialize configuration_version.alertWriteFence and publish that marker in one actual CONFIG transaction. Preserve global installedVersion, the Source preparation slot/cursor/UUIDs and all other feature facts; no preparation history.",
       "evidence": [
         "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java",
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStorageSchemaIT.java",
