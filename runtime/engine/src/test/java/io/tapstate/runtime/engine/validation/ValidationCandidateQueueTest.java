@@ -11,6 +11,7 @@ import io.tapstate.core.validation.ValidationOwner;
 import io.tapstate.core.validation.ValidationRoot;
 import io.tapstate.core.validation.ValidationRunIdentity;
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -263,6 +264,94 @@ class ValidationCandidateQueueTest {
             var lease = queue.poll().orElseThrow();
             assertThat(lease.windowExhausted()).isFalse();
             queue.settle(lease, Completion.SETTLED);
+        }
+    }
+
+    @Test void applyingDelayChangesOnlyWaitsCreatedAfterTheApplication() {
+        var clock = new AtomicLong();
+        try (var queue = queue(clock, LIMITS)) {
+            queue.tryOffer(List.of(root(1))); var before = queue.snapshot();
+            clock.set(1);
+            var change = new DelayChange(run(), 1, UUID.randomUUID(), 30);
+            assertThat(queue.applyDelay(change)).isEqualTo(DelayApplication.APPLIED);
+            assertThat(queue.applyDelay(change)).isEqualTo(DelayApplication.ALREADY_APPLIED);
+            assertThat(queue.snapshot()).isEqualTo(before);
+            queue.tryOffer(List.of(root(1), root(2)));
+            clock.set(10); var first = queue.poll().orElseThrow();
+            assertThat(first.observation().root()).isEqualTo(root(1));
+            assertThat(queue.settle(first, Completion.RETRY)).isEqualTo(Settlement.RETRY_SCHEDULED);
+            clock.set(19); assertThat(queue.poll()).isEmpty();
+            clock.set(20);
+            assertThat(queue.snapshot().leased()).isZero();
+            var due = queue.poll(); assertThat(due.map(lease -> lease.observation().root())).contains(root(1));
+            var retried = due.orElseThrow();
+            assertThat(retried.observation()).isEqualTo(first.observation()); queue.settle(retried, Completion.SETTLED);
+            clock.set(30); assertThat(queue.poll()).isEmpty();
+            clock.set(31); var second = queue.poll().orElseThrow();
+            assertThat(second.observation().root()).isEqualTo(root(2)); queue.settle(second, Completion.SETTLED);
+            assertThat(queue.delayState()).isEqualTo(new DelayState(run(), 1, change.commandId(), 30, false));
+        }
+    }
+
+    @Test void delayApplicationsCannotCrossRunIdentityRevisionOrClosure() {
+        var clock = new AtomicLong();
+        try (var queue = queue(clock, LIMITS)) {
+            var current = new DelayChange(run(), 2, UUID.randomUUID(), 30);
+            assertThat(queue.applyDelay(current)).isEqualTo(DelayApplication.APPLIED);
+            for (var stale : List.of(new DelayChange(run(), 1, UUID.randomUUID(), 10),
+                    new DelayChange(run(), 2, current.commandId(), 20), new DelayChange(run(), 2, UUID.randomUUID(), 30)))
+                assertThat(queue.applyDelay(stale)).isEqualTo(DelayApplication.STALE);
+            var state = queue.delayState();
+            var old = new ValidationRunIdentity(new ValidationOwner("cluster", "pipeline", "node", "old-boot", 1, 1, 0),
+                    "task", "run", ValidationMode.INCREMENTAL, "spec", 1, "rules");
+            assertThatThrownBy(() -> queue.applyDelay(new DelayChange(old, 3, UUID.randomUUID(), 10))).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> queue.applyDelay(new DelayChange(run(), 3, UUID.randomUUID(), 101))).isInstanceOf(TapstateException.class);
+            assertThat(queue.delayState()).isEqualTo(state);
+            queue.close();
+            assertThat(queue.applyDelay(new DelayChange(run(), 3, UUID.randomUUID(), 10))).isEqualTo(DelayApplication.CLOSED);
+            assertThat(queue.delayState()).isEqualTo(new DelayState(run(), 2, current.commandId(), 30, true));
+        }
+    }
+
+    @Test void aNewDelayCannotExtendTheOriginalConfirmationWindow() {
+        var clock = new AtomicLong(); var limits = new Limits(4, 65536, 4, 5, 10, 100);
+        try (var queue = queue(clock, limits)) {
+            queue.tryOffer(List.of(root(1))); clock.set(10); var checking = queue.poll().orElseThrow();
+            clock.set(90); queue.applyDelay(new DelayChange(run(), 1, UUID.randomUUID(), 50));
+            assertThat(queue.settle(checking, Completion.RETRY)).isEqualTo(Settlement.RETRY_SCHEDULED);
+            clock.set(99); assertThat(queue.poll()).isEmpty();
+            clock.set(100); var exhausted = queue.poll().orElseThrow();
+            assertThat(exhausted.windowExhausted()).isTrue();
+            assertThatThrownBy(() -> queue.settle(exhausted, Completion.RETRY)).isInstanceOf(TapstateException.class);
+            queue.settle(exhausted, Completion.SETTLED);
+        }
+    }
+
+    @Test void aNewDelayCannotResetTheExhaustedConfirmationAttemptBudget() {
+        var clock = new AtomicLong();
+        try (var queue = queue(clock, LIMITS)) {
+            queue.tryOffer(List.of(root(1))); clock.set(10); var first = queue.poll().orElseThrow();
+            queue.settle(first, Completion.RETRY); clock.set(20); var second = queue.poll().orElseThrow();
+            queue.settle(second, Completion.RETRY);
+            queue.applyDelay(new DelayChange(run(), 1, UUID.randomUUID(), 50));
+            var exhausted = queue.poll().orElseThrow(); assertThat(exhausted.windowExhausted()).isTrue();
+            assertThatThrownBy(() -> queue.settle(exhausted, Completion.RETRY)).isInstanceOf(TapstateException.class);
+            queue.settle(exhausted, Completion.SETTLED);
+        }
+    }
+
+    @Test void concurrentDelayApplicationsKeepTheNewestSchedulingRevision() throws Exception {
+        var clock = new AtomicLong();
+        try (var queue = queue(clock, LIMITS); var workers = Executors.newFixedThreadPool(2)) {
+            var old = new DelayChange(run(), 1, UUID.randomUUID(), 20); var latest = new DelayChange(run(), 2, UUID.randomUUID(), 30);
+            var gate = new CountDownLatch(1);
+            var a = workers.submit(() -> { gate.await(); return queue.applyDelay(old); });
+            var b = workers.submit(() -> { gate.await(); return queue.applyDelay(latest); }); gate.countDown();
+            assertThat(a.get(5, TimeUnit.SECONDS)).isIn(DelayApplication.APPLIED, DelayApplication.STALE);
+            assertThat(b.get(5, TimeUnit.SECONDS)).isEqualTo(DelayApplication.APPLIED);
+            assertThat(queue.delayState()).isEqualTo(new DelayState(run(), 2, latest.commandId(), 30, false));
+            queue.tryOffer(List.of(root(1))); clock.set(29); assertThat(queue.poll()).isEmpty();
+            clock.set(30); var ready = queue.poll().orElseThrow(); queue.settle(ready, Completion.SETTLED);
         }
     }
 

@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.locks.ReentrantLock;
@@ -43,6 +44,15 @@ public final class ValidationCandidateQueue implements AutoCloseable {
     public enum Completion { RETRY, SETTLED }
     public enum Settlement { REMOVED, RETRY_SCHEDULED, SUPERSEDED, CLOSED, ALREADY_SETTLED }
     public record Snapshot(int roots, int leased, long bytes, long revision, boolean closed) {}
+    public record DelayChange(ValidationRunIdentity run, long schedulingRevision, UUID commandId, long delayNanos) {
+        public DelayChange {
+            Objects.requireNonNull(run, "run"); Objects.requireNonNull(commandId, "commandId");
+            if (schedulingRevision < 1 || schedulingRevision == Long.MAX_VALUE || delayNanos < 0 || delayNanos > 86_400_000_000_000L)
+                throw invalid("candidate.delayChange");
+        }
+    }
+    public enum DelayApplication { APPLIED, ALREADY_APPLIED, STALE, CLOSED }
+    public record DelayState(ValidationRunIdentity run, long schedulingRevision, UUID commandId, long delayNanos, boolean closed) {}
 
     public static final class Lease {
         private final ValidationCandidateQueue owner;
@@ -82,15 +92,42 @@ public final class ValidationCandidateQueue implements AutoCloseable {
     private long revision;
     private int leased;
     private boolean closed;
+    private long delayNanos;
+    private long schedulingRevision;
+    private UUID delayCommand;
 
     /** nanoTime is local, monotonic and nonblocking; no store, connector or user callback runs under the lock. */
     public ValidationCandidateQueue(ValidationRunIdentity run, Limits limits, LongSupplier nanoTime) {
         this.run = Objects.requireNonNull(run, "run"); this.limits = Objects.requireNonNull(limits, "limits");
         this.nanoTime = Objects.requireNonNull(nanoTime, "nanoTime");
+        delayNanos = limits.delayNanos();
     }
 
     public ValidationRunIdentity run() { return run; }
     public Limits limits() { return limits; }
+
+    /** Runtime application only; callers separately fence durable saved/applied acknowledgments. */
+    public DelayApplication applyDelay(DelayChange change) {
+        Objects.requireNonNull(change, "change");
+        if (!run.equals(change.run()) || run.mode() != io.tapstate.core.validation.ValidationMode.INCREMENTAL
+                || change.delayNanos() > limits.windowNanos()) throw invalid("candidate.delayScope");
+        lock.lock();
+        try {
+            if (closed) return DelayApplication.CLOSED;
+            if (change.schedulingRevision() < schedulingRevision) return DelayApplication.STALE;
+            if (change.schedulingRevision() == schedulingRevision)
+                return change.commandId().equals(delayCommand) && change.delayNanos() == delayNanos
+                        ? DelayApplication.ALREADY_APPLIED : DelayApplication.STALE;
+            schedulingRevision = change.schedulingRevision(); delayCommand = change.commandId(); delayNanos = change.delayNanos();
+            return DelayApplication.APPLIED;
+        } finally { lock.unlock(); }
+    }
+
+    public DelayState delayState() {
+        lock.lock();
+        try { return new DelayState(run, schedulingRevision, delayCommand, delayNanos, closed); }
+        finally { lock.unlock(); }
+    }
 
     /** The caller supplies a stable, admitted batch of complete root identities, including both sides of a move. */
     public Offer tryOffer(List<ValidationRoot> roots) {
@@ -116,7 +153,7 @@ public final class ValidationCandidateQueue implements AutoCloseable {
             for (ValidationRoot root : distinct) {
                 Entry entry = entries.get(root);
                 if (entry == null) {
-                    entry = new Entry(root, charge(root), next, now, limits.delayNanos());
+                    entry = new Entry(root, charge(root), next, now, delayNanos);
                     entries.put(root, entry);
                     bytes += entry.charge;
                 } else {
