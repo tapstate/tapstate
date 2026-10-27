@@ -51,22 +51,30 @@ final class PdkSinkWriter implements SinkWriter {
     private final PdkConnector connector;
     private final WriteRecordFunction write;
     private final WriteMode mode;
+    private final Map<String,String> writeAlternatives;
     private final DdlPolicy ddl;
     private final Map<String, TargetTable> targets;
     private final PdkTargetPreparation preparation;
+    private Map<String, TargetIdentityPlan> identities = Map.of();
+    private SinkConfig identityConfig;
+    private boolean identityPrepared;
     // What closing this writer does to its connector: stops and closes it, or - where the connector is shared
     // by the writers of one sink - lets go of this writer's hold on it.
     private final Runnable letGo;
     private final Map<String, TapTable> tableModels = new LinkedHashMap<>();
     // Blocking connector calls must leave the shared async pool available for engine lifecycle callbacks.
+    private volatile Thread writeThread;
+    private boolean delivering;
     private final ExecutorService writes = Executors.newSingleThreadExecutor(task -> {
         Thread thread = new Thread(task, "tapstate-sink-write");
         thread.setDaemon(true);
+        writeThread = thread;
         return thread;
     });
     private final Object lifecycle = new Object();
     private final Set<CompletableFuture<WriteResult>> pending = new HashSet<>();
     private boolean closed;
+    private final java.util.concurrent.CountDownLatch closeFinished = new java.util.concurrent.CountDownLatch(1);
 
     PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, WriteMode mode, DdlPolicy ddl, TargetTable target) {
         this(connector, write, mode, ddl, target == null ? Map.of() : Map.of(target.name(), target));
@@ -102,9 +110,33 @@ final class PdkSinkWriter implements SinkWriter {
      */
     PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, SinkConfig config,
             Map<String, TargetTable> targets, KeyedStateStore stateStore, boolean preparedAhead, Runnable letGo) {
+        this(connector, write, config, targets, stateStore, preparedAhead, letGo,
+                io.tapstate.core.model.PipelineNode.Purpose.SYNC);
+    }
+
+    PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, SinkConfig config,
+            Map<String, TargetTable> targets, KeyedStateStore stateStore, boolean preparedAhead, Runnable letGo,
+            io.tapstate.core.model.PipelineNode.Purpose purpose) {
+        this(connector,write,config,targets,stateStore,preparedAhead,letGo,purpose,null);
+    }
+
+    PdkSinkWriter(PdkConnector connector,WriteRecordFunction write,SinkConfig config,
+            Map<String,TargetTable> targets,KeyedStateStore stateStore,boolean preparedAhead,Runnable letGo,
+            io.tapstate.core.model.PipelineNode.Purpose purpose,PdkSinkPreparations receipts) {
+        this(connector,write,config,targets,stateStore,preparedAhead,letGo,purpose,receipts,null);
+    }
+
+    PdkSinkWriter(PdkConnector connector,WriteRecordFunction write,SinkConfig config,
+            Map<String,TargetTable> targets,KeyedStateStore stateStore,boolean preparedAhead,Runnable letGo,
+            io.tapstate.core.model.PipelineNode.Purpose purpose,PdkSinkPreparations receipts,
+            Map<String,TargetIdentityPlan> plannedIdentities) {
         this(connector, write, config.writeMode(), config.ddl(), targets,
                 new PdkTargetPreparation(connector.connectorId(), connector.context(), connector.functions(),
-                        config.onFullLoad(), config.fullLoad(), config.node(), stateStore, preparedAhead), letGo);
+                        config.onFullLoad(), config.fullLoad(), config.node(), stateStore, preparedAhead, purpose, connector::requireActive,receipts), letGo);
+        identityConfig = config;
+        identities = PdkTargetIdentityPlanner.assess(connector, config, this.targets);
+        identities.values().forEach(TargetIdentityProjection::requireUsable);
+        PdkTargetIdentityPlanner.requireSame(config, plannedIdentities, identities);
     }
 
     private PdkSinkWriter(PdkConnector connector, WriteRecordFunction write, WriteMode mode, DdlPolicy ddl,
@@ -119,6 +151,7 @@ final class PdkSinkWriter implements SinkWriter {
             connector.close();
         };
         this.connector = connector;
+        this.writeAlternatives=connector.writeAlternatives(mode);
         this.write = write;
         this.mode = mode;
         this.ddl = ddl;
@@ -130,7 +163,12 @@ final class PdkSinkWriter implements SinkWriter {
     void prepareTargets() throws Throwable {
         connector.underLoader(() -> {
             for (Map.Entry<String, TargetTable> entry : targets.entrySet()) {
-                preparation.prepare(entry.getValue(), tableModel(entry.getKey(), entry.getValue()));
+                TargetTable target = projectedTarget(entry.getKey(), entry.getValue());
+                preparation.prepare(target, tableModel(entry.getKey(), target));
+            }
+            if (identityConfig != null) {
+                PdkTargetIdentityPlanner.verifyPrepared(connector, identityConfig, targets, identities);
+                identityPrepared = true;
             }
             return null;
         });
@@ -157,7 +195,14 @@ final class PdkSinkWriter implements SinkWriter {
             }
             // A cancelled stage releases the caller's batch even while its interrupted callback unwinds.
             List<Envelope> batch = List.copyOf(records);
-            CompletableFuture<WriteResult> result = CompletableFuture.supplyAsync(() -> deliver(batch), writes);
+            CompletableFuture<WriteResult> result = CompletableFuture.supplyAsync(() -> {
+                synchronized (lifecycle) {
+                    if (closed) throw new java.util.concurrent.CancellationException("the sink writer was closed");
+                    delivering = true;
+                }
+                try { return deliver(batch); }
+                finally { delivering = false; }
+            }, writes);
             pending.add(result);
             result.whenComplete((accepted, failure) -> {
                 synchronized (lifecycle) {
@@ -169,19 +214,8 @@ final class PdkSinkWriter implements SinkWriter {
     }
 
     private synchronized WriteResult deliver(List<Envelope> records) {
-        Map<String, List<TapRecordEvent>> rowsByTable = new LinkedHashMap<>();
-        for (Envelope env : records) {
-            if (env.op() == Op.DDL) {
-                if (ddl == DdlPolicy.FAIL) {
-                    throw writeFailed(connector.connectorId(),
-                            new IllegalStateException("schema change reached a sink whose ddl policy is fail"));
-                }
-                // ignore: drop the schema change. apply: applying it to the target is a later slice, so drop it too.
-                continue;
-            }
-            rowsByTable.computeIfAbsent(env.src(), ignored -> new ArrayList<>())
-                    .add(encode(mode == WriteMode.APPEND ? asInsert(env) : env));
-        }
+        EncodedBatch batch = encodedRows(records);
+        Map<String, List<TapRecordEvent>> rowsByTable = batch.rows();
         if (rowsByTable.isEmpty()) {
             return new WriteResult(0);
         }
@@ -193,24 +227,11 @@ final class PdkSinkWriter implements SinkWriter {
         }
         try {
             return connector.underLoader(() -> {
-                long[] accepted = {0};
-                for (Map.Entry<String, List<TapRecordEvent>> entry : rowsByTable.entrySet()) {
-                    List<TapRecordEvent> rows = entry.getValue();
-                    TargetTable target = targets.get(entry.getKey());
-                    TapTable table = target != null
-                            ? tableModel(entry.getKey(), target)
-                            : TargetTapTable.bare(rows.get(0).getTableId());
-                    preparation.prepare(target, table);
-                    if (target != null) {
-                        // The connector receives both a table model and record events; its write path may
-                        // route by the event table id, so both must name the resolved target collection.
-                        rows.forEach(row -> row.setTableId(target.name()));
-                    }
-                    // A connector may report the batch in several flushes, one callback each; accumulate.
-                    write.writeRecord(connector.context(), rows, table,
-                            result -> accepted[0] += accepted(result));
+                if (!batch.keys().isEmpty()) {
+                    if (!identityPrepared) prepareTargets();
+                    batch.keys().forEach((stream, keys) -> PdkMongoIdentityGuard.verify(connector, identities.get(stream), keys));
                 }
-                return new WriteResult(accepted[0]);
+                return writeRows(rowsByTable);
             });
         } catch (TapstateException e) {
             throw e;
@@ -219,12 +240,82 @@ final class PdkSinkWriter implements SinkWriter {
         }
     }
 
+    private record EncodedBatch(Map<String, List<TapRecordEvent>> rows,
+            Map<String, List<Map<String, Object>>> keys) { }
+
+    private EncodedBatch encodedRows(List<Envelope> records) {
+        Map<String, List<Map<String, Object>>> keys = new LinkedHashMap<>();
+        Map<String, List<TapRecordEvent>> rowsByTable = new LinkedHashMap<>();
+        for (Envelope env : records) {
+            if (env.op() == Op.DDL) {
+                if (ddl == DdlPolicy.FAIL) {
+                    throw writeFailed(connector.connectorId(),
+                            new IllegalStateException("schema change reached a sink whose ddl policy is fail"));
+                }
+                // ignore: drop the schema change. apply: applying it to the target is a later slice, so drop it too.
+                continue;
+            }
+            TargetIdentityPlan identity = identities.get(env.src());
+            Envelope row = identity == null ? env : TargetIdentityProjection.apply(identity, env);
+            collectDocumentKeys(identity, row, keys);
+            TapRecordEvent encoded = encode(mode == WriteMode.APPEND ? asInsert(row) : row);
+            verifyDocumentKeys(identity, row, encoded);
+            rowsByTable.computeIfAbsent(env.src(), ignored -> new ArrayList<>()).add(encoded);
+        }
+        return new EncodedBatch(rowsByTable, keys);
+    }
+
+    private static boolean documentIdentity(TargetIdentityPlan identity) {
+        return identity.isAutomatic() && identity.requireDocumentKeys();
+    }
+
+    private static void collectDocumentKeys(TargetIdentityPlan identity, Envelope row,
+            Map<String, List<Map<String, Object>>> keys) {
+        if (identity == null || !documentIdentity(identity)) return;
+        List<Map<String, Object>> streamKeys = keys.computeIfAbsent(row.src(), ignored -> new ArrayList<>());
+        if (row.before() != null) streamKeys.add(MongoIdentityKeys.key(identity, row.before()));
+        if (row.after() != null) streamKeys.add(MongoIdentityKeys.key(identity, row.after()));
+    }
+
+    private void verifyDocumentKeys(TargetIdentityPlan identity, Envelope row, TapRecordEvent encoded) {
+        if (identity != null && documentIdentity(identity)) MongoIdentityKeys.verifyEncoded(connector.conversions(), identity, row, encoded);
+    }
+
+    private WriteResult writeRows(Map<String, List<TapRecordEvent>> rowsByTable) throws Throwable {
+        long[] accepted = {0};
+        for (Map.Entry<String, List<TapRecordEvent>> entry : rowsByTable.entrySet()) {
+            List<TapRecordEvent> rows = entry.getValue();
+            TargetTable target = projectedTarget(entry.getKey(), targets.get(entry.getKey()));
+            TapTable table = target != null
+                    ? tableModel(entry.getKey(), target)
+                    : TargetTapTable.bare(rows.get(0).getTableId());
+            preparation.prepare(target, table);
+            if (target != null) {
+                // The connector receives both a table model and record events; its write path may
+                // route by the event table id, so both must name the resolved target collection.
+                rows.forEach(row -> row.setTableId(target.name()));
+            }
+            // A connector may report the batch in several flushes, one callback each; accumulate.
+            // The frozen PDK API stores alternatives by the current thread name.
+            writeAlternatives.forEach(connector.context().getConnectorCapabilities()::alternative);
+            connector.requireActive();
+            write.writeRecord(connector.context(), rows, table,
+                    result -> accepted[0] += accepted(result));
+        }
+        return new WriteResult(accepted[0]);
+    }
+
+    private TargetTable projectedTarget(String stream, TargetTable original) {
+        TargetIdentityPlan plan = identities.get(stream);
+        return plan == null ? original : plan.target();
+    }
+
     private static long accepted(WriteListResult<TapRecordEvent> result) {
         return result.getInsertedCount() + result.getModifiedCount() + result.getRemovedCount();
     }
 
     private TapRecordEvent encode(Envelope env) {
-        return (TapRecordEvent) TapEventCodec.encode(env, connector.codecs());
+        return (TapRecordEvent) TapEventCodec.encode(env, connector.conversions());
     }
 
     /** Reforge a row envelope into an insert (append mode): the row's payload becomes an inserted row. */
@@ -234,6 +325,8 @@ final class PdkSinkWriter implements SinkWriter {
     }
 
     static TapstateException writeFailed(String connectorId, Throwable cause) {
+        if(cause instanceof Error invariant)throw invariant;
+        if(cause instanceof PdkSinkPreparations.HostInvariant host)throw host.original;
         return new TapstateException(ConnectorError.WRITE_FAILED,
                 Map.of("connector", connectorId, "detail", detail(cause)), cause);
     }
@@ -244,22 +337,60 @@ final class PdkSinkWriter implements SinkWriter {
 
     @Override
     public void close() {
-        List<CompletableFuture<WriteResult>> abandoned;
-        synchronized (lifecycle) {
-            if (closed) {
-                return;
-            }
-            closed = true;
-            abandoned = List.copyOf(pending);
+        if (Thread.currentThread() == writeThread && delivering) {
+            throw new IllegalStateException("a target callback cannot close its active writer");
         }
-        // Completion handlers may wait for the active callback to exit, so interrupt it first.
+        List<CompletableFuture<WriteResult>> abandoned;
+        boolean first;
+        synchronized (lifecycle) {
+            first = !closed;
+            closed = true;
+            abandoned = first ? List.copyOf(pending) : List.of();
+        }
+        if (!first) {
+            // A completion callback has left deliver already; waiting here could cycle with another close.
+            if (Thread.currentThread() == writeThread) return;
+            awaitClosed();
+            return;
+        }
         writes.shutdownNow();
         try {
+            // A blocked target call can need its connector stopped before it can exit.
             letGo.run();
         } finally {
-            // Release the connector before notifying handlers; a blocked call may need that release to exit.
-            // Tasks removed from the executor's queue still owe a result even when connector cleanup fails.
-            abandoned.forEach(result -> result.cancel(false));
+            try {
+                // Jet may swallow close failures. Never leave it while an original callback can still write.
+                // Completion callbacks on our worker run after deliver; queued target calls are refused.
+                if (Thread.currentThread() != writeThread) awaitWrites();
+                abandoned.forEach(result -> result.cancel(false));
+            } finally {
+                closeFinished.countDown();
+            }
         }
     }
+
+    private void awaitWrites() {
+        boolean interrupted = false;
+        try {
+            while (!writes.isTerminated()) {
+                try { writes.awaitTermination(1, java.util.concurrent.TimeUnit.DAYS); }
+                catch (InterruptedException stopping) { interrupted = true; }
+            }
+        } finally {
+            if (interrupted) Thread.currentThread().interrupt();
+        }
+    }
+
+    private void awaitClosed() {
+        boolean interrupted = false;
+        try {
+            for (;;) {
+                try { closeFinished.await(); return; }
+                catch (InterruptedException stopping) { interrupted = true; }
+            }
+        } finally {
+            if (interrupted) Thread.currentThread().interrupt();
+        }
+    }
+
 }

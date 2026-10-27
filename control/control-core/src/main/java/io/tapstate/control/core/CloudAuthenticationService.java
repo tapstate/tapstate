@@ -70,6 +70,10 @@ public final class CloudAuthenticationService {
         return sessions.authenticate(cookie);
     }
 
+    public Optional<AuthenticatedCloudSession> authenticateWithContext(String cookie) {
+        return sessions.authenticateWithContext(cookie);
+    }
+
     public Optional<CloudSessionContext> clusterContext(String cookie) {
         return sessions.clusterContext(cookie);
     }

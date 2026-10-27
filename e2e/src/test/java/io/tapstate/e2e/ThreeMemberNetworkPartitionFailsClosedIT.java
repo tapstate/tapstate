@@ -123,9 +123,8 @@ class ThreeMemberNetworkPartitionFailsClosedIT {
             EndpointAddress targetAddress = EndpointAddress.uri(target.toString());
             files.seed(sourceAddress, TABLE, SeedRows.generated(SEEDED_ROWS));
 
-            String store = SharedMongo.replicaSetUrl("e2e_partition_three");
-            try (PartitionableCluster cluster =
-                         PartitionableCluster.start(store, "e2e-partition-three", nodes)) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                 PartitionableCluster cluster = PartitionableCluster.startPrepared(storage, nodes)) {
                 cluster.awaitMembers("node-a", 3);
                 ControlPlane control = cluster.member("node-a");
                 start(control, connector, source, target);
@@ -254,9 +253,8 @@ class ThreeMemberNetworkPartitionFailsClosedIT {
             EndpointAddress targetAddress = EndpointAddress.uri(target.toString());
             files.seed(sourceAddress, TABLE, SeedRows.generated(SEEDED_ROWS));
 
-            String store = SharedMongo.replicaSetUrl("e2e_partition_four");
-            try (PartitionableCluster cluster =
-                         PartitionableCluster.start(store, "e2e-partition-four", nodes)) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                 PartitionableCluster cluster = PartitionableCluster.startPrepared(storage, nodes)) {
                 cluster.awaitMembers("node-a", 4);
                 ControlPlane control = cluster.member("node-a");
                 start(control, connector, source, target);

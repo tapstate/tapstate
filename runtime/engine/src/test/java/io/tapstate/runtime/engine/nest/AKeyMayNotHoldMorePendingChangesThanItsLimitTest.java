@@ -80,6 +80,19 @@ class AKeyMayNotHoldMorePendingChangesThanItsLimitTest {
                 .doesNotThrowAnyException();
     }
 
+    @Test
+    void aDeletedKeyKeepsTheSameCapacityAndRetainsItsChildrenOnOverflow() throws Exception {
+        ResolverProcessor processor=resolver();
+        feed(processor,OWN_ROWS,policy(1,"p1","c1"));
+        feed(processor,OWN_ROWS,Envelope.delete(2,"policy",row("policy_id","p1","customer_id","c1","policy_no","PN-p1"),null).withOrder(at(2)));
+        assertThatThrownBy(() -> feed(processor,FROM_BENEATH,claim(3,"k1","p1"),claim(4,"k2","p1"),claim(5,"k3","p1")))
+                .isInstanceOfSatisfying(TapstateException.class,error -> {
+                    org.assertj.core.api.Assertions.assertThat(error.code()).isEqualTo(NestError.PENDING_LIMIT_EXCEEDED);
+                    org.assertj.core.api.Assertions.assertThat(error.args()).containsEntry("pending",3L).containsEntry("limit",LIMIT);
+                });
+        org.assertj.core.api.Assertions.assertThat(resolverStore.load(List.of("p1")).pending()).isEqualTo(3);
+    }
+
     /** Per key, so two keys holding what each is allowed are two allowed keys. */
     @Test
     void oneKeyHoldingAllItMayDoesNotSpendAnothersRoom() throws Exception {

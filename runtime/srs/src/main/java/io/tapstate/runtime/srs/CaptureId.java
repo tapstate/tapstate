@@ -1,11 +1,8 @@
 package io.tapstate.runtime.srs;
 
-import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.spi.capture.CaptureConfig;
 
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Objects;
 
 /**
@@ -19,8 +16,6 @@ import java.util.Objects;
  * therefore names that pipeline and source as well, so each such pipeline holds a capture of its own.
  */
 public record CaptureId(String value) {
-
-    private static final String PREFIX = "capture-";
 
     public CaptureId {
         if (value == null || value.isBlank()) {
@@ -44,30 +39,22 @@ public record CaptureId(String value) {
         }
         String reader = Objects.requireNonNull(spec.pipelineId(), "spec.pipelineId");
         String source = Objects.requireNonNull(spec.sourceId(), "spec.sourceId");
-        return of(spec.config(), spec.srsKey(), "tail:direct:" + directStart(spec.startFrom())
-                + '|' + reader.length() + ':' + reader + '|' + source.length() + ':' + source, true);
+        return new CaptureId(io.tapstate.core.model.canonical.SourceCaptureIdentity.directCapture(
+                spec.config().connectorId(),spec.config().settings(),spec.srsKey(),reader,source,directStart(spec.startFrom()),spec.config().streams()));
     }
 
     private static String directStart(StartFrom startFrom) {
         return switch (startFrom) {
             case StartFrom.Earliest ignored -> "earliest";
             case StartFrom.Latest ignored -> "latest";
-            case StartFrom.At at -> "at:" + at.instant();
+            case StartFrom.At at -> at.instant().toString();
         };
     }
 
     private static CaptureId of(CaptureConfig config, String srsKey, String readAxis, boolean namesStreams) {
         Objects.requireNonNull(config, "config");
-        StringBuilder contract = new StringBuilder(MiningChainId.resolve(config, srsKey).value())
-                .append('|').append(readAxis);
-        if (namesStreams) {
-            List<String> streams = new ArrayList<>(Objects.requireNonNull(config.streams(), "config.streams"));
-            streams.sort(String::compareTo);
-            contract.append('|').append(streams.size());
-            for (String stream : streams) {
-                contract.append('|').append(stream.length()).append(':').append(stream);
-            }
-        }
-        return new CaptureId(PREFIX + CanonicalHash.ofText(contract.toString()));
+        if(!namesStreams && readAxis.equals("tail:ring"))return new CaptureId(io.tapstate.core.model.canonical.SourceCaptureIdentity.sharedCapture(MiningChainId.resolve(config,srsKey).value()));
+        if(namesStreams && readAxis.equals("snapshot"))return new CaptureId(io.tapstate.core.model.canonical.SourceCaptureIdentity.snapshotCapture(MiningChainId.resolve(config,srsKey).value(),config.streams()));
+        throw new IllegalStateException("unsupported capture identity axis");
     }
 }

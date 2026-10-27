@@ -4,6 +4,7 @@ import io.tapstate.core.lifecycle.MetricAttributes;
 import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
 import io.tapstate.core.lifecycle.Observation;
+import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.spi.store.RateHistoryStore;
 
@@ -31,7 +32,8 @@ import java.util.concurrent.ConcurrentHashMap;
  * <p>An observation with nothing to draw a line from is not sampled. A pipeline with no live job publishes
  * no counters, and a history of empty documents, one a minute for fifteen days per stopped pipeline, would
  * be the cost of a stop that nobody reads back. The samples that pipeline took while running stay where
- * they are: stopping is not what removes a history, deleting the pipeline is.
+ * they are: stopping is not what removes a history, deleting the pipeline is. A completed pipeline retains
+ * its final metrics for display, but later state publications are not new measurements of those metrics.
  */
 public final class RateSampler {
 
@@ -43,7 +45,8 @@ public final class RateSampler {
 
     private final RateHistoryStore history;
     private final Duration interval;
-    private final Map<String, Instant> lastSampledAt = new ConcurrentHashMap<>();
+    private record Cadence(Object scope, Instant at) {}
+    private final Map<String, Cadence> lastSampledAt = new ConcurrentHashMap<>();
 
     public RateSampler(RateHistoryStore history, Duration interval) {
         this.history = Objects.requireNonNull(history, "history");
@@ -58,7 +61,18 @@ public final class RateSampler {
      * interval older than this observation and the observation carries something to draw a line from.
      */
     public void offer(Observation observation) {
-        Objects.requireNonNull(observation, "observation");
+        Objects.requireNonNull(observation, "observation"); offer(observation.pipelineId(), observation, history);
+    }
+
+    /** The original Pipeline scope owns both the cadence and this invocation's destination. */
+    public void offer(Observation observation, io.tapstate.spi.store.PipelineIntentScope scope, RateHistoryStore destination) {
+        Objects.requireNonNull(observation, "observation"); Objects.requireNonNull(scope, "scope"); Objects.requireNonNull(destination, "destination");
+        if (!scope.pipelineId().equals(observation.pipelineId())) throw new io.tapstate.core.common.TapstateException(
+                io.tapstate.spi.store.IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+        offer(scope, observation, destination);
+    }
+
+    private void offer(Object key, Observation observation, RateHistoryStore destination) {
         if (observation.observedAt() == null) {
             return;
         }
@@ -66,12 +80,12 @@ public final class RateSampler {
         if (sample == null) {
             return;
         }
-        Instant last = lastSampledAt.get(observation.pipelineId());
-        if (last != null && observation.observedAt().isBefore(last.plus(interval))) {
+        Cadence last = lastSampledAt.get(observation.pipelineId());
+        if (last != null && key.equals(last.scope()) && observation.observedAt().isBefore(last.at().plus(interval))) {
             return;
         }
-        history.append(sample);
-        lastSampledAt.put(observation.pipelineId(), observation.observedAt());
+        destination.append(sample);
+        lastSampledAt.put(observation.pipelineId(), new Cadence(key, observation.observedAt()));
     }
 
     /** Drops the cadence bookkeeping of every pipeline outside {@code live}, which is the set that still exists. */
@@ -81,6 +95,9 @@ public final class RateSampler {
 
     /** The sample {@code observation} yields, or {@code null} when it carries nothing to draw a line from. */
     static RateSample sampleOf(Observation observation) {
+        if (observation.state() == PipelineState.COMPLETED) {
+            return null;
+        }
         Map<String, Long> counters = new LinkedHashMap<>();
         Map<String, Long> lag = new LinkedHashMap<>();
         observation.metrics().forEach((key, value) -> {

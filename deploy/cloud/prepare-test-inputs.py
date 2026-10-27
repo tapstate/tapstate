@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -50,17 +51,44 @@ def prepare(lock: Path, output: Path, base_url: str = PUBLIC_RELEASE) -> None:
         STAGE.stage(lock, jars, output)
 
 
+def prepare_mongodb(lock: Path, output: Path, base_url: str = PUBLIC_RELEASE) -> None:
+    """Prepare one verified test dependency, not a partial Cloud release bundle."""
+    entries, licenses = STAGE.read_lock(lock)
+    expected = next(entry for entry in entries if entry["id"] == "mongodb")
+    if output.exists() or output.is_symlink():
+        raise STAGE.StageError("test input output already exists; refusing to overwrite it")
+    with tempfile.TemporaryDirectory(prefix="mongodb-public-test-input-") as temporary:
+        staged = Path(temporary)
+        jar = staged / "mongodb-connector.jar"
+        download(f"{base_url.rstrip('/')}/{jar.name}", jar, expected["bytes"])
+        STAGE.verify_jar(jar, expected)
+        for entry in licenses:
+            license_file = staged / entry["name"]
+            download(f"{base_url.rstrip('/')}/{license_file.name}", license_file, entry["bytes"])
+            STAGE.verify_companion_license(license_file, entry)
+        # Claim a new output only after all inputs verify. A failed copy leaves an explicit,
+        # incomplete output that a later invocation refuses to replace.
+        output.mkdir(parents=True, exist_ok=False)
+        for source in staged.iterdir():
+            shutil.copyfile(source, output / source.name)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lock", type=Path, default=Path(__file__).with_name("connectors.lock.json"))
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--mongodb-only", action="store_true", help="prepare the managed-target test JAR and licenses instead of a Cloud release bundle")
     args = parser.parse_args()
     try:
-        prepare(args.lock, args.output)
+        if args.mongodb_only:
+            prepare_mongodb(args.lock, args.output)
+        else:
+            prepare(args.lock, args.output)
     except STAGE.StageError as failure:
         print(f"Cloud test inputs refused: {failure}", file=sys.stderr)
         return 1
-    print(f"Prepared eight verified public connector inputs in {args.output}")
+    kind = "the verified MongoDB test dependency" if args.mongodb_only else "eight verified public connector inputs"
+    print(f"Prepared {kind} in {args.output}")
     return 0
 
 

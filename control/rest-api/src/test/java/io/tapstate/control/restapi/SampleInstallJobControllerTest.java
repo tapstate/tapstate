@@ -252,9 +252,13 @@ class SampleInstallJobControllerTest {
                     new ConnectionTestResultStore() {
                         @Override public void save(ConnectionTestResult result) { }
                         @Override public Optional<ConnectionTestResult> find(String id) { return Optional.empty(); }
-                    }, audit) : unusedProbes.connectionTestService(audit);
+                    }, audit, null,
+                    io.tapstate.control.core.SourceConnectionResolver.forAdHocConnections())
+                    : unusedProbes.connectionTestService(audit);
             var discovery = cloud ? new SchemaDiscoveryService(config -> new SourceModel(List.of()),
-                    schemas, audit, clock) : unusedProbes.schemaDiscoveryService(audit);
+                    schemas, audit, clock, null,
+                    io.tapstate.control.core.SourceConnectionResolver.forAdHocConnections())
+                    : unusedProbes.schemaDiscoveryService(audit);
             var samples = new SampleSourceService(sources, discovery, connections,
                     catalog(), new SampleSourceCredentialsProvider() {
                         @Override public boolean available() { return true; }

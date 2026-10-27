@@ -4,6 +4,8 @@ import io.tapstate.app.Bootstrap;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.web.server.context.WebServerApplicationContext;
 import org.springframework.context.ConfigurableApplicationContext;
+import org.springframework.context.ApplicationListener;
+import org.springframework.context.event.ContextRefreshedEvent;
 import org.springframework.scheduling.config.ScheduledTask;
 import org.springframework.scheduling.config.ScheduledTaskHolder;
 
@@ -30,9 +32,12 @@ final class InProcessServer implements ServerHandle {
     private final ConfigurableApplicationContext context;
     private final URI baseUrl;
     private final Path stagingDirectory;
+    private final List<ConfigurableApplicationContext> refreshedContexts;
 
-    private InProcessServer(ConfigurableApplicationContext context, URI baseUrl, Path stagingDirectory) {
+    private InProcessServer(ConfigurableApplicationContext context, URI baseUrl, Path stagingDirectory,
+            List<ConfigurableApplicationContext> refreshedContexts) {
         this.context = context;
+        this.refreshedContexts = refreshedContexts;
         this.baseUrl = baseUrl;
         this.stagingDirectory = stagingDirectory;
     }
@@ -40,6 +45,17 @@ final class InProcessServer implements ServerHandle {
     /** Boots the assembly against the given store and returns once its surface is listening. */
     static InProcessServer start(String storeUri) {
         return start(storeUri, SharedMongo.OPERATOR_STATE_DATABASE);
+    }
+
+    static InProcessServer startPrepared(PreparedNativeStore storage) {
+        return startPrepared(storage, List.of());
+    }
+
+    static InProcessServer startPrepared(PreparedNativeStore storage, List<String> additionalArguments) {
+        var arguments = new java.util.ArrayList<>(List.of("--tapstate.cluster.id=" + storage.clusterId(),
+                "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2"));
+        arguments.addAll(additionalArguments);
+        return start(storage.configurationUri(), null, arguments);
     }
 
     /** Boots the assembly with an explicit operator-state database. */
@@ -51,8 +67,9 @@ final class InProcessServer implements ServerHandle {
     static InProcessServer start(String storeUri, String operatorStateDatabase, List<String> additionalArguments) {
         Path stagingDirectory = ServerHandle.privateStagingDirectory();
         ConfigurableApplicationContext context;
+        var refreshed = new java.util.concurrent.CopyOnWriteArrayList<ConfigurableApplicationContext>();
         try {
-            context = boot(storeUri, operatorStateDatabase, stagingDirectory, additionalArguments);
+            context = boot(storeUri, operatorStateDatabase, stagingDirectory, additionalArguments, refreshed);
         } catch (RuntimeException e) {
             // Nothing is handed back to close, so nothing else will ever clear this up. Attached rather
             // than thrown: why the assembly did not boot is the thing a reader needs.
@@ -66,25 +83,31 @@ final class InProcessServer implements ServerHandle {
         int port = ((WebServerApplicationContext) context).getWebServer().getPort();
         // The literal address, not the name: "localhost" resolves to both 127.0.0.1 and ::1, and only
         // one of those is the address bound below.
-        return new InProcessServer(context, URI.create("http://127.0.0.1:" + port), stagingDirectory);
+        return new InProcessServer(context, URI.create("http://127.0.0.1:" + port), stagingDirectory, refreshed);
     }
 
     private static ConfigurableApplicationContext boot(String storeUri, String operatorStateDatabase,
-            Path stagingDirectory, List<String> additionalArguments) {
+            Path stagingDirectory, List<String> additionalArguments,
+            java.util.concurrent.CopyOnWriteArrayList<ConfigurableApplicationContext> refreshedContexts) {
         java.util.ArrayList<String> arguments = new java.util.ArrayList<>(List.of(
                 "--server.address=127.0.0.1", "--server.port=0"));
         arguments.addAll(additionalArguments);
-        return new SpringApplicationBuilder(Bootstrap.class)
-                .properties(
+        var defaults = new java.util.ArrayList<>(List.of(
                         "tapstate.store.mongo.enabled=true",
                         "tapstate.store.mongo.uri=" + storeUri,
-                        ServerHandle.OPERATOR_STATE_DATABASE_SETTING + "=" + operatorStateDatabase,
                         // The container speaks plaintext; store TLS is opt-in, so no flag is needed.
                         "tapstate.store.mongo.server-selection-timeout=5s",
                         // This tier's working directory is the harness's own module, and the setting's
                         // default is relative to it.
                         ServerHandle.PLUGINS_DIRECTORY_SETTING + "=" + stagingDirectory,
-                        ServerHandle.ALSO_ACCEPT_IDS_SETTING + "=" + E2eConnectorJar.CONNECTOR_ID)
+                        ServerHandle.ALSO_ACCEPT_IDS_SETTING + "=" + E2eConnectorJar.CONNECTOR_ID));
+        if (operatorStateDatabase != null) defaults.add(ServerHandle.OPERATOR_STATE_DATABASE_SETTING + "=" + operatorStateDatabase);
+        return new SpringApplicationBuilder(Bootstrap.class)
+                .listeners((ApplicationListener<ContextRefreshedEvent>) event -> {
+                    if (event.getApplicationContext() instanceof ConfigurableApplicationContext refreshed)
+                        refreshedContexts.addIfAbsent(refreshed);
+                })
+                .properties(defaults.toArray(String[]::new))
                 // Port zero, then read back what was granted: a hard-coded port turns a busy machine
                 // into a flaky suite. Both are command-line arguments rather than default properties
                 // because the product's application configuration publishes 8080 as its default, and a
@@ -130,23 +153,33 @@ final class InProcessServer implements ServerHandle {
      */
     int stopPublishingObservations() {
         int cancelled = 0;
-        for (ScheduledTaskHolder holder : context.getBeansOfType(ScheduledTaskHolder.class).values()) {
-            for (ScheduledTask task : holder.getScheduledTasks()) {
-                // The runnable itself is wrapped by the scheduler, so it is matched by how it renders
-                // rather than by its type: the wrapper delegates toString to the scheduled method, which
-                // renders as its declaring class and method name.
-                if (PUBLISHING_PASS.equals(String.valueOf(task.getTask().getRunnable()))) {
-                    task.cancel();
-                    cancelled++;
+        for (var owner : refreshedContexts) {
+            if (!owner.isActive() || !belongsToThisServer(owner)) continue;
+            for (ScheduledTaskHolder holder : owner.getBeansOfType(ScheduledTaskHolder.class).values()) {
+                for (ScheduledTask task : holder.getScheduledTasks()) {
+                    // The runnable is wrapped by the scheduler; its rendering names the scheduled method.
+                    if (PUBLISHING_PASS.equals(String.valueOf(task.getTask().getRunnable()))) {
+                        task.cancel();
+                        cancelled++;
+                    }
                 }
             }
         }
         return cancelled;
     }
 
+    private boolean belongsToThisServer(ConfigurableApplicationContext candidate) {
+        for (org.springframework.context.ApplicationContext owner = candidate; owner != null; owner = owner.getParent())
+            if (owner == context) return true;
+        return false;
+    }
+
     @Override
     public void close() {
-        context.close();
-        ServerHandle.discardStagingDirectory(stagingDirectory);
+        try { context.close(); }
+        finally {
+            refreshedContexts.clear();
+            ServerHandle.discardStagingDirectory(stagingDirectory);
+        }
     }
 }

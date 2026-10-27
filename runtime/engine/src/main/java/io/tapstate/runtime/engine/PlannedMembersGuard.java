@@ -55,7 +55,7 @@ final class PlannedMembersGuard implements ProcessorMetaSupplier {
             // Recorded before the engine wraps it, for the reason every processor here records its own
             // failure: once the job's result is terminal the exact cause cannot be read back from it.
             if (context.hazelcastInstance() != null && pipeline != null) {
-                JobFailureRegistry.of(context.hazelcastInstance()).record(pipeline, refused);
+                JobFailureRegistry.of(context.hazelcastInstance()).forJob(context.jobId(), context.jobConfig()).record(refused);
             }
             throw refused;
         }

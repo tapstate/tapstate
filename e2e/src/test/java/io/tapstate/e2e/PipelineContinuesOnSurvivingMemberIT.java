@@ -2,13 +2,10 @@ package io.tapstate.e2e;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.mongodb.ConnectionString;
-import com.mongodb.client.MongoClient;
-import com.mongodb.client.MongoClients;
-import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.TableSnapshot;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.testsupport.DockerGate;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -88,9 +85,9 @@ class PipelineContinuesOnSurvivingMemberIT {
             EndpointAddress targetAddress = EndpointAddress.uri(target.toString());
             files.seed(sourceAddress, TABLE, SeedRows.generated(SEEDED_ROWS));
 
-            String store = SharedMongo.replicaSetUrl("e2e_failover_cluster");
-            try (MongoClient durable = MongoClients.create(store);
-                    TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-failover")) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                    NativeSrsDocuments documents = new NativeSrsDocuments(storage);
+                    TwoMemberCluster cluster = TwoMemberCluster.startPrepared(storage)) {
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.first();
                 control.registerConnector(E2eConnectorJar.CONNECTOR_ID, connector);
@@ -103,7 +100,7 @@ class PipelineContinuesOnSurvivingMemberIT {
                         () -> files.count(targetAddress, TABLE) >= SEEDED_ROWS,
                         () -> "rows at target = " + files.count(targetAddress, TABLE));
                 Await.until("the target to confirm the initial load in the shared record",
-                        () -> loadCompleted(durable, store),
+                        () -> loadCompleted(documents),
                         () -> "completion mark absent for " + TABLE);
                 TableSnapshot before = Await.answered("the first run's snapshot reading",
                         () -> control.snapshotTable(PIPELINE, TABLE)
@@ -172,16 +169,15 @@ class PipelineContinuesOnSurvivingMemberIT {
                 () -> String.valueOf(state.get()));
     }
 
-    private static boolean loadCompleted(MongoClient client, String storeUri) {
-        String database = new ConnectionString(storeUri).getDatabase();
-        for (Document consumer : client.getDatabase(database)
-                .getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS).find()) {
-            if (consumer.get("snapshotCompletedTables") instanceof List<?> tables
-                    && tables.contains(TABLE)) {
-                return true;
-            }
-        }
-        return false;
+    private static boolean loadCompleted(NativeSrsDocuments documents) {
+        Document member = documents.pipelineMembership(PIPELINE, SOURCE_ID);
+        if (member == null) return false;
+        String chain = member.get("_id", Document.class).getString("chain");
+        Document cursor = documents.consumerOffset(chain, SrsConsumerId.of(PIPELINE, SOURCE_ID).value());
+        return cursor != null && member.get("stateGeneration").equals(cursor.get("stateGeneration"))
+                && member.get("revision").equals(cursor.get("membershipRevision"))
+                && cursor.get("progress", Document.class).getList("snapshotCompletedTables", String.class, List.of())
+                        .contains(TABLE);
     }
 
     private static void awaitRunning(ControlPlane control, String pipelineId, Duration bound) {

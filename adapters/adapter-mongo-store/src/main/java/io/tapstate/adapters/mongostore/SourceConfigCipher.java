@@ -22,7 +22,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
-/** Authenticated encryption of one entire Source config JSON value, independent of connector and mode. */
+/** Authenticated encryption of one entire configuration value, independent of connector and mode. */
 public final class SourceConfigCipher {
 
     private static final String FORMAT = "tscfg";
@@ -58,9 +58,19 @@ public final class SourceConfigCipher {
 
     public String encrypt(String sourceId, String connector, String configJson) {
         Objects.requireNonNull(configJson, "configJson");
+        byte[] plaintext = configJson.getBytes(StandardCharsets.UTF_8);
+        try {
+            return encryptBytes(sourceId, connector, plaintext);
+        } finally {
+            Arrays.fill(plaintext, (byte) 0);
+        }
+    }
+
+    /** Encrypts caller-owned binary input without changing or retaining it. */
+    String encryptBytes(String sourceId, String connector, byte[] plaintext) {
+        Objects.requireNonNull(plaintext, "plaintext");
         byte[] iv = new byte[IV_BYTES];
         random.nextBytes(iv);
-        byte[] plaintext = configJson.getBytes(StandardCharsets.UTF_8);
         try {
             Cipher cipher = cipher();
             cipher.init(Cipher.ENCRYPT_MODE, keys.get(activeKeyId), new GCMParameterSpec(TAG_BYTES * 8, iv));
@@ -73,12 +83,20 @@ public final class SourceConfigCipher {
             // A valid key and a mandated transformation must be usable in this runtime. Do not hide
             // a provider/programming defect as damaged user data or attach any config plaintext.
             throw new IllegalStateException("Source config encryption could not use the configured cipher", unavailable);
+        }
+    }
+
+    public String decrypt(String sourceId, String connector, String envelope) {
+        byte[] plaintext = decryptBytes(sourceId, connector, envelope);
+        try {
+            return new String(plaintext, StandardCharsets.UTF_8);
         } finally {
             Arrays.fill(plaintext, (byte) 0);
         }
     }
 
-    public String decrypt(String sourceId, String connector, String envelope) {
+    /** Returns caller-owned plaintext; the caller must erase it after decoding. */
+    byte[] decryptBytes(String sourceId, String connector, String envelope) {
         Objects.requireNonNull(envelope, "envelope");
         String[] parts = envelope.split(":", -1);
         if (parts.length != 4 || !FORMAT.equals(parts[0]) || !VERSION.equals(parts[1])) {
@@ -95,22 +113,18 @@ public final class SourceConfigCipher {
         if (payload.length < IV_BYTES + TAG_BYTES) {
             throw unreadable(sourceId);
         }
-        byte[] plaintext = null;
         try {
             Cipher cipher = cipher();
             cipher.init(Cipher.DECRYPT_MODE, key,
                     new GCMParameterSpec(TAG_BYTES * 8, Arrays.copyOfRange(payload, 0, IV_BYTES)));
             cipher.updateAAD(context(parts[2], sourceId, connector));
-            plaintext = cipher.doFinal(payload, IV_BYTES, payload.length - IV_BYTES);
-            return new String(plaintext, StandardCharsets.UTF_8);
+            return cipher.doFinal(payload, IV_BYTES, payload.length - IV_BYTES);
         } catch (AEADBadTagException invalidAuthentication) {
             // Wrong context, tampering, and wrong keys are all fail-closed stored-data refusals.
             // Crypto/parser messages and causes are not operator-safe diagnostic payloads.
             throw unreadable(sourceId);
         } catch (GeneralSecurityException unavailable) {
             throw new IllegalStateException("Source config decryption could not use the configured cipher", unavailable);
-        } finally {
-            if (plaintext != null) Arrays.fill(plaintext, (byte) 0);
         }
     }
 

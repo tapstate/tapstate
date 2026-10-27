@@ -63,6 +63,22 @@ class MongoConnectionReplicaSetIT {
     }
 
     @Test
+    void aSavedCacheBindingUsesItsExplicitDatabaseWithoutRunningLegacyMigrations() {
+        String suffix = java.util.UUID.randomUUID().toString().replace("-", "");
+        String uriDatabase = "uri_" + suffix;
+        String selectedDatabase = "cache_" + suffix;
+        var binding = new io.tapstate.spi.store.StorageBinding.Connection(
+                io.tapstate.spi.store.StorageBinding.Connection.Kind.MONGODB,
+                REPLICA_SET.getReplicaSetUrl(uriDatabase), selectedDatabase, null);
+        try (MongoConnection connection = MongoConnection.forCache(binding, Duration.ofSeconds(5), "binding-probe")) {
+            connection.verifyConnectivity();
+            assertThat(connection.database().getName()).isEqualTo(selectedDatabase);
+            assertThat(connection.database().listCollectionNames().into(new java.util.ArrayList<>())).isEmpty();
+            assertThat(connection.client().getDatabase(uriDatabase).listCollectionNames().into(new java.util.ArrayList<>())).isEmpty();
+        }
+    }
+
+    @Test
     void verifySucceedsWhenAddressingTheMemberDirectly() {
         // A containerized server cannot use topology discovery: the set member advertises the address
         // its host reaches it by, which resolves to nothing inside another container. Addressing the

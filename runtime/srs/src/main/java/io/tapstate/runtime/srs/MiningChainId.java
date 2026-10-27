@@ -1,12 +1,8 @@
 package io.tapstate.runtime.srs;
 
-import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.spi.capture.CaptureConfig;
 
-import java.util.List;
-import java.util.Map;
 import java.util.Objects;
-import java.util.TreeMap;
 
 /**
  * The identity a mining chain or an independent direct channel is keyed by. Every per-table change ring and the
@@ -30,9 +26,7 @@ import java.util.TreeMap;
  */
 public record MiningChainId(String value) {
 
-    private static final String DERIVED_PREFIX = "mc-";
     private static final String KEYED_PREFIX = "mck-";
-    private static final String DIRECT_PREFIX = "mcd-";
 
     public MiningChainId {
         if (value == null || value.isBlank()) {
@@ -43,7 +37,7 @@ public record MiningChainId(String value) {
     /** The chain a source reads by its physical coordinate: a content hash of the connector and settings. */
     public static MiningChainId of(CaptureConfig config) {
         Objects.requireNonNull(config, "config");
-        return new MiningChainId(DERIVED_PREFIX + CanonicalHash.ofText(canonicalConfig(config)));
+        return new MiningChainId(io.tapstate.core.model.canonical.SourceCaptureIdentity.physical(config.connectorId(),config.settings()));
     }
 
     /** The chain a manual {@code srs.key} asserts directly, overriding config derivation. */
@@ -67,58 +61,8 @@ public record MiningChainId(String value) {
         if (pipelineId.isBlank() || sourceId.isBlank()) {
             throw new IllegalArgumentException("a direct channel names a non-blank pipeline and source");
         }
-        StringBuilder channel = new StringBuilder();
-        token(channel, resolve(config, srsKey).value());
-        token(channel, pipelineId);
-        token(channel, sourceId);
-        return new MiningChainId(DIRECT_PREFIX + CanonicalHash.ofText(channel.toString()));
+        return new MiningChainId(io.tapstate.core.model.canonical.SourceCaptureIdentity.directChannel(
+                config.connectorId(),config.settings(),srsKey,pipelineId,sourceId));
     }
 
-    /** The connector plus its settings in an order-independent, injective form — the hash input. */
-    private static String canonicalConfig(CaptureConfig config) {
-        StringBuilder sb = new StringBuilder();
-        token(sb, config.connectorId());
-        canonicalValue(sb, config.settings());
-        return sb.toString();
-    }
-
-    private static void canonicalValue(StringBuilder sb, Object value) {
-        switch (value) {
-            case null -> sb.append('~');
-            case Map<?, ?> m -> {
-                TreeMap<String, Object> sorted = new TreeMap<>();
-                for (Map.Entry<?, ?> e : m.entrySet()) {
-                    sorted.put(String.valueOf(e.getKey()), e.getValue());
-                }
-                sb.append('M').append(sorted.size()).append('{');
-                for (Map.Entry<String, Object> e : sorted.entrySet()) {
-                    token(sb, e.getKey());
-                    canonicalValue(sb, e.getValue());
-                }
-                sb.append('}');
-            }
-            case List<?> l -> {
-                sb.append('L').append(l.size()).append('[');
-                for (Object o : l) {
-                    canonicalValue(sb, o);
-                }
-                sb.append(']');
-            }
-            case String s -> {
-                sb.append('S');
-                token(sb, s);
-            }
-            case Boolean b -> sb.append('B').append(b);
-            default -> {
-                // Number and any other scalar: tagged apart from a string so "1" and 1 never coincide.
-                sb.append('N');
-                token(sb, String.valueOf(value));
-            }
-        }
-    }
-
-    /** A length-prefixed string token — the prefix makes the encoding unspoofable by a crafted value. */
-    private static void token(StringBuilder sb, String s) {
-        sb.append(s.length()).append(':').append(s);
-    }
 }

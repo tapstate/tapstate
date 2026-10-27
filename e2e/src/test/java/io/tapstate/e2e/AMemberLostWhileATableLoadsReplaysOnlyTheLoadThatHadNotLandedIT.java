@@ -74,8 +74,8 @@ class AMemberLostWhileATableLoadsReplaysOnlyTheLoadThatHadNotLandedIT {
         Holds holds = new Holds(directory.resolve("holds"));
 
         try (FileEndpoints files = new FileEndpoints()) {
-            String store = SharedMongo.replicaSetUrl("e2e_lost_mid_load_cluster");
-            try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-lost-mid-load")) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                    TwoMemberCluster cluster = TwoMemberCluster.startPrepared(storage)) {
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.first();
                 control.registerConnector(E2eConnectorJar.CONNECTOR_ID, connector);

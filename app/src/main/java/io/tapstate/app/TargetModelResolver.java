@@ -35,15 +35,19 @@ import java.util.Optional;
  */
 final class TargetModelResolver {
 
-    private final StorePort storePort;
     private final ArtifactStore artifacts;
+    private final java.util.function.Function<SourceResource,SourceModel> modelInputs;
 
     TargetModelResolver(StorePort storePort) {
         this(storePort, Objects.requireNonNull(storePort, "storePort").artifacts());
     }
 
     TargetModelResolver(StorePort storePort, ArtifactStore artifacts) {
-        this.storePort = Objects.requireNonNull(storePort, "storePort");
+        this(storePort,artifacts,source -> SourceDiscovery.model(storePort,source));
+    }
+    TargetModelResolver(StorePort storePort,ArtifactStore artifacts,java.util.function.Function<SourceResource,SourceModel> modelInputs) {
+        this.modelInputs = Objects.requireNonNull(modelInputs,"modelInputs");
+        Objects.requireNonNull(storePort, "storePort");
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
     }
 
@@ -55,7 +59,7 @@ final class TargetModelResolver {
     void requireAllDiscovered(Iterable<String> sourceIds) {
         for (String sourceId : sourceIds) {
             SourceResource source = StoredArtifacts.requireSource(artifacts, sourceId);
-            SourceModel discovered = SourceDiscovery.model(storePort, source);
+            SourceModel discovered = modelInputs.apply(source);
             if (discovered == null) {
                 throw new TapstateException(
                         ActuationError.SOURCE_SCHEMA_NOT_DISCOVERED, Map.of("source", source.id()), null);
@@ -76,7 +80,7 @@ final class TargetModelResolver {
         Map<String, TargetTable> targets = new LinkedHashMap<>();
         for (String sourceId : pipeline.sourceIds()) {
             SourceResource source = StoredArtifacts.requireSource(artifacts, sourceId);
-            SourceModel discovered = SourceDiscovery.model(storePort, source);
+            SourceModel discovered = modelInputs.apply(source);
             resolveAll(PipelineTableSelection.resolve(pipeline, source, discovered), discovered)
                     .forEach(targets::putIfAbsent);
         }
@@ -86,13 +90,13 @@ final class TargetModelResolver {
     /** Resolves one target model per selected table of the source that feeds a sink. */
     Map<String, TargetTable> resolveAll(String sourceId) {
         SourceResource source = StoredArtifacts.requireSource(artifacts, sourceId);
-        return resolveAll(source, SourceDiscovery.model(storePort, source));
+        return resolveAll(source, modelInputs.apply(source));
     }
 
     /** Resolves the first selected table for callers that still require a single target. */
     ResolvedTarget resolve(String sourceId) {
         SourceResource source = StoredArtifacts.requireSource(artifacts, sourceId);
-        SourceModel discovered = SourceDiscovery.model(storePort, source);
+        SourceModel discovered = modelInputs.apply(source);
         String table = SourceCaptureResolution.of(source, discovered).table();
         return new ResolvedTarget(table, resolveAll(source, discovered).get(table));
     }
@@ -298,7 +302,7 @@ final class TargetModelResolver {
         if (rename == null) {
             return target;
         }
-        return new TargetTable(TableRename.apply(target.name(), rename), target.fields(), target.indexes());
+        return new TargetTable(TableRename.apply(target.name(), rename), target.fields(), target.indexes(), target.unwindIdentity());
     }
 
     /**
@@ -341,7 +345,7 @@ final class TargetModelResolver {
             // that the source constrains it.
             indexes.add(new TargetIndex(resolvedKey, true, false));
         }
-        return new TargetTable(model.name(), fields, indexes);
+        return new TargetTable(model.name(), fields, indexes, model.unwindIdentity());
     }
 
     /** Applies one sync element's rename rules to every source table that can reach that sink. */
@@ -360,7 +364,7 @@ final class TargetModelResolver {
             String legacyName = rename == null || rename.map() == null || qualified == null
                     || rename.map().containsKey(target.name()) ? null : rename.map().get(qualified);
             renamed.put(sourceTable, legacyName == null ? rename(target, rename)
-                    : new TargetTable(legacyName, target.fields(), target.indexes()));
+                    : new TargetTable(legacyName, target.fields(), target.indexes(), target.unwindIdentity()));
         }
         return Collections.unmodifiableMap(renamed);
     }

@@ -165,13 +165,14 @@ schema configuration before starting.
 ## Existing rows in the target
 
 A target collection is created from the source model when it is absent. Existing
-target rows are governed by `on_full_load` on each `serve.sync` element:
+target rows are governed by `on_full_load` on each `serve.sync` element and on each
+view:
 
 | Policy | Before a new full load |
 |---|---|
 | `append` (default) | Keep existing rows and use the configured `write_mode`. |
 | `clear` | Clear existing rows before writing the new full load. |
-| `fail` | Refuse to start writing if the target collection is not empty. |
+| `fail` | Refuse the start if the target already holds rows. |
 
 For example, a sync to the `warehouse` connection can request a clean full load:
 
@@ -183,11 +184,68 @@ serve:
       on_full_load: clear
 ```
 
+A view takes the same two settings as a sync element, with the same values, meanings
+and defaults: `write_mode` (`upsert`, or `append`) and `on_full_load`. Both may be
+written on an inline view or on a `kind: view` definition; a `use:` reference takes
+neither. With `write_mode: append` a delete at the source removes nothing. On MongoDB,
+the target keeps its key index, so an update still replaces the document under its
+key: each key ends up holding one document, its latest, and a deleted row's last one
+stays.
+
+```yaml
+view:
+  id: order_state
+  from: orders
+  primary_key: id
+  on_full_load: clear
+```
+
 An empty or newly created collection is allowed with `fail`. Resume, failure recovery,
-and `cdc_only` runs never clear the target, even when `clear` is declared.
-`restart --rerun` resets the pipeline's progress and starts a new full load; it
-still follows `on_full_load`, so use `clear` explicitly when existing target rows
-should be removed. A failed clear stops the pipeline before it writes rows.
+`cdc_only` runs, and a pipeline a restarted server carries on never clear the target,
+even when `clear` is declared. A failed clear stops the pipeline before it writes rows.
+
+### A start checks the targets first
+
+Before a start writes anything, it looks at every target its new full load would
+write into. A new full load copies what the source holds now, so a row deleted at the
+source while the pipeline was stopped with its state cleared is in neither the source
+nor the load: kept in a target that is not cleared, it stays there, and nothing else
+would say so. So when a target already holds rows and its policy is `append`, the start
+stops and asks, naming the target and how many rows it holds:
+
+- **`clear`** clears the target before the full load, and records `on_full_load: clear`
+  on the element that writes it. That changes the pipeline's definition on the server;
+  your workspace file still says `append`, so applying it again sets it back, and the
+  next new full load asks again.
+- **`keep`** keeps the rows and starts anyway.
+
+When one write element owns several targets, `clear` changes the policy for all of them;
+its preview names every affected target. Their answers must agree: mixing `clear` and
+`keep` for the same element is refused before the definition or start intent is written.
+
+A non-empty target the server can read, set to `fail`, refuses the start outright before anything is written. A target
+set to `clear`, or an empty one, is not asked about. A target whose rows the server
+cannot read gets a warning and does not stop the start. An element that comes from a
+shared `kind: serve` or `kind: view` definition is only offered `keep`; change the
+shared definition to clear it.
+
+At a terminal, `tapstate start` shows the question and waits for an answer; Enter
+cancels and leaves the pipeline as it is. Where nobody can answer, the start is
+refused with the commands that answer it. In a script:
+
+```sh
+tapstate start orders_sync --checks-only               # what a start would ask; exits 0 when nothing
+tapstate start orders_sync --decide target-not-empty=keep
+tapstate start orders_sync -y                          # answer every question by going ahead as configured
+```
+
+`--decide <check>=<answer>` answers every question one check asks;
+`--decide <check>/<subject>=<answer>` answers one, by the key the start checks print.
+`-o json` prints the report the start was stopped with and never asks.
+`restart --rerun` asks everything, the clearing included, before it stops anything,
+so cancelling leaves the pipeline running untouched. `up --yes` answers every question
+by going ahead as configured. What the checks are and how a new one is added is in
+[Start checks](start-checks/).
 
 ## The one-command demo
 
@@ -919,6 +977,9 @@ Upgrades are supported within one MAJOR line — `0.2.1` to `0.3.0` and onward. 
 `./tapstate --version` afterwards: it is the CLI's own version, and it should be the
 one you just installed.
 
+The downloaded demo is tied to its pinned release. Do not reuse an older demo's database volumes
+as a three-layer installation or mix its bootstrap procedure with the from-source steps below.
+
 ## Alternative: build and run the server from source
 
 Prefer to run the server process directly on the host — to attach a debugger, or to
@@ -960,32 +1021,16 @@ the server and databases are hosted changes.
    fact, and the seed file's `REPLICA IDENTITY FULL` is what lets a deleted shipment leave
    the array it was in (see the note in [step 5](#5-author-the-resources)).
 
-3. **Start the server** on the host with JDK 21, pointing it at your Mongo:
+3. **Initialize and start the server** with the three-layer installation in this checkout.
+   Use the [OP installation procedure](storage/README.md#install-op-and-create-its-first-administrator),
+   including its owner-only directory, three connection tests and saved binding. A built JAR uses
+   `--add-opens java.base/java.lang=ALL-UNNAMED`; the distribution launcher supplies it.
+   Keep your normal port/TLS and packaged connector seed settings.
 
-   ```sh
-   mkdir -p ./plugins       # a writable cache the server unpacks registered connectors into
-   java -jar app/target/app-<version>-boot.jar --role=all \
-     --tapstate.store.mongo.uri="mongodb://127.0.0.1:27017/tapstate?replicaSet=rs0" \
-     --tapstate.store.mongo.operator-state-database=tapstate_nest \
-     --tapstate.connectors.plugins-dir=./plugins
-   ```
-
-   It listens on port **8080**. If that port is taken, set `SERVER_PORT` to another one
-   before starting it, and point the rest of this section at the same value:
-
-   ```sh
-   export TAPSTATE_URL=http://127.0.0.1:8080     # match SERVER_PORT if you set one
-   ```
-
-   A Hazelcast `--add-opens` warning at startup is harmless.
-
-4. **First admin.** There is no bootstrap sidecar here, so create the first user with
-   a one-time, localhost-only `curl` (a `204 No Content` means success):
-
-   ```sh
-   curl -X POST "$TAPSTATE_URL/auth/bootstrap" \
-     -H 'Content-Type: application/json' -d '{"username":"admin","password":"admin123"}'
-   ```
+4. **Restart and create the first administrator.** After the setup page requests a restart,
+   restart with the same installation directory and issue `installation --authorize`. Create
+   the first account on the dedicated management channel, then sign in at the ordinary service
+   address. A public `/auth/bootstrap` request cannot replace that procedure.
 
 5. **Resources.** Use the same three resources as [step 5](#5-author-the-resources),
    with one change: the server now runs on the host, not in the compose network, so
@@ -994,13 +1039,13 @@ the server and databases are hosted changes.
    `config: { host: 127.0.0.1, port: 5432, … }` in `fulfillment_db`. Both of them, not one:
    a source left pointing at a compose service name resolves to nothing from the host, and
    the pipeline names every source it reads. The pipeline itself needs no change — the
-   managed store it materializes into is addressed by the server, through the store settings you
-   passed in step 3, not by a resource here. The operator-state database defaults to `tapstate_nest`;
-   changing its setting selects another database and does not copy the old state.
+   default target is the system-owned `views` Source created by storage setup. Its Application data
+   database is the one you selected, while operator state uses the separate bound Durable cache.
+   Changing a URI or database name is not a state migration.
 
 6. **Online verbs, observe, CDC** are identical to steps 6–8, except you reach the
    databases with your own client (`docker exec tapstate-mysql …` /
-   `docker exec tapstate-mongo mongosh "mongodb://127.0.0.1:27017/views" …`)
+   `docker exec tapstate-mongo mongosh "mongodb://127.0.0.1:27017/tapstate_views" …`)
    rather than `docker compose exec`.
 
 Tear down with `docker rm -f tapstate-mysql tapstate-postgres tapstate-mongo` and `Ctrl-C` in the
@@ -1025,10 +1070,17 @@ This runtime is a preview. Known constraints in this slice:
   unconfirmed work and requires the connector's source history to remain available.
 - **At-least-once delivery.** Retries and restarts can deliver records again;
   idempotent upserts absorb overlap, but there is no exactly-once guarantee.
+- **A new full load cannot see what the source deleted meanwhile.** After a stop that
+  clears the pipeline's state, the next run copies what the source holds then, and a
+  row deleted at the source in between is not in the copy: a target that is not
+  cleared keeps it. The start asks before that happens (see
+  [A start checks the targets first](#a-start-checks-the-targets-first)), but only for
+  targets whose rows the server can read; for any other target it warns and goes ahead.
 - **`logs` is thin.** The per-pipeline `logs` face is a node-local operational tail
   and is often sparse; full runtime detail is in the server process log.
-- **No CLI bootstrap verb.** The compose stack creates the first admin for you; on
-  the from-source path it is the `curl` above.
+- **Installation and application commands are separate.** The released demo has its own bootstrap
+  setup. A server built from this checkout uses the server's `installation` owner command and
+  dedicated management channel; the client CLI does not install the server.
 - **Temporary connections and machine tokens are process-scoped.** A persistent human
   session is created only by `auth login` against a named context; `connect`,
   `--connect`, `--token`, and `TAPSTATE_TOKEN` never create or update that cache.
@@ -1036,8 +1088,11 @@ This runtime is a preview. Known constraints in this slice:
 ### Restart recovery
 
 A single-member process restart with the same MongoDB data re-adopts pipelines
-recorded as running. Keep the store volume and operator-state database: recovery
-positions and state are part of that data. Completed finite runs stay completed;
+recorded as running when its original storage and recovery state are complete. In a three-layer
+installation, retain Configuration and Durable cache, including any additional Nest cache databases:
+recovery positions and state are part of that data. For missing cache state, use the
+[explicit storage recovery procedure](storage/README.md#recover-a-wholly-lost-durable-cache); it leaves
+affected Pipelines stopped until each full rebuild is confirmed. Completed finite runs stay completed;
 failed runs require an explicit recovery action.
 
 All supported database sources use the connector capture path. The runtime passes

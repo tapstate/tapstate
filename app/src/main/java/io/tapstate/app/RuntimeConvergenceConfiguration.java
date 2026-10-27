@@ -58,9 +58,10 @@ class RuntimeConvergenceConfiguration {
     @Bean
     PipelineConverger pipelineConverger(
             StorePort storePort, LifecycleActuator lifecycleActuator, Clock clock,
-            RebuildAdmission rebuildAdmission) {
+            RebuildAdmission rebuildAdmission, ObservationPublisher observationPublisher) {
         return new PipelineConverger(
-                storePort.desired(), storePort.state(), lifecycleActuator, clock, rebuildAdmission);
+                storePort.desired(), storePort.state(), lifecycleActuator, clock, rebuildAdmission,
+                observationPublisher::publish);
     }
 
     @Bean
@@ -140,9 +141,13 @@ class RuntimeConvergenceConfiguration {
     ConvergenceDriver convergenceDriver(
             PipelineConverger pipelineConverger, StorePort storePort, ObservationPublisher observationPublisher,
             RateSampler rateSampler, MetricsExport metricsExport,
-            ClusterMembershipGate membershipGate, PipelineActuationOwnership pipelineActuationOwnership) {
+            ClusterMembershipGate membershipGate, PipelineActuationOwnership pipelineActuationOwnership,
+            ClusterProperties cluster, NodeSessionLease nodeSession) {
         return new ConvergenceDriver(
                 pipelineConverger, storePort.desired(), observationPublisher, rateSampler, metricsExport,
-                membershipGate::businessEligible, pipelineActuationOwnership);
+                // A stopped single member must still report its held engine failure while the original
+                // node proof is live. New claims and execution generations retain the business gate.
+                cluster.getProfile() == ClusterProperties.Profile.SINGLE
+                        ? nodeSession::active : membershipGate::businessEligible, pipelineActuationOwnership);
     }
 }

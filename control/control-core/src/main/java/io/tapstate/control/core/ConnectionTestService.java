@@ -1,9 +1,11 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.runtime.probe.ConnectionProbe;
 import io.tapstate.spi.store.ConnectionConfig;
 import io.tapstate.spi.store.ConnectionTestResult;
 import io.tapstate.spi.store.ConnectionTestResultStore;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
@@ -22,31 +24,41 @@ import java.util.Objects;
  */
 public final class ConnectionTestService {
 
+    /** Optional runtime-local observation; it never adds fields to the persisted test report. */
+    public interface Observer {
+        Attempt begin(ConnectionConfig connection);
+    }
+    public interface Attempt extends AutoCloseable {
+        Attempt NONE = new Attempt() {
+            @Override public void completed(ConnectionTestResult result) {}
+            @Override public void close() {}
+        };
+        void completed(ConnectionTestResult result);
+        @Override void close();
+    }
+
     private final ConnectionProbe probe;
     private final ConnectionTestResultStore resultStore;
     private final AuditGate auditGate;
     private final ConnectorConfigValidator configValidator;
     private final SourceConnectionResolver sourceConnections;
-
-    public ConnectionTestService(
-            ConnectionProbe probe, ConnectionTestResultStore resultStore, AuditGate auditGate) {
-        this(probe, resultStore, auditGate, null);
-    }
-
-    public ConnectionTestService(
-            ConnectionProbe probe, ConnectionTestResultStore resultStore, AuditGate auditGate,
-            ConnectorConfigValidator configValidator) {
-        this(probe, resultStore, auditGate, configValidator, null);
-    }
+    private final Observer observer;
 
     public ConnectionTestService(
             ConnectionProbe probe, ConnectionTestResultStore resultStore, AuditGate auditGate,
             ConnectorConfigValidator configValidator, SourceConnectionResolver sourceConnections) {
+        this(probe, resultStore, auditGate, configValidator, sourceConnections, ignored -> Attempt.NONE);
+    }
+
+    public ConnectionTestService(
+            ConnectionProbe probe, ConnectionTestResultStore resultStore, AuditGate auditGate,
+            ConnectorConfigValidator configValidator, SourceConnectionResolver sourceConnections, Observer observer) {
         this.probe = Objects.requireNonNull(probe, "probe");
         this.resultStore = Objects.requireNonNull(resultStore, "resultStore");
         this.auditGate = Objects.requireNonNull(auditGate, "auditGate");
         this.configValidator = configValidator;
-        this.sourceConnections = sourceConnections;
+        this.sourceConnections = Objects.requireNonNull(sourceConnections, "sourceConnections");
+        this.observer = Objects.requireNonNull(observer, "observer");
     }
 
     /**
@@ -59,19 +71,26 @@ public final class ConnectionTestService {
      */
     public ConnectionTestReport test(
             String connectionId, String connectorId, Map<String, Object> settings, String principal) {
-        ConnectionConfig config = sourceConnections == null
-                ? new ConnectionConfig(connectionId, connectorId, settings)
-                : sourceConnections.resolve(connectionId, connectorId, settings);
-        if (configValidator != null) {
-            configValidator.validate(config.connectorId(), config.settings());
+        SourceConnectionResolver.ResolvedConnection resolved =
+                sourceConnections.resolveWithSecrets(connectionId, connectorId, settings);
+        ConnectionConfig config = resolved.config();
+        List<String> secretValues = resolved.secretValues();
+        try (var attempt = observer.begin(config)) {
+            if (configValidator != null) {
+                configValidator.validate(config.connectorId(), config.settings(), resolved.catalogSnapshot());
+            }
+            return auditGate.dispatch(
+                    ControlOperations.CONNECTION_TEST,
+                    new AuditContext(principal, config.id()),
+                    () -> {
+                        ConnectionTestResult result = probe.probe(config);
+                        ConnectionTestResult safeResult = ConnectionTestResultRedactor.redact(result, secretValues);
+                        resultStore.save(safeResult);
+                        attempt.completed(safeResult);
+                        return ConnectionTestReport.from(safeResult);
+                    });
+        } catch (TapstateException failure) {
+            throw ConnectionTestResultRedactor.redact(failure, secretValues);
         }
-        return auditGate.dispatch(
-                ControlOperations.CONNECTION_TEST,
-                new AuditContext(principal, config.id()),
-                () -> {
-                    ConnectionTestResult result = probe.probe(config);
-                    resultStore.save(result);
-                    return ConnectionTestReport.from(result);
-                });
     }
 }

@@ -55,6 +55,16 @@ class DerivedSchemaReportTest {
 
     private final List<AuditRecord> audited = new ArrayList<>();
     private final AuditGate auditGate = new AuditGate(audited::add, FIXED);
+    @Test void aBlockedAuditCannotBindAnEffectfulNativeModelCommand() {
+        var store = partlyDiscovered(List.of(TableRef.literal("orders")));
+        var bound = new java.util.concurrent.atomic.AtomicBoolean();
+        var rejected = new AuditGate(record -> { throw new IllegalStateException("audit unavailable"); }, FIXED);
+        var schemas = new StoreBackedDerivedSchemas(store, rejected, pipeline -> {
+            bound.set(true); return new StoreBackedDerivedSchemas.Command(store, () -> {});
+        });
+        assertThatThrownBy(() -> schemas.accept("admin", "new_pipeline")).isInstanceOf(TapstateException.class);
+        assertThat(bound).isFalse();
+    }
 
     @ParameterizedTest
     @MethodSource("undiscoveredSelections")
@@ -304,6 +314,30 @@ class DerivedSchemaReportTest {
                 .get().extracting(recorded -> recorded.schema().get("id")).isEqualTo("DECIMAL NULL");
         assertThat(store.derivedSchemas().latest("wide", "widen"))
                 .get().extracting(recorded -> recorded.schema().get("order_id")).isEqualTo("DECIMAL NULL");
+    }
+
+    @Test
+    void completionAllowsSchemaAcceptanceUntilAnotherStartIsAccepted() {
+        InMemoryStorePort store = seeded();
+        new StoreBackedDagSource(store).dagFor("wide");
+        store.state().create("wide", StateJson.of(PipelineState.RUNNING), Instant.EPOCH);
+        store.state().compareAndSwap("wide", 0, StateJson.of(PipelineState.COMPLETED), Instant.EPOCH);
+        store.desired().save(new DesiredState("wide", PipelineState.RUNNING, "revision"));
+        widenTheFactKeyColumn(store);
+        StoreBackedDerivedSchemas schemas = new StoreBackedDerivedSchemas(store, auditGate);
+
+        schemas.accept("alice", "wide");
+
+        var refreshed = store.derivedSchemas().latest("wide", "orders_src.orders").orElseThrow();
+        assertThat(refreshed.schema()).containsEntry("id", "DECIMAL NULL");
+        List<AuditRecord> before = List.copyOf(audited);
+        store.desired().save(new DesiredState("wide", PipelineState.RUNNING,
+                "revision", false, "assembly", true, 1L));
+        assertThatThrownBy(() -> schemas.accept("alice", "wide"))
+                .isInstanceOfSatisfying(TapstateException.class, error ->
+                        assertThat(error.code()).isEqualTo(ActuationError.SCHEMA_SYNC_WHILE_RUNNING));
+        assertThat(store.derivedSchemas().latest("wide", "orders_src.orders")).contains(refreshed);
+        assertThat(audited).isEqualTo(before);
     }
 
     @Test

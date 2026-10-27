@@ -17,6 +17,10 @@ interface ExecutionPlanRecorder {
         @Override
         public void forget(String pipelineId) {
         }
+
+        @Override
+        public void forget(ExecutionPlan expected) {
+        }
     };
 
     /** Records {@code plan} as its pipeline's current one, in place of whatever run came before it. */
@@ -27,6 +31,9 @@ interface ExecutionPlanRecorder {
      * {@link #last} answers with, so a run started later can say how it differs from it.
      */
     void forget(String pipelineId);
+
+    /** Removes the current plan only if it is still this exact execution's plan. */
+    void forget(ExecutionPlan expected);
 
     /**
      * The plan {@code pipelineId}'s latest run was submitted on, whether or not that run is still going, or null

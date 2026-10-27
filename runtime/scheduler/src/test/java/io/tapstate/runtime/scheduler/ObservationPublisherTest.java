@@ -14,6 +14,9 @@ import io.tapstate.core.lifecycle.TableSnapshot;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.StateStore;
+import io.tapstate.spi.store.PipelineIntentScope;
+import io.tapstate.spi.store.IoError;
+import io.tapstate.core.common.TapstateException;
 import org.junit.jupiter.api.Test;
 
 import java.time.Clock;
@@ -467,6 +470,135 @@ class ObservationPublisherTest {
     }
 
     @Test
+    void anUnreadablePositionCannotHideAKnownFailureOrReplaceItsLastConfirmedFacts() {
+        var broken = new java.util.concurrent.atomic.AtomicBoolean();
+        var unavailable = new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN, Map.of("chain", "orders"), null);
+        var cause = new ObservationFailure(IoError.DOCUMENT_UNREADABLE.code(),
+                Map.of("id", "original-checkpoint", "field", "progress"));
+        var wired = new ObservationPublisher(state, observations, id -> OptionalLong.of(17),
+                id -> { if (broken.get()) throw unavailable; return Map.of("orders", "original-position"); },
+                id -> new SnapshotReading(Map.of("orders", new TableSnapshot(1, 1L, 100, true)), T0));
+        state.seed("orders", PipelineState.RUNNING);
+        var previous = wired.publish("orders").orElseThrow();
+        state.seed("orders", PipelineState.FAILED); broken.set(true);
+        var failed = wired.publish("orders", cause).orElseThrow();
+        assertThat(failed.state()).isEqualTo(PipelineState.FAILED);
+        assertThat(failed.failure()).isEqualTo(cause);
+        assertThat(failed.positions()).isEqualTo(previous.positions());
+        assertThat(failed.snapshot()).isEqualTo(previous.snapshot());
+        assertThat(failed.metrics()).containsOnly(entry("errors." + cause.code(), 1L));
+        var next = wired.publish("orders").orElseThrow();
+        assertThat(next.failure()).isEqualTo(cause);
+        assertThat(next.metrics()).isEqualTo(failed.metrics());
+        assertThat(next.positions()).isEqualTo(previous.positions());
+    }
+
+    @Test
+    void aFailedCheckpointWithoutAPreviousObservationNeedsNoInventedMeasurement() {
+        var unavailable = new TapstateException(IoError.SRS_CONSUMER_UNAVAILABLE, Map.of("chain", "orders"), null);
+        var cause = new ObservationFailure(unavailable.code().code(), Map.of("chain", "orders"));
+        var wired = new ObservationPublisher(state, observations,
+                id -> { throw unavailable; }, id -> Map.of());
+        state.seed("orders", PipelineState.FAILED);
+        var failed = wired.publish("orders", cause).orElseThrow();
+        assertThat(failed.state()).isEqualTo(PipelineState.FAILED);
+        assertThat(failed.failure()).isEqualTo(cause);
+        assertThat(failed.positions()).isEmpty(); assertThat(failed.snapshot()).isEmpty();
+        assertThat(failed.metrics()).containsOnly(entry("errors." + cause.code(), 1L));
+    }
+
+    @Test
+    void aRunningCheckpointCannotTurnAMeasurementRefusalIntoATerminalResult() {
+        var unavailable = new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN, Map.of("chain", "orders"), null);
+        var wired = new ObservationPublisher(state, observations, id -> OptionalLong.empty(), id -> { throw unavailable; });
+        state.seed("orders", PipelineState.RUNNING);
+        assertThatThrownBy(() -> wired.publish("orders")).isSameAs(unavailable);
+        assertThat(observations.read("orders")).isEmpty();
+    }
+
+    @Test
+    void aProgrammerDefectStillEscapesEvenWhenTheCheckpointIsFailed() {
+        var defect = new IllegalStateException("broken measurement invariant");
+        var wired = new ObservationPublisher(state, observations, id -> OptionalLong.empty(), id -> { throw defect; });
+        state.seed("orders", PipelineState.FAILED);
+        assertThatThrownBy(() -> wired.publish("orders")).isSameAs(defect);
+        assertThat(observations.read("orders")).isEmpty();
+    }
+
+    @Test
+    void aTerminalDiagnosticCannotBypassItsScopedObservationWriteFence() {
+        var unavailable = new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN, Map.of("chain", "orders"), null);
+        var fenced = new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+        var wired = new ObservationPublisher(state, observations, id -> OptionalLong.empty(), id -> { throw unavailable; });
+        var scoped = new ObservationStore() {
+            @Override public void save(Observation value) { throw fenced; }
+            @Override public Optional<Observation> read(String id) { return Optional.empty(); }
+            @Override public void delete(String id) { throw new UnsupportedOperationException(); }
+        };
+        state.seed("orders", PipelineState.FAILED);
+        var scope = new PipelineIntentScope("cluster", 1, "cache", "orders", 1);
+        assertThatThrownBy(() -> wired.publishScoped(scope, state, scoped,
+                new ObservationFailure(unavailable.code().code(), Map.of("chain", "orders")))).isSameAs(fenced);
+        assertThat(observations.read("orders")).isEmpty();
+    }
+
+    @Test
+    void anIncompleteMeasurementDoesNotAdvanceEitherAlertWatch() {
+        var broken = new java.util.concurrent.atomic.AtomicBoolean();
+        var unavailable = new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN, Map.of("chain", "orders"), null);
+        var alert = new RecordingAlert();
+        var cold = new NestColdLayerWatch(new NestColdLayerPressure(0.5, 100), alert);
+        var frontierEdges = new ArrayList<String>();
+        var frontier = new FrontierStallWatch(FrontierStallPressure.EXPLAIN, new FrontierStallAlert() {
+            @Override public void crossed(String id, io.tapstate.core.lifecycle.FrontierStall stall) {
+                frontierEdges.add("crossed:" + stall.chain());
+            }
+            @Override public void cleared(String id, io.tapstate.core.lifecycle.FrontierStall stall) {
+                frontierEdges.add("cleared:" + stall.chain());
+            }
+        });
+        var wired = new ObservationPublisher(state, observations,
+                id -> OptionalLong.empty(), id -> { if (broken.get()) throw unavailable; return Map.of(); },
+                id -> SnapshotReading.NONE, id -> Map.of("chain", 4L),
+                id -> Map.of(broken.get() ? "unpublished" : "original",
+                        new NestStateReading(100L, 4_000L, 3_800L, 19_000L, OptionalLong.empty())),
+                cold, id -> Map.of(broken.get() ? "unpublished" : "original", 96_000L), frontier,
+                id -> Map.of(), id -> Map.of(), id -> Map.of(), Clock.fixed(OBSERVED_AT, ZoneOffset.UTC));
+        state.seed("orders", PipelineState.RUNNING);
+        wired.publish("orders");
+        assertThat(alert.crossed).containsExactly("original");
+        assertThat(frontierEdges).containsExactly("crossed:original");
+        state.seed("orders", PipelineState.FAILED); broken.set(true);
+        wired.publish("orders", new ObservationFailure(unavailable.code().code(), Map.of("chain", "orders")));
+        assertThat(cold.watching()).containsExactly("orders/original");
+        assertThat(frontier.watching()).containsExactly("orders/original");
+        assertThat(alert.crossed).containsExactly("original");
+        assertThat(alert.cleared).isEmpty();
+        assertThat(frontierEdges).containsExactly("crossed:original");
+    }
+
+    @Test
+    void aFailedDiagnosticRetainsOnlyTheOriginalScopedObservation() {
+        var scoped = new RecordingObservationStore();
+        state.seed("orders", PipelineState.RUNNING);
+        new ObservationPublisher(state, observations, id -> OptionalLong.empty(), id -> Map.of("orders", "global"))
+                .publish("orders");
+        new ObservationPublisher(state, scoped, id -> OptionalLong.empty(), id -> Map.of("orders", "scoped"))
+                .publish("orders");
+        var unavailable = new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN, Map.of("chain", "orders"), null);
+        var wired = new ObservationPublisher(state, observations, id -> OptionalLong.empty(), id -> { throw unavailable; });
+        state.seed("orders", PipelineState.FAILED);
+        var scope = new PipelineIntentScope("cluster", 1, "cache", "orders", 1);
+        var failed = wired.publishScoped(scope, state, scoped,
+                new ObservationFailure(unavailable.code().code(), Map.of("chain", "orders"))).orElseThrow();
+        assertThat(failed.state()).isEqualTo(PipelineState.FAILED);
+        assertThat(failed.positions()).containsOnly(entry("orders", "scoped"));
+        assertThat(scoped.read("orders")).contains(failed);
+        assertThat(observations.read("orders").orElseThrow().state()).isEqualTo(PipelineState.RUNNING);
+        assertThat(observations.read("orders").orElseThrow().positions()).containsOnly(entry("orders", "global"));
+    }
+
+    @Test
     void aFailedStateOnItsOwnPublishesNoFailureMetric() {
         state.seed("orders", PipelineState.FAILED);
 
@@ -523,6 +655,26 @@ class ObservationPublisherTest {
 
         // A publisher with no snapshot source publishes empty (unavailable), never a faked zero-row table.
         assertThat(observations.read("orders").orElseThrow().snapshot()).isEmpty();
+    }
+
+    @Test
+    void completedObservationRetainsItsFinalConfirmedLoadAfterCaptureIsReleased() {
+        state.seed("orders", PipelineState.RUNNING);
+        ObservationPublisher running = new ObservationPublisher(state, observations,
+                id -> OptionalLong.empty(), id -> Map.of(),
+                id -> new SnapshotReading(Map.of("orders", new TableSnapshot(3, 3L, 100, true)), T0));
+        Observation last = running.publish("orders").orElseThrow();
+        state.seed("orders", PipelineState.COMPLETED);
+
+        Observation completed = publisher.publish("orders").orElseThrow();
+        assertThat(completed.snapshot()).isEqualTo(last.snapshot());
+        assertThat(completed.facts()).isEqualTo(last.facts());
+        assertThat(completed.state()).isEqualTo(PipelineState.COMPLETED);
+        assertThat(new ObservationPublisher(state, observations).publish("orders").orElseThrow().snapshot())
+                .isEqualTo(last.snapshot());
+
+        state.seed("orders", PipelineState.STOPPED);
+        assertThat(publisher.publish("orders").orElseThrow().snapshot()).isEmpty();
     }
 
     @Test

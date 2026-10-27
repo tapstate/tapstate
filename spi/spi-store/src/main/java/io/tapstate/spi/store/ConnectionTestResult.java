@@ -18,7 +18,15 @@ public record ConnectionTestResult(
         String connectorId,
         Outcome outcome,
         List<ConnectionTestItem> items,
-        long testedAt) {
+        long testedAt,
+        boolean diagnosticsRedacted) {
+
+    /** Creates a result whose free-form diagnostics have not yet been checked for credentials. */
+    public ConnectionTestResult(
+            String connectionId, String connectorId, Outcome outcome,
+            List<ConnectionTestItem> items, long testedAt) {
+        this(connectionId, connectorId, outcome, items, testedAt, false);
+    }
 
     public ConnectionTestResult {
         Objects.requireNonNull(connectionId, "connectionId");

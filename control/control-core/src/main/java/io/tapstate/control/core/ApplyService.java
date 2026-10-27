@@ -288,6 +288,14 @@ public final class ApplyService {
                         null);
             }
         }
+        store.managedDefaultSourceId().ifPresent(managed -> {
+            for (Resource resource : submitted) {
+                if (resource instanceof PipelineResource pipeline && pipeline.sourceIds().contains(managed)
+                        || resource instanceof SourceResource source && storeMarked(source))
+                    throw new TapstateException(ControlError.MALFORMED_REQUEST,
+                            Map.of("reason", "the managed default target is not an authored input source"), null);
+            }
+        });
         Set<String> submittedIds = submitted.stream().map(Resource::id).collect(java.util.stream.Collectors.toSet());
         List<Resource> storedResources = ReadableArtifactInventory.list(store);
         List<Resource> candidate = new ArrayList<>();

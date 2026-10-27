@@ -61,6 +61,9 @@ final class PartitionableCluster implements AutoCloseable {
     private final String clusterId;
 
     private final String storeUri;
+    private final boolean prepared;
+    private final String admin;
+    private final String password;
     private final Map<String, IntFunction<List<String>>> launchArguments;
 
     /**
@@ -72,12 +75,15 @@ final class PartitionableCluster implements AutoCloseable {
 
     private PartitionableCluster(List<String> nodeIds, Map<String, RealProcessServer> servers,
             Map<String, CuttableLink> links, String clusterId, String storeUri,
-            Map<String, IntFunction<List<String>>> launchArguments) {
+            Map<String, IntFunction<List<String>>> launchArguments, boolean prepared, String admin, String password) {
         this.nodeIds = List.copyOf(nodeIds);
         this.servers = servers;
         this.links = links;
         this.clusterId = clusterId;
         this.storeUri = storeUri;
+        this.prepared = prepared;
+        this.admin = admin;
+        this.password = password;
         this.launchArguments = launchArguments;
         Map<String, ControlPlane> built = new LinkedHashMap<>();
         servers.forEach((nodeId, server) -> built.put(nodeId, new ControlPlane(server.baseUrl())));
@@ -103,7 +109,30 @@ final class PartitionableCluster implements AutoCloseable {
      * on its command line and cannot be told any of it afterwards.
      */
     static PartitionableCluster start(String storeUri, String name, List<String> nodeIds) {
-        String clusterId = name + "-" + UUID.randomUUID();
+        return start(storeUri, name + "-" + UUID.randomUUID(), nodeIds, false, ADMIN, PASSWORD, List.of());
+    }
+
+    /** The caller owns the installation and closes it only after every member has stopped. */
+    static PartitionableCluster startPrepared(PreparedNativeStore storage, List<String> nodeIds) {
+        var cluster = startPrepared(storage.configurationUri(), storage.clusterId(), nodeIds,
+                storage.username(), storage.password(), List.of());
+        try {
+            nodeIds.forEach(node -> storage.awaitBusiness(cluster.member(node)));
+            return cluster;
+        } catch (RuntimeException | Error failure) {
+            cluster.close();
+            throw failure;
+        }
+    }
+
+    /** Uses a native installation prepared by the owning test; never invokes first-admin bootstrap. */
+    static PartitionableCluster startPrepared(String configurationUri, String clusterId, List<String> nodeIds,
+            String admin, String password, List<String> additionalArguments) {
+        return start(configurationUri, clusterId, nodeIds, true, admin, password, additionalArguments);
+    }
+
+    private static PartitionableCluster start(String storeUri, String clusterId, List<String> nodeIds,
+            boolean prepared, String admin, String password, List<String> additionalArguments) {
         String bindAddress = RoutableAddress.ofThisMachine();
         Map<String, Integer> memberPorts = new LinkedHashMap<>();
         Map<String, int[]> outbound = outboundRanges(nodeIds);
@@ -125,13 +154,19 @@ final class PartitionableCluster implements AutoCloseable {
                 int memberPort = memberPorts.get(nodeId);
                 String advertised = links.get(nodeId).address();
                 int[] range = outbound.get(nodeId);
-                launchArguments.put(nodeId, httpPort -> arguments(clusterId, nodeId, memberPort, advertised,
-                        seeds, httpPort, bindAddress, nodeIds.size(), range));
+                launchArguments.put(nodeId, httpPort -> {
+                    var args = new ArrayList<>(arguments(clusterId, nodeId, memberPort, advertised,
+                            seeds, httpPort, bindAddress, nodeIds.size(), range));
+                    args.addAll(additionalArguments);
+                    return List.copyOf(args);
+                });
             }
             for (String nodeId : nodeIds) {
                 servers.put(nodeId,
-                        RealProcessServer.start(storeUri, "0.0.0.0", launchArguments.get(nodeId)));
+                        prepared ? RealProcessServer.launchingPrepared(storeUri, "0.0.0.0", launchArguments.get(nodeId))
+                                : RealProcessServer.start(storeUri, "0.0.0.0", launchArguments.get(nodeId)));
             }
+            if (prepared) servers.values().forEach(RealProcessServer::awaitReady);
         } catch (RuntimeException | Error failure) {
             servers.values().forEach(RealProcessServer::close);
             links.values().forEach(CuttableLink::close);
@@ -140,11 +175,12 @@ final class PartitionableCluster implements AutoCloseable {
             memberPorts.values().forEach(RealProcessServer::releasePort);
         }
         PartitionableCluster cluster = new PartitionableCluster(
-                nodeIds, servers, links, clusterId, storeUri, launchArguments);
+                nodeIds, servers, links, clusterId, storeUri, launchArguments, prepared, admin, password);
         try {
-            cluster.planes.get(nodeIds.getFirst()).bootstrapAndLogin(ADMIN, PASSWORD);
+            if (prepared) cluster.planes.get(nodeIds.getFirst()).login(admin, password);
+            else cluster.planes.get(nodeIds.getFirst()).bootstrapAndLogin(admin, password);
             // The administrator lives in the store they all share, so the rest do not create one.
-            nodeIds.stream().skip(1).forEach(nodeId -> cluster.planes.get(nodeId).login(ADMIN, PASSWORD));
+            nodeIds.stream().skip(1).forEach(nodeId -> cluster.planes.get(nodeId).login(admin, password));
         } catch (RuntimeException | Error failure) {
             cluster.close();
             throw failure;
@@ -240,12 +276,19 @@ final class PartitionableCluster implements AutoCloseable {
         String known = requireKnown(nodeId);
         servers.get(known).close();
         RealProcessServer replacement =
-                RealProcessServer.start(storeUri, "0.0.0.0", launchArguments.get(known));
+                prepared ? RealProcessServer.startPrepared(storeUri, "0.0.0.0", launchArguments.get(known))
+                        : RealProcessServer.start(storeUri, "0.0.0.0", launchArguments.get(known));
         servers.put(known, replacement);
         remember(known, replacement);
         ControlPlane plane = new ControlPlane(replacement.baseUrl());
-        plane.login(ADMIN, PASSWORD);
+        plane.login(admin, password);
         planes.put(known, plane);
+    }
+
+    /** The caller owns the extra boot; the original process and its delayed replies remain alive. */
+    RealProcessServer launchReplacementPrepared(String nodeId) {
+        if (!prepared) throw new IllegalStateException("replacement requires a prepared native installation");
+        return RealProcessServer.startPrepared(storeUri, "0.0.0.0", launchArguments.get(requireKnown(nodeId)));
     }
 
     /** Whether one member's process is still running -- what tells failing closed from falling over. */

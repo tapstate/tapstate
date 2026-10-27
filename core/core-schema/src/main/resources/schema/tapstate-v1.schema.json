@@ -1286,6 +1286,11 @@
         "element_type": {
           "description": "Declared type of the expanded column; absent leaves the connector to infer one.",
           "type": "string"
+        },
+        "source_id_field": {
+          "description": "Field preserving the original parent identifier when the target requires a separate generated row identity. Used only when identity adaptation is needed.",
+          "type": "string",
+          "default": "_unwind_source_id"
         }
       },
       "required": [
@@ -1362,6 +1367,16 @@
           "description": "Storage backend used to persist this view.",
           "$ref": "#/$defs/Storage"
         },
+        "write_mode": {
+          "description": "How rows are written to the view — for example upsert or append.",
+          "$ref": "#/$defs/WriteMode",
+          "default": "upsert"
+        },
+        "on_full_load": {
+          "description": "Treatment of existing view rows before a new full load; resume, recovery and CDC-only never clear rows.",
+          "$ref": "#/$defs/OnFullLoad",
+          "default": "append"
+        },
         "execution": {
           "description": "How this node runs: its target total parallelism across the cluster and its batch.",
           "$ref": "#/$defs/ExecutionSpec"
@@ -1424,6 +1439,16 @@
         "storage": {
           "description": "Where and how the view's data is materialized.",
           "$ref": "#/$defs/Storage"
+        },
+        "write_mode": {
+          "description": "How rows are written to the view — for example upsert or append.",
+          "$ref": "#/$defs/WriteMode",
+          "default": "upsert"
+        },
+        "on_full_load": {
+          "description": "Treatment of existing view rows before a new full load; resume, recovery and CDC-only never clear rows.",
+          "$ref": "#/$defs/OnFullLoad",
+          "default": "append"
         },
         "execution": {
           "description": "How this node runs: its target total parallelism across the cluster and its batch.",

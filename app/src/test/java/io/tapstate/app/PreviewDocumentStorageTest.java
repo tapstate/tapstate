@@ -3,6 +3,8 @@ package io.tapstate.app;
 import io.tapdata.entity.schema.value.DateTime;
 import io.tapstate.core.event.Bytes;
 import io.tapstate.core.event.ConvertedValue;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.event.RowValueError;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
@@ -17,6 +19,22 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class PreviewDocumentStorageTest {
+
+    @Test
+    void preservesCompleteConversionMetadataAndNanoseconds() {
+        ConvertedValue stamp = new ConvertedValue(Instant.parse("2021-11-22T00:08:03.849711123Z"),
+                "timestamp(9)", "TapDateTimeValue", "{\"fraction\":9}", "{\"nano\":849711123}");
+        Map<String, Object> document = Map.of("stamp", stamp);
+        assertThat(PreviewDocumentStorage.decode(PreviewDocumentStorage.encode(document))).isEqualTo(document);
+    }
+
+    @Test
+    void preservesLeafCodecsInsideConvertedContainers() {
+        ConvertedValue key = new ConvertedValue("abcdef", "OBJECT_ID", "TapStringValue", "{\"type\":10}", null);
+        ConvertedValue array = new ConvertedValue(List.of(Map.of("key", key)), "ARRAY", "TapArrayValue", "{\"type\":2}", null);
+        Map<String, Object> document = Map.of("array", array);
+        assertThat(PreviewDocumentStorage.decode(PreviewDocumentStorage.encode(document))).isEqualTo(document);
+    }
 
     @Test
     void preservesTypeCarriersAcrossNestedDocumentsAndArrays() {
@@ -62,8 +80,26 @@ class PreviewDocumentStorageTest {
         @SuppressWarnings("unchecked")
         Map<String, Object> invalidDocument = (Map<String, Object>) (Map<?, ?>) invalid;
         assertThatThrownBy(() -> PreviewDocumentStorage.encode(invalidDocument))
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("field names must be strings");
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(RowValueError.NON_STRING_MAP_KEY);
+                    assertThat(failure.args()).containsExactlyInAnyOrderEntriesOf(
+                            Map.of("path", "$", "keyType", "java.lang.Integer"));
+                });
+    }
+
+    @Test
+    void rejectsNestedKeysBeforePreviewMaterialization() {
+        Map<Object, Object> nested = new LinkedHashMap<>();
+        nested.put(7, "number-key");
+        nested.put("7", "text-key");
+        Map<String, Object> document = Map.of("dict", new ConvertedValue(nested, "object"));
+        assertThatThrownBy(() -> PreviewDocumentStorage.encode(document))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(RowValueError.NON_STRING_MAP_KEY);
+                    assertThat(failure.args()).containsExactlyInAnyOrderEntriesOf(
+                            Map.of("path", "$/dict", "keyType", "java.lang.Integer"));
+                });
+        assertThat(nested).hasSize(2);
     }
 
     @Test

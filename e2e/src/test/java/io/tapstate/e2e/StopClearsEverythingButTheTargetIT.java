@@ -28,9 +28,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * this exists as a single scenario rather than two is that the two readings have to be taken of the same
  * stop.
  *
- * <p>What is checked as gone: the chain's durable record - the position a next run would resume from -
- * and the pipeline's published observation, which is where its counters are read from. What is checked
- * as untouched: the rows already written to the target, counted before the stop and again after it.
+ * <p>The pipeline's consumer cursor and published counters are cleared, while the independent shared
+ * capture pool retains its source checkpoint and necessary identity even after its final consumer leaves.
+ * The target rows are counted before the stop and again after it.
  *
  * <p><b>The nest layer is deliberately not asserted here, and the reason is worth stating.</b> A stop
  * drops the namespaces its pipeline <em>declares</em>, and this pipeline declares none: it carries no
@@ -60,18 +60,17 @@ class StopClearsEverythingButTheTargetIT {
     @EnumSource(Tiers.class)
     void aClearingStopTakesEveryKindOfStateAndLeavesTheTargetAlone(Tiers tier, @TempDir Path directory)
             throws Exception {
-        String storeUri = SharedMongo.replicaSetUrl(
-                "stop_clears_everything_" + tier.name().toLowerCase(Locale.ROOT));
         // The tier rides on the pipeline id, not on the namespace: both tiers use this test deployment's
         // configured state database, so they would otherwise seed over each other. A namespace is built
         // from the id, so a cleanup keyed off that id has to be able to match what is seeded here.
         String pipelineId = PIPELINE_BASE + "_" + tier.name().toLowerCase(Locale.ROOT);
         Path targetDirectory = Files.createDirectories(directory.resolve(TARGET_ID));
 
-        try (ServerHandle server = tier.launch(storeUri);
-                StoreDocuments documents = StoreDocuments.at(storeUri)) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                NativeSrsDocuments documents = new NativeSrsDocuments(storage);
+                ServerHandle server = tier.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(
                     E2eConnectorJar.CONNECTOR_ID, Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
 
@@ -104,6 +103,10 @@ class StopClearsEverythingButTheTargetIT {
                     () -> "chains=" + documents.miningChainIds() + " consumers="
                             + documents.miningChainIds().stream().map(documents::consumersOf).toList());
             String chainId = onlyChain(documents);
+            String consumerId = SrsConsumerId.of(pipelineId, SOURCE_ID).value();
+            var originalCheckpoint = documents.chain(chainId).get("checkpoint");
+            assertThat(originalCheckpoint).isNotNull();
+            assertThat(documents.consumerOffset(chainId, consumerId)).isNotNull();
 
             assertThat(control.recordCount(pipelineId))
                     .as("the pipeline published counters before the stop, so what is asserted after it "
@@ -118,12 +121,13 @@ class StopClearsEverythingButTheTargetIT {
                     () -> control.state(pipelineId).filter(PipelineState.STOPPED::equals).isPresent(),
                     () -> String.valueOf(control.state(pipelineId)));
 
-            // Half one: what the run recorded is gone.
-            assertThat(documents.miningChainIds())
-                    .as("the chain's own record, which is where the position a next run would resume "
-                            + "from is kept; this pipeline was the only one reading it, so the whole "
-                            + "record is this stop's to take")
-                    .doesNotContain(chainId);
+            // The pipeline's private recovery cursor is gone; shared source history belongs to the pool.
+            assertThat(documents.consumersOf(chainId)).doesNotContain(consumerId);
+            assertThat(documents.consumerOffset(chainId, consumerId)).isNull();
+            assertThat(documents.miningChainIds()).containsExactly(chainId);
+            assertThat(documents.chain(chainId).get("checkpoint"))
+                    .as("the final consumer leaving does not reset the independent shared capture pool")
+                    .isEqualTo(originalCheckpoint);
             assertThat(control.recordCount(pipelineId))
                     .as("and the observation its counters are read from")
                     .isEmpty();
@@ -138,7 +142,7 @@ class StopClearsEverythingButTheTargetIT {
     }
 
     /** The single chain this pipeline reads through; asserted to be single before this is ever called. */
-    private static String onlyChain(StoreDocuments documents) {
+    private static String onlyChain(NativeSrsDocuments documents) {
         return documents.miningChainIds().iterator().next();
     }
 

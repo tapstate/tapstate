@@ -19,6 +19,8 @@ import java.util.Optional;
  * is the warm-up this layer exists to avoid. The absence is the contract: an implementation must not add
  * a listing method, and a caller must never need one. Dropping a namespace whole is the one bulk
  * operation, and it names the namespace rather than the keys in it, so it needs no listing either.
+ * The separate {@link NestReleaseStore} facet may page only explicitly marked unfinished handoffs;
+ * it does not expose ordinary keys or change this opaque state's load contract.
  *
  * <p>The value is bytes and stays bytes. What is inside is the running operator's business and changes
  * with it; an implementation that looked in would become a second place that has to agree about the

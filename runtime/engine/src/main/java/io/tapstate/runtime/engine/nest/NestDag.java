@@ -103,6 +103,16 @@ public final class NestDag {
             for (NestInbound edge : spec.inbound()) {
                 connect(dag, vertex, edge, built, upstream, nextOutbound, frontier, width, spec.mapName());
             }
+            if (!spec.isAssembler() && binding.stores().hasReleaseRecovery()) {
+                String name = spec.name() + ":recovery";
+                Vertex recovery = dag.newVertex(name, ProcessorMetaSupplier.forceTotalParallelismOne(
+                        new NestRecoverySupplier(spec, binding.stores()), name));
+                NodeWidth.totalOne(width.node(), null).drawingInto(width.drawn()).sized(recovery);
+                // This source is independent and finite. Its completion precedes data and watermarks,
+                // so a new frontier cannot claim coverage before cold handoffs have been offered.
+                dag.edge(width.into(Edge.from(recovery).to(vertex, spec.inbound().size()).priority(-1),
+                        vertex.getName(), (Object item) -> ((NestReleaseRecovery.Wake) item).key()));
+            }
             assembler = vertex;
         }
         // Drawn after the assembler and never mistaken for it: a lookup takes no part in assembly, and the
@@ -337,6 +347,21 @@ public final class NestDag {
             FunctionEx<Object, Object> key, ToIntFunction<Vertex> nextOutbound, NodeWidth width) {
         dag.edge(width.into(Edge.from(source, nextOutbound.applyAsInt(source)).to(destination, ordinal),
                 destination.getName(), key));
+    }
+
+    private static final class NestRecoverySupplier implements ProcessorSupplier {
+        private static final long serialVersionUID = 1L;
+        private final NestVertex vertex;
+        private final NestBinding.NestStores stores;
+        private transient NestBinding.NestStores bound;
+        private NestRecoverySupplier(NestVertex vertex, NestBinding.NestStores stores) {
+            this.vertex = vertex; this.stores = stores;
+        }
+        @Override public void init(Context context) { bound = stores.bind(context.hazelcastInstance()); }
+        @Override public Collection<? extends Processor> get(int count) {
+            if (count != 1) throw new IllegalStateException("a recovery input has one producer");
+            return List.of(new NestReleaseRecovery(after -> bound.pendingReleaseKeys(vertex, after)));
+        }
     }
 
     private static ProcessorSupplier processorsFor(NestVertex spec, NestTopology topology,

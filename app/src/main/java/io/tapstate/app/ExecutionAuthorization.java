@@ -5,6 +5,8 @@ import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.runtime.engine.EngineError;
 import io.tapstate.spi.store.WorkloadClaimFence;
+import io.tapstate.spi.store.PipelineIntentScope;
+import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimStore;
@@ -20,6 +22,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.LongSupplier;
+import java.util.function.BooleanSupplier;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -68,39 +72,66 @@ final class ExecutionAuthorization implements AutoCloseable {
     private record Entry(WorkloadClaimFence claim, long deadlineNanos) {
     }
 
+    private record ReadKey(String pipelineId, PipelineIntentScope scope, WorkloadClaimType type) {
+        static ReadKey of(ExecutionFence fence) {
+            return new ReadKey(fence.pipelineId(), fence.scope(), WorkloadClaimType.PIPELINE_ACTUATION);
+        }
+    }
+
     private final String clusterId;
+    private final CacheBusinessScope businessScope;
     private final WorkloadClaimStore claims;
     private final Duration window;
     private final long windowNanos;
     private final long refreshIntervalNanos;
     private final LongSupplier nanoTime;
     private final boolean fenced;
-    private final Map<String, Entry> entries = new ConcurrentHashMap<>();
-    private final Map<String, Long> nextReadNanos = new ConcurrentHashMap<>();
+    private final BooleanSupplier nodeActive;
+    private final AtomicBoolean closed = new AtomicBoolean();
+    private final Map<ReadKey, Entry> entries = new ConcurrentHashMap<>();
+    private final Map<ReadKey, Long> nextReadNanos = new ConcurrentHashMap<>();
     private final ScheduledExecutorService refresher;
 
-    private ExecutionAuthorization() {
+    private ExecutionAuthorization(boolean denied) {
+        this.nodeActive = () -> !denied;
         this.clusterId = "single";
+        this.businessScope = null;
         this.claims = null;
         this.window = Duration.ZERO;
         this.windowNanos = 0;
         this.refreshIntervalNanos = 0;
         this.nanoTime = System::nanoTime;
-        this.fenced = false;
+        this.fenced = denied;
         this.refresher = null;
     }
 
-    /** A single-node run has one member and one run of anything, so nothing here is fenced. */
+    /** An explicit fixture guard for a port with no coordinated store. */
     static ExecutionAuthorization unfenced() {
-        return new ExecutionAuthorization();
+        return new ExecutionAuthorization(false);
     }
 
     ExecutionAuthorization(String clusterId, WorkloadClaimStore claims, Duration window) {
         this(clusterId, claims, window, System::nanoTime);
     }
 
-    ExecutionAuthorization(
-            String clusterId, WorkloadClaimStore claims, Duration window, LongSupplier nanoTime) {
+    ExecutionAuthorization(String clusterId, WorkloadClaimStore claims, Duration window, LongSupplier nanoTime) {
+        this(clusterId, claims, window, nanoTime, () -> true);
+    }
+
+    ExecutionAuthorization(String clusterId, WorkloadClaimStore claims, Duration window, LongSupplier nanoTime, BooleanSupplier nodeActive) {
+        this(clusterId, null, claims, window, nanoTime, nodeActive);
+    }
+
+    static ExecutionAuthorization scoped(CacheBusinessScope scope, WorkloadClaimStore claims, Duration window,
+            LongSupplier nanoTime, BooleanSupplier nodeActive) {
+        Objects.requireNonNull(scope, "scope");
+        return new ExecutionAuthorization(scope.clusterId(), scope, claims, window, nanoTime, nodeActive);
+    }
+
+    private ExecutionAuthorization(String clusterId, CacheBusinessScope businessScope, WorkloadClaimStore claims,
+            Duration window, LongSupplier nanoTime, BooleanSupplier nodeActive) {
+        this.businessScope = businessScope;
+        this.nodeActive = Objects.requireNonNull(nodeActive, "nodeActive");
         this.clusterId = Objects.requireNonNull(clusterId, "clusterId");
         this.claims = Objects.requireNonNull(claims, "claims");
         this.nanoTime = Objects.requireNonNull(nanoTime, "nanoTime");
@@ -124,13 +155,11 @@ final class ExecutionAuthorization implements AutoCloseable {
     }
 
     /**
-     * The guard bound to {@code member}, or an unfenced one where nothing is bound — a single-node run,
-     * or a member brought up without a coordination store, neither of which has a second run to fence
-     * against.
+     * The guard bound to {@code member}; a missing binding refuses instead of granting unprotected work.
      */
     static ExecutionAuthorization of(HazelcastInstance member) {
         Object bound = member.getUserContext().get(USER_CONTEXT_KEY);
-        return bound instanceof ExecutionAuthorization authorization ? authorization : unfenced();
+        return bound instanceof ExecutionAuthorization authorization ? authorization : new ExecutionAuthorization(true);
     }
 
     /**
@@ -156,7 +185,7 @@ final class ExecutionAuthorization implements AutoCloseable {
      * Refuses with a diagnosis when the member may no longer act for {@code fence}'s run.
      */
     WorkloadClaimFence require(ExecutionFence fence) {
-        if (!fenced) {
+        if (!fenced && (fence == null || fence.scope() == null)) {
             return null;
         }
         Entry authorized = authorizedEntry(fence);
@@ -167,19 +196,54 @@ final class ExecutionAuthorization implements AutoCloseable {
         return authorized.claim();
     }
 
+    /** A physical source uses the same bounded proof cache, independently of all Pipeline executions. */
+    WorkloadClaimFence requireCapture(CacheBusinessScope originalScope,WorkloadClaimFence original) {
+        Objects.requireNonNull(originalScope,"originalScope"); Objects.requireNonNull(original,"original");
+        if (!fenced || businessScope == null || !businessScope.equals(originalScope)
+                || original.key().type() != WorkloadClaimType.CAPTURE || !clusterId.equals(original.key().clusterId())
+                || closed.get() || !nodeActive.getAsBoolean()) throw captureRefused();
+        var key = new ReadKey(original.key().resourceId(),null,WorkloadClaimType.CAPTURE);
+        Entry entry = entries.get(key); long now = nanoTime.getAsLong();
+        if (entry != null && (entry.claim().claimGeneration() < original.claimGeneration()
+                || entry.claim().claimGeneration() == original.claimGeneration()
+                        && (entry.claim().executionGeneration() < original.executionGeneration()
+                                || entry.claim().executionGeneration() == original.executionGeneration()
+                                        && entry.claim().topologyRevision() != original.topologyRevision()))) read(key,true);
+        else if (entry == null || now - entry.deadlineNanos() >= 0) read(key,false);
+        Entry published = entries.get(key);
+        if (closed.get() || !nodeActive.getAsBoolean() || published == null
+                || nanoTime.getAsLong() - published.deadlineNanos() >= 0 || !original.equals(published.claim())) throw captureRefused();
+        return published.claim();
+    }
+    private static TapstateException captureRefused() {
+        return new TapstateException(io.tapstate.spi.store.IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);
+    }
+
     /** Whether {@code fence}'s run is still the current one, as far as this member can prove locally. */
     boolean authorized(ExecutionFence fence) {
         if (!fenced) {
-            return true;
+            return fence == null || fence.scope() == null;
         }
         return authorizedEntry(fence) != null;
+    }
+
+    /** Rechecks only an already-published proof and its original deadline, without store IO. */
+    WorkloadClaimFence requireLocal(ExecutionFence fence) {
+        Objects.requireNonNull(fence,"fence");
+        Entry entry=entries.get(ReadKey.of(fence));
+        if(!fenced || !accepts(fence) || closed.get() || !nodeActive.getAsBoolean() || entry==null
+                || nanoTime.getAsLong()-entry.deadlineNanos()>=0 || !matches(entry.claim(),fence))
+            throw new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED,Map.of("pipeline",fence.pipelineId()),null);
+        return entry.claim();
     }
 
     /** The current matching entry, refreshing it under the same rules as the boolean guard. */
     private Entry authorizedEntry(ExecutionFence fence) {
         Objects.requireNonNull(fence, "fence");
+        if (!accepts(fence) || closed.get() || !nodeActive.getAsBoolean()) return null;
+        ReadKey key = ReadKey.of(fence);
         long now = nanoTime.getAsLong();
-        Entry entry = entries.get(fence.pipelineId());
+        Entry entry = entries.get(key);
         if (entry != null && precedes(entry, fence)) {
             // This reading was taken before the run asking about itself was submitted, so it is not the
             // one that decides it. Only the store hands generations out, and only upwards, so a run
@@ -187,31 +251,34 @@ final class ExecutionAuthorization implements AutoCloseable {
             // never a superseded one, which is what a reading is held against. So its own deadline is
             // spent rather than waited out: the answer is known to be out of date, and a refusal from it
             // does not pause the run — it reaches the job as an exception, which ends it.
-            entry = read(fence.pipelineId(), true);
+            entry = read(key, true);
         } else if (entry == null || now - entry.deadlineNanos() >= 0) {
-            entry = read(fence.pipelineId(), false);
+            entry = read(key, false);
         }
-        return entry != null
-                && entry.claim().claimGeneration() == fence.claimGeneration()
-                && entry.claim().executionGeneration() == fence.executionGeneration()
-                ? entry
+        // IO or scheduling may have spent the proof's entire window. A concurrent refresh may also
+        // have replaced or revoked it, so use only the matching proof still published at return time.
+        if (closed.get() || !nodeActive.getAsBoolean()) return null;
+        long checkedAt = nanoTime.getAsLong();
+        Entry published = entries.get(key);
+        return !closed.get() && published != null
+                && checkedAt - published.deadlineNanos() < 0
+                && matches(published.claim(), fence)
+                ? published
                 : null;
     }
 
     /** Files a sink's known independent failure under the exact run while its claim is still live. */
     void recordSinkWriteFailure(ExecutionFence fence) {
-        if (!fenced) {
+        if (!fenced || !accepts(fence) || closed.get() || !nodeActive.getAsBoolean()) {
             return;
         }
         try {
-            Optional<WorkloadClaimReading> reading = claims.read(new WorkloadClaimKey(
-                    clusterId, WorkloadClaimType.PIPELINE_ACTUATION, fence.pipelineId()));
+            Optional<WorkloadClaimReading> reading = readStore(ReadKey.of(fence));
             if (reading.isEmpty() || !reading.get().leased()) {
                 return;
             }
             var claim = reading.get().claim();
-            if (claim.claimGeneration() == fence.claimGeneration()
-                    && claim.executionGeneration() == fence.executionGeneration()) {
+            if (matches(WorkloadClaimFence.from(claim), fence)) {
                 claims.recordExecutionFailure(claim, false);
             }
         } catch (RuntimeException unreachable) {
@@ -220,29 +287,61 @@ final class ExecutionAuthorization implements AutoCloseable {
         }
     }
 
+    private boolean accepts(ExecutionFence fence) {
+        PipelineIntentScope scope = fence.scope();
+        return businessScope == null ? scope == null
+                : scope != null && scope.clusterId().equals(businessScope.clusterId())
+                        && scope.bindingVersion() == businessScope.bindingVersion()
+                        && scope.cacheIncarnation().equals(businessScope.cacheIncarnation());
+    }
+
+    private boolean matches(WorkloadClaimFence claim, ExecutionFence fence) {
+        return claim.key().equals(new WorkloadClaimKey(clusterId, WorkloadClaimType.PIPELINE_ACTUATION,
+                        fence.pipelineId()))
+                && claim.claimGeneration() == fence.claimGeneration()
+                && claim.executionGeneration() == fence.executionGeneration()
+                && (fence.scope() == null || claim.owner().nodeId().equals(fence.ownerNodeId())
+                        && claim.owner().bootId().equals(fence.ownerBootId())
+                        && claim.topologyRevision() == fence.topologyRevision());
+    }
+
+    private Optional<WorkloadClaimReading> readStore(ReadKey key) {
+        return key.scope() == null
+                ? claims.read(new WorkloadClaimKey(clusterId, key.type(), key.pipelineId()))
+                : claims.readPipeline(key.scope());
+    }
+
     /**
      * Whether {@code entry} was read before the run {@code fence} names was submitted, ordered the way
      * the store advances the pair: taking a claim over takes the next claim generation and carries the
      * execution generation across, and submitting a run under a claim takes that claim's next execution
-     * generation.
+     * generation. Within the same pair, a newer scoped topology also requires a fresh proof rather than
+     * waiting for a cached reading of its predecessor to expire.
      */
     private static boolean precedes(Entry entry, ExecutionFence fence) {
         return entry.claim().claimGeneration() < fence.claimGeneration()
                 || (entry.claim().claimGeneration() == fence.claimGeneration()
-                        && entry.claim().executionGeneration() < fence.executionGeneration());
+                        && (entry.claim().executionGeneration() < fence.executionGeneration()
+                                || (entry.claim().executionGeneration() == fence.executionGeneration() && fence.scope() != null
+                                        && entry.claim().topologyRevision() < fence.topologyRevision())));
     }
 
     private void refreshAll() {
-        for (String pipelineId : Set.copyOf(entries.keySet())) {
+        for (ReadKey key : Set.copyOf(entries.keySet())) {
             try {
-                read(pipelineId, true);
+                read(key, true);
             } catch (RuntimeException unreachable) {
                 // read() has already dropped the entry, which is what refuses the next batch. Nothing
                 // else is owed here: the point of the background pass is that the batch path finds a
                 // fresh answer, not that it reports on the store.
-                LOG.debug("Could not refresh the execution authorization for {}", pipelineId, unreachable);
+                LOG.debug("Could not refresh the execution authorization for {}", key.pipelineId(), unreachable);
             }
         }
+        nextReadNanos.forEach((key, deadline) -> {
+            if (nanoTime.getAsLong() - deadline >= 0 && !entries.containsKey(key)) {
+                nextReadNanos.remove(key, deadline);
+            }
+        });
     }
 
     /**
@@ -256,14 +355,14 @@ final class ExecutionAuthorization implements AutoCloseable {
      * for a refresh interval is how a member comes to refuse the very run its own takeover submitted,
      * with no reading in hand to say so and no reading allowed until the floor runs out.
      */
-    private synchronized Entry read(String pipelineId, boolean evenIfStillLive) {
+    private synchronized Entry read(ReadKey key, boolean evenIfStillLive) {
         long now = nanoTime.getAsLong();
-        Entry entry = entries.get(pipelineId);
+        Entry entry = entries.get(key);
         if (entry != null && !evenIfStillLive && now - entry.deadlineNanos() < 0) {
             // Refreshed by the background pass, or by another batch, while this call waited for the lock.
             return entry;
         }
-        Long nextRead = nextReadNanos.get(pipelineId);
+        Long nextRead = nextReadNanos.get(key);
         if (nextRead != null && now - nextRead < 0) {
             return evenIfStillLive ? entry : null;
         }
@@ -272,16 +371,24 @@ final class ExecutionAuthorization implements AutoCloseable {
         long startedAt = nanoTime.getAsLong();
         Optional<WorkloadClaimReading> current;
         try {
-            current = claims.read(
-                    new WorkloadClaimKey(clusterId, WorkloadClaimType.PIPELINE_ACTUATION, pipelineId));
+            current = readStore(key);
         } catch (RuntimeException unreachable) {
-            nextReadNanos.put(pipelineId, startedAt + refreshIntervalNanos);
-            entries.remove(pipelineId);
+            nextReadNanos.put(key, startedAt + refreshIntervalNanos);
+            entries.remove(key);
             return null;
         }
-        nextReadNanos.remove(pipelineId);
+        nextReadNanos.remove(key);
+        if (key.scope() != null && !entries.containsKey(key)) {
+            // A proved replacement ends every older positive answer for this Pipeline immediately.
+            // Reads are serialized, and the scoped store refuses a scope that is no longer current.
+            boolean newerKnown = entries.keySet().stream().anyMatch(other -> other.type() == key.type() && other.scope() != null && other.pipelineId().equals(key.pipelineId())
+                    && other.scope().stateGeneration() > key.scope().stateGeneration());
+            if (newerKnown) return null;
+            entries.keySet().removeIf(other -> other.type() == key.type() && other.pipelineId().equals(key.pipelineId()) && !other.equals(key));
+            nextReadNanos.keySet().removeIf(other -> other.type() == key.type() && other.pipelineId().equals(key.pipelineId()) && !other.equals(key));
+        }
         if (current.isEmpty()) {
-            entries.remove(pipelineId);
+            entries.remove(key);
             return null;
         }
         // The shorter of the two bounds, because each covers what the other cannot. The window bounds how
@@ -293,16 +400,17 @@ final class ExecutionAuthorization implements AutoCloseable {
         if (held <= 0) {
             // Nobody owns this run any more, whoever may own it next. Dropping the entry is what refuses
             // the batch: a reading that was already out of date when it arrived is not a reading.
-            entries.remove(pipelineId);
+            entries.remove(key);
             return null;
         }
         Entry refreshed = new Entry(WorkloadClaimFence.from(current.get().claim()), startedAt + held);
-        entries.put(pipelineId, refreshed);
+        entries.put(key, refreshed);
         return refreshed;
     }
 
     @Override
     public void close() {
+        closed.set(true); entries.clear(); nextReadNanos.clear();
         if (refresher != null) {
             refresher.shutdownNow();
         }

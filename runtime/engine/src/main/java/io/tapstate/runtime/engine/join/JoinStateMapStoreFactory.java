@@ -63,6 +63,6 @@ public final class JoinStateMapStoreFactory implements MapStoreFactory<Object, O
 
     @Override
     public MapLoader<Object, Object> newMapStore(String mapName, Properties properties) {
-        return new JoinStateMapStore(mapName);
+        return new JoinStateMapStore(mapName, io.tapstate.runtime.engine.OperatorMapBindings.required(properties));
     }
 }

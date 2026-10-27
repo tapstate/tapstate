@@ -21,6 +21,10 @@ import java.util.Optional;
  * stale writer otherwise, so two owners that both believe they hold the pipeline can never both
  * write. The state carrier is the opaque {@code stateJson}; the fencing decision is made on the
  * epoch alone, never on the state, so a lagging clock or a stale state view can never corrupt it.
+ *
+ * <p>A scope-bound business view additionally checks the fixed physical state and original live claim.
+ * Its initial checkpoint is prepared by a controlled lifecycle operation; ordinary views refuse
+ * {@code create} and {@code delete}, and a missing known checkpoint is a recovery diagnosis.
  */
 public interface StateStore {
 
@@ -41,6 +45,15 @@ public interface StateStore {
      * {@link CasOutcome.Fenced} carrying the stored epoch that superseded the writer.
      */
     CasOutcome compareAndSwap(String pipelineId, long expectedEpoch, String nextStateJson, Instant touchTime);
+
+    /**
+     * Applies a transition only while the expected workload owner and execution are still live, in the
+     * same atomic operation as the checkpoint CAS. A store without that boundary must refuse support.
+     */
+    default CasOutcome compareAndSwap(String pipelineId, long expectedEpoch, String nextStateJson,
+            Instant touchTime, WorkloadClaimFence fence) {
+        throw new UnsupportedOperationException("atomic workload-fenced checkpoint transitions are not implemented");
+    }
 
     /**
      * Removes a pipeline's checkpoint, discarding its fencing epoch along with it. That discard is the

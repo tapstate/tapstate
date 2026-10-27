@@ -221,12 +221,18 @@ class PipelineDraftServiceTest {
                 new PipelineDraft.Wizard(template.wizard().root(), List.of(), List.of(
                         new PipelineDraft.Transform("script", "js", Map.of("script",
                                 "function process(record, ctx) { return record; }")),
-                        new PipelineDraft.Transform("expand", "unwind", Map.of("path", "items"))),
+                        new PipelineDraft.Transform("expand", "unwind", Map.of("path", "items",
+                                "source_id_field", "original_order_id"))),
                         template.wizard().output()), null, null, null, NOW, NOW, "alice");
         store.seed(complete);
 
         assertThat(service.preview("orders", 6).transforms()).extracting(io.tapstate.core.model.Step::id)
                 .containsExactly("script", "expand");
+        PipelineResource preview = service.preview("orders", 6);
+        assertThat(((io.tapstate.core.model.TransformBody.Unwind)
+                ((io.tapstate.core.model.Step.Inline) preview.transforms().get(1)).body()).sourceIdField())
+                .isEqualTo("original_order_id");
+        assertThat(new CanonicalWriter().write(preview)).contains("source_id_field: original_order_id");
         assertThat(service.publish("orders", 6, null, "alice").mutation())
                 .isEqualTo(PipelineDraftMutation.PUBLISHED);
         assertThat(((PipelineResource) store.lastPublication.artifact()).transforms())

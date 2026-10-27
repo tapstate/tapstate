@@ -59,6 +59,12 @@ import java.util.TreeSet;
  */
 public final class ArtifactMutationService {
 
+    /** Native lifecycle deletion owns its atomic retirement; the common service retains references and audit. */
+    @FunctionalInterface public interface PipelineDeletion {
+        /** Binds a read-only original command; the returned action runs only after audit succeeds. */
+        Runnable prepare(PipelineResource original, String expectedContentHash);
+    }
+
     private final ArtifactStore store;
     /**
      * The one reading of "is this pipeline at rest". Held rather than re-derived so this refusal and
@@ -77,6 +83,7 @@ public final class ArtifactMutationService {
     private final AuditGate auditGate;
 
     private final DataBrowserFollows follows;
+    private final PipelineDeletion pipelineDeletion;
 
     public ArtifactMutationService(
             ArtifactStore store,
@@ -208,6 +215,12 @@ public final class ArtifactMutationService {
             RateHistoryStore rateHistory,
             AuditGate auditGate,
             DataBrowserFollows follows) {
+        this(store, desired, state, observations, layouts, srsMeta, derivedSchemas, rateHistory, auditGate, follows, null);
+    }
+
+    public ArtifactMutationService(ArtifactStore store, DesiredStore desired, StateStore state, ObservationStore observations,
+            PipelineLayoutStore layouts, SrsMetaStore srsMeta, DerivedSchemaStore derivedSchemas, RateHistoryStore rateHistory,
+            AuditGate auditGate, DataBrowserFollows follows, PipelineDeletion pipelineDeletion) {
         this.store = Objects.requireNonNull(store, "store");
         this.desired = Objects.requireNonNull(desired, "desired");
         this.state = Objects.requireNonNull(state, "state");
@@ -219,6 +232,7 @@ public final class ArtifactMutationService {
         this.auditGate = Objects.requireNonNull(auditGate, "auditGate");
         this.follows = Objects.requireNonNull(follows, "follows");
         this.live = new LivePipelines(this.desired, this.state);
+        this.pipelineDeletion = pipelineDeletion;
     }
 
     /**
@@ -259,8 +273,10 @@ public final class ArtifactMutationService {
         // not: without the resource, its references are unknown rather than absent, so the strict list
         // fails closed before any audit record or deletion is written.
         refuseWhenReferenced(target, store.list());
-        if (target instanceof PipelineResource) {
-            refuseWhenNotStopped(id);
+        Runnable nativeDeletion = null;
+        if (target instanceof PipelineResource pipeline) {
+            if (pipelineDeletion == null) refuseWhenNotStopped(id);
+            else nativeDeletion = Objects.requireNonNull(pipelineDeletion.prepare(pipeline, expectedContentHash), "original deletion");
         }
 
         // Both grounds are judged above, outside the gate, so a refusal writes no audit record and leaves
@@ -271,7 +287,11 @@ public final class ArtifactMutationService {
         // runs before the compare below, and on the branch where that compare refuses, the version the
         // caller offered is the only one that describes the attempt.
         AuditContext audit = new AuditContext(principal, id, expectedContentHash);
+        Runnable originalDeletion = nativeDeletion;
         auditGate.dispatch(ControlOperations.ARTIFACT_DELETE, audit, () -> {
+            if (originalDeletion != null) {
+                originalDeletion.run(); return null;
+            }
             switch (store.delete(id, expectedContentHash)) {
                 case DELETED -> {
                 }
@@ -458,12 +478,10 @@ public final class ArtifactMutationService {
      * never run, which is the clean case rather than an unknown one.
      */
     private void refuseWhenNotStopped(String id) {
-        PipelineState actual = actualStateOf(id);
-        PipelineState intent = intentOf(id);
-        if (!isAtRest(actual, intent)) {
+        if (!isAtRest(id)) {
             throw error(
                     ArtifactError.PIPELINE_NOT_STOPPED,
-                    Map.of("id", id, "actual", actual.name(), "desired", intent.name()));
+                    Map.of("id", id, "actual", actualStateOf(id).name(), "desired", intentOf(id).name()));
         }
     }
 
@@ -474,10 +492,6 @@ public final class ArtifactMutationService {
      */
     private boolean isAtRest(String id) {
         return live.isAtRest(id);
-    }
-
-    private static boolean isAtRest(PipelineState actual, PipelineState intent) {
-        return LivePipelines.isAtRest(actual, intent);
     }
 
     private PipelineState actualStateOf(String id) {

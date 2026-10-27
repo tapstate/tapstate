@@ -1,6 +1,7 @@
 package io.tapstate.e2e;
 
 import io.tapstate.adapters.pdk.PdkApiLevels;
+import io.tapstate.core.common.JsonReader;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -41,9 +42,10 @@ class E2eConnectorJarTest {
 
         try (JarFile file = new JarFile(jar.toFile())) {
             assertThat(file.getJarEntry("io/tapstate/e2e/connector/CsvConnector.class")).isNotNull();
-            assertThat(new String(file.getInputStream(file.getJarEntry("e2e-file-spec.json")).readAllBytes(),
-                    StandardCharsets.UTF_8))
-                    .contains("\"id\":\"e2e_file\"");
+            String spec = new String(file.getInputStream(file.getJarEntry("e2e-file-spec.json")).readAllBytes(),
+                    StandardCharsets.UTF_8);
+            assertThat(JsonReader.parse(spec)).isInstanceOf(java.util.Map.class);
+            assertThat(spec).contains("\"id\":\"e2e_file\"", "\"sslKey\"", "\"sslKeyPassword\"");
         }
     }
 

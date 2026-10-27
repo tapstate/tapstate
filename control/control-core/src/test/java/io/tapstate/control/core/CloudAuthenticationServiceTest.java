@@ -41,6 +41,33 @@ class CloudAuthenticationServiceTest {
     private final CloudSessionService sessions = new CloudSessionService(store, DEPLOYMENT, secrets, clock);
 
     @Test
+    void identityAndContextComeFromOneValidationAndTheNextRequestStillSeesRevocation() {
+        var context = new CloudSessionContext("org-a", "cluster-a", "Organization", "Cluster", "region");
+        String cookie = sessions.create(new CloudLoginIdentity(DEPLOYMENT, "user", "org-a", "cluster-a",
+                "single-read", Scope.WRITE, NOW.plusSeconds(900)), context).orElseThrow().token();
+        var service = new CloudAuthenticationService((code, cluster) -> { throw new AssertionError("no exchange"); },
+                (jwt, target, audience) -> { throw new AssertionError("no JWT refresh"); }, sessions);
+
+        var authenticated = service.authenticateWithContext(cookie).orElseThrow();
+        assertThat(authenticated.identity()).isEqualTo(new VerifiedToken("user", Scope.WRITE));
+        assertThat(authenticated.clusterContext()).isEqualTo(context);
+        assertThat(store.authentications).isEqualTo(1);
+        assertThat(service.logout(cookie)).isTrue();
+        assertThat(service.authenticateWithContext(cookie)).isEmpty();
+        assertThat(store.authentications).isEqualTo(2);
+    }
+
+    @Test
+    void contextualAuthenticationDoesNotGrantAnOrganizationForALegacySessionOrWrongSecret() {
+        String cookie = sessions.create(login("legacy-context", NOW.plusSeconds(900))).orElseThrow().token();
+        assertThat(sessions.authenticateWithContext(cookie)).isEmpty();
+        var context = new CloudSessionContext("org-a", "cluster-a", "Organization", "Cluster", "region");
+        String contextual = sessions.create(new CloudLoginIdentity(DEPLOYMENT, "user", "org-a", "cluster-a",
+                "wrong-secret", Scope.WRITE, NOW.plusSeconds(900)), context).orElseThrow().token();
+        assertThat(sessions.authenticateWithContext(contextual.replace(".secret", ".incorrect"))).isEmpty();
+    }
+
+    @Test
     void contextViewUsesTheCurrentAddressInsteadOfTheLoginSnapshot() {
         CloudSessionContext snapshot = new CloudSessionContext("org-a", "cluster-a", "Organization", "Cluster",
                 "us-east-1", "198.51.100.1", "DYNAMIC");
@@ -337,6 +364,7 @@ class CloudAuthenticationServiceTest {
     private static final class MemoryStore implements CloudSessionStore {
         final Map<Key, CloudSessionRecord> records = new HashMap<>();
         final Set<Key> revoked = new HashSet<>();
+        int authentications;
 
         @Override public boolean create(CloudSessionRecord record) {
             Key key = new Key(record.identity(), record.jwtId());
@@ -347,6 +375,7 @@ class CloudAuthenticationServiceTest {
         }
         @Override public Optional<CloudSessionRecord> authenticate(CloudSessionIdentity identity, String jti,
                 String hash, Instant now, Instant expiry) {
+            authentications++;
             Key key = new Key(identity, jti);
             CloudSessionRecord existing = records.get(key);
             if (existing == null || revoked.contains(key) || !hash.equals(existing.secretHash())

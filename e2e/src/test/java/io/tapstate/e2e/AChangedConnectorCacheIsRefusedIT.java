@@ -16,7 +16,6 @@ import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 import java.util.jar.JarFile;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -35,12 +34,11 @@ class AChangedConnectorCacheIsRefusedIT {
         Path source = Files.createDirectory(directory.resolve("source"));
         Files.writeString(source.resolve("orders.csv"), "id,amount\n7,70.00\n");
         Map<String, Object> settings = Map.of("uri", source.toString());
-        String database = "e2e_cache_integrity_" + UUID.randomUUID().toString().replace("-", "");
-
-        try (ServerHandle server = InProcessServer.start(SharedMongo.replicaSetUrl(database), database + "_operator",
-                List.of("--" + ServerHandle.PLUGINS_DIRECTORY_SETTING + "=" + cacheDir))) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = InProcessServer.startPrepared(storage,
+                        List.of("--" + ServerHandle.PLUGINS_DIRECTORY_SETTING + "=" + cacheDir))) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID, artifact);
             assertThat(control.testConnection("orders", E2eConnectorJar.CONNECTOR_ID, settings).outcome())
                     .isEqualTo("PASSED");

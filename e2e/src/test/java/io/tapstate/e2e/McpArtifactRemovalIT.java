@@ -67,10 +67,9 @@ class McpArtifactRemovalIT {
 
     @Test
     void aModelReadsTheVersionOfAPipelineItNeverAppliedAndRemovesIt() throws Exception {
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(
-                SharedMongo.replicaSetUrl("mcp_artifact_removal"))) {
+        try (var storage = PreparedNativeStore.create("e2e", "e2e-password"); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(
                     E2eConnectorJar.CONNECTOR_ID, Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
             control.apply(workspace());

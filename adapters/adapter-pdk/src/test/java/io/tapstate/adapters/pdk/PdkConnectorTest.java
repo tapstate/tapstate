@@ -18,6 +18,53 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class PdkConnectorTest {
 
+    @Test
+    void persistedCaMaterialIsOwnedByEachRealConnectorHandle(@TempDir Path dir) throws Exception {
+        String ca;
+        try (var input = PdkConnectorTest.class.getResourceAsStream("/tls/ca.pem")) {
+            ca = new String(java.util.Objects.requireNonNull(input).readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+        }
+        var settings = Map.<String,Object>of("uri", "mongodb://host/master?tls=true", "tlsCaPem", ca);
+        var first = PdkConnector.open("mongodb", ref(dir), settings);
+        Path firstFile;
+        try (var second = PdkConnector.open("mongodb", ref(dir), settings)) {
+            assertThat(first.context().getConnectionConfig()).containsKey("sslCA").doesNotContainKey("tlsCaPem");
+            firstFile = Path.of((String)first.context().getConnectionConfig().get("sslCA"));
+            Path secondFile = Path.of((String)second.context().getConnectionConfig().get("sslCA"));
+            assertThat(firstFile).isNotEqualTo(secondFile);
+            assertThat(java.nio.file.Files.readString(firstFile)).isEqualTo(ca);
+            assertThat(java.nio.file.Files.getPosixFilePermissions(firstFile)).isEqualTo(java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"));
+            assertThat(first.context().getConnectionConfig()).containsEntry("ssl", true).containsEntry("sslValidate", true);
+            first.close(); assertThat(firstFile).doesNotExist(); assertThat(secondFile).exists();
+        } finally { first.close(); }
+        assertThat(firstFile.getParent()).doesNotExist();
+        assertThat(settings).containsEntry("tlsCaPem", ca).doesNotContainKey("sslCA");
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> ConnectorTrustMaterial.open("mongodb", Map.of("tlsCaPem", "invalid CA")))
+                .isInstanceOf(io.tapstate.core.common.TapstateException.class);
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> ConnectorTrustMaterial.open("mongodb", Map.of("tlsCaPem", ca, "uri", "mongodb://host/master?tls=false")))
+                .isInstanceOf(io.tapstate.core.common.TapstateException.class);
+    }
+
+    @Test void trustMaterialRejectsEveryConflictingMongoUriOptionBeforePublication() throws Exception {
+        String ca;
+        try (var input = PdkConnectorTest.class.getResourceAsStream("/tls/ca.pem")) {
+            ca = new String(java.util.Objects.requireNonNull(input).readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+        }
+        for (String query : List.of("sslInvalidHostnameAllowed=true", "tlsCAFile=alternate.pem", "tlsCertificateKeyFile=client.pem",
+                "tlsCertificateKeyFilePassword=private", "authSource=admin;sslInvalidHostnameAllowed=true", "authSource=admin;tlsCAFile=alternate.pem")) {
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> {
+                try (var material = ConnectorTrustMaterial.open("mongodb", Map.of("tlsCaPem", ca, "uri", "mongodb://host/master?" + query))) { }
+            }).as(query).isInstanceOf(io.tapstate.core.common.TapstateException.class);
+        }
+    }
+
+    @Test void unrelatedConnectorsKeepTheirOwnConfigurationFieldSemantics() {
+        var settings = Map.<String,Object>of("tlsCaPem", "a connector-owned opaque setting");
+        try (var material = ConnectorTrustMaterial.open("custom", settings)) {
+            assertThat(material.settings()).isEqualTo(settings).doesNotContainKey("sslCA");
+        }
+    }
+
     private static final String APP_TYPE = "app_type";
 
     private static ConnectorRef ref(Path dir) {

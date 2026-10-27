@@ -61,8 +61,8 @@ public final class ControlOperations {
     // infer it: a remote model reads this text and nothing else before deciding to call it.
     public static final Operation ARTIFACT_DELETE = mcp(
             "artifact.delete", Scope.WRITE, true,
-            "Permanently remove one applied resource of any kind by id. This is not reversible and leaves "
-                    + "no tombstone; restoring means applying the resource again. The expectedContentHash "
+            "Permanently remove one applied resource of any kind by id. This is not reversible; restoring "
+                    + "means applying the resource again after its private resources are retired. The expectedContentHash "
                     + "must be the hash of the version just read, and the removal is refused if the stored "
                     + "version has moved on, if another resource still references the id, or if the id is a "
                     + "pipeline that is not stopped.");
@@ -106,6 +106,18 @@ public final class ControlOperations {
     public static final Operation STATE_STORE_CONNECT = new Operation(
             "state-store.connect", Scope.WRITE, true, null,
             "Configure the one Cloud MongoDB Atlas destination for materialized views.", CLI_AND_REST);
+
+    public static final Operation STORAGE_STATUS = storage("storage.status", Scope.READ, false);
+    public static final Operation STORAGE_TEST = storage("storage.test", Scope.WRITE, false);
+    public static final Operation STORAGE_SETUP_COMMIT = storage("storage.setup.commit", Scope.WRITE, true);
+    public static final Operation STORAGE_SETUP_STATUS = storage("storage.setup.status", Scope.READ, false);
+    public static final Operation STORAGE_RECOVERY_PLAN = storage("storage.recovery.plan", Scope.WRITE, true);
+    public static final Operation STORAGE_RECOVERY_CONFIRM = storage("storage.recovery.confirm", Scope.WRITE, true);
+    public static final Operation STORAGE_RECOVERY_STATUS = storage("storage.recovery.status", Scope.READ, false);
+    public static final Operation CONFIGURATION_EXPORT = storage("configuration.export", Scope.WRITE, true);
+    public static final Operation CONFIGURATION_IMPORT_PREFLIGHT = storage("configuration.import.preflight", Scope.WRITE, true);
+    public static final Operation CONFIGURATION_IMPORT_COMMIT = storage("configuration.import.commit", Scope.WRITE, true);
+    public static final Operation CONFIGURATION_IMPORT_STATUS = storage("configuration.import.status", Scope.READ, false);
 
     // connection domain: each probing verb runs an external probe and persists its result for later query
     // and display, so it mutates persisted state (a write) and is audited; its read-back peer returns the
@@ -253,9 +265,25 @@ public final class ControlOperations {
             "pipeline-draft.rebase", Scope.WRITE, true, null,
             "Explicitly rebase one Pipeline draft onto the artifact hash the caller has just read, preserving its content.",
             CLI_AND_REST);
+    // The start runs its start checks first. The answer convention is in the description because the
+    // caller on that face is a model: it relays the questions and carries back a person's answers, and the
+    // precondition proves that somebody answered the report as it stood, never that a person did.
     public static final Operation PIPELINE_START = mcp(
             "pipeline.start", Scope.WRITE, true,
-            "Set a Pipeline's desired state to running after its workspace has been applied.");
+            "Set a Pipeline's desired state to running after its workspace has been applied. Its start "
+                    + "checks run first: a start they stop is refused with their report under startChecks, "
+                    + "each question listing the answers it offers. Relay the findings to the person starting "
+                    + "the Pipeline and send back the answers they choose as decisions, with the report's "
+                    + "contentHash as expectedContentHash. Never choose an answer that changes the Pipeline "
+                    + "or clears data unless the person said to.");
+    // The start checks a start would be asked, read without starting anything: what a client shows
+    // before it starts, and what a rerun asks about while the pipeline still runs untouched. Read-scoped,
+    // so a caller with no write capability can still see why a start would stop.
+    public static final Operation PIPELINE_START_CHECKS = mcp(
+            "pipeline.start-checks", Scope.READ, false,
+            "Read the start checks a Pipeline start would be asked, without starting it: each finding, "
+                    + "whether it lets the start go ahead, asks a question first, or refuses it, and the "
+                    + "answers a question offers. Relay the findings to the person starting the Pipeline.");
     // The description is rendered from the same declarations a stop works through, both outcomes of
             // them. Written out by hand it would describe whatever was true when somebody last edited it,
             // and a description that has fallen behind reads exactly like one that is complete.
@@ -362,6 +390,9 @@ public final class ControlOperations {
             SAMPLE_SOURCE_LIST,
             SAMPLE_SOURCE_INSTALL,
             STATE_STORE_CONNECT,
+            STORAGE_STATUS, STORAGE_TEST, STORAGE_SETUP_COMMIT, STORAGE_SETUP_STATUS,
+            STORAGE_RECOVERY_PLAN, STORAGE_RECOVERY_CONFIRM, STORAGE_RECOVERY_STATUS,
+            CONFIGURATION_EXPORT, CONFIGURATION_IMPORT_PREFLIGHT, CONFIGURATION_IMPORT_COMMIT, CONFIGURATION_IMPORT_STATUS,
             CONNECTION_TEST,
             CONNECTION_TEST_RESULT,
             CONNECTION_DISCOVER_SCHEMA,
@@ -393,6 +424,7 @@ public final class ControlOperations {
             PIPELINE_DRAFT_PUBLISH,
             PIPELINE_DRAFT_REBASE,
             PIPELINE_START,
+            PIPELINE_START_CHECKS,
             PIPELINE_STOP,
             PIPELINE_PAUSE,
             PIPELINE_RESUME,
@@ -415,6 +447,12 @@ public final class ControlOperations {
             TOKEN_LIST);
 
     private ControlOperations() {
+    }
+
+    private static Operation storage(String id, Scope scope, boolean audited) {
+        return new Operation(id, scope, audited, ControlApiSchema.ref(id),
+                "Manage storage using the original authorized operation and current installation phase; query an uncertain result before retrying.",
+                Map.of(Frontend.CLI, Maturity.CURRENT, Frontend.REST, Maturity.CURRENT, Frontend.MCP, Maturity.CURRENT));
     }
 
     private static Operation mcp(String id, Scope scope, boolean audited, String description) {

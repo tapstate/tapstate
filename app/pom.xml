@@ -363,6 +363,10 @@
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-failsafe-plugin</artifactId>
         <configuration>
+          <!-- Connector runtimes retain process-wide JAR handles after contexts close. End the
+               fork with each class so deleted temporary connector archives release their disk
+               space; restart assertions within a test still run against the same real store. -->
+          <reuseForks>false</reuseForks>
           <classpathDependencyExcludes>
             <classpathDependencyExclude>io.tapstate:mcp-server</classpathDependencyExclude>
           </classpathDependencyExcludes>

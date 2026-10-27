@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ConvertedValue;
+import io.tapstate.core.event.RowValueError;
 import io.tapdata.entity.schema.value.DateTime;
 import io.tapstate.spi.capture.BoundedSnapshotQueryRequest;
 import io.tapstate.spi.capture.BoundedQueryCancellation;
@@ -269,8 +270,14 @@ class PdkBoundedSnapshotQueryPortTest {
                     "source-1", "connector-1", Map.of(), new TableSchema("t1", List.of()), List.of(),
                     new AllRows(), List.of(), 1, Instant.now().plusSeconds(5))))
                     .isInstanceOf(TapstateException.class)
-                    .extracting(failure -> ((TapstateException) failure).code())
-                    .isEqualTo(ConnectorError.READ_FAILED);
+                    .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                        assertThat(failure.code()).isEqualTo(mode.equals("null-field")
+                                ? RowValueError.NON_STRING_MAP_KEY : ConnectorError.READ_FAILED);
+                        if (mode.equals("null-field")) {
+                            assertThat(failure.args()).containsExactlyInAnyOrderEntriesOf(
+                                    Map.of("path", "$", "keyType", "null"));
+                        }
+                    });
         }
 
         Path jar = Synthetic.boundedQuerySource(dir.resolve("empty-results"), "empty-results");
@@ -344,9 +351,12 @@ class PdkBoundedSnapshotQueryPortTest {
         assertThat(result.complete()).isTrue();
         assertThat(result.rows()).hasSize(1);
         Map<String, Object> row = result.rows().getFirst().after();
-        ConvertedValue expected = new ConvertedValue(new DateTime(Instant.ofEpochSecond(1_700_000_000)), "timestamp");
-        assertThat(row.get("created_at")).isEqualTo(expected);
-        assertThat(((Map<?, ?>) row.get("nested")).get("history")).isEqualTo(List.of(expected));
+        Instant expected = Instant.ofEpochSecond(1_700_000_000);
+        assertThat(ConvertedValue.unwrap(row.get("created_at"))).isEqualTo(expected);
+        assertThat(((ConvertedValue) row.get("created_at")).originType()).isEqualTo("timestamp");
+        assertThat(((ConvertedValue) row.get("created_at")).valueKind()).isEqualTo("TapDateTimeValue");
+        assertThat(ConvertedValue.unwrap(row.get("nested")))
+                .isEqualTo(Map.of("history", List.of(expected)));
         BoundedSnapshotQueryRequest tooSmall = new BoundedSnapshotQueryRequest(
                 "source-1", "connector-1", Map.of(), request.table(), request.stableOrder(),
                 new AllRows(), List.of(), 1, 1, Instant.now().plusSeconds(5));
@@ -372,6 +382,21 @@ class PdkBoundedSnapshotQueryPortTest {
 
         assertThat(PdkPreviewJsonValues.encodedSize(row, 16)).isEqualTo(17);
         assertThat(visits).hasValue(0);
+    }
+
+    @Test
+    void previewByteAccountingReportsTheNestedKeyWithoutCoercion() {
+        Map<Object, Object> nested = new LinkedHashMap<>();
+        nested.put(7, "number-key");
+        nested.put("7", "text-key");
+        assertThatThrownBy(() -> PdkPreviewJsonValues.encodedSize(
+                Map.of("dict", new ConvertedValue(nested, "object")), Long.MAX_VALUE))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(RowValueError.NON_STRING_MAP_KEY);
+                    assertThat(failure.args()).containsExactlyInAnyOrderEntriesOf(
+                            Map.of("path", "$/dict", "keyType", "java.lang.Integer"));
+                });
+        assertThat(nested).hasSize(2).containsEntry(7, "number-key").containsEntry("7", "text-key");
     }
 
     private PdkBoundedSnapshotQueryPort port(Path jar) {

@@ -4,6 +4,7 @@ import io.tapstate.control.core.AuthenticationMode;
 import io.tapstate.control.core.CloudAuthenticationService;
 import io.tapstate.control.core.CloudSessionCallbackVerifier;
 import io.tapstate.control.core.ControlError;
+import io.tapstate.control.core.ManagedAuthenticationContext;
 import io.tapstate.core.common.TapstateException;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.beans.factory.ObjectProvider;
@@ -33,20 +34,31 @@ class CloudAuthController {
     private final AuthenticationMode mode;
     private final ObjectProvider<CloudAuthenticationService> authentication;
     private final ObjectProvider<CloudSessionCallbackVerifier> callbacks;
+    private final ObjectProvider<ManagedAuthenticationContext.Provider> contexts;
 
     CloudAuthController(ObjectProvider<AuthenticationMode> modes,
             ObjectProvider<CloudAuthenticationService> authentication,
             ObjectProvider<CloudSessionCallbackVerifier> callbacks) {
+        this(modes, authentication, callbacks, null);
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    CloudAuthController(ObjectProvider<AuthenticationMode> modes,
+            ObjectProvider<CloudAuthenticationService> authentication,
+            ObjectProvider<CloudSessionCallbackVerifier> callbacks,
+            ObjectProvider<ManagedAuthenticationContext.Provider> contexts) {
         mode = modes.getIfAvailable(() -> AuthenticationMode.ON_PREM);
         this.authentication = authentication;
         this.callbacks = callbacks;
+        this.contexts = contexts;
     }
 
     @GetMapping(EXCHANGE_PATH)
     ResponseEntity<Void> exchange(HttpServletRequest request,
             @RequestParam(name = "code", required = false) String code) {
-        CloudAuthenticationService service = requireCloud();
-        var session = service.exchangeCode(code, requestAudience(request));
+        var original = requireCloud(); original.requireActive().run();
+        var session = original.service().exchangeCode(code, requestAudience(request));
+        original.requireActive().run();
         return ResponseEntity.status(302).location(URI.create("/"))
                 .header(HttpHeaders.SET_COOKIE, CloudSessionCookies.set(session.token()))
                 .header(HttpHeaders.CACHE_CONTROL, "no-store")
@@ -59,7 +71,8 @@ class CloudAuthController {
             @RequestParam(name = "ts", required = false) String timestamp,
             @RequestParam(name = "nonce", required = false) String nonce,
             @RequestParam(name = "sign", required = false) String signature) {
-        CloudAuthenticationService service = requireCloud();
+        var original = requireCloud(); original.requireActive().run();
+        CloudAuthenticationService service = original.service();
         CloudSessionCallbackVerifier verifier = callbacks.getIfAvailable();
         if (verifier == null) {
             throw CloudAuthenticationService.unavailable();
@@ -76,19 +89,23 @@ class CloudAuthController {
         if (!service.authorizeCallback(verifier, request.getMethod(), timestamp, nonce, jti, signature)) {
             throw new TapstateException(ControlError.UNAUTHENTICATED, Map.of(), null);
         }
+        original.requireActive().run();
         service.invalidateJwt(jti);
+        original.requireActive().run();
         return ResponseEntity.noContent().header(HttpHeaders.CACHE_CONTROL, "no-store").build();
     }
 
-    private CloudAuthenticationService requireCloud() {
+    private ManagedAuthenticationContext requireCloud() {
         if (mode != AuthenticationMode.CLOUD) {
             throw new TapstateException(ControlError.AUTH_MODE_UNAVAILABLE, Map.of("mode", "on-prem"), null);
         }
+        var provider = contexts == null ? null : contexts.getIfAvailable();
+        if (provider != null) return provider.current();
         CloudAuthenticationService service = authentication.getIfAvailable();
         if (service == null) {
             throw CloudAuthenticationService.unavailable();
         }
-        return service;
+        return new ManagedAuthenticationContext(service, () -> {});
     }
 
     private static TapstateException malformed() {

@@ -30,6 +30,22 @@ import java.util.Objects;
  */
 public record PipelineNode(String pipelineId, String nodeId) implements Serializable {
 
+    /** The fixed use of a connector within a pipeline, independent of its logical node id. */
+    public enum Purpose {
+        CAPTURE("capture"), VIEW("view"), SYNC("sync");
+
+        private final String segment;
+
+        Purpose(String segment) { this.segment = segment; }
+
+        public String segment() { return segment; }
+    }
+
+    /** An unambiguous physical address shared by notes and preparation receipts. */
+    public String physicalAddress(Purpose purpose) {
+        return pipelineId + "." + Objects.requireNonNull(purpose, "purpose").segment() + "." + nodeId;
+    }
+
     public PipelineNode {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(nodeId, "nodeId");
