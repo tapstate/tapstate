@@ -293,6 +293,20 @@ class ValidationCandidateQueueTest {
         }
     }
 
+    @Test void theInitialSavedWaitIsIndependentOfTheFixedConfirmationRetryCadence() {
+        var clock = new AtomicLong();
+        try (var queue = queue(clock, new Limits(4, 65536, 4, 5, 30, 100, 7))) {
+            queue.tryOffer(List.of(root(1))); clock.set(29); assertThat(queue.poll()).isEmpty();
+            clock.set(30); var first = queue.poll().orElseThrow();
+            queue.applyDelay(new DelayChange(run(), 1, UUID.randomUUID(), 50));
+            queue.settle(first, Completion.RETRY); queue.tryOffer(List.of(root(2)));
+            clock.set(36); assertThat(queue.poll()).isEmpty(); clock.set(37);
+            var retry = queue.poll().orElseThrow(); assertThat(retry.observation().root()).isEqualTo(root(1)); queue.settle(retry, Completion.SETTLED);
+            clock.set(79); assertThat(queue.poll()).isEmpty(); clock.set(80);
+            var later = queue.poll().orElseThrow(); assertThat(later.observation().root()).isEqualTo(root(2)); queue.settle(later, Completion.SETTLED);
+        }
+    }
+
     @Test void delayApplicationsCannotCrossRunIdentityRevisionOrClosure() {
         var clock = new AtomicLong();
         try (var queue = queue(clock, LIMITS)) {

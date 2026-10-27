@@ -717,6 +717,14 @@ public final class MongoConfigurationDomain implements AutoCloseable {
             requireCurrent(); return new MongoValidationResultStore(configuration.connection.client(), configuration.connection.database(), configuration.clusterId,
                     () -> { configuration.requireOpen(); local.run(); }, new MongoValidationPreparations.Authority(original));
         }
+        /** Only old-tenure CONFIG rights are revoked; current requests and saved task definitions remain intact. */
+        public boolean closeObsoletePermissions(io.tapstate.core.validation.ValidationOwner current, int maximum) {
+            requireCurrent(); var control = control(); control.snapshot(Objects.requireNonNull(current));
+            var admissions = new MongoValidationAdmissionStore(configuration.connection.client(), configuration.connection.database(), configuration.clusterId,
+                    () -> { configuration.requireOpen(); local.run(); }, new MongoValidationPreparations.Authority(original));
+            boolean complete = admissions.transaction(session -> admissions.closeObsoletePermissionsInTransaction(session, current, maximum));
+            control.snapshot(current); requireCurrent(); return complete;
+        }
     }
 
     /** Bounded metadata retirement for an original native deletion. No production preparation or business IO. */

@@ -280,7 +280,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
                 .append("lastMutationId", 1).append("schedulingRevision", 1).append("schedulingCommandId", 1)
                 .append("definition.formatVersion", 1).append("definition.comparison.fingerprint", 1).append("definition.comparison.mappingRevision", 1)
                 .append("definition.comparison.comparisonRulesVersion", 1).append("definition.comparison.pipelineId", 1)
-                .append("definition.keyInputsPresent", 1).append("definition.full.method", 1)).first();
+                .append("definition.keyInputsPresent", 1).append("definition.full.method", 1).append("definition.incremental.firstCheckDelayMillis", 1)).first();
         if (task == null) return null;
         return validateTask(task, start.task());
     }
@@ -315,7 +315,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
                 .append("lastMutationId", 1).append("schedulingRevision", 1).append("schedulingCommandId", 1)
                 .append("definition.formatVersion", 1).append("definition.comparison.fingerprint", 1).append("definition.comparison.mappingRevision", 1)
                 .append("definition.comparison.comparisonRulesVersion", 1).append("definition.comparison.pipelineId", 1)
-                .append("definition.keyInputsPresent", 1).append("definition.full.method", 1);
+                .append("definition.keyInputsPresent", 1).append("definition.full.method", 1).append("definition.incremental.firstCheckDelayMillis", 1);
     }
     private static void validateDefinitionHeader(Document task, long revision) {
         boolean typed = task.containsKey("definition") || task.containsKey("lastMutationId") || task.containsKey("schedulingRevision") || task.containsKey("schedulingCommandId");
@@ -374,6 +374,9 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
 
     /** Recovery seals run rights, while the durable user configuration and its counters remain available. */
     static void requireClosedPipelinePermissions(ClientSession session, MongoDatabase database, String cluster, String pipeline) {
+        requireKnownPipelinePermissions(session, database, cluster, pipeline, null);
+    }
+    private static void requireKnownPipelinePermissions(ClientSession session, MongoDatabase database, String cluster, String pipeline, Long currentOwner) {
         var filter = new Document("_id.clusterId", cluster).append("_id.pipelineId", pipeline);
         int count = 0;
         try (var cursor = SystemCollections.VALIDATION_TASKS.on(database).find(session, filter).projection(taskHeader())
@@ -387,10 +390,40 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
                 validateTask(row, task, true);
                 for (var selected : ValidationMode.values()) {
                     var held = permission(mode(row, selected));
-                    if (held != null && !phase(held).equals("CLOSED")) throw unreadable("original-permission-closure");
+                    if (held != null && !phase(held).equals("CLOSED") && (currentOwner == null
+                            || decodeIdentity(held.get("identity", Document.class)).run().owner().claimGeneration() < currentOwner))
+                        throw unreadable("original-permission-closure");
                 }
             }
         }
+    }
+
+    boolean closeObsoletePermissionsInTransaction(ClientSession session, io.tapstate.core.validation.ValidationOwner current, int maximum) {
+        if (validation == null || validation.closing() || !validation.pipelineId().equals(current.pipelineId())
+                || !clusterId.equals(current.clusterId()) || maximum < 1 || maximum > 20) throw unreadable("obsolete-permission-closure");
+        var filter = new Document("_id.clusterId", clusterId).append("_id.pipelineId", current.pipelineId()).append("$or", java.util.List.of(
+                new Document("modes.full.permission.phase", new Document("$in", java.util.List.of("OPEN", "BORN")))
+                        .append("modes.full.permission.identity.owner.claimGeneration", new Document("$lt", current.claimGeneration())),
+                new Document("modes.incremental.permission.phase", new Document("$in", java.util.List.of("OPEN", "BORN")))
+                        .append("modes.incremental.permission.identity.owner.claimGeneration", new Document("$lt", current.claimGeneration()))));
+        try (var cursor = tasks.find(session, filter).projection(taskHeader()).limit(maximum).iterator()) {
+            while (cursor.hasNext()) {
+                var row = cursor.next(); Task task;
+                try { task = new Task(clusterId, current.pipelineId(), row.get("_id", Document.class).getString("taskId"), java.util.UUID.fromString(row.getString("taskGeneration"))); }
+                catch (NullPointerException | ClassCastException | IllegalArgumentException invalid) { throw unreadable("task"); }
+                validateTask(row, task, true);
+                for (var mode : ValidationMode.values()) {
+                    var held = permission(mode(row, mode));
+                    if (held != null && !phase(held).equals("CLOSED")) {
+                        var start = decodeIdentity(held.get("identity", Document.class));
+                        if (start.run().owner().claimGeneration() < current.claimGeneration()) closeInTransaction(session, start);
+                    }
+                }
+            }
+        }
+        boolean complete = tasks.find(session, filter).projection(new Document("_id", 1)).limit(1).first() == null;
+        if (complete) requireKnownPipelinePermissions(session, database, clusterId, current.pipelineId(), current.claimGeneration());
+        return complete;
     }
     void requireOriginalInTransaction(ClientSession session, Start start, boolean closed) {
         var task = task(session, start); if (task == null) throw unreadable("original-task");
@@ -410,6 +443,22 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         requireReport(report, start);
         if (task.containsKey("definition")) requireSnapshot(report, start);
         if (report.getBoolean("closed")) throw unreadable("original-report-closed");
+    }
+    void requireRunSnapshotInTransaction(ClientSession session, Start start, io.tapstate.core.validation.ValidationRunSpec snapshot) {
+        requireOriginalInTransaction(session, start, false);
+        if (task(session, start).containsKey("definition") && snapshot == null)
+            throw new TapstateException(ValidationError.INVALID_CONTRACT, Map.of("field", "control.specSnapshot"), null);
+        if (snapshot != null) new Open(start, snapshot);
+    }
+    boolean savedDelayInTransaction(ClientSession session, Start start, long revision, java.util.UUID command, long delayMillis) {
+        var task = task(session, start); if (task == null || Boolean.TRUE.equals(task.get("closed"))) return false;
+        var held = matching(mode(task, start.run().mode()), start);
+        if (held == null || !Set.of("OPEN", "BORN").contains(phase(held))) return false;
+        try {
+            var incremental = task.get("definition", Document.class).get("incremental", Document.class);
+            if (!(incremental.get("firstCheckDelayMillis") instanceof Long saved) || saved < 0 || saved > 86_400_000L) throw unreadable("delay-settings");
+            return revision == task.getLong("schedulingRevision") && command.equals(MongoValidationTaskCodec.uuid(task, "schedulingCommandId")) && delayMillis == saved;
+        } catch (NullPointerException | ClassCastException | IllegalArgumentException invalid) { throw unreadable("delay-settings"); }
     }
     private static void requireSnapshot(Document report, Start start) {
         try {

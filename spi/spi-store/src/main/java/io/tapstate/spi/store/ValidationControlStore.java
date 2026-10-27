@@ -7,6 +7,9 @@ import io.tapstate.core.validation.ValidationOwner;
 import io.tapstate.core.validation.ValidationRunState;
 import java.util.Map;
 import java.util.Objects;
+import java.util.List;
+import java.util.Optional;
+import io.tapstate.core.validation.ValidationRunSpec;
 
 /**
  * Minimum CACHE run-control seam over the existing VALIDATION claim. Normal mutations compete with
@@ -17,12 +20,14 @@ import java.util.Objects;
  * an existing owner is reused. Insufficient owner capacity rejects work rather than moving it.
  */
 public interface ValidationControlStore {
-    record Run(ValidationRunIdentity identity, long countingGeneration, ValidationReportAdmission.Start admission) {
-        public Run(ValidationRunIdentity identity, long countingGeneration) { this(identity, countingGeneration, null); }
+    record Run(ValidationRunIdentity identity, long countingGeneration, ValidationReportAdmission.Start admission, ValidationRunSpec snapshot) {
+        public Run(ValidationRunIdentity identity, long countingGeneration) { this(identity, countingGeneration, null, null); }
+        public Run(ValidationRunIdentity identity, long countingGeneration, ValidationReportAdmission.Start admission) { this(identity, countingGeneration, admission, null); }
         public Run {
             Objects.requireNonNull(identity, "identity");
             if (countingGeneration < 1) throw invalid("control.countingGeneration");
             if (admission != null && !identity.equals(admission.run())) throw invalid("control.admission");
+            if (snapshot != null) new ValidationReportAdmission.Open(Objects.requireNonNull(admission), snapshot);
         }
         public WorkloadClaimFence fence() { return ValidationClaims.fence(identity.owner()); }
         public ValidationResultStore.Report report() {
@@ -58,6 +63,57 @@ public interface ValidationControlStore {
     }
     enum Join { JOINED, ALREADY_JOINED, MODE_BUSY, GENERATION_CLOSED }
     enum Mutation { APPLIED, ALREADY_APPLIED, STALE }
+    record Status(Run run, ValidationRunState state, boolean retired) {
+        public Status { Objects.requireNonNull(run); Objects.requireNonNull(state); if (retired && !state.terminal()) throw invalid("control.retiredState"); }
+    }
+    /** Active entries carry bounded control coordinates; read retrieves one full frozen snapshot. No query resumes work. */
+    record Snapshot(ValidationOwner authority, ValidationOwner ledgerOwner, long countingGeneration, boolean closed,
+                    boolean problemLimit, long retainedRuns, List<Status> active) {
+        public Snapshot {
+            Objects.requireNonNull(authority);
+            if (countingGeneration < 0 || retainedRuns < 0 || active == null || active.size() > 128 || retainedRuns < active.size()
+                    || countingGeneration == 0 && ledgerOwner != null || countingGeneration > 0 && ledgerOwner == null
+                    || countingGeneration == 0 && (!closed || problemLimit || retainedRuns != 0 || !active.isEmpty())
+                    || ledgerOwner != null && (!ledgerOwner.clusterId().equals(authority.clusterId()) || !ledgerOwner.pipelineId().equals(authority.pipelineId()))
+                    || problemLimit && !closed) throw invalid("control.snapshot");
+            var slots = new java.util.HashSet<ValidationRunIdentity.ModeSlot>();
+            for (var status : active) {
+                if (status.retired() || status.run().countingGeneration() != countingGeneration || !status.run().identity().owner().equals(ledgerOwner)
+                        || !status.run().identity().owner().clusterId().equals(authority.clusterId())
+                        || !status.run().identity().owner().pipelineId().equals(authority.pipelineId()) || !slots.add(status.run().identity().slot()))
+                    throw invalid("control.snapshotRun");
+            }
+            active = List.copyOf(active);
+        }
+    }
+
+    default Snapshot snapshot(ValidationOwner authority) { throw invalid("control.snapshotUnsupported"); }
+    default Optional<Status> read(ValidationOwner authority, Run original) { throw invalid("control.readUnsupported"); }
+
+    /** Saved intent and runtime confirmation are separate, bounded facts for the original run. */
+    record Delay(Run run, long schedulingRevision, java.util.UUID commandId, long firstCheckDelayMillis) {
+        public Delay {
+            Objects.requireNonNull(run); Objects.requireNonNull(commandId);
+            if (run.identity().mode() != io.tapstate.core.validation.ValidationMode.INCREMENTAL
+                    || schedulingRevision < 1 || schedulingRevision == Long.MAX_VALUE
+                    || firstCheckDelayMillis < 0 || firstCheckDelayMillis > 86_400_000L) throw invalid("control.delay");
+        }
+    }
+    record Delays(Delay requested, Delay applied) {
+        public Delays {
+            if (applied != null && (requested == null || !applied.run().identity().equals(requested.run().identity())
+                    || applied.run().countingGeneration() != requested.run().countingGeneration()
+                    || applied.schedulingRevision() > requested.schedulingRevision()
+                    || applied.schedulingRevision() == requested.schedulingRevision()
+                    && (!applied.commandId().equals(requested.commandId()) || applied.firstCheckDelayMillis() != requested.firstCheckDelayMillis())))
+                throw invalid("control.delays");
+        }
+    }
+    /** Verify the actual saved CONFIG tuple before and after recording intent in CACHE. */
+    default Mutation requestDelay(Delay change) { throw invalid("control.delayUnsupported"); }
+    /** Only the owning live runtime, after applying that exact tuple, may confirm it. */
+    default Mutation acknowledgeDelay(Delay change) { throw invalid("control.delayUnsupported"); }
+    default Delays delays(ValidationOwner authority, Run original) { throw invalid("control.delayUnsupported"); }
 
     /**
      * Atomically join the exact owner/counting generation and task+mode slot, initially STARTING.

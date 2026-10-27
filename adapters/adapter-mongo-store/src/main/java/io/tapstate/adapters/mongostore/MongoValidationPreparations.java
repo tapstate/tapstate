@@ -111,6 +111,17 @@ final class MongoValidationPreparations {
             requireStart(start, closed, false);
         }
         void requireBornStart(io.tapstate.spi.store.ValidationReportAdmission.Start start) { requireStart(start, false, true); }
+        boolean savedDelay(io.tapstate.spi.store.ValidationControlStore.Delay change) {
+            var start = change.run().admission();
+            if (start == null || !pipelineId().equals(start.task().pipelineId()) || !owner().clusterId.equals(start.task().clusterId())) throw fenced();
+            var owner = owner(); var store = new MongoValidationAdmissionStore(owner.client, owner.database, owner.clusterId, owner.active, this);
+            return store.transaction(session -> store.savedDelayInTransaction(session, start, change.schedulingRevision(), change.commandId(), change.firstCheckDelayMillis()));
+        }
+        void requireRunSnapshot(io.tapstate.spi.store.ValidationReportAdmission.Start start, io.tapstate.core.validation.ValidationRunSpec snapshot) {
+            if (start == null || !pipelineId().equals(start.task().pipelineId()) || !owner().clusterId.equals(start.task().clusterId())) throw fenced();
+            var owner = owner(); var store = new MongoValidationAdmissionStore(owner.client, owner.database, owner.clusterId, owner.active, this);
+            store.transaction(session -> { store.requireRunSnapshotInTransaction(session, start, snapshot); return null; });
+        }
         private void requireStart(io.tapstate.spi.store.ValidationReportAdmission.Start start, boolean closed, boolean born) {
             if (start == null || !pipelineId().equals(start.task().pipelineId()) || !owner().clusterId.equals(start.task().clusterId())) throw fenced();
             var owner = owner();

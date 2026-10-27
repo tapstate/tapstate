@@ -205,7 +205,7 @@ class MongoValidationTaskStoreIT {
             assertThat(admissions.open(reserved.start())).isEqualTo(ValidationReportAdmission.Birth.DUPLICATE);
             assertThatThrownBy(() -> new ValidationReportAdmission.Open(reserved.start(), new ValidationRunSpec(current, ValidationMode.FULL, ValidationMethod.COUNT)))
                     .isInstanceOf(TapstateException.class);
-            var controls = reserved.access().control(); var run = new ValidationControlStore.Run(reserved.start().run(), 1, reserved.start());
+            var controls = reserved.access().control(); var run = new ValidationControlStore.Run(reserved.start().run(), 1, reserved.start(), expected);
             assertThat(controls.join(run)).isEqualTo(ValidationControlStore.Join.JOINED);
             reports.updateOne(id, new Document("$unset", new Document("specSnapshot", "")));
             assertThatThrownBy(() -> controls.transition(new ValidationControlStore.Transition(run, ValidationRunState.STARTING, ValidationRunState.RUNNING)))
@@ -296,6 +296,206 @@ class MongoValidationTaskStoreIT {
         }
     }
 
+    @Test void aTypedRunMissingItsSnapshotCannotBeReadAsLegacyUnknownMetadata() {
+        try (var f = new Fixture()) {
+            var create = f.create("flow"); f.tasks.create(create); var reserved = f.reserve(f.read(create.task()), "missing-description");
+            var spec = new ValidationRunSpec(create.comparison(), ValidationMode.FULL, ValidationMethod.COUNT);
+            var run = new ValidationControlStore.Run(reserved.start().run(), 1, reserved.start(), spec); var control = reserved.access().control();
+            control.join(run);
+            SystemCollections.VALIDATION_RUNS.on(f.cacheDb).updateOne(new Document("_id", MongoValidationControlStore.runId(run)),
+                    new Document("$unset", new Document("specSnapshot", "")));
+            var coordinates = new ValidationControlStore.Run(run.identity(), 1, run.admission());
+            assertThatThrownBy(() -> control.read(run.identity().owner(), coordinates)).isInstanceOf(TapstateException.class);
+            assertThat(control.snapshot(run.identity().owner()).active()).hasSize(1);
+            f.tasks.close(create.task());
+            assertThat(control.transition(new ValidationControlStore.Transition(coordinates, ValidationRunState.STARTING, ValidationRunState.STOPPING))).isEqualTo(ValidationControlStore.Mutation.APPLIED);
+            assertThat(control.transition(new ValidationControlStore.Transition(coordinates, ValidationRunState.STOPPING, ValidationRunState.STOPPED))).isEqualTo(ValidationControlStore.Mutation.APPLIED);
+            assertThat(control.retire(new ValidationControlStore.Retirement(coordinates, coordinates.report(), ValidationRunState.STOPPED))).isEqualTo(ValidationControlStore.Mutation.APPLIED);
+        }
+    }
+
+    @Test void hotDelayKeepsSavedIntentSeparateFromExactRunningAcknowledgment() {
+        try (var f = new Fixture()) {
+            var create = f.create(f.denseComparison("flow", 1)); f.tasks.create(create);
+            var saved = f.read(create.task()); var reserved = f.reserve(saved, "incremental", ValidationMode.INCREMENTAL);
+            var spec = new ValidationRunSpec(create.comparison(), ValidationMode.INCREMENTAL, ValidationMethod.FULL_COLUMN);
+            var run = new ValidationControlStore.Run(reserved.start().run(), 1, reserved.start(), spec); var control = reserved.access().control();
+            assertThat(control.join(run)).isEqualTo(ValidationControlStore.Join.JOINED);
+            var first = new ValidationControlStore.Delay(run, saved.schedulingRevision(), saved.schedulingCommandId(), 1_000);
+            assertThat(control.requestDelay(first)).isEqualTo(ValidationControlStore.Mutation.APPLIED);
+            assertThat(control.delays(run.identity().owner(), run).requested().schedulingRevision()).isOne();
+            assertThat(control.delays(run.identity().owner(), run).applied()).isNull();
+            assertThat(control.acknowledgeDelay(first)).isEqualTo(ValidationControlStore.Mutation.STALE);
+            reserved.access().admissions().open(new ValidationReportAdmission.Open(run.admission(), spec));
+            control.transition(new ValidationControlStore.Transition(run, ValidationRunState.STARTING, ValidationRunState.RUNNING));
+            assertThat(control.acknowledgeDelay(first)).isEqualTo(ValidationControlStore.Mutation.APPLIED);
+            assertThat(control.acknowledgeDelay(first)).isEqualTo(ValidationControlStore.Mutation.ALREADY_APPLIED);
+            assertThat(control.requestDelay(first)).isEqualTo(ValidationControlStore.Mutation.ALREADY_APPLIED);
+            var edit = new Update(create.task(), 1, create.comparison(), Settings.defaults(ValidationMethod.COUNT, 2_000), UUID.randomUUID());
+            assertThat(f.tasks.update(edit)).isEqualTo(Write.APPLIED);
+            var second = new ValidationControlStore.Delay(run, 2, edit.commandId(), 2_000);
+            assertThat(control.acknowledgeDelay(second)).isEqualTo(ValidationControlStore.Mutation.STALE);
+            assertThat(control.requestDelay(second)).isEqualTo(ValidationControlStore.Mutation.APPLIED);
+            var pending = control.delays(run.identity().owner(), run);
+            assertThat(pending.requested().schedulingRevision()).isEqualTo(2); assertThat(pending.applied().schedulingRevision()).isOne();
+            assertThat(control.requestDelay(first)).isEqualTo(ValidationControlStore.Mutation.STALE);
+            assertThat(control.acknowledgeDelay(first)).isEqualTo(ValidationControlStore.Mutation.STALE);
+            assertThat(control.requestDelay(new ValidationControlStore.Delay(run, 2, UUID.randomUUID(), 2_000))).isEqualTo(ValidationControlStore.Mutation.STALE);
+            assertThat(control.requestDelay(new ValidationControlStore.Delay(run, 2, edit.commandId(), 3_000))).isEqualTo(ValidationControlStore.Mutation.STALE);
+            assertThat(control.acknowledgeDelay(second)).isEqualTo(ValidationControlStore.Mutation.APPLIED);
+            control.transition(new ValidationControlStore.Transition(run, ValidationRunState.RUNNING, ValidationRunState.STOPPING));
+            assertThat(control.acknowledgeDelay(second)).isEqualTo(ValidationControlStore.Mutation.STALE);
+            assertThat(control.requestDelay(second)).isEqualTo(ValidationControlStore.Mutation.STALE);
+            assertThat(f.tasks.close(create.task())).isEqualTo(ValidationReportAdmission.Closure.CLOSED);
+            assertThat(control.requestDelay(second)).isEqualTo(ValidationControlStore.Mutation.STALE);
+            assertThat(control.delays(run.identity().owner(), run).applied().schedulingRevision()).isEqualTo(2);
+        }
+    }
+
+    @Test void aCommittedDelayOperationReportsUnknownWhenConfigurationChangesBeforeItsReply() throws Exception {
+        for (boolean acknowledge : List.of(false, true)) {
+            try (var f = new Fixture(); var workers = Executors.newFixedThreadPool(1)) {
+                var create = f.create(f.denseComparison("flow", 1)); f.tasks.create(create);
+                var saved = f.read(create.task()); var reserved = f.reserve(saved, "delay-reply", ValidationMode.INCREMENTAL);
+                var spec = new ValidationRunSpec(create.comparison(), ValidationMode.INCREMENTAL, ValidationMethod.FULL_COLUMN);
+                var run = new ValidationControlStore.Run(reserved.start().run(), 1, reserved.start(), spec); var ordinary = reserved.access().control();
+                ordinary.join(run); reserved.access().admissions().open(new ValidationReportAdmission.Open(run.admission(), spec));
+                ordinary.transition(new ValidationControlStore.Transition(run, ValidationRunState.STARTING, ValidationRunState.RUNNING));
+                var change = new ValidationControlStore.Delay(run, 1, saved.schedulingCommandId(), 1_000);
+                if (acknowledge) ordinary.requestDelay(change);
+                var committed = new CountDownLatch(1); var releaseReply = new CountDownLatch(1); var once = new java.util.concurrent.atomic.AtomicBoolean(true);
+                var listener = new com.mongodb.event.CommandListener() {
+                    @Override public void commandSucceeded(com.mongodb.event.CommandSucceededEvent event) {
+                        if (!event.getCommandName().equals("commitTransaction") || !once.compareAndSet(true, false)) return;
+                        committed.countDown();
+                        try { if (!releaseReply.await(15, TimeUnit.SECONDS)) throw new AssertionError("test reply gate timed out"); }
+                        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new AssertionError(interrupted); }
+                    }
+                };
+                var clientSettings = com.mongodb.MongoClientSettings.builder().applyConnectionString(new com.mongodb.ConnectionString(CACHE.getReplicaSetUrl(f.cacheDb.getName())))
+                        .addCommandListener(listener).build();
+                try (var cacheClient = MongoClients.create(clientSettings)) {
+                    var permission = f.configuration.validationPreparations().issue("flow", f.scope);
+                    var intercepted = new MongoValidationControlStore(cacheClient, cacheClient.getDatabase(f.cacheDb.getName()), f.scope, () -> {},
+                            new MongoValidationPreparations.Authority(permission));
+                    var operation = workers.submit(() -> acknowledge ? intercepted.acknowledgeDelay(change) : intercepted.requestDelay(change));
+                    try {
+                        assertThat(committed.await(10, TimeUnit.SECONDS)).isTrue();
+                        assertThat(f.tasks.update(new Update(create.task(), 1, create.comparison(), Settings.defaults(ValidationMethod.COUNT, 2_000), UUID.randomUUID()))).isEqualTo(Write.APPLIED);
+                    } finally { releaseReply.countDown(); }
+                    assertThatThrownBy(() -> operation.get(10, TimeUnit.SECONDS)).isInstanceOf(java.util.concurrent.ExecutionException.class)
+                            .hasCauseInstanceOf(TapstateException.class).hasStackTraceContaining("delay-saved-changed");
+                    var original = ordinary.delays(run.identity().owner(), run); assertThat(original.requested().schedulingRevision()).isOne();
+                    if (acknowledge) assertThat(original.applied().schedulingRevision()).isOne(); else assertThat(original.applied()).isNull();
+                    assertThat(f.read(create.task()).schedulingRevision()).isEqualTo(2);
+                }
+            }
+        }
+    }
+
+    @Test void malformedDelayFactsAreDiagnosedButNeverBlockOriginalRunClosure() {
+        try (var f = new Fixture()) {
+            var create = f.create(f.denseComparison("flow", 1)); f.tasks.create(create); var saved = f.read(create.task());
+            var reserved = f.reserve(saved, "delay-corruption", ValidationMode.INCREMENTAL);
+            var spec = new ValidationRunSpec(create.comparison(), ValidationMode.INCREMENTAL, ValidationMethod.FULL_COLUMN);
+            var run = new ValidationControlStore.Run(reserved.start().run(), 1, reserved.start(), spec); var control = reserved.access().control();
+            control.join(run); var change = new ValidationControlStore.Delay(run, 1, saved.schedulingCommandId(), 1_000); control.requestDelay(change);
+            var rows = SystemCollections.VALIDATION_RUNS.on(f.cacheDb); var id = new Document("_id", MongoValidationControlStore.runId(run));
+            var correct = rows.find(id).first().get("delayRequested", Document.class);
+            for (var bad : List.of(new Document(correct).append("formatVersion", null), new Document(correct).append("commandId", "bad"),
+                    new Document(correct).append("schedulingRevision", 0L), new Document(correct).append("extra", true))) {
+                rows.updateOne(id, new Document("$set", new Document("delayRequested", bad)));
+                assertThatThrownBy(() -> control.delays(run.identity().owner(), run)).isInstanceOf(TapstateException.class).hasMessageContaining("delay-facts");
+                assertThatThrownBy(() -> control.requestDelay(change)).isInstanceOf(TapstateException.class).hasMessageContaining("delay-facts");
+            }
+            f.tasks.close(create.task());
+            control.transition(new ValidationControlStore.Transition(run, ValidationRunState.STARTING, ValidationRunState.STOPPING));
+            control.transition(new ValidationControlStore.Transition(run, ValidationRunState.STOPPING, ValidationRunState.STOPPED));
+            assertThat(control.retire(new ValidationControlStore.Retirement(run, run.report(), ValidationRunState.STOPPED))).isEqualTo(ValidationControlStore.Mutation.APPLIED);
+        }
+    }
+
+    @Test void cacheQueriesKeepTheOriginalRunSnapshotAndExposeRetirementWithoutResumingIt() {
+        try (var f = new Fixture()) {
+            var create = f.create("flow"); f.tasks.create(create); var reserved = f.reserve(f.read(create.task()), "queried");
+            var spec = new ValidationRunSpec(create.comparison(), ValidationMode.FULL, ValidationMethod.COUNT);
+            var run = new ValidationControlStore.Run(reserved.start().run(), 1, reserved.start(), spec); var owner = run.identity().owner();
+            var control = reserved.access().control(); var empty = control.snapshot(owner);
+            assertThat(empty.countingGeneration()).isZero(); assertThat(empty.active()).isEmpty();
+            assertThatThrownBy(() -> control.join(new ValidationControlStore.Run(run.identity(), 1, run.admission())))
+                    .isInstanceOf(TapstateException.class).hasMessageContaining("control.specSnapshot");
+            assertThat(control.join(run)).isEqualTo(ValidationControlStore.Join.JOINED);
+            assertThat(reserved.access().admissions().open(new ValidationReportAdmission.Open(run.admission(), spec))).isEqualTo(ValidationReportAdmission.Birth.CREATED);
+            var starting = control.snapshot(owner); assertThat(starting.ledgerOwner()).isEqualTo(owner); assertThat(starting.active()).hasSize(1);
+            assertThat(starting.active().getFirst().run().snapshot()).isNull(); assertThat(starting.active().getFirst().run().identity()).isEqualTo(run.identity());
+            assertThat(starting.active().getFirst().state()).isEqualTo(ValidationRunState.STARTING);
+            var coordinates = new ValidationControlStore.Run(run.identity(), 1, run.admission());
+            assertThat(control.read(owner, coordinates).orElseThrow().run().snapshot()).isEqualTo(spec);
+            assertThat(control.transition(new ValidationControlStore.Transition(run, ValidationRunState.STARTING, ValidationRunState.RUNNING))).isEqualTo(ValidationControlStore.Mutation.APPLIED);
+            assertThat(control.read(owner, run).orElseThrow().state()).isEqualTo(ValidationRunState.RUNNING);
+            assertThat(f.tasks.update(new Update(create.task(), 1, create.comparison(), Settings.defaults(ValidationMethod.COUNT, 2_000), UUID.randomUUID()))).isEqualTo(Write.APPLIED);
+            assertThat(control.read(owner, run).orElseThrow().run().snapshot()).isEqualTo(spec);
+            assertThat(f.tasks.close(create.task())).isEqualTo(ValidationReportAdmission.Closure.CLOSED);
+            assertThat(control.transition(new ValidationControlStore.Transition(coordinates, ValidationRunState.RUNNING, ValidationRunState.STOPPING))).isEqualTo(ValidationControlStore.Mutation.APPLIED);
+            assertThat(control.transition(new ValidationControlStore.Transition(coordinates, ValidationRunState.STOPPING, ValidationRunState.STOPPED))).isEqualTo(ValidationControlStore.Mutation.APPLIED);
+            assertThat(control.retire(new ValidationControlStore.Retirement(coordinates, run.report(), ValidationRunState.STOPPED))).isEqualTo(ValidationControlStore.Mutation.APPLIED);
+            assertThat(control.read(owner, coordinates).orElseThrow()).isEqualTo(new ValidationControlStore.Status(run, ValidationRunState.STOPPED, true));
+            var stopped = control.snapshot(owner); assertThat(stopped.closed()).isTrue(); assertThat(stopped.active()).isEmpty(); assertThat(stopped.retainedRuns()).isOne();
+            SystemCollections.VALIDATION_RUNS.on(f.cacheDb).updateOne(new Document("_id", MongoValidationControlStore.runId(run)),
+                    new Document("$unset", new Document("formatVersion", "")));
+            assertThatThrownBy(() -> control.read(owner, coordinates)).isInstanceOf(TapstateException.class);
+            SystemCollections.VALIDATION_RUNS.on(f.cacheDb).updateOne(new Document("_id", MongoValidationControlStore.runId(run)),
+                    new Document("$set", new Document("formatVersion", null)));
+            assertThatThrownBy(() -> control.read(owner, coordinates)).isInstanceOf(TapstateException.class);
+        }
+    }
+
+    @Test void successorClosesOnlyObsoleteRightsAndTerminatesOldMetadataBeforeAdmittingANewRun() {
+        try (var f = new Fixture()) {
+            var create = f.create("flow"); f.tasks.create(create); var reserved = f.reserve(f.read(create.task()), "obsolete");
+            var spec = new ValidationRunSpec(create.comparison(), ValidationMode.FULL, ValidationMethod.COUNT);
+            var old = new ValidationControlStore.Run(reserved.start().run(), 1, reserved.start(), spec); var oldOwner = old.identity().owner();
+            var control = reserved.access().control(); assertThat(control.join(old)).isEqualTo(ValidationControlStore.Join.JOINED);
+            reserved.access().admissions().open(new ValidationReportAdmission.Open(old.admission(), spec));
+            var orphan = f.create("flow"); f.tasks.create(orphan);
+            var orphanIdentity = new ValidationRunIdentity(oldOwner, orphan.task().taskId(), "orphan", ValidationMode.FULL, spec.fingerprint(), 1, "rules-v1");
+            var orphanStart = new ValidationReportAdmission.Start(orphan.task(), 1, 1, UUID.randomUUID().toString(), orphanIdentity);
+            assertThat(reserved.access().admissions().reserve(orphanStart)).isEqualTo(ValidationReportAdmission.Reservation.RESERVED);
+            var oldClaims = reserved.access().claims(); var key = ValidationClaims.key("cluster", "flow");
+            var oldClaim = oldClaims.read(key).orElseThrow().claim(); assertThat(oldClaims.release(oldClaim)).isTrue();
+            var node = f.cache.workloadClaims(f.scope).acquire(new WorkloadClaimKey("cluster", WorkloadClaimType.NODE_SESSION, "successor-node"),
+                    new WorkloadOwner("successor-node", "successor-boot"), 1, TTL).claim();
+            var successor = f.configuration.prepareValidationAccess("flow", f.scope, f.cache, WorkloadClaimFence.from(node), () -> {});
+            var claims = successor.claims(); var acquired = claims.acquire(key, node.owner(), 1, TTL).claim();
+            var executing = claims.advanceExecution(acquired, 1, Set.of(node.owner().nodeId())).orElseThrow(); var owner = ValidationClaims.owner("flow", executing);
+            assertThat(owner.claimGeneration()).isGreaterThan(oldOwner.claimGeneration());
+            var current = successor.control(); assertThat(current.snapshot(owner).ledgerOwner()).isEqualTo(oldOwner);
+            assertThat(successor.closeObsoletePermissions(owner, 20)).isTrue();
+            assertThat(f.read(create.task()).closed()).isFalse(); assertThat(f.read(create.task()).full().permission().phase()).isEqualTo(Phase.CLOSED);
+            assertThat(f.read(orphan.task()).closed()).isFalse(); assertThat(f.read(orphan.task()).full().permission().phase()).isEqualTo(Phase.CLOSED);
+            var obsoleteId = new Document("_id", MongoValidationControlStore.runId(old));
+            SystemCollections.VALIDATION_RUNS.on(f.cacheDb).updateOne(obsoleteId,
+                    new Document("$set", new Document("specSnapshot", new Document("formatVersion", 999))));
+            assertThatThrownBy(() -> current.read(owner, old)).isInstanceOf(TapstateException.class);
+            assertThatCode(() -> assertThat(current.terminateLostOwner(new ValidationControlStore.LostOwner(owner,
+                    new ValidationControlStore.Run(old.identity(), 1, old.admission()), old.report()))).isEqualTo(ValidationControlStore.Mutation.APPLIED))
+                    .doesNotThrowAnyException();
+            assertThat(SystemCollections.VALIDATION_RUNS.on(f.cacheDb).find(obsoleteId).first()).containsEntry("state", "FAILED").containsEntry("retired", true);
+            assertThatThrownBy(() -> current.read(owner, old)).isInstanceOf(TapstateException.class);
+            assertThat(current.snapshot(owner).active()).isEmpty();
+            var identity = new ValidationRunIdentity(owner, create.task().taskId(), "fresh", ValidationMode.FULL, spec.fingerprint(), 1, "rules-v1");
+            var start = new ValidationReportAdmission.Start(create.task(), 1, 2, UUID.randomUUID().toString(), identity);
+            assertThat(successor.admissions().reserve(start)).isEqualTo(ValidationReportAdmission.Reservation.RESERVED);
+            var next = new ValidationControlStore.Run(identity, 2, start, spec); assertThat(current.join(next)).isEqualTo(ValidationControlStore.Join.JOINED);
+            assertThat(successor.closeObsoletePermissions(owner, 20)).isTrue();
+            assertThat(f.read(create.task()).full().permission().start()).isEqualTo(start); assertThat(f.read(create.task()).full().permission().phase()).isEqualTo(Phase.OPEN);
+            assertThatThrownBy(() -> reserved.access().closeObsoletePermissions(oldOwner, 20)).isInstanceOf(TapstateException.class);
+            assertThat(f.read(create.task()).full().permission().start()).isEqualTo(start);
+            assertThat(successor.admissions().open(new ValidationReportAdmission.Open(start, spec))).isEqualTo(ValidationReportAdmission.Birth.CREATED);
+            assertThat(current.snapshot(owner).active()).hasSize(1);
+        }
+    }
+
     private static boolean capacityCreate(ValidationTaskStore tasks, Create request, String limit) {
         try { assertThat(tasks.create(request)).isEqualTo(Write.APPLIED); return true; }
         catch (TapstateException refusal) {
@@ -349,14 +549,17 @@ class MongoValidationTaskStoreIT {
         Document document(ValidationReportAdmission.Task task) { return collection().find(new Document("_id", MongoValidationAdmissionStore.taskId(task))).first(); }
         com.mongodb.client.MongoCollection<Document> collection() { return SystemCollections.VALIDATION_TASKS.on(configDb); }
         Reserved reserve(Snapshot snapshot, String runId) {
+            return reserve(snapshot, runId, ValidationMode.FULL);
+        }
+        Reserved reserve(Snapshot snapshot, String runId, ValidationMode mode) {
             var node = cache.workloadClaims(scope).acquire(new WorkloadClaimKey("cluster", WorkloadClaimType.NODE_SESSION, "node"), new WorkloadOwner("node", "boot"), 1, TTL).claim();
             var access = configuration.prepareValidationAccess(snapshot.task().pipelineId(), scope, cache, WorkloadClaimFence.from(node), () -> {});
             var claims = access.claims(); var acquired = claims.acquire(ValidationClaims.key("cluster", snapshot.task().pipelineId()), node.owner(), 1, TTL).claim();
             var claim = claims.advanceExecution(acquired, 1, Set.of(node.owner().nodeId())).orElseThrow();
-            var spec = new ValidationRunSpec(snapshot.comparison(), ValidationMode.FULL, snapshot.settings().full().method());
+            var spec = new ValidationRunSpec(snapshot.comparison(), mode, mode == ValidationMode.FULL ? snapshot.settings().full().method() : ValidationMethod.FULL_COLUMN);
             var identity = new ValidationRunIdentity(ValidationClaims.owner(snapshot.task().pipelineId(), claim), snapshot.task().taskId(), runId, spec.mode(), spec.fingerprint(),
                     snapshot.comparison().mappingRevision(), snapshot.comparison().comparisonRulesVersion());
-            var start = new ValidationReportAdmission.Start(snapshot.task(), snapshot.revision(), snapshot.full().nextStartSequence(), UUID.randomUUID().toString(), identity);
+            var start = new ValidationReportAdmission.Start(snapshot.task(), snapshot.revision(), mode == ValidationMode.FULL ? snapshot.full().nextStartSequence() : snapshot.incremental().nextStartSequence(), UUID.randomUUID().toString(), identity);
             assertThat(access.admissions().reserve(start)).isEqualTo(ValidationReportAdmission.Reservation.RESERVED); return new Reserved(access, start);
         }
         @Override public void close() { try { configDb.drop(); cacheDb.drop(); } finally { configuration.close(); cache.close(); configClient.close(); cacheClient.close(); } }

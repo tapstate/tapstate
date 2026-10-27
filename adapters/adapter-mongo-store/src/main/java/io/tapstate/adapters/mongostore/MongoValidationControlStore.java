@@ -48,6 +48,7 @@ final class MongoValidationControlStore implements ValidationControlStore {
 
     @Override public Join join(Run run) {
         Objects.requireNonNull(run);
+        if (validation != null) validation.requireRunSnapshot(run.admission(), run.snapshot());
         requireAdmission(run, false);
         var joined = transaction(run.identity().owner(), true, session -> {
             var control = control(session, run.identity().owner().pipelineId());
@@ -78,21 +79,114 @@ final class MongoValidationControlStore implements ValidationControlStore {
             if (slots.size() == MAX_ACTIVE_RUNS || control.getLong("retainedRuns") == MAX_RETAINED_RUNS) throw limit();
             slots.put(key, runId(run)); control.put("retainedRuns", control.getLong("retainedRuns") + 1);
             writeControl(session, control);
-            var record = new Document("_id", runId(run)).append("formatVersion", validation == null ? 1 : 2).append("scope", scope(scope))
+            var record = new Document("_id", runId(run)).append("formatVersion", validation == null ? 1 : run.snapshot() == null ? 2 : 3).append("scope", scope(scope))
                     .append("identity", identity(run)).append("state", ValidationRunState.STARTING.name()).append("retired", false);
             if (validation != null) record.append("validationSubject", MongoValidationPreparationFacts.encode(validation.subject()));
             if (validation != null) record.append("admission", MongoValidationAdmissionStore.identity(run.admission()));
+            if (run.snapshot() != null) record.append("specSnapshot", MongoValidationTaskCodec.run(run.snapshot()));
+            bounded(record, 512 * 1024);
             rows.insertOne(session, record);
             return Join.JOINED;
         });
-        requireAdmission(run, false); return joined;
+        requireAdmission(run, false);
+        if (validation != null) validation.requireRunSnapshot(run.admission(), run.snapshot());
+        return joined;
+    }
+
+    @Override public Snapshot snapshot(ValidationOwner authority) {
+        Objects.requireNonNull(authority);
+        return transaction(authority, false, session -> {
+            var control = control(session, authority.pipelineId()); var active = new ArrayList<Status>();
+            for (var id : slots(control).values()) {
+                var row = rows.find(session, new Document("_id", id)).projection(controlHeader()).first(); if (row == null) throw unreadable("missing-slot-run");
+                var run = decodeRun(row); requireRow(row, run, false);
+                if (!current(control, run) || row.getBoolean("retired")) throw unreadable("slot-owner");
+                active.add(new Status(run, state(row), false));
+            }
+            var ledger = control.get("owner", Document.class);
+            return new Snapshot(authority, ledger == null ? null : owner(ledger, authority.pipelineId()), control.getLong("countingGeneration"),
+                    control.getBoolean("closed"), control.getBoolean("problemLimit"), control.getLong("retainedRuns"), active);
+        });
+    }
+
+    @Override public Optional<Status> read(ValidationOwner authority, Run original) {
+        Objects.requireNonNull(authority); Objects.requireNonNull(original);
+        if (!authority.clusterId().equals(original.identity().owner().clusterId()) || !authority.pipelineId().equals(original.identity().owner().pipelineId())) throw fenced();
+        return transaction(authority, false, session -> {
+            control(session, authority.pipelineId()); var row = row(session, original);
+            return row == null ? Optional.empty() : Optional.of(new Status(decodeRun(row), state(row), row.getBoolean("retired")));
+        });
+    }
+
+    @Override public Mutation requestDelay(Delay change) { return changeDelay(change, false); }
+    @Override public Mutation acknowledgeDelay(Delay change) { return changeDelay(change, true); }
+
+    private Mutation changeDelay(Delay change, boolean acknowledge) {
+        Objects.requireNonNull(change);
+        if (validation == null) throw new TapstateException(ValidationError.INVALID_CONTRACT, Map.of("field", "control.nativeDelay"), null);
+        if (!validation.savedDelay(change)) return Mutation.STALE;
+        var run = change.run();
+        var result = transaction(run.identity().owner(), true, session -> {
+            var control = control(session, run.identity().owner().pipelineId());
+            var row = rows.find(session, new Document("_id", runId(run))).first();
+            if (row == null) return Mutation.STALE;
+            requireRow(row, run, false);
+            if (row.getBoolean("retired") || control.getBoolean("closed") || !current(control, run) || !slot(control, run)
+                    || state(row) != ValidationRunState.RUNNING && (acknowledge || state(row) != ValidationRunState.STARTING)) return Mutation.STALE;
+            var current = decodeDelays(row, run);
+            if (acknowledge) {
+                if (!sameDelay(current.requested(), change)) return Mutation.STALE;
+                if (sameDelay(current.applied(), change)) return Mutation.ALREADY_APPLIED;
+            } else if (current.requested() != null) {
+                if (current.requested().schedulingRevision() > change.schedulingRevision()) return Mutation.STALE;
+                if (current.requested().schedulingRevision() == change.schedulingRevision())
+                    return sameDelay(current.requested(), change) ? Mutation.ALREADY_APPLIED : Mutation.STALE;
+            }
+            String field = acknowledge ? "delayApplied" : "delayRequested";
+            var values = new Document(field, encodeDelay(change)); var next = new Document(row); next.putAll(values); bounded(next, 512 * 1024);
+            writeControl(session, control); updateRun(session, run, row, values); return Mutation.APPLIED;
+        });
+        // CONFIG may change after the CACHE commit. Such a response is unknown for this original
+        // operation, never an acknowledgment that the runtime still uses the latest saved value.
+        if (result != Mutation.STALE && !validation.savedDelay(change)) throw unreadable("delay-saved-changed");
+        return result;
+    }
+
+    @Override public Delays delays(ValidationOwner authority, Run original) {
+        Objects.requireNonNull(authority); Objects.requireNonNull(original);
+        if (!authority.clusterId().equals(original.identity().owner().clusterId()) || !authority.pipelineId().equals(original.identity().owner().pipelineId())) throw fenced();
+        return transaction(authority, false, session -> {
+            control(session, authority.pipelineId()); var row = row(session, original, false);
+            if (row == null) throw unreadable("delay-original-run");
+            return decodeDelays(row, new Run(original.identity(), original.countingGeneration(), original.admission()));
+        });
+    }
+
+    private static boolean sameDelay(Delay one, Delay two) {
+        return one != null && one.schedulingRevision() == two.schedulingRevision() && one.commandId().equals(two.commandId())
+                && one.firstCheckDelayMillis() == two.firstCheckDelayMillis();
+    }
+    private static Document encodeDelay(Delay change) {
+        return new Document("formatVersion", 1).append("schedulingRevision", change.schedulingRevision())
+                .append("commandId", change.commandId().toString()).append("firstCheckDelayMillis", change.firstCheckDelayMillis());
+    }
+    private static Delays decodeDelays(Document row, Run run) {
+        try { return new Delays(decodeDelay(row, "delayRequested", run), decodeDelay(row, "delayApplied", run)); }
+        catch (NullPointerException | ClassCastException | IllegalArgumentException | TapstateException invalid) { throw unreadable("delay-facts"); }
+    }
+    private static Delay decodeDelay(Document row, String field, Run run) {
+        if (!row.containsKey(field)) return null;
+        var value = row.get(field, Document.class);
+        if (!value.keySet().equals(Set.of("formatVersion", "schedulingRevision", "commandId", "firstCheckDelayMillis"))
+                || !Integer.valueOf(1).equals(value.get("formatVersion"))) throw unreadable("delay-facts");
+        return new Delay(run, value.getLong("schedulingRevision"), MongoValidationTaskCodec.uuid(value, "commandId"), value.getLong("firstCheckDelayMillis"));
     }
 
     @Override public Mutation transition(Transition command) {
         Objects.requireNonNull(command); var run = command.run();
         requireTransitionAdmission(command);
         var changed = transaction(run.identity().owner(), command.next() == ValidationRunState.RUNNING, session -> {
-            var control = control(session, run.identity().owner().pipelineId()); var row = row(session, run);
+            var control = control(session, run.identity().owner().pipelineId()); var row = row(session, run, command.next() == ValidationRunState.RUNNING);
             if (row == null || row.getBoolean("retired") || !current(control, run) || !slot(control, run)) return Mutation.STALE;
             var current = state(row);
             if (current == command.next()) return Mutation.ALREADY_APPLIED;
@@ -107,21 +201,21 @@ final class MongoValidationControlStore implements ValidationControlStore {
 
     private void requireTransitionAdmission(Transition command) {
         if (command.next() == ValidationRunState.RUNNING) {
-            if (validation != null) validation.requireBornStart(command.run().admission());
+            if (validation != null) { validation.requireRunSnapshot(command.run().admission(), command.run().snapshot()); validation.requireBornStart(command.run().admission()); }
         } else if (command.next().terminal()) requireAdmission(command.run(), true);
     }
 
     @Override public Mutation latchProblemLimit(Run run) {
         Objects.requireNonNull(run);
         return transaction(run.identity().owner(), false, session -> {
-            var control = control(session, run.identity().owner().pipelineId()); var target = row(session, run);
+            var control = control(session, run.identity().owner().pipelineId()); var target = row(session, run, false);
             if (target == null || target.getBoolean("retired") || !current(control, run) || !slot(control, run)) return Mutation.STALE;
             if (control.getBoolean("problemLimit")) return Mutation.ALREADY_APPLIED;
             if (state(target).terminal()) return Mutation.STALE;
             for (var id : slots(control).values()) {
-                var held = rows.find(session, new Document("_id", id)).first();
+                var held = rows.find(session, new Document("_id", id)).projection(controlHeader()).first();
                 if (held == null) throw unreadable("missing-slot-run");
-                var member = decodeRun(held); requireRow(held, member);
+                var member = decodeRun(held); requireRow(held, member, false);
                 if (!current(control, member) || held.getBoolean("retired")) throw unreadable("slot-owner");
                 var state = state(held);
                 if (state == ValidationRunState.STARTING || state == ValidationRunState.RUNNING)
@@ -136,7 +230,7 @@ final class MongoValidationControlStore implements ValidationControlStore {
         Objects.requireNonNull(command); var run = command.run();
         requireAdmission(run, true);
         var retired = transaction(run.identity().owner(), false, session -> {
-            var control = control(session, run.identity().owner().pipelineId()); var row = row(session, run);
+            var control = control(session, run.identity().owner().pipelineId()); var row = row(session, run, false);
             if (row == null || !current(control, run) || state(row) != command.terminal()) return Mutation.STALE;
             if (row.getBoolean("retired")) return Mutation.ALREADY_APPLIED;
             if (!slot(control, run)) throw unreadable("missing-retirement-slot");
@@ -150,7 +244,7 @@ final class MongoValidationControlStore implements ValidationControlStore {
         Objects.requireNonNull(command); var obsolete = command.obsolete();
         requireAdmission(obsolete, true);
         var retired = transaction(command.authority(), false, session -> {
-            var control = control(session, command.authority().pipelineId()); var row = row(session, obsolete);
+            var control = control(session, command.authority().pipelineId()); var row = row(session, obsolete, false);
             if (row == null) return Mutation.STALE;
             if (row.getBoolean("retired")) return Mutation.ALREADY_APPLIED;
             if (!slot(control, obsolete) || !current(control, obsolete)) throw unreadable("obsolete-slot");
@@ -331,32 +425,44 @@ final class MongoValidationControlStore implements ValidationControlStore {
     }
     static void validateIndependentSlots(ClientSession session, MongoDatabase database, Document control, CacheBusinessScope scope, Document subject) {
         for (var id : slots(control).values()) {
-            var row = SystemCollections.VALIDATION_RUNS.on(database).find(session, new Document("_id", id)).first();
+            var row = SystemCollections.VALIDATION_RUNS.on(database).find(session, new Document("_id", id)).projection(controlHeader()).first();
             if (row == null) throw unreadable("missing-slot-run");
             var run = decodeRun(row);
-            if (!runId(run).equals(row.get("_id")) || !Integer.valueOf(2).equals(row.get("formatVersion"))
+            if (!runId(run).equals(row.get("_id")) || !nativeRunVersion(row.get("formatVersion"))
                     || !scope(scope).equals(row.get("scope")) || !subject.equals(row.get("validationSubject"))
                     || !Boolean.FALSE.equals(row.get("retired")) || !current(control, run)) throw unreadable("slot-run");
             state(row);
         }
     }
     private Document row(ClientSession session, Run run) {
-        var row = rows.find(session, new Document("_id", runId(run))).first(); if (row != null) requireRow(row, run); return row;
+        return row(session, run, true);
+    }
+    private Document row(ClientSession session, Run run, boolean description) {
+        var query = rows.find(session, new Document("_id", runId(run))); if (!description) query = query.projection(controlHeader());
+        var row = query.first(); if (row != null) requireRow(row, run, description); return row;
     }
     private void requireRow(Document row, Run run) {
-        if (!runId(run).equals(row.get("_id")) || !Integer.valueOf(validation == null ? 1 : 2).equals(row.get("formatVersion")) || !scope(scope).equals(row.get("scope"))
+        requireRow(row, run, true);
+    }
+    private void requireRow(Document row, Run run, boolean description) {
+        if (!runId(run).equals(row.get("_id")) || !(validation == null ? Integer.valueOf(1).equals(row.get("formatVersion")) : nativeRunVersion(row.get("formatVersion"))) || !scope(scope).equals(row.get("scope"))
                 || validation != null && !MongoValidationPreparationFacts.encode(validation.subject()).equals(row.get("validationSubject"))
                 || validation != null && (run.admission() == null || !MongoValidationAdmissionStore.identity(run.admission()).equals(row.get("admission")))
                 || !identity(run).equals(row.get("identity")) || !(row.get("retired") instanceof Boolean)) throw unreadable("run");
         state(row);
+        if (description && row.containsKey("specSnapshot")) {
+            var snapshot = MongoValidationTaskCodec.run(row.get("specSnapshot", Document.class)); new ValidationReportAdmission.Open(run.admission(), snapshot);
+            if (run.snapshot() != null && !run.snapshot().equals(snapshot)) throw unreadable("spec-snapshot");
+        } else if (description && (run.snapshot() != null || Integer.valueOf(3).equals(row.get("formatVersion")))) throw unreadable("spec-snapshot");
     }
     static Run decodeRun(Document row) {
         try {
             var id = row.get("identity", Document.class); var who = owner(id.get("owner", Document.class), id.getString("pipelineId"));
-            var admission = Integer.valueOf(2).equals(row.get("formatVersion"))
+            var admission = nativeRunVersion(row.get("formatVersion"))
                     ? MongoValidationAdmissionStore.decodeIdentity(row.get("admission", Document.class)) : null;
             var run = new Run(new ValidationRunIdentity(who, id.getString("taskId"), id.getString("runId"), ValidationMode.valueOf(id.getString("mode")),
-                    id.getString("specHash"), id.getLong("keyMappingRevision"), id.getString("comparisonRulesVersion")), id.getLong("countingGeneration"), admission);
+                    id.getString("specHash"), id.getLong("keyMappingRevision"), id.getString("comparisonRulesVersion")), id.getLong("countingGeneration"), admission,
+                    row.containsKey("specSnapshot") ? MongoValidationTaskCodec.run(row.get("specSnapshot", Document.class)) : null);
             if (!identity(run).equals(id)) throw unreadable("run-identity"); return run;
         } catch (NullPointerException | ClassCastException | IllegalArgumentException | TapstateException invalid) { throw unreadable("run-identity"); }
     }
@@ -367,6 +473,7 @@ final class MongoValidationControlStore implements ValidationControlStore {
             if (!WorkloadClaimDocuments.stored(ValidationClaims.fence(who)).equals(value)) throw unreadable("owner"); return who;
         } catch (NullPointerException | ClassCastException | IllegalArgumentException | TapstateException invalid) { throw unreadable("owner"); }
     }
+    private static boolean nativeRunVersion(Object value) { return Integer.valueOf(2).equals(value) || Integer.valueOf(3).equals(value); }
     private static ValidationRunState state(Document row) {
         try { return ValidationRunState.valueOf(row.getString("state")); }
         catch (NullPointerException | ClassCastException | IllegalArgumentException invalid) { throw unreadable("state"); }
@@ -388,6 +495,10 @@ final class MongoValidationControlStore implements ValidationControlStore {
     private static void removeSlot(Document control, Run run) { slots(control).remove(slotKey(run.identity())); if (slots(control).isEmpty()) control.put("closed", true); }
     private static Document slots(Document control) { if (!(control.get("slots") instanceof Document slots)) throw unreadable("slots"); return slots; }
     static Document controlId(String cluster, String pipeline) { return new Document("kind", "pipeline").append("clusterId", cluster).append("pipelineId", pipeline); }
+    static Document controlHeader() {
+        return new Document("_id", 1).append("formatVersion", 1).append("scope", 1).append("identity", 1).append("state", 1)
+                .append("retired", 1).append("validationSubject", 1).append("admission", 1).append("delayRequested", 1).append("delayApplied", 1);
+    }
     static Document runId(Run run) { var id = run.identity(); return new Document("kind", "run").append("clusterId", id.owner().clusterId()).append("pipelineId", id.owner().pipelineId()).append("taskId", id.taskId()).append("mode", id.mode().name()).append("runId", id.runId()); }
     private static String slotKey(ValidationRunIdentity run) { return slotKey(run.taskId(), run.mode().name()); }
     private static String slotKey(String task, String mode) { return Base64.getUrlEncoder().withoutPadding().encodeToString(task.getBytes(StandardCharsets.UTF_8)) + ":" + mode; }

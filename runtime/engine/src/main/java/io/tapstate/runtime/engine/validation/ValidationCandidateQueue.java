@@ -31,12 +31,15 @@ import java.util.function.LongSupplier;
  * quota slot. The caller admits the queue envelope and bounded producer scratch space before use.
  */
 public final class ValidationCandidateQueue implements AutoCloseable {
-    public record Limits(int roots, long bytes, int batch, int attempts, long delayNanos, long windowNanos) {
+    public record Limits(int roots, long bytes, int batch, int attempts, long delayNanos, long windowNanos, long retryDelayNanos) {
+        public Limits(int roots, long bytes, int batch, int attempts, long delayNanos, long windowNanos) {
+            this(roots, bytes, batch, attempts, delayNanos, windowNanos, delayNanos);
+        }
         public Limits {
             if (roots < 1 || roots > 4096 || bytes < 1 || bytes > 64L * 1024 * 1024
                     || batch < 1 || batch > 256 || attempts < 1 || attempts > 100
                     || delayNanos < 0 || windowNanos < 1 || windowNanos > 86_400_000_000_000L
-                    || delayNanos > windowNanos) throw invalid("candidate.limits");
+                    || delayNanos > windowNanos || retryDelayNanos < 0 || retryDelayNanos > windowNanos) throw invalid("candidate.limits");
         }
     }
     public enum Offer { ACCEPTED, FULL, BUSY, CLOSED }
@@ -201,7 +204,7 @@ public final class ValidationCandidateQueue implements AutoCloseable {
             if (!closed && lease.windowExhausted && completion == Completion.RETRY) throw invalid("candidate.exhaustedRetry");
             boolean current = entry.revision == lease.observation.revision();
             long retryAt = !closed && current && completion == Completion.RETRY
-                    ? nanoTime.getAsLong() + limits.delayNanos() : 0;
+                    ? nanoTime.getAsLong() + limits.retryDelayNanos() : 0;
             lease.settled = true; entry.lease = null; leased--;
             if (closed) {
                 remove(entry);
