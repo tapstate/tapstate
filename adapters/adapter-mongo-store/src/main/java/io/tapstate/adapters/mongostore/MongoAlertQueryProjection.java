@@ -51,4 +51,20 @@ final class MongoAlertQueryProjection {
         candidates.add(r.resultUntil());
         return MongoAlertNotificationCodec.cleanup(candidates.stream().min(Comparator.naturalOrder()).orElseThrow());
     }
+    static Date scheduleCheck(io.tapstate.core.alerting.AlertSchedule.Record value) {
+        List<Instant> candidates = new ArrayList<>(); var clock = value.clock();
+        if (value.disposition() != null && value.disposition().recheckAt() != null) { candidates.add(value.disposition().recheckAt()); }
+        if (value.retiredAt() == null && value.batch() == null && clock.firstCandidateAt() != null && !value.members().isEmpty()) {
+            Instant due = clock.lastPlannedAt() == null ? clock.firstCandidateAt().plus(value.grouping().initialWait())
+                    : clock.lastPlannedAt().plus(clock.changed() ? value.grouping().changeInterval() : value.grouping().repeatInterval());
+            if (!clock.changed() && clock.reminderEligibleAt() != null && clock.reminderEligibleAt().isAfter(due)) { due = clock.reminderEligibleAt(); }
+            if (value.owner().generation() > 0 && value.owner().leaseUntil().isAfter(due)) { due = value.owner().leaseUntil(); }
+            candidates.add(due);
+        }
+        if (value.batch() != null && value.hasOpenWork() && (value.disposition() == null || value.disposition().recheckAt() == null)) {
+            candidates.add(value.createdAt());
+        }
+        if (value.retiredAt() != null && value.hasOpenWork()) { candidates.add(value.retiredAt()); }
+        return candidates.isEmpty() ? null : MongoAlertNotificationCodec.cleanup(candidates.stream().min(Comparator.naturalOrder()).orElseThrow());
+    }
 }

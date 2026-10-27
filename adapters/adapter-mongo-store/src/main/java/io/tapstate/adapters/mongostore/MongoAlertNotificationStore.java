@@ -9,6 +9,7 @@ import io.tapstate.core.alerting.AlertTargetLimit;
 import io.tapstate.core.alerting.AlertTestQuota;
 import io.tapstate.core.alerting.AlertIntent;
 import io.tapstate.core.alerting.AlertTestCommand;
+import io.tapstate.core.alerting.AlertSchedule;
 import io.tapstate.core.alerting.DeliveryEvidence;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.IoError;
@@ -301,6 +302,144 @@ final class MongoAlertNotificationStore {
     private static Instant responseRestriction(AlertIntent.Record value) {
         return value.state().attempts().stream().map(AlertIntent.Attempt::protocol).filter(Objects::nonNull)
                 .map(AlertIntent.Protocol::retryAfter).filter(Objects::nonNull).max(Instant::compareTo).orElse(null);
+    }
+
+    Optional<MongoAlertScheduleCodec.Stored> schedule(ClientSession session, AlertSchedule.Key key) {
+        context(session, key.scope());
+        Document row = SystemCollections.ALERT_NOTIFICATION_SCHEDULES.on(configuration)
+                .find(session, new Document("_id", MongoAlertScheduleCodec.key(key))).first();
+        var found = row == null ? Optional.<MongoAlertScheduleCodec.Stored>empty() : Optional.of(MongoAlertScheduleCodec.read(key, row));
+        requireActive.run(); return found;
+    }
+    MongoAlertScheduleCodec.Stored requiredSchedule(ClientSession session, AlertSchedule.Key key, long minimumRevision) {
+        if (minimumRevision < 1) { throw new IllegalArgumentException("original schedule reference required"); }
+        var found = schedule(session, key);
+        if (found.isEmpty() || found.orElseThrow().recordRevision() < minimumRevision) { throw unreadable("missing-schedule"); }
+        return found.orElseThrow();
+    }
+    Stage stageSchedule(ClientSession session, MongoAlertScheduleCodec.Stored expected, AlertSchedule.Record candidate) {
+        context(session, candidate.key().scope());
+        if (candidate.retention().deployment() != deployment) { throw unreadable("deployment"); }
+        var actual = schedule(session, candidate.key());
+        if (actual.isPresent() && actual.orElseThrow().value().equals(candidate)) { return Stage.UNCHANGED; }
+        if (expected == null ? actual.isPresent() : actual.isEmpty() || !actual.orElseThrow().equals(expected)) { return Stage.CONFLICT; }
+        if (candidate.createdAt().isAfter(clock.instant()) || candidate.retiredAt() != null && candidate.retiredAt().isAfter(clock.instant())) { throw stale("schedule-progress"); }
+        if (expected != null) {
+            scheduleSuccessor(expected.value(), candidate, clock.instant());
+            validateSummaryHandoff(session, expected.value(), candidate);
+            if (candidate.clock().round() > expected.value().clock().round() && candidate.protectedIntents().stream().noneMatch(key ->
+                    !expected.value().protectedIntents().contains(key) && key.notification().round() == candidate.clock().round())) {
+                throw unreadable("planned-round-without-intent");
+            }
+        } else if (!candidate.summaries().isEmpty()) { throw new IllegalArgumentException("a new schedule cannot fabricate predecessor summaries"); }
+        validateScheduleReferences(session, candidate);
+        long revision = expected == null ? 1 : next(expected.recordRevision());
+        Document row = MongoAlertScheduleCodec.write(candidate, revision); MongoAlertScheduleCodec.read(candidate.key(), row);
+        var collection = SystemCollections.ALERT_NOTIFICATION_SCHEDULES.on(configuration);
+        if (expected == null) { collection.insertOne(session, row); }
+        else if (collection.replaceOne(session, new Document("_id", row.get("_id")).append("recordRevision", expected.recordRevision()), row).getModifiedCount() != 1) { return Stage.CONFLICT; }
+        requireActive.run(); return Stage.STAGED;
+    }
+    private void validateScheduleReferences(ClientSession session, AlertSchedule.Record value) {
+        for (var key : value.protectedIntents()) { requiredIntent(session, new AlertIntent.Business(key), 1); }
+        if (value.batch() != null) {
+            var original = requiredIntent(session, new AlertIntent.Business(value.batch().delivery()), 1).value();
+            if (!original.frozen().members().equals(value.batch().members())) { throw unreadable("frozen-batch-members"); }
+            if (value.disposition() != null) {
+                var frozen = new io.tapstate.core.alerting.FrozenGroupPolicy.Batch(value.batch().delivery(), value.batch().revision(),
+                        value.batch().members().stream().map(AlertIntent.Member::episodeMember).toList());
+                var eligible = value.batch().members().stream().filter(value.members()::contains).map(AlertIntent.Member::episodeMember)
+                        .collect(java.util.stream.Collectors.toSet());
+                var inFlight = original.state().attempts().stream().filter(attempt -> attempt.endedAt() == null)
+                        .map(attempt -> attempt.permit().deadline()).min(Instant::compareTo).orElse(null);
+                var evidence = new DeliveryEvidence.Previous(original.state().summary(), original.frozen().content().renderingFailed(), inFlight);
+                var decision = io.tapstate.core.alerting.FrozenGroupPolicy.reconcile(frozen, eligible, List.of(evidence), clock.instant());
+                if (value.disposition().action() != decision.action() || value.disposition().previousOutcome() != original.state().summary()
+                        || !Objects.equals(value.disposition().recheckAt(), decision.recheckAt())) { throw unreadable("disposition-evidence-or-action"); }
+                if (value.disposition().action() != io.tapstate.core.alerting.FrozenGroupPolicy.Action.STOP_COVERED || value.disposition().successor() == null) {
+                    var pending = value.batch().members().stream().filter(member -> decision.pendingMembers().contains(member.episodeMember())).toList();
+                    if (!pending.equals(value.disposition().pending())) { throw unreadable("missing-original-survivor"); }
+                }
+            }
+            if (value.disposition() != null && value.disposition().action() != io.tapstate.core.alerting.FrozenGroupPolicy.Action.KEEP_ORIGINAL) {
+                if (!original.state().permitsStopped()) { throw unreadable("original-batch-still-permitted"); }
+                if (value.disposition().action() == io.tapstate.core.alerting.FrozenGroupPolicy.Action.STOP_PENDING
+                        && (original.state().summary() == DeliveryEvidence.Outcome.ACCEPTED
+                        || original.state().attempts().stream().anyMatch(attempt -> attempt.endedAt() == null))) { throw stale("group-successor"); }
+                if (value.disposition().action() == io.tapstate.core.alerting.FrozenGroupPolicy.Action.STOP_COVERED
+                        && original.state().summary() != DeliveryEvidence.Outcome.ACCEPTED) { throw unreadable("missing-covered-evidence"); }
+                if (value.disposition().action() == io.tapstate.core.alerting.FrozenGroupPolicy.Action.STOP_WAIT) {
+                    var pending = original.state().attempts().stream().filter(attempt -> attempt.endedAt() == null)
+                            .map(attempt -> attempt.permit().deadline()).min(Instant::compareTo);
+                    if (pending.isEmpty() || !pending.orElseThrow().equals(value.disposition().recheckAt())) { throw unreadable("original-batch-wait"); }
+                }
+                if (value.disposition().successor() != null) {
+                    var successor = requiredIntent(session, new AlertIntent.Business(value.disposition().successor()), 1).value();
+                    if (!successor.frozen().members().equals(value.disposition().pending())) { throw unreadable("successor-members"); }
+                    if (successor.frozen().deadline().isAfter(original.frozen().deadline()) || !successor.frozen().retry().equals(original.frozen().retry())
+                            || !successor.frozen().retention().equals(original.frozen().retention())) {
+                        throw unreadable("successor-expanded-window-or-policy");
+                    }
+                    if (value.disposition().action() == io.tapstate.core.alerting.FrozenGroupPolicy.Action.STOP_COVERED
+                            && !successor.state().permitsStopped()) { throw unreadable("covered-successor-still-permitted"); }
+                }
+            }
+        }
+    }
+    private void validateSummaryHandoff(ClientSession session, AlertSchedule.Record before, AlertSchedule.Record after) {
+        var expected = new java.util.LinkedHashMap<io.tapstate.core.alerting.FrozenGroupPolicy.Member, AlertSchedule.Previous>();
+        for (var summary : before.summaries()) { expected.put(new io.tapstate.core.alerting.FrozenGroupPolicy.Member(summary.alarm(), summary.episode()), summary); }
+        for (var key : before.protectedIntents()) {
+            if (after.protectedIntents().contains(key)) { continue; }
+            var original = requiredIntent(session, new AlertIntent.Business(key), 1).value();
+            if (original.state().retained().stoppedAt() == null || original.state().attempts().stream().anyMatch(attempt -> attempt.endedAt() == null)) {
+                throw unreadable("unsettled-intent-reference");
+            }
+            if (key.notification().kind() != io.tapstate.core.alerting.DeliveryKey.Kind.FAULT
+                    && key.notification().kind() != io.tapstate.core.alerting.DeliveryKey.Kind.REMINDER) { continue; }
+            for (var member : original.frozen().members()) {
+                var id = member.episodeMember(); var prior = expected.get(id);
+                var outcome = prior == null ? original.state().summary() : DeliveryEvidence.aggregate(List.of(prior.outcome(), original.state().summary()));
+                expected.put(id, new AlertSchedule.Previous(id.key(), id.episode(), outcome,
+                        original.frozen().content().renderingFailed() || prior != null && prior.renderingFailed()));
+            }
+        }
+        var actual = new java.util.LinkedHashMap<io.tapstate.core.alerting.FrozenGroupPolicy.Member, AlertSchedule.Previous>();
+        for (var summary : after.summaries()) { actual.put(new io.tapstate.core.alerting.FrozenGroupPolicy.Member(summary.alarm(), summary.episode()), summary); }
+        if (!expected.equals(actual)) { throw unreadable("summary-without-original-handoff"); }
+    }
+    private static void scheduleSuccessor(AlertSchedule.Record a, AlertSchedule.Record b, Instant now) {
+        if (!a.key().equals(b.key()) || !a.retention().equals(b.retention()) || !a.createdAt().equals(b.createdAt())
+                || b.clock().round() < a.clock().round() || b.clock().round() > a.clock().round() && (a.clock().round() == Long.MAX_VALUE || b.clock().round() != a.clock().round() + 1)
+                || b.batchSequence() < a.batchSequence() || b.batchSequence() > a.batchSequence() && (a.batchSequence() == Long.MAX_VALUE || b.batchSequence() != a.batchSequence() + 1)
+                || a.clock().firstCandidateAt() != null && !a.clock().firstCandidateAt().equals(b.clock().firstCandidateAt())
+                || a.clock().lastPlannedAt() != null && (b.clock().lastPlannedAt() == null || b.clock().lastPlannedAt().isBefore(a.clock().lastPlannedAt()))
+                || a.clock().reminderEligibleAt() != null && (b.clock().reminderEligibleAt() == null || b.clock().reminderEligibleAt().isBefore(a.clock().reminderEligibleAt()))
+                || a.retiredAt() != null && !a.retiredAt().equals(b.retiredAt()) || a.summariesHandedOff() && !b.summariesHandedOff()
+                || a.batch() != null && !a.batch().equals(b.batch())
+                || a.batch() != null && !a.members().containsAll(b.members())
+                || a.disposition() != null && a.disposition().successor() != null
+                        && (b.disposition() == null || !a.disposition().successor().equals(b.disposition().successor()))) {
+            throw new IllegalArgumentException("schedule identity, original batch, successor and progress cannot reset");
+        }
+        var priorOwner = a.owner(); var owner = b.owner();
+        if (owner.generation() < priorOwner.generation()
+                || owner.generation() > priorOwner.generation() && (priorOwner.generation() == Long.MAX_VALUE || owner.generation() != priorOwner.generation() + 1)
+                || owner.generation() == priorOwner.generation() && (!Objects.equals(owner.ownerId(), priorOwner.ownerId())
+                        || priorOwner.leaseUntil() != null && owner.leaseUntil().isBefore(priorOwner.leaseUntil()))) {
+            throw new IllegalArgumentException("schedule owner cannot move backwards or change within one generation");
+        }
+        if (owner.generation() > priorOwner.generation() && (priorOwner.activeAt(now) || !owner.activeAt(now))
+                || owner.generation() == priorOwner.generation() && !Objects.equals(owner.leaseUntil(), priorOwner.leaseUntil())
+                        && (!priorOwner.activeAt(now) || !owner.activeAt(now))) { throw stale("schedule-owner"); }
+        if (a.route() instanceof AlertIntent.ConfiguredRoute old && (!(b.route() instanceof AlertIntent.ConfiguredRoute updated)
+                || !old.identity().equals(updated.identity()) || updated.bindingRevision() < old.bindingRevision())
+                || a.route() instanceof AlertIntent.SystemRoute && !a.route().equals(b.route())) {
+            throw new IllegalArgumentException("schedule route binding cannot change identity or move backwards");
+        }
+        if (a.clock().round() == b.clock().round() && !Objects.equals(a.clock().lastPlannedAt(), b.clock().lastPlannedAt())) {
+            throw new IllegalArgumentException("an original group round cannot acquire a new planning time");
+        }
     }
 
     private static boolean manualReady(AlertIntent.Record before) {

@@ -3526,7 +3526,9 @@
       "evidence": [
         "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertLifecycleTest.java",
         "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java",
-        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStorageSchemaIT.java"
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStorageSchemaIT.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertScheduleCodecTest.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertScheduleStoreIT.java"
       ]
     },
     {

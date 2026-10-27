@@ -335,24 +335,24 @@ final class MongoAlertDeliveryCodec {
     private static void requireBudget(boolean condition, String field) {
         if (!condition) { throw new TapstateException(AlertError.INVALID_CONFIGURATION, Map.of("field", field, "reason", "encoded-intent-or-result-reservation-too-large"), null); }
     }
-    private static Document scope(AlarmKey.Scope value) { return new Document("authorityId", value.authorityId()).append("clusterId", value.clusterId()); }
-    private static AlarmKey.Scope readScope(Document value) { return new AlarmKey.Scope(text(value, "authorityId"), text(value, "clusterId")); }
-    private static void sameKey(Document expected, Document actual) { require(expected.equals(actual) && List.copyOf(expected.keySet()).equals(List.copyOf(actual.keySet()))); }
-    private static String time(Instant value) { return value == null ? null : value.toString(); }
-    private static Instant instant(Document row, String name, boolean nullable) {
+    static Document scope(AlarmKey.Scope value) { return new Document("authorityId", value.authorityId()).append("clusterId", value.clusterId()); }
+    static AlarmKey.Scope readScope(Document value) { return new AlarmKey.Scope(text(value, "authorityId"), text(value, "clusterId")); }
+    static void sameKey(Document expected, Document actual) { require(expected.equals(actual) && List.copyOf(expected.keySet()).equals(List.copyOf(actual.keySet()))); }
+    static String time(Instant value) { return value == null ? null : value.toString(); }
+    static Instant instant(Document row, String name, boolean nullable) {
         if (nullable && row.get(name) == null) { return null; }
         String value = text(row, name); require(value.length() <= 40); Instant parsed = Instant.parse(value); require(parsed.toString().equals(value)); return parsed;
     }
-    private static String text(Document row, String name) { require(row.get(name) instanceof String); return row.getString(name); }
-    private static String nullableText(Document row, String name) { return row.get(name) == null ? null : text(row, name); }
-    private static long number(Document row, String name, long minimum) { require(row.get(name) instanceof Long n && n >= minimum); return row.getLong(name); }
-    private static int integer(Document row, String name, int minimum) { require(row.get(name) instanceof Integer n && n >= minimum); return row.getInteger(name); }
-    private static boolean bool(Document row, String name) { require(row.get(name) instanceof Boolean); return row.getBoolean(name); }
-    private static Document document(Object value) { require(value instanceof Document); return (Document) value; }
-    private static Document doc(Document row, String name) { return document(row.get(name)); }
-    private static List<?> list(Document row, String name, int maximum) { require(row.get(name) instanceof List<?> list && list.size() <= maximum); return (List<?>) row.get(name); }
-    private static void fields(Document row, Set<String> expected) { require(row != null && row.keySet().equals(expected)); }
-    private static void require(boolean value) { if (!value) { throw new IllegalArgumentException("invalid delivery record encoding"); } }
-    private static <E extends Enum<E>> E enumeration(E[] known, String text) { return Arrays.stream(known).filter(value -> value.name().equals(text)).findFirst().orElseThrow(IllegalArgumentException::new); }
+    static String text(Document row, String name) { require(row.get(name) instanceof String); return row.getString(name); }
+    static String nullableText(Document row, String name) { return row.get(name) == null ? null : text(row, name); }
+    static long number(Document row, String name, long minimum) { require(row.get(name) instanceof Long n && n >= minimum); return row.getLong(name); }
+    static int integer(Document row, String name, int minimum) { require(row.get(name) instanceof Integer n && n >= minimum); return row.getInteger(name); }
+    static boolean bool(Document row, String name) { require(row.get(name) instanceof Boolean); return row.getBoolean(name); }
+    static Document document(Object value) { require(value instanceof Document); return (Document) value; }
+    static Document doc(Document row, String name) { return document(row.get(name)); }
+    static List<?> list(Document row, String name, int maximum) { require(row.get(name) instanceof List<?> list && list.size() <= maximum); return (List<?>) row.get(name); }
+    static void fields(Document row, Set<String> expected) { require(row != null && row.keySet().equals(expected)); }
+    static void require(boolean value) { if (!value) { throw new IllegalArgumentException("invalid delivery record encoding"); } }
+    static <E extends Enum<E>> E enumeration(E[] known, String text) { return Arrays.stream(known).filter(value -> value.name().equals(text)).findFirst().orElseThrow(IllegalArgumentException::new); }
     private static TapstateException unreadable(String field) { return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "alert-intent", "field", field), null); }
 }
