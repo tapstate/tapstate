@@ -64,25 +64,7 @@ class PipelineBuilderAssistantProviderSettingsIT {
             ControlPlane control = runtime.control(server, true);
             connection.verify();
             var store = new io.tapstate.adapters.mongostore.MongoStorePort(connection, database + "_operator");
-            store.artifacts().save(new io.tapstate.core.model.SourceResource("orders_src", null, "mysql",
-                    Map.of(), io.tapstate.core.model.SourceMode.CDC, null, null, null));
-            store.artifacts().save(new io.tapstate.core.model.SourceResource("destination", null, "mongodb",
-                    Map.of(), null, null, null, null));
-            store.schemas().save(new io.tapstate.spi.store.DiscoveredSourceModel("orders_src", "mysql", 1,
-                    new io.tapstate.spi.store.SourceModel(java.util.List.of(new io.tapstate.spi.store.SourceTable("orders",
-                            java.util.List.of(new io.tapstate.spi.store.SourceField("id", "integer")),
-                            java.util.List.of("id"), java.util.List.of())))));
-            Map<String, Object> wizard = new LinkedHashMap<>();
-            wizard.put("root", null);
-            wizard.put("related", java.util.List.of());
-            wizard.put("transforms", java.util.List.of());
-            wizard.put("output", Map.of("kind", "atlas", "config", Map.of("sourceId", "destination", "table", "orders", "writeMode", "upsert")));
-            control.createPipelineDraft("blank_auto", Map.of("pipelineId", "blank_auto", "mode", "wizard", "name", "Blank", "wizard", wizard));
-            Map<String, Object> candidate = Map.of(
-                    "root", Map.of("source", "orders_src", "table", "orders", "primaryKey", "id", "keys", java.util.List.of("id"),
-                            "columns", java.util.List.of(), "transforms", java.util.List.of()),
-                    "relations", java.util.List.of(), "transforms", java.util.List.of(),
-                    "destinationSourceId", "destination", "destinationTable", "orders", "destinationWriteMode", "upsert");
+            Map<String, Object> candidate = seedDraft(store, control);
             HttpRequest request = HttpRequest.newBuilder(server.baseUrl().resolve("/api/pipelines/blank_auto/draft:assistant-validate"))
                     .header("Cookie", control.credential()).header("Origin", server.baseUrl().toString())
                     .header("Content-Type", "application/json")
@@ -103,7 +85,9 @@ class PipelineBuilderAssistantProviderSettingsIT {
         var calls = new java.util.concurrent.atomic.AtomicInteger();
         var received = new java.util.concurrent.atomic.AtomicReference<java.util.List<Map<String, String>>>();
         var proposed = new java.util.concurrent.atomic.AtomicReference<Map<String, Object>>();
-        io.tapstate.control.core.AiProviderClient provider = new io.tapstate.control.core.AiProviderClient() {
+        var closed = new java.util.concurrent.atomic.AtomicBoolean();
+        class ControlledProvider implements io.tapstate.control.core.AiProviderClient, AutoCloseable {
+            public void close() { closed.set(true); }
             public void check(io.tapstate.control.core.AiProviderSettings settings) { }
             public java.util.Optional<Map<String, Object>> propose(io.tapstate.control.core.AiProviderSettings settings,
                     java.util.List<Map<String, String>> messages, Map<String, Object> context,
@@ -112,33 +96,18 @@ class PipelineBuilderAssistantProviderSettingsIT {
                 text.accept(calls.getAndIncrement() == 0 ? "Which source?" : "Using orders.");
                 return java.util.Optional.of(calls.get() == 1 ? Map.of() : proposed.get());
             }
-        };
+        }
+        var provider = new ControlledProvider();
         try (AtlasRuntime runtime = new AtlasRuntime(AtlasRuntime.Mode.CLOUD, storeUri);
                 ServerHandle server = runtime.launch(Tiers.IN_PROCESS, java.util.List.of(), provider);
                 var connection = new io.tapstate.adapters.mongostore.MongoConnection(
                         new io.tapstate.adapters.mongostore.MongoConnectionSettings(storeUri, null, java.time.Duration.ofSeconds(5)))) {
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> runtime.launch(Tiers.REAL_PROCESS, java.util.List.of(), provider))
+                    .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("in-process tier");
             ControlPlane control = runtime.control(server, true);
             connection.verify();
             var store = new io.tapstate.adapters.mongostore.MongoStorePort(connection, database + "_operator");
-            store.artifacts().save(new io.tapstate.core.model.SourceResource("orders_src", null, "mysql",
-                    Map.of(), io.tapstate.core.model.SourceMode.CDC, null, null, null));
-            store.artifacts().save(new io.tapstate.core.model.SourceResource("destination", null, "mongodb",
-                    Map.of(), null, null, null, null));
-            store.schemas().save(new io.tapstate.spi.store.DiscoveredSourceModel("orders_src", "mysql", 1,
-                    new io.tapstate.spi.store.SourceModel(java.util.List.of(new io.tapstate.spi.store.SourceTable("orders",
-                            java.util.List.of(new io.tapstate.spi.store.SourceField("id", "integer")),
-                            java.util.List.of("id"), java.util.List.of())))));
-            Map<String, Object> wizard = new LinkedHashMap<>();
-            wizard.put("root", null);
-            wizard.put("related", java.util.List.of());
-            wizard.put("transforms", java.util.List.of());
-            wizard.put("output", Map.of("kind", "atlas", "config", Map.of("sourceId", "destination", "table", "orders", "writeMode", "upsert")));
-            control.createPipelineDraft("blank_auto", Map.of("pipelineId", "blank_auto", "mode", "wizard", "name", "Blank", "wizard", wizard));
-            Map<String, Object> candidate = Map.of(
-                    "root", Map.of("source", "orders_src", "table", "orders", "primaryKey", "id", "keys", java.util.List.of("id"),
-                            "columns", java.util.List.of(), "transforms", java.util.List.of()),
-                    "relations", java.util.List.of(), "transforms", java.util.List.of(),
-                    "destinationSourceId", "destination", "destinationTable", "orders", "destinationWriteMode", "upsert");
+            Map<String, Object> candidate = seedDraft(store, control);
             var originalDraft = store.drafts().get("blank_auto").orElseThrow();
             proposed.set(candidate);
             HttpClient client = HttpClient.newHttpClient();
@@ -160,6 +129,29 @@ class PipelineBuilderAssistantProviderSettingsIT {
             assertThat(received.get()).contains(Map.of("role", "user", "content", "Use orders_src"));
             assertThat(store.drafts().get("blank_auto")).contains(originalDraft);
         }
+        assertThat(closed).isTrue();
+    }
+
+    private static Map<String, Object> seedDraft(io.tapstate.adapters.mongostore.MongoStorePort store, ControlPlane control) {
+        store.artifacts().save(new io.tapstate.core.model.SourceResource("orders_src", null, "mysql",
+                Map.of(), io.tapstate.core.model.SourceMode.CDC, null, null, null));
+        store.artifacts().save(new io.tapstate.core.model.SourceResource("destination", null, "mongodb",
+                Map.of(), null, null, null, null));
+        store.schemas().save(new io.tapstate.spi.store.DiscoveredSourceModel("orders_src", "mysql", 1,
+                new io.tapstate.spi.store.SourceModel(java.util.List.of(new io.tapstate.spi.store.SourceTable("orders",
+                    java.util.List.of(new io.tapstate.spi.store.SourceField("id", "integer")),
+                    java.util.List.of("id"), java.util.List.of())))));
+        Map<String, Object> wizard = new LinkedHashMap<>();
+        wizard.put("root", null);
+        wizard.put("related", java.util.List.of());
+        wizard.put("transforms", java.util.List.of());
+        wizard.put("output", Map.of("kind", "atlas", "config", Map.of("sourceId", "destination", "table", "orders", "writeMode", "upsert")));
+        control.createPipelineDraft("blank_auto", Map.of("pipelineId", "blank_auto", "mode", "wizard", "name", "Blank", "wizard", wizard));
+        return Map.of(
+                "root", Map.of("source", "orders_src", "table", "orders", "primaryKey", "id", "keys", java.util.List.of("id"),
+                    "columns", java.util.List.of(), "transforms", java.util.List.of()),
+                "relations", java.util.List.of(), "transforms", java.util.List.of(),
+                "destinationSourceId", "destination", "destinationTable", "orders", "destinationWriteMode", "upsert");
     }
 
     private static HttpResponse<String> assistant(HttpClient client, ServerHandle server, ControlPlane control,

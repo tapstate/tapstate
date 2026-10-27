@@ -77,6 +77,10 @@ jobs:
           distribution: temurin
           java-version: '21.0.13+9.0.LTS'
           cache: maven
+      - name: Verify exact Java build
+        shell: bash
+        run: |
+          java -XshowSettings:properties -version 2>&1 | grep -Fx '    java.runtime.version = 21.0.13+9-LTS'
       - uses: actions/download-artifact@v4
         with:
           name: ci-shard-plan
@@ -237,6 +241,10 @@ jobs:
           distribution: temurin
           java-version: '21.0.13+9.0.LTS'
           cache: maven
+      - name: Verify exact Java build
+        shell: bash
+        run: |
+          java -XshowSettings:properties -version 2>&1 | grep -Fx '    java.runtime.version = 21.0.13+9-LTS'
       - name: Check secret availability
         id: guard
         env:
@@ -811,7 +819,11 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "21"
+          java-version: "21.0.13+9.0.LTS"
           cache: maven
+      - name: Verify exact Java build
+        shell: bash
+        run: |
+          java -XshowSettings:properties -version 2>&1 | grep -Fx '    java.runtime.version = 21.0.13+9-LTS'
       - name: image smoke (builds the boot jar + image, then runs the black-box checks)
         run: bash deploy/docker/image-smoke.sh --build

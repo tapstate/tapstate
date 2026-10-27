@@ -54,8 +54,12 @@ def check(workflows, contexts, inputs):
         'matrix IDs must come from the actual emitted plan'
     build = ci.get('build', '')
     assert build, 'required check build must exist'
-    assert "java-version: '21.0.13+9.0.LTS'" in build and "java-version: '21.0.13+9.0.LTS'" in ci.get('test-shards', ''), \
-        'aggregate and test shards must use the same exact Java version'
+    versions = [re.findall(r"java-version:\s*['\"]([^'\"]+)['\"]", ci.get(role, '')) for role in ('test-shards', 'build', 'image-smoke')]
+    assert all(len(value) == 1 for value in versions) and len({value[0] for value in versions}) == 1, \
+        'test, build and image jobs must use the same Java version'
+    for role in ('test-shards', 'build'):
+        assert 'Verify exact Java build' in ci[role] and 'java.runtime.version' in ci[role], \
+            'each receipt producer must verify the resolved Java build'
     assert not re.search(r'^\s+matrix:', build, re.M), 'build must not be a matrix'
     assert not re.search(r'^    name:', build, re.M), 'build must retain its check name'
     assert re.search(r'^    needs:.*test-shards', build, re.M), 'build must wait for all shards'
@@ -216,6 +220,8 @@ assert contexts, 'required context list is empty'
 check(workflows, contexts, inputs)
 mutations = 0
 for original, replacement in [
+    ("java-version: '21.0.13+9.0.LTS'", "java-version: '21.0.12+8.0.LTS'"),
+    ('Verify exact Java build', 'Missing exact Java build'),
     (MAVEN_ARGS, ''),
     (MAVEN_ARGS, MAVEN_ARGS.replace('1.44', '1.32')),
     (MAVEN_ARGS, '    env:\n' + '\n'.join('      ' + line[10:] for line in MAVEN_ARGS.splitlines())),

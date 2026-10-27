@@ -619,7 +619,7 @@ class PipelineAssistantControllerTest {
         emptyCandidateResponse.getBody().writeTo(emptyCandidateOutput);
         String emptyCandidateStream = emptyCandidateOutput.toString(StandardCharsets.UTF_8);
         assertThat(emptyCandidateStream).contains(ControlError.AI_INVALID_PROPOSAL.code(), "\"state\":\"needs-input\"", "\"finishReason\":\"stop\"")
-                .doesNotContain("data-proposal", "\"type\":\"error\"");
+                .doesNotContain("data-proposal", "\"type\":\"error\"", "\"state\":\"complete\"");
         assertThat(store.get("orders")).contains(base);
         providerFailure.set(true);
         var failedOutput = new ByteArrayOutputStream();

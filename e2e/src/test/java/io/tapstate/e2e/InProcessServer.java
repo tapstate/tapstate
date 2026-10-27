@@ -83,8 +83,13 @@ final class InProcessServer implements ServerHandle {
         if (provider != null) {
             builder.initializers(context -> context.addBeanFactoryPostProcessor(factory -> {
                 var registry = (org.springframework.beans.factory.support.BeanDefinitionRegistry) factory;
+                if (!registry.containsBeanDefinition("aiProviderClient")) {
+                    throw new IllegalStateException("the application does not define aiProviderClient");
+                }
                 registry.removeBeanDefinition("aiProviderClient");
-                factory.registerSingleton("aiProviderClient", provider);
+                var replacement = new org.springframework.beans.factory.support.RootBeanDefinition(
+                        io.tapstate.control.core.AiProviderClient.class, () -> provider);
+                registry.registerBeanDefinition("aiProviderClient", replacement);
             }));
         }
         return builder.properties(

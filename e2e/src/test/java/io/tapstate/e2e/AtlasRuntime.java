@@ -87,6 +87,9 @@ final class AtlasRuntime implements AutoCloseable {
     }
 
     ServerHandle launch(Tiers tier, List<String> additionalArguments, io.tapstate.control.core.AiProviderClient provider) {
+        if (provider != null && tier != Tiers.IN_PROCESS) {
+            throw new IllegalArgumentException("a controlled provider requires the in-process tier");
+        }
         List<String> arguments = new ArrayList<>(List.of(
                 "--spring.config.location=optional:classpath:/application.properties",
                 "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2",

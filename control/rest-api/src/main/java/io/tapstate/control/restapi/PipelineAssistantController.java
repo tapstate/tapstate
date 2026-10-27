@@ -51,6 +51,7 @@ class PipelineAssistantController {
     private static final String FINISH = "finish";
     private static final String FINISH_REASON = "finishReason";
     private static final String VALID = "valid";
+    private static final String VALIDATION = "validation";
     private static final String DIAGNOSTICS = "diagnostics";
     private static final String TRANSFORMS = "transforms";
     private static final String PRE_TRANSFORMS = "preTransforms";
@@ -130,10 +131,7 @@ class PipelineAssistantController {
                     String code = diagnostics.isEmpty()
                             ? ControlError.AI_INVALID_PROPOSAL.code()
                             : AssistantWizardJson.text(diagnostics.getFirst().get("code"));
-                    streamEvents.event(Map.of("type", DATA_STATUS, "data", Map.of(STATE, "needs-input", STATUS, "needs-input",
-                            "code", code, DIAGNOSTICS, diagnostics)));
-                    streamEvents.event(Map.of("type", FINISH, FINISH_REASON, "stop"));
-                    streamEvents.done();
+                    streamEvents.needsInput(code, diagnostics);
                     return;
                 }
                 Map<String, Object> proposal = new LinkedHashMap<>(validated);
@@ -184,7 +182,7 @@ class PipelineAssistantController {
             diff(WIZARD, before, wizard(candidate), changes);
             current(id, revision);
             return Map.of(VALID, true, "candidateWizard", AssistantWizardJson.view(wizard(candidate)),
-                    "validation", Map.of(VALID, true, DIAGNOSTICS, List.of()),
+                    VALIDATION, Map.of(VALID, true, DIAGNOSTICS, List.of()),
                     "diff", Map.of("before", beforeDsl, "after", afterDsl, "changes", changes));
         } catch (IllegalArgumentException malformed) {
             return invalid(ControlError.AI_INVALID_PROPOSAL.code(), Map.of());
@@ -478,11 +476,11 @@ class PipelineAssistantController {
     private PipelineDraftService service() { return drafts.getObject(); }
     private Map<String, Object> wizard(PipelineDraft draft) { return AssistantWizardJson.object(PipelineDraftJson.write(json, draft).get(WIZARD)); }
     private static Map<String, Object> invalid(String code, Map<String, Object> params) {
-        return Map.of(VALID, false, "validation", Map.of(VALID, false,
+        return Map.of(VALID, false, VALIDATION, Map.of(VALID, false,
                 DIAGNOSTICS, List.of(Map.of("code", code, "params", params))), "diff", Map.of("changes", List.of()));
     }
     private static List<Map<String, Object>> diagnostics(Map<String, Object> validationResult) {
-        Map<String, Object> validation = AssistantWizardJson.object(validationResult.get("validation"));
+        Map<String, Object> validation = AssistantWizardJson.object(validationResult.get(VALIDATION));
         List<Map<String, Object>> result = new ArrayList<>();
         for (Object raw : AssistantWizardJson.list(validation.get(DIAGNOSTICS))) {
             if (raw instanceof Map<?, ?>) result.add(AssistantWizardJson.object(raw));
@@ -572,18 +570,16 @@ class PipelineAssistantController {
             write(": heartbeat\n\n");
         }
 
-        private void failure(String code) {
-            failure(code, List.of());
+        private void needsInput(String code, List<Map<String, Object>> diagnostics) {
+            event(Map.of("type", DATA_STATUS, "data", Map.of(STATE, "needs-input", STATUS, "needs-input",
+                    "code", code, DIAGNOSTICS, diagnostics)));
+            event(Map.of("type", FINISH, FINISH_REASON, "stop"));
+            done();
         }
 
-        private void failure(String code, List<Map<String, Object>> diagnostics) {
+        private void failure(String code) {
             try {
-                Map<String, Object> status = new LinkedHashMap<>();
-                status.put(STATE, ERROR);
-                status.put(STATUS, ERROR);
-                status.put("code", code);
-                if (!diagnostics.isEmpty()) status.put(DIAGNOSTICS, diagnostics);
-                event(Map.of("type", DATA_STATUS, "data", status));
+                event(Map.of("type", DATA_STATUS, "data", Map.of(STATE, ERROR, STATUS, ERROR, "code", code)));
                 event(Map.of("type", ERROR, ERROR_TEXT, code));
                 event(Map.of("type", FINISH, FINISH_REASON, ERROR));
                 done();
