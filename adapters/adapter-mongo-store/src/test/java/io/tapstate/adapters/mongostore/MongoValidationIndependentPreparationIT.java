@@ -14,6 +14,8 @@ import io.tapstate.spi.store.*;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
@@ -131,6 +133,41 @@ class MongoValidationIndependentPreparationIT {
             f.controls().deleteOne(new Document("_id", MongoValidationControlStore.controlId("cluster", PIPELINE)));
             assertThatThrownBy(() -> f.cache.prepare(permission, f.nodeA)).isInstanceOf(TapstateException.class);
             assertThat(f.controls().countDocuments()).isZero(); assertThat(f.rawClaims().read(key)).isEmpty();
+        }
+    }
+
+    @Test void completedBirthLossCannotBeCancelledAsUnusedOrReopenedWithResetCounters() {
+        try (var f = new Fixture()) {
+            var permission = f.config.issue(PIPELINE, f.scope);
+            f.config.complete(permission, f.cache.prepare(permission, f.nodeA));
+            var key = ValidationClaims.key("cluster", PIPELINE);
+            var claim = f.rawClaims().acquire(key, f.nodeA.owner(), 1, TTL).claim();
+            f.rawClaims().advanceExecution(claim, 1, Set.of(f.nodeA.owner().nodeId())).orElseThrow();
+            var closing = f.config.beginClose(PIPELINE, permission.subject().generation(), UUID.randomUUID());
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.cacheDb).deleteOne(new Document("_id", MongoWorkloadClaimStore.id(key)));
+            f.controls().deleteOne(new Document("_id", MongoValidationControlStore.controlId("cluster", PIPELINE)));
+
+            assertThatThrownBy(() -> f.cache.cancel(closing, f.nodeB)).isInstanceOf(TapstateException.class);
+            assertThat(f.config.read(PIPELINE).phase()).isEqualTo(Phase.COMPLETE);
+            assertThat(f.config.read(PIPELINE).closingOperationId()).isEqualTo(closing.operation());
+            assertThatThrownBy(() -> f.config.restartClosed(PIPELINE, permission.subject().generation(), f.config.read(PIPELINE).revision()))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(f.controls().countDocuments()).isZero();
+            assertThat(f.rawClaims().read(key)).isEmpty();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"countingGeneration", "retainedRuns", "owner", "closed", "problemLimit", "revision", "admissionClosed", "slots"})
+    void incompleteControlCannotCertifyPreparedOrCompleteConfiguration(String field) {
+        try (var f = new Fixture()) {
+            var permission = f.config.issue(PIPELINE, f.scope);
+            var proof = f.cache.prepare(permission, f.nodeA);
+            f.controls().updateOne(new Document("_id", f.control().get("_id")), new Document("$unset", new Document(field, "")));
+            var damaged = f.control();
+            assertThatThrownBy(() -> f.config.complete(permission, proof)).isInstanceOf(TapstateException.class);
+            assertThat(f.config.read(PIPELINE).phase()).isEqualTo(Phase.ISSUED);
+            assertThat(f.control()).isEqualTo(damaged);
         }
     }
 
