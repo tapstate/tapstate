@@ -462,6 +462,24 @@
         "No new collection, protocol lease, event history, stored model body or credential is added by this control contract. CONFIG retains one current bounded plan, one current mapping plus flat predecessor per canonical capture, and one scope gate per affected Pipeline. Each actual recovery leaves an old quarantined physical namespace and retirement marker; precise final destruction is outside this entry, required identity cannot be discarded for a budget and insufficient capacity refuses. Existing ordinary model/log/retention and pending-full budgets and validation remain.",
         "The recovery CAPTURE claim annex is exactly formatVersion 2, original (the complete immutable version 1 birth row), physicalChain and preparationId. The preparationId equals the fixed operation UUID. Its CONFIG currentRecovery keeps only previousPhysicalChain and previousPreparationId as a flat predecessor; canonical predecessor coordinates must match the immutable birth. The Pipeline sharedRecovery marker never changes original operationId/preparation/stateRebuild and is consumed only by the winning exact old-scope full completion, never by replay or an unrelated generation."
       ]
+    },
+    "validation-configuration": {
+      "goal": "Retain original validation configuration, one-time report birth rights and complete retained observations without recreating old runs.",
+      "entry": "Restore the original matching CONFIG backup; explicitly prepare or upgrade the validation schema before admitting work.",
+      "prerequisites": [
+        "Original Cluster identity, task generation, two bounded mode permissions and configuration revision are trusted.",
+        "An OPEN permission is consumed by report birth or revoked by closure in the same CONFIG transaction. BORN without its original report is loss, not permission to recreate. CLOSED or superseded sequences never reopen.",
+        "A new task identity never inherits a deleted task generation. History cleanup does not reset start counters; validation never resumes old execution."
+      ]
+    },
+    "validation-control": {
+      "goal": "Retain original validation ownership and terminate obsolete runs; never resume old queries, jobs or queues.",
+      "entry": "Original CACHE load and current-fence cleanup after known CONFIG closure, or explicit whole-cache recovery under the existing Cluster protocol.",
+      "prerequisites": [
+        "Original CacheBusinessScope, Pipeline preparation and VALIDATION claim/control birth are intact.",
+        "Controlled Pipeline preparation creates the original claim and control together. Normal admission cannot create a missing claim/control row or reset its generations.",
+        "Both storage domains have the explicit validation schema preparation; partial schema or control loss refuses ordinary admission."
+      ]
     }
   },
   "consistencyProfiles": {
@@ -504,6 +522,14 @@
     "shared-srs-cache": {
       "atomicDomain": "CACHE",
       "fencing": "Existing ordinary NODE/PIPELINE/CAPTURE and pending-full root/model/pin/checkpoint transactions remain. The separate shared replacement proves the exact original preparation, complete control view, current NODE and ended original tenures in one actual CACHE client/session transaction; it advances the known canonical CAPTURE annex/counters, expires exact old Pipeline tenures without discarding their private state, detaches the old shared relations, records a RETIRED control receipt and creates the entirely empty replacement physical root atomically. Cancellation competes on that same root, proves the unchanged old effective annex and absence of every replacement namespace fact, and persists CANCELLED before CONFIG can replan the same operation. Opaque handles and exact operation/plan/control digests prohibit old attempts after cancellation. Ordinary old-domain operations refuse both quarantine variants before reading payload. CONFIG checks stay outside the CACHE retry callback."
+    },
+    "validation-config": {
+      "atomicDomain": "CONFIG",
+      "fencing": "The original task generation, immutable run identity, command and mode sequence compete on the same task permission. Reserve advances the sequence and fixes OPEN. Report insert and OPEN-to-BORN are one transaction. Revocation closes OPEN or seals the exact BORN report and closes the permission atomically. Root publication and report sealing compete in the same CONFIG client/session. No CACHE lease read grants a CONFIG transaction."
+    },
+    "validation-cache": {
+      "atomicDomain": "CACHE",
+      "fencing": "The original complete VALIDATION claim fence and fixed CacheBusinessScope compete with the Pipeline control record, mode slots, last exit and problem-limit latch in the same CACHE client/session. Controlled birth creates claim/control atomically; missing known facts refuse. A successor terminates old runs only after known CONFIG closure and cannot alter an existing terminal outcome or new run."
     }
   },
   "resources": [
@@ -1278,15 +1304,15 @@
     },
     {
       "id": "mongo.config.schema_migrations",
-      "resourceVersion": 1,
-      "proposalVersion": 1,
+      "resourceVersion": 2,
+      "proposalVersion": 2,
       "kind": "COLLECTION",
       "layer": "CONFIG",
       "database": "CONFIG",
       "physicalNames": [
         "schema_migrations"
       ],
-      "responsibility": "Storage-domain schema version and migration ownership.",
+      "responsibility": "Storage-domain schema version and migration ownership. Explicit validation schema version 1-to-2 preparation records the original maintenance operation; normal access never adds missing validation resources. CONFIG/CACHE commit independently and both must be verified before validation starts; version 1 synchronization remains available.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoConfigurationDomain"
       ],
@@ -1815,15 +1841,15 @@
     },
     {
       "id": "mongo.cache.schema_migrations",
-      "resourceVersion": 1,
-      "proposalVersion": 1,
+      "resourceVersion": 2,
+      "proposalVersion": 2,
       "kind": "COLLECTION",
       "layer": "CACHE",
       "database": "CACHE",
       "physicalNames": [
         "schema_migrations"
       ],
-      "responsibility": "Storage-domain schema version and migration ownership.",
+      "responsibility": "Storage-domain schema version and migration ownership. Explicit validation schema version 1-to-2 preparation records the original maintenance operation; normal access never adds missing validation resources. CONFIG/CACHE commit independently and both must be verified before validation starts; version 1 synchronization remains available.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoCacheIdentity"
       ],
@@ -1985,15 +2011,15 @@
     },
     {
       "id": "mongo.cache.workload_claims",
-      "resourceVersion": 2,
-      "proposalVersion": 2,
+      "resourceVersion": 3,
+      "proposalVersion": 3,
       "kind": "COLLECTION",
       "layer": "CACHE",
       "database": "CACHE",
       "physicalNames": [
         "workload_claims"
       ],
-      "responsibility": "Runtime NODE/Pipeline/CAPTURE leases, epochs and write fences.",
+      "responsibility": "Runtime NODE/Pipeline/CAPTURE leases, epochs and write fences. Independent VALIDATION ownership per Cluster/Pipeline uses the existing complete lease/generation fence. Its original claim and validation control are born together under controlled Pipeline preparation; ordinary validation admission refuses missing original state.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoWorkloadClaimStore",
         "io.tapstate.adapters.mongostore.MongoCaptureCachePreparations"
@@ -2988,6 +3014,57 @@
       "growth": "Bounded by the selected connector input set.",
       "evidence": [
         "tools/catalog-derive/src/test/java/io/tapstate/tools/catalog/derive/CatalogDeriveTest.java"
+      ]
+    },
+    {
+      "id": "mongo.config.validation_tasks",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "validation_tasks"
+      ],
+      "responsibility": "Pipeline-bound validation configuration and its two bounded one-time report birth permissions. Immutable taskGeneration, separate configuration revision and monotonic nextStartSequence per FULL/INCREMENTAL; one OPEN/BORN/CLOSED permission per mode binds original command and run.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoValidationAdmissionStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoValidationAdmissionStore"
+      ],
+      "recovery": "validation-configuration",
+      "consistency": "validation-config",
+      "growth": "At most two current permissions and counters per task; added admission metadata <=16 KiB actual BSON per task. No request history or per-run tombstones. Config deletion first closes original permissions; same-name recreation uses a fresh generation. Existing total CONFIG budgets reject new work when exhausted.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationAdmissionStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.config.validation_reports",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "validation_reports"
+      ],
+      "responsibility": "Original validation report identity, publication epoch, known terminal mirror and retained bounded scope/diagnostic summaries. Only the exact OPEN task permission may create a report; publish never creates one.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoValidationResultStore",
+        "io.tapstate.adapters.mongostore.MongoValidationAdmissionStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoValidationResultStore",
+        "io.tapstate.adapters.mongostore.MongoValidationAdmissionStore"
+      ],
+      "recovery": "validation-configuration",
+      "consistency": "validation-config",
+      "growth": "One bounded report per actual run, with pending-history mirrors counted in the same per-task/per-mode retention (default 10, range 1..100). Admission identity <=8 KiB per report. Actual total bytes and active/unknown records remain accounted; cleanup cannot reopen birth rights.",
+      "evidence": [
+        "spi/spi-store/src/test/java/io/tapstate/spi/store/ValidationResultStoreContractTest.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationAdmissionStoreIT.java"
       ]
     }
   ]

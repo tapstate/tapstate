@@ -200,6 +200,8 @@ public enum SystemCollections {
     CONFIG_PIPELINE_DRAFTS("pipeline_drafts", Database.CONFIG, MongoConfigurationDraftStore.class, Strategy.MIGRATED, 1,
             new IndexSpec(List.of("revision"), false, "pipeline_drafts_revision"),
             new IndexSpec(List.of("updatedAt"), false, "pipeline_drafts_updated_at")),
+    VALIDATION_TASKS("validation_tasks", Database.CONFIG, MongoValidationAdmissionStore.class, Strategy.MIGRATED, 2),
+    VALIDATION_REPORTS("validation_reports", Database.CONFIG, MongoValidationAdmissionStore.class, Strategy.MIGRATED, 2),
     CACHE_IDENTITY("cache_identity", Database.CACHE, MongoCacheIdentity.class, Strategy.MIGRATED, 1),
     CACHE_SCHEMA_MIGRATIONS("schema_migrations", Database.CACHE, MongoCacheIdentity.class, Strategy.MIGRATED, 1),
     OP_SESSIONS("op_sessions", Database.CACHE, MongoCacheDomain.class, Strategy.MIGRATED, 1,
