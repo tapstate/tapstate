@@ -34,7 +34,7 @@ class PipelineCatalogServiceTest {
         List<Resource> resources = new ArrayList<>();
         for (String id : List.of("artifact-stop", "failed", "resuming", "starting", "pausing", "running",
                 "paused", "desired-running", "desired-paused", "desired-stopped", "desired-failed",
-                "desired-new", "desired-completed", "completed-running-intent", "corrupt-intent", "new")) {
+                "desired-new", "desired-completed", "completed-running-intent", "new")) {
             resources.add(pipeline(id, id.equals("artifact-stop") ? "artifact description" : null));
         }
         resources.add(new DslParser().parse("""
@@ -62,7 +62,6 @@ class PipelineCatalogServiceTest {
         desired.save(intent("desired-new", PipelineState.NEW));
         desired.save(intent("desired-completed", PipelineState.COMPLETED));
         desired.save(intent("completed-running-intent", PipelineState.RUNNING));
-        desired.corrupt("corrupt-intent");
         MemoryObservationStore observations = new MemoryObservationStore();
         observations.save(observation("artifact-stop", PipelineState.RUNNING));
         observations.save(observation("failed", PipelineState.FAILED));
@@ -85,7 +84,7 @@ class PipelineCatalogServiceTest {
         assertThat(items).extracting(PipelineCatalogItem::id).isSorted().doesNotContain("unrelated");
         assertThat(byId).containsOnlyKeys("artifact-stop", "failed", "resuming", "starting", "pausing", "running",
                 "paused", "desired-running", "desired-paused", "desired-stopped", "desired-failed",
-                "desired-new", "desired-completed", "completed-running-intent", "corrupt-intent", "new",
+                "desired-new", "desired-completed", "completed-running-intent", "new",
                 "draft-only");
         assertThat(byId.get("failed").name()).isEqualTo("failed");
         assertThat(byId.get("failed").description()).isEqualTo("draft description");
@@ -114,13 +113,53 @@ class PipelineCatalogServiceTest {
         assertThat(byId.get("desired-completed").status().state()).isEqualTo(PipelineCatalogItem.DisplayState.COMPLETED);
         assertThat(byId.get("completed-running-intent").status().state())
                 .isEqualTo(PipelineCatalogItem.DisplayState.COMPLETED);
-        assertThat(byId.get("corrupt-intent").status().state()).isEqualTo(PipelineCatalogItem.DisplayState.NEW);
         assertThat(byId.get("new").status().state()).isEqualTo(PipelineCatalogItem.DisplayState.NEW);
         assertThat(byId.get("new").hasArtifact()).isTrue();
-        assertThat(byId.get("new").status().displayState()).isEqualTo(PipelineCatalogItem.UiState.NEW);
+        assertThat(byId.get("new").status().displayState()).isEqualTo(PipelineCatalogItem.UiState.NOT_STARTED);
         assertThat(service.find("new")).contains(byId.get("new"));
         assertThat(service.list(0, 2)).extracting(PipelineCatalogItem::id)
                 .containsExactly("artifact-stop", "completed-running-intent");
+    }
+
+    @Test
+    void listDoesNotProjectAnUnreadableIntentAsNotStarted() {
+        List<Resource> resources = List.of(pipeline("corrupt-intent", null));
+        MemoryDesiredStore desired = new MemoryDesiredStore();
+        desired.corrupt("corrupt-intent");
+        ArtifactQueryService artifacts = new ArtifactQueryService(artifactStore(resources));
+        PipelineCatalogService service = new PipelineCatalogService(artifacts,
+                new PipelineDraftService(new MemoryDraftStore()), desired,
+                new PipelineObservationQueryService(artifacts, new MemoryObservationStore()));
+
+        PipelineCatalogItem item = service.list().getFirst();
+
+        assertThat(item.status().state()).isNull();
+        assertThat(item.status().displayState()).isNull();
+        assertThat(item.status().intentReadFailure()).isNotNull();
+        assertThat(item.status().intentReadFailure().code()).isEqualTo(IoError.DOCUMENT_UNREADABLE.code());
+        assertThat(item.hasArtifact()).isTrue();
+    }
+
+    @Test
+    void findPreservesRuntimeFactsWhenIntentCannotBeRead() {
+        List<Resource> resources = List.of(pipeline("corrupt-intent", null));
+        MemoryDesiredStore desired = new MemoryDesiredStore();
+        desired.corrupt("corrupt-intent");
+        MemoryObservationStore observations = new MemoryObservationStore();
+        observations.save(observation("corrupt-intent", PipelineState.RUNNING,
+                Instant.parse("2026-01-01T00:00:00Z")));
+        ArtifactQueryService artifacts = new ArtifactQueryService(artifactStore(resources));
+        PipelineCatalogService service = new PipelineCatalogService(artifacts,
+                new PipelineDraftService(new MemoryDraftStore()), desired,
+                new PipelineObservationQueryService(artifacts, observations));
+
+        PipelineCatalogItem item = service.find("corrupt-intent").orElseThrow();
+
+        assertThat(item.status().state()).isEqualTo(PipelineCatalogItem.DisplayState.RUNNING);
+        assertThat(item.status().desiredState()).isNull();
+        assertThat(item.status().observedState()).isEqualTo(PipelineState.RUNNING);
+        assertThat(item.status().observedAt()).isEqualTo(Instant.parse("2026-01-01T00:00:00Z"));
+        assertThat(item.status().intentReadFailure().code()).isEqualTo(IoError.DOCUMENT_UNREADABLE.code());
     }
 
     private static Resource pipeline(String id, String description) {
@@ -141,7 +180,11 @@ class PipelineCatalogServiceTest {
     }
 
     private static Observation observation(String id, PipelineState state) {
-        return new Observation(id, state, Map.of(), Map.of(), Map.of());
+        return observation(id, state, null);
+    }
+
+    private static Observation observation(String id, PipelineState state, Instant observedAt) {
+        return new Observation(id, state, Map.of(), Map.of(), Map.of(), null, observedAt);
     }
 
     private static ArtifactStore artifactStore(List<Resource> resources) {

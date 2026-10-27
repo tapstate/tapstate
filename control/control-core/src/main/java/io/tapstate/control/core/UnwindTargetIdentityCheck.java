@@ -1,5 +1,8 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.Step;
+import io.tapstate.core.model.TransformBody;
 import io.tapstate.spi.store.StartLoad;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
@@ -19,6 +22,14 @@ public final class UnwindTargetIdentityCheck implements StartCheck {
 
     @Override public String id() { return CHECK_ID; }
     @Override public StartFinding.Behavior whenUnavailable() { return StartFinding.Behavior.BLOCK; }
+
+    @Override
+    public boolean mayApply(PipelineResource definition) {
+        if (definition.serve() == null || definition.transforms() == null) return false;
+        // A shared transform's body needs storage reads, so only rule out known inline bodies here.
+        return definition.transforms().stream().anyMatch(step -> !(step instanceof Step.Inline inline)
+                || inline.body() instanceof TransformBody.Unwind);
+    }
 
     @Override
     public List<StartFinding> evaluate(StartCheckContext context) {

@@ -133,7 +133,7 @@ def uncomment(text):
 
 
 def enum_constants(text, declaration):
-    clean = masked(text)
+    clean = without_annotations(text)
     body = clean[declaration['start'] + 1:declaration['end']]
     depth, stop = 0, len(body)
     for position, char in enumerate(body):
@@ -679,6 +679,25 @@ def canonical_expression(expression, root, source, sources, body, enum_context=N
     array = re.fullmatch(r'new\s+String\s*\[\s*\]\s*\{([\s\S]*)\}', expression)
     if array:
         return ['array', 'java.lang.String', [canonical_expression(v, root, source, sources, body, enum_context) for v in split_values(array.group(1))]]
+    constructor = re.fullmatch(r'new\s+((?:[\w.]+\.)?RenameSpec)\s*\(([\s\S]*)\)', expression)
+    if constructor:
+        lookup, offset = enum_context or (DisabledLookup(root, sources), 0)
+        name, target = lookup.resolve(source, constructor.group(1), offset)
+        if name == 'io.tapstate.core.model.RenameSpec' and target is not None:
+            definition, declaration = target
+            # This constructor only copies the map; it does not compute new component values.
+            # Bind both its shape and body before projecting source arguments as record fields.
+            contract = ('package io.tapstate.core.model;'
+                        'import java.util.Collections;import java.util.LinkedHashMap;import java.util.Map;'
+                        'public record RenameSpec(Map<String,String> map,RenameCase caseMode,String prefix,String suffix) {'
+                        'public RenameSpec {map = map == null ? null : Collections.unmodifiableMap(new LinkedHashMap<>(map));}}')
+            require(declaration['kind'] == 'record' and
+                    re.sub(r'\s+', '', without_annotations(definition.read_text())) == re.sub(r'\s+', '', contract),
+                    'RenameSpec source constructor contract changed')
+            values = [canonical_expression(v, root, source, sources, body, enum_context)
+                      for v in split_values(constructor.group(2))]
+            require(len(values) == 4, 'invalid RenameSpec source constructor arity')
+            return ['record', name, list(zip(('map', 'caseMode', 'prefix', 'suffix'), values))]
     call = re.fullmatch(r'(List\.of|Map\.of|new Document|TableRef\.literal|TableRef\.regex)\s*\(([\s\S]*)\)', expression)
     if call:
         values = [canonical_expression(v, root, source, sources, body, enum_context) for v in split_values(call.group(2))]
