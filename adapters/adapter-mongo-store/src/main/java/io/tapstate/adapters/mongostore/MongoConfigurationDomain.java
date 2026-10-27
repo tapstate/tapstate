@@ -147,6 +147,19 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                 configurationKey.refresh(budget).activeKeyId(), this::requireOpen).prepare(operationId, budget);
     }
 
+    /** Adapter-private composition only; production management requires the complete authorization coordinator. */
+    MongoAlertConfigurationStore alertDefinitions(io.tapstate.core.alerting.AlarmKey.Scope scope,
+            io.tapstate.core.alerting.AlarmTypeCatalog catalog) {
+        if (!clusterId.equals(scope.clusterId())) { throw unreadable("alert-configuration", "scope"); }
+        if (alertSchemaVersion() != MongoAlertStorageSchema.VERSION) { throw unreadable("alert-configuration", "schema-not-prepared"); }
+        return new MongoAlertConfigurationStore(connection.database(), scope, catalog, this::requireOpen, configurationKey);
+    }
+
+    <T> T alertTransaction(MongoReadBudget budget, java.util.function.Function<com.mongodb.client.ClientSession, T> action) {
+        requireOpen();
+        return budget.transaction(connection.client(), session -> { requireOpen(); T value = action.apply(session); requireOpen(); return value; });
+    }
+
     /** Load-only progress. Absence does not authorize a normal access path to create identities. */
     public java.util.Optional<io.tapstate.spi.store.SourceIdentityPreparation> sourceIdentityPreparation() {
         var budget = new MongoReadBudget(java.time.Duration.ofSeconds(5)); requireOpen();
@@ -542,7 +555,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
             SourceConfigCipher observed = decode(keys.find(scope.session(), new Document("_id", "cluster")).first());
             if (!cipher.activeKeyId().equals(keyId) || !keyId.equals(observed.activeKeyId())) throw invalidKey();
             return keys.updateOne(scope.session(), new Document("_id", "cluster").append("keyId", keyId),
-                    new Document("$inc", new Document("sourceWriteFence", 1L))).getMatchedCount() == 1;
+                    new Document("$inc", new Document("sourceWriteFence", 1L))).getModifiedCount() == 1;
         }
 
         private SourceConfigCipher decode(Document document) {

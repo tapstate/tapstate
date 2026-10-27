@@ -1,0 +1,57 @@
+{
+  "receiver": {
+    "_id": {
+      "authorityId": "org-a",
+      "clusterId": "cluster-a",
+      "id": "receiver-a"
+    },
+    "formatVersion": 1,
+    "kind": "RECEIVER",
+    "incarnation": "11111111-1111-4111-8111-111111111111",
+    "recordRevision": {
+      "$numberLong": "1"
+    },
+    "writeFence": {
+      "$numberLong": "0"
+    },
+    "deployment": "ON_PREM",
+    "createdAt": "2026-10-27T00:00:00.123456789Z",
+    "createdBy": "actor-a",
+    "updatedAt": "2026-10-27T00:00:00.123456789Z",
+    "updatedBy": "actor-a",
+    "retiredAt": null,
+    "body": {
+      "name": "Email",
+      "enabled": true,
+      "bindingRevision": {
+        "$numberLong": "1"
+      },
+      "transport": {
+        "channelType": "email",
+        "host": "smtp.example.invalid",
+        "port": 465,
+        "encryption": "IMPLICIT_TLS",
+        "authentication": "PLAIN",
+        "username": "account-a",
+        "from": "sender@example.invalid",
+        "recipients": [
+          "recipient@example.invalid"
+        ],
+        "trust": "SYSTEM"
+      },
+      "credentials": {
+        "credentialId": "22222222-2222-4222-8222-222222222222",
+        "authenticationIdentity": "[\"smtp\",\"PLAIN\",\"account-a\"]"
+      }
+    },
+    "privateSlot": {
+      "formatVersion": 1,
+      "credentialId": "22222222-2222-4222-8222-222222222222",
+      "authenticationIdentity": "[\"smtp\",\"PLAIN\",\"account-a\"]",
+      "keyId": "648aa5c579fb30f38af744d97d6ec840c7a91277a499a0d780f3e7314eca090b",
+      "ciphertext": "tscfg:1:648aa5c579fb30f38af744d97d6ec840c7a91277a499a0d780f3e7314eca090b:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    }
+  },
+  "aad": "[\"tscfg\",\"1\",\"648aa5c579fb30f38af744d97d6ec840c7a91277a499a0d780f3e7314eca090b\",\"domain\",\"alert-receiver-credentials-v1\",\"[\\\"org-a\\\",\\\"cluster-a\\\",\\\"receiver-a\\\",\\\"11111111-1111-4111-8111-111111111111\\\",\\\"22222222-2222-4222-8222-222222222222\\\",\\\"[\\\\\\\"smtp\\\\\\\",\\\\\\\"PLAIN\\\\\\\",\\\\\\\"account-a\\\\\\\"]\\\"]\"]",
+  "transportDigest": "c7bb8cf4a22141a33ea6a431aa37f0df62fa1e8ef09a4d6fedb2209343d27ef0"
+}

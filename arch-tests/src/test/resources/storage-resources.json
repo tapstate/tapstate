@@ -475,7 +475,7 @@
     },
     "alert_receivers": {
       "goal": "Restore original target, authentication identity and revocation facts with the paired keyring. Original trusted CONFIG scope, paired configuration backup and keyring, supported schema/record versions and identity/structure validation; missing necessary history refuses reopening rather than seeding an empty ledger. Normal first preparation and reopening use the existing validated storage identity path. CACHE loss cannot restart alarm identities or erase budgets; backup restoration does not retract external unknown effects.",
-      "entry": "Validate and reopen the original CONFIG bundle, or restore its paired backup through that same validated entry. Never replay expired external work or reconstruct missing necessary facts from new samples.",
+      "entry": "Validate and reopen the original CONFIG bundle, or restore its paired backup through that same validated entry. Never replay expired external work or reconstruct missing necessary facts from new samples. Restore the same receiver and its encrypted private slot with the original CONFIG key; no fallback to another receiver or current newly created credential.",
       "prerequisites": [
         "Original trusted CONFIG identity and paired keyring",
         "Supported schema and record capabilities",
@@ -641,7 +641,7 @@
     },
     "alert_receivers": {
       "atomicDomain": "CONFIG",
-      "fencing": "Original receiver incarnation and CAS revision compete with permission grants; changed target semantics stop old grants. Only one actual CONFIG client/session transaction. Protected writes compete on their original scope, identity and version; never claim a CONFIG/CACHE or remote Cloud IAM transaction. Existing authorization must prove a consumable revocation-ordering/local grant boundary before new operations; otherwise refuse, without copied Cloud accounts or invented revisions. Network and external secret IO stay outside the transaction."
+      "fencing": "Original receiver incarnation and CAS revision compete with permission grants; changed target semantics stop old grants. Only one actual CONFIG client/session transaction. Protected writes compete on their original scope, identity and version; never claim a CONFIG/CACHE or remote Cloud IAM transaction. Existing authorization must prove a consumable revocation-ordering/local grant boundary before new operations; otherwise refuse, without copied Cloud accounts or invented revisions. Network and external secret IO stay outside the transaction. Credential-slot replacement and receiver revision/fence compete in that same CONFIG transaction. Cipher preparation and external material use remain outside retried transaction callbacks."
     },
     "alert_subscriptions": {
       "atomicDomain": "CONFIG",
@@ -3205,7 +3205,7 @@
     {
       "id": "alert_receivers",
       "resourceVersion": 1,
-      "proposalVersion": 3,
+      "proposalVersion": 4,
       "kind": "COLLECTION",
       "layer": "CONFIG",
       "database": "CONFIG",
@@ -3224,11 +3224,14 @@
       ],
       "recovery": "alert_receivers",
       "consistency": "alert_receivers",
-      "growth": "One receiver with bounded targets; testing a current form never saves this definition. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL.",
+      "growth": "One receiver with bounded targets; testing a current form never saves this definition. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL. Current receiver format v1 contains at most one private encrypted credential/trust-material slot of 16 KiB ciphertext, included in a 64 KiB encoded receiver limit. Its stable scoped reference binds the original receiver incarnation, credential UUID and authentication identity; equivalent material rotation preserves that reference. No separate secret collection, file, key or history. Public reads omit the private slot; missing or mismatched original material refuses use.",
       "evidence": [
         "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertLifecycleTest.java",
         "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java",
-        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStorageSchemaIT.java"
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStorageSchemaIT.java",
+        "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertReceiverTest.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertReceiverSecretsTest.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertReceiverStoreIT.java"
       ]
     },
     {

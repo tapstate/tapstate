@@ -26,6 +26,8 @@ final class MongoAlertConfigurationCodec {
     static final int MAX_BYTES = 256 * 1024;
     private static final Set<String> FIELDS = Set.of("_id", "formatVersion", "kind", "incarnation", "recordRevision",
             "writeFence", "deployment", "createdAt", "createdBy", "updatedAt", "updatedBy", "retiredAt", "body");
+    private static final Set<String> RECEIVER_FIELDS = receiverFields();
+    static final int MAX_RECEIVER_BYTES = 64 * 1024;
     record Stored(Definition definition, long writeFence) { }
     private MongoAlertConfigurationCodec() { }
 
@@ -49,13 +51,15 @@ final class MongoAlertConfigurationCodec {
                             .append("changeNanos", route.grouping().changeInterval().toNanos()).append("repeatNanos", route.grouping().repeatInterval().toNanos()))
                     .append("inhibition", route.inhibition().stream().map(edge -> new Document("root", edge.rootType()).append("dependent", edge.dependentType())).toList());
             case Silence silence -> new Document("reason", silence.reason()).append("window", window(silence.window()));
+            case AlertReceiver receiver -> MongoAlertReceiverCodec.body(receiver);
         };
         Document row = new Document("_id", key(id.scope(), id.id())).append("formatVersion", AlertConfiguration.FORMAT_VERSION)
                 .append("kind", id.kind().name()).append("incarnation", id.incarnation()).append("recordRevision", h.revision())
                 .append("writeFence", fence).append("deployment", h.deployment().name()).append("createdAt", h.createdAt().toString())
                 .append("createdBy", h.createdBy()).append("updatedAt", h.updatedAt().toString()).append("updatedBy", h.updatedBy())
                 .append("retiredAt", h.retiredAt() == null ? null : h.retiredAt().toString()).append("body", body);
-        if (size(row) > MAX_BYTES) {
+        if (definition instanceof AlertReceiver) { row.append("privateSlot", null); }
+        if (size(row) > (definition instanceof AlertReceiver ? MAX_RECEIVER_BYTES : MAX_BYTES)) {
             throw new TapstateException(AlertError.INVALID_CONFIGURATION,
                     Map.of("field", "configurationBytes", "reason", "encoded-record-too-large"), null);
         }
@@ -64,7 +68,8 @@ final class MongoAlertConfigurationCodec {
 
     static Stored read(Kind expectedKind, AlarmKey.Scope expectedScope, String expectedId, Document row) {
         try {
-            fields(row, FIELDS); require(size(row) <= MAX_BYTES);
+            fields(row, expectedKind == Kind.RECEIVER ? RECEIVER_FIELDS : FIELDS);
+            require(size(row) <= (expectedKind == Kind.RECEIVER ? MAX_RECEIVER_BYTES : MAX_BYTES));
             require(row.get("formatVersion") instanceof Integer version && version == AlertConfiguration.FORMAT_VERSION);
             Document key = doc(row, "_id"); fields(key, Set.of("authorityId", "clusterId", "id"));
             require(key(expectedScope, expectedId).equals(key));
@@ -82,8 +87,11 @@ final class MongoAlertConfigurationCodec {
                     fields(body, Set.of("reason", "window"));
                     yield new Silence(header, text(body, "reason"), readWindow(expectedScope, doc(body, "window")));
                 }
-                case RECEIVER -> throw new IllegalArgumentException("unsupported receiver format");
+                case RECEIVER -> MongoAlertReceiverCodec.read(header, body);
             };
+            if (definition instanceof AlertReceiver receiver) {
+                MongoAlertReceiverSecrets.validateSlot(receiver, row.get("privateSlot") == null ? null : doc(row, "privateSlot"));
+            }
             return new Stored(definition, number(row, "writeFence", 0));
         } catch (IllegalArgumentException | NullPointerException | ArithmeticException | java.time.DateTimeException | TapstateException invalid) {
             throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
@@ -240,6 +248,9 @@ final class MongoAlertConfigurationCodec {
         return Arrays.stream(known).filter(item -> item.name().equals(value)).findFirst().orElseThrow(IllegalArgumentException::new);
     }
     private static void fields(Document value, Set<String> expected) { require(value.keySet().equals(expected)); }
+    private static Set<String> receiverFields() {
+        Set<String> result = new HashSet<>(FIELDS); result.add("privateSlot"); return Set.copyOf(result);
+    }
     private static void require(boolean condition) { if (!condition) { throw new IllegalArgumentException("invalid alert configuration encoding"); } }
     static int size(Document document) {
         try (BasicOutputBuffer output = new BasicOutputBuffer(); BsonBinaryWriter writer = new BsonBinaryWriter(output)) {

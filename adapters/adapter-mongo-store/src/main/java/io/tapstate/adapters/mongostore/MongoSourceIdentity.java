@@ -108,7 +108,7 @@ final class MongoSourceIdentity {
             }
         } finally { java.util.Arrays.fill(bytes, (byte) 0); }
         if (keys.updateOne(session, new Document("_id", "cluster").append("keyId", state.keyId()),
-                new Document("$inc", new Document("sourceWriteFence", 1L))).getMatchedCount() != 1) {
+                new Document("$inc", new Document("sourceWriteFence", 1L))).getModifiedCount() != 1) {
             throw MongoSourceIdentitySchema.unreadable("original-key");
         }
     }

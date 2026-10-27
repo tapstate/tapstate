@@ -42,6 +42,18 @@ class MongoSourceIdentityIT {
     private static final TransactionOptions TRANSACTION = TransactionOptions.builder().readConcern(ReadConcern.SNAPSHOT)
             .writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
 
+    @Test void aMatchedButUnchangedKeyRowCannotAuthorizeTheSourceBindingFence() {
+        withConfiguration(false, fixture -> {
+            fixture.domain().artifacts().create(source("orders", null, "first"));
+            var captured = fixture.domain().artifacts().sourceBinding("orders").orElseThrow();
+            SystemCollections.CLUSTER_KEYS.on(fixture.database()).updateOne(new Document(),
+                    new Document("$set", new Document("sourceWriteFence", Double.POSITIVE_INFINITY)));
+            assertThatThrownBy(() -> transaction(fixture, session -> fixture.originalClientStore().fenceSourceBinding(session, captured.identity())))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(header(fixture, "orders").writeFence()).isZero();
+        });
+    }
+
     @Test void sourceLifetimeSurvivesEditsButNotDeletionAndSameContentRecreation() {
         withConfiguration(false, fixture -> {
             var source = source("orders", null, "first");

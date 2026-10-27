@@ -71,7 +71,7 @@ public final class AlertConfiguration {
         }
     }
 
-    public sealed interface Definition permits Rule, Subscription, Silence {
+    public sealed interface Definition permits Rule, Subscription, Silence, AlertReceiver {
         Header header();
     }
 

@@ -115,7 +115,7 @@ class MongoConfigurationArtifactStoreIT {
 
     @Test
     void fiveClientsRacingDifferentKindsCannotPublishTheSameGlobalId() {
-        withStore((store, database) -> {
+        withConfigurationStore((store, database) -> {
             var candidates = List.of(source("same_id", "secret"), pipeline("same_id"), definition("transform", "same_id"),
                     definition("view", "same_id"), definition("serve", "same_id"));
             var clients = new java.util.ArrayList<MongoClient>();
