@@ -129,7 +129,10 @@ class PipelineAssistantController {
                     String code = diagnostics.isEmpty()
                             ? ControlError.AI_INVALID_PROPOSAL.code()
                             : AssistantWizardJson.text(diagnostics.getFirst().get("code"));
-                    streamEvents.failure(code, diagnostics);
+                    streamEvents.event(Map.of("type", DATA_STATUS, "data", Map.of(STATE, "needs-input", STATUS, "needs-input",
+                            "code", code, "diagnostics", diagnostics)));
+                    streamEvents.event(Map.of("type", FINISH, FINISH_REASON, "stop"));
+                    streamEvents.done();
                     return;
                 }
                 Map<String, Object> proposal = new LinkedHashMap<>(validated);
