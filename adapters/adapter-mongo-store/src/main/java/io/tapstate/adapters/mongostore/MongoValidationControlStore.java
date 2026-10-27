@@ -79,18 +79,50 @@ final class MongoValidationControlStore implements ValidationControlStore {
             if (slots.size() == MAX_ACTIVE_RUNS || control.getLong("retainedRuns") == MAX_RETAINED_RUNS) throw limit();
             slots.put(key, runId(run)); control.put("retainedRuns", control.getLong("retainedRuns") + 1);
             writeControl(session, control);
-            var record = new Document("_id", runId(run)).append("formatVersion", validation == null ? 1 : run.snapshot() == null ? 2 : 3).append("scope", scope(scope))
-                    .append("identity", identity(run)).append("state", ValidationRunState.STARTING.name()).append("retired", false);
-            if (validation != null) record.append("validationSubject", MongoValidationPreparationFacts.encode(validation.subject()));
-            if (validation != null) record.append("admission", MongoValidationAdmissionStore.identity(run.admission()));
-            if (run.snapshot() != null) record.append("specSnapshot", MongoValidationTaskCodec.run(run.snapshot()));
-            bounded(record, 512 * 1024);
-            rows.insertOne(session, record);
+            rows.insertOne(session, record(run, ValidationRunState.STARTING, false));
             return Join.JOINED;
         });
         requireAdmission(run, false);
         if (validation != null) validation.requireRunSnapshot(run.admission(), run.snapshot());
         return joined;
+    }
+
+    private Document record(Run run, ValidationRunState state, boolean retired) {
+        var record = new Document("_id", runId(run)).append("formatVersion", validation == null ? 1 : run.snapshot() == null ? 2 : 3).append("scope", scope(scope))
+                .append("identity", identity(run)).append("state", state.name()).append("retired", retired);
+        if (validation != null) record.append("validationSubject", MongoValidationPreparationFacts.encode(validation.subject()));
+        if (validation != null) record.append("admission", MongoValidationAdmissionStore.identity(run.admission()));
+        if (run.snapshot() != null) record.append("specSnapshot", MongoValidationTaskCodec.run(run.snapshot()));
+        bounded(record, 512 * 1024); return record;
+    }
+
+    @Override public Mutation abandonClosedStart(Abandonment command) {
+        Objects.requireNonNull(command); var run = command.run(); requireAdmission(run, true);
+        var result = transaction(run.identity().owner(), false, session -> {
+            var control = control(session, run.identity().owner().pipelineId()); var row = row(session, run, false);
+            if (row == null) {
+                if (control.getLong("retainedRuns") == MAX_RETAINED_RUNS) throw limit();
+                if (!current(control, run)) {
+                    long previous = control.getLong("countingGeneration");
+                    if (!slots(control).isEmpty() || !control.getBoolean("closed") || previous == Long.MAX_VALUE || run.countingGeneration() != previous + 1) return Mutation.STALE;
+                    var prior = control.get("owner", Document.class);
+                    if (prior != null) {
+                        var old = owner(prior, run.identity().owner().pipelineId());
+                        if (run.identity().owner().claimGeneration() < old.claimGeneration() || run.identity().owner().executionGeneration() <= old.executionGeneration()) return Mutation.STALE;
+                    }
+                    control.put("owner", WorkloadClaimDocuments.stored(run.fence())); control.put("countingGeneration", run.countingGeneration());
+                    control.put("problemLimit", false);
+                }
+                rows.insertOne(session, record(run, command.terminal(), true));
+                control.put("retainedRuns", control.getLong("retainedRuns") + 1); writeControl(session, control); return Mutation.APPLIED;
+            }
+            if (row.getBoolean("retired")) return Mutation.ALREADY_APPLIED;
+            if (!current(control, run) || !slot(control, run)) return Mutation.STALE;
+            var terminal = state(row).terminal() ? state(row) : command.terminal();
+            updateRun(session, run, row, new Document("state", terminal.name()).append("retired", true));
+            removeSlot(control, run); writeControl(session, control); return Mutation.APPLIED;
+        });
+        requireAdmission(run, true); return result;
     }
 
     @Override public Snapshot snapshot(ValidationOwner authority) {

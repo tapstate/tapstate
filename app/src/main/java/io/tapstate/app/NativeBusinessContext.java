@@ -258,6 +258,25 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         }
         @Bean SnapshotBuffer snapshotBuffer() { return new SnapshotBuffer(); }
         @Bean Engine engine(HazelcastInstance member) { return new Engine(member); }
+        @Bean(destroyMethod = "close") ValidationMemberResources.Member validationMemberResourceScope(
+                ValidationMemberResources resources, NativeBusinessContext owner, HazelcastInstance member) {
+            var local = member.getCluster().getLocalMember();
+            return resources.bind(owner.original.preparation().businessScope().clusterId(),
+                    local.getAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE), local.getAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE),
+                    member.getConfig().getJetConfig().getCooperativeThreadCount(), owner.memberStorage::requireNode);
+        }
+        @Bean(destroyMethod = "close") NativeValidationOwnerReservations nativeValidationOwnerReservations(
+                NativeBusinessContext owner, HazelcastInstance member, NodeSessionLease node, ClusterMembershipGate membership,
+                ValidationMemberResources.Member resources, ValidationMemberResources process, ValidationOwnerTimers timers, ClusterProperties cluster) {
+            return new NativeValidationOwnerReservations(member, owner.configuration, owner.original.cache(), owner.original.preparation().businessScope(),
+                    () -> node.currentFence().orElseThrow(ThreeLayerStorePort::refused), membership, resources, process, timers,
+                    owner.memberStorage::requireNode, cluster.getWorkloadClaimTtl(), cluster.getWorkloadClaimRenewInterval());
+        }
+        @Bean(destroyMethod = "close") ValidationOwnerRouter validationOwnerRouter(HazelcastInstance member, NodeSessionLease node,
+                ClusterMembershipGate membership, NativeValidationOwnerReservations owners, NativeBusinessContext owner) {
+            return new ValidationOwnerRouter(member, membership, () -> node.currentFence().orElseThrow(ThreeLayerStorePort::refused),
+                    owners::readOwner, owners, owner.memberStorage::requireNode, Duration.ofSeconds(5));
+        }
         @Bean(destroyMethod = "close") ExecutionAuthorization executionAuthorization(HazelcastInstance member, NativeBusinessContext owner) {
             return owner.memberStorage.authorization();
         }

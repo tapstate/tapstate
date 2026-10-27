@@ -111,6 +111,10 @@ final class MongoValidationPreparations {
             requireStart(start, closed, false);
         }
         void requireBornStart(io.tapstate.spi.store.ValidationReportAdmission.Start start) { requireStart(start, false, true); }
+        boolean currentResources(ClientSession session, io.tapstate.core.validation.ValidationTaskSpec spec) {
+            if (!pipelineId().equals(spec.pipelineId())) throw fenced();
+            return MongoValidationAdmissionStore.matchingResources(owner().artifacts.versionsInTransaction(session, spec.dependencyHashes().keySet()), spec);
+        }
         boolean savedDelay(io.tapstate.spi.store.ValidationControlStore.Delay change) {
             var start = change.run().admission();
             if (start == null || !pipelineId().equals(start.task().pipelineId()) || !owner().clusterId.equals(start.task().clusterId())) throw fenced();
@@ -262,6 +266,15 @@ final class MongoValidationPreparations {
             var next = new State(Objects.requireNonNull(generations.get(pipeline)), 0, Phase.UNASSIGNED, null, null, null);
             if (rows.updateOne(session, row, new Document("$set", new Document("validationPreparation", encode(next)))).getMatchedCount() != 1) throw fenced();
         }
+    }
+
+    UUID currentGeneration(String pipeline, CacheBusinessScope expected) {
+        return transaction(session -> {
+            requireDefinition(session, pipeline); requireBinding(session, expected);
+            var current = state(mapping(session, pipeline), pipeline);
+            if (current.closingOperationId() != null || current.phase() == Phase.CLOSED) throw fenced();
+            return current.generation();
+        });
     }
 
     Permission issue(String pipeline, CacheBusinessScope expected) {

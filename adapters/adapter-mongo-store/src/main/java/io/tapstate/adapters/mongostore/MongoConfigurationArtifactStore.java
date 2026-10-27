@@ -174,6 +174,40 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
 
     record Version(String kind, String hash) {}
 
+    /** Probe total stored bytes before materializing any selected resource body or decrypted secret. */
+    Optional<Map<String, String>> validationInputsInTransaction(ClientSession session, Map<String, String> expected) {
+        var headers = versionsInTransaction(session, expected.keySet());
+        if (!headers.keySet().equals(expected.keySet()) || headers.entrySet().stream().anyMatch(entry -> !entry.getValue().hash().equals(expected.get(entry.getKey()))))
+            return Optional.empty();
+        var requested = List.copyOf(expected.keySet()); long stored = 0;
+        for (var collection : collections.values()) {
+            var size = collection.aggregate(session, List.of(new Document("$match", new Document("_id", new Document("$in", requested))),
+                    new Document("$group", new Document("_id", null).append("bytes", new Document("$sum", new Document("$bsonSize", "$$ROOT")))))).first();
+            if (size != null) {
+                var number = size.get("bytes"); long bytes;
+                if (number instanceof Integer value) bytes = value; else if (number instanceof Long value) bytes = value; else throw unreadable("validation", "input-size");
+                if (bytes < 0 || bytes > io.tapstate.spi.store.ValidationTaskStore.Inputs.MAX_STORED_BYTES - stored) throw validationInputLimit();
+                stored += bytes;
+            }
+        }
+        var result = new LinkedHashMap<String, String>(); long characters = 0;
+        for (var collection : collections.values()) {
+            try (var rows = collection.find(session, new Document("_id", new Document("$in", requested))).batchSize(64).iterator()) {
+                while (rows.hasNext()) {
+                    var resource = decode(rows.next()); var canonical = WRITER.write(resource); characters += canonical.length();
+                    if (characters > io.tapstate.spi.store.ValidationTaskStore.Inputs.MAX_CANONICAL_CHARACTERS) throw validationInputLimit();
+                    if (result.putIfAbsent(resource.id(), canonical) != null || !expected.get(resource.id()).equals(CanonicalHash.of(resource)))
+                        throw unreadable("validation", "input-version");
+                }
+            }
+        }
+        if (!result.keySet().equals(expected.keySet())) throw unreadable("validation", "input-snapshot");
+        return Optional.of(Map.copyOf(result));
+    }
+    private static TapstateException validationInputLimit() {
+        return new TapstateException(io.tapstate.core.validation.ValidationError.VALUE_LIMIT_EXCEEDED, Map.of("limit", "validation.configurationInputs"), null);
+    }
+
     /** Header-only version checks in the caller's actual CONFIG transaction; no secret or body materialization. */
     Map<String, Version> versionsInTransaction(ClientSession session, java.util.Collection<String> ids) {
         if (ids.isEmpty() || ids.size() > 1024) throw unreadable("validation", "dependency-count");

@@ -850,6 +850,12 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     }
 
     /** Independent preparation only. The caller authenticates its command and supplies a pure local lifecycle guard. */
+    public java.util.UUID currentValidationGeneration(String pipeline, io.tapstate.spi.store.CacheBusinessScope expected, Runnable local) {
+        requireOpen(); Objects.requireNonNull(local).run();
+        return validationPreparations().guardedBy(local).currentGeneration(pipeline, Objects.requireNonNull(expected));
+    }
+
+    /** Independent preparation only. The caller authenticates its command and supplies a pure local lifecycle guard. */
     public ValidationAccess prepareValidationAccess(String pipeline, io.tapstate.spi.store.CacheBusinessScope expected,
             MongoCacheDomain cache, io.tapstate.spi.store.WorkloadClaimFence node, Runnable local) {
         Objects.requireNonNull(local).run(); requireOpen(); Objects.requireNonNull(expected); Objects.requireNonNull(cache);

@@ -20,6 +20,8 @@ import java.util.Map;
         ControlAuthProperties.class, ConnectorPluginProperties.class})
 @Import({ClusterMembershipConfiguration.class, StorageHttpFace.class})
 class StorageRootConfiguration {
+    @Bean(destroyMethod = "close") ValidationMemberResources validationMemberResources() { return new ValidationMemberResources(); }
+    @Bean(destroyMethod = "close") ValidationOwnerTimers validationOwnerTimers() { return new ValidationOwnerTimers(); }
     @Bean CloudRuntimeSettings cloudRuntimeSettings(CloudProperties properties, MongoProperties mongo, Environment environment) {
         var settings = CloudRuntimeSettings.resolve(properties, environment.getProperty("CLUSTER_ID"));
         if (settings.cloud() && !mongo.isEnabled())

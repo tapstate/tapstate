@@ -75,6 +75,19 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
             return call(session -> java.util.Optional.ofNullable(document(session, pipeline, task)).map(row -> MongoValidationTaskCodec.snapshot(row, owner.clusterId)));
         }
 
+        @Override public java.util.Optional<Inputs> inputs(Task task, long revision) {
+            Objects.requireNonNull(task); scope(task);
+            if (revision < 1 || revision == Long.MAX_VALUE) throw unreadable("task-revision");
+            return call(session -> {
+                var row = document(session, task.pipelineId(), task.taskId()); if (row == null) return java.util.Optional.empty();
+                var saved = MongoValidationTaskCodec.snapshot(row, owner.clusterId);
+                if (!saved.task().equals(task) || saved.revision() != revision || saved.closed()) return java.util.Optional.empty();
+                MongoValidationPreparations.requireTaskAuthoringParent(session, owner.database, owner.clusterId, task.pipelineId());
+                long current = ConfigurationVersion.read(session, SystemCollections.CONFIGURATION_VERSION.on(owner.database));
+                return artifacts.validationInputsInTransaction(session, saved.comparison().dependencyHashes()).map(resources -> new Inputs(saved, current, resources));
+            });
+        }
+
         @Override public Write create(Create command) {
             Objects.requireNonNull(command); scope(command.task());
             return call(session -> {
@@ -138,22 +151,11 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         }
 
         private boolean currentResources(ClientSession session, io.tapstate.core.validation.ValidationTaskSpec comparison) {
-            var versions = artifacts.versionsInTransaction(session, comparison.dependencyHashes().keySet());
-            if (!versions.containsKey(comparison.pipelineId()) || !"pipeline".equals(versions.get(comparison.pipelineId()).kind())) return false;
-            for (var entry : comparison.dependencyHashes().entrySet())
-                if (!versions.containsKey(entry.getKey()) || !entry.getValue().equals(versions.get(entry.getKey()).hash())) return false;
-            for (var mapping : comparison.mappings())
-                if (!"source".equals(versions.get(mapping.source().sourceId()).kind()) || !"source".equals(versions.get(mapping.target().sourceId()).kind())) return false;
-            return true;
+            return matchingResources(artifacts.versionsInTransaction(session, comparison.dependencyHashes().keySet()), comparison);
         }
 
         private Document document(ClientSession session, String pipeline, String task) {
-            var id = new Document("clusterId", owner.clusterId).append("pipelineId", pipeline).append("taskId", task);
-            var length = owner.tasks.aggregate(session, java.util.List.of(new Document("$match", new Document("_id", id)),
-                    new Document("$project", new Document("_id", 0).append("bytes", new Document("$bsonSize", "$$ROOT"))))).first();
-            if (length == null) return null;
-            if (aggregateNumber(length, "bytes") > MongoValidationTaskCodec.MAX_TASK_BYTES) throw taskLimit("validation.taskBytes");
-            return owner.tasks.find(session, new Document("_id", id)).first();
+            return owner.definitionDocument(session, pipeline, task);
         }
 
         private void capacity(ClientSession session, String pipeline, Document previous, Document next) {
@@ -193,6 +195,24 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         private static TapstateException taskLimit(String limit) { return new TapstateException(ValidationError.VALUE_LIMIT_EXCEEDED, Map.of("limit", limit), null); }
     }
 
+    private Document definitionDocument(ClientSession session, String pipeline, String task) {
+        var id = new Document("clusterId", clusterId).append("pipelineId", pipeline).append("taskId", task);
+        var length = tasks.aggregate(session, java.util.List.of(new Document("$match", new Document("_id", id)),
+                new Document("$project", new Document("_id", 0).append("bytes", new Document("$bsonSize", "$$ROOT"))))).first();
+        if (length == null) return null;
+        if (Definitions.aggregateNumber(length, "bytes") > MongoValidationTaskCodec.MAX_TASK_BYTES) throw Definitions.taskLimit("validation.taskBytes");
+        return tasks.find(session, new Document("_id", id)).first();
+    }
+
+    static boolean matchingResources(Map<String, MongoConfigurationArtifactStore.Version> versions, io.tapstate.core.validation.ValidationTaskSpec comparison) {
+        if (!versions.containsKey(comparison.pipelineId()) || !"pipeline".equals(versions.get(comparison.pipelineId()).kind())) return false;
+        for (var entry : comparison.dependencyHashes().entrySet())
+            if (!versions.containsKey(entry.getKey()) || !entry.getValue().equals(versions.get(entry.getKey()).hash())) return false;
+        for (var mapping : comparison.mappings())
+            if (!"source".equals(versions.get(mapping.source().sourceId()).kind()) || !"source".equals(versions.get(mapping.target().sourceId()).kind())) return false;
+        return true;
+    }
+
     @Override public Reservation reserve(Start start) {
         requireStart(start);
         return transaction(true, () -> {}, session -> {
@@ -207,6 +227,13 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
                     || task.getLong("revision") != start.configurationRevision()) return Reservation.STALE;
             if (held != null && !phase(held).equals("CLOSED")) return Reservation.MODE_BUSY;
             if (!matchingDefinition(task, start)) return Reservation.STALE;
+            if (validation != null && task.containsKey("definition")) {
+                var saved = MongoValidationTaskCodec.snapshot(definitionDocument(session, start.task().pipelineId(), start.task().taskId()), clusterId);
+                if (!validation.currentResources(session, saved.comparison())) return Reservation.STALE;
+                // Source/definition writers share this original CONFIG write. A concurrent edit
+                // forces a retry of these exact pins instead of admitting a stale snapshot.
+                ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database));
+            }
             var next = new Document("nextStartSequence", start.sequence() + 1)
                     .append("permission", new Document("sequence", start.sequence()).append("phase", "OPEN").append("identity", identity(start)));
             updateMode(session, task, start, next); return Reservation.RESERVED;

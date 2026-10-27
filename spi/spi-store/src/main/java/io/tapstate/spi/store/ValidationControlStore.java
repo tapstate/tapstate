@@ -123,6 +123,21 @@ public interface ValidationControlStore {
      */
     Join join(Run run);
 
+    /**
+     * After known original CONFIG closure, fence an unsuccessful join against a late join commit.
+     * Records a bounded retired original when no row exists; otherwise ends only this exact
+     * original, preserving a known terminal outcome. Never adopts or starts a Job. The tombstone uses
+     * the existing run budget and participates in the same CACHE fence/transaction as join.
+     */
+    record Abandonment(Run run, ValidationRunState terminal) {
+        public Abandonment {
+            Objects.requireNonNull(run); Objects.requireNonNull(terminal);
+            if (terminal != ValidationRunState.FAILED && terminal != ValidationRunState.STOPPED) throw invalid("control.abandonTerminal");
+        }
+    }
+    default Mutation abandonClosedStart(Run run) { return abandonClosedStart(new Abandonment(run, ValidationRunState.FAILED)); }
+    default Mutation abandonClosedStart(Abandonment command) { throw invalid("control.abandonUnsupported"); }
+
     /** CAS only the original run/state. Unknown responses may retry that operation, never a new run. */
     Mutation transition(Transition transition);
 

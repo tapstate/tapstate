@@ -71,9 +71,10 @@ public final class ValidationDeclarations {
         private final List<Route> routes;
         private final List<Pending> pending;
         private final Set<String> requiredResourceIds;
+        private final Set<String> upstreamSourceIds;
         private final long accountedMetadataBytes;
 
-        private Inspection(Inspector inspector, FromClause from, List<Route> routes, List<Pending> pending) {
+        private Inspection(Inspector inspector, FromClause from, List<Route> routes, List<Pending> pending, Set<String> upstreamSourceIds) {
             output = inspector.output;
             this.from = from;
             view = inspector.view;
@@ -82,6 +83,7 @@ public final class ValidationDeclarations {
             this.routes = List.copyOf(routes);
             this.pending = List.copyOf(pending);
             requiredResourceIds = Set.copyOf(inspector.required);
+            this.upstreamSourceIds = Set.copyOf(upstreamSourceIds);
             accountedMetadataBytes = inspector.bytes;
         }
         public Output output() { return output; }
@@ -94,6 +96,8 @@ public final class ValidationDeclarations {
         public List<Route> routes() { return routes; }
         public List<Pending> pending() { return pending; }
         public Set<String> requiredResourceIds() { return requiredResourceIds; }
+        /** Selected upstream declarations, excluding destination-only Source dependencies. */
+        public Set<String> upstreamSourceIds() { return upstreamSourceIds; }
         public long accountedMetadataBytes() { return accountedMetadataBytes; }
     }
 
@@ -149,7 +153,7 @@ public final class ValidationDeclarations {
                 charge(256L + 32L * reference.downstreamSteps().size());
                 pending.add(new Pending(reference.reference(), expanded(reference.downstreamSteps())));
             }
-            return new Inspection(this, from, routes, pending);
+            return new Inspection(this, from, routes, pending, wiring.sourceDeclarations());
         }
 
         private FromClause selectOutput() {

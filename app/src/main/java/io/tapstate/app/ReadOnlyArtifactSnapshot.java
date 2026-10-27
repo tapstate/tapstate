@@ -36,6 +36,30 @@ final class ReadOnlyArtifactSnapshot implements ArtifactStore {
         return new ReadOnlyArtifactSnapshot(Objects.requireNonNull(source, "source").list(), source.managedDefaultSourceId());
     }
 
+    /** An already bounded native validation reading; it never broadens to an ambient store list. */
+    static ReadOnlyArtifactSnapshot validation(io.tapstate.spi.store.ValidationTaskStore.Inputs inputs, String managedDefault) {
+        Objects.requireNonNull(inputs);
+        var parser = new io.tapstate.core.dsl.DslParser(); var expected = inputs.task().comparison().dependencyHashes();
+        var owned = new java.util.TreeMap<String, String>(inputs.canonicalResources());
+        for (var entry : owned.entrySet()) {
+            Resource resource;
+            try { resource = parser.parse(entry.getValue()); }
+            catch (io.tapstate.core.common.TapstateException invalid) { throw invalidValidationInputs(); }
+            if (!entry.getKey().equals(resource.id()) || !io.tapstate.core.model.canonical.CanonicalHash.of(resource).equals(expected.get(entry.getKey())))
+                throw invalidValidationInputs();
+        }
+        return new ReadOnlyArtifactSnapshot(owned, Optional.ofNullable(managedDefault));
+    }
+
+    private ReadOnlyArtifactSnapshot(Map<String, String> canonical, Optional<String> managedDefault) {
+        this.managedDefault = managedDefault; this.byId = Map.copyOf(canonical); this.canonical = List.copyOf(canonical.values());
+    }
+
+    private static io.tapstate.core.common.TapstateException invalidValidationInputs() {
+        return new io.tapstate.core.common.TapstateException(io.tapstate.core.validation.ValidationError.INVALID_CONTRACT,
+                Map.of("field", "configuration.validationInputs"), null);
+    }
+
     /** Overlays one validated candidate closure without mutating the underlying artifact store. */
     static ReadOnlyArtifactSnapshot overlay(ArtifactStore source, List<Resource> overrides) {
         Objects.requireNonNull(source, "source");

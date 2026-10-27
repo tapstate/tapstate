@@ -217,6 +217,9 @@ final class ValidationOwnerLease implements AutoCloseable {
     }
 
     /** Releasing an old exact tenure cannot release a successor, even after a late response. */
+    void revoke() { lose(LossReason.CLOSED); }
+
+    /** Releasing an old exact tenure cannot release a successor, even after a late response. */
     @Override public void close() {
         var failure = new ValidationFailureLatch();
         try { lose(LossReason.CLOSED); }

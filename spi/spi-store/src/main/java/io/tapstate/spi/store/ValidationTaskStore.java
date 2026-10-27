@@ -65,8 +65,40 @@ public interface ValidationTaskStore {
     }
     enum Write { APPLIED, DUPLICATE, CONFLICT, CLOSED }
 
+    /**
+     * One native CONFIG snapshot for internal preflight, never an HTTP response or execution grant.
+     * Canonical definitions may contain connection secrets. They are immutable owned strings, not
+     * production models or operator state. The assembly admits the complete metadata frame before
+     * fetching it and must independently validate the selected output's full dependency closure.
+     */
+    final class Inputs {
+        public static final int MAX_STORED_BYTES = 256 * 1024;
+        public static final int MAX_CANONICAL_CHARACTERS = 2 * 1024 * 1024;
+        public static final long WORK_RESERVATION_BYTES = 64L * 1024 * 1024;
+        private final Snapshot task;
+        private final long configurationRevision;
+        private final Map<String, String> canonicalResources;
+        public Inputs(Snapshot task, long configurationRevision, Map<String, String> canonicalResources) {
+            this.task = Objects.requireNonNull(task); Objects.requireNonNull(canonicalResources);
+            if (configurationRevision < 0 || configurationRevision == Long.MAX_VALUE
+                    || !canonicalResources.keySet().equals(task.comparison().dependencyHashes().keySet())) throw invalid("task.inputs");
+            long characters = 0;
+            for (var resource : canonicalResources.values()) {
+                if (resource == null || resource.isBlank()) throw invalid("task.inputs");
+                characters += resource.length(); if (characters > MAX_CANONICAL_CHARACTERS) throw invalid("task.inputBytes");
+            }
+            this.configurationRevision = configurationRevision; this.canonicalResources = Map.copyOf(canonicalResources);
+        }
+        public Snapshot task() { return task; }
+        public long configurationRevision() { return configurationRevision; }
+        public Map<String, String> canonicalResources() { return canonicalResources; }
+        @Override public String toString() { return "ValidationTaskInputs[resources=" + canonicalResources.size() + ", revision=" + configurationRevision + "]"; }
+    }
+
     /** Missing definitions are not initialized on read. Returned descriptors never grant execution. */
     Optional<Snapshot> read(String pipelineId, String taskId);
+    /** Exact saved lifetime/revision and pinned resources in one snapshot; stale/closed returns empty. */
+    default Optional<Inputs> inputs(ValidationReportAdmission.Task task, long revision) { throw invalid("task.inputsUnsupported"); }
     /** Explicit first create; a conflicting task lifetime is never overwritten. Replay uses the same command and body. */
     Write create(Create command);
     /** Exact task lifetime/revision CAS. Existing start sequences and permissions remain unchanged. */

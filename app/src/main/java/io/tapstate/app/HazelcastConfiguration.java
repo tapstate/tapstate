@@ -584,6 +584,8 @@ class HazelcastConfiguration {
             }
         }
         config.getJetConfig().setEnabled(true);
+        config.addExecutorConfig(new com.hazelcast.config.ExecutorConfig(ValidationOwnerRouter.EXECUTOR)
+                .setPoolSize(4).setQueueCapacity(64).setStatisticsEnabled(true));
         Integer cooperativeThreads = properties.getJet().getCooperativeThreadCount();
         if (cooperativeThreads != null) {
             config.getJetConfig().setCooperativeThreadCount(cooperativeThreads);
