@@ -10,7 +10,6 @@ import io.tapstate.control.core.ControlError;
 import io.tapstate.control.core.CreatedSession;
 import io.tapstate.control.core.CloudAuthenticationService;
 import io.tapstate.control.core.LoginService;
-import io.tapstate.control.core.Scope;
 import io.tapstate.control.core.SessionService;
 import io.tapstate.core.common.TapstateException;
 import jakarta.servlet.http.HttpServletRequest;
@@ -90,7 +89,7 @@ class AuthController {
                 grant.expiresAt().toString(),
                 identity.issuer(),
                 grant.principal(),
-                scopesFor(grant.scope()),
+                AuthSupport.scopesFor(grant.scope()),
                 session == null ? null : session.token(),
                 session == null ? null : session.idleExpiresAt().toString(),
                 session == null ? null : session.absoluteExpiresAt().toString()));
@@ -105,7 +104,7 @@ class AuthController {
                 .orElseThrow(AuthController::unauthenticated);
         return ResponseEntity.ok(new SessionExchangeResponse(
                 grant.token(), grant.expiresAt().toString(), identity.issuer(), grant.principal(),
-                scopesFor(grant.scope())));
+                AuthSupport.scopesFor(grant.scope())));
     }
 
     @PostMapping(AuthWire.LOGOUT_PATH)
@@ -162,19 +161,6 @@ class AuthController {
     }
 
     private void requireOnPremAuthentication() {
-        if (authenticationMode != AuthenticationMode.ON_PREM) {
-            throw new TapstateException(ControlError.AUTH_MODE_UNAVAILABLE,
-                    Map.of("mode", authenticationMode.name().toLowerCase(java.util.Locale.ROOT)), null);
-        }
-    }
-
-    private static List<String> scopesFor(Scope grade) {
-        List<String> scopes = new ArrayList<>();
-        for (Scope scope : Scope.values()) {
-            if (grade.permits(scope)) {
-                scopes.add(scope.name().toLowerCase(java.util.Locale.ROOT));
-            }
-        }
-        return List.copyOf(scopes);
+        AuthSupport.requireOnPrem(authenticationMode);
     }
 }
