@@ -289,8 +289,17 @@ public enum SystemCollections {
         return collectionName;
     }
 
+    /** The stable identity binding this declaration to its storage contract inventory. */
+    public String resourceId() {
+        return "mongo." + database.name().toLowerCase(Locale.ROOT) + "." + collectionName;
+    }
+
     public Database database() {
         return database;
+    }
+
+    public Kind kind() {
+        return kind;
     }
 
     public Strategy strategy() {

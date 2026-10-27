@@ -31,7 +31,25 @@ public record NestBinding(
         NestStateLedger ledger,
         NestSettings settings,
         NestClock clock,
-        boolean settleMissingReferencesOnComplete) implements Serializable {
+        boolean settleMissingReferencesOnComplete,
+        Map<String, Long> snapshotEpochs) implements Serializable {
+
+    public NestBinding {
+        snapshotEpochs = Map.copyOf(snapshotEpochs);
+    }
+
+    public NestBinding(Function<String, NestTable> tables, NestStores stores, NestDeadLetter deadLetter,
+            ReplayFloorFactory replayFloor, NestStateLedger ledger, NestSettings settings, NestClock clock,
+            boolean settleMissingReferencesOnComplete) {
+        this(tables, stores, deadLetter, replayFloor, ledger, settings, clock,
+                settleMissingReferencesOnComplete, Map.of());
+    }
+
+    /** Expected generations come from the same prepared capture as the source suppliers. */
+    public NestBinding withSnapshotEpochs(Map<String, Long> epochs) {
+        return new NestBinding(tables, stores, deadLetter, replayFloor, ledger, settings, clock,
+                settleMissingReferencesOnComplete, epochs);
+    }
 
     /** Keeps bounded preview runs from omitting every root when a referenced row is absent in the sample. */
     public NestBinding(Function<String, NestTable> tables, NestStores stores, NestDeadLetter deadLetter,
@@ -40,7 +58,7 @@ public record NestBinding(
                 settings, NestClock.SYSTEM, settleMissingReferencesOnComplete);
     }
 
-    /** Existing bindings preserve the live-run behavior when their upstream work completes. */
+    /** Ordinary bindings wait for unknown references while their inputs are still live. */
     public NestBinding(Function<String, NestTable> tables, NestStores stores, NestDeadLetter deadLetter,
             ReplayFloorFactory replayFloor, NestStateLedger ledger, NestSettings settings, NestClock clock) {
         this(tables, stores, deadLetter, replayFloor, ledger, settings, clock, false);
