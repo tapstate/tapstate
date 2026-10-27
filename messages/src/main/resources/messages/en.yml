@@ -1320,3 +1320,10 @@ io.srs-full-preparation-unproven:
 io.srs-position-model-unproven:
   message: "The requested source position for chain {chain} cannot prove compatibility with its model history."
   solution: "Arbitrary position editing is unavailable after model handoff or replacement-cache history. Stop, clear the task state and explicitly rerun a full load instead."
+
+io.source-identity-unavailable:
+  message: "Source '{id}' does not have a usable lifecycle binding."
+  solution: "Complete the supported Source identity preparation or restore its original configuration before retrying."
+io.source-identity-exhausted:
+  message: "The lifecycle revision of Source '{id}' cannot advance."
+  solution: "Replace the Source through its supported lifecycle after preserving required state. Do not reset its identity or counters in place."

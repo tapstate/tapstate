@@ -60,7 +60,7 @@ class MongoConfigurationArtifactStoreIT {
 
     @Test
     void fiveAuthoringKindsCommitInOneRevisionAndRemainInIndependentCollections() {
-        withStore((store, database) -> {
+        withConfigurationStore((store, database) -> {
             var objects = List.of(source("src", "secret-sentinel"), pipeline("flow"), definition("transform", "filter_def"),
                     definition("view", "view_def"), definition("serve", "serve_def"));
             store.saveAll(objects);
@@ -200,7 +200,7 @@ class MongoConfigurationArtifactStoreIT {
 
     @Test
     void separateCollectionsRetainEncryptedSourcesAndCanonicalReads() {
-        withStore((store, database) -> {
+        withConfigurationStore((store, database) -> {
             Resource source = source("input", "private-sentinel");
             Resource pipeline = pipeline("flow");
             store.saveAll(List.of(source, pipeline));
@@ -220,13 +220,14 @@ class MongoConfigurationArtifactStoreIT {
             assertThat(store.listStored("view")).isEmpty();
             assertThat(revision(database)).isEqualTo(1);
             assertThat(database.listCollectionNames().into(new java.util.ArrayList<>()))
-                    .containsExactlyInAnyOrder("sources", "pipelines", "configuration_version", "operator_generations");
+                    .containsExactlyInAnyOrder("sources", "pipelines", "configuration_version", "operator_generations",
+                            "cluster_identity", "schema_migrations", "cluster_keys");
         });
     }
 
     @Test
     void refusingASiblingRollsBackBothTablesAndTheRevision() {
-        withStore((store, database) -> {
+        withConfigurationStore((store, database) -> {
             Resource original = pipeline("existing");
             store.save(original);
             var refused = store.writeAll(List.of(ArtifactWrite.createOnly(source("fresh", "secret")),
@@ -241,7 +242,7 @@ class MongoConfigurationArtifactStoreIT {
 
     @Test
     void uniqueIndexFaultAbortsSiblingWritesRatherThanBecomingAnIdRefusal() {
-        withStore((store, database) -> {
+        withConfigurationStore((store, database) -> {
             store.save(pipeline("existing"));
             SystemCollections.PIPELINES.on(database).createIndex(new Document("kind", 1),
                     new IndexOptions().unique(true));
@@ -258,7 +259,7 @@ class MongoConfigurationArtifactStoreIT {
 
     @Test
     void aReadDependencyInTheOtherTableGuardsTheWholeTransaction() {
-        withStore((store, database) -> {
+        withConfigurationStore((store, database) -> {
             Resource original = source("input", "first");
             store.save(original);
             Resource replacement = source("input", "changed");
@@ -275,7 +276,7 @@ class MongoConfigurationArtifactStoreIT {
 
     @Test
     void normalCreateReplaceDeleteAllContendOnConfigurationRevision() {
-        withStore((store, database) -> {
+        withConfigurationStore((store, database) -> {
             Resource original = source("flow", "original");
             assertThat(store.create(original)).isEqualTo(ArtifactMutation.CREATED);
             assertThat(revision(database)).isEqualTo(1);
@@ -298,7 +299,7 @@ class MongoConfigurationArtifactStoreIT {
 
     @Test
     void distinctClientsRacingDifferentKindsHaveOnlyOneGlobalIdentityWinner() {
-        withStore((store, database) -> {
+        withConfigurationStore((store, database) -> {
             try (MongoClient otherClient = MongoClients.create(MONGO.getReplicaSetUrl());
                     var executor = Executors.newFixedThreadPool(2)) {
                 var other = new MongoConfigurationArtifactStore(otherClient,
@@ -332,7 +333,7 @@ class MongoConfigurationArtifactStoreIT {
 
     @Test
     void ambiguousStoredIdentityIsCorruptionAndNeverSelectsOneTable() {
-        withStore((store, database) -> {
+        withConfigurationStore((store, database) -> {
             store.save(source("shared", "secret"));
             SystemCollections.PIPELINES.on(database).insertOne(MongoArtifactStore.toDocument(pipeline("shared")));
             assertThatThrownBy(() -> store.get("shared"))
@@ -1016,6 +1017,18 @@ class MongoConfigurationArtifactStoreIT {
                 id: %s
                 source: []
                 """.formatted(id));
+    }
+
+    private static void withConfigurationStore(Scenario scenario) {
+        withStore((store, database) -> {
+                SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database).insertOne(new Document("_id", "cluster")
+                        .append("clusterId", "fixture-cluster").append("layoutId", MongoConfigurationDomain.LAYOUT));
+                SystemCollections.SCHEMA_MIGRATIONS.on(database).insertOne(new Document("_id", "config").append("installedVersion", 1));
+                SystemCollections.CLUSTER_KEYS.on(database).insertOne(new Document("_id", "cluster").append("clusterId", "fixture-cluster")
+                        .append("formatVersion", 1).append("keyId", SourceConfigCipher.fingerprint(new byte[32]))
+                        .append("material", java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(new byte[32])));
+            scenario.run(store, database);
+        });
     }
 
     private static void withStore(Scenario scenario) {

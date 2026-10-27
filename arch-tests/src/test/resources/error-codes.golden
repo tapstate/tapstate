@@ -290,6 +290,8 @@ io.required-dead-letter-fenced
 io.schema-read-contention
 io.schema-write-contention
 io.sink-writer-progress-ambiguous
+io.source-identity-exhausted
+io.source-identity-unavailable
 io.srs-checkpoint-unproven
 io.srs-consumer-unavailable
 io.srs-event-model-unavailable

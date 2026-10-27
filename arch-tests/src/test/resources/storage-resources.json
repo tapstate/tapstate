@@ -572,6 +572,26 @@
         "Original backup and resource-reference closure when restoration is required",
         "Required producer, authorization and grant-ordering proof"
       ]
+    },
+    "source-identity-v1": {
+      "goal": "Restore the original Source resource lifetime, connection/runtime binding revision and definition without confusing a deleted/recreated same-id Source with its predecessor. Content hashes and cipher IVs are not creation identities. Preserve these necessary facts in the paired CONFIG backup.",
+      "entry": "Reopen the original validated CONFIG and paired keyring. First enrollment of legacy Sources is an explicit controlled same-version maintenance operation after old writers stop; ordinary reads/writes never mint a missing enrolled identity. Restore required used facts from the matching full backup instead.",
+      "prerequisites": [
+        "Original trusted Cluster/layout and paired keyring, with valid encrypted Source definitions",
+        "Supported Source identity header and Source-identity preparation state",
+        "Old writers stopped before controlled first enrollment; mixed old writers are unsupported",
+        "After preparation is READY, missing or corrupt UUID/revision/fence refuses use rather than recreating identity"
+      ]
+    },
+    "source-identity-preparation-v1": {
+      "goal": "Restore the exact original Source identity preparation operation and bounded cursor together with the Source headers it published. A READY marker cannot stand in for missing per-Source facts; Source headers cannot substitute for a lost preparation operation.",
+      "entry": "Resume only the original controlled maintenance operation against the same CONFIG/key identity. Existing feature absence with unmarked partial headers is refused. Preserve installedVersion, alerting and other feature metadata; normal facet access performs no migration.",
+      "prerequisites": [
+        "Original CONFIG identity, layout and paired persistent key",
+        "Original operation and fixed bounded phase/cursor/count when resuming",
+        "Old writers quiescent and controlled same-version deployment for first enrollment",
+        "Matching Source/header and schema aggregate backup for restoration"
+      ]
     }
   },
   "consistencyProfiles": {
@@ -658,6 +678,14 @@
     "alert_test_quotas": {
       "atomicDomain": "CONFIG",
       "fencing": "Same CONFIG transaction as unique command and intent, actor/scope counts and receiver or canonical target occupancy. Use original deadlines and settle overdue in-flight occupancy before release. Only one actual CONFIG client/session transaction. Protected writes compete on their original scope, identity and version; never claim a CONFIG/CACHE or remote Cloud IAM transaction. Existing authorization must prove a consumable revocation-ordering/local grant boundary before new operations; otherwise refuse, without copied Cloud accounts or invented revisions. Network and external secret IO stay outside the transaction."
+    },
+    "source-identity-v1": {
+      "atomicDomain": "CONFIG",
+      "fencing": "Source definition and its identity header are one original CONFIG document. Create allocates one server UUID; updates preserve it and advance bindingRevision only for non-presentation execution changes; delete/recreate gets a new UUID. Facts and send grants recheck original UUID/bindingRevision and conditionally advance the same document writeFence in the same client/session as their state/schedule/intent commit. Source writes preserve fencing state and retain existing configuration_version/CAS ordering. No external IO in the transaction."
+    },
+    "source-identity-preparation-v1": {
+      "atomicDomain": "CONFIG",
+      "fencing": "Controlled first enrollment, preparation phase/cursor and Source writes serialize through the original CONFIG client/session and configuration_version. Each transaction publishes one Source header with its original operation cursor. Unknown commits read the same operation/header; existing UUIDs are never reallocated. Old writers must be stopped before first enrollment; no cross-client or remote maintenance atomicity is claimed."
     }
   },
   "resources": [
@@ -1312,24 +1340,24 @@
     },
     {
       "id": "mongo.config.sources",
-      "resourceVersion": 1,
-      "proposalVersion": 1,
+      "resourceVersion": 2,
+      "proposalVersion": 2,
       "kind": "COLLECTION",
       "layer": "CONFIG",
       "database": "CONFIG",
       "physicalNames": [
         "sources"
       ],
-      "responsibility": "Authoritative Source definitions and encrypted connector configuration.",
+      "responsibility": "Authoritative Source definitions, encrypted connector configuration and original immutable Source incarnation with bounded binding and write-fencing revisions.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoConfigurationArtifactStore"
       ],
       "readers": [
         "io.tapstate.adapters.mongostore.MongoConfigurationArtifactStore"
       ],
-      "recovery": "configuration-backup",
-      "consistency": "config",
-      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "recovery": "source-identity-v1",
+      "consistency": "source-identity-v1",
+      "growth": "One current Source identity header per definition: format version, canonical creation UUID, int64 bindingRevision and int64 writeFence; at most 192 BSON bytes including field names. No credential copies, mutation history or signal receipts. Existing Source document size limits still apply; missing enrolled identity is never replaced for capacity or convenience.",
       "evidence": [
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoConfigurationArtifactStoreIT.java"
       ]
@@ -1433,7 +1461,7 @@
     {
       "id": "mongo.config.schema_migrations",
       "resourceVersion": 1,
-      "proposalVersion": 1,
+      "proposalVersion": 2,
       "kind": "COLLECTION",
       "layer": "CONFIG",
       "database": "CONFIG",
@@ -1447,9 +1475,9 @@
       "readers": [
         "io.tapstate.adapters.mongostore.MongoConfigurationDomain"
       ],
-      "recovery": "configuration-backup",
-      "consistency": "config",
-      "growth": "One bounded aggregate per Cluster/domain; no event or lease history.",
+      "recovery": "source-identity-preparation-v1",
+      "consistency": "source-identity-preparation-v1",
+      "growth": "One existing bounded CONFIG schema aggregate. Add one fixed Source-identity preparation slot of at most 2 KiB for original operation, identity/key binding, phase, cursor and count; preserve global version, alerting and other feature facts. No per-Source preparation log or per-operation history.",
       "evidence": [
         "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java",
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStorageSchemaIT.java",

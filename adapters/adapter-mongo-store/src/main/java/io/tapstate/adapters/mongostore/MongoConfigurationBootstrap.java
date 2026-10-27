@@ -98,6 +98,8 @@ public final class MongoConfigurationBootstrap {
                             SystemCollections.SCHEMA_MIGRATIONS.on(database).insertOne(session,
                                     new Document("_id", "config").append("installedVersion", MongoConfigurationDomain.SCHEMA_VERSION)
                                             .append(MongoAlertStorageSchema.FIELD, MongoAlertStorageSchema.initialMarker(
+                                                    clusterId, SourceConfigCipher.fingerprint(key), operationId))
+                                            .append(MongoSourceIdentitySchema.FIELD, MongoSourceIdentitySchema.initial(
                                                     clusterId, SourceConfigCipher.fingerprint(key), operationId)));
                             SystemCollections.CONFIGURATION_VERSION.on(database).insertOne(session,
                                     new Document("_id", ConfigurationVersion.ID).append("revision", 0L));

@@ -146,6 +146,20 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         return new MongoAlertStorageSchema(connection.client(), connection.database(), clusterId,
                 configurationKey.refresh(budget).activeKeyId(), this::requireOpen).prepare(operationId, budget);
     }
+
+    /** Load-only progress. Absence does not authorize a normal access path to create identities. */
+    public java.util.Optional<io.tapstate.spi.store.SourceIdentityPreparation> sourceIdentityPreparation() {
+        var budget = new MongoReadBudget(java.time.Duration.ofSeconds(5)); requireOpen();
+        return new MongoSourceIdentityPreparation(connection.client(), connection.database(), clusterId,
+                configurationKey.refresh(budget), this::requireOpen).load(budget);
+    }
+
+    /** Controlled same-version maintenance only; the installation owner must first stop old writers. */
+    public io.tapstate.spi.store.SourceIdentityPreparation prepareSourceIdentities(String operationId) {
+        var budget = new MongoReadBudget(java.time.Duration.ofSeconds(30)); requireOpen();
+        return new MongoSourceIdentityPreparation(connection.client(), connection.database(), clusterId,
+                configurationKey.refresh(budget), this::requireOpen).step(operationId, budget);
+    }
     public String databaseName() { requireOpen(); return connection.database().getName(); }
 
     public ArtifactStore artifacts() {
@@ -497,6 +511,9 @@ public final class MongoConfigurationDomain implements AutoCloseable {
             return cipher;
         }
 
+        /** The same-session fence below verifies this original immutable key before any write commits. */
+        @Override public SourceConfigCipher currentForWrite() { return cipher; }
+
         @Override
         public SourceConfigCipher refresh() {
             SourceConfigCipher observed = StoreIo.call(() -> decode(keys.find(new Document("_id", "cluster")).first()));
@@ -504,7 +521,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
             return observed;
         }
 
-        SourceConfigCipher refresh(MongoReadBudget budget) {
+        @Override public SourceConfigCipher refresh(MongoReadBudget budget) {
             SourceConfigCipher observed = StoreIo.call(() -> {
                 SourceConfigCipher value = decode(keys.withTimeout(budget.operationMillis(), java.util.concurrent.TimeUnit.MILLISECONDS)
                         .find(new Document("_id", "cluster")).first());
