@@ -1,6 +1,7 @@
 package io.tapstate.core.alerting;
 
 import java.time.Instant;
+import java.util.Map;
 import java.util.Objects;
 
 /** Fixed-minute arithmetic, never a local quota authority. Counts and the admitted test must commit in one conditional transaction. */
@@ -8,6 +9,43 @@ public final class AlertTestQuota {
     private AlertTestQuota() { }
     public static final int ACTOR_LIMIT = 3;
     public static final int SCOPE_LIMIT = 10;
+    /** One bounded scope/minute head is the authority for both dimensions; separate actor rows would race the scope total. */
+    public record Bucket(AlarmKey.Scope scope, Instant minute, Map<String, Integer> actors) {
+        public Bucket {
+            Objects.requireNonNull(scope, "scope");
+            AlertValidation.require(minute != null && minute.equals(AlertTestQuota.minute(minute)), "quotaMinute", "not-fixed-minute");
+            AlertValidation.require(actors != null && actors.size() <= SCOPE_LIMIT, "quotaActors", "outside-scope-budget");
+            actors.forEach((actor, count) -> {
+                AlertValidation.text(actor, "actorPrincipal", 256);
+                AlertValidation.require(count != null && count >= 1 && count <= ACTOR_LIMIT, "actorAccepted", "outside-actor-budget");
+            });
+            actors = Map.copyOf(actors);
+            AlertValidation.require(actors.values().stream().mapToInt(Integer::intValue).sum() <= SCOPE_LIMIT,
+                    "scopeAccepted", "outside-scope-budget");
+        }
+        public static Bucket empty(AlarmKey.Scope scope, Instant at) { return new Bucket(scope, AlertTestQuota.minute(at), Map.of()); }
+        public int scopeAccepted() { return actors.values().stream().mapToInt(Integer::intValue).sum(); }
+        public Window window(String actor) { return new Window(scope, actor, minute, actors.getOrDefault(actor, 0), scopeAccepted()); }
+        /** The caller must commit this candidate with the same newly admitted test intent. */
+        public Bucket accepted(String actor) {
+            Window window = window(actor);
+            AlertValidation.require(window.actorAccepted() < ACTOR_LIMIT && window.scopeAccepted() < SCOPE_LIMIT,
+                    "quota", "window-exhausted");
+            var counts = new java.util.HashMap<>(actors); counts.put(actor, window.actorAccepted() + 1);
+            return new Bucket(scope, minute, counts);
+        }
+        public boolean succeeds(Bucket before) {
+            if (before == null || !scope.equals(before.scope) || !minute.equals(before.minute)
+                    || scopeAccepted() != before.scopeAccepted() + 1 || !actors.keySet().containsAll(before.actors.keySet())) { return false; }
+            int changed = 0;
+            for (var entry : actors.entrySet()) {
+                int delta = entry.getValue() - before.actors.getOrDefault(entry.getKey(), 0);
+                if (delta == 1) { changed++; } else if (delta != 0) { return false; }
+            }
+            return changed == 1;
+        }
+        public Instant cleanupAfter() { return DeliveryRetention.add(minute, java.time.Duration.ofSeconds(60 + 3600)); }
+    }
     public enum Refusal { NONE, ACTOR_LIMIT, SCOPE_LIMIT, RECEIVER_BUSY, TARGET_BUSY }
     public record Window(AlarmKey.Scope scope, String actorPrincipal, Instant minute, int actorAccepted, int scopeAccepted) {
         public Window {

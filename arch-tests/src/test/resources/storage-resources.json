@@ -3510,7 +3510,10 @@
       "evidence": [
         "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertLifecycleTest.java",
         "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java",
-        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStorageSchemaIT.java"
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStorageSchemaIT.java",
+        "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertTargetLimitTest.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertNotificationCodecTest.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertNotificationStoreIT.java"
       ]
     },
     {
@@ -3538,7 +3541,10 @@
       "evidence": [
         "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertLifecycleTest.java",
         "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java",
-        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStorageSchemaIT.java"
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStorageSchemaIT.java",
+        "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertQuotaBucketTest.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertNotificationCodecTest.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertNotificationStoreIT.java"
       ]
     }
   ]
