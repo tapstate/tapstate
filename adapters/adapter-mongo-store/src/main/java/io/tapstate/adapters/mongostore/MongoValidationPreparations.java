@@ -113,9 +113,11 @@ final class MongoValidationPreparations {
         if (closing == null || closing.owner != this) throw fenced();
         var before = closing.requireCurrent(); if (before.phase() == Phase.CLOSED) return before;
         Receipt receipt = before.subject() == null ? before.previous() : Objects.requireNonNull(proof, "original CACHE closure").requireClosed(before.subject());
+        if (before.phase() == Phase.COMPLETE && receipt.outcome() != Outcome.RETIRED) throw unreadable();
         return transaction(session -> {
             var row = mapping(session, closing.pipeline); var current = state(row, closing.pipeline); requireClosing(current, closing);
             if (current.phase() == Phase.CLOSED) return current;
+            if (current.phase() == Phase.COMPLETE && receipt.outcome() != Outcome.RETIRED) throw unreadable();
             // Parent closure is not final while any original report creation/publication permission remains open.
             var tasks = SystemCollections.VALIDATION_TASKS.on(database);
             var unfinished = new Document("_id.clusterId", clusterId).append("_id.pipelineId", closing.pipeline)

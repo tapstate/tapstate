@@ -244,11 +244,15 @@ final class MongoValidationControlStore implements ValidationControlStore {
     }
     private static void validateControl(Document row, CacheBusinessScope scope, String pipeline) {
         if (row == null || !Integer.valueOf(1).equals(row.get("formatVersion")) || !scope(scope).equals(row.get("scope"))
-                || !(row.get("birth") instanceof Document birth) || !scope(scope).equals(birth.get("scope")) || !pipeline.equals(birth.get("pipelineId"))
-                || !(row.get("countingGeneration") instanceof Long generation) || generation < 0 || !(row.get("revision") instanceof Long revision)
+                || !(row.get("birth") instanceof Document birth) || !scope(scope).equals(birth.get("scope")) || !pipeline.equals(birth.get("pipelineId"))) throw unreadable("control");
+        validateLedger(row, scope, pipeline);
+    }
+    /** Both birth formats retain the same bounded owner, generation and physical mode-slot ledger. */
+    static void validateLedger(Document row, CacheBusinessScope scope, String pipeline) {
+        if (!(row.get("countingGeneration") instanceof Long generation) || generation < 0 || !(row.get("revision") instanceof Long revision)
                 || revision < 0 || revision == Long.MAX_VALUE || !(row.get("retainedRuns") instanceof Long count) || count < 0 || count > MAX_RETAINED_RUNS
-                || !(row.get("closed") instanceof Boolean closed) || !(row.get("problemLimit") instanceof Boolean)) throw unreadable("control");
-        var slots = slots(row); if (slots.size() > MAX_ACTIVE_RUNS || count < slots.size() || !closed && slots.isEmpty()) throw unreadable("control-counts");
+                || !row.containsKey("owner") || !(row.get("closed") instanceof Boolean closed) || !(row.get("problemLimit") instanceof Boolean)) throw unreadable("control");
+        var slots = slots(row); if (slots.size() > MAX_ACTIVE_RUNS || count < slots.size() || !closed && (slots.isEmpty() || row.getBoolean("problemLimit"))) throw unreadable("control-counts");
         if (generation == 0) { if (row.get("owner") != null || !closed || !slots.isEmpty() || count != 0 || row.getBoolean("problemLimit")) throw unreadable("control-first-use"); }
         else if (!(row.get("owner") instanceof Document current) || !scope.clusterId().equals(owner(current, pipeline).clusterId())) throw unreadable("control-owner");
         for (var entry : slots.entrySet()) {
@@ -258,6 +262,17 @@ final class MongoValidationControlStore implements ValidationControlStore {
                     || task.isBlank() || run.isBlank() || !Set.of("FULL", "INCREMENTAL").contains(mode) || !entry.getKey().equals(slotKey(task, mode))) throw unreadable("slot");
         }
         bounded(row, MAX_CONTROL_BYTES);
+    }
+    static void validateIndependentSlots(ClientSession session, MongoDatabase database, Document control, CacheBusinessScope scope, Document subject) {
+        for (var id : slots(control).values()) {
+            var row = SystemCollections.VALIDATION_RUNS.on(database).find(session, new Document("_id", id)).first();
+            if (row == null) throw unreadable("missing-slot-run");
+            var run = decodeRun(row);
+            if (!runId(run).equals(row.get("_id")) || !Integer.valueOf(2).equals(row.get("formatVersion"))
+                    || !scope(scope).equals(row.get("scope")) || !subject.equals(row.get("validationSubject"))
+                    || !Boolean.FALSE.equals(row.get("retired")) || !current(control, run)) throw unreadable("slot-run");
+            state(row);
+        }
     }
     private Document row(ClientSession session, Run run) {
         var row = rows.find(session, new Document("_id", runId(run))).first(); if (row != null) requireRow(row, run); return row;
@@ -275,7 +290,7 @@ final class MongoValidationControlStore implements ValidationControlStore {
             if (!identity(run).equals(id)) throw unreadable("run-identity"); return run;
         } catch (NullPointerException | ClassCastException | IllegalArgumentException | TapstateException invalid) { throw unreadable("run-identity"); }
     }
-    private static ValidationOwner owner(Document value, String pipeline) {
+    static ValidationOwner owner(Document value, String pipeline) {
         try {
             var who = new ValidationOwner(value.getString("clusterId"), pipeline, value.getString("ownerNodeId"), value.getString("ownerBootId"),
                     value.getLong("claimGeneration"), value.getLong("executionGeneration"), value.getLong("topologyRevision"));

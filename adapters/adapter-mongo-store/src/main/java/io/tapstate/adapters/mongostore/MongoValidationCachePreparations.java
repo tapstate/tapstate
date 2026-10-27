@@ -90,6 +90,8 @@ final class MongoValidationCachePreparations {
         mutate(node, session -> {
             var current = control(session, subject.pipelineId());
             if (current == null || !subject.equals(binding(current))) {
+                // COMPLETE records a known successful birth. Absence cannot revoke that fact.
+                if (state.phase() == Phase.COMPLETE) throw unreadable();
                 var previous = requirePredecessor(session, current, state.previous(), subject);
                 var origin = previous == null ? null : previous.origin();
                 var replacement = root(subject, origin, Outcome.CANCELLED, current); replacement.put("closingOperationId", closing.operation().toString());
@@ -97,6 +99,7 @@ final class MongoValidationCachePreparations {
                 replaceControl(session, current, replacement); return null;
             }
             var known = receipt(session, current);
+            if (state.phase() == Phase.COMPLETE && known.outcome() == Outcome.CANCELLED) throw unreadable();
             if (known.outcome() != Outcome.PREPARED) return null;
             var already = current.getString("closingOperationId"); if (already != null && !already.equals(closing.operation().toString())) throw fenced();
             var next = new Document(current); next.put("admissionClosed", true); next.put("closingOperationId", closing.operation().toString());
@@ -151,15 +154,25 @@ final class MongoValidationCachePreparations {
     }
     private Receipt receipt(ClientSession session, Document root) {
         var subject = binding(root); var origin = origin(root); var state = outcome(root);
+        MongoValidationControlStore.validateIndependentSlots(session, database, root, scope, encode(subject));
         long generation = 0, execution = 0;
         var key = ValidationClaims.key(scope.clusterId(), subject.pipelineId());
         var table = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
         var claim = table.find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
-        if (origin == null) { if (claim != null || state != Outcome.CANCELLED) throw unreadable(); }
+        if (origin == null) {
+            if (claim != null || state != Outcome.CANCELLED || longValue(root, "countingGeneration") != 0) throw unreadable();
+        }
         else {
-            if (claim == null || !root.get("birth").equals(claim.get("validationPreparation"))) throw unreadable();
+            if (claim == null || !root.get("birth").equals(claim.get("validationPreparation"))
+                    || !(claim.get("fencedValidationWrites") instanceof Long writes) || writes < 0 || writes == Long.MAX_VALUE) throw unreadable();
             var decoded = new MongoWorkloadClaimStore(table).inStrictSession(session).decodeStored(claim);
             generation = decoded.claimGeneration(); execution = decoded.executionGeneration();
+            if (root.get("owner") instanceof Document stored) {
+                var retained = MongoValidationControlStore.owner(stored, subject.pipelineId());
+                if (generation < retained.claimGeneration() || execution < retained.executionGeneration()
+                        || longValue(root, "countingGeneration") > execution
+                        || generation == retained.claimGeneration() && !decoded.owner().equals(new WorkloadOwner(retained.nodeId(), retained.bootId()))) throw unreadable();
+            }
             if (state != Outcome.PREPARED && new MongoWorkloadClaimStore(table).inStrictSession(session).read(key).orElseThrow().leased()) throw unreadable();
         }
         return new Receipt(subject, origin, state, longValue(root, "revision"), generation, execution);
@@ -190,6 +203,11 @@ final class MongoValidationCachePreparations {
                     || !(row.get("admissionClosed") instanceof Boolean closed) || outcome != Outcome.PREPARED && (!closed || !slots.isEmpty())
                     || !(row.get("revision") instanceof Long revision) || revision < 0 || revision == Long.MAX_VALUE) throw unreadable();
             bounded(birth);
+            MongoValidationControlStore.validateLedger(row, scope, pipeline);
+            if (row.containsKey("closingOperationId")) {
+                var operation = row.getString("closingOperationId");
+                if (!UUID.fromString(operation).toString().equals(operation) || !closed) throw unreadable();
+            } else if (closed != (outcome != Outcome.PREPARED)) throw unreadable();
         } catch (NullPointerException | ClassCastException | IllegalArgumentException invalid) { throw unreadable(); }
     }
     private static Document root(Subject subject, Subject origin, Outcome outcome, Document previous) {

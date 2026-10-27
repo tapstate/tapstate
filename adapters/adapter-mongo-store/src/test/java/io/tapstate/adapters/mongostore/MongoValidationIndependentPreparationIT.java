@@ -10,12 +10,15 @@ import com.mongodb.event.CommandStartedEvent;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.SourceResource;
+import io.tapstate.core.validation.*;
 import io.tapstate.spi.store.*;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
@@ -25,6 +28,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Stream;
 import static io.tapstate.adapters.mongostore.MongoValidationPreparationFacts.*;
 import static org.assertj.core.api.Assertions.*;
 
@@ -168,6 +172,133 @@ class MongoValidationIndependentPreparationIT {
             assertThatThrownBy(() -> f.config.complete(permission, proof)).isInstanceOf(TapstateException.class);
             assertThat(f.config.read(PIPELINE).phase()).isEqualTo(Phase.ISSUED);
             assertThat(f.control()).isEqualTo(damaged);
+        }
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("damagedControlFields")
+    void malformedControlOrMissingPhysicalSlotCannotIssueAReceipt(String reason, Document changes) {
+        try (var f = new Fixture()) {
+            var permission = f.config.issue(PIPELINE, f.scope);
+            var proof = f.cache.prepare(permission, f.nodeA);
+            var damaged = f.control(); damaged.putAll(changes);
+            f.controls().replaceOne(new Document("_id", damaged.get("_id")), damaged);
+            assertThatThrownBy(() -> f.config.complete(permission, proof)).as(reason).isInstanceOf(TapstateException.class);
+            assertThat(f.config.read(PIPELINE).phase()).isEqualTo(Phase.ISSUED);
+            assertThat(f.control()).isEqualTo(damaged);
+        }
+    }
+
+    static Stream<Arguments> damagedControlFields() {
+        var owner = WorkloadClaimDocuments.stored(ValidationClaims.fence(new ValidationOwner("cluster", PIPELINE, "node-a", "boot-a", 1, 1, 1)));
+        var runId = new Document("kind", "run").append("clusterId", "cluster").append("pipelineId", PIPELINE)
+                .append("taskId", "task").append("mode", "FULL").append("runId", "run");
+        return Stream.of(
+                Arguments.of("negative generation", new Document("countingGeneration", -1L)),
+                Arguments.of("wrong generation BSON type", new Document("countingGeneration", 0)),
+                Arguments.of("negative retained count", new Document("retainedRuns", -1L)),
+                Arguments.of("unbounded retained count", new Document("retainedRuns", MongoValidationControlStore.MAX_RETAINED_RUNS + 1)),
+                Arguments.of("open empty generation", new Document("closed", false)),
+                Arguments.of("first use with an owner", new Document("owner", owner)),
+                Arguments.of("first use with problem stop", new Document("problemLimit", true)),
+                Arguments.of("first use with retained history", new Document("retainedRuns", 1L)),
+                Arguments.of("noncanonical close identity", new Document("closingOperationId", "invalid").append("admissionClosed", true)),
+                Arguments.of("slot count exceeds retained", new Document("countingGeneration", 1L).append("owner", owner)
+                        .append("closed", false).append("slots", new Document("dGFzaw:FULL", runId))),
+                Arguments.of("slot key disagrees with physical identity", new Document("countingGeneration", 1L).append("owner", owner)
+                        .append("retainedRuns", 1L).append("closed", false).append("slots", new Document("wrong:FULL", runId))),
+                Arguments.of("missing physical run", new Document("countingGeneration", 1L).append("owner", owner)
+                        .append("retainedRuns", 1L).append("closed", false).append("slots", new Document("dGFzaw:FULL", runId))));
+    }
+
+    @Test void neverBornCancellationCannotCertifyNonzeroOwnerHistory() {
+        try (var f = new Fixture()) {
+            var permission = f.config.issue(PIPELINE, f.scope);
+            var closing = f.config.beginClose(PIPELINE, permission.subject().generation(), UUID.randomUUID());
+            var proof = f.cache.cancel(closing, f.nodeA);
+            var owner = new ValidationOwner("cluster", PIPELINE, "node-a", "boot-a", 1, 1, 1);
+            f.controls().updateOne(new Document("_id", f.control().get("_id")), new Document("$set", new Document("countingGeneration", 1L)
+                    .append("owner", WorkloadClaimDocuments.stored(ValidationClaims.fence(owner)))));
+            assertThatThrownBy(() -> f.config.finishClose(closing, proof)).isInstanceOf(TapstateException.class);
+            assertThat(f.config.read(PIPELINE).phase()).isEqualTo(Phase.ISSUED);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"missing", "negative", "wrong-type", "exhausted"})
+    void claimWithoutAValidWriteWitnessCannotCertifyPreparation(String damage) {
+        try (var f = new Fixture()) {
+            var permission = f.config.issue(PIPELINE, f.scope);
+            var proof = f.cache.prepare(permission, f.nodeA);
+            Object value = switch (damage) { case "negative" -> -1L; case "wrong-type" -> 0; default -> Long.MAX_VALUE; };
+            var update = damage.equals("missing") ? new Document("$unset", new Document("fencedValidationWrites", ""))
+                    : new Document("$set", new Document("fencedValidationWrites", value));
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.cacheDb).updateOne(
+                    new Document("_id", MongoWorkloadClaimStore.id(ValidationClaims.key("cluster", PIPELINE))), update);
+            assertThatThrownBy(() -> f.config.complete(permission, proof)).isInstanceOf(TapstateException.class);
+            assertThat(f.config.read(PIPELINE).phase()).isEqualTo(Phase.ISSUED);
+        }
+    }
+
+    @Test void openActiveLedgerCannotCertifyAProblemLimitLatch() {
+        try (var f = new Fixture()) {
+            var permission = f.config.issue(PIPELINE, f.scope);
+            var proof = f.cache.prepare(permission, f.nodeA);
+            var key = ValidationClaims.key("cluster", PIPELINE);
+            var claim = f.rawClaims().acquire(key, f.nodeA.owner(), 1, TTL).claim();
+            claim = f.rawClaims().advanceExecution(claim, 1, Set.of(f.nodeA.owner().nodeId())).orElseThrow();
+            var run = new ValidationControlStore.Run(new ValidationRunIdentity(ValidationClaims.owner(PIPELINE, claim), "task", "run",
+                    ValidationMode.FULL, "spec", 1, "rules"), 1);
+            f.controls().insertOne(new Document("_id", MongoValidationControlStore.runId(run)).append("formatVersion", 2)
+                    .append("scope", MongoValidationControlStore.scope(f.scope)).append("validationSubject", encode(permission.subject()))
+                    .append("identity", MongoValidationControlStore.identity(run)).append("state", "STARTING").append("retired", false));
+            f.controls().updateOne(new Document("_id", f.control().get("_id")), new Document("$set", new Document("countingGeneration", 1L)
+                    .append("owner", WorkloadClaimDocuments.stored(run.fence())).append("retainedRuns", 1L).append("closed", false)
+                    .append("slots", new Document("dGFzaw:FULL", MongoValidationControlStore.runId(run)))));
+            assertThat(proof.requirePrepared(permission.subject()).outcome()).isEqualTo(Outcome.PREPARED);
+            f.controls().updateOne(new Document("_id", f.control().get("_id")), new Document("$set", new Document("problemLimit", true)));
+            assertThatThrownBy(() -> f.config.complete(permission, proof)).isInstanceOf(TapstateException.class);
+            assertThat(f.config.read(PIPELINE).phase()).isEqualTo(Phase.ISSUED);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"claimGeneration", "executionGeneration"})
+    void claimCountersCannotRegressBelowTheRetainedOwnerHistory(String counter) {
+        try (var f = new Fixture()) {
+            var permission = f.config.issue(PIPELINE, f.scope);
+            f.config.complete(permission, f.cache.prepare(permission, f.nodeA));
+            var key = ValidationClaims.key("cluster", PIPELINE);
+            var claim = f.rawClaims().acquire(key, f.nodeA.owner(), 1, TTL).claim();
+            claim = f.rawClaims().advanceExecution(claim, 1, Set.of(f.nodeA.owner().nodeId())).orElseThrow();
+            claim = f.rawClaims().advanceExecution(claim, 1, Set.of(f.nodeA.owner().nodeId())).orElseThrow();
+            f.controls().updateOne(new Document("_id", f.control().get("_id")), new Document("$set", new Document("countingGeneration", 1L)
+                    .append("owner", WorkloadClaimDocuments.stored(ValidationClaims.fence(ValidationClaims.owner(PIPELINE, claim))))));
+            var closing = f.config.beginClose(PIPELINE, permission.subject().generation(), UUID.randomUUID());
+            var claims = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.cacheDb);
+            claims.updateOne(new Document("_id", MongoWorkloadClaimStore.id(key)), new Document("$inc", new Document(counter, -1L)));
+            var original = f.control();
+            assertThatThrownBy(() -> f.cache.cancel(closing, f.nodeB)).isInstanceOf(TapstateException.class);
+            assertThat(f.config.read(PIPELINE).phase()).isEqualTo(Phase.COMPLETE);
+            assertThat(f.control()).isEqualTo(original);
+        }
+    }
+
+    @Test void lawfulSameOwnerTopologyRefreshKeepsHistoricalClosureAvailable() {
+        try (var f = new Fixture()) {
+            var permission = f.config.issue(PIPELINE, f.scope);
+            f.config.complete(permission, f.cache.prepare(permission, f.nodeA));
+            var key = ValidationClaims.key("cluster", PIPELINE);
+            var claim = f.rawClaims().acquire(key, f.nodeA.owner(), 1, TTL).claim();
+            claim = f.rawClaims().advanceExecution(claim, 1, Set.of(f.nodeA.owner().nodeId())).orElseThrow();
+            f.controls().updateOne(new Document("_id", f.control().get("_id")), new Document("$set", new Document("countingGeneration", 1L)
+                    .append("owner", WorkloadClaimDocuments.stored(ValidationClaims.fence(ValidationClaims.owner(PIPELINE, claim))))));
+            var refreshed = f.rawClaims().acquire(key, f.nodeA.owner(), 2, TTL).claim();
+            assertThat(refreshed.claimGeneration()).isEqualTo(claim.claimGeneration());
+            assertThat(refreshed.executionGeneration()).isEqualTo(claim.executionGeneration());
+            assertThat(refreshed.topologyRevision()).isEqualTo(2);
+            var closing = f.config.beginClose(PIPELINE, permission.subject().generation(), UUID.randomUUID());
+            assertThat(f.config.finishClose(closing, f.cache.cancel(closing, f.nodeB)).phase()).isEqualTo(Phase.CLOSED);
         }
     }
 
