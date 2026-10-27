@@ -113,9 +113,10 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
     private Iterator<Object> snapshotWaiters;
     private boolean flushingSnapshotBatch;
     private final Map<Object, Map<String, ChainPosition>> waitingPositions = new LinkedHashMap<>();
-    // Advisory keys only. A miss, including every restart, checks the durable absence set instead.
-    private final LinkedHashMap<Object, Boolean> recentlyComplete = new LinkedHashMap<>(64, 0.75f, true);
-    private static final int MAX_RECENT_COMPLETE = 4_096;
+    // Bounded key observations, never root values. Only this processor creates state under its keys,
+    // and the first touch consumes a remembered absence. Eviction and restart read durable state again.
+    private final LinkedHashMap<Object, ReferenceState> recentReferenceStates = new LinkedHashMap<>(64, 0.75f, true);
+    private static final int MAX_RECENT_REFERENCE_STATES = 4_096;
 
     /**
      * Keys keeping the record of a deletion, which is where the sweep that drops them has to look. Kept for
@@ -782,13 +783,16 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         if (item instanceof NestTouch word) {
             if ((word.onlyIfWaiting() || word.firstFiling()) && !waiting.contains(word.key())) {
                 Touched inDrain = touched.get(word.key());
-                if (inDrain == null && recentlyComplete.get(word.key()) != null) {
+                if (inDrain == null && recentReferenceStates.get(word.key()) != null) {
                     if (word.firstFiling()) {
                         SettledPositions.fold(settledAhead, word.positions());
                     }
                     return;
                 }
                 RootAssembly assembly = inDrain == null ? store.load(word.key()) : inDrain.assembly;
+                if (assembly == null) {
+                    rememberReferenceState(word.key(), ReferenceState.ABSENT);
+                }
                 if (assembly == null || !assembly.mayNeedReferenceUpdate()
                         || !assembly.needsReferenceUpdate(slots, referencesFor(assembly))) {
                     if (word.firstFiling()) {
@@ -1223,7 +1227,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
     private void settle(Map<Object, Touched> touched, boolean allowMissingReferences, boolean allowMissingObjects) {
         Map<String, Map<Object, Map<String, Object>>> resolved = resolveReferences(touched);
         touched.forEach((key, document) -> {
-            recentlyComplete.remove(key);
+            recentReferenceStates.remove(key);
             document.assembly.reconcileMissingObjects(slots);
             document.assembly.render(slots, resolved).ifPresentOrElse(
                     rendered -> {
@@ -1662,9 +1666,9 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
     }
 
     private Touched touched(Object key, Map<Object, Touched> touched) {
-        recentlyComplete.remove(key);
+        ReferenceState known = recentReferenceStates.remove(key);
         return touched.computeIfAbsent(key, k -> {
-            RootAssembly held = store.load(k);
+            RootAssembly held = known == ReferenceState.ABSENT ? null : store.load(k);
             // Whether anything was there is carried to the write at the end of the drain rather than worked
             // out again there. Only the read can answer it - a write that asked would be the very fetch the
             // answer exists to save - and by then the state to be written is there either way, so the two
@@ -1676,13 +1680,21 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
     private void documentSent(Object key, RootAssembly assembly) {
         assembly.documentSent();
         if (assembly.mayNeedReferenceUpdate()) {
-            recentlyComplete.remove(key);
+            recentReferenceStates.remove(key);
         } else {
-            recentlyComplete.put(key, Boolean.TRUE);
-            if (recentlyComplete.size() > MAX_RECENT_COMPLETE) {
-                recentlyComplete.remove(recentlyComplete.keySet().iterator().next());
-            }
+            rememberReferenceState(key, ReferenceState.COMPLETE);
         }
+    }
+
+    private void rememberReferenceState(Object key, ReferenceState state) {
+        recentReferenceStates.put(key, state);
+        if (recentReferenceStates.size() > MAX_RECENT_REFERENCE_STATES) {
+            recentReferenceStates.remove(recentReferenceStates.keySet().iterator().next());
+        }
+    }
+
+    private enum ReferenceState {
+        ABSENT, COMPLETE
     }
 
     private boolean flush() {
