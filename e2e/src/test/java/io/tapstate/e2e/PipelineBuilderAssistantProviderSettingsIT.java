@@ -101,12 +101,14 @@ class PipelineBuilderAssistantProviderSettingsIT {
         String database = "ts_plan_ai_discovery_" + UUID.randomUUID().toString().replace("-", "");
         String storeUri = SharedMongo.replicaSetUrl(database);
         var calls = new java.util.concurrent.atomic.AtomicInteger();
+        var received = new java.util.concurrent.atomic.AtomicReference<java.util.List<Map<String, String>>>();
         var proposed = new java.util.concurrent.atomic.AtomicReference<Map<String, Object>>();
         io.tapstate.control.core.AiProviderClient provider = new io.tapstate.control.core.AiProviderClient() {
             public void check(io.tapstate.control.core.AiProviderSettings settings) { }
             public java.util.Optional<Map<String, Object>> propose(io.tapstate.control.core.AiProviderSettings settings,
                     java.util.List<Map<String, String>> messages, Map<String, Object> context,
                     java.util.function.Consumer<String> text) {
+                received.set(java.util.List.copyOf(messages));
                 text.accept(calls.getAndIncrement() == 0 ? "Which source?" : "Using orders.");
                 return java.util.Optional.of(calls.get() == 1 ? Map.of() : proposed.get());
             }
@@ -137,6 +139,7 @@ class PipelineBuilderAssistantProviderSettingsIT {
                             "columns", java.util.List.of(), "transforms", java.util.List.of()),
                     "relations", java.util.List.of(), "transforms", java.util.List.of(),
                     "destinationSourceId", "destination", "destinationTable", "orders", "destinationWriteMode", "upsert");
+            var originalDraft = store.drafts().get("blank_auto").orElseThrow();
             proposed.set(candidate);
             HttpClient client = HttpClient.newHttpClient();
             var settingsRequest = HttpRequest.newBuilder(server.baseUrl().resolve("/api/ai-provider-settings"))
@@ -148,13 +151,14 @@ class PipelineBuilderAssistantProviderSettingsIT {
             assertThat(first.statusCode()).isEqualTo(200);
             assertThat(first.body()).contains("Which source?", "needs-input", "control.ai-invalid-proposal", "\"finishReason\":\"stop\"")
                     .doesNotContain("data-proposal", "\"type\":\"error\"");
-            assertThat(store.drafts().get("blank_auto").orElseThrow().wizard().root()).isNull();
+            assertThat(store.drafts().get("blank_auto")).contains(originalDraft);
             var second = assistant(client, server, control, java.util.List.of(
                     Map.of("role", "user", "text", "Choose tables"),
                     Map.of("role", "assistant", "text", "Which source?"),
                     Map.of("role", "user", "text", "Use orders_src")));
             assertThat(second.body()).contains("Using orders.", "data-proposal", "\"finishReason\":\"stop\"");
-            assertThat(store.drafts().get("blank_auto").orElseThrow().wizard().root()).isNull();
+            assertThat(received.get()).contains(Map.of("role", "user", "content", "Use orders_src"));
+            assertThat(store.drafts().get("blank_auto")).contains(originalDraft);
         }
     }
 
