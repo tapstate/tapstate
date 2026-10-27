@@ -142,7 +142,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
                         || original.configurationRevision() > revision) throw unreadable("permission-scope");
             }
         }
-        bounded(new Document("taskGeneration", generation).append("modes", modes), 16 * 1024);
+        bounded(admissionMetadata(task, modes), 16 * 1024);
         return task;
     }
 
@@ -235,7 +235,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
     }
     private void updateMode(ClientSession session, Document task, Start start, Document next) {
         var modes = new Document(task.get("modes", Document.class)); modes.put(modeName(start.run().mode()), next);
-        bounded(new Document("taskGeneration", task.get("taskGeneration")).append("modes", modes), 16 * 1024);
+        bounded(admissionMetadata(task, modes), 16 * 1024);
         var filter = new Document("_id", task.get("_id")).append("taskGeneration", task.get("taskGeneration"))
                 .append("revision", task.get("revision")).append("modes", task.get("modes"));
         if (tasks.updateOne(session, filter, new Document("$set", new Document("modes", modes))).getMatchedCount() != 1)
@@ -296,6 +296,20 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
                         .append("executionGeneration", owner.executionGeneration()).append("topologyRevision", owner.topologyRevision()));
     }
     private static String modeName(ValidationMode mode) { return mode == ValidationMode.FULL ? "full" : "incremental"; }
+    private static Document admissionMetadata(Document task, Document modes) {
+        var maximumModes = new Document();
+        for (var entry : modes.entrySet()) {
+            var mode = new Document((Document) entry.getValue());
+            if (mode.get("permission") instanceof Document held) {
+                // Admission reserves the largest remaining phase so every accepted permission can close.
+                mode.put("permission", new Document(held).append("phase", "CLOSED"));
+            }
+            maximumModes.put(entry.getKey(), mode);
+        }
+        var metadata = new Document("taskGeneration", task.get("taskGeneration")).append("modes", maximumModes);
+        if (task.containsKey("closed")) metadata.append("closed", task.get("closed"));
+        return metadata;
+    }
     private static void bounded(Document value, int maximum) {
         // Every input component is bounded before BSON materialization; this measures the actual encoded form.
         try (var output = new BasicOutputBuffer(); var writer = new BsonBinaryWriter(output)) {

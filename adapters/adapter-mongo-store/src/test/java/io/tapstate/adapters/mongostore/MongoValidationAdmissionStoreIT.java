@@ -187,6 +187,74 @@ class MongoValidationAdmissionStoreIT {
         }
     }
 
+    @Test void taskClosureFlagSharesTheOriginalAdmissionMetadataBudget() {
+        for (int excess : List.of(0, 1)) {
+            try (var f = new Fixture()) {
+                f.tasks().updateOne(new Document("_id", MongoValidationAdmissionStore.taskId(f.task)),
+                        new Document("$set", new Document("closed", false)));
+                var full = largeStart(f, ValidationMode.FULL, 0);
+                for (int length = 1; length < 510; length++) {
+                    var candidate = largeStart(f, ValidationMode.FULL, length);
+                    if (bsonBytes(MongoValidationAdmissionStore.identity(candidate)) > 8 * 1024) break;
+                    full = candidate;
+                }
+                Start incremental = null;
+                for (int length = 0; length < 510; length++) {
+                    var candidate = largeStart(f, ValidationMode.INCREMENTAL, length);
+                    var fullFinal = permission(full); fullFinal.get("permission", Document.class).put("phase", "CLOSED");
+                    var incrementalFinal = permission(candidate); incrementalFinal.get("permission", Document.class).put("phase", "CLOSED");
+                    var modes = new Document("full", fullFinal).append("incremental", incrementalFinal);
+                    var metadata = new Document("taskGeneration", f.task.generation().toString()).append("modes", modes).append("closed", false);
+                    if (bsonBytes(metadata) == 16 * 1024 + excess) { incremental = candidate; break; }
+                }
+                assertThat(incremental).as("valid descriptors at the exact BSON boundary").isNotNull();
+                assertThat(bsonBytes(MongoValidationAdmissionStore.identity(incremental))).isLessThanOrEqualTo(8 * 1024);
+                assertThat(f.first.reserve(full)).isEqualTo(Reservation.RESERVED);
+                var original = f.tasks().find().first(); var second = incremental;
+                if (excess == 0) {
+                    assertThat(f.second.reserve(second)).isEqualTo(Reservation.RESERVED);
+                    var task = f.tasks().find().first();
+                    assertThat(bsonBytes(new Document("taskGeneration", task.get("taskGeneration"))
+                            .append("modes", task.get("modes")).append("closed", task.get("closed")))).isEqualTo(16 * 1024 - 4);
+                    var first = full;
+                    assertThat(f.first.close(first)).isEqualTo(Closure.CLOSED);
+                    assertThat(f.second.close(second)).isEqualTo(Closure.CLOSED);
+                    var ended = f.tasks().find().first();
+                    assertThat(bsonBytes(new Document("taskGeneration", ended.get("taskGeneration"))
+                            .append("modes", ended.get("modes")).append("closed", ended.get("closed")))).isEqualTo(16 * 1024);
+                } else {
+                    assertThatThrownBy(() -> f.second.reserve(second)).isInstanceOf(TapstateException.class)
+                            .hasMessageContaining("admission-bytes");
+                    assertThat(f.tasks().find().first()).isEqualTo(original);
+                    var oversized = new Document(original); var modes = new Document(original.get("modes", Document.class));
+                    modes.put("incremental", permission(second)); oversized.put("modes", modes);
+                    f.tasks().replaceOne(new Document("_id", original.get("_id")), oversized);
+                    var first = full;
+                    assertThatThrownBy(() -> f.first.close(first)).isInstanceOf(TapstateException.class)
+                            .hasMessageContaining("admission-bytes");
+                    assertThat(f.tasks().find().first()).isEqualTo(oversized);
+                }
+            }
+        }
+    }
+
+    private static Start largeStart(Fixture f, ValidationMode mode, int length) {
+        var wide = "\u20ac".repeat(512);
+        var owner = new ValidationOwner("cluster", "pipeline", wide, wide, 1, 1, 1);
+        return new Start(f.task, 1, 1, wide, new ValidationRunIdentity(owner, "task", "run" + "r".repeat(length), mode,
+                wide, 1, "\u20ac".repeat(256) + "r".repeat(256)));
+    }
+    private static Document permission(Start start) {
+        return new Document("nextStartSequence", 2L).append("permission", new Document("sequence", 1L)
+                .append("phase", "OPEN").append("identity", MongoValidationAdmissionStore.identity(start)));
+    }
+    private static int bsonBytes(Document value) {
+        try (var output = new org.bson.io.BasicOutputBuffer(); var writer = new org.bson.BsonBinaryWriter(output)) {
+            new org.bson.codecs.DocumentCodec().encode(writer, value, org.bson.codecs.EncoderContext.builder().build());
+            return output.getSize();
+        }
+    }
+
     private static final class Fixture implements AutoCloseable {
         final MongoClient client = MongoClients.create(MONGO.getReplicaSetUrl());
         final MongoClient other = MongoClients.create(MONGO.getReplicaSetUrl());
