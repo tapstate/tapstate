@@ -252,6 +252,38 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         return new MongoValidationCachePreparations(client, database, expected, targetFingerprint, this::businessActive);
     }
 
+    WorkloadClaimStore validationClaims(MongoValidationPreparations.Permission original) {
+        return validationClaims(new MongoValidationPreparations.Authority(original));
+    }
+
+    io.tapstate.spi.store.ValidationControlStore validationControl(MongoValidationPreparations.Permission original) {
+        return validationControl(new MongoValidationPreparations.Authority(original));
+    }
+
+    WorkloadClaimStore validationClaims(MongoValidationPreparations.Closing original) {
+        return validationClaims(new MongoValidationPreparations.Authority(original));
+    }
+
+    io.tapstate.spi.store.ValidationControlStore validationControl(MongoValidationPreparations.Closing original) {
+        return validationControl(new MongoValidationPreparations.Authority(original));
+    }
+
+    private WorkloadClaimStore validationClaims(MongoValidationPreparations.Authority original) {
+        requireValidationPreparation(original);
+        return new MongoCacheWorkloadClaimStore(client, database, original.subject().scope(), this::businessActive, original);
+    }
+
+    private io.tapstate.spi.store.ValidationControlStore validationControl(MongoValidationPreparations.Authority original) {
+        requireValidationPreparation(original);
+        return new MongoValidationControlStore(client, database, original.subject().scope(), this::businessActive, original);
+    }
+
+    private void requireValidationPreparation(MongoValidationPreparations.Authority original) {
+        Objects.requireNonNull(original, "original").require(false);
+        if (!targetFingerprint.equals(MongoStorageBindingStore.targetFingerprint(original.binding().cache()))) throw MongoCacheIdentity.fenced();
+        loadBusinessScope(original.subject().scope());
+    }
+
     /** The claims share this exact cache client, original scope and owner lifecycle. */
     public WorkloadClaimStore workloadClaims(CacheBusinessScope expected) {
         loadBusinessScope(expected);

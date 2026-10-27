@@ -153,6 +153,10 @@ final class MongoValidationCachePreparations {
                 new Document("$set", new Document("validationPreparation", birth(next, origin)))).getMatchedCount() != 1) throw fenced();
     }
     private Receipt receipt(ClientSession session, Document root) {
+        return receiptInTransaction(session, database, scope, root);
+    }
+    static Receipt receiptInTransaction(ClientSession session, MongoDatabase database, CacheBusinessScope scope, Document root) {
+        if (!session.hasActiveTransaction()) throw new IllegalStateException("validation receipts require their original CACHE transaction");
         var subject = binding(root); var origin = origin(root); var state = outcome(root);
         MongoValidationControlStore.validateIndependentSlots(session, database, root, scope, encode(subject));
         long generation = 0, execution = 0;

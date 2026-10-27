@@ -32,11 +32,18 @@ final class MongoValidationControlStore implements ValidationControlStore {
     private final CacheBusinessScope scope;
     private final Runnable requireActive;
     private final MongoCollection<Document> rows;
+    private final MongoValidationPreparations.Authority validation;
 
     MongoValidationControlStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive) {
+        this(client, database, scope, requireActive, null);
+    }
+
+    MongoValidationControlStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive,
+            MongoValidationPreparations.Authority validation) {
         this.client = Objects.requireNonNull(client); this.database = Objects.requireNonNull(database);
         this.scope = Objects.requireNonNull(scope); this.requireActive = Objects.requireNonNull(requireActive);
         rows = SystemCollections.VALIDATION_RUNS.on(database);
+        this.validation = validation;
     }
 
     @Override public Join join(Run run) {
@@ -70,15 +77,17 @@ final class MongoValidationControlStore implements ValidationControlStore {
             if (slots.size() == MAX_ACTIVE_RUNS || control.getLong("retainedRuns") == MAX_RETAINED_RUNS) throw limit();
             slots.put(key, runId(run)); control.put("retainedRuns", control.getLong("retainedRuns") + 1);
             writeControl(session, control);
-            rows.insertOne(session, new Document("_id", runId(run)).append("formatVersion", 1).append("scope", scope(scope))
-                    .append("identity", identity(run)).append("state", ValidationRunState.STARTING.name()).append("retired", false));
+            var record = new Document("_id", runId(run)).append("formatVersion", validation == null ? 1 : 2).append("scope", scope(scope))
+                    .append("identity", identity(run)).append("state", ValidationRunState.STARTING.name()).append("retired", false);
+            if (validation != null) record.append("validationSubject", MongoValidationPreparationFacts.encode(validation.subject()));
+            rows.insertOne(session, record);
             return Join.JOINED;
         });
     }
 
     @Override public Mutation transition(Transition command) {
         Objects.requireNonNull(command); var run = command.run();
-        return transaction(run.identity().owner(), false, session -> {
+        return transaction(run.identity().owner(), command.next() == ValidationRunState.RUNNING, session -> {
             var control = control(session, run.identity().owner().pipelineId()); var row = row(session, run);
             if (row == null || row.getBoolean("retired") || !current(control, run) || !slot(control, run)) return Mutation.STALE;
             var current = state(row);
@@ -141,14 +150,17 @@ final class MongoValidationControlStore implements ValidationControlStore {
         if (!scope.clusterId().equals(owner.clusterId())) throw fenced();
         return StoreIo.call(() -> {
             requireActive.run(); requireCollection(database);
+            requireValidationAuthority(owner, admission);
             try (var session = client.startSession()) {
-                return session.withTransaction(() -> {
+                var committed = session.withTransaction(() -> {
                     requireActive.run();
                     // Prove the latest live tenure before any read pins a snapshot. Every later domain
                     // and preparation check is in this transaction and rolls the witness back on failure.
-                    var filter = WorkloadClaimDocuments.live(ValidationClaims.fence(owner))
-                            .append("validationPreparation.scope", scope(scope)).append("validationPreparation.pipelineId", owner.pipelineId())
-                            .append("contextExecutionGeneration", owner.executionGeneration()).append("executionClaimGeneration", owner.claimGeneration())
+                    var filter = WorkloadClaimDocuments.live(ValidationClaims.fence(owner));
+                    if (validation == null) filter.append("validationPreparation.scope", scope(scope)).append("validationPreparation.pipelineId", owner.pipelineId());
+                    else filter.append("validationPreparation.formatVersion", 2)
+                            .append("validationPreparation.subject", MongoValidationPreparationFacts.encode(validation.subject()));
+                    filter.append("contextExecutionGeneration", owner.executionGeneration()).append("executionClaimGeneration", owner.claimGeneration())
                             .append("executionNodeIds", List.of(owner.nodeId()))
                             .append("fencedValidationWrites", new Document("$gte", 0L).append("$lt", Long.MAX_VALUE));
                     if (SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session, filter,
@@ -157,13 +169,22 @@ final class MongoValidationControlStore implements ValidationControlStore {
                     if (admission) business.admitMetadataWrite(session); else business.requireAdmissionState(session);
                     var key = ValidationClaims.key(scope.clusterId(), owner.pipelineId());
                     var claim = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
-                    requirePreparedClaim(session, database, claim, key, scope);
+                    requirePreparedClaim(session, database, claim, key, scope, validation == null ? null : validation.subject(), admission);
                     var decoded = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database)).inStrictSession(session).decodeStored(claim);
                     if (!ValidationClaims.owner(owner.pipelineId(), decoded).equals(owner)) throw fenced();
                     var result = work.apply(session); requireActive.run(); return result;
                 }, TRANSACTION);
+                requireValidationAuthority(owner, admission);
+                return committed;
             }
         });
+    }
+
+    private void requireValidationAuthority(ValidationOwner owner, boolean admission) {
+        if (validation != null) {
+            if (!validation.subject().pipelineId().equals(owner.pipelineId())) throw fenced();
+            validation.require(admission);
+        }
     }
 
     /** Only an existing controlled preparation may call this, in the same transaction as its original Pipeline facts. */
@@ -205,7 +226,24 @@ final class MongoValidationControlStore implements ValidationControlStore {
     }
 
     static void requirePreparedClaim(ClientSession session, MongoDatabase database, Document claim, WorkloadClaimKey key, CacheBusinessScope scope) {
+        requirePreparedClaim(session, database, claim, key, scope, null, false);
+    }
+
+    static void requirePreparedClaim(ClientSession session, MongoDatabase database, Document claim, WorkloadClaimKey key, CacheBusinessScope scope,
+            MongoValidationPreparationFacts.Subject expected, boolean admission) {
         requireCollection(database);
+        if (claim != null && claim.get("validationPreparation") instanceof Document independent && Integer.valueOf(2).equals(independent.get("formatVersion"))) {
+            if (expected == null || !expected.scope().equals(scope) || !key.equals(ValidationClaims.key(scope.clusterId(), expected.pipelineId()))
+                    || !(claim.get("fencedValidationWrites") instanceof Long writes) || writes < 0 || writes == Long.MAX_VALUE) throw fenced();
+            var control = SystemCollections.VALIDATION_RUNS.on(database).find(session, new Document("_id", controlId(scope.clusterId(), expected.pipelineId()))).first();
+            if (control == null) throw unreadable("control");
+            MongoValidationCachePreparations.validateRoot(control, scope, expected.pipelineId());
+            if (!expected.equals(MongoValidationCachePreparations.binding(control)) || !independent.equals(control.get("birth"))) throw fenced();
+            if (MongoValidationCachePreparations.receiptInTransaction(session, database, scope, control).outcome() != MongoValidationPreparationFacts.Outcome.PREPARED
+                    || admission && control.getBoolean("admissionClosed")) throw fenced();
+            return;
+        }
+        if (expected != null) throw fenced();
         if (claim == null || key.type() != WorkloadClaimType.VALIDATION || !(claim.get("validationPreparation") instanceof Document birth)
                 || !birth.keySet().equals(Set.of("formatVersion", "scope", "pipelineScope", "pipelineId", "preparationId"))
                 || !Integer.valueOf(1).equals(birth.get("formatVersion")) || !scope(scope).equals(birth.get("scope"))
@@ -240,7 +278,14 @@ final class MongoValidationControlStore implements ValidationControlStore {
     }
 
     private Document control(ClientSession session, String pipeline) {
-        var row = rows.find(session, new Document("_id", controlId(scope.clusterId(), pipeline))).first(); validateControl(row, scope, pipeline); return row;
+        var row = rows.find(session, new Document("_id", controlId(scope.clusterId(), pipeline))).first();
+        if (validation == null) validateControl(row, scope, pipeline);
+        else {
+            if (row == null) throw unreadable("control");
+            MongoValidationCachePreparations.validateRoot(row, scope, pipeline);
+            if (!validation.subject().equals(MongoValidationCachePreparations.binding(row))) throw fenced();
+        }
+        return row;
     }
     private static void validateControl(Document row, CacheBusinessScope scope, String pipeline) {
         if (row == null || !Integer.valueOf(1).equals(row.get("formatVersion")) || !scope(scope).equals(row.get("scope"))
@@ -278,7 +323,8 @@ final class MongoValidationControlStore implements ValidationControlStore {
         var row = rows.find(session, new Document("_id", runId(run))).first(); if (row != null) requireRow(row, run); return row;
     }
     private void requireRow(Document row, Run run) {
-        if (!runId(run).equals(row.get("_id")) || !Integer.valueOf(1).equals(row.get("formatVersion")) || !scope(scope).equals(row.get("scope"))
+        if (!runId(run).equals(row.get("_id")) || !Integer.valueOf(validation == null ? 1 : 2).equals(row.get("formatVersion")) || !scope(scope).equals(row.get("scope"))
+                || validation != null && !MongoValidationPreparationFacts.encode(validation.subject()).equals(row.get("validationSubject"))
                 || !identity(run).equals(row.get("identity")) || !(row.get("retired") instanceof Boolean)) throw unreadable("run");
         state(row);
     }

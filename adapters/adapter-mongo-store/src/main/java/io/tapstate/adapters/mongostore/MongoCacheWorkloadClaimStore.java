@@ -40,13 +40,20 @@ final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
     private final CacheBusinessScope scope;
     private final Runnable requireActive;
     private final MongoWorkloadClaimStore raw;
+    private final MongoValidationPreparations.Authority validation;
 
     MongoCacheWorkloadClaimStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive) {
+        this(client, database, scope, requireActive, null);
+    }
+
+    MongoCacheWorkloadClaimStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive,
+            MongoValidationPreparations.Authority validation) {
         this.client = Objects.requireNonNull(client, "client");
         this.database = Objects.requireNonNull(database, "database");
         this.scope = Objects.requireNonNull(scope, "scope");
         this.requireActive = Objects.requireNonNull(requireActive, "requireActive");
         this.raw = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database));
+        this.validation = validation;
     }
 
     @Override public WorkloadClaimAttempt acquire(WorkloadClaimKey key, WorkloadOwner owner, long topologyRevision, Duration ttl) {
@@ -55,7 +62,7 @@ final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
         return transaction(true, (store, session) -> {
             if (key.type() == WorkloadClaimType.VALIDATION) {
                 var row = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
-                MongoValidationControlStore.requirePreparedClaim(session, database, row, key, scope);
+                requireValidationClaim(session, row, key);
                 return store.acquireExisting(key, owner, topologyRevision, ttl);
             }
             if(key.type()==WorkloadClaimType.CAPTURE) {
@@ -179,7 +186,7 @@ final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
     private PipelineIntentScope storedScope(ClientSession session, WorkloadClaimKey key) {
         if (key.type() == WorkloadClaimType.VALIDATION) {
             var row = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
-            MongoValidationControlStore.requirePreparedClaim(session, database, row, key, scope); return null;
+            requireValidationClaim(session, row, key); return null;
         }
         if(key.type()==WorkloadClaimType.CAPTURE) {
             var capture=SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session,new Document("_id",MongoWorkloadClaimStore.id(key))).first();
@@ -192,6 +199,11 @@ final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
 
     private PipelineIntentScope decodeScope(Document row, WorkloadClaimKey key) {
         return preparedScope(row,key,scope);
+    }
+
+    private void requireValidationClaim(ClientSession session, Document row, WorkloadClaimKey key) {
+        MongoValidationControlStore.requirePreparedClaim(session, database, row, key, scope,
+                validation == null ? null : validation.subject(), validation == null || !validation.closing());
     }
     static PipelineIntentScope preparedScope(Document row,WorkloadClaimKey key,CacheBusinessScope scope) {
         try {
@@ -226,9 +238,10 @@ final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
         return StoreIo.call(() -> {
             try {
                 requireActive.run();
+                requireValidationAuthority();
                 for (int attempt = 0; ; attempt++) {
                     try (var session = client.startSession()) {
-                        return session.withTransaction(() -> {
+                        var committed = session.withTransaction(() -> {
                             requireActive.run();
                             var identity = new MongoCacheBusinessIdentity(database, scope);
                             if (!renewalFirst) {
@@ -250,6 +263,8 @@ final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
                             requireActive.run();
                             return result;
                         }, TRANSACTION);
+                        requireValidationAuthority();
+                        return committed;
                     } catch (MongoException conflict) {
                         // A duplicate-key error aborts its transaction; retry the original callback,
                         // never keep using that session or adopt another scope.
@@ -266,12 +281,16 @@ final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
 
     private void requireScope(PipelineIntentScope original) {
         Objects.requireNonNull(original, "scope");
+        if (validation != null) throw claimFenced();
         if (!scope.equals(new CacheBusinessScope(original.clusterId(), original.bindingVersion(), original.cacheIncarnation())))
             throw MongoCacheBusinessIdentity.businessFenced();
     }
     private void requireKey(WorkloadClaimKey key) {
         if (!scope.clusterId().equals(Objects.requireNonNull(key, "key").clusterId())) throw MongoCacheBusinessIdentity.businessFenced();
+        if (validation != null && !key.equals(io.tapstate.spi.store.ValidationClaims.key(scope.clusterId(), validation.subject().pipelineId()))) throw claimFenced();
     }
+
+    private void requireValidationAuthority() { if (validation != null) validation.require(false); }
 
     static void requireCollection(MongoDatabase database) {
         var table = SystemCollections.CACHE_WORKLOAD_CLAIMS;

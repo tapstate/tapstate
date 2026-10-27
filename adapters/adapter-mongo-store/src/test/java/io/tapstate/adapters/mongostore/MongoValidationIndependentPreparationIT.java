@@ -12,6 +12,7 @@ import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.validation.*;
 import io.tapstate.spi.store.*;
+import io.tapstate.spi.store.ValidationControlStore.*;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
@@ -302,6 +303,136 @@ class MongoValidationIndependentPreparationIT {
         }
     }
 
+    @Test void nativeFacadesShareOneOwnerAcrossMembersTasksAndModesWithoutProductionPreparation() {
+        try (var f = new Fixture(); var other = MongoCacheDomain.connect(f.cacheConnection, Duration.ofSeconds(5), "other-validation-member")) {
+            var before = f.productionFacts(); var complete = f.complete();
+            var first = f.cacheDomain.validationClaims(complete); var second = other.validationClaims(f.config.issue(PIPELINE, f.scope));
+            var key = ValidationClaims.key("cluster", PIPELINE);
+            var acquired = first.acquire(key, f.nodeA.owner(), 1, TTL); assertThat(acquired.acquired()).isTrue();
+            var loser = second.acquire(key, f.nodeB.owner(), 1, TTL); assertThat(loser.acquired()).isFalse();
+            assertThat(loser.claim().owner()).isEqualTo(acquired.claim().owner());
+            var claim = first.advanceExecution(acquired.claim(), 1, Set.of(f.nodeA.owner().nodeId())).orElseThrow();
+            var a = f.cacheDomain.validationControl(complete); var b = other.validationControl(complete);
+            var full = f.run(claim, "one", ValidationMode.FULL, "full", 1);
+            assertThat(a.join(full)).isEqualTo(Join.JOINED);
+            assertThat(b.join(f.run(claim, "one", ValidationMode.FULL, "busy", 1))).isEqualTo(Join.MODE_BUSY);
+            assertThat(b.join(f.run(claim, "one", ValidationMode.INCREMENTAL, "incremental", 1))).isEqualTo(Join.JOINED);
+            assertThat(b.join(f.run(claim, "two", ValidationMode.FULL, "other-task", 1))).isEqualTo(Join.JOINED);
+            assertThat(a.join(full)).isEqualTo(Join.ALREADY_JOINED);
+            assertThat(f.control().get("slots", Document.class)).hasSize(3);
+            assertThat(f.controls().find(new Document("_id", MongoValidationControlStore.runId(full))).first().get("validationSubject"))
+                    .isEqualTo(encode(complete.subject()));
+            assertThat(first.renew(claim, TTL)).isPresent(); assertThat(f.productionFacts()).isEqualTo(before);
+            assertThat(f.cacheDb.listCollectionNames()).doesNotContain("pipeline_state", "source_schemas");
+        }
+    }
+
+    @Test void nativeClaimsRequireCompletedOriginalAuthorityAndNeverAdoptThroughTheUnboundFacade() {
+        try (var f = new Fixture()) {
+            var permission = f.config.issue(PIPELINE, f.scope); var proof = f.cache.prepare(permission, f.nodeA);
+            assertThatThrownBy(() -> f.cacheDomain.validationClaims(permission)).isInstanceOf(TapstateException.class);
+            var complete = f.config.complete(permission, proof); var key = ValidationClaims.key("cluster", PIPELINE);
+            assertThatThrownBy(() -> f.cacheDomain.workloadClaims(f.scope).acquire(key, f.nodeA.owner(), 1, TTL)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> f.cacheDomain.validationClaims(complete).acquire(ValidationClaims.key("cluster", "other"), f.nodeA.owner(), 1, TTL))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(f.cacheDomain.validationClaims(complete).acquire(key, f.nodeA.owner(), 1, TTL).acquired()).isTrue();
+        }
+    }
+
+    @Test void closingAuthorityDrainsOriginalRunsAndReportsButCannotAdmitNewWork() {
+        try (var f = new Fixture()) {
+            var complete = f.complete(); var claims = f.cacheDomain.validationClaims(complete);
+            var claim = claims.acquire(ValidationClaims.key("cluster", PIPELINE), f.nodeA.owner(), 1, TTL).claim();
+            claim = claims.advanceExecution(claim, 1, Set.of(f.nodeA.owner().nodeId())).orElseThrow();
+            var original = claim; var control = f.cacheDomain.validationControl(complete);
+            var run = f.run(claim, "task", ValidationMode.FULL, "run", 1); control.join(run);
+            var start = f.openReport(run);
+            var closing = f.config.beginClose(PIPELINE, complete.subject().generation(), UUID.randomUUID());
+            var pending = f.cache.cancel(closing, f.nodeB);
+            assertThatThrownBy(() -> f.config.finishClose(closing, pending)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> claims.renew(original, TTL)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> control.transition(new Transition(run, ValidationRunState.STOPPING, ValidationRunState.STOPPED)))
+                    .isInstanceOf(TapstateException.class);
+            var cleanup = f.cacheDomain.validationControl(closing);
+            assertThatThrownBy(() -> cleanup.join(f.run(original, "another", ValidationMode.FULL, "late", 1))).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> cleanup.transition(new Transition(run, ValidationRunState.STARTING, ValidationRunState.RUNNING)))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(f.cacheDomain.validationClaims(closing).renew(original, TTL)).isPresent();
+            assertThat(f.admissions().close(start)).isEqualTo(ValidationReportAdmission.Closure.CLOSED);
+            assertThat(cleanup.transition(new Transition(run, ValidationRunState.STOPPING, ValidationRunState.STOPPED))).isEqualTo(Mutation.APPLIED);
+            assertThat(cleanup.retire(new Retirement(run, start.report(), ValidationRunState.STOPPED))).isEqualTo(Mutation.APPLIED);
+            var retired = f.cache.cancel(closing, f.nodeB);
+            assertThat(f.config.finishClose(closing, retired).phase()).isEqualTo(Phase.CLOSED);
+            assertThatThrownBy(() -> cleanup.join(run)).isInstanceOf(TapstateException.class);
+            assertThat(f.rawClaims().read(ValidationClaims.key("cluster", PIPELINE)).orElseThrow().leased()).isFalse();
+        }
+    }
+
+    @Test void oldNativeFacadesCannotAcquireOrJoinAfterAClosedPredecessorIsReplaced() {
+        try (var f = new Fixture()) {
+            var old = f.complete(); var oldClaims = f.cacheDomain.validationClaims(old); var oldControl = f.cacheDomain.validationControl(old);
+            var key = ValidationClaims.key("cluster", PIPELINE); var first = oldClaims.acquire(key, f.nodeA.owner(), 1, TTL).claim();
+            first = oldClaims.advanceExecution(first, 1, Set.of(f.nodeA.owner().nodeId())).orElseThrow();
+            var closing = f.config.beginClose(PIPELINE, old.subject().generation(), UUID.randomUUID());
+            var closed = f.config.finishClose(closing, f.cache.cancel(closing, f.nodeB));
+            f.config.restartClosed(PIPELINE, closed.generation(), closed.revision());
+            var fresh = f.complete(); var claims = f.cacheDomain.validationClaims(fresh);
+            var next = claims.acquire(key, f.nodeB.owner(), 1, TTL).claim();
+            next = claims.advanceExecution(next, 1, Set.of(f.nodeB.owner().nodeId())).orElseThrow();
+            assertThat(next.claimGeneration()).isGreaterThan(first.claimGeneration());
+            assertThat(next.executionGeneration()).isGreaterThan(first.executionGeneration());
+            var run = f.run(next, "task", ValidationMode.FULL, "new", 1);
+            assertThat(f.cacheDomain.validationControl(fresh).join(run)).isEqualTo(Join.JOINED);
+            var before = f.control();
+            assertThatThrownBy(() -> oldClaims.acquire(key, f.nodeA.owner(), 1, TTL)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> oldControl.join(run)).isInstanceOf(TapstateException.class);
+            assertThat(f.control()).isEqualTo(before);
+        }
+    }
+
+    @Test void cacheClosingGateRejectsAdmissionAlreadyPastItsConfigurationPrecheck() throws Exception {
+        try (var f = new Fixture(); var worker = Executors.newSingleThreadExecutor()) {
+            var complete = f.complete(); var claims = f.cacheDomain.validationClaims(complete);
+            var claim = claims.acquire(ValidationClaims.key("cluster", PIPELINE), f.nodeA.owner(), 1, TTL).claim();
+            claim = claims.advanceExecution(claim, 1, Set.of(f.nodeA.owner().nodeId())).orElseThrow();
+            var run = f.run(claim, "task", ValidationMode.FULL, "late", 1);
+            var entered = new CountDownLatch(1); var release = new CountDownLatch(1); var once = new AtomicBoolean();
+            try (var observed = MongoClients.create(MongoClientSettings.builder().applyConnectionString(new ConnectionString(CACHE.getReplicaSetUrl()))
+                    .addCommandListener(new CommandListener() {
+                        @Override public void commandStarted(CommandStartedEvent event) {
+                            if (event.getCommandName().equals("update") && event.getCommand().getString("update").getValue().equals("workload_claims")
+                                    && once.compareAndSet(false, true)) { entered.countDown(); await(release); }
+                        }
+                    }).build())) {
+                var delayed = new MongoValidationControlStore(observed, observed.getDatabase(f.cacheDb.getName()), f.scope, () -> {},
+                        new MongoValidationPreparations.Authority(complete));
+                var pending = worker.submit(() -> delayed.join(run));
+                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+                try {
+                    var closing = f.config.beginClose(PIPELINE, complete.subject().generation(), UUID.randomUUID());
+                    f.config.finishClose(closing, f.cache.cancel(closing, f.nodeB));
+                } finally { release.countDown(); }
+                assertThatThrownBy(() -> pending.get(10, TimeUnit.SECONDS)).hasCauseInstanceOf(TapstateException.class);
+                assertThat(f.controls().countDocuments(new Document("_id.kind", "run"))).isZero();
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"read", "acquire"})
+    void validationBoundClaimFacadeCannotUseInheritedProductionPipelineMethods(String method) {
+        try (var f = new Fixture()) {
+            var complete = f.complete(); var production = f.seedProduction();
+            assertThat(f.cacheDomain.workloadClaims(f.scope).readPipeline(production)).isPresent();
+            var before = f.productionCacheFacts(); var claims = f.cacheDomain.validationClaims(complete);
+            assertThatThrownBy(() -> {
+                if (method.equals("read")) claims.readPipeline(production);
+                else claims.acquirePipeline(production, f.nodeB.owner(), 1, TTL);
+            }).isInstanceOf(TapstateException.class);
+            assertThat(f.productionCacheFacts()).isEqualTo(before);
+        }
+    }
+
     @Test void closedPredecessorReplacementKeepsCountersAndFencesOldCallbacks() {
         try (var f = new Fixture()) {
             var old = f.config.issue(PIPELINE, f.scope); f.config.complete(old, f.cache.prepare(old, f.nodeA));
@@ -378,6 +509,40 @@ class MongoValidationIndependentPreparationIT {
         com.mongodb.client.MongoCollection<Document> controls() { return SystemCollections.VALIDATION_RUNS.on(cacheDb); }
         Document control() { return controls().find(new Document("_id", MongoValidationControlStore.controlId("cluster", PIPELINE))).first(); }
         MongoWorkloadClaimStore rawClaims() { return new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(cacheDb)); }
+        MongoValidationPreparations.Permission complete() {
+            var original = config.issue(PIPELINE, scope); return config.complete(original, cache.prepare(original, nodeA));
+        }
+        Run run(WorkloadClaim claim, String task, ValidationMode mode, String run, long generation) {
+            return new Run(new ValidationRunIdentity(ValidationClaims.owner(PIPELINE, claim), task, run, mode, "spec", 1, "rules"), generation);
+        }
+        MongoValidationAdmissionStore admissions() { return new MongoValidationAdmissionStore(configClient, configDb, "cluster", () -> {}); }
+        PipelineIntentScope seedProduction() {
+            var original = new PipelineIntentScope("cluster", scope.bindingVersion(), scope.cacheIncarnation(), PIPELINE, 1);
+            try (var session = cacheClient.startSession()) { SystemCollections.CACHE_PIPELINE_STATE.prepareCollectionOn(cacheDb, session); }
+            var key = new WorkloadClaimKey("cluster", WorkloadClaimType.PIPELINE_ACTUATION, PIPELINE);
+            var claim = rawClaims().acquire(key, nodeA.owner(), 1, TTL).claim(); rawClaims().release(claim);
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(cacheDb).updateOne(new Document("_id", MongoWorkloadClaimStore.id(key)), new Document("$set",
+                    new Document("pipelineScope", MongoPipelinePreparationFacts.scope(original)).append("pipelinePreparation",
+                            MongoCachePipelinePreparations.marker(UUID.randomUUID().toString(), PipelineCachePreparations.Phase.PREPARED))));
+            SystemCollections.CACHE_PIPELINE_STATE.on(cacheDb).insertOne(new Document("_id", PIPELINE).append("scope", MongoPipelinePreparationFacts.scope(original))
+                    .append("stateJson", "NEW").append("epoch", 0L).append("touchMillis", 0L).append("runtimeWriteFence", 1L));
+            return original;
+        }
+        Document productionCacheFacts() {
+            return new Document("claim", SystemCollections.CACHE_WORKLOAD_CLAIMS.on(cacheDb).find(new Document("_id", MongoWorkloadClaimStore.id(
+                    new WorkloadClaimKey("cluster", WorkloadClaimType.PIPELINE_ACTUATION, PIPELINE)))).first())
+                    .append("state", SystemCollections.CACHE_PIPELINE_STATE.on(cacheDb).find(new Document("_id", PIPELINE)).first());
+        }
+        ValidationReportAdmission.Start openReport(Run run) {
+            var task = new ValidationReportAdmission.Task("cluster", PIPELINE, run.identity().taskId(), UUID.randomUUID());
+            SystemCollections.VALIDATION_TASKS.on(configDb).insertOne(new Document("_id", new Document("clusterId", "cluster")
+                    .append("pipelineId", PIPELINE).append("taskId", task.taskId())).append("formatVersion", 1)
+                    .append("taskGeneration", task.generation().toString()).append("revision", 1L)
+                    .append("modes", new Document("full", new Document("nextStartSequence", 1L)).append("incremental", new Document("nextStartSequence", 1L))));
+            var start = new ValidationReportAdmission.Start(task, 1, 1, UUID.randomUUID().toString(), run.identity());
+            assertThat(admissions().reserve(start)).isEqualTo(ValidationReportAdmission.Reservation.RESERVED);
+            assertThat(admissions().open(start)).isEqualTo(ValidationReportAdmission.Birth.CREATED); return start;
+        }
         @Override public void close() { try { configDb.drop(); cacheDb.drop(); } finally { configuration.close(); cacheDomain.close(); configClient.close(); cacheClient.close(); } }
     }
 }

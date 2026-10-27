@@ -66,6 +66,32 @@ final class MongoValidationPreparations {
         @Override public String toString() { return "ValidationClosing[original]"; }
     }
 
+    /** Fixed native authority: closing can settle original work but can never admit another run. */
+    static final class Authority {
+        private final Permission permission;
+        private final Closing closing;
+        private final Subject subject;
+        Authority(Permission permission) {
+            this.permission = Objects.requireNonNull(permission); this.closing = null;
+            permission.requireComplete(); this.subject = permission.subject();
+        }
+        Authority(Closing closing) {
+            this.permission = null; this.closing = Objects.requireNonNull(closing);
+            var state = closing.requireCurrent();
+            if (state.subject() == null || state.phase() == Phase.CLOSED) throw fenced(); this.subject = state.subject();
+        }
+        Subject subject() { return subject; }
+        boolean closing() { return closing != null; }
+        void require(boolean admission) {
+            if (permission != null) permission.requireComplete();
+            else {
+                if (admission) throw fenced(); var state = closing.requireCurrent();
+                if (!subject.equals(state.subject()) || state.phase() == Phase.CLOSED) throw fenced();
+            }
+        }
+        StorageBinding binding() { require(false); return permission == null ? closing.binding() : permission.binding(); }
+    }
+
     State read(String pipeline) { return transaction(session -> state(mapping(session, pipeline), pipeline)); }
 
     Permission issue(String pipeline, CacheBusinessScope expected) {
