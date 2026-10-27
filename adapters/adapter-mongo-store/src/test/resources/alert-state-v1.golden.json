@@ -1,0 +1,99 @@
+{
+  "head": {
+    "_id": {
+      "authorityId": "org-a",
+      "clusterId": "cluster-a",
+      "resourceKind": "pipeline",
+      "resourceId": "orders",
+      "resourceIncarnation": "resource-1",
+      "typeId": "pipeline.failed",
+      "qualifier": "rule-a"
+    },
+    "formatVersion": 1,
+    "recordRevision": {
+      "$numberLong": "3"
+    },
+    "enabled": true,
+    "status": "FIRING",
+    "quality": "VALID",
+    "lastSequence": {
+      "$numberLong": "1"
+    },
+    "lastObservedAt": "2026-10-27T00:00:00.123456789Z",
+    "pendingSince": null,
+    "recoverySince": null,
+    "episodeSequence": {
+      "$numberLong": "1"
+    },
+    "episodeNumber": {
+      "$numberLong": "1"
+    },
+    "evaluationBinding": {
+      "ruleRevision": {
+        "$numberLong": "1"
+      },
+      "generation": {
+        "$numberLong": "2"
+      },
+      "producerIncarnation": "producer-1",
+      "triggerNanos": {
+        "$numberLong": "0"
+      },
+      "resolveNanos": {
+        "$numberLong": "0"
+      },
+      "maxAgeNanos": {
+        "$numberLong": "15000000000"
+      },
+      "maxGapNanos": {
+        "$numberLong": "10000000000"
+      }
+    }
+  },
+  "episode": {
+    "_id": {
+      "alarm": {
+        "authorityId": "org-a",
+        "clusterId": "cluster-a",
+        "resourceKind": "pipeline",
+        "resourceId": "orders",
+        "resourceIncarnation": "resource-1",
+        "typeId": "pipeline.failed",
+        "qualifier": "rule-a"
+      },
+      "number": {
+        "$numberLong": "1"
+      }
+    },
+    "formatVersion": 1,
+    "firedAt": "2026-10-27T00:00:00.123456789Z",
+    "severity": "MAJOR",
+    "endedAt": null,
+    "recoveredAt": null,
+    "endReason": null
+  },
+  "transition": {
+    "_id": {
+      "alarm": {
+        "authorityId": "org-a",
+        "clusterId": "cluster-a",
+        "resourceKind": "pipeline",
+        "resourceId": "orders",
+        "resourceIncarnation": "resource-1",
+        "typeId": "pipeline.failed",
+        "qualifier": "rule-a"
+      },
+      "recordRevision": {
+        "$numberLong": "3"
+      },
+      "ordinal": 0
+    },
+    "formatVersion": 1,
+    "kind": "FIRING",
+    "at": "2026-10-27T00:00:00.123456789Z",
+    "episodeNumber": {
+      "$numberLong": "1"
+    },
+    "severity": "MAJOR"
+  }
+}

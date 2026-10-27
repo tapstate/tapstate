@@ -462,6 +462,116 @@
         "No new collection, protocol lease, event history, stored model body or credential is added by this control contract. CONFIG retains one current bounded plan, one current mapping plus flat predecessor per canonical capture, and one scope gate per affected Pipeline. Each actual recovery leaves an old quarantined physical namespace and retirement marker; precise final destruction is outside this entry, required identity cannot be discarded for a budget and insufficient capacity refuses. Existing ordinary model/log/retention and pending-full budgets and validation remain.",
         "The recovery CAPTURE claim annex is exactly formatVersion 2, original (the complete immutable version 1 birth row), physicalChain and preparationId. The preparationId equals the fixed operation UUID. Its CONFIG currentRecovery keeps only previousPhysicalChain and previousPreparationId as a flat predecessor; canonical predecessor coordinates must match the immutable birth. The Pipeline sharedRecovery marker never changes original operationId/preparation/stateRebuild and is consumed only by the winning exact old-scope full completion, never by replay or an unrelated generation."
       ]
+    },
+    "alert_rules": {
+      "goal": "Original rule identity, definition and revocation cannot be inferred from measurements. Original trusted CONFIG scope, paired configuration backup and keyring, supported schema/record versions and identity/structure validation; missing necessary history refuses reopening rather than seeding an empty ledger. Normal first preparation and reopening use the existing validated storage identity path. CACHE loss cannot restart alarm identities or erase budgets; backup restoration does not retract external unknown effects.",
+      "entry": "Validate and reopen the original CONFIG bundle, or restore its paired backup through that same validated entry. Never replay expired external work or reconstruct missing necessary facts from new samples.",
+      "prerequisites": [
+        "Original trusted CONFIG identity and paired keyring",
+        "Supported schema and record capabilities",
+        "Original backup and resource-reference closure when restoration is required",
+        "Required producer, authorization and grant-ordering proof"
+      ]
+    },
+    "alert_receivers": {
+      "goal": "Restore original target, authentication identity and revocation facts with the paired keyring. Original trusted CONFIG scope, paired configuration backup and keyring, supported schema/record versions and identity/structure validation; missing necessary history refuses reopening rather than seeding an empty ledger. Normal first preparation and reopening use the existing validated storage identity path. CACHE loss cannot restart alarm identities or erase budgets; backup restoration does not retract external unknown effects.",
+      "entry": "Validate and reopen the original CONFIG bundle, or restore its paired backup through that same validated entry. Never replay expired external work or reconstruct missing necessary facts from new samples.",
+      "prerequisites": [
+        "Original trusted CONFIG identity and paired keyring",
+        "Supported schema and record capabilities",
+        "Original backup and resource-reference closure when restoration is required",
+        "Required producer, authorization and grant-ordering proof"
+      ]
+    },
+    "alert_subscriptions": {
+      "goal": "Restore original selectors, channel references, customization and revocations; delivery history cannot reconstruct them. Original trusted CONFIG scope, paired configuration backup and keyring, supported schema/record versions and identity/structure validation; missing necessary history refuses reopening rather than seeding an empty ledger. Normal first preparation and reopening use the existing validated storage identity path. CACHE loss cannot restart alarm identities or erase budgets; backup restoration does not retract external unknown effects.",
+      "entry": "Validate and reopen the original CONFIG bundle, or restore its paired backup through that same validated entry. Never replay expired external work or reconstruct missing necessary facts from new samples.",
+      "prerequisites": [
+        "Original trusted CONFIG identity and paired keyring",
+        "Supported schema and record capabilities",
+        "Original backup and resource-reference closure when restoration is required",
+        "Required producer, authorization and grant-ordering proof"
+      ]
+    },
+    "alert_silences": {
+      "goal": "Missing records must not silently remove an operator silence; restore the original window and revocation. Original trusted CONFIG scope, paired configuration backup and keyring, supported schema/record versions and identity/structure validation; missing necessary history refuses reopening rather than seeding an empty ledger. Normal first preparation and reopening use the existing validated storage identity path. CACHE loss cannot restart alarm identities or erase budgets; backup restoration does not retract external unknown effects.",
+      "entry": "Validate and reopen the original CONFIG bundle, or restore its paired backup through that same validated entry. Never replay expired external work or reconstruct missing necessary facts from new samples.",
+      "prerequisites": [
+        "Original trusted CONFIG identity and paired keyring",
+        "Supported schema and record capabilities",
+        "Original backup and resource-reference closure when restoration is required",
+        "Required producer, authorization and grant-ordering proof"
+      ]
+    },
+    "alert_instances": {
+      "goal": "Preserve original generation, current episode pointer, continuity and accepted frontier; new samples cannot recreate history. Original trusted CONFIG scope, paired configuration backup and keyring, supported schema/record versions and identity/structure validation; missing necessary history refuses reopening rather than seeding an empty ledger. Normal first preparation and reopening use the existing validated storage identity path. CACHE loss cannot restart alarm identities or erase budgets; backup restoration does not retract external unknown effects.",
+      "entry": "Validate and reopen the original CONFIG bundle, or restore its paired backup through that same validated entry. Never replay expired external work or reconstruct missing necessary facts from new samples.",
+      "prerequisites": [
+        "Original trusted CONFIG identity and paired keyring",
+        "Supported schema and record capabilities",
+        "Original backup and resource-reference closure when restoration is required",
+        "Required producer, authorization and grant-ordering proof"
+      ]
+    },
+    "alert_episodes": {
+      "goal": "Restore original firing, ending, recovery and occurrence identity. A missing original Throwable is not reconstructed from latest logs. Original trusted CONFIG scope, paired configuration backup and keyring, supported schema/record versions and identity/structure validation; missing necessary history refuses reopening rather than seeding an empty ledger. Normal first preparation and reopening use the existing validated storage identity path. CACHE loss cannot restart alarm identities or erase budgets; backup restoration does not retract external unknown effects.",
+      "entry": "Validate and reopen the original CONFIG bundle, or restore its paired backup through that same validated entry. Never replay expired external work or reconstruct missing necessary facts from new samples.",
+      "prerequisites": [
+        "Original trusted CONFIG identity and paired keyring",
+        "Supported schema and record capabilities",
+        "Original backup and resource-reference closure when restoration is required",
+        "Required producer, authorization and grant-ordering proof"
+      ]
+    },
+    "alert_transitions": {
+      "goal": "Restore original order and administrative cause; expired history is not recomputed. Original trusted CONFIG scope, paired configuration backup and keyring, supported schema/record versions and identity/structure validation; missing necessary history refuses reopening rather than seeding an empty ledger. Normal first preparation and reopening use the existing validated storage identity path. CACHE loss cannot restart alarm identities or erase budgets; backup restoration does not retract external unknown effects.",
+      "entry": "Validate and reopen the original CONFIG bundle, or restore its paired backup through that same validated entry. Never replay expired external work or reconstruct missing necessary facts from new samples.",
+      "prerequisites": [
+        "Original trusted CONFIG identity and paired keyring",
+        "Supported schema and record capabilities",
+        "Original backup and resource-reference closure when restoration is required",
+        "Required producer, authorization and grant-ordering proof"
+      ]
+    },
+    "alert_notification_schedules": {
+      "goal": "Restore original round, unresolved references, unique successor and target eligibility; remaining intents cannot reconstruct deleted planning facts. Original trusted CONFIG scope, paired configuration backup and keyring, supported schema/record versions and identity/structure validation; missing necessary history refuses reopening rather than seeding an empty ledger. Normal first preparation and reopening use the existing validated storage identity path. CACHE loss cannot restart alarm identities or erase budgets; backup restoration does not retract external unknown effects.",
+      "entry": "Validate and reopen the original CONFIG bundle, or restore its paired backup through that same validated entry. Never replay expired external work or reconstruct missing necessary facts from new samples.",
+      "prerequisites": [
+        "Original trusted CONFIG identity and paired keyring",
+        "Supported schema and record capabilities",
+        "Original backup and resource-reference closure when restoration is required",
+        "Required producer, authorization and grant-ordering proof"
+      ]
+    },
+    "alert_delivery_intents": {
+      "goal": "Restore original target, content, attempts, remaining budget, unknown results, command identity and sealed candidate. Never replace missing or expired candidate credentials with current saved values. Original trusted CONFIG scope, paired configuration backup and keyring, supported schema/record versions and identity/structure validation; missing necessary history refuses reopening rather than seeding an empty ledger. Normal first preparation and reopening use the existing validated storage identity path. CACHE loss cannot restart alarm identities or erase budgets; backup restoration does not retract external unknown effects.",
+      "entry": "Validate and reopen the original CONFIG bundle, or restore its paired backup through that same validated entry. Never replay expired external work or reconstruct missing necessary facts from new samples.",
+      "prerequisites": [
+        "Original trusted CONFIG identity and paired keyring",
+        "Supported schema and record capabilities",
+        "Original backup and resource-reference closure when restoration is required",
+        "Required producer, authorization and grant-ordering proof"
+      ]
+    },
+    "alert_target_limits": {
+      "goal": "Restore original target restriction; a new route, candidate or recreated equivalent target cannot reset it. Original trusted CONFIG scope, paired configuration backup and keyring, supported schema/record versions and identity/structure validation; missing necessary history refuses reopening rather than seeding an empty ledger. Normal first preparation and reopening use the existing validated storage identity path. CACHE loss cannot restart alarm identities or erase budgets; backup restoration does not retract external unknown effects.",
+      "entry": "Validate and reopen the original CONFIG bundle, or restore its paired backup through that same validated entry. Never replay expired external work or reconstruct missing necessary facts from new samples.",
+      "prerequisites": [
+        "Original trusted CONFIG identity and paired keyring",
+        "Supported schema and record capabilities",
+        "Original backup and resource-reference closure when restoration is required",
+        "Required producer, authorization and grant-ordering proof"
+      ]
+    },
+    "alert_test_quotas": {
+      "goal": "Restore accepted scope/actor counts without refund; original command replay does not recreate admission. Original trusted CONFIG scope, paired configuration backup and keyring, supported schema/record versions and identity/structure validation; missing necessary history refuses reopening rather than seeding an empty ledger. Normal first preparation and reopening use the existing validated storage identity path. CACHE loss cannot restart alarm identities or erase budgets; backup restoration does not retract external unknown effects.",
+      "entry": "Validate and reopen the original CONFIG bundle, or restore its paired backup through that same validated entry. Never replay expired external work or reconstruct missing necessary facts from new samples.",
+      "prerequisites": [
+        "Original trusted CONFIG identity and paired keyring",
+        "Supported schema and record capabilities",
+        "Original backup and resource-reference closure when restoration is required",
+        "Required producer, authorization and grant-ordering proof"
+      ]
     }
   },
   "consistencyProfiles": {
@@ -504,6 +614,50 @@
     "shared-srs-cache": {
       "atomicDomain": "CACHE",
       "fencing": "Existing ordinary NODE/PIPELINE/CAPTURE and pending-full root/model/pin/checkpoint transactions remain. The separate shared replacement proves the exact original preparation, complete control view, current NODE and ended original tenures in one actual CACHE client/session transaction; it advances the known canonical CAPTURE annex/counters, expires exact old Pipeline tenures without discarding their private state, detaches the old shared relations, records a RETIRED control receipt and creates the entirely empty replacement physical root atomically. Cancellation competes on that same root, proves the unchanged old effective annex and absence of every replacement namespace fact, and persists CANCELLED before CONFIG can replan the same operation. Opaque handles and exact operation/plan/control digests prohibit old attempts after cancellation. Ordinary old-domain operations refuse both quarantine variants before reading payload. CONFIG checks stay outside the CACHE retry callback."
+    },
+    "alert_rules": {
+      "atomicDomain": "CONFIG",
+      "fencing": "Original rule incarnation and CAS revision; replacement invalidates old evaluation generations. Only one actual CONFIG client/session transaction. Protected writes compete on their original scope, identity and version; never claim a CONFIG/CACHE or remote Cloud IAM transaction. Existing authorization must prove a consumable revocation-ordering/local grant boundary before new operations; otherwise refuse, without copied Cloud accounts or invented revisions. Network and external secret IO stay outside the transaction."
+    },
+    "alert_receivers": {
+      "atomicDomain": "CONFIG",
+      "fencing": "Original receiver incarnation and CAS revision compete with permission grants; changed target semantics stop old grants. Only one actual CONFIG client/session transaction. Protected writes compete on their original scope, identity and version; never claim a CONFIG/CACHE or remote Cloud IAM transaction. Existing authorization must prove a consumable revocation-ordering/local grant boundary before new operations; otherwise refuse, without copied Cloud accounts or invented revisions. Network and external secret IO stay outside the transaction."
+    },
+    "alert_subscriptions": {
+      "atomicDomain": "CONFIG",
+      "fencing": "Original route incarnation and CAS revision compete with grants; no cross-scope routing. Only one actual CONFIG client/session transaction. Protected writes compete on their original scope, identity and version; never claim a CONFIG/CACHE or remote Cloud IAM transaction. Existing authorization must prove a consumable revocation-ordering/local grant boundary before new operations; otherwise refuse, without copied Cloud accounts or invented revisions. Network and external secret IO stay outside the transaction."
+    },
+    "alert_silences": {
+      "atomicDomain": "CONFIG",
+      "fencing": "Original identity, fixed window and CAS revision; early termination writes that same revision. Only one actual CONFIG client/session transaction. Protected writes compete on their original scope, identity and version; never claim a CONFIG/CACHE or remote Cloud IAM transaction. Existing authorization must prove a consumable revocation-ordering/local grant boundary before new operations; otherwise refuse, without copied Cloud accounts or invented revisions. Network and external secret IO stay outside the transaction."
+    },
+    "alert_instances": {
+      "atomicDomain": "CONFIG",
+      "fencing": "Original AlarmKey, input and evaluation generation, owner fence and CAS; state, episode, transition and required external planning commit together. Only one actual CONFIG client/session transaction. Protected writes compete on their original scope, identity and version; never claim a CONFIG/CACHE or remote Cloud IAM transaction. Existing authorization must prove a consumable revocation-ordering/local grant boundary before new operations; otherwise refuse, without copied Cloud accounts or invented revisions. Network and external secret IO stay outside the transaction."
+    },
+    "alert_episodes": {
+      "atomicDomain": "CONFIG",
+      "fencing": "Original AlarmKey, episode and CAS; current input generation binds capture atomically to the original occurrence. Diagnostic updates never change lifecycle or a newer episode. Only one actual CONFIG client/session transaction. Protected writes compete on their original scope, identity and version; never claim a CONFIG/CACHE or remote Cloud IAM transaction. Existing authorization must prove a consumable revocation-ordering/local grant boundary before new operations; otherwise refuse, without copied Cloud accounts or invented revisions. Network and external secret IO stay outside the transaction."
+    },
+    "alert_transitions": {
+      "atomicDomain": "CONFIG",
+      "fencing": "Commit with the original instance, episode and required external plan under their generation fences. Only one actual CONFIG client/session transaction. Protected writes compete on their original scope, identity and version; never claim a CONFIG/CACHE or remote Cloud IAM transaction. Existing authorization must prove a consumable revocation-ordering/local grant boundary before new operations; otherwise refuse, without copied Cloud accounts or invented revisions. Network and external secret IO stay outside the transaction."
+    },
+    "alert_notification_schedules": {
+      "atomicDomain": "CONFIG",
+      "fencing": "Progress and unique external intent commit together under original owner/version. Partial group invalidation and summary handoff remain atomic. Only one actual CONFIG client/session transaction. Protected writes compete on their original scope, identity and version; never claim a CONFIG/CACHE or remote Cloud IAM transaction. Existing authorization must prove a consumable revocation-ordering/local grant boundary before new operations; otherwise refuse, without copied Cloud accounts or invented revisions. Network and external secret IO stay outside the transaction."
+    },
+    "alert_delivery_intents": {
+      "atomicDomain": "CONFIG",
+      "fencing": "Original complete delivery or test key, owner/attempt fences, and same-domain schedule, revocation, target-limit and quota writes. No external call inside a transaction. Only one actual CONFIG client/session transaction. Protected writes compete on their original scope, identity and version; never claim a CONFIG/CACHE or remote Cloud IAM transaction. Existing authorization must prove a consumable revocation-ordering/local grant boundary before new operations; otherwise refuse, without copied Cloud accounts or invented revisions. Network and external secret IO stay outside the transaction."
+    },
+    "alert_target_limits": {
+      "atomicDomain": "CONFIG",
+      "fencing": "Canonical scope, channel, endpoint and authentication semantics plus CAS order grants and legal protocol evidence. Only one actual CONFIG client/session transaction. Protected writes compete on their original scope, identity and version; never claim a CONFIG/CACHE or remote Cloud IAM transaction. Existing authorization must prove a consumable revocation-ordering/local grant boundary before new operations; otherwise refuse, without copied Cloud accounts or invented revisions. Network and external secret IO stay outside the transaction."
+    },
+    "alert_test_quotas": {
+      "atomicDomain": "CONFIG",
+      "fencing": "Same CONFIG transaction as unique command and intent, actor/scope counts and receiver or canonical target occupancy. Use original deadlines and settle overdue in-flight occupancy before release. Only one actual CONFIG client/session transaction. Protected writes compete on their original scope, identity and version; never claim a CONFIG/CACHE or remote Cloud IAM transaction. Existing authorization must prove a consumable revocation-ordering/local grant boundary before new operations; otherwise refuse, without copied Cloud accounts or invented revisions. Network and external secret IO stay outside the transaction."
     }
   },
   "resources": [
@@ -2988,6 +3142,309 @@
       "growth": "Bounded by the selected connector input set.",
       "evidence": [
         "tools/catalog-derive/src/test/java/io/tapstate/tools/catalog/derive/CatalogDeriveTest.java"
+      ]
+    },
+    {
+      "id": "alert_rules",
+      "resourceVersion": 1,
+      "proposalVersion": 3,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "alert_rules"
+      ],
+      "responsibility": "Current bounded rule definitions",
+      "writers": [
+        "alert-rule-management",
+        "io.tapstate.adapters.mongostore.MongoAlertConfigurationStore"
+      ],
+      "readers": [
+        "alert-evaluator",
+        "alert-configuration-query"
+      ],
+      "recovery": "alert_rules",
+      "consistency": "alert_rules",
+      "growth": "One current definition per rule; no configuration version-history store. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL.",
+      "evidence": [
+        "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertLifecycleTest.java",
+        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java"
+      ]
+    },
+    {
+      "id": "alert_receivers",
+      "resourceVersion": 1,
+      "proposalVersion": 3,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "alert_receivers"
+      ],
+      "responsibility": "Current bounded transport receiver definitions",
+      "writers": [
+        "alert-receiver-management",
+        "io.tapstate.adapters.mongostore.MongoAlertConfigurationStore"
+      ],
+      "readers": [
+        "alert-planner",
+        "alert-permission-grant",
+        "alert-test-admission"
+      ],
+      "recovery": "alert_receivers",
+      "consistency": "alert_receivers",
+      "growth": "One receiver with bounded targets; testing a current form never saves this definition. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL.",
+      "evidence": [
+        "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertLifecycleTest.java",
+        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java"
+      ]
+    },
+    {
+      "id": "alert_subscriptions",
+      "resourceVersion": 1,
+      "proposalVersion": 3,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "alert_subscriptions"
+      ],
+      "responsibility": "Current additional-notification routes",
+      "writers": [
+        "alert-route-management",
+        "io.tapstate.adapters.mongostore.MongoAlertConfigurationStore"
+      ],
+      "readers": [
+        "alert-router",
+        "alert-permission-grant"
+      ],
+      "recovery": "alert_subscriptions",
+      "consistency": "alert_subscriptions",
+      "growth": "Bounded selectors, explicit inhibition relationships and four text fields per route and channel; no separate template store. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL.",
+      "evidence": [
+        "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertLifecycleTest.java",
+        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java"
+      ]
+    },
+    {
+      "id": "alert_silences",
+      "resourceVersion": 1,
+      "proposalVersion": 3,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "alert_silences"
+      ],
+      "responsibility": "Explicit silence windows and their revocation facts",
+      "writers": [
+        "alert-silence-management",
+        "io.tapstate.adapters.mongostore.MongoAlertConfigurationStore"
+      ],
+      "readers": [
+        "alert-router",
+        "alert-configuration-query"
+      ],
+      "recovery": "alert_silences",
+      "consistency": "alert_silences",
+      "growth": "One bounded record per silence; retired default OP seven days and Cloud one day with reference protection. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL.",
+      "evidence": [
+        "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertLifecycleTest.java",
+        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java"
+      ]
+    },
+    {
+      "id": "alert_instances",
+      "resourceVersion": 1,
+      "proposalVersion": 3,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "alert_instances"
+      ],
+      "responsibility": "Current alarm head and accepted input frontier",
+      "writers": [
+        "alert-evaluator",
+        "io.tapstate.adapters.mongostore.MongoAlertStateStore"
+      ],
+      "readers": [
+        "alert-evaluator",
+        "alert-center-query"
+      ],
+      "recovery": "alert_instances",
+      "consistency": "alert_instances",
+      "growth": "One head per rule-matched resource; no raw telemetry stream; current active count and highest five are authorized read-only queries. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL.",
+      "evidence": [
+        "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertLifecycleTest.java",
+        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java"
+      ]
+    },
+    {
+      "id": "alert_episodes",
+      "resourceVersion": 1,
+      "proposalVersion": 3,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "alert_episodes"
+      ],
+      "responsibility": "One automatic fault episode and its bounded occurrence evidence",
+      "writers": [
+        "alert-lifecycle",
+        "alert-diagnostic-capture",
+        "io.tapstate.adapters.mongostore.MongoAlertStateStore"
+      ],
+      "readers": [
+        "alert-center-query",
+        "alert-recovery-planner"
+      ],
+      "recovery": "alert_episodes",
+      "consistency": "alert_episodes",
+      "growth": "Active episodes protected; ended default OP thirty days and Cloud seven days. No personal read or acknowledgement fields. At most first/latest captures, one shared slot for the same occurrence; each text at most 16 KiB UTF-8, 256 lines and eight total exception nodes; both plus metadata at most 36 KiB per episode. Bound traversal before rendering; redact registered secrets and authentication/URI data before persistence; unproven messages omitted. Preserve safe line breaks, tabs, frames and chains with explicit truncation. No complete business rows or connection strings. After ending, traces expire no later than OP seven days or Cloud one day and never after episode expiry; retain pruned status without rebuilding old text. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL.",
+      "evidence": [
+        "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertLifecycleTest.java",
+        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java",
+        "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlarmDiagnosticsTest.java"
+      ]
+    },
+    {
+      "id": "alert_transitions",
+      "resourceVersion": 1,
+      "proposalVersion": 3,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "alert_transitions"
+      ],
+      "responsibility": "Narrow state, severity and administrative-ending history",
+      "writers": [
+        "alert-lifecycle",
+        "io.tapstate.adapters.mongostore.MongoAlertStateStore"
+      ],
+      "readers": [
+        "alert-history-query"
+      ],
+      "recovery": "alert_transitions",
+      "consistency": "alert_transitions",
+      "growth": "Only real transitions, not every sample; default OP fourteen days and Cloud three days. Reference capture identity instead of duplicating stack text. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL.",
+      "evidence": [
+        "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertLifecycleTest.java",
+        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java"
+      ]
+    },
+    {
+      "id": "alert_notification_schedules",
+      "resourceVersion": 1,
+      "proposalVersion": 3,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "alert_notification_schedules"
+      ],
+      "responsibility": "External notification planning progress and predecessor summary",
+      "writers": [
+        "alert-planner",
+        "alert-result-merge",
+        "io.tapstate.adapters.mongostore.MongoAlertNotificationStore"
+      ],
+      "readers": [
+        "alert-planner",
+        "alert-recovery-planner"
+      ],
+      "recovery": "alert_notification_schedules",
+      "consistency": "alert_notification_schedules",
+      "growth": "Active subject by route and single semantic target; fixed or bounded summaries and references; no accumulated reminder debt or in-app delivery schedule. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL.",
+      "evidence": [
+        "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertLifecycleTest.java",
+        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java"
+      ]
+    },
+    {
+      "id": "alert_delivery_intents",
+      "resourceVersion": 1,
+      "proposalVersion": 3,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "alert_delivery_intents"
+      ],
+      "responsibility": "One logical external delivery or explicit receiver-test command",
+      "writers": [
+        "alert-planner",
+        "alert-test-admission",
+        "alert-permission-grant",
+        "alert-result-merge",
+        "io.tapstate.adapters.mongostore.MongoAlertNotificationStore"
+      ],
+      "readers": [
+        "alert-sender",
+        "alert-delivery-query"
+      ],
+      "recovery": "alert_delivery_intents",
+      "consistency": "alert_delivery_intents",
+      "growth": "At most 512 KiB encoded per intent including reserved lawful result space; embedded attempts at most thirty and 4 KiB each, protocol diagnostic at most 2 KiB. Email at most 256 KiB and webhook 64 KiB. Formal delivery deadline at most twenty-four hours; explicit tests and local Cloud SDK placeholder at most one attempt. Tests have a fixed five-minute deadline. A current candidate fixes bounded transport, target, authentication identity/material, payload and optional original receiver/CAS baseline; new receivers need no saved identity. Keyed digest is purpose-separated from the original cluster key. Seal candidate credentials with existing encryption and AAD bound to scope, complete command/candidate and purpose; at most 16 KiB ciphertext, no plaintext/log/browser-persistence/temp-file/extra secret store. Preparation occurs outside the transaction and original receiver/credential/authorization baseline competes at admission. At terminal state or original deadline deny new decrypt/use; after original in-flight work settles, normal available rated operation targets physical pruning within five minutes of eligibility. Outage or backlog remains expired, visible and bounded-recoverable, not a hard physical deletion guarantee. Keep command digest/result after credential pruning so replay cannot send again. Pre-reserve lawful evidence space; never delete unknown or dedup facts to admit new work. No in-app intent. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL.",
+      "evidence": [
+        "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertLifecycleTest.java",
+        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java"
+      ]
+    },
+    {
+      "id": "alert_target_limits",
+      "resourceVersion": 1,
+      "proposalVersion": 3,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "alert_target_limits"
+      ],
+      "responsibility": "Cross-intent not-before for a canonical semantic target",
+      "writers": [
+        "alert-protocol-result",
+        "io.tapstate.adapters.mongostore.MongoAlertNotificationStore"
+      ],
+      "readers": [
+        "alert-permission-grant",
+        "alert-test-admission"
+      ],
+      "recovery": "alert_target_limits",
+      "consistency": "alert_target_limits",
+      "growth": "One bounded head per restricted target; prune only one hour after not-before has elapsed and no necessary reference remains. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL.",
+      "evidence": [
+        "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertLifecycleTest.java",
+        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java"
+      ]
+    },
+    {
+      "id": "alert_test_quotas",
+      "resourceVersion": 1,
+      "proposalVersion": 3,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "alert_test_quotas"
+      ],
+      "responsibility": "Fixed-minute receiver-test admission counts",
+      "writers": [
+        "alert-test-admission",
+        "io.tapstate.adapters.mongostore.MongoAlertNotificationStore"
+      ],
+      "readers": [
+        "alert-test-admission",
+        "alert-test-diagnostics"
+      ],
+      "recovery": "alert_test_quotas",
+      "consistency": "alert_test_quotas",
+      "growth": "Actor three per minute and scope ten per minute; one in-flight test per existing receiver and canonical semantic target, including unsaved candidates. Fixed active windows; prune one hour after end and required references. No personal-read data. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL.",
+      "evidence": [
+        "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertLifecycleTest.java",
+        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java"
       ]
     }
   ]

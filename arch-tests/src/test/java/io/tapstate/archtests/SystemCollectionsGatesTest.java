@@ -164,6 +164,17 @@ class SystemCollectionsGatesTest {
     }
 
     @Test
+    void mongoResourceIdsCannotAvoidRegistryClosureByOmittingTheConventionalPrefix() throws IOException {
+        ObjectNode declarations = contracts();
+        ObjectNode extra = resource(declarations, "mongo.config.sources").deepCopy();
+        extra.put("id", "unregistered_collection");
+        extra.putArray("physicalNames").add("unregistered_collection");
+        ((ArrayNode) declarations.get("resources")).add(extra);
+        assertThatThrownBy(() -> validateContracts(declarations)).isInstanceOf(AssertionError.class)
+                .hasMessageContaining("unregistered_collection");
+    }
+
+    @Test
     void directFileMutationsAndChannelOpenersHaveExplicitResourceOwners() throws IOException {
         ObjectNode declarations = contracts();
         assertFileOwners(declarations);
@@ -248,7 +259,9 @@ class SystemCollectionsGatesTest {
             assertThat(requiredTexts(row, "physicalNames")).containsExactlyElementsOf(declaration.physicalNames());
             assertThat(requiredTexts(row, "writers")).contains(declaration.owner().getName());
         }
-        assertThat(rows.keySet().stream().filter(id -> id.startsWith("mongo.")).toList())
+        assertThat(rows.values().stream()
+                .filter(row -> Set.of("COLLECTION", "GRIDFS_BUCKET").contains(row.path("kind").asText()))
+                .map(row -> row.path("id").asText()).toList())
                 .containsExactlyInAnyOrderElementsOf(mongo);
     }
 

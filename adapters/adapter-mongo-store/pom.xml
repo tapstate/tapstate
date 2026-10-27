@@ -19,6 +19,11 @@
   <description>MongoDB storage adapter: the connection substrate (reach + replica-set check + coded diagnostics), the artifact truth-layer store (canonical save / get / list), the CAS state store (epoch-fencing compare-and-swap on the pipeline checkpoint), and the connection catalog store (structured connection configs), with driver failures translated into io-domain coded diagnostics</description>
 
   <dependencies>
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-alerting</artifactId>
+      <version>${revision}</version>
+    </dependency>
     <!-- Shared test scaffolding: the Docker gate these suites are held to. A test-jar in test
          scope - nothing from it reaches the shipped artifact. -->
     <dependency>

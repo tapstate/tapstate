@@ -90,3 +90,14 @@ sink_preparations | cache | MongoSinkPreparationStore | migrated | 1 | _id.scope
 capture_preparations | config | MongoCaptureStatePreparations | migrated | 1 | _id.clusterId+_id.bindingVersion+_id.capture
 snapshot_orders | cache | MongoSnapshotStateStore | migrated | 1 | -
 snapshot_counts | cache | MongoSnapshotStateStore | migrated | 1 | _id.scope
+alert_rules | config | MongoAlertConfigurationStore | migrated | 2 | _id.authorityId+_id.clusterId+cleanupAt+_id
+alert_receivers | config | MongoAlertConfigurationStore | migrated | 2 | _id.authorityId+_id.clusterId+cleanupAt+_id
+alert_subscriptions | config | MongoAlertConfigurationStore | migrated | 2 | _id.authorityId+_id.clusterId+cleanupAt+_id
+alert_silences | config | MongoAlertConfigurationStore | migrated | 2 | _id.authorityId+_id.clusterId+cleanupAt+_id
+alert_instances | config | MongoAlertStateStore | migrated | 2 | _id.authorityId+_id.clusterId+cleanupAt+_id
+alert_episodes | config | MongoAlertStateStore | migrated | 2 | _id.alarm.authorityId+_id.alarm.clusterId+cleanupAt+_id, _id.alarm
+alert_transitions | config | MongoAlertStateStore | migrated | 2 | _id.alarm.authorityId+_id.alarm.clusterId+cleanupAt+_id, _id.alarm
+alert_notification_schedules | config | MongoAlertNotificationStore | migrated | 2 | _id.authorityId+_id.clusterId+cleanupAt+_id
+alert_delivery_intents | config | MongoAlertNotificationStore | migrated | 2 | _id.authorityId+_id.clusterId+cleanupAt+_id
+alert_target_limits | config | MongoAlertNotificationStore | migrated | 2 | _id.authorityId+_id.clusterId+cleanupAt+_id
+alert_test_quotas | config | MongoAlertNotificationStore | migrated | 2 | _id.authorityId+_id.clusterId+cleanupAt+_id

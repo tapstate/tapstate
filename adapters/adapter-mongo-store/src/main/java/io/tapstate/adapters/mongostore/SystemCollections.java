@@ -261,7 +261,31 @@ public enum SystemCollections {
             new IndexSpec(List.of("_id.clusterId","_id.bindingVersion","_id.capture"),false,"capture_preparation_history")),
     CACHE_SNAPSHOT_ORDERS("snapshot_orders",Database.CACHE,MongoSnapshotStateStore.class,Strategy.MIGRATED,1),
     CACHE_SNAPSHOT_COUNTS("snapshot_counts",Database.CACHE,MongoSnapshotStateStore.class,Strategy.MIGRATED,1,
-            new IndexSpec(List.of("_id.scope"),false,"snapshot_scope"));
+            new IndexSpec(List.of("_id.scope"),false,"snapshot_scope")),
+    ALERT_RULES("alert_rules", Database.CONFIG, MongoAlertConfigurationStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup")),
+    ALERT_RECEIVERS("alert_receivers", Database.CONFIG, MongoAlertConfigurationStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup")),
+    ALERT_SUBSCRIPTIONS("alert_subscriptions", Database.CONFIG, MongoAlertConfigurationStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup")),
+    ALERT_SILENCES("alert_silences", Database.CONFIG, MongoAlertConfigurationStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup")),
+    ALERT_INSTANCES("alert_instances", Database.CONFIG, MongoAlertStateStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup")),
+    ALERT_EPISODES("alert_episodes", Database.CONFIG, MongoAlertStateStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.alarm.authorityId", "_id.alarm.clusterId", "cleanupAt", "_id"), false, "alert_cleanup"),
+            new IndexSpec(List.of("_id.alarm"), false, "alert_alarm_history")),
+    ALERT_TRANSITIONS("alert_transitions", Database.CONFIG, MongoAlertStateStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.alarm.authorityId", "_id.alarm.clusterId", "cleanupAt", "_id"), false, "alert_cleanup"),
+            new IndexSpec(List.of("_id.alarm"), false, "alert_alarm_history")),
+    ALERT_NOTIFICATION_SCHEDULES("alert_notification_schedules", Database.CONFIG, MongoAlertNotificationStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup")),
+    ALERT_DELIVERY_INTENTS("alert_delivery_intents", Database.CONFIG, MongoAlertNotificationStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup")),
+    ALERT_TARGET_LIMITS("alert_target_limits", Database.CONFIG, MongoAlertNotificationStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup")),
+    ALERT_TEST_QUOTAS("alert_test_quotas", Database.CONFIG, MongoAlertNotificationStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup"));
 
     /** What happens to a collection's documents as the product's shape moves on. */
     public enum Strategy {
@@ -407,7 +431,12 @@ public enum SystemCollections {
 
     /** Stable engineering identity shared with the closed storage contract inventory. */
     public String resourceId() {
-        return "mongo." + database.name().toLowerCase(Locale.ROOT) + "." + collectionName;
+        return switch (this) {
+            case ALERT_RULES, ALERT_RECEIVERS, ALERT_SUBSCRIPTIONS, ALERT_SILENCES, ALERT_INSTANCES,
+                    ALERT_EPISODES, ALERT_TRANSITIONS, ALERT_NOTIFICATION_SCHEDULES, ALERT_DELIVERY_INTENTS,
+                    ALERT_TARGET_LIMITS, ALERT_TEST_QUOTAS -> collectionName;
+            default -> "mongo." + database.name().toLowerCase(Locale.ROOT) + "." + collectionName;
+        };
     }
 
     public Kind kind() { return kind; }
