@@ -477,7 +477,7 @@ class MongoValidationSchemaIT {
                         assertThatCode(() -> reopened.prepareStoppedRecovery(resumedCache, running, () -> {})).doesNotThrowAnyException();
                     }
                 } else f.configuration.prepareStoppedRecovery(target, running, () -> {});
-                assertThat(SystemCollections.VALIDATION_TASKS.on(f.configDb).find().first()).containsEntry("closed", true);
+                assertThat(SystemCollections.VALIDATION_TASKS.on(f.configDb).find().first()).containsEntry("closed", false);
                 assertThat(SystemCollections.VALIDATION_REPORTS.on(f.configDb).find().first()).containsEntry("closed", true);
                 assertThatThrownBy(() -> preparations.issue("flow0", auth.businessScope())).isInstanceOf(TapstateException.class);
                 assertThat(commands.complete(running).phase()).isEqualTo(StorageRecoveryCommands.Phase.COMPLETE);
@@ -582,6 +582,108 @@ class MongoValidationSchemaIT {
                 }
             }
         }
+    }
+
+    @Test void explicitCacheReplacementPreservesConfigurationAndMonotonicStartPermissionsForANewRun() {
+        try (var f = new Fixture(1)) {
+            f.configuration.bindings().complete(new StorageSetupScope("cluster", "installation", "setup", 1));
+            f.configuration.firstAdmin().create(f.configuration.firstAdmin().load().orElseThrow().scope(), new User("admin", "fixture-hash", "admin"));
+            var started = f.startValidation(1, true); var old = started.runs().getFirst();
+            var originalTask = SystemCollections.VALIDATION_TASKS.on(f.configDb).find().first();
+            var permission = f.configuration.validationPreparations().issue("flow0", f.scope);
+            var deleted = f.reserveRun(f.configuration, permission, started.owner(), "deleted-config", "never-started");
+            f.configuration.validationAdmissions(permission).close(deleted.admission());
+            var deletedId = new Document("_id", MongoValidationAdmissionStore.taskId(deleted.admission().task()));
+            SystemCollections.VALIDATION_TASKS.on(f.configDb).updateOne(deletedId, new Document("$set", new Document("closed", true)));
+            var deletedBefore = SystemCollections.VALIDATION_TASKS.on(f.configDb).find(deletedId).first();
+            f.cacheDb.drop();
+            try (var cache = MongoCacheDomain.connect(f.endpoint, Duration.ofSeconds(5), "validation-config-preservation")) {
+                var authentication = f.configuration.prepareAuthenticationRecovery(cache, () -> {}); var commands = f.configuration.recoveryCommands();
+                f.configuration.cacheRecoveries().stageCluster(commands.confirm(commands.plan(authentication.authScope(), f.recoveryManifest(authentication.authScope()), null, null)));
+                var running = commands.current(authentication.authScope()).orElseThrow();
+                f.configuration.prepareStoppedRecovery(cache, running, () -> {}); commands.complete(running);
+                var retained = SystemCollections.VALIDATION_TASKS.on(f.configDb).find(new Document("_id", originalTask.get("_id"))).first();
+                assertThat(retained).containsEntry("closed", false).containsEntry("taskGeneration", originalTask.get("taskGeneration"))
+                        .containsEntry("revision", originalTask.get("revision"));
+                var full = retained.get("modes", Document.class).get("full", Document.class);
+                assertThat(full.getLong("nextStartSequence")).isEqualTo(2);
+                assertThat(full.get("permission", Document.class)).containsEntry("phase", "CLOSED");
+                assertThat(SystemCollections.VALIDATION_TASKS.on(f.configDb).find(deletedId).first()).isEqualTo(deletedBefore);
+                var preparations = f.configuration.validationPreparations(); var next = preparations.issue("flow0", authentication.businessScope());
+                var node = cache.workloadClaims(authentication.businessScope()).acquire(f.nodeKey(), f.nodeOwner(), 1, TTL).claim();
+                preparations.complete(next, cache.validationPreparations(authentication.businessScope()).prepare(next, WorkloadClaimFence.from(node)));
+                var claims = cache.validationClaims(next); var key = ValidationClaims.key("cluster", "flow0");
+                var held = claims.acquire(key, node.owner(), 1, TTL).claim(); var owner = claims.advanceExecution(held, 1, Set.of(node.owner().nodeId())).orElseThrow();
+                var identity = new io.tapstate.core.validation.ValidationRunIdentity(ValidationClaims.owner("flow0", owner), old.identity().taskId(), "fresh-run",
+                        io.tapstate.core.validation.ValidationMode.FULL, "spec", 1, "rules");
+                var command = new ValidationReportAdmission.Start(old.admission().task(), old.admission().configurationRevision(), 2, UUID.randomUUID().toString(), identity);
+                var admissions = f.configuration.validationAdmissions(next);
+                assertThat(admissions.reserve(command)).isEqualTo(ValidationReportAdmission.Reservation.RESERVED);
+                assertThat(admissions.open(command)).isEqualTo(ValidationReportAdmission.Birth.CREATED);
+                assertThat(admissions.open(old.admission())).isEqualTo(ValidationReportAdmission.Birth.STALE);
+                assertThat(cache.validationControl(next).join(new ValidationControlStore.Run(identity, 1, command))).isEqualTo(ValidationControlStore.Join.JOINED);
+                assertThat(SystemCollections.VALIDATION_REPORTS.on(f.configDb).find(new Document("_id", MongoValidationAdmissionStore.reportId(old.identity()))).first())
+                        .containsEntry("closed", true);
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"closure-missing", "closure-type", "mode-type", "identity-missing", "generation", "counter", "phase"})
+    void recoveryCannotIgnoreMalformedClosedPermissionHeadersOutsideItsOpenPermissionBatch(String corruption) {
+        try (var f = new Fixture(1)) {
+            f.configuration.bindings().complete(new StorageSetupScope("cluster", "installation", "setup", 1));
+            f.configuration.firstAdmin().create(f.configuration.firstAdmin().load().orElseThrow().scope(), new User("admin", "fixture-hash", "admin"));
+            var started = f.startValidation(1, true); var permission = f.configuration.validationPreparations().issue("flow0", f.scope);
+            var bad = f.reserveRun(f.configuration, permission, started.owner(), "bad", "cancelled-before-birth");
+            f.configuration.validationAdmissions(permission).close(bad.admission());
+            var tasks = SystemCollections.VALIDATION_TASKS.on(f.configDb); var originalId = new Document("_id", MongoValidationAdmissionStore.taskId(bad.admission().task()));
+            var row = tasks.find(originalId).first(); row.put("closed", true); var mode = row.get("modes", Document.class).get("full", Document.class);
+            switch (corruption) {
+                case "closure-missing" -> row.remove("closed");
+                case "closure-type" -> row.put("closed", "true");
+                case "mode-type" -> mode.put("nextStartSequence", 2.0);
+                case "identity-missing" -> mode.get("permission", Document.class).get("identity", Document.class).remove("run");
+                case "generation" -> row.put("taskGeneration", "invalid");
+                case "counter" -> mode.put("nextStartSequence", 1L);
+                default -> mode.get("permission", Document.class).put("phase", "UNKNOWN");
+            }
+            tasks.replaceOne(originalId, row); f.cacheDb.drop();
+            try (var cache = MongoCacheDomain.connect(f.endpoint, Duration.ofSeconds(5), "validation-recovery-bad-header")) {
+                var auth = f.configuration.prepareAuthenticationRecovery(cache, () -> {}); var commands = f.configuration.recoveryCommands();
+                f.configuration.cacheRecoveries().stageCluster(commands.confirm(commands.plan(auth.authScope(), f.recoveryManifest(auth.authScope()), null, null)));
+                var running = commands.current(auth.authScope()).orElseThrow();
+                var before = tasks.find().sort(new Document("_id.taskId", 1)).into(new ArrayList<>());
+                assertThatThrownBy(() -> f.configuration.prepareStoppedRecovery(cache, running, () -> {})).isInstanceOf(TapstateException.class);
+                assertThat(tasks.find().sort(new Document("_id.taskId", 1)).into(new ArrayList<>())).isEqualTo(before);
+                assertThat(SystemCollections.VALIDATION_REPORTS.on(f.configDb).find().first()).containsEntry("closed", false);
+                assertThat(commands.current(auth.authScope()).orElseThrow().phase()).isEqualTo(StorageRecoveryCommands.Phase.RUNNING);
+                assertThat(f.cacheDb.listCollectionNames()).doesNotContain("validation_runs");
+            }
+        }
+    }
+
+    @Test void closedPermissionVerificationHasAnExplicitHeaderCountBound() {
+        try (var f = new Fixture(1)) {
+            f.upgrade(); var rows = new ArrayList<Document>();
+            for (int n = 0; n < MongoValidationAdmissionStore.MAX_TASKS_PER_PIPELINE; n++) rows.add(emptyTaskHeader("task-" + n));
+            SystemCollections.VALIDATION_TASKS.on(f.configDb).insertMany(rows);
+            try (var session = f.configClient.startSession()) {
+                assertThatCode(() -> session.withTransaction(() -> {
+                    MongoValidationAdmissionStore.requireClosedPipelinePermissions(session, f.configDb, "cluster", "flow0"); return null;
+                })).doesNotThrowAnyException();
+                SystemCollections.VALIDATION_TASKS.on(f.configDb).insertOne(emptyTaskHeader("one-too-many"));
+                assertThatThrownBy(() -> session.withTransaction(() -> {
+                    MongoValidationAdmissionStore.requireClosedPipelinePermissions(session, f.configDb, "cluster", "flow0"); return null;
+                })).isInstanceOf(TapstateException.class).hasMessageContaining("validation.taskControlHeaders");
+            }
+        }
+    }
+
+    private static Document emptyTaskHeader(String task) {
+        return new Document("_id", new Document("clusterId", "cluster").append("pipelineId", "flow0").append("taskId", task))
+                .append("formatVersion", 1).append("taskGeneration", UUID.randomUUID().toString()).append("revision", 1L).append("closed", false)
+                .append("modes", new Document("full", new Document("nextStartSequence", 1L)).append("incremental", new Document("nextStartSequence", 1L)));
     }
 
     private static boolean attemptRecovery(MongoConfigurationDomain configuration, MongoCacheDomain cache, StorageRecoveryCommands.Plan running) {

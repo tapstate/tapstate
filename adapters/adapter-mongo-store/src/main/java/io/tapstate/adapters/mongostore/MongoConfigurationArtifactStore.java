@@ -172,6 +172,26 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         return Optional.ofNullable(find(session, id)).map(this::decode);
     }
 
+    record Version(String kind, String hash) {}
+
+    /** Header-only version checks in the caller's actual CONFIG transaction; no secret or body materialization. */
+    Map<String, Version> versionsInTransaction(ClientSession session, java.util.Collection<String> ids) {
+        if (ids.isEmpty() || ids.size() > 1024) throw unreadable("validation", "dependency-count");
+        var result = new LinkedHashMap<String, Version>(); var requested = List.copyOf(ids);
+        for (var entry : collections.entrySet()) {
+            try (var rows = entry.getValue().find(session, new Document("_id", new Document("$in", requested)))
+                    .projection(new Document("_id", 1).append("kind", 1).append("contentHash", 1)).batchSize(128).iterator()) {
+                while (rows.hasNext()) {
+                    var row = rows.next();
+                    if (!(row.get("_id") instanceof String id) || !entry.getKey().equals(row.get("kind"))
+                            || !(row.get("contentHash") instanceof String hash) || !hash.matches("[a-f0-9]{64}")) throw unreadable("validation", "dependency-version");
+                    if (result.putIfAbsent(id, new Version(entry.getKey(), hash)) != null) throw unreadable(id, "cross-kind-identity");
+                }
+            }
+        }
+        return Map.copyOf(result);
+    }
+
     /** A pending rebuild keeps its exact authoring dependencies; unrelated configuration remains writable. */
     private void requireRebuildDependenciesUnchanged(ClientSession session, Set<String> changed) {
         if (changed.isEmpty()) return;

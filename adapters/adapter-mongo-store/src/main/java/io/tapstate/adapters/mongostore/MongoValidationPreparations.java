@@ -192,11 +192,26 @@ final class MongoValidationPreparations {
                         new Document("modes.incremental.permission.phase", new Document("$in", List.of("OPEN", "BORN")))));
     }
 
+    static Document openReportPermissions(String cluster, String pipeline) {
+        return new Document("_id.clusterId", cluster).append("_id.pipelineId", pipeline).append("$or", List.of(
+                new Document("modes.full.permission.phase", new Document("$in", List.of("OPEN", "BORN"))),
+                new Document("modes.incremental.permission.phase", new Document("$in", List.of("OPEN", "BORN")))));
+    }
+
     static boolean validationEnabled(com.mongodb.client.ClientSession session, MongoDatabase database, String cluster) {
         var schema = SystemCollections.SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "config")).first();
         if (schema != null && Integer.valueOf(1).equals(schema.get("installedVersion")) && !schema.containsKey("validation")) return false;
         var marker = MongoValidationSchema.requireVersionTwo(schema, "READY");
         if (!cluster.equals(MongoValidationSchema.scope(marker).clusterId())) throw unreadable(); return true;
+    }
+
+    static void requireTaskAuthoringParent(com.mongodb.client.ClientSession session, MongoDatabase database, String cluster, String pipeline) {
+        if (!validationEnabled(session, database, cluster)) throw fenced();
+        var row = SystemCollections.OPERATOR_GENERATIONS.on(database).find(session, new Document("_id", pipeline)).first();
+        var mapping = MongoPipelineStateMappings.decode(pipeline, row);
+        if (mapping.phase() == io.tapstate.spi.store.PipelineStateMapping.Phase.RETIRING
+                || mapping.phase() == io.tapstate.spi.store.PipelineStateMapping.Phase.RETIRED) throw fenced();
+        decode(row.get("validationPreparation", Document.class), cluster, pipeline);
     }
 
     static void beginCacheReplacement(com.mongodb.client.ClientSession session, MongoDatabase database, String cluster,
@@ -231,7 +246,7 @@ final class MongoValidationPreparations {
         if (!target.equals(MongoValidationSchema.scope(marker)) || !running.operationId().equals(marker.get("operationId"))) throw fenced();
         for (String pipeline : running.manifest().affectedPipelineIds()) {
             requireCacheReplacement(session, database, cluster, pipeline, running);
-            if (SystemCollections.VALIDATION_TASKS.on(database).find(session, unfinishedReports(cluster, pipeline)).limit(1).first() != null) throw fenced();
+            MongoValidationAdmissionStore.requireClosedPipelinePermissions(session, database, cluster, pipeline);
             var rows = SystemCollections.OPERATOR_GENERATIONS.on(database); var row = rows.find(session, new Document("_id", pipeline)).first();
             var next = new State(Objects.requireNonNull(generations.get(pipeline)), 0, Phase.UNASSIGNED, null, null, null);
             if (rows.updateOne(session, row, new Document("$set", new Document("validationPreparation", encode(next)))).getMatchedCount() != 1) throw fenced();

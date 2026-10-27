@@ -2,6 +2,7 @@ package io.tapstate.spi.store;
 
 import io.tapstate.core.validation.ValidationError;
 import io.tapstate.core.validation.ValidationRunIdentity;
+import io.tapstate.core.validation.ValidationRunSpec;
 import java.util.Objects;
 import java.util.UUID;
 
@@ -26,6 +27,14 @@ public interface ValidationReportAdmission {
         }
         public ValidationResultStore.Report report() { return new ValidationResultStore.Report(run, sequence); }
     }
+    record Open(Start start, ValidationRunSpec snapshot) {
+        public Open {
+            Objects.requireNonNull(start); Objects.requireNonNull(snapshot);
+            if (!start.task().pipelineId().equals(snapshot.task().pipelineId()) || start.run().mode() != snapshot.mode()
+                    || !start.run().specHash().equals(snapshot.fingerprint()) || start.run().keyMappingRevision() != snapshot.task().mappingRevision()
+                    || !start.run().comparisonRulesVersion().equals(snapshot.task().comparisonRulesVersion())) throw invalid("report.specSnapshot");
+        }
+    }
     private static String identifier(String value, String field) {
         if (value == null || value.isBlank()) throw invalid(field);
         ValidationError.fieldName(value, field); return value;
@@ -41,6 +50,8 @@ public interface ValidationReportAdmission {
     Reservation reserve(Start start);
     /** Original OPEN -> BORN plus original report insert in one CONFIG transaction; missing BORN report is loss. */
     Birth open(Start start);
+    /** Original immutable comparison snapshot; implementations may not replace it from latest task settings. */
+    default Birth open(Open command) { throw invalid("report.specSnapshotUnsupported"); }
     /** Competes with birth: revokes OPEN, or seals the exact BORN report, and stores CLOSED atomically. */
     Closure close(Start start);
 }

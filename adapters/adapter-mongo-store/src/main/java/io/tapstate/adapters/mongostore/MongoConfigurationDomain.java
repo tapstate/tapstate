@@ -565,8 +565,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                             MongoValidationPreparations.unfinishedReports(clusterId, null)).limit(1).first() != null) throw MongoValidationSchema.refused();
                     for (String pipeline : running.manifest().affectedPipelineIds()) {
                         MongoValidationPreparations.requireCacheReplacement(session, connection.database(), clusterId, pipeline, running);
-                        if (SystemCollections.VALIDATION_TASKS.on(connection.database()).find(session,
-                                MongoValidationPreparations.unfinishedReports(clusterId, pipeline)).limit(1).first() != null) throw MongoValidationSchema.refused();
+                        MongoValidationAdmissionStore.requireClosedPipelinePermissions(session, connection.database(), clusterId, pipeline);
                     }
                     var schemas = SystemCollections.SCHEMA_MIGRATIONS.on(connection.database());
                     var original = schemas.find(session, new Document("_id", "config")).first();
@@ -670,6 +669,14 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     MongoValidationAdmissionStore validationAdmissions(MongoValidationPreparations.Permission original) {
         requireOpen(); return new MongoValidationAdmissionStore(connection.client(), connection.database(), clusterId,
                 this::requireOpen, new MongoValidationPreparations.Authority(original));
+    }
+
+    /** Configuration authoring remains CONFIG-only and never requires a running validation owner. */
+    public io.tapstate.spi.store.ValidationTaskStore validationTasks(Runnable local) {
+        requireOpen(); Objects.requireNonNull(local).run();
+        StoreIo.run(() -> MongoValidationSchema.requireReady(connection.database(), true));
+        return MongoValidationAdmissionStore.taskDefinitions(connection.client(), connection.database(), clusterId,
+                () -> { requireOpen(); local.run(); }, artifacts);
     }
 
     /** Independent preparation only. The caller authenticates its command and supplies a pure local lifecycle guard. */
