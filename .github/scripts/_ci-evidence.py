@@ -194,6 +194,7 @@ def literals(value, text):
     value = uncomment(value).strip()
     if value.startswith('{') and value.endswith('}'):
         value = value[1:-1]
+    number = r'-?\d(?:_*\d)*(?:\.\d(?:_*\d)*)?[dDfFlL]?'
     result = []
     for item in split_values(value):
         if re.fullmatch(r'"(?:\\.|[^"\\])*"', item):
@@ -204,10 +205,10 @@ def literals(value, text):
                 raise ValueError('unsupported Java string escape')
         elif re.fullmatch(r"'(?:\\.|[^'\\])'", item):
             result.append(item)
-        elif re.fullmatch(r'(?:true|false|-?\d+(?:\.\d+)?[dDfFlL]?)', item):
-            result.append(item)
+        elif re.fullmatch(r'(?:true|false|' + number + r')', item):
+            result.append(item.replace('_', ''))
         elif re.fullmatch(r'\w+', item):
-            definition = re.search(r'\b' + re.escape(item) + r'\s*=\s*("(?:\\.|[^"\\])*"|true|false|-?\d+)\s*;', text)
+            definition = re.search(r'\b' + re.escape(item) + r'\s*=\s*("(?:\\.|[^"\\])*"|true|false|' + number + r')\s*;', text)
             require(definition is not None, 'unresolved annotation constant: ' + item)
             result.extend(literals(definition.group(1), text))
         else:

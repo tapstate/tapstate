@@ -15,6 +15,8 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Arrays;
+import tools.jackson.databind.json.JsonMapper;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -37,6 +39,27 @@ import static org.assertj.core.api.Assertions.assertThat;
 class SystemCollectionsGatesTest {
 
     private static final Path GOLDEN = Path.of("src/test/resources/system-collections.golden");
+
+    @Test
+    void everyCollectionHasTheSamePhysicalNamesAndLayerInTheStorageInventory() throws IOException {
+        var manifest = JsonMapper.builder().build().readTree(
+                Files.readString(Path.of("src/test/resources/storage-resources.json")));
+        var rows = new java.util.LinkedHashMap<String, tools.jackson.databind.JsonNode>();
+        for (var row : manifest.get("resources")) {
+            assertThat(rows.put(row.get("id").asString(), row)).isNull();
+        }
+        assertThat(rows.keySet()).containsExactlyInAnyOrderElementsOf(
+                Arrays.stream(SystemCollections.values()).map(SystemCollections::resourceId).toList());
+        for (SystemCollections declaration : SystemCollections.values()) {
+            var row = rows.get(declaration.resourceId());
+            assertThat(row.get("database").asString()).isEqualTo(declaration.database().name());
+            assertThat(row.get("layer").asString()).isEqualTo("LEGACY");
+            assertThat(row.get("kind").asString()).isEqualTo(declaration.kind().name());
+            var names = new java.util.ArrayList<String>();
+            row.get("physicalNames").forEach(name -> names.add(name.asString()));
+            assertThat(names).containsExactlyElementsOf(declaration.physicalNames());
+        }
+    }
 
     private static JavaClasses tapstateClasses;
 
