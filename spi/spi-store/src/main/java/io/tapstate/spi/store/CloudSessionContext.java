@@ -5,11 +5,16 @@ import java.util.Objects;
 /** Display context returned by a verified Cloud code exchange and bound to one local session. */
 public record CloudSessionContext(
         String organizationId, String clusterId, String organizationName, String clusterName, String region,
-        String ec2PublicIp, String egressAddressStatus) {
+        String ec2PublicIp, String egressAddressStatus, String userEmail) {
 
     public CloudSessionContext(String organizationId, String clusterId, String organizationName,
             String clusterName, String region) {
-        this(organizationId, clusterId, organizationName, clusterName, region, null, null);
+        this(organizationId, clusterId, organizationName, clusterName, region, null, null, null);
+    }
+
+    public CloudSessionContext(String organizationId, String clusterId, String organizationName,
+            String clusterName, String region, String ec2PublicIp, String egressAddressStatus) {
+        this(organizationId, clusterId, organizationName, clusterName, region, ec2PublicIp, egressAddressStatus, null);
     }
 
     public CloudSessionContext {

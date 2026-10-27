@@ -34,15 +34,18 @@ class MongoCloudSessionStoreTest {
     @Test
     void egressContextRoundTripsAndPreEgressSessionDocumentsRemainReadable() {
         var context = new CloudSessionContext("org-one", "cluster-one", "Organization", "Cluster", "us-east-1",
-                "203.0.113.42", "STABLE");
+                "203.0.113.42", "STABLE", "user@example.test");
         var session = new CloudSessionRecord(IDENTITY, "jwt-one", "cookie-hash", "user-one", "workload:read",
                 false, CREATED, CREATED, CREATED.plusSeconds(1800), context);
         Document document = MongoCloudSessionStore.toDocument(session);
         assertThat(MongoCloudSessionStore.toRecord(document)).contains(session);
         Document storedContext = document.get("clusterContext", Document.class);
+        assertThat(storedContext.getString("userEmail")).isEqualTo("user@example.test");
+        storedContext.remove("userEmail");
         storedContext.remove("ec2PublicIp");
         storedContext.remove("egressAddressStatus");
         var legacy = MongoCloudSessionStore.toRecord(document).orElseThrow();
+        assertThat(legacy.clusterContext().userEmail()).isNull();
         assertThat(legacy.clusterContext().ec2PublicIp()).isNull();
         assertThat(legacy.clusterContext().egressAddressStatus()).isNull();
         assertThat(legacy.clusterContext().clusterId()).isEqualTo("cluster-one");

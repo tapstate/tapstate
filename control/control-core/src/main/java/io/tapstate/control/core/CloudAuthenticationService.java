@@ -85,7 +85,7 @@ public final class CloudAuthenticationService {
             return new CloudClusterContextView(context.organizationId(), context.clusterId(),
                     context.organizationName(), context.clusterName(), context.region(),
                     current == null ? null : current.ec2PublicIp(),
-                    current == null ? null : current.egressAddressStatus());
+                    current == null ? null : current.egressAddressStatus(), context.userEmail());
         });
     }
 

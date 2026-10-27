@@ -241,14 +241,19 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
     record ExchangeResult(
             String jwt, String organizationId, String clusterId,
             String organizationName, String clusterName, String region,
-            String ec2PublicIp, String egressAddressStatus) {
+            String ec2PublicIp, String egressAddressStatus, String userEmail) {
         ExchangeResult(String jwt) {
-            this(jwt, null, null, null, null, null, null, null);
+            this(jwt, null, null, null, null, null, null, null, null);
         }
 
         ExchangeResult(String jwt, String organizationId, String clusterId,
                 String organizationName, String clusterName, String region) {
-            this(jwt, organizationId, clusterId, organizationName, clusterName, region, null, null);
+            this(jwt, organizationId, clusterId, organizationName, clusterName, region, null, null, null);
+        }
+
+        ExchangeResult(String jwt, String organizationId, String clusterId, String organizationName,
+                String clusterName, String region, String ec2PublicIp, String egressAddressStatus) {
+            this(jwt, organizationId, clusterId, organizationName, clusterName, region, ec2PublicIp, egressAddressStatus, null);
         }
 
         ExchangeResult {
@@ -264,7 +269,7 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
         CloudSessionContext context() {
             return organizationId == null ? null
                     : new CloudSessionContext(organizationId, clusterId, organizationName, clusterName, region,
-                            ec2PublicIp, egressAddressStatus);
+                            ec2PublicIp, egressAddressStatus, userEmail);
         }
     }
 
@@ -294,7 +299,8 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
             throw new ProviderFailure();
         }
         return new ExchangeResult(jwt, organizationId, clusterId, organizationName, clusterName, region,
-                optionalText(exchanged.ec2PublicIp()), optionalText(exchanged.egressAddressStatus()));
+                optionalText(exchanged.ec2PublicIp()), optionalText(exchanged.egressAddressStatus()),
+                optionalText(exchanged.userEmail()));
     }
 
     private static String optionalText(String value) {

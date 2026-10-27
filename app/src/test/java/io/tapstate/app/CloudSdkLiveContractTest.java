@@ -361,7 +361,7 @@ class CloudSdkLiveContractTest {
                 String code = "one-time-code-" + ++expectedExchanges;
                 var result = bridge.exchangeWithContext(code, CLUSTER);
                 assertThat(result.context()).isEqualTo(new CloudSessionContext(
-                        "org-one", CLUSTER, "Organization One", "Cluster One", "us-east-1"));
+                        "org-one", CLUSTER, "Organization One", "Cluster One", "us-east-1", null, null, "user@example.test"));
                 String exchanged = result.jwt();
                 assertThat(bridge.validate(exchanged, deployment, audience)).hasValueSatisfying(login -> {
                     assertThat(login.userId()).isEqualTo("stable-user-one");

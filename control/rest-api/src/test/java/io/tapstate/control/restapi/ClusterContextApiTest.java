@@ -51,7 +51,7 @@ class ClusterContextApiTest {
             .encodeToString(JTI.getBytes(StandardCharsets.UTF_8)) + "." + SECRET;
     private static final CloudSessionContext DISPLAY = new CloudSessionContext(
             "context-org", "context-cluster", "Workspace organization", "Workspace cluster", "workspace-region",
-            "198.51.100.1", "DYNAMIC");
+            "198.51.100.1", "DYNAMIC", "user@example.test");
     private static final CloudClusterEgressAddress CURRENT_ADDRESS = new CloudClusterEgressAddress(
             DISPLAY.organizationId(), DISPLAY.clusterId(), "203.0.113.42", "STABLE");
     private static final CloudSessionIdentity IDENTITY = new CloudSessionIdentity(
@@ -80,6 +80,7 @@ class ClusterContextApiTest {
             assertThat(body.get("organizationName")).isEqualTo(DISPLAY.organizationName());
             assertThat(body.get("clusterName")).isEqualTo(DISPLAY.clusterName());
             assertThat(body.get("region")).isEqualTo(DISPLAY.region());
+            assertThat(body).containsEntry("userEmail", includeEgress ? "user@example.test" : null);
             if (includeEgress) {
                 assertThat(body).containsEntry("ec2PublicIp", CURRENT_ADDRESS.ec2PublicIp());
                 assertThat(body).containsEntry("egressAddressStatus", CURRENT_ADDRESS.egressAddressStatus());
@@ -88,7 +89,7 @@ class ClusterContextApiTest {
                 assertThat(body).containsEntry("egressAddressStatus", null);
             }
             assertThat(body.keySet().stream().map(Object::toString).toList()).containsExactlyInAnyOrder("organizationId", "organizationName", "clusterId",
-                    "clusterName", "region", "clusterState", "ec2PublicIp", "egressAddressStatus");
+                    "clusterName", "region", "clusterState", "ec2PublicIp", "egressAddressStatus", "userEmail");
             // The workspace client accepts a null or string state and rejects an absent property.
             assertThat(body).as("workspace context contains its nullable state")
                     .containsKey("clusterState")
