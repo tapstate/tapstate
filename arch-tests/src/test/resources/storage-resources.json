@@ -612,6 +612,16 @@
         "Old writers quiescent and controlled same-version deployment for first enrollment",
         "Matching Source/header and schema aggregate backup for restoration"
       ]
+    },
+    "alert-route-binding-r1": {
+      "goal": "Restore the original route identity, semantic binding revision, selectors, references, customization and revocation facts from the paired CONFIG backup. Do not infer binding history from current content or delivery logs.",
+      "entry": "Ordinary reads retain closed subscription format 1 for management/diagnosis but never fabricate a send-capable binding. New subscriptions write closed format 2 with bindingRevision=1. Explicit authenticated management CAS of a supported format-1 row keeps its original identity/incarnation, advances its original record revision once, and initializes bindingRevision to that new record revision; new format-2 send grants require the exact current positive binding revision. Existing format-2 loss/corruption is refused, never defaulted or automatically reset. Repeated/unknown writes reconcile the same candidate identity and revision.",
+      "prerequisites": [
+        "Original trusted CONFIG identity and paired persistent key",
+        "Original supported subscription record and its scope/incarnation/revision",
+        "Exact authenticated management edit for explicit format-1 enrollment",
+        "Matching route/intent backup and reference closure for restoration"
+      ]
     }
   },
   "consistencyProfiles": {
@@ -714,6 +724,10 @@
     "source-and-alert-preparation-v2": {
       "atomicDomain": "CONFIG",
       "fencing": "Controlled first enrollment, preparation phase/cursor and Source writes serialize through the original CONFIG client/session and configuration_version. Each transaction publishes one Source header with its original operation cursor. Unknown commits read the same operation/header; existing UUIDs are never reallocated. Old writers must be stopped before first enrollment; no cross-client or remote maintenance atomicity is claimed. The alert version-1 to version-2 upgrade conditionally changes only its bounded component slot and the original configuration_version singleton in one actual CONFIG transaction; preserve all Source preparation and other component facts, and reconcile unknown commits by the original operation."
+    },
+    "alert-route-binding-r1": {
+      "atomicDomain": "CONFIG",
+      "fencing": "The existing route row keeps its authoring revision and gains one monotonic semantic binding revision. Changes to enabled state, match, channel/receiver identities, grouping or inhibition advance the semantic revision (including change-away-and-back); name and message text/settings-only edits do not. Original header retirement and receiver/key checks remain mandatory. Same actual CONFIG session checks the current route identity/binding and competes through the original configuration singleton with grants and corresponding local writes. Pure content equality cannot restore revoked old work; template-only changes preserve frozen original payload. No CACHE/remote IAM atomicity or fabricated permission version is claimed."
     }
   },
   "resources": [
@@ -3266,8 +3280,8 @@
     },
     {
       "id": "alert_subscriptions",
-      "resourceVersion": 1,
-      "proposalVersion": 3,
+      "resourceVersion": 2,
+      "proposalVersion": 4,
       "kind": "COLLECTION",
       "layer": "CONFIG",
       "database": "CONFIG",
@@ -3283,13 +3297,13 @@
         "alert-router",
         "alert-permission-grant"
       ],
-      "recovery": "alert_subscriptions",
-      "consistency": "alert_subscriptions",
-      "growth": "Bounded selectors, explicit inhibition relationships and four text fields per route and channel; no separate template store. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL.",
+      "recovery": "alert-route-binding-r1",
+      "consistency": "alert-route-binding-r1",
+      "growth": "Bounded selectors, explicit inhibition relationships and four text fields per route and channel; no separate template store. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL. Add one bindingRevision:Int64 to the existing subscription body (25 BSON bytes), within the existing 256 KiB definition cap and 512 MiB per-scope threshold. No additional collection, route history, authorization service or preparation history.",
       "evidence": [
-        "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertLifecycleTest.java",
-        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java",
-        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStorageSchemaIT.java"
+        "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertConfigurationTest.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertConfigurationCodecTest.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertConfigurationStoreIT.java"
       ]
     },
     {

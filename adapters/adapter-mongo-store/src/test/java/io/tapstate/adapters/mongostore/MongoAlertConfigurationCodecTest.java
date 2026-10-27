@@ -21,13 +21,13 @@ import static org.assertj.core.api.Assertions.*;
 class MongoAlertConfigurationCodecTest {
     @Test void explicitShapesMatchTheAuthoredGoldenAndRetainBsonTypesAndNanoseconds() throws Exception {
         Document actual = new Document("rule", MongoAlertConfigurationCodec.write(rule(), 0))
-                .append("subscription", MongoAlertConfigurationCodec.write(route(), 0))
+                .append("subscription", MongoAlertConfigurationCodec.write(legacyRoute(), 0))
                 .append("silence", MongoAlertConfigurationCodec.write(silence(), 0));
         try (var input = getClass().getResourceAsStream("/alert-configuration-v1.golden.json")) {
             assertThat(input).isNotNull();
             assertThat(actual).isEqualTo(Document.parse(new String(input.readAllBytes(), StandardCharsets.UTF_8)));
         }
-        for (Definition definition : List.of(rule(), route(), silence(), retire(rule()))) {
+        for (Definition definition : List.of(rule(), route(), legacyRoute(), silence(), retire(rule()))) {
             Document encoded = bson(MongoAlertConfigurationCodec.write(definition, 7));
             var identity = definition.header().identity();
             assertThat(MongoAlertConfigurationCodec.read(identity.kind(), identity.scope(), identity.id(), encoded))
@@ -35,6 +35,27 @@ class MongoAlertConfigurationCodecTest {
             assertThat(encoded.get("recordRevision")).isInstanceOf(Long.class);
             assertThat(encoded.get("formatVersion")).isInstanceOf(Integer.class);
         }
+    }
+
+    @Test void subscriptionVersionTwoMatchesItsSeparateGoldenAndRejectsMissingOrMalformedSemanticFacts() throws Exception {
+        Document actual = bson(MongoAlertConfigurationCodec.write(route(), 0));
+        try (var input = getClass().getResourceAsStream("/alert-subscription-v2.golden.json")) {
+            assertThat(input).isNotNull();
+            assertThat(actual).isEqualTo(Document.parse(new String(input.readAllBytes(), StandardCharsets.UTF_8)));
+        }
+        assertThat(actual.getInteger("formatVersion")).isEqualTo(2);
+        assertThat(actual.get("body", Document.class).get("bindingRevision")).isInstanceOf(Long.class);
+        assertThat(MongoAlertConfigurationCodec.size(actual)
+                - MongoAlertConfigurationCodec.size(MongoAlertConfigurationCodec.write(legacyRoute(), 0))).isEqualTo(25);
+        for (Object bad : java.util.Arrays.asList(null, 1, 0L, -1L, 2L, Double.POSITIVE_INFINITY)) {
+            Document row = bson(actual);
+            if (bad == null) { row.get("body", Document.class).remove("bindingRevision"); }
+            else { row.get("body", Document.class).put("bindingRevision", bad); }
+            assertUnreadable(() -> MongoAlertConfigurationCodec.read(Kind.SUBSCRIPTION, SCOPE, "route-a", row));
+        }
+        Document legacyWithExtra = MongoAlertConfigurationCodec.write(legacyRoute(), 0);
+        legacyWithExtra.get("body", Document.class).append("bindingRevision", 1L);
+        assertUnreadable(() -> MongoAlertConfigurationCodec.read(Kind.SUBSCRIPTION, SCOPE, "route-a", legacyWithExtra));
     }
 
     @Test void malformedOrFutureEnvelopeCannotMasqueradeAsAnEmptyDefinition() {

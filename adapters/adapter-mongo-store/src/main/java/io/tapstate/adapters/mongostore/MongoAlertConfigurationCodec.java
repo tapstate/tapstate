@@ -58,6 +58,10 @@ final class MongoAlertConfigurationCodec {
                 .append("writeFence", fence).append("deployment", h.deployment().name()).append("createdAt", h.createdAt().toString())
                 .append("createdBy", h.createdBy()).append("updatedAt", h.updatedAt().toString()).append("updatedBy", h.updatedBy())
                 .append("retiredAt", h.retiredAt() == null ? null : h.retiredAt().toString()).append("body", body);
+        if (definition instanceof Subscription route && route.bindingRevision() > 0) {
+            body.append("bindingRevision", route.bindingRevision());
+            row.put("formatVersion", AlertConfiguration.SUBSCRIPTION_FORMAT_VERSION);
+        }
         if (definition instanceof AlertReceiver) { row.append("privateSlot", null); }
         if (size(row) > (definition instanceof AlertReceiver ? MAX_RECEIVER_BYTES : MAX_BYTES)) {
             throw new TapstateException(AlertError.INVALID_CONFIGURATION,
@@ -70,7 +74,10 @@ final class MongoAlertConfigurationCodec {
         try {
             fields(row, expectedKind == Kind.RECEIVER ? RECEIVER_FIELDS : FIELDS);
             require(size(row) <= (expectedKind == Kind.RECEIVER ? MAX_RECEIVER_BYTES : MAX_BYTES));
-            require(row.get("formatVersion") instanceof Integer version && version == AlertConfiguration.FORMAT_VERSION);
+            require(row.get("formatVersion") instanceof Integer);
+            int version = row.getInteger("formatVersion");
+            require(version == AlertConfiguration.FORMAT_VERSION
+                    || expectedKind == Kind.SUBSCRIPTION && version == AlertConfiguration.SUBSCRIPTION_FORMAT_VERSION);
             Document key = doc(row, "_id"); fields(key, Set.of("authorityId", "clusterId", "id"));
             require(key(expectedScope, expectedId).equals(key));
             require(text(row, "kind").equals(expectedKind.name()));
@@ -82,7 +89,7 @@ final class MongoAlertConfigurationCodec {
             Document body = doc(row, "body");
             Definition definition = switch (expectedKind) {
                 case RULE -> readRule(header, body);
-                case SUBSCRIPTION -> readSubscription(header, body);
+                case SUBSCRIPTION -> readSubscription(header, body, version);
                 case SILENCE -> {
                     fields(body, Set.of("reason", "window"));
                     yield new Silence(header, text(body, "reason"), readWindow(expectedScope, doc(body, "window")));
@@ -111,8 +118,10 @@ final class MongoAlertConfigurationCodec {
                 bool(body, "enabled"), body.get("metric") == null ? null : readMetric(doc(body, "metric")));
     }
 
-    private static Subscription readSubscription(Header header, Document body) {
-        fields(body, Set.of("name", "match", "enabled", "channels", "groupBy", "grouping", "inhibition"));
+    private static Subscription readSubscription(Header header, Document body, int version) {
+        var expected = new HashSet<>(Set.of("name", "match", "enabled", "channels", "groupBy", "grouping", "inhibition"));
+        if (version == AlertConfiguration.SUBSCRIPTION_FORMAT_VERSION) { expected.add("bindingRevision"); }
+        fields(body, expected);
         Document grouping = doc(body, "grouping"); fields(grouping, Set.of("initialNanos", "changeNanos", "repeatNanos"));
         List<RouteChannel> channels = new ArrayList<>();
         for (Object value : list(body, "channels", 16)) { channels.add(readChannel(document(value))); }
@@ -127,7 +136,8 @@ final class MongoAlertConfigurationCodec {
         }
         return new Subscription(header, text(body, "name"), readMatch(doc(body, "match")), bool(body, "enabled"),
                 channels, groups, new AlertGroupingClock.Policy(Duration.ofNanos(number(grouping, "initialNanos", 0)),
-                Duration.ofNanos(number(grouping, "changeNanos", 1)), Duration.ofNanos(number(grouping, "repeatNanos", 1))), inhibition);
+                Duration.ofNanos(number(grouping, "changeNanos", 1)), Duration.ofNanos(number(grouping, "repeatNanos", 1))), inhibition,
+                version == AlertConfiguration.SUBSCRIPTION_FORMAT_VERSION ? number(body, "bindingRevision", 1) : 0);
     }
 
     private static Document resource(AlarmKey.Resource value) {

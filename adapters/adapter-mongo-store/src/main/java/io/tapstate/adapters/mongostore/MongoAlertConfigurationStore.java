@@ -75,11 +75,17 @@ final class MongoAlertConfigurationStore {
         requireScope(identity.scope());
         if (expected == null) {
             if (header.revision() != 1 || !header.active()) { throw new IllegalArgumentException("invalid initial definition"); }
+            if (candidate instanceof AlertConfiguration.Subscription route && route.bindingRevision() != 1) {
+                throw new IllegalArgumentException("a new subscription requires its first semantic binding");
+            }
         } else {
             requireScope(expected.header().identity().scope());
             if (!header.succeeds(expected.header())) { throw new IllegalArgumentException("definition does not succeed its original revision"); }
-            if (!header.active() && !MongoAlertConfigurationCodec.write(expected, 0).get("body")
-                    .equals(MongoAlertConfigurationCodec.write(candidate, 0).get("body"))) {
+            if (candidate instanceof AlertConfiguration.Subscription route
+                    && (!(expected instanceof AlertConfiguration.Subscription original) || !route.succeeds(original))) {
+                throw new IllegalArgumentException("subscription does not succeed its original semantic binding");
+            }
+            if (!header.active() && !retirementBody(expected).equals(retirementBody(candidate))) {
                 throw new IllegalArgumentException("retirement cannot replace the definition body");
             }
         }
@@ -104,7 +110,17 @@ final class MongoAlertConfigurationStore {
     /** A real protected-row write orders a current binding check against edit or retirement. */
     boolean fence(ClientSession session, Definition expected) {
         if (expected instanceof AlertReceiver) { throw new IllegalArgumentException("receiver use requires its captured private material"); }
+        if (expected instanceof AlertConfiguration.Subscription route && route.bindingRevision() == 0) { return false; }
         return fenceRecord(session, expected);
+    }
+
+    /** A name or message-only edit keeps eligibility; changing away and back cannot revive an old binding. */
+    boolean fenceSubscriptionBinding(ClientSession session, AlertConfiguration.Identity identity, long bindingRevision) {
+        if (identity.kind() != Kind.SUBSCRIPTION) { throw new IllegalArgumentException("subscription identity required"); }
+        var current = load(session, Kind.SUBSCRIPTION, identity.id());
+        if (current.isEmpty()) { return false; }
+        var route = (AlertConfiguration.Subscription) current.orElseThrow().definition();
+        return route.hasBinding(identity, bindingRevision) && fenceRecord(session, route);
     }
     private boolean fenceRecord(ClientSession session, Definition expected) {
         Objects.requireNonNull(expected, "expected");
@@ -118,7 +134,7 @@ final class MongoAlertConfigurationStore {
                 .append("incarnation", identity.incarnation()).append("recordRevision", expected.header().revision())
                 .append("writeFence", original);
         boolean changed = collection(identity.kind()).updateOne(session, filter,
-                new Document("$set", new Document("writeFence", next))).getMatchedCount() == 1;
+                new Document("$set", new Document("writeFence", next))).getModifiedCount() == 1;
         requireActive.run(); return changed;
     }
 
@@ -230,6 +246,11 @@ final class MongoAlertConfigurationStore {
     }
     private Definition normalized(Definition value) {
         return value instanceof AlertConfiguration.Rule rule ? rule.validated(catalog) : value;
+    }
+    private static Document retirementBody(Definition value) {
+        var body = new Document((Document) MongoAlertConfigurationCodec.write(value, 0).get("body"));
+        if (value instanceof AlertConfiguration.Subscription) { body.remove("bindingRevision"); }
+        return body;
     }
     private void requireScope(AlarmKey.Scope supplied) {
         if (!scope.equals(supplied)) { throw unreadable("scope"); }

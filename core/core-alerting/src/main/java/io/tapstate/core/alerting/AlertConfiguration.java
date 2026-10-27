@@ -11,6 +11,7 @@ import java.util.UUID;
 /** Bounded authoring definitions, separate from per-resource evaluation and delivery snapshots. */
 public final class AlertConfiguration {
     public static final int FORMAT_VERSION = 1;
+    public static final int SUBSCRIPTION_FORMAT_VERSION = 2;
     private AlertConfiguration() { }
 
     public enum Kind { RULE, RECEIVER, SUBSCRIPTION, SILENCE }
@@ -169,7 +170,12 @@ public final class AlertConfiguration {
 
     public record Subscription(Header header, String name, Match match, boolean enabled,
             List<RouteChannel> channels, Set<GroupBy> groupBy, AlertGroupingClock.Policy grouping,
-            List<AlertInhibitionPolicy.Edge> inhibition) implements Definition {
+            List<AlertInhibitionPolicy.Edge> inhibition, long bindingRevision) implements Definition {
+        public Subscription(Header header, String name, Match match, boolean enabled,
+                List<RouteChannel> channels, Set<GroupBy> groupBy, AlertGroupingClock.Policy grouping,
+                List<AlertInhibitionPolicy.Edge> inhibition) {
+            this(header, name, match, enabled, channels, groupBy, grouping, inhibition, header.revision());
+        }
         public Subscription {
             requireKind(header, Kind.SUBSCRIPTION);
             name = AlertValidation.text(name, "subscriptionName", 128);
@@ -186,6 +192,42 @@ public final class AlertConfiguration {
             groupBy = checkedSet(groupBy, "groupBy", GroupBy.values().length, true);
             new AlertInhibitionPolicy(header.identity().scope(), inhibition);
             inhibition = List.copyOf(inhibition);
+            // Zero represents a decoded legacy record with no send-capable semantic binding.
+            AlertValidation.require(bindingRevision >= 0 && bindingRevision <= header.revision(), "routeBinding", "invalid-revision");
+        }
+        public Subscription edit(String name, Match match, boolean enabled, List<RouteChannel> channels,
+                Set<GroupBy> groupBy, AlertGroupingClock.Policy grouping, List<AlertInhibitionPolicy.Edge> inhibition,
+                Instant at, String actor) {
+            Header next = header.next(at, actor);
+            var candidate = new Subscription(next, name, match, enabled, channels, groupBy, grouping, inhibition, bindingRevision);
+            long binding = bindingRevision == 0 ? next.revision()
+                    : Math.addExact(bindingRevision, sameBinding(candidate) ? 0 : 1);
+            return new Subscription(next, name, match, enabled, channels, groupBy, grouping, inhibition, binding);
+        }
+        public Subscription retire(Instant at, String actor) {
+            Header next = header.retire(at, actor);
+            return new Subscription(next, name, match, enabled, channels, groupBy, grouping, inhibition,
+                    bindingRevision == 0 ? next.revision() : bindingRevision);
+        }
+        public boolean succeeds(Subscription before) {
+            if (!header.succeeds(before.header())) { return false; }
+            long expected = before.bindingRevision == 0 ? header.revision()
+                    : before.bindingRevision + (before.sameBinding(this) ? 0 : 1);
+            return bindingRevision > 0 && bindingRevision == expected;
+        }
+        public boolean hasBinding(Identity identity, long revision) {
+            return header.active() && enabled && header.identity().equals(identity)
+                    && revision > 0 && bindingRevision == revision;
+        }
+        private boolean sameBinding(Subscription other) {
+            return enabled == other.enabled && match.equals(other.match) && groupBy.equals(other.groupBy)
+                    && grouping.equals(other.grouping) && Set.copyOf(inhibition).equals(Set.copyOf(other.inhibition))
+                    && channelBindings(channels).equals(channelBindings(other.channels));
+        }
+        private static Map<String, Set<Identity>> channelBindings(List<RouteChannel> channels) {
+            var result = new java.util.HashMap<String, Set<Identity>>();
+            channels.forEach(channel -> result.put(channel.channelType(), Set.copyOf(channel.receivers())));
+            return Map.copyOf(result);
         }
         public boolean matches(AlarmKey key, AlarmSeverity severity) {
             return header.active() && enabled && header.identity().scope().equals(key.scope()) && match.matches(key, severity);

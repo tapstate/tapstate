@@ -27,6 +27,11 @@ final class AlertConfigurationFixtures {
                 List.of(new RouteChannel("email", List.of(receiver), new MessageSettings("[team] ", "", "Runbook", ""))),
                 Set.of(GroupBy.TYPE), new AlertGroupingClock.Policy(Duration.ofSeconds(10), Duration.ofSeconds(30), Duration.ofSeconds(120)), List.of());
     }
+    static Subscription legacyRoute() {
+        Subscription value = route();
+        return new Subscription(value.header(), value.name(), value.match(), value.enabled(), value.channels(),
+                value.groupBy(), value.grouping(), value.inhibition(), 0);
+    }
     static Silence silence() {
         return new Silence(header(Kind.SILENCE, "silence-a"), "Maintenance",
                 new AlertSilenceWindow(SCOPE, true, Set.of(), Set.of("source.connection-failed"), AT, Duration.ofSeconds(600), null, null));

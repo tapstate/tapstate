@@ -183,6 +183,96 @@ class MongoAlertConfigurationStoreIT {
         });
     }
 
+    @Test void legacySubscriptionIsLoadOnlyAndExplicitCasEnrollsWithoutChangingItsCreationIdentity() {
+        withConfiguration(f -> {
+            Subscription legacy = legacyRoute();
+            SystemCollections.ALERT_SUBSCRIPTIONS.on(f.database).insertOne(MongoAlertConfigurationCodec.write(legacy, 0));
+            assertThat(MongoAlertConfigurationStoreIT.<Definition>transaction(f, s -> f.store.load(s, Kind.SUBSCRIPTION, "route-a").orElseThrow().definition()))
+                    .isEqualTo(legacy);
+            assertThat(MongoAlertConfigurationStoreIT.<Boolean>transaction(f, s -> f.store.fence(s, legacy))).isFalse();
+            assertThat(MongoAlertConfigurationStoreIT.<Boolean>transaction(f, s -> f.store.fenceSubscriptionBinding(s, legacy.header().identity(), 0))).isFalse();
+            assertThat(SystemCollections.ALERT_SUBSCRIPTIONS.on(f.database).find().first().getInteger("formatVersion")).isEqualTo(1);
+            Subscription enrolled = editRoute(legacy, legacy.name(), legacy.channels());
+            assertThat(enrolled.bindingRevision()).isEqualTo(2);
+            assertThat(MongoAlertConfigurationStoreIT.<MongoAlertConfigurationStore.Stage>transaction(f, s -> f.store.stage(s, legacy, enrolled)))
+                    .isEqualTo(MongoAlertConfigurationStore.Stage.STAGED);
+            assertThat(MongoAlertConfigurationStoreIT.<MongoAlertConfigurationStore.Stage>transaction(f, s -> f.store.stage(s, legacy, enrolled)))
+                    .isEqualTo(MongoAlertConfigurationStore.Stage.UNCHANGED);
+            assertThat(SystemCollections.ALERT_SUBSCRIPTIONS.on(f.database).find().first().getInteger("formatVersion")).isEqualTo(2);
+            assertThat(MongoAlertConfigurationStoreIT.<Boolean>transaction(f, s -> f.store.fenceSubscriptionBinding(s,
+                    legacy.header().identity(), enrolled.bindingRevision()))).isTrue();
+        });
+    }
+
+    @Test void currentSubscriptionBindingSurvivesMessageEditsButNotAReceiverChangeAwayAndBack() {
+        withConfiguration(f -> {
+            Subscription original = route(); transaction(f, s -> f.store.stage(s, null, original));
+            RouteChannel channel = original.channels().getFirst();
+            Subscription text = editRoute(original, "Renamed", List.of(new RouteChannel(channel.channelType(), channel.receivers(),
+                    new MessageSettings("[new] ", "", "New runbook", ""))));
+            transaction(f, s -> f.store.stage(s, original, text));
+            assertThat(MongoAlertConfigurationStoreIT.<Boolean>transaction(f, s -> f.store.fenceSubscriptionBinding(s,
+                    original.header().identity(), original.bindingRevision()))).isTrue();
+            assertThat(original.channels().getFirst().messages().titlePrefix()).isEqualTo("[team] ");
+            Identity other = Identity.create(Kind.RECEIVER, SCOPE, "another-receiver");
+            Subscription changed = editRoute(text, text.name(), List.of(new RouteChannel(channel.channelType(), List.of(other), channel.messages())));
+            transaction(f, s -> f.store.stage(s, text, changed));
+            Subscription returned = editRoute(changed, text.name(), text.channels());
+            transaction(f, s -> f.store.stage(s, changed, returned));
+            assertThat(returned.bindingRevision()).isEqualTo(3);
+            assertThat(MongoAlertConfigurationStoreIT.<Boolean>transaction(f, s -> f.store.fenceSubscriptionBinding(s,
+                    original.header().identity(), original.bindingRevision()))).isFalse();
+            assertThat(MongoAlertConfigurationStoreIT.<Boolean>transaction(f, s -> f.store.fenceSubscriptionBinding(s,
+                    returned.header().identity(), returned.bindingRevision()))).isTrue();
+        });
+    }
+
+    @Test void anOldPermissionSnapshotRetriesAgainstTheCurrentSemanticBinding() {
+        for (boolean semanticChange : new boolean[] {false, true}) {
+            withConfiguration(f -> {
+                Subscription original = route(); transaction(f, s -> f.store.stage(s, null, original));
+                CountDownLatch read = new CountDownLatch(1), changed = new CountDownLatch(1);
+                AtomicBoolean first = new AtomicBoolean(true);
+                try (var executor = Executors.newSingleThreadExecutor()) {
+                    var permission = executor.submit(() -> transaction(f, s -> {
+                        if (first.compareAndSet(true, false)) {
+                            assertThat(f.store.load(s, Kind.SUBSCRIPTION, "route-a").orElseThrow().definition()).isEqualTo(original);
+                            read.countDown(); await(changed);
+                        }
+                        return f.store.fenceSubscriptionBinding(s, original.header().identity(), original.bindingRevision());
+                    }));
+                    await(read);
+                    var channels = semanticChange ? List.of(new RouteChannel("email", List.of(Identity.create(Kind.RECEIVER, SCOPE, "other")), MessageSettings.empty()))
+                            : List.of(new RouteChannel("email", original.channels().getFirst().receivers(), new MessageSettings("[new] ", "", "", "")));
+                    Subscription edited = editRoute(original, "Renamed", channels);
+                    transaction(f, s -> f.store.stage(s, original, edited));
+                    changed.countDown();
+                    assertThat(permission.get(15, TimeUnit.SECONDS)).isEqualTo(!semanticChange);
+                    assertThat(MongoAlertConfigurationStoreIT.<Definition>transaction(f, s -> f.store.load(s, Kind.SUBSCRIPTION, "route-a").orElseThrow().definition()))
+                            .isEqualTo(edited);
+                } catch (Exception failure) { throw new AssertionError(failure); }
+                finally { changed.countDown(); }
+            });
+        }
+    }
+
+    @Test void aCandidateCannotForgeOrResetASubscriptionSemanticRevision() {
+        withConfiguration(f -> {
+            Subscription original = route(); transaction(f, s -> f.store.stage(s, null, original));
+            Subscription forged = new Subscription(original.header().next(AT.plusSeconds(1), "actor-b"), original.name(), original.match(), false,
+                    original.channels(), original.groupBy(), original.grouping(), original.inhibition(), original.bindingRevision());
+            assertThatThrownBy(() -> transaction(f, s -> f.store.stage(s, original, forged))).isInstanceOf(IllegalArgumentException.class);
+            assertThat(MongoAlertConfigurationStoreIT.<Definition>transaction(f, s -> f.store.load(s, Kind.SUBSCRIPTION, "route-a").orElseThrow().definition()))
+                    .isEqualTo(original);
+            assertThatThrownBy(() -> transaction(f, s -> f.store.stage(s, null, legacyRoute()))).isInstanceOf(IllegalArgumentException.class);
+        });
+    }
+
+    private static Subscription editRoute(Subscription route, String name, List<RouteChannel> channels) {
+        return route.edit(name, route.match(), route.enabled(), channels, route.groupBy(), route.grouping(), route.inhibition(),
+                AT.plusSeconds(route.header().revision()), "actor-b");
+    }
+
     private record Fixture(MongoClient client, MongoDatabase database, MongoAlertConfigurationStore store) { }
     private static <T> T transaction(Fixture f, Function<ClientSession, T> action) {
         try (var session = f.client.startSession()) { return StoreIo.call(() -> session.withTransaction(() -> action.apply(session), OPTIONS)); }

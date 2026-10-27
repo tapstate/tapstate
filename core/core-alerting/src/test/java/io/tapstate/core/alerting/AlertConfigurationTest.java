@@ -126,6 +126,63 @@ class AlertConfigurationTest {
         assertThatThrownBy(() -> new Resources(Set.of("pipeline"), false, Set.of(SOURCE))).isInstanceOf(TapstateException.class);
     }
 
+    @Test void routeTextEditsKeepSemanticBindingButChangeAwayAndBackNeverRestoresIt() {
+        Identity a = Identity.create(Kind.RECEIVER, SCOPE, "a"), b = Identity.create(Kind.RECEIVER, SCOPE, "b");
+        Subscription original = route(header(Kind.SUBSCRIPTION, "route"),
+                List.of(new RouteChannel("email", List.of(a), MessageSettings.empty())), List.of());
+        Subscription text = original.edit("Renamed", original.match(), true,
+                List.of(new RouteChannel("email", List.of(a), new MessageSettings("[team] ", "", "", ""))),
+                original.groupBy(), original.grouping(), original.inhibition(), AT.plusSeconds(1), "creator");
+        assertThat(text.header().revision()).isEqualTo(2);
+        assertThat(text.bindingRevision()).isEqualTo(1);
+        assertThat(text.succeeds(original)).isTrue();
+        assertThat(text.hasBinding(original.header().identity(), original.bindingRevision())).isTrue();
+        Subscription changed = text.edit(text.name(), text.match(), true,
+                List.of(new RouteChannel("email", List.of(b), MessageSettings.empty())), text.groupBy(), text.grouping(), text.inhibition(),
+                AT.plusSeconds(2), "creator");
+        Subscription returned = changed.edit(text.name(), text.match(), true, text.channels(), text.groupBy(), text.grouping(), text.inhibition(),
+                AT.plusSeconds(3), "creator");
+        assertThat(returned.channels()).isEqualTo(text.channels());
+        assertThat(returned.bindingRevision()).isEqualTo(3);
+        assertThat(returned.hasBinding(original.header().identity(), original.bindingRevision())).isFalse();
+        assertThat(returned.retire(AT.plusSeconds(4), "creator").hasBinding(returned.header().identity(), returned.bindingRevision())).isFalse();
+    }
+
+    @Test void routeSemanticRevisionIgnoresOrderingButTracksEnableMatchGroupingAndInhibition() {
+        Identity a = Identity.create(Kind.RECEIVER, SCOPE, "a"), b = Identity.create(Kind.RECEIVER, SCOPE, "b");
+        Subscription original = route(header(Kind.SUBSCRIPTION, "route"),
+                List.of(new RouteChannel("email", List.of(a, b), MessageSettings.empty())), List.of());
+        Subscription reordered = original.edit(original.name(), original.match(), true,
+                List.of(new RouteChannel("email", List.of(b, a), MessageSettings.empty())), original.groupBy(), original.grouping(), original.inhibition(), AT, "creator");
+        assertThat(reordered.bindingRevision()).isEqualTo(1);
+        List<Subscription> changes = List.of(
+                original.edit(original.name(), original.match(), false, original.channels(), original.groupBy(), original.grouping(), original.inhibition(), AT, "creator"),
+                original.edit(original.name(), new Match(sources(), Set.of("source.connection-failed"), Set.of()), true,
+                        original.channels(), original.groupBy(), original.grouping(), original.inhibition(), AT, "creator"),
+                original.edit(original.name(), original.match(), true, original.channels(), Set.of(GroupBy.RESOURCE), original.grouping(), original.inhibition(), AT, "creator"),
+                original.edit(original.name(), original.match(), true, original.channels(), original.groupBy(),
+                        new AlertGroupingClock.Policy(Duration.ZERO, Duration.ofSeconds(1), Duration.ofSeconds(2)), original.inhibition(), AT, "creator"),
+                original.edit(original.name(), original.match(), true, original.channels(), original.groupBy(), original.grouping(),
+                        List.of(new AlertInhibitionPolicy.Edge("test.a", "test.b")), AT, "creator"));
+        assertThat(changes).allSatisfy(value -> { assertThat(value.bindingRevision()).isEqualTo(2); assertThat(value.succeeds(original)).isTrue(); });
+        Subscription invalid = new Subscription(changes.getFirst().header(), original.name(), original.match(), false,
+                original.channels(), original.groupBy(), original.grouping(), original.inhibition(), 1);
+        assertThat(invalid.succeeds(original)).isFalse();
+    }
+
+    @Test void legacyRouteHasNoSendBindingAndOnlyAnExplicitEditEnrollsItAtTheNewRecordRevision() {
+        Subscription original = route(header(Kind.SUBSCRIPTION, "route"), List.of(new RouteChannel("email",
+                List.of(Identity.create(Kind.RECEIVER, SCOPE, "a")), MessageSettings.empty())), List.of());
+        Subscription legacy = new Subscription(original.header(), original.name(), original.match(), original.enabled(), original.channels(),
+                original.groupBy(), original.grouping(), original.inhibition(), 0);
+        assertThat(legacy.hasBinding(legacy.header().identity(), 0)).isFalse();
+        Subscription enrolled = legacy.edit(legacy.name(), legacy.match(), legacy.enabled(), legacy.channels(),
+                legacy.groupBy(), legacy.grouping(), legacy.inhibition(), AT, "creator");
+        assertThat(enrolled.header().revision()).isEqualTo(2);
+        assertThat(enrolled.bindingRevision()).isEqualTo(2);
+        assertThat(enrolled.succeeds(legacy)).isTrue();
+    }
+
     private static Header header(Kind kind, String id) {
         return Header.create(Identity.create(kind, SCOPE, id), AlertChannelPolicy.Deployment.ON_PREM, AT, "creator");
     }
