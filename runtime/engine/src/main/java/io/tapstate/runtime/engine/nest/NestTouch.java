@@ -32,8 +32,8 @@ import java.util.Objects;
  * that arrived before it - and a document that resolved that row on its own has nothing to learn from it.
  * Sent as an edit, it draws and sends every one of those documents a second time: measured over two
  * hundred, that is twice the records downstream and two and a half times the reach into this vertex's own
- * state, on the ordinary path where nothing was ever waiting. So it is marked, and a document that is not
- * waiting drops it without reading anything.
+ * state, on the ordinary path where nothing was ever waiting. So it is marked: a document already emitted
+ * complete needs no further copy, while a persisted missing object can still need completion after restart.
  *
  * <p><b>{@code firstFiling} identifies the one edit a document can already have rendered before its word
  * arrives.</b> The row is written before this word is queued, while the root and this word travel on

@@ -1,0 +1,689 @@
+{
+  "schemaVersion": 1,
+  "recoveryProfiles": {
+    "legacy-preserve": {
+      "goal": "Retain old-layout facts without treating them as a new three-layer installation.",
+      "entry": "Matching old-version backup/diagnostics; no automatic cross-layout migration.",
+      "prerequisites": [
+        "Original legacy identity and matching version/backup are retained.",
+        "The current three-layer root does not admit this legacy layout."
+      ]
+    },
+    "existing-operator-state-missing-objects-v1": {
+      "goal": "Recover existing keyed operator state and retain responsibility for object references absent from the last emitted root document.",
+      "entry": "Resume the existing operator namespace and root key using its stored RootAssembly, matching lookup rows, reverse references and source positions; re-evaluate old serialized bytes that have no missing-reference field.",
+      "prerequisites": [
+        "The same configured operator-state database, namespace and root identity remain available.",
+        "Each sparse missing-reference entry names its stable slot path, lookup namespace and composite key.",
+        "Snapshot completion is scoped to the source generation and all producers and lookup partitions; an old generation cannot settle a new load.",
+        "Old serialized bytes mean pending re-determination, not an already-complete root; no state reset or forced reload substitutes for compatible recovery."
+      ]
+    }
+  },
+  "consistencyProfiles": {
+    "legacy": {
+      "atomicDomain": "LEGACY",
+      "fencing": "Matching legacy migration/ownership behavior; not admitted by the three-layer root."
+    },
+    "existing-single-root-write": {
+      "atomicDomain": "Existing keyed operator-state write for one namespace and root key; no additional collection or cross-key transaction.",
+      "fencing": "Keep existing owner and source-order rules. Record missing identities with the missing-object emission and clear or recompute them on completion, retargeting, root deletion and subsequent root output. Source progress cannot substitute for target confirmation."
+    }
+  },
+  "resources": [
+    {
+      "id": "mongo.store.artifacts",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "artifacts"
+      ],
+      "responsibility": "Legacy mixed authored resources.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoArtifactStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoArtifactStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.pipeline_state",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "pipeline_state"
+      ],
+      "responsibility": "Actual durable Pipeline checkpoint/state in its original scope.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoStateStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoStateStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.pipeline_desired",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "pipeline_desired"
+      ],
+      "responsibility": "Legacy latest desired Pipeline state.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoDesiredStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoDesiredStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.pipeline_observation",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "pipeline_observation"
+      ],
+      "responsibility": "Latest observed Pipeline state; absent observations remain unknown.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoObservationStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoObservationStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.workload_claims",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "workload_claims"
+      ],
+      "responsibility": "Runtime NODE/Pipeline/CAPTURE leases, epochs and write fences.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoWorkloadClaimStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoWorkloadClaimStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.cluster_membership",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "cluster_membership"
+      ],
+      "responsibility": "Committed runtime member/topology history.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoClusterMembershipStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoClusterMembershipStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.connections",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "connections"
+      ],
+      "responsibility": "Authored connection definitions.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoCatalogStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoCatalogStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.source_schemas",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "source_schemas"
+      ],
+      "responsibility": "Discovered source schemas for authoring.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoSchemaStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoSchemaStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.connector_catalog",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "connector_catalog"
+      ],
+      "responsibility": "Derived connector catalog metadata.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoConnectorCatalogStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoConnectorCatalogStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.connector_specs",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "connector_specs"
+      ],
+      "responsibility": "Immutable connector specifications addressed by verified content.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoConnectorSpecStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoConnectorSpecStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.connection_test_results",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "connection_test_results"
+      ],
+      "responsibility": "Bounded latest connection diagnostics; not submission authority.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoConnectionTestResultStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoConnectionTestResultStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.users",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "users"
+      ],
+      "responsibility": "Original OP account hashes and roles.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoAuthStores"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoAuthStores"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.tokens",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "tokens"
+      ],
+      "responsibility": "Durable API token grants and revocations.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoAuthStores"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoAuthStores"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.sessions",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "sessions"
+      ],
+      "responsibility": "Legacy session records.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoAuthStores"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoAuthStores"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.audit",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "audit"
+      ],
+      "responsibility": "Necessary append-only security/operation audit facts.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoAuthStores"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoAuthStores"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Append-only facts grow with audited operations; required history is not a cache optimization.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.cluster_identity",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "cluster_identity"
+      ],
+      "responsibility": "Stable Cluster identity.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoAuthStores"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoAuthStores"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "One bounded aggregate per Cluster/domain; no event or lease history.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.connector_artifacts",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "GRIDFS_BUCKET",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "connector_artifacts.files",
+        "connector_artifacts.chunks"
+      ],
+      "responsibility": "Content-addressed original connector artifact bytes.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoConnectorRegistry"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoConnectorRegistry"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Artifact bytes grow with retained hashes; originals must remain obtainable for rebuild.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.srs_meta",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "srs_meta"
+      ],
+      "responsibility": "Legacy mixed source-replay metadata.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoSrsMetaStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoSrsMetaStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.system_meta",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "system_meta"
+      ],
+      "responsibility": "Legacy schema/key metadata.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoConnection"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoConnection"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.pipeline_layouts",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "pipeline_layouts"
+      ],
+      "responsibility": "Authored Pipeline editor layout.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoPipelineLayoutStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoPipelineLayoutStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.pipeline_drafts",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "pipeline_drafts"
+      ],
+      "responsibility": "Unpublished authored Pipeline drafts and publication revisions.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoPipelineDraftStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoPipelineDraftStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.srs_log",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "srs_log"
+      ],
+      "responsibility": "Legacy durable source event log.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoSrsLogStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoSrsLogStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.derived_schemas",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "derived_schemas"
+      ],
+      "responsibility": "Derived model versions and required pins.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoDerivedSchemaStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoDerivedSchemaStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.pipeline_rate_history",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "pipeline_rate_history"
+      ],
+      "responsibility": "Reconstructable observed rate-history samples.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoRateHistoryStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoRateHistoryStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Observed samples use configured TTL/indexes; no promise to reconstruct old curves.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.store.srs_consumer_offsets",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "STORE",
+      "physicalNames": [
+        "srs_consumer_offsets"
+      ],
+      "responsibility": "Per-consumer durable read, target ACK, snapshot pin and writer facts.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoSrsMetaStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoSrsMetaStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    },
+    {
+      "id": "mongo.nest.operator_state",
+      "resourceVersion": 1,
+      "proposalVersion": 2,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "NEST",
+      "physicalNames": [
+        "operator_state"
+      ],
+      "responsibility": "Retain existing keyed operator state; RootAssembly additionally carries a v1 sparse set of slot paths, lookup namespaces and composite keys still absent from its last emitted document.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoKeyedStateStore",
+        "io.tapstate.runtime.engine.nest.AssemblerProcessor"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoKeyedStateStore",
+        "io.tapstate.runtime.engine.nest.AssemblerProcessor"
+      ],
+      "recovery": "existing-operator-state-missing-objects-v1",
+      "consistency": "existing-single-root-write",
+      "growth": "Existing operator-state growth is retained. The added sparse set is proportional to currently missing references of a root, stores no copied customer rows, and is cleared or recomputed when references complete, change or disappear.",
+      "evidence": [
+        "runtime/engine/src/main/java/io/tapstate/runtime/engine/nest/RootAssembly.java",
+        "runtime/engine/src/main/java/io/tapstate/runtime/engine/nest/AssemblerProcessor.java",
+        "runtime/engine/src/test/java/io/tapstate/runtime/engine/nest/AMissingObjectReferenceKeepsTheRootDocumentTest.java",
+        "arch-tests/src/test/java/io/tapstate/archtests/NestStateSerialFormGatesTest.java"
+      ]
+    },
+    {
+      "id": "mongo.nest.nest_dead_letters",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "LEGACY",
+      "database": "NEST",
+      "physicalNames": [
+        "nest_dead_letters"
+      ],
+      "responsibility": "Necessary unique discarded-row facts; not reconstructable from source replay.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoNestDeadLetterStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoNestDeadLetterStore"
+      ],
+      "recovery": "legacy-preserve",
+      "consistency": "legacy",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+      ]
+    }
+  ]
+}

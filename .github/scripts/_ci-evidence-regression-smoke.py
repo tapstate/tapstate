@@ -117,6 +117,34 @@ class SourceIdentityTests(unittest.TestCase):
                                                 ['injected', 'org.junit.jupiter.api.TestInfo']])
             self.assertEqual(inv['methods'][0]['argument_digests'], [expected])
 
+    def test_value_source_decimal_separators_match_runtime_argument_identities(self):
+        declarations = [
+            '@ParameterizedTest @ValueSource(ints={2_000, 4_097}) void counts(int count) {}',
+            'static final int FIRST = 2_000; static final int SECOND = 4_097; '
+            '@ParameterizedTest @ValueSource(ints={FIRST, SECOND}) void counts(int count) {}',
+        ]
+        for declaration in declarations:
+            with self.subTest(declaration=declaration), tempfile.TemporaryDirectory() as temporary:
+                _, inv = self.inventory(Path(temporary), declaration)
+                self.assertTrue(inv['complete'], inv['unresolved'])
+                self.assertEqual(inv['methods'][0]['argument_digests'], [
+                    evidence.argument_digest([['java.lang.Integer', value]]) for value in ('2000', '4097')])
+                self.assertEqual(len(inv['cases']), 2)
+                self.assertEqual(len({evidence.identity(case) for case in inv['cases']}), 2)
+
+    def test_numeric_separator_support_preserves_strings_and_refuses_invalid_tokens(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, inv = self.inventory(Path(temporary),
+                '@ParameterizedTest @ValueSource(strings={"2_000"}) void label(String value) {}')
+            self.assertTrue(inv['complete'], inv['unresolved'])
+            self.assertEqual(inv['methods'][0]['argument_digests'],
+                             [evidence.argument_digest([['java.lang.String', '2_000']])])
+        for token in ('_2000', '2000_', '2_.0', '2._0', '2_000_L', 'UNKNOWN_COUNT'):
+            with self.subTest(token=token), tempfile.TemporaryDirectory() as temporary:
+                _, inv = self.inventory(Path(temporary),
+                    '@ParameterizedTest @ValueSource(ints={' + token + '}) void count(int value) {}')
+                self.assertFalse(inv['complete'])
+
     def test_repetition_info_uses_the_actual_repetition_without_provider_values(self):
         with tempfile.TemporaryDirectory() as temporary:
             _, inv = self.inventory(Path(temporary), '@RepeatedTest(2) void repeat(RepetitionInfo info) {}')

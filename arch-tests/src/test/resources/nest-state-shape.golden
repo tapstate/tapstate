@@ -64,6 +64,9 @@ io.tapstate.runtime.engine.nest.RootAssembly :: field :: children :: java.util.M
 io.tapstate.runtime.engine.nest.RootAssembly :: field :: flatFields :: java.util.Map<java.lang.String, java.util.Set<java.lang.String>>
 io.tapstate.runtime.engine.nest.RootAssembly :: field :: fromRoot :: io.tapstate.runtime.engine.nest.RootAssembly$Absorbed
 io.tapstate.runtime.engine.nest.RootAssembly :: field :: heldElements :: java.util.List<io.tapstate.runtime.engine.nest.NestElement>
+# Older bytes have no missing-object set. Null means pending re-determination on the next read,
+# never that a root was already emitted complete. The class identity remains readable.
+io.tapstate.runtime.engine.nest.RootAssembly :: field :: missingObjectReferences :: java.util.Set<io.tapstate.runtime.engine.nest.RootAssembly$MissingObjectReference>
 io.tapstate.runtime.engine.nest.RootAssembly :: field :: rootFields :: java.util.Map<java.lang.String, java.lang.Object>
 io.tapstate.runtime.engine.nest.RootAssembly :: field :: rootOrder :: io.tapstate.core.event.SourceOrder
 io.tapstate.runtime.engine.nest.RootAssembly :: field :: rootPresent :: boolean
@@ -76,6 +79,10 @@ io.tapstate.runtime.engine.nest.RootAssembly$ElementNode :: field :: children ::
 io.tapstate.runtime.engine.nest.RootAssembly$ElementNode :: field :: deletedAt :: java.util.Map<java.lang.String, io.tapstate.core.event.SourceOrder>
 io.tapstate.runtime.engine.nest.RootAssembly$ElementNode :: field :: fields :: java.util.Map<java.lang.String, java.lang.Object>
 io.tapstate.runtime.engine.nest.RootAssembly$ElementNode :: field :: order :: io.tapstate.core.event.SourceOrder
+io.tapstate.runtime.engine.nest.RootAssembly$MissingObjectReference :: field :: key :: java.util.List<java.lang.Object>
+io.tapstate.runtime.engine.nest.RootAssembly$MissingObjectReference :: field :: namespace :: java.lang.String
+io.tapstate.runtime.engine.nest.RootAssembly$MissingObjectReference :: field :: path :: java.util.List<java.lang.String>
+io.tapstate.runtime.engine.nest.RootAssembly$MissingObjectReference :: record :: uid=1
 io.tapstate.runtime.engine.nest.RootAssembly$Pending :: field :: held :: io.tapstate.runtime.engine.nest.NestElement
 io.tapstate.runtime.engine.nest.RootAssembly$Pending :: field :: node :: io.tapstate.runtime.engine.nest.RootAssembly$ElementNode
 io.tapstate.runtime.engine.nest.RootAssembly$Pending :: record :: uid=0
