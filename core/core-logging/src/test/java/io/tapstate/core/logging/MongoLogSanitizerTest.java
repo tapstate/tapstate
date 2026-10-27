@@ -7,6 +7,20 @@ import static org.assertj.core.api.Assertions.assertThat;
 class MongoLogSanitizerTest {
 
     @Test
+    void preservesDiagnosticsAfterCredentialFreeUriAuthorities() {
+        for (String uri : java.util.List.of(
+                "mongodb://db.example/data",
+                "mongodb+srv://db.example?tls=true",
+                "mongodb://db.example#diagnostic")) {
+            String text = "Connection failed for " + uri + "\n"
+                    + "java.lang.IllegalStateException: ops@example.com: connection refused\n"
+                    + "\tat example.Client.connect(Client.java:42)\n";
+
+            assertThat(new SecretRedactor().redactLog(text)).isEqualTo(text);
+        }
+    }
+
+    @Test
     void hidesDriverAcceptedQuotesAndWhitespaceInUserInfo() {
         SecretRedactor redactor = new SecretRedactor();
         assertThat(redactor.redactLog("connecting mongodb://quote-user:pa\"ss@host.example/db"))

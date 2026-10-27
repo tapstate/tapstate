@@ -21,7 +21,7 @@ final class MongoLogSanitizer {
             int end = next < 0 ? safe.length() : next;
             // The driver accepts raw quotes and whitespace in userinfo. Only another scheme can
             // safely split this diagnostic span; the URI helper identifies its authority boundary.
-            result.append(MongoUriUserInfo.redact(safe.substring(start, end)));
+            result.append(MongoUriUserInfo.redactAuthority(safe.substring(start, end)));
             cursor = end;
             start = next;
         }

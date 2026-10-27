@@ -92,6 +92,25 @@ class PipelineLogAppenderTest {
     }
 
     @Test
+    void preservesExceptionDetailsAfterACredentialFreeMongoUri() {
+        RingBufferLogSink sink = new RingBufferLogSink(8, 8);
+
+        withAppender(sink, "test.logs.mongo-cause", logger -> {
+            MDC.put(MDC_KEY, "pl-mongo-err");
+            logger.error("Connection failed for mongodb://db.example/data",
+                    new IllegalStateException("ops@example.com: connection refused",
+                            new IllegalArgumentException("endpoint unavailable")));
+        });
+
+        assertThat(sink.tail("pl-mongo-err")).singleElement().satisfies(line ->
+                assertThat(line.message()).contains(
+                        "Connection failed for mongodb://db.example/data",
+                        "IllegalStateException: ops@example.com: connection refused",
+                        "Caused by: java.lang.IllegalArgumentException: endpoint unavailable",
+                        "\tat io.tapstate.app.PipelineLogAppenderTest."));
+    }
+
+    @Test
     void redactsRegisteredSecretsBeforeWritingToTheSink() {
         RingBufferLogSink sink = new RingBufferLogSink(8, 8);
         SecretRedactor redactor = new SecretRedactor();
