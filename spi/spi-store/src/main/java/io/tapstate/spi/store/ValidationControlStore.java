@@ -11,17 +11,23 @@ import java.util.Objects;
 /**
  * Minimum CACHE run-control seam over the existing VALIDATION claim. Normal mutations compete with
  * ValidationClaims.fence(run.owner()) in the SAME verified CACHE client/session/transaction as the
- * protected run/control record. This port adds no lease, restores no work and never touches CONFIG.
+ * protected run/control record. Its protected CACHE callback never touches CONFIG; native assembly
+ * may verify original CONFIG authority before and after it. This port adds no lease or work recovery.
  * Selection uses stable eligible-member ranking, real local reservation and the existing claim store;
  * an existing owner is reused. Insufficient owner capacity rejects work rather than moving it.
  */
 public interface ValidationControlStore {
-    record Run(ValidationRunIdentity identity, long countingGeneration) {
+    record Run(ValidationRunIdentity identity, long countingGeneration, ValidationReportAdmission.Start admission) {
+        public Run(ValidationRunIdentity identity, long countingGeneration) { this(identity, countingGeneration, null); }
         public Run {
             Objects.requireNonNull(identity, "identity");
             if (countingGeneration < 1) throw invalid("control.countingGeneration");
+            if (admission != null && !identity.equals(admission.run())) throw invalid("control.admission");
         }
         public WorkloadClaimFence fence() { return ValidationClaims.fence(identity.owner()); }
+        public ValidationResultStore.Report report() {
+            if (admission == null) throw invalid("control.admission"); return admission.report();
+        }
     }
     record Transition(Run run, ValidationRunState expected, ValidationRunState next) {
         public Transition {
@@ -32,7 +38,7 @@ public interface ValidationControlStore {
     record Retirement(Run run, ValidationResultStore.Report sealedReport, ValidationRunState terminal) {
         public Retirement {
             Objects.requireNonNull(run, "run"); Objects.requireNonNull(sealedReport, "sealedReport"); Objects.requireNonNull(terminal, "terminal");
-            if (!run.identity().equals(sealedReport.run()) || !terminal.terminal()
+            if (!run.identity().equals(sealedReport.run()) || run.admission() != null && !run.report().equals(sealedReport) || !terminal.terminal()
                     || terminal == ValidationRunState.COMPLETED && run.identity().mode() == io.tapstate.core.validation.ValidationMode.INCREMENTAL) {
                 throw invalid("control.retirement");
             }
@@ -44,7 +50,7 @@ public interface ValidationControlStore {
             Objects.requireNonNull(authority, "authority"); Objects.requireNonNull(obsolete, "obsolete");
             Objects.requireNonNull(sealedReport, "sealedReport");
             var previous = obsolete.identity().owner();
-            if (!obsolete.identity().equals(sealedReport.run())
+            if (!obsolete.identity().equals(sealedReport.run()) || obsolete.admission() != null && !obsolete.report().equals(sealedReport)
                     || !authority.clusterId().equals(previous.clusterId()) || !authority.pipelineId().equals(previous.pipelineId())
                     || authority.claimGeneration() <= previous.claimGeneration()) throw invalid("control.lostOwner");
         }

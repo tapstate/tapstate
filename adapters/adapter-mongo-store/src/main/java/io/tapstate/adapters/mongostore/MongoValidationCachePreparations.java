@@ -36,13 +36,14 @@ final class MongoValidationCachePreparations {
         private final Subject subject;
         private Proof(MongoValidationCachePreparations owner, Subject subject) { this.owner = owner; this.subject = subject; }
         Receipt requirePrepared(Subject expected) {
-            if (!subject.equals(expected)) throw fenced(); var receipt = owner.observe(subject);
+            var receipt = requireResult(expected);
             if (receipt.outcome() != Outcome.PREPARED) throw fenced(); return receipt;
         }
         Receipt requireClosed(Subject expected) {
-            if (!subject.equals(expected)) throw fenced(); var receipt = owner.observe(subject);
+            var receipt = requireResult(expected);
             if (receipt.outcome() == Outcome.PREPARED) throw fenced(); return receipt;
         }
+        Receipt requireResult(Subject expected) { if (!subject.equals(expected)) throw fenced(); return owner.observe(subject); }
         @Override public String toString() { return "ValidationCacheProof[original]"; }
     }
 
@@ -131,6 +132,45 @@ final class MongoValidationCachePreparations {
             var current = control(session, subject.pipelineId());
             if (current == null || !subject.equals(binding(current))) throw unreadable(); return receipt(session, current);
         });
+    }
+
+    WorkloadClaim cleanupOwner(MongoValidationPreparations.Closing closing, WorkloadClaimFence node, java.time.Duration ttl) {
+        closing.requireReportsClosed(); var state = closing.requireCurrent(); var subject = state.subject();
+        if (subject == null) throw fenced(); requireTarget(closing.binding(), subject);
+        var result = mutate(node, session -> {
+            var control = control(session, subject.pipelineId()); requireClosingRoot(control, subject, closing);
+            receipt(session, control);
+            var key = ValidationClaims.key(scope.clusterId(), subject.pipelineId());
+            var rows = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
+            var raw = new MongoWorkloadClaimStore(rows).inStrictSession(session);
+            var current = rows.find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
+            if (current == null || !raw.release(raw.decodeStored(current))) throw fenced();
+            var acquired = raw.acquireExisting(key, node.owner(), node.topologyRevision(), ttl);
+            if (!acquired.acquired()) throw fenced();
+            return raw.advanceExecution(acquired.claim(), node.topologyRevision(), Set.of(node.owner().nodeId())).orElseThrow(MongoValidationCachePreparations::fenced);
+        });
+        closing.requireReportsClosed(); closing.requireCurrent(); return result;
+    }
+
+    List<ValidationControlStore.Run> activeRuns(MongoValidationPreparations.Closing closing, int maximum) {
+        if (maximum < 1 || maximum > 20) throw new IllegalArgumentException("cleanup batch must contain 1 to 20 runs");
+        closing.requireReportsClosed(); var subject = closing.requireCurrent().subject(); if (subject == null) throw fenced();
+        var result = read(session -> {
+            var root = control(session, subject.pipelineId()); requireClosingRoot(root, subject, closing); receipt(session, root);
+            var runs = new ArrayList<ValidationControlStore.Run>();
+            for (var id : root.get("slots", Document.class).values()) {
+                if (runs.size() == maximum) break;
+                var row = SystemCollections.VALIDATION_RUNS.on(database).find(session, new Document("_id", id)).first();
+                if (row == null) throw unreadable(); runs.add(MongoValidationControlStore.decodeRun(row));
+            }
+            return List.copyOf(runs);
+        });
+        closing.requireCurrent(); return result;
+    }
+
+    private static void requireClosingRoot(Document root, Subject subject, MongoValidationPreparations.Closing closing) {
+        if (root == null || !subject.equals(binding(root)) || outcome(root) != Outcome.PREPARED
+                || !Boolean.TRUE.equals(root.get("admissionClosed")) || !closing.operation().toString().equals(root.get("closingOperationId"))) throw fenced();
     }
 
     private Receipt requirePredecessor(ClientSession session, Document current, Receipt expected, Subject next) {

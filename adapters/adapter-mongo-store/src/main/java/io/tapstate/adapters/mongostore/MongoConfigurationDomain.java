@@ -599,6 +599,44 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         return validationPreparations;
     }
 
+    MongoValidationAdmissionStore validationAdmissions(MongoValidationPreparations.Permission original) {
+        requireOpen(); return new MongoValidationAdmissionStore(connection.client(), connection.database(), clusterId,
+                this::requireOpen, new MongoValidationPreparations.Authority(original));
+    }
+
+    /** Bounded metadata retirement for an original native deletion. No production preparation or business IO. */
+    public boolean retireValidation(io.tapstate.spi.store.PipelineRetirementPreparation original, MongoCacheDomain cache,
+            io.tapstate.spi.store.WorkloadClaimFence node, Runnable local) {
+        Objects.requireNonNull(local).run(); requireOpen(); MongoPipelineRetirements.requireOriginalPending(original);
+        boolean enabled = StoreIo.call(() -> {
+            var schema = SystemCollections.SCHEMA_MIGRATIONS.on(connection.database()).find(new Document("_id", "config")).first();
+            if (schema != null && Integer.valueOf(1).equals(schema.get("installedVersion")) && !schema.containsKey("validation")) return false;
+            MongoValidationSchema.requireReady(connection.database(), true); return true;
+        });
+        if (!enabled) return true;
+        var preparation = validationPreparations().guardedBy(local); var closing = preparation.forRetirement(original);
+        if (!preparation.closeReports(closing, 20)) return false;
+        preparation.requireReportsClosed(closing); var state = closing.requireCurrent();
+        if (state.phase() == MongoValidationPreparationFacts.Phase.CLOSED) return true;
+        if (state.subject() == null) { preparation.finishClose(closing, null); return true; }
+        var controls = cache.validationPreparations(state.subject().scope(), local);
+        var result = controls.cancel(closing, node);
+        if (result.requireResult(state.subject()).outcome() == MongoValidationPreparationFacts.Outcome.PREPARED) {
+            var cleanup = controls.cleanupOwner(closing, node, java.time.Duration.ofSeconds(30));
+            var authority = io.tapstate.spi.store.ValidationClaims.owner(state.subject().pipelineId(), cleanup);
+            var current = cache.validationControl(closing, local);
+            var reports = new MongoValidationResultStore(connection.client(), connection.database(), clusterId,
+                    () -> { requireOpen(); local.run(); }, new MongoValidationPreparations.Authority(closing));
+            for (var run : controls.activeRuns(closing, 20)) {
+                local.run(); reports.seal(run.report());
+                current.terminateLostOwner(new io.tapstate.spi.store.ValidationControlStore.LostOwner(authority, run, run.report()));
+            }
+            result = controls.cancel(closing, node);
+            if (result.requireResult(state.subject()).outcome() == MongoValidationPreparationFacts.Outcome.PREPARED) return false;
+        }
+        preparation.finishClose(closing, result); local.run(); return true;
+    }
+
     public PipelineDraftStore drafts() { return drafts; }
 
     public io.tapstate.spi.store.RequiredDeadLetterStore requiredDeadLetters() {

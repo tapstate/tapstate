@@ -248,9 +248,12 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     }
 
     MongoValidationCachePreparations validationPreparations(CacheBusinessScope expected) {
+        return validationPreparations(expected, () -> {});
+    }
+    MongoValidationCachePreparations validationPreparations(CacheBusinessScope expected, Runnable local) {
         loadBusinessScope(expected);
         StoreIo.run(() -> MongoValidationSchema.requireReady(database, false));
-        return new MongoValidationCachePreparations(client, database, expected, targetFingerprint, this::businessActive);
+        return new MongoValidationCachePreparations(client, database, expected, targetFingerprint, () -> { businessActive(); local.run(); });
     }
 
     WorkloadClaimStore validationClaims(MongoValidationPreparations.Permission original) {
@@ -267,6 +270,10 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
 
     io.tapstate.spi.store.ValidationControlStore validationControl(MongoValidationPreparations.Closing original) {
         return validationControl(new MongoValidationPreparations.Authority(original));
+    }
+    io.tapstate.spi.store.ValidationControlStore validationControl(MongoValidationPreparations.Closing original, Runnable local) {
+        var authority = new MongoValidationPreparations.Authority(original); requireValidationPreparation(authority);
+        return new MongoValidationControlStore(client, database, authority.subject().scope(), () -> { businessActive(); local.run(); }, authority);
     }
 
     private WorkloadClaimStore validationClaims(MongoValidationPreparations.Authority original) {

@@ -60,6 +60,7 @@ final class MongoValidationPreparations {
         }
         State requireCurrent() { return owner.requireClosing(this); }
         UUID operation() { return operation; }
+        void requireReportsClosed() { owner.requireReportsClosed(this); }
         StorageBinding binding() {
             var state = requireCurrent(); if (state.subject() == null) throw fenced(); return owner.binding(state.subject().scope());
         }
@@ -78,21 +79,115 @@ final class MongoValidationPreparations {
         Authority(Closing closing) {
             this.permission = null; this.closing = Objects.requireNonNull(closing);
             var state = closing.requireCurrent();
-            if (state.subject() == null || state.phase() == Phase.CLOSED) throw fenced(); this.subject = state.subject();
+            this.subject = state.subject();
         }
-        Subject subject() { return subject; }
+        Subject subject() { if (subject == null) throw fenced(); return subject; }
+        String pipelineId() { return permission == null ? closing.pipeline : subject.pipelineId(); }
         boolean closing() { return closing != null; }
         void require(boolean admission) {
             if (permission != null) permission.requireComplete();
             else {
                 if (admission) throw fenced(); var state = closing.requireCurrent();
-                if (!subject.equals(state.subject()) || state.phase() == Phase.CLOSED) throw fenced();
+                if (!Objects.equals(subject, state.subject()) || state.phase() == Phase.CLOSED || subject == null) throw fenced();
             }
         }
         StorageBinding binding() { require(false); return permission == null ? closing.binding() : permission.binding(); }
+        private MongoValidationPreparations owner() { return permission == null ? closing.owner : permission.owner; }
+        void enter(MongoClient client, MongoDatabase database, ClientSession session, boolean admission) {
+            var owner = owner(); owner.active.run();
+            if (owner.client != client || !owner.database.getName().equals(database.getName())) throw fenced();
+            var row = owner.mapping(session, pipelineId()); var state = owner.state(row, pipelineId());
+            if (!Objects.equals(subject, state.subject())) throw fenced();
+            if (subject != null) owner.requireBinding(session, subject.scope());
+            if (permission != null) {
+                owner.requireDefinition(session, pipelineId());
+                if (state.phase() != Phase.COMPLETE || state.closingOperationId() != null) throw fenced();
+            } else {
+                if (admission) throw fenced(); requireClosing(state, closing);
+            }
+            if (admission) owner.replace(session, row, state.change(state.phase(), state.subject(), state.closingOperationId(), state.previous()));
+        }
+        void requireStart(io.tapstate.spi.store.ValidationReportAdmission.Start start, boolean closed) {
+            if (start == null || !pipelineId().equals(start.task().pipelineId()) || !owner().clusterId.equals(start.task().clusterId())) throw fenced();
+            var owner = owner();
+            var store = new MongoValidationAdmissionStore(owner.client, owner.database, owner.clusterId, owner.active, this);
+            store.transaction(session -> { store.requireOriginalInTransaction(session, start, closed); return null; });
+        }
     }
 
     State read(String pipeline) { return transaction(session -> state(mapping(session, pipeline), pipeline)); }
+
+    MongoValidationPreparations guardedBy(Runnable local) {
+        Objects.requireNonNull(local);
+        return new MongoValidationPreparations(client, database, clusterId, bindings, artifacts, () -> { active.run(); local.run(); });
+    }
+
+    Closing forRetirement(io.tapstate.spi.store.PipelineRetirementPreparation original) {
+        MongoPipelineRetirements.requireOriginalPending(original);
+        return transaction(session -> {
+            var request = original.request(); var row = mapping(session, request.scope().pipelineId());
+            var fact = MongoPipelineRetirementFacts.read(row);
+            if (!"RETIRING".equals(row.get("phase")) || !request.equals(fact.request())) throw fenced();
+            var state = state(row, request.scope().pipelineId());
+            if (state.closingOperationId() == null) throw fenced();
+            return new Closing(this, request.scope().pipelineId(), state.generation(), state.closingOperationId());
+        });
+    }
+
+    boolean closeReports(Closing closing, int maximum) {
+        if (closing == null || closing.owner != this || maximum < 1 || maximum > 20) throw fenced();
+        var authority = new Authority(closing);
+        var store = new MongoValidationAdmissionStore(client, database, clusterId, active, authority);
+        return store.transaction(session -> store.closePipelineInTransaction(session, closing.pipeline, maximum));
+    }
+
+    void requireReportsClosed(Closing closing) {
+        if (closing == null || closing.owner != this) throw fenced();
+        transaction(session -> {
+            requireClosing(state(mapping(session, closing.pipeline), closing.pipeline), closing);
+            var unfinished = unfinishedReports(clusterId, closing.pipeline);
+            var activeTask = new Document("_id.clusterId", clusterId).append("_id.pipelineId", closing.pipeline).append("closed", new Document("$ne", true));
+            if (SystemCollections.VALIDATION_TASKS.on(database).find(session, unfinished).limit(1).first() != null
+                    || SystemCollections.VALIDATION_TASKS.on(database).find(session, activeTask).limit(1).first() != null) throw fenced();
+            return null;
+        });
+    }
+
+    static void beginRetirement(com.mongodb.client.ClientSession session, MongoDatabase database, String cluster,
+            io.tapstate.spi.store.PipelineRetirementRequest original, UUID closingOperation) {
+        if (!validationEnabled(session, database, cluster)) return;
+        var rows = SystemCollections.OPERATOR_GENERATIONS.on(database);
+        var row = rows.find(session, new Document("_id", original.scope().pipelineId())).first();
+        if (row == null || !(row.get("validationPreparation") instanceof Document value)) throw unreadable();
+        var held = decode(value, cluster, original.scope().pipelineId());
+        if (held.phase() == Phase.CLOSED) return;
+        if (held.closingOperationId() != null || held.subject() != null && !held.subject().scope().equals(
+                new CacheBusinessScope(original.scope().clusterId(), original.scope().bindingVersion(), original.scope().cacheIncarnation()))) throw fenced();
+        var next = held.change(held.phase(), held.subject(), closingOperation, held.previous());
+        if (rows.updateOne(session, new Document("_id", row.get("_id")).append("validationPreparation", value),
+                new Document("$set", new Document("validationPreparation", encode(next)))).getMatchedCount() != 1) throw fenced();
+    }
+
+    static void requireRetired(com.mongodb.client.ClientSession session, MongoDatabase database, String cluster, String pipeline) {
+        if (!validationEnabled(session, database, cluster)) return;
+        var row = SystemCollections.OPERATOR_GENERATIONS.on(database).find(session, new Document("_id", pipeline)).first();
+        if (row == null || !(row.get("validationPreparation") instanceof Document value) || decode(value, cluster, pipeline).phase() != Phase.CLOSED) throw fenced();
+        if (SystemCollections.VALIDATION_TASKS.on(database).find(session, unfinishedReports(cluster, pipeline)).limit(1).first() != null) throw fenced();
+    }
+
+    private static Document unfinishedReports(String cluster, String pipeline) {
+        return new Document("_id.clusterId", cluster).append("_id.pipelineId", pipeline)
+                .append("$or", List.of(new Document("closed", new Document("$ne", true)),
+                        new Document("modes.full.permission.phase", new Document("$in", List.of("OPEN", "BORN"))),
+                        new Document("modes.incremental.permission.phase", new Document("$in", List.of("OPEN", "BORN")))));
+    }
+
+    private static boolean validationEnabled(com.mongodb.client.ClientSession session, MongoDatabase database, String cluster) {
+        var schema = SystemCollections.SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "config")).first();
+        if (schema != null && Integer.valueOf(1).equals(schema.get("installedVersion")) && !schema.containsKey("validation")) return false;
+        var marker = MongoValidationSchema.requireVersionTwo(schema, "READY");
+        if (!cluster.equals(MongoValidationSchema.scope(marker).clusterId())) throw unreadable(); return true;
+    }
 
     Permission issue(String pipeline, CacheBusinessScope expected) {
         Objects.requireNonNull(expected); UUID preparation = UUID.randomUUID();
@@ -137,7 +232,7 @@ final class MongoValidationPreparations {
 
     State finishClose(Closing closing, MongoValidationCachePreparations.Proof proof) {
         if (closing == null || closing.owner != this) throw fenced();
-        var before = closing.requireCurrent(); if (before.phase() == Phase.CLOSED) return before;
+        var before = closing.requireCurrent(); if (before.phase() == Phase.CLOSED) { requireReportsClosed(closing); return before; }
         Receipt receipt = before.subject() == null ? before.previous() : Objects.requireNonNull(proof, "original CACHE closure").requireClosed(before.subject());
         if (before.phase() == Phase.COMPLETE && receipt.outcome() != Outcome.RETIRED) throw unreadable();
         return transaction(session -> {
@@ -146,9 +241,7 @@ final class MongoValidationPreparations {
             if (current.phase() == Phase.COMPLETE && receipt.outcome() != Outcome.RETIRED) throw unreadable();
             // Parent closure is not final while any original report creation/publication permission remains open.
             var tasks = SystemCollections.VALIDATION_TASKS.on(database);
-            var unfinished = new Document("_id.clusterId", clusterId).append("_id.pipelineId", closing.pipeline)
-                    .append("$or", List.of(new Document("modes.full.permission.phase", new Document("$in", List.of("OPEN", "BORN"))),
-                            new Document("modes.incremental.permission.phase", new Document("$in", List.of("OPEN", "BORN")))));
+            var unfinished = unfinishedReports(clusterId, closing.pipeline);
             if (tasks.find(session, unfinished).limit(1).first() != null) throw fenced();
             var next = current.change(Phase.CLOSED, current.subject(), closing.operation, receipt); replace(session, row, next); return next;
         });

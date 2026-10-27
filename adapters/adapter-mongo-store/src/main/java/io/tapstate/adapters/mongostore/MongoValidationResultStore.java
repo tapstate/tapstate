@@ -31,13 +31,18 @@ final class MongoValidationResultStore implements ValidationResultStore {
     private final String clusterId;
 
     MongoValidationResultStore(MongoClient client, MongoDatabase database, String clusterId, Runnable requireActive) {
-        this.admission = new MongoValidationAdmissionStore(client, database, clusterId, requireActive);
+        this(client, database, clusterId, requireActive, null);
+    }
+    MongoValidationResultStore(MongoClient client, MongoDatabase database, String clusterId, Runnable requireActive,
+            MongoValidationPreparations.Authority validation) {
+        this.admission = new MongoValidationAdmissionStore(client, database, clusterId, requireActive, validation);
         this.database = Objects.requireNonNull(database); this.clusterId = Objects.requireNonNull(clusterId);
         reports = SystemCollections.VALIDATION_REPORTS.on(database); differences = SystemCollections.VALIDATION_DIFFERENCES.on(database);
     }
 
     @Override public Publication publish(RootWrite write) {
         Objects.requireNonNull(write); requireCluster(write.report()); admission.checkActive();
+        if (admission.closing()) return Publication.CLOSED_OR_EXPIRED;
         var payload = MongoValidationObservationCodec.encode(write.check());
         var root = MongoValidationObservationCodec.root(write.check().observation().root());
         var id = new Document("report", MongoValidationAdmissionStore.reportId(write.report().run())).append("rootHash", new Binary(hash(encoded(root))));
@@ -95,6 +100,7 @@ final class MongoValidationResultStore implements ValidationResultStore {
     }
 
     private Document report(ClientSession session, Report expected) {
+        admission.requirePipeline(expected.run().owner().pipelineId());
         var row = reports.find(session, new Document("_id", MongoValidationAdmissionStore.reportId(expected.run()))).first();
         if (row == null) return null;
         if (!Integer.valueOf(1).equals(row.get("formatVersion")) || !(row.get("admission") instanceof Document identity)

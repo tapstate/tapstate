@@ -34,17 +34,24 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
     private final Runnable requireActive;
     private final MongoCollection<Document> tasks;
     private final MongoCollection<Document> reports;
+    private final MongoValidationPreparations.Authority validation;
 
     MongoValidationAdmissionStore(MongoClient client, MongoDatabase database, String clusterId, Runnable requireActive) {
+        this(client, database, clusterId, requireActive, null);
+    }
+    MongoValidationAdmissionStore(MongoClient client, MongoDatabase database, String clusterId, Runnable requireActive,
+            MongoValidationPreparations.Authority validation) {
         this.client = Objects.requireNonNull(client); this.database = Objects.requireNonNull(database);
         this.clusterId = Objects.requireNonNull(clusterId); this.requireActive = Objects.requireNonNull(requireActive);
         tasks = SystemCollections.VALIDATION_TASKS.on(database); reports = SystemCollections.VALIDATION_REPORTS.on(database);
+        this.validation = validation;
     }
 
     @Override public Reservation reserve(Start start) {
         requireStart(start);
-        return transaction(session -> {
+        return transaction(true, () -> {}, session -> {
             var task = task(session, start); if (task == null) return Reservation.STALE;
+            if (Boolean.TRUE.equals(task.get("closed"))) return Reservation.CLOSED;
             var mode = mode(task, start.run().mode()); var held = permission(mode);
             if (held != null && held.getLong("sequence") == start.sequence()) {
                 if (!identity(start).equals(held.get("identity"))) return Reservation.STALE;
@@ -61,8 +68,9 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
 
     @Override public Birth open(Start start) {
         requireStart(start);
-        return transaction(session -> {
+        return transaction(true, () -> {}, session -> {
             var task = task(session, start); if (task == null) return Birth.STALE;
+            if (Boolean.TRUE.equals(task.get("closed"))) return Birth.CLOSED;
             var mode = mode(task, start.run().mode()); var held = matching(mode, start);
             if (held == null) return Birth.STALE;
             if (phase(held).equals("CLOSED")) return Birth.CLOSED;
@@ -104,30 +112,74 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
 
     boolean bornInTransaction(ClientSession session, Start start) {
         var task = task(session, start); if (task == null) return false;
+        if (Boolean.TRUE.equals(task.get("closed"))) return false;
         var held = matching(mode(task, start.run().mode()), start);
         return held != null && phase(held).equals("BORN");
     }
 
     private Document task(ClientSession session, Start start) {
-        var task = tasks.find(session, new Document("_id", taskId(start.task()))).first();
+        requireStart(start);
+        var task = tasks.find(session, new Document("_id", taskId(start.task()))).projection(new Document("_id", 1).append("formatVersion", 1)
+                .append("taskGeneration", 1).append("revision", 1).append("modes", 1).append("closed", 1)).first();
         if (task == null) return null;
+        return validateTask(task, start.task());
+    }
+    private Document validateTask(Document task, Task expected) {
         if (!Integer.valueOf(1).equals(task.get("formatVersion")) || !(task.get("revision") instanceof Long revision) || revision < 1
                 || !(task.get("taskGeneration") instanceof String generation) || !(task.get("modes") instanceof Document modes)
-                || !modes.keySet().equals(Set.of("full", "incremental"))) throw unreadable("task");
+                || !modes.keySet().equals(Set.of("full", "incremental")) || task.containsKey("closed") && !(task.get("closed") instanceof Boolean)
+                || validation != null && !(task.get("closed") instanceof Boolean)) throw unreadable("task");
         try {
             if (!java.util.UUID.fromString(generation).toString().equals(generation)) throw unreadable("task-generation");
         } catch (IllegalArgumentException invalid) { throw unreadable("task-generation"); }
-        if (!generation.equals(start.task().generation().toString())) return null;
+        if (!taskId(expected).equals(task.get("_id"))) throw unreadable("task-id");
+        if (!generation.equals(expected.generation().toString())) return null;
         for (var selected : ValidationMode.values()) {
             var held = permission(mode(task, selected));
             if (held != null) {
                 var original = decodeIdentity(held.get("identity", Document.class));
-                if (!original.task().equals(start.task()) || original.run().mode() != selected
+                if (!original.task().equals(expected) || original.run().mode() != selected
                         || original.configurationRevision() > revision) throw unreadable("permission-scope");
             }
         }
         bounded(new Document("taskGeneration", generation).append("modes", modes), 16 * 1024);
         return task;
+    }
+
+    boolean closePipelineInTransaction(ClientSession session, String pipeline, int maximum) {
+        if (validation == null || !validation.closing() || !validation.pipelineId().equals(pipeline)) throw unreadable("pipeline-closure");
+        var filter = new Document("_id.clusterId", clusterId).append("_id.pipelineId", pipeline).append("$or", java.util.List.of(
+                new Document("closed", new Document("$ne", true)), new Document("modes.full.permission.phase", new Document("$in", java.util.List.of("OPEN", "BORN"))),
+                new Document("modes.incremental.permission.phase", new Document("$in", java.util.List.of("OPEN", "BORN")))));
+        try (var cursor = tasks.find(session, filter).projection(new Document("_id", 1).append("formatVersion", 1)
+                .append("taskGeneration", 1).append("revision", 1).append("modes", 1).append("closed", 1)).limit(maximum).iterator()) {
+            while (cursor.hasNext()) {
+                var row = cursor.next(); Task original;
+                try {
+                    var id = row.get("_id", Document.class);
+                    original = new Task(clusterId, pipeline, id.getString("taskId"), java.util.UUID.fromString(row.getString("taskGeneration")));
+                } catch (NullPointerException | ClassCastException | IllegalArgumentException invalid) { throw unreadable("task"); }
+                validateTask(row, original);
+                if (tasks.updateOne(session, new Document("_id", row.get("_id")).append("taskGeneration", row.get("taskGeneration"))
+                        .append("revision", row.get("revision")).append("modes", row.get("modes")),
+                        new Document("$set", new Document("closed", true))).getMatchedCount() != 1) throw unreadable("task-close");
+                for (var selected : ValidationMode.values()) {
+                    var held = permission(mode(row, selected));
+                    if (held != null) closeInTransaction(session, decodeIdentity(held.get("identity", Document.class)));
+                }
+            }
+        }
+        return tasks.find(session, filter).projection(new Document("_id", 0).append("remaining", new Document("$literal", true))).limit(1).first() == null;
+    }
+    void requireOriginalInTransaction(ClientSession session, Start start, boolean closed) {
+        var task = task(session, start); if (task == null) throw unreadable("original-task");
+        var selected = mode(task, start.run().mode()); var held = permission(selected);
+        if (closed) {
+            if (held == null || held.getLong("sequence") < start.sequence()
+                    || held.getLong("sequence") == start.sequence() && (!identity(start).equals(held.get("identity")) || !phase(held).equals("CLOSED")))
+                throw unreadable("original-permission-closure");
+        } else if (Boolean.TRUE.equals(task.get("closed")) || held == null || !identity(start).equals(held.get("identity"))
+                || !Set.of("OPEN", "BORN").contains(phase(held))) throw unreadable("original-permission");
     }
     private static Document mode(Document task, ValidationMode mode) {
         var modes = task.get("modes", Document.class);
@@ -200,15 +252,24 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
     private void requireStart(Start start) {
         Objects.requireNonNull(start);
         if (!clusterId.equals(start.task().clusterId())) throw new TapstateException(ValidationError.INVALID_CONTRACT, Map.of("field", "start.clusterId"), null);
+        if (validation != null && !validation.pipelineId().equals(start.task().pipelineId())) throw unreadable("start-pipeline");
         bounded(identity(start), 8 * 1024);
     }
     void checkActive() { requireActive.run(); }
+    boolean closing() { return validation != null && validation.closing(); }
+    void requirePipeline(String pipeline) { if (validation != null && !validation.pipelineId().equals(pipeline)) throw unreadable("pipeline"); }
     <T> T transaction(Function<ClientSession, T> work) { return transaction(() -> {}, work); }
     <T> T transaction(Runnable verifyAdditionalStructures, Function<ClientSession, T> work) {
+        return transaction(false, verifyAdditionalStructures, work);
+    }
+    private <T> T transaction(boolean admission, Runnable verifyAdditionalStructures, Function<ClientSession, T> work) {
         return StoreIo.call(() -> {
             requireActive.run(); verifyStructures(); verifyAdditionalStructures.run();
             try (var session = client.startSession()) {
-                return session.withTransaction(() -> { requireActive.run(); var result = work.apply(session); requireActive.run(); return result; }, TRANSACTION);
+                return session.withTransaction(() -> {
+                    requireActive.run(); if (validation != null) validation.enter(client, database, session, admission);
+                    var result = work.apply(session); requireActive.run(); return result;
+                }, TRANSACTION);
             }
         });
     }

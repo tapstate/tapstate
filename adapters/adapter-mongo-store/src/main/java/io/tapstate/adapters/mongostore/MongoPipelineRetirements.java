@@ -31,6 +31,7 @@ final class MongoPipelineRetirements implements PipelineRetirements {
     }
     @Override public PipelineRetirementPreparation begin(PipelineRetirementRequest original) {
         Objects.requireNonNull(original);
+        var validationClosing = UUID.randomUUID();
         return transaction(session -> {
             requireBusiness(session,original.scope());var row=mapping(session,original.scope().pipelineId());
             var state=MongoPipelineStateMappings.decode(original.scope().pipelineId(),row);
@@ -55,6 +56,7 @@ final class MongoPipelineRetirements implements PipelineRetirements {
             var tokens=notes.retirementScopes(session,original.scope(),original.operationId());
             var fact=new MongoPipelineRetirementFacts.Fact(original,MongoPipelineRetirementFacts.notesHash(tokens),tokens.size(),"RETIRING",predecessor,Optional.empty());
             ConfigurationVersion.advance(session,SystemCollections.CONFIGURATION_VERSION.on(database));
+            MongoValidationPreparations.beginRetirement(session,database,cluster,original,validationClosing);
             var filter=new Document("_id",state.pipelineId()).append("phase","ACTIVE").append("stateGeneration",state.stateGeneration())
                     .append("noteWriteFence",row.get("noteWriteFence")).append("cachePreparation",row.get("cachePreparation"));
             if(SystemCollections.OPERATOR_GENERATIONS.on(database).updateOne(session,filter,new Document("$set",new Document("phase","RETIRING")
@@ -94,6 +96,7 @@ final class MongoPipelineRetirements implements PipelineRetirements {
             var complete=new MongoPipelineRetirementFacts.Fact(pending.request(),pending.privateScopesHash(),pending.privateScopesCount(),"COMPLETE",pending.predecessor(),receipt.retiredState());
             long fence=row.getLong("noteWriteFence");if(fence>=Long.MAX_VALUE-1)throw fenced();
             ConfigurationVersion.advance(session,SystemCollections.CONFIGURATION_VERSION.on(database));
+            MongoValidationPreparations.requireRetired(session,database,cluster,pending.request().scope().pipelineId());
             artifacts.deleteRetiredPipeline(session,pending.request().scope().pipelineId(),pending.request().definitionHash());
             new MongoPipelineIntentStore(client,database,cluster,bindings).retire(session,pending.request().scope());
             if(SystemCollections.OPERATOR_GENERATIONS.on(database).updateOne(session,new Document("_id",pending.request().scope().pipelineId())

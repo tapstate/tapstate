@@ -212,8 +212,7 @@ class MongoValidationSchemaIT {
                 var claims = f.cache.validationClaims(complete); var control = f.cache.validationControl(complete);
                 var key = ValidationClaims.key("cluster", "flow0"); var acquired = claims.acquire(key, f.nodeOwner(), 1, TTL).claim();
                 var executing = claims.advanceExecution(acquired, 1, Set.of(f.nodeOwner().nodeId())).orElseThrow();
-                var run = new ValidationControlStore.Run(new io.tapstate.core.validation.ValidationRunIdentity(ValidationClaims.owner("flow0", executing),
-                        "task", "run", io.tapstate.core.validation.ValidationMode.FULL, "spec", 1, "rules"), 1);
+                var run = f.reserveRun(reopened, complete, executing, "task", "run");
                 if (entry.equals("existing-config")) SystemCollections.VALIDATION_DIFFERENCES.on(f.configDb).dropIndex("validation_differences_report");
                 else SystemCollections.VALIDATION_RUNS.on(f.cacheDb).dropIndex("validation_runs_pipeline");
                 assertThatThrownBy(() -> {
@@ -269,6 +268,99 @@ class MongoValidationSchemaIT {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"admission", "completion"})
+    void schemaTwoRetirementRequiresTheOriginalValidationClosingGate(String stage) {
+        try (var f = new Fixture(0)) {
+            f.upgrade();
+            var definition = new DslParser().parse("version: tapstate/v1\nkind: pipeline\nid: deleting\nsource: []\n");
+            f.configuration.artifacts().create(definition);
+            var scope = new PipelineIntentScope("cluster", f.scope.bindingVersion(), f.scope.cacheIncarnation(), "deleting", 1);
+            var retirements = f.configuration.retirements();
+            var pending = retirements.begin(new PipelineRetirementRequest(UUID.randomUUID().toString(), scope,
+                    io.tapstate.core.model.canonical.CanonicalHash.of(definition), Optional.empty()));
+            if (stage.equals("admission")) {
+                assertThat(f.configuration.validationPreparations().read("deleting").closingOperationId()).isNotNull();
+            } else {
+                var claims = f.cache.workloadClaims(f.scope); var node = claims.acquire(f.nodeKey(), f.nodeOwner(), 1, TTL).claim();
+                var receipt = f.cache.pipelineRetirements(f.scope, () -> {}).retire(pending, WorkloadClaimFence.from(node));
+                assertThatThrownBy(() -> retirements.complete(receipt)).isInstanceOf(TapstateException.class);
+                assertThat(f.configuration.artifacts().get("deleting")).isPresent();
+            }
+        }
+    }
+
+    @Test void unusedValidationRetirementNeedsNoCacheViewAndSameIdRecreationGetsANewGeneration() {
+        try (var f = new Fixture(0)) {
+            f.upgrade();
+            var definition = new DslParser().parse("version: tapstate/v1\nkind: pipeline\nid: unused\nsource: []\n");
+            f.configuration.artifacts().create(definition);
+            var previous = f.configuration.validationPreparations().read("unused");
+            var scope = new PipelineIntentScope("cluster", f.scope.bindingVersion(), f.scope.cacheIncarnation(), "unused", 1);
+            var retirements = f.configuration.retirements();
+            var pending = retirements.begin(new PipelineRetirementRequest(UUID.randomUUID().toString(), scope,
+                    io.tapstate.core.model.canonical.CanonicalHash.of(definition), Optional.empty()));
+            assertThat(f.configuration.retireValidation(pending, null, null, () -> {})).isTrue();
+            assertThat(f.configuration.validationPreparations().read("unused").phase()).isEqualTo(MongoValidationPreparationFacts.Phase.CLOSED);
+            assertThat(SystemCollections.VALIDATION_RUNS.on(f.cacheDb).countDocuments()).isZero();
+            var node = f.cache.workloadClaims(f.scope).acquire(f.nodeKey(), f.nodeOwner(), 1, TTL).claim();
+            var receipt = f.cache.pipelineRetirements(f.scope, () -> {}).retire(pending, WorkloadClaimFence.from(node));
+            retirements.complete(receipt);
+            f.configuration.artifacts().create(definition);
+            var fresh = f.configuration.validationPreparations().read("unused");
+            assertThat(fresh.generation()).isNotEqualTo(previous.generation());
+            assertThat(fresh.phase()).isEqualTo(MongoValidationPreparationFacts.Phase.UNASSIGNED);
+            assertThat(fresh.previous()).isNull();
+        }
+    }
+
+    @Test void deletionClosesTheOriginalReportRevokesItsOwnerAndPreservesHistoryForSameIdReplacement() {
+        try (var f = new Fixture(1)) {
+            f.upgrade(); var preparations = f.configuration.validationPreparations();
+            var first = preparations.issue("flow0", f.scope);
+            var generic = f.cache.workloadClaims(f.scope); var nodeA = generic.acquire(f.nodeKey(), f.nodeOwner(), 1, TTL).claim();
+            var complete = preparations.complete(first, f.cache.validationPreparations(f.scope).prepare(first, WorkloadClaimFence.from(nodeA)));
+            var claims = f.cache.validationClaims(complete); var key = ValidationClaims.key("cluster", "flow0");
+            var acquired = claims.acquire(key, f.nodeOwner(), 1, TTL).claim();
+            var executing = claims.advanceExecution(acquired, 1, Set.of(f.nodeOwner().nodeId())).orElseThrow();
+            var run = f.reserveRun(f.configuration, complete, executing, "task", "run");
+            var control = f.cache.validationControl(complete); assertThat(control.join(run)).isEqualTo(ValidationControlStore.Join.JOINED);
+            assertThat(f.configuration.validationAdmissions(complete).open(run.admission())).isEqualTo(ValidationReportAdmission.Birth.CREATED);
+            var definition = f.configuration.artifacts().get("flow0").orElseThrow();
+            var scope = new PipelineIntentScope("cluster", f.scope.bindingVersion(), f.scope.cacheIncarnation(), "flow0", 1);
+            var retirements = f.configuration.retirements();
+            var pending = retirements.begin(new PipelineRetirementRequest(UUID.randomUUID().toString(), scope,
+                    io.tapstate.core.model.canonical.CanonicalHash.of(definition), Optional.empty()));
+            var nodeB = generic.acquire(new WorkloadClaimKey("cluster", WorkloadClaimType.NODE_SESSION, "node-b"), new WorkloadOwner("node-b", "boot-b"), 1, TTL).claim();
+            assertThat(f.configuration.retireValidation(pending, f.cache, WorkloadClaimFence.from(nodeB), () -> {})).isTrue();
+            var closed = preparations.read("flow0");
+            assertThat(closed.phase()).isEqualTo(MongoValidationPreparationFacts.Phase.CLOSED);
+            assertThat(closed.previous().claimGeneration()).isGreaterThan(executing.claimGeneration());
+            assertThat(closed.previous().executionGeneration()).isGreaterThan(executing.executionGeneration());
+            var ended = SystemCollections.VALIDATION_RUNS.on(f.cacheDb).find(new Document("_id", MongoValidationControlStore.runId(run))).first();
+            assertThat(ended).containsEntry("state", "FAILED").containsEntry("retired", true);
+            assertThat(SystemCollections.VALIDATION_REPORTS.on(f.configDb).find(new Document("_id", MongoValidationAdmissionStore.reportId(run.identity()))).first())
+                    .containsEntry("closed", true);
+            assertThatThrownBy(() -> claims.renew(executing, TTL)).isInstanceOf(TapstateException.class);
+            var receipt = f.cache.pipelineRetirements(f.scope, () -> {}).retire(pending, WorkloadClaimFence.from(nodeB));
+            for (var notes : f.configuration.requiredNotes().retirements(scope, pending.request().operationId())) {
+                assertThat(notes.origin()).isEmpty(); notes.completeAfterVerifiedRelease();
+            }
+            retirements.complete(receipt); f.configuration.artifacts().create(definition);
+            var replaced = preparations.read("flow0");
+            assertThat(replaced.generation()).isNotEqualTo(closed.generation()); assertThat(replaced.previous()).isEqualTo(closed.previous());
+            var next = preparations.issue("flow0", f.scope);
+            preparations.complete(next, f.cache.validationPreparations(f.scope).prepare(next, WorkloadClaimFence.from(nodeB)));
+            var current = f.cache.validationClaims(next).acquire(key, nodeB.owner(), 1, TTL).claim();
+            assertThat(current.claimGeneration()).isGreaterThan(closed.previous().claimGeneration());
+            var oldTask = run.admission().task();
+            var stale = new ValidationReportAdmission.Start(oldTask, 1, 2, UUID.randomUUID().toString(),
+                    new io.tapstate.core.validation.ValidationRunIdentity(ValidationClaims.owner("flow0", executing), "task", "new-run",
+                            io.tapstate.core.validation.ValidationMode.FULL, "spec", 1, "rules"));
+            assertThat(f.configuration.validationAdmissions(next).reserve(stale)).isEqualTo(ValidationReportAdmission.Reservation.CLOSED);
+        }
+    }
+
     private static final class Fixture implements AutoCloseable {
         final MongoClient configClient = MongoClients.create(CONFIG.getReplicaSetUrl()), cacheClient = MongoClients.create(CACHE.getReplicaSetUrl());
         final String suffix = UUID.randomUUID().toString().replace("-", "");
@@ -300,6 +392,17 @@ class MongoValidationSchemaIT {
         Document cacheSchema() { return SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(cacheDb).find(new Document("_id", "business")).first(); }
         WorkloadOwner nodeOwner() { return new WorkloadOwner("node", "boot"); }
         WorkloadClaimKey nodeKey() { return new WorkloadClaimKey("cluster", WorkloadClaimType.NODE_SESSION, "node"); }
+        ValidationControlStore.Run reserveRun(MongoConfigurationDomain context, MongoValidationPreparations.Permission original, WorkloadClaim owner, String task, String run) {
+            var taskIdentity = new ValidationReportAdmission.Task("cluster", original.subject().pipelineId(), task, UUID.randomUUID());
+            SystemCollections.VALIDATION_TASKS.on(configDb).insertOne(new Document("_id", MongoValidationAdmissionStore.taskId(taskIdentity))
+                    .append("formatVersion", 1).append("taskGeneration", taskIdentity.generation().toString()).append("revision", 1L).append("closed", false)
+                    .append("modes", new Document("full", new Document("nextStartSequence", 1L)).append("incremental", new Document("nextStartSequence", 1L))));
+            var identity = new io.tapstate.core.validation.ValidationRunIdentity(ValidationClaims.owner(original.subject().pipelineId(), owner), task, run,
+                    io.tapstate.core.validation.ValidationMode.FULL, "spec", 1, "rules");
+            var start = new ValidationReportAdmission.Start(taskIdentity, 1, 1, UUID.randomUUID().toString(), identity);
+            assertThat(context.validationAdmissions(original).reserve(start)).isEqualTo(ValidationReportAdmission.Reservation.RESERVED);
+            return new ValidationControlStore.Run(identity, 1, start);
+        }
         List<Document> productionFacts() {
             var rows = SystemCollections.OPERATOR_GENERATIONS.on(configDb).find().sort(new Document("_id", 1)).into(new ArrayList<>());
             rows.forEach(row -> row.remove("validationPreparation")); return rows;

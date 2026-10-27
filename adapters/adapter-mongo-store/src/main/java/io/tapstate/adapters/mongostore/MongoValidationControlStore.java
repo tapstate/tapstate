@@ -48,7 +48,8 @@ final class MongoValidationControlStore implements ValidationControlStore {
 
     @Override public Join join(Run run) {
         Objects.requireNonNull(run);
-        return transaction(run.identity().owner(), true, session -> {
+        requireAdmission(run, false);
+        var joined = transaction(run.identity().owner(), true, session -> {
             var control = control(session, run.identity().owner().pipelineId());
             var existing = row(session, run);
             if (existing != null) {
@@ -80,14 +81,17 @@ final class MongoValidationControlStore implements ValidationControlStore {
             var record = new Document("_id", runId(run)).append("formatVersion", validation == null ? 1 : 2).append("scope", scope(scope))
                     .append("identity", identity(run)).append("state", ValidationRunState.STARTING.name()).append("retired", false);
             if (validation != null) record.append("validationSubject", MongoValidationPreparationFacts.encode(validation.subject()));
+            if (validation != null) record.append("admission", MongoValidationAdmissionStore.identity(run.admission()));
             rows.insertOne(session, record);
             return Join.JOINED;
         });
+        requireAdmission(run, false); return joined;
     }
 
     @Override public Mutation transition(Transition command) {
         Objects.requireNonNull(command); var run = command.run();
-        return transaction(run.identity().owner(), command.next() == ValidationRunState.RUNNING, session -> {
+        if (command.next() == ValidationRunState.RUNNING || command.next().terminal()) requireAdmission(run, command.next().terminal());
+        var changed = transaction(run.identity().owner(), command.next() == ValidationRunState.RUNNING, session -> {
             var control = control(session, run.identity().owner().pipelineId()); var row = row(session, run);
             if (row == null || row.getBoolean("retired") || !current(control, run) || !slot(control, run)) return Mutation.STALE;
             var current = state(row);
@@ -97,6 +101,8 @@ final class MongoValidationControlStore implements ValidationControlStore {
             updateRun(session, run, row, new Document("state", command.next().name()));
             return Mutation.APPLIED;
         });
+        if (command.next() == ValidationRunState.RUNNING || command.next().terminal()) requireAdmission(run, command.next().terminal());
+        return changed;
     }
 
     @Override public Mutation latchProblemLimit(Run run) {
@@ -122,7 +128,8 @@ final class MongoValidationControlStore implements ValidationControlStore {
 
     @Override public Mutation retire(Retirement command) {
         Objects.requireNonNull(command); var run = command.run();
-        return transaction(run.identity().owner(), false, session -> {
+        requireAdmission(run, true);
+        var retired = transaction(run.identity().owner(), false, session -> {
             var control = control(session, run.identity().owner().pipelineId()); var row = row(session, run);
             if (row == null || !current(control, run) || state(row) != command.terminal()) return Mutation.STALE;
             if (row.getBoolean("retired")) return Mutation.ALREADY_APPLIED;
@@ -130,11 +137,13 @@ final class MongoValidationControlStore implements ValidationControlStore {
             updateRun(session, run, row, new Document("retired", true)); removeSlot(control, run); writeControl(session, control);
             return Mutation.APPLIED;
         });
+        requireAdmission(run, true); return retired;
     }
 
     @Override public Mutation terminateLostOwner(LostOwner command) {
         Objects.requireNonNull(command); var obsolete = command.obsolete();
-        return transaction(command.authority(), false, session -> {
+        requireAdmission(obsolete, true);
+        var retired = transaction(command.authority(), false, session -> {
             var control = control(session, command.authority().pipelineId()); var row = row(session, obsolete);
             if (row == null) return Mutation.STALE;
             if (row.getBoolean("retired")) return Mutation.ALREADY_APPLIED;
@@ -144,6 +153,11 @@ final class MongoValidationControlStore implements ValidationControlStore {
             updateRun(session, obsolete, row, values); removeSlot(control, obsolete); writeControl(session, control);
             return Mutation.APPLIED;
         });
+        requireAdmission(obsolete, true); return retired;
+    }
+
+    private void requireAdmission(Run run, boolean closed) {
+        if (validation != null) validation.requireStart(run.admission(), closed);
     }
 
     private <T> T transaction(ValidationOwner owner, boolean admission, Function<ClientSession, T> work) {
@@ -326,14 +340,17 @@ final class MongoValidationControlStore implements ValidationControlStore {
     private void requireRow(Document row, Run run) {
         if (!runId(run).equals(row.get("_id")) || !Integer.valueOf(validation == null ? 1 : 2).equals(row.get("formatVersion")) || !scope(scope).equals(row.get("scope"))
                 || validation != null && !MongoValidationPreparationFacts.encode(validation.subject()).equals(row.get("validationSubject"))
+                || validation != null && (run.admission() == null || !MongoValidationAdmissionStore.identity(run.admission()).equals(row.get("admission")))
                 || !identity(run).equals(row.get("identity")) || !(row.get("retired") instanceof Boolean)) throw unreadable("run");
         state(row);
     }
-    private static Run decodeRun(Document row) {
+    static Run decodeRun(Document row) {
         try {
             var id = row.get("identity", Document.class); var who = owner(id.get("owner", Document.class), id.getString("pipelineId"));
+            var admission = Integer.valueOf(2).equals(row.get("formatVersion"))
+                    ? MongoValidationAdmissionStore.decodeIdentity(row.get("admission", Document.class)) : null;
             var run = new Run(new ValidationRunIdentity(who, id.getString("taskId"), id.getString("runId"), ValidationMode.valueOf(id.getString("mode")),
-                    id.getString("specHash"), id.getLong("keyMappingRevision"), id.getString("comparisonRulesVersion")), id.getLong("countingGeneration"));
+                    id.getString("specHash"), id.getLong("keyMappingRevision"), id.getString("comparisonRulesVersion")), id.getLong("countingGeneration"), admission);
             if (!identity(run).equals(id)) throw unreadable("run-identity"); return run;
         } catch (NullPointerException | ClassCastException | IllegalArgumentException | TapstateException invalid) { throw unreadable("run-identity"); }
     }

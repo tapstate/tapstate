@@ -245,21 +245,22 @@ class MongoValidationIndependentPreparationIT {
         try (var f = new Fixture()) {
             var permission = f.config.issue(PIPELINE, f.scope);
             var proof = f.cache.prepare(permission, f.nodeA);
+            f.config.complete(permission, proof);
             var key = ValidationClaims.key("cluster", PIPELINE);
             var claim = f.rawClaims().acquire(key, f.nodeA.owner(), 1, TTL).claim();
             claim = f.rawClaims().advanceExecution(claim, 1, Set.of(f.nodeA.owner().nodeId())).orElseThrow();
-            var run = new ValidationControlStore.Run(new ValidationRunIdentity(ValidationClaims.owner(PIPELINE, claim), "task", "run",
-                    ValidationMode.FULL, "spec", 1, "rules"), 1);
+            var run = f.run(claim, "task", ValidationMode.FULL, "run", 1);
             f.controls().insertOne(new Document("_id", MongoValidationControlStore.runId(run)).append("formatVersion", 2)
                     .append("scope", MongoValidationControlStore.scope(f.scope)).append("validationSubject", encode(permission.subject()))
-                    .append("identity", MongoValidationControlStore.identity(run)).append("state", "STARTING").append("retired", false));
+                    .append("identity", MongoValidationControlStore.identity(run)).append("admission", MongoValidationAdmissionStore.identity(run.admission()))
+                    .append("state", "STARTING").append("retired", false));
             f.controls().updateOne(new Document("_id", f.control().get("_id")), new Document("$set", new Document("countingGeneration", 1L)
                     .append("owner", WorkloadClaimDocuments.stored(run.fence())).append("retainedRuns", 1L).append("closed", false)
                     .append("slots", new Document("dGFzaw:FULL", MongoValidationControlStore.runId(run)))));
             assertThat(proof.requirePrepared(permission.subject()).outcome()).isEqualTo(Outcome.PREPARED);
             f.controls().updateOne(new Document("_id", f.control().get("_id")), new Document("$set", new Document("problemLimit", true)));
             assertThatThrownBy(() -> f.config.complete(permission, proof)).isInstanceOf(TapstateException.class);
-            assertThat(f.config.read(PIPELINE).phase()).isEqualTo(Phase.ISSUED);
+            assertThat(f.config.read(PIPELINE).phase()).isEqualTo(Phase.COMPLETE);
         }
     }
 
@@ -315,10 +316,12 @@ class MongoValidationIndependentPreparationIT {
             var a = f.cacheDomain.validationControl(complete); var b = other.validationControl(complete);
             var full = f.run(claim, "one", ValidationMode.FULL, "full", 1);
             assertThat(a.join(full)).isEqualTo(Join.JOINED);
-            assertThat(b.join(f.run(claim, "one", ValidationMode.FULL, "busy", 1))).isEqualTo(Join.MODE_BUSY);
+            assertThat(a.join(full)).isEqualTo(Join.ALREADY_JOINED);
+            f.admissions().close(full.admission());
+            var busy = f.run(claim, "one", ValidationMode.FULL, "busy", 1);
+            assertThat(b.join(busy)).isEqualTo(Join.MODE_BUSY); f.admissions().close(busy.admission());
             assertThat(b.join(f.run(claim, "one", ValidationMode.INCREMENTAL, "incremental", 1))).isEqualTo(Join.JOINED);
             assertThat(b.join(f.run(claim, "two", ValidationMode.FULL, "other-task", 1))).isEqualTo(Join.JOINED);
-            assertThat(a.join(full)).isEqualTo(Join.ALREADY_JOINED);
             assertThat(f.control().get("slots", Document.class)).hasSize(3);
             assertThat(f.controls().find(new Document("_id", MongoValidationControlStore.runId(full))).first().get("validationSubject"))
                     .isEqualTo(encode(complete.subject()));
@@ -358,7 +361,7 @@ class MongoValidationIndependentPreparationIT {
             assertThatThrownBy(() -> cleanup.transition(new Transition(run, ValidationRunState.STARTING, ValidationRunState.RUNNING)))
                     .isInstanceOf(TapstateException.class);
             assertThat(f.cacheDomain.validationClaims(closing).renew(original, TTL)).isPresent();
-            assertThat(f.admissions().close(start)).isEqualTo(ValidationReportAdmission.Closure.CLOSED);
+            assertThat(f.config.closeReports(closing, 20)).isTrue();
             assertThat(cleanup.transition(new Transition(run, ValidationRunState.STOPPING, ValidationRunState.STOPPED))).isEqualTo(Mutation.APPLIED);
             assertThat(cleanup.retire(new Retirement(run, start.report(), ValidationRunState.STOPPED))).isEqualTo(Mutation.APPLIED);
             var retired = f.cache.cancel(closing, f.nodeB);
@@ -410,6 +413,7 @@ class MongoValidationIndependentPreparationIT {
                 assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
                 try {
                     var closing = f.config.beginClose(PIPELINE, complete.subject().generation(), UUID.randomUUID());
+                    assertThat(f.config.closeReports(closing, 20)).isTrue();
                     f.config.finishClose(closing, f.cache.cancel(closing, f.nodeB));
                 } finally { release.countDown(); }
                 assertThatThrownBy(() -> pending.get(10, TimeUnit.SECONDS)).hasCauseInstanceOf(TapstateException.class);
@@ -518,9 +522,22 @@ class MongoValidationIndependentPreparationIT {
             var original = config.issue(PIPELINE, scope); return config.complete(original, cache.prepare(original, nodeA));
         }
         Run run(WorkloadClaim claim, String task, ValidationMode mode, String run, long generation) {
-            return new Run(new ValidationRunIdentity(ValidationClaims.owner(PIPELINE, claim), task, run, mode, "spec", 1, "rules"), generation);
+            var identity = new ValidationRunIdentity(ValidationClaims.owner(PIPELINE, claim), task, run, mode, "spec", 1, "rules");
+            var id = new Document("clusterId", "cluster").append("pipelineId", PIPELINE).append("taskId", task);
+            var tasks = SystemCollections.VALIDATION_TASKS.on(configDb); var row = tasks.find(new Document("_id", id)).first();
+            if (row == null) {
+                row = new Document("_id", id).append("formatVersion", 1).append("taskGeneration", UUID.randomUUID().toString()).append("revision", 1L)
+                        .append("closed", false).append("modes", new Document("full", new Document("nextStartSequence", 1L))
+                                .append("incremental", new Document("nextStartSequence", 1L))); tasks.insertOne(row);
+            }
+            var selected = mode == ValidationMode.FULL ? "full" : "incremental";
+            long sequence = row.get("modes", Document.class).get(selected, Document.class).getLong("nextStartSequence");
+            var start = new ValidationReportAdmission.Start(new ValidationReportAdmission.Task("cluster", PIPELINE, task, UUID.fromString(row.getString("taskGeneration"))),
+                    1, sequence, UUID.randomUUID().toString(), identity);
+            assertThat(admissions().reserve(start)).isEqualTo(ValidationReportAdmission.Reservation.RESERVED);
+            return new Run(identity, generation, start);
         }
-        MongoValidationAdmissionStore admissions() { return new MongoValidationAdmissionStore(configClient, configDb, "cluster", () -> {}); }
+        MongoValidationAdmissionStore admissions() { return configuration.validationAdmissions(config.issue(PIPELINE, scope)); }
         PipelineIntentScope seedProduction() {
             var original = new PipelineIntentScope("cluster", scope.bindingVersion(), scope.cacheIncarnation(), PIPELINE, 1);
             try (var session = cacheClient.startSession()) { SystemCollections.CACHE_PIPELINE_STATE.prepareCollectionOn(cacheDb, session); }
@@ -539,13 +556,7 @@ class MongoValidationIndependentPreparationIT {
                     .append("state", SystemCollections.CACHE_PIPELINE_STATE.on(cacheDb).find(new Document("_id", PIPELINE)).first());
         }
         ValidationReportAdmission.Start openReport(Run run) {
-            var task = new ValidationReportAdmission.Task("cluster", PIPELINE, run.identity().taskId(), UUID.randomUUID());
-            SystemCollections.VALIDATION_TASKS.on(configDb).insertOne(new Document("_id", new Document("clusterId", "cluster")
-                    .append("pipelineId", PIPELINE).append("taskId", task.taskId())).append("formatVersion", 1)
-                    .append("taskGeneration", task.generation().toString()).append("revision", 1L)
-                    .append("modes", new Document("full", new Document("nextStartSequence", 1L)).append("incremental", new Document("nextStartSequence", 1L))));
-            var start = new ValidationReportAdmission.Start(task, 1, 1, UUID.randomUUID().toString(), run.identity());
-            assertThat(admissions().reserve(start)).isEqualTo(ValidationReportAdmission.Reservation.RESERVED);
+            var start = run.admission();
             assertThat(admissions().open(start)).isEqualTo(ValidationReportAdmission.Birth.CREATED); return start;
         }
         @Override public void close() { try { configDb.drop(); cacheDb.drop(); } finally { configuration.close(); cacheDomain.close(); configClient.close(); cacheClient.close(); } }
