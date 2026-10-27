@@ -61,7 +61,7 @@ public final class StorageSetupService {
     public record Status(StorageBinding.Mode mode, String clusterId, String operationId, long generation,
             StorageSetupStateStore.Phase setupPhase, long bindingVersion) {}
     private record Prepared(Candidate candidate, SourceResource target, ConnectorIdentity connector, String hash) {}
-    private record Tested(StorageSetupScope scope, String hash, String token, Instant expiresAt) {}
+    private record Tested(StorageSetupScope scope, String hash, String token, Instant checkedAt, Instant expiresAt) {}
 
     private final StorageBinding.Mode mode;
     private final StorageBindingStore bindings;
@@ -78,6 +78,7 @@ public final class StorageSetupService {
     private StorageBindingCommit pending;
     private final java.util.function.Function<Supplier<Status>,Status> commitOwner;
     private final ConfigurationPreparation configurationPreparation;
+    private final StorageInitializationProgress progress;
 
     public StorageSetupService(StorageBinding.Mode mode, StorageBindingStore bindings, StorageSetupStateStore states,
             StorageConnectionProbe probe, DefaultTarget target, Supplier<Optional<StorageBinding.Connection>> configuration,
@@ -104,6 +105,15 @@ public final class StorageSetupService {
             StorageConnectionProbe probe, DefaultTarget target, Supplier<Optional<StorageBinding.Connection>> configuration,
             AuditGate audit, Clock clock, Runnable operationActive, java.util.function.Consumer<StorageBindingCommit> continuation,
             java.util.function.Function<Supplier<Status>,Status> commitOwner, ConfigurationPreparation configurationPreparation) {
+        this(mode, bindings, states, probe, target, configuration, audit, clock, operationActive, continuation,
+                commitOwner, configurationPreparation, null);
+    }
+
+    public StorageSetupService(StorageBinding.Mode mode, StorageBindingStore bindings, StorageSetupStateStore states,
+            StorageConnectionProbe probe, DefaultTarget target, Supplier<Optional<StorageBinding.Connection>> configuration,
+            AuditGate audit, Clock clock, Runnable operationActive, java.util.function.Consumer<StorageBindingCommit> continuation,
+            java.util.function.Function<Supplier<Status>,Status> commitOwner, ConfigurationPreparation configurationPreparation,
+            StorageInitializationProgress progress) {
         this.mode = Objects.requireNonNull(mode, "mode"); this.bindings = Objects.requireNonNull(bindings, "bindings");
         this.states = Objects.requireNonNull(states, "states"); this.probe = Objects.requireNonNull(probe, "probe");
         this.target = Objects.requireNonNull(target, "target"); this.configuration = Objects.requireNonNull(configuration, "configuration");
@@ -112,6 +122,7 @@ public final class StorageSetupService {
         this.continuation = Objects.requireNonNull(continuation, "continuation");
         this.commitOwner = Objects.requireNonNull(commitOwner, "commitOwner");
         this.configurationPreparation = Objects.requireNonNull(configurationPreparation, "configurationPreparation");
+        this.progress = progress;
     }
 
     /** The caller guard is established by the server's existing Cloud identity or OP management capability. */
@@ -129,8 +140,9 @@ public final class StorageSetupService {
         if (!prepared.connector().equals(target.identity(prepared.candidate().master()))) throw testsRequired();
         if (tests.values().stream().anyMatch(test -> !test.scope().equals(expected) || !test.hash().equals(prepared.hash()))) tests.clear();
         String stamp = UUID.randomUUID().toString();
-        Instant expires = clock.instant().plus(TEST_LIFETIME);
-        tests.put(layer, new Tested(expected, prepared.hash(), stamp, expires));
+        Instant checkedAt = clock.instant();
+        Instant expires = checkedAt.plus(TEST_LIFETIME);
+        tests.put(layer, new Tested(expected, prepared.hash(), stamp, checkedAt, expires));
         return new TestResult(layer, stamp, expires, layer == Layer.MASTER
                 ? List.of("transactional-crud", "index-permissions", "registered-connector")
                 : List.of("transactional-crud", "index-permissions"));
@@ -139,7 +151,13 @@ public final class StorageSetupService {
     /** Binding is durable before runtime activation. A lost HTTP response never discards its original first-cache invocation. */
     public synchronized Status commit(String subject, StorageSetupScope expected, Runnable active,
             Candidate candidate, Map<Layer,String> stamps) {
-        return commitOwner.apply(() -> commitOwned(subject, expected, active, candidate, stamps));
+        return commitOwner.apply(() -> {
+            try { return commitOwned(subject, expected, active, candidate, stamps); }
+            catch (RuntimeException | Error failure) {
+                if (progress != null) progress.failed(expected, failure);
+                throw failure;
+            }
+        });
     }
 
     private Status commitOwned(String subject, StorageSetupScope expected, Runnable active, Candidate candidate, Map<Layer,String> stamps) {
@@ -155,11 +173,20 @@ public final class StorageSetupService {
         requireInstalledConfiguration(prepared.candidate().configuration());
         var guarded = bindings.guardedBy(active);
         Optional<StorageBinding> previous = guarded.load();
+        if (progress != null && previous.isPresent()) progress.begin(expected, 1, false);
         if (previous.isEmpty()) {
             requireSetup(expected, active);
             requireTests(expected, prepared, stamps);
+            if (progress != null) {
+                var verifiedChecks = new EnumMap<Layer, Instant>(Layer.class);
+                for (Layer layer : Layer.values()) verifiedChecks.put(layer, tests.get(layer).checkedAt());
+                progress.begin(expected, 0, false, verifiedChecks);
+            }
             for (Layer layer : Layer.values()) {
-                try { probe.test(prepared.candidate().connection(layer)); }
+                try {
+                    probe.test(prepared.candidate().connection(layer));
+                    if (progress != null) progress.checked(expected, layer);
+                }
                 catch (TapstateException refused) {
                     throw new TapstateException(ControlError.STORAGE_TEST_FAILED,
                             Map.of("layer", layer.name(), "causeCode", refused.code().code()), null);
@@ -178,6 +205,7 @@ public final class StorageSetupService {
                     || !pending.preparation().equals(result.preparation())) pending = result;
             return result.binding();
         });
+        if (progress != null) progress.completed(expected, StorageInitializationProgress.Stage.SAVE_SETTINGS);
         // The committed operation owns continuation even if the HTTP request or its test stamps expire.
         continuation.accept(pending);
         Status result = status(expected, operationActive);

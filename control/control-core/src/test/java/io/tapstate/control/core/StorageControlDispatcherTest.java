@@ -74,6 +74,31 @@ class StorageControlDispatcherTest {
         assertThat(checks).hasValue(2);
     }
 
+    @Test void initializationProgressIsAnOptionalScopedReadOnlyProjectionWithoutSubmissionProofs() {
+        var f = new Fixture();
+        var progress = new StorageInitializationProgress(java.time.Clock.systemUTC());
+        progress.begin(SCOPE, 1, true);
+        progress.checked(SCOPE, StorageSetupService.Layer.MASTER);
+        var original = f.snapshot;
+        f.snapshot = new StorageControlDispatcher.Snapshot(original.mode(), original.clusterId(), original.operationId(),
+                original.setupGeneration(), original.bindingVersion(), original.authGeneration(), original.stateVersion(),
+                "STORAGE_BOUND", StorageControlDispatcher.BusinessPhase.PREPARING, original.health(), original.allowedActions(),
+                false, original.applicationDataVerification(), progress.snapshot(SCOPE).orElseThrow());
+        var result = f.dispatcher().dispatch("storage.status", f.admin(), Map.of());
+        var view = (Map<?,?>) result.get("initializationProgress");
+        assertThat(view.get("operationId")).isEqualTo(SCOPE.operationId());
+        assertThat((List<?>) view.get("milestones")).hasSize(4);
+        assertThat((List<?>) view.get("connectionChecks")).hasSize(1);
+        assertThat(JsonWriter.write(result)).doesNotContain("testStamp", "sentinel-secret", "mongodb://");
+        var schema = (Map<?,?>) StorageOperationSchemas.definitions().get("StorageStatusResult");
+        assertThat(((List<?>) schema.get("required")).contains("initializationProgress")).isFalse();
+        assertThatThrownBy(() -> new StorageControlDispatcher.Snapshot(original.mode(), original.clusterId(), "different",
+                original.setupGeneration(), original.bindingVersion(), original.authGeneration(), original.stateVersion(),
+                "STORAGE_BOUND", StorageControlDispatcher.BusinessPhase.PREPARING, original.health(), original.allowedActions(),
+                false, original.applicationDataVerification(), progress.snapshot(SCOPE).orElseThrow()))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
     @Test void aRevocationOrStorageFenceAfterProjectionPreventsReturningItsCapturedValues() {
         for (var code : List.of(ControlError.UNAUTHENTICATED, ControlError.STORAGE_UNAVAILABLE)) {
             var f = new Fixture(); var checks = new AtomicInteger(); var revoked = new java.util.concurrent.atomic.AtomicBoolean();

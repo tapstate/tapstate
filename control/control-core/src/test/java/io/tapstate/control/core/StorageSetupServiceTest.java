@@ -82,6 +82,7 @@ class StorageSetupServiceTest {
         final List<AuditRecord> audit = new ArrayList<>();
         Runnable onAudit = () -> {};
         java.util.function.Consumer<StorageBindingCommit> continuation = committed -> {};
+        StorageInitializationProgress progress;
         boolean operationAlive = true;
         StorageBinding.Mode mode = StorageBinding.Mode.OP;
         StorageBinding.Connection installedConfiguration = CANDIDATE.configuration();
@@ -93,7 +94,7 @@ class StorageSetupServiceTest {
             return new StorageSetupService(mode, binding, states, probe, target, () -> Optional.ofNullable(installedConfiguration),
                     new AuditGate(record -> { onAudit.run(); audit.add(record); }, time), time, () -> {
                         if (!operationAlive) throw new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), null);
-                    }, continuation);
+                    }, continuation, java.util.function.Supplier::get, (scope, tested, active) -> {}, progress);
         }
         Map<StorageSetupService.Layer,String> tested(StorageSetupService service, StorageSetupService.Candidate candidate) {
             var stamps = new EnumMap<StorageSetupService.Layer,String>(StorageSetupService.Layer.class);
@@ -108,6 +109,34 @@ class StorageSetupServiceTest {
         var master = new StorageBinding.Connection(StorageBinding.Connection.Kind.ATLAS, "mongodb://user:secret@customer/master?tls=true", "master", null);
         assertThatCode(() -> service.test(SCOPE, () -> {}, new StorageSetupService.Candidate(null, cache, master), StorageSetupService.Layer.CONFIG))
                 .doesNotThrowAnyException();
+    }
+
+    @Test void savingRetainsOnlyTheCurrentCandidatesVerifiedChecksWhileRecheckingConnections() {
+        var f = new Fixture(); f.progress = new StorageInitializationProgress(f.time);
+        var committing = new java.util.concurrent.atomic.AtomicBoolean();
+        f.probe = new StorageConnectionProbe() {
+            @Override public StorageBinding.Connection normalize(StorageBinding.Connection input) { return input; }
+            @Override public void test(StorageBinding.Connection input) {
+                if (committing.get()) {
+                    var view = f.progress.snapshot(SCOPE).orElseThrow();
+                    assertThat(view.connectionChecks()).hasSize(3);
+                    assertThat(view.connectionChecks().values()).allMatch(f.time.instant()::equals);
+                }
+            }
+        };
+        var service = f.service();
+        var stamps = f.tested(service, CANDIDATE);
+        f.binding.beforeCommit = () -> { throw new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), null); };
+        committing.set(true);
+        assertThatThrownBy(() -> service.commit("owner", SCOPE, () -> {}, CANDIDATE, stamps)).isInstanceOf(TapstateException.class);
+        committing.set(false);
+        f.time.now = f.time.now.plusSeconds(60);
+        var changed = new StorageSetupService.Candidate(CANDIDATE.configuration(), connection("cache-next"), connection("master-next"));
+        var changedStamps = f.tested(service, changed);
+        f.binding.beforeCommit = () -> {};
+        committing.set(true);
+        service.commit("owner", SCOPE, () -> {}, changed, changedStamps);
+        assertThat(f.binding.inserts).isEqualTo(1);
     }
     @Test void anOpCandidateCanBeTestedBeforeItsConfigurationUriIsInstalled() {
         var f = new Fixture(); f.installedConfiguration = null;

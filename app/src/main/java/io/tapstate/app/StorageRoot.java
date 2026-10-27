@@ -40,6 +40,7 @@ final class StorageRoot implements AutoCloseable {
     private record RecoveryFailure(StorageRecoveryCommands.Plan operation, TapstateException cause) {}
     private volatile RecoveryFailure recoveryFailure;
     private final Runnable installationActive;
+    private final StorageInitializationProgress initializationProgress;
 
     StorageRoot(MongoProperties mongo, CloudRuntimeSettings cloud, CloudSdkBridge bridge, BootId boot,
             MetricsHistoryProperties history, TokenSecrets secrets, Clock clock, byte[] signingKey) {
@@ -48,6 +49,7 @@ final class StorageRoot implements AutoCloseable {
     StorageRoot(MongoProperties mongo, CloudRuntimeSettings cloud, CloudSdkBridge bridge, BootId boot,
             MetricsHistoryProperties history, TokenSecrets secrets, Clock clock, byte[] signingKey, Runnable installationActive) {
         this.installationActive = Objects.requireNonNull(installationActive);
+        initializationProgress = new StorageInitializationProgress(clock);
         this.cloud = Objects.requireNonNull(cloud);
         String uri = cloud.metadataUri(mongo.getUri());
         StorageBinding.Connection selectedEndpoint = null;
@@ -113,6 +115,7 @@ final class StorageRoot implements AutoCloseable {
         return business instanceof NativeBusinessContext nativeBusiness ? nativeBusiness.availability() : Optional.empty();
     }
     StorageAuthentication authentication() { requireOpen(); return authentication; }
+    StorageInitializationProgress initializationProgress() { return initializationProgress; }
     Optional<TapstateException> recoveryFailure() {
         var current = recoveryFailure; return current == null ? Optional.empty() : Optional.of(current.cause());
     }
@@ -151,9 +154,41 @@ final class StorageRoot implements AutoCloseable {
         requireOpen();
         if (!cloud.cloud() || committed.binding().mode() != StorageBinding.Mode.CLOUD || runtime.cleanupRequired())
             throw StorageRuntime.unavailable();
-        var original = prepareInitialSetup(committed, target);
-        authentication.install(original); phase = Phase.AUTH_READY;
-        if (startBusiness) { runtime.startBusiness(original, assembly); phase = Phase.BUSINESS_READY; }
+        var scope = committed.binding().setup();
+        initializationProgress.begin(scope, 1, true);
+        initializationProgress.started(scope, StorageInitializationProgress.Stage.PREPARE_STORAGE);
+        try {
+            var original = prepareInitialSetup(committed, target);
+            authentication.install(original); phase = Phase.AUTH_READY;
+            initializationProgress.completed(scope, StorageInitializationProgress.Stage.PREPARE_STORAGE);
+            if (startBusiness) startInitialBusiness(original, assembly);
+        } catch (RuntimeException | Error failure) {
+            initializationProgress.failed(scope, failure);
+            throw failure;
+        }
+    }
+
+    private void startInitialBusiness(StorageRuntime.Bound original,
+            Function<StorageRuntime.Bound, ? extends StorageRuntime.Business> assembly) {
+        var authority = original.preparation().authScope();
+        boolean tracked = authority.mode() == StorageBinding.Mode.CLOUD && authority.authGeneration() == 1;
+        var scope = tracked ? original.binding().setup() : null;
+        if (tracked) {
+            initializationProgress.begin(scope, 2, true);
+            initializationProgress.started(scope, StorageInitializationProgress.Stage.START_RUNTIME);
+        }
+        try {
+            runtime.startBusiness(original, assembly);
+            if (tracked) {
+                initializationProgress.completed(scope, StorageInitializationProgress.Stage.START_RUNTIME);
+                initializationProgress.started(scope, StorageInitializationProgress.Stage.PUBLISH_READY);
+            }
+            phase = Phase.BUSINESS_READY;
+            if (tracked) initializationProgress.completed(scope, StorageInitializationProgress.Stage.PUBLISH_READY);
+        } catch (RuntimeException | Error failure) {
+            if (tracked) initializationProgress.failed(scope, failure);
+            throw failure;
+        }
     }
 
     /** OP prepares its original storage but keeps authentication and business behind a controlled restart. */
@@ -192,6 +227,7 @@ final class StorageRoot implements AutoCloseable {
                     ? StorageBinding.Connection.Kind.ATLAS : StorageBinding.Connection.Kind.MONGODB, uri, MongoDatabaseNames.fromUri(uri),
                     source.config().get(StorageSetupService.CA_BUNDLE_FIELD) instanceof String ca ? ca : null);
             target.test(master, source, target.identity(master)); active.run();
+            if (cloud.cloud()) initializationProgress.checked(committed.binding().setup(), StorageSetupService.Layer.MASTER);
             if (committed.firstCreation().isPresent() && attemptedCreation != committed.firstCreation().orElseThrow()) {
                 attemptedCreation = committed.firstCreation().orElseThrow();
                 original.cache().prepareFirstAuth(attemptedCreation);
@@ -231,7 +267,7 @@ final class StorageRoot implements AutoCloseable {
             original = runtime.current(); phase = Phase.AUTH_READY;
             wakeRecovery();
             if (runtime.requireConfiguration().setupStates().load().phase() == StorageSetupStateStore.Phase.COMPLETE) {
-                runtime.startBusiness(original.orElseThrow(), assembly); phase = Phase.BUSINESS_READY;
+                startInitialBusiness(original.orElseThrow(), assembly);
                 wakeRecovery();
             }
         } catch (TapstateException unavailable) {
@@ -610,8 +646,8 @@ final class StorageRoot implements AutoCloseable {
         if (runtime.requireConfiguration().setupStates().load().phase() != StorageSetupStateStore.Phase.COMPLETE) return;
         try {
             var original = runtime.current().orElseThrow(StorageRuntime::unavailable);
-            runtime.startBusiness(original, retainedAssembly);
-            phase = Phase.BUSINESS_READY;recoveryFailed=false;recoveryFailure=null;
+            startInitialBusiness(original, retainedAssembly);
+            recoveryFailed=false;recoveryFailure=null;
         } catch (TapstateException unavailable) {
             // Formal login remains usable while a missing or failed business domain stays gated.
             phase = Phase.AUTH_READY;
@@ -701,7 +737,9 @@ final class StorageRoot implements AutoCloseable {
                 .orElseGet(() -> awaitingRebuild ? preparation.orElseThrow().operationId() : status.scope().operationId()),
                 status.scope().generation(), status.bindingVersion(), preparation.map(value -> value.authScope().authGeneration()).orElse(0L),
                 revision, status.phase().name(), business, health,
-                actions, false, masterVerification);
+                actions, false, masterVerification,
+                cloud.cloud() && !formalRecovery && pending.isEmpty()
+                        ? initializationProgress.snapshot(status.scope()).orElse(null) : null);
     }
 
     private void requireOpen() { if (closeRequested || closed) throw StorageRuntime.unavailable(); installationActive.run(); }
