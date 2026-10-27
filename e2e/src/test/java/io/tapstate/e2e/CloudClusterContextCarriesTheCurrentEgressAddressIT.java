@@ -53,7 +53,7 @@ class CloudClusterContextCarriesTheCurrentEgressAddressIT {
             new CloudSessionIdentity(CLOUD_URL, ORGANIZATION, CLUSTER);
     private static final CloudSessionContext LOGIN_CONTEXT = new CloudSessionContext(
             ORGANIZATION, CLUSTER, "Workspace organization", "Workspace cluster", "workspace-region",
-            "198.51.100.1", "DYNAMIC");
+            "198.51.100.1", "DYNAMIC", "user@example.test");
     private static final CloudClusterEgressAddress CURRENT_ADDRESS = new CloudClusterEgressAddress(
             ORGANIZATION, CLUSTER, "203.0.113.42", "STABLE");
     private static final CloudSessionContext LOGIN_CONTEXT_WITHOUT_ADDRESS = new CloudSessionContext(
@@ -109,6 +109,7 @@ class CloudClusterContextCarriesTheCurrentEgressAddressIT {
                         .containsEntry("organizationName", "Workspace organization")
                         .containsEntry("clusterName", "Workspace cluster")
                         .containsEntry("region", "workspace-region")
+                        .containsEntry("userEmail", "user@example.test")
                         .containsEntry("ec2PublicIp", CURRENT_ADDRESS.ec2PublicIp())
                         .containsEntry("egressAddressStatus", CURRENT_ADDRESS.egressAddressStatus())
                         .containsKey("clusterState")
@@ -131,7 +132,8 @@ class CloudClusterContextCarriesTheCurrentEgressAddressIT {
                 noAddressParsed.forEach((key, value) -> noAddressBody.put((String) key, value));
                 assertThat(noAddressBody)
                         .containsEntry("ec2PublicIp", null)
-                        .containsEntry("egressAddressStatus", null);
+                        .containsEntry("egressAddressStatus", null)
+                        .containsEntry("userEmail", null);
                 assertThat(noAddressResponse.body())
                         .doesNotContain(JWT_WITHOUT_ADDRESS, noAddressCookie, "controlled-machine-token");
 
@@ -139,7 +141,7 @@ class CloudClusterContextCarriesTheCurrentEgressAddressIT {
                         .timeout(Duration.ofSeconds(10)).GET().build(), HttpResponse.BodyHandlers.ofString());
                 assertThat(anonymous.statusCode()).isEqualTo(401);
                 assertThat(anonymous.body()).doesNotContain(
-                        LOGIN_CONTEXT.ec2PublicIp(), JWT, JWT_WITHOUT_ADDRESS);
+                        LOGIN_CONTEXT.ec2PublicIp(), "user@example.test", JWT, JWT_WITHOUT_ADDRESS);
             }
         } finally {
             ServerHandle.discardStagingDirectory(stagingDirectory);
