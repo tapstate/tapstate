@@ -14,6 +14,7 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
     private final SrsStoreViews views;
     private final HazelcastInstance member;
     private final SourceAcknowledgements acknowledgements;
+    private final CaptureObservation.Factory observations;
     private final Set<Tail> tails = ConcurrentHashMap.newKeySet();
     private final Set<CaptureRun> snapshots = ConcurrentHashMap.newKeySet();
     private final Map<Runnable,Runnable> pendingCloses = new ConcurrentHashMap<>();
@@ -22,6 +23,12 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
 
     /** The same canonical log instance must also back the member's durable ring configuration. */
     public NativeSrsCaptureRunUnit(CacheBusinessScope scope,SrsStores stores,HazelcastInstance member) {
+        this(scope, stores, member, CaptureObservation.NONE);
+    }
+
+    public NativeSrsCaptureRunUnit(CacheBusinessScope scope, SrsStores stores, HazelcastInstance member,
+            CaptureObservation.Factory observations) {
+        this.observations = Objects.requireNonNull(observations, "observations");
         Objects.requireNonNull(scope,"scope"); Objects.requireNonNull(stores,"stores");
         this.member = Objects.requireNonNull(member,"member");
         this.views = (expected,guard) -> {
@@ -47,13 +54,30 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
         try {
             var port = Objects.requireNonNull(ports.apply(writer),"prepared capture port");
             if (port instanceof AutoCloseable opening) owned.opening = () -> closeOpening(opening, opened.captureId());
-            var source = writer.start(port,config,start,health);
+            var source = observe(config, opened.captureId(), opened.miningChainId(), opened.epoch(), originalCapture,
+                    observation -> writer.start(port,config,start,health,observation));
             owned.subscription = source; fixed.run();
             owned.opening = null;
             owned.subscription = acknowledgements.follow(stores.chains().guardedBy(fixed),opened.miningChainId(),opened.epoch(),source,health,fixed);
             fixed.run(); return owned;
         } catch (RuntimeException | Error failure) {
             writer.close(); closeAfter(failure,owned::close); throw failure;
+        }
+    }
+
+    private Subscription observe(CaptureConfig config, String captureId, String chainId, long epoch,
+            WorkloadClaimFence fence, Function<CaptureObservation, Subscription> open) {
+        if (observations == CaptureObservation.NONE || config.node() == null) return open.apply(CaptureObservation.none());
+        var node = config.node();
+        // A shared physical tail has no single schema revision. Each admitted binding owns its models.
+        var context = new CaptureObservation.Context(captureId, UUID.randomUUID().toString(), chainId,
+                node.nodeId(), node.pipelineId(), SrsConsumerId.of(node.pipelineId(), node.nodeId()).value(),
+                epoch, 0, fence, config.streams());
+        var observation = CaptureObservation.create(observations, context);
+        try { return open.apply(observation); }
+        catch (RuntimeException | Error failure) {
+            closeAfter(failure, () -> observation.retire(failure));
+            throw failure;
         }
     }
 
@@ -132,7 +156,8 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
         Runnable ending=() -> {writer.close();writer.stopSources();closePortOpening(port,opened.context().captureId());};pendingCloses.put(ending,requireActive);
         var health=new CaptureHealth();Subscription source=null;CaptureRun provisional=null;
         try {
-            source=writer.start(port,config,start,health);fixed.run();
+            source=observe(config, opened.context().captureId(), opened.context().channelId(), opened.epoch(), window.captureFence(),
+                    observation -> writer.start(port,config,start,health,observation));fixed.run();
             source=acknowledgements.follow(channels,opened,source,health,fixed);
             provisional=new CaptureRun(Optional.empty(),false,0L,Optional.empty(),Optional.of(source),health);
             register(provisional,requireActive);fixed.run();pendingCloses.remove(ending);return provisional;
@@ -168,7 +193,8 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
                 Runnable ending=() -> {writer.close();writer.stopSources();closePortOpening(port,current.context().captureId());};pendingCloses.put(ending,requireActive);
                 Subscription source=null;
                 try {
-                    source=writer.start(port,config,CaptureStart.resume(new io.tapstate.spi.capture.SourcePosition(saved)),health);fixed.run();
+                    source=observe(config, current.context().captureId(), current.context().channelId(), current.epoch(), window.captureFence(),
+                            observation -> writer.start(port,config,CaptureStart.resume(new io.tapstate.spi.capture.SourcePosition(saved)),health,observation));fixed.run();
                     var followed=acknowledgements.follow(channels,current,source,health,fixed);pendingCloses.remove(ending);return Optional.of(followed);
                 } catch(RuntimeException|Error failure) {
                     writer.close();if(source!=null)closeAfter(failure,source::close);closeAfter(failure,() -> closePending(ending));throw failure;

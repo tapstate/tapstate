@@ -103,14 +103,16 @@ public final class CaptureObservation {
             throw failure;
         }
         return new Subscription() {
-            private final AtomicBoolean closed = new AtomicBoolean();
-            @Override public void acknowledge(SourcePosition position) { if (!closed.get()) underlying.acknowledge(position); }
-            @Override public void close() {
-                if (!closed.compareAndSet(false, true)) return;
+            private final AtomicBoolean closing = new AtomicBoolean();
+            private boolean ended;
+            @Override public void acknowledge(SourcePosition position) { if (!closing.get()) underlying.acknowledge(position); }
+            @Override public synchronized void close() {
+                if (ended) return;
+                closing.set(true);
                 Error observerFatal = null;
                 try { retire(null); }
                 catch (Error fatal) { observerFatal = fatal; }
-                try { underlying.close(); }
+                try { underlying.close(); ended = true; }
                 catch (RuntimeException | Error failure) {
                     if (observerFatal != null) { context(observerFatal, failure); throw observerFatal; }
                     throw failure;

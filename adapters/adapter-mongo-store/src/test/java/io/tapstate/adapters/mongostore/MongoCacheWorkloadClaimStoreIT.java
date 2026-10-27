@@ -54,6 +54,32 @@ class MongoCacheWorkloadClaimStoreIT {
     private static final Duration TTL = Duration.ofSeconds(30);
     private static final Runnable ACTIVE = () -> {};
 
+    @Test void validationTenureUsesIndependentNativeClientsWithoutReleasingThePipeline() {
+        withBusiness(f -> {
+            var claims = f.domain().workloadClaims(SCOPE);
+            var production = claims.acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
+            var key = io.tapstate.spi.store.ValidationClaims.key(SCOPE.clusterId(), PIPELINE.pipelineId());
+            var granted = claims.acquire(key, OWNER, 1, TTL).claim();
+            var first = claims.advanceExecution(granted, 1, Set.of(OWNER.nodeId())).orElseThrow();
+            var firstOwner = io.tapstate.spi.store.ValidationClaims.owner(PIPELINE.pipelineId(), first);
+            try (var second = MongoCacheDomain.connect(f.binding(), Duration.ofSeconds(5), "validation-second-client")) {
+                var competing = second.workloadClaims(SCOPE);
+                assertThat(competing.read(key).orElseThrow().claim()).isEqualTo(first);
+                var nextNode = new WorkloadOwner("node-b", "boot-b");
+                assertThat(competing.acquire(key, nextNode, 1, TTL).claim().owner()).isEqualTo(OWNER);
+                assertThat(claims.release(first)).isTrue();
+                var replacement = competing.acquire(key, nextNode, 1, TTL).claim();
+                var next = competing.advanceExecution(replacement, 1, Set.of(nextNode.nodeId())).orElseThrow();
+                var nextOwner = io.tapstate.spi.store.ValidationClaims.owner(PIPELINE.pipelineId(), next);
+                assertThat(nextOwner.claimGeneration()).isGreaterThan(firstOwner.claimGeneration());
+                assertThat(nextOwner.executionGeneration()).isGreaterThan(firstOwner.executionGeneration());
+                assertThat(claims.renew(first, TTL)).isEmpty(); assertThat(claims.release(first)).isFalse();
+                assertThat(competing.read(key).orElseThrow().claim()).isEqualTo(next);
+                assertThat(claims.readPipeline(PIPELINE).orElseThrow().claim()).isEqualTo(production);
+            }
+        });
+    }
+
     @Test void renewalDoesNotMistakeAnOldSnapshotForAnExpiredSameTenure() {
         withBusiness(f -> {
             String name = "held-renewal-" + UUID.randomUUID();

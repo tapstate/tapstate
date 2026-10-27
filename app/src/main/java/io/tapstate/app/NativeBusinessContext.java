@@ -288,9 +288,13 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                     owner.original.cache().pipelinePreparations(scope, owner.memberStorage::requireNode), node::currentFence,
                     owner.memberStorage::requireNode, clock, cluster.getWorkloadClaimTtl());
         }
+        @Bean(destroyMethod = "close") ValidationCaptureObservations validationCaptureObservations(
+                HazelcastInstance member, ClusterProperties cluster) {
+            return new DataPlaneActuationConfiguration().validationCaptureObservations(member, cluster);
+        }
         @Bean(destroyMethod = "close") NativeSrsCaptureRunUnit nativeSrsCaptureRunUnit(NativeBusinessContext owner, SrsStores sources,
-                HazelcastInstance member) {
-            return new NativeSrsCaptureRunUnit(owner.original.preparation().businessScope(), sources, member);
+                HazelcastInstance member, ValidationCaptureObservations observations) {
+            return new NativeSrsCaptureRunUnit(owner.original.preparation().businessScope(), sources, member, observations);
         }
         @Bean(destroyMethod = "close") PipelineCaptureCoordinator pipelineCaptureCoordinator(NativeBusinessContext owner,
                 NodeSessionLease node, ExecutionAuthorization authorization, CaptureOwnership ownership, ClusterProperties cluster,

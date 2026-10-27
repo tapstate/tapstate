@@ -136,6 +136,13 @@ public final class SrsCaptureWriter implements AutoCloseable {
 
     /** Starts only once; a snapshot preparation receipt cannot replace this CDC session's own callback. */
     public Subscription start(CapturePort port, CaptureConfig config, CaptureStart start, CaptureHealth health) {
+        return start(port, config, start, health, CaptureObservation.none());
+    }
+
+    /** Optional observation wraps the physical source callback, never the durable writer or its ACK. */
+    public Subscription start(CapturePort port, CaptureConfig config, CaptureStart start, CaptureHealth health,
+            CaptureObservation observation) {
+        Objects.requireNonNull(observation, "observation");
         Objects.requireNonNull(port, "port"); Objects.requireNonNull(config, "config");
         Objects.requireNonNull(start, "start"); Objects.requireNonNull(health, "health");
         requireActive();
@@ -144,14 +151,14 @@ public final class SrsCaptureWriter implements AutoCloseable {
                 || !opened.resumeToken().equals(resume.position().token()))) throw unproven();
         if (!started.compareAndSet(false, true)) throw unproven();
         try {
-            Subscription source = port.cdc(config, start, health.recording(new CaptureStartedListener() {
+            Subscription source = observation.start(health.recording(new CaptureStartedListener() {
                 @Override public void onStart(SourcePosition position) {
                     try { began(position); } catch (RuntimeException | Error failure) { close(); throw failure; }
                 }
                 @Override public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
                     try { append(events, position); } catch (RuntimeException | Error failure) { close(); throw failure; }
                 }
-            }));
+            }), listener -> port.cdc(config, start, listener));
             sourceHandles.add(source);
             try { requireActive(); }
             catch (RuntimeException | Error failure) {

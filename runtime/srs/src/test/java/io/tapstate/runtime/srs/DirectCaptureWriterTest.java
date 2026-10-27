@@ -19,6 +19,33 @@ class DirectCaptureWriterTest {
     private static final WorkloadClaimFence CAPTURE=new WorkloadClaimFence(new WorkloadClaimKey("cluster",WorkloadClaimType.CAPTURE,"capture"),OWNER,5,0,2);
     private static final CaptureConfig CONFIG=new CaptureConfig("demo",Map.of(),List.of("a","b"),new PipelineNode("flow","input"));
 
+    @Test void nativePrivateTailObservesTheSamePhysicalOpeningAndPreservesDelivery() {
+        var f = new Fixture(8); var observer = new RecordingCaptureObservation();
+        f.source.allowDurableAcknowledgements = true;
+        var sources = new SrsStores(unused(SrsChainStore.class), unused(SrsModelStore.class), unused(SrsLogStore.class), unused(SrsConsumerStore.class));
+        var scope = new CacheBusinessScope(SCOPE.clusterId(), SCOPE.bindingVersion(), SCOPE.cacheIncarnation());
+        try (var unit = new NativeSrsCaptureRunUnit(scope, sources, unused(com.hazelcast.core.HazelcastInstance.class), observer)) {
+            var run = unit.startDirect(CONFIG, f.progress.get(), f.store, CaptureStart.present(), f.port,
+                    CaptureHandoff.of(f.delivered::add), 8, () -> {});
+            assertThat(observer.contexts).singleElement().satisfies(context -> {
+                assertThat(context.chainId()).isEqualTo("channel"); assertThat(context.sourceId()).isEqualTo("input");
+                assertThat(context.fence()).isEqualTo(CAPTURE); assertThat(context.epoch()).isEqualTo(1);
+            });
+            var original = row("a", 0);
+            f.listener.onBatch(List.of(original), Optional.of(new SourcePosition("observed")));
+            assertThat(observer.events).containsExactly(original); assertThat(f.delivered).hasSize(1);
+            assertThat(f.batches).hasSize(1);
+            assertThat(f.source.acknowledged).containsExactly("start");
+            unit.stopSnapshot(run); unit.stopSnapshot(run);
+            assertThat(observer.retirements).hasValue(1); assertThat(f.source.closed).hasValue(1);
+        }
+    }
+
+    private static <T> T unused(Class<T> type) {
+        return type.cast(java.lang.reflect.Proxy.newProxyInstance(type.getClassLoader(), new Class<?>[]{type},
+                (proxy, method, arguments) -> { throw new AssertionError(method.getName()); }));
+    }
+
     @Test void durableOriginalReceiptPrecedesRowsAndContainsOnlyTablesChangedSinceThePreviousBoundary() {
         var f=new Fixture(8); f.start();
         f.listener.onBatch(List.of(row("a",0),row("b",1)),Optional.of(new SourcePosition("batch-one")));
@@ -199,7 +226,12 @@ class DirectCaptureWriterTest {
         }
         private static final class Source implements Subscription {
             final AtomicInteger closed=new AtomicInteger();volatile RuntimeException closeFailure;
-            public void acknowledge(SourcePosition position) { throw new AssertionError("producer does not acknowledge its own delivery"); }
+            boolean allowDurableAcknowledgements;
+            final List<String> acknowledged = new CopyOnWriteArrayList<>();
+            public void acknowledge(SourcePosition position) {
+                if (!allowDurableAcknowledgements) throw new AssertionError("producer does not acknowledge its own delivery");
+                acknowledged.add(position.token());
+            }
             public void close() { closed.incrementAndGet();if(closeFailure!=null)throw closeFailure; }
         }
     }

@@ -47,6 +47,22 @@ class CaptureObservationTest {
     }
 
     @Test
+    void failedSourceCloseRemainsRetryableWithoutReopeningObserverOrAcknowledgements() {
+        var factory = new Factory(); var source = new Source();
+        source.closeFailure = new IllegalStateException("source still ending");
+        var opened = CaptureObservation.create(factory, CONTEXT).start(ORIGINAL, listener -> source);
+        assertThatThrownBy(opened::close).isSameAs(source.closeFailure);
+        opened.acknowledge(new SourcePosition("late"));
+        assertThat(source.ack).isNull();
+        assertThatThrownBy(opened::close).isSameAs(source.closeFailure);
+        assertThat(source.closed).hasValue(2);
+        source.closeFailure = null;
+        opened.close(); opened.close();
+        assertThat(source.closed).hasValue(3);
+        assertThat(factory.hooks.retired).hasValue(1);
+    }
+
+    @Test
     void factoryFailureIsReportedWithoutChangingTheSourceOperation() {
         var factory = new Factory(); factory.openFailure = new IllegalStateException("optional factory failed");
         var observation = CaptureObservation.create(factory, CONTEXT);

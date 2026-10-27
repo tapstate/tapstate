@@ -44,6 +44,13 @@ public final class DirectCaptureWriter implements CaptureStartedListener, AutoCl
     }
 
     public Subscription start(CapturePort port, CaptureConfig config, CaptureStart start, CaptureHealth health) {
+        return start(port, config, start, health, CaptureObservation.none());
+    }
+
+    /** Optional observation wraps the physical source callback, never the durable writer or its ACK. */
+    public Subscription start(CapturePort port, CaptureConfig config, CaptureStart start, CaptureHealth health,
+            CaptureObservation observation) {
+        Objects.requireNonNull(observation, "observation");
         Objects.requireNonNull(port,"port"); Objects.requireNonNull(start,"start"); Objects.requireNonNull(health,"health"); requireUsable();
         if (config.node()==null || !context.scope().pipelineId().equals(config.node().pipelineId())
                 || !context.sourceId().equals(config.node().nodeId()) || !opened.tables().equals(new HashSet<>(config.streams()))
@@ -56,7 +63,7 @@ public final class DirectCaptureWriter implements CaptureStartedListener, AutoCl
         this.health=health;
         Subscription source=null;
         try {
-            source=Objects.requireNonNull(port.cdc(config,start,health.recording(this)),"source subscription"); sourceHandles.add(source); requireUsable();
+            source=Objects.requireNonNull(observation.start(health.recording(this), listener -> port.cdc(config,start,listener)),"source subscription"); sourceHandles.add(source); requireUsable();
             var original=source; var ended=new AtomicBoolean();
             return new Subscription() {
                 @Override public void acknowledge(SourcePosition position) { requireUsable(); original.acknowledge(position); }
