@@ -13,6 +13,7 @@ import org.opentest4j.TestAbortedException;
 import java.lang.reflect.Array;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.lang.reflect.Proxy;
 import java.lang.reflect.RecordComponent;
 import java.math.BigDecimal;
@@ -306,6 +307,26 @@ public final class CiCaseEvidence implements InvocationInterceptor {
         return type.getClassLoader() == null && names.contains(type.getName());
     }
 
+    private static boolean unmodifiableMap(Object value) {
+        return value.getClass().getClassLoader() == null
+                && value.getClass().getName().equals("java.util.Collections$UnmodifiableMap");
+    }
+
+    private static Object mapDelegate(Object wrapper) throws ReflectiveOperationException {
+        Field singleton = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+        if (!singleton.trySetAccessible()) {
+            throw new IllegalStateException("Map delegate inspection is unavailable");
+        }
+        sun.misc.Unsafe memory = (sun.misc.Unsafe) singleton.get(null);
+        Field delegate = wrapper.getClass().getDeclaredField("m");
+        if (delegate.getType() != Map.class || !Modifier.isFinal(delegate.getModifiers())
+                || Modifier.isStatic(delegate.getModifiers())) {
+            throw new IllegalStateException("Map delegate field changed");
+        }
+        // Read only this exact bootstrap field. Calling a wrapper method could execute unknown delegate code.
+        return memory.getObject(wrapper, memory.objectFieldOffset(delegate));
+    }
+
     private static boolean validUnicode(String text) {
         for (int i = 0; i < text.length(); i++) {
             char character = text.charAt(i);
@@ -375,6 +396,22 @@ public final class CiCaseEvidence implements InvocationInterceptor {
         }
         if (value instanceof RepetitionInfo info) {
             return known("[\"repetition\"," + info.getCurrentRepetition() + "," + info.getTotalRepetitions() + "]");
+        }
+        if (unmodifiableMap(value)) {
+            if (active.put(value, Boolean.TRUE) != null) {
+                return opaque(value, "cycle");
+            }
+            try {
+                Object delegate = mapDelegate(value);
+                if (!(delegate instanceof Map<?, ?>) || !builtinCollection(delegate, BUILTIN_MAPS)) {
+                    return opaque(value, "unsupported-collection-implementation");
+                }
+                return canonical(delegate, active, nodes, depth + 1);
+            } catch (ReflectiveOperationException | RuntimeException unavailable) {
+                return opaque(value, "structural-access-unavailable");
+            } finally {
+                active.remove(value);
+            }
         }
         if (value instanceof List<?> && !builtinCollection(value, BUILTIN_LISTS)
                 || value instanceof Map<?, ?> && !builtinCollection(value, BUILTIN_MAPS)

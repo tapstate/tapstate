@@ -13,6 +13,7 @@ import io.tapstate.core.model.ServeResource;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TableRef;
+import io.tapstate.core.model.TableRename;
 import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.model.ViewResource;
 
@@ -79,8 +80,7 @@ public final class ViewCatalogService {
                 String kind = pipeline.transforms() != null && !pipeline.transforms().isEmpty()
                         ? "view" : "replica";
                 for (String table : outputTables) {
-                    String collection = element.rename() != null && element.rename().map() != null
-                            ? element.rename().map().getOrDefault(table, table) : table;
+                    String collection = TableRename.apply(table, element.rename());
                     result.add(item(kind, pipeline.id(), pipeline.id() + ":" + element.id() + ":" + table,
                             element.source(), collection, status, metrics, snapshot, resources));
                 }
