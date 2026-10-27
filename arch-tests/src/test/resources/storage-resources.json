@@ -1451,7 +1451,9 @@
       "consistency": "config",
       "growth": "One bounded aggregate per Cluster/domain; no event or lease history.",
       "evidence": [
-        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java"
+        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStorageSchemaIT.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStorageSchemaTest.java"
       ]
     },
     {
@@ -3168,7 +3170,8 @@
       "growth": "One current definition per rule; no configuration version-history store. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL.",
       "evidence": [
         "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertLifecycleTest.java",
-        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java"
+        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStorageSchemaIT.java"
       ]
     },
     {
@@ -3196,7 +3199,8 @@
       "growth": "One receiver with bounded targets; testing a current form never saves this definition. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL.",
       "evidence": [
         "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertLifecycleTest.java",
-        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java"
+        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStorageSchemaIT.java"
       ]
     },
     {
@@ -3223,7 +3227,8 @@
       "growth": "Bounded selectors, explicit inhibition relationships and four text fields per route and channel; no separate template store. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL.",
       "evidence": [
         "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertLifecycleTest.java",
-        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java"
+        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStorageSchemaIT.java"
       ]
     },
     {
@@ -3250,7 +3255,8 @@
       "growth": "One bounded record per silence; retired default OP seven days and Cloud one day with reference protection. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL.",
       "evidence": [
         "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertLifecycleTest.java",
-        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java"
+        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStorageSchemaIT.java"
       ]
     },
     {
@@ -3277,7 +3283,10 @@
       "growth": "One head per rule-matched resource; no raw telemetry stream; current active count and highest five are authorized read-only queries. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL.",
       "evidence": [
         "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertLifecycleTest.java",
-        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java"
+        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStorageSchemaIT.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStateStoreIT.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStateCodecTest.java"
       ]
     },
     {
@@ -3306,7 +3315,10 @@
       "evidence": [
         "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertLifecycleTest.java",
         "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java",
-        "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlarmDiagnosticsTest.java"
+        "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlarmDiagnosticsTest.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStorageSchemaIT.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStateStoreIT.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStateCodecTest.java"
       ]
     },
     {
@@ -3332,7 +3344,10 @@
       "growth": "Only real transitions, not every sample; default OP fourteen days and Cloud three days. Reference capture identity instead of duplicating stack text. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL.",
       "evidence": [
         "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertLifecycleTest.java",
-        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java"
+        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStorageSchemaIT.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStateStoreIT.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStateCodecTest.java"
       ]
     },
     {
@@ -3360,7 +3375,8 @@
       "growth": "Active subject by route and single semantic target; fixed or bounded summaries and references; no accumulated reminder debt or in-app delivery schedule. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL.",
       "evidence": [
         "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertLifecycleTest.java",
-        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java"
+        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStorageSchemaIT.java"
       ]
     },
     {
@@ -3390,7 +3406,8 @@
       "growth": "At most 512 KiB encoded per intent including reserved lawful result space; embedded attempts at most thirty and 4 KiB each, protocol diagnostic at most 2 KiB. Email at most 256 KiB and webhook 64 KiB. Formal delivery deadline at most twenty-four hours; explicit tests and local Cloud SDK placeholder at most one attempt. Tests have a fixed five-minute deadline. A current candidate fixes bounded transport, target, authentication identity/material, payload and optional original receiver/CAS baseline; new receivers need no saved identity. Keyed digest is purpose-separated from the original cluster key. Seal candidate credentials with existing encryption and AAD bound to scope, complete command/candidate and purpose; at most 16 KiB ciphertext, no plaintext/log/browser-persistence/temp-file/extra secret store. Preparation occurs outside the transaction and original receiver/credential/authorization baseline competes at admission. At terminal state or original deadline deny new decrypt/use; after original in-flight work settles, normal available rated operation targets physical pruning within five minutes of eligibility. Outage or backlog remains expired, visible and bounded-recoverable, not a hard physical deletion guarantee. Keep command digest/result after credential pruning so replay cannot send again. Pre-reserve lawful evidence space; never delete unknown or dedup facts to admit new work. No in-app intent. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL.",
       "evidence": [
         "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertLifecycleTest.java",
-        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java"
+        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStorageSchemaIT.java"
       ]
     },
     {
@@ -3417,7 +3434,8 @@
       "growth": "One bounded head per restricted target; prune only one hour after not-before has elapsed and no necessary reference remains. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL.",
       "evidence": [
         "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertLifecycleTest.java",
-        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java"
+        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStorageSchemaIT.java"
       ]
     },
     {
@@ -3444,7 +3462,8 @@
       "growth": "Actor three per minute and scope ten per minute; one in-flight test per existing receiver and canonical semantic target, including unsaved candidates. Fixed active windows; prune one hour after end and required references. No personal-read data. All encoded records and result reservations count toward the existing 512 MiB per-scope management threshold; preserve bounded cleanup and evidence protections. No automatic direct created-at TTL.",
       "evidence": [
         "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertLifecycleTest.java",
-        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java"
+        "arch-tests/src/test/java/io/tapstate/archtests/AlertCoreContractTest.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertStorageSchemaIT.java"
       ]
     }
   ]

@@ -594,6 +594,7 @@ class MongoConfigurationArtifactStoreIT {
                     "cluster-a", "installation-a", "setup-a", 1)) {
                 assertThat(retry.artifacts().get("proof")).isPresent();
                 assertThat(SystemCollections.CLUSTER_KEYS.on(database).find().first()).isEqualTo(key);
+                assertThat(retry.alertSchemaVersion()).isEqualTo(MongoAlertStorageSchema.VERSION);
             }
             assertThat(SystemCollections.CLUSTER_KEYS.on(database).countDocuments()).isEqualTo(1);
             assertThat(SystemCollections.STORAGE_SETUP.on(database).find().first())
@@ -601,7 +602,10 @@ class MongoConfigurationArtifactStoreIT {
                     .containsEntry("operationId", "setup-a").containsEntry("generation", 1L);
             assertThat(database.listCollectionNames().into(new java.util.ArrayList<>()))
                     .containsExactlyInAnyOrder("storage_setup", "cluster_identity", "cluster_keys",
-                            "schema_migrations", "configuration_version", "sources", "pdk_note_origins", "pdk_note_carries", "pipeline_drafts", "configuration_imports", "nest_dead_letters", "capture_preparations");
+                            "schema_migrations", "configuration_version", "sources", "pdk_note_origins", "pdk_note_carries", "pipeline_drafts", "configuration_imports", "nest_dead_letters", "capture_preparations",
+                            "alert_rules", "alert_receivers", "alert_subscriptions", "alert_silences", "alert_instances",
+                            "alert_episodes", "alert_transitions", "alert_notification_schedules", "alert_delivery_intents",
+                            "alert_target_limits", "alert_test_quotas");
             assertThat(SystemCollections.CAPTURE_PREPARATIONS.on(database).countDocuments()).isZero();
             assertThat(SystemCollections.PDK_NOTE_ORIGINS.on(database).countDocuments()).isZero();
             assertThat(SystemCollections.PDK_NOTE_CARRIES.on(database).countDocuments()).isZero();

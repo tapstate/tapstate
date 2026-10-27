@@ -44,6 +44,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     private final MongoConfigurationSecurityStores security;
     private final MongoFirstAdminStore firstAdmin;
     private final MongoConfigurationDraftStore drafts;
+    private final PersistentKey configurationKey;
     private final String clusterId;
     private final int installedSchemaVersion;
     private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
@@ -76,6 +77,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
             throw unreadable(ConfigurationVersion.ID, "revision");
         }
         PersistentKey key = new PersistentKey(database, clusterId);
+        this.configurationKey = key;
         this.artifacts = new MongoConfigurationArtifactStore(connection.client(), database, key);
         this.requiredNotes = new MongoRequiredNoteStore(connection.client(), database, key);
         this.catalog = new MongoConfigurationCatalogStore(connection.client(), database, key);
@@ -128,6 +130,22 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     public String clusterId() { requireOpen(); return clusterId; }
     /** The CONFIG schema fact verified when this domain was opened, not a CACHE readiness signal. */
     public int schemaVersion() { requireOpen(); return installedSchemaVersion; }
+
+    /** Feature schema validation is load-only and does not change the global CONFIG version. */
+    public int alertSchemaVersion() {
+        var budget = new MongoReadBudget(java.time.Duration.ofSeconds(5));
+        requireOpen();
+        return new MongoAlertStorageSchema(connection.client(), connection.database(), clusterId,
+                configurationKey.refresh(budget).activeKeyId(), this::requireOpen).load(budget);
+    }
+
+    /** Explicit additive preparation; ordinary opens and reads never repair lost alert resources. */
+    public int prepareAlertStorage(String operationId) {
+        var budget = new MongoReadBudget(java.time.Duration.ofSeconds(30));
+        requireOpen();
+        return new MongoAlertStorageSchema(connection.client(), connection.database(), clusterId,
+                configurationKey.refresh(budget).activeKeyId(), this::requireOpen).prepare(operationId, budget);
+    }
     public String databaseName() { requireOpen(); return connection.database().getName(); }
 
     public ArtifactStore artifacts() {
@@ -482,6 +500,17 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         @Override
         public SourceConfigCipher refresh() {
             SourceConfigCipher observed = StoreIo.call(() -> decode(keys.find(new Document("_id", "cluster")).first()));
+            if (!cipher.activeKeyId().equals(observed.activeKeyId())) throw invalidKey();
+            return observed;
+        }
+
+        SourceConfigCipher refresh(MongoReadBudget budget) {
+            SourceConfigCipher observed = StoreIo.call(() -> {
+                SourceConfigCipher value = decode(keys.withTimeout(budget.operationMillis(), java.util.concurrent.TimeUnit.MILLISECONDS)
+                        .find(new Document("_id", "cluster")).first());
+                budget.remainingMillis();
+                return value;
+            });
             if (!cipher.activeKeyId().equals(observed.activeKeyId())) throw invalidKey();
             return observed;
         }

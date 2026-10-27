@@ -82,6 +82,7 @@ public final class MongoConfigurationBootstrap {
                             SystemCollections.CAPTURE_PREPARATIONS.prepareCollectionOn(database,session);
                             for(var index:SystemCollections.CAPTURE_PREPARATIONS.indexes())
                                 IndexEnsure.createInTransaction(session,SystemCollections.CAPTURE_PREPARATIONS.on(database),index);
+                            MongoAlertStorageSchema.prepareCollections(session, database);
                             SystemCollections.STORAGE_SETUP.on(database).insertOne(session,
                                     new Document("_id", "cluster").append("clusterId", clusterId)
                                             .append("installationId", installationId).append("operationId", operationId)
@@ -95,7 +96,9 @@ public final class MongoConfigurationBootstrap {
                                             .append("formatVersion", 1).append("keyId", SourceConfigCipher.fingerprint(key))
                                             .append("material", Base64.getUrlEncoder().withoutPadding().encodeToString(key)));
                             SystemCollections.SCHEMA_MIGRATIONS.on(database).insertOne(session,
-                                    new Document("_id", "config").append("installedVersion", MongoConfigurationDomain.SCHEMA_VERSION));
+                                    new Document("_id", "config").append("installedVersion", MongoConfigurationDomain.SCHEMA_VERSION)
+                                            .append(MongoAlertStorageSchema.FIELD, MongoAlertStorageSchema.initialMarker(
+                                                    clusterId, SourceConfigCipher.fingerprint(key), operationId)));
                             SystemCollections.CONFIGURATION_VERSION.on(database).insertOne(session,
                                     new Document("_id", ConfigurationVersion.ID).append("revision", 0L));
                             return null;

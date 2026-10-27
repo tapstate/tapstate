@@ -46,8 +46,6 @@ class MongoAlertStateStoreIT {
             Duration.ZERO, Duration.ofSeconds(15), Duration.ofSeconds(10));
     private static final TransactionOptions TRANSACTION = TransactionOptions.builder()
             .readConcern(ReadConcern.SNAPSHOT).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
-    private static final TransactionOptions PREPARATION = TransactionOptions.builder()
-            .readConcern(ReadConcern.LOCAL).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
 
     @Test void stateEpisodeAndTransitionsSurviveASeparateClientWithoutOpeningCache() {
         withConfiguration(fixture -> {
@@ -181,16 +179,7 @@ class MongoAlertStateStoreIT {
             var settings = new MongoConnectionSettings(MONGO.getReplicaSetUrl(database.getName()), null, Duration.ofSeconds(5));
             try (var original = MongoConfigurationBootstrap.prepare(settings, SCOPE.clusterId(), "installation-a", "setup-a", 1)) {
                 assertThat(original.clusterId()).isEqualTo(SCOPE.clusterId());
-                // Fixture preparation exercises the real declared DDL in one CONFIG transaction.
-                // Host startup, authorization and full state/schedule/intent acceptance remain separate tests.
-                try (var session = client.startSession()) {
-                    session.withTransaction(() -> {
-                        MongoAlertConfigurationStore.prepare(session, database);
-                        MongoAlertStateStore.prepare(session, database);
-                        MongoAlertNotificationStore.prepare(session, database);
-                        return null;
-                    }, PREPARATION);
-                }
+                assertThat(original.alertSchemaVersion()).isEqualTo(MongoAlertStorageSchema.VERSION);
                 scenario.accept(new Fixture(client, database, new MongoAlertStateStore(database, SCOPE, () -> {})));
             } finally { database.drop(); }
         }
