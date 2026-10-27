@@ -65,6 +65,11 @@ final class MongoConfigurationSecurityStores {
         });
     }
 
+    Optional<TokenRecord> tokenInTransaction(ClientSession session,String id) {
+        MongoAlertStateStore.requireTransaction(session); readIdentity(session);
+        return Optional.ofNullable(tokens.find(session,new Document("_id",id)).first()).map(MongoConfigurationSecurityStores::decodeToken);
+    }
+
     private final class Tokens implements TokenStore {
         private final MongoReadBudget budget;
         private Tokens(MongoReadBudget budget) { this.budget = budget; }

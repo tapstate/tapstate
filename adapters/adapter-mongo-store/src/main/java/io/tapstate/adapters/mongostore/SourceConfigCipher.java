@@ -147,6 +147,21 @@ public final class SourceConfigCipher {
         }
     }
 
+    /** Stable domain-separated authentication of bounded caller-owned bytes; no new persistent key is introduced. */
+    String keyedDigest(String keyId, String domain, byte[] value) {
+        requireDomain(domain, ""); Objects.requireNonNull(value, "value");
+        SecretKeySpec key = keys.get(keyId); if (key == null) { throw unreadable("alert-candidate"); }
+        byte[] encoded = key.getEncoded(); byte[] derived = null;
+        try {
+            var mac = javax.crypto.Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(encoded, "HmacSHA256"));
+            derived = mac.doFinal(boundContext(keyId, domain, "keyed-digest-v1"));
+            mac.init(new SecretKeySpec(derived, "HmacSHA256"));
+            return HexFormat.of().formatHex(mac.doFinal(value));
+        } catch (GeneralSecurityException unavailable) { throw new IllegalStateException("HmacSHA256 is required by the storage runtime", unavailable); }
+        finally { Arrays.fill(encoded, (byte) 0); if (derived != null) { Arrays.fill(derived, (byte) 0); } }
+    }
+
     String activeKeyId() {
         return activeKeyId;
     }

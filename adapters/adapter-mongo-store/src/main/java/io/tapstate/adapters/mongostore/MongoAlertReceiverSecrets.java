@@ -41,7 +41,7 @@ final class MongoAlertReceiverSecrets {
         byte[] authentication = material.authentication(); byte[] ca = material.privateCa();
         byte[] encoded = null;
         try {
-            validate(receiver, authentication, ca, material.webhookEndpoint());
+            validate(receiver.transport(), authentication, ca, material.webhookEndpoint());
             Document value = new Document("formatVersion", 1).append("transportDigest", transportDigest(receiver))
                     .append("authentication", authentication == null ? null : new Binary(authentication))
                     .append("privateCa", ca == null ? null : new Binary(ca))
@@ -79,7 +79,7 @@ final class MongoAlertReceiverSecrets {
             authentication = binary(value.get("authentication")); ca = binary(value.get("privateCa"));
             if (value.get("webhookEndpoint") != null && !(value.get("webhookEndpoint") instanceof String)) { throw unreadable(); }
             URI endpoint = value.get("webhookEndpoint") == null ? null : URI.create(value.getString("webhookEndpoint"));
-            validate(receiver, authentication, ca, endpoint);
+            validate(receiver.transport(), authentication, ca, endpoint);
             return new ReceiverSecretMaterial(authentication, ca, endpoint);
         } catch (TapstateException | IllegalArgumentException | org.bson.BSONException malformed) { throw unreadable(); }
         finally { erase(plaintext); erase(authentication); erase(ca); }
@@ -109,8 +109,7 @@ final class MongoAlertReceiverSecrets {
         } catch (IllegalArgumentException malformed) { throw unreadable(); }
     }
 
-    private static void validate(AlertReceiver receiver, byte[] authentication, byte[] ca, URI endpoint) {
-        var transport = receiver.transport();
+    static void validate(AlertReceiver.Transport transport, byte[] authentication, byte[] ca, URI endpoint) {
         boolean authenticated = transport.authentication() != AlertReceiver.Authentication.NONE;
         require(authenticated ? authentication != null && authentication.length > 0 && authentication.length <= 8192 : authentication == null,
                 "authentication-material-mismatch");

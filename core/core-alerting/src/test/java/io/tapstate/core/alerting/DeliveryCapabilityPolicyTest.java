@@ -19,7 +19,7 @@ class DeliveryCapabilityPolicyTest {
 
     @Test void unknownEnvelopeCannotTrustExpiryOrAnAllegedTerminalState() {
         var policy = installed();
-        for (Integer version : new Integer[] { null, 0, 2 }) {
+        for (Integer version : new Integer[] { null, 0, 3 }) {
             var header = new Header(version, SCOPE, "delivery-1", "webhook", 1, START);
             assertThat(policy.assess(SCOPE, header, true, Deployment.ON_PREM, DEADLINE).disposition())
                     .isEqualTo(Disposition.ISOLATED);

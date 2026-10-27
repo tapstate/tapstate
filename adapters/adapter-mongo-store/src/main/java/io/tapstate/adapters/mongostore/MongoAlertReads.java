@@ -1,0 +1,111 @@
+package io.tapstate.adapters.mongostore;
+
+import com.mongodb.client.*;
+import io.tapstate.core.alerting.*;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.*;
+import io.tapstate.spi.store.AlertStore.*;
+import java.time.Instant;
+import java.util.*;
+import org.bson.Document;
+import org.bson.types.MaxKey;
+import org.bson.types.MinKey;
+
+/** Bounded keyset reads over declared indexes. Unknown formats remain visible as an isolation indication. */
+final class MongoAlertReads {
+    private final MongoDatabase db;private final AlarmKey.Scope scope;private final MongoAlertStateStore states;
+    MongoAlertReads(MongoDatabase db,AlarmKey.Scope scope,MongoAlertStateStore states){this.db=db;this.scope=scope;this.states=states;}
+    ActivePage active(ClientSession session,ActiveCursor after,int limit,ReadAccess access){
+        limit(limit);Document base=scopeFilter().append("formatVersion",2).append("status","FIRING");
+        if(!access.allResources()){
+            var resources=access.resources().stream().map(r->new Document("_id.resourceKind",r.kind()).append("_id.resourceId",r.id()).append("_id.resourceIncarnation",r.incarnation())).toList();
+            base=and(base,resources.isEmpty()?new Document("_id",new Document("$exists",false)):new Document("$or",resources));
+        }
+        var heads=SystemCollections.ALERT_INSTANCES.on(db);long count=heads.countDocuments(session,base);
+        Document filter=base;
+        if(after!=null){if(!scope.equals(after.key().scope())||!access.permits(after.key()))throw unreadable("cursor-scope");
+            filter=and(filter,lexAfter(List.of("severityRank","recentSecondOrder","recentNanoOrder","_id"),List.of(after.severityRank(),after.secondOrder(),after.nanoOrder(),MongoAlertStateCodec.key(after.key()))));}
+        var raw=heads.find(session,filter).sort(new Document("severityRank",1).append("recentSecondOrder",1).append("recentNanoOrder",1).append("_id",1)).limit(limit+1).into(new ArrayList<>());
+        boolean more=raw.size()>limit;if(more)raw.removeLast();var values=new ArrayList<Stored<AlertStateRecord.Head>>();
+        for(var row:raw){var key=MongoAlertStateCodec.readKey(row.get("_id",Document.class));var stored=states.loadEnvelope(session,key).orElseThrow(()->unreadable("missing-head"));values.add(new Stored<>(stored.revision(),stored.value()));}
+        ActiveCursor next=null;if(more){var r=raw.getLast();next=new ActiveCursor(r.getInteger("severityRank"),r.getLong("recentSecondOrder"),r.getInteger("recentNanoOrder"),values.getLast().value().snapshot().rule().key());}
+        access.requireActive().run();return new ActivePage(count,values,next,isolated(session,SystemCollections.ALERT_INSTANCES,Set.of(2),access));
+    }
+    HistoryPage history(ClientSession s,AlarmKey key,Long after,int limit){
+        limit(limit);var alarm=MongoAlertStateCodec.key(key);var range=new Document(after==null?"$gte":"$gt",new Document("alarm",alarm).append("number",after==null?1L:after))
+                .append("$lte",new Document("alarm",alarm).append("number",Long.MAX_VALUE));
+        var raw=SystemCollections.ALERT_EPISODES.on(db).find(s,new Document("_id",range)).sort(new Document("_id",1)).limit(limit+1).into(new ArrayList<>());
+        boolean more=raw.size()>limit;if(more)raw.removeLast();boolean isolated=false;var values=new ArrayList<AlertStateRecord.Episode>();
+        for(var row:raw){if(!Integer.valueOf(2).equals(row.get("formatVersion"))){isolated=true;continue;}values.add(MongoAlertStateEnvelope.readEpisode(key,row.get("_id",Document.class).getLong("number"),row));}
+        return new HistoryPage(values,more?raw.getLast().get("_id",Document.class).getLong("number"):null,isolated);
+    }
+    TransitionPage transitions(ClientSession s,AlarmKey key,TransitionCursor after,int limit){
+        limit(limit);var alarm=MongoAlertStateCodec.key(key);var low=new Document("alarm",alarm).append("recordRevision",after==null?1L:after.revision()).append("ordinal",after==null?0:after.ordinal());
+        var high=new Document("alarm",alarm).append("recordRevision",Long.MAX_VALUE).append("ordinal",Integer.MAX_VALUE);
+        var raw=SystemCollections.ALERT_TRANSITIONS.on(db).find(s,new Document("_id",new Document(after==null?"$gte":"$gt",low).append("$lte",high))).sort(new Document("_id",1)).limit(limit+1).into(new ArrayList<>());
+        boolean more=raw.size()>limit;if(more)raw.removeLast();boolean isolated=false;var values=new ArrayList<AlertStateRecord.Transition>();
+        for(var row:raw){if(!Integer.valueOf(2).equals(row.get("formatVersion"))){isolated=true;continue;}var id=row.get("_id",Document.class);values.add(MongoAlertStateEnvelope.readTransition(key,id.getLong("recordRevision"),id.getInteger("ordinal"),row));}
+        TransitionCursor next=null;if(more){var id=raw.getLast().get("_id",Document.class);next=new TransitionCursor(id.getLong("recordRevision"),id.getInteger("ordinal"));}
+        return new TransitionPage(values,next,isolated);
+    }
+    DuePage due(ClientSession s,Instant through,DueCursor after,int limit){
+        limit(limit);var filter=scopeFilter().append("formatVersion",new Document("$in",List.of(1,2))).append("nextCheckAt",new Document("$type","date").append("$lte",Date.from(through)));
+        if(after!=null){var id=MongoAlertDeliveryCodec.scope(scope).append("purpose",after.purpose()).append("deliveryId",after.deliveryId());filter=and(filter,lexAfter(List.of("nextCheckAt","_id"),List.of(Date.from(after.candidateAt()),id)));}
+        var raw=SystemCollections.ALERT_DELIVERY_INTENTS.on(db).find(s,filter).sort(new Document("nextCheckAt",1).append("_id",1)).limit(limit+1).into(new ArrayList<>());
+        boolean more=raw.size()>limit;if(more)raw.removeLast();var values=new ArrayList<Stored<AlertIntent.Record>>();
+        for(var row:raw){try{var v=MongoAlertDeliveryCodec.readAny(scope,row);values.add(new Stored<>(v.recordRevision(),v.value()));}catch(IllegalArgumentException ex){throw unreadable("intent-format");}}
+        DueCursor next=null;if(more){var r=raw.getLast();var id=r.get("_id",Document.class);next=new DueCursor(r.getDate("nextCheckAt").toInstant(),id.getString("purpose"),id.getString("deliveryId"));}
+        return new DuePage(values,next,isolated(s,SystemCollections.ALERT_DELIVERY_INTENTS,Set.of(1,2),null));
+    }
+    SchedulePage schedules(ClientSession s,Instant through,ScheduleCursor after,int limit){
+        limit(limit);var filter=scopeFilter().append("formatVersion",1).append("nextCheckAt",new Document("$type","date").append("$lte",Date.from(through)));
+        if(after!=null){if(!scope.equals(after.key().scope()))throw unreadable("schedule-cursor-scope");filter=and(filter,lexAfter(List.of("nextCheckAt","_id"),List.of(Date.from(after.candidateAt()),MongoAlertScheduleCodec.key(after.key()))));}
+        var raw=SystemCollections.ALERT_NOTIFICATION_SCHEDULES.on(db).find(s,filter).sort(new Document("nextCheckAt",1).append("_id",1)).limit(limit+1).into(new ArrayList<>());
+        boolean more=raw.size()>limit;if(more)raw.removeLast();var values=new ArrayList<Stored<AlertSchedule.Record>>();
+        for(var row:raw){var v=MongoAlertScheduleCodec.read(scheduleKey(row.get("_id",Document.class)),row);values.add(new Stored<>(v.recordRevision(),v.value()));}
+        ScheduleCursor next=more?new ScheduleCursor(raw.getLast().getDate("nextCheckAt").toInstant(),values.getLast().value().key()):null;
+        return new SchedulePage(values,next,isolated(s,SystemCollections.ALERT_NOTIFICATION_SCHEDULES,Set.of(1),null));
+    }
+    DefinitionPage definitions(ClientSession s,AlertConfiguration.Kind kind,String after,int limit){
+        limit(limit);var low=MongoAlertDeliveryCodec.scope(scope).append("id",after==null?new MinKey():after);var high=MongoAlertDeliveryCodec.scope(scope).append("id",new MaxKey());
+        var raw=collection(kind).on(db).find(s,new Document("_id",new Document(after==null?"$gte":"$gt",low).append("$lte",high))).sort(new Document("_id",1)).limit(limit+1).into(new ArrayList<>());
+        boolean more=raw.size()>limit;if(more)raw.removeLast();var values=new ArrayList<AlertConfiguration.Definition>();
+        for(var row:raw){var id=row.get("_id",Document.class).getString("id");values.add(MongoAlertConfigurationCodec.read(kind,scope,id,row).definition());}
+        return new DefinitionPage(values,more?raw.getLast().get("_id",Document.class).getString("id"):null);
+    }
+    List<AlertIntent.Record> testWindow(ClientSession s,Instant now){
+        var filter=scopeFilter().append("_id.purpose","channel-test").append("quotaMinute",new Document("$gte",AlertTestQuota.minute(now.minusSeconds(300)).toString()));
+        var raw=SystemCollections.ALERT_DELIVERY_INTENTS.on(db).find(s,filter).hintString("alert_query_test_window").sort(new Document("quotaMinute",1)).limit(61).into(new ArrayList<>());
+        if(raw.size()>60)throw unreadable("test-window-budget-or-clock");var values=new ArrayList<AlertIntent.Record>();
+        for(var row:raw){var v=MongoAlertDeliveryCodec.readAny(scope,row).value();if(v.frozen().createdAt().isAfter(now))throw unreadable("test-clock-moved-backwards");values.add(v);}return List.copyOf(values);
+    }
+    List<AlertIntent.Record> intentSnapshot(ClientSession s,int maximum){
+        var lower=MongoAlertDeliveryCodec.scope(scope).append("purpose",new MinKey());var upper=MongoAlertDeliveryCodec.scope(scope).append("purpose",new MaxKey());
+        var raw=SystemCollections.ALERT_DELIVERY_INTENTS.on(db).find(s,new Document("_id",new Document("$gte",lower).append("$lte",upper)))
+                .sort(new Document("_id",1)).limit(maximum+1).into(new ArrayList<>());
+        if(raw.size()>maximum)throw unreadable("target-proof-read-budget");var values=new ArrayList<AlertIntent.Record>();
+        for(var row:raw){try{values.add(MongoAlertDeliveryCodec.readAny(scope,row).value());}catch(IllegalArgumentException invalid){throw unreadable("target-proof-isolated");}}return List.copyOf(values);
+    }
+    List<AlertStateRecord.Head> activeSnapshot(ClientSession s,int maximum){
+        if(isolated(s,SystemCollections.ALERT_INSTANCES,Set.of(2),null))throw unreadable("inhibition-state-isolated");
+        var raw=SystemCollections.ALERT_INSTANCES.on(db).find(s,scopeFilter().append("formatVersion",2).append("status","FIRING"))
+                .hintString("alert_query_active").limit(maximum+1).into(new ArrayList<>());
+        if(raw.size()>maximum)throw unreadable("inhibition-read-budget");var values=new ArrayList<AlertStateRecord.Head>();
+        for(var row:raw)values.add(states.loadEnvelope(s,MongoAlertStateCodec.readKey(row.get("_id",Document.class))).orElseThrow(()->unreadable("inhibition-head")).value());return List.copyOf(values);
+    }
+    private boolean isolated(ClientSession s,SystemCollections c,Set<Integer> supported,ReadAccess access){
+        var filter=scopeFilter().append("formatVersion",new Document("$nin",supported.stream().sorted().toList()));
+        if(access!=null&&!access.allResources()){
+            var resources=access.resources().stream().map(r->new Document("_id.resourceKind",r.kind()).append("_id.resourceId",r.id()).append("_id.resourceIncarnation",r.incarnation())).toList();
+            filter=and(filter,resources.isEmpty()?new Document("_id",new Document("$exists",false)):new Document("$or",resources));
+        }
+        return c.on(db).find(s,filter).projection(new Document("_id",1)).limit(1).first()!=null;
+    }
+    private Document scopeFilter(){return new Document("_id.authorityId",scope.authorityId()).append("_id.clusterId",scope.clusterId());}
+    private static Document and(Document a,Document b){return new Document("$and",List.of(a,b));}
+    private static Document lexAfter(List<String> names,List<?> values){var options=new ArrayList<Document>();for(int i=0;i<names.size();i++){var term=new Document();for(int j=0;j<i;j++)term.put(names.get(j),values.get(j));term.put(names.get(i),new Document("$gt",values.get(i)));options.add(term);}return new Document("$or",options);}
+    private static void limit(int limit){if(limit<1||limit>100)throw new TapstateException(AlertError.INVALID_CONFIGURATION,Map.of("field","pageSize","reason","outside-1-100"),null);}
+    private static SystemCollections collection(AlertConfiguration.Kind kind){return switch(kind){case RULE->SystemCollections.ALERT_RULES;case SUBSCRIPTION->SystemCollections.ALERT_SUBSCRIPTIONS;case SILENCE->SystemCollections.ALERT_SILENCES;case RECEIVER->SystemCollections.ALERT_RECEIVERS;};}
+    private static AlertSchedule.Key scheduleKey(Document id){return new AlertSchedule.Key(MongoAlertDeliveryCodec.readScope(id),AlertSchedule.SubjectKind.valueOf(id.getString("subjectKind")),id.getString("subjectId"),id.getString("subjectIncarnation"),id.getString("routeId"),id.getString("routeIncarnation"),id.getString("channelType"),id.getString("receiverIncarnation"),id.getString("targetId"));}
+    private static TapstateException unreadable(String field){return new TapstateException(IoError.DOCUMENT_UNREADABLE,Map.of("id","alert-query","field",field),null);}
+}

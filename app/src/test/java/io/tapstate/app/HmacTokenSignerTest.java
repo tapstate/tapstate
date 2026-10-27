@@ -124,4 +124,17 @@ class HmacTokenSignerTest {
         Optional<VerifiedToken> nullToken = signer.verify(null);
         assertThat(nullToken).isEmpty();
     }
+    @org.junit.jupiter.api.Test void detailedClaimsComeFromTheSameVerifiedTokenAndBindTheActualSigner() {
+        byte[] key=new byte[32];java.util.Arrays.fill(key,(byte)7);
+        var at=java.time.Instant.parse("2026-10-28T00:00:00Z");var clock=java.time.Clock.fixed(at,java.time.ZoneOffset.UTC);
+        var signer=new HmacTokenSigner(key,java.time.Duration.ofMinutes(15),clock);
+        String token=signer.issue("alice",io.tapstate.control.core.Scope.ADMIN);
+        var detailed=signer.verifyDetailed(token).orElseThrow();
+        org.assertj.core.api.Assertions.assertThat(detailed.identity()).isEqualTo(signer.verify(token).orElseThrow());
+        org.assertj.core.api.Assertions.assertThat(detailed.continuation().expiresAt()).isEqualTo(at.plusSeconds(900));
+        org.assertj.core.api.Assertions.assertThat(detailed.continuation().verifierBinding()).isEqualTo(new HmacTokenSigner(key,java.time.Duration.ofMinutes(15),clock).verifierBinding());
+        org.assertj.core.api.Assertions.assertThat(new HmacTokenSigner(new byte[32],java.time.Duration.ofMinutes(15),clock).verifyDetailed(token)).isEmpty();
+        org.assertj.core.api.Assertions.assertThat(new HmacTokenSigner(key,java.time.Duration.ofMinutes(15),java.time.Clock.fixed(at.plusSeconds(900),java.time.ZoneOffset.UTC)).verifyDetailed(token)).isEmpty();
+        org.assertj.core.api.Assertions.assertThat(detailed.continuation().toString()).doesNotContain(token);
+    }
 }

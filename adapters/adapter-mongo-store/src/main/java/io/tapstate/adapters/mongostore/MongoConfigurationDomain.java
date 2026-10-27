@@ -171,6 +171,15 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         return new MongoAlertConfigurationStore(connection.database(), scope, catalog, this::requireOpen, configurationKey);
     }
 
+    /** The assembly supplies original trusted host facts; this does not open CACHE or a sender. */
+    public io.tapstate.spi.store.AlertStore alerts(io.tapstate.spi.store.AlertStore.Host host,
+            io.tapstate.core.alerting.AlarmTypeCatalog catalog,java.time.Clock clock) {
+        requireOpen();
+        if(!clusterId.equals(host.scope().clusterId()))throw unreadable("alert-store","scope");
+        if(alertSchemaVersion()!=MongoAlertStorageSchema.VERSION)throw unreadable("alert-store","capability");
+        return new MongoAlertCoordinator(this,connection.database(),configurationKey,artifacts,security,bindings,host,catalog,clock);
+    }
+
     <T> T alertTransaction(MongoReadBudget budget, java.util.function.Function<com.mongodb.client.ClientSession, T> action) {
         requireOpen();
         return budget.transaction(connection.client(), session -> { requireOpen(); T value = action.apply(session); requireOpen(); return value; });

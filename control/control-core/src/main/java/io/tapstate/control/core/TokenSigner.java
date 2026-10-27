@@ -18,4 +18,9 @@ public interface TokenSigner {
 
     /** Returns the verified content of {@code token}, or empty if it is unsigned, expired, or malformed. */
     Optional<VerifiedToken> verify(String token);
+    record Detailed(VerifiedToken identity, HumanTokenEvidence continuation) {
+        public Detailed { java.util.Objects.requireNonNull(identity); java.util.Objects.requireNonNull(continuation); }
+    }
+    /** Implementations without verified continuation claims do not authorize asynchronous work. */
+    default Optional<Detailed> verifyDetailed(String token) { return Optional.empty(); }
 }

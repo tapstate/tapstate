@@ -32,7 +32,7 @@ final class MongoAlertDeliveryCodec {
     static Document write(AlertIntent.Record value, long revision) {
         if (revision < 1) { throw new IllegalArgumentException("stored revision must be positive"); }
         Frozen frozen = value.frozen(); State state = value.state();
-        var encoded = new Document("_id", key(frozen.identity())).append("formatVersion", AlertIntent.FORMAT_VERSION)
+        var encoded = new Document("_id", key(frozen.identity())).append("formatVersion", frozen.testAuthority() == null ? AlertIntent.FORMAT_VERSION : 2)
                 .append("recordRevision", revision).append("channelType", frozen.channel().typeId()).append("channelVersion", frozen.channel().version())
                 .append("deadline", time(frozen.deadline())).append("quotaMinute", frozen.identity() instanceof Test test
                         ? time(AlertTestQuota.minute(test.command().acceptedAt())) : null)
@@ -44,9 +44,10 @@ final class MongoAlertDeliveryCodec {
     static Stored read(Identity expected, Document row) {
         try {
             fields(row, FIELDS); require(MongoAlertConfigurationCodec.size(row) <= AlertIntent.MAX_BYTES);
-            sameKey(key(expected), doc(row, "_id")); require(Integer.valueOf(AlertIntent.FORMAT_VERSION).equals(row.get("formatVersion")));
+            sameKey(key(expected), doc(row, "_id")); require(Integer.valueOf(1).equals(row.get("formatVersion")) || Integer.valueOf(2).equals(row.get("formatVersion")));
             long revision = number(row, "recordRevision", 1);
             Frozen frozen = readFrozen(doc(row, "frozen")); require(sameIdentity(frozen.identity(), expected));
+            require(Integer.valueOf(frozen.testAuthority() == null ? 1 : 2).equals(row.get("formatVersion")));
             require(frozen.channel().typeId().equals(text(row, "channelType")) && frozen.channel().version() == integer(row, "channelVersion", 1));
             require(frozen.deadline().equals(instant(row, "deadline", false)));
             require(Objects.equals(row.get("quotaMinute"), expected instanceof Test test ? time(AlertTestQuota.minute(test.command().acceptedAt())) : null));
@@ -57,6 +58,10 @@ final class MongoAlertDeliveryCodec {
         } catch (IllegalArgumentException | NullPointerException | ArithmeticException | java.time.DateTimeException | TapstateException invalid) {
             throw unreadable("format-or-identity");
         }
+    }
+
+    static Stored readAny(AlarmKey.Scope scope,Document row) {
+        Frozen frozen=readFrozen(doc(row,"frozen")); require(frozen.identity().scope().equals(scope));return read(frozen.identity(),row);
     }
 
     static Stored readTest(AlertTestCommand.Key expected, Document row) {
@@ -92,21 +97,35 @@ final class MongoAlertDeliveryCodec {
     }
 
     private static Document frozen(Frozen value) {
-        return new Document("identity", identity(value.identity())).append("channel", new Document("type", value.channel().typeId())
+        Document encoded = new Document("identity", identity(value.identity())).append("channel", new Document("type", value.channel().typeId())
                 .append("version", value.channel().version()).append("family", value.channel().family().name()))
                 .append("route", route(value.route())).append("target", target(value.target())).append("content", content(value.content()))
                 .append("members", value.members().stream().map(MongoAlertDeliveryCodec::member).toList())
                 .append("retry", retry(value.retry())).append("retention", policy(value.retention()))
                 .append("createdAt", time(value.createdAt())).append("deadline", time(value.deadline()));
+        if (value.testAuthority() != null) { encoded.append("testAuthority", authority(value.testAuthority())); }
+        return encoded;
     }
     private static Frozen readFrozen(Document value) {
-        fields(value, Set.of("identity", "channel", "route", "target", "content", "members", "retry", "retention", "createdAt", "deadline"));
+        var expected = new java.util.HashSet<>(Set.of("identity", "channel", "route", "target", "content", "members", "retry", "retention", "createdAt", "deadline"));
+        if (value.containsKey("testAuthority")) { expected.add("testAuthority"); }
+        fields(value, expected);
         Document channel = doc(value, "channel"); fields(channel, Set.of("type", "version", "family"));
         List<Member> members = new ArrayList<>(); for (Object item : list(value, "members", 100)) { members.add(readMember(document(item))); }
         return new Frozen(readIdentity(doc(value, "identity")), new AlertChannelPolicy.Capability(text(channel, "type"), integer(channel, "version", 1),
                 enumeration(AlertChannelPolicy.Family.values(), text(channel, "family"))), value.get("route") == null ? null : readRoute(doc(value, "route")),
                 readTarget(doc(value, "target")), readContent(doc(value, "content")), members, readRetry(doc(value, "retry")),
-                readPolicy(doc(value, "retention")), instant(value, "createdAt", false), instant(value, "deadline", false));
+                readPolicy(doc(value, "retention")), instant(value, "createdAt", false), instant(value, "deadline", false),
+                value.containsKey("testAuthority") ? readAuthority(doc(value,"testAuthority")) : null);
+    }
+    static Document authority(AlertTestAuthority value) {
+        return new Document("mechanism",value.mechanism().name()).append("realm",value.realm()).append("subject",value.subject())
+                .append("grantedScope",value.grantedScope()).append("credentialBinding",value.credentialBinding()).append("expiresAt",time(value.expiresAt()));
+    }
+    static AlertTestAuthority readAuthority(Document row) {
+        fields(row,Set.of("mechanism","realm","subject","grantedScope","credentialBinding","expiresAt"));
+        return new AlertTestAuthority(enumeration(AlertTestAuthority.Mechanism.values(),text(row,"mechanism")),text(row,"realm"),text(row,"subject"),
+                text(row,"grantedScope"),text(row,"credentialBinding"),instant(row,"expiresAt",true));
     }
     static Document deliveryKey(DeliveryKey value) {
         var n = value.notification();

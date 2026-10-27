@@ -55,7 +55,7 @@ public final class DeliveryCapabilityPolicy {
         Objects.requireNonNull(expectedScope, "expectedScope"); Objects.requireNonNull(header, "header");
         Objects.requireNonNull(deployment, "deployment"); Objects.requireNonNull(now, "now");
         if (header.recordVersion() == null) { return decision(Disposition.ISOLATED, Reason.MISSING_RECORD_VERSION); }
-        if (header.recordVersion() != AlarmTypeCatalog.RECORD_FORMAT_VERSION) {
+        if (header.recordVersion() != AlarmTypeCatalog.RECORD_FORMAT_VERSION && header.recordVersion() != 2) {
             return decision(Disposition.ISOLATED, Reason.UNSUPPORTED_RECORD_VERSION);
         }
         if (header.scope() == null || header.deliveryId() == null

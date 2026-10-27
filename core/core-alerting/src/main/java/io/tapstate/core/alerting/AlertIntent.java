@@ -157,7 +157,10 @@ public final class AlertIntent {
         public FrozenGroupPolicy.Member episodeMember() { return new FrozenGroupPolicy.Member(evaluation.key(), episode); }
     }
     public record Frozen(Identity identity, AlertChannelPolicy.Capability channel, Route route, Target target,
-            Content content, List<Member> members, ChannelRetryPolicy retry, Policy retention, Instant createdAt, Instant deadline) {
+            Content content, List<Member> members, ChannelRetryPolicy retry, Policy retention, Instant createdAt, Instant deadline, AlertTestAuthority testAuthority) {
+        public Frozen(Identity identity, AlertChannelPolicy.Capability channel, Route route, Target target, Content content, List<Member> members, ChannelRetryPolicy retry, Policy retention, Instant createdAt, Instant deadline) {
+            this(identity,channel,route,target,content,members,retry,retention,createdAt,deadline,null);
+        }
         public Frozen {
             Objects.requireNonNull(identity, "identity"); Objects.requireNonNull(channel, "channel"); Objects.requireNonNull(target, "target");
             Objects.requireNonNull(content, "content"); Objects.requireNonNull(retry, "retry"); Objects.requireNonNull(retention, "retention");
@@ -170,6 +173,7 @@ public final class AlertIntent {
             AlertChannelPolicy.requireDeliverable(retention.deployment(), channel);
             DeliveryRetention.begin(retention.value(), kind(identity, retention.deployment()), createdAt, deadline);
             AlertValidation.require(!deadline.isAfter(DeliveryRetention.add(createdAt, retry.maximumAge())), "deadline", "outside-original-retry-age");
+            AlertValidation.require(testAuthority == null || identity instanceof Test test && test.command().key().actorPrincipal().equals(testAuthority.principalKey()), "testAuthority", "foreign-original-actor");
             if (identity instanceof Business business) {
                 AlertValidation.require(route != null && route.id().equals(business.key().notification().routeId())
                         && route.incarnation().equals(business.key().notification().routeIncarnation()), "route", "foreign-frozen-route");
