@@ -96,6 +96,78 @@ class PipelineBuilderAssistantProviderSettingsIT {
         }
     }
 
+    @Test
+    void invalidAssistantCandidateCanBeClarifiedWithoutChangingTheDraft() throws Exception {
+        String database = "ts_plan_ai_discovery_" + UUID.randomUUID().toString().replace("-", "");
+        String storeUri = SharedMongo.replicaSetUrl(database);
+        var calls = new java.util.concurrent.atomic.AtomicInteger();
+        var proposed = new java.util.concurrent.atomic.AtomicReference<Map<String, Object>>();
+        io.tapstate.control.core.AiProviderClient provider = new io.tapstate.control.core.AiProviderClient() {
+            public void check(io.tapstate.control.core.AiProviderSettings settings) { }
+            public java.util.Optional<Map<String, Object>> propose(io.tapstate.control.core.AiProviderSettings settings,
+                    java.util.List<Map<String, String>> messages, Map<String, Object> context,
+                    java.util.function.Consumer<String> text) {
+                text.accept(calls.getAndIncrement() == 0 ? "Which source?" : "Using orders.");
+                return java.util.Optional.of(calls.get() == 1 ? Map.of() : proposed.get());
+            }
+        };
+        try (AtlasRuntime runtime = new AtlasRuntime(AtlasRuntime.Mode.CLOUD, storeUri);
+                ServerHandle server = runtime.launch(Tiers.IN_PROCESS, java.util.List.of(), provider);
+                var connection = new io.tapstate.adapters.mongostore.MongoConnection(
+                        new io.tapstate.adapters.mongostore.MongoConnectionSettings(storeUri, null, java.time.Duration.ofSeconds(5)))) {
+            ControlPlane control = runtime.control(server, true);
+            connection.verify();
+            var store = new io.tapstate.adapters.mongostore.MongoStorePort(connection, database + "_operator");
+            store.artifacts().save(new io.tapstate.core.model.SourceResource("orders_src", null, "mysql",
+                    Map.of(), io.tapstate.core.model.SourceMode.CDC, null, null, null));
+            store.artifacts().save(new io.tapstate.core.model.SourceResource("destination", null, "mongodb",
+                    Map.of(), null, null, null, null));
+            store.schemas().save(new io.tapstate.spi.store.DiscoveredSourceModel("orders_src", "mysql", 1,
+                    new io.tapstate.spi.store.SourceModel(java.util.List.of(new io.tapstate.spi.store.SourceTable("orders",
+                            java.util.List.of(new io.tapstate.spi.store.SourceField("id", "integer")),
+                            java.util.List.of("id"), java.util.List.of())))));
+            Map<String, Object> wizard = new LinkedHashMap<>();
+            wizard.put("root", null);
+            wizard.put("related", java.util.List.of());
+            wizard.put("transforms", java.util.List.of());
+            wizard.put("output", Map.of("kind", "atlas", "config", Map.of("sourceId", "destination", "table", "orders", "writeMode", "upsert")));
+            control.createPipelineDraft("blank_auto", Map.of("pipelineId", "blank_auto", "mode", "wizard", "name", "Blank", "wizard", wizard));
+            Map<String, Object> candidate = Map.of(
+                    "root", Map.of("source", "orders_src", "table", "orders", "primaryKey", "id", "keys", java.util.List.of("id"),
+                            "columns", java.util.List.of(), "transforms", java.util.List.of()),
+                    "relations", java.util.List.of(), "transforms", java.util.List.of(),
+                    "destinationSourceId", "destination", "destinationTable", "orders", "destinationWriteMode", "upsert");
+            proposed.set(candidate);
+            HttpClient client = HttpClient.newHttpClient();
+            var settingsRequest = HttpRequest.newBuilder(server.baseUrl().resolve("/api/ai-provider-settings"))
+                    .header("Cookie", control.credential()).header("Origin", server.baseUrl().toString()).header("Content-Type", "application/json")
+                    .PUT(HttpRequest.BodyPublishers.ofString(JsonWriter.write(Map.of(
+                            "providerId", "openai-compatible", "model", "e2e-model", "apiKey", TEST_KEY)))).build();
+            assertThat(client.send(settingsRequest, HttpResponse.BodyHandlers.ofString()).statusCode()).isEqualTo(204);
+            var first = assistant(client, server, control, java.util.List.of(Map.of("role", "user", "text", "Choose tables")));
+            assertThat(first.statusCode()).isEqualTo(200);
+            assertThat(first.body()).contains("Which source?", "needs-input", "control.ai-invalid-proposal", "\"finishReason\":\"stop\"")
+                    .doesNotContain("data-proposal", "\"type\":\"error\"");
+            assertThat(store.drafts().get("blank_auto").orElseThrow().wizard().root()).isNull();
+            var second = assistant(client, server, control, java.util.List.of(
+                    Map.of("role", "user", "text", "Choose tables"),
+                    Map.of("role", "assistant", "text", "Which source?"),
+                    Map.of("role", "user", "text", "Use orders_src")));
+            assertThat(second.body()).contains("Using orders.", "data-proposal", "\"finishReason\":\"stop\"");
+            assertThat(store.drafts().get("blank_auto").orElseThrow().wizard().root()).isNull();
+        }
+    }
+
+    private static HttpResponse<String> assistant(HttpClient client, ServerHandle server, ControlPlane control,
+            java.util.List<Map<String, String>> messages) throws Exception {
+        var request = HttpRequest.newBuilder(server.baseUrl().resolve("/api/pipelines/blank_auto/draft:assistant"))
+                .header("Cookie", control.credential()).header("Origin", server.baseUrl().toString())
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(JsonWriter.write(Map.of("revision", 1, "messages", messages))))
+                .build();
+        return client.send(request, HttpResponse.BodyHandlers.ofString());
+    }
+
     private static HttpResponse<String> providerSettings(HttpClient client, ServerHandle server,
             ControlPlane control, String method, String body) throws Exception {
         HttpRequest.Builder request = HttpRequest.newBuilder(server.baseUrl().resolve("/api/ai-provider-settings"))
