@@ -53,6 +53,11 @@ final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
         requireKey(key);
         if (key.type() == WorkloadClaimType.PIPELINE_ACTUATION) throw MongoCacheBusinessIdentity.businessFenced();
         return transaction(true, (store, session) -> {
+            if (key.type() == WorkloadClaimType.VALIDATION) {
+                var row = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
+                MongoValidationControlStore.requirePreparedClaim(session, database, row, key, scope);
+                return store.acquireExisting(key, owner, topologyRevision, ttl);
+            }
             if(key.type()==WorkloadClaimType.CAPTURE) {
                 var row=SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session,new Document("_id",MongoWorkloadClaimStore.id(key))).first();
                 if(row==null)throw MongoCapturePreparationFacts.history(key.resourceId());
@@ -137,7 +142,7 @@ final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
         if (captured.isEmpty()) return Map.of();
         captured.forEach(this::requireKey);
         return transaction(false, (store, session) -> {
-            for(var key:captured)if(key.type()==WorkloadClaimType.CAPTURE)storedScope(session,key);
+            for(var key:captured)if(key.type()==WorkloadClaimType.CAPTURE || key.type()==WorkloadClaimType.VALIDATION)storedScope(session,key);
             Map<Document, WorkloadClaimKey> pipelines = new LinkedHashMap<>();
             for (var key : captured) if (key.type() == WorkloadClaimType.PIPELINE_ACTUATION) pipelines.put(MongoWorkloadClaimStore.id(key), key);
             if (!pipelines.isEmpty()) {
@@ -172,6 +177,10 @@ final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
     }
 
     private PipelineIntentScope storedScope(ClientSession session, WorkloadClaimKey key) {
+        if (key.type() == WorkloadClaimType.VALIDATION) {
+            var row = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
+            MongoValidationControlStore.requirePreparedClaim(session, database, row, key, scope); return null;
+        }
         if(key.type()==WorkloadClaimType.CAPTURE) {
             var capture=SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session,new Document("_id",MongoWorkloadClaimStore.id(key))).first();
             if(capture!=null)MongoCaptureCachePreparations.requirePreparation(capture,key,scope);return null;

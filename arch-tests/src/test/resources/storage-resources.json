@@ -2022,11 +2022,13 @@
       "responsibility": "Runtime NODE/Pipeline/CAPTURE leases, epochs and write fences. Independent VALIDATION ownership per Cluster/Pipeline uses the existing complete lease/generation fence. Its original claim and validation control are born together under controlled Pipeline preparation; ordinary validation admission refuses missing original state.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoWorkloadClaimStore",
-        "io.tapstate.adapters.mongostore.MongoCaptureCachePreparations"
+        "io.tapstate.adapters.mongostore.MongoCaptureCachePreparations",
+        "io.tapstate.adapters.mongostore.MongoValidationControlStore"
       ],
       "readers": [
         "io.tapstate.adapters.mongostore.MongoWorkloadClaimStore",
-        "io.tapstate.adapters.mongostore.MongoCaptureCachePreparations"
+        "io.tapstate.adapters.mongostore.MongoCaptureCachePreparations",
+        "io.tapstate.adapters.mongostore.MongoValidationControlStore"
       ],
       "recovery": "shared-srs-replacement-workload_claims",
       "consistency": "shared-srs-cache",
@@ -3091,6 +3093,30 @@
       "evidence": [
         "spi/spi-store/src/test/java/io/tapstate/spi/store/ValidationResultStoreContractTest.java",
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationResultStoreIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.validation_runs",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "validation_runs"
+      ],
+      "responsibility": "Original validation runs and Pipeline owner/counting control, task-mode slots and problem-limit latch, with separate immutable run identities and six execution states. No business rows, pending keys or resumable checkpoints.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoValidationControlStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoValidationControlStore"
+      ],
+      "recovery": "validation-control",
+      "consistency": "validation-cache",
+      "growth": "One current Pipeline control with <=8 KiB preparation metadata and bounded active-run references. Ended and pending-history controls count toward original retention and byte budgets. No lease/event history; exhausted storage refuses new validation without stopping synchronization.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationControlStoreIT.java"
       ]
     }
   ]

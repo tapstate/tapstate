@@ -204,6 +204,8 @@ public enum SystemCollections {
     VALIDATION_REPORTS("validation_reports", Database.CONFIG, MongoValidationAdmissionStore.class, Strategy.MIGRATED, 2),
     VALIDATION_DIFFERENCES("validation_differences", Database.CONFIG, MongoValidationResultStore.class, Strategy.MIGRATED, 2,
             new IndexSpec(List.of("_id.report"), false, "validation_differences_report")),
+    VALIDATION_RUNS("validation_runs", Database.CACHE, MongoValidationControlStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.clusterId", "_id.pipelineId"), false, "validation_runs_pipeline")),
     CACHE_IDENTITY("cache_identity", Database.CACHE, MongoCacheIdentity.class, Strategy.MIGRATED, 1),
     CACHE_SCHEMA_MIGRATIONS("schema_migrations", Database.CACHE, MongoCacheIdentity.class, Strategy.MIGRATED, 1),
     OP_SESSIONS("op_sessions", Database.CACHE, MongoCacheDomain.class, Strategy.MIGRATED, 1,

@@ -55,6 +55,7 @@ pipeline_drafts | config | MongoConfigurationDraftStore | migrated | 1 | revisio
 validation_tasks | config | MongoValidationAdmissionStore | migrated | 2 | -
 validation_reports | config | MongoValidationAdmissionStore | migrated | 2 | -
 validation_differences | config | MongoValidationResultStore | migrated | 2 | _id.report
+validation_runs | cache | MongoValidationControlStore | migrated | 2 | _id.clusterId+_id.pipelineId
 cache_identity | cache | MongoCacheIdentity | migrated | 1 | -
 schema_migrations | cache | MongoCacheIdentity | migrated | 1 | -
 op_sessions | cache | MongoCacheDomain | migrated | 1 | secretHash+issuer

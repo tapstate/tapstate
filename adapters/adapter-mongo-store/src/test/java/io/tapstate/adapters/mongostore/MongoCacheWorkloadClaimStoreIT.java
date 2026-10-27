@@ -58,6 +58,16 @@ class MongoCacheWorkloadClaimStoreIT {
         withBusiness(f -> {
             var claims = f.domain().workloadClaims(SCOPE);
             var production = claims.acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
+            try (var session = f.admin().startSession()) {
+                SystemCollections.VALIDATION_RUNS.prepareCollectionOn(f.database(), session);
+                session.withTransaction(() -> {
+                    var original = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).find(session,
+                            new Document("_id", MongoWorkloadClaimStore.id(KEY))).first();
+                    MongoValidationControlStore.prepareInTransaction(session, f.database(), PIPELINE,
+                            original.get("pipelinePreparation", Document.class).getString("preparationId"), true);
+                    return null;
+                });
+            }
             var key = io.tapstate.spi.store.ValidationClaims.key(SCOPE.clusterId(), PIPELINE.pipelineId());
             var granted = claims.acquire(key, OWNER, 1, TTL).claim();
             var first = claims.advanceExecution(granted, 1, Set.of(OWNER.nodeId())).orElseThrow();
