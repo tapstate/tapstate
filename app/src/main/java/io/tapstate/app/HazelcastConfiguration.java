@@ -15,7 +15,6 @@ import com.hazelcast.core.HazelcastException;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.core.HazelcastInstanceNotActiveException;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
-import io.tapstate.adapters.mongostore.SourceConfigKeyringSession;
 import io.tapstate.adapters.pdk.SharedSinkConnectors;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.Envelope;
@@ -75,6 +74,10 @@ import java.util.regex.Pattern;
 @EnableConfigurationProperties({HazelcastProperties.class, ControlEndpointProperties.class})
 @Import(ClusterMembershipConfiguration.class)
 class HazelcastConfiguration {
+    private ObjectProvider<MemberStorage> nativeStorage;
+
+    @org.springframework.beans.factory.annotation.Autowired
+    void memberStorage(ObjectProvider<MemberStorage> providers) { nativeStorage = providers; }
 
     static final String NODE_SESSION_CONTEXT_KEY = "tapstate.cluster.node-session";
 
@@ -104,44 +107,53 @@ class HazelcastConfiguration {
             @Nullable OperatorStateStores operatorStateStores, @Nullable SrsLogStore srsLogStore,
             ObjectProvider<ClusterIdentityStore> clusterIdentities,
             ObjectProvider<WorkloadClaimStore> workloadClaims,
-            ObjectProvider<SourceConfigKeyringSession> sourceConfigKeyrings,
-            ClusterMembershipGate membershipGate, BootId bootId, ObjectProvider<StorePort> storePorts) {
+            ClusterMembershipGate membershipGate, BootId bootId, ObjectProvider<StorePort> storePorts,
+            ObjectProvider<ClusterMembershipStore> membershipStores) {
         ClusterMemberPreflight.Identity identity =
                 ClusterMemberPreflight.validate(properties, clusterProperties, controlProperties);
         warnAboutClusterProfile(clusterProperties);
         WorkloadClaimStore claimStore = workloadClaims.getIfAvailable();
-        SourceConfigKeyringSession sourceConfigKeyring = sourceConfigKeyrings.getIfAvailable();
+        ClusterIdentityStore identityStore = clusterIdentities.getIfAvailable();
+        if (identity == null && clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE && (identityStore != null || claimStore != null)) {
+            identity = ClusterMemberPreflight.singleIdentity(clusterProperties, identityStore, membershipStores.getIfAvailable());
+        }
         long sessionAskedAt = System.nanoTime();
         if (identity != null) {
-            try {
-                identity = ClusterMemberPreflight.reserve(identity, clusterProperties,
-                        clusterIdentities.getIfAvailable(), claimStore, bootId.value());
-                if (sourceConfigKeyring == null) {
-                    throw new IllegalStateException("cluster member started without its Source config keyring");
-                }
-                sourceConfigKeyring.acknowledge(identity.nodeSession(), clusterProperties.getNodeSessionTtl());
-            } catch (RuntimeException startupFailure) {
-                if (identity.nodeSession() != null && claimStore != null) {
-                    claimStore.release(identity.nodeSession());
-                    if (sourceConfigKeyring != null) sourceConfigKeyring.release(identity.nodeSession());
-                }
-                throw startupFailure;
-            }
-        }
-        Config config = memberConfig(properties, nestStateStore, nestSettings, srsLogStore);
-        if (identity != null) {
-            identify(config, identity);
-            configureClusterProtection(config, membershipGate);
-        } else {
-            identifyConfiguredSingleMember(config, clusterProperties, controlProperties, bootId);
+            identity = clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE
+                    ? ClusterMemberPreflight.reserveExisting(identity, clusterProperties, identityStore, claimStore, bootId.value())
+                    : ClusterMemberPreflight.reserve(identity, clusterProperties, identityStore, claimStore, bootId.value());
+            if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) membershipGate.bindSingle(identity.nodeSession());
         }
         HazelcastInstance member;
+        var candidate = new java.util.concurrent.atomic.AtomicReference<HazelcastInstance>();
         try {
+            Config config = memberConfig(properties, nestStateStore, nestSettings, srsLogStore);
+            if (identity != null) {
+                identify(config, identity);
+                configureClusterProtection(config, membershipGate, clusterProperties.getProfile() != ClusterProperties.Profile.SINGLE);
+            } else {
+                identifyConfiguredSingleMember(config, clusterProperties, controlProperties, bootId);
+            }
+            MemberStorage storage = nativeStorage == null ? null : nativeStorage.getIfAvailable();
+            if (storage != null) {
+                if (identity == null) throw ThreeLayerStorePort.refused();
+                storage.prepare(config, identity.nodeSession(), sessionAskedAt);
+            }
             member = startMember(() -> Hazelcast.newHazelcastInstance(config));
-        } catch (RuntimeException startupFailure) {
+            candidate.set(member);
+            if (storage != null) storage.joined(member);
+        } catch (RuntimeException | Error startupFailure) {
+            if (candidate.get() != null) {
+                try { candidate.get().shutdown(); }
+                catch (RuntimeException | Error cleanupFailure) {
+                    if (cleanupFailure != startupFailure) startupFailure.addSuppressed(cleanupFailure);
+                }
+            }
             if (identity != null && claimStore != null) {
-                claimStore.release(identity.nodeSession());
-                if (sourceConfigKeyring != null) sourceConfigKeyring.release(identity.nodeSession());
+                try { claimStore.release(identity.nodeSession()); }
+                catch (RuntimeException | Error cleanupFailure) {
+                    if (cleanupFailure != startupFailure) startupFailure.addSuppressed(cleanupFailure);
+                }
             }
             throw startupFailure;
         }
@@ -154,7 +166,7 @@ class HazelcastConfiguration {
             member.getUserContext().put("tapstate.cluster.id", identity.clusterId());
             member.getUserContext().put("tapstate.cluster.node-id", identity.nodeId());
             member.getUserContext().put("tapstate.cluster.boot-id", identity.nodeSession().owner().bootId());
-            member.getUserContext().put("tapstate.control.advertise-url", identity.controlUrl().toString());
+            if (identity.controlUrl() != null) member.getUserContext().put("tapstate.control.advertise-url", identity.controlUrl().toString());
             member.getUserContext().put(NODE_SESSION_CONTEXT_KEY, identity.nodeSession());
             member.getUserContext().put(NODE_SESSION_ASKED_AT_CONTEXT_KEY, sessionAskedAt);
             member.getUserContext().put(
@@ -263,8 +275,7 @@ class HazelcastConfiguration {
     NodeSessionLease nodeSessionLease(
             HazelcastInstance member,
             ClusterProperties clusterProperties,
-            ObjectProvider<WorkloadClaimStore> workloadClaims,
-            ObjectProvider<SourceConfigKeyringSession> sourceConfigKeyrings) {
+            ObjectProvider<WorkloadClaimStore> workloadClaims, ClusterMembershipGate membershipGate) {
         Object stored = member.getUserContext().get(NODE_SESSION_CONTEXT_KEY);
         if (!(stored instanceof io.tapstate.spi.store.WorkloadClaim claim)) {
             return NodeSessionLease.inactive();
@@ -276,9 +287,10 @@ class HazelcastConfiguration {
         if (!(member.getUserContext().get(NODE_SESSION_ASKED_AT_CONTEXT_KEY) instanceof Long askedAt)) {
             throw new IllegalStateException("cluster member started without the time its node session was asked for");
         }
-        return new NodeSessionLease(store, claim, askedAt, clusterProperties.getNodeSessionTtl(),
-                clusterProperties.getNodeSessionRenewInterval(), sourceConfigKeyrings.getIfAvailable(),
-                member::shutdown);
+        NodeSessionLease lease = new NodeSessionLease(store, claim, askedAt, clusterProperties.getNodeSessionTtl(),
+                clusterProperties.getNodeSessionRenewInterval(), () -> { membershipGate.failClosed(); member.shutdown(); });
+        membershipGate.observeNodeSession(lease::active);
+        return lease;
     }
 
     /** Keeps the local gate aligned with the majority-committed ACTIVE node set. */
@@ -307,10 +319,10 @@ class HazelcastConfiguration {
         return hazelcastMember(properties, new ClusterProperties(), new ControlEndpointProperties(),
                 srsMetaStore, connectorProvisioner, snapshotBuffer, nestStateStore, nestSettings,
                 nestDeadLetterStore, null, srsLogStore, emptyProvider(), emptyProvider(),
-                emptyProvider(), new ClusterMembershipGate(new ClusterProperties()), BootId.fresh(), emptyProvider());
+                new ClusterMembershipGate(new ClusterProperties()), BootId.fresh(), emptyProvider(), emptyProvider());
     }
 
-    /** Direct member-admission seam retained for focused keyring wiring tests. */
+    /** Direct member-admission seam for focused configuration and claim cleanup tests. */
     HazelcastInstance hazelcastMember(HazelcastProperties properties, ClusterProperties clusterProperties,
             ControlEndpointProperties controlProperties, @Nullable SrsMetaStore srsMetaStore,
             @Nullable ConnectorProvisioner connectorProvisioner, @Nullable SnapshotBuffer snapshotBuffer,
@@ -319,12 +331,11 @@ class HazelcastConfiguration {
             @Nullable OperatorStateStores operatorStateStores, @Nullable SrsLogStore srsLogStore,
             ObjectProvider<ClusterIdentityStore> clusterIdentities,
             ObjectProvider<WorkloadClaimStore> workloadClaims,
-            ObjectProvider<SourceConfigKeyringSession> sourceConfigKeyrings,
             ClusterMembershipGate membershipGate) {
         return hazelcastMember(properties, clusterProperties, controlProperties, srsMetaStore,
                 connectorProvisioner, snapshotBuffer, nestStateStore, nestSettings, nestDeadLetterStore,
-                operatorStateStores, srsLogStore, clusterIdentities, workloadClaims, sourceConfigKeyrings,
-                membershipGate, BootId.fresh(), emptyProvider());
+                operatorStateStores, srsLogStore, clusterIdentities, workloadClaims,
+                membershipGate, BootId.fresh(), emptyProvider(), emptyProvider());
     }
 
     private static <T> ObjectProvider<T> emptyProvider() {
@@ -457,10 +468,9 @@ class HazelcastConfiguration {
         config.setClusterName(identity.clusterId());
         config.getMemberAttributeConfig()
                 .setAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE, identity.nodeId())
-                .setAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE,
-                        identity.nodeSession().owner().bootId())
-                .setAttribute(ClusterMembershipGate.CONTROL_URL_ATTRIBUTE,
-                        identity.controlUrl().toString());
+                .setAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE, identity.nodeSession().owner().bootId());
+        if (identity.controlUrl() != null) config.getMemberAttributeConfig()
+                .setAttribute(ClusterMembershipGate.CONTROL_URL_ATTRIBUTE, identity.controlUrl().toString());
         return config;
     }
 
@@ -677,6 +687,7 @@ class HazelcastConfiguration {
      */
     private static boolean dataPlaneAdmitsWork(HazelcastInstance member) {
         try {
+            if (!member.getLifecycleService().isRunning()) return false;
             return member.getSplitBrainProtectionService()
                     .getSplitBrainProtection(ClusterMembershipGate.PROTECTION_NAME)
                     .hasMinimumSize();
@@ -685,13 +696,14 @@ class HazelcastConfiguration {
         }
     }
 
-    static void configureClusterProtection(Config config, ClusterMembershipGate gate) {
+    static void configureClusterProtection(Config config, ClusterMembershipGate gate) { configureClusterProtection(config, gate, true); }
+    private static void configureClusterProtection(Config config, ClusterMembershipGate gate, boolean replicated) {
         config.addSplitBrainProtectionConfig(new SplitBrainProtectionConfig(
                 ClusterMembershipGate.PROTECTION_NAME, true)
                 .setProtectOn(SplitBrainProtectionOn.READ_WRITE)
                 .setFunctionImplementation(gate));
         config.getRingbufferConfigs().values().forEach(ring -> {
-            ring.setBackupCount(Math.max(1, ring.getBackupCount()));
+            if (replicated) ring.setBackupCount(Math.max(1, ring.getBackupCount()));
             ring.setSplitBrainProtectionName(ClusterMembershipGate.PROTECTION_NAME);
         });
         config.getMapConfigs().values().forEach(map ->

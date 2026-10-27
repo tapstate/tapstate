@@ -90,6 +90,29 @@ class ASinksWritersShareAConnectorOnlyWhenItsArtifactIsCertifiedTest {
         assertThat(Files.readAllLines(trace)).filteredOn("init"::equals).hasSize(2);
     }
 
+    @Test
+    void sameNamedViewAndSyncHaveIndependentInstancesAndClosingOneLeavesTheOtherUsable(@TempDir Path dir)
+            throws Exception {
+        Path trace = Files.createFile(dir.resolve("trace"));
+        Path jar = Synthetic.lifecycleSink(dir, trace);
+        ConnectorRef ref = certified(jar, "h1");
+        SharedSinkConnectors sharing = new SharedSinkConnectors();
+        PdkSinkPort view = new PdkSinkPort(id -> ref, null, sharing, PipelineNode.Purpose.VIEW);
+        PdkSinkPort sync = new PdkSinkPort(id -> ref, null, sharing, PipelineNode.Purpose.SYNC);
+        try (SinkWriter syncWriter = sync.openPrepared(config(SINK), Map.of())) {
+            try (SinkWriter viewWriter = view.openPrepared(config(SINK), Map.of())) {
+                assertThat(Files.readAllLines(trace)).containsExactly("init", "init");
+                assertThat(sharing.holders(SINK, PipelineNode.Purpose.VIEW, "demo", ref)).isOne();
+                assertThat(sharing.holders(SINK, PipelineNode.Purpose.SYNC, "demo", ref)).isOne();
+            }
+            assertThat(sharing.holders(SINK, PipelineNode.Purpose.VIEW, "demo", ref)).isZero();
+            assertThat(sharing.holders(SINK, PipelineNode.Purpose.SYNC, "demo", ref)).isOne();
+            writeThroughEach(List.of(syncWriter));
+            assertThat(Files.readAllLines(trace)).containsExactly("init", "init", "stop", "write");
+        }
+        assertThat(Files.readAllLines(trace)).endsWith("write", "stop");
+    }
+
     private static PdkSinkPort port(Path dir, Path trace, String contentHash, boolean shareSafe) {
         Path jar = Synthetic.lifecycleSink(dir, trace);
         ConnectorRef ref = new ConnectorRef(List.of(jar), "synthetic.LifecycleSink", "2.0.8", null, null,

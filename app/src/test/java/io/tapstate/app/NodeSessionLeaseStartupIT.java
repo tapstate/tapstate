@@ -3,7 +3,6 @@ package io.tapstate.app;
 import io.tapstate.adapters.mongostore.MongoConnection;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
 import io.tapstate.adapters.mongostore.MongoStorePort;
-import io.tapstate.adapters.mongostore.SourceConfigKeyringSession;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimReading;
@@ -44,7 +43,6 @@ class NodeSessionLeaseStartupIT {
             Duration ttl = Duration.ofSeconds(8);
             Duration interval = Duration.ofSeconds(6);
             Acquired acquired = fixture.acquire("boot-live", ttl);
-            fixture.keyring.acknowledge(acquired.claim, ttl);
             long proofDeadline = acquired.askedAt + ttl.toNanos();
             long adoptionAt = proofDeadline - Duration.ofSeconds(3).toNanos();
             TimeUnit.NANOSECONDS.sleep(Math.max(0, adoptionAt - System.nanoTime()));
@@ -52,11 +50,11 @@ class NodeSessionLeaseStartupIT {
             assertThat(before.leased()).isTrue();
             assertThat(before.leaseRemaining()).isPositive().isLessThan(interval);
             assertThat(proofDeadline - System.nanoTime()).isPositive().isLessThan(interval.toNanos());
-            TrackingKeyring keyring = new TrackingKeyring(fixture.keyring);
+            TrackingClaims tracked = new TrackingClaims(fixture.claims);
             AtomicInteger stopped = new AtomicInteger();
-            try (NodeSessionLease lease = new NodeSessionLease(fixture.claims, acquired.claim, acquired.askedAt,
-                    ttl, interval, keyring, stopped::incrementAndGet)) {
-                boolean renewed = keyring.acknowledged.await(
+            try (NodeSessionLease lease = new NodeSessionLease(tracked, acquired.claim, acquired.askedAt,
+                    ttl, interval, stopped::incrementAndGet)) {
+                boolean renewed = tracked.renewed.await(
                         Math.max(0, proofDeadline - System.nanoTime()), TimeUnit.NANOSECONDS);
                 assertThat(renewed).as("a still-live late-adopted claim must renew before its original proof expires").isTrue();
                 WorkloadClaimReading after = fixture.claims.read(acquired.claim.key()).orElseThrow();
@@ -76,12 +74,12 @@ class NodeSessionLeaseStartupIT {
             Acquired acquired = fixture.acquire("boot-expired", ttl);
             WorkloadClaimReading before = fixture.awaitRemainingBelow(acquired.claim, Duration.ZERO);
             assertThat(before.leased()).isFalse();
-            TrackingKeyring keyring = new TrackingKeyring(fixture.keyring);
+            TrackingClaims tracked = new TrackingClaims(fixture.claims);
             CountDownLatch stopped = new CountDownLatch(1);
-            try (NodeSessionLease lease = new NodeSessionLease(fixture.claims, acquired.claim, acquired.askedAt,
-                    ttl, Duration.ofMillis(50), keyring, stopped::countDown)) {
+            try (NodeSessionLease lease = new NodeSessionLease(tracked, acquired.claim, acquired.askedAt,
+                    ttl, Duration.ofMillis(50), stopped::countDown)) {
                 assertThat(stopped.await(1, TimeUnit.SECONDS)).isTrue();
-                assertThat(keyring.calls).hasValue(0);
+                assertThat(tracked.calls).hasValue(0);
                 WorkloadClaimReading after = fixture.claims.read(acquired.claim.key()).orElseThrow();
                 assertThat(after.leased()).isFalse();
                 assertThat(after.claim()).isEqualTo(before.claim());
@@ -97,12 +95,12 @@ class NodeSessionLeaseStartupIT {
             assertThat(fixture.claims.release(old.claim)).isTrue();
             Acquired replacement = fixture.acquire("boot-replacement", ttl);
             assertThat(replacement.claim.claimGeneration()).isGreaterThan(old.claim.claimGeneration());
-            TrackingKeyring keyring = new TrackingKeyring(fixture.keyring);
+            TrackingClaims tracked = new TrackingClaims(fixture.claims);
             CountDownLatch stopped = new CountDownLatch(1);
-            try (NodeSessionLease lease = new NodeSessionLease(fixture.claims, old.claim, old.askedAt,
-                    ttl, Duration.ofMillis(100), keyring, stopped::countDown)) {
+            try (NodeSessionLease lease = new NodeSessionLease(tracked, old.claim, old.askedAt,
+                    ttl, Duration.ofMillis(100), stopped::countDown)) {
                 assertThat(stopped.await(1, TimeUnit.SECONDS)).isTrue();
-                assertThat(keyring.calls).hasValue(0);
+                assertThat(tracked.calls).hasValue(1);
             }
             WorkloadClaimReading after = fixture.claims.read(replacement.claim.key()).orElseThrow();
             assertThat(after.leased()).isTrue();
@@ -112,26 +110,35 @@ class NodeSessionLeaseStartupIT {
 
     private record Acquired(WorkloadClaim claim, long askedAt) {}
 
-    private static final class TrackingKeyring implements SourceConfigKeyringSession {
-        private final SourceConfigKeyringSession delegate;
+    private static final class TrackingClaims implements WorkloadClaimStore {
+        private final WorkloadClaimStore delegate;
         private final AtomicInteger calls = new AtomicInteger();
-        private final CountDownLatch acknowledged = new CountDownLatch(1);
+        private final CountDownLatch renewed = new CountDownLatch(1);
 
-        private TrackingKeyring(SourceConfigKeyringSession delegate) { this.delegate = delegate; }
-        @Override
-        public void acknowledge(WorkloadClaim session, Duration ttl) {
-            delegate.acknowledge(session, ttl);
+        private TrackingClaims(WorkloadClaimStore delegate) { this.delegate = delegate; }
+        @Override public java.util.Optional<WorkloadClaim> renew(WorkloadClaim expected, Duration ttl) {
             calls.incrementAndGet();
-            acknowledged.countDown();
+            var result = delegate.renew(expected, ttl);
+            if (result.isPresent()) renewed.countDown();
+            return result;
         }
-        @Override
-        public void release(WorkloadClaim session) { delegate.release(session); }
+        @Override public io.tapstate.spi.store.WorkloadClaimAttempt acquire(WorkloadClaimKey key,
+                WorkloadOwner owner, long topologyRevision, Duration ttl) {
+            return delegate.acquire(key, owner, topologyRevision, ttl);
+        }
+        @Override public boolean release(WorkloadClaim expected) { return delegate.release(expected); }
+        @Override public java.util.Optional<WorkloadClaim> advanceExecution(WorkloadClaim expected,
+                long topologyRevision, java.util.Set<String> executionNodeIds) {
+            return delegate.advanceExecution(expected, topologyRevision, executionNodeIds);
+        }
+        @Override public java.util.Optional<WorkloadClaim> recordExecutionFailure(WorkloadClaim expected,
+                boolean afterMemberLoss) { return delegate.recordExecutionFailure(expected, afterMemberLoss); }
+        @Override public java.util.Optional<WorkloadClaimReading> read(WorkloadClaimKey key) { return delegate.read(key); }
     }
 
     private static final class Fixture implements AutoCloseable {
         private final MongoConnection connection;
         private final WorkloadClaimStore claims;
-        private final SourceConfigKeyringSession keyring;
 
         private Fixture() {
             String database = "lease_adoption_" + UUID.randomUUID().toString().replace("-", "");
@@ -140,7 +147,6 @@ class NodeSessionLeaseStartupIT {
             try {
                 connection.verify();
                 claims = new MongoStorePort(connection, database + "_state").workloadClaims();
-                keyring = connection.sourceConfigKeyring();
             } catch (RuntimeException | Error failure) {
                 connection.close();
                 throw failure;

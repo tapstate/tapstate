@@ -5,23 +5,11 @@ import com.hazelcast.core.HazelcastInstance;
 import java.io.Serializable;
 
 /**
- * Where changes that can never reach a document go.
+ * Where an explicit abandonment decision places changes that cannot be handed on normally.
  *
- * <p>Three things end up here and they are not the same news. A child whose parent row is known deleted,
- * and a child still waiting when that parent is deleted, are past saving: no later event will give them a
- * document to sit in. A child whose parent was established absent — the stream it would have come on
- * finished loading and has been read past the child's own time — is the ordinary shape of a reference
- * pointing nowhere. A child the backstop gave up on is neither: nothing was established, the wait was
- * simply ended so the frontier could move again, and the parent may have been about to arrive. The verdict
- * is what tells them apart, and running them together into one undifferentiated channel leaves whoever
- * reads it unable to see which of "this is how the data is" and "a row may just have been lost" they are
- * looking at.
- *
- * <p>They must still go somewhere. Dropping them loses data that no assertion about a document can ever
- * see, because those rows were never going to appear in one - and holding them instead would pin the
- * durable frontier for events that will never be emitted.
- *
- * <p>Whoever builds the vertex decides where they go; the vertex only insists that they go.
+ * <p>An ordinary missing or deleted parent is not such a decision: its children wait in durable state
+ * for a later declaration. Separate relocation ownership rules can still abandon an unclaimed
+ * handover. Whoever owns that decision must write the changes here before reclaiming their last copy.
  */
 @FunctionalInterface
 public interface NestDeadLetter extends Serializable {

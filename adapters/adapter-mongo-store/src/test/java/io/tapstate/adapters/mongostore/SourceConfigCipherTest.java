@@ -30,6 +30,19 @@ class SourceConfigCipherTest {
     }
 
     @Test
+    void binaryPayloadRoundTripsWithoutUtf8ConversionOrChangingCallerMemory() {
+        SourceConfigCipher cipher = new SourceConfigCipher(key((byte) 1));
+        byte[] original = new byte[256];
+        for (int i = 0; i < original.length; i++) original[i] = (byte) i;
+        byte[] before = original.clone();
+        String envelope = cipher.encryptBytes("source-a", "binary", original);
+        assertThat(original).isEqualTo(before);
+        assertThat(cipher.decryptBytes("source-a", "binary", envelope)).isEqualTo(before);
+        unreadable(() -> cipher.decryptBytes("source-b", "binary", envelope));
+        unreadable(() -> cipher.decryptBytes("source-a", "text", envelope));
+    }
+
+    @Test
     void sourceAndConnectorSwapsAndCiphertextTamperingFailClosedWithoutSecretDiagnostics() {
         SourceConfigCipher cipher = new SourceConfigCipher(key((byte) 1));
         String envelope = cipher.encrypt("source-a", "connector-a", JSON);

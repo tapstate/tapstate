@@ -12,6 +12,9 @@ import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -112,6 +115,21 @@ class HttpControlClientTest {
     }
 
     @Test
+    void deletionWaitsForRetirementWithinTheHeavyBudgetWithoutRetrying() throws Exception {
+        var calls = new java.util.concurrent.atomic.AtomicInteger();
+        HttpServer server = server(exchange -> {
+            calls.incrementAndGet();
+            try { Thread.sleep(400); } catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
+            answer(exchange, 204, "");
+        });
+        try (var client = new HttpControlClient(Duration.ofMillis(100), Duration.ofSeconds(2))) {
+            assertThat(client.delete(baseOf(server), "secret", "/api/artifacts/flow", "a".repeat(64)))
+                    .isInstanceOf(ControlResponse.Success.class);
+            assertThat(calls.get()).isEqualTo(1);
+        } finally { server.stop(0); }
+    }
+
+    @Test
     void codedHttpFailureRetainsStatusCodeMessageAndParams() throws Exception {
         HttpServer server = server(exchange -> answer(exchange, 403,
                 "{\"code\":\"control.forbidden\",\"message\":\"Forbidden.\","
@@ -121,6 +139,41 @@ class HttpControlClientTest {
 
             assertThat(response).isEqualTo(new ControlResponse.Rejected(
                     403, "control.forbidden", "Forbidden.", Map.of("required", "admin")));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void aRefusalKeepsWhatItCarriedBesidesItsCodeMessageAndParams() throws Exception {
+        HttpServer server = server(exchange -> answer(exchange, 409,
+                "{\"code\":\"lifecycle.start-needs-confirmation\",\"message\":\"Answer first.\","
+                        + "\"params\":{\"pipeline\":\"orders\"},\"startChecks\":{\"outcome\":\"NEEDS_CONFIRMATION\"}}"));
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+            ControlResponse response = client.post(baseOf(server), "token", "/api/pipelines/orders:start", null,
+                    RequestBudget.HEAVY);
+
+            assertThat(response).isEqualTo(new ControlResponse.Rejected(409, "lifecycle.start-needs-confirmation",
+                    "Answer first.", Map.of("pipeline", "orders"),
+                    Map.of("startChecks", Map.of("outcome", "NEEDS_CONFIRMATION"))));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void aPostCarriesThePreconditionAsAnEntityTagAndNoneWhenThereIsNone() throws Exception {
+        List<String> preconditions = Collections.synchronizedList(new ArrayList<>());
+        HttpServer server = server(exchange -> {
+            preconditions.add(String.valueOf(exchange.getRequestHeaders().getFirst("If-Match")));
+            answer(exchange, 200, "{}");
+        });
+        try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(1), Duration.ofSeconds(2))) {
+            client.post(baseOf(server), "token", "/api/pipelines/orders:start", Map.of("decisions", List.of()),
+                    RequestBudget.HEAVY, "c".repeat(64));
+            client.post(baseOf(server), "token", "/api/pipelines/orders:start", null, RequestBudget.HEAVY);
+
+            assertThat(preconditions).containsExactly("\"" + "c".repeat(64) + "\"", "null");
         } finally {
             server.stop(0);
         }

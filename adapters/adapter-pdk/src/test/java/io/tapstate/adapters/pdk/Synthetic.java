@@ -95,6 +95,29 @@ final class Synthetic {
                 source("BlockingDiscoverySource", "", register, members, discovery, "stopped = true;"));
     }
 
+    /** The real plugin stop waits on a host-owned gate, independently of its completed metadata worker. */
+    static Path gatedStopSource(Path dir, String channel) {
+        String register = "functions.supportBatchRead((context,table,offset,size,consumer) -> {});"
+                + "functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
+                + "  throw new AssertionError(\"stream read must not start after a host refusal\"); });";
+        String discovery = "TapTable table = new TapTable(\"t1\");table.add(new TapField(\"id\", \"int\"));s.accept(List.of(table));";
+        String stop = "((java.util.concurrent.CountDownLatch)System.getProperties().get(\"" + channel + ".entered\")).countDown();"
+                + "boolean interrupted=false;for(;;)try{((java.util.concurrent.CountDownLatch)System.getProperties().get(\"" + channel + ".release\")).await();break;}"
+                + "catch(InterruptedException ignored){interrupted=true;}"
+                + "((java.util.concurrent.CountDownLatch)System.getProperties().get(\"" + channel + ".ended\")).countDown();"
+                + "if(interrupted)Thread.currentThread().interrupt();";
+        return SyntheticJar.compileToJar(dir, "synthetic.GatedStopSource", source("GatedStopSource", "", register, "", discovery, stop));
+    }
+
+    /** A transient failure belongs to the original plugin instance; a second stop on it succeeds. */
+    static Path retryingStopSource(Path dir, String channel) {
+        String register = "functions.supportStreamRead((context,tables,offset,size,consumer) -> {throw new AssertionError();});";
+        String discovery = "TapTable table=new TapTable(\"t1\");table.add(new TapField(\"id\",\"int\"));s.accept(List.of(table));";
+        String stop = "if(((java.util.concurrent.atomic.AtomicInteger)System.getProperties().get(\""+channel+"\")).incrementAndGet()==1)"
+                + "throw new IllegalStateException(\"synthetic transient stop failure\");";
+        return SyntheticJar.compileToJar(dir,"synthetic.RetryingStopSource",source("RetryingStopSource","",register,"",discovery,stop));
+    }
+
     /** A stream source whose discovered table and column names are supplied by the caller. */
     static Path namedStreamSource(Path dir, String table, String column) {
         String register = "functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
@@ -594,6 +617,11 @@ final class Synthetic {
      * having first, with {@code writeAfterInterrupt}, tried to write a note, reporting under {@code lateWrite}
      * whether the write was taken.
      */
+    static Path originMutatingConnector(Path dir, String channel) {
+        return SyntheticJar.compileToJar(dir, "synthetic.OriginMutating",
+                source("OriginMutating", "((Runnable) System.getProperties().get(\"" + channel + "\")).run();", ""));
+    }
+
     static Path slotKeepingSource(Path dir, String channel) {
         String register = ""
                 + "functions.supportBatchRead((context, table, offset, size, consumer) -> {"
@@ -609,6 +637,7 @@ final class Synthetic {
                 + "  consumer.accept(evs, null);"
                 + "});"
                 + "functions.supportReleaseExternalFunction(context -> {"
+                + "  channel().put(\"releaseSettings\", new LinkedHashMap<>(context.getConnectionConfig()));"
                 + "  @SuppressWarnings(\"unchecked\") List<Object> released = (List<Object>) channel().get(\"released\");"
                 + "  released.add(String.valueOf(context.getStateMap().get(\"tapdata_pg_slot\")));"
                 + "  if (channel().containsKey(\"hang\")) {"
@@ -915,11 +944,20 @@ final class Synthetic {
     private static final String LIFECYCLE_WRITES = "functions.supportWriteRecord((c, e, t, r) -> { mark(\"write\");"
             + "  r.accept(new io.tapdata.pdk.apis.entity.WriteListResult<>((long) e.size(), 0L, 0L)); });";
 
+    static Path lifecycleSinkThatLosesAuthorityOnActivation(Path dir, Path trace, String channel) {
+        return lifecycleSink(dir, trace, "ActivationLosingSink", LIFECYCLE_WRITES, "mark(\"init\");",
+                "((java.util.concurrent.atomic.AtomicBoolean) System.getProperties().get(\"" + channel + "\")).set(false);");
+    }
+
     private static Path lifecycleSink(Path dir, Path trace, String simpleName, String register, String init) {
+        return lifecycleSink(dir, trace, simpleName, register, init, "");
+    }
+
+    private static Path lifecycleSink(Path dir, Path trace, String simpleName, String register, String init, String ctor) {
         String members = "private void mark(String value) throws Exception {"
                 + "java.nio.file.Files.writeString(java.nio.file.Path.of(\"" + trace + "\"), value + \"\\n\","
                 + "java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND); }";
-        String code = source(simpleName, "", register, members)
+        String code = source(simpleName, ctor, register, members)
                 .replace("public void init(TapConnectionContext c) {}",
                         "public void init(TapConnectionContext c) throws Throwable { " + init + " }")
                 .replace("public void stop(TapConnectionContext c) {}",
@@ -1279,6 +1317,13 @@ final class Synthetic {
         return SyntheticJar.compileToJar(dir, "synthetic.CountingDiscoverable",
                 discoverSource("CountingDiscoverable", ORDERS_TABLE,
                         "functions.supportBatchCount((context, table) -> 4200000L);"));
+    }
+
+    /** Structural recovery probes must never invoke this count callback. */
+    static Path countTracingDiscoverableSource(Path dir) {
+        return SyntheticJar.compileToJar(dir,"synthetic.TracingCount",
+                discoverSource("TracingCount",ORDERS_TABLE,"functions.supportBatchCount((context, table) -> {"
+                        + "java.nio.file.Files.writeString(java.nio.file.Path.of((String)context.getConnectionConfig().get(\"countTrace\")),\"counted\");return 7L;});"));
     }
 
     /** The two-table discoverSchema body the multi-table counting fixtures share. */

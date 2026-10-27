@@ -8,6 +8,7 @@ import io.tapstate.control.core.LivePipelines;
 import io.tapstate.control.core.SchemaDerivation;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.core.model.PipelineResource;
@@ -55,11 +56,21 @@ final class StoreBackedDerivedSchemas implements DerivedSchemas, SchemaDerivatio
     private final StorePort storePort;
     private final StoreBackedDagSource joins;
     private final AuditGate auditGate;
+    @FunctionalInterface interface Commands { Command bind(String pipeline); }
+    record Command(StorePort ports, Runnable release) implements AutoCloseable {
+        Command { Objects.requireNonNull(ports); Objects.requireNonNull(release); }
+        @Override public void close() { release.run(); }
+    }
+    private final Commands commands;
 
     StoreBackedDerivedSchemas(StorePort storePort, AuditGate auditGate) {
+        this(storePort, auditGate, null);
+    }
+    StoreBackedDerivedSchemas(StorePort storePort, AuditGate auditGate, Commands commands) {
         this.storePort = Objects.requireNonNull(storePort, "storePort");
         this.auditGate = Objects.requireNonNull(auditGate, "auditGate");
         this.joins = new StoreBackedDagSource(storePort);
+        this.commands = commands;
     }
 
     @Override
@@ -113,24 +124,36 @@ final class StoreBackedDerivedSchemas implements DerivedSchemas, SchemaDerivatio
         refuseUnlessAtRest(pipelineId);
         auditGate.dispatch(ControlOperations.PIPELINE_ACCEPT_DERIVED_SCHEMA,
                 new AuditContext(principal, pipelineId), () -> {
-                    // The physical model first, then everything worked out from it. This order is what
-                    // makes the act one thing rather than two: a re-derivation over source copies that
-                    // were not refreshed records today's answer to yesterday's question, and the report
-                    // afterwards agrees with itself while agreeing with nothing outside.
-                    joins.copySourceSchemas(pipelineId);
-                    // Recorded through the same class the gate records through, so accepting cannot
-                    // write a shape a start would then refuse - which is what a second write path here
-                    // would eventually do.
-                    JoinSchemaDrift accepting = new JoinSchemaDrift(storePort.derivedSchemas());
-                    joins.compiledJoinsOf(pipelineId).forEach((stepId, compiled) -> accepting.record(
-                            pipelineId, stepId, compiled.body(), compiled.plan(), compiled.tables()));
-                    joins.refreshStepSchemas(pipelineId);
+                    if (commands == null) acceptModels(pipelineId);
+                    else try (var command = commands.bind(pipelineId)) {
+                        var fixed = new StoreBackedDerivedSchemas(command.ports(), auditGate);
+                        fixed.refuseUnlessAtRest(pipelineId); fixed.acceptModels(pipelineId);
+                    }
                     return null;
                 });
     }
 
+    private void acceptModels(String pipelineId) {
+        // The physical model first, then everything worked out from it. This order is what
+        // makes the act one thing rather than two: a re-derivation over source copies that
+        // were not refreshed records today's answer to yesterday's question, and the report
+        // afterwards agrees with itself while agreeing with nothing outside.
+        joins.copySourceSchemas(pipelineId);
+        // Recorded through the same class the gate records through, so accepting cannot
+        // write a shape a start would then refuse - which is what a second write path here
+        // would eventually do.
+        JoinSchemaDrift accepting = new JoinSchemaDrift(storePort.derivedSchemas());
+        joins.compiledJoinsOf(pipelineId).forEach((stepId, compiled) -> accepting.record(
+                pipelineId, stepId, compiled.body(), compiled.plan(), compiled.tables()));
+        joins.refreshStepSchemas(pipelineId);
+    }
+
     @Override
     public void derive(String pipelineId) {
+        if (commands != null) {
+            try (var command = commands.bind(pipelineId)) { new StoreBackedDerivedSchemas(command.ports(), auditGate).derive(pipelineId); }
+            return;
+        }
         Objects.requireNonNull(pipelineId, "pipelineId");
         // Apply converts this coded refusal into a warning after committing its artifacts. The held
         // run keeps its models; pipelines that are at rest can still refresh in the same batch.
@@ -145,11 +168,13 @@ final class StoreBackedDerivedSchemas implements DerivedSchemas, SchemaDerivatio
      * states must be at rest before any record is moved.
      */
     private void refuseUnlessAtRest(String pipelineId) {
-        PipelineState actual = actualStateOf(pipelineId);
-        PipelineState desired = desiredStateOf(pipelineId);
+        CheckpointDoc actual = storePort.state().read(pipelineId).orElse(null);
+        DesiredState desired = storePort.desired().read(pipelineId).orElse(null);
         if (!LivePipelines.isAtRest(actual, desired)) {
             throw new TapstateException(ActuationError.SCHEMA_SYNC_WHILE_RUNNING,
-                    Map.of("pipeline", pipelineId, "state", actual.name(), "desired", desired.name()),
+                    Map.of("pipeline", pipelineId,
+                            "state", actual == null ? PipelineState.NEW.name() : StateJson.parse(actual.stateJson()).name(),
+                            "desired", desired == null ? PipelineState.NEW.name() : desired.targetState().name()),
                     null);
         }
     }
@@ -178,12 +203,6 @@ final class StoreBackedDerivedSchemas implements DerivedSchemas, SchemaDerivatio
     private PipelineState actualStateOf(String pipelineId) {
         return storePort.state().read(pipelineId)
                 .map(checkpoint -> StateJson.parse(checkpoint.stateJson()))
-                .orElse(PipelineState.NEW);
-    }
-
-    private PipelineState desiredStateOf(String pipelineId) {
-        return storePort.desired().read(pipelineId)
-                .map(DesiredState::targetState)
                 .orElse(PipelineState.NEW);
     }
 

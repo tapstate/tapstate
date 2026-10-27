@@ -51,7 +51,20 @@ final class FencedSinkWriterFactory implements SupplierEx<SinkWriter> {
 
     @Override
     public SinkWriter getEx() throws Exception {
-        return guarded(delegate.get(), fence, ExecutionAuthorization.local());
+        ExecutionAuthorization authorization = ExecutionAuthorization.local();
+        authorization.require(fence);
+        SinkWriter opened = delegate.get();
+        try {
+            authorization.require(fence);
+            return guarded(opened, fence, authorization);
+        } catch (RuntimeException | Error failure) {
+            try {
+                opened.close();
+            } catch (RuntimeException | Error cleanup) {
+                if (cleanup != failure) failure.addSuppressed(cleanup);
+            }
+            throw failure;
+        }
     }
 
     /** {@code writer}, asking {@code authorization} for {@code fence}'s run before each batch. */

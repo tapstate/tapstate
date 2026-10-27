@@ -67,6 +67,9 @@ public final class SrsRingReader {
         this.cursor = startSeq;
     }
 
+    /** The run-local next read position, used only to save an initial arrival before any fill; it is not an ACK. */
+    public long nextReadSequence() { return cursor; }
+
     /**
      * A reader positioned by a {@code start} point resolved against the ring: {@code earliest} at the head
      * (replay everything buffered), {@code latest} just past the tail (only changes appended from now on),

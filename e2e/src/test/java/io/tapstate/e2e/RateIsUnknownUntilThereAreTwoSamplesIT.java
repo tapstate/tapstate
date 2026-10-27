@@ -49,9 +49,9 @@ class RateIsUnknownUntilThereAreTwoSamplesIT {
 
     @Test
     void aWatchOpensNotKnowingAndThenSaysANumberAndAOneShotStatusSaysOne(@TempDir Path directory) throws Exception {
-        String storeUri = SharedMongo.replicaSetUrl("rate_two_samples_state");
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(storeUri)) {
-            RunningPipeline running = RunningPipeline.started(server, directory);
+        try (PreparedNativeStore storage = PreparedNativeStore.create(USER, PASSWORD);
+             ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
+            RunningPipeline running = RunningPipeline.started(server, directory, storage);
             String pipelineId = running.pipelineId();
 
             try (CliProcess watch = CliProcess.onAPipe(Map.of("TAPSTATE_PASSWORD", PASSWORD),

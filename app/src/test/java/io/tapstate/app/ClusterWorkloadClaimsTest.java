@@ -138,6 +138,30 @@ class ClusterWorkloadClaimsTest {
         assertThat(raw.calls).hasValue(1);
     }
 
+    @Test
+    void stoppedSingleControlRenewalCannotGrantBusinessOrOutliveItsOriginalNode() {
+        var gate = new ClusterMembershipGate(new ClusterProperties());
+        var node = new WorkloadClaim(new WorkloadClaimKey("node-a", WorkloadClaimType.NODE_SESSION, "node-a"),
+                OWNER, 1, 0, 0, Instant.now().plus(TTL));
+        var active = new java.util.concurrent.atomic.AtomicBoolean(true);
+        gate.bindSingle(node); gate.observeNodeSession(active::get); gate.observeDataPlane(() -> false);
+        var raw = new RecordingClaims(); var claims = new ClusterWorkloadClaims(raw, gate);
+        var pipeline = raw.claim(new WorkloadClaimKey("node-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders"));
+        assertThat(claims.renewActuationControl(pipeline, TTL)).contains(pipeline);
+        assertThat(claims.renew(pipeline, TTL)).isEmpty();
+        assertThat(claims.acquire(pipeline.key(), OWNER, 1, TTL)).isEmpty();
+        assertThat(claims.advanceExecution(pipeline, 1, Set.of("node-a"))).isEmpty();
+        assertThat(claims.read(pipeline.key())).isEmpty();
+        assertThat(claims.renewActuationControl(raw.claim(new WorkloadClaimKey("node-a", WorkloadClaimType.CAPTURE, "tail")), TTL)).isEmpty();
+        assertThat(claims.renewActuationControl(raw.claim(new WorkloadClaimKey("another", WorkloadClaimType.PIPELINE_ACTUATION, "orders")), TTL)).isEmpty();
+        assertThat(claims.renewActuationControl(new WorkloadClaim(pipeline.key(), new WorkloadOwner("node-a", "old-boot"),
+                1, 0, 1, Instant.now().plus(TTL)), TTL)).isEmpty();
+        assertThat(raw.calls).hasValue(1);
+        active.set(false);
+        assertThat(claims.renewActuationControl(pipeline, TTL)).isEmpty();
+        assertThat(raw.calls).hasValue(1);
+    }
+
     private static ClusterMembershipGate productionGate() {
         ClusterProperties properties = new ClusterProperties();
         properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);

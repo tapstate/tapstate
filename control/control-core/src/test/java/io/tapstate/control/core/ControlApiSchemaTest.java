@@ -14,13 +14,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ControlApiSchemaTest {
 
     private static final Set<String> MCP_OPERATIONS = Set.of(
-            "system.version",
+            "storage.status", "storage.test", "storage.setup.commit", "storage.setup.status", "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status",
+            "configuration.export", "configuration.import.preflight", "configuration.import.commit", "configuration.import.status", "system.version",
             "connector.list", "connector.get",
             "source.draft", "source.list",
             "connection.test", "connection.test-result", "connection.discover-schema", "connection.schema",
             "artifact.validate", "artifact.apply", "artifact.delete", "artifact.get",
-            "pipeline.list", "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume",
-            "pipeline.status", "pipeline.metrics",
+            "pipeline.list", "pipeline.start", "pipeline.start-checks", "pipeline.stop", "pipeline.pause",
+            "pipeline.resume", "pipeline.status", "pipeline.metrics",
             "pipeline.snapshot", "pipeline.logs", "pipeline.metrics.history", "pipeline.explain",
             "data-browser.collections", "data-browser.find", "data-browser.stats");
 

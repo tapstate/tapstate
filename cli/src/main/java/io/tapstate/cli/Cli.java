@@ -129,6 +129,10 @@ public final class Cli implements Runnable {
     static final String DATA_BROWSER_VERB = "data-browser";
 
     public static final Map<String, String> VERB_BY_OPERATION = Map.ofEntries(
+            Map.entry("storage.status", "storage"), Map.entry("storage.test", "storage"), Map.entry("storage.setup.commit", "storage"), Map.entry("storage.setup.status", "storage"),
+            Map.entry("storage.recovery.plan", "storage"), Map.entry("storage.recovery.confirm", "storage"), Map.entry("storage.recovery.status", "storage"),
+            Map.entry("configuration.export", "configuration"),
+            Map.entry("configuration.import.preflight", "configuration"), Map.entry("configuration.import.commit", "configuration"), Map.entry("configuration.import.status", "configuration"),
             Map.entry("data-browser.collections", DATA_BROWSER_VERB),
             Map.entry("data-browser.find", DATA_BROWSER_VERB),
             Map.entry("data-browser.stats", DATA_BROWSER_VERB),
@@ -149,6 +153,9 @@ public final class Cli implements Runnable {
             Map.entry("token.list", "token"),
             Map.entry("token.revoke", "token"),
             Map.entry("pipeline.start", "start"),
+            // Read through the start verb itself, as start --checks-only: what a start would be asked is
+            // looked at where the start is made.
+            Map.entry("pipeline.start-checks", "start"),
             Map.entry("pipeline.stop", "stop"),
             Map.entry("pipeline.pause", "pause"),
             Map.entry("pipeline.resume", "resume"),
@@ -232,6 +239,8 @@ public final class Cli implements Runnable {
      * that only some of these verbs accept.
      */
     static final Map<String, VerbHelp> VERB_HELP = Map.ofEntries(
+            Map.entry("storage", new VerbHelp("<status|test|setup ACTION|recovery ACTION> [--file request.json]", "Query storage or submit one confirmed operation; request secrets stay in the file.")),
+            Map.entry("configuration", new VerbHelp("export|import <preflight|commit|status> --file request.json", "Export encrypted configuration, or preflight, confirm, and query an import by its original ID.")),
             Map.entry("apply", new VerbHelp("[<path>] [--if-match <hash>]",
                     "Upload the workspace, or one artifact, creating or updating each resource.")),
             Map.entry("get", new VerbHelp("<id>",
@@ -254,12 +263,16 @@ public final class Cli implements Runnable {
                     "Show a connection's discovered schema, or one table of it.")),
             Map.entry("token", new VerbHelp("<create|list|revoke> [ARGS...] [-o text|json|yaml]",
                     "Create, list, or revoke machine tokens.")),
-            Map.entry("start", new VerbHelp("<pipeline-id>",
-                    "Start a pipeline.")),
+            Map.entry("start", new VerbHelp(
+                    "<pipeline-id> [-y] [--decide <check>[/<subject>]=<answer>]... [--checks-only] [-o text|json|yaml]",
+                    "Start a pipeline after its start checks: answer their questions at the terminal, with "
+                            + "--decide, or with -y to go ahead as configured; --checks-only only shows them.")),
             Map.entry("stop", new VerbHelp("<pipeline-id> [--keep-state] [-y]",
                     "Stop a pipeline and clear what it accumulated; --keep-state keeps it.")),
-            Map.entry("restart", new VerbHelp("<pipeline-id> [--rerun] [-y]",
-                    "Cycle a pipeline and carry on; --rerun reads the whole source again.")),
+            Map.entry("restart", new VerbHelp(
+                    "<pipeline-id> [--rerun] [-y] [--decide <check>[/<subject>]=<answer>]...",
+                    "Cycle a pipeline and carry on; --rerun reads the whole source again, asking its start "
+                            + "checks before anything is stopped.")),
             Map.entry("pause", new VerbHelp("<pipeline-id>",
                     "Pause a running pipeline, holding its position.")),
             Map.entry("resume", new VerbHelp("<pipeline-id>",

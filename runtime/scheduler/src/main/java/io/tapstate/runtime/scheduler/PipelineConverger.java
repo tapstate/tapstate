@@ -7,12 +7,17 @@ import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.spi.store.DesiredStore;
+import io.tapstate.spi.store.PipelineIntentSnapshot;
+import io.tapstate.spi.store.IoError;
+import java.util.Map;
 import io.tapstate.spi.store.StateStore;
 
 import java.time.Clock;
 import java.util.Collection;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.Consumer;
+import java.util.function.BooleanSupplier;
 
 /**
  * Converges a pipeline's actual state toward its desired intent. It reads the desired target, seeds
@@ -33,6 +38,9 @@ public final class PipelineConverger {
     private final LifecycleActuator actuator;
     private final Clock clock;
     private final RebuildAdmission rebuilds;
+    private final boolean requirePreparedState;
+    private final Consumer<String> beforeCompletion;
+    private final BooleanSupplier stillOriginalIntent;
 
     /** A converge loop that never rebuilds a failed run, which is every run on a single node. */
     public PipelineConverger(DesiredStore desired, StateStore state, LifecycleActuator actuator, Clock clock) {
@@ -42,11 +50,27 @@ public final class PipelineConverger {
     public PipelineConverger(
             DesiredStore desired, StateStore state, LifecycleActuator actuator, Clock clock,
             RebuildAdmission rebuilds) {
+        this(desired, state, actuator, clock, rebuilds, pipeline -> { });
+    }
+
+    /** Records the final confirmed observation before completion releases the run's live readings. */
+    public PipelineConverger(
+            DesiredStore desired, StateStore state, LifecycleActuator actuator, Clock clock,
+            RebuildAdmission rebuilds, Consumer<String> beforeCompletion) {
+        this(desired, state, actuator, clock, rebuilds, false, beforeCompletion, () -> false);
+    }
+
+    private PipelineConverger(DesiredStore desired, StateStore state, LifecycleActuator actuator, Clock clock,
+            RebuildAdmission rebuilds, boolean requirePreparedState, Consumer<String> beforeCompletion,
+            BooleanSupplier stillOriginalIntent) {
+        this.requirePreparedState = requirePreparedState;
         this.desired = Objects.requireNonNull(desired, "desired");
         this.state = Objects.requireNonNull(state, "state");
         this.actuator = Objects.requireNonNull(actuator, "actuator");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.rebuilds = Objects.requireNonNull(rebuilds, "rebuilds");
+        this.beforeCompletion = Objects.requireNonNull(beforeCompletion, "beforeCompletion");
+        this.stillOriginalIntent = Objects.requireNonNull(stillOriginalIntent, "stillOriginalIntent");
     }
 
     /** Tells the rebuild admission which pipelines are still desired, so it forgets the rest. */
@@ -56,7 +80,30 @@ public final class PipelineConverger {
 
     /** Drives the pipeline's actual state toward its current desired target, seeding it if new. */
     public ConvergeResult converge(String pipelineId) {
-        Optional<DesiredState> intent = desired.read(pipelineId);
+        return converge(pipelineId, desired.read(pipelineId));
+    }
+
+    /**
+     * Consumes one captured CONFIG intent and this pass's bound ports. Retries read only those ports;
+     * neither a newer intent nor another physical state can be adopted in the middle of this pass.
+     * Initial checkpoints belong to controlled preparation, never ordinary scoped convergence.
+     */
+    public ConvergeResult convergeScoped(PipelineIntentSnapshot intent, StateStore scopedState,
+            LifecycleActuator scopedActuator, RebuildAdmission scopedRebuilds) {
+        // Without a current CONFIG authority, this entry cannot publish a terminal completion.
+        return convergeScoped(intent, scopedState, scopedActuator, scopedRebuilds, ignored -> {}, () -> false);
+    }
+
+    /** Completion retains the final scoped reading and rejects a changed original CONFIG intent. */
+    public ConvergeResult convergeScoped(PipelineIntentSnapshot intent, StateStore scopedState,
+            LifecycleActuator scopedActuator, RebuildAdmission scopedRebuilds, Consumer<String> finalObservation,
+            BooleanSupplier currentIntent) {
+        Objects.requireNonNull(intent, "intent");
+        return new PipelineConverger(desired, scopedState, scopedActuator, clock, scopedRebuilds, true, finalObservation, currentIntent)
+                .converge(intent.scope().pipelineId(), Optional.ofNullable(intent.desired()));
+    }
+
+    private ConvergeResult converge(String pipelineId, Optional<DesiredState> intent) {
         if (intent.isEmpty()) {
             return ConvergeResult.nothingToDo();
         }
@@ -77,15 +124,17 @@ public final class PipelineConverger {
         // An epoch that has already moved on is not a lost instruction: it means the stop was
         // converged after all, and then what is wanted is exactly the ordinary start below.
         Long stampedAt = intent.get().rebuiltAtStateEpoch();
-        boolean rebuildOwed = reassemble && stampedAt != null
-                && actualDoc.map(CheckpointDoc::epoch).orElse(-1L).equals(stampedAt);
-        boolean rebuild = reassemble && (stampedAt == null || rebuildOwed);
+        // A native clearing operation is consumed only by CONFIG successor completion, which clears
+        // purgeState. An earlier STOP may have moved the CACHE epoch without finishing replacement.
+        boolean nativeClearingStart = requirePreparedState && target == PipelineState.RUNNING && purgeState;
+        boolean rebuildOwed = nativeClearingStart || intent.get().rebuildOwedAt(actualDoc.orElse(null));
+        boolean rebuild = nativeClearingStart || reassemble && (stampedAt == null || rebuildOwed);
 
         // An owed restart must reach the fenced stop/start below before checking the old run.
         // Recording that run's failure would advance the epoch without carrying out the restart,
         // consuming its accepted start and any clearing the user requested.
         if (target == PipelineState.RUNNING && actual == PipelineState.RUNNING && !rebuildOwed) {
-            return convergeRunning(pipelineId, actualDoc.orElseThrow(), purgeState, rebuild);
+            return convergeRunning(pipelineId, actualDoc.orElseThrow(), purgeState, rebuild, intent.get());
         }
 
         if (target == PipelineState.PAUSED && actual == PipelineState.PAUSED) {
@@ -110,14 +159,19 @@ public final class PipelineConverger {
             // out. Driving it would start the whole run again -- on this tick, and on every tick after
             // it, since each new run reaches the same end. Running it again is a user's stop and start,
             // which arrives as the one instruction handled above.
+            actuator.retryCompletion(pipelineId);
             return ConvergeResult.converged(actualDoc.orElseThrow());
         }
 
-        return driveTo(pipelineId, target, true, actualDoc.orElse(null), purgeState, rebuild, rebuildOwed);
+        // Native replacement consumes the explicit clearing flag in the successor CONFIG intent.
+        // STOPPED alone proves no clearing: a prior keeping stop may already have reached it.
+        boolean clearRetainedState = requirePreparedState && target == PipelineState.STOPPED && purgeState;
+        return driveTo(pipelineId, target, true, actualDoc.orElse(null), purgeState, rebuild,
+                rebuildOwed || clearRetainedState);
     }
 
     private ConvergeResult convergeRunning(
-            String pipelineId, CheckpointDoc current, boolean purgeState, boolean rebuild) {
+            String pipelineId, CheckpointDoc current, boolean purgeState, boolean rebuild, DesiredState intent) {
         // A pipeline believed running whose job has died converges to the observable FAILED state,
         // rather than reporting RUNNING over a dead job. The failure cause rides out on the result so
         // the driver can surface it. A converge-side transition, never a user verb.
@@ -127,6 +181,18 @@ public final class PipelineConverger {
             return driven.checkpoint()
                     .map(checkpoint -> ConvergeResult.failed(checkpoint, failure.get()))
                     .orElse(driven);
+        }
+        Optional<LifecycleActuator.Completion> completion = actuator.completion(pipelineId);
+        if (completion.isPresent()) {
+            // Success belongs to this execution, not to an intent that can be retried on a new epoch.
+            // Save the final reading while capture is still present, then prove the run and intent again.
+            beforeCompletion.accept(pipelineId);
+            if (!actuator.completion(pipelineId).equals(completion)
+                    || !(requirePreparedState ? stillOriginalIntent.getAsBoolean()
+                            : desired.read(pipelineId).filter(intent::equals).isPresent())) {
+                return ConvergeResult.superseded();
+            }
+            return completeRun(pipelineId, current, completion.orElseThrow());
         }
         // Nothing failed and nothing is carrying it: this process has come up to a checkpoint an
         // earlier one wrote. The state already matches the intent, so the drive below would call
@@ -152,6 +218,21 @@ public final class PipelineConverger {
             return ConvergeResult.converged(current);
         }
         return driveTo(pipelineId, PipelineState.RUNNING, true, current, purgeState, rebuild, false);
+    }
+
+    private ConvergeResult completeRun(
+            String pipelineId, CheckpointDoc current, LifecycleActuator.Completion completion) {
+        CasOutcome outcome = completion.fence() == null
+                ? state.compareAndSwap(pipelineId, current.epoch(), StateJson.of(PipelineState.COMPLETED), clock.instant())
+                : state.compareAndSwap(pipelineId, current.epoch(), StateJson.of(PipelineState.COMPLETED),
+                        clock.instant(), completion.fence());
+        if (!(outcome instanceof CasOutcome.Applied applied)) {
+            return ConvergeResult.superseded();
+        }
+        // Cleanup failures are reconcile failures, not a new verdict about the successful data run.
+        // A later completed pass retries cleanup without consuming another lifecycle epoch.
+        actuator.complete(pipelineId, completion);
+        return ConvergeResult.converged(applied.next());
     }
 
     private ConvergeResult convergeFailed(String pipelineId, PipelineState target, CheckpointDoc current) {
@@ -197,6 +278,7 @@ public final class PipelineConverger {
             boolean purgeState, boolean rebuild, boolean evenIfAlreadyThere) {
         String targetJson = StateJson.of(target);
         if (current == null) {
+            if (requirePreparedState) throw missingCheckpoint(pipelineId);
             if (!seedIfAbsent) {
                 return ConvergeResult.nothingToDo();
             }
@@ -222,6 +304,7 @@ public final class PipelineConverger {
                 try {
                     actuate(pipelineId, from, target, purgeState, rebuild);
                 } catch (TapstateException refused) {
+                    if(target==PipelineState.COMPLETED)return ConvergeResult.failed(applied.next(),refused);
                     // The job side refused with a diagnosis. Record it the way a job that died is recorded,
                     // because to everyone reading the product they are the same event: the pipeline is not
                     // going to run, and here is why. Letting it escape instead leaves the pass to abort
@@ -241,10 +324,10 @@ public final class PipelineConverger {
             if (current.stateJson().equals(targetJson)) {
                 return ConvergeResult.converged(current);
             }
-            if (target == PipelineState.FAILED) {
+            if (target == PipelineState.FAILED || target == PipelineState.COMPLETED) {
                 // Every other target is an intent, and an intent survives being fenced: it is still what
-                // is wanted, so rebasing onto the fresh epoch and asking again is right. FAILED is not an
-                // intent -- it is a conclusion about the state that was read, and being fenced means that
+                // is wanted, so rebasing onto the fresh epoch and asking again is right. A terminal result is
+                // a conclusion about the state that was read, and being fenced means that
                 // state is no longer there. Re-driving it would record a failure over whatever the other
                 // writer just landed (a user's stop, most often), actuate a second stop for it, and be
                 // corrected by the next pass: one tick of a pipeline reading failed that nothing failed,
@@ -291,7 +374,8 @@ public final class PipelineConverger {
                 }
             }
             case PAUSED -> actuator.pause(pipelineId);
-            case STOPPED, COMPLETED, FAILED -> actuator.stop(pipelineId, purgeState);
+            case STOPPED, FAILED -> actuator.stop(pipelineId, purgeState);
+            case COMPLETED -> actuator.complete(pipelineId);
             case NEW -> {
                 // The seed state is written through create(), never a compare-and-swap target, so it
                 // never reaches this actuation path.
@@ -314,6 +398,12 @@ public final class PipelineConverger {
 
     private CheckpointDoc requireCheckpoint(String pipelineId) {
         return state.read(pipelineId)
-                .orElseThrow(() -> new IllegalStateException("checkpoint vanished for pipeline " + pipelineId));
+                .orElseThrow(() -> missingCheckpoint(pipelineId));
+    }
+
+    private RuntimeException missingCheckpoint(String pipelineId) {
+        return requirePreparedState
+                ? new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", pipelineId, "field", "checkpoint"), null)
+                : new IllegalStateException("checkpoint vanished for pipeline " + pipelineId);
     }
 }

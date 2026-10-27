@@ -7,18 +7,18 @@
 # Nothing is discovered on purpose, and that absence is the case. The setup has no discover step, which
 # every other example that reads a source has.
 #
-# The state and the code are both asserted. FAILED alone would also pass for an unrelated crash, and the
-# code alone would not show that the lifecycle state was published. The count is asserted beside them so
-# that "refused" means no rows were written, rather than a refusal that arrived after a partial write.
+# The start is refused with its exact admission code before first runtime state can be prepared.
+# The count beside it proves no output was written; no failed execution is fabricated for this refusal.
 name: a-view-whose-source-matches-tables-by-pattern-is-refused-without-discovery
 setup:
-  connectors: [e2e_file]
-  apply: [src_file.tap.yml, views.tap.yml, pipeline.tap.yml]
+  databases:
+    store: { kind: mongo }
+  connectors: [e2e_file, mongodb]
+  managed_target: views.tap.yml
+  apply: [src_file.tap.yml, pipeline.tap.yml]
 pipeline: pipeline.tap.yml
 seed:
   src_file.orders: { rows: 3 }
 steps:
-  - start
-  - await: { state: FAILED }
-  - assert: { failure_code: actuation.source-schema-not-discovered }
+  - start_refused: actuation.source-schema-not-discovered
   - assert: { count: { views.order_state: 0 } }

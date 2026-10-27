@@ -231,10 +231,9 @@ final class Wiring {
             String value = ref instanceof FromRef.Literal literal ? literal.ref() : ((FromRef.Regex)ref).pattern();
             inspection.charge(64L + 2L * value.length());
         }
-        if (ref instanceof FromRef.Regex) {
+        if (ref instanceof FromRef.Regex regex) {
             if (inspection != null) { inspection.pending(ref, steps); return; }
-            // which tables it selects needs a connection to answer, so every table is in play
-            arrive(whole(allSources), reached, routes, steps, ref);
+            collectRegex(regex, reached, visiting, routes, steps);
             return;
         }
         String token = ((FromRef.Literal) ref).ref();
@@ -285,6 +284,24 @@ final class Wiring {
         // A name nothing claims cannot be attributed, so no source may be ruled out.
         for (String sourceId : supplying.isEmpty() ? allSources : supplying) {
             arrive(Set.of(new Upstream(sourceId, token)), reached, routes, steps, ref);
+        }
+    }
+
+    private void collectRegex(FromRef.Regex regex, Set<Upstream> reached, Set<String> visiting,
+            List<Route> routes, List<Step> steps) {
+        // Table discovery stays conservative, but declared transform IDs are already known.
+        arrive(whole(allSources), reached, routes, steps, regex);
+        java.util.regex.Pattern pattern;
+        try {
+            pattern = java.util.regex.Pattern.compile(regex.pattern());
+        } catch (java.util.regex.PatternSyntaxException invalid) {
+            // Runtime owns the syntax diagnostic; an unresolvable selector cannot hide a step.
+            pattern = null;
+        }
+        for (String stepId : stepsById.keySet()) {
+            if (pattern == null || pattern.matcher(stepId).matches()) {
+                followNode(stepId, reached, visiting, routes, steps);
+            }
         }
     }
 

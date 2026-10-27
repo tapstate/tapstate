@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 import zipfile
 
 SPEC = importlib.util.spec_from_file_location("runtime_metadata", Path(__file__).with_name("image-runtime-metadata.py"))
@@ -26,6 +27,13 @@ class MetadataTest(unittest.TestCase):
         original = SUBJECT.SDK_SHA
         SUBJECT.SDK_SHA = hashlib.sha256(self.sdk_bytes).hexdigest()
         self.addCleanup(setattr, SUBJECT, "SDK_SHA", original)
+
+    def test_locked_sdk_coordinate_matches_the_build_dependency(self):
+        pom = ET.parse(SUBJECT.ROOT / "pom.xml")
+        namespace = {"m": "http://maven.apache.org/POM/4.0.0"}
+        version = pom.findtext("m:properties/m:cloud.sdk.version", namespaces=namespace)
+        self.assertIsNotNone(version)
+        self.assertEqual(SUBJECT.SDK, f"BOOT-INF/lib/cloud-control-plane-sdk-{version}.jar")
 
     def inputs(self, profile):
         content = f"<script src=\"/assets/{profile}.js\"></script>".encode()

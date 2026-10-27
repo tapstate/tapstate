@@ -18,6 +18,7 @@ import com.mongodb.client.gridfs.model.GridFSFile;
 import io.tapstate.spi.store.ContentHash;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.testsupport.JvmTestEnvironment;
 import org.bson.BsonBinary;
 import org.bson.BsonDocument;
 import org.bson.BsonInt32;
@@ -37,6 +38,7 @@ import java.util.Collection;
 import java.util.Date;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
@@ -68,7 +70,7 @@ class MongoConnectorArtifactReadTest {
         String classpath = System.getProperty("surefire.test.class.path", System.getProperty("java.class.path"));
         ProcessBuilder command = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
                 "-Xmx" + heap, "-XX:+UseSerialGC", "-cp", classpath, getClass().getName(), witness);
-        for (String variable : List.of("JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS")) command.environment().remove(variable);
+        JvmTestEnvironment.configure(command, Map.of());
         command.redirectErrorStream(true);
         Process child = command.start();
         boolean completed = child.waitFor(30, TimeUnit.SECONDS);

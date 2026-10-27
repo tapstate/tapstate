@@ -2,6 +2,7 @@ package io.tapstate.control.core;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.LifecycleMachine;
 import io.tapstate.core.lifecycle.LifecycleVerb;
@@ -23,7 +24,8 @@ import java.util.function.Function;
  *
  * <p>Current state comes from the pipeline's last desired intent: a pipeline with no desired doc is
  * {@link PipelineState#NEW}, and each verb advances the intent. This lets the four verbs be issued before
- * the converge side writes any actual state; once it does, current state is read from there instead.
+ * the converge side writes any actual state. Natural completion is read from its actual checkpoint,
+ * while a new start accepted at that checkpoint remains a pending RUNNING intent.
  *
  * <p>A pipeline's revision is the content hash of its applied artifact's canonical form. The minimal
  * check is that a run verb (start / resume) runs at the latest applied revision: start always adopts the
@@ -45,43 +47,83 @@ public final class PipelineLifecycleService {
     private final ArtifactQueryService artifacts;
     private final DesiredStore desired;
     private final AuditGate auditGate;
-    /**
-     * One question about the actual state, and no way to ask another: where the pipeline's fencing
-     * epoch stands, empty where it has no checkpoint yet. A start superseding a stop nobody has read
-     * yet is an instruction carried out once rather than a wish held true, and this is the mark it is
-     * stamped with. Narrow on purpose -- writing actual state is the converge loop's alone, and this
-     * side is not handed a store it could write.
-     */
-    private final Function<String, Optional<Long>> actualStateEpoch;
+    /** Read-only actual state: its epoch stamps one-shot starts, and completion permits a new start. */
+    private final Function<String, Optional<CheckpointDoc>> actualCheckpoint;
 
     public PipelineLifecycleService(
             ArtifactQueryService artifacts, DesiredStore desired, AuditGate auditGate,
-            Function<String, Optional<Long>> actualStateEpoch) {
+            Function<String, Optional<CheckpointDoc>> actualCheckpoint) {
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
         this.desired = Objects.requireNonNull(desired, "desired");
         this.auditGate = Objects.requireNonNull(auditGate, "auditGate");
-        this.actualStateEpoch = Objects.requireNonNull(actualStateEpoch, "actualStateEpoch");
+        this.actualCheckpoint = Objects.requireNonNull(actualCheckpoint, "actualCheckpoint");
     }
 
     /** Starts the pipeline (from NEW / STOPPED / COMPLETED), running it at the latest applied revision. */
     public DesiredState start(String principal, String pipelineId) {
-        return apply(principal, pipelineId, LifecycleVerb.START, false);
+        return apply(principal, pipelineId, LifecycleVerb.START, false, null, null);
     }
 
     /**
-     * Stops the pipeline (from RUNNING / PAUSED). {@code purgeState} says whether stopping also clears
+     * Starts the pipeline at the definition its start checks were evaluated against. Refused with
+     * {@code pipeline.version-conflict} when the stored definition is no longer {@code expectedContentHash},
+     * however recently it moved: a start runs a definition somebody checked, or does not run. {@code detail}
+     * goes on the start's audit record -- what the start checks found and what the person answered.
+     */
+    public DesiredState start(
+            String principal, String pipelineId, String expectedContentHash, Map<String, Object> detail) {
+        Objects.requireNonNull(expectedContentHash, "expectedContentHash");
+        return apply(principal, pipelineId, LifecycleVerb.START, false, expectedContentHash, detail);
+    }
+
+    /**
+     * What every start is checked for before anything else is asked of it: the pipeline is applied, it
+     * is runnable, and its state lets it start. Answers with what the start would run and what the
+     * pipeline last intended, for the start checks to be evaluated against.
+     */
+    public Startable startable(String pipelineId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        StoredResource latestArtifact = requireRunnable(pipelineId);
+        Optional<DesiredState> prior = desired.read(pipelineId);
+        LifecycleMachine.transition(currentState(prior, actualCheckpoint.apply(pipelineId)), LifecycleVerb.START);
+        return new Startable(latestArtifact, (PipelineResource) latestArtifact.resource(), prior);
+    }
+
+    /**
+     * What a pipeline is, for the purpose of predicting its next start, whatever state it is in now: the
+     * applied definition and the last intent. A rerun is asked about while the pipeline still runs, so
+     * no transition is checked here.
+     */
+    public Startable rerunnable(String pipelineId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        StoredResource latestArtifact = requireRunnable(pipelineId);
+        return new Startable(latestArtifact, (PipelineResource) latestArtifact.resource(), desired.read(pipelineId));
+    }
+
+    /**
+     * A pipeline as a start would find it.
+     *
+     * @param artifact the applied definition with its content hash
+     * @param pipeline the same definition as a model
+     * @param prior    the pipeline's last desired intent, empty for one never started
+     */
+    public record Startable(StoredResource artifact, PipelineResource pipeline, Optional<DesiredState> prior) {
+    }
+
+    /**
+     * Stops the pipeline, or explicitly clears an already stopped pipeline. {@code purgeState} says whether stopping also clears
      * what this pipeline has accumulated — its resume position and its operators' state — and it is a
      * parameter rather than a policy because the two answers are not variations of one act: keeping
      * leaves a pipeline that carries on where it left off, clearing leaves one whose next run reads its
      * whole source again. The surface that takes the verb refuses a stop that did not state it.
      */
     public DesiredState stop(String principal, String pipelineId, boolean purgeState) {
-        return apply(principal, pipelineId, LifecycleVerb.STOP, purgeState);
+        return apply(principal, pipelineId, LifecycleVerb.STOP, purgeState, null, null);
     }
 
     /** Pauses the running pipeline, retaining the revision it was running at. */
     public DesiredState pause(String principal, String pipelineId) {
-        return apply(principal, pipelineId, LifecycleVerb.PAUSE, false);
+        return apply(principal, pipelineId, LifecycleVerb.PAUSE, false, null, null);
     }
 
     /**
@@ -91,28 +133,51 @@ public final class PipelineLifecycleService {
      * afresh; anything else is still {@code incompatible-revision}.
      */
     public DesiredState resume(String principal, String pipelineId) {
-        return apply(principal, pipelineId, LifecycleVerb.RESUME, false);
+        return apply(principal, pipelineId, LifecycleVerb.RESUME, false, null, null);
     }
 
-    private DesiredState apply(String principal, String pipelineId, LifecycleVerb verb, boolean purgeState) {
-        Objects.requireNonNull(principal, "principal");
-        Objects.requireNonNull(pipelineId, "pipelineId");
-
-        StoredResource latestArtifact = artifacts.getResource(pipelineId)
-                .filter(stored -> stored.resource() instanceof PipelineResource)
-                .orElseThrow(() -> new TapstateException(
-                        LifecycleError.UNKNOWN_PIPELINE, Map.of("pipeline", pipelineId), null));
+    /** The applied pipeline, refused when it is unknown or is a draft that cannot run yet. */
+    private StoredResource requireRunnable(String pipelineId) {
+        StoredResource latestArtifact = requireApplied(pipelineId);
         PipelineResource pipeline = (PipelineResource) latestArtifact.resource();
-        if ((verb == LifecycleVerb.START || verb == LifecycleVerb.RESUME)
-                && (pipeline.sources().isEmpty() || pipeline.view() == null && pipeline.serve() == null)) {
+        if (pipeline.sources().isEmpty() || pipeline.view() == null && pipeline.serve() == null) {
             throw new TapstateException(
                     LifecycleError.PIPELINE_NOT_RUNNABLE, Map.of("pipeline", pipelineId), null);
         }
+        return latestArtifact;
+    }
+
+    private StoredResource requireApplied(String pipelineId) {
+        return artifacts.getResource(pipelineId)
+                .filter(stored -> stored.resource() instanceof PipelineResource)
+                .orElseThrow(() -> new TapstateException(
+                        LifecycleError.UNKNOWN_PIPELINE, Map.of("pipeline", pipelineId), null));
+    }
+
+    private static PipelineState currentState(Optional<DesiredState> prior, Optional<CheckpointDoc> actual) {
+        return prior.map(intent -> intent.targetStateAt(actual.orElse(null))).orElse(PipelineState.NEW);
+    }
+
+    private DesiredState apply(String principal, String pipelineId, LifecycleVerb verb, boolean purgeState,
+            String expectedContentHash, Map<String, Object> detail) {
+        Objects.requireNonNull(principal, "principal");
+        Objects.requireNonNull(pipelineId, "pipelineId");
+
+        StoredResource latestArtifact = verb == LifecycleVerb.START || verb == LifecycleVerb.RESUME
+                ? requireRunnable(pipelineId)
+                : requireApplied(pipelineId);
         String latest = latestArtifact.contentHash();
+        if (expectedContentHash != null && !expectedContentHash.equals(latest)) {
+            throw new TapstateException(PipelineError.VERSION_CONFLICT, Map.of("id", pipelineId), null);
+        }
 
         Optional<DesiredState> prior = desired.read(pipelineId);
-        PipelineState current = prior.map(DesiredState::targetState).orElse(PipelineState.NEW);
-        PipelineState target = LifecycleMachine.transition(current, verb);
+        Optional<CheckpointDoc> checkpoint = actualCheckpoint.apply(pipelineId);
+        PipelineState current = currentState(prior, checkpoint);
+        // Clearing retained state is meaningful after a keeping stop. A repeated keeping stop remains
+        // illegal, including while a clearing operation is pending, so it cannot withdraw that decision.
+        PipelineState target = verb == LifecycleVerb.STOP && purgeState && current == PipelineState.STOPPED
+                ? PipelineState.STOPPED : LifecycleMachine.transition(current, verb);
 
         // What the latest artifact would be assembled from, alongside what it hashes to. Both are taken off
         // the same canonical structure, so a field that moves one moves the other and the two cannot drift
@@ -150,7 +215,8 @@ public final class PipelineLifecycleService {
                 && prior.map(DesiredState::targetState).orElse(null) == PipelineState.STOPPED;
         boolean clears =
                 purgeState || (rebuildAfterStop && prior.map(DesiredState::purgeState).orElse(false));
-        Long stampedAt = rebuildAfterStop ? actualStateEpoch.apply(pipelineId).orElse(null) : null;
+        boolean startAfterCompletion = verb == LifecycleVerb.START && current == PipelineState.COMPLETED;
+        Long stampedAt = rebuildAfterStop || startAfterCompletion ? checkpoint.map(CheckpointDoc::epoch).orElse(null) : null;
 
         if ((verb == LifecycleVerb.START || verb == LifecycleVerb.RESUME)
                 && !runRevision.equals(latest) && !reassemble) {
@@ -178,10 +244,18 @@ public final class PipelineLifecycleService {
                 : prior.map(DesiredState::assemblyRevision).orElse(null);
 
         DesiredState next = new DesiredState(pipelineId, target, runRevision, clears, runAssembly,
-                reassemble || rebuildAfterStop, stampedAt);
-        return auditGate.dispatch(OPERATIONS.get(verb), new AuditContext(principal, pipelineId), () -> {
-            desired.save(next);
-            return next;
-        });
+                reassemble || rebuildAfterStop || startAfterCompletion, stampedAt);
+        return auditGate.dispatch(OPERATIONS.get(verb),
+                new AuditContext(principal, pipelineId, expectedContentHash, detail), () -> {
+                    // Asked again at the last moment for a start held to a definition: the definition could
+                    // have been replaced while the intent was being worked out, and a start that went ahead
+                    // over that would run a definition nobody checked.
+                    if (expectedContentHash != null && !artifacts.getResource(pipelineId)
+                            .map(StoredResource::contentHash).filter(expectedContentHash::equals).isPresent()) {
+                        throw new TapstateException(PipelineError.VERSION_CONFLICT, Map.of("id", pipelineId), null);
+                    }
+                    desired.save(next);
+                    return next;
+                });
     }
 }

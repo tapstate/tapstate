@@ -1,13 +1,19 @@
 package io.tapstate.control.core;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.catchThrowable;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.catalog.TapstateCatalog;
+import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.SourceResource;
 import io.tapstate.runtime.probe.ConnectionProbe;
 import io.tapstate.spi.store.AuditRecord;
 import io.tapstate.spi.store.AuditStore;
+import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ConnectionConfig;
+import io.tapstate.spi.store.ConnectionTestItem;
 import io.tapstate.spi.store.ConnectionTestResult;
 import io.tapstate.spi.store.ConnectionTestResult.Outcome;
 import io.tapstate.spi.store.ConnectionTestResultStore;
@@ -15,10 +21,12 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
@@ -38,7 +46,8 @@ class ConnectionTestServiceTest {
         };
         RecordingResultStore store = new RecordingResultStore();
         RecordingAuditStore auditStore = new RecordingAuditStore();
-        ConnectionTestService service = new ConnectionTestService(probe, store, gate(auditStore));
+        ConnectionTestService service = new ConnectionTestService(
+                probe, store, gate(auditStore), null, SourceConnectionResolver.forAdHocConnections());
 
         ConnectionTestReport returned = service.test(CONFIG.id(), CONFIG.connectorId(), CONFIG.settings(), "alice");
 
@@ -48,15 +57,150 @@ class ConnectionTestServiceTest {
         assertThat(returned.outcome()).isEqualTo(ConnectionTestReport.Outcome.PASSED);
         // The probe was driven with a config carrying exactly the given connection.
         assertThat(probed.get()).isEqualTo(CONFIG);
-        // The storage-port result is what gets persisted, unchanged.
-        assertThat(store.saved).isSameAs(RESULT);
+        // The stored result carries the marker proving diagnostics were checked before persistence.
+        assertThat(store.saved).isEqualTo(new ConnectionTestResult(
+                RESULT.connectionId(), RESULT.connectorId(), RESULT.outcome(), RESULT.items(),
+                RESULT.testedAt(), true));
+    }
+
+    @Test
+    void redactsConfiguredSecretsFromImmediateAndStoredReportsWithoutDroppingDiagnostics() {
+        String password = "database-password-sentinel";
+        String tlsKey = "tls-private-key-sentinel";
+        String tlsKeyPassword = "tls-key-password-sentinel";
+        String sshPassword = "ssh-password-sentinel";
+        Map<String, Object> savedConfig = new LinkedHashMap<>();
+        savedConfig.put("password", password);
+        savedConfig.put("sslKey", tlsKey);
+        savedConfig.put("sslKeyPassword", tlsKeyPassword);
+        savedConfig.put("__TAPDATA", Map.of("sshPassword", sshPassword));
+        SourceResource source = new SourceResource(
+                "source-transport", null, "mysql", savedConfig, null, null, null, null);
+        ArtifactStore artifacts = new ArtifactStore() {
+            @Override
+            public void saveAll(List<Resource> resources) { }
+
+            @Override
+            public Optional<Resource> get(String id) {
+                return source.id().equals(id) ? Optional.of(source) : Optional.empty();
+            }
+
+            @Override
+            public List<Resource> list() {
+                return List.of(source);
+            }
+        };
+        ConnectionTestResult echoed = new ConnectionTestResult(
+                "source-transport", "mysql", Outcome.FAILED,
+                List.of(new ConnectionTestItem(
+                        "Login", ConnectionTestItem.Status.FAILED,
+                        "handshake detail includes " + tlsKey,
+                        "authentication rejected " + password,
+                        "use the configured key password " + tlsKeyPassword + " and SSH password " + sshPassword,
+                        "TLS error after " + tlsKey)),
+                1_700_000_000_000L);
+        RecordingResultStore store = new RecordingResultStore();
+        ConnectionTestService service = new ConnectionTestService(
+                config -> echoed, store, gate(new RecordingAuditStore()), null,
+                new SourceConnectionResolver(artifacts));
+
+        ConnectionTestReport immediate = service.test(
+                "source-transport", "mysql", Map.of("host", "preview"), "alice");
+        ConnectionTestReport stored = new ConnectionTestResultQueryService(store).find("source-transport").orElseThrow();
+        String visible = immediate.checks().toString() + stored.checks();
+
+        assertThat(visible)
+                .contains("handshake detail includes", "authentication rejected", "use the configured key password",
+                        "and SSH password", "TLS error after", "<redacted>")
+                .doesNotContain(password, tlsKey, tlsKeyPassword, sshPassword);
+        assertThat(store.saved.diagnosticsRedacted()).isTrue();
+        assertThat(store.saved.items()).singleElement().satisfies(item -> {
+            assertThat(item.message()).contains("handshake detail includes", "<redacted>");
+            assertThat(item.reason()).contains("authentication rejected", "<redacted>");
+            assertThat(item.solution()).contains("use the configured key password", "and SSH password", "<redacted>");
+            assertThat(item.connectorErrorCode()).contains("TLS error after", "<redacted>");
+        });
+
+        RecordingResultStore legacyStore = new RecordingResultStore();
+        legacyStore.saved = echoed;
+        ConnectionTestReport legacy = new ConnectionTestResultQueryService(legacyStore)
+                .find("source-transport").orElseThrow();
+        assertThat(legacy.checks().toString())
+                .contains("Check 1")
+                .doesNotContain(password, tlsKey, tlsKeyPassword, sshPassword);
+        assertThat(legacy.checks().getFirst().message()).isNull();
+    }
+
+    @Test
+    void validatesAgainstTheSameCatalogSnapshotUsedToResolveSecrets() {
+        TapstateCatalog catalog = TapstateCatalog.load();
+        AtomicInteger catalogReads = new AtomicInteger();
+        ArtifactStore emptyArtifacts = new ArtifactStore() {
+            @Override
+            public void saveAll(List<Resource> resources) { }
+
+            @Override
+            public Optional<Resource> get(String id) {
+                return Optional.empty();
+            }
+
+            @Override
+            public List<Resource> list() {
+                return List.of();
+            }
+        };
+        SourceConnectionResolver resolver = new SourceConnectionResolver(emptyArtifacts, () -> {
+            catalogReads.incrementAndGet();
+            return catalog;
+        });
+        ConnectorConfigValidator validator = new ConnectorConfigValidator(() -> {
+            catalogReads.incrementAndGet();
+            return catalog;
+        });
+        ConnectionTestService service = new ConnectionTestService(
+                config -> RESULT, new RecordingResultStore(), gate(new RecordingAuditStore()), validator, resolver);
+
+        service.test("conn-orders", "mongodb",
+                Map.of("isUri", false, "host", "localhost", "database", "orders"), "alice");
+
+        assertThat(catalogReads).hasValue(1);
+    }
+
+    @Test
+    void redactsTransportSecretsFromCodedProbeFailures() {
+        String tlsKey = "private-key-sentinel";
+        String causeSecret = "cause-secret-sentinel";
+        TapstateException failure = new TapstateException(
+                ControlError.MALFORMED_REQUEST,
+                Map.of("reason", Map.of("detail", "connector read " + tlsKey,
+                        "attempts", List.of("nested " + tlsKey))),
+                new IllegalStateException("connector cause " + causeSecret));
+        RecordingResultStore store = new RecordingResultStore();
+        ConnectionTestService service = new ConnectionTestService(
+                config -> { throw failure; }, store, gate(new RecordingAuditStore()), null,
+                SourceConnectionResolver.forAdHocConnections());
+
+        Throwable observed = catchThrowable(() -> service.test(
+                "conn-orders", "mysql", Map.of("sslKey", tlsKey), "alice"));
+
+        assertThat(observed).isInstanceOf(TapstateException.class);
+        TapstateException safeFailure = (TapstateException) observed;
+        assertThat(safeFailure.code()).isEqualTo(failure.code());
+        assertThat(safeFailure.args().get("reason").toString())
+                .contains("connector read <redacted>", "nested <redacted>")
+                .doesNotContain(tlsKey, causeSecret);
+        assertThat(safeFailure.getCause()).isNull();
+        assertThat(safeFailure.getStackTrace()).containsExactly(failure.getStackTrace());
+        assertThat(safeFailure.getMessage()).doesNotContain(tlsKey, causeSecret);
+        assertThat(store.saved).isNull();
     }
 
     @Test
     void auditsTheTestUnderConnectionTestAgainstTheConnectionId() {
         RecordingAuditStore auditStore = new RecordingAuditStore();
-        ConnectionTestService service =
-                new ConnectionTestService(config -> RESULT, new RecordingResultStore(), gate(auditStore));
+        ConnectionTestService service = new ConnectionTestService(
+                config -> RESULT, new RecordingResultStore(), gate(auditStore), null,
+                SourceConnectionResolver.forAdHocConnections());
 
         service.test(CONFIG.id(), CONFIG.connectorId(), CONFIG.settings(), "alice");
 
@@ -78,7 +222,8 @@ class ConnectionTestServiceTest {
         AuditStore failing = record -> {
             throw new RuntimeException("audit log unavailable");
         };
-        ConnectionTestService service = new ConnectionTestService(probe, store, gate(failing));
+        ConnectionTestService service = new ConnectionTestService(
+                probe, store, gate(failing), null, SourceConnectionResolver.forAdHocConnections());
 
         assertThatThrownBy(() -> service.test(CONFIG.id(), CONFIG.connectorId(), CONFIG.settings(), "alice"))
                 .isInstanceOf(TapstateException.class);
@@ -91,11 +236,14 @@ class ConnectionTestServiceTest {
         ConnectionProbe probe = config -> RESULT;
         RecordingResultStore store = new RecordingResultStore();
         AuditGate auditGate = gate(new RecordingAuditStore());
-        assertThatThrownBy(() -> new ConnectionTestService(null, store, auditGate))
+        var resolver = SourceConnectionResolver.forAdHocConnections();
+        assertThatThrownBy(() -> new ConnectionTestService(null, store, auditGate, null, resolver))
                 .isInstanceOf(NullPointerException.class);
-        assertThatThrownBy(() -> new ConnectionTestService(probe, null, auditGate))
+        assertThatThrownBy(() -> new ConnectionTestService(probe, null, auditGate, null, resolver))
                 .isInstanceOf(NullPointerException.class);
-        assertThatThrownBy(() -> new ConnectionTestService(probe, store, null))
+        assertThatThrownBy(() -> new ConnectionTestService(probe, store, null, null, resolver))
+                .isInstanceOf(NullPointerException.class);
+        assertThatThrownBy(() -> new ConnectionTestService(probe, store, auditGate, null, null))
                 .isInstanceOf(NullPointerException.class);
     }
 

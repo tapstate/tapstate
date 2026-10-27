@@ -43,4 +43,55 @@ public final class SyntheticSinkJars {
     public static Path lifecycleSink(Path workDir, Path trace) {
         return Synthetic.lifecycleSink(workDir, trace);
     }
+
+    /** A registered storage-test artifact: connectionTest is observable, while init and discovery refuse. */
+    public static Path registeredStorageProbe(Path workDir, Path trace) {
+        return registeredStorageProbe(workDir, trace, "mongodb", "mongodb://fixture/accepted");
+    }
+
+    /** A synthetic registered adapter used to observe persisted URI and trust handoff, not certify a release artifact. */
+    public static Path registeredStorageProbe(Path workDir, Path trace, String connectorId, String acceptedPrefix) {
+        String file = trace.toAbsolutePath().toString().replace("\\", "\\\\").replace("\"", "\\\"");
+        String code = """
+                package synthetic;
+                import io.tapdata.pdk.apis.TapConnector;
+                import io.tapdata.pdk.apis.annotations.TapConnectorClass;
+                import io.tapdata.pdk.apis.functions.ConnectorFunctions;
+                import io.tapdata.entity.codec.TapCodecsRegistry;
+                import io.tapdata.pdk.apis.context.TapConnectionContext;
+                import io.tapdata.pdk.apis.entity.ConnectionOptions;
+                import io.tapdata.pdk.apis.entity.TestItem;
+                import io.tapdata.entity.schema.TapTable;
+                import java.util.List;
+                import java.util.function.Consumer;
+                @TapConnectorClass("mongodb-spec.json")
+                public class StorageProbe implements TapConnector {
+                    public void registerCapabilities(ConnectorFunctions functions, TapCodecsRegistry codecs) {
+                        functions.supportWriteRecord((c, e, t, r) -> { throw new AssertionError("business write must not run"); });
+                    }
+                    public void init(TapConnectionContext context) { throw new AssertionError("init must not run"); }
+                    public void stop(TapConnectionContext context) {}
+                    public void discoverSchema(TapConnectionContext c, List<String> t, int n, Consumer<List<TapTable>> sink) {
+                        throw new AssertionError("discovery must not run");
+                    }
+                    public int tableCount(TapConnectionContext context) { throw new AssertionError("table count must not run"); }
+                    public ConnectionOptions connectionTest(TapConnectionContext context, Consumer<TestItem> sink) throws Throwable {
+                        String uri = context.getConnectionConfig().getString("uri");
+                        java.nio.file.Files.writeString(java.nio.file.Path.of("%s"), uri + "\\n",
+                                java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+                        String ca = context.getConnectionConfig().getString("sslCA");
+                        if (ca != null) {
+                            try (var input = java.nio.file.Files.newInputStream(java.nio.file.Path.of(ca))) {
+                                java.security.cert.CertificateFactory.getInstance("X.509").generateCertificates(input);
+                            }
+                        }
+                        sink.accept(new TestItem("fixture", uri.startsWith("%s")
+                                ? TestItem.RESULT_SUCCESSFULLY : TestItem.RESULT_FAILED));
+                        return ConnectionOptions.create();
+                    }
+                }
+                """.formatted(file, acceptedPrefix);
+        return SyntheticJar.compileToJar(workDir, "synthetic.StorageProbe", code,
+                java.util.Map.of("mongodb-spec.json", "{\"properties\":{\"id\":\"" + connectorId + "\"}}"), java.util.Map.of());
+    }
 }

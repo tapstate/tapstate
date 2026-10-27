@@ -32,6 +32,33 @@ class E2eExecutorTest {
 
     private final RecordingBinding binding = new RecordingBinding();
 
+    @Test
+    void aRefusedStartIsCheckedAsAdmissionRatherThanAnAcceptedFailedRun() {
+        execute("""
+                name: refused
+                pipeline: p.tap.yml
+                steps:
+                  - start_refused: actuation.source-schema-not-discovered
+                """);
+        assertThat(binding.calls).containsExactly("apply:[p.tap.yml]",
+                "start_refused:" + PIPELINE_ID + ":actuation.source-schema-not-discovered");
+    }
+
+    @Test
+    void theManagedInstallationTargetIsReadButNeverArtifactApplied() {
+        execute("""
+                name: managed
+                setup:
+                  managed_target: views.tap.yml
+                  connectors: [mongodb]
+                  apply: [src.tap.yml]
+                pipeline: p.tap.yml
+                steps: [start]
+                """);
+        assertThat(binding.calls).containsExactly("register:mongodb", "read:[views.tap.yml]",
+                "read:[src.tap.yml]", "apply:[src.tap.yml, p.tap.yml]", "drive:START");
+    }
+
     /**
      * The dependency order, and the seed is part of it. A connector must be registered before a resource
      * naming it can be applied, and a resource must exist before its model can be discovered - but a model
@@ -910,6 +937,11 @@ class E2eExecutorTest {
         public void drive(String pipelineId, LifecycleVerb verb) {
             drivenPipelineIds.add(pipelineId);
             calls.add("drive:" + verb);
+        }
+
+        @Override
+        public void startRefused(String pipelineId, String expectedCode) {
+            calls.add("start_refused:" + pipelineId + ":" + expectedCode);
         }
 
         @Override

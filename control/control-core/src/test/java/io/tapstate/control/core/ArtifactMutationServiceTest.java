@@ -128,6 +128,29 @@ class ArtifactMutationServiceTest {
         }
     }
 
+    @Test void nativeDeletionBindsBeforeAuditAndAuditFailureCannotInvokeItsMutation() {
+        var events=new ArrayList<String>(); var failed=new java.util.concurrent.atomic.AtomicBoolean(true);
+        var original=pipeline("native"); store.save(original);
+        var unreadableState=new StateStore() {
+            @Override public java.util.Optional<CheckpointDoc> read(String id) { throw new AssertionError("native lifecycle validation"); }
+            @Override public void create(String id,String json,Instant at) { throw new AssertionError("native creation"); }
+            @Override public io.tapstate.core.lifecycle.CasOutcome compareAndSwap(String id,long epoch,String json,Instant at) { throw new AssertionError("native CAS"); }
+            @Override public void delete(String id) { throw new AssertionError("native reclamation"); }
+        };
+        AuditStore audit=record -> { events.add("audit"); if(failed.get())throw new IllegalStateException("audit down"); };
+        var nativeService=new ArtifactMutationService(store,desired,unreadableState,observations,layouts,srsMeta,derivedSchemas,rateHistory,
+                new AuditGate(audit,FIXED_CLOCK),DataBrowserFollows.NONE,(captured,expected) -> {
+                    assertThat(captured).isEqualTo(original); assertThat(expected).isEqualTo(hash(original)); events.add("bind");
+                    return () -> events.add("retire");
+                });
+        assertThatThrownBy(() -> nativeService.delete(PRINCIPAL,"native",hash(original))).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(ControlError.AUDIT_BLOCKED));
+        assertThat(events).containsExactly("bind","audit");
+        failed.set(false); nativeService.delete(PRINCIPAL,"native",hash(original));
+        assertThat(events).containsExactly("bind","audit","bind","audit","retire");
+        assertThat(store.get("native")).isPresent();
+    }
+
     @Test
     void deletesAnyKindThroughTheOneVerbAndRemovesOnlyThatArtifact() {
         List<Resource> kinds = List.of(
@@ -367,6 +390,59 @@ class ArtifactMutationServiceTest {
                 ArtifactError.PIPELINE_NOT_STOPPED,
                 Map.of("id", "flow", "actual", "STOPPED", "desired", "RUNNING"));
         assertThat(store.get("flow")).isPresent();
+    }
+
+    @Test
+    void aNaturallyCompletedPipelineIsDeletedWithItsConsumedRunningIntent() {
+        PipelineResource flow = pipeline("flow");
+        store.save(flow);
+        state.put("flow", PipelineState.COMPLETED, 8L);
+        desired.put("flow", PipelineState.RUNNING);
+
+        service.delete(PRINCIPAL, "flow", hash(flow));
+
+        assertThat(store.get("flow")).isEmpty();
+        assertThat(state.read("flow")).isEmpty();
+        assertThat(desired.read("flow")).isEmpty();
+    }
+
+    @Test
+    void completionCannotMakeAPendingStartDeletable() {
+        PipelineResource flow = pipeline("flow");
+        store.save(flow);
+        DesiredState pending = new DesiredState("flow", PipelineState.RUNNING,
+                "revision", false, "assembly", true, 8L);
+        desired.save(pending);
+        for (long epoch : List.of(7L, 8L, 9L)) {
+            state.put("flow", PipelineState.COMPLETED, epoch);
+            assertArtifactError(() -> service.delete(PRINCIPAL, "flow", hash(flow)),
+                    ArtifactError.PIPELINE_NOT_STOPPED,
+                    Map.of("id", "flow", "actual", "COMPLETED", "desired", "RUNNING"));
+            assertThat(store.get("flow")).isPresent();
+            assertThat(desired.read("flow")).contains(pending);
+        }
+    }
+
+    @Test
+    void aStartAcceptedAfterTheCompletedPipelineDeleteCheckKeepsItsCheckpoint() {
+        PipelineResource flow = pipeline("flow");
+        store.save(flow);
+        state.put("flow", PipelineState.COMPLETED, 8L);
+        desired.put("flow", PipelineState.RUNNING);
+        DesiredState pending = new DesiredState("flow", PipelineState.RUNNING,
+                "revision", false, "assembly", true, 8L);
+        store.afterDelete = () -> desired.save(pending);
+
+        assertThatThrownBy(() -> service.delete(PRINCIPAL, "flow", hash(flow)))
+                .isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code()).isEqualTo(ArtifactError.RECLAIM_INCOMPLETE);
+                    assertThat(error.args()).containsEntry("reason", "pipeline-live");
+                });
+
+        assertThat(store.get("flow")).isEmpty();
+        assertThat(state.read("flow")).isPresent();
+        assertThat(desired.read("flow")).contains(pending);
+        assertThat(reclaimOrder).isEmpty();
     }
 
     @Test
@@ -1065,7 +1141,11 @@ class ArtifactMutationServiceTest {
         private RuntimeException deleteFailure;
 
         void put(String pipelineId, PipelineState actual) {
-            docs.put(pipelineId, CheckpointDoc.initial(pipelineId, StateJson.of(actual), Instant.EPOCH));
+            put(pipelineId, actual, 0);
+        }
+
+        void put(String pipelineId, PipelineState actual, long epoch) {
+            docs.put(pipelineId, new CheckpointDoc(pipelineId, StateJson.of(actual), epoch, Instant.EPOCH));
         }
 
         void failDeleteWith(RuntimeException failure) {

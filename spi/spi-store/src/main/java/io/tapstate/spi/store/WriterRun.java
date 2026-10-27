@@ -43,4 +43,17 @@ public record WriterRun(
     public Map<String, WriterProgress> progressFor(String table) {
         return progress.getOrDefault(table, Map.of());
     }
+    /** Folds one expected writer monotonically without treating its faster peer as confirmation. */
+    public WriterRun advance(String table,String writer,WriterProgress report) {
+        java.util.Objects.requireNonNull(report,"report");
+        if (!expectedFor(table).contains(writer)) throw new IllegalArgumentException("report does not name an expected writer");
+        var next = new java.util.LinkedHashMap<>(progress); var writers = new java.util.LinkedHashMap<>(progressFor(table));
+        var before = writers.get(writer);
+        var durable = before == null || report.durableThrough().compareTo(before.durableThrough()) > 0 ? report.durableThrough() : before.durableThrough();
+        var tokened = before == null ? null : before.lastTokened();
+        if (report.lastTokened() != null && (tokened == null || report.lastTokened().order().compareTo(tokened.order()) > 0)) tokened = report.lastTokened();
+        writers.put(writer,new WriterProgress(durable,tokened)); next.put(table,writers);
+        return new WriterRun(runId,expected,next,snapshotEpoch);
+    }
+
 }

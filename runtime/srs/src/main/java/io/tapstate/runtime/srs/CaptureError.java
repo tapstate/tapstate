@@ -21,6 +21,8 @@ public enum CaptureError implements TapstateErrorCode {
 
     /** An optional observer failed; this diagnostic does not fail normal source processing. */
     OBSERVER_FAILED("capture.observer-failed", Set.of("captureId", "openingId", "phase")),
+    /** The original read is still running; its owner and cleanup handle must be retained. */
+    STILL_ENDING("capture.still-ending", Set.of("captureId")),
 
     /** A live capture could no longer renew the cluster ownership generation that fences its writes. */
     CLAIM_LOST("capture.claim-lost", Set.of("captureId")),

@@ -87,6 +87,9 @@ public final class DslParser {
     private static final String EXPERIMENTAL_FIELD = "experimental";
     private static final String CONNECTOR_FIELD = "connector";
     private static final String OPTIONS_FIELD = "options";
+    private static final String EXPECTED_TOKEN = "expected";
+    private static final String VALUE_TOKEN = "value";
+    private static final String SOURCE_ID_FIELD_TOKEN = "source_id_field";
     private static final String SOURCE_TOKEN = "source";
     private static final String TRANSFORMS_FIELD = "transforms";
     private static final String SERVE_TOKEN = "serve";
@@ -122,8 +125,8 @@ public final class DslParser {
     static final Set<String> REQUIRED_NEST_STATE_KEYS = Set.of("database");
     private static final Set<String> EMBED_KEYS = Set.of(
             "from", "on", "as", "path", "key", "arrayKey", "ignoreUpdates", "trackKeyChanges", "embed");
-    private static final Set<String> VIEW_INLINE_KEYS =
-            Set.of("id", "from", PRIMARY_KEY_FIELD, STORAGE_FIELD, EXECUTION_FIELD);
+    private static final Set<String> VIEW_INLINE_KEYS = Set.of(
+            "id", "from", PRIMARY_KEY_FIELD, STORAGE_FIELD, "write_mode", "on_full_load", EXECUTION_FIELD);
     private static final Set<String> VIEW_USE_KEYS = Set.of("id", "use", "from");
     private static final Set<String> STORAGE_KEYS = Set.of("hot", "warm", "cold");
     private static final Set<String> HOT_KEYS = Set.of("ttl");
@@ -144,8 +147,8 @@ public final class DslParser {
     static final Set<String> TRANSFORM_DEF_KEYS = Set.of(
             VERSION_FIELD, "kind", "id", METADATA_FIELD, "type", OPTIONS_FIELD, EXPERIMENTAL_FIELD);
     private static final Set<String> VIEW_DEF_KEYS = Set.of(
-            VERSION_FIELD, "kind", "id", METADATA_FIELD, PRIMARY_KEY_FIELD, STORAGE_FIELD, EXECUTION_FIELD,
-            EXPERIMENTAL_FIELD);
+            VERSION_FIELD, "kind", "id", METADATA_FIELD, PRIMARY_KEY_FIELD, STORAGE_FIELD,
+            "write_mode", "on_full_load", EXECUTION_FIELD, EXPERIMENTAL_FIELD);
     private static final Set<String> SERVE_DEF_KEYS = Set.of(
             VERSION_FIELD, "kind", "id", METADATA_FIELD, "sync", "query", "push", EXPERIMENTAL_FIELD);
 
@@ -256,7 +259,7 @@ public final class DslParser {
         Node root = compose(yaml);
         if (!(root instanceof MappingNode mapping)) {
             throw YamlMap.error(DslError.ILLEGAL_VALUE, "", root,
-                    Map.of("value", YamlMap.nodeTypeName(root), "expected", "a mapping"));
+                    Map.of(VALUE_TOKEN, YamlMap.nodeTypeName(root), EXPECTED_TOKEN, "a mapping"));
         }
         return mapping;
     }
@@ -321,8 +324,8 @@ public final class DslParser {
             case "view" -> viewDefinition(doc);
             case SERVE_TOKEN -> serveDefinition(doc);
             case null, default -> throw YamlMap.error(DslError.ILLEGAL_VALUE, "kind", mapping,
-                    Map.of("value", kind == null ? "(absent)" : kind,
-                            "expected", "one of: source, pipeline, transform, view, serve"));
+                    Map.of(VALUE_TOKEN, kind == null ? "(absent)" : kind,
+                            EXPECTED_TOKEN, "one of: source, pipeline, transform, view, serve"));
         };
     }
 
@@ -516,7 +519,7 @@ public final class DslParser {
             case "map" -> Set.of("fields");
             case FILTER_TOKEN -> Set.of("expr");
             case "unwind" -> Set.of("path", "include_array_index",
-                    "preserve_null_and_empty_arrays", "element_key", "element_type");
+                    "preserve_null_and_empty_arrays", "element_key", "element_type", SOURCE_ID_FIELD_TOKEN);
             case "union" -> Set.of();
             case "nest" -> Set.of(
                     PRIMARY_KEY_FIELD, "order", "entries_in_memory", "max_elements_per_document",
@@ -558,7 +561,8 @@ public final class DslParser {
                     s.string("include_array_index"),
                     boolValue(s, "preserve_null_and_empty_arrays"),
                     s.string("element_key"),
-                    elementType(s));
+                    elementType(s),
+                    sourceIdField(s));
             case "union" -> new TransformBody.Union();
             case "nest" -> new TransformBody.Nest(
                     s.string(PRIMARY_KEY_FIELD),
@@ -575,7 +579,7 @@ public final class DslParser {
                 yield new TransformBody.Join(engine, sql);
             }
             default -> throw YamlMap.error(DslError.ILLEGAL_VALUE, "type", s.node("type"),
-                    Map.of("value", type, "expected", "a known transform type (js, map, filter, unwind, union, nest, join)"));
+                    Map.of(VALUE_TOKEN, type, EXPECTED_TOKEN, "a known transform type (js, map, filter, unwind, union, nest, join)"));
         };
     }
 
@@ -679,6 +683,8 @@ public final class DslParser {
                 blockFrom(v, prevId, n),
                 v.string(PRIMARY_KEY_FIELD),
                 storage(v.mapping(STORAGE_FIELD)),
+                enumByYaml(WriteMode.values(), WriteMode::yaml, v, "write_mode"),
+                enumByYaml(OnFullLoad.values(), OnFullLoad::yaml, v, "on_full_load"),
                 execution(v.mapping(EXECUTION_FIELD)));
     }
 
@@ -869,7 +875,10 @@ public final class DslParser {
         m.requirePresent(REQUIRED_VIEW_DEF_KEYS);
         return new ViewResource(
                 m.require("id", idOf(m)), metadata(m), m.string(PRIMARY_KEY_FIELD),
-                storage(m.mapping(STORAGE_FIELD)), execution(m.mapping(EXECUTION_FIELD)),
+                storage(m.mapping(STORAGE_FIELD)),
+                enumByYaml(WriteMode.values(), WriteMode::yaml, m, "write_mode"),
+                enumByYaml(OnFullLoad.values(), OnFullLoad::yaml, m, "on_full_load"),
+                execution(m.mapping(EXECUTION_FIELD)),
                 m.freeMap(EXPERIMENTAL_FIELD));
     }
 
@@ -904,7 +913,7 @@ public final class DslParser {
         }
         if (!(fn instanceof SequenceNode seq)) {
             throw owner.errorAt("from", DslError.ILLEGAL_VALUE,
-                    Map.of("value", YamlMap.nodeTypeName(fn), "expected", "a scalar or list for a streaming step"));
+                    Map.of(VALUE_TOKEN, YamlMap.nodeTypeName(fn), EXPECTED_TOKEN, "a scalar or list for a streaming step"));
         }
         List<FromRef> refs = new ArrayList<>();
         for (Node item : seq.getValue()) {
@@ -1009,7 +1018,7 @@ public final class DslParser {
         for (Map.Entry<String, Object> e : raw.entrySet()) {
             if (!(e.getValue() instanceof String s)) {
                 throw owner.errorAt(key, DslError.ILLEGAL_VALUE,
-                        Map.of("value", String.valueOf(e.getValue()), "expected", "a string"));
+                        Map.of(VALUE_TOKEN, String.valueOf(e.getValue()), EXPECTED_TOKEN, "a string"));
             }
             out.put(e.getKey(), s);
         }
@@ -1022,10 +1031,10 @@ public final class DslParser {
             return null;
         }
         if (!(v instanceof Number num)) {
-            throw m.errorAt(key, DslError.ILLEGAL_VALUE, Map.of("value", v, "expected", "an integer"));
+            throw m.errorAt(key, DslError.ILLEGAL_VALUE, Map.of(VALUE_TOKEN, v, EXPECTED_TOKEN, "an integer"));
         }
         if (v instanceof Long l && (l < Integer.MIN_VALUE || l > Integer.MAX_VALUE)) {
-            throw m.errorAt(key, DslError.ILLEGAL_VALUE, Map.of("value", l, "expected", "a 32-bit integer"));
+            throw m.errorAt(key, DslError.ILLEGAL_VALUE, Map.of(VALUE_TOKEN, l, EXPECTED_TOKEN, "a 32-bit integer"));
         }
         return num.intValue();
     }
@@ -1065,11 +1074,11 @@ public final class DslParser {
         }
         String expected = "a whole number from " + min + " to " + max;
         if (!(v instanceof Integer || v instanceof Long)) {
-            throw m.errorAt(key, DslError.ILLEGAL_VALUE, Map.of("value", String.valueOf(v), "expected", expected));
+            throw m.errorAt(key, DslError.ILLEGAL_VALUE, Map.of(VALUE_TOKEN, String.valueOf(v), EXPECTED_TOKEN, expected));
         }
         long value = ((Number) v).longValue();
         if (value < min || value > max) {
-            throw m.errorAt(key, DslError.ILLEGAL_VALUE, Map.of("value", value, "expected", expected));
+            throw m.errorAt(key, DslError.ILLEGAL_VALUE, Map.of(VALUE_TOKEN, value, EXPECTED_TOKEN, expected));
         }
         return (int) value;
     }
@@ -1086,11 +1095,11 @@ public final class DslParser {
         }
         String expected = "a duration from 0ms to 60s, such as 0ms, 50ms or 2s";
         if (!(v instanceof String text)) {
-            throw m.errorAt(key, DslError.ILLEGAL_VALUE, Map.of("value", String.valueOf(v), "expected", expected));
+            throw m.errorAt(key, DslError.ILLEGAL_VALUE, Map.of(VALUE_TOKEN, String.valueOf(v), EXPECTED_TOKEN, expected));
         }
         long millis = BatchSpec.durationMillis(text);
         if (millis < 0 || millis > BatchSpec.MAX_WAIT_LIMIT_MILLIS) {
-            throw m.errorAt(key, DslError.ILLEGAL_VALUE, Map.of("value", text, "expected", expected));
+            throw m.errorAt(key, DslError.ILLEGAL_VALUE, Map.of(VALUE_TOKEN, text, EXPECTED_TOKEN, expected));
         }
         return text;
     }
@@ -1104,7 +1113,7 @@ public final class DslParser {
         Integer value = intValue(m, key);
         if (value != null && value <= 0) {
             throw m.errorAt(key, DslError.ILLEGAL_VALUE,
-                    Map.of("value", value, "expected", "a count above zero"));
+                    Map.of(VALUE_TOKEN, value, EXPECTED_TOKEN, "a count above zero"));
         }
         return value;
     }
@@ -1119,6 +1128,16 @@ public final class DslParser {
      * silently become whatever the target guessed. Kept as the string the model carries: what
      * travels downstream is the token, not the enum.
      */
+    private static String sourceIdField(YamlMap s) {
+        String field = s.string(SOURCE_ID_FIELD_TOKEN);
+        if (field != null && (field.isBlank() || field.contains(".") || field.startsWith("$")
+                || field.indexOf('\0') >= 0)) {
+            throw s.errorAt(SOURCE_ID_FIELD_TOKEN, DslError.ILLEGAL_VALUE,
+                    Map.of(VALUE_TOKEN, field, EXPECTED_TOKEN, "a nonblank top-level field name without dots or a dollar prefix"));
+        }
+        return field;
+    }
+
     private static String elementType(YamlMap s) {
         TapstateType declared = enumByYaml(
                 TapstateType.values(), t -> t.name().toLowerCase(Locale.ROOT), s, "element_type");
@@ -1131,7 +1150,7 @@ public final class DslParser {
             return null;
         }
         if (!(v instanceof Boolean b)) {
-            throw m.errorAt(key, DslError.ILLEGAL_VALUE, Map.of("value", v, "expected", "true or false"));
+            throw m.errorAt(key, DslError.ILLEGAL_VALUE, Map.of(VALUE_TOKEN, v, EXPECTED_TOKEN, "true or false"));
         }
         return b;
     }
@@ -1145,7 +1164,7 @@ public final class DslParser {
         String id = m.string("id");
         if (id != null && id.indexOf('.') >= 0) {
             throw m.errorAt("id", DslError.ILLEGAL_VALUE,
-                    Map.of("value", id, "expected", "an id without '.', the reserved addressing separator (§2)"));
+                    Map.of(VALUE_TOKEN, id, EXPECTED_TOKEN, "an id without '.', the reserved addressing separator (§2)"));
         }
         // An id travels into places that write it as a line of text and read it back by splitting on
         // lines, so one carrying a newline is recorded as several and read back as names that were never
@@ -1153,7 +1172,7 @@ public final class DslParser {
         // found, and one missed is state left behind or another id's state dropped in its place.
         if (id != null && hasControlCharacter(id)) {
             throw m.errorAt("id", DslError.ILLEGAL_VALUE,
-                    Map.of("value", id, "expected", "an id without control characters"));
+                    Map.of(VALUE_TOKEN, id, EXPECTED_TOKEN, "an id without control characters"));
         }
         return id;
     }
@@ -1179,7 +1198,7 @@ public final class DslParser {
             }
         }
         throw owner.errorAt(key, DslError.ILLEGAL_VALUE,
-                Map.of("value", raw, "expected", allowedValues(values, yaml)));
+                Map.of(VALUE_TOKEN, raw, EXPECTED_TOKEN, allowedValues(values, yaml)));
     }
 
     /** Renders an enum's accepted {@code yaml()} tokens as {@code "one of: a, b, c"} for error reporting. */

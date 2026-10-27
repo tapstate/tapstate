@@ -4,7 +4,6 @@ import io.tapstate.testsupport.DockerGate;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
-import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -52,12 +51,11 @@ class ClosingAConnectorLeavesAnotherOnItsJarReadingIT {
         Path otherSignals = Files.createDirectory(directory.resolve("other-signals"));
         // The other connector reads the same resource straight through: it is told to go on before it asks.
         Files.writeString(otherSignals.resolve("resume"), "");
-        String database = "e2e_shared_jar_" + UUID.randomUUID().toString().replace("-", "");
 
         ExecutorService background = Executors.newSingleThreadExecutor();
-        try (ServerHandle server = InProcessServer.start(SharedMongo.replicaSetUrl(database))) {
+        try (var storage = PreparedNativeStore.create(); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID, Files.readAllBytes(jar));
 
             Future<?> held = background.submit(() -> control.discoverSchema("src_held",

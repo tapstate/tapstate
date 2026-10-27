@@ -36,6 +36,7 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
 
     private final String namespace;
     private final String database;
+    private final boolean scoped;
 
     /**
      * The layer this files under, and where a trip made here is counted. Neither can be handed in: the
@@ -53,15 +54,25 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
     }
 
     NestStateMapStore(String namespace, String database) {
+        this(namespace, database, false);
+    }
+
+    NestStateMapStore(String namespace, String database, boolean scoped) {
+        this.scoped = scoped;
         this.namespace = Objects.requireNonNull(namespace, "namespace");
         this.database = database;
     }
 
     @Override
     public void init(HazelcastInstance member, Properties properties, String mapName) {
-        var stores = NestStateMapStoreFactory.boundTo(member);
-        String resolved = database == null ? stores.defaultDatabase() : database;
-        this.store = stores.inDatabase(resolved).state();
+        boolean required = scoped || io.tapstate.runtime.engine.OperatorMapBindings.required(properties);
+        var bindings = io.tapstate.runtime.engine.OperatorMapBindings.resolve(member, required);
+        if (bindings != null) this.store = required ? bindings.initializingNest(namespace, database) : bindings.nest(namespace, database);
+        else {
+            var stores = NestStateMapStoreFactory.boundTo(member);
+            String resolved = database == null ? stores.defaultDatabase() : database;
+            this.store = stores.inDatabase(resolved).state();
+        }
         this.stats = NestStateStats.of(member);
     }
 
@@ -78,7 +89,7 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
     public Object load(Object key) {
         long began = System.nanoTime();
         Object state = store.load(namespace, NestStateKeys.nameOf(key))
-                .map(NestStateMapStore::fromBytes).orElse(null);
+                .map(this::fromBytes).orElse(null);
         if (stats != null) {
             stats.backfill(namespace, System.nanoTime() - began);
         }
@@ -125,7 +136,11 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
 
     @Override
     public void store(Object key, Object value) {
-        store.save(namespace, NestStateKeys.nameOf(key), toBytes(value));
+        byte[] state = toBytes(value);
+        if (store instanceof io.tapstate.spi.store.NestReleaseStore releases) {
+            byte[] originalKey = value instanceof ResolverState resolver && !resolver.releases().isEmpty() ? toBytes(key) : null;
+            releases.saveWithRelease(namespace, NestStateKeys.nameOf(key), state, originalKey);
+        } else store.save(namespace, NestStateKeys.nameOf(key), state);
     }
 
     @Override
@@ -163,11 +178,28 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
         return bytes.toByteArray();
     }
 
-    private static Object fromBytes(byte[] bytes) {
+    static Object releaseKey(io.tapstate.spi.store.NestReleaseStore.PendingKey pending) {
+        try {
+            Object key = readObject(pending.routingKey());
+            if (NestStateKeys.nameOf(key).equals(pending.stateKey())) return key;
+        } catch (IOException | ClassNotFoundException | IllegalArgumentException malformed) {
+            // Stored recovery coordinates must be readable without exposing their payload as a cause.
+        }
+        throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.DOCUMENT_UNREADABLE,
+                Map.of("id", pending.stateKey(), "field", "operator-release-key"), null);
+    }
+
+    private Object fromBytes(byte[] bytes) {
+        try { return readObject(bytes); }
+        catch (IOException | ClassNotFoundException malformed) {
+            throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id",namespace,"field","operator-state"),null);
+        }
+    }
+
+    private static Object readObject(byte[] bytes) throws IOException, ClassNotFoundException {
         try (ObjectInputStream in = new ObjectInputStream(new ByteArrayInputStream(bytes))) {
             return in.readObject();
-        } catch (IOException | ClassNotFoundException cause) {
-            throw new IllegalStateException("could not read back nest state", cause);
         }
     }
 

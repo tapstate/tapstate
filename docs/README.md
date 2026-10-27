@@ -28,6 +28,7 @@ CLI's: the path for scripts, CI, and machines without a browser or an AI assista
 |---|---|
 | [Quickstart](quickstart-online.md) | The full demo: sample databases, the server, and a live object assembled from two engines - and the same flow by hand, verb by verb, from the CLI. |
 | [First run](first-run/) | The CLI's guided path: answer a few questions and bring a workspace to running - the contract every step is held to. |
+| [Storage setup and recovery](storage/) | OP installation and first administrator, Cloud re-entry, TLS, explicit recovery, configuration transfer and backups. |
 | [Running on your own databases](running-on-your-own-databases.md) | Run the server as a process on your machine, against a MySQL and a MongoDB you already have. |
 | [Tutorials](tutorials/) | Worked scenarios, each with its own sample data, run end to end. |
 
@@ -38,6 +39,7 @@ CLI's: the path for scripts, CI, and machines without a browser or an AI assista
 | [Nest](nest/) | Assemble one document out of many tables and keep it current. |
 | [Unwind](unwind/) | Expand array elements into individually keyed rows and keep them current. |
 | [Observability](observability/) | Read current state, bounded output-rate and lag history, and one shared evidence-backed explanation. |
+| [Start checks](start-checks/) | What a start looks at before it writes anything, how its questions are answered from each client, and how a new check is added. |
 | [Connectors](connectors/) | How the bundled connector catalog is generated, what has to be rebuilt when something moves upstream, and how this repository declares what a connector can do. |
 | [Cluster preview](cluster/) | Configure explicit member discovery, stable identities, failure-detection budgets, and the supported cluster safety profiles. |
 

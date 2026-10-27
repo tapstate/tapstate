@@ -18,6 +18,24 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * what holds that line, so they read the surface exactly as an author writes it.
  */
 class EnvelopeParserTest {
+    @Test
+    void aManagedTargetIsInstallationInputAndCannotAlsoBeApplied() {
+        String specification = """
+                name: managed
+                setup:
+                  managed_target: views.tap.yml
+                  apply: [src.tap.yml]
+                pipeline: p.tap.yml
+                steps: [start]
+                """;
+        var setup = EnvelopeParser.parse(specification).setup();
+        assertThat(setup.managedTarget()).isEqualTo("views.tap.yml");
+        assertThat(setup.apply()).containsExactly("src.tap.yml");
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> EnvelopeParser.parse(
+                specification.replace("apply: [src.tap.yml]", "apply: [src.tap.yml, views.tap.yml]")))
+                .isInstanceOf(EnvelopeException.class);
+    }
+
 
     private static final String FIRST_EXAMPLE =
             """

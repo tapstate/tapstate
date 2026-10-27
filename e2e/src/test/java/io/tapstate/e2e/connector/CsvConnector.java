@@ -147,6 +147,9 @@ public class CsvConnector implements TapConnector {
     /** A test affordance for a saved-source witness: discovery fails when persistence loses this secret. */
     private static final String REQUIRE_PASSWORD = "require_password";
 
+    /** A test affordance for a saved source whose shared TLS and SSH secrets must be restored on connection test. */
+    private static final String REQUIRE_TRANSPORT_CREDENTIALS = "require_transport_credentials";
+
     /**
      * A test affordance naming a directory this connector notes every batch of rows it hands over into.
      *
@@ -402,6 +405,13 @@ public class CsvConnector implements TapConnector {
                 "directory",
                 reachable ? TestItem.RESULT_SUCCESSFULLY : TestItem.RESULT_FAILED,
                 reachable ? null : directory(context) + " is not a directory"));
+        if (transportCredentialsRequired(context)) {
+            boolean present = transportCredentialsPresent(context);
+            consumer.accept(new TestItem(
+                    "transport credentials",
+                    present ? TestItem.RESULT_SUCCESSFULLY : TestItem.RESULT_FAILED,
+                    present ? null : "configured transport credentials were not restored"));
+        }
         return ConnectionOptions.create();
     }
 
@@ -416,6 +426,14 @@ public class CsvConnector implements TapConnector {
     private List<TapEvent> snapshot(TapConnectionContext context, String table) {
         List<TapEvent> events = new ArrayList<>();
         for (Map<String, Object> row : rows(file(context, table))) {
+            // JSON and CSV cannot seed distinct Integer and String keys with the same text.
+            if (context.getConnectionConfig() != null
+                    && Boolean.TRUE.equals(context.getConnectionConfig().getObject("mixed_map_keys"))) {
+                Map<Object, Object> nested = new LinkedHashMap<>();
+                nested.put(7, "number-key");
+                nested.put("7", "text-key");
+                row.put("dict", nested);
+            }
             events.add(insert(table, row));
         }
         return events;
@@ -1156,6 +1174,26 @@ public class CsvConnector implements TapConnector {
                 ? null
                 : context.getConnectionConfig().getObject("password");
         return password != null && !String.valueOf(password).isBlank();
+    }
+
+    private static boolean transportCredentialsRequired(TapConnectionContext context) {
+        Object required = context.getConnectionConfig() == null
+                ? null
+                : context.getConnectionConfig().getObject(REQUIRE_TRANSPORT_CREDENTIALS);
+        return required != null && Boolean.parseBoolean(String.valueOf(required));
+    }
+
+    private static boolean transportCredentialsPresent(TapConnectionContext context) {
+        if (context.getConnectionConfig() == null) return false;
+        Object sslKey = context.getConnectionConfig().getObject("sslKey");
+        Object sslKeyPassword = context.getConnectionConfig().getObject("sslKeyPassword");
+        Object tapdata = context.getConnectionConfig().getObject("__TAPDATA");
+        Object sshPassword = tapdata instanceof Map<?, ?> nested ? nested.get("sshPassword") : null;
+        return present(sslKey) && present(sslKeyPassword) && present(sshPassword);
+    }
+
+    private static boolean present(Object value) {
+        return value != null && !String.valueOf(value).isBlank();
     }
 
     /**

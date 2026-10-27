@@ -81,6 +81,20 @@ class ControlFaceProjectionGatesTest {
                 .collect(toCollection(TreeSet::new));
     }
 
+    @Test void storageRoutesMatchTheSharedClientAndCanonicalRegistry() {
+        var ids = io.tapstate.control.client.StorageControlClient.OPERATIONS;
+        assertThat(ids).contains("configuration.export").hasSize(11);
+        for (var id : ids) {
+            var methods = restApi.stream().flatMap(type -> type.getMethods().stream()).filter(method -> method.isAnnotatedWith(Verb.class)
+                    && method.getAnnotationOfType(Verb.class).value().equals(id)).toList();
+            assertThat(methods).as(id).hasSize(1);
+            var mapping = methods.getFirst().getAnnotationOfType(org.springframework.web.bind.annotation.PostMapping.class);
+            assertThat(mapping.value()).containsExactly(io.tapstate.control.client.StorageControlClient.path(id).substring("/api".length()));
+            for (var face : java.util.List.of(Frontend.CLI, Frontend.REST, Frontend.MCP))
+                assertThat(ControlOperations.registry().resolve(id).exposure()).containsKey(face);
+        }
+    }
+
     @Test
     @DisplayName("every HTTP handler projects a registered operation")
     void everyProjectedVerbIsRegistered() {

@@ -10,7 +10,6 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
 import java.nio.file.Path;
-import java.util.Locale;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -58,8 +57,8 @@ class ArtifactDeletePipelineNotStoppedIT {
     @EnumSource(Tiers.class)
     void aRunningPipelineIsRefusedAndBecomesRemovableOnceItIsStopped(Tiers tier, @TempDir Path directory)
             throws Exception {
-        try (ServerHandle server = tier.launch(storeUri("delete_not_stopped", tier))) {
-            RunningPipeline running = RunningPipeline.started(server, directory);
+        try (PreparedNativeStore storage = PreparedNativeStore.create(); ServerHandle server = tier.launch(storage)) {
+            RunningPipeline running = RunningPipeline.started(server, directory, storage);
             ControlPlane control = running.control();
             String pipelineId = running.pipelineId();
 
@@ -97,7 +96,4 @@ class ArtifactDeletePipelineNotStoppedIT {
         }
     }
 
-    private static String storeUri(String name, Tiers tier) {
-        return SharedMongo.replicaSetUrl(name + "_" + tier.name().toLowerCase(Locale.ROOT));
-    }
 }

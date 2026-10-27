@@ -209,7 +209,8 @@ public final class PipelineRepresentation {
                             "preserveNullAndEmptyArrays"), path + ".preserve_null_and_empty_arrays"),
                     textOrNull(value(payload, "element_key", "elementKey"), path + ".element_key"),
                     elementType(value(payload, "element_type", "elementType"),
-                            path + ".element_type"));
+                            path + ".element_type"),
+                    textOrNull(value(payload, "source_id_field", "sourceIdField"), path + ".source_id_field"));
             case "nest" -> new TransformBody.Nest(
                     textOrNull(value(payload, "primary_key", "primaryKey"), path + ".primary_key"),
                     enumValue(value(payload, "order"), NestOrder.values(), NestOrder::yaml, path + ".order"),
@@ -376,6 +377,7 @@ public final class PipelineRepresentation {
                 value.put("preserveNullAndEmptyArrays", unwind.preserveNullAndEmptyArrays());
                 value.put("elementKey", unwind.elementKey());
                 value.put("elementType", unwind.elementType());
+                value.put("sourceIdField", unwind.sourceIdField());
             }
             case TransformBody.Union ignored -> {
             }
@@ -470,6 +472,8 @@ public final class PipelineRepresentation {
             value.put("from", fromRefValue(inline.from()));
             value.put("primaryKey", inline.primaryKey());
             value.put("storage", storageValue(inline.storage()));
+            value.put("writeMode", inline.writeMode() == null ? null : inline.writeMode().name());
+            value.put("onFullLoad", inline.onFullLoad() == null ? null : inline.onFullLoad().name());
             value.put("execution", executionValue(inline.execution()));
         }
         return Collections.unmodifiableMap(value);
@@ -658,6 +662,10 @@ public final class PipelineRepresentation {
                 from,
                 textOrNull(value(value, "primary_key", "primaryKey"), path + ".primary_key"),
                 storage(objectOrNull(value.get("storage"), path + ".storage")),
+                enumValue(value(value, "write_mode", "writeMode"), WriteMode.values(), WriteMode::yaml,
+                        path + ".writeMode"),
+                enumValue(value(value, "on_full_load", "onFullLoad"), OnFullLoad.values(), OnFullLoad::yaml,
+                        path + ".onFullLoad"),
                 execution(value.get("execution"), path + ".execution"));
     }
 

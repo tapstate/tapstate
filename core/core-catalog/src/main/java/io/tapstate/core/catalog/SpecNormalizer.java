@@ -198,7 +198,7 @@ public final class SpecNormalizer {
             Map<String, String> label = resolveLabel(str(def.get("title")), key, defaultLocale, locales);
             boolean required = Boolean.TRUE.equals(def.get("required"));
             String defaultValue = textOf(def.get("default"));
-            boolean secret = "Password".equals(str(def.get("x-component")));
+            boolean secret = SecretConfigPaths.isSecretField(key, def);
             List<EnumOption> options = parseEnum(def.get("enum"), defaultLocale, locales);
             out.add(new ConfigField(key, type, label, required, defaultValue, secret, options,
                     reactions.get(key)));

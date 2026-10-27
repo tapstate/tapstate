@@ -33,7 +33,7 @@ import java.util.Set;
  */
 public final class ReferenceGraph {
 
-    /** A directed edge to a resolved resource: its top-level id and its (parsed) kind. */
+    /** A top-level target and its kind; declarations retain the expected kind before resolution. */
     public record Edge(String id, String kind) {
     }
 
@@ -93,48 +93,38 @@ public final class ReferenceGraph {
     }
 
     /** The deduped set of top-level ids one resource names; intra-pipeline wiring is excluded. */
-    private static Set<String> referencedIds(Resource r) {
+    private static Set<String> referencedIds(Resource resource) {
         Set<String> ids = new LinkedHashSet<>();
-        if (r instanceof PipelineResource p) {
-            ids.addAll(p.sourceIds());
-            if (p.transforms() != null) {
-                for (Step step : p.transforms()) {
-                    if (step instanceof Step.Use u) {
-                        ids.add(u.use());
-                    }
-                }
-            }
-            if (p.view() instanceof ViewBlock.Use u) {
-                ids.add(u.use());
-            }
-            collectServe(p.serve(), ids);
-        } else if (r instanceof ServeResource serve) {
-            collectSinkSources(serve.sync(), serve.push(), ids);
-        }
+        declaredReferences(resource).forEach(target -> ids.add(target.id()));
         return ids;
     }
 
-    /** A pipeline's serve block: a use-reference names its definition; an inline one names its sink sources. */
-    private static void collectServe(ServeBlock serve, Set<String> ids) {
-        switch (serve) {
-            case null -> {
-            }
-            case ServeBlock.Use u -> ids.add(u.use());
-            case ServeBlock.Inline inline -> collectSinkSources(inline.sync(), inline.push(), ids);
-        }
+    /**
+     * Every declared top-level reference, including unresolved targets. Its kind is the required
+     * resource kind, so a caller can prove a complete typed closure instead of using the descriptive
+     * graph's deliberately resolved-only edges as evidence of completeness.
+     */
+    public static List<Edge> declaredReferences(Resource resource) {
+        List<Edge> targets = new ArrayList<>();
+        if (resource instanceof PipelineResource pipeline) {
+            pipeline.sourceIds().forEach(id -> targets.add(new Edge(id,"source")));
+            if (pipeline.transforms() != null) for (Step step : pipeline.transforms())
+                if (step instanceof Step.Use use) targets.add(new Edge(use.use(),"transform"));
+            if (pipeline.view() instanceof ViewBlock.Use use) targets.add(new Edge(use.use(),"view"));
+            collectServe(pipeline.serve(),targets);
+        } else if (resource instanceof ServeResource serve) collectSinkSources(serve.sync(),serve.push(),targets);
+        return targets.stream().distinct().sorted(BY_ID.thenComparing(Edge::kind)).toList();
     }
 
-    /** The connection-source ids named by sync / push elements (X18). */
-    private static void collectSinkSources(List<SyncElement> sync, List<PushElement> push, Set<String> ids) {
-        if (sync != null) {
-            for (SyncElement s : sync) {
-                ids.add(s.source());
-            }
+    private static void collectServe(ServeBlock serve,List<Edge> targets) {
+        switch (serve) {
+            case null -> { }
+            case ServeBlock.Use use -> targets.add(new Edge(use.use(),"serve"));
+            case ServeBlock.Inline inline -> collectSinkSources(inline.sync(),inline.push(),targets);
         }
-        if (push != null) {
-            for (PushElement pe : push) {
-                ids.add(pe.source());
-            }
-        }
+    }
+    private static void collectSinkSources(List<SyncElement> sync,List<PushElement> push,List<Edge> targets) {
+        if (sync != null) sync.forEach(element -> targets.add(new Edge(element.source(),"source")));
+        if (push != null) push.forEach(element -> targets.add(new Edge(element.source(),"source")));
     }
 }

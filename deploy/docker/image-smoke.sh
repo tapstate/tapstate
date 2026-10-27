@@ -14,12 +14,10 @@
 #   3. an unsupported --role is rejected with the coded diagnostic and a non-zero exit, before the
 #      application context starts.
 #
-# A store is required for the boot check, not optional: /healthz lives in the control REST layer, which
-# only comes up once the store does, so a store-less boot serves HTTP but answers /healthz with 404 and
-# never turns healthy. The suite therefore brings up a throwaway single-member replica set -- one write
-# path opens a transaction, and MongoDB offers transactions only on a replica set -- and tears it down
-# after. This stays far lighter than the full end-to-end (no source database, no pipeline, no CLI): it
-# asserts the image, not a data flow.
+# The smoke installs three independent databases on a throwaway replica set through the real local
+# owner channel, restarts, and creates the first administrator before testing authenticated routes.
+# The Mongo connector comes from explicit, verified test inputs; it is never baked into the OP image.
+# There is no source data flow or Pipeline in this fixture.
 #
 # The same image is built once for the host's native architecture and smoked here; the multi-arch
 # (amd64 + arm64) publish is a separate release step. Running this suite on a native runner of each
@@ -68,6 +66,8 @@ check_not() {
 NET="tapstate-smoke-net-$$"
 MONGO="tapstate-smoke-mongo-$$"
 SERVER="tapstate-image-smoke-$$"
+VOLUME="tapstate-image-smoke-state-$$"
+VOLUME_CREATED=0
 WORK="$(mktemp -d)"
 MONGO_STARTING=0
 
@@ -94,7 +94,8 @@ cleanup() {
   if [[ $status -ne 0 && $MONGO_STARTING -eq 1 ]]; then
     mongo_diagnostics >&2 || true
   fi
-  docker rm -f "$SERVER" "$MONGO" >/dev/null 2>&1 || true
+  docker rm -fv "$SERVER" "$MONGO" >/dev/null 2>&1 || true
+  if [[ $VOLUME_CREATED -eq 1 ]]; then docker volume rm "$VOLUME" >/dev/null 2>&1 || true; fi
   docker network rm "$NET" >/dev/null 2>&1 || true
   rm -rf "$WORK" || true
   exit "$status"
@@ -200,6 +201,13 @@ done
 MONGO_STARTING=0
 green "  store ready (primary elected)"
 
+if docker volume inspect "$VOLUME" >/dev/null 2>&1; then
+  red "refusing to reuse an existing smoke state volume"; exit 2
+fi
+docker volume create "$VOLUME" >/dev/null
+VOLUME_CREATED=1
+python3 "$REPO_ROOT/deploy/docker/native-install-smoke.py" prepare --image "$IMAGE" --volume "$VOLUME"
+
 bold "1. container boots against the store, HEALTHCHECK reaches healthy, runs as the unprivileged uid"
 host_ip=""
 if command -v ipconfig >/dev/null 2>&1; then
@@ -213,9 +221,12 @@ if [[ -z "$host_ip" ]]; then
   FAIL=$((FAIL + 1))
 fi
 if docker run -d --name "$SERVER" --network "$NET" \
-     -e TAPSTATE_STORE_MONGO_URI="mongodb://$MONGO:27017/tapstate?directConnection=true" \
+     -e TZ=Etc/UTC \
+     -e 'JAVA_TOOL_OPTIONS=-Xmx768m -XX:ActiveProcessorCount=2' \
+     --mount "type=volume,src=$VOLUME,dst=/var/lib/tapstate" \
      -p "$host_ip::8080" \
-     "$IMAGE" --role=all >/dev/null; then
+     "$IMAGE" --role=all --tapstate.installation.directory=/var/lib/tapstate/installation \
+     --tapstate.hz.jet.cooperative-thread-count=2 >/dev/null; then
   # Poll the container's own health -- the signal a dependent's service_healthy waits on. Break early
   # if the container exits before turning healthy: the embedded member + engine are the keep-alive
   # plane and must hold the process up.
@@ -243,11 +254,12 @@ if docker run -d --name "$SERVER" --network "$NET" \
     check "deep route returns the same SPA entry" cmp -s "$WORK/root.html" "$WORK/deep.html"
     check "static asset is the packaged fixture" grep -qF "__tapstateWebSmoke" "$WORK/app.js"
     check "health endpoint responds over HTTP" curl -fsS "$base_url/healthz" -o /dev/null
-    bootstrap_status="$(docker exec "$SERVER" curl -sS -o /dev/null -w '%{http_code}' \
-      -X POST http://127.0.0.1:8080/auth/bootstrap \
-      -H 'Content-Type: application/json' \
-      -d '{"username":"smoke-admin","password":"smoke-password"}')"
-    check "loopback bootstrap creates the smoke admin" test "$bootstrap_status" = "204"
+    python3 "$REPO_ROOT/deploy/docker/native-install-smoke.py" install --server "$SERVER" \
+      --mongo "mongodb://$MONGO:27017/{database}?directConnection=true" \
+      --username smoke-admin --password smoke-password
+    check "native setup and first-admin handoff reach the normal login entry" true
+    host_port="$(docker port "$SERVER" 8080/tcp | sed 's/.*://')"
+    base_url="http://$host_ip:$host_port"
     token="$(curl -fsS "$base_url/auth/login" -H 'Content-Type: application/json' \
       -d '{"username":"smoke-admin","password":"smoke-password"}' | jq -er '.token')"
     api_status="$(curl -sS -o "$WORK/api-not-found.txt" -w '%{http_code}' \
@@ -272,6 +284,7 @@ if is_running "$SERVER"; then
   # The member's own orderly-leave line proves the shutdown hooks ran, rather than the process merely
   # happening to end at 0.
   docker logs "$SERVER" >"$WORK/run.log" 2>&1 || true
+  check "image uses the canonical server timezone" grep -qF "Server time zone: UTC (default)" "$WORK/run.log"
   check "member logged an orderly SHUTDOWN" grep -q "is SHUTDOWN" "$WORK/run.log"
 else
   red "  FAIL: container was not running to stop (boot check failed above)"; FAIL=$((FAIL + 1))

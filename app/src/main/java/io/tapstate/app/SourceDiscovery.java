@@ -12,8 +12,11 @@ final class SourceDiscovery {
     }
 
     static SourceModel model(StorePort storePort, SourceResource source) {
-        return storePort.schemas().get(source.id())
-                .filter(discovered -> discovered.connectorId().equals(source.connector()))
+        return matched(storePort.schemas().get(source.id()),source);
+    }
+
+    static SourceModel matched(java.util.Optional<DiscoveredSourceModel> captured,SourceResource source) {
+        return captured.filter(discovered -> discovered.connectorId().equals(source.connector()))
                 .map(DiscoveredSourceModel::model)
                 .orElse(null);
     }

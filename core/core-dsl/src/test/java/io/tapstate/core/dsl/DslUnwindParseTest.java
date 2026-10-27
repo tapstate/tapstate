@@ -109,6 +109,22 @@ class DslUnwindParseTest {
     }
 
     @Test
+    void aSourceIdentityFieldCanBeConfiguredWithoutAddingAnotherTransform() {
+        assertThatCode(() -> batch("""
+                path: items
+                include_array_index: item_no
+                source_id_field: original_order_id
+                """)).doesNotThrowAnyException();
+        assertThat(unwindIn(new DslParser().parse(pipeline("""
+                path: items
+                include_array_index: item_no
+                source_id_field: original_order_id
+                """))).sourceIdField()).isEqualTo("original_order_id");
+        assertThat(unwindIn(new DslParser().parse(pipeline("path: items"))).resolvedSourceIdField())
+                .isEqualTo("_unwind_source_id");
+    }
+
+    @Test
     @DisplayName("an unwind with no path is refused as a missing field, not accepted as a no-op")
     void thePathIsRequired() {
         DslException ex = refused("element_key: sku");

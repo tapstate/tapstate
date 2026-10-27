@@ -59,43 +59,41 @@ class ARestartedServerKeepsCarryingIT {
     @EnumSource(Tiers.class)
     void aChangeMadeAfterTheServerIsRestartedStillReachesTheTarget(Tiers tier) throws Exception {
         Path directory = Files.createTempDirectory("restarted-server-keeps-carrying");
-        // Suffixed by tier: the two runs are the same specification, not the same state, and a shared
-        // store would have the second one adopt what the first left rather than what it set up itself.
-        String storeUri = SharedMongo.replicaSetUrl("restart_carries_store_" + tier.name().toLowerCase());
-
-        RunningPipeline running;
-        long carriedBeforeTheRestart;
-        try (ServerHandle first = tier.launch(storeUri)) {
-            running = RunningPipeline.started(first, directory);
-            // Every seeded row, not the first: the count read here is what the half after the restart is
-            // held to exactly, and one read while the load was still arriving undercounts it. The row that
-            // was still on its way then satisfies the wait for the change below, and the restarted target,
-            // holding everything, can never again equal the number taken down -- measured once in CI as a
-            // minute spent waiting for fewer rows than a fully restored target held.
-            long seeded = awaitAtLeast(running, RunningPipeline.SEEDED_ROWS, "every seeded row to reach the target");
-            // Live before the restart, so the wait after it is measuring the restart and nothing else.
-            running.insertAtSource(1);
-            carriedBeforeTheRestart = awaitAtLeast(running, seeded + 1, "a change made before the restart");
-        }
-
-        // The process is gone. The store it wrote, the source directory and the target directory are not.
-        try (ServerHandle second = tier.launch(storeUri)) {
-            ControlPlane control = new ControlPlane(second.baseUrl());
-            control.login("e2e", "e2e-password");
-
-            assertThat(control.state(running.pipelineId()))
-                    .as("the pipeline the restarted server adopted from the store it read")
-                    .contains(PipelineState.RUNNING);
-            if (tier == Tiers.REAL_PROCESS) {
-                running.delayTargetVisibility(SLOW_TARGET_VISIBILITY);
+        try (PreparedNativeStore storage = PreparedNativeStore.create()) {
+            RunningPipeline running;
+            long carriedBeforeTheRestart;
+            try (ServerHandle first = tier.launch(storage)) {
+                running = RunningPipeline.started(first, directory, storage);
+                // Every seeded row, not the first: the count read here is what the half after the restart is
+                // held to exactly, and one read while the load was still arriving undercounts it. The row that
+                // was still on its way then satisfies the wait for the change below, and the restarted target,
+                // holding everything, can never again equal the number taken down -- measured once in CI as a
+                // minute spent waiting for fewer rows than a fully restored target held.
+                long seeded = awaitAtLeast(running, RunningPipeline.SEEDED_ROWS, "every seeded row to reach the target");
+                // Live before the restart, so the wait after it is measuring the restart and nothing else.
+                running.insertAtSource(1);
+                carriedBeforeTheRestart = awaitAtLeast(running, seeded + 1, "a change made before the restart");
             }
-            awaitExactly(
-                    running,
-                    carriedBeforeTheRestart,
-                    "the target to be restored before anything new is laid down");
 
-            running.insertAtSource(1);
-            awaitAtLeast(running, carriedBeforeTheRestart + 1, "a change made after the restart");
+            // The process is gone. The store it wrote, the source directory and the target directory are not.
+            try (ServerHandle second = tier.launch(storage)) {
+                ControlPlane control = new ControlPlane(second.baseUrl());
+                storage.loginAndAwaitBusiness(control);
+
+                assertThat(control.state(running.pipelineId()))
+                        .as("the pipeline the restarted server adopted from the store it read")
+                        .contains(PipelineState.RUNNING);
+                if (tier == Tiers.REAL_PROCESS) {
+                    running.delayTargetVisibility(SLOW_TARGET_VISIBILITY);
+                }
+                awaitExactly(
+                        running,
+                        carriedBeforeTheRestart,
+                        "the target to be restored before anything new is laid down");
+
+                running.insertAtSource(1);
+                awaitAtLeast(running, carriedBeforeTheRestart + 1, "a change made after the restart");
+            }
         }
     }
 

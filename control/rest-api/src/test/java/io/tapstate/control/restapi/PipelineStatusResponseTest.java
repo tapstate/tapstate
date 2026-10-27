@@ -25,6 +25,25 @@ class PipelineStatusResponseTest {
     private final MessageCatalog catalog = MessageCatalog.bundled();
 
     @Test
+    void aCurrentDiagnosisKeepsTheLastStoredStateAndAgeExplicit() {
+        var failure = new io.tapstate.core.lifecycle.ObservationFailure("engine.out-of-memory", java.util.Map.of("pipeline", "orders"));
+        var status = new PipelineStatus("orders", PipelineState.RUNNING, null, OBSERVED_AT).diagnosed(failure);
+        var response = PipelineStatusResponse.of(status, catalog, Clock.fixed(OBSERVED_AT.plusSeconds(90), ZoneOffset.UTC));
+        assertThat(response.state()).isEqualTo(PipelineState.FAILED);
+        assertThat(response.observedState()).isEqualTo(PipelineState.RUNNING);
+        assertThat(response.observedAt()).isEqualTo(OBSERVED_AT);
+        assertThat(response.observedAgeMillis()).isEqualTo(90_000L);
+        assertThat(response.failure().code()).isEqualTo(failure.code());
+        var item = new PipelineCatalogItem("orders", "orders", null, null, null, null, null, true,
+                new PipelineCatalogItem.Status(PipelineCatalogItem.DisplayState.FAILED, PipelineCatalogItem.UiState.STOPPING,
+                        PipelineState.STOPPED, PipelineState.RUNNING, failure, OBSERVED_AT));
+        var catalogResponse = PipelineStatusResponse.of(item, catalog, status);
+        assertThat(catalogResponse.state()).isEqualTo(PipelineState.FAILED);
+        assertThat(catalogResponse.observedState()).isEqualTo(PipelineState.RUNNING);
+        assertThat(catalogResponse.displayState()).isEqualTo(PipelineCatalogItem.UiState.STOPPING);
+    }
+
+    @Test
     void carriesWhenTheObservationWasTakenAndHowLongAgoThatWas() {
         PipelineStatus status = new PipelineStatus("orders", PipelineState.RUNNING, null, OBSERVED_AT);
 

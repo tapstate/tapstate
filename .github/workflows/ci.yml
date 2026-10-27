@@ -5,8 +5,8 @@
 # separate workflow (no-agent-footprint.yml).
 # Specifications (e2e/*IT) run here against real containers: this runner has a Docker daemon, and
 # the e2e module fails rather than skips when one is missing, so a green build here means they ran.
-# On a developer machine they skip instead — and note Docker 29 rejects the API version the client
-# negotiates by default, so running them locally needs -Dapi.version=1.44.
+# On a developer machine they skip instead. Docker 29 rejects the client's default API version;
+# the test steps pass API 1.44 explicitly, as local verification can with -Dapi.version=1.44.
 # Deliberately excluded for now: native-image build (pinned to local darwin-arm64 until D5) and the
 # connector catalog *refresh* - regenerating it needs a connectors checkout and built connector jars.
 # The catalog's own consistency gates are PDK-free and run in the build above; the shell that drives
@@ -51,6 +51,14 @@ jobs:
           path: ${{ runner.temp }}/shards.json
           if-no-files-found: error
           retention-days: 7
+      - name: Prepare the verified Mongo dependency for managed-target examples
+        run: python3 deploy/cloud/prepare-test-inputs.py --mongodb-only --output "$RUNNER_TEMP/managed-mongo"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: managed-mongo-test-input
+          path: ${{ runner.temp }}/managed-mongo/
+          if-no-files-found: error
+          retention-days: 7
 
   test-shards:
     needs: shard-plan
@@ -61,6 +69,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        if: startsWith(matrix.shard, 'e2e-')
+        with:
+          name: managed-mongo-test-input
+          path: ${{ runner.temp }}/managed-mongo/
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -93,7 +106,7 @@ jobs:
           shard = next((item for item in plan["shards"] if item["id"] == sys.argv[2]), None)
           if shard is None:
               raise SystemExit("unknown test shard")
-          cloud_context_test = "io.tapstate.e2e.CloudClusterContextCarriesTheCurrentEgressAddressIT"
+          cloud_context_test = "io.tapstate.app.CloudClusterContextCarriesTheCurrentEgressAddressIT"
           print("true" if any(test["class"] == cloud_context_test for test in shard["tests"]) else "false")
           PY
           )"
@@ -102,10 +115,36 @@ jobs:
             python3 deploy/cloud/prepare-test-inputs.py --output "$RUNNER_TEMP/cloud-test-release"
             echo "TAPSTATE_TEST_CLOUD_RELEASE_DIR=$RUNNER_TEMP/cloud-test-release" >> "$GITHUB_ENV"
           fi
+      - name: Record storage before the test shard
+        run: |
+          df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP" /tmp
+          if ! docker system df; then
+            echo '::warning::Docker storage could not be observed before the test shard.'
+          fi
       - name: Execute exactly this shard
         env:
           SHARD: ${{ matrix.shard }}
-        run: .github/scripts/ci-shard.sh run --plan "$RUNNER_TEMP/shards.json" --shard "$SHARD" --repo-local "$RUNNER_TEMP/m2"
+          # The pinned client otherwise selects an API version current runners reject.
+          # Cloud fixtures must share the release-input filesystem for hard links and space.
+          MAVEN_ARGS: >-
+            -Dapi.version=1.44
+            -Dtapstate.it.jvmArgs=-Djava.io.tmpdir=${{ runner.temp }}/test-tmp
+        run: |
+          mkdir -p "$RUNNER_TEMP/test-tmp"
+          if [[ "$SHARD" == e2e-* ]]; then
+            export MAVEN_ARGS="$MAVEN_ARGS -Dtapstate.e2e.managed-mongo-jar=$RUNNER_TEMP/managed-mongo/mongodb-connector.jar"
+          fi
+          .github/scripts/ci-shard.sh run --plan "$RUNNER_TEMP/shards.json" --shard "$SHARD" --repo-local "$RUNNER_TEMP/m2"
+      - name: Record storage after the test shard
+        if: always()
+        run: |
+          df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP" /tmp
+          if ! docker system df; then
+            echo '::warning::Docker storage could not be observed after the test shard.'
+          fi
+          if ! du -sh "$RUNNER_TEMP/m2" "$GITHUB_WORKSPACE" /tmp; then
+            echo '::warning::Some test storage could not be measured.'
+          fi
       - name: Preserve downloaded dependencies
         if: always()
         run: .github/scripts/ci-maven-cache.sh collect "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
@@ -432,12 +471,15 @@ jobs:
         run: |
           bash deploy/docker/image-smoke-test.sh
           bash deploy/docker/image-smoke-fixture-test.sh
+          PYTHONDONTWRITEBYTECODE=1 python3 deploy/docker/native-install-smoke-test.py
       - name: Web asset packaging cases
         run: bash scripts/prepare-web-assets-smoke.sh
       - name: Web release provenance cases
         run: python3 .github/scripts/web-provenance-smoke.py
       - name: Cloud connector input and test-preparation cases
-        run: python3 deploy/cloud/stage-connectors-test.py
+        run: |
+          python3 deploy/cloud/stage-connectors-test.py
+          PYTHONDONTWRITEBYTECODE=1 python3 deploy/cloud/prepare-test-inputs-test.py
       - name: Cloud image runtime helper cases
         run: |
           node --test deploy/cloud/image-runtime-probe.test.mjs
@@ -644,4 +686,8 @@ jobs:
           java-version: "21"
           cache: maven
       - name: image smoke (builds the boot jar + image, then runs the black-box checks)
-        run: bash deploy/docker/image-smoke.sh --build
+        env:
+          TAPSTATE_TEST_CLOUD_RELEASE_DIR: ${{ runner.temp }}/image-test-release
+        run: |
+          python3 deploy/cloud/prepare-test-inputs.py --output "$TAPSTATE_TEST_CLOUD_RELEASE_DIR"
+          bash deploy/docker/image-smoke.sh --build

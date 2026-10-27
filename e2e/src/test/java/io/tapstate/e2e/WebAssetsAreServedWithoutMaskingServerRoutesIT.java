@@ -24,9 +24,10 @@ class WebAssetsAreServedWithoutMaskingServerRoutesIT {
 
     @Test
     void servesRootDeepRouteAndAssetWhileKeepingHealthAndApiResponses() throws Exception {
-        try (InProcessServer server = InProcessServer.start(SharedMongo.replicaSetUrl("e2e_web_assets"))) {
+        try (var storage = PreparedNativeStore.create("web-assets", "web-assets-password");
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("web-assets", "web-assets-password");
+            storage.loginAndAwaitBusiness(control);
 
             HttpClient client = HttpClient.newHttpClient();
             HttpResponse<String> root = document(client, server.baseUrl(), "/");

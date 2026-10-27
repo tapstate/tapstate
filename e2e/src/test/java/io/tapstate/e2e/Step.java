@@ -21,6 +21,9 @@ public sealed interface Step {
     /** Drives one lifecycle verb and returns once the intent is recorded, not once it converges. */
     record Lifecycle(LifecycleVerb verb) implements Step {}
 
+    /** An admission conflict carrying the exact code, before an execution intent is accepted. */
+    record StartRefused(String code) implements Step {}
+
     /**
      * Holds or releases one source stream, leaving every other stream of the same pipeline running.
      *

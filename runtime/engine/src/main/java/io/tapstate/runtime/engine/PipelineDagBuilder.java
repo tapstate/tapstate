@@ -11,6 +11,7 @@ import io.tapstate.core.model.ExecutionSpec;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.ReadMode;
 import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.SyncElement;
@@ -404,18 +405,18 @@ public final class PipelineDagBuilder {
                         throw new IllegalStateException("transform step '" + step.id()
                                 + "' is a nest, but no nest binding was supplied to the builder");
                     }
-                    NestTopology topology =
-                            NestTopology.compile(pipeline.id(), step.id(), nest, bindings.nest().tables());
+                    var nestBinding = bindings.nest().forStep(pipeline.id(),step.id());
+                    NestTopology topology = nestBinding.topology(pipeline.id(),step.id(),nest);
                     // Before a vertex is drawn, not after: the paths a tree keeps its state under are
                     // named by the tree, so a job built first and refused afterwards would already have
                     // decided which entries it was about to read - and every one of them would be the
                     // wrong entry, silently, with nothing downstream able to tell.
-                    NestStateLedger.reconcile(bindings.nest().ledger(), pipeline.id(), step.id(),
-                            topology.statePaths());
+                    NestStateLedger.reconcile(nestBinding.ledger(), pipeline.id(), step.id(),
+                            nestBinding.stores().hasTypedPlacements() ? topology.stateIdentityPaths() : topology.statePaths());
                     byKey.put(step.id(), NestDag.attach(dag, topology,
                             step.id(), nest.root().from(), step.id(),
                             alias -> verticesOf(aliasUpstream(inline.from(), alias, bindings), byKey),
-                            bindings.nest(),
+                            nestBinding,
                             vertex -> outboundOrdinal.merge(vertex, 1, Integer::sum) - 1,
                             chains == null ? null : new NestFrontier(axes,
                                     alias -> chains.perProducer(
@@ -509,7 +510,8 @@ public final class PipelineDagBuilder {
 
         // Only once every sink is known: what a source's changes wait for depends on every sink its rows reach.
         // Held against the durable record the acks write, so a graph whose sinks record nothing holds nothing.
-        if (sinkAck != null && chains != null) {
+        boolean readsSnapshot = pipeline.settings() == null || pipeline.settings().readMode() != ReadMode.CDC_ONLY;
+        if (sinkAck != null && chains != null && readsSnapshot) {
             Map<String, List<AwaitedLoad>> gates = loadGates(sinks, chains, shape);
             for (String sourceId : pipeline.sourceIds()) {
                 for (String sourceKey : bindings.sourceKeys().apply(sourceId)) {

@@ -13,6 +13,11 @@ import io.tapstate.adapters.mongostore.migration.MigrationRunner;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.StorageBinding;
+import com.mongodb.AuthenticationMechanism;
+import java.io.ByteArrayInputStream;
+import java.net.URLDecoder;
+import java.util.Locale;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -24,6 +29,7 @@ import java.security.GeneralSecurityException;
 import java.security.KeyStore;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateFactory;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -50,6 +56,7 @@ import org.bson.Document;
  * lands later.
  */
 public final class MongoConnection implements AutoCloseable {
+    private static final org.slf4j.Logger LOG = org.slf4j.LoggerFactory.getLogger(MongoConnection.class);
 
     /** The database used when the connection URI names none. */
     private static final String DEFAULT_DATABASE = "tapstate";
@@ -58,12 +65,73 @@ public final class MongoConnection implements AutoCloseable {
     private static final int MAX_APPLICATION_NAME_BYTES = 128;
 
     private final MongoConnectionSettings settings;
+    private final String explicitDatabase;
+    private final String caPem;
+    private final boolean strictStorage;
+    private final boolean userAtlas;
     private MongoClient client;
     private String databaseName;
     private SourceConfigKeyringHandle sourceConfigKeyring;
 
     public MongoConnection(MongoConnectionSettings settings) {
+        this(settings, null, null, false, false);
+    }
+
+    /** A configuration domain preserves deployment authentication and verifies peers whenever TLS is enabled. */
+    public static MongoConnection forConfiguration(MongoConnectionSettings settings) {
+        return new MongoConnection(settings, null, null, true, false);
+    }
+
+    /** The stored database and CA contents are authoritative; no temporary trust file is required. */
+    public static MongoConnection forCache(StorageBinding.Connection binding, Duration timeout, String processId) {
+        Objects.requireNonNull(binding, "binding");
+        if (!validDatabase(binding.database())) throw unsupportedStorage();
+        return new MongoConnection(new MongoConnectionSettings(binding.uri(), null, timeout, processId),
+                binding.database(), binding.caPem(), true, binding.kind() == StorageBinding.Connection.Kind.ATLAS);
+    }
+
+    private MongoConnection(MongoConnectionSettings settings, String explicitDatabase, String caPem,
+            boolean strictStorage, boolean userAtlas) {
         this.settings = Objects.requireNonNull(settings, "settings");
+        this.explicitDatabase = explicitDatabase;
+        this.caPem = caPem;
+        this.strictStorage = strictStorage;
+        this.userAtlas = userAtlas;
+        if (strictStorage) validateStorageOptions(settings.uri());
+    }
+
+    private static boolean validDatabase(String database) {
+        return database != null && !database.isBlank() && database.getBytes(StandardCharsets.UTF_8).length <= 63
+                && MongoDatabaseNames.isValid(database);
+    }
+
+    String selectedDatabase(ConnectionString connectionString) {
+        String selected = explicitDatabase == null ? connectionString.getDatabase() : explicitDatabase;
+        if (strictStorage && !validDatabase(selected)) throw unsupportedStorage();
+        return selected == null ? DEFAULT_DATABASE : selected;
+    }
+
+    private static void validateStorageOptions(String uri) {
+        int query = uri.indexOf('?');
+        if (query < 0) return;
+        try {
+            for (String option : uri.substring(query + 1).split("[&;]")) {
+                String[] pair = option.split("=", 2);
+                String key = URLDecoder.decode(pair[0], StandardCharsets.UTF_8).toLowerCase(Locale.ROOT);
+                String value = pair.length == 2 ? URLDecoder.decode(pair[1], StandardCharsets.UTF_8) : "";
+                if ((java.util.Set.of("tlsinsecure", "tlsallowinvalidhostnames", "sslinvalidhostnameallowed",
+                        "tlsallowinvalidcertificates").contains(key) && !value.equalsIgnoreCase("false"))
+                        || java.util.Set.of("tlscertificatekeyfile", "tlscertificatekeyfilepassword", "tlscafile").contains(key)) {
+                    throw unsupportedStorage();
+                }
+            }
+        } catch (IllegalArgumentException invalid) {
+            throw unsupportedStorage();
+        }
+    }
+
+    private static TapstateException unsupportedStorage() {
+        return new TapstateException(StoreError.STORAGE_CONNECTION_UNSUPPORTED, Map.of(), null);
     }
 
     /**
@@ -127,6 +195,39 @@ public final class MongoConnection implements AutoCloseable {
         }
     }
 
+    /**
+     * Exercises the storage permission set on an isolated namespace, including index creation and
+     * multi-document transactional CRUD. The transaction is always aborted; no probe namespace or
+     * document becomes durable, including when authorization fails halfway through the check.
+     */
+    public void verifyStoragePermissions() {
+        UUID probeId = UUID.randomUUID();
+        var collection = SystemCollections.accessProbeOn(database(), probeId);
+        String id = probeId.toString();
+        try (var session = client().startSession()) {
+            session.startTransaction(TransactionOptions.builder().readConcern(ReadConcern.LOCAL)
+                    .writeConcern(WriteConcern.MAJORITY.withJournal(true))
+                    .timeout(Math.max(1L, settings.serverSelectionTimeout().toMillis()), TimeUnit.MILLISECONDS).build());
+            try {
+                collection.createIndex(session, new Document("value", 1),
+                        new com.mongodb.client.model.IndexOptions().name("storage_probe_value").unique(true));
+                collection.insertOne(session, new Document("_id", id).append("value", "initial"));
+                Document read = collection.find(session, new Document("_id", id)).first();
+                if (read == null || !"initial".equals(read.get("value"))
+                        || collection.updateOne(session, new Document("_id", id),
+                        new Document("$set", new Document("value", "updated"))).getModifiedCount() != 1
+                        || collection.deleteOne(session, new Document("_id", id)).getDeletedCount() != 1) {
+                    throw new TapstateException(StoreError.DATABASE_ACCESS_FAILED,
+                            Map.of("database", databaseName), null);
+                }
+            } finally {
+                if (session.hasActiveTransaction()) session.abortTransaction();
+            }
+        } catch (MongoException refused) {
+            throw new TapstateException(StoreError.DATABASE_ACCESS_FAILED, Map.of("database", databaseName), null);
+        }
+    }
+
     /** Verifies existing Source envelopes and logical identity before handing out the store connection. */
     private void verifySourceConfigStorage() {
         EncryptedArtifactCodec codec = new EncryptedArtifactCodec(sourceConfigKeyring);
@@ -148,8 +249,8 @@ public final class MongoConnection implements AutoCloseable {
     /**
      * Opens the client and verifies the store is reachable and supports transactions, and nothing further.
      * Raises a {@code store.unreachable} coded diagnostic if the target cannot be reached within the
-     * configured server-selection timeout, or {@code store.not-replica-set} if it is reached but is a
-     * standalone server. On success the client is held open for the process lifetime.
+     * configured server-selection timeout, {@code io.store-unauthorized} for rejected database
+     * credentials, or {@code store.not-replica-set} if it is reached but is a standalone server. On success the client is held open for the process lifetime.
      *
      * <p>Separate from {@link #verify()} for the read-only inspection commands, whose whole point is to
      * work on a store a normal start refuses on: they have to reach it without changing it.
@@ -161,7 +262,7 @@ public final class MongoConnection implements AutoCloseable {
         ConnectionString connectionString = parseConnectionString(settings.uri(), ConnectionString::new);
         // The store database is the one named in the URI, falling back to the default when it names
         // none. Resolved here from the same URI the client uses, so database() reflects the target.
-        this.databaseName = resolveDatabaseName(connectionString);
+        this.databaseName = selectedDatabase(connectionString);
         String target = String.join(",", connectionString.getHosts());
         MongoClientSettings clientSettings = buildClientSettings(connectionString);
 
@@ -174,9 +275,20 @@ public final class MongoConnection implements AutoCloseable {
             if (opened != null) {
                 opened.close();
             }
-            // Driver failures may quote connection options, including credentials, in their messages.
-            // The safe host and coded error are enough for the public and application-log boundary.
-            throw new TapstateException(StoreError.UNREACHABLE, Map.of("target", target), null);
+            // Classify explicit server authentication results. The driver also wraps SASL socket failures
+            // in MongoSecurityException; those remain connectivity failures.
+            var authenticationFailure = e instanceof com.mongodb.MongoSecurityException
+                    && e.getCause() instanceof com.mongodb.MongoCommandException command ? command : null;
+            var failure = authenticationFailure != null && authenticationFailure.getErrorCode() == 334 ? unsupportedStorage()
+                    : authenticationFailure != null && (authenticationFailure.getErrorCode() == 18 || authenticationFailure.getErrorCode() == 8000) ? StoreIo.coded(e)
+                    : new TapstateException(StoreError.UNREACHABLE, Map.of("target", target), null);
+            // Driver messages and causes can contain credentials. Log only bounded type and numeric metadata.
+            Throwable cause = e.getCause();
+            LOG.warn("Storage connection check failed [code={}, driver_type={}, driver_code={}, cause_type={}, cause_code={}]",
+                    failure.code().code(), e.getClass().getSimpleName(), e.getCode(),
+                    cause == null ? "none" : cause.getClass().getSimpleName(),
+                    cause instanceof MongoException mongo ? mongo.getCode() : -1);
+            throw failure;
         }
         // A replica-set member reports setName; a sharded router reports msg=isdbgrid.
         // A standalone server reports neither and cannot host checkpoint transactions.
@@ -297,9 +409,23 @@ public final class MongoConnection implements AutoCloseable {
         // TLS follows the URI (applyConnectionString already applied it). A CA file is meaningful only
         // when TLS is on, so it is applied then and ignored otherwise: it trusts the self-signed chain
         // without touching the JVM-wide trust store.
-        boolean useTls = Boolean.TRUE.equals(connectionString.getSslEnabled());
-        if (useTls && settings.tlsCaFile() != null) {
-            builder.applyToSslSettings(b -> b.context(buildSslContext(settings.tlsCaFile())));
+        boolean useTls = builder.build().getSslSettings().isEnabled();
+        if (strictStorage && (Boolean.TRUE.equals(connectionString.getSslInvalidHostnameAllowed())
+                || (!useTls && (userAtlas || caPem != null || settings.tlsCaFile() != null)))) throw unsupportedStorage();
+        if (userAtlas) {
+            var credential = connectionString.getCredential();
+            if (credential == null || credential.getPassword() == null || !"admin".equals(credential.getSource())
+                    || (credential.getAuthenticationMechanism() != null
+                    && credential.getAuthenticationMechanism() != AuthenticationMechanism.SCRAM_SHA_256
+                    && credential.getAuthenticationMechanism() != AuthenticationMechanism.SCRAM_SHA_1)) throw unsupportedStorage();
+            // Preserve an explicit mechanism. Otherwise let the driver negotiate from server-advertised SCRAM support.
+            builder.credential(credential);
+        }
+        if (useTls && caPem != null) {
+            builder.applyToSslSettings(b -> b.context(buildPemSslContext(caPem)));
+        } else if (useTls && settings.tlsCaFile() != null) {
+            builder.applyToSslSettings(b -> b.context(strictStorage
+                    ? buildPemSslContext(readTrustFile(settings.tlsCaFile())) : buildSslContext(settings.tlsCaFile())));
         }
         // Named for this start of the process, so that once it has gone - killed halfway through a write, say -
         // whoever is left can find the transactions it left open and end them; see endTransactionsLeftOpenBy.
@@ -383,6 +509,44 @@ public final class MongoConnection implements AutoCloseable {
         }
         StoreIo.run(() -> admin.runCommand(new Document("killSessions", sessions)));
         return sessions.size();
+    }
+
+    private static String readTrustFile(String path) {
+        try (InputStream input = Files.newInputStream(Path.of(path))) {
+            byte[] content = input.readNBytes(65_537);
+            if (content.length > 65_536) throw invalidTrust();
+            return new String(content, StandardCharsets.UTF_8);
+        } catch (IOException invalid) {
+            throw new TapstateException(StoreError.TLS_CA_UNREADABLE, Map.of("path", path), null);
+        }
+    }
+
+    static SSLContext buildPemSslContext(String pem) {
+        if (pem == null || pem.isBlank() || pem.getBytes(StandardCharsets.UTF_8).length > 65_536
+                || pem.toUpperCase(Locale.ROOT).contains("PRIVATE KEY")) throw invalidTrust();
+        try {
+            CertificateFactory factory = CertificateFactory.getInstance("X.509");
+            KeyStore trust = KeyStore.getInstance(KeyStore.getDefaultType());
+            trust.load(null, null);
+            int count = 0;
+            try (InputStream input = new ByteArrayInputStream(pem.getBytes(StandardCharsets.UTF_8))) {
+                for (Certificate certificate : factory.generateCertificates(input)) {
+                    trust.setCertificateEntry("ca-" + count++, certificate);
+                }
+            }
+            if (count == 0) throw invalidTrust();
+            TrustManagerFactory managers = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+            managers.init(trust);
+            SSLContext context = SSLContext.getInstance("TLS");
+            context.init(null, managers.getTrustManagers(), null);
+            return context;
+        } catch (GeneralSecurityException | IOException invalid) {
+            throw invalidTrust();
+        }
+    }
+
+    private static TapstateException invalidTrust() {
+        return new TapstateException(StoreError.TLS_TRUST_INVALID, Map.of(), null);
     }
 
     /**

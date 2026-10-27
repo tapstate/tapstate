@@ -99,9 +99,8 @@ class ANestFirstFilingPublishesEachDocumentOnceIT {
             assertCompleted(mongo, target, 1);
             assertCompleted(mongo, target, ROWS);
 
-            control.stop(pipelineId, true);
-            Await.until("the nest run to stop before its write ledger is read",
-                    () -> control.state(pipelineId).filter(PipelineState.STOPPED::equals).isPresent(),
+            Await.until("the bounded nest run to complete before its write ledger is read",
+                    () -> control.state(pipelineId).filter(PipelineState.COMPLETED::equals).isPresent(),
                     () -> String.valueOf(control.state(pipelineId)));
 
             assertThat(recordsWritten(witness))

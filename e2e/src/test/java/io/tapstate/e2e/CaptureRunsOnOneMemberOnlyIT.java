@@ -90,9 +90,6 @@ class CaptureRunsOnOneMemberOnlyIT {
     private static final String SECOND_PIPELINE = "capture_once_second";
     private static final String SECOND_TARGET = "capture_once_second_tgt";
 
-    private static final String ADMIN = "e2e";
-    private static final String PASSWORD = "e2e-password";
-
     /** How long the ledger must hold still before it is read. See the class note on why it is this long. */
     private static final Duration QUIET = Duration.ofSeconds(5);
 
@@ -126,8 +123,8 @@ class CaptureRunsOnOneMemberOnlyIT {
             Path secondTarget = Files.createDirectories(directory.resolve("cluster/tgt-second"));
             files.seed(EndpointAddress.uri(source.toString()), TABLE, SeedRows.generated(SEEDED_ROWS));
 
-            String store = SharedMongo.replicaSetUrl("e2e_capture_once_cluster");
-            try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-capture-once")) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                    TwoMemberCluster cluster = TwoMemberCluster.startPrepared(storage)) {
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.first();
                 control.registerConnector(E2eConnectorJar.CONNECTOR_ID, connector);
@@ -220,10 +217,10 @@ class CaptureRunsOnOneMemberOnlyIT {
         try (FileEndpoints files = new FileEndpoints()) {
             EndpointAddress address = EndpointAddress.uri(source.toString());
             files.seed(address, TABLE, SeedRows.generated(SEEDED_ROWS));
-            String store = SharedMongo.replicaSetUrl("e2e_capture_once_single_pair");
-            try (RealProcessServer server = RealProcessServer.start(store)) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                    ServerHandle server = Tiers.REAL_PROCESS.launch(storage)) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
-                control.bootstrapAndLogin(ADMIN, PASSWORD);
+                storage.loginAndAwaitBusiness(control);
                 control.registerConnector(E2eConnectorJar.CONNECTOR_ID, connector);
                 control.discoverSchema(SOURCE_ID, E2eConnectorJar.CONNECTOR_ID, settings(source, ledger));
 
@@ -281,10 +278,10 @@ class CaptureRunsOnOneMemberOnlyIT {
         Path target = Files.createDirectories(root.resolve("tgt"));
         files.seed(EndpointAddress.uri(source.toString()), TABLE, SeedRows.generated(SEEDED_ROWS));
 
-        String store = SharedMongo.replicaSetUrl("e2e_capture_once_one_member");
-        try (RealProcessServer server = RealProcessServer.start(store)) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = Tiers.REAL_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin(ADMIN, PASSWORD);
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID, connector);
             control.discoverSchema(SOURCE_ID, E2eConnectorJar.CONNECTOR_ID, settings(source, ledger));
 

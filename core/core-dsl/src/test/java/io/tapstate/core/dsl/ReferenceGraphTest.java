@@ -26,6 +26,22 @@ class ReferenceGraphTest {
         return Arrays.stream(docs).map(parser::parse).toList();
     }
 
+    @Test
+    void typedDeclarationsKeepMissingReferencesWhileTheDescriptiveGraphStillOmitsThem() {
+        var pipeline = new io.tapstate.core.model.PipelineResource("p",null,
+                List.of(io.tapstate.core.model.SourceRef.spec("missing_source",true)),
+                List.of(io.tapstate.core.model.Step.use("step","missing_transform",io.tapstate.core.model.FromClause.list(io.tapstate.core.model.FromRef.literal("orders")))),
+                new io.tapstate.core.model.ViewBlock.Use(null,"missing_view",io.tapstate.core.model.FromRef.literal("step")),
+                new io.tapstate.core.model.ServeBlock.Use(null,"missing_serve",io.tapstate.core.model.FromRef.literal("step")),null,null);
+        assertThat(ReferenceGraph.declaredReferences(pipeline)).containsExactly(
+                new ReferenceGraph.Edge("missing_serve","serve"),new ReferenceGraph.Edge("missing_source","source"),
+                new ReferenceGraph.Edge("missing_transform","transform"),new ReferenceGraph.Edge("missing_view","view"));
+        assertThat(ReferenceGraph.of(List.of(pipeline)).references("p")).isEmpty();
+        var serve = new io.tapstate.core.model.ServeResource("serve",null,
+                List.of(new io.tapstate.core.model.SyncElement("sink","missing_sink_source",null,null,null)),null,null,null);
+        assertThat(ReferenceGraph.declaredReferences(serve)).containsExactly(new ReferenceGraph.Edge("missing_sink_source","source"));
+    }
+
     // ---- forward edges: what a resource references --------------------------------------
 
     @Test

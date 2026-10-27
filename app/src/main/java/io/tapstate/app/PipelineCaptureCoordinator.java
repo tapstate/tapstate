@@ -15,6 +15,16 @@ import java.util.function.Predicate;
  */
 interface PipelineCaptureCoordinator {
 
+    /** A scoped lifecycle captures the original run separately from its current command authority. */
+    default PipelineCaptureCoordinator forRun(io.tapstate.spi.store.PipelineIntentScope commandScope, io.tapstate.spi.store.WorkloadClaimFence command, ExecutionFence original) {
+        throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.PIPELINE_INTENT_FENCED,java.util.Map.of(),null);
+    }
+
+    /** Only a scoped successful start can supply the immutable source results for its deferred DAG. */
+    default PipelineCaptureBindings captureBindings() {
+        throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.PIPELINE_INTENT_FENCED,java.util.Map.of(),null);
+    }
+
     /** Keeps a shared claim only while the capture serves a pipeline driven here, preserving durable positions. */
     default void runOnlyWhileDriving(Predicate<String> drivesPipeline) {
     }
@@ -38,6 +48,11 @@ interface PipelineCaptureCoordinator {
      */
     default void startCapture(String pipelineId, ArtifactStore artifactSnapshot) {
         startCapture(pipelineId);
+    }
+
+    /** Explicit model-aware adapters consume the original per-start discovery choices. */
+    default void startCapture(String pipelineId,ArtifactStore artifactSnapshot,SourceModelSnapshot sourceModels) {
+        throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.PIPELINE_INTENT_FENCED,java.util.Map.of(),null);
     }
 
     /**
@@ -90,6 +105,14 @@ interface PipelineCaptureCoordinator {
      * question on the path it already takes.
      */
     default boolean loadDelivered(String pipelineId) {
+        return true;
+    }
+
+    /**
+     * Records the load as landed after the exact bounded job has succeeded at every sink. False while
+     * its capture is still finishing, or when this member cannot account for the whole load.
+     */
+    default boolean confirmBoundedLoad(String pipelineId) {
         return true;
     }
 

@@ -120,6 +120,73 @@ class WorkloadClaimStoreIT {
     }
 
     @Test
+    void theSameBootCannotReviveAReleasedTenureOrUseItsLateRelease() {
+        withStore((store, collection) -> {
+            var owner = new WorkloadOwner("node-a", "boot-1");
+            var first = store.acquire(KEY, owner, 0, TTL).claim();
+            assertThat(store.release(first)).isTrue();
+            var next = store.acquire(KEY, owner, 0, TTL).claim();
+            assertThat(next.claimGeneration()).isEqualTo(first.claimGeneration() + 1);
+            assertThat(store.renew(first, TTL)).isEmpty();
+            assertThat(store.release(first)).isFalse();
+            assertThat(store.read(KEY).orElseThrow().leased()).isTrue();
+            assertThat(collection.countDocuments()).isEqualTo(1);
+        });
+    }
+
+    @Test
+    void theSameBootKeepsItsLiveTenureButTakesANewOneAfterExpiry() {
+        withStore((store, collection) -> {
+            var owner = new WorkloadOwner("node-a", "boot-1");
+            var first = store.acquire(KEY, owner, 0, TTL).claim();
+            var live = store.acquire(KEY, owner, 1, TTL).claim();
+            assertThat(live.claimGeneration()).isEqualTo(first.claimGeneration());
+            assertThat(live.topologyRevision()).isEqualTo(1);
+            collection.updateOne(new org.bson.Document(), new org.bson.Document("$set",
+                    new org.bson.Document("leaseUntil", java.util.Date.from(java.time.Instant.EPOCH))));
+            var next = store.acquire(KEY, owner, 1, TTL).claim();
+            assertThat(next.claimGeneration()).isEqualTo(live.claimGeneration() + 1);
+            assertThat(store.release(live)).isFalse();
+            assertThat(store.read(KEY).orElseThrow().leased()).isTrue();
+        });
+    }
+
+    @Test
+    void callerOwnedTransactionKeepsRefusalUsableAndRollsBackEveryClaimTransition() {
+        String databaseName = "claim_txn_" + java.util.UUID.randomUUID().toString().replace("-", "");
+        try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
+            var database = client.getDatabase(databaseName);
+            database.createCollection("workload_claims");
+            var collection = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
+            var store = new MongoWorkloadClaimStore(collection);
+            var key = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+            var owner = new WorkloadOwner("node-a", "boot-1");
+            var original = store.acquire(key, owner, 1, TTL).claim();
+            var another = new WorkloadClaimKey("cluster-a", WorkloadClaimType.CAPTURE, "another");
+            var options = com.mongodb.TransactionOptions.builder().readConcern(com.mongodb.ReadConcern.SNAPSHOT)
+                    .writeConcern(com.mongodb.WriteConcern.MAJORITY.withJournal(true)).build();
+            try (var session = client.startSession()) {
+                org.assertj.core.api.Assertions.assertThatThrownBy(() -> session.withTransaction(() -> {
+                    var scoped = store.inSession(session);
+                    assertThat(scoped.acquire(key, new WorkloadOwner("node-b", "boot-2"), 1, TTL).acquired()).isFalse();
+                    var advanced = scoped.advanceExecution(original, 1, Set.of("node-a")).orElseThrow();
+                    var renewed = scoped.renew(advanced, TTL).orElseThrow();
+                    var failed = scoped.recordExecutionFailure(renewed, false).orElseThrow();
+                    assertThat(scoped.read(key).orElseThrow().claim()).isEqualTo(failed);
+                    assertThat(scoped.readAll(List.of(key))).containsKey(key);
+                    assertThat(scoped.release(failed)).isTrue();
+                    assertThat(scoped.acquire(another, owner, 1, TTL).acquired()).isTrue();
+                    throw new IllegalStateException("abort this fixture transaction");
+                }, options)).isInstanceOf(IllegalStateException.class).hasMessage("abort this fixture transaction");
+            }
+            assertThat(store.read(key).orElseThrow().claim()).isEqualTo(original);
+            assertThat(store.read(another)).isEmpty();
+            assertThat(collection.countDocuments()).isEqualTo(1);
+            database.drop();
+        }
+    }
+
+    @Test
     void oneExpectedExecutionGenerationCanAdvanceOnlyOnce() {
         withStore((store, collection) -> {
             WorkloadClaim claim = store.acquire(

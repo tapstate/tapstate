@@ -109,9 +109,9 @@ class AnUnsupportedTargetConnectorIsRefusedAtApplyIT {
 
     @Test
     void aSyncOntoAnotherSupportedConnectorIsRefusedAndNoneOfTheBatchIsFiled() {
-        try (ServerHandle server = InProcessServer.start(SharedMongo.replicaSetUrl("e2e_target_connector"))) {
+        try (var storage = PreparedNativeStore.create("e2e", "e2e-password"); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
 
             ControlPlane.Refusal refusal = control.applyExpectingRefusal(Map.of(
                     "src_orders.tap.yml", SOURCE,
@@ -142,9 +142,9 @@ class AnUnsupportedTargetConnectorIsRefusedAtApplyIT {
 
     @Test
     void aSyncDeclaredInAServeDefinitionIsRefusedEvenWhenItsTargetWasFiledEarlier() {
-        try (ServerHandle server = InProcessServer.start(SharedMongo.replicaSetUrl("e2e_target_connector_serve"))) {
+        try (var storage = PreparedNativeStore.create("e2e", "e2e-password"); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
 
             // A connection is filed on its own and referred to afterwards, which is how a deployment
             // is built up. Nothing about the document says which role it will be asked for, so filing
@@ -182,9 +182,9 @@ class AnUnsupportedTargetConnectorIsRefusedAtApplyIT {
 
     @Test
     void awsRdsMysqlIsAcceptedAsAReadSourceButRefusedAsAWriteTarget() {
-        try (ServerHandle server = InProcessServer.start(SharedMongo.replicaSetUrl("e2e_aws_rds_target_gate"))) {
+        try (var storage = PreparedNativeStore.create("e2e", "e2e-password"); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             String awsSource = SOURCE.replace("connector: mysql", "connector: aws-rds-mysql");
 
             ControlPlane.Refusal refusal = control.applyExpectingRefusal(Map.of(

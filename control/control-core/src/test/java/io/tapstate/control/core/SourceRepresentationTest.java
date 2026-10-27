@@ -28,6 +28,15 @@ class SourceRepresentationTest {
     private final SourceRepresentation representation =
             new SourceRepresentation(TapstateCatalog.load());
 
+    @Test void aManagedMongoSourceNeverReturnsItsPersistedTrustBundle() {
+        for (String connector : List.of("mongodb", "mongodb-atlas")) {
+            var source = new SourceResource("views", null, connector, Map.of("uri", "mongodb://user:password@host/views", "tlsCaPem", "sentinel-trust-bundle"), null, null, null, null);
+            var view = representation.toView(source, CanonicalHash.of(source));
+            assertThat(view.config()).doesNotContainKey("tlsCaPem");
+            assertThat(source.config()).containsEntry("tlsCaPem", "sentinel-trust-bundle");
+        }
+    }
+
     @Test
     void refusesADraftCarryingOptions() {
         // Options are the engine's own configuration and its vocabulary is empty today, so the model
@@ -213,6 +222,137 @@ class SourceRepresentationTest {
         assertThat(view.config()).containsOnly(Map.entry("host", "localhost"));
         assertThat(view.configuredSecrets()).containsExactly("password");
         assertThat(view.toString()).doesNotContain(SECRET);
+    }
+
+    @Test
+    void redactsTransportSecretsAndReportsTheirPathsWithoutMutatingTheSource() {
+        SourceResource model = source("mysql", linkedMap(
+                "password", SECRET, "sslKey", "private-key", "sslKeyPassword", "key-password",
+                "sslCa", "public-ca", "sslCert", "public-cert",
+                "__TAPDATA", linkedMap("useSSH", true, "sshHost", "bastion", "sshPassword", "ssh-password")));
+
+        SourceView view = representation.toView(model, hash(model));
+
+        assertThat(view.config()).doesNotContainKeys("password", "sslKey", "sslKeyPassword");
+        assertThat(view.config()).containsEntry("sslCa", "public-ca").containsEntry("sslCert", "public-cert");
+        assertThat(view.config().get("__TAPDATA"))
+                .isEqualTo(Map.of("useSSH", true, "sshHost", "bastion"));
+        assertThat(view.configuredSecrets())
+                .containsExactly("__TAPDATA.sshPassword", "password", "sslKey", "sslKeyPassword");
+        assertThat(model.config().get("__TAPDATA"))
+                .isEqualTo(Map.of("useSSH", true, "sshHost", "bastion", "sshPassword", "ssh-password"));
+    }
+
+    @Test
+    void redactsKerberosKeytabFromSourceResponses() {
+        for (String connector : List.of("kafka", "kafka_enhanced", "kafka_avro")) {
+            SourceResource model = source(connector, linkedMap(
+                    "krb5Keytab", "base64-keytab-secret", "krb5KeytabFile", "client.keytab",
+                    "krb5Conf", "base64-config"));
+
+            SourceView view = representation.toView(model, hash(model));
+
+            assertThat(view.config()).doesNotContainKey("krb5Keytab");
+            assertThat(view.config()).containsEntry("krb5KeytabFile", "client.keytab")
+                    .containsEntry("krb5Conf", "base64-config");
+            assertThat(view.configuredSecrets()).contains("krb5Keytab");
+            assertThat(view.config().toString()).doesNotContain("base64-keytab-secret");
+        }
+    }
+
+    @Test
+    void preservesOmittedTransportSecretsWhileReplacingOtherSettings() {
+        SourceResource existing = source("mysql", linkedMap(
+                "sslKey", "private-key", "sslKeyPassword", "key-password",
+                "__TAPDATA", linkedMap("sshHost", "old-host", "sshPassword", "ssh-password")));
+        SourceDraft draft = draft("mysql", Map.of("__TAPDATA", Map.of("sshHost", "new-host")), List.of());
+
+        SourceResource replacement = representation.toModel(draft, existing);
+
+        assertThat(replacement.config()).containsEntry("sslKey", "private-key")
+                .containsEntry("sslKeyPassword", "key-password");
+        assertThat(replacement.config().get("__TAPDATA"))
+                .isEqualTo(Map.of("sshHost", "new-host", "sshPassword", "ssh-password"));
+        assertThat(draft.config().get("__TAPDATA")).isEqualTo(Map.of("sshHost", "new-host"));
+        SourceResource omittedGroup = representation.toModel(draft("mysql", Map.of(), List.of()), existing);
+        assertThat(omittedGroup.config().get("__TAPDATA")).isEqualTo(Map.of("sshPassword", "ssh-password"));
+    }
+
+    @Test
+    void replacesSuppliedTransportSecretsAndDoesNotCarryThemToAnotherConnector() {
+        SourceResource existing = source("mysql", linkedMap(
+                "sslKey", "old-key", "sslKeyPassword", "old-password",
+                "__TAPDATA", Map.of("sshPassword", "old-ssh-password")));
+        Map<String, Object> config = linkedMap(
+                "sslKey", "new-key", "sslKeyPassword", "new-password",
+                "__TAPDATA", Map.of("sshPassword", "new-ssh-password"));
+
+        assertThat(representation.toModel(draft("mysql", config, List.of()), existing).config())
+                .isEqualTo(config);
+        assertThat(representation.toModel(draft("postgres", Map.of(), List.of()), existing).config())
+                .isEmpty();
+    }
+
+    @Test
+    void clearsTransportSecretsByPathAndKeepsOtherSshSettings() {
+        SourceResource existing = source("mysql", linkedMap(
+                "sslKey", "private-key", "sslKeyPassword", "key-password",
+                "__TAPDATA", Map.of("sshPassword", "ssh-password")));
+        SourceDraft draft = draft("mysql", Map.of("__TAPDATA", Map.of("sshHost", "bastion")),
+                List.of("sslKey", "sslKeyPassword", "__TAPDATA.sshPassword"));
+
+        SourceResource replacement = representation.toModel(draft, existing);
+
+        assertThat(replacement.config()).containsOnlyKeys("__TAPDATA");
+        assertThat(replacement.config().get("__TAPDATA")).isEqualTo(Map.of("sshHost", "bastion"));
+        assertThat(representation.toView(replacement, hash(replacement)).configuredSecrets()).isEmpty();
+    }
+
+    @Test
+    void appliesDottedSecretRemovalToDraftProbes() {
+        SourceDraft draft = draft("mysql", linkedMap(
+                "sslKey", "private-key", "__TAPDATA", Map.of("sshHost", "bastion", "sshPassword", SECRET)),
+                List.of("sslKey", "__TAPDATA.sshPassword"));
+
+        SourceResource model = representation.toDraftModel(draft);
+
+        assertThat(model.config()).containsOnlyKeys("__TAPDATA");
+        assertThat(model.config().get("__TAPDATA")).isEqualTo(Map.of("sshHost", "bastion"));
+        assertThat(draft.config()).containsKey("sslKey");
+        assertThat(draft.config().get("__TAPDATA")).isEqualTo(Map.of("sshHost", "bastion", "sshPassword", SECRET));
+    }
+
+    @Test
+    void doesNotPreserveOrReportNullLegacyTransportSecrets() {
+        SourceResource existing = source("mysql", linkedMap(
+                "sslKey", null, "sslKeyPassword", null, "__TAPDATA", linkedMap("sshPassword", null)));
+
+        SourceView view = representation.toView(existing, hash(existing));
+        SourceResource replacement = representation.toModel(draft("mysql", Map.of(), List.of()), existing);
+
+        assertThat(view.configuredSecrets()).isEmpty();
+        assertThat(view.config()).doesNotContainKeys("sslKey", "sslKeyPassword");
+        assertThat(view.config().get("__TAPDATA")).isEqualTo(Map.of());
+        assertThat(replacement.config()).isEmpty();
+    }
+
+    @Test
+    void rejectsTransportSecretsSuppliedAndClearedTogether() {
+        for (String secret : List.of("sslKey", "sslKeyPassword", "__TAPDATA.sshPassword")) {
+            Map<String, Object> config = secret.startsWith("__TAPDATA.")
+                    ? Map.of("__TAPDATA", Map.of("sshPassword", SECRET)) : Map.of(secret, SECRET);
+            assertMalformed(draft("mysql", config, List.of(secret)));
+        }
+    }
+
+    @Test
+    void rejectsNullTransportSecretsAndDuplicateClearPaths() {
+        for (String secret : List.of("sslKey", "sslKeyPassword", "__TAPDATA.sshPassword")) {
+            Map<String, Object> config = secret.startsWith("__TAPDATA.")
+                    ? Map.of("__TAPDATA", linkedMap("sshPassword", null)) : linkedMap(secret, null);
+            assertMalformed(draft("mysql", config, List.of()));
+            assertMalformed(draft("mysql", Map.of(), List.of(secret, secret)));
+        }
     }
 
     @Test

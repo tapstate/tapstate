@@ -25,11 +25,15 @@ import java.util.Set;
  */
 public enum ConnectorError implements TapstateErrorCode {
 
+    TARGET_IDENTITY_CONFLICT("connector.target-identity-conflict", Set.of("table", "field", "preserved", "reason")),
+    TARGET_IDENTITY_CHECK_FAILED("connector.target-identity-check-failed", Set.of(Parameters.CONNECTOR, "table", Parameters.DETAIL)),
+
+
     /**
      * No artifact is registered in the distribution store for this connector id, so it resolves to
      * nothing and cannot be loaded. {@code connector} is the connector id that resolved to no artifact.
      */
-    NOT_REGISTERED("connector.not-registered", Set.of("connector")),
+    NOT_REGISTERED("connector.not-registered", Set.of(Parameters.CONNECTOR)),
 
     /**
      * A connector id resolves to more than one registered artifact — different artifact bytes
@@ -37,7 +41,7 @@ public enum ConnectorError implements TapstateErrorCode {
      * not supported and a silent wrong-version load is never taken. {@code connector} is the connector
      * id; {@code artifacts} lists the competing content hashes.
      */
-    AMBIGUOUS_REGISTRATION("connector.ambiguous-registration", Set.of("connector", "artifacts")),
+    AMBIGUOUS_REGISTRATION("connector.ambiguous-registration", Set.of(Parameters.CONNECTOR, "artifacts")),
 
     /**
      * A different artifact is being registered under a connector id that already has one — same id,
@@ -46,7 +50,7 @@ public enum ConnectorError implements TapstateErrorCode {
      * load. {@code connector} is the connector id; {@code existing} is the content hash already
      * registered; {@code incoming} is the content hash refused.
      */
-    REGISTRATION_CONFLICT("connector.registration-conflict", Set.of("connector", "existing", "incoming")),
+    REGISTRATION_CONFLICT("connector.registration-conflict", Set.of(Parameters.CONNECTOR, "existing", "incoming")),
 
     /**
      * A runtime register names a connector outside the officially supported set, so it is refused
@@ -55,19 +59,24 @@ public enum ConnectorError implements TapstateErrorCode {
      * {@code connector} is the id the artifact declared; {@code official} lists the ids supported
      * today, so the message states the boundary rather than leaving the caller to guess it.
      */
-    NOT_OFFICIAL("connector.not-official", Set.of("connector", "official")),
+    NOT_OFFICIAL("connector.not-official", Set.of(Parameters.CONNECTOR, "official")),
 
     /**
      * The connector jar or its classpath could not be opened / linked. {@code connector} is the
      * connector id being loaded.
      */
-    LOAD_FAILED("connector.load-failed", Set.of("connector")),
+    LOAD_FAILED("connector.load-failed", Set.of(Parameters.CONNECTOR)),
+
+    /** The persisted server trust bundle or its verification options cannot be used safely. */
+    TLS_TRUST_INVALID("connector.tls-trust-invalid", Set.of("connector")),
+    /** Owned temporary trust material could not be removed after its connector use. */
+    TLS_MATERIAL_CLEANUP_FAILED("connector.tls-material-cleanup-failed", Set.of("connector")),
 
     /**
      * The declared entry class is not on the connector's classpath or is not a connector.
      * {@code connector} is the connector id; {@code class} is the class name that was looked up.
      */
-    CLASS_NOT_FOUND("connector.class-not-found", Set.of("connector", "class")),
+    CLASS_NOT_FOUND("connector.class-not-found", Set.of(Parameters.CONNECTOR, "class")),
 
     /**
      * A connector artifact's archive or spec resource could not be read. {@code artifact} names the
@@ -102,7 +111,7 @@ public enum ConnectorError implements TapstateErrorCode {
      * refused. {@code artifact} names the artifact; {@code spec} is the spec resource path;
      * {@code detail} says what was wrong with it.
      */
-    SPEC_INVALID("connector.spec-invalid", Set.of(Parameters.ARTIFACT, "spec", "detail")),
+    SPEC_INVALID("connector.spec-invalid", Set.of(Parameters.ARTIFACT, "spec", Parameters.DETAIL)),
 
     /**
      * A connection config value cannot be converted to the type the connector's own connection form
@@ -111,7 +120,7 @@ public enum ConnectorError implements TapstateErrorCode {
      * is the type its form declares; {@code value} is what the connection holds.
      */
     CONFIG_TYPE_MISMATCH("connector.config-type-mismatch",
-            Set.of("connector", "field", "expected", "value")),
+            Set.of(Parameters.CONNECTOR, "field", "expected", "value")),
 
     /**
      * Oracle LogMiner cannot represent an identifier longer than its documented limit, so starting CDC
@@ -120,21 +129,21 @@ public enum ConnectorError implements TapstateErrorCode {
      * refused name; {@code limit} is the supported character count.
      */
     LOGMINER_IDENTIFIER_TOO_LONG("connector.logminer-identifier-too-long",
-            Set.of("connector", "kind", "identifier", "limit")),
+            Set.of(Parameters.CONNECTOR, "kind", "identifier", "limit")),
 
     /**
      * Oracle LogMiner did not finish connector initialization and schema discovery within the start
      * deadline, so its worker and connector were stopped instead of holding the reconciliation loop.
      * {@code connector} is the Oracle connector id; {@code timeout} is how long preflight was given.
      */
-    LOGMINER_PREFLIGHT_TIMEOUT("connector.logminer-preflight-timeout", Set.of("connector", "timeout")),
+    LOGMINER_PREFLIGHT_TIMEOUT("connector.logminer-preflight-timeout", Set.of(Parameters.CONNECTOR, Parameters.TIMEOUT)),
 
     /**
      * The connector requires a newer PDK API level than the bridge provides, so it is refused rather
      * than silently downgraded. {@code connector} is the connector id; {@code required} is the level
      * it asked for; {@code provided} is the level the bridge provides.
      */
-    API_LEVEL_INCOMPATIBLE("connector.api-level-incompatible", Set.of("connector", "required", "provided")),
+    API_LEVEL_INCOMPATIBLE("connector.api-level-incompatible", Set.of(Parameters.CONNECTOR, "required", "provided")),
 
     /**
      * The connector declares a PDK API version the Tapstate-side level registry has no row for, so the
@@ -143,19 +152,19 @@ public enum ConnectorError implements TapstateErrorCode {
      * it is API-compatible, or to use a build whose version the bridge recognizes. {@code connector} is
      * the connector id; {@code version} is the unrecognized declared PDK API version.
      */
-    API_LEVEL_UNKNOWN("connector.api-level-unknown", Set.of("connector", "version")),
+    API_LEVEL_UNKNOWN("connector.api-level-unknown", Set.of(Parameters.CONNECTOR, "version")),
 
     /**
      * A PDK event could not be projected to or from the tapstate envelope. {@code connector} is the
      * connector id; {@code detail} is the projection failure.
      */
-    PROJECTION_FAILED("connector.projection-failed", Set.of("connector", "detail")),
+    PROJECTION_FAILED("connector.projection-failed", Set.of(Parameters.CONNECTOR, Parameters.DETAIL)),
 
     /**
      * The connector failed while reading (snapshot or cdc). {@code connector} is the connector id;
      * {@code detail} is the failure the connector reported.
      */
-    CAPTURE_FAILED("connector.capture-failed", Set.of("connector", "detail")),
+    CAPTURE_FAILED("connector.capture-failed", Set.of(Parameters.CONNECTOR, Parameters.DETAIL)),
 
     /**
      * The connector's own connection test could not be run to completion — the connector threw out of
@@ -163,20 +172,20 @@ public enum ConnectorError implements TapstateErrorCode {
      * FAILED result, not this code. {@code connector} is the connector id; {@code detail} is the failure
      * the connector reported.
      */
-    TEST_FAILED("connector.test-failed", Set.of("connector", "detail")),
+    TEST_FAILED("connector.test-failed", Set.of(Parameters.CONNECTOR, Parameters.DETAIL)),
 
     /**
      * The connector's schema discovery could not be run to completion — the connector threw out of
      * {@code discoverSchema}. {@code connector} is the connector id; {@code detail} is the failure the
      * connector reported.
      */
-    DISCOVER_FAILED("connector.discover-failed", Set.of("connector", "detail")),
+    DISCOVER_FAILED("connector.discover-failed", Set.of(Parameters.CONNECTOR, Parameters.DETAIL)),
 
     /**
      * The connector failed while writing a batch. {@code connector} is the connector id;
      * {@code detail} is the failure the connector reported.
      */
-    WRITE_FAILED("connector.write-failed", Set.of("connector", "detail")),
+    WRITE_FAILED("connector.write-failed", Set.of(Parameters.CONNECTOR, Parameters.DETAIL)),
 
     /**
      * The connector failed while reading the store — it threw out of the read, or reported the failure
@@ -185,7 +194,10 @@ public enum ConnectorError implements TapstateErrorCode {
      * this one is a user looking at it, and the two fail for different reasons and reach different
      * people.
      */
-    READ_FAILED("connector.read-failed", Set.of("connector", "detail")),
+    READ_FAILED("connector.read-failed", Set.of(Parameters.CONNECTOR, Parameters.DETAIL)),
+
+    /** A snapshot cannot establish its required metadata and replay anchor before reading source rows. */
+    SNAPSHOT_PREPARATION_UNAVAILABLE("connector.snapshot-preparation-unavailable", Set.of("connector", "reason")),
 
     /**
      * The connector gave up part way through a read and returned as if it had not. {@code connector} is
@@ -194,7 +206,7 @@ public enum ConnectorError implements TapstateErrorCode {
      * leaves a short answer no other signal contradicts, and a short answer is indistinguishable from a
      * small collection, so it would otherwise be handed to a caller as a complete one.
      */
-    READ_ABANDONED("connector.read-abandoned", Set.of("connector")),
+    READ_ABANDONED("connector.read-abandoned", Set.of(Parameters.CONNECTOR)),
 
     /**
      * The connector registers no function for the capability this read needs, so the read cannot be
@@ -203,7 +215,7 @@ public enum ConnectorError implements TapstateErrorCode {
      * serve a read is a property of the connector, not something the request was validated against, so
      * a user can reach it by asking to read a source whose connector does not offer it.
      */
-    CAPABILITY_MISSING("connector.capability-missing", Set.of("connector", "capability")),
+    CAPABILITY_MISSING("connector.capability-missing", Set.of(Parameters.CONNECTOR, "capability")),
 
     /**
      * Every live instance of this connection stayed busy for the whole wait, so the read was refused
@@ -211,7 +223,7 @@ public enum ConnectorError implements TapstateErrorCode {
      * {@code timeout} is how long the read waited. A caller that sees this repeatedly is contending
      * with other reads of the same connection, not with a broken one.
      */
-    INSTANCES_BUSY("connector.instances-busy", Set.of("connector", "timeout")),
+    INSTANCES_BUSY("connector.instances-busy", Set.of(Parameters.CONNECTOR, Parameters.TIMEOUT)),
 
     /**
      * The host already holds as many live connector instances as it allows and every one of them is
@@ -226,7 +238,7 @@ public enum ConnectorError implements TapstateErrorCode {
      * connector id; {@code timeout} is how long it was given. The instance it ran on is closed rather
      * than reused, because the abandoned read is still inside it.
      */
-    READ_TIMEOUT("connector.read-timeout", Set.of("connector", "timeout")),
+    READ_TIMEOUT("connector.read-timeout", Set.of(Parameters.CONNECTOR, Parameters.TIMEOUT)),
 
     /**
      * A connector asked to keep a value whose type this build has no encoding for. Refused where it is
@@ -240,7 +252,7 @@ public enum ConnectorError implements TapstateErrorCode {
      * end early. Reported rather than treated as absent, because absent is what a connector reads as
      * "this is my first run", and acting on that quietly discards whatever it had recorded.
      */
-    STATE_UNREADABLE("connector.state-unreadable", Set.of("detail")),
+    STATE_UNREADABLE("connector.state-unreadable", Set.of(Parameters.DETAIL)),
 
     /**
      * A connector's own stream position could not be written down, so this source has no position to
@@ -248,7 +260,7 @@ public enum ConnectorError implements TapstateErrorCode {
      * {@code detail} is why the position could not be rendered. Reporting no position instead would
      * claim the source has nowhere to resume from, which is a different and untrue statement.
      */
-    POSITION_UNRENDERABLE("connector.position-unrenderable", Set.of("connector", "detail")),
+    POSITION_UNRENDERABLE("connector.position-unrenderable", Set.of(Parameters.CONNECTOR, Parameters.DETAIL)),
 
     /**
      * A recorded position could not be read back into something this connector accepts — most often its
@@ -256,7 +268,7 @@ public enum ConnectorError implements TapstateErrorCode {
      * id; {@code detail} is why it could not be read. Refusing is deliberate: starting from the present
      * instead would silently drop every change made since the position was recorded.
      */
-    POSITION_UNREADABLE("connector.position-unreadable", Set.of("connector", "detail")),
+    POSITION_UNREADABLE("connector.position-unreadable", Set.of(Parameters.CONNECTOR, Parameters.DETAIL)),
 
     /**
      * A running change stream could not tell its connector how far the source may release its change log:
@@ -266,7 +278,7 @@ public enum ConnectorError implements TapstateErrorCode {
      * because what a missed release costs is the source keeping some log a while longer, and failing the
      * stream over that would make an outage of a delay.
      */
-    ACKNOWLEDGE_FAILED("connector.acknowledge-failed", Set.of("connector", "detail")),
+    ACKNOWLEDGE_FAILED("connector.acknowledge-failed", Set.of(Parameters.CONNECTOR, Parameters.DETAIL)),
 
     /**
      * A connector could not let go of what it set up on its source to read changes -- a replication slot,
@@ -275,9 +287,12 @@ public enum ConnectorError implements TapstateErrorCode {
      * there by hand. Reported, never fatal: the clearing completes, because a source that cannot be reached
      * must not leave a pipeline that can neither keep its state nor let go of it.
      */
-    RELEASE_FAILED("connector.release-failed", Set.of("connector", "detail", "resources"));
+    RELEASE_FAILED("connector.release-failed", Set.of(Parameters.CONNECTOR, Parameters.DETAIL, "resources"));
 
     static final class Parameters {
+        static final String TIMEOUT = "timeout";
+        static final String CONNECTOR = "connector";
+        static final String DETAIL = "detail";
         static final String ARTIFACT = "artifact";
 
         private Parameters() {
