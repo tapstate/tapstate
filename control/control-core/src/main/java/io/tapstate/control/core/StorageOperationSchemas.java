@@ -66,7 +66,22 @@ final class StorageOperationSchemas {
         var nullableTime = Map.<String,Object>of("anyOf", List.of(Map.of("type", "string", "format", "date-time"), Map.of("type", "null")));
         snapshot.put("applicationDataVerification", object(List.of("status", "checkedAt", "validUntil"), Map.of(
                 "status", choice("UNKNOWN", "CHECKING", "PASSED", "FAILED", "EXPIRED"), "checkedAt", nullableTime, "validUntil", nullableTime)));
-        defs.put("StorageStatusResult", object(List.copyOf(snapshot.keySet()), snapshot));
+        var requiredSnapshot = List.copyOf(snapshot.keySet());
+        var nullableElapsed = Map.<String,Object>of("anyOf", List.of(nonnegative(), Map.of("type", "null")));
+        var milestone = object(List.of("id", "state", "elapsedMillis", "errorCode"), Map.of(
+                "id", choice("SAVE_SETTINGS", "PREPARE_STORAGE", "START_RUNTIME", "PUBLISH_READY"),
+                "state", choice("PENDING", "RUNNING", "COMPLETE", "FAILED"), "elapsedMillis", nullableElapsed,
+                "errorCode", Map.of("anyOf", List.of(text(), Map.of("type", "null")))));
+        snapshot.put("initializationProgress", object(List.of("operationId", "generation", "attemptId", "state", "observedAt",
+                "elapsedMillis", "restored", "milestones", "connectionChecks"), Map.of(
+                "operationId", text(), "generation", positive(), "attemptId", text(), "state", choice("RUNNING", "COMPLETE", "FAILED"),
+                "observedAt", Map.of("type", "string", "format", "date-time"), "elapsedMillis", nonnegative(),
+                "restored", Map.of("type", "boolean"),
+                "milestones", Map.of("type", "array", "items", milestone, "minItems", 4, "maxItems", 4),
+                "connectionChecks", Map.of("type", "array", "maxItems", 3, "items",
+                        object(List.of("layer", "checkedAt"), Map.of("layer", choice("CONFIG", "CACHE", "MASTER"),
+                                "checkedAt", Map.of("type", "string", "format", "date-time")))))));
+        defs.put("StorageStatusResult", object(requiredSnapshot, snapshot));
         var recovery = new LinkedHashMap<String,Object>();
         recovery.put("operationId", text()); recovery.put("previousOperationId", Map.of("anyOf", List.of(text(), Map.of("type", "null"))));
         recovery.put("phase", choice("PLANNED", "CONFIRMED", "RUNNING", "COMPLETE")); recovery.put("scope", choice("PIPELINE", "CLUSTER"));

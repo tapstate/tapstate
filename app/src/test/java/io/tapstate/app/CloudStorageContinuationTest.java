@@ -86,6 +86,33 @@ class CloudStorageContinuationTest {
         @Override public boolean awaitTermination(long timeout, java.util.concurrent.TimeUnit unit) { return closed; }
     }
 
+    @Test void initializationMilestonesRemainReadableWhileTheOriginalBusinessStartupHoldsItsOwner() throws Exception {
+        try (var f = new Fixture(); var readers = java.util.concurrent.Executors.newSingleThreadExecutor()) {
+            var principal = mock(TapstatePrincipal.class);
+            when(principal.credentialType()).thenReturn(CredentialType.CLOUD_SESSION);
+            when(principal.permits(any())).thenReturn(true);
+            var caller = StorageControlAccess.ordinary(StorageBinding.Mode.CLOUD, SETUP, PREPARATION.authScope(),
+                    principal, "organization", () -> {});
+            var business = f.business();
+            doAnswer(ignored -> {
+                var snapshot = readers.submit(() -> f.root.snapshot(caller, () -> {})).get(2, java.util.concurrent.TimeUnit.SECONDS);
+                assertThat(snapshot.setupPhase()).isEqualTo("COMPLETE");
+                assertThat(snapshot.businessPhase()).isEqualTo(StorageControlDispatcher.BusinessPhase.AUTH_READY);
+                assertThat(snapshot.initializationProgress().state()).isEqualTo(StorageInitializationProgress.State.RUNNING);
+                assertThat(snapshot.initializationProgress().milestones()).extracting(StorageInitializationProgress.Milestone::state)
+                        .containsExactly(StorageInitializationProgress.State.COMPLETE, StorageInitializationProgress.State.COMPLETE,
+                                StorageInitializationProgress.State.RUNNING, StorageInitializationProgress.State.PENDING);
+                assertThat(snapshot.initializationProgress().milestones().get(0).elapsedMillis()).isNull();
+                return null;
+            }).when(business).start();
+            f.continueWith(business);
+            var finished = f.root.snapshot(caller, () -> {});
+            assertThat(finished.businessPhase()).isEqualTo(StorageControlDispatcher.BusinessPhase.READY);
+            assertThat(finished.initializationProgress().state()).isEqualTo(StorageInitializationProgress.State.COMPLETE);
+            assertThat(finished.initializationProgress().milestones()).allMatch(step -> step.state() == StorageInitializationProgress.State.COMPLETE);
+        }
+    }
+
     @Test void retainedBusinessStartupFailureIsDiagnosableWithoutExposingSensitiveDetails() {
         try (var f = new Fixture()) {
             f.phase.set(StorageSetupStateStore.Phase.COMPLETE);
@@ -102,6 +129,10 @@ class CloudStorageContinuationTest {
                 });
                 assertThat(f.root.phase()).isEqualTo(StorageRoot.Phase.AUTH_READY);
                 assertThat(f.root.runtime().businessStarted()).isFalse();
+                var progress = f.root.initializationProgress().snapshot(SETUP).orElseThrow();
+                assertThat(progress.state()).isEqualTo(StorageInitializationProgress.State.FAILED);
+                assertThat(progress.milestones().get(2).errorCode()).isEqualTo(ControlError.MALFORMED_REQUEST.code());
+                assertThat(progress.toString()).doesNotContain("secret-sentinel");
                 assertThat(events.list).singleElement().satisfies(event -> {
                     assertThat(event.getFormattedMessage()).contains(ControlError.MALFORMED_REQUEST.code())
                             .doesNotContain("secret-sentinel");

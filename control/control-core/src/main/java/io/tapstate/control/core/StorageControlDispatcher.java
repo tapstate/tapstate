@@ -24,7 +24,15 @@ public final class StorageControlDispatcher {
     public record Snapshot(StorageBinding.Mode mode, String clusterId, String operationId, long setupGeneration,
             long bindingVersion, long authGeneration, long stateVersion, String setupPhase, BusinessPhase businessPhase,
             Map<StorageSetupService.Layer,Health> health, List<String> allowedActions, boolean restartRequired,
-            DefaultSourceVerification.Verification applicationDataVerification) {
+            DefaultSourceVerification.Verification applicationDataVerification,
+            StorageInitializationProgress.View initializationProgress) {
+        public Snapshot(StorageBinding.Mode mode, String clusterId, String operationId, long setupGeneration,
+                long bindingVersion, long authGeneration, long stateVersion, String setupPhase, BusinessPhase businessPhase,
+                Map<StorageSetupService.Layer,Health> health, List<String> allowedActions, boolean restartRequired,
+                DefaultSourceVerification.Verification applicationDataVerification) {
+            this(mode, clusterId, operationId, setupGeneration, bindingVersion, authGeneration, stateVersion, setupPhase,
+                    businessPhase, health, allowedActions, restartRequired, applicationDataVerification, null);
+        }
         public Snapshot(StorageBinding.Mode mode, String clusterId, String operationId, long setupGeneration,
                 long bindingVersion, long authGeneration, long stateVersion, String setupPhase, BusinessPhase businessPhase,
                 Map<StorageSetupService.Layer,Health> health, List<String> allowedActions, boolean restartRequired) {
@@ -39,6 +47,9 @@ public final class StorageControlDispatcher {
                 throw new IllegalArgumentException("invalid storage snapshot");
             health = Map.copyOf(health); allowedActions = List.copyOf(allowedActions);
             Objects.requireNonNull(applicationDataVerification, "applicationDataVerification");
+            if (initializationProgress != null && (!operationId.equals(initializationProgress.operationId())
+                    || setupGeneration != initializationProgress.generation()))
+                throw new IllegalArgumentException("initialization progress scope disagrees with snapshot");
             if (health.size() != StorageSetupService.Layer.values().length || allowedActions.stream().anyMatch(
                     action -> !StorageOperationSchemas.STEMS.containsKey(action) && !Set.of("login", "restart", "first-admin", "connection.test").contains(action)))
                 throw new IllegalArgumentException("invalid storage snapshot actions or health");
@@ -197,7 +208,22 @@ public final class StorageControlDispatcher {
         checked.put("checkedAt", verification.checkedAt() == null ? null : verification.checkedAt().toString());
         checked.put("validUntil", verification.validUntil() == null ? null : verification.validUntil().toString());
         out.put("applicationDataVerification", checked);
+        if (value.initializationProgress() != null) out.put("initializationProgress", progress(value.initializationProgress()));
         out.put("allowedActions", value.allowedActions()); out.put("restartRequired", value.restartRequired()); return out;
+    }
+    private static Map<String,Object> progress(StorageInitializationProgress.View value) {
+        var out = new LinkedHashMap<String,Object>();
+        out.put("operationId", value.operationId()); out.put("generation", value.generation());
+        out.put("attemptId", value.attemptId()); out.put("state", value.state().name());
+        out.put("observedAt", value.observedAt().toString()); out.put("elapsedMillis", value.elapsedMillis());
+        out.put("restored", value.restored());
+        out.put("milestones", value.milestones().stream().map(step -> {
+            var row = new LinkedHashMap<String,Object>(); row.put("id", step.id().name()); row.put("state", step.state().name());
+            row.put("elapsedMillis", step.elapsedMillis()); row.put("errorCode", step.errorCode()); return row;
+        }).toList());
+        out.put("connectionChecks", value.connectionChecks().entrySet().stream().sorted(Map.Entry.comparingByKey())
+                .map(entry -> Map.of("layer", entry.getKey().name(), "checkedAt", entry.getValue().toString())).toList());
+        return out;
     }
     private static Map<String,Object> setup(StorageSetupService.Status value) {
         return Map.of("mode", value.mode().name(), "clusterId", value.clusterId(), "operationId", value.operationId(), "generation", value.generation(),

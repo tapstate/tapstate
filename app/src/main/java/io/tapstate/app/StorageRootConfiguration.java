@@ -161,7 +161,8 @@ class StorageRootConfiguration {
                 committed -> {
                     if (root.mode() == StorageBinding.Mode.CLOUD)
                         root.continueCloudSetup(committed, target, original -> factories.getObject().create(original));
-                }, root::coordinateSetup);
+                }, root::coordinateSetup, (expected, tested, active) -> {},
+                root.mode() == StorageBinding.Mode.CLOUD ? root.initializationProgress() : null);
     }
     @Bean StorageBusinessFactory storageBusinessFactory(StorageRoot root, org.springframework.context.ConfigurableApplicationContext context) {
         return original -> new NativeBusinessContext(root, original, context);
