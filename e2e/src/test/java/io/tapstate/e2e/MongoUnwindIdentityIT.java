@@ -98,7 +98,7 @@ class MongoUnwindIdentityIT {
     }
 
     @Test
-    void specialUniqueIndexesDoNotMasqueradeAsCompleteLogicalKeyConstraints() {
+    void connectorDeclaredUniqueIndexesAreAcceptedWithoutDatabaseSpecificOptions() throws Exception {
         String database = "unwind_indexes_" + UUID.randomUUID().toString().replace("-", "");
         String uri = SharedMongo.replicaSetUrl(database);
         TargetTable target = new TargetTable("orders", List.of(
@@ -121,8 +121,16 @@ class MongoUnwindIdentityIT {
                     mongo.getCollection("orders").createIndex(new Document("_unwind_source_id", 1).append("TAG_NO", 1), options);
                     var plan = new io.tapstate.adapters.pdk.PdkTargetIdentityPlanner(id -> connector)
                             .assess(config, Map.of("orders", target)).get("orders");
-                    assertThat(plan.status()).isEqualTo("action-required");
-                    assertThat(plan.reason()).isEqualTo("other-unique-constraint");
+                    assertThat(plan.status()).isEqualTo("automatic");
+                    var rows = List.of(Envelope.insert(1L, "orders", Map.<String, Object>of("_id", "p", "TAG_NO", 0L), null),
+                            Envelope.insert(1L, "orders", Map.<String, Object>of("_id", "p", "TAG_NO", 1L), null));
+                    try (var writer = new PdkSinkPort(id -> connector).open(config)) {
+                        writer.write(rows).toCompletableFuture().get(30, TimeUnit.SECONDS);
+                    }
+                    try (var writer = new PdkSinkPort(id -> connector).open(config)) {
+                        writer.write(rows).toCompletableFuture().get(30, TimeUnit.SECONDS);
+                    }
+                    assertThat(mongo.getCollection("orders").countDocuments()).isEqualTo(2);
                     mongo.getCollection("orders").drop();
                 }
             } finally {
