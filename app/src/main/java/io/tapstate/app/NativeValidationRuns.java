@@ -63,8 +63,8 @@ final class NativeValidationRuns implements AutoCloseable {
         Actor(ValidationControlStore.Run original,NativeValidationOwnerReservations.Reservation reservation,ValidationRunLifecycle.Activation activation) {
             this.original=original;this.reservation=reservation;allocation=reservation.resources();control=allocation.controlExecutor();
             var factory=new ValidationRunLifecycle.Activation(){
-                public ValidationRunLifecycle.Readiness readiness(){return activation.readiness();}
-                public ValidationRunLifecycle.Execution create(){var created=activation.create();execution=created;return created;}
+                public ValidationRunLifecycle.Readiness readiness(){var nativeReady=reservation.readiness();return nativeReady==ValidationRunLifecycle.Readiness.READY?activation.readiness():nativeReady;}
+                public ValidationRunLifecycle.Execution create(){reservation.beginExecution();var created=activation.create();execution=created;return created;}
                 public void prepared(ValidationRunLifecycle.Execution created){
                     activation.prepared(created);
                     if(original.identity().mode()==ValidationMode.INCREMENTAL){

@@ -534,6 +534,11 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     @Override public io.tapstate.spi.store.StateStore pipelineStates(io.tapstate.spi.store.PipelineIntentScope scope) {
         return new MongoCachePipelineStateStore(pipelineAccess(scope, null, () -> {}));
     }
+    /** Only the original prepared control header, without positions or operator state materialization. */
+    public io.tapstate.core.lifecycle.CheckpointDoc validationPipelineState(io.tapstate.spi.store.PipelineIntentScope scope,Runnable local){
+        return pipelineAccess(scope,null,Objects.requireNonNull(local)).validationControlTransaction(SystemCollections.CACHE_PIPELINE_STATE,
+                (session,state)->MongoStateStore.toCheckpoint(state));
+    }
 
     /** A write view retains exactly the original claim; a later pass opens its own view. */
     @Override public io.tapstate.spi.store.StateStore pipelineStates(io.tapstate.spi.store.PipelineIntentScope scope,

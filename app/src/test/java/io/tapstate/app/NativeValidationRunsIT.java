@@ -19,6 +19,47 @@ import static org.assertj.core.api.Assertions.*;
 @RequiresDocker
 class NativeValidationRunsIT {
     @Container static final MongoDBContainer MONGO=NativeValidationOwnerReservationsIT.MONGO;
+    @Test void nativeInitialWaitOwnsOnlyControlAndUpgradesBeforeCreatingExecution()throws Exception{
+        var ready=new AtomicReference<>(ValidationRunLifecycle.Readiness.WAITING_FOR_INITIAL_LOAD);var created=new java.util.concurrent.atomic.AtomicInteger();var released=new java.util.concurrent.atomic.AtomicBoolean();
+        var reader=new AtomicReference<ValidationLocalBudget.Reservation>();
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers)){
+            f.startup=(saved,spec)->new NativeValidationOwnerReservations.StartupGate(true,ready::get);
+            var request=f.request("FULL",1);var accepted=f.owners.reserve(request);assertThat(accepted.outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
+            var spec=new ValidationRunSpec(f.comparison,ValidationMode.FULL,ValidationMethod.COUNT);var identity=new ValidationRunIdentity(accepted.owner(),"task",request.run(),spec.mode(),spec.fingerprint(),1,"rules");
+            var start=new ValidationReportAdmission.Start(f.task,1,1,request.command().toString(),identity);var reservation=f.owners.take(start);
+            runs.start(start,new ValidationRunLifecycle.Activation(){
+                public ValidationRunLifecycle.Readiness readiness(){return ValidationRunLifecycle.Readiness.READY;}
+                public ValidationRunLifecycle.Execution create(){created.incrementAndGet();assertThat(f.resources.snapshot().processReserved().connections()).isEqualTo(2);assertThat(f.resources.snapshot().processors()).isOne();
+                    reader.set(reservation.resources().budget().reserve(new ValidationLocalBudget.Amount(1024,0,1,1)));
+                    return new ValidationRunLifecycle.Execution(){public ValidationRunIdentity identity(){return identity;}public void start(){}public ValidationRunLifecycle.Progress progress(){return new ValidationRunLifecycle.Progress(false,true,released.get(),null);}public void cancel(){}};
+                }
+            });
+            await(()->runs.read(identity).waiting());assertThat(created).hasValue(0);assertThat(f.resources.snapshot().processors()).isZero();
+            assertThat(f.resources.snapshot().processReserved()).isEqualTo(new ValidationLocalBudget.Amount(65536,1,0,0));assertThat(f.member.getJet().getJobs()).isEmpty();
+            ready.set(ValidationRunLifecycle.Readiness.UNKNOWN);await(()->runs.read(identity).controlUnknown());assertThat(created).hasValue(0);assertThat(f.resources.snapshot().processReserved().reads()).isZero();
+            ready.set(ValidationRunLifecycle.Readiness.READY);await(()->created.get()==1&&runs.read(identity).state()==ValidationRunState.RUNNING);
+            runs.stop(identity);await(()->f.tasks.read("flow","task").orElseThrow().full().permission().phase()==ValidationTaskStore.Phase.CLOSED);
+            assertThat(f.resources.snapshot().processReserved().bytes()).isEqualTo(1024*1024);reader.get().close();released.set(true);
+            await(()->f.resources.snapshot().metadataFrames()==0);assertThat(f.resources.snapshot().processReserved().isEmpty()).isTrue();
+        }finally{if(reader.get()!=null)reader.get().close();released.set(true);}
+    }
+    @Test void readyCapacityRefusalEndsTheAlreadyChosenOwnerWithoutCreatingExecution()throws Exception{
+        var ready=new java.util.concurrent.atomic.AtomicBoolean();var created=new java.util.concurrent.atomic.AtomicInteger();
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers)){
+            f.startup=(saved,spec)->new NativeValidationOwnerReservations.StartupGate(true,()->ready.get()?ValidationRunLifecycle.Readiness.READY:ValidationRunLifecycle.Readiness.WAITING_FOR_INITIAL_LOAD);
+            var request=f.request("FULL",1);var accepted=f.owners.reserve(request);var spec=new ValidationRunSpec(f.comparison,ValidationMode.FULL,ValidationMethod.COUNT);
+            var identity=new ValidationRunIdentity(accepted.owner(),"task",request.run(),spec.mode(),spec.fingerprint(),1,"rules");var start=new ValidationReportAdmission.Start(f.task,1,1,request.command().toString(),identity);var reservation=f.owners.take(start);
+            var original=new ValidationControlStore.Run(identity,reservation.countingGeneration(),start,spec);var control=reservation.access().control();
+            runs.start(start,new ValidationRunLifecycle.Activation(){public ValidationRunLifecycle.Readiness readiness(){return ValidationRunLifecycle.Readiness.READY;}public ValidationRunLifecycle.Execution create(){created.incrementAndGet();throw new AssertionError("unadmitted execution");}});
+            await(()->runs.read(identity).waiting());
+            var blockerIdentity=new ValidationRunIdentity(identity.owner(),"blocker",UUID.randomUUID().toString(),ValidationMode.FULL,"blocker",1,"rules");
+            var blocker=f.resources.admit(blockerIdentity,new ValidationLocalBudget.Amount(1024*1024,16,16,16),1,()->{});
+            try{ready.set(true);await(()->control.read(identity.owner(),original).map(value->value.retired()&&value.state()==ValidationRunState.FAILED).orElse(false));
+                assertThat(created).hasValue(0);assertThat(control.read(identity.owner(),original).orElseThrow().run().identity().owner()).isEqualTo(accepted.owner());
+                await(()->f.resources.snapshot().metadataFrames()==0);assertThat(f.resources.snapshot().processReserved().connections()).isEqualTo(16);assertThat(f.member.getJet().getJobs()).isEmpty();
+            }finally{blocker.close();blocker.processorsExited();}
+        }
+    }
     @Test void savedDelayIsAppliedToTheOriginalLiveQueueAndStopRetainsItsActualLease() throws Exception {
         var clock=new AtomicLong();var actual=new AtomicReference<ValidationCandidateQueue>();
         try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers)) {

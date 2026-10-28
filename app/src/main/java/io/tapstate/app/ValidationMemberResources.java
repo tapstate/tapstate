@@ -57,7 +57,7 @@ final class ValidationMemberResources implements AutoCloseable {
         Unbound reserve(ValidationLocalBudget.Amount envelope, int processors) {
             Objects.requireNonNull(envelope); require();
             if (envelope.isEmpty()) throw invalid("resources.envelope");
-            if (processors < 1 || processors > 1024) throw invalid("resources.processors");
+            if (processors < 0 || processors > 1024) throw invalid("resources.processors");
             var unbound = new Unbound(this, envelope, processors);
             synchronized (ValidationMemberResources.this) {
                 if (closed) throw invalid("resources.processClosed");
@@ -75,7 +75,7 @@ final class ValidationMemberResources implements AutoCloseable {
 
     /** Local envelope comes before durable owner acquisition; no invented owner identity is needed. */
     final class Unbound implements AutoCloseable {
-        private final Member member; private final ValidationLocalBudget.Amount envelope; private final int processors;
+        private final Member member; private ValidationLocalBudget.Amount envelope; private int processors;
         private final AtomicBoolean dataReturned = new AtomicBoolean(), processorsReturned = new AtomicBoolean();
         private int phase; private boolean closeRequested;
         private Unbound(Member member, ValidationLocalBudget.Amount envelope, int processors) { this.member = member; this.envelope = envelope; this.processors = processors; }
@@ -92,10 +92,10 @@ final class ValidationMemberResources implements AutoCloseable {
                 if (allocated != null) allocated.close(); phase = 3; returnData(); returnProcessors(); throw failed;
             }
         }
-        private void returnData() {
+        private synchronized void returnData() {
             if (dataReturned.compareAndSet(false, true)) synchronized (ValidationMemberResources.this) { reserved = subtract(reserved, envelope); }
         }
-        private void returnProcessors() {
+        private synchronized void returnProcessors() {
             synchronized (ValidationMemberResources.this) {
                 if (processorsReturned.get()) return;
                 member.state.processors -= processors; ValidationMemberResources.this.processors -= processors; processorsReturned.set(true);
@@ -130,6 +130,26 @@ final class ValidationMemberResources implements AutoCloseable {
             });
         }
         ValidationLocalBudget.Run budget() { return budget; }
+        /** Same original allocation; process capacity is charged before member growth and any work. */
+        void growTo(ValidationLocalBudget.Amount target,int desiredProcessors){
+            Objects.requireNonNull(target);
+            reservation.member.require();var growth=reservation.member.state.budget.prepareGrowth(budget,target);
+            synchronized(reservation){
+                if(reservation.phase!=2||reservation.dataReturned.get()||reservation.processorsReturned.get())throw invalid("resources.executionClosed");
+                var old=reservation.envelope;int oldProcessors=reservation.processors;
+                if(!old.equals(growth.originalEnvelope()))throw invalid("resources.executionGrowthChanged");
+                if(target.bytes()<old.bytes()||target.workers()<old.workers()||target.connections()<old.connections()||target.reads()<old.reads()
+                        ||desiredProcessors<oldProcessors||desiredProcessors>1024)throw invalid("resources.executionGrowth");
+                var extra=subtract(target,old);int extraProcessors=desiredProcessors-oldProcessors;
+                synchronized(ValidationMemberResources.this){
+                    if(closed||reservation.member.retired)throw invalid("resources.executionClosed");
+                    if(!reservation.member.compatible||extraProcessors>processorCapacity-processors)throw limit("validation.cooperativeHeadroom");
+                    requireSpace(extra);reserved=add(reserved,extra);processors+=extraProcessors;reservation.member.state.processors+=extraProcessors;
+                }
+                try{growth.commit();reservation.envelope=target;reservation.processors=desiredProcessors;}
+                catch(RuntimeException|Error failed){synchronized(ValidationMemberResources.this){reserved=subtract(reserved,extra);processors-=extraProcessors;reservation.member.state.processors-=extraProcessors;}throw failed;}
+            }
+        }
         synchronized ExecutorService queryExecutor() { return view(queries); }
         synchronized ExecutorService decodeExecutor() { return view(decoders); }
         synchronized ExecutorService checkExecutor() { return view(checks); }

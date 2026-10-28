@@ -21,6 +21,15 @@ class ValidationLocalBudgetTest {
     private static final ValidationLocalBudget.Amount ONE = new ValidationLocalBudget.Amount(1024, 1, 1, 1);
     private static final ValidationLocalBudget.Amount TWO = new ValidationLocalBudget.Amount(2048, 2, 2, 2);
     private static final ValidationLocalBudget.Amount ZERO = new ValidationLocalBudget.Amount(0, 0, 0, 0);
+    @Test void onlyTheOriginalAdmissionControllerCanGrowItsEnvelope(){
+        try(var owner=budget(TWO);var other=budget(TWO)){
+            var run=owner.admit(run("growth-owner"),ONE,()->{});
+            assertThatThrownBy(()->other.prepareGrowth(run,TWO)).isInstanceOf(TapstateException.class);
+            assertThat(run.envelope()).isEqualTo(ONE);var growing=owner.prepareGrowth(run,TWO);growing.commit();growing.commit();
+            assertThat(run.envelope()).isEqualTo(TWO);assertThat(owner.snapshot().reserved()).isEqualTo(TWO);
+            run.close();assertThat(owner.snapshot().reserved()).isEqualTo(ZERO);
+        }
+    }
 
     @Test void simultaneousRunsShareTheNodeEnvelopeBeforeAnyBusinessAllocation() {
         try (var budget = budget(TWO)) {

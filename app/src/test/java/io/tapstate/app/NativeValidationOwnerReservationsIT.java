@@ -200,6 +200,7 @@ class NativeValidationOwnerReservationsIT {
         final int maxPipelines, maxOperations;
         final LongSupplier handoffClock;
         volatile Runnable localGuard = () -> {};
+        volatile NativeValidationOwnerReservations.Startup startup=(saved,spec)->NativeValidationOwnerReservations.StartupGate.ready();
         Fixture() { this(64, 128); }
         Fixture(int maxPipelines, int maxOperations) { this(maxPipelines, maxOperations, System::nanoTime); }
         Fixture(int maxPipelines, int maxOperations, LongSupplier handoffClock) {
@@ -235,7 +236,7 @@ class NativeValidationOwnerReservationsIT {
         ValidationOwnerRouter.Request request(String mode, long sequence) { return new ValidationOwnerRouter.Request("flow", "task", task.generation(), 1, sequence, mode, UUID.randomUUID(), UUID.randomUUID().toString()); }
         NativeValidationOwnerReservations owner(ValidationMemberResources.Member resources) {
             return new NativeValidationOwnerReservations(member, configuration, cache, scope, () -> WorkloadClaimFence.from(node), gate, resources, process, timers,
-                    () -> localGuard.run(), Duration.ofSeconds(30), Duration.ofSeconds(5), maxPipelines, maxOperations, handoffClock);
+                    () -> localGuard.run(), Duration.ofSeconds(30), Duration.ofSeconds(5), maxPipelines, maxOperations, handoffClock,(saved,spec)->startup.inspect(saved,spec));
         }
         @Override public void close() {
             owners.close(); resources.close(); member.shutdown(); timers.close(); process.close(); configuration.close(); cache.close();

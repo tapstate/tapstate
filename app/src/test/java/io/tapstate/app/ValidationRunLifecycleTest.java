@@ -8,6 +8,12 @@ import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.*;
 
 class ValidationRunLifecycleTest {
+    @Test void unknownInitialEvidenceKeepsTheOriginalStartingRunWithoutCreatingWork(){
+        var f=new Fixture();f.proofUnknown=true;var status=f.lifecycle.advance();
+        assertThat(status.controlUnknown()).isTrue();assertThat(status.waiting()).isTrue();assertThat(status.state()).isEqualTo(ValidationRunState.STARTING);
+        assertThat(f.created).isZero();assertThat(f.closed).isFalse();f.proofUnknown=false;
+        assertThat(f.lifecycle.advance().state()).isEqualTo(ValidationRunState.RUNNING);assertThat(f.created).isOne();assertThat(f.execution.starts).isOne();
+    }
     @Test void stoppingBeforeSubmissionRetainsTheRememberedHandlesActualResources() {
         var f=new Fixture();f.loseRunningReply=true;assertThat(f.lifecycle.advance().controlUnknown()).isTrue();
         f.lifecycle.stop();var stopped=f.lifecycle.advance();
@@ -130,9 +136,9 @@ class ValidationRunLifecycleTest {
         final List<Start> starts = new ArrayList<>(); final Work execution = new Work();
         final ValidationRunLifecycle lifecycle = new ValidationRunLifecycle(original, this, this, this, this);
         ValidationRunState actual = ValidationRunState.STARTING;
-        boolean waiting, open, closed, sealed, loseRunningReply, loseCloseReply, loseRetireReply, joinClosesConfigAndThrows, closeAfterJoin, ownerLive = true; int created, processorsReturned, dataReturned, abandoned;
+        boolean proofUnknown,waiting, open, closed, sealed, loseRunningReply, loseCloseReply, loseRetireReply, joinClosesConfigAndThrows, closeAfterJoin, ownerLive = true; int created, processorsReturned, dataReturned, abandoned;
         Join joinAnswer = Join.JOINED;
-        @Override public ValidationRunLifecycle.Readiness readiness() { return waiting ? ValidationRunLifecycle.Readiness.WAITING_FOR_INITIAL_LOAD : ValidationRunLifecycle.Readiness.READY; }
+        @Override public ValidationRunLifecycle.Readiness readiness() { return proofUnknown?ValidationRunLifecycle.Readiness.UNKNOWN:waiting ? ValidationRunLifecycle.Readiness.WAITING_FOR_INITIAL_LOAD : ValidationRunLifecycle.Readiness.READY; }
         @Override public ValidationRunLifecycle.Execution create() { created++; return execution; }
         @Override public void requireOwner() { if (!ownerLive) throw unknown(); }
         @Override public void requireRun() { if (sealed) throw new IllegalStateException("publication already sealed"); }

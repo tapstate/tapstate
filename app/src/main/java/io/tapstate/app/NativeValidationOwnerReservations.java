@@ -27,6 +27,12 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
     private static final String CONTEXT = "tapstate.validation-owner-reservations";
     private static final int MAX_PIPELINES = 64, MAX_OPERATIONS = 128;
     private static final long HANDOFF_NANOS = Duration.ofSeconds(30).toNanos();
+    private static final ValidationLocalBudget.Amount CONTROL_ENVELOPE=new ValidationLocalBudget.Amount(64*1024,1,0,0);
+    @FunctionalInterface interface Startup {StartupGate inspect(ValidationSavedDeclarations saved,ValidationRunSpec spec);}
+    record StartupGate(boolean controlOnly,Supplier<ValidationRunLifecycle.Readiness> current){
+        StartupGate{Objects.requireNonNull(current);}
+        static StartupGate ready(){return new StartupGate(false,()->ValidationRunLifecycle.Readiness.READY);}
+    }
     private record Operation(String task, UUID generation, String mode, UUID command) {}
     private final HazelcastInstance member;
     private final MongoConfigurationDomain configuration;
@@ -41,6 +47,7 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
     private final Duration ttl, renewal;
     private final int maxPipelines, maxOperations;
     private final LongSupplier handoffClock;
+    private final Startup startup;
     private final Map<String, Pipeline> pipelines = new ConcurrentHashMap<>();
     private final ScheduledFuture<?> expiry;
     private volatile boolean closed;
@@ -60,7 +67,19 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
     NativeValidationOwnerReservations(HazelcastInstance member, MongoConfigurationDomain configuration, MongoCacheDomain cache,
             CacheBusinessScope scope, Supplier<WorkloadClaimFence> node, ClusterMembershipGate membership,
             ValidationMemberResources.Member resources, ValidationMemberResources process, ValidationOwnerTimers timers,
+            Runnable active, Duration ttl, Duration renewal,Startup startup){
+        this(member,configuration,cache,scope,node,membership,resources,process,timers,active,ttl,renewal,MAX_PIPELINES,MAX_OPERATIONS,System::nanoTime,startup);
+    }
+    NativeValidationOwnerReservations(HazelcastInstance member, MongoConfigurationDomain configuration, MongoCacheDomain cache,
+            CacheBusinessScope scope, Supplier<WorkloadClaimFence> node, ClusterMembershipGate membership,
+            ValidationMemberResources.Member resources, ValidationMemberResources process, ValidationOwnerTimers timers,
             Runnable active, Duration ttl, Duration renewal, int maxPipelines, int maxOperations, LongSupplier handoffClock) {
+        this(member,configuration,cache,scope,node,membership,resources,process,timers,active,ttl,renewal,maxPipelines,maxOperations,handoffClock,(saved,spec)->StartupGate.ready());
+    }
+    NativeValidationOwnerReservations(HazelcastInstance member, MongoConfigurationDomain configuration, MongoCacheDomain cache,
+            CacheBusinessScope scope, Supplier<WorkloadClaimFence> node, ClusterMembershipGate membership,
+            ValidationMemberResources.Member resources, ValidationMemberResources process, ValidationOwnerTimers timers,
+            Runnable active, Duration ttl, Duration renewal, int maxPipelines, int maxOperations, LongSupplier handoffClock,Startup startup) {
         this.member = Objects.requireNonNull(member); this.configuration = Objects.requireNonNull(configuration); this.cache = Objects.requireNonNull(cache);
         this.scope = Objects.requireNonNull(scope); this.node = Objects.requireNonNull(node); this.membership = Objects.requireNonNull(membership);
         this.resources = Objects.requireNonNull(resources); this.process = Objects.requireNonNull(process); this.timers = Objects.requireNonNull(timers);
@@ -68,6 +87,7 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         if (maxPipelines < 1 || maxPipelines > MAX_PIPELINES || maxOperations < 1 || maxOperations > MAX_OPERATIONS) throw invalid("owner.reservationLimits");
         this.maxPipelines = maxPipelines; this.maxOperations = maxOperations;
         this.handoffClock = Objects.requireNonNull(handoffClock);
+        this.startup=Objects.requireNonNull(startup);
         if (ttl.isNegative() || ttl.isZero() || renewal.isNegative() || renewal.isZero() || renewal.compareTo(ttl) >= 0) throw invalid("owner.leaseIntervals");
         if (member.getUserContext().putIfAbsent(CONTEXT, this) != null) throw invalid("owner.alreadyBound");
         expiry = timers.deadlines.scheduleWithFixedDelay(this::expire, 1, 1, TimeUnit.SECONDS);
@@ -108,7 +128,8 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
             var selected = saved.mode(operation.spec.mode());
             if (selected.permission() != null && selected.permission().start().sequence() == request.startSequence()) return operation.reject();
             if (selected.nextStartSequence() != request.startSequence()) return operation.reject();
-            operation.unbound = resources.reserve(envelope(saved, operation.spec), 1);
+            operation.startup=startup.inspect(operation.declarations,operation.spec);operation.dataEnvelope=envelope(saved,operation.spec);
+            operation.unbound = resources.reserve(operation.startup.controlOnly()?CONTROL_ENVELOPE:operation.dataEnvelope, operation.startup.controlOnly()?0:1);
             operation.claimUncertain = true;
             var owner = ensureOwner(local); operation.claimUncertain = false; if (owner == null) return operation.redirect();
             operation.owner = owner; operation.access = local.access; owner.lease.require();
@@ -299,6 +320,7 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         final AtomicBoolean cancelled = new AtomicBoolean(), stopSignalled = new AtomicBoolean();
         volatile boolean preparing, activated, accepted, superseded, completed, claimUncertain, unknown; volatile String reason;
         volatile Owner owner; volatile ValidationSavedDeclarations declarations; volatile ValidationRunSpec spec;
+        volatile StartupGate startup;volatile ValidationLocalBudget.Amount dataEnvelope;
         volatile MongoConfigurationDomain.ValidationAccess access;
         volatile ValidationMemberResources.Metadata metadata; volatile ValidationMemberResources.Unbound unbound; volatile ValidationMemberResources.Run bound;
         private volatile Runnable stop;
@@ -307,6 +329,8 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         ValidationMemberResources.Run resources() { requireReserved(); return bound; }
         MongoConfigurationDomain.ValidationAccess access() { return access; }
         long countingGeneration() { requireReserved(); return owner.countingGeneration; }
+        ValidationRunLifecycle.Readiness readiness(){requireReserved();var answer=Objects.requireNonNull(startup.current().get());requireReserved();return answer;}
+        void beginExecution(){requireReserved();if(readiness()!=ValidationRunLifecycle.Readiness.READY)throw invalid("owner.initialReadinessChanged");bound.growTo(dataEnvelope,1);requireReserved();}
         ValidationTaskStore.Snapshot savedTask() {
             requireReserved();
             var saved=configuration.validationTasks(this::requireReserved).read(request.pipeline(),request.task()).orElseThrow(()->invalid("owner.savedTaskUnavailable"));
@@ -346,7 +370,7 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
             if (bound != null) { bound.close(); bound.processorsExited(); }
             if (unbound != null) unbound.close(); clearMetadata();
         }
-        private synchronized void clearMetadata() { declarations = null; spec = null; if (metadata != null) { metadata.close(); metadata = null; } }
+        private synchronized void clearMetadata() { declarations = null; spec = null;startup=null;dataEnvelope=null; if (metadata != null) { metadata.close(); metadata = null; } }
         @Override public void close() {
             Runnable callback;
             synchronized (this) {

@@ -14,7 +14,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * durable closure and actual task/query drain remain separate, retryable original operations.
  */
 final class ValidationRunLifecycle {
-    enum Readiness { WAITING_FOR_INITIAL_LOAD, READY }
+    enum Readiness { WAITING_FOR_INITIAL_LOAD, UNKNOWN, READY }
     interface Execution {
         ValidationRunIdentity identity();
         /** Submission is single attempt. A thrown response may still have created the original Job. */
@@ -119,7 +119,9 @@ final class ValidationRunLifecycle {
                     }
                     local.requireRun();
                     if (state == ValidationRunState.STARTING) {
-                        try { waiting = activation.readiness() == Readiness.WAITING_FOR_INITIAL_LOAD; }
+                        try { var ready=activation.readiness();waiting=ready!=Readiness.READY;
+                            if(ready==Readiness.UNKNOWN){unknown=true;controlFailure=invalid("run.initialEvidenceUnknown");return settled();}
+                        }
                         catch (TapstateException refused) { fail(refused); finish(); return settled(); }
                         if (!waiting && !stopping.get()) {
                             if (execution == null) {

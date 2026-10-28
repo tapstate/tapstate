@@ -109,6 +109,9 @@ final class MongoCachePipelineAccess {
     }
     /** Read-only control header access; never materializes Pipeline positions or operator bodies. */
     <T> T validationControlTransaction(SystemCollections table,Function<ClientSession,T> action){
+        return validationControlTransaction(table,(session,state)->action.apply(session));
+    }
+    <T> T validationControlTransaction(SystemCollections table,java.util.function.BiFunction<ClientSession,Document,T> action){
         return transaction(session->{
             var state=MongoValidationMetadata.read(session,SystemCollections.CACHE_PIPELINE_STATE.on(database),new Document("_id",scope.pipelineId()),
                     new Document("scope",1).append("epoch",1).append("runtimeWriteFence",1).append("stateJson",1).append("touchMillis",1),64*1024);
@@ -120,7 +123,7 @@ final class MongoCachePipelineAccess {
             var key=new io.tapstate.spi.store.WorkloadClaimKey(scope.clusterId(),WorkloadClaimType.PIPELINE_ACTUATION,scope.pipelineId());
             var claim=MongoValidationMetadata.read(session,SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database),new Document("_id",MongoWorkloadClaimStore.id(key)),
                     MongoValidationMetadata.claimProjection("pipelineScope","pipelinePreparation"),64*1024);
-            requirePreparedClaim(session,claim);new MongoCacheMetadataStructure(database,rateRetention).verifyFacet(table);return action.apply(session);
+            requirePreparedClaim(session,claim);new MongoCacheMetadataStructure(database,rateRetention).verifyFacet(table);return action.apply(session,state);
         });
     }
 

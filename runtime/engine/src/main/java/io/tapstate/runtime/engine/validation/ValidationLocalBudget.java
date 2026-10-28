@@ -73,6 +73,10 @@ public final class ValidationLocalBudget implements AutoCloseable {
     }
 
     public Snapshot snapshot() { synchronized (lock) { return new Snapshot(capacity, reserved, runs.size(), closed); } }
+    /** Only the admission controller holding this budget may enlarge one of its original runs. */
+    public Run.Growth prepareGrowth(Run run,Amount target){
+        Objects.requireNonNull(run);if(!run.belongsTo(this))throw invalid("budget.growthOwner");return run.prepareGrowth(target);
+    }
 
     /** Prevents new allocations without reclaiming another owner's still-live resources. */
     @Override public void close() {
@@ -83,7 +87,7 @@ public final class ValidationLocalBudget implements AutoCloseable {
 
     public final class Run implements AutoCloseable {
         private final ValidationRunIdentity identity;
-        private final Amount envelope;
+        private Amount envelope;
         private final Runnable requireAuthorized;
         private final CompletableFuture<Void> released = new CompletableFuture<>();
         private Amount used = ZERO;
@@ -94,7 +98,29 @@ public final class ValidationLocalBudget implements AutoCloseable {
             this.identity = identity; this.envelope = envelope; this.requireAuthorized = requireAuthorized;
         }
         public ValidationRunIdentity identity() { return identity; }
-        public Amount envelope() { return envelope; }
+        public Amount envelope() { synchronized(lock){return envelope;} }
+        /** Invokes guards without resource monitors. This is memory accounting, never execution authority. */
+        private Growth prepareGrowth(Amount target){
+            Objects.requireNonNull(target);requireAuthorized.run();requireSynchronizationHeadroom.run();
+            synchronized(lock){
+                if(closed||retiring||returned)throw cancelled();
+                if(target.bytes()<envelope.bytes()||target.workers()<envelope.workers()||target.connections()<envelope.connections()||target.reads()<envelope.reads())throw invalid("budget.growth");
+                return new Growth(envelope,target);
+            }
+        }
+        private boolean belongsTo(ValidationLocalBudget original){return ValidationLocalBudget.this==original;}
+        /** Original native accounting attempt; reserve() still checks live authority for every resource. */
+        public final class Growth {
+            private final Amount original,target;private boolean applied;
+            private Growth(Amount original,Amount target){this.original=original;this.target=target;}
+            public Amount originalEnvelope(){return original;}
+            /** No injected callback or future completion runs during this atomic counter update. */
+            public void commit(){synchronized(lock){
+                if(closed||retiring||returned)throw cancelled();if(applied)return;
+                if(!envelope.equals(original))throw invalid("budget.growthChanged");
+                var extra=target.minus(original);fits(capacity,reserved,extra,"validation.node");reserved=reserved.plus(extra);envelope=target;applied=true;
+            }}
+        }
         public Amount used() { synchronized (lock) { return used; } }
         public CompletionStage<Void> released() { return released.minimalCompletionStage(); }
 
