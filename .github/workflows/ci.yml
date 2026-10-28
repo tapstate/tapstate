@@ -75,8 +75,8 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          # Shards and the aggregate must use the same JDK even during runner image rollouts.
-          java-version: '21.0.13'
+          # Include build metadata to avoid mixing runner-provided and downloaded JDKs.
+          java-version: '21.0.13+9.0.LTS'
           cache: maven
       - uses: actions/download-artifact@v4
         with:
@@ -236,7 +236,7 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '21.0.13'
+          java-version: '21.0.13+9.0.LTS'
           cache: maven
       - name: Check secret availability
         id: guard
