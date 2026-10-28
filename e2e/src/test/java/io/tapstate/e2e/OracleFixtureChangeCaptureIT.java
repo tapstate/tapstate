@@ -154,10 +154,16 @@ class OracleFixtureChangeCaptureIT {
                         input=$(mktemp)
                         cat > "$input"
                         if grep -q 'ALTER DATABASE ADD SUPPLEMENTAL LOG DATA' "$input"; then
-                          awk '/ALTER DATABASE ADD SUPPLEMENTAL LOG DATA/ {
+                          awk 'BEGIN { print "SPOOL /tmp/tapstate-initialization.log" }
+                          /^PROMPT / {
+                            print "HOST date -u >> /tmp/tapstate-initialization-stage.log"
+                            print "HOST echo " sprintf("%c", 39) $0 sprintf("%c", 39)                               " >> /tmp/tapstate-initialization-stage.log"
+                          }
+                          /ALTER DATABASE ADD SUPPLEMENTAL LOG DATA/ {
                             print "HOST bash /tmp/tapstate-hold-transaction.sh"
                           } { print }' "$input" > "$input.delayed"
                           input="$input.delayed"
+                          printf '%s\\n' "$$" > /tmp/tapstate-main-sqlplus.pid
                         fi
                         exec "$ORACLE_HOME/bin/sqlplus-probe-real" "$@" < "$input"
                         """)
@@ -170,18 +176,22 @@ class OracleFixtureChangeCaptureIT {
                         HOST date -u '+oracle-fixture-probe holder-stage=holder-before-create epoch-ms=%s%3N' >> /tmp/tapstate-holder-stage-probe.log
                         CREATE TABLE SYSTEM.TAPSTATE_LOGGING_HOLD (ID NUMBER);
                         INSERT INTO SYSTEM.TAPSTATE_LOGGING_HOLD VALUES (1);
+                        PROMPT capture-probe: holder inserted the row;
                         HOST touch /tmp/tapstate-transaction-ready
                         HOST date -u '+oracle-fixture-probe holder-stage=holder-ready epoch-ms=%s%3N' >> /tmp/tapstate-holder-stage-probe.log
                         HOST date -u '+oracle-fixture-probe holder-stage=holder-sleep-start epoch-ms=%s%3N' >> /tmp/tapstate-holder-stage-probe.log
                         BEGIN DBMS_SESSION.SLEEP(130); END;
                         /
+                        PROMPT capture-probe: holder sleep completed;
                         HOST date -u '+oracle-fixture-probe holder-stage=holder-sleep-end epoch-ms=%s%3N' >> /tmp/tapstate-holder-stage-probe.log
                         ROLLBACK;
+                        PROMPT capture-probe: holder rollback completed;
                         HOST date -u '+oracle-fixture-probe holder-stage=holder-rollback-end epoch-ms=%s%3N' >> /tmp/tapstate-holder-stage-probe.log
                         HOST date -u '+oracle-fixture-probe holder-stage=holder-exit epoch-ms=%s%3N' >> /tmp/tapstate-holder-stage-probe.log
                         EXIT;
                         SQL
                         holder=$!
+                        printf '%s\\n' "$holder" > /tmp/tapstate-transaction.pid
                         for attempt in {1..30}; do
                           if [ -f /tmp/tapstate-transaction-ready ]; then
                             printf 'capture-probe: real transaction active; bounded rollback in 130 seconds\\n'

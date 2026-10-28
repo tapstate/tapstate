@@ -15,7 +15,7 @@ class CurrentUserQueryServiceTest {
         assertThat(new CurrentUserQueryService(AuthenticationMode.CLOUD).get(TapstatePrincipal.cloudSession(user)))
                 .isEqualTo(new CurrentUserView("cloud", "stable-user", List.of("read", "write")));
         assertThat(new CurrentUserQueryService(AuthenticationMode.ON_PREM).get(TapstatePrincipal.humanJwt(user)))
-                .isEqualTo(new CurrentUserView("on-prem", "stable-user", List.of("read", "write")));
+                .isEqualTo(new CurrentUserView("on-prem", "stable-user", List.of("read", "write"), "stable-user", null));
     }
 
     @Test

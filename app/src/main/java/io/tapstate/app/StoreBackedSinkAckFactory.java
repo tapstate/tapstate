@@ -29,6 +29,9 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 
 /**
  * The production sink-ack factory carried onto the DAG: it confirms each source node's own per-table progress as
@@ -82,6 +85,7 @@ import java.util.Set;
 final class StoreBackedSinkAckFactory implements SinkAckFactory {
 
     private static final long serialVersionUID = 1L;
+    private static final Logger LOG = LoggerFactory.getLogger(StoreBackedSinkAckFactory.class);
 
     private final Map<String, SourceProgress> progressByTable;
     private final String pipelineId;
@@ -305,6 +309,8 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
         private final Map<SourceProgress, String> cdcStarts = new HashMap<>();
         // The tables already recorded as loaded. The mark is idempotent; this only saves the round trip.
         private final Set<String> loaded = new HashSet<>();
+        // Logging only: the first confirmed change and each decade after it, per table and writer.
+        private final transient Map<String, Long> loggedUpdates = new HashMap<>();
         // Whether a later run has taken over the accounting, after which nothing this writer says lands.
         private boolean replaced;
 
@@ -474,9 +480,40 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
                     return false;
                 }
                 loaded.add(chain);
+                logProgress("Snapshot finished for table {} (target writes confirmed)", table);
             }
             landed.put(chain, now);
+            logCdcProgress(chain, table, now, before);
             return true;
+        }
+
+        private void logCdcProgress(String chain, String table, Landed now, Landed before) {
+            if (now.resumableAt() != null && !isSnapshotOf(now.resumableAt())
+                    && (before == null || now.durableThrough().compareTo(before.durableThrough()) > 0)) {
+                long updates = loggedUpdates.merge(chain, 1L, Long::sum);
+                long decade = updates;
+                while (decade > 1 && decade % 10 == 0) {
+                    decade /= 10;
+                }
+                if (decade == 1) {
+                    logProgress("CDC confirmed for table {} (epoch {}, seq {}; {} updates on writer {})",
+                            table, now.durableThrough().epoch(), now.durableThrough().seq(), updates, writerId);
+                }
+            }
+        }
+
+        private void logProgress(String message, Object... args) {
+            String previous = MDC.get(PipelineLogAppender.PIPELINE_ID_MDC_KEY);
+            MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, pipelineId);
+            try {
+                LOG.info(message, args);
+            } finally {
+                if (previous == null) {
+                    MDC.remove(PipelineLogAppender.PIPELINE_ID_MDC_KEY);
+                } else {
+                    MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, previous);
+                }
+            }
         }
 
         private boolean advanceResumableProgress(SourceProgress source, WriterRun run, Landed now, Landed before,

@@ -26,6 +26,8 @@ import java.util.Set;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.LinkedHashMap;
+import java.util.Arrays;
+import tools.jackson.databind.json.JsonMapper;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -51,6 +53,32 @@ class SystemCollectionsGatesTest {
     private static final Path GOLDEN = Path.of("src/test/resources/system-collections.golden");
     private static final Path CONTRACTS = Path.of("src/test/resources/storage-resources.json");
 
+    @Test
+    void everyCollectionHasTheSamePhysicalNamesAndLayerInTheStorageInventory() throws IOException {
+        var manifest = JsonMapper.builder().build().readTree(
+                Files.readString(Path.of("src/test/resources/storage-resources.json")));
+        var rows = new java.util.LinkedHashMap<String, tools.jackson.databind.JsonNode>();
+        for (var row : manifest.get("resources")) {
+            assertThat(rows.put(row.get("id").asString(), row)).isNull();
+        }
+        assertThat(rows.entrySet().stream().filter(entry -> !"LOCAL".equals(entry.getValue().get("database").asString()))
+                .map(Map.Entry::getKey).toList()).containsExactlyInAnyOrderElementsOf(
+                Arrays.stream(SystemCollections.values()).map(SystemCollections::resourceId).toList());
+        for (SystemCollections declaration : SystemCollections.values()) {
+            var row = rows.get(declaration.resourceId());
+            assertThat(row.get("database").asString()).isEqualTo(declaration.database().name());
+            assertThat(row.get("layer").asString()).isEqualTo(switch (declaration.database()) {
+                case CONFIG -> "CONFIG";
+                case CACHE -> "CACHE";
+                case STORE, NEST -> "LEGACY";
+            });
+            assertThat(row.get("kind").asString()).isEqualTo(declaration.kind().name());
+            var names = new java.util.ArrayList<String>();
+            row.get("physicalNames").forEach(name -> names.add(name.asString()));
+            assertThat(names).containsExactlyElementsOf(declaration.physicalNames());
+        }
+    }
+
     private static JavaClasses tapstateClasses;
 
     /** A call that turns a database into a plain collection handle. */
@@ -75,9 +103,7 @@ class SystemCollectionsGatesTest {
 
     @BeforeAll
     static void importTapstateClasses() {
-        tapstateClasses = new ClassFileImporter()
-                .withImportOption(ImportOption.Predefined.DO_NOT_INCLUDE_TESTS)
-                .importPackages("io.tapstate");
+        tapstateClasses = ProductionClassImports.packages("io.tapstate");
     }
 
     @Test

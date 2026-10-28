@@ -88,6 +88,9 @@ public final class SourceConfigKeyringStore {
         Document encryptedSource = new Document("$or", List.of(
                 new Document("kind", "source"), new Document("body.kind", "source")))
                 .append("body.config", new Document("$type", "string"));
+        if (StoreIo.call(() -> systemMeta.find(MongoAiProviderSettingsStore.recordsFilter()).projection(new Document("_id", 1)).first()) != null) {
+            return loadExistingCipher();
+        }
         if (StoreIo.call(() -> artifacts.find(encryptedSource).projection(new Document("_id", 1)).first()) != null) {
             return loadExistingCipher();
         }
@@ -319,6 +322,11 @@ public final class SourceConfigKeyringStore {
                         }
                     }
                 }
+                for (Document provider : systemMeta.find(transaction, MongoAiProviderSettingsStore.recordsFilter())) {
+                    String envelope = provider.getString("secret");
+                    loaded.cipher().providerSecrets().decrypt(provider.getString("owner"), MongoAiProviderSettingsStore.context(provider), envelope);
+                    if (!loaded.activeKeyId().equals(ProviderSecretCipher.keyId(envelope))) throw rotationBlocked();
+                }
                 if (systemMeta.updateOne(transaction, expected,
                         new Document("$set", new Document("keys", active))
                                 .append("$inc", new Document("epoch", 1L))).getModifiedCount() != 1) {
@@ -374,7 +382,29 @@ public final class SourceConfigKeyringStore {
         return new TapstateException(StoreError.SOURCE_CONFIG_KEYRING_ROTATION_BLOCKED, Map.of(), null);
     }
 
+    private void reencryptProviders() {
+        for (Document record : systemMeta.find(MongoAiProviderSettingsStore.recordsFilter())) {
+            SourceConfigCipher cipher = loadExistingCipher();
+            String envelope = record.getString("secret");
+            if (cipher.activeKeyId().equals(ProviderSecretCipher.keyId(envelope))) continue;
+            String owner = record.getString("owner");
+            String provider = MongoAiProviderSettingsStore.context(record);
+            String secret = cipher.providerSecrets().decrypt(owner, provider, envelope);
+            // Recheck the original envelope so replacing a key concurrently cannot restore the old key.
+            try (ClientSession session = client.startSession()) {
+                session.withTransaction(() -> {
+                    SourceConfigCipher current = loadExistingCipher();
+                    if (!fenceActiveWriter(session, current.activeKeyId())) throw rotationBlocked();
+                    systemMeta.updateOne(session, new Document("_id", record.get("_id")).append("secret", envelope),
+                            new Document("$set", new Document("secret", current.providerSecrets().encrypt(owner, provider, secret))));
+                    return null;
+                }, ACK_TRANSACTION);
+            }
+        }
+    }
+
     private void reencryptSources() {
+        reencryptProviders();
         SourceConfigKeyringHandle current = new SourceConfigKeyringHandle(this);
         EncryptedArtifactCodec codec = new EncryptedArtifactCodec(current);
         MongoArtifactStore writes = new MongoArtifactStore(client, artifacts, current);

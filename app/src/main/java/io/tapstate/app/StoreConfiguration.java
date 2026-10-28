@@ -69,6 +69,12 @@ class StoreConfiguration {
                 history.getRetention());
     }
 
+    @Bean
+    @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
+    io.tapstate.spi.store.AiProviderSettingsStore aiProviderSettingsStore(MongoConnection connection) {
+        return connection.aiProviderSettings();
+    }
+
     /** The deployment's default and per-Nest operator-state databases over the verified store client. */
     @Bean
     @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)

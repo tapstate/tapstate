@@ -16,6 +16,7 @@ final class NativeMemberStorage implements MemberStorage, AutoCloseable {
     private final ClusterProperties properties;
     private final WorkloadClaimStore claims;
     private final SrsStores sources;
+    private volatile NodeSessionLease startupLease;
     private final AtomicReference<NodeSessionLease> lease = new AtomicReference<>();
     private volatile HazelcastInstance member;
     private volatile boolean closed;
@@ -41,15 +42,22 @@ final class NativeMemberStorage implements MemberStorage, AutoCloseable {
         ScopedSinkStateProvider.bind(config, bound.cache(), configuration.requiredNotes());
         RequiredNestDeadLetter.bindTo(config, new ScopedRequiredDeadLetterProvider(configuration.requiredDeadLetters(), authorization));
     }
+    @Override public synchronized void prepare(Config config, WorkloadClaim originalNode, long askedAt, NodeSessionLease proof) {
+        if (proof == null || !proof.active()) throw ThreeLayerStorePort.refused();
+        prepare(config, originalNode, askedAt);
+        startupLease = proof;
+    }
     @Override public void joined(HazelcastInstance member) { this.member = Objects.requireNonNull(member); }
     synchronized void admitted(NodeSessionLease original) {
-        if (closed || lease.get() != null || !original.active() || member == null) throw ThreeLayerStorePort.refused();
+        if (closed || lease.get() != null || startupLease != null && startupLease != original || !original.active() || member == null) throw ThreeLayerStorePort.refused();
         lease.set(original); requireNode();
     }
     boolean nodeActive() {
         if (closed) return false;
         var actual = lease.get();
         if (actual != null) return actual.active() && member != null && member.getLifecycleService().isRunning();
+        var starting = startupLease;
+        if (starting != null) return starting.active();
         return initialDeadline != 0 && System.nanoTime() - initialDeadline < 0;
     }
     void requireNode() { bound.requireBusiness(); if (!nodeActive()) throw ThreeLayerStorePort.refused(); }

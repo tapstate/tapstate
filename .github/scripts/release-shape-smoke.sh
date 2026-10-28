@@ -2,7 +2,7 @@
 # The release workflow's shape, checked as a text.
 #
 # What this holds down is the one property the whole arrangement rests on and that nothing else can
-# see: the acts that cannot be taken back -- creating the tag, publishing, pushing the image, and
+# see: production publication -- creating the tag, publishing, pushing the release image, and
 # tagging the satellite repositories --
 # are all downstream of the pause a person approves, and none of them happens before it. Every one of
 # them is one line away from moving. A `push: true` on the image build, a second release action after
@@ -48,6 +48,18 @@ hasnt()  { if grep -qE -- "$3" <<<"$(job "$2")"; then bad "$1" "job '$2' still m
 
 # --- the approval is upstream of everything irreversible -------------------------------------------
 has "the publish job waits on the approval" publish 'needs:.*approve'
+has "the approval waits for the Cloud dev candidate" approve 'needs:.*cloud-dev'
+has "the approval uses the protected release environment" approve '^    environment: release$'
+has "Cloud dev starts only after the release gates" cloud-dev 'needs:.*gates'
+has "Cloud dev reuses its existing workflow" cloud-dev 'uses: [.]\/[.]github/workflows/cloud-cluster-dev[.]yml'
+has "Cloud dev consumes the selected release version" cloud-dev 'version:.*needs[.]version[.]outputs[.]version'
+has "Cloud dev consumes the frozen Tapstate commit" cloud-dev 'source-sha:.*needs[.]version[.]outputs[.]sha'
+has "Cloud dev consumes the frozen Web commit" cloud-dev 'web-sha:.*needs[.]version[.]outputs[.]web_sha'
+for j in cloud-dev approve publish; do
+  hasnt "$j cannot bypass a failed prerequisite" "$j" '^    (if:|continue-on-error:)'
+done
+has "cleanup waits until Cloud dev has stopped" cleanup 'needs:.*cloud-dev'
+has "cleanup waits until approval has concluded" cleanup 'needs:.*approve'
 
 # Tagging three other repositories is the fourth act that cannot be taken back, and the one furthest
 # from the approval -- it happens in repositories this workflow cannot see the inside of, so nothing
@@ -159,7 +171,7 @@ else
     "Cloud verify ${cloud_verify_at:-none}, OP verify ${onprem_verify_at:-none}, runtime ${cloud_runtime_at:-none}, seal ${cloud_seal_at:-none}, upload ${cloud_upload_at:-none}"
 fi
 
-# Cloud publishes only through release, after the same approval as OP. Intermediate artifacts
+# Production Cloud publishes through release, after the same approval as OP. Intermediate artifacts
 # must remain authenticated ciphertext even though this repository's Actions runs are public.
 has   "Cloud GHCR waits until satellite publication is complete" cloud-ghcr 'needs:.*satellites'
 has   "Cloud GHCR consumes the checked sealed archive" cloud-ghcr 'name: cloud-image-sealed'
@@ -398,6 +410,13 @@ if [ -z "$missing" ]; then
   ok "every output read from another job is one that job declares"
 else
   bad "every output read from another job is one that job declares" "undeclared:${missing}"
+fi
+
+if python3 "$here/release-cloud-dev-gates-test.py"; then
+  ok "the actual distribution-completeness check blocks Cloud dev publication"
+else
+  bad "the actual distribution-completeness check blocks Cloud dev publication" \
+      "the release dependency graph or one of its negative controls failed"
 fi
 
 printf '\n%s passed, %s failed\n' "$passed" "$failed"

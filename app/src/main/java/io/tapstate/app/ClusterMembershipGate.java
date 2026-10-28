@@ -45,8 +45,6 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
         committed.set(new ClusterMembership(original.key().clusterId(), 1, Set.of(original.owner().nodeId())));
     }
 
-    void observeNodeSession(BooleanSupplier active) { nodeSession.set(Objects.requireNonNull(active, "active")); }
-
     /**
      * The data plane's own answer to this same predicate. Until a member binds one, nothing is asked -
      * a build with no member has no data plane to disagree with.
@@ -141,8 +139,14 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
         dataPlane.set(Objects.requireNonNull(admits, "admits"));
     }
 
+    /** The pre-join identity must remain proved while the member is starting or carrying work. */
+    void observeNodeSession(BooleanSupplier current) {
+        nodeSession.set(Objects.requireNonNull(current, "current"));
+    }
+
     boolean canCommit(Set<String> visibleNodeIds) {
         rememberVisible(visibleNodeIds);
+        if (!nodeSession.get().getAsBoolean()) return false;
         ClusterMembership current = committed.get();
         if (profile == ClusterProperties.Profile.SINGLE) {
             return singleOwner == null;
@@ -204,6 +208,7 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
 
     private boolean eligible(VisibleSnapshot snapshot) {
         Set<String> visibleNodeIds = snapshot.nodeIds();
+        if (!nodeSession.get().getAsBoolean()) return false;
         if (profile == ClusterProperties.Profile.SINGLE) {
             return singleOwner == null || singleEligible(snapshot);
         }

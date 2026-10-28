@@ -181,6 +181,9 @@ final class NodeSessionLease implements AutoCloseable {
         return !closed.get();
     }
 
+    /** The startup listener shares the same irreversible local proof as runtime admission. */
+    boolean isCurrent() { return active(); }
+
     private void loseALapsedSession() {
         if (nanoTime.getAsLong() - provenUntil >= 0) {
             lose("no renewal was accepted within the lease the last one bought", null);
@@ -213,13 +216,36 @@ final class NodeSessionLease implements AutoCloseable {
 
     @Override
     public void close() {
-        if (store == null) {
-            return;
+        stopAndClose(() -> { });
+    }
+
+    /** Fence locally before stopping, and never put coordination I/O ahead of the member stop. */
+    void stopAndClose(Runnable stop) {
+        boolean release = store != null && closed.compareAndSet(false, true);
+        try {
+            stop.run();
+        } finally {
+            if (release) {
+                renewer.shutdownNow();
+                releaseCurrent();
+            }
         }
-        if (!closed.compareAndSet(false, true)) {
-            return;
-        }
-        renewer.shutdownNow();
+    }
+
+    /** A library lifecycle listener cannot wait for coordination-store I/O. */
+    void closeAfterMemberStops() {
+        if (store == null || !closed.compareAndSet(false, true)) return;
+        renewer.execute(() -> {
+            try {
+                releaseCurrent();
+            } finally {
+                renewer.shutdownNow();
+            }
+        });
+        renewer.shutdown();
+    }
+
+    private void releaseCurrent() {
         WorkloadClaim ending = current.get();
         try {
             store.release(ending);

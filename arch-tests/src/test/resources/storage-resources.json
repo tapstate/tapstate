@@ -1254,7 +1254,8 @@
       "evidence": [
         "runtime/engine/src/main/java/io/tapstate/runtime/engine/nest/RootAssembly.java",
         "runtime/engine/src/main/java/io/tapstate/runtime/engine/nest/AssemblerProcessor.java",
-        "arch-tests/src/test/java/io/tapstate/archtests/NestStateSerialFormGatesTest.java"
+        "arch-tests/src/test/java/io/tapstate/archtests/NestStateSerialFormGatesTest.java",
+        "runtime/engine/src/test/java/io/tapstate/runtime/engine/nest/AMissingObjectReferenceKeepsTheRootDocumentTest.java"
       ]
     },
     {

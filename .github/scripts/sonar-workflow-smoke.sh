@@ -25,8 +25,49 @@ assert 'pull_request:' in text and '- main' in text
 assert 'matrix:' not in build and 'matrix:' not in reporter
 assert re.search(r'^    name: sonarqube$',reporter,re.M), 'native check name must be sonarqube'
 assert 'SONAR_REQUIRED' not in text and 'ci-summary' not in text, 'dead branch-push analysis path remains'
-assert "group: ${{ format('sonarqube-{0}', github.event.pull_request.number || github.ref) }}" in text
-assert '  cancel-in-progress: false' in text, 'in-flight server analysis must finish'
+def analysis_locks(ci_text, manual):
+    assert not re.search(r'^concurrency:', ci_text, re.M), 'Sonar lock must not serialize the entire CI workflow'
+    ci_build=block(ci_text,r'^  build:\n',r'^  [\w-]+:')
+    lock=block(ci_build,r'^    concurrency:\n',r'^    \S')
+    assert "      group: ${{ format('sonarqube-{0}', github.event.pull_request.number || github.ref) }}" in lock
+    assert re.search(r'^      cancel-in-progress: false$', lock, re.M), 'in-flight server analysis must finish'
+    assert re.search(r'^      queue: max$', lock, re.M), 'multiple pending analyses must not replace each other'
+    assert not re.search(r'^concurrency:', manual, re.M), 'manual analysis must lock its analysis job'
+    manual_job=block(manual,r'^  analyze:\n',r'^  [\w-]+:')
+    manual_lock=block(manual_job,r'^    concurrency:\n',r'^    \S')
+    assert re.search(r'^      group: sonarqube-\$\{\{ inputs.pr \}\}$', manual_lock, re.M)
+    assert re.search(r'^      cancel-in-progress: false$', manual_lock, re.M)
+    assert re.search(r'^      queue: max$', manual_lock, re.M), 'manual analysis must retain the same queue policy'
+    for name in ('shard-plan', 'test-shards', 'sonarqube'):
+        body=block(ci_text,r'^  '+name+r':\n',r'^  [\w-]+:')
+        assert 'sonarqube-' not in body, 'tests and outcome reporting must not acquire the analysis lock'
+manual=(root/'sonar-pr.yml').read_text()
+analysis_locks(text,manual)
+lock_mutations=0
+for target, original, replacement in [
+    ('ci', "      group: ${{ format('sonarqube-{0}', github.event.pull_request.number || github.ref) }}", '      group: unrelated-analysis'),
+    ('ci', '      cancel-in-progress: false', '      cancel-in-progress: true'),
+    ('ci', '      queue: max', '      queue: single'),
+    ('ci', 'permissions:', 'concurrency: sonarqube-global\npermissions:'),
+    ('ci', '  test-shards:', '  test-shards:\n    concurrency: sonarqube-workers'),
+    ('manual', '      group: sonarqube-${{ inputs.pr }}', '      group: unrelated-analysis'),
+    ('manual', '      cancel-in-progress: false', '      cancel-in-progress: true'),
+    ('manual', '      queue: max', '      queue: single'),
+    ('manual', 'permissions:', 'concurrency: sonarqube-global\npermissions:'),
+]:
+    original_text=text if target=='ci' else manual
+    assert original in original_text
+    if target=='ci' and original in ('      cancel-in-progress: false', '      queue: max'):
+        before_build, build_and_tail=original_text.split('  build:\n',1)
+        changed=before_build+'  build:\n'+build_and_tail.replace(original,replacement,1)
+    else:
+        changed=original_text.replace(original,replacement,1)
+    try:
+        analysis_locks(changed if target=='ci' else text,changed if target=='manual' else manual)
+    except AssertionError:
+        lock_mutations+=1
+    else:
+        raise AssertionError('escaped analysis lock mutation: '+replacement)
 # Bind cases to the actual subscribed event/ref set; ws pushes must not be a test-only lane.
 trigger=block(text,r'^on:\n',r'^\S')
 assert re.search(r'^  push:\n    branches:\n      - main\n',trigger,re.M)
@@ -108,6 +149,11 @@ esac
     curl.chmod(0o755)
     gh=tmp/'gh'
     gh.write_text('''#!/usr/bin/env bash
+if [[ "$*" == *"/pulls/"* ]]; then
+  [[ "${LIVE_HEAD_FAIL:-false}" != true ]] || exit 1
+  printf '%s\n' "${LIVE_HEAD_SHA:-$EXPECTED_HEAD_SHA}"
+  exit 0
+fi
 for arg in "$@"; do
   case "$arg" in
     body=*) printf '%s' "${arg#body=}" > "$CAPTURED_COMMENT" ;;
@@ -119,11 +165,12 @@ done
     curl_urls=tmp/'curl-urls'
     env=dict(os.environ,PATH=str(tmp)+os.pathsep+os.environ['PATH'],SONAR_TOKEN='token',
              SONAR_HOST_URL='https://sonar.example.invalid',GH_TOKEN='token',PR_NUMBER='540',
-             GITHUB_REPOSITORY='tapstate/tapstate',CAPTURED_COMMENT=str(captured),
+             GITHUB_REPOSITORY='tapstate/tapstate',EXPECTED_HEAD_SHA='a'*40,GITHUB_RUN_ID='123',GITHUB_RUN_ATTEMPT='1',CAPTURED_COMMENT=str(captured),
              CAPTURED_CURL_URLS=str(curl_urls))
     run=subprocess.run(['bash','-e','-c',script(comment)],env=env,cwd=tmp,capture_output=True,text=True)
     assert run.returncode==0,run.stdout+run.stderr
     body=captured.read_text()
+    assert 'Analyzed PR head `'+('a'*40)+'`' in body and '/actions/runs/123/attempts/1' in body
     assert 'Open unresolved issues:' in body
     for finding in ['java:S1000','java:S1099','java:S2095','java:S3649']:
         assert finding in body, 'PR comment omitted '+finding
@@ -131,6 +178,10 @@ done
     assert len(issue_requests)==2, issue_requests
     assert issue_requests[0].endswith('&p=1'), issue_requests
     assert issue_requests[1].endswith('&p=2'), issue_requests
+    for extra in ({'LIVE_HEAD_SHA': 'b'*40}, {'LIVE_HEAD_FAIL': 'true'}):
+        captured.unlink(missing_ok=True)
+        run=subprocess.run(['bash','-e','-c',script(comment)],env={**env,**extra},cwd=tmp,capture_output=True,text=True)
+        assert run.returncode==0 and not captured.exists(), 'old or unknown head must not replace the current PR decoration'
 command=script(step(reporter,'Report analysis outcome'))
 with tempfile.TemporaryDirectory() as tmp:
     for build_result, enabled, outcome, expect in [
@@ -139,6 +190,10 @@ with tempfile.TemporaryDirectory() as tmp:
         ('success','true','skipped',1),
         ('success','','',1),
         ('failure','false','skipped',1),
+        ('cancelled','true','success',1),
+        ('cancelled','false','skipped',1),
+        ('skipped','false','skipped',1),
+        ('success','true','cancelled',1),
         ('success','false','skipped',0),
     ]:
         summary=Path(tmp)/'summary'; summary.write_text('')
@@ -169,7 +224,7 @@ with tempfile.TemporaryDirectory() as tmp:
     recorder.chmod(0o755)
     for ref_type, ref_name in [('tag','v1.2.3'),('branch','main')]:
         args=Path(tmp)/'args'
-        env=dict(os.environ,PATH=tmp+os.pathsep+os.environ['PATH'],SONAR_TOKEN='token',SONAR_HOST_URL='https://example.invalid',RUNNER_TEMP=tmp,GITHUB_REF_TYPE=ref_type,GITHUB_REF_NAME=ref_name,RECORDED_ARGS=str(args))
+        env=dict(os.environ,PATH=tmp+os.pathsep+os.environ['PATH'],SONAR_TOKEN='token',SONAR_HOST_URL='https://example.invalid',RUNNER_TEMP=tmp,GITHUB_REF_TYPE=ref_type,GITHUB_REF_NAME=ref_name,GITHUB_EVENT_NAME='pull_request' if ref_type=='branch' else 'push',GITHUB_REF='refs/pull/1/merge' if ref_type=='branch' else 'refs/tags/'+ref_name,RECORDED_ARGS=str(args))
         run=subprocess.run(['bash','-e','-c',script(analyze)],env=env,capture_output=True,text=True)
         assert run.returncode==0,run.stderr
         values=args.read_text().splitlines()
@@ -181,5 +236,64 @@ with tempfile.TemporaryDirectory() as tmp:
     recorder.write_text('#!/usr/bin/env bash\nexit 23\n')
     run=subprocess.run(['bash','-e','-c',script(analyze)],env=env,capture_output=True,text=True)
     assert run.returncode!=0, 'scanner failure was suppressed before the required check could see it'
-print('sonar-workflow smoke: 7 event/ref cases and 14 runtime cases passed, including 102 paginated issues')
+revision_controls=0
+with tempfile.TemporaryDirectory(prefix='sonar-revision-') as temporary:
+    directory=Path(temporary); repo=directory/'repo'; repo.mkdir(); commands=directory/'bin'; commands.mkdir()
+    git_env={key:value for key,value in os.environ.items() if key not in (
+        'GIT_DIR','GIT_WORK_TREE','GIT_INDEX_FILE','GIT_PREFIX','GIT_QUARANTINE_PATH','GIT_COMMON_DIR')}
+    def git(*args):
+        return subprocess.check_output(['git','-c','core.hooksPath=/dev/null','-c','commit.gpgsign=false',
+                                        '-C',str(repo),*args],env=git_env,text=True,stderr=subprocess.DEVNULL).strip()
+    git('init','-b','main')
+    assert Path(git('rev-parse','--show-toplevel')).resolve()==repo.resolve(), 'not the owned Git fixture'
+    git('config','user.email','fixture@example.invalid');git('config','user.name','Fixture')
+    (repo/'source').write_text('old');git('add','source');git('commit','-m','Old revision');old=git('rev-parse','HEAD')
+    (repo/'source').write_text('new');git('commit','-am','New revision');new=git('rev-parse','HEAD')
+    gh=commands/'gh'
+    gh.write_text('''#!/usr/bin/env python3
+import json,os,sys
+with open(os.environ['API_LOG'],'a') as out:out.write(json.dumps(sys.argv[1:])+'\\n')
+assert sys.argv[1:]==['api','--method','GET','repos/tapstate/tapstate/git/ref/heads/main','--jq','.object.sha']
+if os.environ.get('LIVE_MAIN_MODE')=='failed':raise SystemExit(1)
+print(os.environ['LIVE_MAIN_HEAD'])
+''');gh.chmod(0o755)
+    recorder=commands/'mvn'
+    recorder.write_text('''#!/usr/bin/env bash
+printf '%s\\n' "$GITHUB_SHA" > "$SONAR_STATE"
+printf '%s' "${GH_TOKEN+present}${GITHUB_TOKEN+present}" > "$SCANNER_AUTH"
+''');recorder.chmod(0o755)
+    state=directory/'sonar-state';auth=directory/'scanner-auth';api_log=directory/'api-log'
+    environment=dict(git_env,PATH=str(commands)+os.pathsep+os.environ['PATH'],SONAR_TOKEN='fixture-token',
+        SONAR_HOST_URL='https://example.invalid',RUNNER_TEMP=str(directory),GITHUB_REPOSITORY='tapstate/tapstate',
+        GITHUB_REF_TYPE='branch',GITHUB_REF_NAME='main',GITHUB_REF='refs/heads/main',GITHUB_EVENT_NAME='push',
+        GH_TOKEN='fixture-read-token',GITHUB_TOKEN='fixture-other-token',LIVE_MAIN_HEAD=new,
+        SONAR_STATE=str(state),SCANNER_AUTH=str(auth),API_LOG=str(api_log))
+    def run_revision(checkout, extra=None):
+        git('checkout','--detach',checkout)
+        return subprocess.run(['bash','-e','-c',script(analyze)],cwd=repo,
+                              env={**environment,'GITHUB_SHA':checkout,**(extra or {})},capture_output=True,text=True)
+    # A newer fast run reaches the shared analysis lock before the older slow run.
+    run=run_revision(new);assert run.returncode==0,run.stdout+run.stderr
+    assert state.read_text().strip()==new;revision_controls+=1
+    run=run_revision(old)
+    assert run.returncode!=0 and state.read_text().strip()==new, 'a late old main run overwrote newer Sonar state'
+    revision_controls+=1
+    assert auth.read_text()=='', 'scanner inherited GitHub API credentials'
+    for extra in ({'LIVE_MAIN_MODE':'failed'},{'LIVE_MAIN_HEAD':'null'},
+                  {'LIVE_MAIN_HEAD':''},{'GITHUB_SHA':old}):
+        state.unlink(missing_ok=True)
+        run=run_revision(new,extra)
+        assert run.returncode!=0 and not state.exists(), 'unknown or inconsistent main identity reached upload'
+        revision_controls+=1
+    for event,ref in [('pull_request','refs/pull/1/merge'),('push','refs/tags/v1.2.3'),
+                      ('workflow_dispatch','refs/heads/ws/feature')]:
+        run=run_revision(old,{'GITHUB_EVENT_NAME':event,'GITHUB_REF':ref,'LIVE_MAIN_MODE':'failed'})
+        assert run.returncode==0 and state.read_text().strip()==old, 'non-main analysis behavior changed'
+        revision_controls+=1
+    run=run_revision(old,{'GITHUB_EVENT_NAME':'workflow_dispatch'})
+    assert run.returncode!=0 and state.read_text().strip()==old, 'stale manual main upload was allowed'
+    revision_controls+=1
+    calls=[json.loads(line) for line in api_log.read_text().splitlines()]
+    assert calls and all(row==['api','--method','GET','repos/tapstate/tapstate/git/ref/heads/main','--jq','.object.sha'] for row in calls)
+print(f'sonar-workflow smoke: 7 event/ref cases, 20 runtime cases, {revision_controls} revision-order controls and {lock_mutations} lock mutations passed, including 102 paginated issues')
 PY

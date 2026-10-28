@@ -1,5 +1,6 @@
 package io.tapstate.e2e;
 
+import com.sun.net.httpserver.HttpServer;
 import io.tapstate.control.core.ClusterError;
 import io.tapstate.control.core.MonitorError;
 import io.tapstate.core.common.JsonWriter;
@@ -7,8 +8,14 @@ import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.PipelineState;
 import org.junit.jupiter.api.Test;
 
+import java.net.InetSocketAddress;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -24,6 +31,59 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class ControlPlaneTest {
 
     private static final String PIPELINE = "mongo2mongo";
+
+    @Test
+    void allSelectedTablesMustReachTheSampleBeforeTheirReadCountsAreUsed() throws Exception {
+        try (SnapshotMetrics fixture = new SnapshotMetrics(List.of(
+                Map.of(), Map.of("alpha", 2L), Map.of("alpha", 2L, "beta", 3L)))) {
+            assertThat(fixture.control.awaitSnapshotRowsRead(
+                    PIPELINE, Set.of("alpha", "beta"), Duration.ofSeconds(2)))
+                    .containsEntry("alpha", 2L).containsEntry("beta", 3L);
+            assertThat(fixture.reads.get()).as("both earlier incomplete observations were read").isEqualTo(3);
+        }
+    }
+
+    @Test
+    void aPermanentlyMissingSelectedTableFailsWithTheLastSample() throws Exception {
+        try (SnapshotMetrics fixture = new SnapshotMetrics(List.of(Map.of("alpha", 2L)))) {
+            assertThatThrownBy(() -> fixture.control.awaitSnapshotRowsRead(
+                    PIPELINE, Set.of("alpha", "beta"), Duration.ofMillis(200)))
+                    .isInstanceOf(AssertionError.class).hasMessageContaining("beta").hasMessageContaining("alpha=2");
+        }
+    }
+
+    @Test
+    void nonPositivePublicationBudgetsAreRejectedWithoutReadingMetrics() throws Exception {
+        try (SnapshotMetrics fixture = new SnapshotMetrics(List.of(Map.of("alpha", 2L)))) {
+            for (Duration invalid : List.of(Duration.ZERO, Duration.ofNanos(-1))) {
+                assertThatThrownBy(() -> fixture.control.awaitSnapshotRowsRead(PIPELINE, Set.of("alpha"), invalid))
+                        .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("positive");
+            }
+            assertThat(fixture.reads.get()).isZero();
+        }
+    }
+
+    @Test
+    void collidingTableNamesKeepTheirQualifiedKeysAndSeparateCounts() throws Exception {
+        try (SnapshotMetrics fixture = new SnapshotMetrics(List.of(
+                Map.of("left.orders", 2L), Map.of("left.orders", 2L, "right.orders", 5L)))) {
+            assertThat(fixture.control.awaitSnapshotRowsRead(
+                    PIPELINE, Set.of("left.orders", "right.orders")))
+                    .containsExactlyInAnyOrderEntriesOf(Map.of("left.orders", 2L, "right.orders", 5L));
+            assertThat(fixture.reads.get()).isEqualTo(2);
+        }
+    }
+
+    @Test
+    void aCompleteSampleIsReturnedBeforeALaterSampleCanRepairItsWrongCounts() throws Exception {
+        try (SnapshotMetrics fixture = new SnapshotMetrics(List.of(
+                Map.of("alpha", 2L, "beta", 99L), Map.of("alpha", 2L, "beta", 3L)))) {
+            assertThat(fixture.control.awaitSnapshotRowsRead(
+                    PIPELINE, Set.of("alpha", "beta"), Duration.ofSeconds(2)))
+                    .containsEntry("beta", 99L);
+            assertThat(fixture.reads.get()).isEqualTo(1);
+        }
+    }
 
     @Test
     void readsThePublishedState() {
@@ -437,6 +497,41 @@ class ControlPlaneTest {
         assertThatThrownBy(() -> ControlPlane.interpretClusterRefusal(500, "boom"))
                 .isInstanceOf(AssertionError.class)
                 .hasMessageContaining("would not say why");
+    }
+
+    private static final class SnapshotMetrics implements AutoCloseable {
+        final HttpServer server;
+        final AtomicInteger reads = new AtomicInteger();
+        final ControlPlane control;
+
+        SnapshotMetrics(List<Map<String, Long>> samples) throws Exception {
+            server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            server.createContext("/", exchange -> {
+                Map<String, ?> body;
+                if (exchange.getRequestURI().getPath().equals("/auth/login")) {
+                    body = Map.of("token", "controlled-token");
+                } else {
+                    Map<String, Long> sample = samples.get(Math.min(reads.getAndIncrement(), samples.size() - 1));
+                    Map<String, Long> metrics = new java.util.LinkedHashMap<>();
+                    sample.forEach((table, count) -> metrics.put("snapshot.rows.read." + table, count));
+                    body = Map.of("metrics", metrics);
+                }
+                byte[] bytes = JsonWriter.write(body).getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(200, bytes.length);
+                try (var output = exchange.getResponseBody()) { output.write(bytes); }
+            });
+            try {
+                server.start();
+                control = new ControlPlane(URI.create("http://127.0.0.1:" + server.getAddress().getPort()));
+                control.login("test", "local-password");
+            } catch (RuntimeException | Error failure) {
+                try { server.stop(0); }
+                catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
+                throw failure;
+            }
+        }
+
+        @Override public void close() { server.stop(0); }
     }
 
     /** A topology answer naming {@code nodeIds}, in the order given. */

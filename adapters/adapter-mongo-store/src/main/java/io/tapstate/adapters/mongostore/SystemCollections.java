@@ -416,12 +416,14 @@ public enum SystemCollections {
         return "mongo." + database.name().toLowerCase(Locale.ROOT) + "." + collectionName;
     }
 
-    public Kind kind() { return kind; }
-
     public Class<?> owner() { return owner; }
 
     public Database database() {
         return database;
+    }
+
+    public Kind kind() {
+        return kind;
     }
 
     public Strategy strategy() {

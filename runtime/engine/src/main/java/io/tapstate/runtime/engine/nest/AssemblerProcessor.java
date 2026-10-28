@@ -104,6 +104,19 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
     private final NestDeadLetter deadLetter;
     private final boolean settleMissingReferencesOnComplete;
     private boolean settledMissingReferencesOnComplete;
+    private Iterator<Object> referencesToSettleOnComplete;
+    private boolean flushingCompletedReferenceBatch;
+    private final ChainAxes snapshotAxes;
+    private final Map<String, LookupSnapshot> lookupSnapshots;
+    private final Map<Integer, Map<String, SourceOrder>> snapshotBounds = new LinkedHashMap<>();
+    private final Set<String> completedObjectLookups = new LinkedHashSet<>();
+    private Iterator<Object> snapshotWaiters;
+    private boolean flushingSnapshotBatch;
+    private final Map<Object, Map<String, ChainPosition>> waitingPositions = new LinkedHashMap<>();
+    // Bounded key observations, never root values. Only this processor creates state under its keys,
+    // and the first touch consumes a remembered absence. Eviction and restart read durable state again.
+    private final LinkedHashMap<Object, ReferenceState> recentReferenceStates = new LinkedHashMap<>(64, 0.75f, true);
+    private static final int MAX_RECENT_REFERENCE_STATES = 4_096;
 
     /**
      * Keys keeping the record of a deletion, which is where the sweep that drops them has to look. Kept for
@@ -348,6 +361,18 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
             NestStore<ParkedSubtree> parking, NestDeadLetter deadLetter,
             Map<String, NestStore<Map<String, Object>>> referenced,
             boolean settleMissingReferencesOnComplete) {
+        this(vertex, slots, store, outputStream, axes, chainsByOrdinal, floor, settings, clock, sending,
+                parking, deadLetter, referenced, settleMissingReferencesOnComplete, Map.of());
+    }
+
+    public AssemblerProcessor(NestVertex vertex, List<EmbedSlot> slots, NestStore<RootAssembly> store,
+            String outputStream, ChainAxes axes, Map<Integer, List<String>> chainsByOrdinal,
+            ReplayFloor floor, NestSettings settings, NestClock clock, NestSendPolicy sending,
+            NestStore<ParkedSubtree> parking, NestDeadLetter deadLetter,
+            Map<String, NestStore<Map<String, Object>>> referenced, boolean settleMissingReferencesOnComplete,
+            Map<String, LookupSnapshot> lookupSnapshots) {
+        this.snapshotAxes = axes;
+        this.lookupSnapshots = Map.copyOf(lookupSnapshots);
         this.referenced = Map.copyOf(referenced);
         this.parking = parking;
         this.deadLetter = Objects.requireNonNull(deadLetter, "deadLetter");
@@ -651,6 +676,10 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
      */
     @Override
     public boolean tryProcessWatermark(int ordinal, Watermark watermark) {
+        observeLookupSnapshots(ordinal, watermark);
+        if (!settleSnapshotWaiters()) {
+            return false;
+        }
         // Before the bound, and on this path as well as the other two, because a level whose rows have
         // stopped while its bounds have not is neither draining nor idle - the ordinary shape of a source
         // that has caught up. A window ending only on those two would hold its last version of every
@@ -666,6 +695,67 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
             return true;
         }
         return bounds.advance(ordinal, watermark, this::tryEmit);
+    }
+
+    private void observeLookupSnapshots(int ordinal, Watermark watermark) {
+        if (lookupSnapshots.isEmpty()) {
+            return;
+        }
+        String chain = snapshotAxes.chainOn(watermark.key());
+        SourceOrder through = io.tapstate.runtime.engine.FrontierOrders.unpack(watermark.timestamp());
+        snapshotBounds.computeIfAbsent(ordinal, ignored -> new LinkedHashMap<>())
+                .merge(chain, through, (previous, next) -> previous.compareTo(next) >= 0 ? previous : next);
+        boolean changed = false;
+        for (var entry : lookupSnapshots.entrySet()) {
+            LookupSnapshot expected = entry.getValue();
+            if (expected.ordinal() != ordinal || completedObjectLookups.contains(entry.getKey())) {
+                continue;
+            }
+            Map<String, SourceOrder> observed = snapshotBounds.get(ordinal);
+            if (expected.epochs().entrySet().stream().allMatch(e -> observed.containsKey(e.getKey())
+                    && observed.get(e.getKey()).compareTo(SourceOrder.snapshotRow(e.getValue())) >= 0)) {
+                completedObjectLookups.add(entry.getKey());
+                changed = true;
+            }
+        }
+        if (changed && snapshotWaiters == null) {
+            snapshotWaiters = List.copyOf(waiting).iterator();
+        }
+    }
+
+    private boolean settleSnapshotWaiters() {
+        if (snapshotWaiters == null) {
+            return true;
+        }
+        if (!flush()) {
+            return false;
+        }
+        if (!flushingSnapshotBatch) {
+            Map<Object, Touched> touched = new LinkedHashMap<>();
+            int examined = 0;
+            while (snapshotWaiters.hasNext() && examined++ < DrainFolding.MAX_KEYS_HELD) {
+                Object key = snapshotWaiters.next();
+                RootAssembly assembly = store.load(key);
+                if (assembly == null) {
+                    stopWaitingForReference(key);
+                } else {
+                    Touched document = new Touched(assembly, false);
+                    document.ts = waitingTimestamps.getOrDefault(key, 0L);
+                    touched.put(key, document);
+                }
+            }
+            settle(touched);
+            flushingSnapshotBatch = true;
+        }
+        if (!flush() || !sendWhatWindowsHaveRunOutOn()) {
+            return false;
+        }
+        flushingSnapshotBatch = false;
+        if (snapshotWaiters.hasNext()) {
+            return false;
+        }
+        snapshotWaiters = null;
+        return bounds == null || bounds.release(this::tryEmit);
     }
 
     /**
@@ -691,27 +781,44 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
             return;
         }
         if (item instanceof NestTouch word) {
-            // A word that only answers a wait is dropped where there is none, before anything is read: it
-            // is sent on every row of a pointing stream whose row is already filed, and drawing those
-            // documents again would double what a stream costs to say nothing new.
-            if (word.onlyIfWaiting() && !waiting.contains(word.key())) {
-                return;
+            if ((word.onlyIfWaiting() || word.firstFiling()) && !waiting.contains(word.key())) {
+                Touched inDrain = touched.get(word.key());
+                if (inDrain == null && recentReferenceStates.get(word.key()) != null) {
+                    if (word.firstFiling()) {
+                        SettledPositions.fold(settledAhead, word.positions());
+                    }
+                    return;
+                }
+                RootAssembly assembly = inDrain == null ? store.load(word.key()) : inDrain.assembly;
+                if (assembly == null) {
+                    rememberReferenceState(word.key(), ReferenceState.ABSENT);
+                }
+                if (assembly == null || !assembly.mayNeedReferenceUpdate()
+                        || !assembly.needsReferenceUpdate(slots, referencesFor(assembly))) {
+                    if (word.firstFiling()) {
+                        SettledPositions.fold(settledAhead, word.positions());
+                    }
+                    return;
+                }
+                if (inDrain == null) {
+                    touched.put(word.key(), new Touched(assembly, false));
+                }
             }
-            // A lookup writes a row before queueing its first wake. If the root crossed the other edge in
-            // between, it has already read that row and sent the complete document, so the wake changes no
-            // content. Its position still has to reach the sink: the row is durable in the lookup and any
-            // root that has not arrived yet will read it there, so the position can travel without another
-            // copy of the document. An edit to an existing filed row is never folded here.
-            if (word.firstFiling() && !waiting.contains(word.key())) {
-                SettledPositions.fold(settledAhead, word.positions());
-                return;
-            }
+            // The durable absence set above distinguishes a real completion from a queued first filing
+            // already reflected in the emitted document. An ordinary later edit always redraws it.
             // Nothing here changes - what the document should now show is read out of that row's own
             // namespace when it is drawn - so all this does is put the document in the drain, which is
             // what gets it drawn and sent again.
             Touched document = touched(word.key(), touched);
             document.ts = Math.max(document.ts, word.ts());
-            document.assembly.absorb(word.positions());
+            Map<String, ChainPosition> positions = word.positions();
+            if (word.onlyIfWaiting() && bounds != null) {
+                // A delayed registration can name an already-emitted version of a root that now waits
+                // for a different row. Keep the wake, but do not turn its passed positions into new holds.
+                positions = new LinkedHashMap<>(positions);
+                positions.entrySet().removeIf(entry -> bounds.hasPassed(entry.getKey(), entry.getValue().order()));
+            }
+            document.assembly.absorb(positions);
             return;
         }
         if (edge.isCascade()) {
@@ -1121,13 +1228,14 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
      * is what is still owed rather than what has just been paid.
      */
     private void settle(Map<Object, Touched> touched) {
-        settle(touched, false);
+        settle(touched, false, false);
     }
 
-    /** Settles documents against the completed bounded sample, where absent references cannot arrive later. */
-    private void settle(Map<Object, Touched> touched, boolean allowMissingReferences) {
+    private void settle(Map<Object, Touched> touched, boolean allowMissingReferences, boolean allowMissingObjects) {
         Map<String, Map<Object, Map<String, Object>>> resolved = resolveReferences(touched);
         touched.forEach((key, document) -> {
+            recentReferenceStates.remove(key);
+            document.assembly.reconcileMissingObjects(slots);
             document.assembly.render(slots, resolved).ifPresentOrElse(
                     rendered -> {
                         deleted.remove(key);
@@ -1135,8 +1243,9 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
                             return;
                         }
                         if (!allowMissingReferences
-                                && document.assembly.waitsForARowItPointsAt(slots, resolved)) {
-                            waitForReference(key, document.ts);
+                                && document.assembly.waitsForARowItPointsAt(slots, resolved,
+                                        allowMissingObjects, completedObjectLookups)) {
+                            waitForReference(key, document.ts, document.assembly, resolved);
                             return;
                         }
                         stopWaitingForReference(key);
@@ -1149,7 +1258,8 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
                                     // target applies one by setting what is in it, so what is gone from it
                                     // stays there at its last value unless the emission names it.
                                     .withRemoved(document.assembly.embedsNotRendered(slots, rendered)));
-                            document.assembly.documentSent();
+                            document.assembly.rememberMissingObjects(slots, resolved);
+                            documentSent(key, document.assembly);
                         } else {
                             windows.get(key).holds(document.ts, unsent);
                         }
@@ -1286,9 +1396,15 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         if (!flush()) {
             return false;
         }
-        if (settleMissingReferencesOnComplete && !settledMissingReferencesOnComplete) {
+        if (!settledMissingReferencesOnComplete && !flushingCompletedReferenceBatch) {
+            if (referencesToSettleOnComplete == null) {
+                referencesToSettleOnComplete = List.copyOf(waiting).iterator();
+            }
             Map<Object, Touched> touched = new LinkedHashMap<>();
-            for (Object key : List.copyOf(waiting)) {
+            int examined = 0;
+            while (referencesToSettleOnComplete.hasNext() && examined < DrainFolding.MAX_KEYS_HELD) {
+                Object key = referencesToSettleOnComplete.next();
+                examined++;
                 RootAssembly assembly = store.load(key);
                 if (assembly == null) {
                     stopWaitingForReference(key);
@@ -1298,26 +1414,48 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
                 document.ts = waitingTimestamps.getOrDefault(key, 0L);
                 touched.put(key, document);
             }
-            settle(touched, true);
-            settledMissingReferencesOnComplete = true;
-            if (!flush()) {
-                return false;
+            // All inputs ended normally. An object with no row is absent from its document; the
+            // bounded preview also settles the other shapes against its deliberately finite sample.
+            settle(touched, settleMissingReferencesOnComplete, true);
+            settledMissingReferencesOnComplete = !referencesToSettleOnComplete.hasNext();
+            if (settledMissingReferencesOnComplete) {
+                referencesToSettleOnComplete = null;
             }
+            flushingCompletedReferenceBatch = true;
         }
-        return sendFolded(false);
+        if (!flush() || !sendFolded(false, true)) {
+            return false;
+        }
+        flushingCompletedReferenceBatch = false;
+        // Flush each bounded batch before taking in another. The last send can clear a window's hold
+        // without going through sendFolded, so release its bound here too, retrying a refused offer.
+        return settledMissingReferencesOnComplete && (bounds == null || bounds.release(this::tryEmit));
     }
 
-    private void waitForReference(Object key, long ts) {
+    private void waitForReference(Object key, long ts, RootAssembly assembly,
+            Map<String, Map<Object, Map<String, Object>>> resolved) {
         waiting.add(key);
         waitingTimestamps.put(key, ts);
+        Set<String> incomplete = new LinkedHashSet<>(lookupSnapshots.keySet());
+        incomplete.removeAll(completedObjectLookups);
+        if (!incomplete.isEmpty() && assembly.waitsForObjectSnapshot(slots, resolved, incomplete)) {
+            waitingPositions.put(key, assembly.lowestUnsentByChain());
+        } else {
+            waitingPositions.remove(key);
+        }
     }
 
     private void stopWaitingForReference(Object key) {
         waiting.remove(key);
         waitingTimestamps.remove(key);
+        waitingPositions.remove(key);
     }
 
     private boolean sendFolded(boolean onlyWhatHasRunOut) {
+        return sendFolded(onlyWhatHasRunOut, false);
+    }
+
+    private boolean sendFolded(boolean onlyWhatHasRunOut, boolean allowMissingObjects) {
         if (windows.isEmpty()) {
             return flush();
         }
@@ -1364,11 +1502,13 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
             }
             // The same as the hold above, and for the same reason: a window running out is a clock, and a
             // clock is exactly what must not release a document that is still missing a row it names.
-            if (assembly.waitsForARowItPointsAt(slots, references)) {
+            if (!(allowMissingObjects && settleMissingReferencesOnComplete)
+                    && assembly.waitsForARowItPointsAt(slots, references,
+                            allowMissingObjects, completedObjectLookups)) {
                 // Recorded as well as skipped, so the next turn takes the cheap exit above rather than
                 // reading the same absence again. A restart arrives here with nothing recorded, which is
                 // what this covers: the drain that first saw the wait may be on the other side of it.
-                waitForReference(entry.getKey(), window.ts);
+                waitForReference(entry.getKey(), window.ts, assembly, references);
                 continue;
             }
             stopWaitingForReference(entry.getKey());
@@ -1378,7 +1518,8 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
                     // and needs the same saying-so - and this is the path a deployment with a window open
                     // sends most of them on, so leaving it out would fix nothing where it matters.
                     .withRemoved(assembly.embedsNotRendered(slots, rendered.get())));
-            assembly.documentSent();
+            assembly.rememberMissingObjects(slots, references);
+            documentSent(entry.getKey(), assembly);
             store.save(entry.getKey(), assembly);
             window.reopen(now);
             letGo = true;
@@ -1441,6 +1582,12 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
      */
     private SourceOrder lowestUnsentOn(String chain) {
         SourceOrder lowest = null;
+        for (Map<String, ChainPosition> positions : waitingPositions.values()) {
+            ChainPosition held = positions.get(chain);
+            if (held != null && (lowest == null || held.order().compareTo(lowest) < 0)) {
+                lowest = held.order();
+            }
+        }
         for (Window window : windows.values()) {
             if (window.unsent == null) {
                 continue;
@@ -1526,14 +1673,35 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
     }
 
     private Touched touched(Object key, Map<Object, Touched> touched) {
+        ReferenceState known = recentReferenceStates.remove(key);
         return touched.computeIfAbsent(key, k -> {
-            RootAssembly held = store.load(k);
+            RootAssembly held = known == ReferenceState.ABSENT ? null : store.load(k);
             // Whether anything was there is carried to the write at the end of the drain rather than worked
             // out again there. Only the read can answer it - a write that asked would be the very fetch the
             // answer exists to save - and by then the state to be written is there either way, so the two
             // cases are the same object and tell nothing apart.
             return held == null ? new Touched(new RootAssembly(), true) : new Touched(held, false);
         });
+    }
+
+    private void documentSent(Object key, RootAssembly assembly) {
+        assembly.documentSent();
+        if (assembly.mayNeedReferenceUpdate()) {
+            recentReferenceStates.remove(key);
+        } else {
+            rememberReferenceState(key, ReferenceState.COMPLETE);
+        }
+    }
+
+    private void rememberReferenceState(Object key, ReferenceState state) {
+        recentReferenceStates.put(key, state);
+        if (recentReferenceStates.size() > MAX_RECENT_REFERENCE_STATES) {
+            recentReferenceStates.remove(recentReferenceStates.keySet().iterator().next());
+        }
+    }
+
+    private enum ReferenceState {
+        ABSENT, COMPLETE
     }
 
     private boolean flush() {

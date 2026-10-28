@@ -113,13 +113,13 @@ class PdkTargetIdentityPlannerTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"missing-table-names", "missing-exact-indexes", "malformed-generic-index"})
+    @ValueSource(strings = {"missing-table-names", "missing-index-query", "malformed-generic-index"})
     void missingOrMalformedCapabilitiesCannotPassStartup(String kind) throws Throwable {
         String id = kind.equals("malformed-generic-index") ? "postgres" : "mongodb";
         try (var connector = PdkConnector.open(id, ref, Map.of("rows", IdentityConnectorFixture.mongoIndexes()))) {
             switch (kind) {
                 case "missing-table-names" -> connector.functions().supportGetTableNamesFunction(null);
-                case "missing-exact-indexes" -> connector.functions().supportExecuteCommandFunction(null);
+                case "missing-index-query" -> connector.functions().supportQueryIndexes(null);
                 default -> connector.functions().supportQueryIndexes((context, table, out) -> out.accept(List.of(new TapIndex().unique(true))));
             }
             assertThatThrownBy(() -> PdkTargetIdentityPlanner.assess(connector, config(id, Map.of()), Map.of("orders", target(id.equals("mongodb") ? "_id" : "id"))))
@@ -147,8 +147,8 @@ class PdkTargetIdentityPlannerTest {
         try (var connector = PdkConnector.open("mongodb", ref, settings)) {
             var expected = PdkTargetIdentityPlanner.assess(connector, config, Map.of("orders", target));
             PdkTargetIdentityPlanner.verifyPrepared(connector, config, Map.of("orders", target), expected);
-            connector.functions().supportExecuteCommandFunction((context, command, out) -> out.accept(new ExecuteResult<>()
-                    .result(List.of(IdentityConnectorFixture.mongoIndex("_id_", Map.of("_id", 1))))));
+            connector.functions().supportQueryIndexes((context, table, out) -> out.accept(List.of(
+                    new TapIndex().name("_id_").unique(true).indexField(new TapIndexField().name("_id")))));
             assertThatThrownBy(() -> PdkTargetIdentityPlanner.verifyPrepared(connector, config, Map.of("orders", target), expected))
                     .isInstanceOfSatisfying(TapstateException.class, error ->
                             assertThat(error.args()).containsEntry("reason", "logical-key-index-missing"));

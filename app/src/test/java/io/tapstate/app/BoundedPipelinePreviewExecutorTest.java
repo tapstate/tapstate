@@ -29,16 +29,20 @@ import org.junit.jupiter.api.Test;
 import java.lang.reflect.Proxy;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
+import java.time.Clock;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -178,6 +182,65 @@ class BoundedPipelinePreviewExecutorTest {
         } finally {
             executor.close();
             member.shutdown();
+        }
+    }
+
+    @Test
+    void completionAfterTheInitialCheckDoesNotInventAnotherDeadlineFailure() throws Exception {
+        HazelcastInstance member = member("preview-finished-during-poll");
+        CountDownLatch startWorker = new CountDownLatch(1);
+        CountDownLatch workerFinished = new CountDownLatch(1);
+        ThreadPoolExecutor workers = new ThreadPoolExecutor(1, 1, 0, TimeUnit.SECONDS,
+                new ArrayBlockingQueue<>(1), Thread.ofPlatform().name("preview-finish-control").factory()) {
+            @Override
+            protected void beforeExecute(Thread thread, Runnable task) {
+                try {
+                    if (!startWorker.await(5, TimeUnit.SECONDS)) {
+                        throw new AssertionError("the consumer did not release the preview worker");
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("the preview worker was interrupted before release", interrupted);
+                }
+            }
+
+            @Override
+            protected void afterExecute(Runnable task, Throwable failure) {
+                workerFinished.countDown();
+            }
+        };
+        Instant deadline = Instant.parse("2026-01-01T00:00:01Z");
+        AtomicBoolean consumerRead = new AtomicBoolean();
+        Clock clock = mock(Clock.class);
+        when(clock.instant()).thenAnswer(ignored -> {
+            if (consumerRead.compareAndSet(false, true)) {
+                // next() has passed its initial finished check. Finish the worker before the empty poll.
+                startWorker.countDown();
+                assertThat(workerFinished.await(5, TimeUnit.SECONDS)).isTrue();
+                return deadline.minusNanos(1);
+            }
+            // The worker reaches its deadline without publishing an event, then finalizes the stream.
+            return deadline;
+        });
+        BoundedPipelinePreviewExecutor executor = new BoundedPipelinePreviewExecutor(
+                unusedStore(), (ConnectorProvisioner) connectorId -> null, member, NestSettings.defaults(),
+                clock, workers);
+        try {
+            var stream = executor.preview(new PipelinePreviewRequest(
+                    "run-exhausted", "author", "pipeline", "output", 3, "sample", "candidate-hash",
+                    List.of("not: a tapstate resource"), deadline));
+
+            assertThat(stream.next()).isNull();
+            assertThat(member.<String, String>getMap(BoundedPipelinePreviewExecutor.LEASE_MAP).size()).isZero();
+            assertThat(stream.next()).isNull();
+        } finally {
+            startWorker.countDown();
+            try {
+                executor.close();
+                assertThat(workers.awaitTermination(5, TimeUnit.SECONDS)).isTrue();
+            } finally {
+                member.shutdown();
+            }
         }
     }
 

@@ -61,7 +61,14 @@ class NativeBusinessCandidateLifecycleIT {
                                 var starting=(java.util.concurrent.atomic.AtomicBoolean)ReflectionTestUtils.getField(owner,"active");
                                 assertThat(starting.get()).isFalse();
                                 assertThat(child.getBean(NodeSessionLease.class).active()).isTrue();
-                                assertThat(((NativeMemberStorage)ReflectionTestUtils.getField(owner,"memberStorage")).nodeActive()).isTrue();
+                                var memberStorage = (NativeMemberStorage)ReflectionTestUtils.getField(owner,"memberStorage");
+                                var member = child.getBean(com.hazelcast.core.HazelcastInstance.class);
+                                long askedAt = (Long)member.getUserContext().get(HazelcastConfiguration.NODE_SESSION_ASKED_AT_CONTEXT_KEY);
+                                long originalDeadline = askedAt + child.getBean(ClusterProperties.class).getNodeSessionTtl().toNanos();
+                                await().atMost(Duration.ofSeconds(15)).until(() -> System.nanoTime() - originalDeadline >= 0);
+                                assertThat(starting.get()).as("candidate admission is still held beyond its original lease proof").isFalse();
+                                assertThat(child.getBean(NodeSessionLease.class).active()).isTrue();
+                                assertThat(memberStorage.nodeActive()).as("native storage uses the renewed startup lease, not its expired initial deadline").isTrue();
                                 await().atMost(Duration.ofSeconds(10)).until(child.getBean(ClusterMembershipGate.class)::businessEligible);
                                 var driver=child.getBean(ConvergenceDriver.class);
                                 var ports=(ConvergenceDriver.ScopedPorts)ReflectionTestUtils.getField(driver,"scoped");
@@ -86,6 +93,7 @@ class NativeBusinessCandidateLifecycleIT {
                             beans.destroySingleton("seedSweepRunner");beans.registerSingleton("seedSweepRunner",held);
                         });
                     }).run("--server.address=127.0.0.1","--server.port=0","--logging.level.root=ERROR",
+                            "--tapstate.cluster.node-session-ttl=10s","--tapstate.cluster.node-session-renew-interval=200ms",
                             "--tapstate.store.mongo.uri="+storage.configurationUri(),"--tapstate.hz.member-port=0",
                             "--tapstate.hz.jet.cooperative-thread-count=2","--tapstate.connectors.seed-dir="+work.resolve("no-seeds"),
                             "--tapstate.connectors.plugins-dir="+work.resolve("plugins"),"--tapstate.control.auth.jwt-secret=candidate-test-signing-key")) {

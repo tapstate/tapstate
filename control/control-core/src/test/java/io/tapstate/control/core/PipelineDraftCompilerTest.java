@@ -806,7 +806,7 @@ class PipelineDraftCompilerTest {
         PipelineDraft template = wizardDraft();
         assertCompileFails(withWizard(template, template.wizard().root(), List.of(),
                 List.of(new PipelineDraft.Transform("step", "union", Map.of())), template.wizard().output()),
-                "unsupported wizard transform: union");
+                "wizard union requires at least one additional input");
         assertCompileFails(withWizard(template, template.wizard().root(), List.of(),
                 List.of(new PipelineDraft.Transform("step", "filter", Map.of())), template.wizard().output()),
                 "transform field must be non-blank: expr");
@@ -826,6 +826,196 @@ class PipelineDraftCompilerTest {
                 new PipelineDraft.Node("filter", "filter", null, null, Map.of("expr", "active"), Map.of())),
                 List.of(), new PipelineDraft.Viewport(0, 0, 1));
         assertCompileFails(dagDraft(noInput), "graph node requires an input: filter");
+    }
+
+    @Test
+    void compilesWizardUnionWithCurrentOutputAndAdditionalQualifiedInputs() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Transform union = new PipelineDraft.Transform("merge-orders", "union",
+                Map.of("from", List.of("warehouse.archive_orders", "crm.priority_orders")));
+
+        PipelineResource compiled = compiler.compile(withWizard(template, template.wizard().root(),
+                template.wizard().related(), List.of(union), template.wizard().output()));
+
+        Step.Inline compiledUnion = (Step.Inline) compiled.transforms().getLast();
+        assertThat(compiledUnion.body()).isEqualTo(new TransformBody.Union());
+        assertThat(((FromClause.Flow) compiledUnion.from()).refs()).containsExactly(
+                FromRef.literal("customer-orders__nest"),
+                FromRef.literal("warehouse.archive_orders"),
+                FromRef.literal("crm.priority_orders"));
+        assertThat(compiled.sources()).extracting(source -> source.id()).containsExactly("crm", "warehouse");
+        assertThat(((ServeBlock.Inline) compiled.serve()).from()).isEqualTo(
+                FromClause.list(FromRef.literal("merge-orders")));
+    }
+
+    @Test
+    void rejectsRootPreTransformUnionInputAlreadyReadByRelatedBranch() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        PipelineDraft.Transform union = new PipelineDraft.Transform("dup", "union",
+                Map.of("from", List.of("crm.policies")));
+        List<PipelineDraft.Related> related = List.of(wizard.related().getFirst());
+        String duplicateMessage = "wizard union input duplicates an existing pipeline input";
+
+        assertCompileFails(withWizard(template, wizard.root(), related, List.of(union), wizard.output()),
+                duplicateMessage);
+
+        PipelineDraft.Root root = wizard.root();
+        PipelineDraft.Root rootWithUnion = new PipelineDraft.Root(root.id(), root.sourceId(), root.table(),
+                root.key(), List.of(union));
+        assertCompileFails(withWizard(template, rootWithUnion, related, List.of(), wizard.output()),
+                duplicateMessage);
+    }
+
+    @Test
+    void rejectsRelatedUnionInputsReadByRootOrAnotherRelatedBranchInEitherOrder() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        PipelineDraft.Related policy = wizard.related().getFirst();
+        for (String input : List.of("crm.orders", "crm.claims")) {
+            PipelineDraft.Related policyWithUnion = withPreTransforms(policy, List.of(
+                    new PipelineDraft.Transform("dup", "union", Map.of("from", List.of(input)))));
+            List<PipelineDraft.Related> related = List.of(policyWithUnion, wizard.related().getLast());
+            for (List<PipelineDraft.Related> order : List.of(related, related.reversed())) {
+                assertCompileFails(withWizard(template, wizard.root(), order, List.of(), wizard.output()),
+                        "wizard union input duplicates an existing pipeline input");
+                PipelineDraft incomplete = withWizard(template, wizard.root(), order, List.of(), null);
+                assertThatThrownBy(() -> compiler.compileCandidate(incomplete))
+                        .isInstanceOf(IllegalArgumentException.class)
+                        .hasMessage("wizard union input duplicates an existing pipeline input");
+            }
+        }
+    }
+
+    @Test
+    void rejectsWizardUnionInputWithWhitespacePaddedSource() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Transform union = new PipelineDraft.Transform("merge", "union",
+                Map.of("from", List.of(" crm.extra")));
+        PipelineDraft draft = withWizard(template, template.wizard().root(), List.of(),
+                List.of(union), template.wizard().output());
+
+        assertCompileFails(draft, "wizard union input must be a source-qualified table reference");
+    }
+
+    @Test
+    void rejectsWhitespacePaddedUnionInputsAcrossWizardBranchesAndIncompleteCandidates() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Root root = template.wizard().root();
+        PipelineDraft.Related related = template.wizard().related().getFirst();
+        for (String input : List.of("crm.extra ", "\tcrm.extra", "crm.extra\t")) {
+            PipelineDraft.Transform union = new PipelineDraft.Transform("merge", "union",
+                    Map.of("from", List.of(input)));
+            PipelineDraft.Root rootWithUnion = new PipelineDraft.Root(root.id(), root.sourceId(),
+                    root.table(), root.key(), List.of(union));
+            PipelineDraft.Related relatedWithUnion = new PipelineDraft.Related(related.id(), related.parentId(),
+                    related.sourceId(), related.table(), related.relation(), List.of(union));
+            for (PipelineDraft draft : List.of(
+                    withWizard(template, rootWithUnion, List.of(), List.of(), null),
+                    withWizard(template, root, List.of(relatedWithUnion), List.of(), null),
+                    withWizard(template, root, List.of(), List.of(union), null))) {
+                assertCompileFails(draft, "wizard union input must be a source-qualified table reference");
+                assertThatThrownBy(() -> compiler.compileCandidate(draft))
+                        .isInstanceOf(IllegalArgumentException.class)
+                        .hasMessage("wizard union input must be a source-qualified table reference");
+            }
+        }
+    }
+
+    @Test
+    void rejectsAdditionalUnionInputsRepeatedAcrossBranchesAndLaterTransforms() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        PipelineDraft.Transform union = new PipelineDraft.Transform("merge", "union",
+                Map.of("from", List.of("warehouse.archive_orders")));
+        PipelineDraft.Root root = wizard.root();
+        PipelineDraft.Root rootWithUnion = new PipelineDraft.Root(root.id(), root.sourceId(), root.table(),
+                root.key(), List.of(union));
+        PipelineDraft.Related policyWithUnion = withPreTransforms(wizard.related().getFirst(), List.of(union));
+        PipelineDraft.Related claimWithUnion = withPreTransforms(wizard.related().getLast(), List.of(union));
+        List<PipelineDraft.Related> bothRelated = List.of(policyWithUnion, claimWithUnion);
+
+        for (List<PipelineDraft.Related> order : List.of(bothRelated, bothRelated.reversed())) {
+            assertCompileFails(withWizard(template, root, order, List.of(), wizard.output()),
+                    "wizard union input duplicates an existing pipeline input");
+        }
+        assertCompileFails(withWizard(template, rootWithUnion, List.of(policyWithUnion), List.of(), wizard.output()),
+                "wizard union input duplicates an existing pipeline input");
+        assertCompileFails(withWizard(template, rootWithUnion, wizard.related(), List.of(union), wizard.output()),
+                "wizard union input duplicates an existing pipeline input");
+        PipelineDraft.Root repeatedRoot = new PipelineDraft.Root(root.id(), root.sourceId(), root.table(),
+                root.key(), List.of(union, new PipelineDraft.Transform("merge-again", "union", union.fields())));
+        assertCompileFails(withWizard(template, repeatedRoot, wizard.related(), List.of(), wizard.output()),
+                "wizard union input duplicates an existing pipeline input");
+    }
+
+    @Test
+    void preservesDistinctUnionInputsAliasesAndOrderAcrossRepeatedCompilations() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        PipelineDraft.Root root = wizard.root();
+        PipelineDraft.Root rootWithUnion = new PipelineDraft.Root(root.id(), root.sourceId(), root.table(),
+                root.key(), List.of(new PipelineDraft.Transform("merge-orders", "union",
+                        Map.of("from", List.of("warehouse.orders")))));
+        PipelineDraft.Related policy = withPreTransforms(wizard.related().getFirst(), List.of(
+                new PipelineDraft.Transform("merge-policies", "union",
+                        Map.of("from", List.of("warehouse.policies")))));
+        PipelineDraft draft = withWizard(template, rootWithUnion, List.of(policy), List.of(
+                new PipelineDraft.Transform("merge-archive", "union",
+                        Map.of("from", List.of("warehouse.archive_orders")))), wizard.output());
+
+        PipelineResource compiled = compiler.compile(draft);
+
+        assertThat(compiled.sources()).extracting(source -> source.id()).containsExactly("crm", "warehouse");
+        assertThat(compiled.transforms()).extracting(Step::id)
+                .containsExactly("orders__pre", "policy__pre", "customer-orders__nest", "merge-archive");
+        assertThat(((FromClause.Flow) ((Step.Inline) compiled.transforms().get(0)).from()).refs())
+                .containsExactly(FromRef.literal("crm.orders"), FromRef.literal("warehouse.orders"));
+        assertThat(((FromClause.Flow) ((Step.Inline) compiled.transforms().get(1)).from()).refs())
+                .containsExactly(FromRef.literal("crm.policies"), FromRef.literal("warehouse.policies"));
+        assertThat(((FromClause.Aliases) ((Step.Inline) compiled.transforms().get(2)).from()).aliases())
+                .containsOnlyKeys("orders", "policy")
+                .containsEntry("orders", FromRef.literal("orders__pre"))
+                .containsEntry("policy", FromRef.literal("policy__pre"));
+        assertThat(((FromClause.Flow) ((Step.Inline) compiled.transforms().get(3)).from()).refs())
+                .containsExactly(FromRef.literal("customer-orders__nest"), FromRef.literal("warehouse.archive_orders"));
+        CanonicalWriter writer = new CanonicalWriter();
+        assertThat(writer.write(compiler.compile(draft))).isEqualTo(writer.write(compiled));
+        assertThat(writer.write(compiler.compileCandidate(draft))).isEqualTo(writer.write(compiled));
+    }
+
+    @Test
+    void stillAllowsRelatedBranchesToReadTheSameBaseTableWithoutAUnion() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        PipelineDraft.Related policy = wizard.related().getFirst();
+        PipelineDraft.Related otherPolicy = new PipelineDraft.Related("other-policy", "orders",
+                policy.sourceId(), policy.table(), new PipelineDraft.Relation(policy.relation().on(),
+                        PipelineDraft.Shape.OBJECT, "other_policy", List.of()), List.of());
+
+        PipelineResource compiled = compiler.compile(withWizard(template, wizard.root(),
+                List.of(policy, otherPolicy), List.of(), wizard.output()));
+
+        Step.Inline nest = (Step.Inline) compiled.transforms().getLast();
+        assertThat(((FromClause.Aliases) nest.from()).aliases())
+                .containsEntry("policy", FromRef.literal("policy__pre"))
+                .containsEntry("other-policy", FromRef.literal("crm.policies"));
+    }
+
+    @Test
+    void rejectsMalformedOrDuplicateWizardUnionInputs() {
+        PipelineDraft template = wizardDraft();
+        assertCompileFails(withWizard(template, template.wizard().root(), template.wizard().related(),
+                List.of(new PipelineDraft.Transform("merge", "union", Map.of("from", List.of("archive")))),
+                template.wizard().output()), "wizard union input must be a source-qualified table reference");
+        assertCompileFails(withWizard(template, template.wizard().root(), template.wizard().related(),
+                List.of(new PipelineDraft.Transform("merge", "union",
+                        Map.of("from", List.of("warehouse.archive", "warehouse.archive")))),
+                template.wizard().output()), "wizard union inputs must be unique");
+        assertCompileFails(withWizard(template, template.wizard().root(), template.wizard().related(),
+                List.of(new PipelineDraft.Transform("merge", "union",
+                        Map.of("from", List.of("crm.orders")))),
+                template.wizard().output()), "wizard union input duplicates an existing pipeline input");
     }
 
     @Test
@@ -855,6 +1045,12 @@ class PipelineDraftCompilerTest {
                         new PipelineDraft.Edge("source-b", "source", "target-b")),
                 new PipelineDraft.Viewport(0, 0, 1));
         assertCompileFails(dagDraft(duplicateTargets), "graph has more than one target node");
+    }
+
+    private static PipelineDraft.Related withPreTransforms(PipelineDraft.Related related,
+            List<PipelineDraft.Transform> transforms) {
+        return new PipelineDraft.Related(related.id(), related.parentId(), related.sourceId(), related.table(),
+                related.relation(), transforms);
     }
 
     private void assertCompileFails(PipelineDraft draft, String message) {

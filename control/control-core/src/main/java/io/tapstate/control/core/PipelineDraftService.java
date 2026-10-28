@@ -1,9 +1,13 @@
 package io.tapstate.control.core;
 
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.dsl.DslException;
+import io.tapstate.core.dsl.DslParser;
 import io.tapstate.spi.store.PipelineDraft;
 import io.tapstate.spi.store.PipelineDraftMutation;
 import io.tapstate.spi.store.PipelineDraftStore;
@@ -14,6 +18,7 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.UUID;
 
 /** Application service for durable draft CAS, preview compilation, and atomic publication. */
 public final class PipelineDraftService {
@@ -21,6 +26,7 @@ public final class PipelineDraftService {
     private final PipelineDraftStore store;
     private final PipelineDraftCompiler compiler;
     private final CanonicalWriter writer;
+    private final DslParser parser = new DslParser();
     private final Clock clock;
     private final AuditGate auditGate;
     private final ApplyService validation;
@@ -206,7 +212,40 @@ public final class PipelineDraftService {
                 candidate.graph(), candidate.wizard(), current.baseArtifactHash(),
                 current.publishedDraftRevision(), current.publishedArtifactHash(), current.createdAt(),
                 current.updatedAt(), current.updatedBy());
+        if (candidate.mode() == PipelineDraft.Mode.WIZARD && candidate.wizard() != null
+                && (candidate.wizard().output() == null || !hasDestination(candidate.wizard().output()))) {
+            try {
+                PipelineResource partial = compiler.compileCandidate(transientDraft);
+                PipelineResource validationCandidate = withTemporaryValidationView(partial, candidate);
+                parser.parse(writer.write(validationCandidate));
+                validateAndPrepare(pipelineId, validationCandidate);
+                return partial;
+            } catch (DslException | IllegalArgumentException error) {
+                throw new TapstateException(PipelineDraftError.INVALID,
+                        java.util.Map.of("id", pipelineId, "reason", error.getMessage() == null
+                                ? "candidate cannot be compiled" : error.getMessage()), error);
+            }
+        }
         return validateAndPrepare(pipelineId, compile(pipelineId, transientDraft));
+    }
+
+    private static boolean hasDestination(PipelineDraft.Output output) {
+        Object source = output.config().get("sourceId");
+        Object table = output.config().get("table");
+        return source instanceof String s && !s.isBlank() && table instanceof String t && !t.isBlank();
+    }
+
+    private static PipelineResource withTemporaryValidationView(
+            PipelineResource candidate, PipelineDraft draft) {
+        String upstream = candidate.transforms() == null || candidate.transforms().isEmpty()
+                ? draft.wizard().root().sourceId() + "." + draft.wizard().root().table()
+                : candidate.transforms().getLast().id();
+        // The DSL requires a view or serve block. This disposable view exists only on the validation copy.
+        String validationViewId = "assistant_validation_" + UUID.randomUUID().toString().replace("-", "");
+        ViewBlock view = new ViewBlock.Inline(validationViewId,
+                FromRef.literal(upstream), "assistant_validation_key", null);
+        return new PipelineResource(candidate.id(), candidate.metadata(), candidate.sources(),
+                candidate.transforms(), view, candidate.serve(), candidate.settings(), candidate.experimental());
     }
 
     /**
@@ -249,7 +288,13 @@ public final class PipelineDraftService {
 
     private PipelineResource compile(String pipelineId, PipelineDraft draft) {
         try {
-            return compiler.compile(draft);
+            PipelineResource candidate = compiler.compile(draft);
+            parser.parse(writer.write(candidate));
+            return candidate;
+        } catch (DslException diagnostic) {
+            String reason = validationReason(new ValidationDiagnostic(diagnostic.code().code(), diagnostic.args()));
+            throw new TapstateException(PipelineDraftError.INVALID,
+                    java.util.Map.of("id", pipelineId, "reason", reason), diagnostic);
         } catch (IllegalArgumentException error) {
             throw new TapstateException(PipelineDraftError.INVALID,
                     java.util.Map.of("id", pipelineId,

@@ -1,6 +1,8 @@
 package io.tapstate.adapters.pdk;
 
 import io.tapdata.pdk.apis.entity.TapExecuteCommand;
+import io.tapdata.entity.schema.TapIndex;
+import io.tapdata.entity.schema.TapTable;
 import io.tapstate.core.common.JsonReader;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -8,7 +10,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-/** Full unique-key evidence that the frozen generic index descriptor cannot represent. */
+/** Target unique-key evidence from portable indexes or exact relational metadata. */
 final class PdkIdentityIndexes {
     private static final Set<String> MYSQL = Set.of("mysql", "aws-rds-mysql", "aliyun-rds-mysql", "aliyun-rds-mariadb");
     private PdkIdentityIndexes() { }
@@ -104,29 +106,33 @@ final class PdkIdentityIndexes {
     }
 
     static Evidence mongo(PdkConnector connector, String table) throws Throwable {
-        List<List<String>> keys = new ArrayList<>();
-        boolean opaque = false;
-        var rows = execute(connector, "aggregate", Map.of("collection", table,
-                "pipeline", List.of(Map.of("$indexStats", Map.of())), "batchSize", 1000));
-        if (rows.isEmpty()) throw new IllegalStateException("target index inspection returned no index specs");
-        for (Map<?, ?> row : rows) {
-            if (!(row.get("spec") instanceof Map<?, ?> spec) || !(spec.get("key") instanceof Map<?, ?> fields)) {
-                throw new IllegalStateException("target index inspection returned an incomplete index spec");
-            }
-            if (Boolean.TRUE.equals(spec.get("unique")) || "_id_".equals(spec.get("name"))) {
-                if (safeMongoIndex(spec, fields)) keys.add(fields.keySet().stream().map(String.class::cast).toList());
-                else opaque = true;
-            }
+        var query = connector.functions().getQueryIndexesFunction();
+        if (query == null) throw new IllegalStateException("target index query is unavailable");
+        List<TapIndex> indexes = new ArrayList<>();
+        java.util.concurrent.atomic.AtomicBoolean answered = new java.util.concurrent.atomic.AtomicBoolean();
+        query.query(connector.context(), new TapTable(table), batch -> {
+            if (batch == null) throw new IllegalStateException("target index query returned a null batch");
+            answered.set(true);
+            indexes.addAll(batch);
+        });
+        if (!answered.get() || indexes.isEmpty()) {
+            throw new IllegalStateException("target index query returned no indexes");
         }
-        return new Evidence(keys, opaque, Set.of());
-    }
-
-    private static boolean safeMongoIndex(Map<?, ?> spec, Map<?, ?> fields) {
-        return !Boolean.TRUE.equals(spec.get("sparse")) && !spec.containsKey("partialFilterExpression")
-                && !spec.containsKey("collation") && !fields.isEmpty()
-                && fields.keySet().stream().allMatch(String.class::isInstance)
-                && fields.values().stream().allMatch(value -> value instanceof Number number
-                        && (number.intValue() == 1 || number.intValue() == -1));
+        List<List<String>> keys = new ArrayList<>();
+        for (TapIndex index : indexes) {
+            if (index == null) throw new IllegalStateException("target index query returned a null index");
+            boolean primaryIdentity = "_id_".equals(index.getName());
+            if (!Boolean.TRUE.equals(index.getUnique()) && !Boolean.TRUE.equals(index.getPrimary()) && !primaryIdentity) continue;
+            if (index.getIndexFields() == null || index.getIndexFields().isEmpty()
+                    || index.getIndexFields().stream().anyMatch(field -> field == null
+                            || field.getName() == null || field.getName().isBlank())) {
+                throw new IllegalStateException("a target unique index cannot be represented by field names");
+            }
+            keys.add(index.getIndexFields().stream().map(io.tapdata.entity.schema.TapIndexField::getName).toList());
+        }
+        // The connector's portable index declaration is authoritative. Database-specific options
+        // outside TapIndex are deliberately not required as proof of the declared uniqueness.
+        return new Evidence(keys, false, Set.of());
     }
 
     private static List<Map<Object, Object>> query(PdkConnector connector, String sql) throws Throwable {

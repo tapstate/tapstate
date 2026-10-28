@@ -43,7 +43,20 @@ public final class IdentityConnectorFixture {
                     public void registerCapabilities(ConnectorFunctions f, TapCodecsRegistry codecs) {
                         f.supportGetTableNamesFunction((c, size, out) -> out.accept(
                             Boolean.FALSE.equals(c.getConnectionConfig().get("exists")) ? List.of() : List.of("orders")));
-                        f.supportQueryIndexes((c, table, out) -> out.accept(List.of()));
+                        f.supportQueryIndexes((c, table, out) -> {
+                            List<TapIndex> indexes = new ArrayList<>();
+                            Object rows = c.getConnectionConfig().getOrDefault("rows", List.of());
+                            if (rows instanceof List<?> values) for (Object value : values) {
+                                if (!(value instanceof Map<?, ?> row) || !(row.get("spec") instanceof Map<?, ?> spec)
+                                    || !(spec.get("key") instanceof Map<?, ?> key)) continue;
+                                TapIndex index = new TapIndex().name((String) spec.get("name"))
+                                    .unique(Boolean.TRUE.equals(spec.get("unique")) || "_id_".equals(spec.get("name")));
+                                key.forEach((name, direction) -> index.indexField(new TapIndexField().name((String) name)
+                                    .fieldAsc(!Integer.valueOf(-1).equals(direction))));
+                                indexes.add(index);
+                            }
+                            out.accept(indexes);
+                        });
                         f.supportCountByPartitionFilterFunction((c, table, filter) ->
                             ((Number) c.getConnectionConfig().getOrDefault("count", 0L)).longValue());
                         f.supportCreateIndex((c, table, event) -> {});

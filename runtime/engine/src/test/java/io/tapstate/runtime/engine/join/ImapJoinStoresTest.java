@@ -1,7 +1,6 @@
 package io.tapstate.runtime.engine.join;
 
 import com.hazelcast.config.Config;
-import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.map.IMap;
 import io.tapstate.spi.store.KeyedStateStore;
@@ -9,6 +8,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestInfo;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -42,8 +42,15 @@ class ImapJoinStoresTest {
     private ImapJoinStores stores;
 
     @BeforeEach
-    void startMember() {
+    void startMember(TestInfo test) {
         cold = new RecordingColdLayer();
+        member = StandaloneJoinMember.start(memberConfig(),
+                "ImapJoinStoresTest/" + test.getTestMethod().orElseThrow().getName());
+        JoinStateMapStoreFactory.bindTo(member, cold);
+        stores = new ImapJoinStores(member, PIPELINE, STEP, 4);
+    }
+
+    static Config memberConfig() {
         Config config = new Config().setClusterName("join-store-"+java.util.UUID.randomUUID());
         config.setProperty("hazelcast.phone.home.enabled","false"); config.setProperty("hazelcast.shutdownhook.enabled","false");
         config.setProperty("hazelcast.operation.thread.count","2"); config.setProperty("hazelcast.operation.generic.thread.count","2");
@@ -54,10 +61,9 @@ class ImapJoinStoresTest {
         config.getJetConfig().setEnabled(false);
         config.getNetworkConfig().getJoin().getMulticastConfig().setEnabled(false);
         config.getNetworkConfig().getJoin().getTcpIpConfig().setEnabled(false);
+        config.getNetworkConfig().getJoin().getAutoDetectionConfig().setEnabled(false);
         config.addMapConfig(JoinMaps.backedStateMaps(JoinMaps.DEFAULT_ENTRIES_HELD_IN_MEMORY));
-        member = Hazelcast.newHazelcastInstance(config);
-        JoinStateMapStoreFactory.bindTo(member, cold);
-        stores = new ImapJoinStores(member, PIPELINE, STEP, 4);
+        return config;
     }
 
     @AfterEach

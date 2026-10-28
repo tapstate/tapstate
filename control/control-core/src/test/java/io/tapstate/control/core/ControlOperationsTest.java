@@ -15,7 +15,10 @@ class ControlOperationsTest {
         assertThat(registry.ids())
                 .containsExactlyInAnyOrder(
                         "storage.status", "storage.test", "storage.setup.commit", "storage.setup.status", "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status",
-                        "configuration.export", "configuration.import.preflight", "configuration.import.commit", "configuration.import.status", "system.version",
+                        "configuration.export", "configuration.import.preflight", "configuration.import.commit", "configuration.import.status",
+                        "ai-provider.get", "ai-provider.replace", "ai-provider.delete", "ai-provider.check",
+                        "pipeline-draft.assistant", "pipeline-draft.assistant-validate",
+                        "system.version",
                         "artifact.apply",
                         "artifact.validate",
                         "artifact.get",
@@ -217,7 +220,7 @@ class ControlOperationsTest {
     void theRegistryOpensEveryUsableOperationOnCliAndKeepsTheRevealReservationClosed() {
         // The cluster context is REST-only. The reveal reservation stays unpublished until its
         // dedicated authorizer exists.
-        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(78);
+        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(84);
         assertThat(registry.all()).filteredOn(op -> !"source.reveal-config".equals(op.id())
                 && !"cluster.context".equals(op.id())).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
@@ -267,6 +270,8 @@ class ControlOperationsTest {
         assertThat(registry.exposedOn(Frontend.REST, Maturity.GA))
                 .extracting(Operation::id)
                 .containsExactlyInAnyOrder(
+                        "ai-provider.get", "ai-provider.replace", "ai-provider.delete", "ai-provider.check",
+                        "pipeline-draft.assistant", "pipeline-draft.assistant-validate",
                         "sample-source.list", "sample-source.install", "state-store.connect",
                         "storage.status", "storage.test", "storage.setup.commit", "storage.setup.status", "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status",
                         "configuration.export", "configuration.import.preflight", "configuration.import.commit", "configuration.import.status",

@@ -147,7 +147,8 @@ class CloudConnectorSeedReadinessIT {
     }
 
     private static SpringApplicationBuilder builder(AtomicInteger ready) {
-        return new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated())
+        return new SpringApplicationBuilder(Bootstrap.class)
+                .initializers(CloudConnectorTestInputs::reportCapabilityFailures).environment(CloudFixtureEnvironment.isolated())
                 .listeners(event -> {
                     if (event instanceof ApplicationReadyEvent) { ready.incrementAndGet(); }
                 });
