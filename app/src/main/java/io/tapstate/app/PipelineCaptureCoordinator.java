@@ -118,6 +118,12 @@ interface PipelineCaptureCoordinator {
         return SnapshotReading.NONE;
     }
 
+    /** A current-run display projection, absent when the capture or its binding is unavailable. */
+    default io.tapstate.core.lifecycle.InitialLoad initialLoad(String pipelineId,
+            io.tapstate.core.lifecycle.ExecutionPlan plan, java.time.Instant at) {
+        return null;
+    }
+
     /** The rows this run itself read during its bounded snapshot, without earlier completed loads. */
     default SnapshotReading runSnapshotProgress(String pipelineId) {
         return SnapshotReading.NONE;

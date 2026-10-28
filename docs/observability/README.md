@@ -72,6 +72,37 @@ latest observation and can still return retained samples for a stopped pipeline.
 The current read faces are separate requests, not one transactional snapshot. If you need a diagnostic
 conclusion, read `pipeline.explain`; do not join the other responses and copy its rules.
 
+## Current-run initial-load display
+
+The snapshot response can additionally carry `initialLoad`. Its `runKey` binds the reading to the
+execution that produced it, and `observedAt` records when those progress facts were observed.
+The existing `snapshot` map and its `rowsDone`, `rowsTotal`, `donePct`, and `landed` meanings stay unchanged.
+
+`initialLoad.tables` names the complete resolved set of tables requiring initial loading for that run.
+Each table reports `PENDING`, `READING`, `LANDING`, or `LANDED`, optional `rowsRead`, and optional
+`rowsTotalEstimate`. Unknown counts stay unknown. `LANDING` means the source read finished; only the
+existing durable target completion receipt establishes `LANDED`. A table confirmed by an older receipt
+can therefore be landed even when no row count is available. Estimates never establish completion.
+
+The server returns `phase`, `landedTables`, and `totalTables` with that projection. `SNAPSHOTTING`
+means the load is still outstanding. `MIXED` means some tables have landed and can take CDC while
+others still load. `STREAMING` identifies the CDC phase, including `cdc_only`, which requests no initial
+snapshot. A finished `snapshot_only` run reports `COMPLETED`, not streaming. The displayed N/M counts
+are target-confirmed tables out of that run's complete initial-load table set, not a row percentage.
+
+The optional projection is unavailable for old observations, unverified execution bindings, or stale
+observations. A mismatched replacement execution never inherits the preceding run's partial counts.
+Normal cleanup of a completed bounded execution can retain its target-confirmed final facts without an
+active plan; those facts describe the completed run. The projection is for display, not pipeline recovery,
+and it does not make separate status, metrics, and snapshot requests a transactional snapshot.
+
+Monitoring uses readable labels and units for known counters and event ages. Per-second output comes
+from the server history, not from relabelling a cumulative counter. Unknown numeric metrics and opaque
+target-position tokens remain available behind closed details disclosures. The recent-error panel shows
+only errors visible in the contacted node's retained log tail and links to pipeline logs; an empty tail
+is not proof that no error occurred elsewhere. Neither a running lifecycle state nor the age of the last
+target-acknowledged event proves that the source is caught up.
+
 ## What history measures
 
 History contains samples, not stored rates. By default the server samples no more often than once per
