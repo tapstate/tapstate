@@ -23,37 +23,49 @@ final class PipelineTableSelection {
 
     static List<String> resolve(PipelineResource pipeline, SourceResource source, SourceModel discovered) {
         List<String> declared = SourceTableSelection.resolve(source, discovered);
+        return referencedTables(pipeline, source.id(), declared, true);
+    }
+
+    /** Whether the graph could select this table after discovery, without pretending other tables are absent. */
+    static boolean references(PipelineResource pipeline, String sourceId, String table) {
+        return !referencedTables(pipeline, sourceId, List.of(table), false).isEmpty();
+    }
+
+    private static List<String> referencedTables(PipelineResource pipeline, String sourceId,
+            List<String> declared, boolean requireSelected) {
         if (pipeline.transforms() == null && pipeline.view() == null && pipeline.serve() == null) {
             return declared;
         }
         Set<String> referenced = new LinkedHashSet<>();
         if (pipeline.transforms() != null) {
             for (Step step : pipeline.transforms()) {
-                collect(step.from(), source.id(), declared, referenced);
+                collect(step.from(), sourceId, declared, referenced, requireSelected);
             }
         }
         if (pipeline.view() instanceof ViewBlock.Inline view) {
-            collect(view.from(), source.id(), declared, referenced);
+            collect(view.from(), sourceId, declared, referenced, requireSelected);
         } else if (pipeline.view() instanceof ViewBlock.Use view) {
-            collect(view.from(), source.id(), declared, referenced);
+            collect(view.from(), sourceId, declared, referenced, requireSelected);
         }
         if (pipeline.serve() instanceof ServeBlock.Inline serve) {
-            collect(serve.from(), source.id(), declared, referenced);
+            collect(serve.from(), sourceId, declared, referenced, requireSelected);
         } else if (pipeline.serve() instanceof ServeBlock.Use serve) {
-            collect(serve.from(), source.id(), declared, referenced);
+            collect(serve.from(), sourceId, declared, referenced, requireSelected);
         }
         return declared.stream().filter(referenced::contains).toList();
     }
 
-    private static void collect(FromClause from, String sourceId, List<String> declared, Set<String> referenced) {
+    private static void collect(FromClause from, String sourceId, List<String> declared, Set<String> referenced,
+            boolean requireSelected) {
         if (from instanceof FromClause.Flow flow) {
-            flow.refs().forEach(ref -> collect(ref, sourceId, declared, referenced));
+            flow.refs().forEach(ref -> collect(ref, sourceId, declared, referenced, requireSelected));
         } else if (from instanceof FromClause.Aliases aliases) {
-            aliases.aliases().values().forEach(ref -> collect(ref, sourceId, declared, referenced));
+            aliases.aliases().values().forEach(ref -> collect(ref, sourceId, declared, referenced, requireSelected));
         }
     }
 
-    private static void collect(FromRef from, String sourceId, List<String> declared, Set<String> referenced) {
+    private static void collect(FromRef from, String sourceId, List<String> declared, Set<String> referenced,
+            boolean requireSelected) {
         if (from instanceof FromRef.Literal literal) {
             String token = literal.ref();
             if (token.equals(sourceId)) {
@@ -61,7 +73,8 @@ final class PipelineTableSelection {
             } else {
                 declared.stream().filter(table -> token.equals(table) || token.equals(sourceId + "." + table))
                         .forEach(referenced::add);
-                if (token.startsWith(sourceId + ".") && !referenced.contains(token.substring(sourceId.length() + 1))) {
+                if (requireSelected && token.startsWith(sourceId + ".")
+                        && !referenced.contains(token.substring(sourceId.length() + 1))) {
                     throw new TapstateException(ActuationError.SOURCE_TABLE_NOT_DISCOVERED,
                             Map.of("source", sourceId, "table", token.substring(sourceId.length() + 1)), null);
                 }

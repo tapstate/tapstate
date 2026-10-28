@@ -53,12 +53,90 @@ class ViewsListOnlyShapeOutputsIT {
                 """, 1);
     }
 
-    private static void verify(String shape, String transforms, long count) {
+    @Test
+    void aMissingDiscoveryKeepsKnownSyncOutputsVisibleUntilItIsResolved() {
         RealConnectorGate.require("mongodb");
-        var container = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
+        try (MongoDBContainer mongo = mongoFixture()) {
+            mongo.start();
+            String sourceUri = mongo.getReplicaSetUrl("source_db");
+            try (var client = MongoClients.create(sourceUri)) {
+                client.getDatabase("source_db").getCollection("customers")
+                        .insertOne(new Document("_id", "customer-1"));
+                client.getDatabase("target_db").getCollection("out_orders")
+                        .insertOne(new Document("_id", "order-1"));
+                try (ServerHandle server = Tiers.IN_PROCESS.launch(mongo.getReplicaSetUrl("control_db"), "operator_db")) {
+                    ControlPlane control = new ControlPlane(server.baseUrl());
+                    control.bootstrapAndLogin("e2e", "e2e-password");
+                    control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+                    Map<String, String> resources = new LinkedHashMap<>();
+                    resources.put("sources.tap.yml", """
+                            version: tapstate/v1
+                            kind: source
+                            id: src
+                            connector: mongodb
+                            config: {uri: "%s"}
+                            mode: cdc
+                            tables: [orders]
+                            """.formatted(sourceUri));
+                    resources.put("unknown.tap.yml", """
+                            version: tapstate/v1
+                            kind: source
+                            id: unknown
+                            connector: mongodb
+                            config: {uri: "%s"}
+                            mode: cdc
+                            tables: ["/customer.*/"]
+                            """.formatted(sourceUri));
+                    resources.put("target.tap.yml", """
+                            version: tapstate/v1
+                            kind: source
+                            id: target
+                            connector: mongodb
+                            config: {uri: "%s"}
+                            """.formatted(mongo.getReplicaSetUrl("target_db")));
+                    resources.put("pipeline.tap.yml", """
+                            version: tapstate/v1
+                            kind: pipeline
+                            id: p
+                            source: [src, unknown]
+                            serve:
+                              from: [src.orders, unknown]
+                              sync: [{id: output, source: target, rename: {prefix: out_}}]
+                            """);
+                    control.apply(resources);
+                    Map<?, ?> before = (Map<?, ?>) JsonReader.parse(
+                            control.sourceRequest("GET", "/api/views", null, null, 200).body());
+                    assertThat((List<?>) before.get("items")).singleElement().satisfies(value -> {
+                        Map<?, ?> row = (Map<?, ?>) value;
+                        assertThat(row.get("location")).isEqualTo(Map.of(
+                                "storeId", "target", "database", "target_db", "collection", "out_orders"));
+                        assertThat(((Number) row.get("documents")).longValue()).isEqualTo(1);
+                    });
+                    assertThat((List<?>) before.get("unresolved")).singleElement().satisfies(value ->
+                            assertThat(((Map<?, ?>) value).get("code")).isEqualTo("actuation.source-schema-not-discovered"));
+                    control.discoverSchema("unknown", "mongodb", Map.of("uri", sourceUri));
+                    Map<?, ?> after = (Map<?, ?>) JsonReader.parse(
+                            control.sourceRequest("GET", "/api/views", null, null, 200).body());
+                    assertThat((List<?>) after.get("unresolved")).isEmpty();
+                    List<?> rows = (List<?>) after.get("items");
+                    assertThat(rows).extracting(value -> (String) ((Map<?, ?>) ((Map<?, ?>) value).get("location")).get("collection"))
+                            .containsExactlyInAnyOrder("out_orders", "out_customers");
+                    assertThat(client.getDatabase("target_db").listCollectionNames()).containsExactly("out_orders");
+                }
+            }
+        }
+    }
+
+    private static MongoDBContainer mongoFixture() {
+        return new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
                 .withTmpFs(Map.of("/data/db", "rw,size=512m", "/data/configdb", "rw,size=16m"))
                 .withCreateContainerCmdModifier(cmd -> cmd.getHostConfig()
                         .withMemory(1L << 30).withNanoCPUs(1_000_000_000L));
+    }
+
+    private static void verify(String shape, String transforms, long count) {
+        RealConnectorGate.require("mongodb");
+        var container = mongoFixture();
         try (MongoDBContainer mongo = container) {
             mongo.start();
             String sourceUri = mongo.getReplicaSetUrl("source_db");
