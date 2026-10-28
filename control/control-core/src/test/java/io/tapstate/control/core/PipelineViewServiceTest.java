@@ -30,6 +30,60 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class PipelineViewServiceTest {
 
     @Test
+    void viewCatalogReportsTheSyncRenamedCollection() {
+        ReadOnlyArtifactStore store = new ReadOnlyArtifactStore();
+        var parser = new io.tapstate.core.dsl.DslParser();
+        store.seed(parser.parse("""
+                version: tapstate/v1
+                kind: source
+                id: mysql_source
+                connector: mysql
+                config: { database: acceptance }
+                mode: cdc
+                tables: [ ACC_COMPOSITE ]
+                """));
+        store.seed(parser.parse("""
+                version: tapstate/v1
+                kind: source
+                id: atlas-store
+                connector: mongodb
+                config: { uri: "mongodb://localhost:27017/tapstate_acc" }
+                """));
+        store.seed(parser.parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: acc_copy_mysql
+                source: mysql_source
+                serve:
+                  from: ACC_COMPOSITE
+                  sync:
+                    - id: acc_copy_mysql_to_store
+                      source: atlas-store
+                      rename: { prefix: "mysql_" }
+                """));
+        ArtifactQueryService artifacts = new ArtifactQueryService(store);
+        EmptySchemaStore schemas = new EmptySchemaStore();
+        DataBrowserService browser = new DataBrowserService(store, schemas,
+                config -> List.of("mysql_ACC_COMPOSITE"),
+                (config, collection) -> new io.tapstate.spi.store.DataBrowserTableInfo(null, null, null),
+                (config, query) -> { throw new AssertionError("Listing views must not read rows"); },
+                (config, request, listener) -> { throw new AssertionError("Listing views must not follow rows"); });
+        ViewCatalogService views = new ViewCatalogService(artifacts,
+                new PipelineObservationQueryService(artifacts, new InMemoryObservationStore()),
+                browser, copyOutputNames(store));
+
+        assertThat(views.list()).singleElement().satisfies(view -> {
+            assertThat(view.id()).isEqualTo("acc_copy_mysql:acc_copy_mysql_to_store:ACC_COMPOSITE");
+            assertThat(view.kind()).isEqualTo("replica");
+            assertThat(view.location().storeId()).isEqualTo("atlas-store");
+            assertThat(view.location().database()).isEqualTo("tapstate_acc");
+            assertThat(view.location().collection())
+                    .as("the view must point to the collection written after the sync rename")
+                    .isEqualTo("mysql_ACC_COMPOSITE");
+        });
+    }
+
+    @Test
     void listsPipelinesInStableIdOrderAndKeepsDeclaredSourceOrder() {
         ReadOnlyArtifactStore store = new ReadOnlyArtifactStore();
         store.seed(source("orders", "Orders", "mysql"));
@@ -168,6 +222,107 @@ class PipelineViewServiceTest {
                     assertThat(error.code()).isEqualTo(PipelineError.NOT_FOUND);
                     assertThat(error.args()).containsEntry("id", "ghost");
                 });
+    }
+
+    @ParameterizedTest
+    @MethodSource("collectionRenames")
+    void viewCatalogUsesTheRenamedCollectionForInlineAndReusableServe(RenameSpec rename, String collection) {
+        for (boolean reusable : List.of(false, true)) {
+            ReadOnlyArtifactStore store = replicaSources();
+            List<SyncElement> sync = List.of(new SyncElement("sink", "atlas-store", null, rename, null));
+            ServeBlock serve;
+            if (reusable) {
+                store.seed(new ServeResource("shared_serve", null, sync, null, null, null));
+                serve = new ServeBlock.Use(null, "shared_serve", FromRef.literal("ACC_COMPOSITE"));
+            } else {
+                serve = new ServeBlock.Inline(null, FromRef.literal("ACC_COMPOSITE"), sync, null, null);
+            }
+            store.seed(new PipelineResource("copy", null, List.of(SourceRef.bare("mysql_source")),
+                    null, null, serve, null, null));
+            List<String> statsRequests = new ArrayList<>();
+
+            assertThat(replicaCatalog(store, List.of(collection), statsRequests).list())
+                    .as("reusable serve: %s", reusable).singleElement().satisfies(view -> {
+                        assertThat(view.id()).isEqualTo("copy:sink:ACC_COMPOSITE");
+                        assertThat(view.location()).isEqualTo(
+                                new ViewCatalogItem.Location("atlas-store", "tapstate_acc", collection));
+                        assertThat(view.documents()).isEqualTo(7L);
+                        assertThat(view.sizeBytes()).isEqualTo(42L);
+                    });
+            assertThat(statsRequests).containsExactly("atlas-store/" + collection);
+        }
+    }
+
+    private static Stream<Arguments> collectionRenames() {
+        return Stream.of(
+                Arguments.of(null, "ACC_COMPOSITE"),
+                Arguments.of(new RenameSpec(null, RenameCase.LOWER, "Raw_", "_v1"), "Raw_acc_composite_v1"),
+                Arguments.of(new RenameSpec(Map.of("ACC_COMPOSITE", "chosen"), RenameCase.UPPER,
+                        "ignored_", "_ignored"), "chosen"),
+                Arguments.of(new RenameSpec(Map.of(), null, null, "_archive"), "ACC_COMPOSITE_archive"),
+                Arguments.of(new RenameSpec(null, RenameCase.PASCAL, null, null), "AccComposite"));
+    }
+
+    @Test
+    void viewCatalogDistinguishesPipelinesCopyingTheSameTableWithDifferentPrefixes() {
+        ReadOnlyArtifactStore store = replicaSources();
+        for (String prefix : List.of("mysql_", "ora_", "pg_")) {
+            store.seed(new PipelineResource("copy_" + prefix, null, List.of(SourceRef.bare("mysql_source")),
+                    null, null, new ServeBlock.Inline(null, FromRef.literal("ACC_COMPOSITE"),
+                            List.of(new SyncElement("sink", "atlas-store", null,
+                                    new RenameSpec(null, null, prefix, null), null)), null, null), null, null));
+        }
+        List<String> collections = List.of("mysql_ACC_COMPOSITE", "ora_ACC_COMPOSITE", "pg_ACC_COMPOSITE");
+        List<String> statsRequests = new ArrayList<>();
+
+        List<ViewCatalogItem> listed = replicaCatalog(store, collections, statsRequests).list();
+
+        assertThat(listed).extracting(view -> view.location().collection()).containsExactlyElementsOf(collections);
+        assertThat(listed).extracting(ViewCatalogItem::id).containsExactly(
+                "copy_mysql_:sink:ACC_COMPOSITE", "copy_ora_:sink:ACC_COMPOSITE", "copy_pg_:sink:ACC_COMPOSITE");
+        assertThat(statsRequests).containsExactly(
+                "atlas-store/mysql_ACC_COMPOSITE", "atlas-store/ora_ACC_COMPOSITE", "atlas-store/pg_ACC_COMPOSITE");
+    }
+
+    private static PipelineOutputNames copyOutputNames(ReadOnlyArtifactStore store) {
+        return pipeline -> {
+            ServeBlock.Inline serve;
+            if (pipeline.serve() instanceof ServeBlock.Inline inline) {
+                serve = inline;
+            } else {
+                ServeBlock.Use use = (ServeBlock.Use) pipeline.serve();
+                ServeResource resource = (ServeResource) store.get(use.use()).orElseThrow();
+                serve = new ServeBlock.Inline(null, use.from(), resource.sync(), null, null);
+            }
+            return serve.sync().stream().map(sync -> new PipelineOutputNames.Output(sync.id(), "replica",
+                    sync.source(), io.tapstate.core.model.TableRename.apply("ACC_COMPOSITE", sync.rename()),
+                    sync.id() + ":ACC_COMPOSITE")).toList();
+        };
+    }
+
+    private static ReadOnlyArtifactStore replicaSources() {
+        ReadOnlyArtifactStore store = new ReadOnlyArtifactStore();
+        store.seed(new SourceResource("mysql_source", null, "mysql", Map.of(), null,
+                List.of(new TableRef.Literal("ACC_COMPOSITE")), null, null));
+        store.seed(new SourceResource("atlas-store", null, "mongodb",
+                Map.of("uri", "mongodb://localhost:27017/tapstate_acc"), null, null, null, null));
+        return store;
+    }
+
+    private static ViewCatalogService replicaCatalog(ReadOnlyArtifactStore store,
+            List<String> collections, List<String> statsRequests) {
+        ArtifactQueryService artifacts = new ArtifactQueryService(store);
+        EmptySchemaStore schemas = new EmptySchemaStore();
+        DataBrowserService browser = new DataBrowserService(store, schemas, config -> collections,
+                (config, collection) -> {
+                    statsRequests.add(config.id() + "/" + collection);
+                    return new DataBrowserTableInfo(7L, 42L, 6L);
+                },
+                (config, query) -> { throw new AssertionError("Listing views must not read rows"); },
+                (config, request, listener) -> { throw new AssertionError("Listing views must not follow rows"); });
+        return new ViewCatalogService(artifacts,
+                new PipelineObservationQueryService(artifacts, new InMemoryObservationStore()),
+                browser, copyOutputNames(store));
     }
 
     private static SourceResource source(String id, String description, String connector) {
