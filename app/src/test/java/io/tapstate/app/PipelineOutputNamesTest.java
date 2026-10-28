@@ -153,7 +153,30 @@ class PipelineOutputNamesTest {
         assertQualifiedJoin("", "right.orders");
     }
 
+    @Test
+    void qualifiedNestUsesTheConfiguredRootSourcesRename() {
+        assertQualifiedOutput("""
+                  - id: shaped
+                    type: nest
+                    from: {o: right.orders, c: left.orders}
+                    root:
+                      from: o
+                      key: [id]
+                      embed: [{from: c, on: {id: id}, as: object, path: related}]
+                """, ", rename: {map: {left.orders: wrong, right.orders: correct}}", "correct");
+    }
+
     private static void assertQualifiedJoin(String rename, String expected) {
+        assertQualifiedOutput("""
+                  - id: shaped
+                    type: join
+                    from: {o: right.orders, c: left.orders}
+                    engine: builtin
+                    sql: SELECT o.id FROM o LEFT JOIN c ON o.id = c.id
+                """, rename, expected);
+    }
+
+    private static void assertQualifiedOutput(String transform, String rename, String expected) {
         var store = sources();
         var parser = new DslParser();
         for (String id : List.of("left", "right")) {
@@ -166,15 +189,10 @@ class PipelineOutputNamesTest {
                 id: joined
                 source: [left, right]
                 transforms:
-                  - id: shaped
-                    type: join
-                    from: {o: right.orders, c: left.orders}
-                    engine: builtin
-                    sql: SELECT o.id FROM o LEFT JOIN c ON o.id = c.id
-                serve:
+                %sserve:
                   from: shaped
                   sync: [{id: sink, source: target%s}]
-                """.formatted(rename));
+                """.formatted(transform, rename));
         assertThat(new StoreBackedDagSource(store).outputNames(pipeline)).singleElement()
                 .satisfies(output -> assertThat(output.table()).isEqualTo(expected));
         store.artifacts().save(pipeline);
