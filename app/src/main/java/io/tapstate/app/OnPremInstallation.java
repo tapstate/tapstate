@@ -90,6 +90,20 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
         if (connector == null || connector.getLocalPort() < 1) throw StorageRuntime.unavailable();
         files.locked(() -> { files.saveStage(files.stage().withManagementUrl("http://127.0.0.1:" + connector.getLocalPort())); return null; });
     }
+    @Override public String normalLoginUrl() {
+        if (connector == null || connector.getService() == null) return null;
+        return Arrays.stream(connector.getService().findConnectors())
+                .filter(value -> value != connector && value.getLocalPort() > 0)
+                .filter(value -> Set.of("http", "https").contains(value.getScheme()))
+                .map(value -> {
+                    Object configured = value.getProperty("address");
+                    String address = configured instanceof java.net.InetAddress inet ? inet.getHostAddress()
+                            : configured instanceof String text ? text : null;
+                    if (address == null || Set.of("0.0.0.0", "::", "0:0:0:0:0:0:0:0").contains(address)) address = "127.0.0.1";
+                    try { return new java.net.URI(value.getScheme(), null, address, value.getLocalPort(), "/login", null, null).toString(); }
+                    catch (java.net.URISyntaxException invalid) { throw InstallationFiles.refused(); }
+                }).findFirst().orElse(null);
+    }
     @Override public boolean isManagementRequest(HttpServletRequest request) { return request.getAttribute(CONNECTOR_ATTRIBUTE) == connectorIdentity; }
     @Override public void requireManagementRequest(HttpServletRequest request) {
         boolean shellForward = request.getDispatcherType() == jakarta.servlet.DispatcherType.FORWARD && "/index.html".equals(request.getRequestURI());

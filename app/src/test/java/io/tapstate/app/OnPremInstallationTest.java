@@ -17,7 +17,7 @@ import static org.mockito.Mockito.*;
 class OnPremInstallationTest {
     @TempDir Path directory;
 
-    @Test void managementOverviewCanBeReopenedButArbitraryRoutesRemainClosed() {
+    @Test void managementOverviewCanBeReopenedButArbitraryRoutesRemainClosed() throws Exception {
         var files = InstallationFiles.initialize(directory.resolve("reopen"));
         var root = mock(StorageRoot.class); var runtime = mock(StorageRuntime.class);
         when(root.mode()).thenReturn(StorageBinding.Mode.OP); when(root.runtime()).thenReturn(runtime);
@@ -25,6 +25,13 @@ class OnPremInstallationTest {
         try (var installation = new OnPremInstallation(root, files, new MongoProperties(), mock(StorageSetupService.DefaultTarget.class), Clock.systemUTC())) {
             var connector = mock(org.apache.catalina.connector.Connector.class);
             when(connector.getLocalPort()).thenReturn(51599); installation.attach(connector);
+            var normal = mock(org.apache.catalina.connector.Connector.class);
+            var service = mock(org.apache.catalina.Service.class);
+            when(connector.getService()).thenReturn(service);
+            when(service.findConnectors()).thenReturn(new org.apache.catalina.connector.Connector[]{connector, normal});
+            when(normal.getLocalPort()).thenReturn(50690); when(normal.getScheme()).thenReturn("http");
+            when(normal.getProperty("address")).thenReturn(java.net.InetAddress.getByName("127.0.0.1"));
+            assertThat(installation.normalLoginUrl()).isEqualTo("http://127.0.0.1:50690/login");
             var request = mock(org.apache.catalina.connector.Request.class); var attributes = new java.util.HashMap<String,Object>();
             when(request.getConnector()).thenReturn(connector);
             doAnswer(call -> { attributes.put(call.getArgument(0), call.getArgument(1)); return null; }).when(request).setAttribute(anyString(), any());
