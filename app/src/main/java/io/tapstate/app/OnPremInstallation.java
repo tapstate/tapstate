@@ -116,7 +116,7 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
         String path = request.getRequestURI();
         boolean write = "POST".equals(request.getMethod()) && (STORAGE_PATHS.contains(path) || path.equals("/installation/first-admin"));
         boolean read = Set.of("GET", "HEAD").contains(request.getMethod()) && (path.equals("/healthz")
-                || path.equals("/auth/storage-entry") || path.equals("/index.html") || path.equals("/installation") || path.equals("/overview")
+                || path.equals("/installation-reconnect.js") || path.equals("/auth/storage-entry") || path.equals("/index.html") || path.equals("/installation") || path.equals("/overview")
                 || path.equals("/") || path.startsWith("/assets/"));
         if (!write && !read) throw InstallationFiles.refused();
     }
