@@ -166,6 +166,11 @@ public final class StorageSetupService {
         if (mode == StorageBinding.Mode.OP && states.load().phase() == StorageSetupStateStore.Phase.LOCAL_SETUP) {
             requireSetup(expected, active);
             requireTests(expected, prepared, stamps);
+            if (progress != null) {
+                var verifiedChecks = new EnumMap<Layer, Instant>(Layer.class);
+                for (Layer layer : Layer.values()) verifiedChecks.put(layer, tests.get(layer).checkedAt());
+                progress.begin(expected, 0, false, verifiedChecks);
+            }
             for (Layer layer : Layer.values()) probe.test(prepared.candidate().connection(layer));
             requireSetup(expected, active);
             configurationPreparation.prepare(expected, prepared.candidate(), active);
