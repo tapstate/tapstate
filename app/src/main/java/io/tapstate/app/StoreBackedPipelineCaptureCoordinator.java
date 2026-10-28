@@ -31,6 +31,8 @@ import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.store.StorePort;
 import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.SnapshotReading;
+import io.tapstate.core.lifecycle.InitialLoad;
+import io.tapstate.core.lifecycle.ExecutionPlan;
 import io.tapstate.core.lifecycle.TableSnapshot;
 
 import java.time.Duration;
@@ -857,6 +859,8 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         private final Instant began;
         private final Map<CoveredTable, String> keys;
         private final Map<CoveredTable, Long> estimates;
+        private String executionKey;
+        private String readMode;
         private final Map<String, TableSnapshot> through = new ConcurrentHashMap<>();
 
         private PipelineLoad(Instant began, Map<CoveredTable, String> keys, Map<CoveredTable, Long> estimates) {
@@ -888,7 +892,10 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
                 keys.put(entry, occurrences.get(entry.table()) > 1
                         ? entry.sourceId() + "." + entry.table() : entry.table());
             }
-            return new PipelineLoad(began, Map.copyOf(keys), Map.copyOf(estimates));
+            PipelineLoad result = new PipelineLoad(began, Map.copyOf(keys), Map.copyOf(estimates));
+            var modes = plans.stream().map(plan -> plan.spec().readMode().yaml()).distinct().toList();
+            result.readMode = modes.size() == 1 ? modes.getFirst() : null;
+            return result;
         }
 
         /** {@code table} of {@code sourceId} is through, having read {@code rows} out of about {@code total}. */
@@ -961,6 +968,46 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
             return null;
         }
         return (int) Math.min(100L, loaded * 100L / total);
+    }
+
+    @Override
+    public synchronized InitialLoad initialLoad(String pipelineId, ExecutionPlan plan, Instant at) {
+        PipelineLoad load = loadsByPipeline.get(pipelineId);
+        List<PipelineRun> runs = runsByPipeline.get(pipelineId);
+        if (load == null || runs == null || load.readMode == null) return null;
+        String key;
+        if (plan != null) {
+            if (!pipelineId.equals(plan.pipelineId())) return null;
+            key = InitialLoad.executionKey(plan);
+            if (load.executionKey == null) load.executionKey = key;
+            if (!key.equals(load.executionKey)) return null;
+        } else {
+            if (load.executionKey != null) return null;
+            key = "capture:" + pipelineId + ":" + load.began;
+        }
+        Map<String, Map<String, Long>> countsBySource = new LinkedHashMap<>();
+        for (PipelineRun run : runs) {
+            countsBySource.putIfAbsent(run.spec().sourceId(), run.run().snapshotCounts());
+        }
+        Set<String> landed = new java.util.HashSet<>();
+        for (SnapshotOnChain source : snapshotTablesByPipeline.getOrDefault(pipelineId, List.of())) {
+            source.chainId().flatMap(storePort.meta()::read).ifPresent(record -> {
+                for (String table : record.snapshotCompletedTables(source.consumerId())) {
+                    String name = load.keyOf(source.sourceId(), table);
+                    if (name != null) landed.add(name);
+                }
+            });
+        }
+        Map<String, InitialLoad.Table> tables = new LinkedHashMap<>();
+        load.keys.forEach((covered, name) -> {
+            Long count = countsBySource.getOrDefault(covered.sourceId(), Map.of()).get(covered.table());
+            TableSnapshot progress = load.through.get(name);
+            InitialLoad.Stage stage = landed.contains(name) || progress != null && progress.landed() ? InitialLoad.Stage.LANDED
+                    : load.through.containsKey(name) ? InitialLoad.Stage.LANDING
+                    : count != null ? InitialLoad.Stage.READING : InitialLoad.Stage.PENDING;
+            tables.put(name, new InitialLoad.Table(stage, count, load.estimates.get(covered)));
+        });
+        return new InitialLoad(key, at, load.readMode, tables);
     }
 
     @Override

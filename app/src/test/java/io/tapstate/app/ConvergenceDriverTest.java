@@ -14,12 +14,22 @@ import io.tapstate.core.lifecycle.SnapshotReading;
 
 import ch.qos.logback.classic.Logger;
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.CaptureReading;
+import io.tapstate.core.lifecycle.DeliveryReading;
+import io.tapstate.core.lifecycle.FrontierStallPressure;
+import io.tapstate.core.lifecycle.InitialLoad;
+import io.tapstate.core.lifecycle.NestColdLayerPressure;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.ObservationFailure;
+import io.tapstate.core.lifecycle.StageReading;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.core.logging.LogLine;
 import io.tapstate.core.logging.RingBufferLogSink;
 import io.tapstate.runtime.scheduler.LifecycleActuator;
+import io.tapstate.runtime.scheduler.FrontierStallAlert;
+import io.tapstate.runtime.scheduler.FrontierStallWatch;
+import io.tapstate.runtime.scheduler.NestColdLayerAlert;
+import io.tapstate.runtime.scheduler.NestColdLayerWatch;
 import io.tapstate.runtime.scheduler.ObservationPublisher;
 import io.tapstate.runtime.scheduler.PipelineConverger;
 import io.tapstate.runtime.scheduler.RebuildAdmission;
@@ -98,20 +108,32 @@ class ConvergenceDriverTest {
     }
 
     @Test
-    void aCompletionCleanupFailureAndItsRetryKeepTheFinalConfirmedSnapshot() {
+    void aCompletionCleanupFailureAndItsRetryKeepTheFinalConfirmedLoad() {
         var reading = new AtomicReference<>(new SnapshotReading(
                 Map.of("orders", new TableSnapshot(3, 3L, 100, true)), T0));
+        var load = new AtomicReference<>(new InitialLoad("run-1", T0, "snapshot_only",
+                Map.of("orders", new InitialLoad.Table(InitialLoad.Stage.LANDED, 3L, 3L))));
         FailingActuator actuator = new FailingActuator();
         ObservationPublisher publisher = new ObservationPublisher(state, observations,
-                id -> OptionalLong.empty(), id -> Map.of(), id -> reading.get());
+                id -> OptionalLong.empty(), id -> Map.of(), id -> reading.get(),
+                id -> Map.of(), id -> Map.of(),
+                new NestColdLayerWatch(NestColdLayerPressure.DEFAULT, NestColdLayerAlert.NONE),
+                id -> Map.of(),
+                new FrontierStallWatch(FrontierStallPressure.DEFAULT, FrontierStallAlert.NONE),
+                id -> Map.of(), id -> Map.of(), id -> Map.of(),
+                id -> CaptureReading.NONE, id -> DeliveryReading.NONE, id -> StageReading.NONE,
+                id -> reading.get(), id -> load.get(), Clock.fixed(T0, ZoneOffset.UTC));
         PipelineConverger completing = new PipelineConverger(desired, state, actuator,
                 Clock.fixed(T0, ZoneOffset.UTC), RebuildAdmission.never(), publisher::publish);
         ConvergenceDriver completingDriver = new ConvergenceDriver(completing, desired, publisher);
         desired.save(new DesiredState("orders", RUNNING, "rev-1"));
         completingDriver.reconcile();
+        InitialLoad confirmed = observations.read("orders").orElseThrow().initialLoad();
+        assertThat(confirmed).isEqualTo(load.get());
         actuator.completed = true;
         actuator.cleanup = () -> {
             reading.set(SnapshotReading.NONE);
+            load.set(null);
             throw new IllegalStateException("temporary plan cleanup refusal");
         };
         completingDriver.reconcile();
@@ -119,13 +141,19 @@ class ConvergenceDriverTest {
         assertThat(refused.state()).isEqualTo(PipelineState.COMPLETED);
         assertThat(refused.snapshot()).containsEntry("orders", new TableSnapshot(3, 3L, 100, true));
         assertThat(refused.metrics()).containsEntry("reconcileFailuresInARow", 1L);
+        assertThat(refused.initialLoad()).isEqualTo(confirmed);
 
         actuator.cleanup = () -> { };
         completingDriver.reconcile();
         Observation completed = observations.read("orders").orElseThrow();
         assertThat(completed.snapshot()).isEqualTo(refused.snapshot());
         assertThat(completed.metrics()).doesNotContainKey("reconcileFailuresInARow");
+        assertThat(completed.initialLoad()).isEqualTo(confirmed);
+        assertThat(completed.initialLoad().phase(completed.state())).isEqualTo(InitialLoad.Phase.COMPLETED);
+        assertThat(completed.initialLoad().landedTables()).isEqualTo(1);
+        assertThat(completed.initialLoad().tables().get("orders").rowsRead()).isEqualTo(3L);
         completingDriver.reconcile();
+        assertThat(observations.read("orders").orElseThrow().initialLoad()).isEqualTo(confirmed);
         assertThat(actuator.cleanupCalls).isEqualTo(2);
     }
 

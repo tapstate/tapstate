@@ -3,6 +3,9 @@ package io.tapstate.app;
 import java.util.OptionalLong;
 import java.time.Instant;
 import io.tapstate.core.lifecycle.DeliveryReading;
+import io.tapstate.core.lifecycle.ExecutionPlans;
+import org.springframework.beans.factory.ObjectProvider;
+import java.util.List;
 import io.tapstate.core.lifecycle.FrontierStallPressure;
 import io.tapstate.core.lifecycle.NestColdLayerPressure;
 import io.tapstate.runtime.engine.Engine;
@@ -64,9 +67,20 @@ class RuntimeConvergenceConfiguration {
                 observationPublisher::publish);
     }
 
-    @Bean
-    ObservationPublisher observationPublisher(
-            StorePort storePort, Engine engine, PipelineCaptureCoordinator captureCoordinator) {
+    @Bean(name = "observationPublisher")
+    ObservationPublisher plannedObservationPublisher(StorePort storePort, Engine engine,
+            PipelineCaptureCoordinator captureCoordinator, ObjectProvider<ExecutionPlans> executionPlans) {
+        return observationPublisher(storePort, engine, captureCoordinator,
+                executionPlans.getIfAvailable(() -> ExecutionPlans.NONE));
+    }
+
+    ObservationPublisher observationPublisher(StorePort storePort, Engine engine,
+            PipelineCaptureCoordinator captureCoordinator) {
+        return observationPublisher(storePort, engine, captureCoordinator, ExecutionPlans.NONE);
+    }
+
+    private ObservationPublisher observationPublisher(StorePort storePort, Engine engine,
+            PipelineCaptureCoordinator captureCoordinator, ExecutionPlans executionPlans) {
         // The publisher's four run-statistic sources: recordCount and the per-chain frontier readings ride
         // from the engine's live Jet job, the per-table sink-acked positions from the store, and the
         // per-table initial load from the capture coordinator. All are ports, so the scheduler stays clear
@@ -108,6 +122,9 @@ class RuntimeConvergenceConfiguration {
                 // units of work; a run that has timed nothing yet reports nothing rather than a stage at zero.
                 engine::stageDurations,
                 captureCoordinator::runSnapshotProgress,
+                id -> captureCoordinator.initialLoad(id,
+                        executionPlans.current(List.of(id)).get(id),
+                        Instant.now()),
                 Clock.systemUTC());
     }
 
