@@ -153,6 +153,13 @@ final class ValidationMemberResources implements AutoCloseable {
         synchronized ExecutorService queryExecutor() { return view(queries); }
         synchronized ExecutorService decodeExecutor() { return view(decoders); }
         synchronized ExecutorService checkExecutor() { return view(checks); }
+        /** Reports a proven unsubmitted check outside resource locks; unknown execution stays owned. */
+        void executeCheck(Runnable command,Runnable notSubmitted) {
+            final View executor;
+            try{synchronized(this){executor=view(checks);}}
+            catch(RuntimeException|Error refused){notSubmitted.run();throw refused;}
+            executor.execute(command,notSubmitted);
+        }
         synchronized ExecutorService controlExecutor() { return view(controls); }
         private View view(ExecutorService executor) {
             if (retired) throw invalid("resources.executorView");
@@ -200,16 +207,21 @@ final class ValidationMemberResources implements AutoCloseable {
         private boolean closed; private int outstanding;
         private View(ExecutorService executor, ValidationLocalBudget.Run budget) { this.executor = executor; this.budget = budget; }
         @Override public void execute(Runnable command) {
+            execute(command,()->{});
+        }
+        private void execute(Runnable command,Runnable notSubmitted) {
             Objects.requireNonNull(command);
-            var worker = budget.reserve(new ValidationLocalBudget.Amount(1024, 1, 0, 0));
+            final ValidationLocalBudget.Reservation worker;
+            try{worker=budget.reserve(new ValidationLocalBudget.Amount(1024,1,0,0));}
+            catch(RuntimeException|Error refused){notSubmitted.run();throw refused;}
             boolean admitted;
             synchronized (this) { admitted = !closed; if (admitted) outstanding++; }
-            if (!admitted) { worker.close(); throw new RejectedExecutionException("validation executor view is closed"); }
+            if (!admitted) { worker.close();notSubmitted.run();throw new RejectedExecutionException("validation executor view is closed"); }
             Runnable retained = () -> { try { command.run(); } finally { exited(worker); } };
             try { executor.execute(retained); }
-            catch (RejectedExecutionException notSubmitted) { exited(worker); throw notSubmitted; }
+            catch (RejectedExecutionException refused) { exited(worker);notSubmitted.run();throw refused; }
             catch (RuntimeException | Error unknown) {
-                if (((ThreadPoolExecutor) executor).remove(retained)) exited(worker);
+                if (((ThreadPoolExecutor) executor).remove(retained)) {exited(worker);notSubmitted.run();}
                 throw unknown;
             }
         }

@@ -22,6 +22,8 @@ final class ValidationJobExecution implements ValidationRunLifecycle.Execution {
         Throwable failure();
         /** Pure local cancellation signal; no transport, native stop or waiting here. */
         void cancel();
+        /** Retry original cleanup only, on admitted control I/O, including after known retirement. */
+        default void maintain() {}
         /** Original queue, whose complete envelope and retained leases are charged by this work. */
         default java.util.Optional<io.tapstate.runtime.engine.validation.ValidationCandidateQueue> candidates() { return java.util.Optional.empty(); }
     }
@@ -62,6 +64,7 @@ final class ValidationJobExecution implements ValidationRunLifecycle.Execution {
     }
     /** Retry only the original lookup/cancel. Invocation must remain separate from deadline callbacks. */
     void maintain() {
+        work.maintain();
         if(!cancelled.get())return;requireOriginalCleanup.run();
         Job known=originalJob;
         if(known==null&&graph.handedToJet()) {known=graph.reconcile(jet,requireOriginalCleanup).orElse(null);if(known!=null)originalJob=known;}

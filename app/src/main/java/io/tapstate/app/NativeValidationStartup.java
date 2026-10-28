@@ -21,23 +21,27 @@ final class NativeValidationStartup implements NativeValidationOwnerReservations
         this.cache=Objects.requireNonNull(cache);this.scope=Objects.requireNonNull(scope);this.active=Objects.requireNonNull(active);
     }
     @Override public NativeValidationOwnerReservations.StartupGate inspect(ValidationSavedDeclarations saved,ValidationRunSpec spec){
+        active.run();
+        // An independent full scan does not inherit a joint-start readiness barrier.
+        if(spec.mode()==ValidationMode.FULL)return NativeValidationOwnerReservations.StartupGate.ready();
+        return inspectJoint(saved,spec);
+    }
+    NativeValidationOwnerReservations.StartupGate inspectJoint(ValidationSavedDeclarations saved,ValidationRunSpec spec){
         active.run();var pipeline=spec.task().pipelineId();var intent=configuration.intents().guardedBy(active).load(pipeline);
         if(intent.isEmpty()||intent.orElseThrow().deleted()||intent.orElseThrow().desired().targetState()!=PipelineState.RUNNING){
-            if(spec.mode()==ValidationMode.INCREMENTAL)throw invalid("startup.pipelineNotRunning");return NativeValidationOwnerReservations.StartupGate.ready();
+            throw invalid("startup.pipelineNotRunning");
         }
         var originalIntent=intent.orElseThrow();var prepared=configuration.preparations().read(pipeline).orElseThrow(()->invalid("startup.originalPipelineUnavailable"));
         if(prepared.phase()==PipelinePreparation.Phase.COMPLETE){
             var state=cache.validationPipelineState(prepared.scope(),active);
-            if(spec.mode()==ValidationMode.FULL&&originalIntent.desired().targetStateAt(state)!=PipelineState.RUNNING)return NativeValidationOwnerReservations.StartupGate.ready();
+            if(originalIntent.desired().targetStateAt(state)!=PipelineState.RUNNING)throw invalid("startup.pipelineNotRunning");
             if(originalIntent.desired().rebuildOwedAt(state))throw invalid("startup.pipelineStartNotObserved");
         }
         var found=engine.captureRun(pipeline).orElseThrow(()->invalid("startup.pipelineStartNotObserved"));
         if(!(found.operatorManifest().executionIdentity() instanceof ExecutionFence original)||original.scope()==null
                 ||!scope.equals(new CacheBusinessScope(original.scope().clusterId(),original.scope().bindingVersion(),original.scope().cacheIncarnation()))
                 ||!originalIntent.scope().equals(original.scope()))throw invalid("startup.originalPipelineUnavailable");
-        if(found.status().isTerminal()){
-            if(spec.mode()==ValidationMode.FULL)return NativeValidationOwnerReservations.StartupGate.ready();throw invalid("startup.pipelineNotRunning");
-        }
+        if(found.status().isTerminal())throw invalid("startup.pipelineNotRunning");
         if(found.status()!=JobStatus.RUNNING&&found.status()!=JobStatus.STARTING)throw invalid("startup.pipelineNotRunning");
         var outputs=new HashSet<String>();
         for(var mapping:spec.task().mappings()){
@@ -51,8 +55,8 @@ final class NativeValidationStartup implements NativeValidationOwnerReservations
             if(!currentIntent.equals(originalIntent))throw invalid("startup.originalPipelineChanged");
             var current=engine.captureRun(pipeline).orElseThrow(()->invalid("startup.originalPipelineEnded"));
             if(current.jobId()!=job||!original.equals(current.operatorManifest().executionIdentity()))throw invalid("startup.originalPipelineChanged");
-            var status=current.status();if(status!=JobStatus.RUNNING&&status!=JobStatus.STARTING&&status!=JobStatus.COMPLETED)throw invalid("startup.originalPipelineEnded");
-            var ready=read(original,selected);if(status==JobStatus.COMPLETED&&ready!=ValidationRunLifecycle.Readiness.READY)throw invalid("startup.originalInitialLoadUnproven");
+            var status=current.status();if(status!=JobStatus.RUNNING&&status!=JobStatus.STARTING)throw invalid("startup.originalPipelineEnded");
+            var ready=read(original,selected);
             if(first==ValidationRunLifecycle.Readiness.READY&&ready==ValidationRunLifecycle.Readiness.WAITING_FOR_INITIAL_LOAD)throw invalid("startup.initialReadinessChanged");
             return ready;
         });

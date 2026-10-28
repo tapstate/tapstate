@@ -30,6 +30,8 @@ final class ValidationRunLifecycle {
     interface Activation {
         /** Metadata/control evidence only. Waiting must create no Job, reader or hint registration. */
         Readiness readiness();
+        /** Recheck and reserve execution resources; uncertain evidence retains this STARTING run. */
+        default Readiness prepare(){return readiness();}
         /** Construct a local handle after readiness, with no reader, subscription or Job side effect. */
         Execution create();
         /** Bind local control to the remembered handle before RUNNING or its single submission. */
@@ -119,7 +121,7 @@ final class ValidationRunLifecycle {
                     }
                     local.requireRun();
                     if (state == ValidationRunState.STARTING) {
-                        try { var ready=activation.readiness();waiting=ready!=Readiness.READY;
+                        try { var ready=activation.prepare();waiting=ready!=Readiness.READY;
                             if(ready==Readiness.UNKNOWN){unknown=true;controlFailure=invalid("run.initialEvidenceUnknown");return settled();}
                         }
                         catch (TapstateException refused) { fail(refused); finish(); return settled(); }

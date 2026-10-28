@@ -43,6 +43,27 @@ class NativeValidationRunsIT {
             await(()->f.resources.snapshot().metadataFrames()==0);assertThat(f.resources.snapshot().processReserved().isEmpty()).isTrue();
         }finally{if(reader.get()!=null)reader.get().close();released.set(true);}
     }
+    @Test void uncertaintyOnTheFinalReadinessCheckKeepsControlOnlyResourcesAndTheSameRun()throws Exception{
+        var calls=new java.util.concurrent.atomic.AtomicInteger();var resume=new java.util.concurrent.atomic.AtomicBoolean();var created=new java.util.concurrent.atomic.AtomicInteger();
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers)){
+            f.startup=(saved,spec)->new NativeValidationOwnerReservations.StartupGate(true,()->calls.incrementAndGet()==1||resume.get()?ValidationRunLifecycle.Readiness.READY:ValidationRunLifecycle.Readiness.UNKNOWN);
+            var request=f.request("FULL",1);var accepted=f.owners.reserve(request);assertThat(accepted.outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
+            var spec=new ValidationRunSpec(f.comparison,ValidationMode.FULL,ValidationMethod.COUNT);var identity=new ValidationRunIdentity(accepted.owner(),"task",request.run(),spec.mode(),spec.fingerprint(),1,"rules");
+            var start=new ValidationReportAdmission.Start(f.task,1,1,request.command().toString(),identity);
+            runs.start(start,new ValidationRunLifecycle.Activation(){
+                public ValidationRunLifecycle.Readiness readiness(){return ValidationRunLifecycle.Readiness.READY;}
+                public ValidationRunLifecycle.Execution create(){created.incrementAndGet();return new ValidationRunLifecycle.Execution(){
+                    public ValidationRunIdentity identity(){return identity;}public void start(){}public void cancel(){}
+                    public ValidationRunLifecycle.Progress progress(){return new ValidationRunLifecycle.Progress(false,true,true,null);}
+                };}
+            });
+            await(()->runs.read(identity).controlUnknown());var unknown=runs.read(identity);
+            assertThat(unknown.state()).isEqualTo(ValidationRunState.STARTING);assertThat(unknown.retired()).isFalse();assertThat(created).hasValue(0);
+            assertThat(f.resources.snapshot().processReserved()).isEqualTo(new ValidationLocalBudget.Amount(65536,1,0,0));assertThat(f.resources.snapshot().processors()).isZero();
+            resume.set(true);await(()->runs.read(identity).state()==ValidationRunState.RUNNING);assertThat(created).hasValue(1);
+            runs.stop(identity);await(()->f.resources.snapshot().metadataFrames()==0);
+        }
+    }
     @Test void readyCapacityRefusalEndsTheAlreadyChosenOwnerWithoutCreatingExecution()throws Exception{
         var ready=new java.util.concurrent.atomic.AtomicBoolean();var created=new java.util.concurrent.atomic.AtomicInteger();
         try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers)){
