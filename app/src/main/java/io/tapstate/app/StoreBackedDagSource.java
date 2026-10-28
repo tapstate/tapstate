@@ -987,14 +987,14 @@ final class StoreBackedDagSource implements DagSource {
 
     /** A non-null failure map is used only by name queries; write and start callers remain fail-fast. */
     private Map<String, SourceVertex> sourceVertices(PipelineResource pipeline, boolean skipUndiscovered,
-            Map<String, TapstateException> failures) {
+            Map<String, List<TapstateException>> failures) {
         Map<String, SourceVertex> vertices = new LinkedHashMap<>();
         for (String sourceId : pipeline.sourceIds()) {
             try {
-                addSourceVertices(pipeline, sourceId, skipUndiscovered, vertices);
+                addSourceVertices(pipeline, sourceId, skipUndiscovered, vertices, failures);
             } catch (TapstateException unavailable) {
                 if (failures == null) throw unavailable;
-                failures.put(sourceId, unavailable);
+                failures.computeIfAbsent(sourceId, ignored -> new ArrayList<>()).add(unavailable);
             }
         }
         Map<String, Long> counts = vertices.values().stream().collect(java.util.stream.Collectors.groupingBy(
@@ -1007,11 +1007,19 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     private void addSourceVertices(PipelineResource pipeline, String sourceId, boolean skipUndiscovered,
-            Map<String, SourceVertex> vertices) {
+            Map<String, SourceVertex> vertices, Map<String, List<TapstateException>> failures) {
         SourceResource source = StoredArtifacts.requireSource(artifacts(), sourceId);
         SourceModel discovered = SourceDiscovery.model(storePort, source);
         if (skipUndiscovered && discovered == null) return;
-        Optional<SourceCaptureResolution> selected = SourceCaptureResolution.forPipeline(pipeline, source, discovered);
+        Optional<SourceCaptureResolution> selected;
+        if (failures == null) {
+            selected = SourceCaptureResolution.forPipeline(pipeline, source, discovered);
+        } else {
+            SourceTableSelection.Names names = SourceTableSelection.forOutputNames(source, discovered);
+            if (!names.unresolved().isEmpty()) failures.put(sourceId, new ArrayList<>(names.unresolved()));
+            selected = SourceCaptureResolution.forSelectedTables(pipeline, source,
+                    PipelineTableSelection.forOutputNames(pipeline, source, names.tables()));
+        }
         if (selected.isEmpty()) return;
         SourceCaptureResolution resolution = selected.orElseThrow();
         for (String table : resolution.tables()) {
@@ -3322,7 +3330,7 @@ final class StoreBackedDagSource implements DagSource {
     private final class PartialOutputStreams {
         private final PipelineResource pipeline;
         private final List<PipelineOutputNames.Unresolved> unresolved;
-        private final Map<String, TapstateException> failures = new LinkedHashMap<>();
+        private final Map<String, List<TapstateException>> failures = new LinkedHashMap<>();
         private final Map<String, Optional<SourceResource>> failedDefinitions = new LinkedHashMap<>();
         private final Map<String, SourceVertex> vertices;
         private final Map<String, String> keys;
@@ -3337,6 +3345,7 @@ final class StoreBackedDagSource implements DagSource {
             vertices = sourceVertices(pipeline, false, failures);
             keys = sourceKeyByTable(vertices);
             sources = sourceKeysById(vertices);
+            pipeline.sourceIds().forEach(id -> sources.putIfAbsent(id, List.of()));
             steps = stepIds(pipeline);
         }
 
@@ -3409,12 +3418,21 @@ final class StoreBackedDagSource implements DagSource {
 
         private void requireAvailableReference(FromRef ref) {
             if (ref instanceof FromRef.Regex) {
-                failures.values().forEach(this::record);
+                failures.values().forEach(errors -> errors.forEach(this::record));
                 return;
             }
             String token = ((FromRef.Literal) ref).ref();
             for (var entry : failures.entrySet()) {
-                if (token.equals(entry.getKey()) || token.startsWith(entry.getKey() + ".")) throw entry.getValue();
+                if (token.equals(entry.getKey())) {
+                    entry.getValue().forEach(this::record);
+                    return;
+                }
+                String prefix = entry.getKey() + ".";
+                if (token.startsWith(prefix)) {
+                    if (hasKnownTable(entry.getKey(), token.substring(prefix.length()))) return;
+                    entry.getValue().forEach(this::record);
+                    throw entry.getValue().getFirst();
+                }
             }
             if (steps.contains(token) || pipeline.sourceIds().contains(token)) return;
             int dot = token.indexOf('.');
@@ -3424,8 +3442,16 @@ final class StoreBackedDagSource implements DagSource {
 
         private void requireUnambiguousUnavailableSources(String table) {
             for (var entry : failures.entrySet()) {
-                if (maySelect(entry.getKey(), table)) throw entry.getValue();
+                if (!hasKnownTable(entry.getKey(), table) && maySelect(entry.getKey(), table)) {
+                    entry.getValue().forEach(this::record);
+                    throw entry.getValue().getFirst();
+                }
             }
+        }
+
+        private boolean hasKnownTable(String sourceId, String table) {
+            return vertices.values().stream().anyMatch(vertex ->
+                    vertex.sourceId().equals(sourceId) && vertex.table().equals(table));
         }
 
         private boolean maySelect(String sourceId, String table) {

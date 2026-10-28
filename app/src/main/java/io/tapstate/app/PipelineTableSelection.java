@@ -31,6 +31,11 @@ final class PipelineTableSelection {
         return !referencedTables(pipeline, sourceId, List.of(table), false).isEmpty();
     }
 
+    /** Filters a known subset without rejecting qualified references that may belong to unresolved selectors. */
+    static List<String> forOutputNames(PipelineResource pipeline, SourceResource source, List<String> known) {
+        return referencedTables(pipeline, source.id(), known, false);
+    }
+
     private static List<String> referencedTables(PipelineResource pipeline, String sourceId,
             List<String> declared, boolean requireSelected) {
         if (pipeline.transforms() == null && pipeline.view() == null && pipeline.serve() == null) {

@@ -55,11 +55,27 @@ class ViewsListOnlyShapeOutputsIT {
 
     @Test
     void aMissingDiscoveryKeepsKnownSyncOutputsVisibleUntilItIsResolved() {
+        verifyPartialDiscovery(false, "[orders]");
+    }
+
+    @Test
+    void aMixedLiteralSelectorKeepsItsKnownOutputBeforeDiscovery() {
+        verifyPartialDiscovery(true, "[orders, \"/customer.*/\"]");
+    }
+
+    @Test
+    void aMixedStructuredSelectorKeepsItsKnownOutputBeforeDiscovery() {
+        verifyPartialDiscovery(true, "[{name: orders}, \"/customer.*/\"]");
+    }
+
+    private static void verifyPartialDiscovery(boolean sameSource, String selectors) {
         RealConnectorGate.require("mongodb");
         try (MongoDBContainer mongo = mongoFixture()) {
             mongo.start();
             String sourceUri = mongo.getReplicaSetUrl("source_db");
             try (var client = MongoClients.create(sourceUri)) {
+                client.getDatabase("source_db").getCollection("orders")
+                        .insertOne(new Document("_id", "order-1"));
                 client.getDatabase("source_db").getCollection("customers")
                         .insertOne(new Document("_id", "customer-1"));
                 client.getDatabase("target_db").getCollection("out_orders")
@@ -76,9 +92,9 @@ class ViewsListOnlyShapeOutputsIT {
                             connector: mongodb
                             config: {uri: "%s"}
                             mode: cdc
-                            tables: [orders]
-                            """.formatted(sourceUri));
-                    resources.put("unknown.tap.yml", """
+                            tables: %s
+                            """.formatted(sourceUri, selectors));
+                    if (!sameSource) resources.put("unknown.tap.yml", """
                             version: tapstate/v1
                             kind: source
                             id: unknown
@@ -98,11 +114,11 @@ class ViewsListOnlyShapeOutputsIT {
                             version: tapstate/v1
                             kind: pipeline
                             id: p
-                            source: [src, unknown]
+                            source: %s
                             serve:
-                              from: [src.orders, unknown]
+                              from: [src.orders, %s]
                               sync: [{id: output, source: target, rename: {prefix: out_}}]
-                            """);
+                            """.formatted(sameSource ? "src" : "[src, unknown]", sameSource ? "src" : "unknown"));
                     control.apply(resources);
                     Map<?, ?> before = (Map<?, ?>) JsonReader.parse(
                             control.sourceRequest("GET", "/api/views", null, null, 200).body());
@@ -114,7 +130,7 @@ class ViewsListOnlyShapeOutputsIT {
                     });
                     assertThat((List<?>) before.get("unresolved")).singleElement().satisfies(value ->
                             assertThat(((Map<?, ?>) value).get("code")).isEqualTo("actuation.source-schema-not-discovered"));
-                    control.discoverSchema("unknown", "mongodb", Map.of("uri", sourceUri));
+                    control.discoverSchema(sameSource ? "src" : "unknown", "mongodb", Map.of("uri", sourceUri));
                     Map<?, ?> after = (Map<?, ?>) JsonReader.parse(
                             control.sourceRequest("GET", "/api/views", null, null, 200).body());
                     assertThat((List<?>) after.get("unresolved")).isEmpty();
