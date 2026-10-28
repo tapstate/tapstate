@@ -92,7 +92,7 @@ class AlertManagementIT {
         AlertEvaluationHostIT.withFixture(f->{AlertDeliveryRuntimeIT.seed(f);var s=service(f);var p=call(s,"deliveries",map("limit",1,"channel","email","result","NOT_ATTEMPTED"));assertThat((List<?>)p.get("rows")).hasSize(1);assertThat(p.get("nextCursor")).isNotNull();
             var next=call(s,"deliveries",map("limit",1,"channel","email","result","NOT_ATTEMPTED","cursor",p.get("nextCursor")));assertThat((List<?>)next.get("rows")).hasSize(1);
             assertThatThrownBy(()->call(s,"deliveries",map("channel","webhook","cursor",p.get("nextCursor")))).isInstanceOf(TapstateException.class);
-            var row=object(((List<?>)p.get("rows")).getFirst());var detail=call(s,"deliveries",map("id",row.get("id")));assertThat(detail).doesNotContainKeys("payload","candidate","credentials");
+            var row=object(((List<?>)p.get("rows")).getFirst());var detail=call(s,"deliveries",map("id",row.get("id")));assertThat(detail).doesNotContainKeys("payload","candidate","credentials");var original=sendingStore(f).delivery(text(row,"id"),f.reads()).orElseThrow();grant(f,original);accepted(f,original.value().frozen().identity());var received=call(s,"deliveries",map("id",row.get("id")));assertThat(object(received.get("diagnostic"))).containsEntry("phase","FINAL_RESPONSE").containsEntry("status",250);
             assertThat(f.store().deliveries(null,100,null,null,new AlertStore.ReadAccess(false,Set.of(),ACTIVE)).rows()).isEmpty();
         });
     }
