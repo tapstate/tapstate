@@ -147,6 +147,8 @@ public final class StorageInitializationProgress {
         finished = now;
     }
 
+    public synchronized Optional<View> snapshot() { return scope == null ? Optional.empty() : snapshot(scope); }
+
     /** No IO or long-running action is performed while holding this monitor. */
     public synchronized Optional<View> snapshot(StorageSetupScope original) {
         if (!original.equals(scope)) return Optional.empty();

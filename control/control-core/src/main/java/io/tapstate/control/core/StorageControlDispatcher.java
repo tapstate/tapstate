@@ -211,7 +211,7 @@ public final class StorageControlDispatcher {
         if (value.initializationProgress() != null) out.put("initializationProgress", progress(value.initializationProgress()));
         out.put("allowedActions", value.allowedActions()); out.put("restartRequired", value.restartRequired()); return out;
     }
-    private static Map<String,Object> progress(StorageInitializationProgress.View value) {
+    public static Map<String,Object> progress(StorageInitializationProgress.View value) {
         var out = new LinkedHashMap<String,Object>();
         out.put("operationId", value.operationId()); out.put("generation", value.generation());
         out.put("attemptId", value.attemptId()); out.put("state", value.state().name());
