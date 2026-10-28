@@ -120,6 +120,171 @@ class PipelineOutputNamesTest {
     }
 
     @Test
+    void knownSyncSurvivesAnUnavailableInputInTheSamePipeline() {
+        var store = sources();
+        var parser = new DslParser();
+        store.artifacts().save(parser.parse("""
+                version: tapstate/v1
+                kind: source
+                id: unknown
+                connector: mongodb
+                tables: ["/customer.*/"]
+                """));
+        var pipeline = (PipelineResource) parser.parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: partial
+                source: [src, unknown]
+                serve:
+                  from: [src.orders, unknown]
+                  sync: [{id: sink, source: target, rename: {prefix: out_}}]
+                """);
+        store.artifacts().save(pipeline);
+        var report = catalog(store).catalog();
+        assertThat(report.items()).singleElement().satisfies(row ->
+                assertThat(row.location().collection()).isEqualTo("out_orders"));
+        assertThat(report.unresolved()).singleElement().satisfies(problem -> {
+            assertThat(problem.code()).isEqualTo("actuation.source-schema-not-discovered");
+            assertThat(problem.params()).containsEntry("source", "unknown");
+        });
+        assertThatThrownBy(() -> new StoreBackedPipelineWriteTargets(store).of(pipeline))
+                .hasMessageContaining("actuation.source-schema-not-discovered");
+        store.schemas().save(new io.tapstate.spi.store.DiscoveredSourceModel("unknown", "mongodb", 0L,
+                new io.tapstate.spi.store.SourceModel(List.of(new io.tapstate.spi.store.SourceTable("customers",
+                        List.of(new io.tapstate.spi.store.SourceField("id", "INT")), List.of("id"), List.of())))));
+        var recovered = catalog(store).catalog();
+        assertThat(recovered.items()).extracting(row -> row.location().collection())
+                .containsExactlyInAnyOrder("out_orders", "out_customers");
+        assertThat(recovered.unresolved()).isEmpty();
+    }
+
+    @Test
+    void unionAndUnwindKeepTheResolvableBranchAndDoNotInventTheMissingOne() {
+        var store = sources();
+        var pipeline = partialPipeline(store, """
+                transforms:
+                  - {id: merged, type: union, from: [src.orders, unknown]}
+                  - {id: expanded, type: unwind, from: merged, path: items, element_key: sku}
+                serve:
+                  from: expanded
+                  sync: [{id: sink, source: target, rename: {prefix: out_}}]
+                """, "customer.*");
+        var result = new StoreBackedDagSource(store).outputNameResult(pipeline);
+        assertThat(result.outputs()).extracting(PipelineOutputNames.Output::table).containsExactly("out_orders");
+        assertThat(result.unresolved()).hasSize(1);
+        assertThatThrownBy(() -> new StoreBackedPipelineWriteTargets(store).of(pipeline))
+                .hasMessageContaining("actuation.source-schema-not-discovered");
+    }
+
+    @Test
+    void unavailableSourceCannotSilentlyDisambiguateABareTableOrJoinFact() {
+        for (String from : List.of("[orders, src.customers]", "[shaped, src.customers]")) {
+            var store = sources();
+            var pipeline = partialPipeline(store, """
+                    transforms:
+                      - id: shaped
+                        type: join
+                        from: {o: src.orders, c: unknown.orders}
+                        engine: builtin
+                        sql: SELECT o.id FROM o LEFT JOIN c ON o.id = c.id
+                    serve:
+                      from: %s
+                      sync: [{id: sink, source: target, rename: {prefix: out_}}]
+                    """.formatted(from), "order.*");
+            var result = new StoreBackedDagSource(store).outputNameResult(pipeline);
+            assertThat(result.outputs()).extracting(PipelineOutputNames.Output::table).containsExactly("out_customers");
+            assertThat(result.unresolved()).singleElement().satisfies(problem ->
+                    assertThat(problem.params()).containsEntry("source", "unknown"));
+        }
+    }
+
+    @Test
+    void partialRegexDoesNotClaimCompletenessOrSuppressExplicitKnownOutput() {
+        var store = sources();
+        var pipeline = partialPipeline(store, """
+                serve:
+                  from: [src.orders, "/customer.*/"]
+                  sync: [{id: sink, source: target, rename: {prefix: out_}}]
+                """, "customer.*");
+        var result = new StoreBackedDagSource(store).outputNameResult(pipeline);
+        assertThat(result.outputs()).extracting(PipelineOutputNames.Output::table)
+                .containsExactly("out_orders", "out_customers");
+        assertThat(result.unresolved()).singleElement().satisfies(problem ->
+                assertThat(problem.code()).isEqualTo("actuation.source-schema-not-discovered"));
+    }
+
+    @Test
+    void unavailableNestRootIsNotNamedAfterItsUnresolvedReference() {
+        var store = sources();
+        var pipeline = partialPipeline(store, """
+                transforms:
+                  - id: shaped
+                    type: nest
+                    from: {o: unknown.orders, c: src.customers}
+                    root:
+                      from: o
+                      key: [id]
+                      embed: [{from: c, on: {id: customer_id}, as: object, path: customer}]
+                serve:
+                  from: [shaped, src.customers]
+                  sync: [{id: sink, source: target, rename: {prefix: out_}}]
+                """, "order.*");
+        var result = new StoreBackedDagSource(store).outputNameResult(pipeline);
+        assertThat(result.outputs()).extracting(PipelineOutputNames.Output::table).containsExactly("out_customers");
+        assertThat(result.unresolved()).hasSize(1);
+    }
+
+    @Test
+    void unselectedTableCannotMakeAQualifiedFactNameAmbiguous() {
+        var store = sources();
+        var pipeline = partialPipeline(store, """
+                transforms:
+                  - id: shaped
+                    type: join
+                    from: {o: src.orders, c: unknown.order_items}
+                    engine: builtin
+                    sql: SELECT o.id FROM o LEFT JOIN c ON o.id = c.id
+                serve:
+                  from: shaped
+                  sync: [{id: sink, source: target, rename: {prefix: out_}}]
+                """, "order.*");
+        var result = new StoreBackedDagSource(store).outputNameResult(pipeline);
+        assertThat(result.outputs()).extracting(PipelineOutputNames.Output::table).containsExactly("out_orders");
+        assertThat(result.unresolved()).isEmpty();
+        assertThatThrownBy(() -> new StoreBackedPipelineWriteTargets(store).of(pipeline))
+                .hasMessageContaining("actuation.source-schema-not-discovered");
+    }
+
+    @Test
+    void reconvergingUnionDagIsResolvedWithoutEnumeratingEveryPath() {
+        var store = sources();
+        StringBuilder body = new StringBuilder("transforms:\n");
+        body.append("  - {id: s0, type: filter, from: src.orders, expr: 'true'}\n");
+        body.append("  - {id: s1, type: filter, from: s0, expr: 'true'}\n");
+        for (int index = 2; index <= 45; index++) {
+            body.append("  - {id: s").append(index).append(", type: union, from: [s")
+                    .append(index - 1).append(", s").append(index - 2).append("]}\n");
+        }
+        body.append("serve: {from: s45, sync: [{id: sink, source: target, rename: {prefix: out_}}]}\n");
+        var pipeline = pipeline(store, body.toString());
+        org.junit.jupiter.api.Assertions.assertTimeoutPreemptively(java.time.Duration.ofSeconds(10), () -> {
+            var result = new StoreBackedDagSource(store).outputNameResult(pipeline);
+            assertThat(result.outputs()).extracting(PipelineOutputNames.Output::table).containsExactly("out_orders");
+            assertThat(result.unresolved()).isEmpty();
+        });
+    }
+
+    private static PipelineResource partialPipeline(InMemoryStorePort store, String body, String selector) {
+        var parser = new DslParser();
+        store.artifacts().save(parser.parse("version: tapstate/v1\nkind: source\nid: unknown\nconnector: mongodb\ntables: [\"/"
+                + selector + "/\"]\n"));
+        var pipeline = (PipelineResource) parser.parse(
+                "version: tapstate/v1\nkind: pipeline\nid: partial\nsource: [src, unknown]\n" + body);
+        store.artifacts().save(pipeline);
+        return pipeline;
+    }
+
+    @Test
     void knownManagedViewSurvivesAnUnresolvedSyncInTheSamePipeline() {
         var store = sources();
         store.artifacts().save(new DslParser().parse("""
