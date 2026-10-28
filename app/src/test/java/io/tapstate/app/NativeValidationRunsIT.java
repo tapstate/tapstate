@@ -7,6 +7,10 @@ import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import io.tapstate.runtime.engine.validation.ValidationCandidateQueue;
+import io.tapstate.runtime.engine.validation.ValidationLocalBudget;
 import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
@@ -15,6 +19,53 @@ import static org.assertj.core.api.Assertions.*;
 @RequiresDocker
 class NativeValidationRunsIT {
     @Container static final MongoDBContainer MONGO=NativeValidationOwnerReservationsIT.MONGO;
+    @Test void savedDelayIsAppliedToTheOriginalLiveQueueAndStopRetainsItsActualLease() throws Exception {
+        var clock=new AtomicLong();var actual=new AtomicReference<ValidationCandidateQueue>();
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers)) {
+            var request=f.request("INCREMENTAL",1);var accepted=f.owners.reserve(request);
+            assertThat(accepted.outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
+            var spec=new ValidationRunSpec(f.comparison,ValidationMode.INCREMENTAL,ValidationMethod.FULL_COLUMN);
+            var identity=new ValidationRunIdentity(accepted.owner(),"task",request.run(),spec.mode(),spec.fingerprint(),1,"rules");
+            var start=new ValidationReportAdmission.Start(f.task,1,1,request.command().toString(),identity);var reservation=f.owners.take(start);
+            var original=new ValidationControlStore.Run(identity,reservation.countingGeneration(),start,spec);var control=reservation.access().control();
+            runs.start(start,new ValidationRunLifecycle.Activation(){
+                public ValidationRunLifecycle.Readiness readiness(){return ValidationRunLifecycle.Readiness.READY;}
+                public ValidationRunLifecycle.Execution create(){
+                    var paid=reservation.resources().budget().reserve(new ValidationLocalBudget.Amount(64*1024,0,0,0));
+                    var queue=new ValidationCandidateQueue(identity,new ValidationCandidateQueue.Limits(8,64*1024,8,3,0,TimeUnit.SECONDS.toNanos(8)),clock::get);
+                    queue.drained().whenComplete((ignored,failed)->paid.close());actual.set(queue);
+                    return new ValidationRunLifecycle.Execution(){
+                        public ValidationRunIdentity identity(){return identity;}
+                        public void start(){}
+                        public ValidationRunLifecycle.Progress progress(){return new ValidationRunLifecycle.Progress(false,true,queue.drained().toCompletableFuture().isDone(),null);}
+                        public Optional<ValidationCandidateQueue> candidates(){return Optional.of(queue);}
+                        public void cancel(){queue.close();}
+                    };
+                }
+            });
+            await(()->actual.get()!=null&&actual.get().delayState().schedulingRevision()==1&&control.delays(identity.owner(),original).applied()!=null);
+            var queue=actual.get();assertThat(control.delays(identity.owner(),original).applied().schedulingRevision()).isEqualTo(1);
+            var early=root(1);var later=root(2);assertThat(queue.tryOffer(List.of(early))).isEqualTo(ValidationCandidateQueue.Offer.ACCEPTED);
+            var saved=f.tasks.read("flow","task").orElseThrow();
+            var settings=new ValidationTaskStore.Settings(saved.settings().full(),new ValidationTaskStore.Incremental(100,10));
+            assertThat(f.tasks.update(new ValidationTaskStore.Update(f.task,saved.revision(),f.comparison,settings,UUID.randomUUID()))).isEqualTo(ValidationTaskStore.Write.APPLIED);
+            await(()->queue.delayState().schedulingRevision()==2&&control.delays(identity.owner(),original).applied()!=null&&control.delays(identity.owner(),original).applied().schedulingRevision()==2);
+            assertThat(queue.tryOffer(List.of(later))).isEqualTo(ValidationCandidateQueue.Offer.ACCEPTED);clock.set(TimeUnit.MILLISECONDS.toNanos(100));
+            var held=queue.poll().orElseThrow();assertThat(held.observation().root()).isEqualTo(later);assertThat(queue.poll()).isEmpty();
+            saved=f.tasks.read("flow","task").orElseThrow();settings=new ValidationTaskStore.Settings(saved.settings().full(),new ValidationTaskStore.Incremental(9000,10));
+            assertThat(f.tasks.update(new ValidationTaskStore.Update(f.task,saved.revision(),f.comparison,settings,UUID.randomUUID()))).isEqualTo(ValidationTaskStore.Write.APPLIED);
+            await(()->queue.delayState().schedulingRevision()==3&&control.delays(identity.owner(),original).applied()!=null&&control.delays(identity.owner(),original).applied().schedulingRevision()==3);
+            assertThat(runs.read(identity).state()).isEqualTo(ValidationRunState.RUNNING);
+            runs.stop(identity);assertThat(queue.delayState().closed()).isTrue();
+            await(()->f.tasks.read("flow","task").orElseThrow().incremental().permission().phase()==ValidationTaskStore.Phase.CLOSED);
+            assertThat(queue.drained().toCompletableFuture()).isNotDone();assertThat(reservation.resources().budget().used().bytes()).isGreaterThanOrEqualTo(64*1024);
+            queue.settle(held,ValidationCandidateQueue.Completion.SETTLED);
+            await(()->f.resources.snapshot().metadataFrames()==0);assertThat(f.resources.snapshot().processors()).isZero();
+            assertThat(f.member.getJet().getJobs()).isEmpty();
+        }
+    }
+    private static ValidationRoot root(int value){return new ValidationRoot("mapping","out",new ValidationKey(List.of(ValidationKey.Part.number(value))),List.of());}
+    private static void await(java.util.function.BooleanSupplier fact)throws InterruptedException{long until=System.nanoTime()+TimeUnit.SECONDS.toNanos(8);while(!fact.getAsBoolean()&&System.nanoTime()-until<0)Thread.sleep(10);assertThat(fact.getAsBoolean()).isTrue();}
     @Test void actualNativeRunRegistryWaitsCancelsAndReleasesItsSharedGeneration() throws Exception {
         try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers)) {
             var request=f.request("FULL",1);var accepted=f.owners.reserve(request);assertThat(accepted.outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);

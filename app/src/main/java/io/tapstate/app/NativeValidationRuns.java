@@ -56,12 +56,23 @@ final class NativeValidationRuns implements AutoCloseable {
         final ValidationRunLifecycle lifecycle;
         final AtomicBoolean inFlight=new AtomicBoolean(),sealed=new AtomicBoolean();
         volatile Shared shared;volatile ValidationRunLifecycle.Execution execution;
+        volatile io.tapstate.runtime.engine.validation.ValidationCandidateQueue candidates;
+        io.tapstate.runtime.engine.validation.ValidationDelayController delays;
+        ValidationControlStore.Delay confirmedDelay;
         volatile ValidationRunLifecycle.Status observed;
         Actor(ValidationControlStore.Run original,NativeValidationOwnerReservations.Reservation reservation,ValidationRunLifecycle.Activation activation) {
             this.original=original;this.reservation=reservation;allocation=reservation.resources();control=allocation.controlExecutor();
             var factory=new ValidationRunLifecycle.Activation(){
                 public ValidationRunLifecycle.Readiness readiness(){return activation.readiness();}
                 public ValidationRunLifecycle.Execution create(){var created=activation.create();execution=created;return created;}
+                public void prepared(ValidationRunLifecycle.Execution created){
+                    activation.prepared(created);
+                    if(original.identity().mode()==ValidationMode.INCREMENTAL){
+                        candidates=created.candidates().orElseThrow(()->invalid("runs.incrementalQueueUnavailable"));
+                        if(!original.identity().equals(candidates.run()))throw invalid("runs.incrementalQueueIdentity");
+                        delays=new io.tapstate.runtime.engine.validation.ValidationDelayController(reservation.access().control(),original,candidates,Actor.this::requireRun);
+                    }
+                }
             };
             lifecycle=new ValidationRunLifecycle(original,reservation.access().admissions(),reservation.access().control(),factory,this);
             observed=lifecycle.status();
@@ -75,6 +86,7 @@ final class NativeValidationRuns implements AutoCloseable {
                     if(execution instanceof ValidationJobExecution job)job.maintain();
                     var state=lifecycle.advance();
                     observed=state;
+                    if(state.state()==ValidationRunState.RUNNING&&!sealed.get()&&delays!=null)applySavedDelay();
                     if(state.retired()&&state.drained()) {
                         if(execution instanceof ValidationJobExecution job)job.releaseFactories();
                         runs.remove(original.identity(),this);
@@ -90,7 +102,16 @@ final class NativeValidationRuns implements AutoCloseable {
         @Override public void joined(){shared=NativeValidationRuns.this.shared(this);shared.quota.joined(original,this::requireRun,lifecycle::stop);shared.members.add(original.identity());}
         @Override public void requireOwner(){reservation.requireOwner();}
         @Override public void requireRun(){reservation.requireReserved();if(sealed.get())throw invalid("runs.publicationClosed");}
-        @Override public void sealPublication(){sealed.set(true);var value=shared;if(value!=null)value.quota.seal(original.identity());}
+        @Override public void sealPublication(){sealed.set(true);var queue=candidates;if(queue!=null)queue.close();var value=shared;if(value!=null)value.quota.seal(original.identity());}
+        private void applySavedDelay(){
+            var saved=reservation.savedTask();var originalStart=original.admission();
+            if(!saved.task().equals(originalStart.task())||saved.closed()){lifecycle.stop();return;}
+            var permission=saved.incremental().permission();
+            if(permission==null||!permission.start().equals(originalStart)||permission.phase()!=ValidationTaskStore.Phase.BORN){lifecycle.stop();return;}
+            var change=new ValidationControlStore.Delay(original,saved.schedulingRevision(),saved.schedulingCommandId(),saved.settings().incremental().firstCheckDelayMillis());
+            if(change.equals(confirmedDelay))return;
+            if(delays.apply(change)==io.tapstate.runtime.engine.validation.ValidationDelayController.Application.ACKNOWLEDGED)confirmedDelay=change;
+        }
         @Override public void retired(ValidationRunState terminal){
             var value=shared;if(value!=null){value.quota.retired(original,terminal);value.members.remove(original.identity());releaseShared(value);}
             reservation.releaseAfterKnownTerminal();

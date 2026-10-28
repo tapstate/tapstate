@@ -867,6 +867,13 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         var completed = configuration.complete(original, cachePreparation.prepare(original, node));
         local.run(); requireOpen(); return new ValidationAccess(this, cache, completed, local);
     }
+    /** Read-only access to an already completed original. Missing preparation is never initialized. */
+    public ValidationAccess loadValidationAccess(String pipeline,io.tapstate.spi.store.CacheBusinessScope expected,MongoCacheDomain cache,Runnable local){
+        Objects.requireNonNull(local).run();requireOpen();Objects.requireNonNull(expected);Objects.requireNonNull(cache);
+        cache.requireRecoveryTarget(bindings.load().orElseThrow(MongoCachePipelineAccess::fenced));
+        var original=validationPreparations().guardedBy(local).loadComplete(pipeline,expected);
+        local.run();requireOpen();return new ValidationAccess(this,cache,original,local);
+    }
 
     /** Fixed native preparation, not a renewable owner grant. Each caller still proves its exact owner/run. */
     public static final class ValidationAccess {

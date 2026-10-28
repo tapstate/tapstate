@@ -142,11 +142,20 @@ public final class ValidationCaptureHintRegistry implements AutoCloseable {
      * is refused. This does not accept an old opening merely because its source/epoch numbers match.
      */
     public Registration register(Scope expected, ValidationCaptureHintTap.Binding binding) {
+        return registerAlias(expected,scope.sourceId(),binding);
+    }
+    /** The native registrar independently proves this logical alias on the same physical capture. */
+    Registration registerAlias(Scope expected,String alias,ValidationCaptureHintTap.Binding binding) {
+        return registerAlias(expected,alias,binding,ignored->{});
+    }
+    /** Pure local ownership handoff precedes publication; it performs no IO or user callbacks. */
+    Registration registerAlias(Scope expected,String alias,ValidationCaptureHintTap.Binding binding,
+            java.util.function.Consumer<Registration> originalOwner) {
         Objects.requireNonNull(binding, "binding");
         if (!scope.equals(expected)) throw invalid("hint.captureScopeChanged");
         var sender = binding.outbox().sender();
         if (!binding.outbox().run().owner().clusterId().equals(scope.clusterId())
-                || !sender.sourceId().equals(scope.sourceId()) || !sender.nodeId().equals(scope.nodeId())
+                || !sender.sourceId().equals(alias) || !sender.nodeId().equals(scope.nodeId())
                 || !sender.bootId().equals(scope.bootId()) || sender.captureEpoch() != scope.epoch()
                 || sender.captureFence() != (scope.fence() == null ? 0 : scope.fence().claimGeneration())
                 || !scope.tables().contains(sender.tableId())) {
@@ -159,11 +168,13 @@ public final class ValidationCaptureHintRegistry implements AutoCloseable {
             Registration previous = retained.get(sender.registrationId());
             if (previous != null) {
                 if (previous.binding != binding) throw invalid("hint.registrationCollision");
+                originalOwner.accept(previous);
                 return previous;
             }
             reapLocked();
             if (retained.size() == limits.registrations() || charge > limits.bytes() - bytes) throw invalid("hint.registrationCapacity");
             added = new Registration(binding, charge);
+            originalOwner.accept(added);
             retained.put(sender.registrationId(), added); bytes += charge;
             publish();
         }

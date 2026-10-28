@@ -590,6 +590,8 @@ class HazelcastConfiguration {
                 .setPoolSize(4).setQueueCapacity(64).setStatisticsEnabled(true));
         config.addExecutorConfig(new com.hazelcast.config.ExecutorConfig(ValidationPipelineInitials.LOOKUP_EXECUTOR)
                 .setPoolSize(2).setQueueCapacity(64).setStatisticsEnabled(true));
+        config.addExecutorConfig(new com.hazelcast.config.ExecutorConfig(NativeValidationCaptureRoutes.EXECUTOR)
+                .setPoolSize(2).setQueueCapacity(32).setStatisticsEnabled(true));
         Integer cooperativeThreads = properties.getJet().getCooperativeThreadCount();
         if (cooperativeThreads != null) {
             config.getJetConfig().setCooperativeThreadCount(cooperativeThreads);

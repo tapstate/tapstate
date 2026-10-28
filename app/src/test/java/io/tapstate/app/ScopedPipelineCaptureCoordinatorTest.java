@@ -21,6 +21,31 @@ import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class ScopedPipelineCaptureCoordinatorTest {
+    @Test void validationRouteUsesTheOriginalAliasMembershipAndCurrentRemoteCapture() {
+        try(var f=new Fixture(ReadMode.SNAPSHOT_AND_CDC)){
+            var run=f.coordinator.forRun(SCOPE,PIPELINE,ORIGINAL);run.startCapture("flow",f.snapshot(),f.models());
+            var route=run.validationRoute("input","orders");
+            assertThat(route.execution()).isEqualTo(ORIGINAL);assertThat(route.alias()).isEqualTo("input");
+            assertThat(route.capture()).isEqualTo(WorkloadClaimFence.from(f.capture));assertThat(route.epoch()).isOne();
+            assertThat(route.membershipRevision()).isOne();assertThat(route.preparation().birth().captureId()).isEqualTo(f.capture.key().resourceId());
+            var opening=new CaptureObservation.Context(route.preparation().captureId(),UUID.randomUUID().toString(),route.channel(),
+                    "another-alias","another-pipeline","physical-consumer",route.epoch(),0,route.capture(),List.of("orders"));
+            route.requireOpening(opening);
+            assertThatThrownBy(()->run.validationRoute("wrong","orders")).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(()->run.validationRoute("input","wrong")).isInstanceOf(TapstateException.class);
+            var old=route.capture();var replaced=new WorkloadClaimFence(old.key(),old.owner(),old.claimGeneration()+1,old.executionGeneration(),old.topologyRevision());
+            when(f.cache.load(route.preparation())).thenReturn(new CaptureCacheState(route.preparation(),replaced,Optional.of(Fixture.streamingChain())));
+            assertThatThrownBy(()->run.validationRoute("input","orders")).isInstanceOf(TapstateException.class);
+        }
+    }
+    @Test void aRetiredOrSnapshotOnlySessionCannotSupplyACdcValidationRoute(){
+        try(var f=new Fixture()){
+            var run=f.coordinator.forRun(SCOPE,PIPELINE,ORIGINAL);run.startCapture("flow",f.snapshot(),f.models());
+            assertThatThrownBy(()->run.validationRoute("input","orders")).isInstanceOf(TapstateException.class);
+            run.stopCapture("flow",false);
+            assertThatThrownBy(()->run.validationRoute("input","orders")).isInstanceOf(TapstateException.class);
+        }
+    }
     private static final CacheBusinessScope BUSINESS=new CacheBusinessScope("cluster",1,"cache");
     private static final PipelineIntentScope SCOPE=new PipelineIntentScope("cluster",1,"cache","flow",7);
     private static final WorkloadOwner OWNER=new WorkloadOwner("node","boot");

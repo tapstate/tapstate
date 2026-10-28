@@ -22,6 +22,8 @@ final class ValidationJobExecution implements ValidationRunLifecycle.Execution {
         Throwable failure();
         /** Pure local cancellation signal; no transport, native stop or waiting here. */
         void cancel();
+        /** Original queue, whose complete envelope and retained leases are charged by this work. */
+        default java.util.Optional<io.tapstate.runtime.engine.validation.ValidationCandidateQueue> candidates() { return java.util.Optional.empty(); }
     }
     private final ValidationRunIdentity identity;
     private final ValidationJobGraph graph;
@@ -42,6 +44,7 @@ final class ValidationJobExecution implements ValidationRunLifecycle.Execution {
         if(!identity.equals(processors.identity()))throw invalid("job.executionIdentity");
     }
     @Override public ValidationRunIdentity identity(){return identity;}
+    @Override public java.util.Optional<io.tapstate.runtime.engine.validation.ValidationCandidateQueue> candidates(){return work.candidates();}
     @Override public void start() {
         if(!attempted.compareAndSet(false,true))throw invalid("job.executionAlreadyAttempted");
         try {

@@ -1,5 +1,7 @@
 package io.tapstate.runtime.engine.validation;
 
+import static org.assertj.core.api.Assertions.assertThatCode;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static io.tapstate.runtime.engine.validation.ValidationCandidateQueue.*;
@@ -19,7 +21,32 @@ import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 
 class ValidationCandidateQueueTest {
-    private static final Limits LIMITS = new Limits(4, 65536, 4, 2, 10, 100);
+    private static final Limits LIMITS = new Limits(4, 65536, 4, 2, 10, 100, 10);
+    @Test void theDefaultRetryCadenceDoesNotDependOnTheUsersInitialDelay() {
+        assertThat(new Limits(4,65536,4,5,0,100).retryDelayNanos()).isEqualTo(100);
+        assertThat(new Limits(4,65536,4,5,1000,100).retryDelayNanos()).isEqualTo(100);
+    }
+    @Test void anInitialWaitMayExceedTheConfirmationWindowWithoutExhaustingIt() {
+        var clock=new AtomicLong();
+        assertThatCode(()->{
+            try(var queue=queue(clock,new Limits(4,65536,4,5,1000,100,7))){
+                queue.tryOffer(List.of(root(1)));clock.set(999);assertThat(queue.poll()).isEmpty();
+                clock.set(1000);var first=queue.poll().orElseThrow();assertThat(first.windowExhausted()).isFalse();
+                queue.settle(first,Completion.RETRY);clock.set(1100);var exhausted=queue.poll().orElseThrow();
+                assertThat(exhausted.windowExhausted()).isTrue();queue.settle(exhausted,Completion.SETTLED);
+            }
+        }).doesNotThrowAnyException();
+    }
+    @Test void aHotDelayMayExceedTheFixedConfirmationWindow() {
+        var clock=new AtomicLong();
+        try(var queue=queue(clock,LIMITS)){
+            assertThatCode(()->queue.applyDelay(new DelayChange(run(),1,UUID.randomUUID(),1000))).doesNotThrowAnyException();
+            queue.tryOffer(List.of(root(1)));clock.set(999);assertThat(queue.poll()).isEmpty();
+            clock.set(1000);var first=queue.poll().orElseThrow();assertThat(first.windowExhausted()).isFalse();
+            queue.settle(first,Completion.RETRY);clock.set(1100);var exhausted=queue.poll().orElseThrow();
+            assertThat(exhausted.windowExhausted()).isTrue();queue.settle(exhausted,Completion.SETTLED);
+        }
+    }
 
     @Test
     void oldAndNewRootsEnterTogetherAndBatchDuplicatesConsumeOneSlot() {
@@ -121,8 +148,9 @@ class ValidationCandidateQueueTest {
         var clock = new AtomicLong();
         try (var queue = queue(clock, LIMITS)) {
             queue.tryOffer(List.of(root(1)));
+            clock.set(10);var first=queue.poll().orElseThrow();queue.settle(first,Completion.RETRY);
             clock.set(99); queue.tryOffer(List.of(root(1)));
-            clock.set(100);
+            clock.set(110);
             var exhausted = queue.poll().orElseThrow();
             assertThat(exhausted.windowExhausted()).isTrue();
             queue.settle(exhausted, Completion.SETTLED);
@@ -319,7 +347,7 @@ class ValidationCandidateQueueTest {
             var old = new ValidationRunIdentity(new ValidationOwner("cluster", "pipeline", "node", "old-boot", 1, 1, 0),
                     "task", "run", ValidationMode.INCREMENTAL, "spec", 1, "rules");
             assertThatThrownBy(() -> queue.applyDelay(new DelayChange(old, 3, UUID.randomUUID(), 10))).isInstanceOf(TapstateException.class);
-            assertThatThrownBy(() -> queue.applyDelay(new DelayChange(run(), 3, UUID.randomUUID(), 101))).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> new DelayChange(run(), 3, UUID.randomUUID(), 86_400_000_000_001L)).isInstanceOf(TapstateException.class);
             assertThat(queue.delayState()).isEqualTo(state);
             queue.close();
             assertThat(queue.applyDelay(new DelayChange(run(), 3, UUID.randomUUID(), 10))).isEqualTo(DelayApplication.CLOSED);
@@ -334,7 +362,7 @@ class ValidationCandidateQueueTest {
             clock.set(90); queue.applyDelay(new DelayChange(run(), 1, UUID.randomUUID(), 50));
             assertThat(queue.settle(checking, Completion.RETRY)).isEqualTo(Settlement.RETRY_SCHEDULED);
             clock.set(99); assertThat(queue.poll()).isEmpty();
-            clock.set(100); var exhausted = queue.poll().orElseThrow();
+            clock.set(110); var exhausted = queue.poll().orElseThrow();
             assertThat(exhausted.windowExhausted()).isTrue();
             assertThatThrownBy(() -> queue.settle(exhausted, Completion.RETRY)).isInstanceOf(TapstateException.class);
             queue.settle(exhausted, Completion.SETTLED);

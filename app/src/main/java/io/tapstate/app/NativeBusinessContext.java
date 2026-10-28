@@ -337,6 +337,18 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                     new ScopedPipelineCaptureCoordinator.Execution(node::currentFence, authorization, ownership,
                             cluster.getWorkloadClaimRenewInterval(), owner.memberStorage::requireNode, clock), runtime, buffer, connectors);
         }
+        @Bean(destroyMethod="close") NativeValidationCaptureRoutes nativeValidationCaptureRoutes(NativeBusinessContext owner,
+                HazelcastInstance member,PipelineCaptureCoordinator captures,ExecutionAuthorization authorization,ValidationMemberResources.Member resources){
+            if(!(captures instanceof ScopedPipelineCaptureCoordinator nativeCaptures))throw ThreeLayerStorePort.refused();
+            return new NativeValidationCaptureRoutes(member,owner.original.preparation().businessScope(),nativeCaptures,owner.memberStorage::requireNode,authorization::require,resources);
+        }
+        @Bean(destroyMethod="close") NativeValidationCaptureRegistrar nativeValidationCaptureRegistrar(NativeBusinessContext owner,
+                NativeValidationCaptureRoutes routes,ValidationCaptureObservations observations,ValidationMemberResources.Member resources,
+                ValidationMemberResources process,ValidationOwnerTimers timers,ExecutionAuthorization authorization){
+            var authority=new NativeValidationCaptureAuthority(owner.configuration,owner.original.cache(),owner.original.preparation().businessScope(),
+                    owner.memberStorage.sourceViews(),authorization,owner.memberStorage::requireNode);
+            return new NativeValidationCaptureRegistrar(authority,routes::readPaid,observations,resources,process,timers);
+        }
         @Bean NativePipelineRecovery nativePipelineRecovery(NativeBusinessContext owner,PipelineFirstStatePreparer preparer,
                 ConnectorProvisioner connectors,Engine engine,PipelineCaptureCoordinator captures,ExecutionAuthorization authorization) {
             return new NativePipelineRecovery(owner.configuration,owner.original.preparation().authScope(),owner.port,preparer,

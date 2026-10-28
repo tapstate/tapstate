@@ -307,6 +307,11 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         ValidationMemberResources.Run resources() { requireReserved(); return bound; }
         MongoConfigurationDomain.ValidationAccess access() { return access; }
         long countingGeneration() { requireReserved(); return owner.countingGeneration; }
+        ValidationTaskStore.Snapshot savedTask() {
+            requireReserved();
+            var saved=configuration.validationTasks(this::requireReserved).read(request.pipeline(),request.task()).orElseThrow(()->invalid("owner.savedTaskUnavailable"));
+            requireReserved();return saved;
+        }
         void requireReserved() {
             requireOwner(); if (cancelled.get() || bound == null) throw invalid("owner.reservationClosed");
         }

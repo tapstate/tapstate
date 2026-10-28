@@ -100,6 +100,18 @@ public final class ValidationCaptureObservations implements CaptureObservation.F
         if (closed.get() || selected.retired.get()) throw invalid("hint.originalOpeningUnavailable");
         return selected.registry.register(selected.registry.scope(), binding);
     }
+    /** Only the native control registrar uses alias routes, after current store authority checks. */
+    ValidationCaptureHintRegistry.Registration register(ValidationCaptureRoute route,CaptureObservation.Context expected,
+            ValidationCaptureHintTap.Binding binding) {
+        return register(route,expected,binding,ignored->{});
+    }
+    ValidationCaptureHintRegistry.Registration register(ValidationCaptureRoute route,CaptureObservation.Context expected,
+            ValidationCaptureHintTap.Binding binding,java.util.function.Consumer<ValidationCaptureHintRegistry.Registration> originalOwner) {
+        route.requireOpening(expected);
+        Opening selected=current.stream().filter(value->value.context.equals(expected)).findFirst().orElseThrow(()->invalid("hint.originalOpeningUnavailable"));
+        if(closed.get()||selected.retired.get())throw invalid("hint.originalOpeningUnavailable");
+        return selected.registry.registerAlias(selected.registry.scope(),route.alias(),binding,originalOwner);
+    }
     @Override public void failed(CaptureObservation.Context context, String phase, RuntimeException failure) {
         // A callback from an older opening can only invalidate that exact retained object.
         for (Opening opening : current) if (opening.context.equals(context)) opening.retire(failure);

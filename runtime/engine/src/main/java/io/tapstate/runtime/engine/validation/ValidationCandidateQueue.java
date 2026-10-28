@@ -15,6 +15,7 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.LongSupplier;
 
@@ -33,13 +34,13 @@ import java.util.function.LongSupplier;
 public final class ValidationCandidateQueue implements AutoCloseable {
     public record Limits(int roots, long bytes, int batch, int attempts, long delayNanos, long windowNanos, long retryDelayNanos) {
         public Limits(int roots, long bytes, int batch, int attempts, long delayNanos, long windowNanos) {
-            this(roots, bytes, batch, attempts, delayNanos, windowNanos, delayNanos);
+            this(roots, bytes, batch, attempts, delayNanos, windowNanos, Math.min(TimeUnit.SECONDS.toNanos(1), windowNanos));
         }
         public Limits {
             if (roots < 1 || roots > 4096 || bytes < 1 || bytes > 64L * 1024 * 1024
                     || batch < 1 || batch > 256 || attempts < 1 || attempts > 100
                     || delayNanos < 0 || windowNanos < 1 || windowNanos > 86_400_000_000_000L
-                    || delayNanos > windowNanos || retryDelayNanos < 0 || retryDelayNanos > windowNanos) throw invalid("candidate.limits");
+                    || delayNanos > 86_400_000_000_000L || retryDelayNanos < 0 || retryDelayNanos > windowNanos) throw invalid("candidate.limits");
         }
     }
     public enum Offer { ACCEPTED, FULL, BUSY, CLOSED }
@@ -75,13 +76,14 @@ public final class ValidationCandidateQueue implements AutoCloseable {
     private static final class Entry {
         private final ValidationRoot root;
         private final long charge;
-        private final long createdAt;
+        private long checkingSince;
+        private boolean checking;
         private long revision;
         private long dueAt;
         private int attempts;
         private Lease lease;
         private Entry(ValidationRoot root, long charge, long revision, long now, long delay) {
-            this.root = root; this.charge = charge; this.revision = revision; this.createdAt = now;
+            this.root = root; this.charge = charge; this.revision = revision;
             dueAt = now + delay;
         }
     }
@@ -112,8 +114,7 @@ public final class ValidationCandidateQueue implements AutoCloseable {
     /** Runtime application only; callers separately fence durable saved/applied acknowledgments. */
     public DelayApplication applyDelay(DelayChange change) {
         Objects.requireNonNull(change, "change");
-        if (!run.equals(change.run()) || run.mode() != io.tapstate.core.validation.ValidationMode.INCREMENTAL
-                || change.delayNanos() > limits.windowNanos()) throw invalid("candidate.delayScope");
+        if (!run.equals(change.run()) || run.mode() != io.tapstate.core.validation.ValidationMode.INCREMENTAL) throw invalid("candidate.delayScope");
         lock.lock();
         try {
             if (closed) return DelayApplication.CLOSED;
@@ -176,8 +177,11 @@ public final class ValidationCandidateQueue implements AutoCloseable {
             long now = nanoTime.getAsLong();
             for (Entry entry : entries.values()) {
                 if (entry.lease != null) continue;
-                boolean exhausted = entry.attempts >= limits.attempts() || elapsed(now, entry.createdAt) >= limits.windowNanos();
+                boolean exhausted = entry.checking && (entry.attempts >= limits.attempts() || elapsed(now, entry.checkingSince) >= limits.windowNanos());
                 if (!exhausted && now - entry.dueAt < 0) continue;
+                // Initial scheduling does not consume the separate confirmation window. Once the
+                // first check starts, retries, dirty hints and hot settings never reset its clock.
+                if (!entry.checking) { entry.checking = true; entry.checkingSince = now; }
                 entry.lease = new Lease(this, entry, exhausted);
                 if (!exhausted) entry.attempts++;
                 leased++;

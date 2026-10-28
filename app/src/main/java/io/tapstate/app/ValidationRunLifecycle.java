@@ -21,6 +21,8 @@ final class ValidationRunLifecycle {
         void start();
         /** Passive facts from the original execution; Jet completion alone is insufficient. */
         Progress progress();
+        /** The actual admitted owner-local queue; absent for a full scan. No query runs here. */
+        default java.util.Optional<io.tapstate.runtime.engine.validation.ValidationCandidateQueue> candidates() { return java.util.Optional.empty(); }
         /** Nonblocking local cancellation signal only, idempotent even before start. */
         void cancel();
     }
@@ -30,6 +32,8 @@ final class ValidationRunLifecycle {
         Readiness readiness();
         /** Construct a local handle after readiness, with no reader, subscription or Job side effect. */
         Execution create();
+        /** Bind local control to the remembered handle before RUNNING or its single submission. */
+        default void prepared(Execution execution) {}
     }
     interface Local {
         /** Known CACHE join, followed only by local quota admission; never a second store join. */
@@ -119,7 +123,7 @@ final class ValidationRunLifecycle {
                         catch (TapstateException refused) { fail(refused); finish(); return settled(); }
                         if (!waiting && !stopping.get()) {
                             if (execution == null) {
-                                try { execution = Objects.requireNonNull(activation.create()); }
+                                try { execution = Objects.requireNonNull(activation.create()); activation.prepared(execution); }
                                 catch (TapstateException refused) { fail(refused); finish(); return settled(); }
                                 if (!execution.identity().equals(original.identity())) throw invalid("run.executionIdentity");
                             }
@@ -212,7 +216,7 @@ final class ValidationRunLifecycle {
     }
     private void observeDrain() {
         if ((!retired && !stopping.get()) || drained) return;
-        var progress = execution == null || !attempted ? new Progress(false, true, true, null) : execution.progress();
+        var progress = execution == null ? new Progress(false, true, true, null) : execution.progress();
         if (!processorReceipt && progress.processorsExited()) { local.processorsExited(); processorReceipt = true; }
         if (processorReceipt && progress.readersReleased()) { local.drained(); drained = true; }
     }

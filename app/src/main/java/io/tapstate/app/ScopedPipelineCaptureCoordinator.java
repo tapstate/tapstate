@@ -157,6 +157,9 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             synchronized (ScopedPipelineCaptureCoordinator.this) { var session=sessions.get(original); if(session!=null) {stop(session);sessions.remove(original,session);} }
         }
         @Override public PipelineCaptureBindings captureBindings() { return session().bindings; }
+        @Override public ValidationCaptureRoute validationRoute(String alias,String table) {
+            synchronized(ScopedPipelineCaptureCoordinator.this){return route(session(),alias,table);}
+        }
         @Override public boolean isCapturing(String pipeline) { requireId(pipeline); synchronized(ScopedPipelineCaptureCoordinator.this) { return sessions.containsKey(original); } }
         @Override public Optional<Throwable> captureFailure(String pipeline) {
             requireId(pipeline); synchronized(ScopedPipelineCaptureCoordinator.this) {
@@ -177,6 +180,35 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         private Session current() { synchronized(ScopedPipelineCaptureCoordinator.this) { return sessions.get(original); } }
         private Session session() { var session=current(); if(session==null || session.bindings==null)throw refused(); return session; }
         private void requireId(String pipeline) { if(!original.pipelineId().equals(pipeline))throw refused(); }
+    }
+    /** Exact original session only; a current claim never relabels an old alias binding. */
+    synchronized ValidationCaptureRoute validationRoute(ExecutionFence original,String alias,String table) {
+        var held=sessions.get(original);if(held==null)throw refused();return route(held,alias,table);
+    }
+    private ValidationCaptureRoute route(Session held,String alias,String table) {
+        requireSession(held);var source=held.sources.get(alias);
+        if(held.bounded||source==null||!source.selected.tables().contains(table))throw refused();
+        var state=stores.preparations().load(source.prepared);
+        if(!source.prepared.equals(state.preparation()))throw refused();
+        var expected=source.owner==null?source.foreign:source.owner.fence;
+        if(!state.claim().equals(expected))throw refused();
+        execution.authorization().requireCapture(stores.scope(),expected);
+        String channel;long epoch,membership;
+        if(source.shared){
+            var member=source.srs.consumers().find(source.consumer.context().key()).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
+            if(member.detached()||!member.context().equals(source.consumer.context())||member.revision()!=source.consumer.membershipRevision()
+                    ||!member.commandFence().equals(claim(held.original))||!member.tables().contains(table))throw refused();
+            var chain=state.chain().orElseThrow(ScopedPipelineCaptureCoordinator::refused);
+            if(!chain.servingTables().contains(table))throw refused();
+            channel=chain.miningChainId();epoch=chain.epoch();membership=member.revision();
+        }else{
+            var fixed=held.bindings.direct().get(alias);if(fixed==null)throw refused();
+            fixed.requireOriginal(source.channels.load(fixed.context()));
+            if(!fixed.captureClaim().equals(expected)||!fixed.tables().contains(table))throw refused();
+            channel=fixed.context().channelId();epoch=fixed.epoch();membership=0;
+        }
+        requireSession(held);execution.authorization().requireCapture(stores.scope(),expected);
+        return new ValidationCaptureRoute(held.original,alias,table,state.preparation(),expected,channel,epoch,membership);
     }
     private synchronized void start(Run run,ArtifactStore artifacts,SourceModelSnapshot models) {
         active(); requirePipeline(run.original); Objects.requireNonNull(artifacts); Objects.requireNonNull(models).requirePipeline(run.original.pipelineId());

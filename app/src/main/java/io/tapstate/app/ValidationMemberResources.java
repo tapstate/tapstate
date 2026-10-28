@@ -69,6 +69,7 @@ final class ValidationMemberResources implements AutoCloseable {
         }
         Snapshot snapshot() { synchronized (ValidationMemberResources.this) { return new Snapshot(state.budget.snapshot(), reserved, processors, processorCapacity, METADATA_FRAMES - metadata.availablePermits()); } }
         private void require() { if (closed || retired) throw invalid("resources.contextClosed"); active.run(); }
+        private ValidationMemberResources process(){return ValidationMemberResources.this;}
         @Override public void close() { retired = true; }
     }
 
@@ -109,6 +110,7 @@ final class ValidationMemberResources implements AutoCloseable {
     final class Metadata implements AutoCloseable {
         private final AtomicBoolean returned = new AtomicBoolean();
         long reservedBytes() { return ValidationTaskStore.Inputs.WORK_RESERVATION_BYTES; }
+        void requireRetained(Member member){if(member.process()!=ValidationMemberResources.this||returned.get())throw invalid("resources.metadataOwner");member.require();}
         /** Return after the actual read/planner and every retained definition have relinquished ownership. */
         @Override public void close() { if (returned.compareAndSet(false, true)) metadata.release(); }
     }

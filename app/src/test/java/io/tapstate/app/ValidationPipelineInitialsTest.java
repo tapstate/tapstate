@@ -12,6 +12,7 @@ import io.tapstate.spi.store.*;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -26,6 +27,41 @@ import static org.assertj.core.api.Assertions.*;
 /** Real cross-member metadata transport; ordinary ACK stores remain separately authoritative. */
 class ValidationPipelineInitialsTest {
     private static volatile CompletableFuture<WriteResult> actualWrite;
+    @Test @Timeout(35) void nativeCaptureRouteCrossesMembersWithoutSerializingStoreObjects()throws Exception{
+        var owner=Hazelcast.newHazelcastInstance(config("capture-routes-"+UUID.randomUUID(),"owner",null));HazelcastInstance source=null;
+        try{
+            var address=owner.getCluster().getLocalMember().getAddress();source=Hazelcast.newHazelcastInstance(config(owner.getConfig().getClusterName(),"source",address.getHost()+":"+address.getPort()));
+            var remote=source;await(()->owner.getCluster().getMembers().size()==2&&remote.getCluster().getMembers().size()==2);
+            var scope=new CacheBusinessScope("cluster",1,"cache");var execution=fence();
+            var preparation=new CapturePreparation(scope,CapturePreparation.Mode.SHARED_SRS,"chain","physical","mc-"+"a".repeat(64),UUID.randomUUID().toString());
+            var capture=new WorkloadClaimFence(new WorkloadClaimKey("cluster",WorkloadClaimType.CAPTURE,"physical"),new WorkloadOwner("source","source-boot"),1,0,1);
+            var expected=new ValidationCaptureRoute(execution,"logical-alias","orders",preparation,capture,"chain",1,3);
+            var nativeOwner=org.mockito.Mockito.mock(ScopedPipelineCaptureCoordinator.class);var nativeSource=org.mockito.Mockito.mock(ScopedPipelineCaptureCoordinator.class);
+            var proof=new AtomicReference<java.util.function.Consumer<ExecutionFence>>(value->assertThat(value).isEqualTo(execution));
+            org.mockito.Mockito.when(nativeOwner.validationRoute(execution,"logical-alias","orders")).thenReturn(expected);
+            try(var process=new ValidationMemberResources();var ownerResources=process.bind("cluster","owner","owner-boot",4,()->{});var sourceResources=process.bind("cluster","source","source-boot",4,()->{});
+                var a=new NativeValidationCaptureRoutes(owner,scope,nativeOwner,()->{},value->proof.get().accept(value),ownerResources);
+                var b=new NativeValidationCaptureRoutes(source,scope,nativeSource,()->{},value->assertThat(value).isEqualTo(execution),sourceResources)){
+                assertThat(b.read(execution,"logical-alias","orders")).isEqualTo(expected);org.mockito.Mockito.verifyNoInteractions(nativeSource);
+                try(var firstLease=ownerResources.admitMetadata();var secondLease=ownerResources.admitMetadata();var workers=Executors.newFixedThreadPool(2,task->new Thread(task,"route-local-check"))){
+                    var enteredBoth=new CountDownLatch(2);var releaseBoth=new CountDownLatch(1);var seen=ConcurrentHashMap.<Thread>newKeySet();
+                    proof.set(value->{assertThat(value).isEqualTo(execution);if(Thread.currentThread().getName().equals("route-local-check")&&seen.add(Thread.currentThread())){enteredBoth.countDown();try{if(!releaseBoth.await(4,TimeUnit.SECONDS))throw new AssertionError("local route fixture timeout");}catch(InterruptedException interrupted){throw new AssertionError(interrupted);}}});
+                    var one=workers.submit(()->a.read(execution,"logical-alias","orders"));var two=workers.submit(()->a.read(execution,"logical-alias","orders"));
+                    try{assertThat(enteredBoth.await(2,TimeUnit.SECONDS)).isTrue();assertThat(ownerResources.snapshot().metadataFrames()).isEqualTo(4);releaseBoth.countDown();
+                        assertThatCode(()->{assertThat(one.get(3,TimeUnit.SECONDS)).isEqualTo(expected);assertThat(two.get(3,TimeUnit.SECONDS)).isEqualTo(expected);}).doesNotThrowAnyException();
+                    }finally{releaseBoth.countDown();proof.set(value->assertThat(value).isEqualTo(execution));}
+                }
+                var entered=new CountDownLatch(1);var leave=new CountDownLatch(1);
+                org.mockito.Mockito.when(nativeOwner.validationRoute(execution,"logical-alias","orders")).thenAnswer(call->{entered.countDown();if(!leave.await(8,TimeUnit.SECONDS))throw new AssertionError("route IO fixture timeout");return expected;});
+                try{
+                    assertThatThrownBy(()->b.read(execution,"logical-alias","orders")).isInstanceOf(io.tapstate.core.common.TapstateException.class).hasMessageContaining("routeUnknown");
+                    assertThat(entered.getCount()).isZero();assertThat(ownerResources.snapshot().metadataFrames()).isOne();
+                }finally{leave.countDown();}
+                await(()->ownerResources.snapshot().metadataFrames()==0);
+                a.close();assertThatThrownBy(()->b.read(execution,"logical-alias","orders")).isInstanceOf(io.tapstate.core.common.TapstateException.class).hasMessageContaining("routeUnknown");
+            }
+        }finally{if(source!=null)source.shutdown();owner.shutdown();}
+    }
     @Test @Timeout(50) void remoteWriterReceiptsCannotMakeTheSelectedOutputReadyUntilEveryWriterLands() throws Exception {
         String cluster = "initial-receipts-" + UUID.randomUUID();
         var owner = Hazelcast.newHazelcastInstance(config(cluster, "owner", null)); HazelcastInstance writer = null;
@@ -196,6 +232,7 @@ class ValidationPipelineInitialsTest {
         config.getMemberAttributeConfig().setAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE, node).setAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE, node + "-boot");
         config.addExecutorConfig(new ExecutorConfig(ValidationPipelineInitials.EXECUTOR).setPoolSize(2).setQueueCapacity(32));
         config.addExecutorConfig(new ExecutorConfig(ValidationPipelineInitials.LOOKUP_EXECUTOR).setPoolSize(2).setQueueCapacity(32));
+        config.addExecutorConfig(new ExecutorConfig(NativeValidationCaptureRoutes.EXECUTOR).setPoolSize(2).setQueueCapacity(32));
         config.setProperty("hazelcast.logging.type", "none").setProperty("hazelcast.phone.home.enabled", "false").setProperty("hazelcast.shutdownhook.enabled", "false")
                 .setProperty("hazelcast.operation.thread.count", "2").setProperty("hazelcast.operation.generic.thread.count", "2")
                 .setProperty("hazelcast.io.input.thread.count", "1").setProperty("hazelcast.io.output.thread.count", "1").setProperty("hazelcast.partition.count", "17");

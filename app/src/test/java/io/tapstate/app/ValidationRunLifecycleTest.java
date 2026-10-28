@@ -8,6 +8,14 @@ import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.*;
 
 class ValidationRunLifecycleTest {
+    @Test void stoppingBeforeSubmissionRetainsTheRememberedHandlesActualResources() {
+        var f=new Fixture();f.loseRunningReply=true;assertThat(f.lifecycle.advance().controlUnknown()).isTrue();
+        f.lifecycle.stop();var stopped=f.lifecycle.advance();
+        assertThat(f.execution.starts).isZero();assertThat(stopped.retired()).isTrue();
+        assertThat(stopped.drained()).isFalse();assertThat(f.dataReturned).isZero();assertThat(f.processorsReturned).isZero();
+        f.execution.processors=true;f.lifecycle.observePhysicalDrain();assertThat(f.processorsReturned).isEqualTo(1);assertThat(f.dataReturned).isZero();
+        f.execution.readers=true;f.lifecycle.observePhysicalDrain();assertThat(f.dataReturned).isEqualTo(1);
+    }
     @Test void initialWaitingCreatesNoJobReaderOrHintAndCancelsTheOriginalUnstartedRun() {
         var f = new Fixture(); f.waiting = true;
         var status = f.lifecycle.advance();

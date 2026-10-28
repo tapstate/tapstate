@@ -277,6 +277,15 @@ final class MongoValidationPreparations {
         });
     }
 
+    Permission loadComplete(String pipeline,CacheBusinessScope expected){
+        return transaction(session->{
+            requireDefinition(session,pipeline);requireBinding(session,expected);
+            var current=state(mapping(session,pipeline),pipeline);
+            if(current.phase()!=Phase.COMPLETE||current.closingOperationId()!=null||!current.subject().scope().equals(expected))throw fenced();
+            return new Permission(this,current.subject(),false);
+        });
+    }
+
     Permission issue(String pipeline, CacheBusinessScope expected) {
         Objects.requireNonNull(expected); UUID preparation = UUID.randomUUID();
         return transaction(session -> {
