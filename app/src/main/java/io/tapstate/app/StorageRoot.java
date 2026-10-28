@@ -171,7 +171,7 @@ final class StorageRoot implements AutoCloseable {
     private void startInitialBusiness(StorageRuntime.Bound original,
             Function<StorageRuntime.Bound, ? extends StorageRuntime.Business> assembly) {
         var authority = original.preparation().authScope();
-        boolean tracked = authority.mode() == StorageBinding.Mode.CLOUD && authority.authGeneration() == 1;
+        boolean tracked = authority.authGeneration() == 1;
         var scope = tracked ? original.binding().setup() : null;
         if (tracked) {
             initializationProgress.begin(scope, 2, true);
@@ -195,8 +195,17 @@ final class StorageRoot implements AutoCloseable {
     synchronized void continueOnPremSetup(StorageBindingCommit committed, StorageSetupService.DefaultTarget target) {
         requireOpen();
         if (cloud.cloud() || committed.binding().mode() != StorageBinding.Mode.OP || runtime.cleanupRequired()) throw StorageRuntime.unavailable();
-        prepareInitialSetup(committed, target);
-        phase = Phase.SETUP_REQUIRED;
+        var scope = committed.binding().setup();
+        initializationProgress.begin(scope, 1, true);
+        initializationProgress.started(scope, StorageInitializationProgress.Stage.PREPARE_STORAGE);
+        try {
+            prepareInitialSetup(committed, target);
+            initializationProgress.completed(scope, StorageInitializationProgress.Stage.PREPARE_STORAGE);
+            initializationProgress.started(scope, StorageInitializationProgress.Stage.START_RUNTIME);
+            phase = Phase.SETUP_REQUIRED;
+        } catch (RuntimeException | Error failure) {
+            initializationProgress.failed(scope, failure); throw failure;
+        }
     }
 
     private StorageRuntime.Bound prepareInitialSetup(StorageBindingCommit committed, StorageSetupService.DefaultTarget target) {
