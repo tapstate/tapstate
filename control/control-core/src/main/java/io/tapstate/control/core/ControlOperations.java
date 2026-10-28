@@ -192,7 +192,7 @@ public final class ControlOperations {
     public static final Operation CLUSTER_MEMBERS = new Operation("cluster.members", Scope.READ, false, null, CLI_ONLY);
     public static final Operation CLUSTER_CONTEXT = new Operation(
             "cluster.context", Scope.READ, false, null,
-            "Read the organization and Cluster display context bound to the authenticated Cloud session.",
+            "Read the organization and Cluster display context and verified user email bound to the authenticated Cloud session.",
             Map.of(Frontend.REST, Maturity.CURRENT));
 
     // pipeline domain: static projection reads, conditional definition replacement, and the four lifecycle

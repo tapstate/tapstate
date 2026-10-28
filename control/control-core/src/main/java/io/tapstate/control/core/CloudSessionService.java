@@ -73,6 +73,13 @@ public final class CloudSessionService {
                 || !identity.clusterId().equals(clusterContext.clusterId()))) {
             return Optional.empty();
         }
+        if (clusterContext != null) {
+            String email = login.userEmail();
+            clusterContext = new CloudSessionContext(clusterContext.organizationId(), clusterContext.clusterId(),
+                    clusterContext.organizationName(), clusterContext.clusterName(), clusterContext.region(),
+                    clusterContext.ec2PublicIp(), clusterContext.egressAddressStatus(),
+                    email == null || email.isBlank() ? null : email);
+        }
         GeneratedSecret secret = secrets.generate();
         var expires = now.plus(IDLE_TTL);
         CloudSessionRecord record = new CloudSessionRecord(identity, login.jwtId(), secret.secretHash(),

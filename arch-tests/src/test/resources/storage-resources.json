@@ -9,6 +9,15 @@
         "The current three-layer root does not admit this legacy layout."
       ]
     },
+    "session-record-recovery-v1": {
+      "goal": "Retain existing standalone and Cloud session records and Cloud revocation markers across process restarts; a missing optional email remains readable.",
+      "entry": "Read the original session from the existing store after restart or restore a matching legacy backup; a missing or expired session requires a new login.",
+      "prerequisites": [
+        "The original sessions collection and matching deployment identity remain available or are restored from a matching legacy backup.",
+        "Authentication requires the matching browser credential, the persisted secret hash, an unrevoked record and a valid idle deadline.",
+        "A backup cannot establish revocations made after it was taken; the feature does not reconstruct those later revocations."
+      ]
+    },
     "existing-operator-state-missing-objects-v1": {
       "goal": "Recover existing keyed operator state and retain responsibility for object references absent from the last emitted root document.",
       "entry": "Resume the existing operator namespace and root key using its stored RootAssembly, matching lookup rows, reverse references and source positions; re-evaluate old serialized bytes that have no missing-reference field.",
@@ -24,6 +33,10 @@
     "legacy": {
       "atomicDomain": "LEGACY",
       "fencing": "Matching legacy migration/ownership behavior; not admitted by the three-layer root."
+    },
+    "session-record-write-v1": {
+      "atomicDomain": "STORE: one sessions collection document per session or revocation marker.",
+      "fencing": "Managed sessions use a unique deployment and JWT identity and insert-only creation; authentication and logout use conditional single-document updates, while signed callbacks retain deny markers. Standalone session keys use a distinct key type."
     },
     "existing-single-root-write": {
       "atomicDomain": "Existing keyed operator-state write for one namespace and root key; no additional collection or cross-key transaction.",
@@ -346,25 +359,31 @@
     {
       "id": "mongo.store.sessions",
       "resourceVersion": 1,
-      "proposalVersion": 1,
+      "proposalVersion": 2,
       "kind": "COLLECTION",
       "layer": "LEGACY",
       "database": "STORE",
       "physicalNames": [
         "sessions"
       ],
-      "responsibility": "Legacy session records.",
+      "responsibility": "Store standalone and Cloud session records and revocation markers; Cloud session context may contain the verified login-time email.",
       "writers": [
-        "io.tapstate.adapters.mongostore.MongoAuthStores"
+        "io.tapstate.adapters.mongostore.MongoAuthStores",
+        "io.tapstate.adapters.mongostore.MongoCloudSessionStore",
+        "io.tapstate.adapters.mongostore.MongoSessionStore"
       ],
       "readers": [
-        "io.tapstate.adapters.mongostore.MongoAuthStores"
+        "io.tapstate.adapters.mongostore.MongoAuthStores",
+        "io.tapstate.adapters.mongostore.MongoCloudSessionStore",
+        "io.tapstate.adapters.mongostore.MongoSessionStore"
       ],
-      "recovery": "legacy-preserve",
-      "consistency": "legacy",
-      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "recovery": "session-record-recovery-v1",
+      "consistency": "session-record-write-v1",
+      "growth": "One optional email value per Cloud session; records grow with session creation. Idle expiry and revocation do not delete records or erase email, and the collection has no TTL cleanup.",
       "evidence": [
-        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCloudSessionStoreTest.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCloudSessionStoreIT.java"
       ]
     },
     {

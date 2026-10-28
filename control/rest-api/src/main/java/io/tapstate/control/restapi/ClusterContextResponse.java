@@ -8,7 +8,8 @@ import io.tapstate.control.core.CloudClusterContextView;
 public record ClusterContextResponse(
         String organizationId, String clusterId, String organizationName, String clusterName, String region,
         @JsonInclude(JsonInclude.Include.ALWAYS) String ec2PublicIp,
-        @JsonInclude(JsonInclude.Include.ALWAYS) String egressAddressStatus) {
+        @JsonInclude(JsonInclude.Include.ALWAYS) String egressAddressStatus,
+        @JsonInclude(JsonInclude.Include.ALWAYS) String userEmail) {
 
     /** The local session captures display names while the live Cloud runtime state remains unknown. */
     @JsonProperty("clusterState")
@@ -19,6 +20,6 @@ public record ClusterContextResponse(
 
     static ClusterContextResponse from(CloudClusterContextView context) {
         return new ClusterContextResponse(context.organizationId(), context.clusterId(), context.organizationName(),
-                context.clusterName(), context.region(), context.ec2PublicIp(), context.egressAddressStatus());
+                context.clusterName(), context.region(), context.ec2PublicIp(), context.egressAddressStatus(), context.userEmail());
     }
 }
