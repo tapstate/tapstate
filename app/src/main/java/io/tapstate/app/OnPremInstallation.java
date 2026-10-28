@@ -33,6 +33,9 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
     private volatile boolean closed;
     private final boolean completedBeforeBoot;
     private MongoConfigurationDomain.InitialOpRecovery recoveryInvocation;
+    private boolean credentialRequired = true;
+    void requireCredential(boolean required) { credentialRequired = required; }
+    @Override public boolean automaticAuthorization() { return !credentialRequired; }
     private Runnable restartRequired = () -> {};
     private Runnable startupCompleted = () -> {};
     void onStartupCompleted(Runnable action) { startupCompleted = Objects.requireNonNull(action); }
@@ -114,6 +117,12 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
 
     private synchronized SetupCapabilityService.Permission permission(HttpServletRequest request) {
         requireManagementRequest(request);
+        if (!credentialRequired) {
+            var state = states.load();
+            var purpose = state.phase() == StorageSetupStateStore.Phase.COMPLETE
+                    ? StorageSetupStateStore.Purpose.FIRST_ADMIN : StorageSetupStateStore.Purpose.SETUP;
+            return capabilities.authorizeLocal(state.scope(), purpose);
+        }
         var issued = files.capability().orElseThrow(InstallationFiles::refused);
         if (!issued.equals(restored)) { capabilities.restore(issued); restored = issued; }
         return capabilities.authorize(request.getHeader(CAPABILITY_HEADER), issued.scope(), issued.purpose());

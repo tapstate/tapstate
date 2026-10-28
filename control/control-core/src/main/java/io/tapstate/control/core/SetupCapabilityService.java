@@ -24,6 +24,7 @@ public final class SetupCapabilityService {
     private final Runnable requireFirstAdminReadiness;
     private final SecureRandom random = new SecureRandom();
     private volatile Current current;
+    private volatile long localRevision;
 
     public record Issued(StorageSetupScope scope, StorageSetupStateStore.Purpose purpose, Instant expiresAt, String token) {
         public Issued {
@@ -34,7 +35,7 @@ public final class SetupCapabilityService {
     }
     private record Current(Issued issued, byte[] digest) {}
 
-    /** Created only after the opaque secret and real management channel were verified by this authority. */
+    /** Created only after the installation authority and real management channel were verified. */
     public static final class Permission implements Runnable {
         private final StorageSetupScope scope;
         private final StorageSetupStateStore.Purpose purpose;
@@ -100,8 +101,23 @@ public final class SetupCapabilityService {
         return new Permission(expected, purpose, active);
     }
 
+    /** Local installation mode uses the deployment process and dedicated listener instead of a copied secret. */
+    public Permission authorizeLocal(StorageSetupScope expected, StorageSetupStateStore.Purpose purpose) {
+        requireDeploymentOwner.run(); requireManagementChannel.run();
+        long revision = localRevision;
+        Runnable active = () -> {
+            requireDeploymentOwner.run(); requireManagementChannel.run();
+            if (localRevision != revision) throw refused();
+            states.requireCurrent(expected, purpose);
+            if (purpose == StorageSetupStateStore.Purpose.FIRST_ADMIN) requireFirstAdminReadiness.run();
+            states.requireCurrent(expected, purpose);
+            if (localRevision != revision) throw refused();
+        };
+        active.run(); return new Permission(expected, purpose, active);
+    }
+
     /** Phase completion is durable; clearing local material never reopens its authority. */
-    public synchronized void close() { current = null; }
+    public synchronized void close() { current = null; localRevision++; }
 
     private static byte[] digest(String token) {
         try { return MessageDigest.getInstance("SHA-256").digest(token.getBytes(StandardCharsets.US_ASCII)); }

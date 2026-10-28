@@ -33,6 +33,25 @@ class SetupCapabilityServiceTest {
                 throw new TapstateException(ControlError.BOOTSTRAP_FORBIDDEN, java.util.Map.of(), null);
         }
     }
+    @Test void localPermissionKeepsPurposeGenerationAndFinalClosureFencesWithoutAPastedSecret() {
+        var states = new States(); var ownerCalls = new AtomicInteger(); var channelCalls = new AtomicInteger();
+        var service = new SetupCapabilityService(states, new Time(), ownerCalls::incrementAndGet, channelCalls::incrementAndGet,
+                () -> { throw new TapstateException(ControlError.BOOTSTRAP_FORBIDDEN, java.util.Map.of(), null); });
+        var permission = service.authorizeLocal(ORIGINAL, StorageSetupStateStore.Purpose.SETUP);
+        assertThat(permission.scope()).isEqualTo(ORIGINAL); permission.run();
+        assertThat(ownerCalls.get()).isGreaterThan(1); assertThat(channelCalls.get()).isGreaterThan(1);
+        states.status = new StorageSetupStateStore.Status(ORIGINAL, StorageSetupStateStore.Phase.COMPLETE, 1);
+        assertThatThrownBy(permission::run).isInstanceOf(TapstateException.class);
+        assertThatThrownBy(() -> service.authorizeLocal(ORIGINAL, StorageSetupStateStore.Purpose.FIRST_ADMIN)).isInstanceOf(TapstateException.class);
+        states.status = new StorageSetupStateStore.Status(ORIGINAL, StorageSetupStateStore.Phase.CONFIG_PREPARED, 0);
+        var previous = service.authorizeLocal(ORIGINAL, StorageSetupStateStore.Purpose.SETUP);
+        states.rotate(ORIGINAL, StorageSetupStateStore.Purpose.SETUP);
+        assertThatThrownBy(previous::run).isInstanceOf(TapstateException.class);
+        states.status = new StorageSetupStateStore.Status(ORIGINAL, StorageSetupStateStore.Phase.CONFIG_PREPARED, 0);
+        var pending = service.authorizeLocal(ORIGINAL, StorageSetupStateStore.Purpose.SETUP); service.close();
+        assertThatThrownBy(pending::run).isInstanceOf(TapstateException.class);
+    }
+
     @Test void requiresTheTrustedChannelBeforeLookingAtInstallationState() {
         var states = new States(); var time = new Time(); var ownerCalls = new AtomicInteger();
         var service = new SetupCapabilityService(states, time, ownerCalls::incrementAndGet,
