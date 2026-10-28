@@ -21,6 +21,15 @@ final class PipelineTableSelection {
 
     private PipelineTableSelection() {}
 
+    /** Test one independently observed table against only the selected output, without widening scope. */
+    static boolean selects(io.tapstate.core.model.FromClause from, SourceResource source,
+            io.tapstate.spi.store.SourceTable knownTable) {
+        if (!SourceTableSelection.selectsKnownTable(source, knownTable)) return false;
+        var referenced = new LinkedHashSet<String>();
+        collect(from, source.id(), List.of(knownTable.name()), referenced, false);
+        return referenced.contains(knownTable.name());
+    }
+
     static List<String> resolve(PipelineResource pipeline, SourceResource source, SourceModel discovered) {
         List<String> declared = SourceTableSelection.resolve(source, discovered);
         if (pipeline.transforms() == null && pipeline.view() == null && pipeline.serve() == null) {
@@ -46,14 +55,24 @@ final class PipelineTableSelection {
     }
 
     private static void collect(FromClause from, String sourceId, List<String> declared, Set<String> referenced) {
+        collect(from, sourceId, declared, referenced, true);
+    }
+
+    private static void collect(FromClause from, String sourceId, List<String> declared, Set<String> referenced,
+            boolean rejectUndiscovered) {
         if (from instanceof FromClause.Flow flow) {
-            flow.refs().forEach(ref -> collect(ref, sourceId, declared, referenced));
+            flow.refs().forEach(ref -> collect(ref, sourceId, declared, referenced, rejectUndiscovered));
         } else if (from instanceof FromClause.Aliases aliases) {
-            aliases.aliases().values().forEach(ref -> collect(ref, sourceId, declared, referenced));
+            aliases.aliases().values().forEach(ref -> collect(ref, sourceId, declared, referenced, rejectUndiscovered));
         }
     }
 
     private static void collect(FromRef from, String sourceId, List<String> declared, Set<String> referenced) {
+        collect(from, sourceId, declared, referenced, true);
+    }
+
+    private static void collect(FromRef from, String sourceId, List<String> declared, Set<String> referenced,
+            boolean rejectUndiscovered) {
         if (from instanceof FromRef.Literal literal) {
             String token = literal.ref();
             if (token.equals(sourceId)) {
@@ -61,7 +80,7 @@ final class PipelineTableSelection {
             } else {
                 declared.stream().filter(table -> token.equals(table) || token.equals(sourceId + "." + table))
                         .forEach(referenced::add);
-                if (token.startsWith(sourceId + ".") && !referenced.contains(token.substring(sourceId.length() + 1))) {
+                if (rejectUndiscovered && token.startsWith(sourceId + ".") && !referenced.contains(token.substring(sourceId.length() + 1))) {
                     throw new TapstateException(ActuationError.SOURCE_TABLE_NOT_DISCOVERED,
                             Map.of("source", sourceId, "table", token.substring(sourceId.length() + 1)), null);
                 }

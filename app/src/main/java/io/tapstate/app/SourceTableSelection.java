@@ -16,6 +16,20 @@ final class SourceTableSelection {
 
     private SourceTableSelection() {}
 
+    /** Other literal names need no invented discovery facts when checking one already observed table. */
+    static boolean selectsKnownTable(SourceResource source, SourceTable knownTable) {
+        if (source.tables() == null) return true;
+        var selected = new LinkedHashSet<String>();
+        for (var selector : source.tables()) {
+            switch (selector) {
+                case TableRef.Literal literal -> addLiteral(source, null, selected, literal.name());
+                case TableRef.Spec spec -> addSpec(source, null, selected, spec);
+                case TableRef.Regex regex -> addRegex(source, new SourceModel(List.of(knownTable)), selected, regex.pattern());
+            }
+        }
+        return selected.contains(knownTable.name());
+    }
+
     static List<String> resolve(SourceResource source, SourceModel discovered) {
         List<TableRef> selectors = source.tables();
         if (selectors == null) {
