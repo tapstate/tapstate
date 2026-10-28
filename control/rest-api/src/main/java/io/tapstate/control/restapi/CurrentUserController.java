@@ -2,7 +2,6 @@ package io.tapstate.control.restapi;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 import io.tapstate.control.core.CloudAuthenticationService;
-import io.tapstate.control.core.CredentialType;
 import io.tapstate.control.core.CurrentUserQueryService;
 import io.tapstate.control.core.CurrentUserView;
 import jakarta.servlet.http.HttpServletRequest;
@@ -28,17 +27,15 @@ class CurrentUserController {
     @Verb("auth.current-user")
     @GetMapping("/auth/me")
     ResponseEntity<CurrentUserResponse> current(HttpServletRequest request) {
-        var principal = AuthenticatedCaller.principal();
         String email = null;
-        if (principal.credentialType() == CredentialType.CLOUD_SESSION) {
+        if (AuthenticatedCaller.isCloudSession()) {
             CloudAuthenticationService service = cloud.getIfAvailable();
             if (service != null) {
                 email = CloudSessionCookies.read(request)
-                        .flatMap(service::clusterContext)
-                        .map(context -> context.userEmail()).orElse(null);
+                        .flatMap(service::userEmail).orElse(null);
             }
         }
-        CurrentUserView user = users.get(principal, email);
+        CurrentUserView user = users.get(AuthenticatedCaller.principal(), email);
         return ResponseEntity.ok().cacheControl(CacheControl.noStore())
                 .body(new CurrentUserResponse(user.mode(), user.principal(), user.scopes(), user.username(), user.email()));
     }

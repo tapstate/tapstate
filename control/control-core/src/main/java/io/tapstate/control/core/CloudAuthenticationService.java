@@ -74,6 +74,11 @@ public final class CloudAuthenticationService {
         return sessions.clusterContext(cookie);
     }
 
+    /** Reads the optional verified email from the authenticated local session. */
+    public Optional<String> userEmail(String cookie) {
+        return sessions.clusterContext(cookie).map(CloudSessionContext::userEmail);
+    }
+
     /** Projects authenticated display fields without exposing a persistence record to presentation adapters. */
     public Optional<CloudClusterContextView> clusterContextView(String cookie) {
         return clusterContext(cookie).map(context -> {
