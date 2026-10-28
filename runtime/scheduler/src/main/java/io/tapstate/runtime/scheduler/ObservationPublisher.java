@@ -849,7 +849,8 @@ public final class ObservationPublisher {
         measured.add(readAt(pipelineId, RECONCILE_STREAK_METRIC, "{pass}", at, consecutiveFailures));
         observations.save(new Observation(pipelineId, lastState,
                 FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(),
-                keepLoad ? previous.snapshot() : null, lastPositions, lastFailure, at, measured));
+                keepLoad ? previous.snapshot() : null, lastPositions, lastFailure, at, measured,
+                keepLoad ? previous.initialLoad() : null));
     }
 
     /**
