@@ -405,8 +405,12 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "21"
+          java-version: "21.0.13+9.0.LTS"
           cache: maven
+      - name: Verify exact Java build
+        shell: bash
+        run: |
+          java -XshowSettings:properties -version 2>&1 | grep -Fx '    java.runtime.version = 21.0.13+9-LTS'
       - name: build the boot jar the image ships
         run: mvn -B -pl app -am -DskipTests package
       - name: read the staged Web provenance
@@ -522,8 +526,12 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "21"
+          java-version: "21.0.13+9.0.LTS"
           cache: maven
+      - name: Verify exact Java build
+        shell: bash
+        run: |
+          java -XshowSettings:properties -version 2>&1 | grep -Fx '    java.runtime.version = 21.0.13+9-LTS'
       - name: build the Cloud Web-bearing Boot JAR
         run: mvn -B -pl app -am -DskipTests package
       - name: read the staged Cloud Web provenance

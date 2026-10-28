@@ -458,7 +458,7 @@ class PipelineAssistantControllerTest {
                     .getBody().writeTo(output);
             assertThat(output.toString(StandardCharsets.UTF_8))
                     .contains(PipelineDraftError.INVALID.code(), "wizard union input duplicates an existing pipeline input",
-                            "\"finishReason\":\"error\"", "[DONE]")
+                            "\"state\":\"needs-input\"", "\"finishReason\":\"stop\"", "[DONE]")
                     .doesNotContain("data-proposal");
             assertThat(store.get("orders")).contains(base);
         }
@@ -618,8 +618,8 @@ class PipelineAssistantControllerTest {
         var emptyCandidateOutput = new ByteArrayOutputStream();
         emptyCandidateResponse.getBody().writeTo(emptyCandidateOutput);
         String emptyCandidateStream = emptyCandidateOutput.toString(StandardCharsets.UTF_8);
-        assertThat(emptyCandidateStream).contains(ControlError.AI_INVALID_PROPOSAL.code())
-                .doesNotContain("\"state\":\"complete\"", "data-proposal");
+        assertThat(emptyCandidateStream).contains(ControlError.AI_INVALID_PROPOSAL.code(), "\"state\":\"needs-input\"", "\"finishReason\":\"stop\"")
+                .doesNotContain("data-proposal", "\"type\":\"error\"", "\"state\":\"complete\"");
         assertThat(store.get("orders")).contains(base);
         providerFailure.set(true);
         var failedOutput = new ByteArrayOutputStream();
@@ -649,10 +649,9 @@ class PipelineAssistantControllerTest {
         var invalidExpressionStreamOutput = new ByteArrayOutputStream();
         controller.assistant("orders", body, request).getBody().writeTo(invalidExpressionStreamOutput);
         String invalidExpressionStream = invalidExpressionStreamOutput.toString(StandardCharsets.UTF_8);
-        assertThat(invalidExpressionStream).contains("dsl.illegal-expression", "transforms[0].expr", "\"finishReason\":\"error\"")
+        assertThat(invalidExpressionStream).contains("dsl.illegal-expression", "transforms[0].expr", "\"state\":\"needs-input\"", "\"finishReason\":\"stop\"")
                 .doesNotContain("data-proposal", "afterr.region");
-        assertThat(invalidExpressionStream.indexOf("\"type\":\"data-status\""))
-                .isLessThan(invalidExpressionStream.indexOf("\"type\":\"error\""));
+        assertThat(invalidExpressionStream).doesNotContain("\"type\":\"error\"");
         assertThat(store.get("orders")).contains(base);
         assertThat(sentContext.get()).containsKey("sources").containsKey("currentWizard");
         assertThat(sentContext.toString()).doesNotContain("sk-test", "private-row");
