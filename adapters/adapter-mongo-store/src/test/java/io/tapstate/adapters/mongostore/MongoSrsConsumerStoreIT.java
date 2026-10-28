@@ -34,6 +34,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -50,6 +51,37 @@ class MongoSrsConsumerStoreIT {
     private static final String CHAIN = "chain-a";
     private static final SrsConsumerContext A = context("pipeline-a", "source-a", 1);
     private static final SrsConsumerContext B = context("pipeline-b", "source-b", 1);
+    @ParameterizedTest @ValueSource(strings={"revision","state","owner","detached","hash"})
+    void validationMembershipRefusesChangedOriginalCoordinates(String changed){
+        withBusiness(f->{
+            var member=f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+            var scope=new io.tapstate.spi.store.PipelineIntentScope(SCOPE.clusterId(),SCOPE.bindingVersion(),SCOPE.cacheIncarnation(),A.key().pipelineId(),A.stateGeneration());
+            var original=io.tapstate.spi.store.SrsConsumerRun.of(scope,member);var fence=member.commandFence();
+            var next=new io.tapstate.spi.store.SrsConsumerMembership(changed.equals("state")?new SrsConsumerContext(A.key(),A.stateGeneration()+1):A,
+                    changed.equals("revision")?member.revision()+1:member.revision(),changed.equals("detached"),changed.equals("detached")?Set.of():member.tables(),
+                    changed.equals("owner")?new WorkloadClaimFence(fence.key(),new WorkloadOwner("other","other-boot"),fence.claimGeneration(),fence.executionGeneration(),fence.topologyRevision()):fence);
+            var row=new MongoSrsConsumerRecords(SCOPE).membership(next);if(changed.equals("hash"))row.put("contentHash","a".repeat(64));
+            SystemCollections.SRS_CONSUMERS.on(f.database()).replaceOne(id(A),row);
+            if(changed.equals("hash"))assertThatThrownBy(()->f.consumers().attached(original,"orders")).isInstanceOf(TapstateException.class);
+            else assertThat(f.consumers().attached(original,"orders")).isFalse();
+            assertThat(membership(f,A)).isEqualTo(row);
+        });
+    }
+    @Test void validationMembershipReadsOnlyItsOriginalRelationAndRejectsOversizedMetadata(){
+        withBusiness(f->{
+            var a=f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+            f.consumers().attach(B,0,Set.of("orders"),f.fenceB()).orElseThrow();
+            var original=io.tapstate.spi.store.SrsConsumerRun.of(new io.tapstate.spi.store.PipelineIntentScope(SCOPE.clusterId(),SCOPE.bindingVersion(),SCOPE.cacheIncarnation(),A.key().pipelineId(),A.stateGeneration()),a);
+            SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).updateOne(id(B),new Document("$set",new Document("progress",new Document("unrelated","x".repeat(512*1024)))));
+            var before=membership(f,A);
+            assertThat(f.consumers().attached(original,"orders")).isTrue();assertThat(f.consumers().attached(original,"missing")).isFalse();
+            assertThatThrownBy(()->f.consumers().find(A.key())).isInstanceOf(TapstateException.class);assertThat(membership(f,A)).isEqualTo(before);
+            var large=new TreeSet<String>();for(int index=0;index<1024;index++)large.add(index+"x".repeat(512));
+            var oversized=new io.tapstate.spi.store.SrsConsumerMembership(a.context(),a.revision(),false,large,a.commandFence());
+            SystemCollections.SRS_CONSUMERS.on(f.database()).replaceOne(id(A),new MongoSrsConsumerRecords(SCOPE).membership(oversized));
+            assertThatThrownBy(()->f.consumers().attached(original,"orders")).isInstanceOf(TapstateException.class).hasMessageContaining("validation.controlMetadata");
+        });
+    }
 
     @Test void sharedLossPreflightKeepsUnleasedConsumersAndReadsNoLostPayloadOrMutableAuthority() {
         withBusiness(f -> {

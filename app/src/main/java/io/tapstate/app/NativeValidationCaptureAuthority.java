@@ -33,22 +33,18 @@ final class NativeValidationCaptureAuthority implements NativeValidationCaptureR
     @Override public void capture(ValidationCaptureRoute route){
         active.run();authorization.require(route.execution());authorization.requireCapture(scope,route.capture());
         if(!scope.equals(route.preparation().scope()))throw invalid("capture.physicalScope");
-        var current=cache.capturePreparations(scope,active).load(route.preparation());
+        var current=cache.capturePreparations(scope,active).control(route.preparation(),route.table());
         if(!current.preparation().equals(route.preparation())||!current.claim().equals(route.capture()))throw invalid("capture.physicalBirth");
         var execution=route.execution();var claim=new WorkloadClaimFence(new WorkloadClaimKey(scope.clusterId(),WorkloadClaimType.PIPELINE_ACTUATION,execution.pipelineId()),
                 new WorkloadOwner(execution.ownerNodeId(),execution.ownerBootId()),execution.claimGeneration(),execution.executionGeneration(),execution.topologyRevision());
         if(route.membershipRevision()>0){
-            var chain=current.chain().orElseThrow(()->invalid("capture.physicalChain"));
-            if(chain.epoch()!=route.epoch()||!chain.miningChainId().equals(route.channel())||!chain.servingTables().contains(route.table()))throw invalid("capture.physicalChain");
-            var key=new SrsConsumerKey(route.channel(),execution.pipelineId(),route.alias());
-            var member=sources.srs(scope,active).consumers().find(key).orElseThrow(()->invalid("capture.aliasMembership"));
-            if(member.detached()||!member.context().equals(new SrsConsumerContext(key,execution.scope().stateGeneration()))
-                    ||member.revision()!=route.membershipRevision()||!member.commandFence().equals(claim)||!member.tables().contains(route.table()))throw invalid("capture.aliasMembership");
+            if(current.epoch()!=route.epoch()||!current.servesTable())throw invalid("capture.physicalChain");
+            var original=new SrsConsumerRun(execution.scope(),route.channel(),route.alias(),route.membershipRevision(),execution.ownerNodeId(),execution.ownerBootId(),execution.claimGeneration(),execution.executionGeneration(),execution.topologyRevision());
+            if(!sources.srs(scope,active).consumers().attached(original,route.table()))throw invalid("capture.aliasMembership");
         }else{
             var context=new DirectChannelContext(execution.scope(),route.channel(),route.alias(),route.preparation().captureId());
-            var direct=sources.directChannels(scope,active).load(context);var window=direct.current();
-            if(window==null||direct.epoch()!=route.epoch()||window.epoch()!=route.epoch()||!window.captureFence().equals(route.capture())
-                    ||!window.pipelineFence().equals(claim)||!direct.tables().contains(route.table()))throw invalid("capture.aliasChannel");
+            var direct=sources.directChannels(scope,active).control(context,route.table()).orElseThrow(()->invalid("capture.aliasChannel"));
+            if(direct.epoch()!=route.epoch()||!direct.capture().equals(route.capture())||!direct.pipeline().equals(claim)||!direct.selectedTable())throw invalid("capture.aliasChannel");
         }
         authorization.require(route.execution());authorization.requireCapture(scope,route.capture());active.run();
     }

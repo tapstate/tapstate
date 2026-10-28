@@ -107,6 +107,22 @@ final class MongoCachePipelineAccess {
     <T> T metadataTransaction(SystemCollections table, boolean mutation, Function<ClientSession, T> action) {
         return metadataTransaction(table, database, mutation, action);
     }
+    /** Read-only control header access; never materializes Pipeline positions or operator bodies. */
+    <T> T validationControlTransaction(SystemCollections table,Function<ClientSession,T> action){
+        return transaction(session->{
+            var state=MongoValidationMetadata.read(session,SystemCollections.CACHE_PIPELINE_STATE.on(database),new Document("_id",scope.pipelineId()),
+                    new Document("scope",1).append("epoch",1).append("runtimeWriteFence",1).append("stateJson",1).append("touchMillis",1),64*1024);
+            if(state==null)throw unreadable("checkpoint");requireScope(state);
+            if(!(state.get("epoch") instanceof Long epoch)||epoch<0||epoch==Long.MAX_VALUE
+                    ||!(state.get("runtimeWriteFence") instanceof Long revision)||revision<1||revision==Long.MAX_VALUE
+                    ||!(state.get("stateJson") instanceof String)||!(state.get("touchMillis") instanceof Long))throw unreadable("checkpoint");
+            MongoCacheWorkloadClaimStore.requireCollection(database);
+            var key=new io.tapstate.spi.store.WorkloadClaimKey(scope.clusterId(),WorkloadClaimType.PIPELINE_ACTUATION,scope.pipelineId());
+            var claim=MongoValidationMetadata.read(session,SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database),new Document("_id",MongoWorkloadClaimStore.id(key)),
+                    MongoValidationMetadata.claimProjection("pipelineScope","pipelinePreparation"),64*1024);
+            requirePreparedClaim(session,claim);new MongoCacheMetadataStructure(database,rateRetention).verifyFacet(table);return action.apply(session);
+        });
+    }
 
     <T> T metadataTransaction(SystemCollections table, MongoDatabase target, boolean mutation, Function<ClientSession, T> action) {
         if(authoringModels!=null)authoringModels.requireActive();
@@ -212,8 +228,11 @@ final class MongoCachePipelineAccess {
         var key = new io.tapstate.spi.store.WorkloadClaimKey(scope.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, scope.pipelineId());
         var table = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
         Document row = table.find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
+        requirePreparedClaim(session,row);
+    }
+    private void requirePreparedClaim(ClientSession session,Document row){
         if (row == null) throw MongoCachePipelinePreparations.rebuild(scope);
-        new MongoWorkloadClaimStore(table).inStrictSession(session).decodeStored(row);
+        new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database)).inStrictSession(session).decodeStored(row);
         try {
             if (!(row.get("pipelineScope") instanceof Document stored)) throw unreadable("pipeline-claim-scope");
             var decoded = MongoPipelinePreparationFacts.scope(stored);

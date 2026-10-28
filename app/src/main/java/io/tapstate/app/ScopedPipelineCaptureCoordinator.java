@@ -188,22 +188,19 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     private ValidationCaptureRoute route(Session held,String alias,String table) {
         requireSession(held);var source=held.sources.get(alias);
         if(held.bounded||source==null||!source.selected.tables().contains(table))throw refused();
-        var state=stores.preparations().load(source.prepared);
+        var state=stores.preparations().control(source.prepared,table);
         if(!source.prepared.equals(state.preparation()))throw refused();
         var expected=source.owner==null?source.foreign:source.owner.fence;
         if(!state.claim().equals(expected))throw refused();
         execution.authorization().requireCapture(stores.scope(),expected);
         String channel;long epoch,membership;
         if(source.shared){
-            var member=source.srs.consumers().find(source.consumer.context().key()).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
-            if(member.detached()||!member.context().equals(source.consumer.context())||member.revision()!=source.consumer.membershipRevision()
-                    ||!member.commandFence().equals(claim(held.original))||!member.tables().contains(table))throw refused();
-            var chain=state.chain().orElseThrow(ScopedPipelineCaptureCoordinator::refused);
-            if(!chain.servingTables().contains(table))throw refused();
-            channel=chain.miningChainId();epoch=chain.epoch();membership=member.revision();
+            if(!source.srs.consumers().attached(source.consumer,table)||!state.servesTable())throw refused();
+            channel=source.prepared.chainId();epoch=state.epoch();membership=source.consumer.membershipRevision();
         }else{
             var fixed=held.bindings.direct().get(alias);if(fixed==null)throw refused();
-            fixed.requireOriginal(source.channels.load(fixed.context()));
+            var direct=source.channels.control(fixed.context(),table).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
+            if(direct.epoch()!=fixed.epoch()||!direct.capture().equals(fixed.captureClaim())||!direct.pipeline().equals(fixed.pipelineClaim())||!direct.selectedTable())throw refused();
             if(!fixed.captureClaim().equals(expected)||!fixed.tables().contains(table))throw refused();
             channel=fixed.context().channelId();epoch=fixed.epoch();membership=0;
         }

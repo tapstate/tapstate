@@ -44,7 +44,7 @@ final class NativeValidationCaptureRegistrar implements AutoCloseable {
             binding=Objects.requireNonNull(factory.apply(route));var sender=binding.outbox().sender();
             if(!binding.outbox().run().equals(original.run())||!sender.pipelineExecutionId().equals(production.operatorExecutionKey())
                     ||!sender.sourceId().equals(alias)||!sender.tableId().equals(table)
-                    ||binding.outbox().limits().reservationBytes()+keyScratchBytes+4L*1024*1024>paid.reservedBytes())throw invalid("capture.bindingOriginal");
+                    ||binding.outbox().limits().reservationBytes()+keyScratchBytes+32L*1024*1024>paid.reservedBytes())throw invalid("capture.bindingOriginal");
             authority.run(original,production);authority.capture(route);
             var envelope=paid;
             var registered=observations.register(route,opening,binding,value->{var admitted=new Lease(original,route,value,envelope);owned.set(admitted);retained.add(admitted);});

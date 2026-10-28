@@ -490,6 +490,16 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         Objects.requireNonNull(key, "key");
         return transaction(session -> Optional.ofNullable(view(session, key.miningChainId()).members().get(key.consumerId())));
     }
+    @Override public boolean attached(SrsConsumerRun original,String table){
+        Objects.requireNonNull(original);Objects.requireNonNull(table);
+        if(table.isBlank()||table.length()>512||!scope.equals(new CacheBusinessScope(original.scope().clusterId(),original.scope().bindingVersion(),original.scope().cacheIncarnation())))throw unavailable(original.miningChainId());
+        return transaction(session->{
+            var row=MongoValidationMetadata.read(session,SystemCollections.SRS_CONSUMERS.on(database),new Document("_id",records.id(original.context().key())),null,256*1024);
+            if(row==null)return false;var member=records.membership(row);
+            return !member.detached()&&member.context().equals(original.context())&&member.revision()==original.membershipRevision()
+                    &&member.commandFence().equals(original.originalClaim())&&member.tables().contains(table);
+        });
+    }
     @Override public SrsConsumerTopology attached(String chain) {
         requireChainName(chain);
         return transaction(session -> {

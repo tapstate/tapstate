@@ -60,6 +60,16 @@ final class MongoPipelineSourcePreparations {
         var fixed = retained(session,database,context.scope());
         if (fixed.directChannels().stream().noneMatch(channel -> channel.context().equals(context) && channel.tables().equals(tables))) throw identityUnproven(context.scope());
     }
+    static void requireDirectTable(ClientSession session,MongoDatabase database,DirectChannelContext context,String table){
+        var scope=context.scope();var key=new WorkloadClaimKey(scope.clusterId(),WorkloadClaimType.PIPELINE_ACTUATION,scope.pipelineId());
+        var row=MongoValidationMetadata.read(session,SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database),new Document("_id",MongoWorkloadClaimStore.id(key)),
+                MongoValidationMetadata.claimProjection("pipelineScope","pipelinePreparation","pipelineSources"),256*1024);
+        if(row==null)throw rebuild(scope);
+        new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database)).inStrictSession(session).decodeStored(row);
+        if(!scope.equals(MongoPipelinePreparationFacts.scope(row.get("pipelineScope",Document.class))))throw rebuild(scope);
+        MongoCachePipelinePreparations.phase(row,scope);var fixed=decode(row.get("pipelineSources"),scope);
+        if(fixed.directChannels().stream().noneMatch(channel->channel.context().equals(context)&&channel.tables().contains(table)))throw identityUnproven(context.scope());
+    }
     static void requireEmpty(ClientSession session,MongoDatabase database,PipelineIntentScope scope) {
         if (SystemCollections.DIRECT_CHANNEL_OFFSETS.on(database).find(session,offsets(scope)).first() != null
                 || SystemCollections.DIRECT_BATCHES.on(database).find(session,batches(scope)).first() != null) throw rebuild(scope);

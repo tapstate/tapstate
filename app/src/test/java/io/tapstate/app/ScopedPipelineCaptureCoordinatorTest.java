@@ -544,6 +544,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             var cached = new CaptureCacheState(prepared, WorkloadClaimFence.from(capture),
                     bounded ? Optional.empty() : Optional.of(streamingChain()));
             when(cache.load(prepared)).thenReturn(cached);
+            when(cache.control(any(),anyString())).thenAnswer(call->{var held=cache.load(call.getArgument(0));return new CaptureCachePreparations.Control(held.preparation(),held.claim(),held.chain().map(SrsChainState::epoch).orElse(0L),held.chain().map(value->value.servingTables().contains(call.getArgument(1,String.class))).orElse(false));});
             when(pipelines.snapshotStates(any(),any(),any())).thenReturn(snapshots);
             when(snapshots.advanceOrder(anyLong(),anyLong(),anyMap())).thenReturn(1L);
             when(snapshots.count(anyString(),anyString(),anyLong())).thenReturn(OptionalLong.of(1));
@@ -581,6 +582,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             when(ownership.acquire(any())).thenReturn(new CaptureOwnership.Permit(false, capture));
             when(snapshots.count(anyString(), anyString(), anyLong())).thenReturn(OptionalLong.of(0));
             var consumers = mock(SrsConsumerStore.class);
+            when(consumers.attached(any(),anyString())).thenAnswer(call->{var run=call.getArgument(0,SrsConsumerRun.class);var member=consumers.find(run.context().key()).orElse(null);return member!=null&&!member.detached()&&member.context().equals(run.context())&&member.revision()==run.membershipRevision()&&member.commandFence().equals(run.originalClaim())&&member.tables().contains(call.getArgument(1,String.class));});
             streamingProgress.set(progress(false, 1, 1));
             when(consumers.find(streamingContext.key())).thenReturn(Optional.of(
                     new SrsConsumerMembership(streamingContext, 1, false, Set.of("orders"), PIPELINE)));

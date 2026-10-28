@@ -30,6 +30,26 @@ public final class MongoDirectChannelStore implements DirectChannelStore {
         return new MongoDirectChannelStore(client,database,scope,() -> { requireActive.run(); additional.run(); },retention);
     }
     @Override public DirectChannelProgress load(DirectChannelContext context) { return transaction(context,null,(session,held) -> held.value()); }
+    @Override public Optional<Control> control(DirectChannelContext context,String table){
+        Objects.requireNonNull(context);if(table==null||table.isBlank()||table.length()>512)throw unavailable(context);
+        if(!scope.equals(new CacheBusinessScope(context.scope().clusterId(),context.scope().bindingVersion(),context.scope().cacheIncarnation())))throw fenced();
+        var access=new MongoCachePipelineAccess(client,database,context.scope(),null,requireActive,retention);
+        return access.validationControlTransaction(SystemCollections.DIRECT_CHANNEL_OFFSETS,session->{
+            new MongoCacheMetadataStructure(database,retention).verifyDirect();MongoPipelineSourcePreparations.requireDirectTable(session,database,context,table);
+            var projection=new Document("formatVersion",1).append("revision",1).append("current.epoch",1).append("current.captureFence",1).append("current.pipelineFence",1)
+                    .append("currentType",new Document("$type","$current")).append("tablesType",new Document("$type","$tables"))
+                    .append("selected",new Document("$in",List.of(new Document("$literal",table),new Document("$ifNull",List.of("$tables",List.of())))));
+            var row=MongoValidationMetadata.read(session,SystemCollections.DIRECT_CHANNEL_OFFSETS.on(database),new Document("_id",MongoDirectChannelRecords.id(context)),projection,64*1024);
+            if(row==null||!context.equals(MongoDirectChannelRecords.context(row.get("_id",Document.class)))||!Integer.valueOf(1).equals(row.get("formatVersion"))
+                    ||!(row.get("revision") instanceof Long revision)||revision<0||revision==Long.MAX_VALUE||!"array".equals(row.get("tablesType"))||!(row.get("selected") instanceof Boolean selected))throw unavailable(context);
+            if("null".equals(row.get("currentType")))return Optional.empty();
+            if(!"object".equals(row.get("currentType"))||!(row.get("current") instanceof Document current)||!(current.get("epoch") instanceof Long epoch)||epoch<1||epoch==Long.MAX_VALUE)throw unavailable(context);
+            var capture=WorkloadClaimDocuments.readCapture(current.get("captureFence",Document.class));var pipeline=WorkloadClaimDocuments.readPipeline(current.get("pipelineFence",Document.class));
+            if(!capture.key().clusterId().equals(scope.clusterId())||!capture.key().resourceId().equals(context.captureId())
+                    ||!pipeline.key().clusterId().equals(scope.clusterId())||!pipeline.key().resourceId().equals(context.scope().pipelineId()))throw unavailable(context);
+            return Optional.of(new Control(context,epoch,capture,pipeline,selected));
+        });
+    }
     @Override public List<DirectBatch> pending(DirectChannelContext context,long epoch) {
         return transaction(context,null,(session,held) -> {
             if (held.value().current() != null && held.value().current().epoch() == epoch) return held.current();
