@@ -39,7 +39,12 @@ public interface AlertStore {
         public String subject(){return actor==null?cloudSubject:actor.subject();}
         public Access { if((actor==null)!=(cloudSubject!=null)||actor==null&&(cloudSubject.isBlank()||cloudOrganization==null||cloudOrganization.isBlank()||cloudGrantedScope==null))throw new IllegalArgumentException("missing verified caller");Objects.requireNonNull(revalidate);Objects.requireNonNull(locallyActive);Objects.requireNonNull(currentVerifierBinding); }
     }
-    record StateChange(long revision,AlertStateRecord.Head before,AlertStateRecord.Head after,List<AlertStateRecord.Transition> transitions,AlertSignal diagnosticSignal) {
+    /** Ephemeral producer proof. The guard is pure; its lease was read before entering CONFIG. */
+    record EvaluationProof(PipelineIntentSnapshot pipeline,Runnable requireCurrent) {
+        public EvaluationProof { Objects.requireNonNull(pipeline);Objects.requireNonNull(requireCurrent);if(pipeline.deleted())throw new IllegalArgumentException("deleted producer intent"); }
+    }
+    record StateChange(long revision,AlertStateRecord.Head before,AlertStateRecord.Head after,List<AlertStateRecord.Transition> transitions,AlertSignal diagnosticSignal,EvaluationProof proof) {
+        public StateChange(long revision,AlertStateRecord.Head before,AlertStateRecord.Head after,List<AlertStateRecord.Transition> transitions,AlertSignal diagnosticSignal){this(revision,before,after,transitions,diagnosticSignal,null);}
         public StateChange { Objects.requireNonNull(after);transitions=List.copyOf(transitions);if(revision<0||(revision==0)!=(before==null))throw new IllegalArgumentException("invalid state baseline"); }
     }
     record IntentChange(Stored<AlertIntent.Record> before,AlertIntent.Record after) { public IntentChange { Objects.requireNonNull(after); } }
@@ -66,12 +71,19 @@ public interface AlertStore {
     record ScheduleCursor(Instant candidateAt,AlertSchedule.Key key){ }
     record SchedulePage(List<Stored<AlertSchedule.Record>> rows,ScheduleCursor next,boolean isolatedRecords){public SchedulePage{rows=List.copyOf(rows);}}
     record DefinitionPage(List<AlertConfiguration.Definition> rows,String nextId){public DefinitionPage{rows=List.copyOf(rows);}}
+    record EvaluationPage(List<Stored<AlertStateRecord.Head>> rows,AlarmKey next,Set<AlarmKey.Resource> removedResources){
+        public EvaluationPage(List<Stored<AlertStateRecord.Head>> rows,AlarmKey next){this(rows,next,Set.of());}
+        public EvaluationPage{rows=List.copyOf(rows);removedResources=Set.copyOf(removedResources);}
+    }
 
     Optional<Stored<AlertStateRecord.Head>> state(AlarmKey key,ReadAccess access);
     Optional<Stored<AlertIntent.Record>> test(AlertTestCommand.Key key,Access access);
     Optional<Stored<AlertIntent.Record>> intent(AlertIntent.Identity identity,Access access);
     Optional<AlertConfiguration.Definition> definition(AlertConfiguration.Kind kind,String id,Access access);
     DefinitionPage definitions(AlertConfiguration.Kind kind,String after,int limit,Access access);
+    /** Background evaluation only, scoped by the original Host; unknown records fail the whole page. */
+    DefinitionPage evaluationRules(String after,int limit);
+    EvaluationPage evaluationStates(AlarmKey after,int limit);
     Outcome saveDefinition(AlertConfiguration.Definition before,AlertConfiguration.Definition after,Access access);
     Outcome saveReceiver(AlertReceiver before,AlertReceiver after,PrivateMaterial replacement,boolean retainOriginalMaterial,Access access);
     enum PrivateField { AUTHENTICATION,PRIVATE_CA }

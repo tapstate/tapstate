@@ -77,6 +77,12 @@ final class MongoAlertCoordinator implements AlertStore {
         return tx(access,false,false,s->definitions.load(s,kind,id).map(MongoAlertConfigurationCodec.Stored::definition));
     }
     @Override public DefinitionPage definitions(Kind kind,String after,int limit,Access access){return tx(access,false,false,s->new MongoAlertReads(db,host.scope(),states).definitions(s,kind,after,limit));}
+    @Override public DefinitionPage evaluationRules(String after,int limit){return tx(null,false,false,s->new MongoAlertReads(db,host.scope(),states).definitions(s,Kind.RULE,after,limit));}
+    @Override public EvaluationPage evaluationStates(AlarmKey after,int limit){return tx(null,false,false,s->{
+        var page=new MongoAlertReads(db,host.scope(),states).evaluationStates(s,after,limit);var removed=new HashSet<AlarmKey.Resource>();
+        for(var row:page.rows()){var resource=row.value().snapshot().rule().key().resource();if(resourceRemoved(s,resource))removed.add(resource);}
+        return new EvaluationPage(page.rows(),page.next(),removed);
+    });}
     @Override public Outcome saveDefinition(Definition before,Definition after,Access access) {
         Objects.requireNonNull(access);management(after,access);
         try{return tx(access,true,true,s->{validateDefinitionReferences(s,after);return outcome(definitions.stage(s,before,after));});}catch(Conflict conflict){return Outcome.CONFLICT;}
@@ -153,13 +159,31 @@ final class MongoAlertCoordinator implements AlertStore {
         try{return tx(access,true,false,s->{
             boolean changed=false;
             if(c.state()!=null){var v=c.state();scope(v.after().snapshot().rule().key().scope());
+                if(v.proof()!=null){
+                    v.proof().requireCurrent().run();var original=v.proof().pipeline();var key=v.after().snapshot().rule().key();
+                    if(!key.resource().kind().equals("pipeline")||!key.resource().id().equals(original.scope().pipelineId())
+                            ||!key.resource().incarnation().equals(Long.toString(original.scope().stateGeneration()))
+                            ||!((MongoPipelineIntentStore)domain.intents()).loadInTransaction(s,original.scope().pipelineId()).filter(original::equals).isPresent())throw stale("pipeline-producer-intent");
+                }
                 if(c.kind()!=CommitKind.STATE_AND_PLAN&&c.kind()!=CommitKind.END)throw stale("state-command");
-                if(c.kind()==CommitKind.END){if(v.after().snapshot().enabled()||v.after().snapshot().status()==AlertSnapshot.Status.FIRING)throw stale("administrative-end");}
+                if(c.kind()==CommitKind.END){
+                    if(v.after().snapshot().enabled()||v.after().snapshot().status()==AlertSnapshot.Status.FIRING||v.before()==null||v.before().binding()==null)throw stale("administrative-end");
+                    if(v.after().retiredAt()==null){
+                        var previous=v.before().binding();var current=definitions.load(s,Kind.RULE,previous.ruleIdentity().id());
+                        if(current.isPresent()&&current.get().definition() instanceof Rule rule&&rule.header().identity().equals(previous.ruleIdentity())
+                                &&rule.matches(v.before().snapshot().rule().key()))throw stale("rule-still-enabled");
+                    }else{
+                        var previous=v.before().binding();var rule=definitions.load(s,Kind.RULE,previous.ruleIdentity().id());
+                        boolean retiredRule=rule.isEmpty()||!rule.get().definition().header().identity().equals(previous.ruleIdentity())||!rule.get().definition().header().active();
+                        if(!retiredRule)requireResourceRemoved(s,v.before().snapshot().rule().key().resource());
+                    }
+                }
                 else {
                     if(v.after().binding()==null)throw stale("state-rule-binding");
                     validateMember(s,v.after().binding(),true);
                 }
                 changed|=outcome(states.stageEnvelope(s,v.revision(),v.before(),v.after(),v.transitions(),v.diagnosticSignal(),clock))==Outcome.STAGED;
+                if(v.proof()!=null)v.proof().requireCurrent().run();
             }
             for(var change:c.intents()){
                 var before=change.before();var after=change.after();scope(after.frozen().identity().scope());
@@ -181,6 +205,20 @@ final class MongoAlertCoordinator implements AlertStore {
             for(var v:c.schedules())changed|=outcome(notifications.stageSchedule(s,v.before()==null?null:new MongoAlertScheduleCodec.Stored(v.before().revision(),v.before().value()),v.after()))==Outcome.STAGED;
             return changed?Outcome.STAGED:Outcome.UNCHANGED;
         });}catch(Conflict conflict){return Outcome.CONFLICT;}
+    }
+    private void requireResourceRemoved(ClientSession s,AlarmKey.Resource resource){
+        if(!resourceRemoved(s,resource))throw stale("resource-still-active-or-unproven");
+    }
+    private boolean resourceRemoved(ClientSession s,AlarmKey.Resource resource){
+        if(resource.kind().equals("pipeline")){
+            var row=SystemCollections.OPERATOR_GENERATIONS.on(db).find(s,new Document("_id",resource.id())).first();
+            if(row==null)throw unreadable("missing-retained-pipeline-identity");
+            var mapping=MongoPipelineStateMappings.decode(resource.id(),row);
+            return mapping.phase()!=PipelineStateMapping.Phase.ACTIVE||!Long.toString(mapping.stateGeneration()).equals(resource.incarnation());
+        }else if(resource.kind().equals("source")){
+            var row=SystemCollections.SOURCES.on(db).find(s,new Document("_id",resource.id())).first();
+            return row==null||!MongoSourceIdentity.read(row).binding().incarnation().equals(resource.incarnation());
+        }else return false;
     }
     private void validateIntent(ClientSession s,AlertIntent.Frozen f,boolean grant,Access access) {
         scope(f.identity().scope());if(f.retention().deployment()!=host.deployment())throw stale("intent-profile");

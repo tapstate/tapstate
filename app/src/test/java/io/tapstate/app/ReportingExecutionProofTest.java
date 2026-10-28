@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
@@ -13,6 +14,14 @@ import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 
 class ReportingExecutionProofTest {
+    @Test void alertEvaluationCanReportTheOriginalSingleProcessFailureWithoutReopeningBusinessWork() {
+        var owner=owner();var permit=owner.permit(SCOPE);var execution=owner.beginExecution(SCOPE,WorkloadClaimFence.from(permit.claim()));
+        alive.set(false);clearInvocations(store);
+        var guard=owner.evaluationProof(SCOPE,execution.claimFence()).orElseThrow();guard.run();
+        verify(store,times(1)).readPipeline(SCOPE);verify(store,never()).acquirePipeline(any(),any(),anyLong(),any());
+        verify(store,never()).renew(any(),any());verify(store,never()).advanceExecution(any(),anyLong(),anySet());
+        node.set(false);assertThatThrownBy(guard::run).isInstanceOf(io.tapstate.core.common.TapstateException.class);
+    }
     private static final CacheBusinessScope BUSINESS = new CacheBusinessScope("node", 1, "cache");
     private static final PipelineIntentScope SCOPE = new PipelineIntentScope("node", 1, "cache", "orders", 1);
     private static final WorkloadOwner OWNER = new WorkloadOwner("node", "boot");

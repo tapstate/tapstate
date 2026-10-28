@@ -32,6 +32,7 @@ public final class AlertLifecycle {
             return uncertain(old, quality, now);
         }
         boolean gap = old.lastObservedAt() == null
+                || old.lastSequence() == Long.MAX_VALUE || signal.sequence() != old.lastSequence() + 1
                 || old.lastObservedAt().plus(rule.maxGap()).isBefore(signal.observedAt())
                 || old.quality() != Quality.VALID;
         Status status = old.status();
@@ -94,6 +95,12 @@ public final class AlertLifecycle {
             return uncertain(old, Quality.STALE, now);
         }
         return new AlertUpdate(old, List.of(), false);
+    }
+
+    /** Current-producer input was refused or lost. Never advance its accepted sample frontier. */
+    public static AlertUpdate discontinuity(AlertSnapshot old, Instant now) {
+        Objects.requireNonNull(old, "old"); Objects.requireNonNull(now, "now");
+        return old.enabled() ? uncertain(old, Quality.UNKNOWN, now) : new AlertUpdate(old, List.of(), true);
     }
 
     public static AlertUpdate terminate(AlertSnapshot old, EndReason reason, Instant now) {

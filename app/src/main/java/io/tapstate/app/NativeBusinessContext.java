@@ -107,6 +107,10 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
     Optional<org.springframework.boot.availability.ApplicationAvailability> availability() {
         return active.get() ? Optional.ofNullable(availability) : Optional.empty();
     }
+    Optional<PipelineAlertRuntime.Health> alertHealth() {
+        Object runtime=context==null?null:context.getBeanFactory().getSingleton("pipelineAlertRuntime");
+        return runtime instanceof PipelineAlertRuntime alerts?Optional.of(alerts.health()):Optional.empty();
+    }
 
     private void preparePipeline(PipelineIntentScope scope) {
         original.requireBusiness();
@@ -381,11 +385,30 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         @Bean(destroyMethod = "close") MetricsExport metricsExport(MetricsExportProperties properties) {
             return RuntimeConvergenceConfiguration.metricsExportFor(properties);
         }
+        @Bean(initMethod = "start",destroyMethod = "close") PipelineAlertRuntime pipelineAlertRuntime(NativeBusinessContext owner,
+                PipelineActuationOwnership ownership, NodeSessionLease node, CloudRuntimeSettings cloud, Clock clock) {
+            String evaluatorId = java.util.UUID.randomUUID().toString();
+            Runnable active = () -> {
+                if (!owner.active.get() || !node.active()) throw ThreeLayerStorePort.refused();
+                owner.original.requireBusiness();
+            };
+            return new PipelineAlertRuntime(() -> {
+                active.run();
+                var setup = owner.original.binding().setup();
+                var scope = cloud.cloud() ? owner.parent.getBean(CloudSdkBridge.class).alertScope().orElseThrow(ThreeLayerStorePort::refused)
+                        : new io.tapstate.core.alerting.AlarmKey.Scope(setup.installationId(), setup.clusterId());
+                var deployment = cloud.cloud() ? io.tapstate.core.alerting.AlertChannelPolicy.Deployment.CLOUD_MANAGED
+                        : io.tapstate.core.alerting.AlertChannelPolicy.Deployment.ON_PREM;
+                var catalog = io.tapstate.core.alerting.BuiltinAlarmTypes.catalog();
+                var store = owner.configuration.alerts(new io.tapstate.spi.store.AlertStore.Host(scope, setup, deployment, active), catalog, clock);
+                return new PipelineAlertRuntime.Services(store, new AlertEvaluationHost(store, catalog, deployment, clock, evaluatorId, active));
+            }, owner.configuration.intents(), ownership::evaluationProof, active, clock);
+        }
         @Bean ConvergenceDriver convergenceDriver(NativeBusinessContext owner, PipelineConverger converger,
                 ObservationPublisher observations, RateSampler samples, MetricsExport export, NodeSessionLease node,
                 ClusterMembershipGate membership, PipelineActuationOwnership ownership, EngineLifecycleActuator actuator,
                 HazelcastInstance member, HazelcastExecutionPlans plans, RebuildAdmission admission, Clock clock, ClusterProperties cluster,
-                ConnectorProvisioner connectors, Engine engine, PipelineCaptureCoordinator captures) {
+                ConnectorProvisioner connectors, Engine engine, PipelineCaptureCoordinator captures, PipelineAlertRuntime alerts) {
             var operators = new HazelcastOperatorReadiness(member, Duration.ofSeconds(60));
             var scope = owner.original.preparation().businessScope();
             var changes = owner.configuration.rebuilds();
@@ -409,7 +432,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             return ConvergenceDriver.scoped(converger, observations, samples, export,
                     () -> owner.active.get() && node.active() && (cluster.getProfile() == ClusterProperties.Profile.SINGLE || membership.businessEligible()),
                     ownership, new ConvergenceDriver.ScopedPorts(owner.configuration.intents(), owner.original.cache(),
-                            owner.memberStorage::requireNode, pass -> actuator.forPass(pass, ports), pass -> admission, admission::retain));
+                            owner.memberStorage::requireNode, pass -> actuator.forPass(pass, ports), pass -> admission, admission::retain, alerts));
         }
         @Bean PipelineStatusDiagnostics nativePipelineStatusDiagnostics(NativeBusinessContext owner, Engine engine,
                 PipelineActuationOwnership ownership) {

@@ -73,6 +73,17 @@ final class MongoAlertReads {
         for(var row:raw){var id=row.get("_id",Document.class).getString("id");values.add(MongoAlertConfigurationCodec.read(kind,scope,id,row).definition());}
         return new DefinitionPage(values,more?raw.getLast().get("_id",Document.class).getString("id"):null);
     }
+    EvaluationPage evaluationStates(ClientSession s,AlarmKey after,int limit){
+        limit(limit);if(after!=null&&!scope.equals(after.scope()))throw unreadable("evaluation-cursor-scope");
+        var lower=after==null?MongoAlertDeliveryCodec.scope(scope).append("resourceKind",new MinKey()):MongoAlertStateCodec.key(after);
+        var upper=MongoAlertDeliveryCodec.scope(scope).append("resourceKind",new MaxKey());
+        var rows=SystemCollections.ALERT_INSTANCES.on(db).find(s,new Document("_id",new Document(after==null?"$gte":"$gt",lower).append("$lte",upper)))
+                .hintString("_id_").sort(new Document("_id",1)).limit(limit+1).into(new ArrayList<>());
+        boolean more=rows.size()>limit;if(more)rows.removeLast();var values=new ArrayList<Stored<AlertStateRecord.Head>>();
+        for(var row:rows){var key=MongoAlertStateCodec.readKey(row.get("_id",Document.class));
+            var value=states.loadEnvelope(s,key).orElseThrow(()->unreadable("evaluation-head"));values.add(new Stored<>(value.revision(),value.value()));}
+        return new EvaluationPage(values,more?values.getLast().value().snapshot().rule().key():null);
+    }
     List<AlertIntent.Record> testWindow(ClientSession s,Instant now){
         var filter=scopeFilter().append("_id.purpose","channel-test").append("quotaMinute",new Document("$gte",AlertTestQuota.minute(now.minusSeconds(300)).toString()));
         var raw=SystemCollections.ALERT_DELIVERY_INTENTS.on(db).find(s,filter).hintString("alert_query_test_window").sort(new Document("quotaMinute",1)).limit(61).into(new ArrayList<>());

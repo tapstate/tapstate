@@ -20,6 +20,61 @@ import static org.assertj.core.api.Assertions.*;
 
 @RequiresDocker
 class MongoAlertCoordinatorIT {
+    @Test void evaluationRecoveryUsesOriginalIdKeysetWithoutMissingOrRepeatingHeads() {
+        withStore(f->{
+            var facts=businessFacts(f);accept(f,facts);
+            var original=facts.head.snapshot().rule();var key=new AlarmKey(original.key().scope(),original.key().resource(),original.key().typeId(),"other-rule");
+            var rule=new AlertRule(key,original.revision(),original.generation(),original.producerIncarnation(),original.triggerFor(),original.resolveFor(),original.maxAge(),original.maxGap());
+            var signal=new AlertSignal(key,rule.revision(),rule.generation(),rule.producerIncarnation(),1,T,AlertSignal.Condition.BAD,AlarmSeverity.MAJOR);
+            var snapshot=AlertLifecycle.evaluate(AlertSnapshot.initial(rule),signal,T).snapshot();
+            var episode=new AlertStateRecord.Episode(rule,snapshot.episode(),POLICY,AlertStateRecord.Diagnostics.empty(true),false);
+            var binding=new AlertIntent.Member(rule,1,facts.head.binding().ruleIdentity(),facts.head.binding().sourceBindingRevision());
+            var head=new AlertStateRecord.Head(snapshot,POLICY.deployment(),AlertOwnership.unclaimed(),null,false,episode,binding);
+            f.store.commit(new Commit(CommitKind.STATE_AND_PLAN,new StateChange(0,null,head,List.of(),null),List.of(),List.of()));
+            var first=f.store.evaluationStates(null,1);assertThat(first.rows()).hasSize(1);assertThat(first.next()).isNotNull();
+            var second=f.store.evaluationStates(first.next(),1);assertThat(second.rows()).hasSize(1);assertThat(second.next()).isNull();
+            assertThat(first.rows().getFirst().value().snapshot().rule().key()).isNotEqualTo(second.rows().getFirst().value().snapshot().rule().key());
+            assertThat(List.of(first.rows().getFirst().value().snapshot().rule().key(),second.rows().getFirst().value().snapshot().rule().key()))
+                    .containsExactlyInAnyOrder(original.key(),key);
+        });
+    }
+    @Test void recoveryPageDiscoversOriginalResourceRemovalAndRetirementRechecksIt() {
+        withStore(f->{
+            var facts=businessFacts(f);accept(f,facts);var resource=facts.head.snapshot().rule().key().resource();
+            assertThat(f.store.evaluationStates(null,10).removedResources()).isEmpty();
+            f.domain.artifacts().delete("orders",f.domain.artifacts().sourceBinding("orders").orElseThrow().contentHash());
+            assertThat(f.store.evaluationStates(null,10).removedResources()).containsExactly(resource);
+            f.domain.artifacts().create(source("orders"));
+            assertThat(f.store.evaluationStates(null,10).removedResources()).containsExactly(resource);
+            f.time.set(T.plusSeconds(1));var old=f.store.state(facts.head.snapshot().rule().key(),readAll()).orElseThrow();
+            var ended=AlertLifecycle.terminate(old.value().snapshot(),AlertSnapshot.EndReason.RESOURCE_REMOVED,f.time.get());
+            var episode=new AlertStateRecord.Episode(old.value().episode().originalBinding(),ended.snapshot().episode(),POLICY,old.value().episode().diagnostics(),false);
+            var head=new AlertStateRecord.Head(ended.snapshot(),POLICY.deployment(),old.value().owner(),f.time.get(),false,episode,old.value().binding());
+            assertThat(f.store.commit(new Commit(CommitKind.END,new StateChange(old.revision(),old.value(),head,List.of(),null),List.of(),List.of()))).isEqualTo(Outcome.STAGED);
+            assertThat(f.store.state(ended.snapshot().rule().key(),readAll()).orElseThrow().value().cleanupAt()).isNotNull();
+        });
+    }
+    @Test void staleDisabledSnapshotCannotTerminateACurrentlyReenabledRule() {
+        withStore(f -> {
+            var facts = businessFacts(f); accept(f, facts);
+            var original = (Rule) f.store.definition(Kind.RULE, "rule-a", f.access).orElseThrow();
+            var disabled = new Rule(original.header().next(T.plusSeconds(1), f.access.subject()), original.name(),
+                    original.typeId(), original.typeVersion(), original.resources(), original.parameters(), null, false, null);
+            f.time.set(T.plusSeconds(1)); f.store.saveDefinition(original, disabled, f.access);
+            var enabled = new Rule(disabled.header().next(T.plusSeconds(2), f.access.subject()), disabled.name(),
+                    disabled.typeId(), disabled.typeVersion(), disabled.resources(), disabled.parameters(), null, true, null);
+            f.time.set(T.plusSeconds(2)); f.store.saveDefinition(disabled, enabled, f.access);
+            var before = f.store.state(facts.head.snapshot().rule().key(), readAll()).orElseThrow();
+            var ended = AlertLifecycle.terminate(before.value().snapshot(), AlertSnapshot.EndReason.DISABLED, f.time.get());
+            var oldEpisode = before.value().episode();
+            var episode = new AlertStateRecord.Episode(oldEpisode.originalBinding(), ended.snapshot().episode(), oldEpisode.policy(), oldEpisode.diagnostics(), false);
+            var after = new AlertStateRecord.Head(ended.snapshot(), POLICY.deployment(), before.value().owner(), null, false, episode, before.value().binding());
+            var change = new StateChange(before.revision(), before.value(), after, List.of(), null);
+            assertThatThrownBy(() -> f.store.commit(new Commit(CommitKind.END, change, List.of(), List.of())))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(f.store.state(facts.head.snapshot().rule().key(), readAll()).orElseThrow()).isEqualTo(before);
+        });
+    }
     @Container static final MongoDBContainer MONGO=new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
     static final Instant T=Instant.parse("2026-10-28T00:00:00Z");static final AlarmKey.Scope SCOPE=new AlarmKey.Scope("installation-a","cluster-a");
     static final AlertIntent.Payload PAYLOAD=new AlertIntent.Payload("hello".getBytes(java.nio.charset.StandardCharsets.UTF_8));
@@ -156,9 +211,10 @@ class MongoAlertCoordinatorIT {
             var r=new AlertRule(key,1,1,"producer-a",Duration.ZERO,Duration.ZERO,Duration.ofSeconds(30),Duration.ofSeconds(30));
             var signal=new AlertSignal(key,1,1,"producer-a",1,T,AlertSignal.Condition.BAD,AlarmSeverity.CRITICAL);var snapshot=AlertLifecycle.evaluate(AlertSnapshot.initial(r),signal,T).snapshot();
             var policy=AlertIntent.Policy.capture(AlertRetentionPolicy.defaults(AlertChannelPolicy.Deployment.CLOUD_MANAGED));
-            var old=new AlertStateRecord.Head(snapshot,policy.deployment(),AlertOwnership.unclaimed(),null,false,new AlertStateRecord.Episode(r,snapshot.episode(),policy,AlertStateRecord.Diagnostics.empty(false),false));
+            var binding=new AlertIntent.Member(r,1,new Identity(Kind.RULE,scope,"removed-rule",UUID_A),0);
+            var old=new AlertStateRecord.Head(snapshot,policy.deployment(),AlertOwnership.unclaimed(),null,false,new AlertStateRecord.Episode(r,snapshot.episode(),policy,AlertStateRecord.Diagnostics.empty(false),false),binding);
             SystemCollections.ALERT_INSTANCES.on(f.db).insertOne(MongoAlertStateEnvelope.head(old,1));SystemCollections.ALERT_EPISODES.on(f.db).insertOne(MongoAlertStateEnvelope.episode(old.episode()));
-            var ended=AlertLifecycle.terminate(snapshot,AlertSnapshot.EndReason.DISABLED,T).snapshot();var after=new AlertStateRecord.Head(ended,policy.deployment(),old.owner(),null,false,new AlertStateRecord.Episode(r,ended.episode(),policy,old.episode().diagnostics(),false));
+            var ended=AlertLifecycle.terminate(snapshot,AlertSnapshot.EndReason.DISABLED,T).snapshot();var after=new AlertStateRecord.Head(ended,policy.deployment(),old.owner(),null,false,new AlertStateRecord.Episode(r,ended.episode(),policy,old.episode().diagnostics(),false),binding);
             var view=f.domain.alerts(new Host(scope,f.host.setup(),policy.deployment(),()->{}),BuiltinAlarmTypes.catalog(),f.clock);
             var access=Access.cloud("cloud-user","managed-org","READ",()->{},()->{});var change=new Commit(CommitKind.END,new StateChange(1,old,after,List.of(),null),List.of(),List.of());
             assertThatThrownBy(()->view.commitAsCaller(change,access)).isInstanceOf(TapstateException.class);

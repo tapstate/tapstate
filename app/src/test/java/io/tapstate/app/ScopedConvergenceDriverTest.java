@@ -67,6 +67,8 @@ class ScopedConvergenceDriverTest {
     private boolean readyToComplete, releasedSnapshot, completionObserved, pendingCleanup, rejectCleanup;
     private final List<String> completionTrace = new ArrayList<>();
     private Runnable onFinalObservation = () -> {};
+    private PipelineAlertFeed alertFeed = PipelineAlertFeed.none();
+    private MetricsExport metricsExport = MetricsExport.none();
 
     private ConvergenceDriver driver() {
         claims.acquire(KEY, OWNER, 7, Duration.ofMinutes(1));
@@ -97,7 +99,7 @@ class ScopedConvergenceDriverTest {
                     pendingCleanup=false; carrying.set(false);
                 }
             };
-        }, pass -> RebuildAdmission.never(), ids -> retained.add(List.copyOf(ids)));
+        }, pass -> RebuildAdmission.never(), ids -> retained.add(List.copyOf(ids)), alertFeed);
         StateStore poisonState = mock(StateStore.class, call -> { throw new AssertionError("unscoped state accessed"); });
         ObservationStore poisonObservations = mock(ObservationStore.class, call -> { throw new AssertionError("unscoped observation accessed"); });
         var poisonDesired = mock(io.tapstate.spi.store.DesiredStore.class,
@@ -118,7 +120,92 @@ class ScopedConvergenceDriverTest {
                             Map.of("orders",new io.tapstate.core.lifecycle.TableSnapshot(8,8L,100,true)),T0)
                             : io.tapstate.core.lifecycle.SnapshotReading.NONE;
                 }),
-                sampler, MetricsExport.none(), eligible::get, ownership, bindings);
+                sampler, metricsExport, eligible::get, ownership, bindings);
+    }
+
+    @Test void originalScopedPublicationReachesAlertsBeforeARefusingExporter() {
+        sampleMetrics = true;
+        var sequence = new ArrayList<String>();
+        var received = new ArrayList<Observation>();
+        alertFeed = new PipelineAlertFeed() {
+            public void expecting(PipelineConvergencePass pass) { sequence.add("expecting"); }
+            public void published(PipelineConvergencePass pass, Observation value, Throwable cause) {
+                sequence.add("alert"); received.add(value);
+                assertThat(pass.scope()).isEqualTo(FIRST);
+                assertThat(pass.claim()).isEqualTo(WorkloadClaimFence.from(claims.read(KEY).orElseThrow().claim()));
+            }
+            public void unavailable(PipelineConvergencePass pass) { throw new AssertionError("export failure is not publication failure"); }
+            public void retain(java.util.Collection<String> ids) { }
+        };
+        metricsExport = new MetricsExport() {
+            public void offer(String id, PipelineState state, Instant at, List<io.tapstate.core.lifecycle.MetricFact> facts) {
+                sequence.add("export"); assertThat(facts).isSameAs(received.getFirst().facts());
+                throw new IllegalStateException("export backend unavailable");
+            }
+            public void forgetPipelinesOutside(java.util.Collection<String> ids) { }
+        };
+        driver().reconcile();
+        assertThat(sequence).containsExactly("expecting", "expecting", "alert", "export");
+        assertThat(received).hasSize(1);
+        assertThat(received.getFirst()).isSameAs(views.observations(FIRST).read("orders").orElseThrow());
+        assertThat(received.getFirst().facts()).isNotEmpty();
+        assertThat(received.getFirst().metrics()).doesNotContainKey("reconcileFailuresInARow");
+    }
+
+    @Test void anAlertInputRefusalCannotBreakTheOriginalObservationOrExport() {
+        var exported = new ArrayList<Observation>();
+        alertFeed = new PipelineAlertFeed() {
+            public void expecting(PipelineConvergencePass pass) { }
+            public void published(PipelineConvergencePass pass, Observation value, Throwable failure) { throw fenced(); }
+            public void unavailable(PipelineConvergencePass pass) { }
+            public void retain(java.util.Collection<String> ids) { }
+        };
+        metricsExport = new MetricsExport() {
+            public void offer(String id, PipelineState state, Instant at, List<io.tapstate.core.lifecycle.MetricFact> facts) {
+                exported.add(new Observation(id,state,Map.of(),Map.of(),Map.of(),null,at,facts));
+            }
+            public void forgetPipelinesOutside(java.util.Collection<String> ids) { }
+        };
+        driver().reconcile();
+        assertThat(exported).hasSize(1);
+        assertThat(views.observations(FIRST).read("orders").orElseThrow().state()).isEqualTo(PipelineState.RUNNING);
+    }
+    @Test void theActualScopedDriverFeedsTheEvaluationWorkersWithNoExporterConfigured() {
+        var harness=new PipelineAlertRuntimeTest();
+        harness.fixture.now.set(Instant.now().plusSeconds(10));
+        harness.intents.put("orders",intents.snapshot);
+        try(var runtime=harness.runtime()){
+            runtime.tick();org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->!runtime.health().degraded());
+            alertFeed=runtime;driver().reconcile();
+            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->!harness.rows.isEmpty());
+            var head=harness.rows.values().iterator().next().value();
+            assertThat(head.snapshot().status()).isEqualTo(io.tapstate.core.alerting.AlertSnapshot.Status.CLEAR);
+            assertThat(head.snapshot().quality()).isEqualTo(io.tapstate.core.alerting.AlertSnapshot.Quality.VALID);
+            assertThat(head.snapshot().lastObservedAt()).isEqualTo(views.observations(FIRST).read("orders").orElseThrow().observedAt());
+            assertThat(head.snapshot().rule().key().resource().incarnation()).isEqualTo(Long.toString(FIRST.stateGeneration()));
+        }
+    }
+    @Test void aRealUnreachableOtlpBackendCannotBlockOrRefreshTheAlertInput() throws Exception {
+        int unusedPort;
+        try(var socket=new java.net.ServerSocket(0,1,java.net.InetAddress.getLoopbackAddress())){unusedPort=socket.getLocalPort();}
+        var settings=io.tapstate.adapters.otel.ExportSettings.otlpTo("http://127.0.0.1:"+unusedPort+"/v1/metrics",
+                io.tapstate.adapters.otel.ExportSettings.Protocol.HTTP_PROTOBUF,Duration.ofHours(1));
+        var captured=new ArrayList<Observation>();
+        alertFeed=new PipelineAlertFeed(){
+            public void expecting(PipelineConvergencePass pass){}
+            public void published(PipelineConvergencePass pass,Observation value,Throwable failure){captured.add(value);}
+            public void unavailable(PipelineConvergencePass pass){throw new AssertionError("OTLP must remain independent");}
+            public void retain(java.util.Collection<String> ids){}
+        };
+        try(var exporter=io.tapstate.adapters.otel.OtelMetricsExport.start(settings)){
+            metricsExport=exporter;sampleMetrics=true;var driver=driver();driver.reconcile();
+            assertThat(captured).hasSize(1);var original=captured.getFirst();
+            assertThat(exporter.flush(Duration.ofSeconds(2))).isFalse();
+            assertThat(captured.getFirst()).isSameAs(original);
+            assertThat(original).isSameAs(views.observations(FIRST).read("orders").orElseThrow());
+            driver.reconcile();assertThat(captured).hasSize(2);
+            assertThat(captured.getLast().state()).isEqualTo(PipelineState.RUNNING);
+        }
     }
 
     private void advance(PipelineConvergencePass pass) {

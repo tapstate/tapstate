@@ -689,6 +689,30 @@ final class PipelineActuationOwnership {
         return proveClaim(scope, expected, true);
     }
 
+    /** Captures a conservative original lease outside CONFIG; the returned guard performs no IO. */
+    Optional<Runnable> evaluationProof(PipelineIntentScope scope, WorkloadClaimFence expected) {
+        Objects.requireNonNull(scope);Objects.requireNonNull(expected);
+        if(!fenced||closing||!accepts(scope)||!expected.owner().equals(owner)
+                ||expected.key().type()!=WorkloadClaimType.PIPELINE_ACTUATION||!scope.pipelineId().equals(expected.key().resourceId()))return Optional.empty();
+        WorkloadClaim original;
+        synchronized(this){var local=held.get(scope.pipelineId());
+            if(local==null||!scope.equals(local.scope)||local.claim==null||!WorkloadClaimFence.from(local.claim).equals(expected))return Optional.empty();
+            original=local.claim;
+        }
+        long askedAt=nanoTime.getAsLong();
+        var reading=membership.businessEligible()?claims.readPipeline(scope):claims.readActuationControl(scope,original);
+        if(reading.isEmpty()||!WorkloadClaimFence.from(reading.orElseThrow().claim()).equals(expected))return Optional.empty();
+        long budget=Math.min(reading.orElseThrow().leaseRemaining().toNanos(),ttl.toNanos());
+        Runnable guard=()->{
+            synchronized(this){var current=held.get(scope.pipelineId());long elapsed=nanoTime.getAsLong()-askedAt;
+                if(closing||elapsed<0||elapsed>=budget||!accepts(scope)
+                        ||!(membership.businessEligible()||membership.singleControlEligible(reading.orElseThrow().claim()))
+                        ||current==null||!scope.equals(current.scope)||current.claim==null
+                        ||!WorkloadClaimFence.from(current.claim).equals(expected))throw ThreeLayerStorePort.refused();}
+        };
+        try{guard.run();return Optional.of(guard);}catch(io.tapstate.core.common.TapstateException expired){return Optional.empty();}
+    }
+
     private boolean proveClaim(PipelineIntentScope scope, WorkloadClaimFence expected, boolean compareTopology) {
         if (!fenced || closing || (scope != null && !accepts(scope)) || !expected.owner().equals(owner)
                 || expected.key().type() != WorkloadClaimType.PIPELINE_ACTUATION

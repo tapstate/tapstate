@@ -8,6 +8,25 @@ import static io.tapstate.core.alerting.AlertSignal.Condition.*;
 import static io.tapstate.core.alerting.AlertSnapshot.*;
 
 class AlertLifecycleTest {
+    @Test void missingProducerSequencesBreakBothTriggerAndRecoveryContinuity() {
+        var pending = sample(AlertSnapshot.initial(rule(1, 10, 10)), 1, 0, BAD);
+        pending = sample(pending, 3, 10, BAD);
+        assertThat(pending.status()).isEqualTo(Status.PENDING);
+        assertThat(pending.pendingSince()).isEqualTo(T.plusSeconds(10));
+        var firing = sample(AlertSnapshot.initial(rule(1, 0, 10)), 1, 0, BAD);
+        firing = sample(firing, 2, 1, GOOD);
+        firing = sample(firing, 4, 11, GOOD);
+        assertThat(firing.status()).isEqualTo(Status.FIRING);
+        assertThat(firing.recoverySince()).isEqualTo(T.plusSeconds(11));
+    }
+    @Test void refusedCurrentInputBreaksContinuityWithoutAdvancingTheAcceptedFrontier() {
+        var pending = sample(AlertSnapshot.initial(rule(1, 10, 10)), 1, 0, BAD);
+        var lost = AlertLifecycle.discontinuity(pending, T.plusSeconds(5)).snapshot();
+        assertThat(lost.lastSequence()).isOne();
+        assertThat(lost.lastObservedAt()).isEqualTo(T);
+        assertThat(lost.pendingSince()).isNull();
+        assertThat(lost.quality()).isEqualTo(Quality.UNKNOWN);
+    }
     static final Instant T = Instant.parse("2026-10-21T00:00:00Z");
     static AlarmKey key(String authority, String incarnation, String qualifier) {
         return new AlarmKey(new AlarmKey.Scope(authority, "cluster"),

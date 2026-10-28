@@ -23,6 +23,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * or IO, so a transaction retry cannot silently become a later command.
  */
 final class PipelineConvergencePass {
+    private final java.util.function.Consumer<PipelineConvergencePass> advancedObserver;
     private final PipelineIntentSnapshot intent;
     private final AtomicReference<WorkloadClaimFence> claim;
     private final PipelineStoreViews views;
@@ -78,6 +79,11 @@ final class PipelineConvergencePass {
 
     PipelineConvergencePass(PipelineIntentSnapshot intent, WorkloadClaimFence original,
             PipelineStoreViews views, Runnable requireActive) {
+        this(intent,original,views,requireActive,ignored->{});
+    }
+    PipelineConvergencePass(PipelineIntentSnapshot intent, WorkloadClaimFence original,
+            PipelineStoreViews views, Runnable requireActive,java.util.function.Consumer<PipelineConvergencePass> advancedObserver) {
+        this.advancedObserver=Objects.requireNonNull(advancedObserver);
         this.intent = Objects.requireNonNull(intent, "intent");
         Objects.requireNonNull(original, "original");
         if (intent.deleted() || original.key().type() != WorkloadClaimType.PIPELINE_ACTUATION
@@ -202,6 +208,7 @@ final class PipelineConvergencePass {
                 || !claim.compareAndSet(before, actual)) {
             throw new IllegalStateException("a convergence pass can advance only its exact original claim");
         }
+        advancedObserver.accept(this);
     }
 
     void requirePipeline(String pipelineId) {
