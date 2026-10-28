@@ -21,7 +21,8 @@ final class AlertManagement implements AlertControlDispatcher {
     }
     @Override public Map<String,Object> dispatch(String operation,CredentialAuthentication caller,Map<String,Object> input){
         var op=ControlOperations.registry().resolve(operation);
-        if(!operation.startsWith("alert.")||!caller.token().scope().permits(op.scope()))throw stale("permission");
+        if(!operation.startsWith("alert.")||!caller.token().scope().permits(op.scope())
+                ||deployment==AlertChannelPolicy.Deployment.ON_PREM&&op.scope()==Scope.WRITE&&!caller.token().scope().permits(Scope.ADMIN))throw stale("permission");
         caller.requireActive().run();var resolved=services.get();var a=access.apply(caller);
         var result=audit.dispatch(op,new AuditContext(caller.token().subject(),"alerts",optional(input,"etag")),()->invoke(operation,input,resolved,a,caller));
         caller.requireActive().run();a.locallyActive().run();return result;
@@ -92,13 +93,14 @@ final class AlertManagement implements AlertControlDispatcher {
                 if(input.get("existingId")!=null){existing=(AlertReceiver)store.definition(AlertConfiguration.Kind.RECEIVER,text(input,"existingId"),access).orElseThrow(()->stale("receiver-not-found"));if(existing.header().revision()!=number(input,"etag",0))throw stale("receiver-etag");}
                 var transport=AlertAuthoring.transport(form,existing);var retain=new LinkedHashSet<AlertStore.PrivateField>();if(bool(form,"retainMaterial",false)&&existing!=null){if(transport.authentication()!=AlertReceiver.Authentication.NONE)retain.add(AlertStore.PrivateField.AUTHENTICATION);if(transport.trust()==AlertReceiver.Trust.PRIVATE_CA)retain.add(AlertStore.PrivateField.PRIVATE_CA);if(transport instanceof AlertReceiver.Webhook&&privateInput(form,"endpoint")==null)retain.add(AlertStore.PrivateField.ENDPOINT);}
                 AlertConfiguration.Subscription route=null;if(input.get("routeId")!=null)route=(AlertConfiguration.Subscription)store.definition(AlertConfiguration.Kind.SUBSCRIPTION,text(input,"routeId"),access).orElseThrow(()->stale("route-not-found"));
-                try(var material=AlertAuthoring.material(form)){return projectDelivery(commands.test(AlertTestCommand.ClientId.parse(text(input,"commandId")),text(input,"candidateId"),transport,transport instanceof AlertReceiver.Webhook w?"webhook-"+w.endpointDigest():text(input,"target"),existing,material,retain,route,access),false,resolved);}
+                try(var material=AlertAuthoring.material(form)){return projectDelivery(commands.test(AlertTestCommand.ClientId.parse(text(input,"commandId")),text(input,"candidateId"),transport,transport instanceof AlertReceiver.Webhook w?"webhook-"+w.endpointDigest():emailTarget(text(input,"target")),existing,material,retain,route,access),false,resolved);}
             }
             case "alert.test-result": {fields(input,"commandId");requireOp();return projectDelivery(commands.result(new AlertTestCommand.Key(scope,access.actor().principalKey(),AlertTestCommand.ClientId.parse(text(input,"commandId"))),access),false,resolved);}
             case "alert.retry": {fields(input,"id","etag");requireOp();var current=store.delivery(text(input,"id"),reads).orElseThrow(()->stale("delivery-not-found"));AlertAuthoring.check(commands.retry(current.value().frozen().identity(),number(input,"etag",0),access));return map("queued",true);}
             default:throw new IllegalStateException("unregistered alert operation");
         }
     }
+    private static String emailTarget(String value){int at=value.lastIndexOf('@');return at<0?value:value.substring(0,at+1)+value.substring(at+1).toLowerCase(Locale.ROOT);}
     private Map<String,Object> preview(Map<String,Object> input){
         fields(input,"messages","kind","channel");requireOp();var kind=value(NotificationRenderer.Kind.class,text(input,"kind"));var channel=text(input,"channel");if(!Set.of("email","webhook").contains(channel))throw invalid("channel");var now=clock.instant();
         var key=new AlarmKey(scope,new AlarmKey.Resource("pipeline","preview","preview"),"pipeline.failed","preview");boolean recovered=kind==NotificationRenderer.Kind.RECOVERY||kind==NotificationRenderer.Kind.RECOVERY_SUMMARY;

@@ -60,6 +60,17 @@ class AlertNotificationPlannerIT {
             assertThat(intents(f)).hasSize(2);
         });
     }
+    @Test void clearEvaluationWithoutAnEpisodeDoesNotBlockAnotherRulesNotification(){
+        AlertEvaluationHostIT.withFixture(f->{route(f,Duration.ZERO);var p=planner(f,"mixed-heads");f.evaluator().withPlanner(p);
+            var h=AlertConfiguration.Header.create(AlertConfiguration.Identity.create(AlertConfiguration.Kind.RULE,f.storeHost().scope(),"clear-rule"),AlertChannelPolicy.Deployment.ON_PREM,T,"operator");
+            var clear=new AlertConfiguration.Rule(h,"No confirmed fault","pipeline.failed",1,f.rule().resources(),Map.of(),null,true,null).validated(BuiltinAlarmTypes.catalog());
+            assertThat(f.store().saveDefinition(null,clear,access())).isEqualTo(AlertStore.Outcome.STAGED);
+            var binding=new AlertEvaluationHost.Binding(clear,new AlarmKey.Resource("pipeline","orders","1"),"clear-producer",0,ACTIVE,()->new AlertStore.EvaluationProof(f.intent(),ACTIVE));
+            assertThat(f.evaluator().accept(binding,1,new AlertInput.Conditions(T,AlertSignal.Condition.UNKNOWN,null))).isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
+            assertThat(f.store().state(binding.key(),f.reads()).orElseThrow().value().episode()).isNull();
+            bad(f);p.tick();assertThat(intents(f)).hasSize(2);
+        });
+    }
     static AlertStore sendingStore(AlertEvaluationHostIT.Fixture f){return f.configuration().alerts(f.storeHost().withChannels(Set.of(new AlertChannelPolicy.Capability("email",1,AlertChannelPolicy.Family.OP_EXTERNAL),new AlertChannelPolicy.Capability("webhook",1,AlertChannelPolicy.Family.OP_EXTERNAL))),BuiltinAlarmTypes.catalog(),f.clock());}
     static AlertIntent.Record grant(AlertEvaluationHostIT.Fixture f,AlertStore.Stored<AlertIntent.Record> before){
         var record=before.value();var original=record.state();var now=f.clock().instant();

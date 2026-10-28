@@ -18,7 +18,7 @@ class AlertManagementIT {
     @org.testcontainers.junit.jupiter.Container static final org.testcontainers.containers.MongoDBContainer MONGO=AlertEvaluationHostIT.MONGO;
     static CredentialAuthentication caller(Scope scope,Runnable guard){return new CredentialAuthentication(new VerifiedToken("operator",scope),Optional.empty(),Optional.empty(),guard);}
     static AlertManagement service(AlertEvaluationHostIT.Fixture f){
-        var host=f.storeHost();return new AlertManagement(()->new PipelineAlertRuntime.Services(host.deployment()==AlertChannelPolicy.Deployment.ON_PREM?sendingStore(f):f.store(),f.evaluator()),c->host.deployment()==AlertChannelPolicy.Deployment.ON_PREM?access():AlertStore.Access.cloud("operator",host.scope().authorityId(),"ADMIN",c.requireActive(),ACTIVE),
+        var host=f.storeHost();return new AlertManagement(()->new PipelineAlertRuntime.Services(host.deployment()==AlertChannelPolicy.Deployment.ON_PREM?sendingStore(f):f.store(),f.evaluator()),c->host.deployment()==AlertChannelPolicy.Deployment.ON_PREM?access():AlertStore.Access.cloud("operator",host.scope().authorityId(),c.token().scope().name(),c.requireActive(),ACTIVE),
                 ()->new PipelineAlertRuntime.Health(false,false,0,null,Map.of(),0,0),host.scope(),host.deployment(),f.clock(),new AuditGate(record->{},f.clock()));
     }
     static Map<String,Object> call(AlertManagement s,String op,Map<String,Object> input){return s.dispatch("alert."+op,caller(Scope.ADMIN,ACTIVE),input);}
@@ -30,6 +30,14 @@ class AlertManagementIT {
             assertThatThrownBy(()->s.dispatch("alert.configuration.save",caller(Scope.READ,ACTIVE),map("kind","RULE","id","rule","etag","1","form",Map.of()))).isInstanceOf(TapstateException.class);
             assertThat(call(s,"health",Map.of())).containsEntry("cleanupAvailable",false);
         });
+    }
+    @Test void existingManagedWriteScopeCanAuthorLocalRulesWhileOpStillRequiresAdmin(){
+        AlertEvaluationHostIT.withFixture(false,true,f->{var s=service(f);var form=map("name","Managed authoring","typeId","pipeline.failed","resourceKinds",List.of("pipeline"),"allResources",true,"resources",List.of(),"parameters",Map.of(),"enabled",true);
+            assertThat(s.dispatch("alert.configuration.save",caller(Scope.WRITE,ACTIVE),map("kind","RULE","id","managed-authoring","etag","0","form",form))).containsEntry("id","managed-authoring");
+            assertThat((List<?>)s.dispatch("alert.configuration.list",caller(Scope.WRITE,ACTIVE),map("kind","RULE")).get("rows")).hasSize(2);
+            assertThatThrownBy(()->s.dispatch("alert.configuration.save",caller(Scope.READ,ACTIVE),map("kind","RULE","id","reader","etag","0","form",form))).isInstanceOf(TapstateException.class);
+        });
+        AlertEvaluationHostIT.withFixture(f->{assertThatThrownBy(()->service(f).dispatch("alert.configuration.save",caller(Scope.WRITE,ACTIVE),map("kind","RULE","id","writer","etag","0","form",map("name","Valid OP rule","typeId","pipeline.failed","resourceKinds",List.of("pipeline"),"allResources",true,"resources",List.of(),"parameters",Map.of(),"enabled",true)))).isInstanceOfSatisfying(TapstateException.class,failure->{assertThat(failure.code()).isEqualTo(AlertError.STALE_ACTION);assertThat(failure.args()).containsEntry("action","permission");});});
     }
     @Test void saveUsesCasAndNeverReturnsOrAuditsPrivateMaterial(){
         AlertEvaluationHostIT.withFixture(f->{var s=service(f);var saved=call(s,"configuration.save",map("kind","RECEIVER","id","smtp","etag","0","form",email()));
@@ -49,10 +57,16 @@ class AlertManagementIT {
             assertThatThrownBy(()->call(s,"test",input)).isInstanceOf(TapstateException.class);
         });
     }
+    @Test void candidateTargetNormalizesOnlyDomainCaseAndRetainsTheChosenRecipient(){
+        AlertEvaluationHostIT.withFixture(f->{var form=email();object(form.get("transport")).put("recipients",List.of("first@example.test","Second@EXAMPLE.TEST"));
+            var result=call(service(f),"test",map("commandId",new AlertTestCommand.ClientId(T,"a".repeat(32)).value(),"candidateId","chosen-recipient","form",form,"target","Second@EXAMPLE.TEST"));
+            assertThat(result.get("id")).isNotNull();var queued=f.store().dueIntents(T.plusSeconds(300),null,100).rows();assertThat(queued).hasSize(1);assertThat(queued.getFirst().value().frozen().identity().targetId()).isEqualTo("Second@example.test");
+        });
+    }
     @Test void savedWebhookWithoutAuthenticationCanTestItsUnchangedPrivateEndpoint(){
         AlertEvaluationHostIT.withFixture(f->{var s=service(f);var form=map("name","Webhook","transport",map("channelType","webhook","authentication","NONE","trust","SYSTEM"),"endpoint","https://notify.example.test/private-token");
             var saved=call(s,"configuration.save",map("kind","RECEIVER","id","webhook","etag","0","form",form));assertThat(saved.toString()).doesNotContain("private-token");
-            var result=call(s,"test",map("commandId",new AlertTestCommand.ClientId(T,"2".repeat(32)).value(),"candidateId","webhook-candidate","existingId","webhook","etag","1","form",saved));assertThat(result.get("id")).isNotNull();
+            var result=call(s,"test",map("commandId",new AlertTestCommand.ClientId(T,"2".repeat(32)).value(),"candidateId","webhook-candidate","existingId","webhook","etag","1","form",saved));assertThat(result.get("id")).isNotNull();assertThat(text(result,"target")).startsWith("https://notify.example.test").doesNotContain("private-token");assertThat(JsonWriter.write(result)).doesNotContain("private-token");
         });
     }
     @Test void emptyHiddenPrivateFieldsFromChannelSwitchAreAbsentMaterial(){
@@ -78,7 +92,7 @@ class AlertManagementIT {
         AlertEvaluationHostIT.withFixture(f->{AlertDeliveryRuntimeIT.seed(f);var s=service(f);var p=call(s,"deliveries",map("limit",1,"channel","email","result","NOT_ATTEMPTED"));assertThat((List<?>)p.get("rows")).hasSize(1);assertThat(p.get("nextCursor")).isNotNull();
             var next=call(s,"deliveries",map("limit",1,"channel","email","result","NOT_ATTEMPTED","cursor",p.get("nextCursor")));assertThat((List<?>)next.get("rows")).hasSize(1);
             assertThatThrownBy(()->call(s,"deliveries",map("channel","webhook","cursor",p.get("nextCursor")))).isInstanceOf(TapstateException.class);
-            var row=object(((List<?>)p.get("rows")).getFirst());var detail=call(s,"deliveries",map("id",row.get("id")));assertThat(detail).doesNotContainKeys("payload","target","candidate","credentials");
+            var row=object(((List<?>)p.get("rows")).getFirst());var detail=call(s,"deliveries",map("id",row.get("id")));assertThat(detail).doesNotContainKeys("payload","candidate","credentials");
             assertThat(f.store().deliveries(null,100,null,null,new AlertStore.ReadAccess(false,Set.of(),ACTIVE)).rows()).isEmpty();
         });
     }

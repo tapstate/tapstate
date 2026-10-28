@@ -41,8 +41,20 @@ class NativeAlertManagementIT {
                 if(control!=null){var directory=Path.of(control);java.nio.file.Files.createDirectories(directory);AlertDeliveryNetworkIT.temp=work;AlertDeliveryNetworkIT.tls();
                     try(var smtp=new AlertDeliveryNetworkIT.SmtpPeer(true)){
                         java.nio.file.Files.write(directory.resolve("smtp-ca.pem"),AlertDeliveryNetworkIT.pem);
+                        var browserData=new NativeAlertBrowserData(application,storage,(operation,input)->{try{var reply=post(client,root,"/api/alerts/"+operation,token,input);assertThat(reply.statusCode()).as(reply.body()).isEqualTo(200);}catch(Exception failure){throw new AssertionError(failure);}});
+                        if(Boolean.getBoolean("tapstate.alert.native-route-probe")){
+                            var receiver=Map.of("name","Native route probe","enabled",true,"transport",Map.of("channelType","email","host","localhost","port",smtp.port(),"encryption","IMPLICIT_TLS","authentication","NONE","from","alerts@example.test","recipients",List.of("a@example.test"),"trust","PRIVATE_CA"),"privateCa",new String(AlertDeliveryNetworkIT.pem,java.nio.charset.StandardCharsets.US_ASCII));
+                            assertThat(post(client,root,"/api/alerts/configuration/save",token,Map.of("kind","RECEIVER","id","probe-receiver","etag","0","form",receiver)).statusCode()).isEqualTo(200);
+                            var route=Map.of("name","Native route probe","enabled",true,"resourceKinds",List.of("pipeline"),"allResources",true,"resources",List.of(),"channels",List.of(Map.of("channelType","email","receivers",List.of("probe-receiver"))),"groupBy",List.of("RESOURCE"),"initialWaitSeconds",0);
+                            var savedRoute=post(client,root,"/api/alerts/configuration/save",token,Map.of("kind","SUBSCRIPTION","id","probe-route","etag","0","form",route));assertThat(savedRoute.statusCode()).as(savedRoute.body()).isEqualTo(200);
+                            var services=NativeAppStorage.business(application).getBean(PipelineAlertRuntime.class).managementServices();
+                            ((AlertNotificationPlanner)org.springframework.test.util.ReflectionTestUtils.getField(services.planner(),"planner")).tick();
+                            services.planner().tick();
+                            assertThat(services.store().deliveries(null,100,null,null,new io.tapstate.spi.store.AlertStore.ReadAccess(true,Set.of(),()->{})).rows()).isNotEmpty();
+                        }
                         java.nio.file.Files.writeString(directory.resolve("ready.json"),JsonWriter.write(Map.of("port",port,"smtpPort",smtp.port(),"smtpHost","localhost","clusterId",storage.clusterId(),"username","alert-operator","mode","actual-native-op","transport","real-local-tls-smtp")));
-                        long until=System.nanoTime()+Duration.ofMinutes(25).toNanos();while(!java.nio.file.Files.exists(directory.resolve("stop"))&&System.nanoTime()<until)Thread.sleep(100);
+                        long until=System.nanoTime()+Duration.ofMinutes(60).toNanos();while(!java.nio.file.Files.exists(directory.resolve("stop"))&&System.nanoTime()<until){if(java.nio.file.Files.exists(directory.resolve("recover"))&&!java.nio.file.Files.exists(directory.resolve("recovered"))){browserData.recover();java.nio.file.Files.createFile(directory.resolve("recovered"));}
+                            if(java.nio.file.Files.exists(directory.resolve("diagnostic"))&&!java.nio.file.Files.exists(directory.resolve("diagnostic-refreshed"))){browserData.refreshDiagnostic();java.nio.file.Files.createFile(directory.resolve("diagnostic-refreshed"));}Thread.sleep(100);}
                         java.nio.file.Files.writeString(directory.resolve("smtp-receipts.json"),JsonWriter.write(Map.of("count",smtp.bodies.size(),"sha256",smtp.bodies.stream().map(body->{try{return java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(body.getBytes(java.nio.charset.StandardCharsets.US_ASCII)));}catch(java.security.NoSuchAlgorithmException impossible){throw new AssertionError(impossible);}}).toList())));
                     }
                 }

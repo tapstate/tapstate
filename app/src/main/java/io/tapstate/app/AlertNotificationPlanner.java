@@ -97,7 +97,7 @@ final class AlertNotificationPlanner {
         var edits=new LinkedHashMap<DeliveryKey,AlertStore.IntentChange>();var schedules=new ArrayList<AlertStore.ScheduleChange>();
         var refs=new ArrayList<>(root.protectedIntents());var summaries=new LinkedHashMap<FrozenGroupPolicy.Member,AlertSchedule.Previous>();
         root.summaries().forEach(s->summaries.put(new FrozenGroupPolicy.Member(s.alarm(),s.episode()),s));
-        var current=new HashMap<FrozenGroupPolicy.Member,AlertStateRecord.Head>();for(var row:view.states())if(row.value().binding()!=null)current.put(row.value().binding().episodeMember(),row.value());
+        var current=new HashMap<FrozenGroupPolicy.Member,AlertStateRecord.Head>();for(var row:view.states())if(row.value().binding()!=null&&row.value().episode()!=null)current.put(row.value().binding().episodeMember(),row.value());
         var eligible=new ArrayList<AlertIntent.Member>();var remaining=new ArrayList<AlertIntent.Member>();var ended=new ArrayList<AlertIntent.Member>();
         for(var member:root.members()){
             var episode=episode(view,member);var head=current.get(member.episodeMember());
