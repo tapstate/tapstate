@@ -1013,6 +1013,18 @@ class PipelineApiTest {
         assertThat(fields.get("old")).isEqualTo(false);
         assertThat(fields.get("renamed")).isEqualTo("$old");
         assertThat(fields.get("computed")).isEqualTo("=1 + 1");
+
+        // The first write materializes source defaults. A projection-only echo must not change that configuration.
+        Map<String, Object> echo = new java.util.LinkedHashMap<>(replaced.getBody());
+        echo.put("outputTargets", Map.of("outputs", List.of(Map.of(
+                "element", "injected", "kind", "view", "connection", "tgt_x", "table", "not_configured",
+                "identity", "injected")), "unresolved", List.of()));
+        ResponseEntity<Map> echoed = client().put().uri("/api/pipelines/roundtrip")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.WRITE))
+                .header(HttpHeaders.IF_MATCH, replaced.getHeaders().getETag())
+                .contentType(MediaType.APPLICATION_JSON).body(echo).retrieve().toEntity(Map.class);
+        assertThat(echoed.getBody().get("contentHash")).isEqualTo(replaced.getBody().get("contentHash"));
+        assertThat(echoed.getBody().get("outputTargets")).isNull();
     }
 
     @Test
