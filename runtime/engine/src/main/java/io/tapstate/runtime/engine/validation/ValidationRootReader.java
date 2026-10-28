@@ -209,11 +209,35 @@ public final class ValidationRootReader {
 
     private ValidationRootReader() {}
 
+    /**
+     * A direct table pair has no filtering or transformation participation. Every returned source
+     * row requires a target root, including duplicated keys; duplicates never select a content winner.
+     * The caller must admit the complete physical queries and each returned row's actual key scope.
+     */
+    public static ValidationRootCheck readDirect(ValidationObservation observation, ValidationMethod method,
+            Query sourceQuery, Query targetQuery, ValidationRelationRows.Limits readLimits, Limits resultLimits,
+            Clock clock, Runnable requireAuthorized, Function<ValidationValues.Row, ValidationPhysicalIdentity> sourceIdentity,
+            Function<ValidationValues.Row, ValidationPhysicalIdentity> targetIdentity, ContentCheck content) {
+        Objects.requireNonNull(sourceIdentity, "sourceIdentity"); Objects.requireNonNull(targetIdentity, "targetIdentity");
+        return read(observation, method, sourceQuery, targetQuery, readLimits, resultLimits, clock, requireAuthorized,
+                row -> new Source(new ValidationRelationReader.Evaluation(ValidationRelationRows.Disposition.INCLUDED,
+                        row, Optional.of(sourceIdentity.apply(row))), List.of()),
+                row -> new Target(row, targetIdentity.apply(row)), content, true);
+    }
+
     /** Opens each cursor only when needed and authorized; the relation reader closes it on every exit. */
     public static ValidationRootCheck read(ValidationObservation observation, ValidationMethod method,
             Query sourceQuery, Query targetQuery, ValidationRelationRows.Limits readLimits, Limits resultLimits,
             Clock clock, Runnable requireAuthorized, Function<ValidationValues.Row, Source> sourceRule,
             Function<ValidationValues.Row, Target> targetRule, ContentCheck content) {
+        return read(observation, method, sourceQuery, targetQuery, readLimits, resultLimits, clock, requireAuthorized,
+                sourceRule, targetRule, content, false);
+    }
+
+    private static ValidationRootCheck read(ValidationObservation observation, ValidationMethod method,
+            Query sourceQuery, Query targetQuery, ValidationRelationRows.Limits readLimits, Limits resultLimits,
+            Clock clock, Runnable requireAuthorized, Function<ValidationValues.Row, Source> sourceRule,
+            Function<ValidationValues.Row, Target> targetRule, ContentCheck content, boolean direct) {
         Objects.requireNonNull(sourceQuery, "sourceQuery");
         Objects.requireNonNull(targetQuery, "targetQuery");
         Objects.requireNonNull(clock, "clock");
@@ -257,7 +281,8 @@ public final class ValidationRootReader {
                 root.finding(cause, sample(source.includedSamples().getFirst(), source.read()), Optional.empty())
                         .notCompared(Check.IDENTITY, whole, cause);
                 blockContent(root, whole, cause);
-                uncertainty.add(cause);
+                contentBlocked[0] = true;
+                if (!direct) uncertainty.add(cause);
             }
             if (!uncertainty.isEmpty()) {
                 root.bindOutcome(Participation.UNKNOWN, TargetPresence.NOT_READ);
@@ -273,11 +298,12 @@ public final class ValidationRootReader {
                         return new ValidationRelationReader.Evaluation(ValidationRelationRows.Disposition.INCLUDED,
                                 classified.working(), Optional.of(classified.physical()));
                     });
-            boolean shouldExist = source.unique().isPresent();
+            boolean shouldExist = direct ? !source.definitelyEmpty() : source.unique().isPresent();
             boolean exists = !target.definitelyEmpty();
             root.bindOutcome(shouldExist ? Participation.SHOULD_EXIST : Participation.SHOULD_NOT_EXIST,
                     exists ? TargetPresence.PRESENT : TargetPresence.ABSENT).read(Side.TARGET, target.read());
-            var sourceSample = source.unique().flatMap(row -> sample(row, source.read()));
+            var sourceSample = source.includedSamples().isEmpty() ? Optional.<SampledSide>empty()
+                    : sample(source.includedSamples().getFirst(), source.read());
             var targetSample = exists ? sample(target.includedSamples().getFirst(), target.read()) : Optional.<SampledSide>empty();
             if (target.atLeastTwo()) {
                 var cause = new Finding(Kind.TARGET_DUPLICATE, whole, Optional.of(new Multiplicity(target.included(), true)));
@@ -290,7 +316,7 @@ public final class ValidationRootReader {
             if (shouldExist != exists) root.finding(new Finding(shouldExist ? Kind.TARGET_MISSING : Kind.TARGET_EXTRA, whole), sourceSample, targetSample);
             root.checked(Check.IDENTITY).checked(Check.PARTICIPATION);
             if (shouldExist && exists) {
-                if (!target.atLeastTwo()) {
+                if (!source.atLeastTwo() && !target.atLeastTwo()) {
                     requireAuthorized.run();
                     content.check(new Pair(source.unique().orElseThrow(), source.read(), target.unique().orElseThrow(), target.read(),
                             Objects.requireNonNull(retainedSource[0], "unique source evidence")), root);

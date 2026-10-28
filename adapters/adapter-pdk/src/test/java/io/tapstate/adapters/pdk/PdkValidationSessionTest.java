@@ -4,6 +4,8 @@ import io.tapdata.entity.schema.TapTable;
 import io.tapdata.entity.schema.value.TapValue;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.validation.ValidationError;
+import io.tapstate.core.validation.ValidationKey;
+import io.tapstate.core.validation.ValidationKeyBinding;
 import io.tapstate.core.validation.ValidationValues;
 import io.tapstate.spi.store.ValidationRowCursor;
 import io.tapstate.spi.store.ValidationReadHandle;
@@ -74,7 +76,7 @@ class PdkValidationSessionTest {
                         codecs.registerToTapValue(Integer.class, (value, model) -> {
                             loader();
                             if (!(model instanceof TapNumber)) throw new IllegalStateException("missing model");
-                            return new TapStringValue(tag + ":" + value);
+                            return new TapStringValue(tag + ":" + (tag.equals("coalesce") && ((Integer)value) == 9 ? 7 : value));
                         });
                         f.supportQueryByAdvanceFilter((c, filter, table, consumer) -> {
                             loader(); count(c, "queries"); signal(c, "entered");
@@ -89,14 +91,21 @@ class PdkValidationSessionTest {
                                         || !new java.util.HashSet<>(filter.getProjection().getIncludeFields())
                                             .equals(java.util.Set.of("id", "nullable", "absent")))
                                     throw new IllegalStateException("missing necessary-field projection");
-                            } else if (filter.getProjection() != null)
+                            } else if (mode(c).equals("empty-match")) {
+                                if (filter.getMatch() != null) {
+                                    FilterResults empty = new FilterResults(); empty.setResults(List.of());
+                                    consumer.accept(empty); return;
+                                }
+                            } else if (!mode(c).equals("filtered-rows") && !mode(c).equals("lookup-tail-failure")
+                                    && filter.getProjection() != null)
                                 throw new IllegalStateException("unexpected full-row projection");
                             FilterResults result = new FilterResults();
                             Map<String, Object> row = new java.util.LinkedHashMap<>();
                             row.put("id", 7);
                             row.put("nullable", null);
                             row.put("opaque", new Object());
-                            result.setResults(List.of(row));
+                            result.setResults(mode(c).equals("filtered-rows")
+                                    ? List.of(Map.of("id",1), Map.of("id",7), Map.of("id",8), Map.of("id",9)) : List.of(row));
                             if (mode(c).equals("callback-thread")) {
                                 java.util.concurrent.CompletableFuture.runAsync(() -> consumer.accept(result)).get();
                             } else if ((mode(c).equals("swallow-callback") || mode(c).equals("swallow-then-throw") || mode(c).equals("swallow-then-fatal"))) {
@@ -106,6 +115,10 @@ class PdkValidationSessionTest {
                             } else if (mode(c).equals("many-batches")) {
                                 for (int i = 0; i < 64; i++) consumer.accept(result);
                             } else consumer.accept(result);
+                            if (mode(c).equals("lookup-tail-failure")) {
+                                while (!((CountDownLatch)c.getConnectionConfig().get("release")).await(10, TimeUnit.MILLISECONDS)) {}
+                                throw new Exception("lookup tail failed");
+                            }
                             if (mode(c).equals("block-query"))
                                 ((CountDownLatch) c.getConnectionConfig().get("release")).await();
                             if (mode(c).equals("abandon")) Thread.currentThread().interrupt();
@@ -121,9 +134,16 @@ class PdkValidationSessionTest {
                             signal(c, "entered");
                             while (!((CountDownLatch)c.getConnectionConfig().get("release")).await(10, TimeUnit.MILLISECONDS)) {}
                         }
+                        if (mode(c).equals("held-init")) {
+                            signal(c, "entered"); boolean released = false;
+                            while (!released) try {
+                                released = ((CountDownLatch)c.getConnectionConfig().get("release")).await(10, TimeUnit.MILLISECONDS);
+                            } catch (InterruptedException ignored) {}
+                        }
                     }
                     public void stop(TapConnectionContext c) {
-                        loader(); count(c, "stops"); signal(c, "release");
+                        loader(); count(c, "stops");
+                        if (!mode(c).equals("held-init")) signal(c, "release");
                         if (Thread.currentThread().isInterrupted()) count(c, "interruptedStops");
                         if (mode(c).equals("query-failure") || mode(c).equals("stop-failure"))
                             throw new IllegalStateException("cleanup failed");
@@ -176,6 +196,172 @@ class PdkValidationSessionTest {
             assertThat(cursor.next()).isEmpty();
         }
         assertThat(probe.queries).hasValue(1);
+    }
+
+    @Test void portableMetadataUsesItsOwnSessionAndNeverCallsTheBusinessQuery() throws Exception {
+        var probe = new Probe("metadata", "normal");
+        var retained = hashedArtifact();
+        var connection = new io.tapstate.spi.store.ConnectionConfig("input", "fixture", probe.settings());
+        try (var io = Executors.newSingleThreadExecutor();
+             var metadata = PdkValidationReads.inspect(connection, retained, "c".repeat(64), "records", List.of("id"),
+                     () -> {}, io, decodeIo, LIMITS)) {
+            var result = metadata.result();
+            assertThat(result.model().name()).isEqualTo("records");
+            assertThat(result.model().fields()).extracting(field -> field.name()).containsExactly("id");
+            assertThat(result.binding().modelVersion()).startsWith("pdk-validation-model-v1:");
+            assertThat(result.binding().codecBinding()).startsWith("pdk-validation-codecs-v1:");
+            metadata.close();
+            metadata.workersExited().toCompletableFuture().get(3, TimeUnit.SECONDS);
+            metadata.rowsReleased().toCompletableFuture().get(3, TimeUnit.SECONDS);
+        }
+        assertThat(probe.inits).hasValue(1); assertThat(probe.discoveries).hasValue(1);
+        assertThat(probe.queries).hasValue(0); assertThat(probe.stops.get()).isGreaterThanOrEqualTo(1);
+    }
+
+    @Test void aSavedModelMismatchIsRejectedBeforeAnyBusinessQuery() throws Exception {
+        var probe = new Probe("changed", "normal");
+        var connection = new io.tapstate.spi.store.ConnectionConfig("input", "fixture", probe.settings());
+        var keys = List.of(new io.tapstate.core.validation.ValidationKeyBinding.Component(List.of("id"),
+                io.tapstate.core.validation.ValidationKey.Kind.EXACT_NUMBER, java.util.Set.of("exact-number")));
+        try (var io = Executors.newSingleThreadExecutor();
+             var cursor = PdkValidationReads.scan(connection, hashedArtifact(), "c".repeat(64), "records",
+                     new PdkValidationReads.Binding("stale-model", "stale-codec"), keys, false,
+                     () -> {}, io, decodeIo, 2, LIMITS)) {
+            assertCode(cursor, ValidationError.INVALID_CONTRACT);
+        }
+        assertThat(probe.queries).hasValue(0);
+    }
+
+    @Test void aCustomKeyCodecCannotTurnAnUnprovedNativePredicateIntoAValidEmptyLookup() throws Exception {
+        var probe = new Probe("custom-key", "empty-match");
+        var connection = new io.tapstate.spi.store.ConnectionConfig("input", "fixture", probe.settings());
+        var retained = hashedArtifact();
+        var keys = List.of(new io.tapstate.core.validation.ValidationKeyBinding.Component(List.of("id"),
+                io.tapstate.core.validation.ValidationKey.Kind.EXACT_NUMBER, java.util.Set.of("exact-number")));
+        try (var io = Executors.newSingleThreadExecutor()) {
+            final PdkValidationReads.Binding binding;
+            try (var metadata = PdkValidationReads.inspect(connection, retained, "c".repeat(64), "records", List.of("id"),
+                    () -> {}, io, decodeIo, LIMITS)) {
+                binding = metadata.result().binding();
+            }
+            try (var lookup = PdkValidationReads.lookup(connection, retained, "c".repeat(64), "records", binding, keys,
+                    new ValidationKey(List.of(ValidationKey.Part.number(8))),
+                    false, () -> {}, io, decodeIo, 2, LIMITS)) {
+                var failed = catchThrowable(lookup::next);
+                assertThat(failed).isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(ValidationError.RULE_UNSUPPORTED));
+                assertThat(catchThrowable(lookup::next)).isSameAs(failed);
+            }
+        }
+        assertThat(probe.queries).hasValue(1);
+    }
+
+    @Test void anIndependentCompleteRereadMatchesTheCustomLogicalKeyWithoutGuessingItsInverse() throws Exception {
+        var probe = new Probe("custom-key", "empty-match");
+        var connection = new io.tapstate.spi.store.ConnectionConfig("input", "fixture", probe.settings());
+        var retained = hashedArtifact();
+        var keys = List.of(new ValidationKeyBinding.Component(List.of("id"),ValidationKey.Kind.TEXT,java.util.Set.of("text")));
+        try (var io = Executors.newSingleThreadExecutor()) {
+            final PdkValidationReads.Binding binding;
+            try (var metadata = PdkValidationReads.inspect(connection, retained, "c".repeat(64), "records", List.of("id"),
+                    () -> {}, io, decodeIo, LIMITS)) {
+                binding = metadata.result().binding();
+            }
+            try (var lookup = PdkValidationReads.lookup(connection, retained, "c".repeat(64), "records", binding, keys,
+                    new ValidationKey(List.of(ValidationKey.Part.text("custom-key:7"))),false,
+                    () -> {}, io, decodeIo, 2, LIMITS)) {
+                try (var row = lookup.next().orElseThrow()) {
+                    var actual = (ValidationValues.Typed)row.values().fields().get("id");
+                    assertThat(actual.value()).isEqualTo("custom-key:7");
+                    assertThat(actual.conversionOrigin()).isEqualTo("custom");
+                }
+                assertThat(lookup.next()).isEmpty();
+            }
+        }
+        assertThat(probe.queries).hasValue(1);
+    }
+
+    @Test void logicalLookupDeliveryOrdinalsRemainDenseAcrossSkippedAndCoalescedNativeRows() throws Exception {
+        var probe = new Probe("coalesce", "filtered-rows");
+        var connection = new io.tapstate.spi.store.ConnectionConfig("input", "fixture", probe.settings());
+        var retained = hashedArtifact();
+        var keys = List.of(new ValidationKeyBinding.Component(List.of("id"),ValidationKey.Kind.TEXT,java.util.Set.of("text")));
+        try (var io = Executors.newSingleThreadExecutor()) {
+            final PdkValidationReads.Binding binding;
+            try (var metadata = PdkValidationReads.inspect(connection, retained, "c".repeat(64), "records", List.of("id"),
+                    () -> {}, io, decodeIo, LIMITS)) {
+                binding = metadata.result().binding();
+            }
+            try (var lookup = PdkValidationReads.lookup(connection, retained, "c".repeat(64), "records", binding, keys,
+                    new ValidationKey(List.of(ValidationKey.Part.text("coalesce:7"))),false,
+                    () -> {}, io, decodeIo, 2, LIMITS)) {
+                for (long expected : List.of(0L, 1L)) {
+                    try (var row = lookup.next().orElseThrow()) {assertThat(row.ordinal()).isEqualTo(expected);}
+                }
+                assertThat(lookup.next()).isEmpty();
+            }
+        }
+        assertThat(probe.queries).hasValue(1);
+    }
+
+    @Test void aStartedSubmissionWithAnUnknownReplyKeepsItsObservableLifetimeHandle() throws Exception {
+        var probe = new Probe("held", "held-init");
+        var unknown = new IllegalStateException("fixture submission reply unknown");
+        var keys = List.of(new ValidationKeyBinding.Component(List.of("id"),ValidationKey.Kind.EXACT_NUMBER,java.util.Set.of("exact-number")));
+        var connection = new io.tapstate.spi.store.ConnectionConfig("input", "fixture", probe.settings());
+        var io = new java.util.concurrent.ThreadPoolExecutor(1,1,0,TimeUnit.MILLISECONDS,new java.util.concurrent.LinkedBlockingQueue<>()) {
+            @Override public void execute(Runnable command) {
+                super.execute(command);
+                try { assertThat(probe.entered.await(3,TimeUnit.SECONDS)).isTrue(); }
+                catch (InterruptedException interrupted) {Thread.currentThread().interrupt();throw new AssertionError(interrupted);}
+                throw unknown;
+            }
+        };
+        try (io; var reader = PdkValidationReads.scan(connection,hashedArtifact(),"c".repeat(64),"records",
+                new PdkValidationReads.Binding("unused-model","unused-codec"),keys,false,
+                () -> {},io,decodeIo,2,LIMITS)) {
+            try {
+            assertThat(probe.inits).hasValue(0);
+            assertThat(catchThrowable(reader::next)).isSameAs(unknown);
+            assertThat(reader.workersExited().toCompletableFuture().isDone()).isFalse();
+            assertThat(reader.rowsReleased().toCompletableFuture().isDone()).isTrue();
+            assertThat(catchThrowable(reader::next)).isSameAs(unknown);
+            probe.release.countDown();
+            reader.workersExited().handle((ignored,failed)->null).toCompletableFuture().get(3,TimeUnit.SECONDS);
+            assertThat(probe.queries).hasValue(0);
+            } finally {probe.release.countDown();}
+        }
+    }
+
+    @Test void aMatchedLogicalRowCannotHideAFailingNativeQueryTail() throws Exception {
+        var probe = new Probe("tail", "lookup-tail-failure");
+        var connection = new io.tapstate.spi.store.ConnectionConfig("input","fixture",probe.settings());
+        var retained = hashedArtifact(); var tail = new CountDownLatch(1);
+        var keys = List.of(new ValidationKeyBinding.Component(List.of("id"),ValidationKey.Kind.TEXT,java.util.Set.of("text")));
+        try (var io = Executors.newSingleThreadExecutor()) {
+            final PdkValidationReads.Binding binding;
+            try (var metadata = PdkValidationReads.inspect(connection,retained,"c".repeat(64),"records",List.of("id"),
+                    () -> {},io,decodeIo,LIMITS)) {binding=metadata.result().binding();}
+            var controlled = new java.util.LinkedHashMap<>(probe.settings());controlled.put("release",tail);
+            var actual = new io.tapstate.spi.store.ConnectionConfig("input","fixture",controlled);
+            try (var lookup = PdkValidationReads.lookup(actual,retained,"c".repeat(64),"records",binding,keys,
+                    new ValidationKey(List.of(ValidationKey.Part.text("tail:7"))),false,() -> {},io,decodeIo,2,LIMITS)) {
+                try {
+                    lookup.next().orElseThrow().close();tail.countDown();
+                    var failed=catchThrowable(lookup::next);
+                    assertThat(failed).isInstanceOfSatisfying(TapstateException.class,
+                            error->assertThat(error.code()).isEqualTo(ValidationError.READ_FAILED));
+                    assertThat(catchThrowable(lookup::next)).isSameAs(failed);
+                } finally {tail.countDown();}
+            }
+        }
+    }
+
+    private static ConnectorRef hashedArtifact() throws Exception {
+        var bytes = java.nio.file.Files.readAllBytes(artifact.classpath().getFirst());
+        var hash = java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(bytes));
+        return new ConnectorRef(artifact.classpath(), artifact.className(), artifact.pdkApiVersion(), artifact.requiredLevel(),
+                artifact.spec(), hash, artifact.shareSafe());
     }
 
     @Test void fullRowReadKeepsExtraFieldsVisibleToAdmissionAndDecoder() {

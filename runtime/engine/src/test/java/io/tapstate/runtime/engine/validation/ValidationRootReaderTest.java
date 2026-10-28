@@ -75,6 +75,64 @@ class ValidationRootReaderTest {
         assertThat(result.checks().values()).containsOnly(Status.BLOCKED);
     }
 
+    @Test void directRootsConsumeBothCompleteSidesWithoutChoosingADuplicateWinner() {
+        for (var method : List.of(ValidationMethod.UNIQUE_KEY, ValidationMethod.FULL_COLUMN)) {
+            var source = new Cursor(Collections.nCopies(2, row(Map.of("id", 7))));
+            var target = new Cursor(Collections.nCopies(3, row(Map.of("id", 7))));
+            var result = ValidationRootReader.readDirect(observation(), method,
+                    new ValidationRootReader.Query("source", "complete", source::open),
+                    new ValidationRootReader.Query("target", "complete", target::open), READ, RESULT, CLOCK, () -> {},
+                    row -> identity("source"), row -> identity("target"), (pair, root) -> fail("ambiguous content"));
+            assertThat(source.rowsClosed).isEqualTo(2);
+            assertThat(target.rowsClosed).isEqualTo(3);
+            assertThat(result.reads()).hasSize(2);
+            assertThat(result.participation()).isEqualTo(ValidationCheckEvent.Participation.SHOULD_EXIST);
+            assertThat(result.counts()).containsExactlyInAnyOrderEntriesOf(Map.of(Kind.SOURCE_DUPLICATE, 1L, Kind.TARGET_DUPLICATE, 1L));
+            assertThat(result.findings().keySet()).anySatisfy(finding -> {
+                assertThat(finding.kind()).isEqualTo(Kind.TARGET_DUPLICATE);
+                assertThat(finding.multiplicity()).contains(new Multiplicity(3, true));
+            });
+            assertThat(result.observedAgreement()).isFalse();
+        }
+    }
+
+    @Test void directDuplicateSourcesStillRequireATargetWithoutComparingAmbiguousContent() {
+        for (var method : List.of(ValidationMethod.UNIQUE_KEY, ValidationMethod.FULL_COLUMN)) {
+            for (int targetCount : List.of(0, 1)) {
+                var source = new Cursor(Collections.nCopies(2, row(Map.of("id", 7))));
+                var target = new Cursor(Collections.nCopies(targetCount, row(Map.of("id", 7))));
+                var result = direct(source, target, method, () -> {}, (pair, root) -> fail("ambiguous content"));
+                assertThat(result.participation()).isEqualTo(ValidationCheckEvent.Participation.SHOULD_EXIST);
+                assertThat(result.targetPresence()).isEqualTo(targetCount == 0 ? TargetPresence.ABSENT : TargetPresence.PRESENT);
+                assertThat(result.counts()).containsEntry(Kind.SOURCE_DUPLICATE, 1L);
+                assertThat(result.counts().containsKey(Kind.TARGET_MISSING)).isEqualTo(targetCount == 0);
+                assertThat(result.checks()).containsEntry(Check.PARTICIPATION, Status.COMPLETE).containsEntry(Check.STRUCTURE, Status.BLOCKED);
+                assertThat(result.reads()).hasSize(2);
+                assertThat(target.rowsClosed).isEqualTo(targetCount);
+            }
+        }
+    }
+
+    @Test void aDirectTargetsLateFailureCannotPublishAPartialDuplicateObservation() {
+        var source = new Cursor(Collections.nCopies(2, row(Map.of("id", 7))));
+        var target = new Cursor(Collections.nCopies(3, row(Map.of("id", 7))));
+        var failed = failure(ValidationError.READ_FAILED); target.endFailure = failed;
+        assertThat(catchThrowable(() -> direct(source, target, ValidationMethod.FULL_COLUMN, () -> {},
+                (pair, root) -> fail("failed content")))).isSameAs(failed);
+        assertThat(source.rowsClosed).isEqualTo(2); assertThat(target.rowsClosed).isEqualTo(3);
+        assertThat(source.closed && target.closed).isTrue();
+    }
+
+    @Test void directDuplicateClassificationDoesNotAuthorizeATargetReadAfterAuthorityLoss() {
+        var source = new Cursor(Collections.nCopies(2, row(Map.of("id", 7))));
+        var target = new Cursor(Collections.nCopies(3, row(Map.of("id", 7))));
+        var authorized = new AtomicBoolean(true); source.afterClose = () -> authorized.set(false);
+        var lost = failure(ValidationError.OWNER_NOT_AUTHORIZED);
+        assertThat(catchThrowable(() -> direct(source, target, ValidationMethod.FULL_COLUMN,
+                () -> { if (!authorized.get()) throw lost; }, (pair, root) -> fail("unauthorized content")))).isSameAs(lost);
+        assertThat(source.closed).isTrue(); assertThat(target.opened).isZero();
+    }
+
     @Test void unknownParticipationKeepsOriginalSamplesCountsAndScopeInsteadOfReportingTargetExtra() {
         var source = new Cursor(Collections.nCopies(50, row(Map.of("id", 7))));
         var target = new Cursor(List.of(row(Map.of("id", 7))));
@@ -433,6 +491,12 @@ class ValidationRootReaderTest {
     }
     private static ValidationRootCheck read(Cursor source, Cursor target, Function<ValidationValues.Row, ValidationRootReader.Source> rule, ValidationRootReader.ContentCheck content) {
         return read(source, target, rule, content, ValidationMethod.FULL_COLUMN, RESULT, () -> {});
+    }
+    private static ValidationRootCheck direct(Cursor source, Cursor target, ValidationMethod method,
+            Runnable authority, ValidationRootReader.ContentCheck content) {
+        return ValidationRootReader.readDirect(observation(), method, new ValidationRootReader.Query("source", "complete", source::open),
+                new ValidationRootReader.Query("target", "complete", target::open), READ, RESULT, CLOCK, authority,
+                row -> identity("source"), row -> identity("target"), content);
     }
     private static ValidationRootCheck read(Cursor source, Cursor target, Function<ValidationValues.Row, ValidationRootReader.Source> rule,
             ValidationRootReader.ContentCheck content, ValidationMethod method, Limits limits, Runnable authority) {

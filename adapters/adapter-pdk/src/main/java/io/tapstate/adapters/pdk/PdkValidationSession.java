@@ -49,12 +49,25 @@ final class PdkValidationSession {
         Map<String, ?> encode(TapTable model, PdkValidationCodecs codecs, ValidationKey logicalKey);
     }
 
-    sealed interface Request permits Scan, Lookup {
+    sealed interface Request permits Scan, Lookup, Metadata {
         String table();
         List<String> ascendingKeys();
         List<String> projection();
         int batchSize();
         default List<String> matchFields() { return List.of(); }
+    }
+
+    /** Uses the same independent discovery/type binding without invoking a business query. */
+    private record Metadata(String table, List<String> projection) implements Request {
+        private Metadata {
+            Objects.requireNonNull(table, "table"); projection = List.copyOf(projection);
+            if (table.isBlank() || table.length() > 512 || projection.size() > 4096
+                    || projection.stream().anyMatch(field -> field.isBlank() || field.length() > 512)
+                    || projection.stream().distinct().count() != projection.size())
+                throw new IllegalArgumentException("invalid independent metadata shape");
+        }
+        @Override public List<String> ascendingKeys() { return List.of(); }
+        @Override public int batchSize() { return 1; }
     }
 
     /** Empty projection reads the complete row; a nonempty projection lists literal physical fields. */
@@ -174,6 +187,18 @@ final class PdkValidationSession {
         return session.open(io, maxInFlightRows, rowLimits);
     }
 
+    static ValidationReadHandle inspect(String connectorId, ConnectorRef artifact, Map<String, Object> settings,
+            String table, List<String> projection, Consumer<TapTable> capture, Runnable requireAuthorized,
+            ExecutorService io, ExecutorService decodeIo, ValidationValues.Limits rowLimits) {
+        if (io == decodeIo) throw new IllegalArgumentException("query and decoding require distinct executors");
+        var session = new PdkValidationSession(connectorId, artifact, settings, "independent-metadata-v1",
+                new Metadata(table, projection), (model, codecs) -> {
+                    capture.accept(model);
+                    return raw -> { throw new IllegalStateException("metadata discovery cannot deliver a business row"); };
+                }, null, requireAuthorized, decodeIo);
+        return session.open(io, 1, rowLimits);
+    }
+
     private ValidationReadHandle open(ExecutorService io, int maxInFlightRows, ValidationValues.Limits rowLimits) {
         var cursor = new PdkValidationCursor(scan.table(), this::read, row -> decoder.decode(project(row)),
                 this::checkActive, this::cancel, io, maxInFlightRows, rowLimits, queryCancellation);
@@ -233,6 +258,7 @@ final class PdkValidationSession {
                     return decoded;
                 };
                 checkAlive(opened);
+                if (scan instanceof Metadata) return null;
                 TapAdvanceFilter filter = TapAdvanceFilter.create().batchSize(scan.batchSize());
                 for (String key : scan.ascendingKeys()) filter.sort(SortOn.ascending(key));
                 if (scan instanceof Lookup lookup) filter.match(match(model, codecs, lookup));
