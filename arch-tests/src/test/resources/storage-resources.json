@@ -519,6 +519,36 @@
         "Validation generation/revision, original scope/preparationId, optional closingOperationId and one nonrecursive proven-closed predecessor are retained within 8 KiB per Pipeline. Closing gates admissions before final CLOSED; issued unborn CACHE work requires an original cancellation/retirement receipt.",
         "Same-ID recreation and explicit Cluster CACHE recovery reuse their verified original lifecycle paths. Normal production stop/start or full rebuild does not reset validation authority; old queries and reports cannot regain rights."
       ]
+    },
+    "session-record-recovery-v1": {
+      "goal": "Retain existing standalone and Cloud session records and Cloud revocation markers across process restarts; a missing optional email remains readable.",
+      "entry": "Read the original session from the existing store after restart or restore a matching legacy backup; a missing or expired session requires a new login.",
+      "prerequisites": [
+        "The original sessions collection and matching deployment identity remain available or are restored from a matching legacy backup.",
+        "Authentication requires the matching browser credential, the persisted secret hash, an unrevoked record and a valid idle deadline.",
+        "A backup cannot establish revocations made after it was taken; the feature does not reconstruct those later revocations."
+      ]
+    },
+    "existing-operator-state-missing-objects-v1": {
+      "goal": "Recover existing keyed operator state and retain responsibility for object references absent from the last emitted root document.",
+      "entry": "Resume the existing operator namespace and root key using its stored RootAssembly, matching lookup rows, reverse references and source positions; re-evaluate old serialized bytes that have no missing-reference field.",
+      "prerequisites": [
+        "The same configured operator-state database, namespace and root identity remain available.",
+        "Each sparse missing-reference entry names its stable slot path, lookup namespace and composite key.",
+        "Snapshot completion is scoped to the source generation and all producers and lookup partitions; an old generation cannot settle a new load.",
+        "Old serialized bytes mean pending re-determination, not an already-complete root; no state reset or forced reload substitutes for compatible recovery."
+      ]
+    },
+    "cache-nest-missing-objects-v1": {
+      "goal": "Continue only from complete original durable Nest state, including responsibility for missing object references; otherwise require explicitly scoped recovery.",
+      "entry": "Original runtime restart using its stored RootAssembly, matching lookup rows, reverse references and original source positions in the same admitted CACHE placement; storage.recovery.plan/confirm remains the only admitted rebuild entry.",
+      "prerequisites": [
+        "Original CACHE identity, membership, full claim/fence and model/checkpoint closure are intact for continuation.",
+        "Loss does not mint creation rights; isolate old writers and confirm source, model, target and scope before rebuilding.",
+        "Each sparse missing-reference entry contains its stable slot path, lookup namespace and composite key, stored alongside the root emitted state.",
+        "Snapshot completion is scoped to the source generation and all producers and lookup partitions; an old generation cannot settle a new load.",
+        "Older serialized RootAssembly bytes without this optional field mean pending re-determination; no reset, forced reload or automatic creation substitutes for compatible recovery."
+      ]
     }
   },
   "consistencyProfiles": {
@@ -577,6 +607,18 @@
     "validation-cache-r3": {
       "atomicDomain": "CACHE",
       "fencing": "The original complete VALIDATION claim fence and fixed CacheBusinessScope compete with the Pipeline control, mode slots and stop latch in one CACHE client/session. A valid NODE_SESSION and an original independent CONFIG capability authorize first birth, with CONFIG checks outside the CACHE retry callback. First birth and cancellation serialize on one control key with PREPARED/CANCELLED/RETIRED receipts. A closed predecessor is replaced only by exact generation/preparation/revision CAS while retaining known claim counters. No production claim/state is borrowed; no CONFIG/CACHE atomic transaction is claimed."
+    },
+    "session-record-write-v1": {
+      "atomicDomain": "STORE: one sessions collection document per session or revocation marker.",
+      "fencing": "Managed sessions use a unique deployment and JWT identity and insert-only creation; authentication and logout use conditional single-document updates, while signed callbacks retain deny markers. Standalone session keys use a distinct key type."
+    },
+    "existing-single-root-write": {
+      "atomicDomain": "Existing keyed operator-state write for one namespace and root key; no additional collection or cross-key transaction.",
+      "fencing": "Keep existing owner and source-order rules. Record missing identities with the missing-object emission and clear or recompute them on completion, retargeting, root deletion and subsequent root output. Source progress cannot substitute for target confirmation."
+    },
+    "cache-nest-single-root-v1": {
+      "atomicDomain": "CACHE",
+      "fencing": "CACHE, one original operator placement namespace and root key; the existing serialized RootAssembly is replaced with its sparse reference set in the same row. No new collection, cross-key or cross-domain transaction. Same CACHE client/session with original identity and resource-specific guard/revision. Ownership-protected writes additionally compete with the full live claim; CONFIG cannot supply a CACHE fence. Record missing identities with the missing-object emission; clear or recompute on completion, retargeting, root deletion and subsequent output. Source progress does not substitute for target confirmation."
     }
   },
   "resources": [
@@ -895,25 +937,31 @@
     {
       "id": "mongo.store.sessions",
       "resourceVersion": 1,
-      "proposalVersion": 1,
+      "proposalVersion": 2,
       "kind": "COLLECTION",
       "layer": "LEGACY",
       "database": "STORE",
       "physicalNames": [
         "sessions"
       ],
-      "responsibility": "Legacy session records.",
+      "responsibility": "Store standalone and Cloud session records and revocation markers; Cloud session context may contain the verified login-time email.",
       "writers": [
-        "io.tapstate.adapters.mongostore.MongoAuthStores"
+        "io.tapstate.adapters.mongostore.MongoAuthStores",
+        "io.tapstate.adapters.mongostore.MongoCloudSessionStore",
+        "io.tapstate.adapters.mongostore.MongoSessionStore"
       ],
       "readers": [
-        "io.tapstate.adapters.mongostore.MongoAuthStores"
+        "io.tapstate.adapters.mongostore.MongoAuthStores",
+        "io.tapstate.adapters.mongostore.MongoCloudSessionStore",
+        "io.tapstate.adapters.mongostore.MongoSessionStore"
       ],
-      "recovery": "legacy-preserve",
-      "consistency": "legacy",
-      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "recovery": "session-record-recovery-v1",
+      "consistency": "session-record-write-v1",
+      "growth": "One optional email value per Cloud session; records grow with session creation. Idle expiry and revocation do not delete records or erase email, and the collection has no TTL cleanup.",
       "evidence": [
-        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCloudSessionStoreTest.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCloudSessionStoreIT.java"
       ]
     },
     {
@@ -1184,25 +1232,29 @@
     {
       "id": "mongo.nest.operator_state",
       "resourceVersion": 1,
-      "proposalVersion": 1,
+      "proposalVersion": 2,
       "kind": "COLLECTION",
       "layer": "LEGACY",
       "database": "NEST",
       "physicalNames": [
         "operator_state"
       ],
-      "responsibility": "Legacy mixed operator/connector state.",
+      "responsibility": "Retain existing keyed operator state; RootAssembly additionally carries a v1 sparse set of slot paths, lookup namespaces and composite keys still absent from its last emitted document.",
       "writers": [
-        "io.tapstate.adapters.mongostore.MongoKeyedStateStore"
+        "io.tapstate.adapters.mongostore.MongoKeyedStateStore",
+        "io.tapstate.runtime.engine.nest.AssemblerProcessor"
       ],
       "readers": [
-        "io.tapstate.adapters.mongostore.MongoKeyedStateStore"
+        "io.tapstate.adapters.mongostore.MongoKeyedStateStore",
+        "io.tapstate.runtime.engine.nest.AssemblerProcessor"
       ],
-      "recovery": "legacy-preserve",
-      "consistency": "legacy",
-      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "recovery": "existing-operator-state-missing-objects-v1",
+      "consistency": "existing-single-root-write",
+      "growth": "Existing operator-state growth is retained. The added sparse set is proportional to currently missing references of a root, stores no copied customer rows, and is cleared or recomputed when references complete, change or disappear.",
       "evidence": [
-        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+        "runtime/engine/src/main/java/io/tapstate/runtime/engine/nest/RootAssembly.java",
+        "runtime/engine/src/main/java/io/tapstate/runtime/engine/nest/AssemblerProcessor.java",
+        "arch-tests/src/test/java/io/tapstate/archtests/NestStateSerialFormGatesTest.java"
       ]
     },
     {
@@ -2540,25 +2592,28 @@
     {
       "id": "mongo.cache.nest_state",
       "resourceVersion": 1,
-      "proposalVersion": 1,
+      "proposalVersion": 2,
       "kind": "COLLECTION",
       "layer": "CACHE",
       "database": "CACHE",
       "physicalNames": [
         "nest_state"
       ],
-      "responsibility": "Write-through Nest payload state including pending parent state.",
+      "responsibility": "Write-through Nest payload state including pending parents and a v1 sparse set of slot paths, lookup namespaces and composite keys absent from the last emitted root document.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoCacheOperatorStateStore"
       ],
       "readers": [
         "io.tapstate.adapters.mongostore.MongoCacheOperatorStateStore"
       ],
-      "recovery": "runtime-state",
-      "consistency": "cache",
-      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "recovery": "cache-nest-missing-objects-v1",
+      "consistency": "cache-nest-single-root-v1",
+      "growth": "Existing Nest state growth and storage limits are retained. The added set is proportional to currently missing references of each root, contains identities rather than copied customer rows, and is cleared or recomputed after completion, retargeting, deletion or subsequent root output; no extra per-event or per-run history.",
       "evidence": [
-        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCacheOperatorStateStoreIT.java"
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCacheOperatorStateStoreIT.java",
+        "runtime/engine/src/main/java/io/tapstate/runtime/engine/nest/RootAssembly.java",
+        "runtime/engine/src/main/java/io/tapstate/runtime/engine/nest/AssemblerProcessor.java",
+        "arch-tests/src/test/java/io/tapstate/archtests/NestStateSerialFormGatesTest.java"
       ]
     },
     {
