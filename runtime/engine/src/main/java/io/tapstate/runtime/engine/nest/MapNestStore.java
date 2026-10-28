@@ -158,6 +158,20 @@ final class MapNestStore<S> implements NestStore<S> {
         publishReading();
     }
 
+    /** Lookup rows have distinct keys and are small independent values, never assembled documents. */
+    @Override
+    public void saveAll(Map<Object, S> states, Set<Object> firstFilings) {
+        if (states.isEmpty()) return;
+        if (states.size() == 1) {
+            Map.Entry<Object, S> only = states.entrySet().iterator().next();
+            save(only.getKey(), only.getValue(), firstFilings.contains(only.getKey()));
+            return;
+        }
+        states.keySet().forEach(ignored -> countAccess());
+        map.setAll(states);
+        publishReading();
+    }
+
     /**
      * Grows the set at its own key rather than across the map, the same way a state is written: what
      * travels is the one element being added, so registering a row costs the same whether it is the first

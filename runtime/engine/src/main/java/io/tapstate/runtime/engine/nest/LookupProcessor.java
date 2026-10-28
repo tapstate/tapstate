@@ -7,6 +7,7 @@ import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.Watermark;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.PayloadBytes;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.Staged;
 import io.tapstate.runtime.engine.LevelBounds;
@@ -49,6 +50,9 @@ import java.util.Set;
  */
 final class LookupProcessor extends AbstractProcessor implements Staged {
 
+    static final int ROW_BATCH_LIMIT = 16;
+    private static final long ROW_BATCH_BYTES = 8L * 1024 * 1024;
+
     @Override
     public Stage stage() {
         return Stage.NEST;
@@ -74,6 +78,7 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
     private final long referrersAllowed;
     private final LevelBounds bounds;
     private final Queue<Object> outgoing = new ArrayDeque<>();
+    private final Queue<FiledRow> filedRows = new ArrayDeque<>();
     // The highest position per chain among the rows this drain filed that woke nothing, folded as they are
     // met and said in one word when the drain ends. Kept across a drain that stopped early on a full
     // outbox: the word is queued at the end of a later drain, or where the next bound is passed on.
@@ -135,6 +140,10 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
         if (!flush()) {
             return;
         }
+        if (ordinal == ROWS) {
+            processRows(inbox);
+            return;
+        }
         Set<Object> filed = switch (ordinal) {
             case ROWS -> filedKeysIn(inbox, lookup.partitionKey());
             case REGISTRATIONS -> filedKeysIn(inbox, lookup.referenceFields());
@@ -159,6 +168,84 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
         flush();
     }
 
+    private void processRows(Inbox inbox) {
+        while (!inbox.isEmpty()) {
+            if (filedRows.isEmpty() && inbox.peek() instanceof SettledPositions settled) {
+                SettledPositions.fold(owingNothing, settled.positions());
+                inbox.remove();
+                continue;
+            }
+            Map<Object, Set<Object>> buckets;
+            if (filedRows.isEmpty()) {
+                buckets = fileRows(inbox);
+            } else {
+                // Registrations may have run while backpressure held the previous invocation. Only the
+                // acknowledged writes and first-filing flags survive that yield, never the refs snapshot.
+                buckets = referencesFor(filedRows);
+            }
+            while (!filedRows.isEmpty()) {
+                FiledRow filed = filedRows.peek();
+                if (inbox.peek() != filed.event()) {
+                    throw new IllegalStateException("the inbox changed before its filed rows were consumed");
+                }
+                wake(filed.key(), filed.event(), filed.firstFiling(), buckets);
+                inbox.remove();
+                filedRows.remove();
+                if (!flush()) return;
+            }
+        }
+        sayWhatOwesNothing();
+        flush();
+    }
+
+    private Map<Object, Set<Object>> fileRows(Inbox inbox) {
+        List<RowArrival> arrivals = nextRows(inbox);
+        Map<Object, Map<String, Object>> states = new LinkedHashMap<>();
+        for (RowArrival arrival : arrivals) {
+            states.put(arrival.key(), NestKeys.isDeletion(arrival.event())
+                    ? NestLookup.gone() : NestKeys.rowOf(arrival.event()));
+        }
+        Set<Object> firstFilings = new LinkedHashSet<>(states.keySet());
+        firstFilings.removeAll(store.loadAll(states.keySet()).keySet());
+        List<FiledRow> batch = arrivals.stream().map(arrival -> new FiledRow(
+                arrival.event(), arrival.key(), firstFilings.contains(arrival.key()))).toList();
+        Map<Object, Set<Object>> buckets = referencesFor(batch);
+        // A partial durable write failure leaves every input queued and publishes no positions.
+        store.saveAll(states, firstFilings);
+        filedRows.addAll(batch);
+        return buckets;
+    }
+
+    private List<RowArrival> nextRows(Inbox inbox) {
+        List<RowArrival> rows = new ArrayList<>();
+        Set<List<Object>> keys = new LinkedHashSet<>();
+        long bytes = 0;
+        for (Object item : inbox) {
+            if (item instanceof SettledPositions || rows.size() >= ROW_BATCH_LIMIT) break;
+            Envelope event = (Envelope) item;
+            List<Object> key = NestKeys.valuesOf(NestKeys.rowOf(event), lookup.partitionKey(), lookup.mapName());
+            if (keys.contains(key)) break;
+            // This bounds logical row payload as well as count; it is not a measurement of heap use.
+            long eventBytes = PayloadBytes.of(event);
+            if (!rows.isEmpty() && eventBytes > ROW_BATCH_BYTES - bytes) break;
+            rows.add(new RowArrival(event, key));
+            keys.add(key);
+            bytes += eventBytes;
+        }
+        return rows;
+    }
+
+    private record RowArrival(Envelope event, List<Object> key) { }
+
+    private Map<Object, Set<Object>> referencesFor(Collection<FiledRow> rows) {
+        Set<Object> keys = new LinkedHashSet<>();
+        for (FiledRow row : rows) keys.addAll(bucketsOf(row.key()));
+        return references.loadAll(keys);
+    }
+
+    /** Input envelopes remain in the inbox until their durable writes and ordered wakes have completed. */
+    private record FiledRow(Envelope event, List<Object> key, boolean firstFiling) { }
+
     /** Drains queued wakes and settlements even when no further row arrives after backpressure. */
     @Override
     public boolean tryProcess() {
@@ -168,6 +255,7 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
 
     @Override
     public boolean complete() {
+        if (!filedRows.isEmpty()) return false;
         return tryProcess();
     }
 
@@ -272,7 +360,16 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
      * it would have cost a read of every bucket per row of the pointing stream.
      */
     private void wake(List<Object> key, Envelope event, boolean firstFiling) {
-        Collection<Set<Object>> buckets = references.loadAll(bucketsOf(key)).values();
+        wake(key, event, firstFiling, references.loadAll(bucketsOf(key)));
+    }
+
+    private void wake(List<Object> key, Envelope event, boolean firstFiling,
+            Map<Object, Set<Object>> prefetched) {
+        List<Set<Object>> buckets = new ArrayList<>();
+        for (Object bucketKey : bucketsOf(key)) {
+            Set<Object> bucket = prefetched.get(bucketKey);
+            if (bucket != null) buckets.add(bucket);
+        }
         long referrers = 0;
         for (Set<Object> bucket : buckets) {
             referrers += bucket.size();
@@ -434,6 +531,7 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
      */
     @Override
     public boolean tryProcessWatermark(int ordinal, Watermark watermark) {
+        if (ordinal == ROWS && !filedRows.isEmpty()) return false;
         if (bounds == null || ordinal != ROWS) {
             return true;
         }

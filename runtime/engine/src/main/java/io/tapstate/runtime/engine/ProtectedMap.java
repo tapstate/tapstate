@@ -94,6 +94,14 @@ public final class ProtectedMap<K, V> {
         });
     }
 
+    /** Only for idempotent replacement batches whose callers retain their inputs on partial failure. */
+    public void setAll(Map<K, V> values) {
+        waitingOut(() -> {
+            map.setAll(values);
+            return null;
+        });
+    }
+
     public V put(K key, V value) {
         return waitingOut(() -> map.put(key, value));
     }

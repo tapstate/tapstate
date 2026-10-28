@@ -64,6 +64,66 @@ class ANestFirstFilingPublishesEachDocumentOnceIT {
 
     @ParameterizedTest
     @EnumSource(Tiers.class)
+    void customersReadFirstFromOneSourceStillReachOrdersAfterCdcAndRestart(Tiers tier) throws Exception {
+        String suffix = tier.name().toLowerCase(Locale.ROOT);
+        Map<String, Object> mysql = SharedMySql.settings("nest_customer_first_" + suffix);
+        seed(mysql);
+        String pipelineId = "customer_first_" + suffix;
+        String storeUri = SharedMongo.replicaSetUrl("nest_customer_first_store_" + suffix);
+        String targetUri = SharedMongo.replicaSetUrl("nest_customer_first_target_" + suffix);
+        try (ServerHandle server = tier.launch(storeUri); MongoEndpoints mongo = new MongoEndpoints()) {
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            control.bootstrapAndLogin("e2e", "e2e-password");
+            control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
+            control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+            Map<String, String> resources = new LinkedHashMap<>();
+            resources.put("src_all.tap.yml", sourceYaml("src_all", CUSTOMERS + ", " + ORDERS, mysql));
+            resources.put("tgt_mongo.tap.yml", targetYaml(targetUri));
+            resources.put("pipeline.tap.yml", pipelineYaml(pipelineId, "src_all", "snapshot_and_cdc"));
+            control.apply(resources);
+            control.discoverSchema("src_all", "mysql", mysql);
+            control.lifecycle(pipelineId, LifecycleVerb.START);
+            EndpointAddress target = EndpointAddress.uri(targetUri);
+            Await.until("all orders after the customer-only snapshot prefix",
+                    () -> mongo.count(target, ORDERS) == ROWS,
+                    () -> mongo.count(target, ORDERS) + " orders");
+            assertCompleted(mongo, target, 1);
+            assertCompleted(mongo, target, ROWS);
+
+            updateCustomer(mysql, "after-snapshot");
+            awaitCustomerName(mongo, target, "after-snapshot");
+            control.stop(pipelineId, false);
+            Await.until("the pipeline to stop before its state is reused",
+                    () -> control.state(pipelineId).filter(PipelineState.STOPPED::equals).isPresent(),
+                    () -> String.valueOf(control.state(pipelineId)));
+            control.lifecycle(pipelineId, LifecycleVerb.START);
+            Await.until("the pipeline to resume with its retained references",
+                    () -> control.state(pipelineId).filter(PipelineState.RUNNING::equals).isPresent(),
+                    () -> String.valueOf(control.state(pipelineId)));
+            updateCustomer(mysql, "after-restart");
+            awaitCustomerName(mongo, target, "after-restart");
+            assertThat(mongo.count(target, ORDERS)).isEqualTo(ROWS);
+        }
+    }
+
+    private static void updateCustomer(Map<String, Object> mysql, String name) throws Exception {
+        try (Connection connection = SharedMySql.connect(mysql);
+                PreparedStatement update = connection.prepareStatement("UPDATE customers SET name = ? WHERE id = 1")) {
+            update.setString(1, name);
+            assertThat(update.executeUpdate()).isEqualTo(1);
+        }
+    }
+
+    private static void awaitCustomerName(MongoEndpoints mongo, EndpointAddress target, String name) {
+        Await.until("the customer update " + name + " to reach its order",
+                () -> mongo.fetch(target, ORDERS, Map.of("id", 1))
+                        .map(order -> order.get("customer") instanceof Document customer
+                                && name.equals(customer.getString("name"))).orElse(false),
+                () -> String.valueOf(mongo.fetch(target, ORDERS, Map.of("id", 1))));
+    }
+
+    @ParameterizedTest
+    @EnumSource(Tiers.class)
     void aFiledCustomerAlreadyReadByItsOrderDoesNotPublishThatOrderAgain(Tiers tier) throws Exception {
         String suffix = tier.name().toLowerCase(Locale.ROOT);
         Map<String, Object> mysql = SharedMySql.settings("nest_first_filing_" + suffix);
@@ -189,12 +249,16 @@ class ANestFirstFilingPublishesEachDocumentOnceIT {
     }
 
     private static String pipelineYaml(String pipelineId) {
+        return pipelineYaml(pipelineId, "src_orders, src_customers", "snapshot_only");
+    }
+
+    private static String pipelineYaml(String pipelineId, String sources, String readMode) {
         return """
                 version: tapstate/v1
                 kind: pipeline
                 id: %s
-                source: [ src_orders, src_customers ]
-                settings: { read_mode: snapshot_only }
+                source: [ %s ]
+                settings: { read_mode: %s }
                 transforms:
                   - id: order_doc
                     type: nest
@@ -209,6 +273,6 @@ class ANestFirstFilingPublishesEachDocumentOnceIT {
                   sync:
                     - source: tgt_mongo
                 """
-                .formatted(pipelineId);
+                .formatted(pipelineId, sources, readMode);
     }
 }

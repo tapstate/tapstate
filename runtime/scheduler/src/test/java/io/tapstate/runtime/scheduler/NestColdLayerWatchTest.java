@@ -19,6 +19,58 @@ class NestColdLayerWatchTest {
     private final RecordingAlert alert = new RecordingAlert();
 
     @Test
+    void aSmallOrIdleSampleDoesNotClearPressureWhileEveryReadStillGoesToStorage() {
+        NestColdLayerWatch watch = new NestColdLayerWatch(PRESSURE, alert);
+
+        watch.saw("p1", Map.of("ns", reading(239, 239)));
+        watch.saw("p1", Map.of("ns", reading(252, 252)));
+        watch.saw("p1", Map.of("ns", reading(252, 252)));
+        watch.saw("p1", Map.of("ns", reading(491, 491)));
+
+        assertThat(alert.crossed).containsExactly("p1/ns");
+        assertThat(alert.cleared).isEmpty();
+    }
+
+    @Test
+    void smallSamplesAccumulateUntilThereIsEnoughEvidenceOfRecovery() {
+        NestColdLayerWatch watch = new NestColdLayerWatch(PRESSURE, alert);
+        watch.saw("p1", Map.of("ns", reading(200, 200)));
+
+        for (int accesses = 210; accesses < 300; accesses += 10) {
+            watch.saw("p1", Map.of("ns", reading(accesses, 200)));
+            assertThat(alert.cleared).isEmpty();
+        }
+        watch.saw("p1", Map.of("ns", reading(300, 200)));
+
+        assertThat(alert.cleared).containsExactly("p1/ns");
+    }
+
+    @Test
+    void initialSmallSamplesAccumulateInsteadOfMakingLowTrafficInvisible() {
+        NestColdLayerWatch watch = new NestColdLayerWatch(PRESSURE, alert);
+        for (int accesses = 10; accesses < 100; accesses += 10) {
+            watch.saw("p1", Map.of("ns", reading(accesses, accesses)));
+            assertThat(alert.crossed).isEmpty();
+        }
+        watch.saw("p1", Map.of("ns", reading(100, 100)));
+
+        assertThat(alert.crossed).containsExactly("p1/ns");
+    }
+
+    @Test
+    void aCounterResetDiscardsPartialSamplesEvenAboveThePreviousJudgedBaseline() {
+        NestColdLayerWatch watch = new NestColdLayerWatch(PRESSURE, alert);
+        watch.saw("p1", Map.of("ns", reading(200, 200)));
+        watch.saw("p1", Map.of("ns", reading(280, 200)));
+        // A restart resets the counters below the latest observation, but above the old baseline.
+        watch.saw("p1", Map.of("ns", reading(250, 210)));
+
+        assertThat(alert.cleared).isEmpty();
+        watch.saw("p1", Map.of("ns", reading(350, 210)));
+        assertThat(alert.cleared).containsExactly("p1/ns");
+    }
+
+    @Test
     void aNamespaceUnderPressureOnTheFirstReadingIsReportedWithoutWaitingForASecond() {
         // The counts already start at the beginning of the run, so there is nothing to difference against.
         // Holding the first reading back would blind the interval a badly sized namespace announces itself

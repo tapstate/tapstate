@@ -63,6 +63,16 @@ public interface NestStore<S> extends Serializable {
     }
 
     /**
+     * Writes distinct named keys and returns only after every write has completed. This is not an
+     * atomic multi-key transaction: a failure may leave a prefix written, so callers must retain all
+     * corresponding input positions and emit nothing until the call succeeds. Replacing the same
+     * states is idempotent. Repeated events for one key belong in separate batches.
+     */
+    default void saveAll(Map<Object, S> states, Set<Object> firstFilings) {
+        states.forEach((key, state) -> save(key, state, firstFilings.contains(key)));
+    }
+
+    /**
      * Adds {@code element} to the set held under {@code key}, creating the entry if there is none. Only a
      * namespace whose entries are sets is ever asked this, which is why it is expressed over {@code S}
      * rather than parameterised again - the one that is, is the record of which rows point at another.

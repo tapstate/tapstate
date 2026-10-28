@@ -76,6 +76,16 @@ public interface KeyedStateStore {
     void save(String namespace, String key, byte[] state);
 
     /**
+     * Persists states under the named keys, with the same durability as {@link #save}. Success means
+     * every write was acknowledged. This does not promise cross-key atomicity: on failure some keys
+     * may already be written, and callers must not advance their input positions. The default keeps
+     * older backends compatible; remote backends can override it with a bounded bulk operation.
+     */
+    default void saveAll(String namespace, Map<String, byte[]> states) {
+        states.forEach((key, state) -> save(namespace, key, state));
+    }
+
+    /**
      * Stores {@code state} under {@code key} only if the key holds nothing, and says what was already
      * there: empty when this call is what stored it, and the value that was already present when it was
      * not. One operation rather than a load followed by a save, because the answer is what callers decide

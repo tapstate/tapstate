@@ -94,6 +94,7 @@ class NestStateMapGatesTest {
             putOntoNothingMechanisms();
 
     private static final Map<String, Predicate<JavaAccess<?>>> BOUNDED_READ_MECHANISMS = boundedReadMechanisms();
+    private static final Map<String, Predicate<JavaAccess<?>>> BOUNDED_WRITE_MECHANISMS = boundedWriteMechanisms();
 
     private static final Map<String, Predicate<JavaAccess<?>>> INDEX_MECHANISMS = indexMechanisms();
 
@@ -130,6 +131,8 @@ class NestStateMapGatesTest {
                 .as("%s is no longer detected - the API it names has moved or been renamed, and this "
                         + "gate would pass over production code that uses it", mechanism)
                 .isNotEmpty());
+        BOUNDED_WRITE_MECHANISMS.forEach((mechanism, detects) ->
+                assertThat(accesses(fixtureClasses, detects, "")).as(mechanism).isNotEmpty());
         INDEX_MECHANISMS.forEach((mechanism, detects) -> assertThat(accesses(fixtureClasses, detects, ""))
                 .as("%s is no longer detected - the API it names has moved or been renamed, and this "
                         + "gate would pass over production code that uses it", mechanism)
@@ -175,6 +178,22 @@ class NestStateMapGatesTest {
                             + "guarding nothing at all", mechanism)
                     .isNotEmpty();
         });
+    }
+
+    @Test
+    @DisplayName("bounded lookup-row replacement batches stay behind the state-map adapter")
+    void namedReplacementBatchesAreConfinedToTheStateStore() {
+        BOUNDED_WRITE_MECHANISMS.forEach((mechanism, detects) -> {
+            assertThat(accesses(productionClasses, detects, NEST))
+                    .as("%s may replace only a bounded caller-supplied set of independent lookup rows", mechanism)
+                    .isNotEmpty()
+                    .allMatch(access -> access.startsWith(THE_STORE_BEHIND_EVERY_NAMESPACE + " ->"));
+        });
+        assertThat(productionClasses.stream().flatMap(type -> type.getAccessesFromSelf().stream())
+                .filter(access -> access.getName().equals("saveAll")
+                        && access.getTargetOwner().getName().equals(NEST + "NestStore"))
+                .map(access -> access.getOriginOwner().getName()).toList())
+                .isNotEmpty().containsOnly(NEST + "LookupProcessor");
     }
 
     @Test
@@ -275,6 +294,13 @@ class NestStateMapGatesTest {
         return Map.copyOf(mechanisms);
     }
 
+    /** Flat lookup rows have bounded named batches; assembled documents keep their carried writes. */
+    private static Map<String, Predicate<JavaAccess<?>>> boundedWriteMechanisms() {
+        Map<String, Predicate<JavaAccess<?>>> mechanisms = new LinkedHashMap<>();
+        named(mechanisms, "replacing a handed-in set of independent keys", "setAll");
+        return Map.copyOf(mechanisms);
+    }
+
     private static Map<String, Predicate<JavaAccess<?>>> indexMechanisms() {
         Map<String, Predicate<JavaAccess<?>>> mechanisms = new LinkedHashMap<>();
         mechanisms.put("indexing a map after it exists",
@@ -303,7 +329,7 @@ class NestStateMapGatesTest {
         Map<String, Predicate<JavaAccess<?>>> mechanisms = new LinkedHashMap<>();
         named(mechanisms, "listing what the map holds", "keySet", "values", "entrySet", "localKeySet");
         named(mechanisms, "measuring the whole map", "size", "isEmpty");
-        named(mechanisms, "writing or removing across keys", "putAll", "setAll", "removeAll",
+        named(mechanisms, "writing or removing across keys", "putAll", "removeAll",
                 "clear", "evictAll");
         named(mechanisms, "reading across keys", "loadAll");
         named(mechanisms, "running over more than one entry", "executeOnEntries", "executeOnKeys",

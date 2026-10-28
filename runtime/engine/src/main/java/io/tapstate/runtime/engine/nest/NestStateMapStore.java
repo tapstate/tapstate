@@ -45,6 +45,7 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
      * and the difference is silent - counters that are simply never written.
      */
     private KeyedStateStore store;
+    private NestStateIo io;
 
     private NestStateStats stats;
 
@@ -62,6 +63,7 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
         var stores = NestStateMapStoreFactory.boundTo(member);
         String resolved = database == null ? stores.defaultDatabase() : database;
         this.store = stores.inDatabase(resolved).state();
+        this.io = new NestStateIo(store, namespace);
         this.stats = NestStateStats.of(member);
     }
 
@@ -77,8 +79,9 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
     @Override
     public Object load(Object key) {
         long began = System.nanoTime();
-        Object state = store.load(namespace, NestStateKeys.nameOf(key))
-                .map(NestStateMapStore::fromBytes).orElse(null);
+        String name = NestStateKeys.nameOf(key);
+        byte[] bytes = io.load(name);
+        Object state = bytes == null ? null : fromBytes(bytes);
         if (stats != null) {
             stats.backfill(namespace, System.nanoTime() - began);
         }
@@ -108,7 +111,7 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
             byName.put(NestStateKeys.nameOf(key), key);
         }
         long began = System.nanoTime();
-        Map<String, byte[]> found = store.loadAll(namespace, byName.keySet());
+        Map<String, byte[]> found = io.loadAll(byName.keySet());
         if (stats != null) {
             stats.backfill(namespace, System.nanoTime() - began);
         }
@@ -125,12 +128,14 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
 
     @Override
     public void store(Object key, Object value) {
-        store.save(namespace, NestStateKeys.nameOf(key), toBytes(value));
+        io.saveAll(Map.of(NestStateKeys.nameOf(key), toBytes(value)));
     }
 
     @Override
     public void storeAll(Map<Object, Object> map) {
-        map.forEach(this::store);
+        Map<String, byte[]> states = new LinkedHashMap<>();
+        map.forEach((key, value) -> states.put(NestStateKeys.nameOf(key), toBytes(value)));
+        io.saveAll(states);
     }
 
     @Override
