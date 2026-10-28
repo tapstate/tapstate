@@ -62,6 +62,7 @@ class ValidationMongoPortableReadIT {
                     var body = (Map<?, ?>) value(owned.fields().get("body"));
                     assertThat(value(body.get("identifier"))).isEqualTo(identifier.toHexString());
                     assertThat(((ValidationValues.Typed)body.get("identifier")).conversionOrigin()).isEqualTo("custom");
+                    assertThat(((ValidationValues.Typed)body.get("identifier")).logicalType()).isEqualTo("object-id");
                     var binary = (ValidationValues.Binary) value(body.get("binary"));
                     assertThat(binary.subtype()).isEqualTo(128);
                     assertThat(binary.bytes()).containsExactly((byte)0, (byte)1, (byte)-1);

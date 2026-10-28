@@ -59,7 +59,7 @@ public final class PdkValidationReads {
         inputs(connection,artifact,configurationHash);
         var result=new AtomicReference<Metadata>();
         var reader=deferred(table,query,decode,submit->PdkValidationSession.inspect(connection.connectorId(),artifact,connection.settings(),table,projection,model->{
-            String version=PdkValidationModelVersion.of(model);
+            String version=PdkValidationModelVersion.of(model,artifact);
             var structural=PdkSchemaDiscoverer.structuralModel(List.of(model)).tables().getFirst();
             if(!table.equals(structural.name()))throw invalid("metadata.tableScope");
             var described=new Metadata(structural,new Binding(version,
@@ -157,25 +157,38 @@ public final class PdkValidationReads {
     private static PdkValidationCursor.Decoder decoder(TapTable model, PdkValidationCodecs codecs,
             ConnectorRef artifact, String configurationHash, Binding expected,
             List<ValidationKeyBinding.Component> keys, ValidationValues.Limits rowLimits) {
-        requireModel(model,artifact,configurationHash,expected);
+        requireModel(model,artifact,configurationHash,expected,"beforeQuery");
         for(var component:keys){
             String field=component.path().getFirst();var actual=model.getNameFieldMap().get(field);
             if(actual==null||actual.getTapType()==null||actual.getTapType().getClass()==TapRaw.class)
                 throw unsupported(field,"key-model-unknown");
+            boolean nativeId=artifact.className().equals("io.tapdata.mongodb.MongodbConnector")&&actual.getDataType()!=null
+                    &&actual.getDataType().replace("_","").equalsIgnoreCase("OBJECTID");
+            boolean idDomain=component.domain()==ValidationKey.Kind.TEXT&&component.logicalTypes().equals(Set.of("object-id"));
+            if(nativeId!=idDomain)
+                throw unsupported(field,"native-object-id-key-domain");
         }
-        var decoder=new PdkValidationRows(model,codecs,path->PdkValidationRows.Rule.AUTO,rowLimits);
+        var decoder=new PdkValidationRows(model,codecs,path->PdkValidationRows.Rule.AUTO,rowLimits,
+                artifact.className().equals("io.tapdata.mongodb.MongodbConnector"));
         return raw->{
-            requireModel(model,artifact,configurationHash,expected);
+            requireModel(model,artifact,configurationHash,expected,"beforeRow");
             var row=decoder.decode(raw);
-            requireModel(model,artifact,configurationHash,expected);
+            for(var component:keys){
+                var value=row.fields().get(component.path().getFirst());
+                if(value instanceof ValidationValues.Typed typed&&typed.logicalType().equals("object-id")
+                        &&!component.logicalTypes().equals(Set.of("object-id")))
+                    throw unsupported(component.path().getFirst(),"native-object-id-key-domain");
+            }
+            requireModel(model,artifact,configurationHash,expected,"afterRow");
             return row;
         };
     }
 
-    private static void requireModel(TapTable model, ConnectorRef artifact, String configurationHash, Binding expected){
-        String actual=PdkValidationModelVersion.of(model);
-        if(!actual.equals(expected.modelVersion())||!PdkValidationModelVersion.codecBinding(artifact,configurationHash,actual)
-                .equals(expected.codecBinding()))throw invalid("modelOrCodecChanged");
+    private static void requireModel(TapTable model, ConnectorRef artifact, String configurationHash, Binding expected,String phase){
+        String actual=PdkValidationModelVersion.of(model,artifact);
+        if(!actual.equals(expected.modelVersion()))throw invalid("modelChanged."+phase+"."+model.getId());
+        if(!PdkValidationModelVersion.codecBinding(artifact,configurationHash,actual)
+                .equals(expected.codecBinding()))throw invalid("codecChanged."+phase+"."+model.getId());
     }
 
     private static List<String> fields(List<ValidationKeyBinding.Component> keys){
@@ -185,6 +198,9 @@ public final class PdkValidationReads {
         for(var component:keys){
             if(component.path().size()!=1||!component.path().getFirst().matches("[A-Za-z_][A-Za-z0-9_]*"))
                 throw unsupported("key","native-field-syntax");
+            if(component.logicalTypes().contains("object-id")
+                    &&(component.domain()!=ValidationKey.Kind.TEXT||!component.logicalTypes().equals(Set.of("object-id"))))
+                throw unsupported(component.path().getFirst(),"native-object-id-key-domain");
             fields.add(component.path().getFirst());
         }
         if(fields.stream().distinct().count()!=fields.size())throw invalid("duplicateKeys");

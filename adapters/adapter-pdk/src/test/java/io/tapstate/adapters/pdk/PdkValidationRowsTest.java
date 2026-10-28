@@ -37,6 +37,55 @@ class PdkValidationRowsTest {
     private record DriverText(String value) {}
     private record DriverContainer(Map<String, Object> value) {}
 
+    @Test void nativeObjectIdsDoNotBecomeOrdinaryLookalikeStringsAfterTheirCustomCodec(){
+        var id=new org.bson.types.ObjectId("0123456789abcdef01234567");var registry=new TapCodecsRegistry();var calls=new AtomicInteger();
+        registry.registerToTapValue(org.bson.types.ObjectId.class,(value,type)->{
+            calls.incrementAndGet();return new TapStringValue(((org.bson.types.ObjectId)value).toHexString());
+        });
+        var reader=decoder(registry);var nativeRow=reader.decode(Map.of("identifier",id));var textRow=reader.decode(Map.of("identifier",id.toHexString()));
+        assertThat(typed(nativeRow.fields().get("identifier")).logicalType()).isEqualTo("object-id");
+        assertThat(typed(textRow.fields().get("identifier")).logicalType()).isEqualTo("text");
+        assertThat(typed(nativeRow.fields().get("identifier")).conversionOrigin()).isEqualTo("custom");
+        assertThat(calls).hasValue(1);
+    }
+    @Test void anObjectIdCodecCannotInventADifferentCanonicalIdentity(){
+        var id=new org.bson.types.ObjectId("0123456789abcdef01234567");var registry=new TapCodecsRegistry();var calls=new AtomicInteger();
+        registry.registerToTapValue(org.bson.types.ObjectId.class,(value,type)->{
+            calls.incrementAndGet();return new TapStringValue("000000000000000000000000");
+        });
+        assertUnavailable(()->decoder(registry).decode(Map.of("identifier",id)));
+        assertThat(calls).hasValue(1);
+    }
+    @Test void aBoundBsonDateProfileUsesTheSelectedCodecAndRetainsItsExactNativeInstant(){
+        var registry=new TapCodecsRegistry();var calls=new AtomicInteger();var instant=Instant.parse("2026-10-21T01:02:03.123Z");
+        registry.registerToTapValue(java.util.Date.class,(value,type)->{
+            calls.incrementAndGet();return new TapDateTimeValue(new DateTime(((java.util.Date)value).toInstant()));
+        });
+        var table=bsonDateTable();
+        var reader=new PdkValidationRows(table,codecs(registry),path->PdkValidationRows.Rule.AUTO,LIMITS,true);
+        var value=typed(reader.decode(Map.of("time",java.util.Date.from(instant))).fields().get("time"));
+        assertThat(value.logicalType()).isEqualTo("instant");assertThat(value.value()).isEqualTo(instant);
+        assertThat(value.conversionOrigin()).isEqualTo("custom");assertThat(calls).hasValue(1);
+    }
+    @Test void aBsonDateCodecCannotRoundOrShiftTheInstantAndSqlCarriersRemainUnadmitted(){
+        var registry=new TapCodecsRegistry();var calls=new AtomicInteger();
+        registry.registerToTapValue(java.util.Date.class,(value,type)->{
+            calls.incrementAndGet();return new TapDateTimeValue(new DateTime(Instant.EPOCH));
+        });
+        var reader=new PdkValidationRows(bsonDateTable(),codecs(registry),path->PdkValidationRows.Rule.AUTO,LIMITS,true);
+        assertUnavailable(()->reader.decode(Map.of("time",new java.util.Date(1))));assertThat(calls).hasValue(1);
+        registry.registerToTapValue(java.sql.Timestamp.class,(value,type)->new TapDateTimeValue(new DateTime(((java.sql.Timestamp)value).toInstant())));
+        assertUnavailable(()->reader.decode(Map.of("time",java.sql.Timestamp.from(Instant.EPOCH))));
+    }
+    @Test void aMutatingBsonDateCodecCannotRewriteTheValueUsedForItsOwnFidelityCheck(){
+        var registry=new TapCodecsRegistry();
+        registry.registerToTapValue(java.util.Date.class,(value,type)->{
+            ((java.util.Date)value).setTime(0);return new TapDateTimeValue(new DateTime(Instant.EPOCH));
+        });
+        var reader=new PdkValidationRows(bsonDateTable(),codecs(registry),path->PdkValidationRows.Rule.AUTO,LIMITS,true);
+        assertUnavailable(()->reader.decode(Map.of("time",new java.util.Date(1))));
+    }
+
     @Test void rawContainerChildrenRunTheirCustomCodecsOnceAndKeepNestedTypedFacts() {
         var registry = new TapCodecsRegistry();
         var calls = new AtomicInteger();
@@ -267,6 +316,8 @@ class PdkValidationRowsTest {
     }
 
     private static PdkValidationCodecs codecs(TapCodecsRegistry registry) { return new PdkValidationCodecs("fixture", "binding", registry); }
+    private static TapTable bsonDateTable(){return new TapTable("documents").add(new TapField("time","DATE_TIME")
+            .tapType(new io.tapdata.entity.schema.type.TapDateTime()));}
     private static PdkValidationRows decoder(TapCodecsRegistry registry) {
         return decoder(registry, path -> PdkValidationRows.Rule.AUTO, LIMITS);
     }

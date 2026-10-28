@@ -16,13 +16,17 @@ import java.util.*;
 
 /**
  * A bounded, versioned description of the supported independent model, before any business query.
- * Every bean property of an exact supported PDK class participates. Unknown classes and opaque
+ * Bean properties of exact supported PDK classes participate, with explicit runtime/layout profiles.
+ * Unknown classes and opaque
  * defaults are refused rather than serialized as an incomplete shape. The live model is never cloned
  * or replaced: codecs still receive the exact type discovered by their own session. A digest checks
  * the described shape; it neither freezes a plugin's mutable graph nor certifies codec behavior.
  */
 final class PdkValidationModelVersion {
     private static final String PROFILE="pdk-validation-model-v1";
+    private static final String DOCUMENT_PROFILE="pdk-validation-document-model-v1";
+    private static final String CODEC_PROFILE="pdk-validation-codecs-v2";
+    private static final Set<String> DOCUMENT_STATISTICS=Set.of("size","storageSize","avgObjSize","indexSize");
     private static final long MAX_BYTES=1024L*1024;
     private static final int MAX_NODES=65536,MAX_DEPTH=32,MAX_ITEMS=8192;
     private static final Set<Class<?>> MODELS=Set.of(TapTable.class,TapField.class,TapIndex.class,TapIndexEx.class,
@@ -45,12 +49,28 @@ final class PdkValidationModelVersion {
     private PdkValidationModelVersion(){}
 
     static String of(TapTable model){
+        var tree=canonicalModel(model);
+        return PROFILE+":"+CanonicalHash.ofText(JsonWriter.write(List.of(PROFILE,tree)));
+    }
+
+    static String of(TapTable model,ConnectorRef artifact){
+        String profile=documentFields(artifact)?DOCUMENT_PROFILE:PROFILE;
+        return profile+":"+CanonicalHash.ofText(JsonWriter.write(List.of(profile,canonicalModel(model,artifact))));
+    }
+
+    /** Internal bounded representation, also used to verify complete schema-property differences. */
+    static Object canonicalModel(TapTable model,ConnectorRef artifact){return canonicalModel(model,documentFields(artifact));}
+
+    private static Object canonicalModel(TapTable model){return canonicalModel(model,false);}
+    private static Object canonicalModel(TapTable model,boolean documentFields){
         Objects.requireNonNull(model,"independent model");
         if(model.getNameFieldMap()==null||model.getNameFieldMap().size()>4096)throw invalid("fields");
         for(var entry:model.getNameFieldMap().entrySet())
             if(entry.getKey()==null||entry.getValue()==null||!entry.getKey().equals(entry.getValue().getName()))throw invalid("fieldNames");
-        var tree=new Walker().value(model,0);
-        return PROFILE+":"+CanonicalHash.ofText(JsonWriter.write(List.of(PROFILE,tree)));
+        return new Walker(documentFields).value(model,0);
+    }
+    private static boolean documentFields(ConnectorRef artifact){
+        return Objects.requireNonNull(artifact).className().equals("io.tapdata.mongodb.MongodbConnector");
     }
 
     /** Binding to actual retained artifact/configuration/profile; never an equivalence oracle. */
@@ -59,21 +79,27 @@ final class PdkValidationModelVersion {
         if(artifact.contentHash()==null||!artifact.contentHash().matches("[a-f0-9]{64}")
                 ||configurationHash==null||!configurationHash.matches("[a-f0-9]{64}"))throw invalid("codecIdentity");
         var specHash=artifact.spec()==null?null:CanonicalHash.ofText(artifact.spec());
-        return "pdk-validation-codecs-v1:"+CanonicalHash.ofText(JsonWriter.write(Arrays.asList(
-                "pdk-validation-codecs-v1",artifact.contentHash(),artifact.className(),artifact.pdkApiVersion(),
+        return CODEC_PROFILE+":"+CanonicalHash.ofText(JsonWriter.write(Arrays.asList(
+                CODEC_PROFILE,artifact.contentHash(),artifact.className(),artifact.pdkApiVersion(),
                 artifact.requiredLevel(),specHash,configurationHash,modelVersion)));
     }
 
     private static final class Walker {
+        private enum Slot { VALUE, NAMED_FIELDS, NAMED_FIELD, TABLE_ATTRIBUTES }
         private long bytes;
         private int nodes;
+        private final boolean documentFields;
         private final IdentityHashMap<Object,Boolean> active=new IdentityHashMap<>();
-        Object value(Object value,int depth){
+        Walker(boolean documentFields){this.documentFields=documentFields;}
+        Object value(Object value,int depth){return value(value,depth,Slot.VALUE);}
+        private Object value(Object value,int depth,Slot slot){
             if(depth>MAX_DEPTH||++nodes>MAX_NODES)throw limit();
             charge(64);
             if(value==null)return List.of("null");
             if(value instanceof String text){text(text);return List.of("string",text);}
             if(value instanceof Boolean)return List.of("boolean",value);
+            if(value instanceof TapField.TapDefaultFunction function)
+                return List.of("pdk-default-function",function.name());
             if(value instanceof Character character)return List.of("character",Integer.toString(character));
             if(value instanceof Byte||value instanceof Short||value instanceof Integer||value instanceof Long)
                 return List.of(value.getClass().getSimpleName(),value.toString());
@@ -97,7 +123,14 @@ final class PdkValidationModelVersion {
                     if(map.size()>MAX_ITEMS)throw limit();var sorted=new TreeMap<String,Object>();
                     for(var entry:map.entrySet()){
                         if(!(entry.getKey() instanceof String key))throw invalid("mapKey");
-                        charge(64L);text(key);sorted.put(key,value(entry.getValue(),depth+1));
+                        if(documentFields&&slot==Slot.TABLE_ATTRIBUTES&&DOCUMENT_STATISTICS.contains(key)){
+                            // These collection counters are not schema, query fields or codec input.
+                            // Validate and charge even excluded metadata; opaque values cannot hide here.
+                            if(entry.getValue()!=null&&!(entry.getValue() instanceof Number))throw invalid("documentStatistic");
+                            value(entry.getValue(),depth+1);continue;
+                        }
+                        charge(64L);text(key);sorted.put(key,value(entry.getValue(),depth+1,
+                                slot==Slot.NAMED_FIELDS?Slot.NAMED_FIELD:Slot.VALUE));
                     }
                     return List.of("map",sorted);
                 }
@@ -110,8 +143,18 @@ final class PdkValidationModelVersion {
                 }
                 var description=new TreeMap<String,Object>();
                 for(var reader:READERS.get(value.getClass())){
+                    // Document inference replaces fields in random sample order. Its layout ordinal
+                    // is not a physical column or a named query/codec input. Keep primary-key order,
+                    // all types and attributes, and the original live model supplied to the plugin.
+                    if(documentFields&&slot==Slot.NAMED_FIELD&&value.getClass()==TapField.class&&reader.getName().equals("getPos"))continue;
+                    if(documentFields&&depth==0&&value.getClass()==TapTable.class&&reader.getName().equals("getMaxPos"))continue;
                     charge(64L+2L*reader.getName().length());
-                    description.put(reader.getName(),value(read(reader,value),depth+1));
+                    Slot child=Slot.VALUE;
+                    if(depth==0&&value.getClass()==TapTable.class){
+                        if(reader.getName().equals("getNameFieldMap"))child=Slot.NAMED_FIELDS;
+                        else if(reader.getName().equals("getTableAttr"))child=Slot.TABLE_ATTRIBUTES;
+                    }
+                    description.put(reader.getName(),value(read(reader,value),depth+1,child));
                 }
                 return List.of("bean",value.getClass().getName(),description);
             }finally{active.remove(value);}

@@ -209,7 +209,7 @@ class PdkValidationSessionTest {
             assertThat(result.model().name()).isEqualTo("records");
             assertThat(result.model().fields()).extracting(field -> field.name()).containsExactly("id");
             assertThat(result.binding().modelVersion()).startsWith("pdk-validation-model-v1:");
-            assertThat(result.binding().codecBinding()).startsWith("pdk-validation-codecs-v1:");
+            assertThat(result.binding().codecBinding()).startsWith("pdk-validation-codecs-v2:");
             metadata.close();
             metadata.workersExited().toCompletableFuture().get(3, TimeUnit.SECONDS);
             metadata.rowsReleased().toCompletableFuture().get(3, TimeUnit.SECONDS);

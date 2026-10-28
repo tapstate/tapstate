@@ -78,6 +78,36 @@ class NativeValidationFullJobIT {
             assertThat(calls).hasValue(2);assertThat(f.member.getJet().getJobs()).hasSize(1);
         }
     }
+    @Test void aPlanFailureReportedBeforeItsLastReaderExitCannotBecomeSuccessfulCompletion()throws Exception {
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+            var registry=new ValidationProcessorRegistry(f.member,()->{})) {
+            var start=prepare(f);var reservation=f.owners.take(start);
+            var delegate=new Plan(start.run(),f.comparison.mappings().getFirst(),List.of(Plan.row(1,"same")),List.of(Plan.row(1,"same")));
+            var drained=new AtomicBoolean();var late=new AtomicReference<Throwable>();
+            var plan=new NativeValidationFullJob.Plan(){
+                public List<ValidationFullScan.Mapping> mappings(){return delegate.mappings();}
+                public boolean drained(){return drained.get()&&delegate.drained();}
+                public Throwable failure(){return late.get();}
+                public void close(){delegate.close();}
+            };
+            runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,runs,ignored->plan));
+            await(()->delegate.closed);
+            late.set(new io.tapstate.core.common.TapstateException(ValidationError.READ_FAILED,Map.of("table","original-reader"),null));
+            drained.set(true);
+            var exact=new org.bson.Document("_id.kind","run").append("_id.clusterId",start.run().owner().clusterId())
+                    .append("_id.pipelineId",start.run().owner().pipelineId()).append("_id.taskId",start.run().taskId())
+                    .append("_id.mode",start.run().mode().name()).append("_id.runId",start.run().runId());
+            var stored=f.raw.getDatabase(f.cacheName).getCollection("validation_runs");
+            var terminal=new AtomicReference<org.bson.Document>();
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(45)).until(()->{
+                var state=stored.find(exact).first();
+                if(state==null||!Boolean.TRUE.equals(state.getBoolean("retired"))||!ValidationRunState.valueOf(state.getString("state")).terminal())return false;
+                terminal.set(state);return true;
+            });
+            assertThat(terminal.get()).containsEntry("state",ValidationRunState.FAILED.name());
+            await(()->f.resources.snapshot().metadataFrames()==0&&f.resources.snapshot().processReserved().isEmpty());
+        }
+    }
     @Test void theThousandAndFirstLocatedProblemStopsTheOriginalJobAndKeepsItsFirstThousandRoots()throws Exception {
         try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
             var registry=new ValidationProcessorRegistry(f.member,()->{})) {

@@ -191,7 +191,7 @@ class ValidationJdbcMongoReadIT {
             var bindings = new LinkedHashMap<List<String>, ValidationNestTree.Binding>();
             bindMixedRelations(kind, sourceRef, sourceSettings, plan.children(), identity, identityMap, bindings, scope, handles, ids, queryIo, decodeIo);
             var generated = ValidationFieldCheck.generatedId(observation.run(), "mixed_roots", "output", true, false, false,
-                    value -> value instanceof ValidationValues.Typed typed && typed.logicalType().equals("text") && typed.value() instanceof String);
+                    value -> value instanceof ValidationValues.Typed typed && typed.logicalType().equals("object-id") && typed.value() instanceof String);
             var tree = new ValidationNestTree(new ValidationNestObjectProjection.Scope(observation.run(), "mixed_roots", "output"), plan,
                     new ValidationNestObjectProjection.RootKeys(identity, identity), bindings,
                     new ValidationNestTree.Limits(ARRAY_LIMITS, 32 * 1024 * 1024, 64 * 1024 * 1024, 100_000, 20, 100, 8, 100,
@@ -348,7 +348,7 @@ class ValidationJdbcMongoReadIT {
                 new java.util.concurrent.ArrayBlockingQueue<>(8), new java.util.concurrent.ThreadPoolExecutor.AbortPolicy());
              var scope = new ValidationReadScope(observation, cleanup, () -> {}, 8)) {
             var generated = ValidationFieldCheck.generatedId(observation.run(), "array_roots", "output", true, false, false,
-                    value -> value instanceof ValidationValues.Typed typed && typed.logicalType().equals("text") && typed.value() instanceof String);
+                    value -> value instanceof ValidationValues.Typed typed && typed.logicalType().equals("object-id") && typed.value() instanceof String);
             var result = ValidationRootReader.read(observation, ValidationMethod.FULL_COLUMN,
                     new ValidationRootReader.Query(sourceRead, "native-array-v1", () -> openArrayRead(kind, sourceRef, sourceSettings,
                             "array_roots", identity, rootKey, scope, handles, queryIo, decodeIo)),
@@ -580,7 +580,7 @@ class ValidationJdbcMongoReadIT {
         var identity = new ValidationLinearRules.Identity(observation.run(), observation.root().mappingId(), observation.root().outputId(),
                 sourceIdentity, projectedIdentity);
         var generated = ValidationFieldCheck.generatedId(observation.run(), "mapping", "output", true, false, false,
-                                        id -> id instanceof ValidationValues.Typed typed && typed.logicalType().equals("text") && typed.value() instanceof String);
+                                        id -> id instanceof ValidationValues.Typed typed && typed.logicalType().equals("object-id") && typed.value() instanceof String);
                                 ValidationFieldCheck.check(observation, List.of(), projection.apply(sourceGroup.sampleValues()), targetGroup.sampleValues(),
                                         Optional.of(new ValidationRootCheck.SampledSide(sourceGroup.key().physical(), sourceGroup.sampleValues(), "source")),
                                         Optional.of(new ValidationRootCheck.SampledSide(targetGroup.key().physical(), targetGroup.sampleValues(), "target")),
@@ -761,7 +761,7 @@ class ValidationJdbcMongoReadIT {
                     new ValidationNestObjectProjection.Limits(LIMITS, 8 * 1024 * 1024, 64 * 1024 * 1024, 8, 100, 8));
             String sourceRead = "object-source-" + id;
             var generated = ValidationFieldCheck.generatedId(observation.run(), rootTable, "output", true, false, false,
-                    value -> value instanceof ValidationValues.Typed typed && typed.logicalType().equals("text") && typed.value() instanceof String);
+                    value -> value instanceof ValidationValues.Typed typed && typed.logicalType().equals("object-id") && typed.value() instanceof String);
             var result = ValidationRootReader.read(observation, ValidationMethod.FULL_COLUMN,
                     new ValidationRootReader.Query(sourceRead, "native-object-v1", () -> openObjectRead(kind, sourceRef, sourceSettings,
                             rootTable, identity, rootKey, scope, handles, queryIo, decodeIo)),
@@ -901,7 +901,7 @@ class ValidationJdbcMongoReadIT {
         var identity = new ValidationLinearRules.Identity(observation.run(), observation.root().mappingId(), observation.root().outputId(),
                 sourceIdentity, projectedIdentity);
         var generated = ValidationFieldCheck.generatedId(observation.run(), "mapping", "output", true, false, false,
-                value -> value instanceof ValidationValues.Typed typed && typed.logicalType().equals("text") && typed.value() instanceof String);
+                value -> value instanceof ValidationValues.Typed typed && typed.logicalType().equals("object-id") && typed.value() instanceof String);
         var handles = new ArrayList<ValidationReadHandle>();
         try (var cleanup = new java.util.concurrent.ThreadPoolExecutor(1, 1, 0, java.util.concurrent.TimeUnit.SECONDS,
                 new java.util.concurrent.ArrayBlockingQueue<>(2), new java.util.concurrent.ThreadPoolExecutor.AbortPolicy());

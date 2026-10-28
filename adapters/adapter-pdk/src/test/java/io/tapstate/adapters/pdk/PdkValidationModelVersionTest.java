@@ -105,5 +105,48 @@ class PdkValidationModelVersionTest {
         assertThatThrownBy(()->PdkValidationModelVersion.codecBinding(new ConnectorRef(List.of(),"fixture","2.0.8",null),"c".repeat(64),version))
                 .isInstanceOf(TapstateException.class);
     }
+    @Test void sampledDocumentPositionsAreNotColumnsButKeyOrderAndTypesStillBind(){
+        var artifact=new ConnectorRef(List.of(),"io.tapdata.mongodb.MongodbConnector","2.0.8",null,null,"a".repeat(64),false);
+        var first=table();var second=table();second.getNameFieldMap().get("value").pos(4);
+        assertThat(PdkValidationModelVersion.of(first)).isNotEqualTo(PdkValidationModelVersion.of(second));
+        assertThat(PdkValidationModelVersion.of(first,artifact)).isEqualTo(PdkValidationModelVersion.of(second,artifact));
+        second.getNameFieldMap().get("id").primaryKeyPos(2);
+        assertThat(PdkValidationModelVersion.of(first,artifact)).isNotEqualTo(PdkValidationModelVersion.of(second,artifact));
+        second=table();second.getNameFieldMap().get("value").tapType(new TapString().bytes(65L));
+        assertThat(PdkValidationModelVersion.of(first,artifact)).isNotEqualTo(PdkValidationModelVersion.of(second,artifact));
+    }
+    @Test void documentModelProfileDoesNotDropUnknownTableAttributesOrGrantCapabilityByLogicalId(){
+        var actual=new ConnectorRef(List.of(),"io.tapdata.mongodb.MongodbConnector","2.0.8",null,null,"a".repeat(64),false);
+        var ordinary=new ConnectorRef(List.of(),"synthetic.Ordinary","2.0.8",null,null,"a".repeat(64),false);
+        var first=table();var second=table();first.setTableAttr(Map.of("schema-choice",1));second.setTableAttr(Map.of("schema-choice",2));
+        assertThat(PdkValidationModelVersion.of(first,actual)).isNotEqualTo(PdkValidationModelVersion.of(second,actual));
+        second=table();second.getNameFieldMap().get("value").pos(4);
+        assertThat(PdkValidationModelVersion.of(table(),ordinary)).isNotEqualTo(PdkValidationModelVersion.of(second,ordinary));
+    }
+    @Test void documentLayoutNormalizationCannotHideAFieldInsideUnknownMetadata(){
+        var artifact=new ConnectorRef(List.of(),"io.tapdata.mongodb.MongodbConnector","2.0.8",null,null,"a".repeat(64),false);
+        var first=table();var second=table();
+        first.setTableAttr(Map.of("extension",new TapField("nested","VARCHAR").pos(1).tapType(new TapString())));
+        second.setTableAttr(Map.of("extension",new TapField("nested","VARCHAR").pos(2).tapType(new TapString())));
+        assertThat(PdkValidationModelVersion.of(first,artifact)).isNotEqualTo(PdkValidationModelVersion.of(second,artifact));
+    }
+    @Test void knownPdkDefaultFunctionsRetainTheirOwnDomainAndIdentity(){
+        var first=table();var second=table();
+        first.getNameFieldMap().get("value").defaultFunction(TapField.TapDefaultFunction._CURRENT_TIMESTAMP);
+        second.getNameFieldMap().get("value").defaultFunction(TapField.TapDefaultFunction._CURRENT_TIMESTAMP);
+        assertThat(PdkValidationModelVersion.of(first)).isEqualTo(PdkValidationModelVersion.of(second));
+        second.getNameFieldMap().get("value").defaultFunction("_CURRENT_TIMESTAMP");
+        assertThat(PdkValidationModelVersion.of(first)).isNotEqualTo(PdkValidationModelVersion.of(second));
+    }
+    @Test void documentRuntimeStatisticsDoNotBecomeSchemaButOtherAttributesStillDo(){
+        var artifact=new ConnectorRef(List.of(),"io.tapdata.mongodb.MongodbConnector","2.0.8",null,null,"a".repeat(64),false);
+        var first=table();var second=table();
+        first.setTableAttr(Map.of("storageSize",4096L,"indexSize",4096L,"size",100L,"avgObjSize",50.0,"schema-choice",1));
+        second.setTableAttr(Map.of("storageSize",32768L,"indexSize",8192L,"size",200L,"avgObjSize",100.0,"schema-choice",1));
+        assertThat(PdkValidationModelVersion.of(first,artifact)).isEqualTo(PdkValidationModelVersion.of(second,artifact));
+        assertThat(PdkValidationModelVersion.of(first)).isNotEqualTo(PdkValidationModelVersion.of(second));
+        second.setTableAttr(Map.of("storageSize",new Object()));
+        assertThatThrownBy(()->PdkValidationModelVersion.of(second,artifact)).isInstanceOf(TapstateException.class);
+    }
     private static final class ExoticNumber extends TapNumber {}
 }

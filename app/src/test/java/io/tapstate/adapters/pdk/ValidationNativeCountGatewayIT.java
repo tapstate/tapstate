@@ -22,6 +22,76 @@ class ValidationNativeCountGatewayIT {
     private static final String DB="validation_counts", PASSWORD="count-fixture-only";
     @Test @Timeout(120) void mysqlAndMongoUseExactNativeCountsWithoutValueDiscovery()throws Exception { verify(true); }
     @Test @Timeout(120) void postgresAndMongoUseExactNativeCountsWithoutValueDiscovery()throws Exception { verify(false); }
+    @Test @Timeout(60) void nativeIdentifierKeysRequireTheirOwnConfirmedDomain()throws Exception{
+        var artifact=artifact("mongodb");var identifier=new org.bson.types.ObjectId("0123456789abcdef01234567");
+        var limits=new io.tapstate.core.validation.ValidationValues.Limits(64*1024,8192,32);
+        try(var mongo=new MongoDBContainer(DockerImageName.parse("mongo:7.0"))){
+            mongo.start();var settings=Map.<String,Object>of("uri",mongo.getReplicaSetUrl(DB),"database",DB,"isUri",true);
+            try(var client=MongoClients.create(mongo.getReplicaSetUrl(DB))){
+                client.getDatabase(DB).getCollection("identifiers").insertOne(new Document("_id",identifier).append("business_text",identifier.toHexString()));
+            }
+            var connection=new ConnectionConfig("target","document-alias",settings);
+            var resource=new io.tapstate.core.model.SourceResource("target",null,connection.connectorId(),settings,null,null,null,null);
+            var configurationHash=io.tapstate.core.model.canonical.CanonicalHash.of(resource);
+            var idKeys=List.of(new io.tapstate.core.validation.ValidationKeyBinding.Component(List.of("_id"),
+                    io.tapstate.core.validation.ValidationKey.Kind.TEXT,Set.of("object-id")));
+            var textKeys=List.of(new io.tapstate.core.validation.ValidationKeyBinding.Component(List.of("_id"),
+                    io.tapstate.core.validation.ValidationKey.Kind.TEXT,Set.of("text")));
+            try(var query=java.util.concurrent.Executors.newSingleThreadExecutor();var decode=java.util.concurrent.Executors.newSingleThreadExecutor()){
+                final PdkValidationReads.Binding binding;
+                try(var metadata=PdkValidationReads.inspect(connection,artifact,configurationHash,"identifiers",List.of("_id"),()->{},query,decode,limits)){
+                    binding=metadata.result().binding();
+                }
+                try(var reader=PdkValidationReads.scan(connection,artifact,configurationHash,"identifiers",binding,idKeys,false,()->{},query,decode,2,limits)){
+                    try(var row=reader.next().orElseThrow()){
+                        assertThat((io.tapstate.core.validation.ValidationValues.Typed)row.values().fields().get("_id"))
+                                .satisfies(value->{assertThat(value.logicalType()).isEqualTo("object-id");assertThat(value.value()).isEqualTo(identifier.toHexString());});
+                    }
+                    assertThat(reader.next()).isEmpty();
+                }
+                try(var reader=PdkValidationReads.scan(connection,artifact,configurationHash,"identifiers",binding,textKeys,false,()->{},query,decode,2,limits)){
+                    assertThatThrownBy(reader::next).isInstanceOfSatisfying(TapstateException.class,
+                            failure->assertThat(failure.code()).isEqualTo(io.tapstate.core.validation.ValidationError.RULE_UNSUPPORTED));
+                }
+            }
+        }
+    }
+    @Test @Timeout(120) void stableDocumentMetadataHasNoSamplingOrderDependentBinding()throws Exception{
+        var artifact=artifact("mongodb");var limits=new io.tapstate.core.validation.ValidationValues.Limits(64*1024,8192,32);
+        try(var mongo=new MongoDBContainer(DockerImageName.parse("mongo:7.0"))){
+            mongo.start();var settings=Map.<String,Object>of("uri",mongo.getReplicaSetUrl(DB),"database",DB,"isUri",true);
+            try(var client=MongoClients.create(mongo.getReplicaSetUrl(DB))){
+                var rows=new ArrayList<Document>();
+                for(int index=1;index<=7;index++)rows.add(new Document("id",(long)index).append("payload","same"));
+                rows.get(5).append("extra",true);client.getDatabase(DB).getCollection("records").insertMany(rows);
+            }
+            Object baseline=null;
+            try(var query=java.util.concurrent.Executors.newSingleThreadExecutor();var decode=java.util.concurrent.Executors.newSingleThreadExecutor()){
+                for(int attempt=0;attempt<20;attempt++){
+                    var captured=new java.util.concurrent.atomic.AtomicReference<Object>();
+                    try(var reader=PdkValidationSession.inspect("mongodb",artifact,settings,"records",List.of(),
+                            model->captured.set(PdkValidationModelVersion.canonicalModel(model,artifact)),()->{},query,decode,limits)){
+                        assertThat(reader.next()).isEmpty();
+                    }
+                    if(baseline==null)baseline=captured.get();
+                    var paths=new ArrayList<String>();changedPaths(baseline,captured.get(),"model",paths);
+                    assertThat(paths).as("canonical property paths changed; no metadata values are logged").isEmpty();
+                    if(attempt==0)try(var flush=MongoClients.create(mongo.getReplicaSetUrl(DB))){
+                        flush.getDatabase("admin").runCommand(new Document("fsync",1));
+                    }
+                }
+            }
+        }
+    }
+    private static void changedPaths(Object first,Object second,String path,List<String> changed){
+        if(first instanceof Map<?,?> left&&second instanceof Map<?,?> right){
+            var keys=new TreeSet<String>();left.keySet().forEach(key->keys.add(key.toString()));right.keySet().forEach(key->keys.add(key.toString()));
+            for(var key:keys)changedPaths(left.get(key),right.get(key),path+"/"+key,changed);
+        }else if(first instanceof List<?> left&&second instanceof List<?> right){
+            if(left.size()!=right.size()){changed.add(path+"/length");return;}
+            for(int index=0;index<left.size();index++)changedPaths(left.get(index),right.get(index),path+"/"+index,changed);
+        }else if(!Objects.equals(first,second))changed.add(path);
+    }
     private void verify(boolean mysql)throws Exception {
         var kind=mysql?"mysql":"postgres";var sourceRef=artifact(kind);var targetRef=artifact("mongodb");int port=mysql?3306:5432;
         try(var sql=new GenericContainer<>(DockerImageName.parse(mysql?"mysql:8.0":"postgres:16"))
@@ -67,10 +137,12 @@ class ValidationNativeCountGatewayIT {
             long value=count.count();assertThat(count.drained()).isTrue();assertThat(count.callExited().toCompletableFuture()).isCompleted();return value;
         }
     }
-    private static ConnectorRef artifact(String kind) {
+    private static ConnectorRef artifact(String kind)throws Exception {
         var configured=System.getProperty("tapstate.pdk.it."+kind+"-jar");
         assertThat(configured).as("real connector artifact for %s",kind).isNotBlank();
         var paths=List.of(Path.of(configured));var inspected=new ConnectorIntrospector().introspect(paths);
-        return new ConnectorRef(paths,inspected.className(),inspected.pdkApiVersion(),null,inspected.spec());
+        var digest=java.security.MessageDigest.getInstance("SHA-256");
+        try(var input=java.nio.file.Files.newInputStream(paths.getFirst())){var buffer=new byte[8192];for(int read;(read=input.read(buffer))!=-1;)digest.update(buffer,0,read);}
+        return new ConnectorRef(paths,inspected.className(),inspected.pdkApiVersion(),null,inspected.spec(),HexFormat.of().formatHex(digest.digest()),false);
     }
 }

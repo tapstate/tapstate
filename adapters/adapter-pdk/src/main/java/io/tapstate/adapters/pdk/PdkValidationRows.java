@@ -31,7 +31,7 @@ import java.util.Objects;
  * unbounded traversal and copies; they are not a measurement of heap or a driver admission proof.
  */
 final class PdkValidationRows implements PdkValidationCursor.Decoder {
-    enum Shape { AUTO, EXACT_NUMBER, FLOAT32, FLOAT64, TEXT, BOOLEAN, BINARY, JSON, OBJECT, ARRAY,
+    enum Shape { AUTO, EXACT_NUMBER, FLOAT32, FLOAT64, TEXT, OBJECT_ID, BOOLEAN, BINARY, JSON, OBJECT, ARRAY,
         DATE, TIME, LOCAL_DATE_TIME, INSTANT }
     record Rule(Shape shape, PdkValidationTemporal.LegacyEncoding temporalEncoding) {
         static final Rule AUTO = new Rule(Shape.AUTO, null);
@@ -47,11 +47,16 @@ final class PdkValidationRows implements PdkValidationCursor.Decoder {
     private final Map<String, Model> model;
     private final Rules rules;
     private final ValidationValues.Limits limits;
+    private final boolean bsonEpochDates;
 
     PdkValidationRows(TapTable table, PdkValidationCodecs codecs, Rules rules, ValidationValues.Limits limits) {
+        this(table,codecs,rules,limits,false);
+    }
+    PdkValidationRows(TapTable table, PdkValidationCodecs codecs, Rules rules, ValidationValues.Limits limits,boolean bsonEpochDates) {
         this.codecs = Objects.requireNonNull(codecs, "codecs");
         this.rules = Objects.requireNonNull(rules, "rules");
         this.limits = Objects.requireNonNull(limits, "limits");
+        this.bsonEpochDates=bsonEpochDates;
         Objects.requireNonNull(table, "table");
         if (table.getNameFieldMap() == null || table.getNameFieldMap().size() > 4096) throw invalid("model.fields");
         Map<String, Model> fields = new LinkedHashMap<>();
@@ -81,16 +86,40 @@ final class PdkValidationRows implements PdkValidationCursor.Decoder {
             IdentityHashMap<Object, Boolean> active, ArrayList<Object> path) {
         meter.ensureNode(depth);
         String field = diagnostic(path);
+        // Date is mutable. A codec may change its input, so its fidelity reference must be fixed
+        // before conversion. This reference only verifies the selected output; it never replaces it.
+        Instant bsonInstant=bsonEpochDates&&rawValue&&raw!=null&&raw.getClass()==java.util.Date.class
+                ?((java.util.Date)raw).toInstant():null;
         var selected = rawValue ? codecs.select(field, raw, fieldModel == null ? null : fieldModel.type())
                 : new PdkValidationCodecs.Selected(raw, PdkValidationCodecs.Origin.ALREADY_CONVERTED, codecs.binding());
         Rule rule = Objects.requireNonNull(rules.at(List.copyOf(path)), "admitted field rule");
+        boolean bsonDate=bsonInstant!=null;
+        if(bsonDate){
+            // This document protocol's DateCodec supplies epoch milliseconds. The selected codec
+            // must retain that instant; a model's timezone flag cannot establish this encoding.
+            if(rule.shape()!=Shape.AUTO&&rule.shape()!=Shape.INSTANT
+                    ||rule.temporalEncoding()!=null&&rule.temporalEncoding()!=PdkValidationTemporal.LegacyEncoding.EPOCH_SECONDS)
+                throw codecs.unavailable(field);
+            rule=new Rule(Shape.INSTANT,PdkValidationTemporal.LegacyEncoding.EPOCH_SECONDS);
+        }
         Payload payload = payload(selected, fieldModel == null ? null : fieldModel.nativeType(), field, rule);
+        boolean objectId=rawValue&&raw!=null&&raw.getClass().getName().equals("org.bson.types.ObjectId");
+        if(objectId){
+            // The runtime class establishes the domain. The chosen codec must retain its exact
+            // canonical identity; never classify a business string by its printed appearance.
+            String canonical=objectId(raw,field);
+            Object converted=payload.value() instanceof ValidationValues.Typed typed?typed.value():payload.value();
+            if(!(converted instanceof String text)||!canonical.equals(text)
+                    ||rule.shape()!=Shape.AUTO&&rule.shape()!=Shape.OBJECT_ID)throw codecs.unavailable(field);
+            if(payload.value() instanceof ValidationValues.Typed typed&&!typed.logicalType().equals("object-id"))throw codecs.unavailable(field);
+        }
         if (payload.value() instanceof ValidationValues.Typed typed) {
             validateTyped(typed, rule, payload.wrapper(), field);
+            if(bsonDate&&!sameInstant(typed,bsonInstant))throw codecs.unavailable(field);
             return portable(typed, depth, meter, active, path);
         }
         if (payload.value() == null && rule.shape() == Shape.AUTO) return portable(null, depth, meter, active, path);
-        Shape shape = rule.shape() == Shape.AUTO ? infer(payload, field) : rule.shape();
+        Shape shape = objectId?Shape.OBJECT_ID:rule.shape() == Shape.AUTO ? infer(payload, field) : rule.shape();
         if (payload.wrapper() != null && !wrapperMatches(shape, payload.wrapper())) throw codecs.unavailable(field);
         if (!rawValue && shape == Shape.JSON && payload.wrapper() == null && payload.value() != null)
             throw codecs.unavailable(field);
@@ -108,7 +137,7 @@ final class PdkValidationRows implements PdkValidationCursor.Decoder {
             decoded = switch (shape) {
                 case EXACT_NUMBER -> portable(codecs.exactNumber(field, leaf), depth + 1, meter, active, path);
                 case FLOAT32, FLOAT64 -> portable(floating(payload.value(), shape, field), depth + 1, meter, active, path);
-                case TEXT -> portable(require(payload.value(), String.class, field), depth + 1, meter, active, path);
+                case TEXT, OBJECT_ID -> portable(require(payload.value(), String.class, field), depth + 1, meter, active, path);
                 case BOOLEAN -> portable(require(payload.value(), Boolean.class, field), depth + 1, meter, active, path);
                 case BINARY -> portable(codecs.binary(field, leaf, Math.max(1, meter.remainingBytes())), depth + 1, meter, active, path);
                 case JSON -> {
@@ -129,7 +158,13 @@ final class PdkValidationRows implements PdkValidationCursor.Decoder {
                 case AUTO -> throw new IllegalStateException("automatic value shape was not resolved");
             };
         }
+        if(bsonDate&&!sameInstant(decoded,bsonInstant))throw codecs.unavailable(field);
         return new ValidationValues.Typed(logical, payload.nativeType(), codecs.binding(), origin, decoded);
+    }
+    private static boolean sameInstant(Object decoded,Instant expected){
+        int wrappers=0;
+        while(decoded instanceof ValidationValues.Typed typed){if(++wrappers>64)return false;decoded=typed.value();}
+        return decoded instanceof Instant instant&&instant.equals(expected);
     }
 
     private Payload payload(PdkValidationCodecs.Selected selected, String nativeType, String field, Rule rule) {
@@ -187,6 +222,17 @@ final class PdkValidationRows implements PdkValidationCursor.Decoder {
         if (value instanceof LocalDateTime) return Shape.LOCAL_DATE_TIME;
         if (value instanceof Instant || value instanceof OffsetDateTime || value instanceof ZonedDateTime) return Shape.INSTANT;
         throw codecs.unavailable(field);
+    }
+
+    private String objectId(Object raw,String field){
+        try{
+            Object value=raw.getClass().getMethod("toHexString").invoke(raw);
+            if(value instanceof String text&&text.matches("[0-9a-f]{24}"))return text;
+            throw codecs.unavailable(field);
+        }catch(java.lang.reflect.InvocationTargetException failed){
+            if(failed.getCause() instanceof Error fatal)throw fatal;
+            throw codecs.failed(field,new IllegalStateException("native identity accessor failed",failed.getCause()));
+        }catch(ReflectiveOperationException missing){throw codecs.unavailable(field);}
     }
 
     private Map<String, Object> object(Map<?, ?> raw, int depth, Meter meter, IdentityHashMap<Object, Boolean> active,
@@ -327,6 +373,7 @@ final class PdkValidationRows implements PdkValidationCursor.Decoder {
             case FLOAT32 -> value instanceof Float;
             case FLOAT64 -> value instanceof Double;
             case TEXT -> value instanceof String;
+            case OBJECT_ID -> value instanceof String text&&text.matches("[0-9a-f]{24}");
             case BOOLEAN -> value instanceof Boolean;
             case BINARY -> value instanceof ValidationValues.Binary;
             case DATE -> value instanceof LocalDate;
@@ -374,7 +421,7 @@ final class PdkValidationRows implements PdkValidationCursor.Decoder {
     private static boolean wrapperMatches(Shape shape, Class<? extends TapType> wrapper) {
         return switch (shape) {
             case EXACT_NUMBER, FLOAT32, FLOAT64 -> wrapper == TapNumber.class;
-            case TEXT -> wrapper == TapString.class;
+            case TEXT, OBJECT_ID -> wrapper == TapString.class;
             case BOOLEAN -> wrapper == TapBoolean.class;
             case BINARY -> wrapper == TapBinary.class;
             case JSON -> wrapper == TapJson.class;

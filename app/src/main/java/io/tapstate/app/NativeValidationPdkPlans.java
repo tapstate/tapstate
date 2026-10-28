@@ -24,8 +24,6 @@ final class NativeValidationPdkPlans implements NativeValidationFullJob.Factory 
     @Override public NativeValidationFullJob.Plan prepare(NativeValidationOwnerReservations.Reservation original){
         original.requireReserved();var spec=original.spec();
         if(spec.mode()!=ValidationMode.FULL)throw invalid("mode");
-        if(spec.method()!=ValidationMethod.COUNT)throw new TapstateException(ValidationError.RULE_UNSUPPORTED,
-                Map.of("node",spec.task().pipelineId(),"field","method","rule","independent-row-reader-not-admitted"),null);
         var saved=Objects.requireNonNull(original.declarations,"saved declarations");
         if(saved.original().task().settings().full().maxConcurrentTables()!=1)throw invalid("tableConcurrency");
         var declarations=ValidationDirectMappings.declare(saved);var artifacts=new LinkedHashMap<String,ConnectorRef>();
@@ -44,7 +42,9 @@ final class NativeValidationPdkPlans implements NativeValidationFullJob.Factory 
                     Map.of("limit","validation.connectorMetadata"),null);
             original.requireReserved();resolved.put(source.connector(),retained);artifacts.put(source.id(),retained);
         }
-        original.requireReserved();return new Counts(original,saved,declarations,Map.copyOf(artifacts));
+        original.requireReserved();return spec.method()==ValidationMethod.COUNT
+                ?new Counts(original,saved,declarations,Map.copyOf(artifacts))
+                :new NativeValidationPdkRows(original,saved,declarations,Map.copyOf(artifacts),clock);
     }
 
     private final class Counts implements NativeValidationFullJob.Plan {

@@ -19,6 +19,8 @@ final class NativeValidationFullJob implements ValidationRunLifecycle.Activation
         default List<ValidationCountScan.Mapping> counts(){return List.of();}
         /** Actual native/callback/row drain, including cancellation and failed opening. */
         boolean drained();
+        /** Late native/cleanup failures remain observable until every original handle has drained. */
+        default Throwable failure(){return null;}
         /** Idempotently close original resources on admitted I/O, including concurrent cancellation. This call alone does not prove drain. */
         void close();
     }
@@ -122,11 +124,16 @@ final class NativeValidationFullJob implements ValidationRunLifecycle.Activation
                 return;
             }
         }
-        @Override public boolean businessComplete(){var current=scan;var scalar=counts;return finished&&(current!=null&&current.complete()||scalar!=null&&scalar.complete())&&failures.get()==null;}
-        @Override public boolean readersReleased(){
-            boolean done=!workerOutstanding&&runs.publicationsDrained(identity)&&(plan==null||cleanupExited&&plan.drained());if(done)releasePlan();return done;
+        @Override public boolean businessComplete(){
+            var current=scan;var scalar=counts;var prepared=plan;
+            boolean drained=prepared==null||cleanupExited&&prepared.drained();recordPlanFailure();
+            return finished&&drained&&(current!=null&&current.complete()||scalar!=null&&scalar.complete())&&failures.get()==null;
         }
-        @Override public Throwable failure(){return failures.get();}
+        @Override public boolean readersReleased(){
+            boolean done=!workerOutstanding&&runs.publicationsDrained(identity)&&(plan==null||cleanupExited&&plan.drained());
+            recordPlanFailure();if(done)releasePlan();return done;
+        }
+        @Override public Throwable failure(){recordPlanFailure();return failures.get();}
         @Override public void cancel(){
             cancelled.set(true);var current=scan;if(current!=null)current.cancel();var scalar=counts;if(scalar!=null)scalar.cancel();
             maintain();
@@ -149,7 +156,8 @@ final class NativeValidationFullJob implements ValidationRunLifecycle.Activation
             if(lease!=null&&!workerOutstanding&&(current==null||cleanupExited&&current.drained()))lease.close();
         }
         void record(Throwable failed){failures.record(failed);ValidationFailureLatch.addContext(failures.get(),failed);}
-        void throwFailure(){if(failures.get() instanceof Error fatal)throw fatal;if(failures.get() instanceof RuntimeException failed)throw failed;}
+        void recordPlanFailure(){var current=plan;if(current!=null){var failed=current.failure();if(failed!=null)record(failed);}}
+        void throwFailure(){recordPlanFailure();if(failures.get() instanceof Error fatal)throw fatal;if(failures.get() instanceof RuntimeException failed)throw failed;}
     }
     private static TapstateException invalid(String field){return new TapstateException(ValidationError.INVALID_CONTRACT,Map.of("field","fullJob."+field),null);}
 }
