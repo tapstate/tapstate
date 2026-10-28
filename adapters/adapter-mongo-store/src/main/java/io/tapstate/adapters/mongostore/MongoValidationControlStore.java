@@ -93,6 +93,7 @@ final class MongoValidationControlStore implements ValidationControlStore {
         if (validation != null) record.append("validationSubject", MongoValidationPreparationFacts.encode(validation.subject()));
         if (validation != null) record.append("admission", MongoValidationAdmissionStore.identity(run.admission()));
         if (run.snapshot() != null) record.append("specSnapshot", MongoValidationTaskCodec.run(run.snapshot()));
+        if(state.terminal())record.put("endedAt",java.time.Instant.now().toString());
         bounded(record, 512 * 1024); return record;
     }
 
@@ -119,7 +120,7 @@ final class MongoValidationControlStore implements ValidationControlStore {
             if (row.getBoolean("retired")) return Mutation.ALREADY_APPLIED;
             if (!current(control, run) || !slot(control, run)) return Mutation.STALE;
             var terminal = state(row).terminal() ? state(row) : command.terminal();
-            updateRun(session, run, row, new Document("state", terminal.name()).append("retired", true));
+            updateRun(session, run, row, terminalValues(row, terminal).append("retired", true));
             removeSlot(control, run); writeControl(session, control); return Mutation.APPLIED;
         });
         requireAdmission(run, true); return result;
@@ -133,7 +134,7 @@ final class MongoValidationControlStore implements ValidationControlStore {
                 var row = rows.find(session, new Document("_id", id)).projection(controlHeader()).first(); if (row == null) throw unreadable("missing-slot-run");
                 var run = decodeRun(row); requireRow(row, run, false);
                 if (!current(control, run) || row.getBoolean("retired")) throw unreadable("slot-owner");
-                active.add(new Status(run, state(row), false));
+                active.add(new Status(run, state(row), false, endedAt(row)));
             }
             var ledger = control.get("owner", Document.class);
             return new Snapshot(authority, ledger == null ? null : owner(ledger, authority.pipelineId()), control.getLong("countingGeneration"),
@@ -146,7 +147,7 @@ final class MongoValidationControlStore implements ValidationControlStore {
         if (!authority.clusterId().equals(original.identity().owner().clusterId()) || !authority.pipelineId().equals(original.identity().owner().pipelineId())) throw fenced();
         return transaction(authority, false, session -> {
             control(session, authority.pipelineId()); var row = row(session, original);
-            return row == null ? Optional.empty() : Optional.of(new Status(decodeRun(row), state(row), row.getBoolean("retired")));
+            return row == null ? Optional.empty() : Optional.of(new Status(decodeRun(row), state(row), row.getBoolean("retired"), endedAt(row)));
         });
     }
 
@@ -224,7 +225,7 @@ final class MongoValidationControlStore implements ValidationControlStore {
             if (current == command.next()) return Mutation.ALREADY_APPLIED;
             if (current != command.expected()) return Mutation.STALE;
             writeControl(session, control);
-            updateRun(session, run, row, new Document("state", command.next().name()));
+            updateRun(session, run, row, terminalValues(row, command.next()));
             return Mutation.APPLIED;
         });
         requireTransitionAdmission(command);
@@ -281,7 +282,7 @@ final class MongoValidationControlStore implements ValidationControlStore {
             if (row.getBoolean("retired")) return Mutation.ALREADY_APPLIED;
             if (!slot(control, obsolete) || !current(control, obsolete)) throw unreadable("obsolete-slot");
             var values = new Document("retired", true);
-            if (!state(row).terminal()) values.put("state", ValidationRunState.FAILED.name());
+            if (!state(row).terminal()) values.putAll(terminalValues(row, ValidationRunState.FAILED));
             updateRun(session, obsolete, row, values); removeSlot(control, obsolete); writeControl(session, control);
             return Mutation.APPLIED;
         });
@@ -481,7 +482,7 @@ final class MongoValidationControlStore implements ValidationControlStore {
                 || validation != null && !MongoValidationPreparationFacts.encode(validation.subject()).equals(row.get("validationSubject"))
                 || validation != null && (run.admission() == null || !MongoValidationAdmissionStore.identity(run.admission()).equals(row.get("admission")))
                 || !identity(run).equals(row.get("identity")) || !(row.get("retired") instanceof Boolean)) throw unreadable("run");
-        state(row);
+        state(row);endedAt(row);
         if (description && row.containsKey("specSnapshot")) {
             var snapshot = MongoValidationTaskCodec.run(row.get("specSnapshot", Document.class)); new ValidationReportAdmission.Open(run.admission(), snapshot);
             if (run.snapshot() != null && !run.snapshot().equals(snapshot)) throw unreadable("spec-snapshot");
@@ -506,6 +507,17 @@ final class MongoValidationControlStore implements ValidationControlStore {
         } catch (NullPointerException | ClassCastException | IllegalArgumentException | TapstateException invalid) { throw unreadable("owner"); }
     }
     private static boolean nativeRunVersion(Object value) { return Integer.valueOf(2).equals(value) || Integer.valueOf(3).equals(value); }
+    /** The first terminal CACHE write owns this timestamp; retry and mirroring never replace it. */
+    private static Document terminalValues(Document row,ValidationRunState next){
+        var values=new Document("state",next.name());
+        if(next.terminal()&&!state(row).terminal())values.put("endedAt",java.time.Instant.now().toString());
+        return values;
+    }
+    private static java.time.Instant endedAt(Document row){
+        if(!row.containsKey("endedAt"))return null; // Older facts have no invented terminal time.
+        if(!state(row).terminal()||!(row.get("endedAt") instanceof String value))throw unreadable("terminal-time");
+        try{return java.time.Instant.parse(value);}catch(java.time.DateTimeException bad){throw unreadable("terminal-time");}
+    }
     private static ValidationRunState state(Document row) {
         try { return ValidationRunState.valueOf(row.getString("state")); }
         catch (NullPointerException | ClassCastException | IllegalArgumentException invalid) { throw unreadable("state"); }
@@ -529,7 +541,7 @@ final class MongoValidationControlStore implements ValidationControlStore {
     static Document controlId(String cluster, String pipeline) { return new Document("kind", "pipeline").append("clusterId", cluster).append("pipelineId", pipeline); }
     static Document controlHeader() {
         return new Document("_id", 1).append("formatVersion", 1).append("scope", 1).append("identity", 1).append("state", 1)
-                .append("retired", 1).append("validationSubject", 1).append("admission", 1).append("delayRequested", 1).append("delayApplied", 1);
+                .append("retired", 1).append("endedAt",1).append("validationSubject", 1).append("admission", 1).append("delayRequested", 1).append("delayApplied", 1);
     }
     static Document runId(Run run) { var id = run.identity(); return new Document("kind", "run").append("clusterId", id.owner().clusterId()).append("pipelineId", id.owner().pipelineId()).append("taskId", id.taskId()).append("mode", id.mode().name()).append("runId", id.runId()); }
     private static String slotKey(ValidationRunIdentity run) { return slotKey(run.taskId(), run.mode().name()); }

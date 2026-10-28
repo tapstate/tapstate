@@ -621,7 +621,12 @@ class MongoValidationTaskStoreIT {
             assertThat(control.transition(new ValidationControlStore.Transition(coordinates, ValidationRunState.RUNNING, ValidationRunState.STOPPING))).isEqualTo(ValidationControlStore.Mutation.APPLIED);
             assertThat(control.transition(new ValidationControlStore.Transition(coordinates, ValidationRunState.STOPPING, ValidationRunState.STOPPED))).isEqualTo(ValidationControlStore.Mutation.APPLIED);
             assertThat(control.retire(new ValidationControlStore.Retirement(coordinates, run.report(), ValidationRunState.STOPPED))).isEqualTo(ValidationControlStore.Mutation.APPLIED);
-            assertThat(control.read(owner, coordinates).orElseThrow()).isEqualTo(new ValidationControlStore.Status(run, ValidationRunState.STOPPED, true));
+            var terminal=control.read(owner, coordinates).orElseThrow();
+            assertThat(terminal.run()).isEqualTo(run);assertThat(terminal.state()).isEqualTo(ValidationRunState.STOPPED);
+            assertThat(terminal.retired()).isTrue();assertThat(terminal.endedAt()).isNotNull();
+            assertThat(control.retire(new ValidationControlStore.Retirement(coordinates, run.report(), ValidationRunState.STOPPED)))
+                    .isEqualTo(ValidationControlStore.Mutation.ALREADY_APPLIED);
+            assertThat(control.read(owner, coordinates).orElseThrow().endedAt()).isEqualTo(terminal.endedAt());
             var stopped = control.snapshot(owner); assertThat(stopped.closed()).isTrue(); assertThat(stopped.active()).isEmpty(); assertThat(stopped.retainedRuns()).isOne();
             SystemCollections.VALIDATION_RUNS.on(f.cacheDb).updateOne(new Document("_id", MongoValidationControlStore.runId(run)),
                     new Document("$unset", new Document("formatVersion", "")));

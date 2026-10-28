@@ -849,6 +849,12 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                 () -> { requireOpen(); local.run(); }, artifacts);
     }
 
+    /** Retained CONFIG facts only; reading history neither creates a native preparation nor acquires an owner. */
+    public io.tapstate.spi.store.ValidationReports validationReports(Runnable local){
+        requireOpen();Objects.requireNonNull(local).run();StoreIo.run(()->MongoValidationSchema.requireReady(connection.database(),true));
+        return new MongoValidationResultStore(connection.client(),connection.database(),clusterId,()->{requireOpen();local.run();});
+    }
+
     /** Independent preparation only. The caller authenticates its command and supplies a pure local lifecycle guard. */
     public java.util.UUID currentValidationGeneration(String pipeline, io.tapstate.spi.store.CacheBusinessScope expected, Runnable local) {
         requireOpen(); Objects.requireNonNull(local).run();
@@ -899,6 +905,10 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         public io.tapstate.spi.store.ValidationResultStore results() {
             requireCurrent(); return new MongoValidationResultStore(configuration.connection.client(), configuration.connection.database(), configuration.clusterId,
                     () -> { configuration.requireOpen(); local.run(); }, new MongoValidationPreparations.Authority(original));
+        }
+        public io.tapstate.spi.store.ValidationReports reports(){
+            requireCurrent();return new MongoValidationResultStore(configuration.connection.client(),configuration.connection.database(),configuration.clusterId,
+                    ()->{configuration.requireOpen();local.run();},new MongoValidationPreparations.Authority(original));
         }
         /** Only old-tenure CONFIG rights are revoked; current requests and saved task definitions remain intact. */
         public boolean closeObsoletePermissions(io.tapstate.core.validation.ValidationOwner current, int maximum) {

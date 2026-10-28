@@ -568,6 +568,14 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         bounded(identity(start), 8 * 1024);
     }
     void checkActive() { requireActive.run(); }
+    io.tapstate.spi.store.ValidationTaskStore.Snapshot retentionTask(ClientSession session,Task expected){
+        if(!clusterId.equals(expected.clusterId()))throw unreadable("retention-cluster");requirePipeline(expected.pipelineId());
+        var row=tasks.find(session,new Document("_id",taskId(expected))).first();if(row==null)return null;
+        var saved=MongoValidationTaskCodec.snapshot(row,clusterId);if(!saved.task().equals(expected))return null;
+        // Birth and authoring use this same CONFIG write fence. No new lease or acknowledgement is introduced.
+        ConfigurationVersion.advance(session,SystemCollections.CONFIGURATION_VERSION.on(database));
+        return saved;
+    }
     boolean closing() { return validation != null && validation.closing() || recovery != null; }
     void requirePipeline(String pipeline) {
         if (validation != null && !validation.pipelineId().equals(pipeline) || recovery != null && !recovery.pipeline().equals(pipeline)) throw unreadable("pipeline");

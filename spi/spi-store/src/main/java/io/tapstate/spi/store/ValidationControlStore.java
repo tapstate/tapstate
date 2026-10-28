@@ -63,8 +63,10 @@ public interface ValidationControlStore {
     }
     enum Join { JOINED, ALREADY_JOINED, MODE_BUSY, GENERATION_CLOSED }
     enum Mutation { APPLIED, ALREADY_APPLIED, STALE }
-    record Status(Run run, ValidationRunState state, boolean retired) {
-        public Status { Objects.requireNonNull(run); Objects.requireNonNull(state); if (retired && !state.terminal()) throw invalid("control.retiredState"); }
+    record Status(Run run, ValidationRunState state, boolean retired, java.time.Instant endedAt) {
+        public Status(Run run, ValidationRunState state, boolean retired){this(run,state,retired,null);}
+        public Status { Objects.requireNonNull(run); Objects.requireNonNull(state);
+            if (retired && !state.terminal() || endedAt != null && !state.terminal()) throw invalid("control.retiredState"); }
     }
     /** Active entries carry bounded control coordinates; read retrieves one full frozen snapshot. No query resumes work. */
     record Snapshot(ValidationOwner authority, ValidationOwner ledgerOwner, long countingGeneration, boolean closed,
