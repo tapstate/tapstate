@@ -82,7 +82,7 @@ class PipelineViewServiceTest {
                 (config, request, listener) -> { throw new AssertionError("Listing views must not follow rows"); });
         ViewCatalogService views = new ViewCatalogService(artifacts,
                 new PipelineObservationQueryService(artifacts, new InMemoryObservationStore()),
-                browser, new SourceSchemaQueryService(store, schemas));
+                browser, copyOutputNames(store));
 
         assertThat(views.list()).singleElement().satisfies(view -> {
             assertThat(view.id()).isEqualTo("acc_copy_mysql:acc_copy_mysql_to_store:ACC_COMPOSITE");
@@ -296,6 +296,22 @@ class PipelineViewServiceTest {
                 "atlas-store/mysql_ACC_COMPOSITE", "atlas-store/ora_ACC_COMPOSITE", "atlas-store/pg_ACC_COMPOSITE");
     }
 
+    private static PipelineOutputNames copyOutputNames(ReadOnlyArtifactStore store) {
+        return pipeline -> {
+            ServeBlock.Inline serve;
+            if (pipeline.serve() instanceof ServeBlock.Inline inline) {
+                serve = inline;
+            } else {
+                ServeBlock.Use use = (ServeBlock.Use) pipeline.serve();
+                ServeResource resource = (ServeResource) store.get(use.use()).orElseThrow();
+                serve = new ServeBlock.Inline(null, use.from(), resource.sync(), null, null);
+            }
+            return serve.sync().stream().map(sync -> new PipelineOutputNames.Output(sync.id(), "replica",
+                    sync.source(), io.tapstate.core.model.TableRename.apply("ACC_COMPOSITE", sync.rename()),
+                    sync.id() + ":ACC_COMPOSITE")).toList();
+        };
+    }
+
     private static ReadOnlyArtifactStore replicaSources() {
         ReadOnlyArtifactStore store = new ReadOnlyArtifactStore();
         store.seed(new SourceResource("mysql_source", null, "mysql", Map.of(), null,
@@ -318,7 +334,7 @@ class PipelineViewServiceTest {
                 (config, request, listener) -> { throw new AssertionError("Listing views must not follow rows"); });
         return new ViewCatalogService(artifacts,
                 new PipelineObservationQueryService(artifacts, new InMemoryObservationStore()),
-                browser, new SourceSchemaQueryService(store, schemas));
+                browser, copyOutputNames(store));
     }
 
     private static SourceResource source(String id, String description, String connector) {

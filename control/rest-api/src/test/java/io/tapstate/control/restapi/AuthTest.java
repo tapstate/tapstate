@@ -1277,7 +1277,7 @@ class AuthTest {
         ViewCatalogService viewCatalogService(ArtifactQueryService artifacts,
                 PipelineObservationQueryService observations, DataBrowserService browser,
                 SourceSchemaQueryService schemas, Clock clock) {
-            return new ViewCatalogService(artifacts, observations, browser, schemas, clock);
+            return new ViewCatalogService(artifacts, observations, browser, pipeline -> List.of(), clock);
         }
 
         @Bean
