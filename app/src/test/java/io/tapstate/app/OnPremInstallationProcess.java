@@ -16,7 +16,7 @@ public final class OnPremInstallationProcess {
                             () -> new InstalledConnectorTests(properties, java.time.Clock.systemUTC()));
                     definition.setPrimary(true);
                     ((org.springframework.beans.factory.support.BeanDefinitionRegistry)application.getBeanFactory()).registerBeanDefinition("installationTestConnectors", definition);
-                }).run("--server.address=127.0.0.1", "--server.port=0", "--logging.level.root=ERROR",
+                }).run("--tapstate.installation.require-credential=true", "--server.address=127.0.0.1", "--server.port=0", "--logging.level.root=ERROR",
                         "--spring.config.location=optional:classpath:/application.properties",
                         "--tapstate.installation.directory=" + installation, "--tapstate.control.auth.jwt-secret=installation-process-test-signing-key",
                         "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2",

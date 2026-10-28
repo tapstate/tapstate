@@ -29,6 +29,7 @@ class StorageEntryController {
                 : state == null ? new StorageEntryStatus.Summary("OP", StorageEntryStatus.Entry.UNAVAILABLE) : state.read();
         var body = new java.util.LinkedHashMap<String,Object>();
         body.put("mode", summary.mode()); body.put("entry", summary.entry().name()); body.put("management", management);
+        if (management && installation.automaticAuthorization()) body.put("automaticAuthorization", true);
         if (!progress.isEmpty()) body.put("initializationProgress", progress);
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(body);
     }

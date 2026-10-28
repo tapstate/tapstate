@@ -33,10 +33,11 @@ class OnPremInstallationConfiguration {
             MongoProperties mongo, ObjectProvider<StorageSetupService.DefaultTarget> targets, Clock clock,
             org.springframework.context.ConfigurableApplicationContext context, Environment environment) {
         var installation = new OnPremInstallation(root, files, mongo, targets.getObject(), clock);
+        installation.requireCredential(environment.getProperty("tapstate.installation.require-credential", Boolean.class, false));
         if ("true".equals(environment.getProperty("tapstate.installation.automatic-restart"))) {
             installation.onRestartRequired(new InstallationAutomaticRestart(context::close, Runtime.getRuntime()::halt));
             installation.onStartupCompleted(() -> {
-                if (root.runtime().requireConfiguration().firstAdmin().load().orElseThrow(StorageRuntime::unavailable).phase()
+                if (!installation.automaticAuthorization() && root.runtime().requireConfiguration().firstAdmin().load().orElseThrow(StorageRuntime::unavailable).phase()
                         == io.tapstate.spi.store.FirstAdminStore.Phase.PENDING) {
                     InstallationCommand.authorize(files, mongo, clock);
                     org.slf4j.LoggerFactory.getLogger(OnPremInstallationConfiguration.class)
@@ -52,7 +53,7 @@ class OnPremInstallationConfiguration {
             int port = 0;
             var stage = installation.files().stage();
             if ("true".equals(environment.getProperty("tapstate.installation.automatic-restart"))
-                    && stage.handoff() == InstallationFiles.Handoff.RESTART_REQUIRED && stage.managementUrl() != null) {
+                    && stage.managementUrl() != null) {
                 var address = java.net.URI.create(stage.managementUrl());
                 if (!"http".equals(address.getScheme()) || !"127.0.0.1".equals(address.getHost()) || address.getPort() < 1)
                     throw InstallationFiles.refused();
