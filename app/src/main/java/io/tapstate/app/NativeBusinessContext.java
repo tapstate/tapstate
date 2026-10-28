@@ -412,6 +412,26 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                                 owner.root.authentication()::continueAlertTest));
             }, owner.configuration.intents(), ownership::evaluationProof, active, clock);
         }
+        @Bean io.tapstate.control.core.AlertControlDispatcher alertControlDispatcher(NativeBusinessContext owner,
+                PipelineAlertRuntime runtime, CloudRuntimeSettings cloud, Clock clock, AuditGate audit) {
+            return (operation, caller, input) -> {
+                owner.original.requireBusiness();
+                var setup = owner.original.binding().setup();
+                var scope = cloud.cloud() ? owner.parent.getBean(CloudSdkBridge.class).alertScope().orElseThrow(ThreeLayerStorePort::refused)
+                        : new io.tapstate.core.alerting.AlarmKey.Scope(setup.installationId(), setup.clusterId());
+                var deployment = cloud.cloud() ? io.tapstate.core.alerting.AlertChannelPolicy.Deployment.CLOUD_MANAGED
+                        : io.tapstate.core.alerting.AlertChannelPolicy.Deployment.ON_PREM;
+                return new AlertManagement(runtime::managementServices, originalCaller -> {
+                    originalCaller.requireActive().run();
+                    if (!owner.active.get() || originalCaller.storageScope().filter(owner.original.preparation().authScope()::equals).isEmpty())
+                        throw ThreeLayerStorePort.refused();
+                    if (!cloud.cloud()) return owner.root.authentication().alertAccess(originalCaller, setup);
+                    return CloudAlertAccess.bind(originalCaller, scope, owner.original.preparation().authScope(), () -> {
+                        owner.original.requireBusiness(); if (!owner.active.get()) throw ThreeLayerStorePort.refused();
+                    });
+                }, runtime::health, scope, deployment, clock, audit).dispatch(operation, caller, input);
+            };
+        }
         @Bean ConvergenceDriver convergenceDriver(NativeBusinessContext owner, PipelineConverger converger,
                 ObservationPublisher observations, RateSampler samples, MetricsExport export, NodeSessionLease node,
                 ClusterMembershipGate membership, PipelineActuationOwnership ownership, EngineLifecycleActuator actuator,

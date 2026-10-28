@@ -74,12 +74,15 @@ public interface AlertStore {
     record PreparedCandidate(AlertTestCommand.Parameters parameters,AlertIntent.CandidateTarget target,AlertIntent.EncryptedCandidate encrypted) {
         @Override public String toString(){return "PreparedAlertCandidate[redacted]";}
     }
-    /** Safe query capabilities and typed keyset cursors, no free-form filters or offsets. */
+    /** Safe query capabilities and typed keyset cursors. Guards remain process-local inside CONFIG; request IO revalidation belongs outside. */
     record ReadAccess(boolean allResources,Set<AlarmKey.Resource> resources,Runnable requireActive) {
         public ReadAccess { resources=Set.copyOf(resources);Objects.requireNonNull(requireActive);if(resources.size()>1000||allResources&&!resources.isEmpty())throw new IllegalArgumentException("invalid authorized resources"); }
         public boolean permits(AlarmKey key){return allResources||resources.contains(key.resource());}
     }
     record ActiveCursor(int severityRank,long secondOrder,int nanoOrder,AlarmKey key) { }
+    record AlarmFilter(AlarmSeverity severity,String search,AlertConfiguration.Match match) {
+        public AlarmFilter { if(search!=null&&(search.length()>128||search.codePoints().anyMatch(Character::isISOControl)))throw new io.tapstate.core.common.TapstateException(AlertError.INVALID_CONFIGURATION,Map.of("field","search","reason","outside-query-budget"),null); }
+    }
     record ActivePage(long total,List<Stored<AlertStateRecord.Head>> rows,ActiveCursor next,boolean isolatedRecords) {public ActivePage{rows=List.copyOf(rows);}}
     record HistoryPage(List<AlertStateRecord.Episode> rows,Long nextEpisode,boolean isolatedRecords){public HistoryPage{rows=List.copyOf(rows);}}
     record TransitionCursor(long revision,int ordinal){ }
@@ -89,22 +92,33 @@ public interface AlertStore {
     record ScheduleCursor(Instant candidateAt,AlertSchedule.Key key){ }
     record SchedulePage(List<Stored<AlertSchedule.Record>> rows,ScheduleCursor next,boolean isolatedRecords){public SchedulePage{rows=List.copyOf(rows);}}
     record DefinitionPage(List<AlertConfiguration.Definition> rows,String nextId){public DefinitionPage{rows=List.copyOf(rows);}}
+    record ResourcePage(List<AlarmKey.Resource> rows,String nextId){public ResourcePage{rows=List.copyOf(rows);}}
+    default ResourcePage resources(String kind,String after,int limit,Access access){throw new UnsupportedOperationException();}
+    record EpisodeCursor(AlarmKey key,long number,long secondOrder,int nanoOrder) { }
+    record EndedPage(List<AlertStateRecord.Episode> rows,EpisodeCursor next,boolean isolatedRecords){public EndedPage{rows=List.copyOf(rows);}}
+    record DeliveryPage(List<Stored<AlertIntent.Record>> rows,String nextId,boolean isolatedRecords){public DeliveryPage{rows=List.copyOf(rows);}}
     record EvaluationPage(List<Stored<AlertStateRecord.Head>> rows,AlarmKey next,Set<AlarmKey.Resource> removedResources){
         public EvaluationPage(List<Stored<AlertStateRecord.Head>> rows,AlarmKey next){this(rows,next,Set.of());}
         public EvaluationPage{rows=List.copyOf(rows);removedResources=Set.copyOf(removedResources);}
     }
 
     Optional<Stored<AlertStateRecord.Head>> state(AlarmKey key,ReadAccess access);
+    /** Returns parameters only when the current definition is exactly the original evaluation revision. */
+    default Optional<AlertConfiguration.Rule> originalRule(AlertRule binding,ReadAccess access){return Optional.empty();}
     Optional<Stored<AlertIntent.Record>> test(AlertTestCommand.Key key,Access access);
     Optional<Stored<AlertIntent.Record>> intent(AlertIntent.Identity identity,Access access);
     Optional<AlertConfiguration.Definition> definition(AlertConfiguration.Kind kind,String id,Access access);
     DefinitionPage definitions(AlertConfiguration.Kind kind,String after,int limit,Access access);
+    /** Fixed-size index windows; filtered empty pages may still carry a continuation. */
+    default EndedPage ended(EpisodeCursor after,int limit,ReadAccess access,AlertSnapshot.EndReason reason){throw new UnsupportedOperationException();}
+    default DeliveryPage deliveries(String after,int limit,String channel,DeliveryEvidence.Outcome outcome,ReadAccess access){throw new UnsupportedOperationException();}
+    default Optional<Stored<AlertIntent.Record>> delivery(String id,ReadAccess access){throw new UnsupportedOperationException();}
     /** Background evaluation only, scoped by the original Host; unknown records fail the whole page. */
     DefinitionPage evaluationRules(String after,int limit);
     EvaluationPage evaluationStates(AlarmKey after,int limit);
     Outcome saveDefinition(AlertConfiguration.Definition before,AlertConfiguration.Definition after,Access access);
     Outcome saveReceiver(AlertReceiver before,AlertReceiver after,PrivateMaterial replacement,boolean retainOriginalMaterial,Access access);
-    enum PrivateField { AUTHENTICATION,PRIVATE_CA }
+    enum PrivateField { AUTHENTICATION,PRIVATE_CA,ENDPOINT }
     default PreparedCandidate prepareCandidate(AlertTestCommand.Key key,AlertTestCommand.Parameters form,AlertReceiver.Transport transport,
             AlertConfiguration.Identity existingReceiver,long bindingRevision,PrivateMaterial material,Access access){
         return prepareCandidate(key,form,transport,existingReceiver,bindingRevision,material,Set.of(),access);
@@ -116,6 +130,7 @@ public interface AlertStore {
     Outcome commitAsCaller(Commit candidate,Access access);
     PrivateMaterial resolvePermittedMaterial(AlertIntent.Identity identity,DeliveryAttempt.Permit permit,Access access);
     ActivePage active(ActiveCursor after,int limit,ReadAccess access);
+    default ActivePage activeFiltered(ActiveCursor after,int limit,ReadAccess access,AlarmFilter filter){throw new UnsupportedOperationException();}
     HistoryPage history(AlarmKey key,Long after,int limit,ReadAccess access);
     TransitionPage transitions(AlarmKey key,TransitionCursor after,int limit,ReadAccess access);
     DuePage dueIntents(Instant through,DueCursor after,int limit);

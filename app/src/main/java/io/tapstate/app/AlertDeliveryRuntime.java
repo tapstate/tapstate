@@ -35,6 +35,8 @@ final class AlertDeliveryRuntime implements AutoCloseable {
         this.store=store;this.clock=clock;this.worker=worker;this.active=active;this.channels=channels;this.continuation=continuation;timer.setRemoveOnCancelPolicy(true);
     }
     synchronized void start(){if(closed.get())throw new IllegalStateException("closed delivery runtime");timer.scheduleWithFixedDelay(this::tick,0,1,TimeUnit.SECONDS);}
+    /** Capability inspection is local and never opens a channel or resolves private material. */
+    boolean supportsForManagement(AlertIntent.Frozen frozen){return !closed.get()&&channels.supports(frozen);}
     synchronized void tick(){
         if(closed.get())return;
         try {

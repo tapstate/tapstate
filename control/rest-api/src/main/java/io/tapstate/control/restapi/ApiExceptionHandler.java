@@ -113,6 +113,9 @@ class ApiExceptionHandler {
      */
     static HttpStatus statusFor(TapstateErrorCode code) {
         return switch (code.code()) {
+            case "alert.invalid-configuration" -> HttpStatus.BAD_REQUEST;
+            case "alert.stale-action", "alert.command-conflict", "alert.command-expired", "alert.command-not-yet-valid" -> HttpStatus.CONFLICT;
+            case "alert.channel-unavailable" -> HttpStatus.SERVICE_UNAVAILABLE;
             case "control.auth-failed", "control.unauthenticated" -> HttpStatus.UNAUTHORIZED;
             case "control.cloud-auth-unavailable", "control.storage-unavailable" -> HttpStatus.SERVICE_UNAVAILABLE;
             case "control.auth-mode-unavailable" -> HttpStatus.FORBIDDEN;

@@ -1,0 +1,57 @@
+package io.tapstate.app;
+
+import com.mongodb.client.MongoClients;
+import io.tapstate.core.common.JsonReader;
+import io.tapstate.core.common.JsonWriter;
+import io.tapstate.testsupport.RequiresDocker;
+import java.net.URI;
+import java.net.http.*;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.*;
+import org.bson.Document;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.springframework.boot.builder.SpringApplicationBuilder;
+import org.springframework.boot.web.server.context.WebServerApplicationContext;
+import static org.assertj.core.api.Assertions.*;
+import static org.awaitility.Awaitility.await;
+
+/** Actual admitted child, original human authentication, HTTP dispatch and CONFIG authoring. */
+@RequiresDocker
+class NativeAlertManagementIT {
+    @org.testcontainers.junit.jupiter.Container static final org.testcontainers.containers.MongoDBContainer MONGO=AlertEvaluationHostIT.MONGO;
+    @TempDir Path work;
+    @Test void originalNativeHumanSessionOwnsAlertAuthoringWithoutCallerSelectedScope() throws Exception {
+        var storage=NativeAppStorage.createOnPremWithAdmin(MONGO,"native_alert","alert-operator","isolated-native-password");
+        try(var observer=MongoClients.create(storage.configurationUri())){
+            try(var application=new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated()).run(
+                    "--server.address=127.0.0.1","--server.port="+Integer.getInteger("tapstate.alert.native-browser-port",0),"--logging.level.root=ERROR","--tapstate.store.mongo.uri="+storage.configurationUri(),
+                    "--tapstate.hz.member-port=0","--tapstate.hz.jet.cooperative-thread-count=2","--tapstate.connectors.seed-dir="+work.resolve("no-seeds"),
+                    "--tapstate.connectors.plugins-dir="+work.resolve("plugins"),"--tapstate.control.auth.jwt-secret=native-alert-test-signing-key")){
+                NativeAppStorage.awaitBusiness(application);int port=((WebServerApplicationContext)application).getWebServer().getPort();var client=HttpClient.newHttpClient();String root="http://127.0.0.1:"+port;
+                var login=post(client,root,"/auth/login",null,Map.of("username","alert-operator","password","isolated-native-password"));assertThat(login.statusCode()).isEqualTo(200);String token=(String)AlertHttpModel.object(JsonReader.parse(login.body())).get("token");assertThat(token).isNotBlank();
+                await().atMost(Duration.ofSeconds(20)).untilAsserted(()->{var catalog=post(client,root,"/api/alerts/catalog",token,Map.of());assertThat(catalog.statusCode()).isEqualTo(200);assertThat(AlertHttpModel.object(JsonReader.parse(catalog.body()))).containsEntry("clusterId",storage.clusterId()).containsEntry("deployment","ON_PREM");});
+                var form=Map.of("name","Native UI rule","typeId","pipeline.failed","typeVersion",1,"resourceKinds",List.of("pipeline"),"allResources",true,"resources",List.of(),"parameters",Map.of(),"severity","DEFAULT","enabled",true);
+                var saved=post(client,root,"/api/alerts/configuration/save",token,Map.of("kind","RULE","id","native-rule","etag","0","form",form));assertThat(saved.statusCode()).isEqualTo(200);
+                var list=post(client,root,"/api/alerts/configuration/list",token,Map.of("kind","RULE"));assertThat(list.statusCode()).isEqualTo(200);assertThat(list.body()).contains("Native UI rule").doesNotContain("isolated-native-password",token);
+                var raw=observer.getDatabase(storage.configurationDatabase()).getCollection("alert_rules").find(new Document("_id.id","native-rule")).first();assertThat(raw).isNotNull();assertThat(raw.toJson()).contains("alert-operator");
+                assertThat(post(client,root,"/api/alerts/center",token,Map.of("authorityId","foreign")).statusCode()).isEqualTo(400);
+                String control=System.getProperty("tapstate.alert.native-browser-control");
+                if(control!=null){var directory=Path.of(control);java.nio.file.Files.createDirectories(directory);AlertDeliveryNetworkIT.temp=work;AlertDeliveryNetworkIT.tls();
+                    try(var smtp=new AlertDeliveryNetworkIT.SmtpPeer(true)){
+                        java.nio.file.Files.write(directory.resolve("smtp-ca.pem"),AlertDeliveryNetworkIT.pem);
+                        java.nio.file.Files.writeString(directory.resolve("ready.json"),JsonWriter.write(Map.of("port",port,"smtpPort",smtp.port(),"smtpHost","localhost","clusterId",storage.clusterId(),"username","alert-operator","mode","actual-native-op","transport","real-local-tls-smtp")));
+                        long until=System.nanoTime()+Duration.ofMinutes(25).toNanos();while(!java.nio.file.Files.exists(directory.resolve("stop"))&&System.nanoTime()<until)Thread.sleep(100);
+                        java.nio.file.Files.writeString(directory.resolve("smtp-receipts.json"),JsonWriter.write(Map.of("count",smtp.bodies.size(),"sha256",smtp.bodies.stream().map(body->{try{return java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(body.getBytes(java.nio.charset.StandardCharsets.US_ASCII)));}catch(java.security.NoSuchAlgorithmException impossible){throw new AssertionError(impossible);}}).toList())));
+                    }
+                }
+
+            } finally {observer.getDatabase(storage.configurationDatabase()).drop();observer.getDatabase(storage.cacheDatabase()).drop();observer.getDatabase(storage.masterDatabase()).drop();}
+        }
+    }
+    private static HttpResponse<String> post(HttpClient client,String root,String path,String token,Map<String,?> body) throws Exception {
+        var request=HttpRequest.newBuilder(URI.create(root+path)).header("Content-Type","application/json").timeout(Duration.ofSeconds(20));if(token!=null)request.header("Authorization","Bearer "+token);
+        return client.send(request.POST(HttpRequest.BodyPublishers.ofString(JsonWriter.write(body))).build(),HttpResponse.BodyHandlers.ofString());
+    }
+}

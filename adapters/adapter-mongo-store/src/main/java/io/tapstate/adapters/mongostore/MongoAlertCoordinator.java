@@ -73,10 +73,35 @@ final class MongoAlertCoordinator implements AlertStore {
     @Override public Optional<Stored<AlertIntent.Record>> intent(AlertIntent.Identity key,Access access) {
         scope(key.scope());return tx(access,false,false,s->notifications.intent(s,key).map(v->new Stored<>(v.recordRevision(),v.value())));
     }
+    @Override public Optional<Rule> originalRule(AlertRule binding,ReadAccess access){
+        visible(binding.key(),access);
+        var result=tx(null,false,false,s->{var head=states.loadEnvelope(s,binding.key());
+            if(head.isEmpty()||head.get().value().binding()==null)return Optional.<Rule>empty();
+            var identity=head.get().value().binding().ruleIdentity();
+            if(!identity.incarnation().equals(binding.key().qualifier()))return Optional.<Rule>empty();
+            return definitions.load(s,Kind.RULE,identity.id()).map(MongoAlertConfigurationCodec.Stored::definition)
+                    .filter(Rule.class::isInstance).map(Rule.class::cast)
+                    .filter(rule->rule.header().identity().equals(identity)&&rule.header().revision()==binding.revision());
+        });access.requireActive().run();return result;
+    }
     @Override public Optional<Definition> definition(Kind kind,String id,Access access) {
         return tx(access,false,false,s->definitions.load(s,kind,id).map(MongoAlertConfigurationCodec.Stored::definition));
     }
     @Override public DefinitionPage definitions(Kind kind,String after,int limit,Access access){return tx(access,false,false,s->new MongoAlertReads(db,host.scope(),states).definitions(s,kind,after,limit));}
+    @Override public ResourcePage resources(String kind,String after,int limit,Access access){
+        if(limit<1||limit>100)throw stale("resource-page-limit");
+        if(!Set.of("source","pipeline").contains(kind))return new ResourcePage(List.of(),null);
+        return tx(access,false,false,s->{
+            var collection=kind.equals("source")?SystemCollections.SOURCES:SystemCollections.PIPELINES;
+            var filter=after==null?new Document():new Document("_id",new Document("$gt",after));
+            var raw=collection.on(db).find(s,filter).hintString("_id_").sort(new Document("_id",1)).limit(limit+1).into(new ArrayList<>());
+            boolean more=raw.size()>limit;if(more)raw.removeLast();var rows=new ArrayList<AlarmKey.Resource>();
+            for(var row:raw){String id=row.getString("_id");if(kind.equals("source"))rows.add(new AlarmKey.Resource(kind,id,MongoSourceIdentity.read(row).binding().incarnation()));
+                else{var state=MongoPipelineStateMappings.decode(id,SystemCollections.OPERATOR_GENERATIONS.on(db).find(s,new Document("_id",id)).first());
+                    if(state.phase()==PipelineStateMapping.Phase.ACTIVE)rows.add(new AlarmKey.Resource(kind,id,Long.toString(state.stateGeneration())));}}
+            return new ResourcePage(rows,more?raw.getLast().getString("_id"):null);
+        });
+    }
     @Override public DefinitionPage evaluationRules(String after,int limit){return tx(null,false,false,s->new MongoAlertReads(db,host.scope(),states).definitions(s,Kind.RULE,after,limit));}
     @Override public EvaluationPage evaluationStates(AlarmKey after,int limit){return tx(null,false,false,s->{
         var page=new MongoAlertReads(db,host.scope(),states).evaluationStates(s,after,limit);var removed=new HashSet<AlarmKey.Resource>();
@@ -401,7 +426,11 @@ final class MongoAlertCoordinator implements AlertStore {
         }
         return false;
     }
+    @Override public EndedPage ended(EpisodeCursor after,int limit,ReadAccess access,AlertSnapshot.EndReason reason){access.requireActive().run();var result=tx(null,false,false,s->new MongoAlertReads(db,host.scope(),states).ended(s,after,limit,access,reason));access.requireActive().run();return result;}
+    @Override public DeliveryPage deliveries(String after,int limit, String channel,DeliveryEvidence.Outcome outcome,ReadAccess access){access.requireActive().run();var result=tx(null,false,false,s->new MongoAlertReads(db,host.scope(),states).deliveries(s,after,limit,channel,outcome,access));access.requireActive().run();return result;}
+    @Override public Optional<Stored<AlertIntent.Record>> delivery(String id,ReadAccess access){access.requireActive().run();var result=tx(null,false,false,s->new MongoAlertReads(db,host.scope(),states).delivery(s,id,access));access.requireActive().run();return result;}
     @Override public ActivePage active(ActiveCursor after,int limit,ReadAccess access){access.requireActive().run();return tx(null,false,false,s->new MongoAlertReads(db,host.scope(),states).active(s,after,limit,access));}
+    @Override public ActivePage activeFiltered(ActiveCursor after,int limit,ReadAccess access,AlarmFilter filter){access.requireActive().run();return tx(null,false,false,s->new MongoAlertReads(db,host.scope(),states).active(s,after,limit,access,filter));}
     @Override public HistoryPage history(AlarmKey key,Long after,int limit,ReadAccess access){visible(key,access);var result=tx(null,false,false,s->new MongoAlertReads(db,host.scope(),states).history(s,key,after,limit));access.requireActive().run();return result;}
     @Override public TransitionPage transitions(AlarmKey key,TransitionCursor after,int limit,ReadAccess access){visible(key,access);var result=tx(null,false,false,s->new MongoAlertReads(db,host.scope(),states).transitions(s,key,after,limit));access.requireActive().run();return result;}
     @Override public DuePage dueIntents(Instant through,DueCursor after,int limit){return tx(null,false,false,s->new MongoAlertReads(db,host.scope(),states).due(s,through,after,limit));}
@@ -421,6 +450,9 @@ final class MongoAlertCoordinator implements AlertStore {
                 if(retain.contains(PrivateField.PRIVATE_CA)){
                     if(c!=null||captured.receiver().transport().trust()!=AlertReceiver.Trust.PRIVATE_CA||transport.trust()!=AlertReceiver.Trust.PRIVATE_CA)throw stale("retained-trust-binding");c=original.privateCa();
                 }
+                if(retain.contains(PrivateField.ENDPOINT) && (replacement!=null&&replacement.endpoint()!=null
+                        || !(transport instanceof AlertReceiver.Webhook webhook) || original.webhookEndpoint()==null
+                        || !webhook.matchesEndpoint(original.webhookEndpoint()))) throw stale("retained-endpoint-binding");
                 var endpoint=replacement!=null&&replacement.endpoint()!=null?replacement.endpoint():original.webhookEndpoint();
                 return new ReceiverSecretMaterial(a,c,endpoint);
             }finally{if(a!=null)Arrays.fill(a,(byte)0);if(c!=null)Arrays.fill(c,(byte)0);}

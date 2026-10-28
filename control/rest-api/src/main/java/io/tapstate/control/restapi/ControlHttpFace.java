@@ -38,7 +38,7 @@ import java.util.List;
  * by a product whose client, handler and tests all work.
  */
 @Configuration
-@Import({RestApiConfiguration.class, RestApiSecurityConfiguration.class, ArtifactController.class, ConnectionController.class,
+@Import({RestApiConfiguration.class, RestApiSecurityConfiguration.class, ArtifactController.class, AlertController.class, ConnectionController.class,
         ConnectorController.class, DataBrowserController.class, DataBrowserStreamConfiguration.class,
         PipelineController.class, PipelineObservationController.class, PipelineObservabilityController.class,
         PipelineLogsController.class,

@@ -305,6 +305,11 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             LOG.warn("Alert collection is degraded [{}]", refusal.code().code());
         }
     }
+    synchronized Services managementServices() {
+        active.run();
+        if (closed.get() || services == null) throw new TapstateException(io.tapstate.control.core.ControlError.STORAGE_UNAVAILABLE, Map.of(), null);
+        return services;
+    }
     Health health() {
         Failure current=failure.get();var resolved=services;
         var planning=resolved==null||resolved.planner()==null?null:resolved.planner().failure();

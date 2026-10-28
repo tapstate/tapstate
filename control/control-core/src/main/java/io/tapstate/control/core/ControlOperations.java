@@ -372,7 +372,24 @@ public final class ControlOperations {
     public static final Operation TOKEN_REVOKE = new Operation("token.revoke", Scope.ADMIN, true, null, CLI_ONLY);
     public static final Operation TOKEN_LIST = new Operation("token.list", Scope.ADMIN, false, null, CLI_ONLY);
 
+    public static final Operation ALERT_RESOURCES = new Operation("alert.resources", Scope.ADMIN, false, null, "Read a bounded page of current configuration resource identities.", Map.of(Frontend.REST, Maturity.CURRENT));
+    public static final Operation ALERT_RULE_PREVIEW = new Operation("alert.rule-preview", Scope.ADMIN, false, null, "Evaluate synthetic rule lifecycle examples without publishing or persisting alert state.", Map.of(Frontend.REST, Maturity.CURRENT));
+    public static final Operation ALERT_ROUTE_PREVIEW = new Operation("alert.route-preview", Scope.ADMIN, false, null, "Preview matching current alerts without planning or sending notifications.", Map.of(Frontend.REST, Maturity.CURRENT));
+    public static final Operation ALERT_CATALOG = new Operation("alert.catalog", Scope.READ, false, null, "Read scoped alert state using the original verified identity.", Map.of(Frontend.REST, Maturity.CURRENT));
+    public static final Operation ALERT_CENTER = new Operation("alert.center", Scope.READ, false, null, "Read scoped alert state using the original verified identity.", Map.of(Frontend.REST, Maturity.CURRENT));
+    public static final Operation ALERT_DETAIL = new Operation("alert.detail", Scope.READ, false, null, "Read scoped alert state using the original verified identity.", Map.of(Frontend.REST, Maturity.CURRENT));
+    public static final Operation ALERT_DELIVERIES = new Operation("alert.deliveries", Scope.READ, false, null, "Read scoped alert state using the original verified identity.", Map.of(Frontend.REST, Maturity.CURRENT));
+    public static final Operation ALERT_HEALTH = new Operation("alert.health", Scope.READ, false, null, "Read scoped alert state using the original verified identity.", Map.of(Frontend.REST, Maturity.CURRENT));
+    public static final Operation ALERT_CONFIGURATION_LIST = new Operation("alert.configuration.list", Scope.ADMIN, false, null, "Read scoped alert state using the original verified identity.", Map.of(Frontend.REST, Maturity.CURRENT));
+    public static final Operation ALERT_CONFIGURATION_SAVE = new Operation("alert.configuration.save", Scope.ADMIN, true, null, "Manage scoped alert state using the original verified identity.", Map.of(Frontend.REST, Maturity.CURRENT));
+    public static final Operation ALERT_CONFIGURATION_RETIRE = new Operation("alert.configuration.retire", Scope.ADMIN, true, null, "Manage scoped alert state using the original verified identity.", Map.of(Frontend.REST, Maturity.CURRENT));
+    public static final Operation ALERT_PREVIEW = new Operation("alert.preview", Scope.READ, false, null, "Read scoped alert state using the original verified identity.", Map.of(Frontend.REST, Maturity.CURRENT));
+    public static final Operation ALERT_TEST = new Operation("alert.test", Scope.ADMIN, true, null, "Manage scoped alert state using the original verified identity.", Map.of(Frontend.REST, Maturity.CURRENT));
+    public static final Operation ALERT_TEST_RESULT = new Operation("alert.test-result", Scope.ADMIN, false, null, "Read scoped alert state using the original verified identity.", Map.of(Frontend.REST, Maturity.CURRENT));
+    public static final Operation ALERT_RETRY = new Operation("alert.retry", Scope.ADMIN, true, null, "Manage scoped alert state using the original verified identity.", Map.of(Frontend.REST, Maturity.CURRENT));
+
     private static final List<Operation> ALL = List.of(
+            ALERT_RULE_PREVIEW, ALERT_ROUTE_PREVIEW, ALERT_RESOURCES, ALERT_CATALOG, ALERT_CENTER, ALERT_DETAIL, ALERT_DELIVERIES, ALERT_HEALTH, ALERT_CONFIGURATION_LIST, ALERT_CONFIGURATION_SAVE, ALERT_CONFIGURATION_RETIRE, ALERT_PREVIEW, ALERT_TEST, ALERT_TEST_RESULT, ALERT_RETRY,
             SYSTEM_VERSION,
             ARTIFACT_APPLY,
             ARTIFACT_VALIDATE,
