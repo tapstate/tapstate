@@ -44,7 +44,12 @@ record SourceCaptureResolution(
 
     static Optional<SourceCaptureResolution> forPipeline(
             PipelineResource pipeline, SourceResource source, SourceModel discovered) {
-        List<String> tables = PipelineTableSelection.resolve(pipeline, source, discovered);
+        return forSelectedTables(pipeline, source, PipelineTableSelection.resolve(pipeline, source, discovered));
+    }
+
+    /** Carries an already selected subset; write callers must validate it through forPipeline. */
+    static Optional<SourceCaptureResolution> forSelectedTables(
+            PipelineResource pipeline, SourceResource source, List<String> tables) {
         boolean direct = pipeline.sources().stream().anyMatch(ref -> ref.id().equals(source.id())
                 && ref instanceof SourceRef.Spec spec && !spec.srs());
         return tables.isEmpty() ? Optional.empty()

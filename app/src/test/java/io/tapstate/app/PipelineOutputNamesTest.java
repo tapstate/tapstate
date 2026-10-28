@@ -159,6 +159,87 @@ class PipelineOutputNamesTest {
     }
 
     @Test
+    void mixedSelectorsRetainKnownTablesWithinOneSourceBeforeDiscovery() {
+        for (String selectors : List.of("[orders, \"/customer.*/\"]",
+                "[{name: orders}, \"/customer.*/\"]", "[\"/customer.*/\", orders]")) {
+            var store = sources();
+            var parser = new DslParser();
+            store.artifacts().save(parser.parse("version: tapstate/v1\nkind: source\nid: src\nconnector: mongodb\nmode: cdc\ntables: "
+                    + selectors + "\n"));
+            var pipeline = pipeline(store, """
+                    serve:
+                      from: [src.orders, src]
+                      sync: [{id: sink, source: target, rename: {prefix: out_}}]
+                    """);
+            var resolver = new StoreBackedDagSource(store);
+            var before = resolver.outputNameResult(pipeline);
+            assertThat(before.outputs()).extracting(PipelineOutputNames.Output::table).containsExactly("out_orders");
+            assertThat(before.unresolved()).singleElement().satisfies(problem -> {
+                assertThat(problem.code()).isEqualTo("actuation.source-schema-not-discovered");
+                assertThat(problem.params()).containsEntry("source", "src");
+            });
+            assertThatThrownBy(() -> new StoreBackedPipelineWriteTargets(store).of(pipeline))
+                    .hasMessageContaining("actuation.source-schema-not-discovered");
+            assertThatThrownBy(() -> resolver.validateStart(pipeline.id()))
+                    .hasMessageContaining("actuation.source-schema-not-discovered");
+            store.schemas().save(new io.tapstate.spi.store.DiscoveredSourceModel("src", "mongodb", 0L,
+                    new io.tapstate.spi.store.SourceModel(List.of(
+                            new io.tapstate.spi.store.SourceTable("orders", List.of(new io.tapstate.spi.store.SourceField("id", "INT")), List.of("id"), List.of()),
+                            new io.tapstate.spi.store.SourceTable("customers", List.of(new io.tapstate.spi.store.SourceField("id", "INT")), List.of("id"), List.of())))));
+            var after = resolver.outputNameResult(pipeline);
+            assertThat(after.outputs()).extracting(PipelineOutputNames.Output::table).containsExactly("out_orders", "out_customers");
+            assertThat(after.unresolved()).isEmpty();
+            assertThat(after.outputs().getFirst().identity()).isEqualTo(before.outputs().getFirst().identity());
+        }
+    }
+
+    @Test
+    void explicitKnownReferencesDoNotDependOnOtherSelectorsOfTheSameSource() {
+        for (String from : List.of("src.orders", "orders")) {
+            var store = mixedSourceStore("[orders, \"/customer.*/\"]");
+            var pipeline = pipeline(store, "serve: {from: " + from
+                    + ", sync: [{id: sink, source: target, rename: {prefix: out_}}]}\n");
+            var report = new StoreBackedDagSource(store).outputNameResult(pipeline);
+            assertThat(report.outputs()).extracting(PipelineOutputNames.Output::table).containsExactly("out_orders");
+            assertThat(report.unresolved()).isEmpty();
+            assertThatThrownBy(() -> new StoreBackedPipelineWriteTargets(store).of(pipeline))
+                    .hasMessageContaining("actuation.source-schema-not-discovered");
+        }
+    }
+
+    @Test
+    void wholeSourceAndRegexReferencesReportTheirUnexpandedMembers() {
+        for (String from : List.of("src", "\"/.*/\"", "[src.orders, src.customers]")) {
+            var store = mixedSourceStore("[orders, \"/customer.*/\"]");
+            var pipeline = pipeline(store, "serve: {from: " + from
+                    + ", sync: [{id: sink, source: target, rename: {prefix: out_}}]}\n");
+            var report = new StoreBackedDagSource(store).outputNameResult(pipeline);
+            assertThat(report.outputs()).extracting(PipelineOutputNames.Output::table).containsExactly("out_orders");
+            assertThat(report.unresolved()).singleElement().satisfies(problem ->
+                    assertThat(problem.code()).isEqualTo("actuation.source-schema-not-discovered"));
+        }
+    }
+
+    @Test
+    void absentQualifiedTableInACompleteSelectionIsStillDiagnosed() {
+        var store = sources();
+        var pipeline = pipeline(store, "serve: {from: src.absent, sync: [{id: sink, source: target}]}\n");
+        var report = new StoreBackedDagSource(store).outputNameResult(pipeline);
+        assertThat(report.outputs()).isEmpty();
+        assertThat(report.unresolved()).singleElement().satisfies(problem -> {
+            assertThat(problem.code()).isEqualTo("actuation.source-table-not-discovered");
+            assertThat(problem.params()).containsEntry("source", "src").containsEntry("table", "absent");
+        });
+    }
+
+    private static InMemoryStorePort mixedSourceStore(String selectors) {
+        var store = sources();
+        store.artifacts().save(new DslParser().parse("version: tapstate/v1\nkind: source\nid: src\nconnector: mongodb\nmode: cdc\ntables: "
+                + selectors + "\n"));
+        return store;
+    }
+
+    @Test
     void unionAndUnwindKeepTheResolvableBranchAndDoNotInventTheMissingOne() {
         var store = sources();
         var pipeline = partialPipeline(store, """
