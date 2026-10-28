@@ -85,8 +85,12 @@ class AUserReadsOnlyItsVerifiedIdentityIT {
         assertThat(response.statusCode()).isEqualTo(200);
         assertThat(response.headers().firstValue("Cache-Control")).contains("no-store");
         assertThat(response.headers().firstValue("Set-Cookie")).isEmpty();
-        assertThat(object(response)).isEqualTo(Map.of("mode", "on-prem", "principal", USER,
-                "scopes", List.of("read", "write", "admin")));
+        Map<?, ?> body = object(response);
+        assertThat(body.get("mode")).isEqualTo("on-prem");
+        assertThat(body.get("principal")).isEqualTo(USER);
+        assertThat(body.get("username")).isEqualTo(USER);
+        assertThat(body.get("email")).isNull();
+        assertThat(body.get("scopes")).isEqualTo(List.of("read", "write", "admin"));
         assertThat(response.body()).doesNotContain(PASSWORD, token, "password", "jwt", "jti", "tokenId");
     }
 

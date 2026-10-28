@@ -53,7 +53,7 @@ class CloudClusterContextCarriesTheCurrentEgressAddressIT {
             new CloudSessionIdentity(CLOUD_URL, ORGANIZATION, CLUSTER);
     private static final CloudSessionContext LOGIN_CONTEXT = new CloudSessionContext(
             ORGANIZATION, CLUSTER, "Workspace organization", "Workspace cluster", "workspace-region",
-            "198.51.100.1", "DYNAMIC");
+            "198.51.100.1", "DYNAMIC", "untrusted@example.test");
     private static final CloudClusterEgressAddress CURRENT_ADDRESS = new CloudClusterEgressAddress(
             ORGANIZATION, CLUSTER, "203.0.113.42", "STABLE");
     private static final CloudSessionContext LOGIN_CONTEXT_WITHOUT_ADDRESS = new CloudSessionContext(
@@ -109,11 +109,20 @@ class CloudClusterContextCarriesTheCurrentEgressAddressIT {
                         .containsEntry("organizationName", "Workspace organization")
                         .containsEntry("clusterName", "Workspace cluster")
                         .containsEntry("region", "workspace-region")
+                        .containsEntry("userEmail", "user@example.test")
                         .containsEntry("ec2PublicIp", CURRENT_ADDRESS.ec2PublicIp())
                         .containsEntry("egressAddressStatus", CURRENT_ADDRESS.egressAddressStatus())
                         .containsKey("clusterState")
                         .containsEntry("clusterState", null);
                 assertThat(response.body()).doesNotContain(JWT, cookie, "controlled-machine-token");
+                HttpResponse<String> currentUser = client.send(HttpRequest.newBuilder(base.resolve("/api/auth/me"))
+                        .timeout(Duration.ofSeconds(10)).header("Cookie", cookie).GET().build(),
+                        HttpResponse.BodyHandlers.ofString());
+                assertThat(currentUser.statusCode()).isEqualTo(200);
+                Map<?, ?> currentUserBody = (Map<?, ?>) JsonReader.parse(currentUser.body());
+                assertThat(currentUserBody.get("email")).isEqualTo("user@example.test");
+                assertThat(currentUserBody.get("username")).isNull();
+                assertThat(currentUser.body()).doesNotContain(JWT, cookie, "controlled-machine-token");
 
                 HttpResponse<String> noAddressLogin = client.send(HttpRequest.newBuilder(
                                 base.resolve("/auth/exchange?code=controlled-code-without-egress"))
@@ -131,15 +140,21 @@ class CloudClusterContextCarriesTheCurrentEgressAddressIT {
                 noAddressParsed.forEach((key, value) -> noAddressBody.put((String) key, value));
                 assertThat(noAddressBody)
                         .containsEntry("ec2PublicIp", null)
-                        .containsEntry("egressAddressStatus", null);
+                        .containsEntry("egressAddressStatus", null)
+                        .containsEntry("userEmail", null);
                 assertThat(noAddressResponse.body())
                         .doesNotContain(JWT_WITHOUT_ADDRESS, noAddressCookie, "controlled-machine-token");
+                HttpResponse<String> noEmailUser = client.send(HttpRequest.newBuilder(base.resolve("/api/auth/me"))
+                        .timeout(Duration.ofSeconds(10)).header("Cookie", noAddressCookie).GET().build(),
+                        HttpResponse.BodyHandlers.ofString());
+                assertThat(noEmailUser.statusCode()).isEqualTo(200);
+                assertThat(((Map<?, ?>) JsonReader.parse(noEmailUser.body())).get("email")).isNull();
 
                 HttpResponse<String> anonymous = client.send(HttpRequest.newBuilder(base.resolve("/api/cluster/context"))
                         .timeout(Duration.ofSeconds(10)).GET().build(), HttpResponse.BodyHandlers.ofString());
                 assertThat(anonymous.statusCode()).isEqualTo(401);
                 assertThat(anonymous.body()).doesNotContain(
-                        LOGIN_CONTEXT.ec2PublicIp(), JWT, JWT_WITHOUT_ADDRESS);
+                        LOGIN_CONTEXT.ec2PublicIp(), "user@example.test", JWT, JWT_WITHOUT_ADDRESS);
             }
         } finally {
             ServerHandle.discardStagingDirectory(stagingDirectory);
@@ -174,7 +189,7 @@ class CloudClusterContextCarriesTheCurrentEgressAddressIT {
                 if (!DEPLOYMENT.equals(deployment)) return Optional.empty();
                 if (JWT.equals(jwt)) {
                     return Optional.of(new CloudLoginIdentity(DEPLOYMENT, "context-user", ORGANIZATION, CLUSTER,
-                            JTI, Scope.WRITE, Instant.now(clock).plusSeconds(300)));
+                            JTI, Scope.WRITE, Instant.now(clock).plusSeconds(300), "user@example.test"));
                 }
                 if (JWT_WITHOUT_ADDRESS.equals(jwt)) {
                     return Optional.of(new CloudLoginIdentity(DEPLOYMENT, "context-user", ORGANIZATION, CLUSTER,

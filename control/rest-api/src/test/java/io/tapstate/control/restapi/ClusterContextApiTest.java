@@ -7,6 +7,7 @@ import io.tapstate.control.core.CloudClusterEgressAddressProvider;
 import io.tapstate.control.core.CloudSessionService;
 import io.tapstate.control.core.ControlOperations;
 import io.tapstate.control.core.CredentialAuthenticator;
+import io.tapstate.control.core.CurrentUserQueryService;
 import io.tapstate.control.core.GeneratedSecret;
 import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.control.core.Scope;
@@ -51,7 +52,7 @@ class ClusterContextApiTest {
             .encodeToString(JTI.getBytes(StandardCharsets.UTF_8)) + "." + SECRET;
     private static final CloudSessionContext DISPLAY = new CloudSessionContext(
             "context-org", "context-cluster", "Workspace organization", "Workspace cluster", "workspace-region",
-            "198.51.100.1", "DYNAMIC");
+            "198.51.100.1", "DYNAMIC", "user@example.test");
     private static final CloudClusterEgressAddress CURRENT_ADDRESS = new CloudClusterEgressAddress(
             DISPLAY.organizationId(), DISPLAY.clusterId(), "203.0.113.42", "STABLE");
     private static final CloudSessionIdentity IDENTITY = new CloudSessionIdentity(
@@ -80,6 +81,7 @@ class ClusterContextApiTest {
             assertThat(body.get("organizationName")).isEqualTo(DISPLAY.organizationName());
             assertThat(body.get("clusterName")).isEqualTo(DISPLAY.clusterName());
             assertThat(body.get("region")).isEqualTo(DISPLAY.region());
+            assertThat(body).containsEntry("userEmail", "user@example.test");
             if (includeEgress) {
                 assertThat(body).containsEntry("ec2PublicIp", CURRENT_ADDRESS.ec2PublicIp());
                 assertThat(body).containsEntry("egressAddressStatus", CURRENT_ADDRESS.egressAddressStatus());
@@ -88,12 +90,19 @@ class ClusterContextApiTest {
                 assertThat(body).containsEntry("egressAddressStatus", null);
             }
             assertThat(body.keySet().stream().map(Object::toString).toList()).containsExactlyInAnyOrder("organizationId", "organizationName", "clusterId",
-                    "clusterName", "region", "clusterState", "ec2PublicIp", "egressAddressStatus");
+                    "clusterName", "region", "clusterState", "ec2PublicIp", "egressAddressStatus", "userEmail");
             // The workspace client accepts a null or string state and rejects an absent property.
             assertThat(body).as("workspace context contains its nullable state")
                     .containsKey("clusterState")
                     .containsEntry("clusterState", null);
             assertThat(body.toString()).doesNotContain(COOKIE, "password", "jwt", "jti", "secret-sentinel");
+            Map<?, ?> currentUser = RestClient.create("http://127.0.0.1:" + port).get().uri("/api/auth/me")
+                    .header(HttpHeaders.COOKIE, CloudSessionCookies.NAME + "=" + COOKIE)
+                    .retrieve().body(Map.class);
+            assertThat(currentUser.get("principal")).isEqualTo("context-user");
+            assertThat(currentUser.containsKey("username")).isTrue();
+            assertThat(currentUser.get("username")).isNull();
+            assertThat(currentUser.get("email")).isEqualTo("user@example.test");
             for (String cookie : new String[] {"", COOKIE + "-wrong-secret"}) {
                 String errorBody = RestClient.create("http://127.0.0.1:" + port).get().uri("/api/cluster/context")
                         .header(HttpHeaders.COOKIE, CloudSessionCookies.NAME + "=" + cookie)
@@ -111,7 +120,7 @@ class ClusterContextApiTest {
     @Import({RestApiConfiguration.class, RestApiSecurityConfiguration.class, ApiExceptionHandler.class})
     @ComponentScan(basePackageClasses = ControlHttpFace.class, useDefaultFilters = false,
             includeFilters = @ComponentScan.Filter(type = FilterType.REGEX,
-                    pattern = "io\\.tapstate\\.control\\.restapi\\.ClusterContextController"))
+                    pattern = "io\\.tapstate\\.control\\.restapi\\.(ClusterContextController|CurrentUserController)"))
     static class TestApp {
         @Bean
         AuthenticationMode mode() {
@@ -124,6 +133,11 @@ class ClusterContextApiTest {
         }
 
         @Bean
+        CurrentUserQueryService currentUserQueryService(AuthenticationMode mode) {
+            return new CurrentUserQueryService(mode);
+        }
+
+        @Bean
         CloudAuthenticationService authentication(
                 @Value("${tapstate.test.include-egress:true}") boolean includeEgress) {
             TokenSecrets secrets = new TokenSecrets() {
@@ -133,7 +147,7 @@ class ClusterContextApiTest {
             };
             CloudSessionContext sessionContext = includeEgress ? DISPLAY : new CloudSessionContext(
                     DISPLAY.organizationId(), DISPLAY.clusterId(), DISPLAY.organizationName(), DISPLAY.clusterName(),
-                    DISPLAY.region());
+                    DISPLAY.region(), null, null, DISPLAY.userEmail());
             CloudSessionService sessions = new CloudSessionService(
                     new ContextStore(sessionContext), IDENTITY, secrets, Clock.fixed(NOW, ZoneOffset.UTC));
             CloudClusterEgressAddressProvider addressProvider = includeEgress
