@@ -1768,8 +1768,7 @@ final class StoreBackedDagSource implements DagSource {
             }
         }
         List<TargetIndex> indexes = key.isEmpty() ? List.of() : List.of(new TargetIndex(key, true));
-        TargetTable fact = bySourceTable.get(factTable);
-        return new TargetTable(fact == null ? factTable : fact.name(), fields, indexes);
+        return new TargetTable(factTable, fields, indexes);
     }
 
     /**
@@ -3537,7 +3536,11 @@ final class StoreBackedDagSource implements DagSource {
                 NestTable root = roots.get(nest.root().from());
                 if (root != null) table = root.name();
             } else if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Join) {
+                // A join's compiled fact name retains qualification when physical source names repeat.
+                // Preserve that existing write address instead of silently relocating its collection.
                 table = nestTable(assemblyRoot(step), tables).name();
+                names.put(stream, new TargetTable(table, List.of()));
+                continue;
             }
             if (table != null) {
                 names.put(stream, names.getOrDefault(table, new TargetTable(table, List.of())));

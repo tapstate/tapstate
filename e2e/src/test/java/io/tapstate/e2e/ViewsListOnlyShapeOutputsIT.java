@@ -125,6 +125,16 @@ class ViewsListOnlyShapeOutputsIT {
                     Map<?, ?> outputTargets = (Map<?, ?>) pipeline.get("outputTargets");
                     assertThat((List<?>) outputTargets.get("outputs")).singleElement()
                             .satisfies(value -> assertThat(((Map<?, ?>) value).get("table")).isEqualTo(collection));
+                    Map<String, Object> echo = new LinkedHashMap<>();
+                    pipeline.forEach((key, value) -> echo.put((String) key, value));
+                    echo.put("outputTargets", Map.of("outputs", List.of(Map.of(
+                            "element", "output", "kind", "view", "connection", "target",
+                            "table", "forged_collection", "identity", "forged")), "unresolved", List.of()));
+                    var updated = control.sourceRequest("PUT", "/api/pipelines/p", echo,
+                            pipelineResponse.headers().firstValue("ETag").orElseThrow(), 200);
+                    Map<?, ?> updatedPipeline = (Map<?, ?>) JsonReader.parse(updated.body());
+                    assertThat(updatedPipeline.get("outputTargets")).isEqualTo(outputTargets);
+                    assertThat(updatedPipeline.get("contentHash")).isEqualTo(pipeline.get("contentHash"));
                 }
             }
         }

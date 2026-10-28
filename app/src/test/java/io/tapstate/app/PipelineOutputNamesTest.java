@@ -145,6 +145,15 @@ class PipelineOutputNamesTest {
 
     @Test
     void qualifiedJoinPreservesTheDrivingSourceWhenPhysicalNamesRepeat() {
+        assertQualifiedJoin(", rename: {map: {left.orders: wrong, right.orders: correct}}", "correct");
+    }
+
+    @Test
+    void qualifiedJoinKeepsItsExistingDefaultWriteAddress() {
+        assertQualifiedJoin("", "right.orders");
+    }
+
+    private static void assertQualifiedJoin(String rename, String expected) {
         var store = sources();
         var parser = new DslParser();
         for (String id : List.of("left", "right")) {
@@ -164,10 +173,10 @@ class PipelineOutputNamesTest {
                     sql: SELECT o.id FROM o LEFT JOIN c ON o.id = c.id
                 serve:
                   from: shaped
-                  sync: [{id: sink, source: target, rename: {map: {left.orders: wrong, right.orders: correct}}}]
-                """);
+                  sync: [{id: sink, source: target%s}]
+                """.formatted(rename));
         assertThat(new StoreBackedDagSource(store).outputNames(pipeline)).singleElement()
-                .satisfies(output -> assertThat(output.table()).isEqualTo("correct"));
+                .satisfies(output -> assertThat(output.table()).isEqualTo(expected));
         store.artifacts().save(pipeline);
         for (String source : List.of("left", "right")) {
             store.schemas().save(new io.tapstate.spi.store.DiscoveredSourceModel(source, "mongodb", 0L,
@@ -176,7 +185,7 @@ class PipelineOutputNamesTest {
                             List.of("id"), List.of())))));
         }
         assertThat(new StoreBackedPipelineWriteTargets(store).of(pipeline)).singleElement()
-                .satisfies(target -> assertThat(target.table()).isEqualTo("correct"));
+                .satisfies(target -> assertThat(target.table()).isEqualTo(expected));
         OpenRingGenerations.forSources(store, "left", "right");
         Map<String, io.tapstate.spi.sink.TargetTable> bound = new java.util.LinkedHashMap<>();
         var binder = new StoreBackedDagSource.SinkWriterBinder() {
@@ -199,7 +208,7 @@ class PipelineOutputNamesTest {
         };
         new StoreBackedDagSource(store, binder).dagFor("joined");
         assertThat(bound).containsOnlyKeys("shaped");
-        assertThat(bound.get("shaped").name()).isEqualTo("correct");
+        assertThat(bound.get("shaped").name()).isEqualTo(expected);
     }
 
     @Test
