@@ -104,7 +104,9 @@ final class StorageAuthentication implements AutoCloseable {
         Optional<CredentialEvidence> evidence;
         Optional<String> organization = Optional.empty();
         if (cloud.cloud()) {
-            original.requireActive(budget);
+            // The fenced session transaction checks CACHE identity and structure before reading.
+            // Check CONFIG first, then publish only after the full final CACHE/index validation.
+            original.requirePublished(budget);
             try {
                 var authenticated = original.managed(budget).authenticateWithContext(presented);
                 verified = authenticated.map(AuthenticatedCloudSession::identity);
@@ -112,6 +114,7 @@ final class StorageAuthentication implements AutoCloseable {
             } catch (TapstateException failure) {
                 if (failure.code() == IoError.CACHE_AUTH_FENCED || failure.code() == IoError.STORE_UNAVAILABLE)
                     throw StorageRuntime.unavailable();
+                original.requireActive(budget);
                 throw failure;
             }
             original.requireLocallyActive();
@@ -262,15 +265,24 @@ final class StorageAuthentication implements AutoCloseable {
         }
         void requireActive() { requireActive(new MongoReadBudget(AUTHORIZATION_READ_BUDGET)); }
         void requireActive(MongoReadBudget budget) {
+            requirePublished(budget);
             requireLocallyActive();
-            String stage = "configuration-publication";
             try {
-                configuration.requireAuthenticationPublished(bound.preparation(), budget);
-                stage = "cache-authentication-scope";
                 bound.cache().loadAuthScope(bound.preparation().authScope(), budget);
             }
             catch (TapstateException unavailable) {
-                LOG.warn("Storage authentication check failed [stage={}, error_code={}]", stage, unavailable.code().code());
+                LOG.warn("Storage authentication check failed [stage=cache-authentication-scope, error_code={}]", unavailable.code().code());
+                throw StorageRuntime.unavailable();
+            }
+            requireLocallyActive();
+        }
+        void requirePublished(MongoReadBudget budget) {
+            requireLocallyActive();
+            try {
+                configuration.requireAuthenticationPublished(bound.preparation(), budget);
+            }
+            catch (TapstateException unavailable) {
+                LOG.warn("Storage authentication check failed [stage=configuration-publication, error_code={}]", unavailable.code().code());
                 throw StorageRuntime.unavailable();
             }
             requireLocallyActive();

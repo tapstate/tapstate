@@ -39,6 +39,26 @@ import org.testcontainers.utility.DockerImageName;
 @RequiresDocker
 class StorageAuthenticationLatencyIT {
     enum Change { NONE, AUTH_GENERATION, REVOCATION, EPOCH }
+    enum Damage { MISSING_REVOCATIONS, TTL_INDEX }
+
+    @ParameterizedTest
+    @EnumSource(Damage.class)
+    void damagedAuthenticationStructuresCannotPublishEitherAValidOrMissingSession(Damage damage) {
+        withCloud(Change.NONE, fixture -> {
+            if (damage == Damage.MISSING_REVOCATIONS) {
+                SystemCollections.CLOUD_REVOCATIONS.on(fixture.raw.getDatabase(fixture.cacheDatabase)).drop();
+            } else {
+                SystemCollections.CLOUD_SESSIONS.on(fixture.raw.getDatabase(fixture.cacheDatabase)).createIndex(
+                        new Document("unexpectedExpiry", 1), new com.mongodb.client.model.IndexOptions()
+                                .expireAfter(1L, java.util.concurrent.TimeUnit.SECONDS));
+            }
+            for (String cookie : List.of(fixture.cookie, "tcs_anRp.not-a-real-secret")) {
+                assertThatThrownBy(() -> fixture.authentication.credentials().authenticateContext(cookie))
+                        .isInstanceOfSatisfying(TapstateException.class,
+                                failure -> assertThat(failure.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE));
+            }
+        });
+    }
 
     @Test
     void aReadOnlyStorageSnapshotDoesNotRepeatAuthorizationForEachConfigurationRead() {
@@ -66,6 +86,23 @@ class StorageAuthenticationLatencyIT {
                 } finally {
                     admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
                 }
+            }
+        });
+    }
+
+    @Test
+    void healthyAuthenticationDoesNotRepeatTheIndexCensusAroundItsFencedSessionRead() {
+        withCloud(Change.NONE, fixture -> {
+            var admin = fixture.raw.getDatabase("admin");
+            admin.runCommand(new Document("configureFailPoint", "failCommand")
+                    .append("mode", "alwaysOn").append("data", new Document("failCommands", List.of("listIndexes"))
+                            .append("blockConnection", true).append("blockTimeMS", 2600)));
+            try {
+                var proof = fixture.authentication.credentials().authenticateContext(fixture.cookie).orElseThrow();
+                assertThat(proof.storageScope()).contains(fixture.scope);
+                assertThat(proof.organizationId()).contains("organization");
+            } finally {
+                admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
             }
         });
     }
