@@ -17,6 +17,31 @@ import static org.mockito.Mockito.*;
 class OnPremInstallationTest {
     @TempDir Path directory;
 
+    @Test void bootstrapSnapshotKeepsTheActualApplicationDataVerificationAndTime() {
+        var files = InstallationFiles.initialize(directory.resolve("verification"));
+        files.saveStage(files.stage().withHandoff(InstallationFiles.Handoff.RESTARTED, "a".repeat(64)));
+        var scope = files.stage().scope();
+        var root = mock(StorageRoot.class); var runtime = mock(StorageRuntime.class);
+        var configuration = mock(MongoConfigurationDomain.class); var states = mock(StorageSetupStateStore.class);
+        when(root.mode()).thenReturn(StorageBinding.Mode.OP); when(root.runtime()).thenReturn(runtime);
+        when(runtime.configuration()).thenReturn(Optional.of(configuration)); when(configuration.setupStates()).thenReturn(states);
+        when(states.guardedBy(any())).thenReturn(states);
+        when(states.load()).thenReturn(new StorageSetupStateStore.Status(scope, StorageSetupStateStore.Phase.COMPLETE, 1));
+        var verified = new io.tapstate.control.core.DefaultSourceVerification.Verification(
+                io.tapstate.control.core.DefaultSourceVerification.Status.PASSED,
+                java.time.Instant.parse("2026-10-29T00:00:00Z"), java.time.Instant.parse("2026-10-29T00:10:00Z"));
+        var health = java.util.Map.of(io.tapstate.control.core.StorageSetupService.Layer.CONFIG, io.tapstate.control.core.StorageControlDispatcher.Health.AVAILABLE,
+                io.tapstate.control.core.StorageSetupService.Layer.CACHE, io.tapstate.control.core.StorageControlDispatcher.Health.AVAILABLE,
+                io.tapstate.control.core.StorageSetupService.Layer.MASTER, io.tapstate.control.core.StorageControlDispatcher.Health.AVAILABLE);
+        var caller = mock(io.tapstate.control.core.StorageControlAccess.class);
+        when(root.snapshot(eq(caller), any())).thenReturn(new io.tapstate.control.core.StorageControlDispatcher.Snapshot(
+                StorageBinding.Mode.OP, scope.clusterId(), scope.operationId(), scope.generation(), 1, 1, 1, "COMPLETE",
+                io.tapstate.control.core.StorageControlDispatcher.BusinessPhase.READY, health, java.util.List.of("storage.status"), false, verified));
+        try (var installation = new OnPremInstallation(root, files, new MongoProperties(), mock(StorageSetupService.DefaultTarget.class), Clock.systemUTC())) {
+            assertThat(installation.snapshot(caller, () -> {}).applicationDataVerification()).isEqualTo(verified);
+        }
+    }
+
     @Test void managementOverviewCanBeReopenedButArbitraryRoutesRemainClosed() throws Exception {
         var files = InstallationFiles.initialize(directory.resolve("reopen"));
         var root = mock(StorageRoot.class); var runtime = mock(StorageRuntime.class);

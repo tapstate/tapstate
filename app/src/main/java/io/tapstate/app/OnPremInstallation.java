@@ -333,7 +333,8 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
                     original.setupGeneration(), original.bindingVersion(), original.authGeneration(), original.stateVersion(), original.setupPhase(),
                     restart ? StorageControlDispatcher.BusinessPhase.RESTART_REQUIRED : complete ? StorageControlDispatcher.BusinessPhase.FIRST_ADMIN_REQUIRED : original.businessPhase(),
                     original.health(), complete ? List.of("storage.status", "storage.setup.status", restart ? "restart" : "first-admin")
-                            : List.of("storage.status", "storage.test", "storage.setup.commit", "storage.setup.status"), restart);
+                            : List.of("storage.status", "storage.test", "storage.setup.commit", "storage.setup.status"), restart,
+                    original.applicationDataVerification());
         }
         return new StorageControlDispatcher.Snapshot(StorageBinding.Mode.OP, state.scope().clusterId(), state.scope().operationId(),
                 state.scope().generation(), 0, 0, 0, state.phase().name(), StorageControlDispatcher.BusinessPhase.NOT_CONFIGURED,

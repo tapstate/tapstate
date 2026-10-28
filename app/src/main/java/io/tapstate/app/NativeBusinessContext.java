@@ -102,6 +102,21 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         var ordered = new ArrayList<>(context.getBeansOfType(HandlerMapping.class).values());
         AnnotationAwareOrderComparator.sort(ordered); handlers = List.copyOf(ordered);
         original.requireBusiness(); active.set(true);
+        // The first-admin page uses the same formal result and observer as ordinary Source tests.
+        if (original.preparation().authScope().mode() == StorageBinding.Mode.OP) {
+            try {
+                if (configuration.firstAdmin().load().orElseThrow(StorageRuntime::unavailable).phase() == FirstAdminStore.Phase.PENDING) {
+                    var binding = configuration.bindings().load().filter(original.binding()::equals).orElseThrow(StorageRuntime::unavailable);
+                    var source = configuration.artifacts().get(binding.defaultSourceId()).filter(SourceResource.class::isInstance)
+                            .map(SourceResource.class::cast).orElseThrow(StorageRuntime::unavailable);
+                    context.getBean(ConnectionTestService.class).test(source.id(), source.connector(), source.config(),
+                            "installation:" + binding.setup().installationId());
+                }
+            } catch (io.tapstate.core.common.TapstateException unavailable) {
+                org.slf4j.LoggerFactory.getLogger(NativeBusinessContext.class)
+                        .warn("Initial application-data verification unavailable [{}]", unavailable.code().code());
+            }
+        }
     }
 
     Optional<org.springframework.boot.availability.ApplicationAvailability> availability() {
