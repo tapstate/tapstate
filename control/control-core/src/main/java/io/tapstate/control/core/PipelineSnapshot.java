@@ -9,7 +9,13 @@ import java.util.Objects;
  * or when unavailable; a table with no total reports its total as unavailable rather than faking 0 or
  * 100%.
  */
-public record PipelineSnapshot(String pipelineId, Map<String, TableSnapshot> snapshot) {
+public record PipelineSnapshot(String pipelineId, Map<String, TableSnapshot> snapshot,
+        io.tapstate.core.lifecycle.InitialLoad initialLoad,
+        io.tapstate.core.lifecycle.InitialLoad.Phase phase) {
+
+    public PipelineSnapshot(String pipelineId, Map<String, TableSnapshot> snapshot) {
+        this(pipelineId, snapshot, null, null);
+    }
 
     public PipelineSnapshot {
         Objects.requireNonNull(pipelineId, "pipelineId");

@@ -27,6 +27,17 @@
         "Snapshot completion is scoped to the source generation and all producers and lookup partitions; an old generation cannot settle a new load.",
         "Old serialized bytes mean pending re-determination, not an already-complete root; no state reset or forced reload substitutes for compatible recovery."
       ]
+    },
+    "pipeline-observation-initial-load-v2": {
+      "goal": "Preserve the existing latest-observation projection and add optional current-run initial-load facts without making the projection an authority for pipeline recovery or snapshot completion.",
+      "entry": "Republish from the normal runtime convergence observation path. Reconstruct the run table inventory from the current resolved capture plans, rowsRead from that run capture counters, estimates from existing discovery, and landed only from existing durable target completion receipts. Never recover a pipeline from these display fields. Preserve old snapshot and position fields unchanged.",
+      "prerequisites": [
+        "Keep the physical pipeline_observation collection in its existing LEGACY/STORE database; no new namespace, cache layout, collection, retention job or history is introduced.",
+        "An optional initialLoad subdocument contains runKey, observedAt, readMode, and tables keyed with the existing source-qualified collision rule. Each table carries stage PENDING, READING, LANDING or LANDED, rowsRead when measured, and rowsTotalEstimate when available. Absent counters and estimates stay absent, not zero. Landed is a target-confirmed fact, never inferred from an estimate.",
+        "Bind the projection to the active pipeline execution using its execution generation and plannedAt where available, otherwise the pipeline id and capture-load start. If the active execution cannot be matched, report unknown; do not relabel an old run as current. The runKey is observational and supplies no ownership or fencing authority.",
+        "N/M is the number of LANDED tables divided by the complete resolved table set requiring the initial load for that run. A table may enter CDC while another loads. CDC_ONLY has no initial load; SNAPSHOT_ONLY completion is bounded completion, not streaming. Missing or incomplete inventory prevents a denominator or an all-streaming claim.",
+        "Old documents lacking initialLoad remain readable with progress unknown. Restart, replacement and loss of a current runtime reading must not copy previous-run partial counters into the new run or use this projection to advance a completion receipt. Existing legacy facts are not cleared or migrated as part of this change."
+      ]
     }
   },
   "consistencyProfiles": {
@@ -41,6 +52,10 @@
     "existing-single-root-write": {
       "atomicDomain": "Existing keyed operator-state write for one namespace and root key; no additional collection or cross-key transaction.",
       "fencing": "Keep existing owner and source-order rules. Record missing identities with the missing-object emission and clear or recompute them on completion, retargeting, root deletion and subsequent root output. Source progress cannot substitute for target confirmation."
+    },
+    "pipeline-observation-latest-display-v2": {
+      "atomicDomain": "One existing LEGACY/STORE pipeline_observation document replaced by pipeline id, with initialLoad and the other observation facts in the same replacement; no transaction across STORE, CONFIG or CACHE clients.",
+      "fencing": "Retain existing last-write-wins observation publication. Run-key matching and observedAt identify stale display data; neither grants epoch fencing or an atomic multi-endpoint snapshot. Durable sink completion keeps its existing owner and fences. A stale/missing/mismatched reading is unknown, never healthy or completed by default."
     }
   },
   "resources": [
@@ -118,26 +133,28 @@
     },
     {
       "id": "mongo.store.pipeline_observation",
-      "resourceVersion": 1,
-      "proposalVersion": 1,
+      "resourceVersion": 2,
+      "proposalVersion": 2,
       "kind": "COLLECTION",
       "layer": "LEGACY",
       "database": "STORE",
       "physicalNames": [
         "pipeline_observation"
       ],
-      "responsibility": "Latest observed Pipeline state; absent observations remain unknown.",
+      "responsibility": "Latest observed Pipeline state and optional current-run initial-load display projection; absent or mismatched observations remain unknown.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoObservationStore"
       ],
       "readers": [
         "io.tapstate.adapters.mongostore.MongoObservationStore"
       ],
-      "recovery": "legacy-preserve",
-      "consistency": "legacy",
-      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "recovery": "pipeline-observation-initial-load-v2",
+      "consistency": "pipeline-observation-latest-display-v2",
+      "growth": "Still one latest document per pipeline, replaced at the existing observation publication cadence. Initial-load inventory adds O(resolved tables in the active run) names, stages, optional row counters and estimates, not O(rows) and not one record per refresh. No extra history or retention is added. Existing retention and legacy recovery inputs remain protected.",
       "evidence": [
-        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java"
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoObservationStoreTest.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoObservationInitialLoadIT.java"
       ]
     },
     {

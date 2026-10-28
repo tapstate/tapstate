@@ -848,6 +848,15 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         assertThat(buffer.snapshotState("p", ring).declared()).as("declared before the job is assembled").isTrue();
         assertThat(buffer.snapshotState("p", ring).handedOver()).isFalse();
         assertThat(coordinator.snapshotProgress("p")).isEqualTo(SnapshotReading.NONE);
+        var at = java.time.Instant.now();
+        var plan = new io.tapstate.core.lifecycle.ExecutionPlan("p", 1L, 2L, 3L, List.of(), List.of(), at);
+        assertThat(port.atRest.await(10, TimeUnit.SECONDS)).isTrue();
+        var live = coordinator.initialLoad("p", plan, at);
+        assertThat(live.tables().get("orders").rowsRead()).isEqualTo(1L);
+        assertThat(live.tables()).containsKey("orders");
+        assertThat(live.tables().get("orders").stage())
+                .isEqualTo(io.tapstate.core.lifecycle.InitialLoad.Stage.READING);
+        assertThat(live.phase(io.tapstate.core.lifecycle.PipelineState.RUNNING)).isEqualTo(io.tapstate.core.lifecycle.InitialLoad.Phase.SNAPSHOTTING);
 
         rest.countDown();
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
@@ -1025,6 +1034,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
     private static final class HeldSource implements CapturePort {
         private final int rows;
         private final CountDownLatch rest;
+        private final CountDownLatch atRest = new CountDownLatch(1);
         volatile boolean closed;
 
         HeldSource(int rows, CountDownLatch rest) {
@@ -1063,6 +1073,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
         }
 
         private void awaitRest() {
+            atRest.countDown();
             try {
                 while (!rest.await(20, TimeUnit.MILLISECONDS)) {
                     if (closed) {
@@ -1114,6 +1125,15 @@ class StoreBackedPipelineCaptureCoordinatorTest {
                 .containsOnly(entry("orders", new TableSnapshot(500L, null, null)));
         // A total without what it accumulates from cannot be read, so the load says when it opened.
         assertThat(coordinator.snapshotProgress("p").start()).isPresent();
+        var at = java.time.Instant.now();
+        var plan = new io.tapstate.core.lifecycle.ExecutionPlan("p", 1L, 2L, 3L, List.of(), List.of(), at);
+        var display = coordinator.initialLoad("p", plan, at);
+        assertThat(display.tables().get("orders").stage())
+                .isEqualTo(io.tapstate.core.lifecycle.InitialLoad.Stage.LANDING);
+        assertThat(display.tables().get("orders").rowsTotalEstimate()).isNull();
+        var replacement = new io.tapstate.core.lifecycle.ExecutionPlan("p", 1L, 3L, 3L, List.of(), List.of(), at);
+        assertThat(coordinator.initialLoad("p", replacement, at)).isNull();
+
     }
 
     @Test
@@ -1240,6 +1260,16 @@ class StoreBackedPipelineCaptureCoordinatorTest {
                     .containsOnly(entry("orders", new TableSnapshot(5L, 5L, 100, true)));
             verify(source, times(1)).snapshot(org.mockito.ArgumentMatchers.argThat(
                     config -> config.streams().equals(List.of("orders"))));
+            store.keyedState().dropNamespace(SnapshotLoadCounts.namespaceOf(SrsConsumerId.of("p", "orders_src").value()));
+            assertThat(replacement.snapshotProgress("p").byTable()).isEmpty();
+            var at = java.time.Instant.now();
+            var plan = new io.tapstate.core.lifecycle.ExecutionPlan("p", 1L, 2L, 3L, List.of(), List.of(), at);
+            var load = replacement.initialLoad("p", plan, at);
+            assertThat(load.tables().get("orders").stage()).isEqualTo(io.tapstate.core.lifecycle.InitialLoad.Stage.LANDED);
+            assertThat(load.tables().get("orders").rowsRead()).isNull();
+            assertThat(load.landedTables()).isEqualTo(1);
+            assertThat(load.phase(io.tapstate.core.lifecycle.PipelineState.RUNNING)).isEqualTo(io.tapstate.core.lifecycle.InitialLoad.Phase.MIXED);
+
         } finally {
             releaseSecondRead.countDown();
             replacement.stopCapture("p", false);
