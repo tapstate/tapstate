@@ -54,6 +54,27 @@ class RunBoundCaptureReadingsTest {
         verify(run, never()).capturedRows(anyString());
     }
 
+    @Test void initialLoadUsesTheCurrentRunAndRejectsReplacementDuringCollection() {
+        var captures = mock(PipelineCaptureCoordinator.class);
+        var run = mock(PipelineCaptureCoordinator.class);
+        when(captures.forRun(SCOPE, CLAIM, ORIGINAL)).thenReturn(run);
+        var plan = new io.tapstate.core.lifecycle.ExecutionPlan("flow", 2L, 3L, 1L, java.util.List.of("node"), java.util.List.of(), BEGAN);
+        var load = new io.tapstate.core.lifecycle.InitialLoad(io.tapstate.core.lifecycle.InitialLoad.executionKey(plan),
+                BEGAN, "snapshot_and_cdc", Map.of("orders", new io.tapstate.core.lifecycle.InitialLoad.Table(
+                        io.tapstate.core.lifecycle.InitialLoad.Stage.READING, 7L, null)));
+        var selected = new AtomicReference<>(Optional.of(ORIGINAL));
+        var readings = new RunBoundCaptureReadings(captures, ignored -> selected.get(), ignored -> CaptureReading.NONE);
+        when(run.initialLoad("flow", plan, BEGAN)).thenReturn(load);
+        assertThat(readings.initialLoad("flow", plan, BEGAN)).isEqualTo(load);
+        when(run.initialLoad("flow", plan, BEGAN)).thenAnswer(call -> {
+            selected.set(Optional.empty());
+            return load;
+        });
+        assertThatThrownBy(() -> readings.initialLoad("flow", plan, BEGAN)).isInstanceOf(TapstateException.class);
+        assertThat(readings.initialLoad("flow", plan, BEGAN)).isNull();
+        verify(captures, never()).initialLoad(anyString(), any(), any());
+    }
+
     @Test void jobReplacementDuringArrivalCollectionRefusesItsCounters() {
         var captures = mock(PipelineCaptureCoordinator.class);
         var selected = new AtomicReference<>(Optional.of(ORIGINAL));

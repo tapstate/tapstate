@@ -6,6 +6,9 @@ import io.tapstate.core.lifecycle.ExecutionPlans;
 import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.InitialLoad;
+import java.time.Clock;
+import java.time.Duration;
 import io.tapstate.spi.store.ObservationStore;
 
 import java.util.List;
@@ -39,6 +42,7 @@ public final class PipelineObservationQueryService {
     private final ArtifactQueryService artifacts;
     private final ObservationStore observations;
     private final ExecutionPlans plans;
+    private final Clock clock;
     private final Supplier<List<String>> members;
     private final PipelineStatusDiagnostics diagnostics;
 
@@ -58,12 +62,23 @@ public final class PipelineObservationQueryService {
      */
     public PipelineObservationQueryService(ArtifactQueryService artifacts, ObservationStore observations,
             ExecutionPlans plans, Supplier<List<String>> members) {
-        this(artifacts, observations, plans, members, PipelineStatusDiagnostics.NONE);
+        this(artifacts, observations, plans, members, PipelineStatusDiagnostics.NONE, Clock.systemUTC());
     }
 
     public PipelineObservationQueryService(ArtifactQueryService artifacts, ObservationStore observations,
             ExecutionPlans plans, Supplier<List<String>> members, PipelineStatusDiagnostics diagnostics) {
+        this(artifacts, observations, plans, members, diagnostics, Clock.systemUTC());
+    }
+
+    public PipelineObservationQueryService(ArtifactQueryService artifacts, ObservationStore observations,
+            ExecutionPlans plans, Supplier<List<String>> members, Clock clock) {
+        this(artifacts, observations, plans, members, PipelineStatusDiagnostics.NONE, clock);
+    }
+
+    private PipelineObservationQueryService(ArtifactQueryService artifacts, ObservationStore observations,
+            ExecutionPlans plans, Supplier<List<String>> members, PipelineStatusDiagnostics diagnostics, Clock clock) {
         this.diagnostics = Objects.requireNonNull(diagnostics, "diagnostics");
+        this.clock = Objects.requireNonNull(clock, "clock");
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
         this.observations = Objects.requireNonNull(observations, "observations");
         this.plans = Objects.requireNonNull(plans, "plans");
@@ -143,7 +158,18 @@ public final class PipelineObservationQueryService {
     /** The pipeline's per-table initial-load progress. */
     public PipelineSnapshot snapshot(String pipelineId) {
         Observation observation = require(pipelineId);
-        return new PipelineSnapshot(observation.pipelineId(), observation.snapshot());
+        InitialLoad load = observation.initialLoad();
+        if (load != null) {
+            ExecutionPlan plan = plans.current(List.of(pipelineId)).get(pipelineId);
+            // Completion removes the active plan; its target-confirmed final observation remains history.
+            boolean terminal = plan == null && load.phase(observation.state()) == InitialLoad.Phase.COMPLETED;
+            if (!terminal && !load.matches(plan) || observation.observedAt() == null
+                    || Duration.between(observation.observedAt(), clock.instant())
+                            .compareTo(PipelineExplainService.PUBLISHER_SILENCE) >= 0) {
+                load = null;
+            }
+        }
+        return new PipelineSnapshot(observation.pipelineId(), observation.snapshot(), load, load == null ? null : load.phase(observation.state()));
     }
 
     private Observation require(String pipelineId) {

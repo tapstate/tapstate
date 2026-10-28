@@ -32,6 +32,10 @@ final class RunBoundCaptureReadings implements PipelineCaptureCoordinator {
     @Override public SnapshotReading runSnapshotProgress(String pipeline) {
         return read(pipeline, SnapshotReading.NONE, original -> view(original).runSnapshotProgress(pipeline));
     }
+    @Override public io.tapstate.core.lifecycle.InitialLoad initialLoad(String pipeline,
+            io.tapstate.core.lifecycle.ExecutionPlan plan, java.time.Instant at) {
+        return read(pipeline, null, original -> view(original).initialLoad(pipeline, plan, at));
+    }
     @Override public CaptureReading capturedRows(String pipeline) {
         return read(pipeline, CaptureReading.NONE, original -> arrivals.apply(pipeline));
     }

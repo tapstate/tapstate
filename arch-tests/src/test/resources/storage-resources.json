@@ -462,6 +462,16 @@
         "No new collection, protocol lease, event history, stored model body or credential is added by this control contract. CONFIG retains one current bounded plan, one current mapping plus flat predecessor per canonical capture, and one scope gate per affected Pipeline. Each actual recovery leaves an old quarantined physical namespace and retirement marker; precise final destruction is outside this entry, required identity cannot be discarded for a budget and insufficient capacity refuses. Existing ordinary model/log/retention and pending-full budgets and validation remain.",
         "The recovery CAPTURE claim annex is exactly formatVersion 2, original (the complete immutable version 1 birth row), physicalChain and preparationId. The preparationId equals the fixed operation UUID. Its CONFIG currentRecovery keeps only previousPhysicalChain and previousPreparationId as a flat predecessor; canonical predecessor coordinates must match the immutable birth. The Pipeline sharedRecovery marker never changes original operationId/preparation/stateRebuild and is consumed only by the winning exact old-scope full completion, never by replay or an unrelated generation."
       ]
+    },
+    "cache-initial-load-projection-v2": {
+      "goal": "Reproject current-run initial-load display facts after CACHE admission without treating observations as checkpoint or completion authority.",
+      "entry": "Republish through the scoped runtime observation path from current capture plans and counters, existing discovery estimates, and durable target completion receipts. Missing or mismatched readings stay unknown.",
+      "prerequisites": [
+        "The original CACHE business identity, exact pipeline scope and current state are admitted; ordinary reads do not create missing state.",
+        "The optional initialLoad contains runKey, observedAt, readMode and the complete resolved table inventory, with PENDING/READING/LANDING/LANDED, measured rowsRead and optional rowsTotalEstimate. Estimates never prove completion.",
+        "The observational run key must match the current execution; it grants no ownership or fencing authority.",
+        "Old documents without initialLoad remain readable as unknown progress. Rebuild derives a new projection from current facts; no legacy import, automatic migration or previous-run counter adoption is permitted."
+      ]
     }
   },
   "consistencyProfiles": {
@@ -504,6 +514,10 @@
     "shared-srs-cache": {
       "atomicDomain": "CACHE",
       "fencing": "Existing ordinary NODE/PIPELINE/CAPTURE and pending-full root/model/pin/checkpoint transactions remain. The separate shared replacement proves the exact original preparation, complete control view, current NODE and ended original tenures in one actual CACHE client/session transaction; it advances the known canonical CAPTURE annex/counters, expires exact old Pipeline tenures without discarding their private state, detaches the old shared relations, records a RETIRED control receipt and creates the entirely empty replacement physical root atomically. Cancellation competes on that same root, proves the unchanged old effective annex and absence of every replacement namespace fact, and persists CANCELLED before CONFIG can replan the same operation. Opaque handles and exact operation/plan/control digests prohibit old attempts after cancellation. Ordinary old-domain operations refuse both quarantine variants before reading payload. CONFIG checks stay outside the CACHE retry callback."
+    },
+    "cache-initial-load-projection-v2": {
+      "atomicDomain": "CACHE",
+      "fencing": "Keep the exact clusterId/bindingVersion/cacheIncarnation/pipelineId/stateGeneration scope and the original full PIPELINE_ACTUATION claim fence. Prove live ownership and current scope/epoch in the same CACHE transaction; old scope, execution or revoked guard cannot publish. CONFIG is not a CACHE fence. Read-only views cannot mutate."
     }
   },
   "resources": [
@@ -2237,26 +2251,30 @@
     },
     {
       "id": "mongo.cache.pipeline_observation",
-      "resourceVersion": 1,
-      "proposalVersion": 1,
+      "resourceVersion": 2,
+      "proposalVersion": 2,
       "kind": "COLLECTION",
       "layer": "CACHE",
       "database": "CACHE",
       "physicalNames": [
         "pipeline_observation"
       ],
-      "responsibility": "Latest observed Pipeline state; absent observations remain unknown.",
+      "responsibility": "Latest scoped Pipeline observation and optional current-run initial-load display projection; absent or mismatched facts remain unknown.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoCachePipelineObservationStore"
       ],
       "readers": [
         "io.tapstate.adapters.mongostore.MongoCachePipelineObservationStore"
       ],
-      "recovery": "derived-cache",
-      "consistency": "cache",
-      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "recovery": "cache-initial-load-projection-v2",
+      "consistency": "cache-initial-load-projection-v2",
+      "growth": "One latest document per pipeline, replaced at the existing observation cadence. Initial-load fields add O(resolved tables in the active run), not O(rows) or per-refresh history. No new collection, retention schedule or cleanup task.",
       "evidence": [
-        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java"
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCachePipelineStoresIT.java",
+        "app/src/test/java/io/tapstate/app/ThreeLayerObservationTest.java",
+        "app/src/test/java/io/tapstate/app/PipelineDirectPreparationIT.java",
+        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java",
+        "app/src/test/java/io/tapstate/app/RunBoundCaptureReadingsTest.java"
       ]
     },
     {

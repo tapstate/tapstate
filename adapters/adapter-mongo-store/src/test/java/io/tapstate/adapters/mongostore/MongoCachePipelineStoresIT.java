@@ -78,6 +78,42 @@ class MongoCachePipelineStoresIT {
         });
     }
 
+    @Test void aCurrentRunInitialLoadSurvivesTheStrictCacheCodec() {
+        withFixture(f -> {
+            var observations = f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE);
+            observations.save(observation(PipelineState.RUNNING));
+            Document load = new Document("runKey", "run-1").append("observedAt", java.util.Date.from(AT))
+                    .append("readMode", "snapshot_and_cdc")
+                    .append("tables", new Document("orders", new Document("stage", "READING")
+                            .append("rowsRead", 7L).append("rowsTotalEstimate", 10L))
+                            .append("customers", new Document("stage", "PENDING")));
+            var collection = SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database());
+            collection.updateOne(new Document("_id", "orders"), new Document("$set", new Document("initialLoad", load)));
+            Observation decoded = observations.read("orders").orElseThrow();
+            observations.save(decoded);
+            assertThat(collection.find(new Document("_id", "orders")).first().get("initialLoad")).isEqualTo(load);
+        });
+    }
+
+    @Test void malformedInitialLoadCannotBeCoercedOrRepairedByARead() {
+        withFixture(f -> {
+            var observations = f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE);
+            observations.save(observation(PipelineState.RUNNING));
+            var collection = SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database());
+            Document original = collection.find().first();
+            for (var mutation : List.of(new Document("initialLoad.tables.orders.rowsRead", 7.5d),
+                    new Document("initialLoad.tables.orders.rowsRead", -1L),
+                    new Document("initialLoad.tables.orders.stage", "UNRECOGNIZED"),
+                    new Document("initialLoad.unexpected", "private-sentinel"))) {
+                collection.updateOne(new Document("_id", "orders"), new Document("$set", mutation));
+                var before = snapshot(f.database());
+                assertCode(() -> observations.read("orders"), IoError.DOCUMENT_UNREADABLE);
+                assertThat(snapshot(f.database())).isEqualTo(before);
+                collection.replaceOne(new Document("_id", "orders"), original);
+            }
+        });
+    }
+
     @Test void readViewsAndOrdinaryCreateOrDeleteCannotSeedResetOrRetireState() {
         withFixture(f -> {
             var before = snapshot(f.database());
@@ -350,7 +386,11 @@ class MongoCachePipelineStoresIT {
         });
     }
 
-    private static Observation observation(PipelineState state) { return new Observation("orders", state, Map.of(), Map.of(), Map.of(), null, AT, List.of()); }
+    private static Observation observation(PipelineState state) {
+        return new Observation("orders", state, Map.of(), Map.of(), Map.of(), null, AT, List.of(),
+                new io.tapstate.core.lifecycle.InitialLoad("run-1", AT, "snapshot_and_cdc", Map.of(
+                        "orders", new io.tapstate.core.lifecycle.InitialLoad.Table(io.tapstate.core.lifecycle.InitialLoad.Stage.READING, 7L, null))));
+    }
     private static PipelineIntentScope scope(long generation) { return new PipelineIntentScope(SCOPE.clusterId(), 1, SCOPE.cacheIncarnation(), "orders", generation); }
     private static Document header(PipelineIntentScope scope) { return new Document("clusterId", scope.clusterId()).append("bindingVersion", scope.bindingVersion())
             .append("cacheIncarnation", scope.cacheIncarnation()).append("pipelineId", scope.pipelineId()).append("stateGeneration", scope.stateGeneration()); }

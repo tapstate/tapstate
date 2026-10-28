@@ -174,6 +174,15 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                     streamingCursor(held,source).snapshotCompletedTables().containsAll(source.selected.tables())); }
         @Override public SnapshotReading snapshotProgress(String pipeline) { requireId(pipeline); var held=current(); return held==null?SnapshotReading.NONE:snapshotReading(held); }
         @Override public SnapshotReading runSnapshotProgress(String pipeline) { requireId(pipeline); var held=current(); return held==null?SnapshotReading.NONE:runSnapshotReading(held); }
+        @Override public InitialLoad initialLoad(String pipeline, ExecutionPlan plan, Instant at) {
+            requireId(pipeline);
+            var held = current();
+            if (held == null || plan == null || !pipeline.equals(plan.pipelineId())
+                    || !Objects.equals(plan.claimGeneration(), original.claimGeneration())
+                    || !Objects.equals(plan.executionGeneration(), original.executionGeneration())
+                    || !Objects.equals(plan.topologyRevision(), original.topologyRevision())) return null;
+            return initialLoadReading(held, plan, at);
+        }
         private Session current() { synchronized(ScopedPipelineCaptureCoordinator.this) { return sessions.get(original); } }
         private Session session() { var session=current(); if(session==null || session.bindings==null)throw refused(); return session; }
         private void requireId(String pipeline) { if(!original.pipelineId().equals(pipeline))throw refused(); }
@@ -396,15 +405,18 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         final String id; final SourceCaptureResolution selected;final boolean shared;boolean positionEditsRestricted; final Map<String,Long> rows=new ConcurrentHashMap<>();
         final Set<String> completed=ConcurrentHashMap.newKeySet();
         final Map<String,SourceTable> expectedModels;
+        final Map<String,Long> estimates = new LinkedHashMap<>();
         Owner owner;CapturePreparation prepared;WorkloadClaimFence foreign;SrsStores srs;SrsConsumerRun consumer;SrsFreshFullPreparation freshFull; CaptureRun run; DirectChannelStore channels; DirectChannelProgress direct; CaptureStart start; long snapshotEpoch; Set<String> readTables=Set.of();
         Source(String id,SourceCaptureResolution selected,boolean shared,SourceModel frozen) {
             this.id=id;this.selected=selected;this.shared=shared;
             if(frozen==null)expectedModels=null;
             else {
                 var fixed=new LinkedHashMap<String,SourceTable>();
-                for(var table:frozen.tables())if(selected.tables().contains(table.name()))
+                for(var table:frozen.tables())if(selected.tables().contains(table.name())) {
                     if(fixed.put(table.name(),new SourceTable(table.name(),table.fields(),table.primaryKey(),table.indexes()))!=null)
                         throw modelUnproven(this);
+                    if (table.approximateRowCount() != null) estimates.put(table.name(), table.approximateRowCount());
+                }
                 expectedModels=Map.copyOf(fixed);
             }
         }
@@ -421,14 +433,36 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         return new TapstateException(IoError.SRS_FULL_PREPARATION_UNPROVEN,Map.of("chain",source.selected.chainId().value()),null);
     }
     private static final class Session {
-        final ExecutionFence original; final PipelinePreparationInputs inputs; final Instant began; final boolean bounded,snapshot;
+        final ExecutionFence original; final PipelinePreparationInputs inputs; final Instant began; final boolean bounded,snapshot; final ReadMode readMode;
         final Map<String,Source> sources=new LinkedHashMap<>(); final AtomicBoolean ended=new AtomicBoolean(); final AtomicReference<Throwable> failure=new AtomicReference<>();
         PipelineCaptureBindings bindings;
-        Session(ExecutionFence original,PipelinePreparationInputs inputs,Instant began,ReadMode mode) { this.original=original;this.inputs=inputs;this.began=began;this.bounded=mode==ReadMode.SNAPSHOT_ONLY;this.snapshot=mode!=ReadMode.CDC_ONLY; }
+        Session(ExecutionFence original,PipelinePreparationInputs inputs,Instant began,ReadMode mode) { this.original=original;this.inputs=inputs;this.began=began;this.bounded=mode==ReadMode.SNAPSHOT_ONLY;this.snapshot=mode!=ReadMode.CDC_ONLY;this.readMode=mode; }
         String label(String source,String table) {
             return sources.values().stream().filter(item -> item.selected.tables().contains(table)).count()>1?source+"."+table:table;
         }
     }
+    private InitialLoad initialLoadReading(Session session, ExecutionPlan plan, Instant at) {
+        requireSession(session);
+        var tables = new LinkedHashMap<String, InitialLoad.Table>();
+        if (session.snapshot) {
+            boolean boundedLanded = session.bounded && stores.boundedLoads().complete(session.original);
+            for (var source : session.sources.values()) {
+                var confirmed = session.bounded ? List.<String>of() : streamingCursor(session, source).snapshotCompletedTables();
+                for (String table : source.selected.tables()) {
+                    Long rows = source.rows.get(table);
+                    // An empty table is measured only after this run actually completed its read.
+                    if (rows == null && source.completed.contains(table) && source.readTables.contains(table)) rows = 0L;
+                    InitialLoad.Stage stage = boundedLanded || confirmed.contains(table) ? InitialLoad.Stage.LANDED
+                            : source.completed.contains(table) ? InitialLoad.Stage.LANDING
+                            : rows != null ? InitialLoad.Stage.READING : InitialLoad.Stage.PENDING;
+                    tables.put(session.label(source.id, table), new InitialLoad.Table(stage, rows, source.estimates.get(table)));
+                }
+            }
+        }
+        requireSession(session);
+        return new InitialLoad(InitialLoad.executionKey(plan), at, session.readMode.yaml(), tables);
+    }
+
     private SnapshotReading snapshotReading(Session session) {
         requireSession(session); if(!session.snapshot)return SnapshotReading.NONE;
         var state=stores.pipelines().snapshotStates(session.original.scope(),claim(session.original),() -> requireSession(session));
