@@ -7,6 +7,7 @@ import io.tapstate.control.core.CloudClusterEgressAddressProvider;
 import io.tapstate.control.core.CloudSessionService;
 import io.tapstate.control.core.ControlOperations;
 import io.tapstate.control.core.CredentialAuthenticator;
+import io.tapstate.control.core.CurrentUserQueryService;
 import io.tapstate.control.core.GeneratedSecret;
 import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.control.core.Scope;
@@ -95,6 +96,13 @@ class ClusterContextApiTest {
                     .containsKey("clusterState")
                     .containsEntry("clusterState", null);
             assertThat(body.toString()).doesNotContain(COOKIE, "password", "jwt", "jti", "secret-sentinel");
+            Map<?, ?> currentUser = RestClient.create("http://127.0.0.1:" + port).get().uri("/api/auth/me")
+                    .header(HttpHeaders.COOKIE, CloudSessionCookies.NAME + "=" + COOKIE)
+                    .retrieve().body(Map.class);
+            assertThat(currentUser.get("principal")).isEqualTo("context-user");
+            assertThat(currentUser.containsKey("username")).isTrue();
+            assertThat(currentUser.get("username")).isNull();
+            assertThat(currentUser.get("email")).isEqualTo("user@example.test");
             for (String cookie : new String[] {"", COOKIE + "-wrong-secret"}) {
                 String errorBody = RestClient.create("http://127.0.0.1:" + port).get().uri("/api/cluster/context")
                         .header(HttpHeaders.COOKIE, CloudSessionCookies.NAME + "=" + cookie)
@@ -112,7 +120,7 @@ class ClusterContextApiTest {
     @Import({RestApiConfiguration.class, RestApiSecurityConfiguration.class, ApiExceptionHandler.class})
     @ComponentScan(basePackageClasses = ControlHttpFace.class, useDefaultFilters = false,
             includeFilters = @ComponentScan.Filter(type = FilterType.REGEX,
-                    pattern = "io\\.tapstate\\.control\\.restapi\\.ClusterContextController"))
+                    pattern = "io\\.tapstate\\.control\\.restapi\\.(ClusterContextController|CurrentUserController)"))
     static class TestApp {
         @Bean
         AuthenticationMode mode() {
@@ -122,6 +130,11 @@ class ClusterContextApiTest {
         @Bean
         OperationRegistry registry() {
             return ControlOperations.registry();
+        }
+
+        @Bean
+        CurrentUserQueryService currentUserQueryService(AuthenticationMode mode) {
+            return new CurrentUserQueryService(mode);
         }
 
         @Bean

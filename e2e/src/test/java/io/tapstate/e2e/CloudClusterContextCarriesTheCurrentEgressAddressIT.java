@@ -115,6 +115,14 @@ class CloudClusterContextCarriesTheCurrentEgressAddressIT {
                         .containsKey("clusterState")
                         .containsEntry("clusterState", null);
                 assertThat(response.body()).doesNotContain(JWT, cookie, "controlled-machine-token");
+                HttpResponse<String> currentUser = client.send(HttpRequest.newBuilder(base.resolve("/api/auth/me"))
+                        .timeout(Duration.ofSeconds(10)).header("Cookie", cookie).GET().build(),
+                        HttpResponse.BodyHandlers.ofString());
+                assertThat(currentUser.statusCode()).isEqualTo(200);
+                Map<?, ?> currentUserBody = (Map<?, ?>) JsonReader.parse(currentUser.body());
+                assertThat(currentUserBody.get("email")).isEqualTo("user@example.test");
+                assertThat(currentUserBody.get("username")).isNull();
+                assertThat(currentUser.body()).doesNotContain(JWT, cookie, "controlled-machine-token");
 
                 HttpResponse<String> noAddressLogin = client.send(HttpRequest.newBuilder(
                                 base.resolve("/auth/exchange?code=controlled-code-without-egress"))
@@ -136,6 +144,11 @@ class CloudClusterContextCarriesTheCurrentEgressAddressIT {
                         .containsEntry("userEmail", null);
                 assertThat(noAddressResponse.body())
                         .doesNotContain(JWT_WITHOUT_ADDRESS, noAddressCookie, "controlled-machine-token");
+                HttpResponse<String> noEmailUser = client.send(HttpRequest.newBuilder(base.resolve("/api/auth/me"))
+                        .timeout(Duration.ofSeconds(10)).header("Cookie", noAddressCookie).GET().build(),
+                        HttpResponse.BodyHandlers.ofString());
+                assertThat(noEmailUser.statusCode()).isEqualTo(200);
+                assertThat(((Map<?, ?>) JsonReader.parse(noEmailUser.body())).get("email")).isNull();
 
                 HttpResponse<String> anonymous = client.send(HttpRequest.newBuilder(base.resolve("/api/cluster/context"))
                         .timeout(Duration.ofSeconds(10)).GET().build(), HttpResponse.BodyHandlers.ofString());
