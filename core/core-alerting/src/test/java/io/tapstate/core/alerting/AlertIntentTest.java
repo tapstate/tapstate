@@ -201,6 +201,72 @@ class AlertIntentTest {
                 null, C.plusSeconds(13), List.of(0, 1)))).isInstanceOf(TapstateException.class);
     }
 
+    @Test void deliveryProgressPreservesFrozenRetryTimesAndOpensOnlyExplicitManualCycles() {
+        var record=AlertIntentControl.claim(initial(frozen(false)),"sender",C,C.plusSeconds(120));
+        var pending=AlertDeliveryProgress.grant(record,"sender","attempt-a",C);
+        var permit=pending.state().attempts().getFirst().permit();
+        var result=AlertDeliveryProgress.result(pending,permit,Outcome.UNKNOWN,
+                new Protocol(Phase.DEADLINE,Action.RETRY,0,"smtp",null),null,C.plusSeconds(60),2000);
+        assertThat(result.state().nextAttemptAt()).isEqualTo(C.plusSeconds(60+2160));
+        assertThat(result.state().attemptsConsumed()).isOne();
+        assertThat(result.frozen()).isEqualTo(record.frozen());
+        assertThatThrownBy(()->AlertDeliveryProgress.grant(result,"sender","too-early",C.plusSeconds(61))).isInstanceOf(TapstateException.class);
+        var refused=AlertDeliveryProgress.result(pending,permit,Outcome.NOT_ACCEPTED,
+                new Protocol(Phase.FINAL_RESPONSE,Action.STOP,535,"smtp",null),null,C.plusSeconds(1),0);
+        assertThat(refused.state().nextAttemptAt()).isNull();
+        var reopened=AlertDeliveryProgress.manual(refused,C.plusSeconds(2));
+        assertThat(reopened.state().cycleStarts()).containsExactly(0,1);
+        assertThat(reopened.state().attemptsConsumed()).isOne();
+        assertThat(reopened.frozen()).isEqualTo(record.frozen());
+        var late=AlertDeliveryProgress.result(reopened,permit,Outcome.NOT_ACCEPTED,
+                new Protocol(Phase.FINAL_RESPONSE,Action.STOP,535,"smtp",null),null,C.plusSeconds(3),0);
+        assertThat(late.state().nextAttemptAt()).isEqualTo(reopened.state().nextAttemptAt());
+        assertThat(late.state().manualCycles()).isOne();
+    }
+    @Test void deliveryProgressAcceptsOriginalLateReceiptAfterIntentDeadlineWithoutExtendingIt() {
+        var original=AlertIntentControl.claim(initial(frozen(false)),"sender",C,C.plusSeconds(120));
+        var pending=AlertDeliveryProgress.grant(original,"sender","attempt-a",C);
+        var result=AlertDeliveryProgress.result(pending,pending.state().attempts().getFirst().permit(),Outcome.ACCEPTED,
+                new Protocol(Phase.FINAL_RESPONSE,Action.STOP,250,"smtp",null),new Receipt("channel-protocol","accepted",null),C.plusSeconds(86401),0);
+        assertThat(result.state().summary()).isEqualTo(Outcome.ACCEPTED);
+        assertThat(result.state().attempts().getFirst().endedAt()).isEqualTo(C.plusSeconds(60));
+        assertThat(result.frozen().deadline()).isEqualTo(original.frozen().deadline());
+        assertThat(result.state().retained().stoppedAt()).isBeforeOrEqualTo(original.frozen().deadline());
+    }
+    @Test void deliveryProgressNeverRestartsAnOrphanClockOrLosesLateAcceptanceAfterTakeover() {
+        var original=AlertIntentControl.claim(initial(frozen(false)),"sender",C,C.plusSeconds(30));
+        var pending=AlertDeliveryProgress.grant(original,"sender","attempt-a",C);
+        var permit=pending.state().attempts().getFirst().permit();
+        var owned=AlertIntentControl.claim(pending,"replacement",C.plusSeconds(70),C.plusSeconds(100));
+        var result=AlertDeliveryProgress.result(owned,permit,Outcome.UNKNOWN,new Protocol(Phase.DEADLINE,Action.RETRY,0,"orphan-attempt",null),null,C.plusSeconds(70),0);
+        assertThat(result.state().nextAttemptAt()).isEqualTo(C.plusSeconds(1860));
+        assertThat(result.state().owner().generation()).isEqualTo(2);
+        var accepted=AlertDeliveryProgress.result(result,permit,Outcome.ACCEPTED,new Protocol(Phase.FINAL_RESPONSE,Action.STOP,250,"smtp",null),new Receipt("channel-protocol","accepted",null),C.plusSeconds(71),0);
+        assertThat(accepted.state().summary()).isEqualTo(Outcome.ACCEPTED);
+        assertThat(accepted.state().nextAttemptAt()).isNull();
+        assertThat(accepted.state().owner()).isEqualTo(result.state().owner());
+        assertThat(accepted.state().attempts().getFirst().endedAt()).isEqualTo(C.plusSeconds(60));
+    }
+
+    @Test void oldCycleCallbacksOnlyExtendRestrictionsAfterAnExplicitNewCycle() {
+        var value=initial(frozen(false));Instant now=C;DeliveryAttempt.Permit first=null,last=null;
+        for(int i=0;i<5;i++) {
+            value=AlertIntentControl.claim(value,"sender",now,now.plusSeconds(120));
+            value=AlertDeliveryProgress.grant(value,"sender","attempt-"+i,now);last=value.state().attempts().getLast().permit();if(first==null)first=last;
+            now=now.plusSeconds(1);value=AlertDeliveryProgress.result(value,last,Outcome.UNKNOWN,new Protocol(Phase.DEADLINE,Action.RETRY,0,"smtp",null),null,now,0);
+            if(value.state().nextAttemptAt()!=null)now=value.state().nextAttemptAt();
+        }
+        value=AlertDeliveryProgress.manual(value,now.plusSeconds(1));var eligibility=value.state().nextAttemptAt();
+        value=AlertDeliveryProgress.result(value,last,Outcome.UNKNOWN,new Protocol(Phase.DEADLINE,Action.RETRY,0,"smtp",null),null,now.plusSeconds(2),0);
+        assertThat(value.state().nextAttemptAt()).isEqualTo(eligibility);
+        now=now.plusSeconds(3);value=AlertIntentControl.claim(value,"sender",now,now.plusSeconds(120));value=AlertDeliveryProgress.grant(value,"sender","manual-attempt",now);
+        value=AlertDeliveryProgress.result(value,value.state().attempts().getLast().permit(),Outcome.UNKNOWN,new Protocol(Phase.DEADLINE,Action.RETRY,0,"smtp",null),null,now.plusSeconds(1),0);
+        var restriction=value.state().nextAttemptAt().plusSeconds(7200);
+        value=AlertDeliveryProgress.result(value,first,Outcome.UNKNOWN,new Protocol(Phase.FINAL_RESPONSE,Action.RETRY,429,"smtp",restriction),null,now.plusSeconds(2),0);
+        assertThat(value.state().nextAttemptAt()).isEqualTo(restriction);
+        assertThat(value.state().manualCycles()).isOne();assertThat(value.state().attemptsConsumed()).isEqualTo(6);
+    }
+
     private static Frozen frozen(boolean cloud) {
         var ruleId = new AlertConfiguration.Identity(AlertConfiguration.Kind.RULE, SCOPE, "rule-a", UUID);
         var routeId = new AlertConfiguration.Identity(AlertConfiguration.Kind.SUBSCRIPTION, SCOPE, "route-a", UUID);

@@ -197,7 +197,7 @@ final class MongoAlertCoordinator implements AlertStore {
                 boolean grants=after.state().attemptsConsumed()>prior;
                 if(grants&&c.kind()!=CommitKind.PERMIT||c.kind()==CommitKind.PERMIT&&before==null)throw stale("permit-command");
                 if(before!=null&&after.state().manualCycles()!=before.value().state().manualCycles()&&access==null)throw stale("manual-retry-actor");
-                if(before==null||grants)validateIntent(s,after.frozen(),grants,access);
+                if(before==null||grants||before.value().state().manualCycles()!=after.state().manualCycles())validateIntent(s,after.frozen(),grants||before!=null&&before.value().state().manualCycles()!=after.state().manualCycles(),access);
                 if(grants&&host.deployment()==AlertChannelPolicy.Deployment.ON_PREM){var limit=notifications.limit(s,target(after.frozen()));if(limit.isPresent()&&!limit.get().value().restrictionElapsed(clock.instant()))throw stale("target-not-before");}
                 if(c.kind()==CommitKind.END&&(before==null||grants||!after.state().permitsStopped()))throw stale("administrative-stop");
                 if(c.kind()==CommitKind.RESULT&&before!=null&&!before.value().state().owner().equals(after.state().owner()))throw stale("result-owner");

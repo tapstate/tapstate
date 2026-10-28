@@ -267,6 +267,13 @@ class CloudAlertSdkChannelTest {
             assertThat(received).hasValue(1);
         }finally{https.stop(0);}
     }
+    @Test void trustedHttpsSchemeCaseMatchesTheDeploymentCapabilityContract()throws Exception {
+        try(var channel=new CloudAlertSdkChannel(AlertChannelPolicy.Deployment.CLOUD_MANAGED,binding(),URI.create("HTTPS://cloud.example"),"fixture-token",ORG,
+                new InetAddress[]{InetAddress.getLoopbackAddress()},SSLContext.getDefault(),Clock.systemUTC())){
+            assertThat(channel.capabilityVersion()).isEqualTo(2);
+        }
+        assertThat(calls).hasValue(0);
+    }
     @Test void deploymentExpiredAndTestPurposeGatesMakeNoNetworkRequest() throws Exception {
         assertThatThrownBy(()->new CloudAlertSdkChannel(AlertChannelPolicy.Deployment.ON_PREM,binding(),origin,"fixture-token",null,new InetAddress[]{InetAddress.getLoopbackAddress()},SSLContext.getDefault(),Clock.systemUTC())).isInstanceOf(TapstateException.class);
         assertThatThrownBy(()->new CloudAlertSdkChannel(AlertChannelPolicy.Deployment.CLOUD_MANAGED,binding(),origin,"fixture-token",null,new InetAddress[]{InetAddress.getLoopbackAddress()},SSLContext.getDefault(),Clock.systemUTC())).isInstanceOf(TapstateException.class);

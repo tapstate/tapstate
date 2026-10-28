@@ -403,10 +403,13 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 var managedBinding = cloud.cloud() ? AlertNotificationPlanner.managedBinding(cloud.baseUrl(),scope,setup) : null;
                 var route = cloud.cloud() ? new io.tapstate.core.alerting.AlertIntent.SystemRoute("managed-alert-events",managedBinding,1) : null;
                 var target = cloud.cloud() ? new io.tapstate.core.alerting.AlertIntent.SdkTarget(managedBinding,scope.clusterId(),managedBinding) : null;
-                var host = new io.tapstate.spi.store.AlertStore.Host(scope,setup,deployment,active,route,target,r->java.util.Optional.empty(),java.util.Set.of());
+                boolean outbound=AlertChannels.outboundEnabled(owner.parent.getEnvironment().getProperty("tapstate.alerting.outbound-enabled"));
+                var host = new io.tapstate.spi.store.AlertStore.Host(scope,setup,deployment,active,route,target,r->java.util.Optional.empty(),AlertChannels.capabilities(deployment,cloud,outbound));
                 var store = owner.configuration.alerts(host, catalog, clock);
                 var planner = new AlertNotificationPlanner(store,clock,evaluatorId+":planning",cloud.cloud()?cloud.baseUrl():null,active);
-                return new PipelineAlertRuntime.Services(store, new AlertEvaluationHost(store, catalog, deployment, clock, evaluatorId, active).withPlanner(planner),catalog,new AlertPlanningRuntime(planner));
+                return new PipelineAlertRuntime.Services(store, new AlertEvaluationHost(store, catalog, deployment, clock, evaluatorId, active).withPlanner(planner),catalog,new AlertPlanningRuntime(planner),
+                        new AlertDeliveryRuntime(store,clock,evaluatorId+":delivery",active,new AlertChannels(deployment,cloud,clock,active,cloud.cloud()?scope.authorityId():null,outbound),
+                                owner.root.authentication()::continueAlertTest));
             }, owner.configuration.intents(), ownership::evaluationProof, active, clock);
         }
         @Bean ConvergenceDriver convergenceDriver(NativeBusinessContext owner, PipelineConverger converger,

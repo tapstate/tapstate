@@ -34,7 +34,7 @@ import org.apache.hc.core5.http.ContentType;
 import org.apache.hc.core5.http.io.entity.ByteArrayEntity;
 import org.apache.hc.core5.io.CloseMode;
 
-/** Unassembled single-attempt SDK adapter. Durable admission, deduplication and DNS refresh belong to the host. */
+/** Single-attempt SDK adapter. Durable admission, deduplication and DNS refresh belong to the host. */
 final class CloudAlertSdkChannel implements NotificationChannel {
     private static final AlertChannelPolicy.Capability CAPABILITY = new AlertChannelPolicy.Capability("cloud-sdk", 2, AlertChannelPolicy.Family.CLOUD_SDK);
     private static final ObjectMapper JSON = new ObjectMapper();
@@ -65,7 +65,7 @@ final class CloudAlertSdkChannel implements NotificationChannel {
         if (!binding.channelType().equals("cloud-sdk") || !binding.scope().clusterId().matches("[a-fA-F0-9]{24}")
                 || origin.getHost() == null || origin.getRawUserInfo() != null || origin.getRawQuery() != null || origin.getRawFragment() != null
                 || !(origin.getPath().isEmpty() || origin.getPath().equals("/"))
-                || !("https".equals(origin.getScheme()) || (localFixture && "http".equals(origin.getScheme()) && origin.getHost().equals("127.0.0.1")))
+                || !("https".equalsIgnoreCase(origin.getScheme()) || (localFixture && "http".equalsIgnoreCase(origin.getScheme()) && origin.getHost().equals("127.0.0.1")))
                 || token == null || token.isBlank() || token.length() > 4096 || token.codePoints().anyMatch(Character::isISOControl)
                 || trustedAddresses == null || trustedAddresses.length == 0 || trustedAddresses.length > 8
                 || timeout == null || timeout.isZero() || timeout.isNegative() || timeout.compareTo(Duration.ofSeconds(30)) > 0
@@ -128,7 +128,7 @@ final class CloudAlertSdkChannel implements NotificationChannel {
             var response = new C2ClusterEventsApi(client).ingestClusterEvent(binding.scope().clusterId(), event, "Bearer " + token);
             if (Thread.currentThread().isInterrupted()) { throw new InterruptedException(); }
             var data = response == null ? null : response.getData();
-            if (expired.get() || System.nanoTime() - started >= budget.toNanos() || !clock.instant().isBefore(request.deadline()) || response == null || !"ok".equals(response.getCode()) || data == null
+            if (response == null || !"ok".equals(response.getCode()) || data == null
                     || !identifier(data.getId()) || !identifier(data.getOrgId()) || (expectedOrg != null && !expectedOrg.equals(data.getOrgId()))
                     || !"cluster".equals(data.getSource()) || !event.getType().equals(data.getType()) || !event.getDedupeKey().equals(data.getDedupeKey())
                     || !Integer.valueOf(1).equals(data.getSchemaVersion()) || data.getPayload() == null

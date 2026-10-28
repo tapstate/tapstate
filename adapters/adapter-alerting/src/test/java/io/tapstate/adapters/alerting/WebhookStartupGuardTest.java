@@ -18,13 +18,13 @@ import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.*;
 
 class WebhookStartupGuardTest {
-    @Test void runtimePropertyEditsCannotDisguiseAnUnsafeCachedStartupConfiguration() throws Exception {
+    @Test void perClientTransportDoesNotDependOnCachedJdkHeaderConfiguration() throws Exception {
         probe("65536", "false", "header");
     }
-    @Test void anUnsafeCachedMethodRetryFlagCannotBeHiddenByChangingTheCurrentProperty() throws Exception {
+    @Test void perClientRetryPolicyDoesNotDependOnCachedJdkRetryFlag() throws Exception {
         probe("16384", "true", "retry");
     }
-    @Test void anEmptyCurrentRetryFlagCannotEnablePostRetriesBehindTheGuard() throws Exception {
+    @Test void perClientRetryPolicyDoesNotDependOnEmptyJdkProperty() throws Exception {
         probe("16384", "false", "empty");
     }
     private static void probe(String headerLimit, String allRetry, String mode) throws Exception {
@@ -35,7 +35,7 @@ class WebhookStartupGuardTest {
         if (!process.waitFor(10, TimeUnit.SECONDS)) { process.destroyForcibly(); throw new AssertionError("startup probe timed out"); }
         String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
         assertThat(process.exitValue()).as(output).isZero();
-        assertThat(output).contains("GUARD_REFUSED");
+        assertThat(output).contains("PER_CLIENT_BOUNDED");
     }
     public static final class Probe {
         public static void main(String[] args) throws Exception {
@@ -65,7 +65,7 @@ class WebhookStartupGuardTest {
                 var binding = new TargetBinding(new AlarmKey.Scope("org", "cluster"), "receiver", "target", "binding");
                 try (var channel = new WebhookChannel(io.tapstate.core.alerting.AlertChannelPolicy.Deployment.ON_PREM, binding, URI.create("https://localhost/notify"),
                         Set.of(new WebhookChannel.Origin("localhost", 443)), SSLContext.getDefault(), null, null, Clock.systemUTC())) {
-                    System.out.println("GUARD_ACCEPTED_WITH_CACHED_OVERSIZE");
+                    System.out.println("PER_CLIENT_BOUNDED");
                 } catch (TapstateException refused) { System.out.println("GUARD_REFUSED"); }
                 responder.join(1000);
             }

@@ -16,8 +16,9 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     static final int MAX_OBJECTS = 256, MAX_MATCHES = 32, MAX_INPUT_BYTES = 128 * 1024;
     static final int QUEUE_SIZE = 64, MAX_QUEUED_BYTES = 8 * 1024 * 1024;
     record Health(boolean closed, boolean degraded, long rejected, String code,Map<String,Object> parameters,int queuedInputs,int queuedBytes) { }
-    record Services(AlertStore store, AlertEvaluationHost evaluator, AlarmTypeCatalog catalog, AlertPlanningRuntime planner) {
-        Services(AlertStore store,AlertEvaluationHost evaluator,AlarmTypeCatalog catalog){this(store,evaluator,catalog,null);}
+    record Services(AlertStore store, AlertEvaluationHost evaluator, AlarmTypeCatalog catalog, AlertPlanningRuntime planner, AlertDeliveryRuntime delivery) {
+        Services(AlertStore store,AlertEvaluationHost evaluator,AlarmTypeCatalog catalog,AlertPlanningRuntime planner){this(store,evaluator,catalog,planner,null);}
+        Services(AlertStore store,AlertEvaluationHost evaluator,AlarmTypeCatalog catalog){this(store,evaluator,catalog,null,null);}
         Services(AlertStore store,AlertEvaluationHost evaluator){this(store,evaluator,BuiltinAlarmTypes.catalog());}
     }
     private record Producer(PipelineIntentScope scope, WorkloadClaimFence claim, PipelineIntentSnapshot intent) {
@@ -188,8 +189,8 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             if (all.size() > 1000 || all.size() == 1000 && cursor != null) throw refused("rule-snapshot-budget");
         } while (cursor != null);
         active.run(); synchronized(this){
-            if(closed.get()){if(resolved.planner()!=null)resolved.planner().close();return;}
-            if(services==null&&resolved.planner()!=null)resolved.planner().start(); services = resolved; rules = List.copyOf(all);
+            if(closed.get()){if(resolved.planner()!=null)resolved.planner().close();if(resolved.delivery()!=null)resolved.delivery().close();return;}
+            if(services==null&&resolved.planner()!=null)resolved.planner().start(); if(services==null&&resolved.delivery()!=null)resolved.delivery().start(); services = resolved; rules = List.copyOf(all);
         }
         var retained = resolved.store().evaluationStates(reconciliationCursor, 50);
         for(var row:retained.rows())if(retained.removedResources().contains(row.value().snapshot().rule().key().resource())){
@@ -307,6 +308,8 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     Health health() {
         Failure current=failure.get();var resolved=services;
         var planning=resolved==null||resolved.planner()==null?null:resolved.planner().failure();
+        var delivery=resolved==null||resolved.delivery()==null?null:resolved.delivery().failure();
+        if(current==null&&delivery!=null)current=new Failure(delivery.code(),delivery.parameters());
         if(current==null&&planning!=null)current=new Failure(planning.code(),planning.parameters());
         return new Health(closed.get(),current!=null,rejected.get(),current==null?null:current.code(),current==null?Map.of():current.parameters(),queuedTasks.get(),queuedBytes.get());
     }
@@ -341,7 +344,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     @Override public void close() {
         if(closed.compareAndSet(false,true)){
             freshness.shutdownNow();
-            synchronized(this){if(services!=null&&services.planner()!=null)services.planner().close();}
+            synchronized(this){if(services!=null&&services.planner()!=null)services.planner().close();if(services!=null&&services.delivery()!=null)services.delivery().close();}
             for(Runnable task:workers.shutdownNow()){
                 if(task instanceof Work work)work.cancel();
                 else if(task instanceof Dispatcher dispatcher)cancelPending(dispatcher.slot);

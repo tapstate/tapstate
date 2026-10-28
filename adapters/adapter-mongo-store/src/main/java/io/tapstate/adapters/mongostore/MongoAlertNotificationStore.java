@@ -186,7 +186,9 @@ final class MongoAlertNotificationStore {
         }
         if (b.manualCycles() == a.manualCycles()) {
             if (!b.cycleStarts().equals(a.cycleStarts())) { throw new IllegalArgumentException("original cycle starts are immutable"); }
-            if (a.nextAttemptAt() != null && b.nextAttemptAt() == null && b.attemptsConsumed() == a.attemptsConsumed() && !b.permitsStopped()) {
+            if (a.nextAttemptAt() != null && b.nextAttemptAt() == null && b.attemptsConsumed() == a.attemptsConsumed() && !b.permitsStopped()
+                    && (b.attempts().isEmpty() || b.attempts().getLast().protocol()==null
+                            || b.attempts().getLast().protocol().action()!=AlertIntent.Action.STOP)) {
                 throw new IllegalArgumentException("an unconsumed retry lower bound cannot be discarded");
             }
             if (a.nextAttemptAt() != null && b.nextAttemptAt() != null && b.nextAttemptAt().isBefore(a.nextAttemptAt())) {
