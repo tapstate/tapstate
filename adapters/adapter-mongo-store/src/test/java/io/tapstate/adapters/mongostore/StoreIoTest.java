@@ -2,6 +2,10 @@ package io.tapstate.adapters.mongostore;
 
 import com.mongodb.MongoCredential;
 import com.mongodb.MongoException;
+import com.mongodb.MongoBulkWriteException;
+import com.mongodb.bulk.BulkWriteError;
+import com.mongodb.bulk.BulkWriteResult;
+import com.mongodb.bulk.WriteConcernError;
 import com.mongodb.MongoSecurityException;
 import com.mongodb.MongoWriteException;
 import com.mongodb.ServerAddress;
@@ -11,10 +15,13 @@ import io.tapstate.spi.store.IoError;
 import org.bson.BsonDocument;
 import org.bson.BsonMaximumSizeExceededException;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.util.Set;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -28,6 +35,57 @@ import static org.assertj.core.api.Assertions.catchThrowable;
  * not be relabelled a driver failure.
  */
 class StoreIoTest {
+
+    private static final String PRIVATE_PAYLOAD = "row-secret";
+
+    @ParameterizedTest
+    @ValueSource(ints = {10334, 17419})
+    void bulkEndpointSizeRefusalsKeepTheSingleWriteDiagnostic(int code) {
+        MongoBulkWriteException driver = bulk(List.of(new BulkWriteError(code,
+                PRIVATE_PAYLOAD, new BsonDocument(), 0)), null);
+        TapstateException failure = (TapstateException) catchThrowable(() -> StoreIo.run("orders", () -> {
+            throw driver;
+        }));
+        assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_TOO_LARGE);
+        assertThat(failure.args()).containsEntry("id", "orders");
+        assertThat(failure.getCause()).isNull();
+        assertThat(failure.toString()).doesNotContain(PRIVATE_PAYLOAD);
+        assertThat(StoreIo.coded(driver).code()).isEqualTo(IoError.DOCUMENT_TOO_LARGE);
+    }
+
+    @Test
+    void aSizeRefusalIsRecognizedEvenAfterAnotherBulkError() {
+        MongoBulkWriteException driver = bulk(List.of(
+                new BulkWriteError(11000, "duplicate row-secret", new BsonDocument(), 0),
+                new BulkWriteError(10334, "large row-secret", new BsonDocument(), 1)), null);
+        assertThat(StoreIo.coded(driver).code()).isEqualTo(IoError.DOCUMENT_TOO_LARGE);
+    }
+
+    @Test
+    void otherBulkFailuresKeepOnlySafeTypeAndNumericCode() {
+        MongoBulkWriteException driver = bulk(List.of(
+                new BulkWriteError(11000, PRIVATE_PAYLOAD, new BsonDocument(), 0)), null);
+        TapstateException failure = StoreIo.coded(driver);
+        assertThat(failure.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+        assertThat(failure.args()).containsEntry("detail", "MongoBulkWriteException code=11000");
+        assertThat(failure.getCause()).isNull();
+        assertThat(failure.toString()).doesNotContain(PRIVATE_PAYLOAD);
+    }
+
+    @Test
+    void aBulkWriteConcernFailureWithoutPerDocumentErrorsKeepsItsCode() {
+        MongoBulkWriteException driver = bulk(List.of(),
+                new WriteConcernError(64, "WriteConcernFailed", PRIVATE_PAYLOAD, new BsonDocument()));
+        TapstateException failure = StoreIo.coded(driver);
+        assertThat(failure.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+        assertThat(failure.args()).containsEntry("detail", "MongoBulkWriteException code=64");
+        assertThat(failure.getCause()).isNull();
+    }
+
+    private static MongoBulkWriteException bulk(List<BulkWriteError> errors, WriteConcernError concern) {
+        return new MongoBulkWriteException(BulkWriteResult.acknowledged(0, 0, 0, 0, List.of(), List.of()),
+                errors, concern, new ServerAddress(), Set.of());
+    }
 
     @Test
     void returnsTheOperationResultOnSuccess() {

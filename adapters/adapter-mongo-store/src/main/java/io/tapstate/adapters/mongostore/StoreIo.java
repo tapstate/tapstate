@@ -1,6 +1,7 @@
 package io.tapstate.adapters.mongostore;
 
 import com.mongodb.MongoException;
+import com.mongodb.MongoBulkWriteException;
 import com.mongodb.MongoSecurityException;
 import com.mongodb.MongoWriteException;
 import io.tapstate.core.common.TapstateException;
@@ -88,11 +89,23 @@ final class StoreIo {
 
     /**
      * The code the endpoint answered with. A write failure carries it on the write error it reports rather
-     * than on the exception, so both are read: taking only the exception's own code reads a refused write
-     * as code zero, which matches nothing.
+     * than on the exception. Bulk failures likewise carry per-document codes below their wrapper;
+     * the outer code alone cannot classify the endpoint refusal.
      */
     private static int errorCode(MongoException e) {
-        return e instanceof MongoWriteException write ? write.getError().getCode() : e.getCode();
+        if (e instanceof MongoWriteException write) return write.getError().getCode();
+        if (e instanceof MongoBulkWriteException bulk) return bulkErrorCode(bulk);
+        return e.getCode();
+    }
+
+    private static int bulkErrorCode(MongoBulkWriteException bulk) {
+        // The bulk wrapper's code is not the server's per-document refusal. Any size refusal makes
+        // replaying the unchanged batch impossible; retain that diagnostic even among other errors.
+        for (var error : bulk.getWriteErrors()) {
+            if (DOCUMENT_TOO_LARGE_CODES.contains(error.getCode())) return error.getCode();
+        }
+        if (!bulk.getWriteErrors().isEmpty()) return bulk.getWriteErrors().getFirst().getCode();
+        return bulk.getWriteConcernError() == null ? bulk.getCode() : bulk.getWriteConcernError().getCode();
     }
 
     /** Stable diagnostic metadata from the driver, without untrusted message or cause content. */
