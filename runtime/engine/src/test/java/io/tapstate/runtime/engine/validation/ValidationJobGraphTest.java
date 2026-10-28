@@ -84,7 +84,8 @@ class ValidationJobGraphTest {
             assertThat(job.getStatus()).isEqualTo(JobStatus.COMPLETED);
             assertThat(RESULTS.get(complete)).containsExactlyElementsOf(IntStream.range(0, 32).map(i -> i * 2).boxed().toList());
             locations(complete, expectedLocation);
-            assertThat(job.getName()).isEqualTo("validation:" + complete);
+            assertThat(job.getName()).isEqualTo(graph.jobName()).startsWith("validation:" + complete + ":");
+            assertThat(graph.reconcile(first.getJet(), () -> {}).orElseThrow().getId()).isEqualTo(job.getId());
             var config = job.getConfig();
             assertThat(config.getProcessingGuarantee()).isEqualTo(ProcessingGuarantee.NONE);
             assertThat(config.isAutoScaling()).isFalse();

@@ -19,6 +19,7 @@ import java.security.Permission;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.function.Function;
 
@@ -42,17 +43,27 @@ public final class ValidationJobGraph {
     private final int port;
     private final String memberId;
     private final Limits limits;
+    private final ValidationProcessorRegistry.Run processors;
+    private final UUID submission = UUID.randomUUID();
     private final DAG dag = new DAG();
     private int edges;
     private boolean submitted;
+    private volatile boolean handedToJet;
 
     public ValidationJobGraph(ValidationRunIdentity run, Address selectedAddress, UUID selectedMember, Limits limits) {
+        this(run, selectedAddress, selectedMember, limits, null);
+    }
+
+    public ValidationJobGraph(ValidationRunIdentity run, Address selectedAddress, UUID selectedMember, Limits limits,
+            ValidationProcessorRegistry.Run processors) {
         this.run = Objects.requireNonNull(run, "run");
         Objects.requireNonNull(selectedAddress, "selectedAddress");
         this.host = selectedAddress.getHost();
         this.port = selectedAddress.getPort();
         this.memberId = Objects.requireNonNull(selectedMember, "selectedMember").toString();
         this.limits = Objects.requireNonNull(limits, "limits");
+        this.processors = processors;
+        if (processors != null && !processors.identity().equals(run)) throw invalid("job.processorIdentity");
     }
 
     public synchronized void vertex(String name, ProcessorSupplier processors) {
@@ -60,7 +71,8 @@ public final class ValidationJobGraph {
         Objects.requireNonNull(processors, "processors");
         if (name == null || name.isBlank() || name.length() > 512) throw invalid("vertex.name");
         if (dag.vertices().size() == limits.vertices()) throw limit("jobVertices");
-        dag.newVertex(name, new Pinned(processors, host, port, memberId, run.owner().pipelineId())).localParallelism(1);
+        var original = this.processors == null ? processors : this.processors.wrap(name, processors);
+        dag.newVertex(name, new Pinned(original, host, port, memberId, run.owner().pipelineId())).localParallelism(1);
     }
 
     public synchronized void edge(String source, int sourceOrdinal, String target, int targetOrdinal) {
@@ -78,21 +90,48 @@ public final class ValidationJobGraph {
     }
 
     /** Run on admitted I/O; a failed or unknown submission must be reconciled, never blindly retried. */
-    public synchronized Job submit(JetService jet, Runnable requireAuthorized) {
-        mutable();
+    public Job submit(JetService jet, Runnable requireAuthorized) {
         Objects.requireNonNull(jet, "jet");
         Objects.requireNonNull(requireAuthorized, "requireAuthorized");
-        if (dag.vertices().isEmpty()) throw new IllegalStateException("validation graph has no processors");
-        submitted = true;
+        synchronized (this) {
+            mutable();
+            if (dag.vertices().isEmpty()) throw new IllegalStateException("validation graph has no processors");
+            if (processors != null) processors.requireRoster(dag.vertices().stream().map(vertex -> vertex.getName()).collect(java.util.stream.Collectors.toSet()));
+            submitted = true; dag.lock();
+        }
         requireAuthorized.run();
-        dag.lock();
         // No name-based borrowing of an existing job, production identity or initial snapshot.
+        handedToJet = true;
         return jet.newJob(dag, config());
+    }
+
+    public String jobName() { return "validation:" + run.runId() + ":" + submission; }
+    /** False is proof this object has not called Jet; true alone says nothing about the outcome. */
+    public boolean handedToJet() { return handedToJet; }
+
+    /**
+     * Bounded original-name lookup, including after an unknown submit response. Missing is not proof
+     * of absence/exit, and a foreign configuration is never adopted. Run this on admitted control I/O;
+     * it does not hold the graph monitor while a submission is blocked and never creates another Job.
+     */
+    public Optional<Job> reconcile(JetService jet, Runnable requireOriginalLookup) {
+        Objects.requireNonNull(jet); Objects.requireNonNull(requireOriginalLookup).run();
+        if (!handedToJet) return Optional.empty();
+        var job = jet.getJob(jobName()); requireOriginalLookup.run();
+        if (job == null) return Optional.empty();
+        var actual = job.getConfig(); var expected = config();
+        if (!jobName().equals(job.getName()) || actual.getProcessingGuarantee() != ProcessingGuarantee.NONE
+                || actual.isAutoScaling() || actual.isSuspendOnFailure() || actual.getInitialSnapshotName() != null) throw invalid("job.originalSubmission");
+        for (String key : List.of("validation.cluster", "validation.pipeline", "validation.task", "validation.run", "validation.mode", "validation.spec",
+                "validation.keyMappingRevision", "validation.rules", "validation.owner.node", "validation.owner.boot", "validation.owner.claimGeneration",
+                "validation.owner.executionGeneration", "validation.owner.topologyRevision", "validation.owner.member", "validation.submission"))
+            if (!Objects.equals(actual.getArgument(key), expected.getArgument(key))) throw invalid("job.originalSubmission");
+        requireOriginalLookup.run(); return Optional.of(job);
     }
 
     private JobConfig config() {
         var owner = run.owner();
-        return new JobConfig().setName("validation:" + run.runId())
+        return new JobConfig().setName(jobName())
                 .setProcessingGuarantee(ProcessingGuarantee.NONE)
                 .setAutoScaling(false).setSuspendOnFailure(false).setSplitBrainProtection(false)
                 .setStoreMetricsAfterJobCompletion(false)
@@ -106,7 +145,7 @@ public final class ValidationJobGraph {
                 .setArgument("validation.owner.claimGeneration", owner.claimGeneration())
                 .setArgument("validation.owner.executionGeneration", owner.executionGeneration())
                 .setArgument("validation.owner.topologyRevision", owner.topologyRevision())
-                .setArgument("validation.owner.member", memberId);
+                .setArgument("validation.owner.member", memberId).setArgument("validation.submission", submission.toString());
     }
 
     private void mutable() {
