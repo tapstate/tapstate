@@ -8,6 +8,7 @@ import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
 import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.Observation;
+import io.tapstate.core.lifecycle.InitialLoad;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.TableSnapshot;
@@ -111,6 +112,19 @@ public final class MongoObservationStore implements ObservationStore {
                 .append("snapshot", snapshot)
                 .append("positions", positions)
                 .append("facts", facts);
+        if (observation.initialLoad() != null) {
+            InitialLoad load = observation.initialLoad();
+            Document tables = new Document();
+            load.tables().forEach((name, table) -> {
+                Document cell = new Document("stage", table.stage().name());
+                if (table.rowsRead() != null) cell.append("rowsRead", table.rowsRead());
+                if (table.rowsTotalEstimate() != null) cell.append("rowsTotalEstimate", table.rowsTotalEstimate());
+                tables.append(name, cell);
+            });
+            document.append("initialLoad", new Document("runKey", load.runKey())
+                    .append("observedAt", Date.from(load.observedAt())).append("readMode", load.readMode())
+                    .append("tables", tables));
+        }
         if (observation.observedAt() != null) {
             // Stored as a BSON date, not a string: the server can then order and expire on it, and a
             // lexicographic sort over an instant is not a chronological one. Absent when the publisher did
@@ -138,7 +152,7 @@ public final class MongoObservationStore implements ObservationStore {
         }
         return new Observation(id, parseState(state, id), readMetrics(document, id), readSnapshot(document, id),
                 readPositions(document, id), readFailure(document, id), readObservedAt(document, id),
-                readFacts(document, id));
+                readFacts(document, id), readInitialLoad(document, id));
     }
 
     /**
@@ -451,6 +465,27 @@ public final class MongoObservationStore implements ObservationStore {
             throw corrupt(id);
         }
         return number.intValue();
+    }
+
+    private static InitialLoad readInitialLoad(Document document, String id) {
+        if (!document.containsKey("initialLoad")) return null;
+        try {
+            if (!(document.get("initialLoad") instanceof Document load)
+                    || !(load.get("runKey") instanceof String runKey)
+                    || !(load.get("observedAt") instanceof Date at)
+                    || !(load.get("readMode") instanceof String mode)
+                    || !(load.get("tables") instanceof Document tables)) throw corrupt(id, "initialLoad");
+            Map<String, InitialLoad.Table> rows = new TreeMap<>();
+            for (var entry : tables.entrySet()) {
+                if (!(entry.getValue() instanceof Document table)
+                        || !(table.get("stage") instanceof String stage)) throw corrupt(id, "initialLoad");
+                rows.put(entry.getKey(), new InitialLoad.Table(InitialLoad.Stage.valueOf(stage),
+                        optionalLong(table.get("rowsRead"), id), optionalLong(table.get("rowsTotalEstimate"), id)));
+            }
+            return new InitialLoad(runKey, at.toInstant(), mode, rows);
+        } catch (IllegalArgumentException invalid) {
+            throw corrupt(id, "initialLoad");
+        }
     }
 
     private static TapstateException corrupt(String id) {

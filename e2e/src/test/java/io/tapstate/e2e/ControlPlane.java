@@ -2079,6 +2079,19 @@ final class ControlPlane {
         return tables;
     }
 
+    /** Current-run load facts, absent until the runtime publishes them through the snapshot face. */
+    Optional<Map<?, ?>> initialLoad(String pipelineId) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/snapshot"));
+        if (response.statusCode() == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(response.body()))) {
+            return Optional.empty();
+        }
+        expect(response, 200, "read the initial load of " + pipelineId);
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> answer)) {
+            throw new AssertionError("snapshot answer was not an object: " + response.body());
+        }
+        return answer.get("initialLoad") instanceof Map<?, ?> load ? Optional.of(load) : Optional.empty();
+    }
+
     Optional<TableSnapshot> snapshotTable(String pipelineId, String table) {
         HttpResponse<String> response = send(authedGet("/api/pipelines/" + pipelineId + "/snapshot"));
         if (response.statusCode() == 404 && MonitorError.NO_OBSERVATION.code().equals(codeOf(response.body()))) {

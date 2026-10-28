@@ -16,6 +16,7 @@ import io.tapstate.core.lifecycle.MetricPoint;
 import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.NestColdLayerPressure;
 import io.tapstate.core.lifecycle.Observation;
+import io.tapstate.core.lifecycle.InitialLoad;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.NestStateReading;
 import io.tapstate.core.lifecycle.PipelineState;
@@ -358,6 +359,7 @@ public final class ObservationPublisher {
     private final Function<String, Map<String, String>> positions;
     private final Function<String, SnapshotReading> snapshots;
     private final Function<String, SnapshotReading> runSnapshots;
+    private final Function<String, InitialLoad> initialLoads;
     private final Function<String, Map<String, Long>> frontierGaps;
     private final Function<String, Map<String, NestStateReading>> nestStateReadings;
     private final Function<String, Map<String, Long>> frontierStalls;
@@ -668,6 +670,27 @@ public final class ObservationPublisher {
             Function<String, StageReading> stages,
             Function<String, SnapshotReading> runSnapshots,
             Clock clock) {
+        this(state, observations, recordCounts, positions, snapshots, frontierGaps, nestStateReadings, coldLayer, frontierStalls, frontierStall, nestDeadLetters, joinRecomputeDone, joinRecomputeExpected, captures, deliveries, stages, runSnapshots, id -> null, clock);
+    }
+
+    public ObservationPublisher(StateStore state, ObservationStore observations,
+            Function<String, OptionalLong> recordCounts, Function<String, Map<String, String>> positions,
+            Function<String, SnapshotReading> snapshots,
+            Function<String, Map<String, Long>> frontierGaps,
+            Function<String, Map<String, NestStateReading>> nestStateReadings,
+            NestColdLayerWatch coldLayer,
+            Function<String, Map<String, Long>> frontierStalls,
+            FrontierStallWatch frontierStall,
+            Function<String, Map<String, Long>> nestDeadLetters,
+            Function<String, Map<String, Long>> joinRecomputeDone,
+            Function<String, Map<String, Long>> joinRecomputeExpected,
+            Function<String, CaptureReading> captures,
+            Function<String, DeliveryReading> deliveries,
+            Function<String, StageReading> stages,
+            Function<String, SnapshotReading> runSnapshots,
+            Function<String, InitialLoad> initialLoads,
+            Clock clock) {
+        this.initialLoads = Objects.requireNonNull(initialLoads, "initialLoads");
         this.captures = Objects.requireNonNull(captures, "captures");
         this.deliveries = Objects.requireNonNull(deliveries, "deliveries");
         this.stages = Objects.requireNonNull(stages, "stages");
@@ -738,7 +761,7 @@ public final class ObservationPublisher {
                     retainedMetrics.remove(RECONCILE_STREAK_FLAT);
                     Observation terminal = new Observation(pipelineId, actual,
                             retainedMetrics, last.snapshot(),
-                            last.positions(), null, observedNow(), retained);
+                            last.positions(), null, observedNow(), retained, terminalLoad(pipelineId, last));
                     observations.save(terminal);
                     return terminal;
                 }
@@ -773,7 +796,7 @@ public final class ObservationPublisher {
                         joinRecomputeExpected.apply(pipelineId), loaded, readThisRun);
                 published = new Observation(pipelineId, actual,
                         FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(),
-                        loaded.byTable(), positions.apply(pipelineId), carried, at, measured);
+                        loaded.byTable(), positions.apply(pipelineId), carried, at, measured, initialLoadAt(pipelineId, at));
                 measuredSuccessfully = true;
             } catch (TapstateException unavailable) {
                 if (actual != PipelineState.FAILED) throw unavailable;
@@ -785,7 +808,8 @@ public final class ObservationPublisher {
                 published = new Observation(pipelineId, actual,
                         FlatMetricProjection.of(known, FLAT_REDUCTIONS).metrics(),
                         previous != null ? previous.snapshot() : Map.of(),
-                        previous != null ? previous.positions() : Map.of(), carried, at, known);
+                        previous != null ? previous.positions() : Map.of(), carried, at, known,
+                        previous != null ? previous.initialLoad() : null);
             }
             // Both paths use the original observation port. Its scope, checkpoint and claim checks
             // remain authoritative, and a refusal here cannot be mistaken for unreadable telemetry.
@@ -798,6 +822,18 @@ public final class ObservationPublisher {
             // at the time it was published, rather than reading it back or measuring it again.
             return published;
         });
+    }
+
+    private InitialLoad initialLoadAt(String pipelineId, Instant at) {
+        InitialLoad load = initialLoads.apply(pipelineId);
+        return load == null ? null : load.at(at);
+    }
+
+    private InitialLoad terminalLoad(String pipelineId, Observation previous) {
+        InitialLoad active = initialLoadAt(pipelineId, observedNow());
+        if (active != null) return active;
+        InitialLoad retained = previous.initialLoad();
+        return retained != null && retained.landedTables() == retained.tables().size() ? retained : null;
     }
 
     /**
@@ -852,7 +888,8 @@ public final class ObservationPublisher {
         measured.add(readAt(pipelineId, RECONCILE_STREAK_METRIC, "{pass}", at, consecutiveFailures));
         observations.save(new Observation(pipelineId, lastState,
                 FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(),
-                keepLoad ? previous.snapshot() : null, lastPositions, lastFailure, at, measured));
+                keepLoad ? previous.snapshot() : null, lastPositions, lastFailure, at, measured,
+                keepLoad ? previous.initialLoad() : null));
     }
 
     private static TapstateException missingCheckpoint(String pipelineId) {
