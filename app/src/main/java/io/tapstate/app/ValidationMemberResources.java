@@ -161,6 +161,12 @@ final class ValidationMemberResources implements AutoCloseable {
             executor.execute(command,notSubmitted);
         }
         synchronized ExecutorService controlExecutor() { return view(controls); }
+        void executeControl(Runnable command, Runnable notSubmitted) {
+            final View executor;
+            try { synchronized (this) { executor = view(controls); } }
+            catch (RuntimeException | Error refused) { notSubmitted.run(); throw refused; }
+            executor.execute(command, notSubmitted);
+        }
         private View view(ExecutorService executor) {
             if (retired) throw invalid("resources.executorView");
             for (var existing : views) if (existing.executor == executor) return existing;

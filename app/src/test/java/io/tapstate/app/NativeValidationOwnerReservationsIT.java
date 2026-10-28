@@ -195,6 +195,7 @@ class NativeValidationOwnerReservationsIT {
         final MongoCacheDomain cache = MongoCacheDomain.connect(endpoint, Duration.ofSeconds(5), "native-owner-test");
         final ValidationMemberResources process = new ValidationMemberResources(); final ValidationOwnerTimers timers = new ValidationOwnerTimers();
         final ClusterMembershipGate gate; final HazelcastInstance member; final CacheBusinessScope scope; final WorkloadClaim node;
+        final NodeSessionLease nodeLease;
         final ValidationTaskStore tasks; final ValidationReportAdmission.Task task = new ValidationReportAdmission.Task("cluster", "flow", "task", UUID.randomUUID());
         final ValidationTaskSpec comparison; final ValidationMemberResources.Member resources; final NativeValidationOwnerReservations owners;
         final int maxPipelines, maxOperations;
@@ -214,6 +215,7 @@ class NativeValidationOwnerReservationsIT {
             configuration.artifacts().create(new PipelineResource("flow", null, List.of(SourceRef.spec("input", false)), null, null,
                     new ServeBlock.Inline("serving", FromRef.literal("orders"), List.of(new SyncElement("out", "views", null, null, null)), null, null), null, null));
             try (var schema = MongoConfigurationDomain.prepareValidationSchema(settings, "cluster", UUID.randomUUID())) { schema.prepareCache(cache); while (!schema.advance(20).ready()) {} }
+            long nodeAskedAt = System.nanoTime();
             node = cache.workloadClaims(scope).acquire(new WorkloadClaimKey("cluster", WorkloadClaimType.NODE_SESSION, "node"), new WorkloadOwner("node", "boot"), 1, Duration.ofMinutes(5)).claim();
             var config = new Config().setClusterName("native-owner-" + suffix); config.getJetConfig().setEnabled(true).setCooperativeThreadCount(4);
             config.getMemberAttributeConfig().setAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE, "node").setAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE, "boot");
@@ -223,7 +225,10 @@ class NativeValidationOwnerReservationsIT {
             config.getNetworkConfig().setPort(0).setPortAutoIncrement(false).getInterfaces().setEnabled(true).addInterface("127.0.0.1");
             var join = config.getNetworkConfig().getJoin(); join.getMulticastConfig().setEnabled(false); join.getTcpIpConfig().setEnabled(false); join.getAutoDetectionConfig().setEnabled(false);
             member = Hazelcast.newHazelcastInstance(config); var properties = new ClusterProperties(); properties.setProfile(ClusterProperties.Profile.PROCESS_FAILURE_ONLY);
-            gate = new ClusterMembershipGate(properties); gate.install(new ClusterMembership("cluster", 1, Set.of("node"))); gate.apply(member.getCluster().getMembers());
+            nodeLease = new NodeSessionLease(cache.workloadClaims(scope), node, nodeAskedAt,
+                    Duration.ofMinutes(5), Duration.ofMinutes(1), member::shutdown);
+            gate = new ClusterMembershipGate(properties); gate.observeNodeSession(nodeLease::active);
+            gate.install(new ClusterMembership("cluster", 1, Set.of("node"))); gate.apply(member.getCluster().getMembers());
             tasks = configuration.validationTasks(() -> {}); var hashes = new TreeMap<String, String>();
             for (String id : List.of("flow", "input", "views")) hashes.put(id, CanonicalHash.of(configuration.artifacts().get(id).orElseThrow()));
             var keys = List.of(new ValidationKeyBinding.Component(List.of("id"), ValidationKey.Kind.EXACT_NUMBER, Set.of("exact-number")));
@@ -239,7 +244,7 @@ class NativeValidationOwnerReservationsIT {
                     () -> localGuard.run(), Duration.ofSeconds(30), Duration.ofSeconds(5), maxPipelines, maxOperations, handoffClock,(saved,spec)->startup.inspect(saved,spec));
         }
         @Override public void close() {
-            owners.close(); resources.close(); member.shutdown(); timers.close(); process.close(); configuration.close(); cache.close();
+            owners.close(); resources.close(); nodeLease.stopAndClose(member::shutdown); timers.close(); process.close(); configuration.close(); cache.close();
             raw.getDatabase(configName).drop(); raw.getDatabase(cacheName).drop(); raw.close();
         }
     }

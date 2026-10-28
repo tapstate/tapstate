@@ -15,7 +15,8 @@ import java.util.Optional;
 
 /**
  * One owner's bounded local problem-root reservations for one pipeline counting generation.
- * Only confirmed, located problem roots enter here, never count deltas or unresolved candidates.
+ * Only complete, located problem observations enter here, never count deltas or unresolved candidates.
+ * A capacity reservation does not confirm cross-database timing or upgrade an observation's confidence.
  * Guards and publication submission must be bounded, nonblocking local operations. A submission is
  * still fenced by its run/report/observation versions in the result store; this class is not durable
  * authority, a completion receipt, or a replacement for the shared stop latch. On LIMIT_REACHED the

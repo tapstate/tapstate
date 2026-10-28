@@ -55,6 +55,7 @@ final class NativeValidationRuns implements AutoCloseable {
         final ExecutorService control;
         final ValidationRunLifecycle lifecycle;
         final AtomicBoolean inFlight=new AtomicBoolean(),sealed=new AtomicBoolean();
+        final AtomicInteger pendingPublications=new AtomicInteger();
         volatile Shared shared;volatile ValidationRunLifecycle.Execution execution;
         volatile io.tapstate.runtime.engine.validation.ValidationCandidateQueue candidates;
         io.tapstate.runtime.engine.validation.ValidationDelayController delays;
@@ -132,7 +133,7 @@ final class NativeValidationRuns implements AutoCloseable {
             if(shared.members.isEmpty()&&quotas.remove(shared.generation,shared))shared.frame.close();
         }
     }
-    /** Empty means bounded backpressure, not a lost root or permission to publish. */
+    /** Empty means bounded backpressure, not a lost root or permission to publish. Capacity is not timing confirmation. */
     Optional<io.tapstate.runtime.engine.validation.ValidationProblemQuota.Reservation> reserveConfirmed(ValidationRunIdentity original,ValidationRoot root) {
         var actor=runs.get(original);if(actor==null||actor.shared==null)throw invalid("runs.originalUnavailable");
         var result=new AtomicReference<io.tapstate.runtime.engine.validation.ValidationProblemQuota.Reservation>();
@@ -141,6 +142,75 @@ final class NativeValidationRuns implements AutoCloseable {
     }
     boolean publish(ValidationRunIdentity original,io.tapstate.runtime.engine.validation.ValidationProblemQuota.PublicationPermit permit,Runnable boundedSubmit) {
         var actor=runs.get(original);if(actor==null||actor.shared==null)return false;actor.requireRun();return actor.shared.quota.publish(permit,boundedSubmit);
+    }
+
+    /** Reserve a complete located observation, then enqueue its CONFIG write outside all quota locks. */
+    Optional<CompletionStage<ValidationResultStore.Publication>> publishRoot(ValidationResultStore.RootWrite write) {
+        Objects.requireNonNull(write);
+        var identity=write.report().run();var actor=runs.get(identity);
+        if(actor==null||!actor.original.report().equals(write.report())
+                ||actor.original.snapshot().method()!=write.check().method()||write.check().observedAgreement())
+            throw invalid("runs.originalProblem");
+        actor.requireRun();
+        var admitted=reserveConfirmed(identity,write.check().observation().root());
+        if(admitted.isEmpty())return Optional.empty();
+        var permit=admitted.orElseThrow().permit();
+        if(permit.isEmpty())return Optional.of(CompletableFuture.failedFuture(cancelled(identity)));
+        var pending=new RootPublication(actor,write);
+        var attempted=new AtomicBoolean();
+        try {
+            boolean submitted=publish(identity,permit.orElseThrow(),()->{
+                attempted.set(true);
+                actor.allocation.executeControl(pending::run,pending::notSubmitted);
+            });
+            if(!submitted){pending.notSubmitted();pending.result.completeExceptionally(cancelled(identity));}
+        }catch(RuntimeException|Error failed){
+            // An uncertain executor response may still own the queued action and its payload.
+            if(!attempted.get())pending.notSubmitted();
+            var reported=failed instanceof RejectedExecutionException
+                    ? new TapstateException(ValidationError.VALUE_LIMIT_EXCEEDED,Map.of("limit","validation.resultPublications"),failed) : failed;
+            pending.result.completeExceptionally(reported);
+            if(failed instanceof Error fatal)throw fatal;
+        }
+        return Optional.of(pending.result.minimalCompletionStage());
+    }
+
+    boolean publicationsDrained(ValidationRunIdentity identity) {
+        var actor=runs.get(identity);
+        return actor==null||actor.pendingPublications.get()==0;
+    }
+
+    private static final class RootPublication {
+        private final Actor actor;
+        private final io.tapstate.runtime.engine.validation.ValidationLocalBudget.Reservation payload;
+        private final AtomicBoolean released=new AtomicBoolean();
+        private final CompletableFuture<ValidationResultStore.Publication> result=new CompletableFuture<>();
+        private ValidationResultStore.RootWrite write;
+        RootPublication(Actor actor,ValidationResultStore.RootWrite write) {
+            this.actor=actor;this.write=write;
+            // Encoder work is separate from the scan/model plan. This is logical admission, not an RSS measurement.
+            long bytes=Math.addExact(64L*1024,Math.multiplyExact(6L,write.check().accountedBytes()));
+            payload=actor.allocation.budget().reserve(new io.tapstate.runtime.engine.validation.ValidationLocalBudget.Amount(bytes,0,0,0));
+            actor.pendingPublications.incrementAndGet();
+        }
+        void run() {
+            ValidationResultStore.Publication answer=null;var failure=new ValidationFailureLatch();
+            try{actor.requireRun();answer=actor.reservation.access().results().publish(write);}
+            catch(RuntimeException|Error failed){failure.record(failed);}
+            finally{try{release();}catch(RuntimeException|Error cleanup){failure.record(cleanup);}}
+            if(failure.get()==null)result.complete(answer);else result.completeExceptionally(failure.get());
+            if(failure.get() instanceof Error fatal)throw fatal;
+        }
+        void notSubmitted(){release();}
+        private void release(){
+            if(released.compareAndSet(false,true)){
+                write=null;
+                try{payload.close();}finally{actor.pendingPublications.decrementAndGet();}
+            }
+        }
+    }
+    private static TapstateException cancelled(ValidationRunIdentity identity){
+        return new TapstateException(ValidationError.EXECUTION_CANCELLED,Map.of("node",identity.owner().nodeId()),null);
     }
     @Override public void close(){
         List<Actor> ending;synchronized(runs){if(closed)return;closed=true;ending=List.copyOf(runs.values());}

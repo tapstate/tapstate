@@ -29,11 +29,13 @@ final class NativeValidationFullJob implements ValidationRunLifecycle.Activation
     private final ValidationProcessorRegistry registry;
     private final HazelcastInstance member;
     private final ValidationMemberResources process;
+    private final NativeValidationRuns runs;
     private final Factory factory;
     NativeValidationFullJob(NativeValidationOwnerReservations.Reservation original,ValidationProcessorRegistry registry,
-            HazelcastInstance member,ValidationMemberResources process,Factory factory) {
+            HazelcastInstance member,ValidationMemberResources process,NativeValidationRuns runs,Factory factory) {
         this.original=Objects.requireNonNull(original);this.registry=Objects.requireNonNull(registry);this.member=Objects.requireNonNull(member);
         this.process=Objects.requireNonNull(process);this.factory=Objects.requireNonNull(factory);
+        this.runs=Objects.requireNonNull(runs);
     }
     @Override public ValidationRunLifecycle.Readiness readiness(){original.requireReserved();return ValidationRunLifecycle.Readiness.READY;}
     @Override public ValidationRunLifecycle.Execution create() {
@@ -80,11 +82,7 @@ final class NativeValidationFullJob implements ValidationRunLifecycle.Activation
                         });
                         require();counts.run();
                     }else{
-                    scan=new ValidationFullScan(identity,spec,plan.mappings(),this::require,check->{
-                        if(check.observedAgreement())return;
-                        var result=original.access().results().publish(new ValidationResultStore.RootWrite(new ValidationResultStore.Report(identity,original.request.startSequence()),check));
-                        if(result!=ValidationResultStore.Publication.APPLIED&&result!=ValidationResultStore.Publication.DUPLICATE)throw invalid("publicationClosed");
-                    });
+                    scan=new ValidationFullScan(identity,spec,plan.mappings(),this::require,this::publishRoot);
                     require();scan.run();
                     }
                 }
@@ -102,9 +100,31 @@ final class NativeValidationFullJob implements ValidationRunLifecycle.Activation
             throwFailure();if(cancelled.get())throw new TapstateException(ValidationError.EXECUTION_CANCELLED,Map.of("node",identity.owner().nodeId()),null);
             original.requireReserved();
         }
+        void publishRoot(ValidationRootCheck check){
+            if(check.observedAgreement())return;
+            var write=new ValidationResultStore.RootWrite(new ValidationResultStore.Report(identity,original.request.startSequence()),check);
+            while(true){
+                require();var admitted=runs.publishRoot(write);
+                if(admitted.isEmpty()){
+                    java.util.concurrent.locks.LockSupport.parkNanos(java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(1));
+                    continue;
+                }
+                final ValidationResultStore.Publication result;
+                try{result=admitted.orElseThrow().toCompletableFuture().join();}
+                catch(java.util.concurrent.CompletionException failed){
+                    var cause=failed.getCause();
+                    if(cause instanceof Error fatal)throw fatal;
+                    if(cause instanceof RuntimeException runtime)throw runtime;
+                    throw failed;
+                }
+                require();
+                if(result!=ValidationResultStore.Publication.APPLIED&&result!=ValidationResultStore.Publication.DUPLICATE)throw invalid("publicationClosed");
+                return;
+            }
+        }
         @Override public boolean businessComplete(){var current=scan;var scalar=counts;return finished&&(current!=null&&current.complete()||scalar!=null&&scalar.complete())&&failures.get()==null;}
         @Override public boolean readersReleased(){
-            boolean done=!workerOutstanding&&(plan==null||cleanupExited&&plan.drained());if(done)releasePlan();return done;
+            boolean done=!workerOutstanding&&runs.publicationsDrained(identity)&&(plan==null||cleanupExited&&plan.drained());if(done)releasePlan();return done;
         }
         @Override public Throwable failure(){return failures.get();}
         @Override public void cancel(){

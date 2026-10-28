@@ -31,7 +31,7 @@ class NativeValidationFullJobIT {
             var start=new ValidationReportAdmission.Start(f.task,2,1,request.command().toString(),identity);var reservation=f.owners.take(start);var access=reservation.access();
             var original=new ValidationControlStore.Run(identity,reservation.countingGeneration(),start,spec);
             var plan=new Plan(identity,f.comparison.mappings().getFirst());
-            runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,ignored->plan));
+            runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,runs,ignored->plan));
             await(()->f.tasks.read("flow","task").orElseThrow().full().permission()!=null&&f.tasks.read("flow","task").orElseThrow().full().permission().phase()==ValidationTaskStore.Phase.CLOSED);
             var actual=access.control().read(identity.owner(),original).orElseThrow();
             assertThat(actual.state()).isEqualTo(ValidationRunState.COMPLETED);assertThat(actual.retired()).isTrue();
@@ -57,7 +57,7 @@ class NativeValidationFullJobIT {
             var start=new ValidationReportAdmission.Start(f.task,1,1,request.command().toString(),identity);
             var reservation=f.owners.take(start);var access=reservation.access();long countingGeneration=reservation.countingGeneration();var closed=new AtomicBoolean();var calls=new AtomicInteger();
             var mapping=f.comparison.mappings().getFirst();
-            runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,original->new NativeValidationFullJob.Plan(){
+            runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,runs,original->new NativeValidationFullJob.Plan(){
                 public List<ValidationFullScan.Mapping> mappings(){throw new AssertionError("COUNT must not open row readers");}
                 public List<ValidationCountScan.Mapping> counts(){return List.of(new ValidationCountScan.Mapping(mapping.mappingId(),guard->{
                     guard.run();calls.incrementAndGet();return new ValidationCountScan.Scalar(mapping.source(),9007199254740993L,
@@ -78,6 +78,154 @@ class NativeValidationFullJobIT {
             assertThat(calls).hasValue(2);assertThat(f.member.getJet().getJobs()).hasSize(1);
         }
     }
+    @Test void theThousandAndFirstLocatedProblemStopsTheOriginalJobAndKeepsItsFirstThousandRoots()throws Exception {
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+            var registry=new ValidationProcessorRegistry(f.member,()->{})) {
+            var start=prepare(f);var reservation=f.owners.take(start);
+            var original=new ValidationControlStore.Run(start.run(),reservation.countingGeneration(),start,reservation.spec());
+            var rows=java.util.stream.LongStream.rangeClosed(1,1001).mapToObj(id->Plan.row(id,"missing")).toList();
+            var plan=new Plan(start.run(),f.comparison.mappings().getFirst(),rows,List.of());
+            runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,runs,ignored->plan));
+            var stored=f.raw.getDatabase(f.cacheName).getCollection("validation_runs");
+            var exactRun=new org.bson.Document("_id.kind","run").append("_id.clusterId",start.run().owner().clusterId())
+                    .append("_id.pipelineId",start.run().owner().pipelineId()).append("_id.taskId",start.run().taskId())
+                    .append("_id.mode",start.run().mode().name()).append("_id.runId",start.run().runId());
+            var terminal=new AtomicReference<org.bson.Document>();
+            // A long finished run may already have released its live owner. Read the exact durable
+            // fixture record, rather than extending that owner merely to inspect its final result.
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(90)).until(()->{
+                var saved=stored.find(exactRun).first();
+                if(saved==null||!Boolean.TRUE.equals(saved.getBoolean("retired"))||!ValidationRunState.valueOf(saved.getString("state")).terminal())return false;
+                if(f.tasks.read("flow","task").orElseThrow().full().permission().phase()!=ValidationTaskStore.Phase.CLOSED)return false;
+                terminal.set(saved);return true;
+            });
+            assertThat(terminal.get()).containsEntry("state",ValidationRunState.STOPPED.name());
+            var pipeline=stored.find(new org.bson.Document("_id.kind","pipeline").append("_id.clusterId",start.run().owner().clusterId())
+                    .append("_id.pipelineId",start.run().owner().pipelineId())).first();
+            assertThat(pipeline).containsEntry("problemLimit",true).containsEntry("countingGeneration",original.countingGeneration());
+            var report=f.raw.getDatabase(f.configName).getCollection("validation_reports").find().first();
+            assertThat(report).containsEntry("closed",true).containsEntry("rootCount",1000L);
+            assertThat(f.raw.getDatabase(f.configName).getCollection("validation_differences").countDocuments()).isEqualTo(1000);
+            assertThat(plan.checked).hasValue(1001);
+            await(()->f.resources.snapshot().metadataFrames()==0&&f.resources.snapshot().processReserved().isEmpty());
+            assertThat(plan.drained()).isTrue();
+        }
+    }
+    @Test void aBlockedPublicationDoesNotHoldTheQuotaLockOrReturnItsBudgetOnStop()throws Exception {
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+            var registry=new ValidationProcessorRegistry(f.member,()->{})) {
+            var start=prepare(f);var reservation=f.owners.take(start);var access=reservation.access();
+            var original=new ValidationControlStore.Run(start.run(),reservation.countingGeneration(),start,reservation.spec());
+            var actual=access.results();var entered=new java.util.concurrent.CountDownLatch(1);var release=new java.util.concurrent.CountDownLatch(1);
+            var pending=new AtomicReference<ValidationResultStore.RootWrite>();
+            var captured=org.mockito.Mockito.spy(access);
+            org.mockito.Mockito.doReturn(new ValidationResultStore(){
+                public Publication publish(RootWrite write){
+                    assertThat(Thread.currentThread().getName()).startsWith("validation-control-io");
+                    pending.set(write);entered.countDown();
+                    try{assertThat(release.await(30,TimeUnit.SECONDS)).isTrue();}
+                    catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}
+                    return actual.publish(write);
+                }
+                public Seal seal(Report report){return actual.seal(report);}
+            }).when(captured).results();
+            reservation.access=captured;
+            var probe=java.util.concurrent.Executors.newSingleThreadExecutor();
+            try{
+                runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,runs,
+                        ignored->new Plan(start.run(),f.comparison.mappings().getFirst())));
+                assertThat(entered.await(12,TimeUnit.SECONDS)).isTrue();
+                var quota=probe.submit(()->{
+                    while(true){
+                        var answer=runs.reserveConfirmed(start.run(),pending.get().check().observation().root());
+                        if(answer.isPresent())return answer.orElseThrow().admission();
+                        Thread.yield();
+                    }
+                });
+                assertThat(quota.get(5,TimeUnit.SECONDS)).isEqualTo(ValidationProblemQuota.Admission.EXISTING);
+                runs.stop(start.run());
+                await(()->access.control().read(start.run().owner(),original).filter(state->state.retired()&&state.state()==ValidationRunState.STOPPED).isPresent());
+                assertThat(runs.read(start.run()).drained()).isFalse();
+                assertThat(runs.publicationsDrained(start.run())).isFalse();
+                assertThat(f.resources.snapshot().processReserved().isEmpty()).isFalse();
+            }finally{release.countDown();probe.shutdownNow();assertThat(probe.awaitTermination(5,TimeUnit.SECONDS)).isTrue();}
+            await(()->f.resources.snapshot().metadataFrames()==0&&f.resources.snapshot().processReserved().isEmpty());
+            assertThat(f.raw.getDatabase(f.configName).getCollection("validation_differences").countDocuments()).isZero();
+        }
+    }
+    @Test void refusedControlPublicationReturnsOnlyTheProvenUnsubmittedPayload()throws Exception {
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+            var registry=new ValidationProcessorRegistry(f.member,()->{})) {
+            var start=prepare(f);var reservation=f.owners.take(start);var access=reservation.access();
+            var original=new ValidationControlStore.Run(start.run(),reservation.countingGeneration(),start,reservation.spec());
+            var held=new AtomicReference<ValidationLocalBudget.Reservation>();var first=new AtomicBoolean(true);
+            f.localGuard=()->{
+                boolean publishing=StackWalker.getInstance().walk(frames->frames.anyMatch(frame->frame.getClassName().equals(NativeValidationRuns.class.getName())&&frame.getMethodName().equals("publishRoot")));
+                if(publishing&&first.compareAndSet(true,false)){
+                    long until=System.nanoTime()+TimeUnit.SECONDS.toNanos(5);
+                    while(held.get()==null&&System.nanoTime()-until<0){
+                        try{held.set(reservation.resources().budget().reserve(new ValidationLocalBudget.Amount(0,19,0,0)));}
+                        catch(io.tapstate.core.common.TapstateException busy){if(busy.code()!=ValidationError.VALUE_LIMIT_EXCEEDED)throw busy;Thread.yield();}
+                    }
+                    assertThat(held.get()).isNotNull();
+                }
+            };
+            try{
+                runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,runs,
+                        ignored->new Plan(start.run(),f.comparison.mappings().getFirst())));
+                await(()->access.control().read(start.run().owner(),original).filter(state->state.retired()&&state.state()==ValidationRunState.FAILED).isPresent());
+                assertThat(held.get()).isNotNull();
+                assertThat(runs.publicationsDrained(start.run())).isTrue();
+                assertThat(f.raw.getDatabase(f.configName).getCollection("validation_differences").countDocuments()).isZero();
+            }finally{if(held.get()!=null)held.get().close();}
+            await(()->f.resources.snapshot().metadataFrames()==0&&f.resources.snapshot().processReserved().isEmpty());
+        }
+    }
+    @Test void anUnknownControlSubmissionRetainsItsRunningWriteUntilActualExit()throws Exception {
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+            var registry=new ValidationProcessorRegistry(f.member,()->{})) {
+            var start=prepare(f);var reservation=f.owners.take(start);var access=reservation.access();
+            var original=new ValidationControlStore.Run(start.run(),reservation.countingGeneration(),start,reservation.spec());
+            var actual=access.results();var entered=new java.util.concurrent.CountDownLatch(1);var release=new java.util.concurrent.CountDownLatch(1);
+            var captured=org.mockito.Mockito.spy(access);var uncertain=new IllegalStateException("owned response lost after publication started");
+            org.mockito.Mockito.doReturn(new ValidationResultStore(){
+                public Publication publish(RootWrite write){
+                    entered.countDown();
+                    try{assertThat(release.await(30,TimeUnit.SECONDS)).isTrue();}
+                    catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}
+                    return actual.publish(write);
+                }
+                public Seal seal(Report report){return actual.seal(report);}
+            }).when(captured).results();
+            reservation.access=captured;
+            var controls=new java.util.concurrent.ThreadPoolExecutor(4,4,0,TimeUnit.MILLISECONDS,
+                    new java.util.concurrent.ArrayBlockingQueue<Runnable>(64),runnable->Thread.ofPlatform().daemon().name("validation-control-io-owned").unstarted(runnable)){
+                private final AtomicBoolean first=new AtomicBoolean(true);
+                @Override public void execute(Runnable action){
+                    super.execute(action);
+                    boolean publishing=StackWalker.getInstance().walk(frames->frames.anyMatch(frame->frame.getClassName().equals(NativeValidationRuns.class.getName())&&frame.getMethodName().equals("publishRoot")));
+                    if(publishing&&first.compareAndSet(true,false)){
+                        try{assertThat(entered.await(12,TimeUnit.SECONDS)).isTrue();}
+                        catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}
+                        throw uncertain;
+                    }
+                }
+            };
+            var unused=(java.util.concurrent.ExecutorService)org.springframework.test.util.ReflectionTestUtils.getField(f.process,"controls");
+            unused.shutdown();org.springframework.test.util.ReflectionTestUtils.setField(f.process,"controls",controls);
+            try{
+                runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,runs,
+                        ignored->new Plan(start.run(),f.comparison.mappings().getFirst())));
+                assertThat(entered.await(12,TimeUnit.SECONDS)).isTrue();
+                await(()->access.control().read(start.run().owner(),original).filter(state->state.retired()&&state.state()==ValidationRunState.FAILED).isPresent());
+                assertThat(runs.publicationsDrained(start.run())).isFalse();
+                assertThat(runs.read(start.run()).drained()).isFalse();
+                assertThat(f.resources.snapshot().processReserved().isEmpty()).isFalse();
+            }finally{release.countDown();}
+            await(()->f.resources.snapshot().metadataFrames()==0&&f.resources.snapshot().processReserved().isEmpty());
+            assertThat(f.raw.getDatabase(f.configName).getCollection("validation_differences").countDocuments()).isZero();
+        }
+    }
     @Test void refusedWorkerAdmissionCannotLeaveAPhantomReaderAfterTheJobFails()throws Exception {
         try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
             var registry=new ValidationProcessorRegistry(f.member,()->{})) {
@@ -95,7 +243,7 @@ class NativeValidationFullJobIT {
                 }
             };
             try{
-                runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,original->{created.incrementAndGet();return new Plan(start.run(),f.comparison.mappings().getFirst());}));
+                runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,runs,original->{created.incrementAndGet();return new Plan(start.run(),f.comparison.mappings().getFirst());}));
                 await(()->held.get()!=null&&!f.member.getJet().getJobs().isEmpty()&&f.member.getJet().getJobs().getFirst().getStatus().isTerminal());
                 held.get().close();
                 await(()->f.tasks.read("flow","task").orElseThrow().full().permission()!=null&&f.tasks.read("flow","task").orElseThrow().full().permission().phase()==ValidationTaskStore.Phase.CLOSED);
@@ -111,7 +259,7 @@ class NativeValidationFullJobIT {
         try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
             var registry=new ValidationProcessorRegistry(f.member,()->{})) {
             var start=prepare(f);var reservation=f.owners.take(start);
-            runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,original->{
+            runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,runs,original->{
                 assertThat(Thread.currentThread().getName()).startsWith("validation-check");
                 assertThat(original.resources().budget().used().bytes()).isGreaterThanOrEqualTo(8L*1024*1024);
                 entered.countDown();waitFor(returnPlan);
@@ -142,10 +290,14 @@ class NativeValidationFullJobIT {
     }
     static final class Plan implements NativeValidationFullJob.Plan {
         final ValidationRunIdentity run;final ValidationTaskSpec.Mapping mapping;final AtomicInteger checked=new AtomicInteger(),borrowed=new AtomicInteger();
-        final List<Map<String,Object>> source=List.of(row(1,"a"),row(2,"b"),row(3,"c"),row(3,"duplicate"),row(5,"e"));
-        final List<Map<String,Object>> target=List.of(row(1,"a"),row(2,"wrong"),row(4,"extra"),row(5,"e"));
+        final List<Map<String,Object>> source,target;
         volatile boolean closed;
-        Plan(ValidationRunIdentity run,ValidationTaskSpec.Mapping mapping){this.run=run;this.mapping=mapping;}
+        Plan(ValidationRunIdentity run,ValidationTaskSpec.Mapping mapping){this(run,mapping,
+                List.of(row(1,"a"),row(2,"b"),row(3,"c"),row(3,"duplicate"),row(5,"e")),
+                List.of(row(1,"a"),row(2,"wrong"),row(4,"extra"),row(5,"e")));}
+        Plan(ValidationRunIdentity run,ValidationTaskSpec.Mapping mapping,List<Map<String,Object>> source,List<Map<String,Object>> target){
+            this.run=run;this.mapping=mapping;this.source=List.copyOf(source);this.target=List.copyOf(target);
+        }
         public List<ValidationFullScan.Mapping> mappings(){return List.of(new ValidationFullScan.Mapping(mapping.mappingId(),guard->
                 new ValidationOrderedMerge(groups(source,mapping.source(),guard),groups(target,mapping.target(),guard)),this::check));}
         ValidationOrderedGroups groups(List<Map<String,Object>> rows,ValidationTaskSpec.Table side,Runnable guard){
