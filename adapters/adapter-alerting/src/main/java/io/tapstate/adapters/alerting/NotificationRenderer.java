@@ -122,12 +122,91 @@ public final class NotificationRenderer {
         if (facts.detailsUrl() != null) { root.put("detailsUrl", facts.detailsUrl().toASCIIString()); text.append(word("details")).append(": ").append(facts.detailsUrl().toASCIIString()).append('\n'); }
         if (!settings.footerText().isEmpty()) { text.append(word("user-footer")).append(":\n").append(settings.footerText()).append('\n'); }
         String plain = text.toString();
-        String html = "<!doctype html><html lang=\"en\"><body><pre>" + escape(plain) + "</pre></body></html>";
+        String html = html(facts, settings, subject, items, test);
         byte[] json = JsonWriter.write(root).getBytes(StandardCharsets.UTF_8);
         if (json.length > WEBHOOK_LIMIT || plain.getBytes(StandardCharsets.UTF_8).length + html.getBytes(StandardCharsets.UTF_8).length > 160 * 1024) {
             return new Result(null, Failure.PAYLOAD_BUDGET);
         }
         return new Result(new Snapshot(TEMPLATE_VERSION, "en", subject, plain, html, json), null);
+    }
+    private String html(Facts facts, MessageSettings settings, String subject, List<Item> items, boolean test) {
+        StringBuilder out = new StringBuilder(2048);
+        out.append("<!doctype html><html lang=\"en\"><body style=\"margin:0;padding:24px;background:#1b1c1e;color:#f3f4f5;font-family:Arial,Helvetica,sans-serif\">")
+                .append("<table role=\"presentation\" cellspacing=\"0\" cellpadding=\"0\" border=\"0\" width=\"100%\"><tr><td align=\"center\">")
+                .append("<table role=\"presentation\" cellspacing=\"0\" cellpadding=\"0\" border=\"0\" width=\"640\" style=\"max-width:100%;background:#262729;border:1px solid #414347;border-radius:8px\">")
+                .append("<tr><td style=\"padding:24px 28px 12px\"><div style=\"font-size:12px;color:#aeb2b8\">")
+                .append(escape(word("source"))).append("</div><h1 style=\"margin:8px 0 0;font-size:22px;line-height:1.35;color:#f3f4f5\">")
+                .append(escape(subject)).append("</h1></td></tr>");
+
+        if (test) {
+            out.append("<tr><td style=\"padding:0 28px 20px\"><div style=\"padding:14px 16px;border:1px solid #8b702e;background:#3a3322;border-radius:4px\">")
+                    .append("<strong style=\"display:block;margin-bottom:8px\">[TEST] ").append(escape(word("test-summary"))).append("</strong>")
+                    .append("<table cellspacing=\"0\" cellpadding=\"0\" border=\"0\" width=\"100%\">");
+            appendHtmlRow(out, word("test-id"), facts.testId());
+            appendHtmlRow(out, "Channel", facts.channelName());
+            appendHtmlRow(out, word("created"), facts.createdAt().toString());
+            out.append("</table></div></td></tr>");
+        } else {
+            for (Item item : items) {
+                out.append("<tr><td style=\"padding:0 28px 20px\"><table cellspacing=\"0\" cellpadding=\"0\" border=\"0\" width=\"100%\" style=\"border:1px solid #414347;border-radius:4px;border-collapse:separate\">")
+                        .append("<tr><th colspan=\"2\" align=\"left\" style=\"padding:13px 16px;background:#303235;border-bottom:1px solid #414347;font-size:16px\">")
+                        .append(escape(shorten(item.displayName(), 256))).append("</th></tr>");
+                appendHtmlRow(out, word("resource"), item.key().resource().kind() + "/" + item.key().resource().id()
+                        + " [" + item.key().resource().incarnation() + "]");
+                appendHtmlRow(out, "Cluster", item.key().scope().clusterId());
+                appendHtmlRow(out, word("scope"), item.key().scope().authorityId());
+                appendHtmlRow(out, word("alarm-type"), item.key().typeId());
+                appendHtmlRow(out, "Qualifier", item.key().qualifier());
+                appendHtmlRow(out, word("state"), item.state().name());
+                appendHtmlRow(out, word("severity"), item.severity().name());
+                appendHtmlRow(out, word("episode"), item.episode() == null ? word("not-applicable") : item.episode().toString());
+                appendHtmlRow(out, word("occurred"), item.occurredAt() == null ? word("unknown") : item.occurredAt().toString());
+                appendHtmlRow(out, word("observed"), item.observedAt() == null ? word("unknown") : item.observedAt().toString());
+                if (item.recoveredAt() != null) appendHtmlRow(out, word("recovered"), item.recoveredAt().toString());
+                appendHtmlRow(out, word("reason"), item.reason() == null ? word("unknown") : shorten(item.reason(), 512));
+                out.append("</table></td></tr>");
+            }
+            if (facts.totalItems() > items.size()) {
+                out.append("<tr><td style=\"padding:0 28px 20px;color:#aeb2b8\">")
+                        .append(escape(word("omitted"))).append(": ").append(facts.totalItems() - items.size()).append("</td></tr>");
+            }
+        }
+
+        out.append("<tr><td style=\"padding:0 28px\"><div style=\"border-top:1px solid #414347;padding:16px 0\">")
+                .append("<h2 style=\"margin:0 0 10px;font-size:14px\">Supplemental information</h2>")
+                .append("<table cellspacing=\"0\" cellpadding=\"0\" border=\"0\" width=\"100%\">");
+        appendHtmlRow(out, word("delivery-id"), facts.deliveryId());
+        appendHtmlRow(out, word("created"), facts.createdAt().toString());
+        appendHtmlRow(out, "Logical sequence", Long.toString(facts.logicalSequence()));
+        if (!test) {
+            for (Previous previous : facts.previous()) {
+                appendHtmlRow(out, word("previous"), previous.deliveryId() + " " + wire(previous.outcome()));
+            }
+        }
+        out.append("</table>");
+        if (facts.detailsUrl() != null) {
+            String href = escape(facts.detailsUrl().toASCIIString());
+            out.append("<div style=\"margin-top:10px\"><a href=\"").append(href).append("\">")
+                    .append(escape(word("details"))).append("</a></div>");
+        }
+        if (!settings.messageNote().isEmpty()) {
+            out.append("<div style=\"margin-top:14px\"><strong>").append(escape(word("user-note")))
+                    .append("</strong><div style=\"margin-top:5px;white-space:pre-wrap\">")
+                    .append(escape(settings.messageNote())).append("</div></div>");
+        }
+        out.append("</div></td></tr>");
+        if (!settings.footerText().isEmpty()) {
+            out.append("<tr><td style=\"padding:0 28px 20px\"><div style=\"border-top:1px solid #414347;padding-top:14px;color:#aeb2b8;font-size:13px\"><strong>")
+                    .append(escape(word("user-footer"))).append("</strong><div style=\"margin-top:5px;white-space:pre-wrap\">")
+                    .append(escape(settings.footerText())).append("</div></div></td></tr>");
+        }
+        out.append("</table></td></tr></table></body></html>");
+        return out.toString();
+    }
+    private static void appendHtmlRow(StringBuilder out, String label, String value) {
+        out.append("<tr><th scope=\"row\" align=\"left\" valign=\"top\" style=\"padding:7px 16px;color:#aeb2b8;font-size:13px;font-weight:normal;border-bottom:1px solid #414347\">")
+                .append(escape(label)).append("</th><td style=\"padding:7px 16px;color:#f3f4f5;font-size:13px;white-space:pre-wrap;overflow-wrap:anywhere;border-bottom:1px solid #414347\">")
+                .append(escape(value)).append("</td></tr>");
     }
     private static boolean valid(Facts f) {
         if (f == null || f.kind() == null || !identifier(f.deliveryId()) || f.createdAt() == null

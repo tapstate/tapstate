@@ -21,13 +21,24 @@ final class AlertDeliveryCommands {
             AlertConfiguration.Subscription messageRoute,AlertStore.Access access,boolean recoverRace){
         if(deployment!=AlertChannelPolicy.Deployment.ON_PREM||access==null||access.actor()==null)throw stale("test-deployment-or-actor");
         access.revalidate().run();var now=clock.instant();var key=new AlertTestCommand.Key(scope,access.actor().principalKey(),command);
-        var previous=store.test(key,access);var renderedAt=previous.map(p->p.value().frozen().createdAt()).orElse(now);
+        var previous=store.test(key,access);
         MessageSettings settings=MessageSettings.empty();AlertTestCommand.Route route=null;long revision=1;
         if(messageRoute!=null){
             if(!store.definition(AlertConfiguration.Kind.SUBSCRIPTION,messageRoute.header().identity().id(),access).filter(messageRoute::equals).isPresent())throw stale("message-route");
             settings=messageRoute.channels().stream().filter(c->c.channelType().equals(transport.channelType())).findFirst().orElseThrow(()->stale("route-channel")).messages();
             revision=messageRoute.header().revision();route=new AlertTestCommand.Route(messageRoute.header().identity().incarnation(),revision,revision);
         }
+        if(previous.isPresent()){
+            var old=((AlertIntent.Test)previous.get().value().frozen().identity()).command();
+            var form=new AlertTestCommand.Parameters(transport.channelType(),new AlertTestCommand.Candidate(candidateId,"0".repeat(64)),
+                    existing==null?null:new AlertTestCommand.ExistingReceiver(existing.header().identity().incarnation(),existing.header().revision()),
+                    target,"candidate",route,old.parameters().payloadSha256());
+            var prepared=store.prepareCandidate(key,form,transport,existing==null?null:existing.header().identity(),
+                    existing==null?0:existing.bindingRevision(),material,retain,access);
+            if(!old.parameters().equals(prepared.parameters()))throw new TapstateException(AlertError.COMMAND_CONFLICT,Map.of(),null);
+            return previous.get();
+        }
+        var renderedAt=now;
         var rendered=new NotificationRenderer().render(new NotificationRenderer.Facts(NotificationRenderer.Kind.CHANNEL_TEST,key.testId(),0,
                 renderedAt,List.of(),0,null,List.of(),key.testId(),transport.channelType()),settings);
         if(!rendered.successful())throw stale("test-rendering");
@@ -39,12 +50,6 @@ final class AlertDeliveryCommands {
                 existing==null?null:new AlertTestCommand.ExistingReceiver(existing.header().identity().incarnation(),existing.header().revision()),
                 target,"candidate",route,payload.sha256());
         var prepared=store.prepareCandidate(key,form,transport,existing==null?null:existing.header().identity(),existing==null?0:existing.bindingRevision(),material,retain,access);
-        if(previous.isPresent()){
-            var old=((AlertIntent.Test)previous.get().value().frozen().identity()).command();
-            // The original synthetic timestamp and payload remain fixed on command replay.
-            if(!old.parameters().equals(prepared.parameters()))throw new TapstateException(AlertError.COMMAND_CONFLICT,Map.of(),null);
-            return previous.get();
-        }
         var admitted=AlertTestCommand.admit(deployment,new AlertChannelPolicy.Capability(transport.channelType(),1,AlertChannelPolicy.Family.OP_EXTERNAL),key,prepared.parameters(),null,now).command();
         var retention=AlertIntent.Policy.capture(AlertRetentionPolicy.defaults(deployment));
         var frozen=new AlertIntent.Frozen(new AlertIntent.Test(admitted),new AlertChannelPolicy.Capability(transport.channelType(),1,AlertChannelPolicy.Family.OP_EXTERNAL),null,prepared.target(),

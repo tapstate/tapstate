@@ -30,7 +30,13 @@ class NotificationTemplateRenderTest {
             assertThat(result.successful()).isTrue();
             var snapshot = result.snapshot();
             assertThat(snapshot.subject()).startsWith("[prod] [").endsWith(" (team)");
-            assertThat(snapshot.html()).doesNotContain("<script>", "<img>").contains("&lt;script&gt;", "${secret}", "{{literal}}");
+            assertThat(snapshot.html()).doesNotContain("<script>", "<img>", "<pre>")
+                    .contains("<!doctype html>", "<table", "<th scope=\"row\"", "&lt;script&gt;", "&lt;img&gt;",
+                            "${secret}", "{{literal}}", "Supplemental information", "User supplied footer", "footer &amp; text");
+            assertThat(snapshot.html()).contains("[" + kindDisplay(kind) + "]", "Cluster", "Occurred at", "Reason");
+            assertThat(snapshot.html()).contains(">" + stateDisplay(kind) + "</td>");
+            assertThat(snapshot.html()).contains(kind == Kind.RECOVERY || kind == Kind.RECOVERY_SUMMARY
+                    ? "Recovered at" : "Episode");
             assertThat(snapshot.text()).contains("User supplied note", "User supplied footer", "Unknown", "org/cluster");
             var json = (java.util.Map<?, ?>) JsonReader.parse(new String(snapshot.webhook(), StandardCharsets.UTF_8));
             assertThat(json.get("purpose")).isEqualTo("alert");
@@ -41,6 +47,41 @@ class NotificationTemplateRenderTest {
             assertThat(snapshot.webhook()[0]).isEqualTo((byte) '{');
         }
     }
+    private static String kindDisplay(Kind kind) {
+        return switch (kind) {
+            case FAULT -> "Alert";
+            case REMINDER -> "Reminder";
+            case RECOVERY -> "Recovery";
+            case RECOVERY_SUMMARY -> "Recovery summary";
+            case EVENT -> "Event";
+            case CHANNEL_TEST -> "TEST";
+        };
+    }
+    private static String stateDisplay(Kind kind) {
+        return switch (kind) {
+            case FAULT, REMINDER -> "FIRING";
+            case RECOVERY, RECOVERY_SUMMARY -> "RESOLVED";
+            case EVENT -> "EVENT";
+            case CHANNEL_TEST -> throw new IllegalArgumentException("channel tests have no event state");
+        };
+    }
+    @Test void everyFactValueIsEscapedInHtmlTextAndLinkContexts() {
+        var key = new AlarmKey(new AlarmKey.Scope("org&owner", "cluster<svg>"),
+                new AlarmKey.Resource("pipeline", "orders<img src=x>", "resource-1"),
+                "pipeline.failed", "rule'\"><svg>");
+        var item = new Item(key, 1L, State.FIRING, AlarmSeverity.MAJOR,
+                "<img src=x onerror=alert(1)>", "failure </td><script>alert(1)</script>", T, T, null);
+        var f = new Facts(Kind.FAULT, "delivery-1", 1, T, List.of(item), 1,
+                java.net.URI.create("https://tapstate.example/alerts/a&b"), List.of(), null, null);
+        var settings = new MessageSettings("", "", "note <script>alert(1)</script>", "footer </td>");
+        var html = new NotificationRenderer().render(f, settings).snapshot().html();
+        assertThat(html).doesNotContain("<img", "<svg", "<script>", "</td><script>")
+                .contains("org&amp;owner", "cluster&lt;svg&gt;", "orders&lt;img src=x&gt;",
+                        "rule&#39;&quot;&gt;&lt;svg&gt;", "&lt;img src=x onerror=alert(1)&gt;",
+                        "failure &lt;/td&gt;&lt;script&gt;alert(1)&lt;/script&gt;",
+                        "href=\"https://tapstate.example/alerts/a&amp;b\"",
+                        "note &lt;script&gt;alert(1)&lt;/script&gt;", "footer &lt;/td&gt;");
+    }
     @Test void testsHaveAnUnremovableMarkerAndNoRealEpisodeOrReadState() {
         Facts f = new Facts(Kind.CHANNEL_TEST, "test-delivery", 0, T, List.of(), 0, null, List.of(), "test-1", "Email");
         var snapshot = new NotificationRenderer().render(f, new MessageSettings("prefix ", " suffix", "note", "footer")).snapshot();
@@ -48,6 +89,8 @@ class NotificationTemplateRenderTest {
         String json = new String(snapshot.webhook(), StandardCharsets.UTF_8);
         assertThat(json).contains("\"purpose\":\"channel-test\"", "\"isTest\":true", "test-1").doesNotContain("episode", "resource", "firing", "readAt");
         assertThat(snapshot.text()).contains("does not represent a real fault");
+        assertThat(snapshot.html()).contains("[TEST]", "This is a notification configuration test. It does not represent a real fault.",
+                "Test ID", "test-1", "Channel", "Email", "Initiated at").doesNotContain("<pre>");
     }
     @Test void codePointLimitsAndHeaderInjectionAreValidatedBeforeRendering() {
         String point = new String(Character.toChars(0x1f600));

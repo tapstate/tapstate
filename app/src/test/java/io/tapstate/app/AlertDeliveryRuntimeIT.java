@@ -1,6 +1,9 @@
 package io.tapstate.app;
 
+import io.tapstate.adapters.alerting.EmailMime;
+import io.tapstate.adapters.alerting.NotificationRenderer;
 import io.tapstate.core.alerting.*;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.alerting.NotificationChannel;
 import io.tapstate.spi.store.AlertStore;
 import io.tapstate.testsupport.RequiresDocker;
@@ -37,6 +40,34 @@ class AlertDeliveryRuntimeIT {
     }
     static NotificationChannel.Result accepted(){return new NotificationChannel.Result(DeliveryEvidence.Outcome.ACCEPTED,NotificationChannel.Action.STOP,null,NotificationChannel.Phase.FINAL_RESPONSE,250,"smtp");}
     static AlertDeliveryRuntime runtime(AlertEvaluationHostIT.Fixture f,AlertStore store,Channels channels,String name){return new AlertDeliveryRuntime(store,f.clock(),name,ACTIVE,channels,a->access());}
+    static AlertReceiver.Email testEmail(){return new AlertReceiver.Email("smtp.example.test",465,AlertReceiver.Encryption.IMPLICIT_TLS,
+            AlertReceiver.Authentication.NONE,null,"alerts@example.test",List.of("a@example.test","b@example.test"),AlertReceiver.Trust.SYSTEM);}
+    static AlertStore.Stored<AlertIntent.Record> seedLegacyTestPayload(AlertEvaluationHostIT.Fixture f,
+            AlertTestCommand.ClientId clientId,AlertReceiver.Email transport,String target){
+        var originalAccess=access();var key=new AlertTestCommand.Key(f.storeHost().scope(),originalAccess.actor().principalKey(),clientId);
+        var payload=new NotificationRenderer.Snapshot(NotificationRenderer.TEMPLATE_VERSION,"en","[TEST] Email",
+                "Legacy channel-test notification","<!doctype html><html lang=\"en\"><body><pre>Legacy channel-test notification</pre></body></html>",
+                "{}".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        var frozenMime=EmailMime.freeze(key.testId(),clientId.createdAt(),transport.from(),target,payload);
+        assertThat(frozenMime.successful()).isTrue();
+        var originalPayload=new AlertIntent.Payload(frozenMime.bytes());
+        var form=new AlertTestCommand.Parameters("email",new AlertTestCommand.Candidate("candidate","0".repeat(64)),null,
+                target,"candidate",null,originalPayload.sha256());
+        var prepared=f.store().prepareCandidate(key,form,transport,null,0,null,Set.of(),originalAccess);
+        var capability=new AlertChannelPolicy.Capability("email",1,AlertChannelPolicy.Family.OP_EXTERNAL);
+        var accepted=AlertTestCommand.admit(AlertChannelPolicy.Deployment.ON_PREM,capability,key,prepared.parameters(),null,f.clock().instant()).command();
+        var retention=AlertIntent.Policy.capture(AlertRetentionPolicy.defaults(AlertChannelPolicy.Deployment.ON_PREM));
+        var frozen=new AlertIntent.Frozen(new AlertIntent.Test(accepted),capability,null,prepared.target(),
+                new AlertIntent.Content("message/rfc822",originalPayload.sha256(),
+                        new AlertIntent.Template("channel-test",NotificationRenderer.TEMPLATE_VERSION,1,"en",MessageSettings.empty()),false),
+                List.of(),ChannelRetryPolicy.singleAttempt(Duration.ofMinutes(5),Duration.ofSeconds(60)),retention,
+                accepted.acceptedAt(),accepted.deadline(),originalAccess.actor());
+        var retained=AlertIntent.Retained.capture(DeliveryRetention.begin(retention.value(),DeliveryRetention.Kind.CHANNEL_TEST,
+                accepted.acceptedAt(),accepted.deadline()));
+        var record=new AlertIntent.Record(frozen,new AlertIntent.State(AlertOwnership.unclaimed(),0,false,null,accepted.acceptedAt(),0,
+                List.of(),DeliveryEvidence.Outcome.NOT_ATTEMPTED,retained,originalPayload,prepared.encrypted(),null,null,null));
+        return sendingStore(f).admitTest(record,originalAccess);
+    }
     static void seed(AlertEvaluationHostIT.Fixture f){route(f,Duration.ZERO);var planner=planner(f,"planner");f.evaluator().withPlanner(planner);bad(f);planner.tick();}
     static List<AlertIntent.Identity> ids(AlertEvaluationHostIT.Fixture f){return intents(f).stream().map(v->v.value().frozen().identity()).toList();}
     static void settled(AlertDeliveryRuntime runtime){await().atMost(Duration.ofSeconds(10)).until(()->runtime.occupied()==0);}
@@ -108,6 +139,32 @@ class AlertDeliveryRuntimeIT {
             var record=store.test(new AlertTestCommand.Key(f.storeHost().scope(),access().actor().principalKey(),command),access()).orElseThrow().value();
             assertThat(record.state().attemptsConsumed()).isOne();assertThat(record.state().summary()).isEqualTo(DeliveryEvidence.Outcome.UNKNOWN);assertThat(record.state().nextAttemptAt()).isNull();
             assertThat(f.store().active(null,10,f.reads()).total()).isZero();
+        });
+    }
+    @Test void replayReturnsTheOriginalFrozenPayloadAfterTheHtmlRendererChanges() {
+        AlertEvaluationHostIT.withFixture(f->{
+            var email=testEmail();var command=new AlertTestCommand.ClientId(T,"4".repeat(32));
+            var original=seedLegacyTestPayload(f,command,email,"a@example.test");
+            byte[] oldPayload=original.value().state().payload().bytes();
+            assertThat(new String(oldPayload,java.nio.charset.StandardCharsets.US_ASCII)).contains("text/html","base64");
+            var replay=new AlertDeliveryCommands(f.store(),f.storeHost().scope(),AlertChannelPolicy.Deployment.ON_PREM,f.clock())
+                    .test(command,"candidate",email,"a@example.test",null,null,Set.of(),null,access());
+            assertThat(replay).isEqualTo(original);
+            assertThat(replay.value().state().payload().bytes()).isEqualTo(oldPayload);
+            assertThat(replay.value().frozen().identity()).isEqualTo(original.value().frozen().identity());
+        });
+    }
+    @Test void replayStillConflictsWhenItsTargetOrTransportChanges() {
+        AlertEvaluationHostIT.withFixture(f->{
+            var email=testEmail();var command=new AlertTestCommand.ClientId(T,"5".repeat(32));
+            seedLegacyTestPayload(f,command,email,"a@example.test");
+            var commands=new AlertDeliveryCommands(f.store(),f.storeHost().scope(),AlertChannelPolicy.Deployment.ON_PREM,f.clock());
+            assertThatThrownBy(()->commands.test(command,"candidate",email,"b@example.test",null,null,Set.of(),null,access()))
+                    .isInstanceOfSatisfying(TapstateException.class,failure->assertThat(failure.code()).isEqualTo(AlertError.COMMAND_CONFLICT));
+            var changedTransport=new AlertReceiver.Email("smtp.other.example.test",465,AlertReceiver.Encryption.IMPLICIT_TLS,
+                    AlertReceiver.Authentication.NONE,null,email.from(),email.recipients(),AlertReceiver.Trust.SYSTEM);
+            assertThatThrownBy(()->commands.test(command,"candidate",changedTransport,"a@example.test",null,null,Set.of(),null,access()))
+                    .isInstanceOfSatisfying(TapstateException.class,failure->assertThat(failure.code()).isEqualTo(AlertError.COMMAND_CONFLICT));
         });
     }
     @Test void untrustedManagedOriginOrMalformedTokenCannotBecomeAnAvailableChannel() {
