@@ -294,7 +294,8 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
     private ValidationLocalBudget.Amount envelope(ValidationTaskStore.Snapshot saved, ValidationRunSpec spec) {
         int tables = spec.mode() == ValidationMode.FULL ? Math.min(saved.settings().full().maxConcurrentTables(), spec.task().mappings().size()) : 1;
         boolean count = spec.method() == ValidationMethod.COUNT;
-        return new ValidationLocalBudget.Amount(Math.multiplyExact(count ? 1024L * 1024 : 64L * 1024 * 1024, tables),
+        // Scalar plans still retain their fixed metadata and independently admitted connector buffers.
+        return new ValidationLocalBudget.Amount(Math.multiplyExact(count ? 32L * 1024 * 1024 : 64L * 1024 * 1024, tables),
                 Math.multiplyExact(count ? 3 : 20, tables), Math.multiplyExact(count ? 2 : 8, tables), Math.multiplyExact(count ? 2 : 8, tables));
     }
     void expire() {

@@ -4,6 +4,9 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.validation.ValidationError;
 import io.tapstate.core.validation.ValidationRootCheck;
 import io.tapstate.core.validation.ValidationRunIdentity;
+import io.tapstate.core.validation.ValidationRunSpec;
+import io.tapstate.core.validation.ValidationCountCheck;
+import io.tapstate.core.validation.ValidationMethod;
 import java.util.Map;
 import java.util.Objects;
 
@@ -28,6 +31,16 @@ public interface ValidationResultStore {
             if (!report.run().equals(check.observation().run())) throw invalid("report.run");
         }
     }
+    /** COUNT is a bounded table summary, never a synthetic problem root or a row comparison. */
+    record CountWrite(Report report, ValidationRunSpec snapshot, ValidationCountCheck check) {
+        public CountWrite {
+            Objects.requireNonNull(report); Objects.requireNonNull(snapshot); Objects.requireNonNull(check);
+            if (!report.run().equals(check.run()) || snapshot.method() != ValidationMethod.COUNT
+                    || !report.run().specHash().equals(snapshot.fingerprint())
+                    || snapshot.task().mappings().stream().noneMatch(mapping -> mapping.mappingId().equals(check.mappingId())
+                            && mapping.outputId().equals(check.outputId()))) throw invalid("report.countScope");
+        }
+    }
     enum Publication { APPLIED, DUPLICATE, STALE_OBSERVATION, CLOSED_OR_EXPIRED }
     enum Seal { SEALED, ALREADY_SEALED, CLOSED_OR_EXPIRED }
 
@@ -38,6 +51,9 @@ public interface ValidationResultStore {
      * newer ones. Unknown commit is an exception, never APPLIED or permission to free quota.
      */
     Publication publish(RootWrite write);
+
+    /** Same CONFIG open-report fence as root publication; implementations must never create a report. */
+    default Publication publishCount(CountWrite write) { throw invalid("report.countPublicationUnsupported"); }
 
     /**
      * Irreversibly close this original report epoch in the same transaction domain as publish.

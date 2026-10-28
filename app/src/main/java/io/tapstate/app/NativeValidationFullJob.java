@@ -15,7 +15,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 final class NativeValidationFullJob implements ValidationRunLifecycle.Activation {
     interface Plan {
         /** Construction is metadata-only; each mapping opens its independently admitted reads later. */
-        List<ValidationFullScan.Mapping> mappings();
+        default List<ValidationFullScan.Mapping> mappings(){return List.of();}
+        default List<ValidationCountScan.Mapping> counts(){return List.of();}
         /** Actual native/callback/row drain, including cancellation and failed opening. */
         boolean drained();
         /** Idempotently close original resources on admitted I/O, including concurrent cancellation. This call alone does not prove drain. */
@@ -37,7 +38,7 @@ final class NativeValidationFullJob implements ValidationRunLifecycle.Activation
     @Override public ValidationRunLifecycle.Readiness readiness(){original.requireReserved();return ValidationRunLifecycle.Readiness.READY;}
     @Override public ValidationRunLifecycle.Execution create() {
         original.requireReserved();var allocation=original.resources();var spec=original.spec();var identity=allocation.budget().identity();
-        if(spec.mode()!=ValidationMode.FULL||spec.method()==ValidationMethod.COUNT)throw invalid("method");
+        if(spec.mode()!=ValidationMode.FULL)throw invalid("method");
         var work=new Work(identity,spec,allocation);
         ValidationProcessorRegistry.Run processors=null;
         try {
@@ -58,7 +59,7 @@ final class NativeValidationFullJob implements ValidationRunLifecycle.Activation
         final ValidationRunIdentity identity;final ValidationRunSpec spec;final ValidationMemberResources.Run allocation;
         final ValidationFailureLatch failures=new ValidationFailureLatch();
         final AtomicBoolean attempted=new AtomicBoolean(),cancelled=new AtomicBoolean(),cleanupRequested=new AtomicBoolean();
-        volatile Plan plan;volatile ValidationFullScan scan;volatile ValidationLocalBudget.Reservation planLease;
+        volatile Plan plan;volatile ValidationFullScan scan;volatile ValidationCountScan counts;volatile ValidationLocalBudget.Reservation planLease;
         volatile boolean workerOutstanding,finished,cleanupExited;
         Work(ValidationRunIdentity identity,ValidationRunSpec spec,ValidationMemberResources.Run allocation) {
             this.identity=identity;this.spec=spec;this.allocation=allocation;
@@ -71,12 +72,21 @@ final class NativeValidationFullJob implements ValidationRunLifecycle.Activation
                 try{
                     require();planLease=allocation.budget().reserve(new ValidationLocalBudget.Amount(8L*1024*1024,0,0,0));
                     plan=Objects.requireNonNull(factory.prepare(original),"full scan plan");require();
+                    if(spec.method()==ValidationMethod.COUNT){
+                        counts=new ValidationCountScan(identity,spec,plan.counts(),this::require,check->{
+                            var result=original.access().results().publishCount(new ValidationResultStore.CountWrite(
+                                    new ValidationResultStore.Report(identity,original.request.startSequence()),spec,check));
+                            if(result!=ValidationResultStore.Publication.APPLIED&&result!=ValidationResultStore.Publication.DUPLICATE)throw invalid("countPublicationClosed");
+                        });
+                        require();counts.run();
+                    }else{
                     scan=new ValidationFullScan(identity,spec,plan.mappings(),this::require,check->{
                         if(check.observedAgreement())return;
                         var result=original.access().results().publish(new ValidationResultStore.RootWrite(new ValidationResultStore.Report(identity,original.request.startSequence()),check));
                         if(result!=ValidationResultStore.Publication.APPLIED&&result!=ValidationResultStore.Publication.DUPLICATE)throw invalid("publicationClosed");
                     });
                     require();scan.run();
+                    }
                 }
                 catch(RuntimeException|Error failed){record(failed);}
                 finally{
@@ -92,13 +102,13 @@ final class NativeValidationFullJob implements ValidationRunLifecycle.Activation
             throwFailure();if(cancelled.get())throw new TapstateException(ValidationError.EXECUTION_CANCELLED,Map.of("node",identity.owner().nodeId()),null);
             original.requireReserved();
         }
-        @Override public boolean businessComplete(){var current=scan;return finished&&current!=null&&current.complete()&&failures.get()==null;}
+        @Override public boolean businessComplete(){var current=scan;var scalar=counts;return finished&&(current!=null&&current.complete()||scalar!=null&&scalar.complete())&&failures.get()==null;}
         @Override public boolean readersReleased(){
             boolean done=!workerOutstanding&&(plan==null||cleanupExited&&plan.drained());if(done)releasePlan();return done;
         }
         @Override public Throwable failure(){return failures.get();}
         @Override public void cancel(){
-            cancelled.set(true);var current=scan;if(current!=null)current.cancel();
+            cancelled.set(true);var current=scan;if(current!=null)current.cancel();var scalar=counts;if(scalar!=null)scalar.cancel();
             maintain();
         }
         @Override public void maintain(){

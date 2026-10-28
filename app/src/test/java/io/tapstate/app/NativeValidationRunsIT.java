@@ -39,7 +39,7 @@ class NativeValidationRunsIT {
             ready.set(ValidationRunLifecycle.Readiness.UNKNOWN);await(()->runs.read(identity).controlUnknown());assertThat(created).hasValue(0);assertThat(f.resources.snapshot().processReserved().reads()).isZero();
             ready.set(ValidationRunLifecycle.Readiness.READY);await(()->created.get()==1&&runs.read(identity).state()==ValidationRunState.RUNNING);
             runs.stop(identity);await(()->f.tasks.read("flow","task").orElseThrow().full().permission().phase()==ValidationTaskStore.Phase.CLOSED);
-            assertThat(f.resources.snapshot().processReserved().bytes()).isEqualTo(1024*1024);reader.get().close();released.set(true);
+            assertThat(f.resources.snapshot().processReserved().bytes()).isEqualTo(32L*1024*1024);reader.get().close();released.set(true);
             await(()->f.resources.snapshot().metadataFrames()==0);assertThat(f.resources.snapshot().processReserved().isEmpty()).isTrue();
         }finally{if(reader.get()!=null)reader.get().close();released.set(true);}
     }

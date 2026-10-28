@@ -47,6 +47,37 @@ class NativeValidationFullJobIT {
             assertThat(job.getConfig().getInitialSnapshotName()).isNull();
         }
     }
+    @Test void nativeCountUsesTheOriginalFullSlotJobAndConfigSummaryWithoutCreatingRoots()throws Exception {
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+            var registry=new ValidationProcessorRegistry(f.member,()->{})) {
+            var request=f.request("FULL",1);var accepted=f.owners.reserve(request);
+            assertThat(accepted.outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
+            var spec=new ValidationRunSpec(f.comparison,ValidationMode.FULL,ValidationMethod.COUNT);
+            var identity=new ValidationRunIdentity(accepted.owner(),"task",request.run(),ValidationMode.FULL,spec.fingerprint(),1,"rules");
+            var start=new ValidationReportAdmission.Start(f.task,1,1,request.command().toString(),identity);
+            var reservation=f.owners.take(start);var access=reservation.access();long countingGeneration=reservation.countingGeneration();var closed=new AtomicBoolean();var calls=new AtomicInteger();
+            var mapping=f.comparison.mappings().getFirst();
+            runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,original->new NativeValidationFullJob.Plan(){
+                public List<ValidationFullScan.Mapping> mappings(){throw new AssertionError("COUNT must not open row readers");}
+                public List<ValidationCountScan.Mapping> counts(){return List.of(new ValidationCountScan.Mapping(mapping.mappingId(),guard->{
+                    guard.run();calls.incrementAndGet();return new ValidationCountScan.Scalar(mapping.source(),9007199254740993L,
+                            new ValidationCheckEvent.ReadBoundary("source","native-count-v1",java.time.Instant.EPOCH,java.time.Instant.EPOCH));
+                },guard->{guard.run();calls.incrementAndGet();return new ValidationCountScan.Scalar(mapping.target(),9007199254740992L,
+                            new ValidationCheckEvent.ReadBoundary("target","native-count-v1",java.time.Instant.EPOCH,java.time.Instant.EPOCH));}));}
+                public void close(){closed.set(true);}public boolean drained(){return closed.get();}
+            }));
+            await(()->f.tasks.read("flow","task").orElseThrow().full().permission()!=null&&f.tasks.read("flow","task").orElseThrow().full().permission().phase()==ValidationTaskStore.Phase.CLOSED);
+            var original=new ValidationControlStore.Run(identity,countingGeneration,start,spec);
+            assertThat(access.control().read(identity.owner(),original).orElseThrow().state()).isEqualTo(ValidationRunState.COMPLETED);
+            await(()->f.resources.snapshot().processReserved().isEmpty()&&f.resources.snapshot().metadataFrames()==0);
+            var report=f.raw.getDatabase(f.configName).getCollection("validation_reports").find().first();
+            assertThat(report.getLong("rootCount")).isZero();
+            assertThat(report.getList("countSummaries",org.bson.Document.class)).singleElement().satisfies(value->
+                    assertThat(value).containsEntry("sourceCount",9007199254740993L).containsEntry("targetCount",9007199254740992L));
+            assertThat(f.raw.getDatabase(f.configName).getCollection("validation_differences").countDocuments()).isZero();
+            assertThat(calls).hasValue(2);assertThat(f.member.getJet().getJobs()).hasSize(1);
+        }
+    }
     @Test void refusedWorkerAdmissionCannotLeaveAPhantomReaderAfterTheJobFails()throws Exception {
         try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
             var registry=new ValidationProcessorRegistry(f.member,()->{})) {
