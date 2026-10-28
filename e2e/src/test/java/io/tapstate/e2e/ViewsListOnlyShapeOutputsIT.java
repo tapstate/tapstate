@@ -80,9 +80,10 @@ class ViewsListOnlyShapeOutputsIT {
                         .insertOne(new Document("_id", "customer-1"));
                 client.getDatabase("target_db").getCollection("out_orders")
                         .insertOne(new Document("_id", "order-1"));
-                try (ServerHandle server = Tiers.IN_PROCESS.launch(mongo.getReplicaSetUrl("control_db"), "operator_db")) {
+                try (var storage = PreparedNativeStore.createOn(mongo);
+                        ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
                     ControlPlane control = new ControlPlane(server.baseUrl());
-                    control.bootstrapAndLogin("e2e", "e2e-password");
+                    storage.loginAndAwaitBusiness(control);
                     control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
                     Map<String, String> resources = new LinkedHashMap<>();
                     resources.put("sources.tap.yml", """
@@ -167,9 +168,10 @@ class ViewsListOnlyShapeOutputsIT {
                         .append("customer_id", "customer-1").append("TAGS", List.of("red", "blue")));
                 source.getCollection("customers").insertOne(new Document("_id", "customer-1").append("name", "Customer"));
                 var target = client.getDatabase("target_db");
-                try (ServerHandle server = Tiers.IN_PROCESS.launch(mongo.getReplicaSetUrl("control_db"), "operator_db")) {
+                try (var storage = PreparedNativeStore.createOn(mongo);
+                        ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
                     ControlPlane control = new ControlPlane(server.baseUrl());
-                    control.bootstrapAndLogin("e2e", "e2e-password");
+                    storage.loginAndAwaitBusiness(control);
                     control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
                     Map<String, String> resources = new LinkedHashMap<>();
                     resources.put("source.tap.yml", """
