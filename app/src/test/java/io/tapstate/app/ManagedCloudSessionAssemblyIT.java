@@ -4,6 +4,8 @@ import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.control.core.CloudAuthenticationService;
+import io.tapstate.control.core.CloudCodeExchangeResult;
+import io.tapstate.control.core.CloudCodeExchanger;
 import io.tapstate.control.core.CloudLoginIdentity;
 import io.tapstate.control.core.CloudSessionCallbackVerifier;
 import io.tapstate.control.core.CloudSessionService;
@@ -16,10 +18,11 @@ import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
+import io.tapstate.runtime.probe.PipelinePreviewProbe;
 import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.CloudSessionContext;
 import io.tapstate.spi.store.CloudSessionIdentity;
 import io.tapstate.spi.store.CloudSessionStore;
-import io.tapstate.runtime.probe.PipelinePreviewProbe;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
@@ -157,7 +160,7 @@ class ManagedCloudSessionAssemblyIT {
                 for (ControlledLogin login : ports.logins) {
                     String cookie = exchange(client, login);
                     cookies.put(login.jwtId(), cookie);
-                    assertCurrentUser(client, cookie, login.userId());
+                    assertCurrentUser(client, cookie, login);
                     apply(client, origin(context), cookie, source(login), pipeline(login));
                     artifacts.put(login.sourceId(), attributed(context, client, stored, cookie,
                             login.sourceId(), login.userId()));
@@ -202,7 +205,7 @@ class ManagedCloudSessionAssemblyIT {
                 assertThat(status(client, cookieA, ports.userA.sourceId())).isEqualTo(401);
                 assertThat(status(client, cookieB, ports.userB.sourceId())).isEqualTo(200);
                 assertCurrentUserRefused(client, cookieA);
-                assertCurrentUser(client, cookieB, ports.userB.userId());
+                assertCurrentUser(client, cookieB, ports.userB);
                 assertLoginRows(context, stored, ports, cookies);
                 ports.assertOnlyTwoLogins();
             }
@@ -214,7 +217,7 @@ class ManagedCloudSessionAssemblyIT {
                 assertThat(status(client, cookieA, ports.userA.sourceId())).isEqualTo(401);
                 assertThat(status(client, cookieB, ports.userB.sourceId())).isEqualTo(200);
                 assertCurrentUserRefused(client, cookieA);
-                assertCurrentUser(client, cookieB, ports.userB.userId());
+                assertCurrentUser(client, cookieB, ports.userB);
                 assertPipelineCatalog(client, cookieB, ports);
                 for (ControlledLogin login : ports.logins) {
                     for (String id : List.of(login.sourceId(), login.pipelineId())) {
@@ -239,6 +242,32 @@ class ManagedCloudSessionAssemblyIT {
                 assertLoginRows(restarted, stored, ports, cookies);
                 ports.assertOnlyTwoLogins();
             }
+        }
+    }
+
+    @Test
+    void distinctVerifiedEmailsStayWithTheirSessionsAcrossAContextRestart() {
+        String database = "managed_user_emails_" + Long.toUnsignedString(System.nanoTime(), 16);
+        String uri = MONGO.getReplicaSetUrl(database);
+        TwoUserPorts ports = new TwoUserPorts();
+        Map<String, String> cookies = new LinkedHashMap<>();
+        try (var context = startTwoUsers(uri, ports)) {
+            RestClient client = client(context);
+            for (ControlledLogin login : ports.logins) {
+                String cookie = exchange(client, login);
+                cookies.put(login.jwtId(), cookie);
+                assertCurrentUser(client, cookie, login);
+            }
+        }
+        try (var restarted = startTwoUsers(uri, ports)) {
+            RestClient client = client(restarted);
+            for (ControlledLogin login : ports.logins) {
+                assertCurrentUser(client, cookies.get(login.jwtId()), login);
+            }
+            assertThat(callback(client, ports.userA.jwtId(), "controlled-two-users")).isEqualTo(204);
+            assertCurrentUserRefused(client, cookies.get(ports.userA.jwtId()));
+            assertCurrentUser(client, cookies.get(ports.userB.jwtId()), ports.userB);
+            ports.assertOnlyTwoLogins();
         }
     }
 
@@ -373,7 +402,7 @@ class ManagedCloudSessionAssemblyIT {
         return "http://127.0.0.1:" + ((WebServerApplicationContext) context).getWebServer().getPort();
     }
 
-    private static void assertCurrentUser(RestClient client, String cookie, String userId) {
+    private static void assertCurrentUser(RestClient client, String cookie, ControlledLogin login) {
         Map<?, ?> body = client.get().uri("/api/auth/me").header(HttpHeaders.COOKIE, cookie)
                 .exchange((request, response) -> {
                     assertThat(response.getStatusCode().value()).isEqualTo(200);
@@ -382,10 +411,10 @@ class ManagedCloudSessionAssemblyIT {
                     return response.bodyTo(Map.class);
                 });
         assertThat(body.get("mode")).isEqualTo("cloud");
-        assertThat(body.get("principal")).isEqualTo(userId);
+        assertThat(body.get("principal")).isEqualTo(login.userId());
         assertThat(body.get("scopes")).isEqualTo(List.of("read", "write"));
         assertThat(body.get("username")).isNull();
-        assertThat(body.get("email")).isNull();
+        assertThat(body.get("email")).isEqualTo(login.email());
         assertThat(body.toString()).doesNotContain(cookie, TwoUserPorts.STATIC_TOKEN,
                 "jwt", "jti", "password", "displayName");
     }
@@ -550,7 +579,8 @@ class ManagedCloudSessionAssemblyIT {
             assertThat(row).containsEntry("userId", login.userId()).containsEntry("clusterId", TwoUserPorts.CLUSTER);
             assertThat(row.keySet()).containsExactlyInAnyOrder("_id", "origin", "issuer", "organizationId",
                     "clusterId", "jwtId", "secretHash", "userId", "scope", "revoked", "createdAt",
-                    "lastUsedAt", "idleExpiresAt");
+                    "lastUsedAt", "idleExpiresAt", "clusterContext");
+            assertThat(row.get("clusterContext", Document.class).getString("userEmail")).isEqualTo(login.email());
             String cookie = cookies.get(login.jwtId());
             String secret = cookie.substring(cookie.lastIndexOf('.') + 1);
             assertThat(row.getString("secretHash")).isEqualTo(secrets.hash(secret));
@@ -564,6 +594,7 @@ class ManagedCloudSessionAssemblyIT {
     }
 
     private record ControlledLogin(String code, String jwt, String userId, String jwtId, String suffix) {
+        String email() { return suffix + "@example.test"; }
         String sourceId() { return "two_user_source_" + suffix; }
         String pipelineId() { return "two_user_pipeline_" + suffix; }
     }
@@ -606,17 +637,25 @@ class ManagedCloudSessionAssemblyIT {
             CloudSessionIdentity identity = new CloudSessionIdentity(settings.baseUrl().toString(), "controlled-org",
                     settings.clusterId());
             CloudSessionService local = new CloudSessionService(sessions, identity, secrets, clock);
-            return new CloudAuthenticationService((code, cluster) -> {
-                assertThat(cluster).isEqualTo(TwoUserPorts.CLUSTER);
-                ports.exchanges.incrementAndGet();
-                return ports.logins.stream().filter(login -> login.code().equals(code)).findFirst()
-                        .map(ControlledLogin::jwt).orElseThrow(CloudAuthenticationService::unavailable);
-            }, (jwt, expected, audience) -> {
+            CloudCodeExchanger exchanger = new CloudCodeExchanger() {
+                @Override public String exchange(String code, String cluster) {
+                    assertThat(cluster).isEqualTo(TwoUserPorts.CLUSTER);
+                    ports.exchanges.incrementAndGet();
+                    return ports.logins.stream().filter(login -> login.code().equals(code)).findFirst()
+                            .map(ControlledLogin::jwt).orElseThrow(CloudAuthenticationService::unavailable);
+                }
+                @Override public CloudCodeExchangeResult exchangeWithContext(String code, String cluster) {
+                    return new CloudCodeExchangeResult(exchange(code, cluster), new CloudSessionContext(
+                            "controlled-org", cluster, "Organization", "Cluster", "region",
+                            null, null, "untrusted@example.test"));
+                }
+            };
+            return new CloudAuthenticationService(exchanger, (jwt, expected, audience) -> {
                 ports.validations.incrementAndGet();
                 if (!identity.equals(expected)) return Optional.empty();
                 return ports.logins.stream().filter(login -> login.jwt().equals(jwt)).findFirst()
-                        .map(login -> new CloudLoginIdentity(identity, login.userId(), login.jwtId(),
-                                Scope.WRITE, clock.instant().plusSeconds(900)));
+                        .map(login -> new CloudLoginIdentity(identity, login.userId(), "controlled-org", TwoUserPorts.CLUSTER,
+                                login.jwtId(), Scope.WRITE, clock.instant().plusSeconds(900), login.email()));
             }, local);
         }
 
