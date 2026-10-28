@@ -36,6 +36,25 @@ class ValidationDirectMappingsTest {
                 });
         assertThat(reads).hasValue(0);
     }
+    @Test void twoTablesCannotBecomeAnUnmodeledFanInAtOnePhysicalTarget(){
+        var saved=saved("serve: { from: [input.orders, input.items], sync: [{ id: out, source: target, rename: { map: {orders: joined, items: joined} } }] }",
+                List.of("orders","items"),List.of("joined","joined"),false);
+        var reads=new AtomicInteger();
+        assertThatThrownBy(()->ValidationDirectMappings.compile(saved,table->{reads.incrementAndGet();return metadata(table);}))
+                .isInstanceOfSatisfying(TapstateException.class,failure->{
+                    assertThat(failure.code()).isEqualTo(ValidationError.RULE_UNSUPPORTED);
+                    assertThat(failure.args()).containsEntry("rule","direct.target-fan-in");
+                });
+        assertThat(reads).hasValue(0);
+    }
+    @Test void selectingOnlyOneTableDoesNotHideAnotherDeclaredContributorToItsTarget(){
+        var saved=saved("serve: { from: [input.orders, input.items], sync: [{ id: out, source: target, rename: { map: {orders: joined, items: joined} } }] }",
+                List.of("orders"),List.of("joined"),false);
+        var reads=new AtomicInteger();
+        assertThatThrownBy(()->ValidationDirectMappings.compile(saved,table->{reads.incrementAndGet();return metadata(table);}))
+                .isInstanceOfSatisfying(TapstateException.class,failure->assertThat(failure.code()).isEqualTo(ValidationError.RULE_UNSUPPORTED));
+        assertThat(reads).hasValue(0);
+    }
     @Test void everySelectedMappingIsPreflightedBeforeTheFirstMetadataRead() {
         var saved=saved("""
                 view: { id: view_out, from: input.orders, primary_key: id }

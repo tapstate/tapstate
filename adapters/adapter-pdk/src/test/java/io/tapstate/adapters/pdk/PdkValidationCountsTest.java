@@ -47,7 +47,7 @@ class PdkValidationCountsTest {
                     f.supportGetTableNamesFunction((c,batch,sink) -> {
                         loader(); called(c,"metadata");
                         if (batch!=64) throw new AssertionError("metadata batch");
-                        sink.accept(mode(c).equals("missing")?List.of():List.of("records"));
+                        sink.accept(mode(c).equals("missing")?List.of():mode(c).equals("catalog")?List.of("records","other_records"):List.of("records"));
                     });
                     f.supportBatchCount((c,t) -> { throw new AssertionError("estimate fallback"); });
                     f.supportQueryByAdvanceFilter((c,q,t,s) -> { throw new AssertionError("business row scan"); });
@@ -66,6 +66,7 @@ class PdkValidationCountsTest {
                     });
                     f.supportExecuteCommandFunction((c,command,sink) -> {
                         loader(); called(c,"counts");
+                        if (mode(c).equals("protocol")) throw new AssertionError("a logical id cannot select a document protocol");
                         if (!command.getCommand().equals("count") || !command.getParams().get("database").equals("db")
                             || !command.getParams().get("collection").equals("records")
                             || !((Map)command.getParams().get("filter")).isEmpty()) throw new AssertionError("wrong count command");
@@ -131,10 +132,43 @@ class PdkValidationCountsTest {
             assertThat((AtomicInteger)settings.get("counts")).hasValue(0);
         }
     }
+    @Test void aLogicalConnectorNameDoesNotGrantOrSelectANativeCapability(){
+        var values=settings("protocol");
+        try(var reader=new PdkValidationCounts(new ConnectionConfig("source","mongodb",values),artifact,
+                new PdkValidationCounts.Request("records","db",PdkValidationCounts.Operation.NATIVE_PROTOCOL),()->{})){
+            assertThat(reader.count()).isEqualTo(9007199254740993L);
+            assertThat((AtomicInteger)values.get("counts")).hasValue(1);
+        }
+    }
+    @Test void sourceSelectionConsumesOnlyAVerifiedNativeNamespaceBeforeCounting(){
+        var values=settings("large");var admissions=new AtomicInteger();
+        try(var reader=new PdkValidationCounts(new ConnectionConfig("source","fixture",values),artifact,
+                new PdkValidationCounts.Request("records","db",PdkValidationCounts.Operation.NATIVE_PROTOCOL),()->{},actual->{
+                    assertThat(actual).isEqualTo("records");
+                    assertThat((AtomicInteger)values.get("counts")).hasValue(admissions.getAndIncrement());
+                })){
+            assertThat(reader.count()).isEqualTo(9007199254740993L);assertThat(admissions).hasValue(2);
+        }
+        var refused=settings("large");var denied=new TapstateException(ValidationError.INVALID_CONTRACT,Map.of("field","source-scope"),null);
+        try(var reader=new PdkValidationCounts(new ConnectionConfig("source","fixture",refused),artifact,
+                new PdkValidationCounts.Request("records","db",PdkValidationCounts.Operation.NATIVE_PROTOCOL),()->{},actual->{throw denied;})){
+            assertThatThrownBy(reader::count).isSameAs(denied);
+            assertThat((AtomicInteger)refused.get("counts")).hasValue(0);assertThat(reader.drained()).isTrue();
+        }
+    }
+    @Test void scopeAdmissionCanSeeOtherNativeTablesBeforeTheScalarRead(){
+        var values=settings("catalog");var seen=new java.util.ArrayList<String>();
+        try(var reader=new PdkValidationCounts(new ConnectionConfig("source","fixture",values),artifact,
+                new PdkValidationCounts.Request("records","db",PdkValidationCounts.Operation.NATIVE_PROTOCOL),()->{},seen::add)){
+            assertThat(reader.count()).isEqualTo(9007199254740993L);
+            assertThat(seen).containsExactly("records","other_records","records","other_records");
+        }
+    }
     @Test void cancellationBeforeDispatchOpensNothing() {
         var settings=settings("large");var reader=read(settings,PdkValidationCounts.Operation.PARTITION_FILTER);
         reader.close();assertThat(reader.drained()).isTrue();
-        assertThatThrownBy(reader::count).isInstanceOf(TapstateException.class);
+        assertThatThrownBy(reader::count).isInstanceOfSatisfying(TapstateException.class,
+                failed->assertThat(failed.code()).isEqualTo(ValidationError.READ_CANCELLED));
         assertThat((AtomicInteger)settings.get("inits")).hasValue(0);
     }
     @Test void preDispatchCloseDeliversExitCallbacksOutsideLifecycleLocks() {

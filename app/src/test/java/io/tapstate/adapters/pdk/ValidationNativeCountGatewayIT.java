@@ -42,16 +42,16 @@ class ValidationNativeCountGatewayIT {
             settings.put("timezone","+00:00");settings.put("oldVersionTimezone",false);
             if(mysql)settings.put("addtionalString","useSSL=false&allowPublicKeyRetrieval=true");else settings.put("schema","public");
             var source=new ConnectionConfig("source",kind,settings);
-            var target=new ConnectionConfig("target","mongodb",Map.of("uri",mongo.getReplicaSetUrl(DB),"database",DB,"isUri",true));
+            var target=new ConnectionConfig("target","independent-document-alias",Map.of("uri",mongo.getReplicaSetUrl(DB),"database",DB,"isUri",true));
             try(var observer=MongoClients.create(mongo.getReplicaSetUrl(DB))) {
                 var database=observer.getDatabase(DB);database.getCollection("records").insertMany(List.of(new Document("_id",1),new Document("_id",2)));
                 database.createCollection("empty_records");database.runCommand(new Document("profile",2));
-                assertThat(count(source,sourceRef,"records",PdkValidationCounts.Operation.PARTITION_FILTER)).isEqualTo(3);
-                assertThat(count(target,targetRef,"records",PdkValidationCounts.Operation.DOCUMENT_COUNT)).isEqualTo(2);
-                assertThat(count(source,sourceRef,"empty_records",PdkValidationCounts.Operation.PARTITION_FILTER)).isZero();
-                assertThat(count(target,targetRef,"empty_records",PdkValidationCounts.Operation.DOCUMENT_COUNT)).isZero();
-                assertThatThrownBy(()->count(source,sourceRef,"missing_records",PdkValidationCounts.Operation.PARTITION_FILTER)).isInstanceOf(TapstateException.class);
-                assertThatThrownBy(()->count(target,targetRef,"missing_records",PdkValidationCounts.Operation.DOCUMENT_COUNT)).isInstanceOf(TapstateException.class);
+                assertThat(count(source,sourceRef,"records",PdkValidationCounts.Operation.NATIVE_PROTOCOL)).isEqualTo(3);
+                assertThat(count(target,targetRef,"records",PdkValidationCounts.Operation.NATIVE_PROTOCOL)).isEqualTo(2);
+                assertThat(count(source,sourceRef,"empty_records",PdkValidationCounts.Operation.NATIVE_PROTOCOL)).isZero();
+                assertThat(count(target,targetRef,"empty_records",PdkValidationCounts.Operation.NATIVE_PROTOCOL)).isZero();
+                assertThatThrownBy(()->count(source,sourceRef,"missing_records",PdkValidationCounts.Operation.NATIVE_PROTOCOL)).isInstanceOf(TapstateException.class);
+                assertThatThrownBy(()->count(target,targetRef,"missing_records",PdkValidationCounts.Operation.NATIVE_PROTOCOL)).isInstanceOf(TapstateException.class);
                 var commands=database.getCollection("system.profile").find().into(new ArrayList<>()).stream()
                         .map(row->row.get("command",Document.class)).filter(Objects::nonNull).toList();
                 assertThat(commands).filteredOn(command->"records".equals(command.get("aggregate"))||"empty_records".equals(command.get("aggregate")))

@@ -286,6 +286,9 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 ValidationMemberResources process,ValidationOwnerTimers timers) {
             return new NativeValidationRuns(owners,resources,process,timers);
         }
+        @Bean NativeValidationFullJob.Factory nativeValidationFullPlans(ConnectorProvisioner provisioner,Clock clock){
+            return new NativeValidationPdkPlans(provisioner,clock);
+        }
         @Bean(destroyMethod = "close") ExecutionAuthorization executionAuthorization(HazelcastInstance member, NativeBusinessContext owner) {
             return owner.memberStorage.authorization();
         }
