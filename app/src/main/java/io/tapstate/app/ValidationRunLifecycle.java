@@ -32,6 +32,8 @@ final class ValidationRunLifecycle {
         Execution create();
     }
     interface Local {
+        /** Known CACHE join, followed only by local quota admission; never a second store join. */
+        default void joined() {}
         void requireOwner();
         void requireRun();
         void sealPublication();
@@ -95,7 +97,10 @@ final class ValidationRunLifecycle {
                             if (permission != ValidationReportAdmission.Reservation.CLOSED) throw uncertain;
                             joinRejected = true; if (!stopping.get()) fail(uncertain); answer = null;
                         }
-                        if (answer == ValidationControlStore.Join.JOINED || answer == ValidationControlStore.Join.ALREADY_JOINED) joined = true;
+                    if (answer == ValidationControlStore.Join.JOINED || answer == ValidationControlStore.Join.ALREADY_JOINED) {
+                        joined = true;
+                        try { local.joined(); } catch (TapstateException refused) { fail(refused); finish(); return settled(); }
+                    }
                         else if (answer != null) { joinRejected = true; fail(invalid("run.originalJoin")); }
                     }
                 }
@@ -211,5 +216,7 @@ final class ValidationRunLifecycle {
         if (!processorReceipt && progress.processorsExited()) { local.processorsExited(); processorReceipt = true; }
         if (processorReceipt && progress.readersReleased()) { local.drained(); drained = true; }
     }
+    /** Passive physical facts remain observable after failed/unknown control IO or owner loss. */
+    synchronized void observePhysicalDrain(){observeDrain();}
     private static TapstateException invalid(String field) { return new TapstateException(ValidationError.INVALID_CONTRACT, Map.of("field", field), null); }
 }

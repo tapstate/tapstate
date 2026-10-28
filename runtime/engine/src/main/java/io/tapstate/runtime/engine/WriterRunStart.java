@@ -31,21 +31,24 @@ final class WriterRunStart implements ProcessorMetaSupplier {
     private final ProcessorMetaSupplier delegate;
     private final SinkAckFactory acks;
     private final Map<String, List<String>> writersByChain;
+    private final SinkAckFactory.RunWriters roster;
 
     private WriterRunStart(ProcessorMetaSupplier delegate, SinkAckFactory acks,
-            Map<String, List<String>> writersByChain) {
+            SinkAckFactory.RunWriters roster) {
         this.delegate = Objects.requireNonNull(delegate, "delegate");
         this.acks = Objects.requireNonNull(acks, "acks");
         Map<String, List<String>> copy = new LinkedHashMap<>();
-        writersByChain.forEach((chain, writers) -> copy.put(chain, List.copyOf(writers)));
+        roster.byStream().forEach((chain, writers) -> copy.put(chain, List.copyOf(writers)));
         this.writersByChain = Collections.unmodifiableMap(copy);
+        this.roster = roster;
     }
 
     /** {@code delegate}, starting {@code acks}' accounting of {@code writersByChain} as each execution starts. */
     static ProcessorMetaSupplier of(ProcessorMetaSupplier delegate, SinkAckFactory acks,
             Map<String, List<String>> writersByChain) {
-        return new WriterRunStart(delegate, acks, writersByChain);
+        return new WriterRunStart(delegate, acks, new SinkAckFactory.RunWriters(writersByChain, Map.of()));
     }
+    static ProcessorMetaSupplier of(ProcessorMetaSupplier delegate, SinkAckFactory acks, SinkAckFactory.RunWriters roster) { return new WriterRunStart(delegate, acks, roster); }
 
     /** The writers each chain is expected to reach, as this vertex writes them down. */
     Map<String, List<String>> writersByChain() {
@@ -54,7 +57,7 @@ final class WriterRunStart implements ProcessorMetaSupplier {
 
     @Override
     public void init(Context context) throws Exception {
-        acks.beginRun(context.hazelcastInstance(), writersByChain);
+        acks.beginRun(context.hazelcastInstance(), new SinkAckFactory.ExecutionWriters(context.jobId(), context.executionId(), roster));
         delegate.init(context);
     }
 

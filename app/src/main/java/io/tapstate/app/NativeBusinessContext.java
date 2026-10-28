@@ -277,12 +277,23 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             return new ValidationOwnerRouter(member, membership, () -> node.currentFence().orElseThrow(ThreeLayerStorePort::refused),
                     owners::readOwner, owners, owner.memberStorage::requireNode, Duration.ofSeconds(5));
         }
+        @Bean(destroyMethod="close") io.tapstate.runtime.engine.validation.ValidationProcessorRegistry validationProcessorRegistry(HazelcastInstance member,NativeBusinessContext owner) {
+            return new io.tapstate.runtime.engine.validation.ValidationProcessorRegistry(member,owner.memberStorage::requireNode);
+        }
+        @Bean(destroyMethod="close") NativeValidationRuns nativeValidationRuns(NativeValidationOwnerReservations owners,ValidationMemberResources.Member resources,
+                ValidationMemberResources process,ValidationOwnerTimers timers) {
+            return new NativeValidationRuns(owners,resources,process,timers);
+        }
         @Bean(destroyMethod = "close") ExecutionAuthorization executionAuthorization(HazelcastInstance member, NativeBusinessContext owner) {
             return owner.memberStorage.authorization();
         }
         @Bean(destroyMethod = "close") SnapshotLoadReceipts snapshotLoadReceipts(HazelcastInstance member,
                 NativeBusinessContext owner,ExecutionAuthorization authorization) {
             return new SnapshotLoadReceipts(member,owner.memberStorage::requireNode,authorization);
+        }
+        @Bean(destroyMethod = "close") ValidationPipelineInitials validationPipelineInitials(HazelcastInstance member,
+                NativeBusinessContext owner, ExecutionAuthorization authorization) {
+            return new ValidationPipelineInitials(member, owner.original.preparation().businessScope(), owner.memberStorage::requireNode, authorization);
         }
         @Bean PipelineActuationOwnership pipelineActuationOwnership(HazelcastInstance member,
                 NativeBusinessContext owner, ClusterProperties cluster, ClusterMembershipGate membership, ClusterWorkloadClaims claims) {
@@ -339,10 +350,10 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                     environment.getProperty("tapstate.execution.max-blocking-processors-per-member", Integer.class, 128));
         }
         @Bean DagSource dagSource(NativeBusinessContext owner, NestSettings nests, ConnectionTester tester, HazelcastInstance member,
-                CloudRuntimeSettings cloud, ParallelismBudget budget, ConnectorProvisioner connectors, ArtifactStore artifacts, SnapshotLoadReceipts boundedLoads,NativePipelineRecovery recovery) {
+                CloudRuntimeSettings cloud, ParallelismBudget budget, ConnectorProvisioner connectors, ArtifactStore artifacts, SnapshotLoadReceipts boundedLoads,NativePipelineRecovery recovery, ValidationPipelineInitials initialLoads) {
             return StoreBackedDagSource.scopedRoot(owner.port, nests, StoreReachability.probing(tester, Duration.ofSeconds(10)),
                     SourcePlacement.on(member.getCluster().getLocalMember().getAddress()), cloud.cloud(),
-                    () -> ClusterMembershipGate.dataMembers(member), budget, owner.configuration.requiredNotes(), connectors, artifacts,owner::recoveryPinned,boundedLoads::forRun,recovery::inspectCaptured);
+                    () -> ClusterMembershipGate.dataMembers(member), budget, owner.configuration.requiredNotes(), connectors, artifacts,owner::recoveryPinned,boundedLoads::forRun,recovery::inspectCaptured).observedInitialLoads(initialLoads::decorate);
         }
         @Bean(destroyMethod = "close") BoundedPipelinePreviewExecutor boundedPipelinePreviewExecutor(StorePort store, ConnectorProvisioner connectors,
                 HazelcastInstance member, NestSettings nests, Clock clock) {

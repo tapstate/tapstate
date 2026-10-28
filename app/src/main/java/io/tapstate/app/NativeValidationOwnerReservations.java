@@ -151,6 +151,11 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         return reservation;
         } finally { local.lock.unlock(); unpin(local); }
     }
+    /** Serializes only this Pipeline's validation control, independently of normal processing. */
+    boolean control(String pipeline,Runnable action) {
+        var local=pipeline(pipeline);if(!local.lock.tryLock()){unpin(local);return false;}
+        try{action.run();return true;}finally{local.lock.unlock();unpin(local);}
+    }
 
     private Owner ensureOwner(Pipeline local) {
         var current = local.owner;

@@ -412,6 +412,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         if (instance == null && suppliedGauge.readableOnlyOnAJobThread()) {
             this.gauge = FrontierGauge.none();
         }
+        if (ack != null) ack.started(context.jobId(), context.executionId());
     }
 
     /** What this stage has timed so far, for a witness driving it by hand. */

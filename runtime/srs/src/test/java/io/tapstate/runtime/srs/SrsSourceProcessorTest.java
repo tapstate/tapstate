@@ -446,6 +446,11 @@ class SrsSourceProcessorTest {
         SnapshotBuffer buffer = new SnapshotBuffer();
         buffer.declareSnapshot(PIPELINE, ring);
         hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
+        var initialModes = new CopyOnWriteArrayList<String>();
+        hz.getUserContext().put(SourceInitialLoadObserver.USER_CONTEXT_KEY, (SourceInitialLoadObserver) (member, identity, job, execution, stream, index, mode, epoch) -> {
+            assertThat(member.getCluster().getLocalMember().getUuid()).isEqualTo(hz.getCluster().getLocalMember().getUuid()); assertThat(stream).isEqualTo("orders"); assertThat(epoch).isEqualTo(1);
+            assertThat(job).isNotZero(); assertThat(execution).isNotZero(); initialModes.add(mode);
+        });
         DAG dag = new DAG();
         ProcessorMetaSupplier supplier = direct
                 ? SrsSourceProcessor.directMetaSupplier(PIPELINE, ring, "orders", 1L,
@@ -464,6 +469,9 @@ class SrsSourceProcessorTest {
         Job job = hz.getJet().newJob(dag);
         IList<String> out = hz.getList(output);
         try {
+            long initialDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (initialModes.isEmpty() && System.nanoTime() - initialDeadline < 0) Thread.sleep(10);
+            assertThat(initialModes).containsExactly("SNAPSHOT");
             long deadline = System.nanoTime() + Duration.ofSeconds(20).toNanos();
             while (job.getStatus() != JobStatus.RUNNING && System.nanoTime() < deadline) {
                 Thread.sleep(20);
@@ -490,7 +498,28 @@ class SrsSourceProcessorTest {
                 job.cancel();
             }
             hz.getUserContext().remove(SnapshotBuffer.USER_CONTEXT_KEY);
+            hz.getUserContext().remove(SourceInitialLoadObserver.USER_CONTEXT_KEY);
             out.destroy();
+        }
+    }
+
+    @Test void aNoInitialLoadReceiptIsActualAndAnObservationRefusalDoesNotStopTheSource() throws Exception {
+        String ring = "srs.chain.no-initial-observation", output = "out-no-initial-observation";
+        var buffer = new SnapshotBuffer(); var modes = new CopyOnWriteArrayList<String>();
+        hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
+        hz.getUserContext().put(SourceInitialLoadObserver.USER_CONTEXT_KEY, (SourceInitialLoadObserver) (member, identity, job, execution, stream, index, mode, epoch) -> {
+            modes.add(mode);
+            throw new io.tapstate.core.common.TapstateException(CaptureError.OBSERVER_FAILED,
+                    Map.of("captureId", "test", "openingId", "test", "phase", "initial-metadata"), null);
+        });
+        var dag = new DAG(); var source = dag.newVertex("source", SrsSourceProcessor.directMetaSupplier(PIPELINE, ring, "orders", 1, RECORDED_STAMP, SourcePlacement.anyMember()));
+        var sink = dag.newVertex("sink", SinkProcessors.writeListP(output)); dag.edge(between(source, sink)); var job = hz.getJet().newJob(dag);
+        try {
+            long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(5); while (modes.isEmpty() && System.nanoTime() - until < 0) Thread.sleep(10);
+            assertThat(modes).containsExactly("NO_INITIAL_LOAD");
+            assertThat(job.getStatus()).isEqualTo(JobStatus.RUNNING); assertThat(hz.getList(output)).isEmpty();
+        } finally {
+            job.cancel(); hz.getUserContext().remove(SourceInitialLoadObserver.USER_CONTEXT_KEY); hz.getUserContext().remove(SnapshotBuffer.USER_CONTEXT_KEY); hz.getList(output).destroy();
         }
     }
 
