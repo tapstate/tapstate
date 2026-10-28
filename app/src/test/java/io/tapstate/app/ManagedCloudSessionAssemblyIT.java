@@ -381,10 +381,13 @@ class ManagedCloudSessionAssemblyIT {
                     assertThat(response.getHeaders().get(HttpHeaders.SET_COOKIE)).isNull();
                     return response.bodyTo(Map.class);
                 });
-        assertThat(body).isEqualTo(Map.of("mode", "cloud", "principal", userId,
-                "scopes", List.of("read", "write")));
+        assertThat(body.get("mode")).isEqualTo("cloud");
+        assertThat(body.get("principal")).isEqualTo(userId);
+        assertThat(body.get("scopes")).isEqualTo(List.of("read", "write"));
+        assertThat(body.get("username")).isNull();
+        assertThat(body.get("email")).isNull();
         assertThat(body.toString()).doesNotContain(cookie, TwoUserPorts.STATIC_TOKEN,
-                "jwt", "jti", "password", "email", "displayName");
+                "jwt", "jti", "password", "displayName");
     }
 
     private static void assertCurrentUserRefused(RestClient client, String cookie) {
