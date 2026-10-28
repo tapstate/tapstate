@@ -20,6 +20,9 @@ final class AlertEvaluationHost {
     }
     private record Previous(AlertRule rule, MetricPoint point) { }
     private final AlertStore store;
+    private AlertNotificationPlanner planner;
+    AlertEvaluationHost withPlanner(AlertNotificationPlanner planner){this.planner=Objects.requireNonNull(planner);return this;}
+    private AlertStore.Outcome persist(AlertStore.Commit commit){return planner==null?store.commit(commit):planner.accept(commit);}
     private final AlarmTypeCatalog catalog;
     private final AlertChannelPolicy.Deployment deployment;
     private final Clock clock;
@@ -188,7 +191,7 @@ final class AlertEvaluationHost {
                     before.summariesHandedOff(), episode, before.binding());
             var changes = transitions(update, episode, policy);
             requireCurrent.run();
-            var outcome = store.commit(new AlertStore.Commit(AlertStore.CommitKind.END,
+            var outcome = persist(new AlertStore.Commit(AlertStore.CommitKind.END,
                     new AlertStore.StateChange(retained.orElseThrow().revision(), before, after, changes, null), List.of(), List.of()));
             requireCurrent.run();
             if (outcome != AlertStore.Outcome.CONFLICT) { points.remove(key); return Result.ACCEPTED; }
@@ -244,7 +247,7 @@ final class AlertEvaluationHost {
             AlertStateRecord.Head before, AlertStateRecord.Head after, AlertUpdate update, AlertSignal signal, Binding binding) {
         binding.requireCurrent().run();
         var proof=binding.proof().get();if(proof!=null)proof.requireCurrent().run();
-        var result = store.commit(new AlertStore.Commit(AlertStore.CommitKind.STATE_AND_PLAN,
+        var result = persist(new AlertStore.Commit(AlertStore.CommitKind.STATE_AND_PLAN,
                 new AlertStore.StateChange(retained.map(AlertStore.Stored::revision).orElse(0L), before, after,
                         transitions(update, after.episode(), policy), signal,proof), List.of(), List.of()));
         if(proof!=null)proof.requireCurrent().run();binding.requireCurrent().run(); return result;

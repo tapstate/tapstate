@@ -166,4 +166,12 @@ class PipelineAlertRuntimeTest {
             assertThat(runtime.health().queuedBytes()).isZero();
         }finally{release.countDown();runtime.close();}
     }
+    @Test void closingDuringServiceCreationDisposesTheUnpublishedPlanner() throws Exception {
+        var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var planning=mock(AlertPlanningRuntime.class);
+        when(fixture.store.evaluationRules(any(),anyInt())).thenAnswer(call->{entered.countDown();boolean interrupted=false;for(;;)try{release.await();break;}catch(InterruptedException expected){interrupted=true;}if(interrupted)Thread.currentThread().interrupt();return new AlertStore.DefinitionPage(List.of(),null);});
+        var runtime=new PipelineAlertRuntime(()->new PipelineAlertRuntime.Services(fixture.store,fixture.host,BuiltinAlarmTypes.catalog(),planning),intentStore,(scope,claim)->Optional.of(()->{}),()->{},fixture.clock);
+        try{runtime.tick();assertThat(entered.await(3,TimeUnit.SECONDS)).isTrue();runtime.close();release.countDown();verify(planning,timeout(3000)).close();verify(planning,never()).start();assertThat(runtime.health().closed()).isTrue();}
+        finally{release.countDown();runtime.close();}
+    }
+
 }

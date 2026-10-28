@@ -49,7 +49,25 @@ public interface AlertStore {
     }
     record IntentChange(Stored<AlertIntent.Record> before,AlertIntent.Record after) { public IntentChange { Objects.requireNonNull(after); } }
     record ScheduleChange(Stored<AlertSchedule.Record> before,AlertSchedule.Record after) { public ScheduleChange { Objects.requireNonNull(after); } }
-    record Commit(CommitKind kind,StateChange state,List<IntentChange> intents,List<ScheduleChange> schedules) {
+    record PlanVersion(long configurationRevision,long alertFence) { }
+    record Dependency(AlarmKey root,AlarmKey dependent) { }
+    /** One bounded CONFIG read snapshot. The version must accompany every derived write. */
+    record Planning(PlanVersion version,Host host,List<AlertConfiguration.Definition> definitions,
+            List<Stored<AlertStateRecord.Head>> states,List<Stored<AlertSchedule.Record>> schedules,
+            Map<DeliveryKey,Stored<AlertIntent.Record>> intents,
+            Map<FrozenGroupPolicy.Member,AlertStateRecord.Episode> episodes,
+            Map<AlertTargetLimit.Domain,AlertTargetLimit> limits,Set<Dependency> dependencies,boolean isolatedRecords) {
+        public Planning(PlanVersion version,Host host,List<AlertConfiguration.Definition> definitions,List<Stored<AlertStateRecord.Head>> states,
+                List<Stored<AlertSchedule.Record>> schedules,Map<DeliveryKey,Stored<AlertIntent.Record>> intents,
+                Map<FrozenGroupPolicy.Member,AlertStateRecord.Episode> episodes,Map<AlertTargetLimit.Domain,AlertTargetLimit> limits,Set<Dependency> dependencies){
+            this(version,host,definitions,states,schedules,intents,episodes,limits,dependencies,false);
+        }
+        public Planning { definitions=List.copyOf(definitions);states=List.copyOf(states);schedules=List.copyOf(schedules);
+            intents=Map.copyOf(intents);episodes=Map.copyOf(episodes);limits=Map.copyOf(limits);dependencies=Set.copyOf(dependencies); }
+    }
+    Planning planning();
+    record Commit(CommitKind kind,StateChange state,List<IntentChange> intents,List<ScheduleChange> schedules,PlanVersion version) {
+        public Commit(CommitKind kind,StateChange state,List<IntentChange> intents,List<ScheduleChange> schedules){this(kind,state,intents,schedules,null);}
         public Commit { Objects.requireNonNull(kind);intents=List.copyOf(intents);schedules=List.copyOf(schedules);
             if(intents.size()>100||schedules.size()>100||state==null&&intents.isEmpty()&&schedules.isEmpty())throw new IllegalArgumentException("empty or oversized alert commit"); }
     }

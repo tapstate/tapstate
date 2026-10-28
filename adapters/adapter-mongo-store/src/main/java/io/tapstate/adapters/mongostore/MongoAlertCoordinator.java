@@ -158,6 +158,11 @@ final class MongoAlertCoordinator implements AlertStore {
     private Outcome commit(Commit c,Access access) {
         try{return tx(access,true,false,s->{
             boolean changed=false;
+            if(c.version()!=null){
+                var version=SystemCollections.CONFIGURATION_VERSION.on(db).find(s,new Document("_id",ConfigurationVersion.ID)).first();
+                if(version==null||!Long.valueOf(c.version().configurationRevision()).equals(version.get("revision"))
+                        ||!Long.valueOf(Math.incrementExact(c.version().alertFence())).equals(version.get(ConfigurationVersion.ALERT_FENCE)))throw new Conflict();
+            }
             if(c.state()!=null){var v=c.state();scope(v.after().snapshot().rule().key().scope());
                 if(v.proof()!=null){
                     v.proof().requireCurrent().run();var original=v.proof().pipeline();var key=v.after().snapshot().rule().key();
@@ -205,6 +210,61 @@ final class MongoAlertCoordinator implements AlertStore {
             for(var v:c.schedules())changed|=outcome(notifications.stageSchedule(s,v.before()==null?null:new MongoAlertScheduleCodec.Stored(v.before().revision(),v.before().value()),v.after()))==Outcome.STAGED;
             return changed?Outcome.STAGED:Outcome.UNCHANGED;
         });}catch(Conflict conflict){return Outcome.CONFLICT;}
+    }
+    @Override public Planning planning(){return tx(null,false,false,s->{
+        var version=SystemCollections.CONFIGURATION_VERSION.on(db).find(s,new Document("_id",ConfigurationVersion.ID)).first();
+        ConfigurationVersion.validateAlertState(version,true);var budget=new PlanningBudget();
+        var defs=new ArrayList<Definition>();for(var kind:Kind.values()){defs.addAll(definitionSnapshot(s,kind));if(defs.size()>1000)throw unreadable("planning-definitions-budget");}
+        for(var definition:defs)budget.charge(MongoAlertConfigurationCodec.write(definition,0));
+        var heads=new ArrayList<Stored<AlertStateRecord.Head>>();AlarmKey cursor=null;
+        do{var page=new MongoAlertReads(db,host.scope(),states).evaluationStates(s,cursor,100);heads.addAll(page.rows());cursor=page.next();
+            if(heads.size()>1000||heads.size()==1000&&cursor!=null)throw unreadable("planning-states-budget");}while(cursor!=null);
+        for(var head:heads){budget.charge(MongoAlertStateEnvelope.head(head.value(),head.revision()));if(head.value().episode()!=null)budget.charge(MongoAlertStateEnvelope.episode(head.value().episode()));}
+        var schedules=new LinkedHashMap<AlertSchedule.Key,Stored<AlertSchedule.Record>>();boolean isolated=false;
+        var low=MongoAlertDeliveryCodec.scope(host.scope()).append("subjectKind",new org.bson.types.MinKey());
+        var high=MongoAlertDeliveryCodec.scope(host.scope()).append("subjectKind",new org.bson.types.MaxKey());
+        var rows=SystemCollections.ALERT_NOTIFICATION_SCHEDULES.on(db).find(s,new Document("_id",new Document("$gte",low).append("$lte",high))
+                .append("batch",null).append("retiredAt",null)).hintString("_id_").limit(1001);
+        int roots=0;try(var iterator=rows.iterator()){while(iterator.hasNext()){var row=iterator.next();if(++roots>1000)throw unreadable("planning-schedules-budget");budget.charge(row);
+            try{var id=row.get("_id",Document.class);var key=MongoAlertReads.scheduleKey(id);var v=MongoAlertScheduleCodec.read(key,row);schedules.put(key,new Stored<>(v.recordRevision(),v.value()));}
+            catch(TapstateException failure){if(failure.code()!=IoError.DOCUMENT_UNREADABLE)throw failure;isolated=true;}
+            catch(IllegalArgumentException|NullPointerException malformed){isolated=true;}
+        }}
+        var intents=new LinkedHashMap<DeliveryKey,Stored<AlertIntent.Record>>();var episodes=new HashMap<FrozenGroupPolicy.Member,AlertStateRecord.Episode>();
+        for(var row:List.copyOf(schedules.values())){try{
+            for(var member:row.value().members())if(!episodes.containsKey(member.episodeMember())){var episode=states.episodeEnvelope(s,member.evaluation().key(),member.episode()).orElseThrow(()->unreadable("planning-episode"));budget.charge(MongoAlertStateEnvelope.episode(episode));episodes.put(member.episodeMember(),episode);}
+            for(var key:row.value().protectedIntents()){
+                planningIntent(s,key,intents,budget);
+                if(key.notification().kind()==DeliveryKey.Kind.FAULT||key.notification().kind()==DeliveryKey.Kind.REMINDER){
+                    var batchKey=AlertSchedule.Key.forDelivery(AlertSchedule.SubjectKind.GROUP,key);var batch=notifications.schedule(s,batchKey);
+                    if(batch.isEmpty())throw unreadable("planning-batch");
+                    if(batch.isPresent()&&!schedules.containsKey(batchKey)){
+                        budget.charge(MongoAlertScheduleCodec.write(batch.get().value(),batch.get().recordRevision()));schedules.put(batchKey,new Stored<>(batch.get().recordRevision(),batch.get().value()));
+                        var disposition=batch.get().value().disposition();if(disposition!=null&&disposition.successor()!=null)planningIntent(s,disposition.successor(),intents,budget);
+                    }
+                }
+            }
+        }catch(TapstateException failure){if(failure.code()!=IoError.DOCUMENT_UNREADABLE)throw failure;isolated=true;schedules.remove(row.value().key());}}
+        for(var head:heads)if(head.value().episode()!=null)episodes.put(new FrozenGroupPolicy.Member(head.value().snapshot().rule().key(),head.value().episode().value().number()),head.value().episode());
+        var limits=new HashMap<AlertTargetLimit.Domain,AlertTargetLimit>();
+        for(var d:defs)if(d instanceof AlertReceiver receiver&&receiver.header().active()&&receiver.enabled())for(var target:AlertTargetIdentity.domains(host.scope(),receiver.transport()).values())notifications.limit(s,target).ifPresent(v->limits.put(target,v.value()));
+        var dependencies=new HashSet<Dependency>();var active=heads.stream().map(v->v.value().snapshot()).filter(v->v.status()==AlertSnapshot.Status.FIRING).toList();
+        var edges=new HashSet<AlertInhibitionPolicy.Edge>();for(var def:defs)if(def instanceof Subscription route)edges.addAll(route.inhibition());
+        int pairs=0;for(var root:active)for(var dependent:active)if(!root.rule().key().typeId().equals(dependent.rule().key().typeId())
+                &&edges.contains(new AlertInhibitionPolicy.Edge(root.rule().key().typeId(),dependent.rule().key().typeId()))){
+            if(++pairs>10000)throw unreadable("planning-dependency-budget");
+            if(dependency(s,root.rule().key(),dependent.rule().key(),false))dependencies.add(new Dependency(root.rule().key(),dependent.rule().key()));
+        }
+        return new Planning(new PlanVersion(version.getLong("revision"),version.getLong(ConfigurationVersion.ALERT_FENCE)),host,defs,heads,List.copyOf(schedules.values()),intents,episodes,limits,dependencies,isolated);
+    });}
+    private void planningIntent(ClientSession s,DeliveryKey key,Map<DeliveryKey,Stored<AlertIntent.Record>> intents,PlanningBudget budget){
+        if(intents.containsKey(key))return;if(intents.size()>=1000)throw unreadable("planning-intents-budget");
+        var value=notifications.requiredIntent(s,new AlertIntent.Business(key),1);budget.charge(MongoAlertDeliveryCodec.write(value.value(),value.recordRevision()));
+        intents.put(key,new Stored<>(value.recordRevision(),value.value()));
+    }
+    private static final class PlanningBudget {
+        private long bytes;
+        void charge(Document row){bytes+=MongoAlertConfigurationCodec.size(row);if(bytes>16*1024*1024)throw unreadable("planning-bytes-budget");}
     }
     private void requireResourceRemoved(ClientSession s,AlarmKey.Resource resource){
         if(!resourceRemoved(s,resource))throw stale("resource-still-active-or-unproven");
@@ -330,12 +390,13 @@ final class MongoAlertCoordinator implements AlertStore {
         do{var page=new MongoAlertReads(db,host.scope(),states).definitions(s,kind,cursor,100);values.addAll(page.rows());cursor=page.nextId();
             if(values.size()>1000||values.size()==1000&&cursor!=null)throw unreadable("policy-read-budget");}while(cursor!=null);return List.copyOf(values);
     }
-    private boolean dependency(ClientSession s,AlarmKey root,AlarmKey dependent){
+    private boolean dependency(ClientSession s,AlarmKey root,AlarmKey dependent){return dependency(s,root,dependent,true);}
+    private boolean dependency(ClientSession s,AlarmKey root,AlarmKey dependent,boolean fence){
         if(root.resource().equals(dependent.resource()))return true;
         if(root.resource().kind().equals("source")&&dependent.resource().kind().equals("pipeline")){
             var resource=artifacts.getInTransaction(s,dependent.resource().id());
             if(resource.isPresent()&&resource.get() instanceof io.tapstate.core.model.PipelineResource pipeline&&pipeline.sourceIds().contains(root.resource().id())){
-                resource(s,root.resource(),0,true);resource(s,dependent.resource(),0,false);return true;
+                resource(s,root.resource(),0,fence);resource(s,dependent.resource(),0,false);return true;
             }
         }
         return false;

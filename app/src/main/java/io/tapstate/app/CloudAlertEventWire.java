@@ -29,6 +29,11 @@ final class CloudAlertEventWire {
 
     static byte[] encode(URI origin, Destination destination, DeliveryKey key, AlarmKey alarm,
             Instant occurredAt, AlarmSeverity severity, String safeSubject, boolean recoverySummary) {
+        return encode(origin,destination,key,alarm,occurredAt,severity,safeSubject,recoverySummary,null);
+    }
+    static byte[] encode(URI origin, Destination destination, DeliveryKey key, AlarmKey alarm,
+            Instant occurredAt, AlarmSeverity severity, String safeSubject, boolean recoverySummary, Long episode) {
+        if(episode!=null&&episode<1)throw invalid("episode");
         Objects.requireNonNull(origin); Objects.requireNonNull(destination); Objects.requireNonNull(key);
         Objects.requireNonNull(alarm); Objects.requireNonNull(occurredAt); Objects.requireNonNull(severity);
         if (!destination.scope().equals(key.notification().scope()) || !alarm.scope().equals(destination.scope())
@@ -40,6 +45,7 @@ final class CloudAlertEventWire {
         String kind = key.notification().kind().name().toLowerCase(Locale.ROOT);
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("wireVersion", VERSION); payload.put("alarmTypeId", alarm.typeId());
+        if(episode!=null)payload.put("episode",episode);
         payload.put("resourceKind", alarm.resource().kind()); payload.put("resourceId", alarm.resource().id());
         payload.put("resourceIncarnation", alarm.resource().incarnation()); payload.put("qualifier", alarm.qualifier());
         payload.put("subjectId", key.notification().subjectId()); payload.put("subjectIncarnation", key.notification().subjectIncarnation());

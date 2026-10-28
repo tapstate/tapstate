@@ -94,7 +94,10 @@ class AlertEvaluationHostIT {
             }
         });
     }
-    static void withFixture(java.util.function.Consumer<Fixture> test){
+    static void withFixture(java.util.function.Consumer<Fixture> test){withFixture(false,test);}
+    static void withFixture(boolean withSource,java.util.function.Consumer<Fixture> test){withFixture(withSource,false,test);}
+    static void withFixture(boolean withSource,boolean cloud,java.util.function.Consumer<Fixture> test){
+        var deployment=cloud?AlertChannelPolicy.Deployment.CLOUD_MANAGED:AlertChannelPolicy.Deployment.ON_PREM;
         String suffix=UUID.randomUUID().toString().replace("-","");String configName="alert_host_config_"+suffix,cacheName="alert_host_cache_"+suffix;
         try(var client=MongoClients.create(MONGO.getReplicaSetUrl())){
             var configDb=client.getDatabase(configName);var cacheDb=client.getDatabase(cacheName);
@@ -103,10 +106,10 @@ class AlertEvaluationHostIT {
             try(var configuration=MongoConfigurationBootstrap.prepare(settings,SCOPE.clusterId(),"installation-a","setup-a",1);
                     var cache=MongoCacheDomain.connect(connection,Duration.ofSeconds(5),"alert-host-test")){
                 var setup=new StorageSetupScope(SCOPE.clusterId(),"installation-a","setup-a",1);
-                var master=new SourceResource("views",null,"mongodb",Map.of("uri","mongodb://master.invalid/master"),null,null,null,null);
-                var committed=configuration.bindings().commitWithFirstCache(setup,StorageBinding.Mode.OP,connection,master);
+                var master=new SourceResource(cloud?"atlas-store":"views",null,"mongodb",Map.of("uri","mongodb://master.invalid/master"),null,null,null,null);
+                var committed=configuration.bindings().commitWithFirstCache(setup,cloud?StorageBinding.Mode.CLOUD:StorageBinding.Mode.OP,connection,master);
                 var business=committed.preparation().businessScope();cache.prepareFirstAuth(committed.firstCreation().orElseThrow());cache.prepareInitialBusiness(committed.preparation(),ACTIVE);
-                var pipeline=new PipelineResource("orders",null,List.of(),null,null,null,null,null);configuration.artifacts().create(pipeline);
+                var pipeline=new PipelineResource("orders",null,withSource?List.of(SourceRef.spec("views",true)):List.of(),null,null,null,null,null);configuration.artifacts().create(pipeline);
                 var scope=new PipelineIntentScope(SCOPE.clusterId(),business.bindingVersion(),business.cacheIncarnation(),"orders",1);
                 configuration.intents().compareAndSet(scope,0,new DesiredState("orders",PipelineState.RUNNING,CanonicalHash.of(pipeline)));
                 var claims=cache.workloadClaims(business);var node=claims.acquire(new WorkloadClaimKey(SCOPE.clusterId(),WorkloadClaimType.NODE_SESSION,"node-a"),OWNER,1,TTL).claim();
@@ -117,13 +120,14 @@ class AlertEvaluationHostIT {
                 var intent=configuration.intents().loadForActuation("orders").orElseThrow();var claim=claims.acquirePipeline(scope,OWNER,1,TTL).claim();
                 var token=new TokenRecord("operator","ADMIN","isolated-test-hash",false,T);configuration.tokens().save(token);
                 var access=new AlertStore.Access(new AlertTestAuthority(AlertTestAuthority.Mechanism.MACHINE_TOKEN,"installation-a","operator","ADMIN",token.authenticationBinding(),null),ACTIVE,ACTIVE,()->"");
-                var storeHost=new AlertStore.Host(SCOPE,setup,AlertChannelPolicy.Deployment.ON_PREM,ACTIVE);
+                var storeHost=cloud?new AlertStore.Host(SCOPE,setup,deployment,ACTIVE,new AlertIntent.SystemRoute("managed-route","managed-binding",1),new AlertIntent.SdkTarget("managed-target",SCOPE.clusterId(),"binding-a"),r->Optional.empty(),Set.of()):new AlertStore.Host(SCOPE,setup,deployment,ACTIVE);
                 var store=configuration.alerts(storeHost,BuiltinAlarmTypes.catalog(),clock);
-                var header=AlertConfiguration.Header.create(AlertConfiguration.Identity.create(AlertConfiguration.Kind.RULE,SCOPE,"rule"),AlertChannelPolicy.Deployment.ON_PREM,T,"operator");
+                if(cloud)access=AlertStore.Access.cloud("operator",SCOPE.authorityId(),"ADMIN",ACTIVE,ACTIVE);
+                var header=AlertConfiguration.Header.create(AlertConfiguration.Identity.create(AlertConfiguration.Kind.RULE,SCOPE,"rule"),deployment,T,"operator");
                 var rule=new AlertConfiguration.Rule(header,"Failure","pipeline.failed",1,new AlertConfiguration.Resources(Set.of("pipeline"),true,Set.of()),Map.of(),null,true,null).validated(BuiltinAlarmTypes.catalog());
                 assertThat(store.saveDefinition(null,rule,access)).isEqualTo(AlertStore.Outcome.STAGED);
                 test.accept(new Fixture(configuration,cache,settings,business,intent,claim,store,storeHost,rule,
-                        new AlertEvaluationHost(store,BuiltinAlarmTypes.catalog(),AlertChannelPolicy.Deployment.ON_PREM,clock,"host-a",ACTIVE),clock,now));
+                        new AlertEvaluationHost(store,BuiltinAlarmTypes.catalog(),deployment,clock,"host-a",ACTIVE),clock,now));
             }finally{configDb.drop();cacheDb.drop();}
         }
     }
