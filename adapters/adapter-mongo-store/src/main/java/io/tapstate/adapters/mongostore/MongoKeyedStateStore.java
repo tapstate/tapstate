@@ -82,6 +82,8 @@ public final class MongoKeyedStateStore implements KeyedStateStore {
     /** The most bytes one Java character can become in UTF-8. Deliberately the bound, not the average. */
     private static final int WORST_CASE_BYTES_PER_CHAR = 3;
 
+    private static final String NAMESPACE_ARGUMENT = "namespace";
+
     private final MongoCollection<Document> collection;
 
     public MongoKeyedStateStore(MongoCollection<Document> collection) {
@@ -116,7 +118,7 @@ public final class MongoKeyedStateStore implements KeyedStateStore {
      */
     @Override
     public Map<String, byte[]> loadAll(String namespace, Collection<String> keys) {
-        Objects.requireNonNull(namespace, "namespace");
+        Objects.requireNonNull(namespace, NAMESPACE_ARGUMENT);
         Map<String, byte[]> loaded = new LinkedHashMap<>();
         List<Document> batch = new ArrayList<>();
         int idBytes = 0;
@@ -136,7 +138,7 @@ public final class MongoKeyedStateStore implements KeyedStateStore {
 
     @Override
     public void save(String namespace, String key, byte[] state) {
-        Objects.requireNonNull(state, "state");
+        Objects.requireNonNull(state, STATE);
         Document document = new Document("_id", id(namespace, key)).append(STATE, new Binary(state));
         StoreIo.run(() -> collection.replaceOne(byId(namespace, key), document,
                 new ReplaceOptions().upsert(true)));
@@ -144,11 +146,11 @@ public final class MongoKeyedStateStore implements KeyedStateStore {
 
     @Override
     public void saveAll(String namespace, Map<String, byte[]> states) {
-        Objects.requireNonNull(namespace, "namespace");
+        Objects.requireNonNull(namespace, NAMESPACE_ARGUMENT);
         List<WriteModel<Document>> batch = new ArrayList<>();
         long bytes = 0;
         for (Map.Entry<String, byte[]> entry : states.entrySet()) {
-            byte[] value = Objects.requireNonNull(entry.getValue(), "state");
+            byte[] value = Objects.requireNonNull(entry.getValue(), STATE);
             long weight = ID_OVERHEAD_BYTES
                     + (long) WORST_CASE_BYTES_PER_CHAR * (namespace.length() + entry.getKey().length())
                     + value.length;
@@ -186,7 +188,7 @@ public final class MongoKeyedStateStore implements KeyedStateStore {
      */
     @Override
     public Optional<byte[]> saveIfAbsent(String namespace, String key, byte[] state) {
-        Objects.requireNonNull(state, "state");
+        Objects.requireNonNull(state, STATE);
         Document onInsert = new Document("$setOnInsert", new Document(STATE, new Binary(state)));
         FindOneAndUpdateOptions asItWas = new FindOneAndUpdateOptions()
                 .upsert(true)
@@ -219,7 +221,7 @@ public final class MongoKeyedStateStore implements KeyedStateStore {
 
     @Override
     public void dropNamespace(String namespace) {
-        Objects.requireNonNull(namespace, "namespace");
+        Objects.requireNonNull(namespace, NAMESPACE_ARGUMENT);
         StoreIo.run(() -> collection.deleteMany(new Document("_id." + NAMESPACE, namespace)));
     }
 
@@ -236,7 +238,7 @@ public final class MongoKeyedStateStore implements KeyedStateStore {
      */
     @Override
     public long count(String namespace) {
-        Objects.requireNonNull(namespace, "namespace");
+        Objects.requireNonNull(namespace, NAMESPACE_ARGUMENT);
         Document lower = new Document(NAMESPACE, namespace).append(KEY, new MinKey());
         Document upper = new Document(NAMESPACE, namespace).append(KEY, new MaxKey());
         Document withinNamespace = new Document("_id",
@@ -269,7 +271,7 @@ public final class MongoKeyedStateStore implements KeyedStateStore {
     }
 
     private static Document id(String namespace, String key) {
-        Objects.requireNonNull(namespace, "namespace");
+        Objects.requireNonNull(namespace, NAMESPACE_ARGUMENT);
         Objects.requireNonNull(key, "key");
         return new Document(NAMESPACE, namespace).append(KEY, key);
     }

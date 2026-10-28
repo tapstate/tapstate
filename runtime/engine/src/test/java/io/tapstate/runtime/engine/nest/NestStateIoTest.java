@@ -91,8 +91,17 @@ class NestStateIoTest {
 
     @Test
     void backendFailuresReachAllWaitersAndDoNotPoisonTheNextCall() throws Exception {
+        assertFailureReachesWaiters(new IllegalStateException("injected backend failure"));
+    }
+
+    @Test
+    void fatalBackendFailuresAlsoReleaseWaitersAndAreRethrownUnchanged() throws Exception {
+        assertFailureReachesWaiters(new AssertionError("injected fatal backend failure"));
+    }
+
+    private static void assertFailureReachesWaiters(Throwable failure) throws Exception {
         BlockingStore store = new BlockingStore();
-        store.failure = new IllegalStateException("injected backend failure");
+        store.failure = failure;
         NestStateIo io = new NestStateIo(store, "ns");
         List<FutureTask<Map<String, byte[]>>> tasks = new ArrayList<>();
         List<Thread> threads = new ArrayList<>();
@@ -241,12 +250,12 @@ class NestStateIoTest {
         private final AtomicInteger writeCalls = new AtomicInteger();
         private final Map<String, byte[]> saved = new ConcurrentHashMap<>();
         private final List<Integer> writtenValues = new CopyOnWriteArrayList<>();
-        private volatile RuntimeException failure;
+        private volatile Throwable failure;
 
         @Override public Map<String, byte[]> loadAll(String namespace, Collection<String> keys) {
             readCalls.incrementAndGet();
             block();
-            if (failure != null) throw failure;
+            throwFailureIfAny();
             Map<String, byte[]> found = new LinkedHashMap<>();
             for (String key : keys) if (!key.equals("missing")) found.put(key, new byte[] {1});
             return found;
@@ -254,9 +263,13 @@ class NestStateIoTest {
         @Override public void saveAll(String namespace, Map<String, byte[]> states) {
             writeCalls.incrementAndGet();
             block();
-            if (failure != null) throw failure;
+            throwFailureIfAny();
             states.values().forEach(value -> writtenValues.add((int) value[0]));
             saved.putAll(states);
+        }
+        private void throwFailureIfAny() {
+            if (failure instanceof RuntimeException raised) throw raised;
+            if (failure instanceof Error raised) throw raised;
         }
         private void block() {
             entered.countDown();

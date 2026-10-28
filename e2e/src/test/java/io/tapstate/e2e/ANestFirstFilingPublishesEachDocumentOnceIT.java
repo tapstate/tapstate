@@ -10,6 +10,7 @@ import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
+import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -89,6 +90,7 @@ class ANestFirstFilingPublishesEachDocumentOnceIT {
                     () -> mongo.count(target, ORDERS) + " orders");
             assertCompleted(mongo, target, 1);
             assertCompleted(mongo, target, ROWS);
+            assertCustomerSnapshotWasBatched(control, pipelineId);
 
             updateCustomer(mysql, "after-snapshot");
             awaitCustomerName(mongo, target, "after-snapshot");
@@ -112,6 +114,35 @@ class ANestFirstFilingPublishesEachDocumentOnceIT {
             update.setString(1, name);
             assertThat(update.executeUpdate()).isEqualTo(1);
         }
+    }
+
+    private static void assertCustomerSnapshotWasBatched(ControlPlane control, String pipelineId) {
+        String namespace = "nest." + pipelineId + ".order_doc.customer";
+        Await.until("every customer and reverse registration to be durably counted",
+                () -> {
+                    Map<String, Long> stored = control.metricsNamed(pipelineId, "nestStateStored." + namespace);
+                    return Long.valueOf(ROWS).equals(stored.get("nestStateStored." + namespace))
+                            && Long.valueOf(ROWS).equals(stored.get("nestStateStored." + namespace + ".refs"));
+                },
+                () -> String.valueOf(control.metrics(pipelineId)));
+        long[] settled = {-1L};
+        long[] unchangedSince = {System.nanoTime()};
+        Await.until("the completed snapshot cost reading to catch up and settle",
+                () -> {
+                    long current = control.metricTotal(pipelineId,
+                            "nestStateAccesses." + namespace + ".refs").orElse(0L);
+                    if (current != settled[0]) {
+                        settled[0] = current;
+                        unchangedSince[0] = System.nanoTime();
+                        return false;
+                    }
+                    return current >= ROWS && System.nanoTime() - unchangedSince[0] >= Duration.ofSeconds(8).toNanos();
+                }, () -> "reference accesses " + settled[0]);
+        long accesses = settled[0];
+        // Registrations still cost one access each. Customer wake reads must fold across rows; the
+        // old row-at-a-time path costs another ROWS accesses while producing identical target data.
+        assertThat(accesses).as("reference accesses after the customer-first snapshot")
+                .isGreaterThanOrEqualTo(ROWS).isLessThanOrEqualTo(ROWS + ROWS / 2);
     }
 
     private static void awaitCustomerName(MongoEndpoints mongo, EndpointAddress target, String name) {

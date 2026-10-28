@@ -122,8 +122,8 @@ class LookupRowsBatchingTest {
 
         assertThat(inbox.isEmpty()).isTrue();
         assertThat(rows.count()).isEqualTo(40);
-        assertThat(rows.writeBatches).hasSize(3).allSatisfy(batch -> assertThat(batch.size()).isLessThanOrEqualTo(16));
-        assertThat(refs.readBatches).hasSize(3).allSatisfy(batch -> assertThat(batch.size()).isLessThanOrEqualTo(1024));
+        assertThat(rows.writeBatches).hasSize(3).allSatisfy(batch -> assertThat(batch).hasSizeLessThanOrEqualTo(16));
+        assertThat(refs.readBatches).hasSize(3).allSatisfy(batch -> assertThat(batch).hasSizeLessThanOrEqualTo(1024));
     }
 
     @Test

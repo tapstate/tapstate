@@ -9,6 +9,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Queue;
+import java.util.concurrent.Future;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Coalesces partition loaders already waiting for the same namespace's backend. The first caller
@@ -62,13 +66,20 @@ final class NestStateIo {
         private int pendingKeys;
         private long pendingBytes;
         private boolean running;
+        private final ReentrantLock lock = new ReentrantLock();
+        private final Condition changed = lock.newCondition();
 
         private Batcher(boolean writing) {
             this.writing = writing;
         }
 
-        private synchronized Pending pending() {
-            return new Pending(pending.size(), pendingKeys, pendingBytes);
+        private Pending pending() {
+            lock.lock();
+            try {
+                return new Pending(pending.size(), pendingKeys, pendingBytes);
+            } finally {
+                lock.unlock();
+            }
         }
 
         private Map<String, byte[]> call(Map<String, byte[]> values, boolean batchRead) {
@@ -76,33 +87,39 @@ final class NestStateIo {
             Request request = new Request(values, batchRead);
             boolean interrupted = false;
             try {
-                synchronized (this) {
-                    while (!roomFor(request)) interrupted |= waitForChange();
+                lock.lock();
+                try {
+                    while (!roomFor(request)) {
+                        changed.awaitUninterruptibly();
+                        interrupted |= Thread.interrupted();
+                    }
                     pending.add(request);
                     pendingKeys += values.size();
                     pendingBytes += request.bytes;
+                } finally {
+                    lock.unlock();
                 }
                 while (true) {
                     List<Request> batch;
-                    synchronized (this) {
-                        if (request.done) {
-                            if (request.failure instanceof RuntimeException failure) throw failure;
-                            if (request.failure instanceof Error failure) throw failure;
-                            return request.result;
-                        }
+                    lock.lock();
+                    try {
+                        if (request.done) return request.answer();
                         if (running) {
-                            interrupted |= waitForChange();
+                            changed.awaitUninterruptibly();
+                            interrupted |= Thread.interrupted();
                             continue;
                         }
                         running = true;
                         batch = takeBatch();
-                        notifyAll();
+                        changed.signalAll();
+                    } finally {
+                        lock.unlock();
                     }
                     execute(batch);
                 }
             } finally {
-                // Abandoning an in-flight write cannot turn an unknown durable outcome into success.
-                // Keep the interrupt, but only return after the synchronous backend has answered.
+                // Defer interruption until the shared synchronous outcome is known; no write can be
+                // acknowledged merely because its waiter stopped waiting. Preserve the caller's flag.
                 if (interrupted) Thread.currentThread().interrupt();
             }
         }
@@ -133,51 +150,56 @@ final class NestStateIo {
         private void execute(List<Request> batch) {
             Map<String, byte[]> combined = new LinkedHashMap<>();
             batch.forEach(request -> combined.putAll(request.values));
-            Map<String, byte[]> found = Map.of();
-            Throwable failure = null;
+            boolean batchRead = batch.stream().anyMatch(request -> request.batchRead);
+            // Run on this caller, not an executor. FutureTask captures even fatal failures so every
+            // waiter gets the same outcome before the original failure is rethrown by its caller.
+            FutureTask<Map<String, byte[]>> outcome = new FutureTask<>(() -> backend(combined, batchRead));
+            outcome.run();
+            Throwable failure = outcome.state() == Future.State.FAILED ? outcome.exceptionNow() : null;
+            Map<String, byte[]> found = failure == null ? outcome.resultNow() : Map.of();
+            lock.lock();
             try {
-                if (writing) {
-                    if (combined.size() == 1) {
-                        Map.Entry<String, byte[]> only = combined.entrySet().iterator().next();
-                        store.save(namespace, only.getKey(), only.getValue());
-                    } else {
-                        store.saveAll(namespace, combined);
-                    }
-                } else if (combined.size() == 1 && batch.stream().noneMatch(request -> request.batchRead)) {
-                    String key = combined.keySet().iterator().next();
-                    found = store.load(namespace, key).map(value -> Map.of(key, value)).orElse(Map.of());
-                } else {
-                    found = store.loadAll(namespace, combined.keySet());
-                }
-            } catch (RuntimeException | Error raised) {
-                failure = raised;
-            }
-            synchronized (this) {
                 for (Request request : batch) {
-                    Map<String, byte[]> own = new LinkedHashMap<>();
-                    if (!writing && failure == null) {
-                        for (String key : request.values.keySet()) {
-                            byte[] value = found.get(key);
-                            if (value != null) own.put(key, value);
-                        }
-                    }
-                    request.result = own;
+                    request.result = subset(found, request.values.keySet());
                     request.failure = failure;
                     request.done = true;
                 }
                 running = false;
-                notifyAll();
+                changed.signalAll();
+            } finally {
+                lock.unlock();
             }
         }
 
-        private boolean waitForChange() {
-            try {
-                wait();
-                return false;
-            } catch (InterruptedException interrupted) {
-                return true;
+        private Map<String, byte[]> backend(Map<String, byte[]> combined, boolean batchRead) {
+            if (writing) {
+                write(combined);
+                return Map.of();
+            }
+            if (combined.size() == 1 && !batchRead) {
+                String key = combined.keySet().iterator().next();
+                return store.load(namespace, key).map(value -> Map.of(key, value)).orElse(Map.of());
+            }
+            return Objects.requireNonNull(store.loadAll(namespace, combined.keySet()), "loaded states");
+        }
+
+        private void write(Map<String, byte[]> combined) {
+            if (combined.size() == 1) {
+                Map.Entry<String, byte[]> only = combined.entrySet().iterator().next();
+                store.save(namespace, only.getKey(), only.getValue());
+            } else {
+                store.saveAll(namespace, combined);
             }
         }
+    }
+
+    private static Map<String, byte[]> subset(Map<String, byte[]> found, Collection<String> keys) {
+        Map<String, byte[]> own = new LinkedHashMap<>();
+        for (String key : keys) {
+            byte[] value = found.get(key);
+            if (value != null) own.put(key, value);
+        }
+        return own;
     }
 
     private final class Request {
@@ -187,6 +209,13 @@ final class NestStateIo {
         private boolean done;
         private Map<String, byte[]> result;
         private Throwable failure;
+
+        private Map<String, byte[]> answer() {
+            if (failure instanceof RuntimeException raised) throw raised;
+            if (failure instanceof Error raised) throw raised;
+            if (failure != null) throw new IllegalStateException("unexpected checked state I/O failure", failure);
+            return result;
+        }
 
         private Request(Map<String, byte[]> values, boolean batchRead) {
             this.values = values;

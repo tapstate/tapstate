@@ -221,13 +221,13 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
         Set<List<Object>> keys = new LinkedHashSet<>();
         long bytes = 0;
         for (Object item : inbox) {
-            if (item instanceof SettledPositions || rows.size() >= ROW_BATCH_LIMIT) break;
+            if (item instanceof SettledPositions || rows.size() >= ROW_BATCH_LIMIT) return rows;
             Envelope event = (Envelope) item;
             List<Object> key = NestKeys.valuesOf(NestKeys.rowOf(event), lookup.partitionKey(), lookup.mapName());
-            if (keys.contains(key)) break;
+            if (keys.contains(key)) return rows;
             // This bounds logical row payload as well as count; it is not a measurement of heap use.
             long eventBytes = PayloadBytes.of(event);
-            if (!rows.isEmpty() && eventBytes > ROW_BATCH_BYTES - bytes) break;
+            if (!rows.isEmpty() && eventBytes > ROW_BATCH_BYTES - bytes) return rows;
             rows.add(new RowArrival(event, key));
             keys.add(key);
             bytes += eventBytes;
