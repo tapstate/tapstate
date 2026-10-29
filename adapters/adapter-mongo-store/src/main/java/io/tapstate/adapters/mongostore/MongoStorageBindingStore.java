@@ -333,13 +333,13 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
         try {
             if (stored == null || !clusterId.equals(stored.get("clusterId"))
                     || !MongoConfigurationDomain.LAYOUT.equals(stored.get("layoutId"))
-                    || !Long.valueOf(version).equals(stored.get("bindingVersion"))) throw unreadable();
+                    || !version.equals(stored.get("bindingVersion"))) throw unreadable();
             StorageSetupScope scope = new StorageSetupScope(clusterId, stored.getString("installationId"),
                     stored.getString("operationId"), stored.getLong("generation"));
             StorageBinding.Mode mode = StorageBinding.Mode.valueOf(stored.getString("mode"));
             String defaultId = stored.getString("defaultSourceId");
             if (currentGeneration < scope.generation() || !(BOUND.equals(state.get("phase")) || "COMPLETE".equals(state.get("phase")))
-                    || !Long.valueOf(version).equals(state.get("bindingVersion"))
+                    || !version.equals(state.get("bindingVersion"))
                     || !defaultId.equals(state.get("defaultSourceId"))) throw unreadable();
             // A later purpose may advance capability generation; installation and original operation remain fixed.
             if (!scope.clusterId().equals(state.get("clusterId"))

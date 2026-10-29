@@ -97,6 +97,8 @@ final class InstallationFiles {
     }
 
     /** A separate lock region admits one service process without blocking owner CLI file updates. */
+    // The shared file state owns the channel; RuntimeOwner retains its lock and closeIdle releases failed opens.
+    @SuppressWarnings("java:S2095")
     RuntimeOwner ownRuntime() {
         shared.mutex.lock();
         try {
@@ -147,6 +149,8 @@ final class InstallationFiles {
         final Path directory;
         FileChannel channel;
         Object fileKey;
+        // Identity must be readable without reversing the file mutex and runtime lock order.
+        @SuppressWarnings("java:S3077")
         volatile RuntimeOwner runtime;
         boolean mutation;
         volatile boolean poisoned;

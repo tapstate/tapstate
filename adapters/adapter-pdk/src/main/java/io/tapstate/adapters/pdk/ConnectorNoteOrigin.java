@@ -61,8 +61,14 @@ public final class ConnectorNoteOrigin {
             case Long ignored -> "long";
             case Short ignored -> "short";
             case Byte ignored -> "byte";
-            case Double number when Double.isFinite(number) -> "double";
-            case Float number when Float.isFinite(number) -> "float";
+            case Double number -> {
+                if (!Double.isFinite(number)) throw invalid();
+                yield "double";
+            }
+            case Float number -> {
+                if (!Float.isFinite(number)) throw invalid();
+                yield "float";
+            }
             case java.math.BigInteger ignored -> "big-integer";
             case java.math.BigDecimal ignored -> "big-decimal";
             default -> throw invalid();

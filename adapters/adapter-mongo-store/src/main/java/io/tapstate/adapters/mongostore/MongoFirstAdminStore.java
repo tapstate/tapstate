@@ -88,14 +88,14 @@ final class MongoFirstAdminStore implements FirstAdminStore {
         @Override public Optional<User> find(String username) {
             Objects.requireNonNull(username, "username");
             return StoreIo.call(() -> transaction(session -> {
-                load(session).orElseThrow(MongoFirstAdminStore::refused);
+                if (load(session).isEmpty()) throw refused();
                 return Optional.ofNullable(users.find(session, new Document("_id", username)).first()).map(MongoFirstAdminStore::decodeUser);
             }));
         }
 
         @Override public boolean isEmpty() {
             return StoreIo.call(() -> transaction(session -> {
-                load(session).orElseThrow(MongoFirstAdminStore::refused);
+                if (load(session).isEmpty()) throw refused();
                 return users.find(session).limit(1).first() == null;
             }));
         }

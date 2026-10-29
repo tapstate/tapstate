@@ -142,7 +142,7 @@ final class NativePipelineDeletion implements ArtifactMutationService.PipelineDe
                         () -> {active.run();control.requireHeld();active.run();});
             });
             try {
-                if (pending.isPresent()) coordinator.resume(scope,request.operationId(),manifest).orElseThrow(NativePipelineDeletion::fenced);
+                if (pending.isPresent()) { if (coordinator.resume(scope,request.operationId(),manifest).isEmpty()) throw fenced(); }
                 else coordinator.delete(request,manifest);
             } catch (TapstateException failed) {
                 var current=configuration.artifacts().get(original.id());

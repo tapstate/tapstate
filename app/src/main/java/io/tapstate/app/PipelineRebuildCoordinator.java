@@ -56,7 +56,7 @@ final class PipelineRebuildCoordinator {
         guard.run();stores.configuration().requirePending(original);
         for(var member:stores.consumers().guardedBy(guard).forPipeline(request.originalScope())) {
             guard.run();if(member.detached())continue;
-            stores.consumers().guardedBy(guard).detachForRebuild(original,member,currentNode).orElseThrow(PipelineRebuildCoordinator::fenced);
+            if (stores.consumers().guardedBy(guard).detachForRebuild(original,member,currentNode).isEmpty()) throw fenced();
         }
         var snapshot=ReadOnlyArtifactSnapshot.capture(stores.artifacts());
         var pipeline=PipelineInlining.inline(StoredArtifacts.requirePipeline(snapshot,request.originalScope().pipelineId()),snapshot);

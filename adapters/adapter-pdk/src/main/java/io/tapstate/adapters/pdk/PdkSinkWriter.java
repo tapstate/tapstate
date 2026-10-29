@@ -63,6 +63,8 @@ final class PdkSinkWriter implements SinkWriter {
     private final Runnable letGo;
     private final Map<String, TapTable> tableModels = new LinkedHashMap<>();
     // Blocking connector calls must leave the shared async pool available for engine lifecycle callbacks.
+    // Publishes worker identity for self-join avoidance; Thread manages its mutable state.
+    @SuppressWarnings("java:S3077")
     private volatile Thread writeThread;
     private boolean delivering;
     private final ExecutorService writes = Executors.newSingleThreadExecutor(task -> {

@@ -228,7 +228,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             if(session.bounded && !session.sources.isEmpty()) {
                 var captures=new LinkedHashMap<String,CaptureCacheState>();
                 session.sources.forEach((id,source) -> captures.put(id,new CaptureCacheState(source.owner.prepared,source.owner.fence,Optional.empty())));
-                epoch=state.advanceOrder(prior,prior,captures);
+                epoch=Objects.requireNonNull(state,"bounded capture requires snapshot state").advanceOrder(prior,prior,captures);
                 for(var source:session.sources.values())snapshots.put(source.id,new PipelineCaptureBindings.SnapshotOnlySource(source.selected.chainId().value(),Set.copyOf(source.selected.tables()),epoch));
             }
             var direct=new LinkedHashMap<String,DirectSourceRun>();

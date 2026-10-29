@@ -30,6 +30,8 @@ final class NativeSharedSrsRecovery implements AutoCloseable {
     private final HazelcastInstance member;
     private final SharedSrsRecoveryInspector inspector;
     private final SharedSrsPreviewMember participant;
+    // Publishes a fixed plan/ticket identity; ticket phase flags have their own visibility.
+    @SuppressWarnings("java:S3077")
     private volatile Finalized finalized;
 
     NativeSharedSrsRecovery(MongoConfigurationDomain configuration,MongoCacheDomain cache,CacheAuthScope auth,

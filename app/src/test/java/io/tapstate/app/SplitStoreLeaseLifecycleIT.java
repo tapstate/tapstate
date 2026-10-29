@@ -81,7 +81,7 @@ class SplitStoreLeaseLifecycleIT {
             assertThat(root.runtime().requireConfiguration().artifacts().get("views")).isPresent();
             try (MongoClient configObserver = MongoClients.create(CONFIG.getReplicaSetUrl(configDb))) {
                 assertThat(configObserver.getDatabase(configDb).listCollectionNames().into(new ArrayList<>()))
-                        .doesNotContain("workload_claims", "keyring_acks", "source_config_keyring_sessions");
+                        .isNotEmpty().doesNotContain("workload_claims", "keyring_acks", "source_config_keyring_sessions");
             }
 
             CONFIG.getDockerClient().pauseContainerCmd(CONFIG.getContainerId()).exec();
