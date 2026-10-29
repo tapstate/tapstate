@@ -102,7 +102,7 @@ class ArtifactController {
      * as a hash that simply does not match, answering "someone else changed it" (412) for a request that
      * never carried a version at all (428).
      */
-    private static String expectedHash(String id, String ifMatch) {
+    static String expectedHash(String id, String ifMatch) {
         if (ifMatch == null || !ifMatch.matches(QUOTED_HASH)) {
             throw new TapstateException(ArtifactError.PRECONDITION_REQUIRED, Map.of("id", id), null);
         }

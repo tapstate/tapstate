@@ -237,6 +237,14 @@ public final class ArtifactMutationService {
      * partly-executed removal would do next — learning nothing about the residue it now owns.
      */
     public void delete(String principal, String id, String expectedContentHash) {
+        delete(principal, id, expectedContentHash, ControlOperations.ARTIFACT_DELETE);
+    }
+
+    void deletePipeline(String principal, String id, String expectedContentHash) {
+        delete(principal, id, expectedContentHash, ControlOperations.PIPELINE_DELETE);
+    }
+
+    private void delete(String principal, String id, String expectedContentHash, Operation operation) {
         Objects.requireNonNull(principal, "principal");
         Objects.requireNonNull(id, "id");
         if (expectedContentHash == null) {
@@ -271,7 +279,7 @@ public final class ArtifactMutationService {
         // runs before the compare below, and on the branch where that compare refuses, the version the
         // caller offered is the only one that describes the attempt.
         AuditContext audit = new AuditContext(principal, id, expectedContentHash);
-        auditGate.dispatch(ControlOperations.ARTIFACT_DELETE, audit, () -> {
+        auditGate.dispatch(operation, audit, () -> {
             switch (store.delete(id, expectedContentHash)) {
                 case DELETED -> {
                 }

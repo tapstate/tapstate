@@ -31,6 +31,7 @@ import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.control.core.PasswordHasher;
 import io.tapstate.control.core.PipelineLifecycleService;
 import io.tapstate.control.core.PipelineDraftService;
+import io.tapstate.control.core.PipelineDeletionService;
 import io.tapstate.control.core.PipelineCatalogService;
 import io.tapstate.control.core.PipelineLayoutService;
 import io.tapstate.control.core.PipelineLogQueryService;
@@ -178,6 +179,7 @@ class PipelineApiTest {
         artifacts.seed(SOURCE_X);
         artifacts.seed(SOURCE_TARGET);
         artifacts.seed(PIPELINE_V1);
+        context.getBean(DeletionReclaims.class).clear();
     }
 
     private RestClient client() {
@@ -414,6 +416,167 @@ class PipelineApiTest {
                 .retrieve().toBodilessEntity();
         assertThat(deleted.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
         assertThat(context.getBean(FakePipelineDraftStore.class).get("draft-p1")).isEmpty();
+    }
+
+    @Test
+    void deletingAWebPipelineRemovesItsArtifactAndDraftInOneConditionalRequest() {
+        String token = machineToken(Scope.WRITE);
+        String artifactHash = CanonicalHash.of(context.getBean(FakeArtifactStore.class)
+                .get("pl1").orElseThrow());
+        String draft = """
+                {"pipelineId":"pl1","mode":"dag","name":"Orders pipeline",
+                 "baseArtifactHash":"%s",
+                 "graph":{"nodes":[],"edges":[],"viewport":{"x":0,"y":0,"zoom":1}}}
+                """.formatted(artifactHash);
+        ResponseEntity<Map> created = client().post().uri("/api/pipelines/pl1/draft")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON).body(draft).retrieve().toEntity(Map.class);
+
+        context.getBean(DeletionReclaims.class).seed("pl1");
+        ResponseEntity<Void> deleted = client().method(HttpMethod.DELETE).uri("/api/pipelines/pl1")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .header(HttpHeaders.IF_MATCH, "\"" + artifactHash + "\"")
+                .header("If-Draft-Match", created.getHeaders().getETag())
+                .exchange((request, response) -> ResponseEntity.status(response.getStatusCode())
+                        .headers(response.getHeaders()).build());
+
+        assertThat(deleted.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(context.getBean(FakeArtifactStore.class).get("pl1")).isEmpty();
+        assertThat(context.getBean(FakePipelineDraftStore.class).get("pl1")).isEmpty();
+        assertThat(context.getBean(DeletionReclaims.class).records).isEmpty();
+        assertThat(context.getBean(RecordingAuditStore.class).records.stream()
+                .map(AuditRecord::operationId).filter(operation -> operation.endsWith(".delete")).toList())
+                .containsExactly("pipeline.delete", "pipeline-draft.delete");
+    }
+
+    @Test
+    void aLifecycleRefusalLeavesTheArtifactAndDraftUntouched() {
+        String token = machineToken(Scope.WRITE);
+        String artifactHash = CanonicalHash.of(context.getBean(FakeArtifactStore.class)
+                .get("pl1").orElseThrow());
+        String draft = """
+                {"pipelineId":"pl1","mode":"dag","name":"Orders pipeline",
+                 "baseArtifactHash":"%s",
+                 "graph":{"nodes":[],"edges":[],"viewport":{"x":0,"y":0,"zoom":1}}}
+                """.formatted(artifactHash);
+        ResponseEntity<Map> created = client().post().uri("/api/pipelines/pl1/draft")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON).body(draft).retrieve().toEntity(Map.class);
+        client().post().uri("/api/pipelines/pl1:start")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .retrieve().toBodilessEntity();
+
+        ApiError refusal = client().method(HttpMethod.DELETE).uri("/api/pipelines/pl1")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .header(HttpHeaders.IF_MATCH, "\"" + artifactHash + "\"")
+                .header("If-Draft-Match", created.getHeaders().getETag())
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
+                    return response.bodyTo(ApiError.class);
+                });
+
+        assertThat(refusal.code()).isEqualTo("artifact.pipeline-not-stopped");
+        assertThat(context.getBean(FakeArtifactStore.class).get("pl1")).isPresent();
+        assertThat(context.getBean(FakePipelineDraftStore.class).get("pl1")).isPresent();
+        assertThat(context.getBean(RecordingAuditStore.class).records)
+                .extracting(AuditRecord::operationId)
+                .doesNotContain("pipeline.delete", "pipeline-draft.delete", "artifact.delete");
+    }
+
+    @Test
+    void wholePipelineDeletionRequiresWriteScopeAndTheDraftRevisionThatWasRead() {
+        String hash = seedDeletionDraft();
+        ApiError forbidden = deleteWebPipeline(hash, "1", Scope.READ, HttpStatus.FORBIDDEN);
+        assertThat(forbidden.code()).isEqualTo("control.forbidden");
+        ApiError stale = deleteWebPipeline(hash, "2", Scope.WRITE, HttpStatus.PRECONDITION_FAILED);
+        assertThat(stale.code()).isEqualTo("pipeline-draft.revision-conflict");
+        assertThat(context.getBean(FakeArtifactStore.class).get("pl1")).isPresent();
+        assertThat(context.getBean(FakePipelineDraftStore.class).get("pl1")).isPresent();
+    }
+
+    @Test
+    void aDraftEditedDuringArtifactDeletionIsPreservedAndReportedAsIncomplete() {
+        String hash = seedDeletionDraft();
+        FakePipelineDraftStore drafts = context.getBean(FakePipelineDraftStore.class);
+        context.getBean(FakeArtifactStore.class).afterDelete = () -> {
+            PipelineDraft current = drafts.get("pl1").orElseThrow();
+            assertThat(drafts.replace("pl1", current.revision(),
+                    FakePipelineDraftStore.withRevision(current, current.revision() + 1)))
+                    .isEqualTo(PipelineDraftMutation.REPLACED);
+        };
+
+        ApiError partial = deleteWebPipeline(hash, "1", Scope.WRITE, HttpStatus.INTERNAL_SERVER_ERROR);
+
+        assertThat(partial.code()).isEqualTo("artifact.reclaim-incomplete");
+        assertThat(((List<?>) partial.params().get("residue")).stream().map(String::valueOf).toList())
+                .contains("pipeline-draft:pl1");
+        assertThat(context.getBean(FakeArtifactStore.class).get("pl1")).isEmpty();
+        assertThat(drafts.get("pl1").orElseThrow().revision()).isEqualTo(2);
+    }
+
+    @Test
+    void aConcurrentStartAndNewDraftAfterArtifactRemovalReportsThePreservedDraft() {
+        String hash = CanonicalHash.of(context.getBean(FakeArtifactStore.class).get("pl1").orElseThrow());
+        FakePipelineDraftStore drafts = context.getBean(FakePipelineDraftStore.class);
+        context.getBean(FakeArtifactStore.class).afterDelete = () -> {
+            context.getBean(FakeDesiredStore.class).save(new DesiredState("pl1", PipelineState.RUNNING, hash));
+            PipelineDraft concurrent = new PipelineDraft("pl1", PipelineDraft.CURRENT_SCHEMA_VERSION,
+                    1, PipelineDraft.Mode.DAG, "Concurrent authoring", null,
+                    new PipelineDraft.Graph(List.of(), List.of(), new PipelineDraft.Viewport(0, 0, 1)),
+                    null, null, null, null, NOW, NOW, "concurrent-author");
+            assertThat(drafts.create(concurrent)).isEqualTo(PipelineDraftMutation.CREATED);
+        };
+
+        ApiError partial = deleteWebPipeline(hash, "none", Scope.WRITE, HttpStatus.INTERNAL_SERVER_ERROR);
+
+        assertThat(partial.code()).isEqualTo("artifact.reclaim-incomplete");
+        assertThat(((List<?>) partial.params().get("residue")).stream().map(String::valueOf).toList())
+                .contains("pipeline-draft:pl1", "desired");
+        assertThat(context.getBean(FakeArtifactStore.class).get("pl1")).isEmpty();
+        assertThat(drafts.get("pl1").orElseThrow().name()).isEqualTo("Concurrent authoring");
+        assertThat(context.getBean(FakeDesiredStore.class).read("pl1").orElseThrow().targetState())
+                .isEqualTo(PipelineState.RUNNING);
+        assertThat(context.getBean(RecordingAuditStore.class).records)
+                .extracting(AuditRecord::operationId).contains("pipeline.delete")
+                .doesNotContain("pipeline-draft.delete");
+    }
+
+    @Test
+    void rawArtifactDeletionRetainsTheAuthoringDraft() {
+        String hash = seedDeletionDraft();
+        ResponseEntity<Void> deleted = client().method(HttpMethod.DELETE).uri("/api/artifacts/pl1")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.WRITE))
+                .header(HttpHeaders.IF_MATCH, "\"" + hash + "\"")
+                .retrieve().toBodilessEntity();
+
+        assertThat(deleted.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(context.getBean(FakeArtifactStore.class).get("pl1")).isEmpty();
+        assertThat(context.getBean(FakePipelineDraftStore.class).get("pl1")).isPresent();
+        assertThat(context.getBean(PipelineCatalogService.class).find("pl1").orElseThrow().hasArtifact()).isFalse();
+    }
+
+    private String seedDeletionDraft() {
+        String hash = CanonicalHash.of(context.getBean(FakeArtifactStore.class).get("pl1").orElseThrow());
+        String draft = """
+                {"pipelineId":"pl1","mode":"dag","name":"Orders pipeline",
+                 "baseArtifactHash":"%s",
+                 "graph":{"nodes":[],"edges":[],"viewport":{"x":0,"y":0,"zoom":1}}}
+                """.formatted(hash);
+        client().post().uri("/api/pipelines/pl1/draft")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.WRITE))
+                .contentType(MediaType.APPLICATION_JSON).body(draft).retrieve().toBodilessEntity();
+        return hash;
+    }
+
+    private ApiError deleteWebPipeline(String hash, String draftRevision, Scope scope, HttpStatus expectedStatus) {
+        return client().method(HttpMethod.DELETE).uri("/api/pipelines/pl1")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(scope))
+                .header(HttpHeaders.IF_MATCH, "\"" + hash + "\"")
+                .header("If-Draft-Match", "\"" + draftRevision + "\"")
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(expectedStatus);
+                    return response.bodyTo(ApiError.class);
+                });
     }
 
     @Test
@@ -1092,9 +1255,12 @@ class PipelineApiTest {
             Verb verb = handler.getMethodAnnotation(Verb.class);
             if (verb != null && verb.value().startsWith("pipeline.")) {
                 projectedPipelineVerbs.add(verb.value());
-                assertThat(cliExposed)
-                        .as("a projected pipeline verb must be a registered, CLI-exposed operation")
+                assertThat(ControlOperations.registry().ids())
+                        .as("a projected pipeline verb must be registered")
                         .contains(verb.value());
+                if (!"pipeline.delete".equals(verb.value())) {
+                    assertThat(cliExposed).contains(verb.value());
+                }
             }
         });
 
@@ -1103,7 +1269,7 @@ class PipelineApiTest {
                         + "operations, and derived schemas — projects onto the authenticated /api surface")
                 .containsExactlyInAnyOrder(
                         "pipeline.list", "pipeline.catalog", "pipeline.get", "pipeline.layout.get", "pipeline.layout.update", "pipeline.create",
-                        "pipeline.update",
+                        "pipeline.update", "pipeline.delete",
                         "pipeline.preview",
                         "pipeline.start", "pipeline.start-checks", "pipeline.stop", "pipeline.pause",
                         "pipeline.resume",
@@ -1410,13 +1576,27 @@ class PipelineApiTest {
             return new PipelineLayoutService(pipelines, layouts);
         }
 
-        // The removal controller comes in with the whole ControlHttpFace bundle, so its service must be
-        // present for the context to stand up. This suite exercises the lifecycle verbs, not the removal,
-        // so the dependent stores refuse rather than pretend: a reclaim reached from here is a defect.
         @Bean
+        DeletionReclaims deletionReclaims() {
+            return new DeletionReclaims();
+        }
+
+        @Bean
+        PipelineDeletionService pipelineDeletionService(
+                ArtifactQueryService artifacts, ArtifactMutationService mutations, PipelineDraftService drafts) {
+            return new PipelineDeletionService(artifacts, mutations, drafts);
+        }
+
+        @Bean
+        ArtifactMutationService artifactMutationService(ArtifactStore store, FakeDesiredStore desired,
+                FakePipelineLayoutStore layouts, ObservationStore observations,
+                DeletionReclaims reclaim, AuditGate auditGate) {
+            return new ArtifactMutationService(store, desired, reclaim.state(), observations, layouts,
+                    reclaim.srs(), reclaim.derived(), reclaim.rates(), auditGate, DataBrowserFollows.NONE);
+        }
+
         ArtifactMutationService artifactMutationService(ArtifactStore store, AuditGate auditGate) {
-            return new ArtifactMutationService(
-                    store, NoReclaimStores.desired(), NoReclaimStores.state(),
+            return new ArtifactMutationService(store, NoReclaimStores.desired(), NoReclaimStores.state(),
                     NoReclaimStores.observations(), NoReclaimStores.srsMeta(),
                     NoReclaimStores.derivedSchemas(), auditGate, DataBrowserFollows.NONE);
         }
@@ -1587,7 +1767,7 @@ class PipelineApiTest {
             return new ObservationStore() {
                 @Override
                 public void delete(String pipelineId) {
-                    throw new UnsupportedOperationException("removal is not exercised by this double");
+                    context.getBean(DeletionReclaims.class).records.remove("observation:" + pipelineId);
                 }
 
                 @Override
@@ -1852,9 +2032,11 @@ class PipelineApiTest {
     /** An in-memory artifact store holding resources by id, seedable from pipeline DSL. */
     static final class FakeArtifactStore implements ArtifactStore {
         private final Map<String, Resource> byId = new LinkedHashMap<>();
+        Runnable afterDelete = () -> {};
 
         void clear() {
             byId.clear();
+            afterDelete = () -> {};
         }
 
         void seed(String dsl) {
@@ -1904,6 +2086,18 @@ class PipelineApiTest {
         }
 
         @Override
+        public io.tapstate.spi.store.ArtifactMutation delete(String id, String expectedContentHash) {
+            Resource current = byId.get(id);
+            if (current == null) return io.tapstate.spi.store.ArtifactMutation.NOT_FOUND;
+            if (!CanonicalHash.of(current).equals(expectedContentHash)) {
+                return io.tapstate.spi.store.ArtifactMutation.VERSION_CONFLICT;
+            }
+            byId.remove(id);
+            afterDelete.run();
+            return io.tapstate.spi.store.ArtifactMutation.DELETED;
+        }
+
+        @Override
         public Optional<Resource> get(String id) {
             return Optional.ofNullable(byId.get(id));
         }
@@ -1918,7 +2112,7 @@ class PipelineApiTest {
     static final class FakeDesiredStore implements DesiredStore {
         @Override
         public void delete(String pipelineId) {
-            throw new UnsupportedOperationException("removal is not exercised by this double");
+            byId.remove(pipelineId);
         }
 
         private final Map<String, DesiredState> byId = new LinkedHashMap<>();
@@ -2096,6 +2290,60 @@ class PipelineApiTest {
         @Override
         public void delete(String pipelineId) {
             byPipeline.remove(pipelineId);
+        }
+    }
+
+    /** Seeded bookkeeping whose removal is observed through the real reclaim sequence. */
+    static final class DeletionReclaims {
+        final Set<String> records = new java.util.LinkedHashSet<>();
+
+        void clear() { records.clear(); }
+
+        void seed(String id) {
+            for (String kind : List.of("state", "observation", "consumer", "derived", "rate")) {
+                records.add(kind + ":" + id);
+            }
+        }
+
+        io.tapstate.spi.store.StateStore state() {
+            return proxy(io.tapstate.spi.store.StateStore.class, (method, args) -> switch (method) {
+                case "read" -> records.contains("state:" + args[0])
+                        ? Optional.of(io.tapstate.core.lifecycle.CheckpointDoc.initial((String) args[0],
+                                io.tapstate.core.lifecycle.StateJson.of(PipelineState.STOPPED), NOW))
+                        : Optional.empty();
+                case "delete" -> { records.remove("state:" + args[0]); yield null; }
+                default -> throw new AssertionError("unexpected state operation " + method);
+            });
+        }
+
+        io.tapstate.spi.store.SrsMetaStore srs() {
+            return proxy(io.tapstate.spi.store.SrsMetaStore.class, (method, args) -> switch (method) {
+                case "miningChainIdsWithConsumer" -> records.contains("consumer:" + args[0])
+                        ? List.of("fixture-chain") : List.of();
+                case "detachConsumer" -> { records.remove("consumer:" + args[1]); yield null; }
+                default -> throw new AssertionError("unexpected SRS operation " + method);
+            });
+        }
+
+        io.tapstate.spi.store.DerivedSchemaStore derived() {
+            return proxy(io.tapstate.spi.store.DerivedSchemaStore.class, (method, args) -> {
+                if (!"delete".equals(method)) throw new AssertionError("unexpected derived operation " + method);
+                records.remove("derived:" + args[0]);
+                return null;
+            });
+        }
+
+        io.tapstate.spi.store.RateHistoryStore rates() {
+            return proxy(io.tapstate.spi.store.RateHistoryStore.class, (method, args) -> {
+                if (!"deleteAll".equals(method)) throw new AssertionError("unexpected rate operation " + method);
+                records.remove("rate:" + args[0]);
+                return null;
+            });
+        }
+
+        private static <T> T proxy(Class<T> type, java.util.function.BiFunction<String, Object[], Object> operation) {
+            return type.cast(java.lang.reflect.Proxy.newProxyInstance(type.getClassLoader(), new Class<?>[] {type},
+                    (proxy, method, args) -> operation.apply(method.getName(), args)));
         }
     }
 
