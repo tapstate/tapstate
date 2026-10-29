@@ -61,8 +61,18 @@ public final class PdkValidationCounts implements AutoCloseable {
             throw invalid("databaseBinding");
     }
 
-    /** One original attempt. Failure, cancellation or a missing table never becomes a zero count. */
-    public long count() {
+    /** One original count attempt. Failure, cancellation or a missing table never becomes a zero count. */
+    public long count() { return attempt(false).count(); }
+
+    /**
+     * Independent metadata/capability inspection only: never invokes count, query or value discovery.
+     * Method presence and native table enumeration are observations, not proof of a successful future
+     * scalar read. The original handle still owns initialization/cleanup and may be attempted once.
+     */
+    public Operation inspect() { return attempt(true).operation(); }
+
+    private record Outcome(Operation operation,Long count) {}
+    private Outcome attempt(boolean metadataOnly) {
         synchronized (state) {
             if(cancelled)throw new TapstateException(ValidationError.READ_CANCELLED,Map.of("table",request.table()),null);
             if (started || returned) throw invalid("alreadyAttempted");
@@ -80,6 +90,9 @@ public final class PdkValidationCounts implements AutoCloseable {
                 requireTable(opened);
                 Operation operation=operation(opened);
                 if(operation==Operation.DOCUMENT_COUNT&&(request.database()==null||request.database().isBlank()))throw invalid("database");
+                if(operation==Operation.PARTITION_FILTER&&opened.functions().getCountByPartitionFilterFunction()==null)throw missing("count-by-partition-filter");
+                if(operation==Operation.DOCUMENT_COUNT&&opened.functions().getExecuteCommandFunction()==null)throw missing("execute-command-count");
+                if(metadataOnly){check();return new Outcome(operation,null);}
                 long count;
                 if (operation == Operation.PARTITION_FILTER) {
                     var function = opened.functions().getCountByPartitionFilterFunction();
@@ -97,7 +110,7 @@ public final class PdkValidationCounts implements AutoCloseable {
                     count = PdkValidationCounter.callback(request.table(),
                             sink -> function.execute(opened.context(), command, result -> sink.accept(result)), this::check);
                 }
-                requireTable(opened); check(); return count;
+                requireTable(opened); check(); return new Outcome(operation,count);
             });
         } catch (Throwable failed) {
             record(failed); throw failure();

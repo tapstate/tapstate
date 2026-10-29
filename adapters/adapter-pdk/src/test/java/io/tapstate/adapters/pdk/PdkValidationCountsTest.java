@@ -50,7 +50,6 @@ class PdkValidationCountsTest {
                         sink.accept(mode(c).equals("missing")?List.of():mode(c).equals("catalog")?List.of("records","other_records"):List.of("records"));
                     });
                     f.supportBatchCount((c,t) -> { throw new AssertionError("estimate fallback"); });
-                    f.supportQueryByAdvanceFilter((c,q,t,s) -> { throw new AssertionError("business row scan"); });
                     f.supportCountByPartitionFilterFunction((c,t,q) -> {
                         loader(); called(c,"counts");
                         if (!t.getId().equals("records") || q.getLimit()!=null || q.getSkip()!=null)
@@ -102,6 +101,62 @@ class PdkValidationCountsTest {
         return new PdkValidationCounts(new ConnectionConfig("source","fixture",settings), artifact,
                 new PdkValidationCounts.Request("records", "db", operation), () -> {});
     }
+    @Test void metadataInspectionRejectsMissingNativeMethodsWithoutTryingStatistics(){
+        var jar=SyntheticJar.compileToJar(directory,"synthetic.NoNativeCount","""
+            package synthetic;
+            import io.tapdata.pdk.apis.TapConnector;
+            import io.tapdata.pdk.apis.functions.ConnectorFunctions;
+            import io.tapdata.entity.codec.TapCodecsRegistry;
+            import io.tapdata.entity.schema.TapTable;
+            import io.tapdata.pdk.apis.context.TapConnectionContext;
+            import io.tapdata.pdk.apis.entity.ConnectionOptions;
+            import io.tapdata.pdk.apis.entity.TestItem;
+            import java.util.*;
+            import java.util.function.Consumer;
+            public class NoNativeCount implements TapConnector {
+                public void registerCapabilities(ConnectorFunctions functions,TapCodecsRegistry codecs){
+                    functions.supportGetTableNamesFunction((context,batch,sink)->sink.accept(List.of("records")));
+                    functions.supportBatchCount((context,table)->{throw new AssertionError("estimated statistics are not native count capability");});
+                }
+                public void init(TapConnectionContext context){}
+                public void stop(TapConnectionContext context){}
+                public void discoverSchema(TapConnectionContext context,List<String> names,int size,Consumer<List<TapTable>> sink){throw new AssertionError("value discovery is not count capability");}
+                public ConnectionOptions connectionTest(TapConnectionContext context,Consumer<TestItem> sink){return ConnectionOptions.create();}
+                public int tableCount(TapConnectionContext context){return 1;}
+            }
+            """);
+        var noCount=new ConnectorRef(List.of(jar),"synthetic.NoNativeCount","2.0.8",null);
+        for(var operation:PdkValidationCounts.Operation.values()){
+            try(var reader=new PdkValidationCounts(new ConnectionConfig("source","fixture",Map.of("database","db")),noCount,
+                    new PdkValidationCounts.Request("records","db",operation),()->{})){
+                assertThatThrownBy(reader::inspect).isInstanceOfSatisfying(TapstateException.class,
+                        failed->assertThat(failed.code()).isEqualTo(ConnectorError.CAPABILITY_MISSING));
+                assertThat(reader.drained()).isTrue();assertThat(reader.callExited().toCompletableFuture()).isCompletedExceptionally();
+            }
+        }
+    }
+
+    @Test void metadataInspectionNeverCountsOrDiscoversValueModelsAndRetainsOneOriginalAttempt(){
+        for(var operation:PdkValidationCounts.Operation.values()){
+            var values=settings("fail");
+            try(var reader=read(values,operation)){
+                assertThat(reader.inspect()).isEqualTo(operation==PdkValidationCounts.Operation.NATIVE_PROTOCOL
+                        ?PdkValidationCounts.Operation.PARTITION_FILTER:operation);
+                assertThat((AtomicInteger)values.get("counts")).hasValue(0);assertThat((AtomicInteger)values.get("metadata")).hasValue(1);
+                assertThat((AtomicInteger)values.get("inits")).hasValue(1);assertThat(reader.drained()).isTrue();
+                assertThat(reader.callExited().toCompletableFuture()).isCompleted();
+                assertThatThrownBy(reader::count).isInstanceOf(TapstateException.class);
+                assertThatThrownBy(reader::inspect).isInstanceOf(TapstateException.class);
+            }
+        }
+        var missing=settings("missing");
+        try(var reader=read(missing,PdkValidationCounts.Operation.NATIVE_PROTOCOL)){
+            assertThatThrownBy(reader::inspect).isInstanceOfSatisfying(TapstateException.class,
+                    failed->assertThat(failed.code()).isEqualTo(ValidationError.READ_PROTOCOL_VIOLATION));
+            assertThat((AtomicInteger)missing.get("counts")).hasValue(0);assertThat(reader.drained()).isTrue();
+        }
+    }
+
     @Test void exactNativeScalarHasNoBusinessRowsDiscoveryOrEstimateFallback() {
         for (var operation : PdkValidationCounts.Operation.values()) {
             var settings = settings("large");
