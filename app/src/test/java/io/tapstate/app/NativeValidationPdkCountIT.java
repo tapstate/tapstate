@@ -207,7 +207,7 @@ class NativeValidationPdkCountIT {
                     metadata.binding().modelVersion(),metadata.binding().codecBinding());
         }
     }
-    private static ConnectorRef artifact(String kind)throws Exception{
+    static ConnectorRef artifact(String kind)throws Exception{
         var configured=System.getProperty("tapstate.pdk.it."+kind+"-jar");assertThat(configured).as("real connector artifact for %s",kind).isNotBlank();
         var path=Path.of(configured);var hash=MessageDigest.getInstance("SHA-256");
         try(var input=Files.newInputStream(path)){var buffer=new byte[8192];for(int read;(read=input.read(buffer))!=-1;)hash.update(buffer,0,read);}

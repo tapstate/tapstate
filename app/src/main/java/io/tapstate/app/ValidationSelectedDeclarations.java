@@ -18,8 +18,11 @@ final class ValidationSelectedDeclarations {
     private final ValidationTaskStore.DeclarationInputs original;
     private final ReadOnlyArtifactSnapshot artifacts;
     private final List<ValidationDirectMappings.Declared> mappings;
+    private final Map<String,ValidationDeclarations.Inspection> inspections;
     private ValidationSelectedDeclarations(ValidationTaskStore.DeclarationInputs original,ReadOnlyArtifactSnapshot artifacts,
-            List<ValidationDirectMappings.Declared> mappings){this.original=original;this.artifacts=artifacts;this.mappings=mappings;}
+            List<ValidationDirectMappings.Declared> mappings,Map<String,ValidationDeclarations.Inspection> inspections){
+        this.original=original;this.artifacts=artifacts;this.mappings=mappings;this.inspections=Map.copyOf(inspections);
+    }
 
     /** The caller owns the admitted metadata frame until all returned declarations and models are released. */
     static ValidationSelectedDeclarations inspect(ValidationTaskStore.DeclarationInputs original,List<Choice> choices){
@@ -53,7 +56,7 @@ final class ValidationSelectedDeclarations {
         var mappings=ValidationDirectMappings.declare(artifacts,draft,mapping->inspections.get(mapping.outputId()));
         for(var mapping:mappings)if(!PipelineTableSelection.selectsName(mapping.from(),mapping.source(),mapping.mapping().source().table()))
             throw invalid("sourceTableScope");
-        return new ValidationSelectedDeclarations(original,artifacts,mappings);
+        return new ValidationSelectedDeclarations(original,artifacts,mappings,inspections);
     }
     private static ValidationTaskSpec.Table table(String node,SourceResource resource,String table){
         return new ValidationTaskSpec.Table(node,resource.id(),namespace(resource,"database"),namespace(resource,"schema"),table,null,null);
@@ -64,6 +67,7 @@ final class ValidationSelectedDeclarations {
     }
     ValidationTaskStore.DeclarationInputs original(){return original;}
     ArtifactStore artifacts(){return artifacts;}
+    ValidationDeclarations.Inspection output(String id){var value=inspections.get(id);if(value==null)throw invalid("output");return value;}
     List<ValidationDirectMappings.Declared> mappings(){return mappings;}
     @Override public String toString(){return "ValidationSelectedDeclarations[mappings="+mappings.size()+"]";}
     private static void identifier(String value){if(value==null||value.isBlank())throw invalid("identity");ValidationError.fieldName(value,"selection.identity");}

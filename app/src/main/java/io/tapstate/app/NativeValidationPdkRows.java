@@ -256,10 +256,13 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
                 binding.components().stream().map(ValidationKeyBinding.Component::path).toList(),key);
     }
     private static void requireStaticScope(ValidationSavedDeclarations saved,ValidationDirectMappings.Declared declared){
+        requireStaticScope(saved.mapping(declared.mapping().mappingId()),declared);
+    }
+    static void requireStaticScope(io.tapstate.core.dsl.ValidationDeclarations.Inspection inspection,ValidationDirectMappings.Declared declared){
         var mapping=declared.mapping();
         // This proves saved selection intent only; native existence and models are still independent reads.
         ValidationDirectMappings.requireSourceTable(declared,new SourceTable(mapping.source().table(),List.of(),List.of(),List.of()));
-        if(saved.mapping(mapping.mappingId()).routes().stream().noneMatch(route->route.table()==null))return;
+        if(inspection.routes().stream().noneMatch(route->route.table()==null))return;
         if(declared.source().tables()==null||declared.source().tables().stream().anyMatch(selector->selector instanceof TableRef.Regex))
             throw unsupported("from","direct.table-scope-unknown");
         for(var selector:declared.source().tables()){

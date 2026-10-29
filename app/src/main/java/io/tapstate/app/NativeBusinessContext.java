@@ -265,6 +265,10 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                     local.getAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE), local.getAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE),
                     member.getConfig().getJetConfig().getCooperativeThreadCount(), owner.memberStorage::requireNode);
         }
+        @Bean NativeValidationMetadata nativeValidationMetadata(NativeBusinessContext owner,ValidationMemberResources.Member resources,
+                ConnectorProvisioner provisioner,Clock clock){
+            return new NativeValidationMetadata(owner.configuration,resources,provisioner,clock);
+        }
         @Bean(destroyMethod = "close") NativeValidationOwnerReservations nativeValidationOwnerReservations(
                 NativeBusinessContext owner, HazelcastInstance member, NodeSessionLease node, ClusterMembershipGate membership,
                 ValidationMemberResources.Member resources, ValidationMemberResources process, ValidationOwnerTimers timers, ClusterProperties cluster,

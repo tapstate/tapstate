@@ -10,6 +10,24 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import static org.assertj.core.api.Assertions.*;
 
 class ValidationMemberResourcesTest {
+    @Test void aBlockingMetadataConsumerHasAnExplicitThirdWorkerAndNoRunProcessors()throws Exception{
+        var entered=new CountDownLatch(3);var release=new CountDownLatch(1);
+        try(var process=new ValidationMemberResources()){
+            var member=process.bind("cluster","node","boot",4,()->{});var probe=member.admitProbeWithConsumer();
+            Runnable blocked=()->{entered.countDown();while(release.getCount()!=0)try{release.await();}catch(InterruptedException ignored){/* Actual native bodies may ignore cancellation. */}};
+            var query=probe.queryExecutor().submit(blocked);var decode=probe.decodeExecutor().submit(blocked);var consumer=probe.consumerExecutor().submit(blocked);
+            try{
+                assertThat(entered.await(2,TimeUnit.SECONDS)).isTrue();
+                assertThat(member.snapshot().processReserved()).isEqualTo(new ValidationLocalBudget.Amount(16L*1024*1024,3,1,1));
+                assertThat(member.snapshot().data().runs()).isZero();assertThat(member.snapshot().processors()).isZero();
+                assertThatThrownBy(()->probe.consumerExecutor().submit(()->{})).isInstanceOf(TapstateException.class).hasMessageContaining("metadataWorkers");
+                probe.close();assertThat(member.snapshot().metadataFrames()).isOne();consumer.cancel(true);
+                assertThat(member.snapshot().processReserved().isEmpty()).isFalse();release.countDown();query.get(2,TimeUnit.SECONDS);decode.get(2,TimeUnit.SECONDS);
+                probe.released().toCompletableFuture().get(2,TimeUnit.SECONDS);assertThat(member.snapshot().metadataFrames()).isZero();
+            }finally{release.countDown();probe.close();}
+            try(var count=member.admitProbe()){assertThatThrownBy(count::consumerExecutor).isInstanceOf(TapstateException.class).hasMessageContaining("probeConsumer");}
+        }finally{release.countDown();}
+    }
     @Test void aMinimalWorkerReceiptPreservesFatalDiagnosisPriority()throws Exception{
         var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
         try(var process=new ValidationMemberResources()){

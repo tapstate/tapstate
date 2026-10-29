@@ -63,10 +63,14 @@ final class ValidationMemberResources implements AutoCloseable {
             try { require(); return new Metadata(); } catch (RuntimeException | Error failed) { metadata.release(); throw failed; }
         }
         /** Independent metadata discovery has no fictitious validation owner, run or cooperative processor. */
-        Probe admitProbe(){
+        Probe admitProbe(){return admitProbe(false);}
+        /** A blocking metadata consumer is a third paid worker; native query and decode retain their own slots. */
+        Probe admitProbeWithConsumer(){return admitProbe(true);}
+        private Probe admitProbe(boolean consumer){
             var frame=admitMetadata();Unbound allocation=null;
             try{
-                allocation=reserve(new ValidationLocalBudget.Amount(16L*1024*1024,2,1,1),0);var probe=new Probe(this,frame,allocation);
+                int workers=consumer?3:2;
+                allocation=reserve(new ValidationLocalBudget.Amount(16L*1024*1024,workers,1,1),0);var probe=new Probe(this,frame,allocation,workers);
                 synchronized(ValidationMemberResources.this){if(closed||retired)throw invalid("resources.contextClosed");probes.add(probe);}
                 return probe;
             }
@@ -142,12 +146,14 @@ final class ValidationMemberResources implements AutoCloseable {
         private final Set<Handle> handles=new HashSet<>();
         private final CompletableFuture<Void> released=new CompletableFuture<>();
         private final io.tapstate.core.validation.ValidationFailureLatch failure=new io.tapstate.core.validation.ValidationFailureLatch();
-        private final ExecutorService query=new ProbeExecutor(queries),decode=new ProbeExecutor(decoders);
+        private final ExecutorService query=new ProbeExecutor(queries),decode=new ProbeExecutor(decoders),consumer=new ProbeExecutor(checks);
+        private final int workerLimit;
         private int workers;private boolean retiring,returned;private ScheduledFuture<?> retry;
-        Probe(Member member,Metadata frame,Unbound allocation){this.member=member;this.frame=frame;this.allocation=allocation;}
+        Probe(Member member,Metadata frame,Unbound allocation,int workerLimit){this.member=member;this.frame=frame;this.allocation=allocation;this.workerLimit=workerLimit;}
         CompletionStage<Void> released(){return released.minimalCompletionStage();}
         ExecutorService queryExecutor(){require();return query;}
         ExecutorService decodeExecutor(){require();return decode;}
+        ExecutorService consumerExecutor(){require();if(workerLimit!=3)throw invalid("resources.probeConsumer");return consumer;}
         void require(){member.require();synchronized(this){if(retiring)throw invalid("resources.probeClosed");}}
         /** Construction must remain deferred until this handle is remembered; one independent connection at a time. */
         void retain(AutoCloseable original,CompletionStage<Void> workersExited,CompletionStage<Void> rowsReleased){
@@ -184,7 +190,7 @@ final class ValidationMemberResources implements AutoCloseable {
                 // Dispatch only on the process timer; rejected or failed original closes stay retryable.
                 if(retry==null&&handles.stream().anyMatch(handle->!handle.closeSucceeded))retry=controlTicks(this::retryCleanup);
             }
-            query.shutdown();decode.shutdown();retryCleanup();releaseIfDone();
+            query.shutdown();decode.shutdown();consumer.shutdown();retryCleanup();releaseIfDone();
         }
         private void retryCleanup(){
             List<Handle> originals;
@@ -213,7 +219,7 @@ final class ValidationMemberResources implements AutoCloseable {
             @Override public void execute(Runnable command){
                 Objects.requireNonNull(command);require();
                 synchronized(Probe.this){if(retiring||closed)throw new RejectedExecutionException("metadata executor is closed");
-                    if(workers==2)throw limit("validation.metadataWorkers");workers++;outstanding++;}
+                    if(workers==workerLimit)throw limit("validation.metadataWorkers");workers++;outstanding++;}
                 Runnable retained=()->{try{command.run();}finally{exited();}};
                 try{delegate.execute(retained);}
                 catch(RejectedExecutionException refused){exited();throw refused;}
