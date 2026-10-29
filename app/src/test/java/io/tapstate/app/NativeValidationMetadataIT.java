@@ -62,6 +62,9 @@ class NativeValidationMetadataIT {
                     assertThat(f.resources.snapshot().data().runs()).isZero();assertThat(f.resources.snapshot().processors()).isZero();
                     assertThat(f.resources.snapshot().processReserved().isEmpty()).isTrue();assertThat(f.resources.snapshot().metadataFrames()).isOne();
                     assertThat(result.released().toCompletableFuture()).isNotDone();
+                    var compiled=ValidationTaskCompiler.compile(result,Map.of(),null);
+                    assertThat(compiled.comparison().mappings()).allSatisfy(mapping->{assertThat(mapping.keys()).isNull();assertThat(mapping.source().modelVersion()).isNull();});
+                    assertThat(ValidationTaskCompiler.compile(result,Map.of(),compiled.comparison()).fingerprint()).isEqualTo(compiled.fingerprint());
                     assertThat(f.tasks.read("flow","task").orElseThrow()).isEqualTo(original);assertThat(f.configuration.configurationRevision()).isEqualTo(revision);
                     assertThat(f.member.getJet().getJobs()).isEmpty();
                     for(var db:List.of(sourceDb,targetDb)){
@@ -92,9 +95,62 @@ class NativeValidationMetadataIT {
                         assertThat(mapping.target().model().binding().codecBinding()).isNotEqualTo(mapping.source().model().binding().codecBinding());
                     });
                     assertThat(f.resources.snapshot().metadataFrames()).isOne();assertThat(f.resources.snapshot().data().runs()).isZero();
+                    var confirmation=new ValidationTaskCompiler.Confirmation(UUID.randomUUID(),List.of(new ValidationTaskCompiler.Pair("id","id")));
+                    var confirmations=Map.of("orders",confirmation,"items",confirmation);
+                    var compiled=ValidationTaskCompiler.compile(result,confirmations,null);
+                    assertThat(compiled.comparison().mappings()).allSatisfy(mapping->{
+                        assertThat(mapping.keys().source().getFirst().domain()).isEqualTo(ValidationKey.Kind.EXACT_NUMBER);
+                        assertThat(mapping.source().modelVersion()).isNotBlank();assertThat(mapping.target().codecBinding()).isNotBlank();
+                    });
+                    var task=new ValidationReportAdmission.Task("cluster","flow","compiled",UUID.randomUUID());
+                    assertThat(f.tasks.create(new ValidationTaskStore.Create(task,compiled.comparison(),ValidationTaskStore.Settings.defaults(ValidationMethod.UNIQUE_KEY,0),UUID.randomUUID())))
+                            .isEqualTo(ValidationTaskStore.Write.APPLIED);
+                    assertThat(f.tasks.inputs(task,1).orElseThrow().task().comparison()).isEqualTo(compiled.comparison());
+                    assertThat(ValidationTaskCompiler.compile(result,confirmations,compiled.comparison()).fingerprint()).isEqualTo(compiled.fingerprint());
+                    var renewed=new ValidationTaskCompiler.Confirmation(UUID.randomUUID(),confirmation.fields());
+                    var updated=ValidationTaskCompiler.compile(result,Map.of("orders",renewed,"items",confirmation),compiled.comparison());
+                    assertThat(updated.comparison().mappingRevision()).isEqualTo(2);
+                    assertThat(f.tasks.update(new ValidationTaskStore.Update(task,1,updated.comparison(),ValidationTaskStore.Settings.defaults(ValidationMethod.UNIQUE_KEY,0),UUID.randomUUID())))
+                            .isEqualTo(ValidationTaskStore.Write.APPLIED);
+                    var uninspected=new ValidationTaskCompiler.Confirmation(UUID.randomUUID(),List.of(new ValidationTaskCompiler.Pair("payload","payload")));
+                    assertThatThrownBy(()->ValidationTaskCompiler.compile(result,Map.of("orders",uninspected,"items",confirmation),null))
+                            .isInstanceOf(io.tapstate.core.common.TapstateException.class).hasMessageContaining("key-confirmation-preflight-required");
                 }finally{result.close();}
                 result.released().toCompletableFuture().get(2,TimeUnit.SECONDS);
                 assertThat(f.resources.snapshot().metadataFrames()).isZero();assertThatThrownBy(result::mappings).isInstanceOf(io.tapstate.core.common.TapstateException.class);
+            }finally{f.raw.getDatabase(sourceDb).drop();f.raw.getDatabase(targetDb).drop();}
+        }
+    }
+    @Test @Timeout(90) void fullColumnCompilationUsesCompleteModelsAndRejectsCrossSideIdentityCoercion()throws Exception{
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture()){
+            var sourceDb="metadata_source_"+f.suffix;var targetDb="metadata_target_"+f.suffix;
+            try{
+                seed(f,sourceDb,targetDb);var clock=Clock.systemUTC();var artifact=NativeValidationPdkCountIT.artifact("mongodb");
+                var evaluator=new NativeValidationMetadata(f.configuration,f.resources,id->artifact,clock);
+                try(var result=evaluator.inspect(new ValidationTaskStore.Selection("flow",List.of("out")),choices(),ValidationMethod.FULL_COLUMN,Map.of(),clock.instant().plusSeconds(30))){
+                    assertThat(result.mappings().getFirst().source().model().model().fields()).extracting(SourceField::name).contains("_id","id","payload","approximate");
+                    var confirmed=new ValidationTaskCompiler.Confirmation(UUID.randomUUID(),List.of(new ValidationTaskCompiler.Pair("id","id")));
+                    var confirmations=Map.of("orders",confirmed,"items",confirmed);var compiled=ValidationTaskCompiler.compile(result,confirmations,null);
+                    assertThat(compiled.method()).isEqualTo(ValidationMethod.FULL_COLUMN);compiled.comparison().requireFor(ValidationMethod.FULL_COLUMN,ValidationMode.FULL);
+                    var task=new ValidationReportAdmission.Task("cluster","flow","compiled-full",UUID.randomUUID());
+                    assertThat(f.tasks.create(new ValidationTaskStore.Create(task,compiled.comparison(),ValidationTaskStore.Settings.defaults(ValidationMethod.FULL_COLUMN,0),UUID.randomUUID())))
+                            .isEqualTo(ValidationTaskStore.Write.APPLIED);
+                    assertThat(f.tasks.inputs(task,1).orElseThrow().task().comparison()).isEqualTo(compiled.comparison());
+                    for(var pair:List.of(new ValidationTaskCompiler.Pair("id","payload"),new ValidationTaskCompiler.Pair("id","approximate"))){
+                        var incompatible=new ValidationTaskCompiler.Confirmation(UUID.randomUUID(),List.of(pair));
+                        assertThatThrownBy(()->ValidationTaskCompiler.compile(result,Map.of("orders",incompatible,"items",confirmed),null))
+                                .isInstanceOf(io.tapstate.core.common.TapstateException.class).hasMessageContaining("key-domain-mismatch");
+                    }
+                    var textId=new ValidationTaskCompiler.Confirmation(UUID.randomUUID(),List.of(new ValidationTaskCompiler.Pair("_id","payload")));
+                    assertThatThrownBy(()->ValidationTaskCompiler.compile(result,Map.of("orders",textId,"items",confirmed),null))
+                            .isInstanceOf(io.tapstate.core.common.TapstateException.class).hasMessageContaining("native-object-id-domain-mismatch");
+                    var nativeId=new ValidationTaskCompiler.Confirmation(UUID.randomUUID(),List.of(new ValidationTaskCompiler.Pair("_id","_id")));
+                    assertThat(ValidationTaskCompiler.compile(result,Map.of("orders",nativeId,"items",confirmed),null).comparison().mappings().getFirst().keys().source().getFirst().logicalTypes())
+                            .containsExactly("object-id");
+                    var mappings=compiled.comparison().mappings();var hashes=new HashMap<>(compiled.comparison().dependencyHashes());hashes.remove("flow");hashes.put("other","a".repeat(64));
+                    var foreign=new ValidationTaskSpec("other",hashes,1,ValidationTaskCompiler.RULES_VERSION,mappings);
+                    assertThatThrownBy(()->ValidationTaskCompiler.compile(result,confirmations,foreign)).isInstanceOf(io.tapstate.core.common.TapstateException.class).hasMessageContaining("previousPipeline");
+                }
             }finally{f.raw.getDatabase(sourceDb).drop();f.raw.getDatabase(targetDb).drop();}
         }
     }
@@ -102,8 +158,8 @@ class NativeValidationMetadataIT {
             new ValidationSelectedDeclarations.Choice("items","out","input","items"));}
     private static void seed(NativeValidationOwnerReservationsIT.Fixture f,String sourceDb,String targetDb){
         for(var name:List.of("orders","items")){
-            f.raw.getDatabase(sourceDb).getCollection(name).insertOne(new Document("id",1L).append("payload","source"));
-            f.raw.getDatabase(targetDb).getCollection("checked_"+name).insertOne(new Document("id",1L).append("payload","target"));
+            f.raw.getDatabase(sourceDb).getCollection(name).insertOne(new Document("id",1L).append("payload","source").append("approximate",0.1d));
+            f.raw.getDatabase(targetDb).getCollection("checked_"+name).insertOne(new Document("id",1L).append("payload","target").append("approximate",0.1d));
         }
         var source=new SourceResource("input",null,"mongodb",Map.of("uri",MONGO.getReplicaSetUrl(sourceDb),"database",sourceDb,"isUri",true),SourceMode.SNAPSHOT,
                 List.of(TableRef.literal("orders"),TableRef.literal("items")),null,null);

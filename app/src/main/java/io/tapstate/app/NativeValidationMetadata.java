@@ -43,7 +43,7 @@ final class NativeValidationMetadata {
         try{
             scope.require();
             for(var entry:projections.entrySet())if(entry.getKey()==null||entry.getValue()==null)throw invalid("projectionMapping");
-            projections=Map.copyOf(projections);
+            projections=Map.copyOf(projections);scope.projections=projections;
             var inputs=configuration.validationTasks(scope::require).declarations(selection);
             scope.selected=ValidationSelectedDeclarations.inspect(inputs,choices);
             var known=new HashSet<String>();for(var mapping:scope.selected.mappings())known.add(mapping.mapping().mappingId());
@@ -66,6 +66,7 @@ final class NativeValidationMetadata {
         private final Set<ValidationMemberResources.Probe> active=new HashSet<>();
         private final ValidationFailureLatch failure=new ValidationFailureLatch();private final CompletableFuture<Void> released=new CompletableFuture<>();
         private ValidationSelectedDeclarations selected;
+        private Map<String,Projection> projections=Map.of();
         private final Map<String,ConnectorRef> artifacts=new HashMap<>();private final List<Mapping> results=new ArrayList<>();
         private long artifactBytes,modelBytes;private boolean closed,returned;
         private Scope(ValidationMemberResources.Metadata frame,Instant deadline,ValidationMethod method){this.frame=frame;this.deadline=deadline;this.method=method;}
@@ -74,6 +75,12 @@ final class NativeValidationMetadata {
             throwFailure();if(!clock.instant().isBefore(deadline))throw new TapstateException(ValidationError.READ_CANCELLED,Map.of("table","metadata"),null);
         }
         ValidationSelectedDeclarations declarations(){require();return selected;}
+        ValidationMethod method(){require();return method;}
+        Projection projection(String mapping){require();return projections.get(mapping);}
+        boolean nativeBson(String source){
+            require();var resource=StoredArtifacts.requireSource(selected.artifacts(),source);var ref=artifacts.get(resource.connector());
+            if(ref==null)throw invalid("unobservedArtifact");return ref.className().equals("io.tapdata.mongodb.MongodbConnector");
+        }
         List<Mapping> mappings(){require();return List.copyOf(results);}
         CompletionStage<Void> released(){return released.minimalCompletionStage();}
         private ConnectorRef artifact(SourceResource source){
@@ -149,7 +156,7 @@ final class NativeValidationMetadata {
             retiring.forEach(ValidationMemberResources.Probe::close);releaseIfDone();
         }
         private void releaseIfDone(){
-            boolean release;synchronized(this){release=closed&&!returned&&active.isEmpty();if(release){returned=true;selected=null;artifacts.clear();results.clear();}}
+            boolean release;synchronized(this){release=closed&&!returned&&active.isEmpty();if(release){returned=true;selected=null;projections=Map.of();artifacts.clear();results.clear();}}
             if(release){frame.close();var failed=failure.get();if(failed==null)released.complete(null);else released.completeExceptionally(failed);}
         }
     }
