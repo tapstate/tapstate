@@ -110,11 +110,13 @@ final class PdkIdentityIndexes {
         if (query == null) throw new IllegalStateException("target index query is unavailable");
         List<TapIndex> indexes = new ArrayList<>();
         java.util.concurrent.atomic.AtomicBoolean answered = new java.util.concurrent.atomic.AtomicBoolean();
+        connector.requireActive();
         query.query(connector.context(), new TapTable(table), batch -> {
             if (batch == null) throw new IllegalStateException("target index query returned a null batch");
             answered.set(true);
             indexes.addAll(batch);
         });
+        connector.requireActive();
         if (!answered.get() || indexes.isEmpty()) {
             throw new IllegalStateException("target index query returned no indexes");
         }

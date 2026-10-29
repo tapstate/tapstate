@@ -61,17 +61,25 @@ class SystemCollectionsGatesTest {
         for (var row : manifest.get("resources")) {
             assertThat(rows.put(row.get("id").asString(), row)).isNull();
         }
-        assertThat(rows.entrySet().stream().filter(entry -> !"LOCAL".equals(entry.getValue().get("database").asString()))
-                .map(Map.Entry::getKey).toList()).containsExactlyInAnyOrderElementsOf(
+        Set<String> expectedResources = new HashSet<>(
                 Arrays.stream(SystemCollections.values()).map(SystemCollections::resourceId).toList());
+        expectedResources.addAll(Set.of("local.installation", "local.connector-cache",
+                "temporary.connector-registration", "temporary.connector-trust", "temporary.connector-download",
+                "user.cli-context", "user.cli-auth", "user.workspace", "user.local-stack", "user.alias-links", "build.catalog"));
+        assertThat(rows.keySet()).containsExactlyInAnyOrderElementsOf(expectedResources);
+        // Every declaration, including file resources, retains its contract and bytecode-owner checks.
+        ObjectNode completeManifest = (ObjectNode) new ObjectMapper().readTree(Files.readString(CONTRACTS));
+        validateContracts(completeManifest);
+        assertFileOwners(completeManifest);
         for (SystemCollections declaration : SystemCollections.values()) {
             var row = rows.get(declaration.resourceId());
             assertThat(row.get("database").asString()).isEqualTo(declaration.database().name());
-            assertThat(row.get("layer").asString()).isEqualTo(switch (declaration.database()) {
+            String expectedLayer = switch (declaration.database()) {
                 case CONFIG -> "CONFIG";
                 case CACHE -> "CACHE";
-                case STORE, NEST -> "LEGACY";
-            });
+                default -> "LEGACY";
+            };
+            assertThat(row.get("layer").asString()).isEqualTo(expectedLayer);
             assertThat(row.get("kind").asString()).isEqualTo(declaration.kind().name());
             var names = new java.util.ArrayList<String>();
             row.get("physicalNames").forEach(name -> names.add(name.asString()));

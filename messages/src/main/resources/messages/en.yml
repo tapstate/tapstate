@@ -1371,3 +1371,7 @@ io.srs-full-preparation-unproven:
 io.srs-position-model-unproven:
   message: "The requested source position for chain {chain} cannot prove compatibility with its model history."
   solution: "Arbitrary position editing is unavailable after model handoff or replacement-cache history. Stop, clear the task state and explicitly rerun a full load instead."
+
+store.ai-provider-schema-unsupported:
+  message: "AI provider settings require configuration schema {required}."
+  solution: "Keep using the existing non-AI configuration, or explicitly initialize a supported configuration database. No automatic upgrade is performed."

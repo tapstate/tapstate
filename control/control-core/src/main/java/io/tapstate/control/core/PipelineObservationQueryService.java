@@ -76,6 +76,11 @@ public final class PipelineObservationQueryService {
     }
 
     public PipelineObservationQueryService(ArtifactQueryService artifacts, ObservationStore observations,
+            ExecutionPlans plans, Supplier<List<String>> members, Clock clock, PipelineStatusDiagnostics diagnostics) {
+        this(artifacts, observations, plans, members, diagnostics, clock);
+    }
+
+    public PipelineObservationQueryService(ArtifactQueryService artifacts, ObservationStore observations,
             ExecutionPlans plans, Supplier<List<String>> members, PipelineStatusDiagnostics diagnostics, Clock clock) {
         this.diagnostics = Objects.requireNonNull(diagnostics, "diagnostics");
         this.clock = Objects.requireNonNull(clock, "clock");

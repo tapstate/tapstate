@@ -55,7 +55,7 @@ final class MongoPipelineRetirements implements PipelineRetirements {
                     || ConfigurationVersion.read(session,SystemCollections.CONFIGURATION_VERSION.on(database))>=Long.MAX_VALUE-2)throw fenced();
             var tokens=notes.retirementScopes(session,original.scope(),original.operationId());
             var fact=new MongoPipelineRetirementFacts.Fact(original,MongoPipelineRetirementFacts.notesHash(tokens),tokens.size(),"RETIRING",predecessor,Optional.empty());
-            ConfigurationVersion.advance(session,SystemCollections.CONFIGURATION_VERSION.on(database));
+            ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), client);
             MongoValidationPreparations.beginRetirement(session,database,cluster,original,validationClosing);
             var filter=new Document("_id",state.pipelineId()).append("phase","ACTIVE").append("stateGeneration",state.stateGeneration())
                     .append("noteWriteFence",row.get("noteWriteFence")).append("cachePreparation",row.get("cachePreparation"));
@@ -95,7 +95,7 @@ final class MongoPipelineRetirements implements PipelineRetirements {
             notes.requireRetiredScopes(session,pending);
             var complete=new MongoPipelineRetirementFacts.Fact(pending.request(),pending.privateScopesHash(),pending.privateScopesCount(),"COMPLETE",pending.predecessor(),receipt.retiredState());
             long fence=row.getLong("noteWriteFence");if(fence>=Long.MAX_VALUE-1)throw fenced();
-            ConfigurationVersion.advance(session,SystemCollections.CONFIGURATION_VERSION.on(database));
+            ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), client);
             MongoValidationPreparations.requireRetired(session,database,cluster,pending.request().scope().pipelineId());
             artifacts.deleteRetiredPipeline(session,pending.request().scope().pipelineId(),pending.request().definitionHash());
             new MongoPipelineIntentStore(client,database,cluster,bindings).retire(session,pending.request().scope());

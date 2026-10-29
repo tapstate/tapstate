@@ -75,6 +75,13 @@ class StoreConfiguration {
         return connection.aiProviderSettings();
     }
 
+    /** The process-local keyring view used by Source configuration encryption. */
+    @Bean
+    @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
+    io.tapstate.adapters.mongostore.SourceConfigKeyringHandle sourceConfigKeyring(MongoConnection storeConnection) {
+        return storeConnection.sourceConfigKeyring();
+    }
+
     /** The deployment's default and per-Nest operator-state databases over the verified store client. */
     @Bean
     @ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)

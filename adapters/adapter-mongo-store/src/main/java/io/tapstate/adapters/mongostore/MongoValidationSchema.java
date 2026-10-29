@@ -11,6 +11,7 @@ import java.util.*;
 /** Structure checks shared by explicit preparation and load-only validation access. */
 final class MongoValidationSchema {
     static final int VERSION = 2;
+    static final int COMPOSED_CONFIGURATION_VERSION = 3;
     static final List<SystemCollections> CONFIG = List.of(SystemCollections.VALIDATION_TASKS,
             SystemCollections.VALIDATION_REPORTS, SystemCollections.VALIDATION_DIFFERENCES);
     static final List<SystemCollections> CACHE = List.of(SystemCollections.VALIDATION_RUNS);
@@ -47,10 +48,50 @@ final class MongoValidationSchema {
         if (!phase.equals(marker.get("phase"))) throw refused(); return marker;
     }
 
+    /** Version-two components have distinct positive structures; absence never selects a fallback. */
+    static boolean configurationHasValidation(MongoDatabase database, Document schema) {
+        if (schema == null || !(schema.get("installedVersion") instanceof Integer version)) throw unreadable("version");
+        if (version == 1) {
+            if (schema.containsKey("validation")) throw unreadable("marker");
+            return false;
+        }
+        if (version == VERSION && !schema.containsKey("validation")) {
+            MongoConfigurationAiProviderSettingsStore.verifyStructure(database);
+            requireAbsent(database, CONFIG);
+            return false;
+        }
+        configurationMarker(schema);
+        if (version == VERSION) requireAbsent(database, List.of(SystemCollections.CONFIG_AI_PROVIDER_SETTINGS));
+        else MongoConfigurationAiProviderSettingsStore.verifyStructure(database);
+        verify(database, CONFIG);
+        return true;
+    }
+
+    static Document configurationMarker(Document schema) {
+        if (schema == null || !(schema.get("installedVersion") instanceof Integer version)
+                || version != VERSION && version != COMPOSED_CONFIGURATION_VERSION) throw unreadable("version");
+        if (!(schema.get("validation") instanceof Document marker)) throw unreadable("marker");
+        return validateMarker(marker);
+    }
+
+    static Document requireConfiguration(Document schema, String phase) {
+        var marker = configurationMarker(schema);
+        if (!phase.equals(marker.get("phase"))) throw refused();
+        return marker;
+    }
+
+    static int preparedConfigurationVersion(Document original) {
+        if (Integer.valueOf(1).equals(original.get("installedVersion"))) return VERSION;
+        if (Integer.valueOf(VERSION).equals(original.get("installedVersion")) && !original.containsKey("validation"))
+            return COMPOSED_CONFIGURATION_VERSION;
+        throw refused();
+    }
+
     static void requireReady(MongoDatabase database, boolean configuration) {
         var table = configuration ? SystemCollections.SCHEMA_MIGRATIONS : SystemCollections.CACHE_SCHEMA_MIGRATIONS;
         var schema = table.on(database).find(new Document("_id", configuration ? "config" : "business")).first();
-        var marker = requireVersionTwo(schema, "READY");
+        if (configuration && !configurationHasValidation(database, schema)) throw unreadable("version");
+        var marker = configuration ? requireConfiguration(schema, "READY") : requireVersionTwo(schema, "READY");
         var identity = (configuration ? SystemCollections.CONFIG_CLUSTER_IDENTITY : SystemCollections.CACHE_IDENTITY)
                 .on(database).find(new Document("_id", "cluster")).first();
         var original = scope(marker);
@@ -58,7 +99,7 @@ final class MongoValidationSchema {
                 || !MongoConfigurationDomain.LAYOUT.equals(identity.get("layoutId"))
                 || !configuration && (!Long.valueOf(original.bindingVersion()).equals(identity.get("bindingVersion"))
                 || !original.cacheIncarnation().equals(identity.get("cacheIncarnation")))) throw unreadable("identity");
-        verify(database, configuration ? CONFIG : CACHE);
+        if (!configuration) verify(database, CACHE);
     }
 
     static void requireAbsent(MongoDatabase database, List<SystemCollections> tables) {

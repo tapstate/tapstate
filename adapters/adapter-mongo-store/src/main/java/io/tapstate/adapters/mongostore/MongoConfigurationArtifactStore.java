@@ -401,7 +401,7 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
             try (ClientSession session = client.startSession()) {
                 try {
                     return session.withTransaction(() -> {
-                        ConfigurationVersion.advance(session, versions);
+                        ConfigurationVersion.advance(session, versions, client);
                         return body.apply(session);
                     }, TRANSACTION);
                 } catch (Refused refused) {

@@ -132,10 +132,9 @@ final class PartitionableCluster implements AutoCloseable {
     }
 
     private static PartitionableCluster start(String storeUri, String clusterId, List<String> nodeIds,
-            boolean prepared, String admin, String password, List<String> additionalArguments) {
-        if (nodeIds.isEmpty() || nodeIds.stream().distinct().count() != nodeIds.size()) {
+            boolean preparedInstallation, String admin, String password, List<String> additionalArguments) {
+        if (nodeIds.isEmpty() || nodeIds.stream().distinct().count() != nodeIds.size())
             throw new IllegalArgumentException("initial cluster members must have distinct node ids");
-        }
         String bindAddress = RoutableAddress.ofThisMachine();
         Map<String, Integer> memberPorts = new LinkedHashMap<>();
         Map<String, int[]> outbound = outboundRanges(nodeIds);
@@ -167,14 +166,14 @@ final class PartitionableCluster implements AutoCloseable {
                 });
             }
             for (String nodeId : nodeIds) {
-                preparedLaunches.put(nodeId, prepared
-                        ? RealProcessServer.prepareNative(storeUri, "0.0.0.0", launchArguments.get(nodeId))
+                preparedLaunches.put(nodeId, preparedInstallation
+                        ? RealProcessServer.preparePrepared(storeUri, "0.0.0.0", null, launchArguments.get(nodeId))
                         : RealProcessServer.prepare(storeUri, "0.0.0.0", launchArguments.get(nodeId)));
                 RealProcessServer server = preparedLaunches.get(nodeId).launch();
                 servers.put(nodeId, server);
-                if (!prepared) server.awaitHealthy();
+                server.awaitHealthy();
             }
-            if (prepared) servers.values().forEach(RealProcessServer::awaitReady);
+            if (preparedInstallation) servers.values().forEach(RealProcessServer::awaitReady);
         } catch (RuntimeException | Error failure) {
             startingFailure = failure;
             Map<String, Path> launchedLogs = new LinkedHashMap<>();
@@ -206,9 +205,9 @@ final class PartitionableCluster implements AutoCloseable {
             }
         }
         PartitionableCluster cluster = new PartitionableCluster(
-                nodeIds, servers, links, clusterId, storeUri, launchArguments, prepared, admin, password);
+                nodeIds, servers, links, clusterId, storeUri, launchArguments, preparedInstallation, admin, password);
         try {
-            if (prepared) cluster.planes.get(nodeIds.getFirst()).login(admin, password);
+            if (preparedInstallation) cluster.planes.get(nodeIds.getFirst()).login(admin, password);
             else cluster.planes.get(nodeIds.getFirst()).bootstrapAndLogin(admin, password);
             // The administrator lives in the store they all share, so the rest do not create one.
             nodeIds.stream().skip(1).forEach(nodeId -> cluster.planes.get(nodeId).login(admin, password));

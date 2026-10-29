@@ -79,6 +79,7 @@ public final class MongoConfigurationBootstrap {
                                 return null;
                             }
                             if (!mayCreate || !emptyTarget) throw refused();
+                            SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.prepareCollectionOn(database, session);
                             SystemCollections.CAPTURE_PREPARATIONS.prepareCollectionOn(database,session);
                             for(var index:SystemCollections.CAPTURE_PREPARATIONS.indexes())
                                 IndexEnsure.createInTransaction(session,SystemCollections.CAPTURE_PREPARATIONS.on(database),index);
@@ -95,7 +96,7 @@ public final class MongoConfigurationBootstrap {
                                             .append("formatVersion", 1).append("keyId", SourceConfigCipher.fingerprint(key))
                                             .append("material", Base64.getUrlEncoder().withoutPadding().encodeToString(key)));
                             SystemCollections.SCHEMA_MIGRATIONS.on(database).insertOne(session,
-                                    new Document("_id", "config").append("installedVersion", 1));
+                                    new Document("_id", "config").append("installedVersion", 2));
                             SystemCollections.CONFIGURATION_VERSION.on(database).insertOne(session,
                                     new Document("_id", ConfigurationVersion.ID).append("revision", 0L));
                             return null;

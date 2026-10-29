@@ -469,6 +469,15 @@ class PipelineAssistantControllerTest {
     }
 
     private static void verifyValidatedStream(String connector, boolean missingTransformId) throws Exception {
+        verifyValidatedStream(connector, missingTransformId, false);
+    }
+
+    @Test void revokedContextDuringInvalidCandidateValidationCannotPublishDiagnostics() throws Exception {
+        verifyValidatedStream("mysql", false, true);
+    }
+
+    private static void verifyValidatedStream(String connector, boolean missingTransformId,
+            boolean revokeDuringValidation) throws Exception {
         var store = new PipelineApiTest.FakePipelineDraftStore();
         PipelineDraft base = draft(); store.create(base);
         var artifacts = new PipelineApiTest.FakeArtifactStore();
@@ -493,7 +502,8 @@ class PipelineAssistantControllerTest {
                 new SourceRepresentation(TapstateCatalog::load));
         var schemas = new io.tapstate.control.core.SourceSchemaQueryService(artifacts, schemaStore);
         var beans = new DefaultListableBeanFactory();
-        var draftService = new PipelineDraftService(store, services.artifactQueryService(artifacts), audit, apply);
+        var draftService = org.mockito.Mockito.spy(new PipelineDraftService(store,
+                services.artifactQueryService(artifacts), audit, apply));
         beans.registerSingleton("drafts", draftService);
         beans.registerSingleton("sources", sources);
         beans.registerSingleton("schemas", schemas);
@@ -509,6 +519,14 @@ class PipelineAssistantControllerTest {
                     "orders", 1, base.updatedBy()));
         } catch (TapstateException invalid) {
             throw new AssertionError(invalid.getMessage(), invalid);
+        }
+        AtomicBoolean active = new AtomicBoolean(true);
+        if (revokeDuringValidation) {
+            org.mockito.Mockito.doAnswer(invocation -> {
+                active.set(false);
+                throw AiProviderService.error(ControlError.AI_INVALID_PROPOSAL);
+            }).when(draftService).previewCandidate(org.mockito.ArgumentMatchers.eq("orders"),
+                    org.mockito.ArgumentMatchers.any(PipelineDraft.class));
         }
         AtomicReference<Map<String, Object>> sentContext = new AtomicReference<>();
         AtomicReference<Map<String, Object>> proposedCandidate = new AtomicReference<>(candidate);
@@ -528,10 +546,24 @@ class PipelineAssistantControllerTest {
         var controller = new PipelineAssistantController(beans.getBeanProvider(PipelineDraftService.class),
                 beans.getBeanProvider(SourceProjectionService.class),
                 beans.getBeanProvider(io.tapstate.control.core.SourceSchemaQueryService.class),
-                providerController(fake), fake, mapper);
+                providerController(fake, () -> {
+                    if (!active.get()) throw AiProviderService.error(ControlError.UNAUTHENTICATED);
+                }), fake, mapper);
         MockHttpServletRequest request = new MockHttpServletRequest("POST", "/pipelines/orders/draft:assistant");
         Map<String, Object> body = Map.of("revision", 1,
                 "messages", List.of(Map.of("role", "user", "text", "Rename the destination")));
+        if (revokeDuringValidation) {
+            for (int attempt = 0; attempt < 5; attempt++) {
+                active.set(true);
+                var output = new ByteArrayOutputStream();
+                controller.assistant("orders", body, request).getBody().writeTo(output);
+                assertThat(active).isFalse();
+                assertThat(output.toString(StandardCharsets.UTF_8))
+                        .contains(ControlError.UNAUTHENTICATED.code(), "\"finishReason\":\"error\"", "[DONE]")
+                        .doesNotContain("needs-input", "data-proposal", ControlError.AI_OVERLOADED.code());
+            }
+            return;
+        }
         var responses = new java.util.ArrayList<org.springframework.http.ResponseEntity<org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody>>();
 
         for (int index = 0; index < 5; index++) responses.add(controller.assistant("orders", body, request));
@@ -1058,6 +1090,10 @@ class PipelineAssistantControllerTest {
     }
 
     private static AiProviderController providerController(AiProviderClient client) {
+        return providerController(client, () -> {});
+    }
+
+    private static AiProviderController providerController(AiProviderClient client, Runnable active) {
         AiProviderSettingsStore store = new AiProviderSettingsStore() {
             public java.util.Optional<AiProviderSettingsStore.Settings> get(String owner) {
                 return java.util.Optional.of(new AiProviderSettingsStore.Settings("openai-compatible", "https://api.openai.com/v1", "model", "sk-test"));
@@ -1073,7 +1109,7 @@ class PipelineAssistantControllerTest {
         var beans = new DefaultListableBeanFactory();
         beans.registerSingleton("mode", AuthenticationMode.CLOUD);
         return new AiProviderController(null, null, beans.getBeanProvider(AuthenticationMode.class), client) {
-            @Override String owner(HttpServletRequest request) { return "workspace"; }
+            @Override Workspace workspace(HttpServletRequest request) { return new Workspace("workspace", active); }
             @Override AiProviderService service() { return service; }
         };
     }

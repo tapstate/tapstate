@@ -57,8 +57,8 @@ final class BrowserAuthController {
             ObjectProvider<ClusterIdentityService> identities, ObjectProvider<AuthenticationMode> modes) {
         this.local = () -> {
             var selected = contexts.getIfAvailable();
-            return selected != null ? selected.current()
-                    : new LocalAuthenticationContext(logins.getObject(), sessions.getObject(), identities.getObject(), () -> {});
+            return selected != null ? selected.current() : new LocalAuthenticationContext(
+                    logins.getObject(), sessions.getObject(), identities.getObject(), () -> {});
         };
         this.mode = modes.getIfAvailable(() -> AuthenticationMode.ON_PREM);
     }
@@ -117,6 +117,7 @@ final class BrowserAuthController {
         var original = local.get();
         original.requireActive().run();
         SessionService.LogoutResult result = original.sessions().logoutForBrowser(token, original.identity().identityView().issuer());
+        original.requireActive().run();
         if (result == SessionService.LogoutResult.INVALID) throw refused();
         original.requireActive().run();
         return ResponseEntity.noContent().header(HttpHeaders.CACHE_CONTROL, NO_STORE)

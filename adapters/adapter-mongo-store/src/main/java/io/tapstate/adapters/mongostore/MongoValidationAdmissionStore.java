@@ -145,7 +145,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
                 MongoValidationPreparations.requireTaskAuthoringParent(session, owner.database, owner.clusterId, command.task().pipelineId());
                 if (!currentResources(session, command.comparison())) return Write.CONFLICT;
                 var row = MongoValidationTaskCodec.initial(command);
-                ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(owner.database));
+                ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(owner.database), owner.client);
                 capacity(session, command.task().pipelineId(), null, row);
                 owner.tasks.insertOne(session, row); return Write.APPLIED;
             });
@@ -167,7 +167,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
                 if(!currentResources(session,command.comparison()))return new Created(Write.CONFLICT,null);
                 if(!MongoValidationPreparations.taskParentGeneration(session,owner.database,owner.clusterId,command.pipelineId(),true).equals(parent))throw MongoValidationPreparations.fenced();
                 var row=MongoValidationTaskCodec.initial(new Create(task,command.comparison(),command.settings(),command.commandId()));
-                ConfigurationVersion.advance(session,SystemCollections.CONFIGURATION_VERSION.on(owner.database));capacity(session,task.pipelineId(),null,row);
+                ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(owner.database), owner.client);capacity(session,task.pipelineId(),null,row);
                 owner.tasks.insertOne(session,row);return new Created(Write.APPLIED,candidate);
             });
         }
@@ -189,7 +189,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
                 MongoValidationPreparations.requireTaskAuthoringParent(session, owner.database, owner.clusterId, command.task().pipelineId());
                 if (!currentResources(session, command.comparison())) return Write.CONFLICT;
                 var next = MongoValidationTaskCodec.update(previous, current, command);
-                ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(owner.database));
+                ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(owner.database), owner.client);
                 capacity(session, command.task().pipelineId(), previous, next);
                 if (owner.tasks.replaceOne(session, new Document("_id", previous.get("_id")).append("taskGeneration", previous.get("taskGeneration"))
                         .append("revision", current.revision()), next).getMatchedCount() != 1) throw unreadable("task-definition-cas");
@@ -209,7 +209,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
                 if(current.revision()!=command.expectedRevision())return Write.CONFLICT;
                 var full=current.settings().full();var settings=new Settings(new Full(full.method(),full.maxConcurrentTables(),full.schedule(),false,full.historyLimit()),current.settings().incremental());
                 var next=MongoValidationTaskCodec.update(previous,current,new Update(current.task(),current.revision(),current.comparison(),settings,command.commandId()));
-                ConfigurationVersion.advance(session,SystemCollections.CONFIGURATION_VERSION.on(owner.database));capacity(session,current.task().pipelineId(),previous,next);
+                ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(owner.database), owner.client);capacity(session,current.task().pipelineId(),previous,next);
                 if(owner.tasks.replaceOne(session,new Document("_id",previous.get("_id")).append("taskGeneration",previous.get("taskGeneration")).append("revision",current.revision()),next).getMatchedCount()!=1)throw unreadable("task-schedule-cas");
                 return Write.APPLIED;
             });
@@ -224,7 +224,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
                 boolean pending = false;
                 for (var selected : ValidationMode.values()) { var permission = permission(mode(row, selected)); if (permission != null && !phase(permission).equals("CLOSED")) pending = true; }
                 if (wasClosed && !pending) return Closure.ALREADY_CLOSED;
-                ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(owner.database));
+                ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(owner.database), owner.client);
                 if (owner.tasks.updateOne(session, new Document("_id", row.get("_id")).append("taskGeneration", row.get("taskGeneration"))
                         .append("revision", row.get("revision")), new Document("$set", new Document("closed", true))).getMatchedCount() != 1) throw unreadable("task-close");
                 for (var selected : ValidationMode.values()) { var permission = permission(mode(row, selected)); if (permission != null) owner.closeInTransaction(session, decodeIdentity(permission.get("identity", Document.class))); }
@@ -314,7 +314,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
                 if (!validation.currentResources(session, saved.comparison())) return Reservation.STALE;
                 // Source/definition writers share this original CONFIG write. A concurrent edit
                 // forces a retry of these exact pins instead of admitting a stale snapshot.
-                ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database));
+                ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), client);
             }
             var next = new Document("nextStartSequence", start.sequence() + 1)
                     .append("permission", new Document("sequence", start.sequence()).append("phase", "OPEN").append("identity", identity(start)));
@@ -655,7 +655,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         var row=tasks.find(session,new Document("_id",taskId(expected))).first();if(row==null)return null;
         var saved=MongoValidationTaskCodec.snapshot(row,clusterId);if(!saved.task().equals(expected))return null;
         // Birth and authoring use this same CONFIG write fence. No new lease or acknowledgement is introduced.
-        ConfigurationVersion.advance(session,SystemCollections.CONFIGURATION_VERSION.on(database));
+        ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), client);
         return saved;
     }
     boolean closing() { return validation != null && validation.closing() || recovery != null; }

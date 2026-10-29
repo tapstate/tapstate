@@ -19,12 +19,20 @@ class StorageEntryController {
     }
     @GetMapping("/auth/storage-entry") @ResponseBody
     ResponseEntity<Map<String,Object>> entry(HttpServletRequest request) {
-        var state = states.getIfAvailable();
-        var summary = state == null ? new StorageEntryStatus.Summary("OP", StorageEntryStatus.Entry.UNAVAILABLE) : state.read();
         var installation = installations.getIfAvailable();
         boolean management = installation != null && installation.isManagementRequest(request);
         if (management) installation.requireManagementRequest(request);
-        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(Map.of(
-                "mode", summary.mode(), "entry", summary.entry().name(), "management", management));
+        var progress = management ? installation.initializationProgress() : Map.<String,Object>of();
+        var state = "RUNNING".equals(progress.get("state")) ? null : states.getIfAvailable();
+        var summary = "RUNNING".equals(progress.get("state"))
+                ? new StorageEntryStatus.Summary("OP", StorageEntryStatus.Entry.UNAVAILABLE)
+                : state == null ? new StorageEntryStatus.Summary("OP", StorageEntryStatus.Entry.UNAVAILABLE) : state.read();
+        var body = new java.util.LinkedHashMap<String,Object>();
+        body.put("mode", summary.mode()); body.put("entry", summary.entry().name()); body.put("management", management);
+        if (management && summary.entry() == StorageEntryStatus.Entry.LOGIN && installation.normalLoginUrl() != null)
+            body.put("normalLoginUrl", installation.normalLoginUrl());
+        if (management && installation.automaticAuthorization()) body.put("automaticAuthorization", true);
+        if (!progress.isEmpty()) body.put("initializationProgress", progress);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(body);
     }
 }

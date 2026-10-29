@@ -463,6 +463,78 @@
         "The recovery CAPTURE claim annex is exactly formatVersion 2, original (the complete immutable version 1 birth row), physicalChain and preparationId. The preparationId equals the fixed operation UUID. Its CONFIG currentRecovery keeps only previousPhysicalChain and previousPreparationId as a flat predecessor; canonical predecessor coordinates must match the immutable birth. The Pipeline sharedRecovery marker never changes original operationId/preparation/stateRebuild and is consumed only by the winning exact old-scope full completion, never by replay or an unrelated generation."
       ]
     },
+    "session-record-recovery-v1": {
+      "goal": "Retain existing standalone and Cloud session records and Cloud revocation markers across process restarts; a missing optional email remains readable.",
+      "entry": "Read the original session from the existing store after restart or restore a matching legacy backup; a missing or expired session requires a new login.",
+      "prerequisites": [
+        "The original sessions collection and matching deployment identity remain available or are restored from a matching legacy backup.",
+        "Authentication requires the matching browser credential, the persisted secret hash, an unrevoked record and a valid idle deadline.",
+        "A backup cannot establish revocations made after it was taken; the feature does not reconstruct those later revocations."
+      ]
+    },
+    "existing-operator-state-missing-objects-v1": {
+      "goal": "Recover existing keyed operator state and retain responsibility for object references absent from the last emitted root document.",
+      "entry": "Resume the existing operator namespace and root key using its stored RootAssembly, matching lookup rows, reverse references and source positions; re-evaluate old serialized bytes that have no missing-reference field.",
+      "prerequisites": [
+        "The same configured operator-state database, namespace and root identity remain available.",
+        "Each sparse missing-reference entry names its stable slot path, lookup namespace and composite key.",
+        "Snapshot completion is scoped to the source generation and all producers and lookup partitions; an old generation cannot settle a new load.",
+        "Old serialized bytes mean pending re-determination, not an already-complete root; no state reset or forced reload substitutes for compatible recovery."
+      ]
+    },
+    "pipeline-observation-initial-load-v2": {
+      "goal": "Preserve the existing latest-observation projection and add optional current-run initial-load facts without making the projection an authority for pipeline recovery or snapshot completion.",
+      "entry": "Republish from the normal runtime convergence observation path. Reconstruct the run table inventory from the current resolved capture plans, rowsRead from that run capture counters, estimates from existing discovery, and landed only from existing durable target completion receipts. Never recover a pipeline from these display fields. Preserve old snapshot and position fields unchanged.",
+      "prerequisites": [
+        "Keep the physical pipeline_observation collection in its existing LEGACY/STORE database; no new namespace, cache layout, collection, retention job or history is introduced.",
+        "An optional initialLoad subdocument contains runKey, observedAt, readMode, and tables keyed with the existing source-qualified collision rule. Each table carries stage PENDING, READING, LANDING or LANDED, rowsRead when measured, and rowsTotalEstimate when available. Absent counters and estimates stay absent, not zero. Landed is a target-confirmed fact, never inferred from an estimate.",
+        "Bind the projection to the active pipeline execution using its execution generation and plannedAt where available, otherwise the pipeline id and capture-load start. If the active execution cannot be matched, report unknown; do not relabel an old run as current. The runKey is observational and supplies no ownership or fencing authority.",
+        "N/M is the number of LANDED tables divided by the complete resolved table set requiring the initial load for that run. A table may enter CDC while another loads. CDC_ONLY has no initial load; SNAPSHOT_ONLY completion is bounded completion, not streaming. Missing or incomplete inventory prevents a denominator or an all-streaming claim.",
+        "Old documents lacking initialLoad remain readable with progress unknown. Restart, replacement and loss of a current runtime reading must not copy previous-run partial counters into the new run or use this projection to advance a completion receipt. Existing legacy facts are not cleared or migrated as part of this change."
+      ]
+    },
+    "cache-initial-load-projection-v2": {
+      "goal": "Reproject current-run initial-load display facts after CACHE admission without treating observations as checkpoint or completion authority.",
+      "entry": "Republish through the scoped runtime observation path from current capture plans and counters, existing discovery estimates, and durable target completion receipts. Missing or mismatched readings stay unknown.",
+      "prerequisites": [
+        "The original CACHE business identity, exact pipeline scope and current state are admitted; ordinary reads do not create missing state.",
+        "The optional initialLoad contains runKey, observedAt, readMode and the complete resolved table inventory, with PENDING/READING/LANDING/LANDED, measured rowsRead and optional rowsTotalEstimate. Estimates never prove completion.",
+        "The observational run key must match the current execution; it grants no ownership or fencing authority.",
+        "Old documents without initialLoad remain readable as unknown progress. Rebuild derives a new projection from current facts; no legacy import, automatic migration or previous-run counter adoption is permitted."
+      ]
+    },
+    "cache-nest-missing-objects-v1": {
+      "goal": "Continue only from complete original durable Nest state, including responsibility for missing object references; otherwise require explicitly scoped recovery.",
+      "entry": "Original runtime restart using its stored RootAssembly, matching lookup rows, reverse references and original source positions in the same admitted CACHE placement; storage.recovery.plan/confirm remains the only admitted rebuild entry.",
+      "prerequisites": [
+        "Original CACHE identity, membership, full claim/fence and model/checkpoint closure are intact for continuation.",
+        "Loss does not mint creation rights; isolate old writers and confirm source, model, target and scope before rebuilding.",
+        "Each sparse missing-reference entry contains its stable slot path, lookup namespace and composite key, stored alongside the root emitted state.",
+        "Snapshot completion is scoped to the source generation and all producers and lookup partitions; an old generation cannot settle a new load.",
+        "Older serialized RootAssembly bytes without this optional field mean pending re-determination; no reset, forced reload or automatic creation substitutes for compatible recovery."
+      ]
+    },
+    "legacy-observation-retained-v2": {
+      "goal": "Preserve old retained observation bytes without granting current runtime, checkpoint, initialization or recovery authority.",
+      "entry": "Original matching backup/read path for retained legacy observations. Current Pipeline initial-load observations use the admitted CACHE scope.",
+      "prerequisites": [
+        "No implicit read from or fallback to legacy observations in current scoped execution.",
+        "Existing optional initialLoad may be read for historical compatibility, but new initialLoad writes are permitted only through the approved scoped CACHE store.",
+        "Missing, stale or mismatched legacy facts remain unknown and never start a Pipeline, create storage or substitute for durable recovery state."
+      ]
+    },
+    "native-ai-config-v1": {
+      "goal": "Retain the current Cloud workspace provider metadata and purpose-bound encrypted API key across normal restarts and CACHE loss.",
+      "entry": "Fresh controlled CONFIG schema 2 initialization, then existing authenticated Cloud get/replace/delete/check and assistant routes. Schema 1 keeps non-AI capabilities but refuses AI access without automatic upgrade. Recover the original Cluster from its CONFIG backup and matching original key, or explicit user re-entry when a structurally valid owner row is absent. No legacy system_meta migration or cross-Cluster transfer of owner-bound settings.",
+      "prerequisites": [
+        "One dedicated CONFIG ai_provider_settings collection with only its implicit unique _id index, no TTL and at most one current row for the fixed canonical Cloud organization/Cluster owner. No prompts, dialogue, request log or version history.",
+        "Format 1 has exactly _id, formatVersion, owner, providerId, baseUrl, model and secret. The id is ai-provider: plus SHA-256 of canonical server-derived owner JSON [cloud, organizationId, clusterId]. Request JSON cannot choose owner. Unsupported schema, missing collection/index, malformed fields, owner/hash mismatch or bad ciphertext refuse without lazy DDL or overwriting corruption.",
+        "The existing CONFIG key supplies the existing tsai:1 provider AES/GCM ciphertext with owner and provider/baseUrl/model authenticated. No replacement key, rotation, node ACK, lease or CACHE/MASTER fallback. No plaintext key in database, API, logs, draft or browser storage.",
+        "Provider remains openai-compatible with existing HTTPS public endpoint policy. Owner/baseUrl are each at most 4096 UTF-8 bytes, model at most 200 UTF-16 code units, API key at most 8192 characters without controls, and complete encoded BSON at most 256 KiB before any mutation.",
+        "Absence of the owner row under verified schema/collection/indexes returns unconfigured, including explicit delete. No separate tombstone distinguishes arbitrary external whole-row deletion. Normal restart never recreates missing known structures or imports old settings.",
+        "Native AI access accepts only its positively verified original schema 2 without validation markers/residual structures, or composed CONFIG schema 3 with both complete components. Historical validation schema 2 and base schema 1 refuse AI; normal access never upgrades, migrates or creates structures. The owner row format and original cryptographic and transaction bounds are unchanged."
+      ]
+    },
     "validation-configuration": {
       "goal": "Retain original validation configuration, one-time report birth rights and complete retained observations without recreating old runs.",
       "entry": "Restore the original matching CONFIG backup; explicitly prepare or upgrade the validation schema before admitting work.",
@@ -520,45 +592,15 @@
         "Same-ID recreation and explicit Cluster CACHE recovery reuse their verified original lifecycle paths. Normal production stop/start or full rebuild does not reset validation authority; old queries and reports cannot regain rights."
       ]
     },
-    "session-record-recovery-v1": {
-      "goal": "Retain existing standalone and Cloud session records and Cloud revocation markers across process restarts; a missing optional email remains readable.",
-      "entry": "Read the original session from the existing store after restart or restore a matching legacy backup; a missing or expired session requires a new login.",
+    "validation-ai-schema-composition": {
+      "goal": "Preserve the exact original CONFIG installation and independently prepared validation and AI components without conflating historical version-two layouts.",
+      "entry": "Original matching CONFIG/key backup; original controlled initial validation preparation or explicit offline validation maintenance only, never ordinary open or an API write.",
       "prerequisites": [
-        "The original sessions collection and matching deployment identity remain available or are restored from a matching legacy backup.",
-        "Authentication requires the matching browser credential, the persisted secret hash, an unrevoked record and a valid idle deadline.",
-        "A backup cannot establish revocations made after it was taken; the feature does not reconstruct those later revocations."
-      ]
-    },
-    "existing-operator-state-missing-objects-v1": {
-      "goal": "Recover existing keyed operator state and retain responsibility for object references absent from the last emitted root document.",
-      "entry": "Resume the existing operator namespace and root key using its stored RootAssembly, matching lookup rows, reverse references and source positions; re-evaluate old serialized bytes that have no missing-reference field.",
-      "prerequisites": [
-        "The same configured operator-state database, namespace and root identity remain available.",
-        "Each sparse missing-reference entry names its stable slot path, lookup namespace and composite key.",
-        "Snapshot completion is scoped to the source generation and all producers and lookup partitions; an old generation cannot settle a new load.",
-        "Old serialized bytes mean pending re-determination, not an already-complete root; no state reset or forced reload substitutes for compatible recovery."
-      ]
-    },
-    "cache-nest-missing-objects-v1": {
-      "goal": "Continue only from complete original durable Nest state, including responsibility for missing object references; otherwise require explicitly scoped recovery.",
-      "entry": "Original runtime restart using its stored RootAssembly, matching lookup rows, reverse references and original source positions in the same admitted CACHE placement; storage.recovery.plan/confirm remains the only admitted rebuild entry.",
-      "prerequisites": [
-        "Original CACHE identity, membership, full claim/fence and model/checkpoint closure are intact for continuation.",
-        "Loss does not mint creation rights; isolate old writers and confirm source, model, target and scope before rebuilding.",
-        "Each sparse missing-reference entry contains its stable slot path, lookup namespace and composite key, stored alongside the root emitted state.",
-        "Snapshot completion is scoped to the source generation and all producers and lookup partitions; an old generation cannot settle a new load.",
-        "Older serialized RootAssembly bytes without this optional field mean pending re-determination; no reset, forced reload or automatic creation substitutes for compatible recovery."
-      ]
-    },
-    "pipeline-observation-initial-load-v2": {
-      "goal": "Preserve the existing latest-observation projection and add optional current-run initial-load facts without making the projection an authority for pipeline recovery or snapshot completion.",
-      "entry": "Republish from the normal runtime convergence observation path. Reconstruct the run table inventory from the current resolved capture plans, rowsRead from that run capture counters, estimates from existing discovery, and landed only from existing durable target completion receipts. Never recover a pipeline from these display fields. Preserve old snapshot and position fields unchanged.",
-      "prerequisites": [
-        "Keep the physical pipeline_observation collection in its existing LEGACY/STORE database; no new namespace, cache layout, collection, retention job or history is introduced.",
-        "An optional initialLoad subdocument contains runKey, observedAt, readMode, and tables keyed with the existing source-qualified collision rule. Each table carries stage PENDING, READING, LANDING or LANDED, rowsRead when measured, and rowsTotalEstimate when available. Absent counters and estimates stay absent, not zero. Landed is a target-confirmed fact, never inferred from an estimate.",
-        "Bind the projection to the active pipeline execution using its execution generation and plannedAt where available, otherwise the pipeline id and capture-load start. If the active execution cannot be matched, report unknown; do not relabel an old run as current. The runKey is observational and supplies no ownership or fencing authority.",
-        "N/M is the number of LANDED tables divided by the complete resolved table set requiring the initial load for that run. A table may enter CDC while another loads. CDC_ONLY has no initial load; SNAPSHOT_ONLY completion is bounded completion, not streaming. Missing or incomplete inventory prevents a denominator or an all-streaming claim.",
-        "Old documents lacking initialLoad remain readable with progress unknown. Restart, replacement and loss of a current runtime reading must not copy previous-run partial counters into the new run or use this projection to advance a completion receipt. Existing legacy facts are not cleared or migrated as part of this change."
+        "CONFIG schema 1 keeps original non-AI synchronization and existing controlled validation 1-to-2 preparation. It never creates AI structures outside the original fresh CONFIG bootstrap.",
+        "Historical validation schema 2 requires its exact original strict validation marker and structures and refuses AI. Historical native-AI schema 2 requires complete AI structures and no validation marker or residual validation structures; it refuses validation until original controlled preparation.",
+        "Fresh CONFIG bootstrap first publishes the approved native-AI schema 2. Its original initial operation with zero Pipelines and original CACHE authorization, or explicit original offline validation maintenance, may prepare validation and publish CONFIG schema 3 only with both components complete. Original validation schema 2 is not automatically converted.",
+        "CONFIG schema 3 requires both exact AI structures and the original validation marker/collections/indexes. Partial, conflicting or lost structures never fall back, grant birth, trigger automatic DDL or authorize a replacement. CONFIG and CACHE retain independent transactions; CACHE validation schema remains 2.",
+        "Existing schema marker fields, validation generation/preparation/operation/counts, full fences, encrypted owner row, keyring and all row formats remain unchanged; bounded original preparation and retry must prove the same identities."
       ]
     }
   },
@@ -603,6 +645,34 @@
       "atomicDomain": "CACHE",
       "fencing": "Existing ordinary NODE/PIPELINE/CAPTURE and pending-full root/model/pin/checkpoint transactions remain. The separate shared replacement proves the exact original preparation, complete control view, current NODE and ended original tenures in one actual CACHE client/session transaction; it advances the known canonical CAPTURE annex/counters, expires exact old Pipeline tenures without discarding their private state, detaches the old shared relations, records a RETIRED control receipt and creates the entirely empty replacement physical root atomically. Cancellation competes on that same root, proves the unchanged old effective annex and absence of every replacement namespace fact, and persists CANCELLED before CONFIG can replan the same operation. Opaque handles and exact operation/plan/control digests prohibit old attempts after cancellation. Ordinary old-domain operations refuse both quarantine variants before reading payload. CONFIG checks stay outside the CACHE retry callback."
     },
+    "session-record-write-v1": {
+      "atomicDomain": "STORE: one sessions collection document per session or revocation marker.",
+      "fencing": "Managed sessions use a unique deployment and JWT identity and insert-only creation; authentication and logout use conditional single-document updates, while signed callbacks retain deny markers. Standalone session keys use a distinct key type."
+    },
+    "existing-single-root-write": {
+      "atomicDomain": "Existing keyed operator-state write for one namespace and root key; no additional collection or cross-key transaction.",
+      "fencing": "Keep existing owner and source-order rules. Record missing identities with the missing-object emission and clear or recompute them on completion, retargeting, root deletion and subsequent root output. Source progress cannot substitute for target confirmation."
+    },
+    "pipeline-observation-latest-display-v2": {
+      "atomicDomain": "One existing LEGACY/STORE pipeline_observation document replaced by pipeline id, with initialLoad and the other observation facts in the same replacement; no transaction across STORE, CONFIG or CACHE clients.",
+      "fencing": "Retain existing last-write-wins observation publication. Run-key matching and observedAt identify stale display data; neither grants epoch fencing or an atomic multi-endpoint snapshot. Durable sink completion keeps its existing owner and fences. A stale/missing/mismatched reading is unknown, never healthy or completed by default."
+    },
+    "cache-initial-load-projection-v2": {
+      "atomicDomain": "CACHE",
+      "fencing": "Keep the exact clusterId/bindingVersion/cacheIncarnation/pipelineId/stateGeneration scope and the original full PIPELINE_ACTUATION claim fence. Prove live ownership and current scope/epoch in the same CACHE transaction; old scope, execution or revoked guard cannot publish. CONFIG is not a CACHE fence. Read-only views cannot mutate."
+    },
+    "cache-nest-single-root-v1": {
+      "atomicDomain": "CACHE",
+      "fencing": "CACHE, one original operator placement namespace and root key; the existing serialized RootAssembly is replaced with its sparse reference set in the same row. No new collection, cross-key or cross-domain transaction. Same CACHE client/session with original identity and resource-specific guard/revision. Ownership-protected writes additionally compete with the full live claim; CONFIG cannot supply a CACHE fence. Record missing identities with the missing-object emission; clear or recompute on completion, retargeting, root deletion and subsequent output. Source progress does not substitute for target confirmation."
+    },
+    "legacy-observation-retained-v2": {
+      "atomicDomain": "LEGACY STORE",
+      "fencing": "Retain original single-document observation writes for legacy internal fixtures; do not widen their authority or copy them to CONFIG. New initialLoad is excluded from this writer. Existing historical bytes remain intact and readable. Production writes use the approved CACHE transaction with original scope and claim fence."
+    },
+    "native-ai-config-v1": {
+      "atomicDomain": "CONFIG",
+      "fencing": "Each replace/delete uses the original CONFIG client/session to verify Cluster identity/schema, advance the existing configuration version and fence the same original persisted key before the single owner row mutation. Strict current-row decoding refuses corruption rather than repairing it. Existing audit-first and replacement semantics remain. The same captured authenticated Cloud context supplies organization/Cluster and is checked before and after the operation. Provider network calls and CACHE are outside this CONFIG transaction."
+    },
     "validation-config": {
       "atomicDomain": "CONFIG",
       "fencing": "The original task generation, immutable run identity, command and mode sequence compete on the same task permission. Reserve advances the sequence and fixes OPEN. Report insert and OPEN-to-BORN are one transaction. Revocation closes OPEN or seals the exact BORN report and closes the permission atomically. Root publication and report sealing compete in the same CONFIG client/session. No CACHE lease read grants a CONFIG transaction."
@@ -618,22 +688,6 @@
     "validation-cache-r3": {
       "atomicDomain": "CACHE",
       "fencing": "The original complete VALIDATION claim fence and fixed CacheBusinessScope compete with the Pipeline control, mode slots and stop latch in one CACHE client/session. A valid NODE_SESSION and an original independent CONFIG capability authorize first birth, with CONFIG checks outside the CACHE retry callback. First birth and cancellation serialize on one control key with PREPARED/CANCELLED/RETIRED receipts. A closed predecessor is replaced only by exact generation/preparation/revision CAS while retaining known claim counters. No production claim/state is borrowed; no CONFIG/CACHE atomic transaction is claimed."
-    },
-    "session-record-write-v1": {
-      "atomicDomain": "STORE: one sessions collection document per session or revocation marker.",
-      "fencing": "Managed sessions use a unique deployment and JWT identity and insert-only creation; authentication and logout use conditional single-document updates, while signed callbacks retain deny markers. Standalone session keys use a distinct key type."
-    },
-    "existing-single-root-write": {
-      "atomicDomain": "Existing keyed operator-state write for one namespace and root key; no additional collection or cross-key transaction.",
-      "fencing": "Keep existing owner and source-order rules. Record missing identities with the missing-object emission and clear or recompute them on completion, retargeting, root deletion and subsequent root output. Source progress cannot substitute for target confirmation."
-    },
-    "cache-nest-single-root-v1": {
-      "atomicDomain": "CACHE",
-      "fencing": "CACHE, one original operator placement namespace and root key; the existing serialized RootAssembly is replaced with its sparse reference set in the same row. No new collection, cross-key or cross-domain transaction. Same CACHE client/session with original identity and resource-specific guard/revision. Ownership-protected writes additionally compete with the full live claim; CONFIG cannot supply a CACHE fence. Record missing identities with the missing-object emission; clear or recompute on completion, retargeting, root deletion and subsequent output. Source progress does not substitute for target confirmation."
-    },
-    "pipeline-observation-latest-display-v2": {
-      "atomicDomain": "One existing LEGACY/STORE pipeline_observation document replaced by pipeline id, with initialLoad and the other observation facts in the same replacement; no transaction across STORE, CONFIG or CACHE clients.",
-      "fencing": "Retain existing last-write-wins observation publication. Run-key matching and observedAt identify stale display data; neither grants epoch fencing or an atomic multi-endpoint snapshot. Durable sink completion keeps its existing owner and fences. A stale/missing/mismatched reading is unknown, never healthy or completed by default."
     }
   },
   "resources": [
@@ -712,25 +766,24 @@
     {
       "id": "mongo.store.pipeline_observation",
       "resourceVersion": 2,
-      "proposalVersion": 2,
+      "proposalVersion": 3,
       "kind": "COLLECTION",
       "layer": "LEGACY",
       "database": "STORE",
       "physicalNames": [
         "pipeline_observation"
       ],
-      "responsibility": "Latest observed Pipeline state and optional current-run initial-load display projection; absent or mismatched observations remain unknown.",
+      "responsibility": "Retain historical legacy Pipeline observations and their optional existing initial-load display fields without admitting new production legacy initialization or recovery. Current scoped product execution publishes initial-load display only to CACHE.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoObservationStore"
       ],
       "readers": [
         "io.tapstate.adapters.mongostore.MongoObservationStore"
       ],
-      "recovery": "pipeline-observation-initial-load-v2",
-      "consistency": "pipeline-observation-latest-display-v2",
-      "growth": "Still one latest document per pipeline, replaced at the existing observation publication cadence. Initial-load inventory adds O(resolved tables in the active run) names, stages, optional row counters and estimates, not O(rows) and not one record per refresh. No extra history or retention is added. Existing retention and legacy recovery inputs remain protected.",
+      "recovery": "legacy-observation-retained-v2",
+      "consistency": "legacy-observation-retained-v2",
+      "growth": "Existing latest-document count and historical bytes are retained. No new legacy initialLoad writes, new collection, event history, background migration, deletion, creation right or production legacy fallback. Existing ordinary legacy fixture observation writes remain bounded to one latest document per Pipeline.",
       "evidence": [
-        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/SystemCollectionsReconciliationIT.java",
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoObservationStoreTest.java",
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoObservationInitialLoadIT.java"
       ]
@@ -1271,8 +1324,8 @@
       "evidence": [
         "runtime/engine/src/main/java/io/tapstate/runtime/engine/nest/RootAssembly.java",
         "runtime/engine/src/main/java/io/tapstate/runtime/engine/nest/AssemblerProcessor.java",
-        "arch-tests/src/test/java/io/tapstate/archtests/NestStateSerialFormGatesTest.java",
-        "runtime/engine/src/test/java/io/tapstate/runtime/engine/nest/AMissingObjectReferenceKeepsTheRootDocumentTest.java"
+        "runtime/engine/src/test/java/io/tapstate/runtime/engine/nest/AMissingObjectReferenceKeepsTheRootDocumentTest.java",
+        "arch-tests/src/test/java/io/tapstate/archtests/NestStateSerialFormGatesTest.java"
       ]
     },
     {
@@ -1421,22 +1474,22 @@
     },
     {
       "id": "mongo.config.schema_migrations",
-      "resourceVersion": 3,
-      "proposalVersion": 3,
+      "resourceVersion": 4,
+      "proposalVersion": 4,
       "kind": "COLLECTION",
       "layer": "CONFIG",
       "database": "CONFIG",
       "physicalNames": [
         "schema_migrations"
       ],
-      "responsibility": "Storage-domain schema version and migration ownership. Explicit validation schema version 1-to-2 preparation records the original maintenance operation; normal access never adds missing validation resources. CONFIG/CACHE commit independently and both must be verified before validation starts; version 1 synchronization remains available. Controlled validation preparation also establishes independent CONFIG markers and same-key CACHE birth/cancellation semantics. Ordinary version-1 synchronization stays admitted; validation access requires its complete supported preparation and never fills missing version-2 facts.",
+      "responsibility": "Storage-domain schema version and migration ownership, distinguishing original base schema 1, independently approved historical validation and native-AI schema 2, and composed schema 3 with both complete components. Existing validation markers and rows retain their strict original shapes; ordinary access never creates, upgrades or repairs resources.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoConfigurationDomain"
       ],
       "readers": [
         "io.tapstate.adapters.mongostore.MongoConfigurationDomain"
       ],
-      "recovery": "configuration-backup",
+      "recovery": "validation-ai-schema-composition",
       "consistency": "config",
       "growth": "One bounded aggregate per Cluster/domain; no event or lease history.",
       "evidence": [
@@ -2392,26 +2445,30 @@
     },
     {
       "id": "mongo.cache.pipeline_observation",
-      "resourceVersion": 1,
-      "proposalVersion": 1,
+      "resourceVersion": 2,
+      "proposalVersion": 2,
       "kind": "COLLECTION",
       "layer": "CACHE",
       "database": "CACHE",
       "physicalNames": [
         "pipeline_observation"
       ],
-      "responsibility": "Latest observed Pipeline state; absent observations remain unknown.",
+      "responsibility": "Latest scoped Pipeline observation and optional current-run initial-load display projection; absent or mismatched facts remain unknown.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoCachePipelineObservationStore"
       ],
       "readers": [
         "io.tapstate.adapters.mongostore.MongoCachePipelineObservationStore"
       ],
-      "recovery": "derived-cache",
-      "consistency": "cache",
-      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "recovery": "cache-initial-load-projection-v2",
+      "consistency": "cache-initial-load-projection-v2",
+      "growth": "One latest document per pipeline, replaced at the existing observation cadence. Initial-load fields add O(resolved tables in the active run), not O(rows) or per-refresh history. No new collection, retention schedule or cleanup task.",
       "evidence": [
-        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java"
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCachePipelineStoresIT.java",
+        "app/src/test/java/io/tapstate/app/ThreeLayerObservationTest.java",
+        "app/src/test/java/io/tapstate/app/PipelineDirectPreparationIT.java",
+        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java",
+        "app/src/test/java/io/tapstate/app/RunBoundCaptureReadingsTest.java"
       ]
     },
     {
@@ -2631,6 +2688,7 @@
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCacheOperatorStateStoreIT.java",
         "runtime/engine/src/main/java/io/tapstate/runtime/engine/nest/RootAssembly.java",
         "runtime/engine/src/main/java/io/tapstate/runtime/engine/nest/AssemblerProcessor.java",
+        "runtime/engine/src/test/java/io/tapstate/runtime/engine/nest/AMissingObjectReferenceKeepsTheRootDocumentTest.java",
         "arch-tests/src/test/java/io/tapstate/archtests/NestStateSerialFormGatesTest.java"
       ]
     },
@@ -3146,6 +3204,31 @@
       "growth": "Bounded by the selected connector input set.",
       "evidence": [
         "tools/catalog-derive/src/test/java/io/tapstate/tools/catalog/derive/CatalogDeriveTest.java"
+      ]
+    },
+    {
+      "id": "mongo.config.ai_provider_settings",
+      "resourceVersion": 1,
+      "proposalVersion": 2,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "ai_provider_settings"
+      ],
+      "responsibility": "One current authenticated Cloud workspace provider configuration and encrypted API key, without conversation or execution state.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationAiProviderSettingsStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationAiProviderSettingsStore"
+      ],
+      "recovery": "native-ai-config-v1",
+      "consistency": "native-ai-config-v1",
+      "growth": "At most one current owner row per CONFIG Cluster, at most 256 KiB encoded BSON plus the fixed unique _id index; replacement does not accumulate history and no prompts, request bodies or dialogue are retained.",
+      "evidence": [
+        "e2e/src/test/java/io/tapstate/e2e/PipelineBuilderAssistantProviderSettingsIT.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoConfigurationAiProviderSettingsIT.java"
       ]
     },
     {

@@ -118,8 +118,8 @@ class NodeSessionStartupMemberTest {
         private final InMemoryWorkloadClaimStore delegate = new InMemoryWorkloadClaimStore();
         private final AtomicBoolean refuse = new AtomicBoolean();
         private final AtomicInteger acquisitions = new AtomicInteger();
-        private final AtomicInteger renewals = new AtomicInteger();
         private final AtomicInteger releases = new AtomicInteger();
+        private final AtomicInteger renewals = new AtomicInteger();
 
         @Override public WorkloadClaimAttempt acquire(WorkloadClaimKey key, WorkloadOwner owner,
                 long revision, Duration ttl) {

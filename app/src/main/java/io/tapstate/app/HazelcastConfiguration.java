@@ -80,6 +80,7 @@ class HazelcastConfiguration {
     @org.springframework.beans.factory.annotation.Autowired
     void memberStorage(ObjectProvider<MemberStorage> providers) { nativeStorage = providers; }
 
+
     static final String NODE_SESSION_CONTEXT_KEY = "tapstate.cluster.node-session";
 
     /**
@@ -149,7 +150,8 @@ class HazelcastConfiguration {
         warnAboutClusterProfile(clusterProperties);
         WorkloadClaimStore claimStore = workloadClaims.getIfAvailable();
         ClusterIdentityStore identityStore = clusterIdentities.getIfAvailable();
-        if (identity == null && clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE && (identityStore != null || claimStore != null)) {
+        if (identity == null && clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE
+                && (identityStore != null || claimStore != null)) {
             identity = ClusterMemberPreflight.singleIdentity(clusterProperties, identityStore, membershipStores.getIfAvailable());
         }
         long sessionAskedAt = System.nanoTime();
@@ -330,23 +332,14 @@ class HazelcastConfiguration {
 
     /** Destroys the same lease that kept the reserved identity live during member creation. */
     @Bean(destroyMethod = "close")
-    NodeSessionLease nodeSessionLease(
-            HazelcastInstance member,
-            ClusterProperties clusterProperties,
-            ObjectProvider<WorkloadClaimStore> workloadClaims, ClusterMembershipGate membershipGate) {
+    NodeSessionLease nodeSessionLease(HazelcastInstance member) {
         Object stored = member.getUserContext().get(NODE_SESSION_CONTEXT_KEY);
         if (!(stored instanceof io.tapstate.spi.store.WorkloadClaim claim)) {
             return NodeSessionLease.inactive();
         }
-        if (member.getUserContext().get(NODE_SESSION_LEASE_CONTEXT_KEY) instanceof NodeSessionLease startedLease) return startedLease;
-        WorkloadClaimStore store = workloadClaims.getIfAvailable();
-        if (store == null) throw new IllegalStateException("cluster member started without its workload claim store");
-        if (!(member.getUserContext().get(NODE_SESSION_ASKED_AT_CONTEXT_KEY) instanceof Long askedAt)) {
-            throw new IllegalStateException("cluster member started without the time its node session was asked for");
+        if (!(member.getUserContext().get(NODE_SESSION_LEASE_CONTEXT_KEY) instanceof NodeSessionLease lease)) {
+            throw new IllegalStateException("cluster member started without its pre-start node-session lease");
         }
-        NodeSessionLease lease = new NodeSessionLease(store, claim, askedAt, clusterProperties.getNodeSessionTtl(),
-                clusterProperties.getNodeSessionRenewInterval(), () -> { membershipGate.failClosed(); member.shutdown(); });
-        membershipGate.observeNodeSession(lease::active);
         return lease;
     }
 
@@ -762,6 +755,7 @@ class HazelcastConfiguration {
     }
 
     static void configureClusterProtection(Config config, ClusterMembershipGate gate) { configureClusterProtection(config, gate, true); }
+
     private static void configureClusterProtection(Config config, ClusterMembershipGate gate, boolean replicated) {
         config.addSplitBrainProtectionConfig(new SplitBrainProtectionConfig(
                 ClusterMembershipGate.PROTECTION_NAME, true)

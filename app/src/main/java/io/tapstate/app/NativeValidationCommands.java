@@ -24,7 +24,7 @@ final class NativeValidationCommands implements Commands {
         var start=runs.original(command.request(),command.owner()).orElse(null);
         if(command.action()==Action.CANCEL_UNUSED){
             var pending=owners.pending(command.request(),command.owner(),true).orElse(null);
-            if(pending!=null)return new CommandReply(Outcome.ACCEPTED,command,pending.stopped()?"STOPPED":"STARTING",false,false,false,false,pending.drained(),null);
+            if(pending!=null)return pending(command,pending);
             if(start==null)return commandUnavailable(command,Outcome.REJECTED,null);
         }
         if(command.action()==Action.ACTIVATE&&start==null){
@@ -33,12 +33,16 @@ final class NativeValidationCommands implements Commands {
         }
         if(start==null){
             var pending=owners.pending(command.request(),command.owner(),command.action()==Action.STOP).orElse(null);
-            if(pending!=null)return new CommandReply(Outcome.ACCEPTED,command,pending.stopped()?"STOPPED":"STARTING",false,false,false,false,pending.drained(),null);
+            if(pending!=null)return pending(command,pending);
             return commandUnavailable(command,Outcome.REJECTED,null);
         }
         if(command.action()==Action.STOP)runs.stop(start.run());
         var status=runs.read(start.run());
         String code=status.failure() instanceof TapstateException coded?coded.code().code():null;
         return new CommandReply(Outcome.ACCEPTED,command,status.state().name(),status.admitted(),status.waiting(),status.controlUnknown(),status.retired(),status.drained(),code,runs.tables(start.run()));
+    }
+    private static CommandReply pending(Command command,NativeValidationOwnerReservations.Pending value){
+        return new CommandReply(Outcome.ACCEPTED,command,value.terminal()==null?(value.stopped()?"STOPPED":"STARTING"):value.terminal().name(),
+                value.admitted(),false,false,value.terminal()!=null,value.drained(),value.reason());
     }
 }

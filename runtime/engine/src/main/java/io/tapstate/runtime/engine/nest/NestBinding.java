@@ -39,47 +39,55 @@ public record NestBinding(
         NestSettings settings,
         NestClock clock,
         boolean settleMissingReferencesOnComplete,
-        Optional<CompiledPlan> compiledPlan, Map<String, Long> snapshotEpochs) implements Serializable {
+        Optional<CompiledPlan> compiledPlan,
+        Map<String, Long> snapshotEpochs) implements Serializable {
 
-    public record CompiledStep(NestTopology topology,NestSettings settings) implements Serializable {
-        public CompiledStep { Objects.requireNonNull(topology,"topology"); Objects.requireNonNull(settings,"settings"); }
+    public record CompiledStep(NestTopology topology, NestSettings settings) implements Serializable {
+        public CompiledStep { Objects.requireNonNull(topology, "topology"); Objects.requireNonNull(settings, "settings"); }
     }
-    public record CompiledPlan(String pipelineId,Map<String,CompiledStep> steps) implements Serializable {
-        public CompiledPlan { Objects.requireNonNull(pipelineId,"pipelineId"); steps = Map.copyOf(steps); }
-        private CompiledStep require(String pipeline,String step) {
+    public record CompiledPlan(String pipelineId, Map<String, CompiledStep> steps) implements Serializable {
+        public CompiledPlan { Objects.requireNonNull(pipelineId, "pipelineId"); steps = Map.copyOf(steps); }
+        private CompiledStep require(String pipeline, String step) {
             if (!pipelineId.equals(pipeline) || !steps.containsKey(step))
-                throw new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED,Map.of("pipeline",pipelineId),null);
+                throw new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", pipelineId), null);
             return steps.get(step);
         }
     }
-    public NestBinding { Objects.requireNonNull(compiledPlan,"compiledPlan"); snapshotEpochs = Map.copyOf(snapshotEpochs); }
-    public NestBinding(Function<String,NestTable> tables,NestStores stores,NestDeadLetter deadLetter,
-            ReplayFloorFactory replayFloor,NestStateLedger ledger,NestSettings settings,NestClock clock,
+    public NestBinding {
+        Objects.requireNonNull(compiledPlan, "compiledPlan");
+        snapshotEpochs = Map.copyOf(snapshotEpochs);
+    }
+    public NestBinding(Function<String, NestTable> tables, NestStores stores, NestDeadLetter deadLetter,
+            ReplayFloorFactory replayFloor, NestStateLedger ledger, NestSettings settings, NestClock clock,
             boolean settleMissingReferencesOnComplete) {
-        this(tables,stores,deadLetter,replayFloor,ledger,settings,clock,settleMissingReferencesOnComplete,Optional.empty(),Map.of());
+        this(tables, stores, deadLetter, replayFloor, ledger, settings, clock,
+                settleMissingReferencesOnComplete, Optional.empty(), Map.of());
+    }
+    public NestBinding(Function<String, NestTable> tables, NestStores stores, NestDeadLetter deadLetter,
+            ReplayFloorFactory replayFloor, NestStateLedger ledger, NestSettings settings, NestClock clock,
+            boolean settleMissingReferencesOnComplete, Optional<CompiledPlan> compiledPlan) {
+        this(tables, stores, deadLetter, replayFloor, ledger, settings, clock,
+                settleMissingReferencesOnComplete, compiledPlan, Map.of());
+    }
+    public NestBinding(Function<String, NestTable> tables, NestStores stores, NestDeadLetter deadLetter,
+            ReplayFloorFactory replayFloor, NestStateLedger ledger, NestSettings settings, NestClock clock,
+            boolean settleMissingReferencesOnComplete, Map<String, Long> snapshotEpochs) {
+        this(tables, stores, deadLetter, replayFloor, ledger, settings, clock,
+                settleMissingReferencesOnComplete, Optional.empty(), snapshotEpochs);
     }
     /** Uses only the candidate's original topology and per-step settings during deferred drawing. */
-    public NestBinding withCompiledSteps(String pipelineId,Map<String,CompiledStep> steps) {
-        return new NestBinding(tables,stores,deadLetter,replayFloor,ledger,settings,clock,settleMissingReferencesOnComplete,
-                Optional.of(new CompiledPlan(pipelineId,steps)),snapshotEpochs);
+    public NestBinding withCompiledSteps(String pipelineId, Map<String, CompiledStep> steps) {
+        return new NestBinding(tables, stores, deadLetter, replayFloor, ledger, settings, clock,
+                settleMissingReferencesOnComplete, Optional.of(new CompiledPlan(pipelineId, steps)), snapshotEpochs);
     }
-    public NestTopology topology(String pipelineId,String stepId,TransformBody.Nest body) {
-        return compiledPlan.map(plan -> plan.require(pipelineId,stepId).topology())
-                .orElseGet(() -> NestTopology.compile(pipelineId,stepId,body,tables));
-    }
-    public NestBinding(Function<String,NestTable> tables,NestStores stores,NestDeadLetter deadLetter,
-            ReplayFloorFactory replayFloor,NestStateLedger ledger,NestSettings settings,NestClock clock,
-            boolean settleMissingReferencesOnComplete,Optional<CompiledPlan> compiledPlan) {
-        this(tables,stores,deadLetter,replayFloor,ledger,settings,clock,settleMissingReferencesOnComplete,compiledPlan,Map.of());
-    }
-    public NestBinding(Function<String,NestTable> tables,NestStores stores,NestDeadLetter deadLetter,
-            ReplayFloorFactory replayFloor,NestStateLedger ledger,NestSettings settings,NestClock clock,
-            boolean settleMissingReferencesOnComplete,Map<String,Long> snapshotEpochs) {
-        this(tables,stores,deadLetter,replayFloor,ledger,settings,clock,settleMissingReferencesOnComplete,Optional.empty(),snapshotEpochs);
-    }
-    /** Completion witnesses retain the original compiled topology and storage placement. */
+    /** Expected generations come from the same prepared capture as the source suppliers. */
     public NestBinding withSnapshotEpochs(Map<String, Long> epochs) {
-        return new NestBinding(tables,stores,deadLetter,replayFloor,ledger,settings,clock,settleMissingReferencesOnComplete,compiledPlan,epochs);
+        return new NestBinding(tables, stores, deadLetter, replayFloor, ledger, settings, clock,
+                settleMissingReferencesOnComplete, compiledPlan, epochs);
+    }
+    public NestTopology topology(String pipelineId, String stepId, TransformBody.Nest body) {
+        return compiledPlan.map(plan -> plan.require(pipelineId, stepId).topology())
+                .orElseGet(() -> NestTopology.compile(pipelineId, stepId, body, tables));
     }
 
     /** Keeps bounded preview runs from omitting every root when a referenced row is absent in the sample. */

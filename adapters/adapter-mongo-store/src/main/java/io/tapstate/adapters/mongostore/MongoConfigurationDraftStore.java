@@ -198,7 +198,7 @@ final class MongoConfigurationDraftStore implements PipelineDraftStore {
                 if (!Objects.equals(hash, publication.expectedArtifactHash())) return PipelineDraftMutation.ARTIFACT_CONFLICT;
                 ArtifactWrite write = (hash == null ? ArtifactWrite.createOnly(captured) : ArtifactWrite.replaceOnly(captured, hash))
                         .guardedBy(publication.workspacePreconditions());
-                ConfigurationVersion.advance(session, versions);
+                ConfigurationVersion.advance(session, versions, client);
                 artifacts.writeAllInTransaction(session, List.of(write));
                 var published = new PipelineDraft(current.pipelineId(), current.schemaVersion(), current.revision(), current.mode(),
                         current.name(), current.description(), current.graph(), current.wizard(), publication.publishedArtifactHash(),
@@ -241,7 +241,7 @@ final class MongoConfigurationDraftStore implements PipelineDraftStore {
                 }
                 ArtifactWrite write = ArtifactWrite.replaceOnly(captured, change.expectedArtifactHash())
                         .guardedBy(change.workspacePreconditions());
-                ConfigurationVersion.advance(session, versions);
+                ConfigurationVersion.advance(session, versions, client);
                 artifacts.writeAllInTransaction(session, List.of(write));
                 if (candidate != null && !candidate.equals(current)
                         && drafts.replaceOne(session, new Document("_id", current.pipelineId())

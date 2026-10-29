@@ -68,7 +68,7 @@ final class ValidationRunLifecycle {
     private final AtomicBoolean stopping = new AtomicBoolean();
     private final ValidationFailureLatch failure = new ValidationFailureLatch();
     private ValidationRunState state = ValidationRunState.STARTING;
-    private boolean reserved, joined, born, waiting, attempted, unknown, retired, drained, processorReceipt, retirementNotified;
+    private boolean reserved, joined, localJoined, born, waiting, attempted, unknown, retired, drained, processorReceipt, retirementNotified;
     private boolean desiredComplete;
     private ValidationRunState terminalChoice;
     private ValidationControlStore.Transition pendingTransition;
@@ -89,6 +89,7 @@ final class ValidationRunLifecycle {
     void fail(Throwable reported) { failure.record(Objects.requireNonNull(reported)); stop(); }
 
     synchronized Throwable executionFailure(){return failure.get();}
+    synchronized boolean reportBorn(){return born;}
 
     synchronized Status status() { return new Status(state, joined, waiting, unknown, retired, drained, failure.get() != null ? failure.get() : controlFailure); }
 
@@ -115,9 +116,20 @@ final class ValidationRunLifecycle {
                         }
                     if (answer == ValidationControlStore.Join.JOINED || answer == ValidationControlStore.Join.ALREADY_JOINED) {
                         joined = true;
-                        try { local.joined(); } catch (TapstateException refused) { fail(refused); finish(); return settled(); }
                     }
                         else if (answer != null) { joinRejected = true; fail(invalid("run.originalJoin")); }
+                    }
+                }
+                if (joined && !localJoined && !stopping.get()) {
+                    try { local.joined(); localJoined = true; }
+                    catch (TapstateException refused) {
+                        // A denied local frame has no side effect. Retry only that original local
+                        // admission; the durable join, report birth and Job are never repeated.
+                        if (refused.code() == ValidationError.VALUE_LIMIT_EXCEEDED
+                                && "validation.metadataFrames".equals(refused.args().get("limit"))) {
+                            unknown = true; controlFailure = refused; return settled();
+                        }
+                        fail(refused); finish(); return settled();
                     }
                 }
                 if (stopping.get()) finish();

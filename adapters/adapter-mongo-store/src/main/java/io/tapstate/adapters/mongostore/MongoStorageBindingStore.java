@@ -231,7 +231,7 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
                         || hasOtherResource(session, captured.id())
                         || sources.find(session, new Document("systemRole", DEFAULT_ROLE)).first() != null) throw refused();
                 new MongoPipelineStateMappings(client, database).requireNoRetainedIdentity(session, captured.id());
-                ConfigurationVersion.advance(session, versions);
+                ConfigurationVersion.advance(session, versions, client);
                 SourceConfigCipher cipher = cipherForWrite(session);
                 StorageBinding binding = new StorageBinding(expected, mode, 1L, captured.id(), cache);
                 sources.insertOne(session, codec.encode(captured, session).append("systemRole", DEFAULT_ROLE));
@@ -291,7 +291,7 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
                     return bound;
                 }
                 requireSetup(state, expected, BOUND);
-                ConfigurationVersion.advance(session, versions);
+                ConfigurationVersion.advance(session, versions, client);
                 MongoFirstAdminStore.preparePending(session, database, expected, bound.bindingVersion(), bound.mode());
                 if (setup.updateOne(session, setupFilter(expected, BOUND),
                         new Document("$set", new Document("phase", "COMPLETE"))).getMatchedCount() != 1) throw refused();

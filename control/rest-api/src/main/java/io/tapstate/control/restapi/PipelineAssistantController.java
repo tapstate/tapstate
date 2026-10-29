@@ -85,8 +85,10 @@ class PipelineAssistantController {
     @PostMapping(value = "/pipelines/{id}/draft:assistant", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     ResponseEntity<StreamingResponseBody> assistant(@PathVariable("id") String id,
             @RequestBody Map<String, Object> body, HttpServletRequest request) {
-        String owner = providers.owner(request);
+        var workspace = providers.workspace(request);
+        String owner = workspace.owner();
         var settings = providers.service().require(owner);
+        workspace.requireActive().run();
         long revision = revision(body.get("revision"));
         PipelineDraft base = current(id, revision);
         List<Map<String, String>> messages = messages(body.get("messages"));
@@ -108,6 +110,7 @@ class PipelineAssistantController {
                 catch (UncheckedIOException disconnected) { worker.interrupt(); }
             }, 5, 5, java.util.concurrent.TimeUnit.SECONDS);
             try {
+                workspace.requireActive().run();
                 streamEvents.event(Map.of("type", "start", "messageId", UUID.randomUUID().toString()));
                 streamEvents.status("connecting");
                 Map<String, Object> context = context(base);
@@ -115,8 +118,11 @@ class PipelineAssistantController {
                 if (!focus.isEmpty()) context.put("focus", focus);
                 streamEvents.event(Map.of("type", "text-start", "id", textId));
                 streamEvents.status("streaming");
-                var candidate = client.propose(settings, messages, context,
-                        delta -> streamEvents.event(Map.of("type", "text-delta", "id", textId, "delta", delta)));
+                var candidate = client.propose(settings, messages, context, delta -> {
+                    workspace.requireActive().run();
+                    streamEvents.event(Map.of("type", "text-delta", "id", textId, "delta", delta));
+                });
+                workspace.requireActive().run();
                 streamEvents.event(Map.of("type", "text-end", "id", textId));
                 if (candidate.isEmpty()) {
                     streamEvents.status("complete");
@@ -126,6 +132,7 @@ class PipelineAssistantController {
                 }
                 streamEvents.status("validating");
                 Map<String, Object> validated = validate(base, id, revision, candidate.orElseThrow(), context);
+                workspace.requireActive().run();
                 if (!Boolean.TRUE.equals(validated.get(VALID))) {
                     List<Map<String, Object>> diagnostics = diagnostics(validated);
                     String code = diagnostics.isEmpty()
@@ -136,6 +143,7 @@ class PipelineAssistantController {
                 }
                 Map<String, Object> proposal = new LinkedHashMap<>(validated);
                 proposal.put("baseRevision", revision);
+                workspace.requireActive().run();
                 streamEvents.event(Map.of("type", "data-proposal", "data", proposal));
                 streamEvents.status("ready");
                 streamEvents.event(Map.of("type", FINISH, FINISH_REASON, "stop"));
@@ -154,10 +162,12 @@ class PipelineAssistantController {
     @PostMapping("/pipelines/{id}/draft:assistant-validate")
     ResponseEntity<Map<String, Object>> validate(@PathVariable("id") String id,
             @RequestBody Map<String, Object> body, HttpServletRequest request) {
-        providers.owner(request);
+        var workspace = providers.workspace(request);
         Object raw = body.get("candidateWizard");
         if (!(raw instanceof Map<?, ?>)) throw malformed("candidateWizard must be an object");
-        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(validate(id, revision(body.get("revision")), AssistantWizardJson.object(raw)));
+        var result = validate(id, revision(body.get("revision")), AssistantWizardJson.object(raw));
+        workspace.requireActive().run();
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(result);
     }
     Map<String, Object> validate(String id, long revision, Map<String, Object> view) {
         PipelineDraft base = current(id, revision);

@@ -73,6 +73,9 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         }, port.connectionTestResults(), parent.getBean(Clock.class)));
         var overrides = new LinkedHashMap<String,Object>();
         overrides.put("tokenStore", configuration.tokens());
+        overrides.put("aiProviderSettingsStore", configuration.aiProviderSettings());
+        var providerClient = parent.getBeanProvider(AiProviderClient.class).getIfAvailable();
+        if (providerClient != null) overrides.put("aiProviderClient", providerClient);
         overrides.put("auditStore", configuration.audit());
         overrides.put("clusterIdentityStore", configuration.clusterIdentity());
         overrides.put("clusterIdentityService", parent.getBean(ClusterIdentityService.class));
@@ -103,6 +106,21 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         AnnotationAwareOrderComparator.sort(ordered); handlers = List.copyOf(ordered);
         original.requireBusiness(); active.set(true);
         context.getBean(NativeValidationScheduler.class).start();
+        // The first-admin page uses the same formal result and observer as ordinary Source tests.
+        if (original.preparation().authScope().mode() == StorageBinding.Mode.OP) {
+            try {
+                if (configuration.firstAdmin().load().orElseThrow(StorageRuntime::unavailable).phase() == FirstAdminStore.Phase.PENDING) {
+                    var binding = configuration.bindings().load().filter(original.binding()::equals).orElseThrow(StorageRuntime::unavailable);
+                    var source = configuration.artifacts().get(binding.defaultSourceId()).filter(SourceResource.class::isInstance)
+                            .map(SourceResource.class::cast).orElseThrow(StorageRuntime::unavailable);
+                    context.getBean(ConnectionTestService.class).test(source.id(), source.connector(), source.config(),
+                            "installation:" + binding.setup().installationId());
+                }
+            } catch (io.tapstate.core.common.TapstateException unavailable) {
+                org.slf4j.LoggerFactory.getLogger(NativeBusinessContext.class)
+                        .warn("Initial application-data verification unavailable [{}]", unavailable.code().code());
+            }
+        }
     }
 
     Optional<org.springframework.boot.availability.ApplicationAvailability> availability() {
@@ -462,12 +480,12 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         @Bean PipelineConverger pipelineConverger(NativeBusinessContext owner, EngineLifecycleActuator actuator, Clock clock, RebuildAdmission admission) {
             return new PipelineConverger(owner.port.desired(), owner.port.state(), actuator, clock, admission);
         }
-        @Bean ObservationPublisher observationPublisher(NativeBusinessContext owner, Engine engine, PipelineCaptureCoordinator captures) {
+        @Bean ObservationPublisher observationPublisher(NativeBusinessContext owner, Engine engine, PipelineCaptureCoordinator captures, HazelcastExecutionPlans plans) {
             var readings = new RunBoundCaptureReadings(captures, pipeline -> engine.captureRun(pipeline).map(run -> {
                 if (!(run.operatorManifest().executionIdentity() instanceof ExecutionFence original)) throw ThreeLayerStorePort.refused();
                 return original;
             }), engine::capturedRows);
-            return new RuntimeConvergenceConfiguration().observationPublisher(owner.port, engine, readings);
+            return new RuntimeConvergenceConfiguration().observationPublisher(owner.port, engine, readings, plans);
         }
         @Bean RateSampler rateSampler(NativeBusinessContext owner, MetricsHistoryProperties history) {
             return new RateSampler(owner.port.rateHistory(), history.getSampleInterval());

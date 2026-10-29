@@ -24,17 +24,24 @@ final class ConfigurationVersion {
         return revision;
     }
 
-    static void advance(ClientSession session, MongoCollection<Document> versions) {
-        requireNoValidationMaintenance(session, versions, null);
+    static void advance(ClientSession session, MongoCollection<Document> versions, com.mongodb.client.MongoClient originalClient) {
+        advance(session, versions, originalClient.getDatabase(versions.getNamespace().getDatabaseName()));
+    }
+
+    static void advance(ClientSession session, MongoCollection<Document> versions, com.mongodb.client.MongoDatabase originalDatabase) {
+        requireNoValidationMaintenance(session, versions, null, originalDatabase);
         advanceRaw(session, versions);
     }
 
-    static void advanceValidationPreparation(ClientSession session, MongoCollection<Document> versions, String operation) {
-        requireNoValidationMaintenance(session, versions, java.util.Objects.requireNonNull(operation));
+    static void advanceValidationPreparation(ClientSession session, MongoCollection<Document> versions, String operation,
+            com.mongodb.client.MongoClient originalClient) {
+        requireNoValidationMaintenance(session, versions, java.util.Objects.requireNonNull(operation),
+                originalClient.getDatabase(versions.getNamespace().getDatabaseName()));
         advanceRaw(session, versions);
     }
 
-    private static void requireNoValidationMaintenance(ClientSession session, MongoCollection<Document> versions, String operation) {
+    private static void requireNoValidationMaintenance(ClientSession session, MongoCollection<Document> versions, String operation,
+            com.mongodb.client.MongoDatabase originalDatabase) {
         // This read uses the original collection's database and the SAME session. No second client
         // or guessed endpoint can certify the migration gate that protects this revision write.
         var row = versions.aggregate(session, java.util.List.of(new Document("$match", new Document("_id", ID)),
@@ -50,10 +57,11 @@ final class ConfigurationVersion {
         var schemas = row.getList("schema", Document.class);
         if (schemas.isEmpty()) { if (operation != null) throw MongoValidationSchema.refused(); return; }
         var schema = schemas.getFirst();
-        if (schema.containsKey("validation") || Integer.valueOf(MongoValidationSchema.VERSION).equals(schema.get("installedVersion"))) {
-            if (!Integer.valueOf(MongoValidationSchema.VERSION).equals(schema.get("installedVersion"))) throw MongoValidationSchema.unreadable("version");
-            if (!(schema.get("validation") instanceof Document value)) throw MongoValidationSchema.unreadable("marker");
-            var marker = MongoValidationSchema.validateMarker(value);
+        // Metadata probes use the SAME original client and namespace, never an independently opened endpoint.
+        if (!versions.getNamespace().getDatabaseName().equals(originalDatabase.getName()))
+            throw new IllegalArgumentException("configuration version database mismatch");
+        if (MongoValidationSchema.configurationHasValidation(originalDatabase, schema)) {
+            var marker = MongoValidationSchema.configurationMarker(schema);
             var identities = row.getList("identity", Document.class);
             if (identities.size() != 1 || !MongoValidationSchema.scope(marker).clusterId().equals(identities.getFirst().get("clusterId"))
                     || !MongoConfigurationDomain.LAYOUT.equals(identities.getFirst().get("layoutId"))) throw MongoValidationSchema.unreadable("identity");

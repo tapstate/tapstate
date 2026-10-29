@@ -79,7 +79,7 @@ class RuntimeConvergenceConfiguration {
         return observationPublisher(storePort, engine, captureCoordinator, ExecutionPlans.NONE);
     }
 
-    private ObservationPublisher observationPublisher(StorePort storePort, Engine engine,
+    ObservationPublisher observationPublisher(StorePort storePort, Engine engine,
             PipelineCaptureCoordinator captureCoordinator, ExecutionPlans executionPlans) {
         // The publisher's four run-statistic sources: recordCount and the per-chain frontier readings ride
         // from the engine's live Jet job, the per-table sink-acked positions from the store, and the

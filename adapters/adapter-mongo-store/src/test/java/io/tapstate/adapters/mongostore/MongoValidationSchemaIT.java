@@ -318,7 +318,7 @@ class MongoValidationSchemaIT {
             assertThatThrownBy(() -> { try (var ignored = f.prepare(UUID.randomUUID())) {} }).isInstanceOf(TapstateException.class);
             assertThat(f.configSchema()).isEqualTo(before);
             try (var session = f.configClient.startSession()) { session.withTransaction(() -> {
-                ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(f.configDb)); return null;
+                ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(f.configDb), f.configDb); return null;
             }); }
         }
     }
@@ -832,17 +832,29 @@ class MongoValidationSchemaIT {
         }
     }
 
-    private static final class Fixture implements AutoCloseable {
+    static final class Fixture implements AutoCloseable {
         final MongoClient configClient = MongoClients.create(CONFIG.getReplicaSetUrl()), cacheClient = MongoClients.create(CACHE.getReplicaSetUrl());
         final String suffix = UUID.randomUUID().toString().replace("-", "");
         final MongoDatabase configDb = configClient.getDatabase("schema_config_" + suffix), cacheDb = cacheClient.getDatabase("schema_cache_" + suffix);
         final MongoConnectionSettings settings = new MongoConnectionSettings(CONFIG.getReplicaSetUrl(configDb.getName()), null, Duration.ofSeconds(5));
         final StorageBinding.Connection endpoint = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB, CACHE.getReplicaSetUrl(cacheDb.getName()), cacheDb.getName(), null);
-        final MongoConfigurationDomain configuration = MongoConfigurationBootstrap.prepare(settings, "cluster", "installation", "setup", 1);
+        final MongoConfigurationDomain configuration;
         final MongoCacheDomain cache;
         final CacheBusinessScope scope;
         Fixture(int pipelines) { this(pipelines, StorageBinding.Mode.OP); }
         Fixture(int pipelines, StorageBinding.Mode mode) {
+            this(pipelines, mode, false);
+        }
+        Fixture(int pipelines, StorageBinding.Mode mode, boolean nativeAi) {
+            try (var prepared = MongoConfigurationBootstrap.prepare(settings, "cluster", "installation", "setup", 1)) {
+                if (!nativeAi) {
+                    // Preserve the original pre-AI layout as the input to the existing upgrade regressions.
+                    SystemCollections.SCHEMA_MIGRATIONS.on(configDb).updateOne(new Document("_id", "config"),
+                            new Document("$set", new Document("installedVersion", 1)));
+                    SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(configDb).drop();
+                }
+            }
+            configuration = MongoConfigurationDomain.open(settings, "cluster");
             var master = new SourceResource(StorageBinding.defaultSourceId(mode), null, mode == StorageBinding.Mode.CLOUD ? "mongodb-atlas" : "mongodb",
                     Map.of("uri", "mongodb://business.invalid/master"), null, null, null, null);
             var binding = configuration.bindings().commitWithFirstCache(new StorageSetupScope("cluster", "installation", "setup", 1), mode, endpoint, master);

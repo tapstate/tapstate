@@ -17,6 +17,61 @@ import static org.mockito.Mockito.*;
 class OnPremInstallationTest {
     @TempDir Path directory;
 
+    @Test void bootstrapSnapshotKeepsTheActualApplicationDataVerificationAndTime() {
+        var files = InstallationFiles.initialize(directory.resolve("verification"));
+        files.saveStage(files.stage().withHandoff(InstallationFiles.Handoff.RESTARTED, "a".repeat(64)));
+        var scope = files.stage().scope();
+        var root = mock(StorageRoot.class); var runtime = mock(StorageRuntime.class);
+        var configuration = mock(MongoConfigurationDomain.class); var states = mock(StorageSetupStateStore.class);
+        when(root.mode()).thenReturn(StorageBinding.Mode.OP); when(root.runtime()).thenReturn(runtime);
+        when(runtime.configuration()).thenReturn(Optional.of(configuration)); when(configuration.setupStates()).thenReturn(states);
+        when(states.guardedBy(any())).thenReturn(states);
+        when(states.load()).thenReturn(new StorageSetupStateStore.Status(scope, StorageSetupStateStore.Phase.COMPLETE, 1));
+        var verified = new io.tapstate.control.core.DefaultSourceVerification.Verification(
+                io.tapstate.control.core.DefaultSourceVerification.Status.PASSED,
+                java.time.Instant.parse("2026-10-29T00:00:00Z"), java.time.Instant.parse("2026-10-29T00:10:00Z"));
+        var health = java.util.Map.of(io.tapstate.control.core.StorageSetupService.Layer.CONFIG, io.tapstate.control.core.StorageControlDispatcher.Health.AVAILABLE,
+                io.tapstate.control.core.StorageSetupService.Layer.CACHE, io.tapstate.control.core.StorageControlDispatcher.Health.AVAILABLE,
+                io.tapstate.control.core.StorageSetupService.Layer.MASTER, io.tapstate.control.core.StorageControlDispatcher.Health.AVAILABLE);
+        var caller = mock(io.tapstate.control.core.StorageControlAccess.class);
+        when(root.snapshot(eq(caller), any())).thenReturn(new io.tapstate.control.core.StorageControlDispatcher.Snapshot(
+                StorageBinding.Mode.OP, scope.clusterId(), scope.operationId(), scope.generation(), 1, 1, 1, "COMPLETE",
+                io.tapstate.control.core.StorageControlDispatcher.BusinessPhase.READY, health, java.util.List.of("storage.status"), false, verified));
+        try (var installation = new OnPremInstallation(root, files, new MongoProperties(), mock(StorageSetupService.DefaultTarget.class), Clock.systemUTC())) {
+            assertThat(installation.snapshot(caller, () -> {}).applicationDataVerification()).isEqualTo(verified);
+        }
+    }
+
+    @Test void managementOverviewCanBeReopenedButArbitraryRoutesRemainClosed() throws Exception {
+        var files = InstallationFiles.initialize(directory.resolve("reopen"));
+        var root = mock(StorageRoot.class); var runtime = mock(StorageRuntime.class);
+        when(root.mode()).thenReturn(StorageBinding.Mode.OP); when(root.runtime()).thenReturn(runtime);
+        when(runtime.configuration()).thenReturn(Optional.empty());
+        try (var installation = new OnPremInstallation(root, files, new MongoProperties(), mock(StorageSetupService.DefaultTarget.class), Clock.systemUTC())) {
+            var connector = mock(org.apache.catalina.connector.Connector.class);
+            when(connector.getLocalPort()).thenReturn(51599); installation.attach(connector);
+            var normal = mock(org.apache.catalina.connector.Connector.class);
+            var service = mock(org.apache.catalina.Service.class);
+            when(connector.getService()).thenReturn(service);
+            when(service.findConnectors()).thenReturn(new org.apache.catalina.connector.Connector[]{connector, normal});
+            when(normal.getLocalPort()).thenReturn(50690); when(normal.getScheme()).thenReturn("http");
+            when(normal.getProperty("address")).thenReturn(java.net.InetAddress.getByName("127.0.0.1"));
+            assertThat(installation.normalLoginUrl()).isEqualTo("http://127.0.0.1:50690/login");
+            var request = mock(org.apache.catalina.connector.Request.class); var attributes = new java.util.HashMap<String,Object>();
+            when(request.getConnector()).thenReturn(connector);
+            doAnswer(call -> { attributes.put(call.getArgument(0), call.getArgument(1)); return null; }).when(request).setAttribute(anyString(), any());
+            when(request.getAttribute(anyString())).thenAnswer(call -> attributes.get(call.getArgument(0)));
+            when(request.getDispatcherType()).thenReturn(jakarta.servlet.DispatcherType.REQUEST);
+            when(request.getLocalAddr()).thenReturn("127.0.0.1"); when(request.getLocalPort()).thenReturn(51599);
+            when(request.getHeader("Host")).thenReturn("127.0.0.1:51599");
+            when(request.getMethod()).thenReturn("GET"); when(request.getRequestURI()).thenReturn("/overview");
+            installation.markRequest(request);
+            assertThatCode(() -> installation.requireManagementRequest(request)).doesNotThrowAnyException();
+            when(request.getRequestURI()).thenReturn("/api/sources");
+            assertThatThrownBy(() -> installation.requireManagementRequest(request)).isInstanceOf(TapstateException.class);
+        }
+    }
+
     @Test void localAuthorizationGenerationIsNotReportedAsADurableConfigurationRevision() {
         var files = InstallationFiles.initialize(directory.resolve("local-revision"));
         var states = new InstallationSetupStates(files, Optional::empty);

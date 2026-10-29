@@ -33,7 +33,7 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
     /** A publication changes the revision even when the visible members have not changed. */
     record VisibleSnapshot(long revision, Set<String> nodeIds, boolean originalSingleVisible) {}
     private volatile WorkloadOwner singleOwner;
-    private final AtomicReference<BooleanSupplier> nodeSession = new AtomicReference<>(() -> false);
+    private final AtomicReference<BooleanSupplier> nodeSession = new AtomicReference<>(() -> true);
 
     /** A fixed deployment predicate, not a persisted majority decision or recovery epoch. */
     void bindSingle(WorkloadClaim original) {
@@ -41,15 +41,18 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
                 || !original.key().clusterId().equals(original.owner().nodeId()) || !original.key().resourceId().equals(original.owner().nodeId())) {
             throw new IllegalArgumentException("invalid single-node admission");
         }
+        nodeSession.set(() -> false);
         singleOwner = original.owner();
         committed.set(new ClusterMembership(original.key().clusterId(), 1, Set.of(original.owner().nodeId())));
     }
+
 
     /**
      * The data plane's own answer to this same predicate. Until a member binds one, nothing is asked -
      * a build with no member has no data plane to disagree with.
      */
     private final AtomicReference<BooleanSupplier> dataPlane = new AtomicReference<>(() -> true);
+
 
     ClusterMembershipGate(ClusterProperties properties) {
         this.profile = properties.getProfile();

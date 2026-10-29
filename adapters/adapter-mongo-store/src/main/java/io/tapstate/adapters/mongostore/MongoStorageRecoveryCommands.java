@@ -97,7 +97,7 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands,io.t
             requireInitialOpManifest(session, current, verified);
             requireManifest(session, verified);
             if (verified.configurationRevision() != revision) throw refused();
-            ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database));
+            ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), client);
             long next = revision + 1;
             String originalId = operationId != null ? previous.operationId() : id;
             String predecessor = operationId != null ? previous.previousOperationId() : previousOperationId;
@@ -126,7 +126,7 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands,io.t
             if(current.phase()!=Phase.CONFIRMED || confirmed.phase()!=Phase.CONFIRMED
                     || revision(session)!=current.controlRevision()+current.phase().ordinal())throw refused();
             requireManifest(session,current.manifest());
-            ConfigurationVersion.advance(session,SystemCollections.CONFIGURATION_VERSION.on(database));
+            ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), client);
             captureOwner(current).reserveSharedRecovery(session,current);
             var mappings=new MongoPipelineStateMappings(client,database);
             var intents=new MongoPipelineIntentStore(client,database,current.originalScope().clusterId(),bindings);
@@ -168,7 +168,7 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands,io.t
             if(current.phase()!=Phase.RUNNING)throw refused();
             var retained=sharedPending(session,current);
             if(!retained.replacement.equals(original.replacement) || !retained.targetFingerprint.equals(original.targetFingerprint))throw refused();
-            ConfigurationVersion.advance(session,SystemCollections.CONFIGURATION_VERSION.on(database));
+            ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), client);
             captureOwner(current).publishSharedRecovery(session,current);
             var completed=new Plan(current.operationId(),current.previousOperationId(),current.originalScope(),current.manifest(),
                     current.planHash(),current.controlRevision(),Phase.COMPLETE);
@@ -198,7 +198,7 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands,io.t
             var current=requireSharedAuthority(session,original);var row=root(session,current.originalScope());
             requireManifest(session,verified);long revision=revision(session);
             if(verified.configurationRevision()!=revision)throw refused();
-            ConfigurationVersion.advance(session,SystemCollections.CONFIGURATION_VERSION.on(database));
+            ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), client);
             var next=new Plan(current.operationId(),current.previousOperationId(),current.originalScope(),verified,hash(verified),revision+1,Phase.PLANNED);
             save(session,row,next);return next;
         });
@@ -232,7 +232,7 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands,io.t
             if(current.phase()!=Phase.CONFIRMED || !sameOriginal(current,confirmed) || current.controlRevision()!=confirmed.controlRevision()
                     || revision(session)!=current.controlRevision()+current.phase().ordinal())throw refused();
             requireManifest(session,current.manifest());
-            ConfigurationVersion.advance(session,SystemCollections.CONFIGURATION_VERSION.on(database));
+            ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), client);
             captureOwner(current).rebindSharedRecovery(session,current,original.reservation());
             var mappings=new MongoPipelineStateMappings(client,database);
             var intents=new MongoPipelineIntentStore(client,database,current.originalScope().clusterId(),bindings);
@@ -394,7 +394,7 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands,io.t
             if (requireRevision && revision(session) != current.controlRevision()+current.phase().ordinal()) throw refused();
             requireInitialOpManifest(session, original.originalScope(), original.manifest());
             requireManifest(session, original.manifest());
-            ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database));
+            ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), client);
             Plan result = new Plan(current.operationId(), current.previousOperationId(), current.originalScope(), current.manifest(), current.planHash(), current.controlRevision(), to);
             if (stoppedScopes != null) stoppedScopes.publishInTransaction(session, result);
             if (validationReplacement)

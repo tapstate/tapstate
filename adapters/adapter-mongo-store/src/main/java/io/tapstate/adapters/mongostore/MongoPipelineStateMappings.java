@@ -105,8 +105,8 @@ public final class MongoPipelineStateMappings implements PipelineStateMappings {
     private Document validationSchema(ClientSession session) {
         var row = SystemCollections.SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "config")).first();
         if (row == null) throw MongoValidationSchema.unreadable("version");
-        if (Integer.valueOf(1).equals(row.get("installedVersion")) && !row.containsKey("validation")) return null;
-        return MongoValidationSchema.requireVersionTwo(row, "READY");
+        if (!MongoValidationSchema.configurationHasValidation(database, row)) return null;
+        return MongoValidationSchema.requireConfiguration(row, "READY");
     }
 
     static void requireNoSharedReferences(ClientSession session,MongoDatabase database,String operation) {

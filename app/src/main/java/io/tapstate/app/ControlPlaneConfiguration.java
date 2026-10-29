@@ -184,6 +184,7 @@ class ControlPlaneConfiguration {
     io.tapstate.control.core.AiProviderService aiProviderService(
             ObjectProvider<io.tapstate.spi.store.AiProviderSettingsStore> stores, AuditGate auditGate) {
         var store = stores.getIfAvailable();
+        // An optional provider feature cannot block a runtime whose active backend has no settings adapter.
         return store == null ? null : new io.tapstate.control.core.AiProviderService(store, auditGate);
     }
 

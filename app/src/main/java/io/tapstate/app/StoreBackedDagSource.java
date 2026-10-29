@@ -1962,26 +1962,31 @@ final class StoreBackedDagSource implements DagSource {
         long snapshotEpoch = snapshotOnly && captureBindings == null
                 ? SnapshotRunOrder.current(storePort.keyedState(), pipeline.id()) : 0L;
         Map<String, Long> sourceEpochs = new LinkedHashMap<>();
-        for (var vertex : sourceVertices.values()) {
+        sourceVertices.values().forEach(vertex -> {
+            String chain = vertex.resolution().chainId().value();
             long epoch;
-            if (captureBindings == null) epoch = snapshotOnly ? snapshotEpoch
-                    : sourceContextEpoch(vertex.resolution().chainId().value(), vertex.consumerId(), vertex.table());
-            else if (snapshotOnly) epoch = captureBindings.requireSnapshot(vertex.sourceId(), vertex.resolution().chainId().value(), vertex.table()).epoch();
-            else if (captureBindings.direct().containsKey(vertex.sourceId())) epoch = captureBindings.requireDirect(vertex.sourceId(), vertex.resolution().chainId().value(), vertex.table()).loadEpoch();
-            else epoch = captureBindings.require(vertex.sourceId(), vertex.resolution().chainId().value(), vertex.table()).snapshotEpoch();
+            if (captureBindings == null) {
+                epoch = snapshotOnly ? snapshotEpoch : sourceContextEpoch(chain, vertex.consumerId(), vertex.table());
+            } else if (snapshotOnly) {
+                epoch = captureBindings.requireSnapshot(vertex.sourceId(), chain, vertex.table()).epoch();
+            } else if (captureBindings.direct().containsKey(vertex.sourceId())) {
+                epoch = captureBindings.requireDirect(vertex.sourceId(), chain, vertex.table()).loadEpoch();
+            } else {
+                epoch = captureBindings.require(vertex.sourceId(), chain, vertex.table()).snapshotEpoch();
+            }
             sourceEpochs.put(vertex.stream(), epoch);
-        }
-        Map<String, Long> snapshotEpochs = new LinkedHashMap<>();
-        if (readModeOf(pipeline) != ReadMode.CDC_ONLY) sourceEpochs.forEach((chain, epoch) -> {
-            if (epoch > 0) snapshotEpochs.put(chain, epoch);
         });
+        Map<String, Long> snapshotEpochs = new LinkedHashMap<>();
+        if (readModeOf(pipeline) != ReadMode.CDC_ONLY) {
+            sourceEpochs.forEach((chain, epoch) -> { if (epoch > 0) snapshotEpochs.put(chain, epoch); });
+        }
         Map<String, Step.Inline> stepsById = inlineStepsById(pipeline);
         Map<String, String> sourceIdByTable = sourceIdByTable(sourceVertices);
         StartFrom freshStart = freshRingStart(pipeline);
         Map<String, StoreBackedSinkAckFactory.SourceProgress> progress = progressByTable(pipeline);
         return new DagBindings(
                 key -> sourceVertex(sourceVertices.get(key), axes, snapshotOnly, snapshotEpoch, freshStart,
-                        progress.get(sourceVertices.get(key).stream()).kind() == ConsumerProgressKind.DIRECT_SOURCE,captureBindings,sourceEpochs.get(sourceVertices.get(key).stream())),
+                        progress.get(sourceVertices.get(key).stream()).kind() == ConsumerProgressKind.DIRECT_SOURCE,captureBindings, sourceEpochs.get(sourceVertices.get(key).stream())),
                 step -> transformBinding(step, stepsById, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds),
                 element -> FencedSinkWriterFactory.heldTo(
                         sinkWriter(pipeline, element, targets, serveStreams, sourceIdByTable, freshFullLoad,fence,targetPreparations,targetGuard), fence),
@@ -3179,7 +3184,7 @@ final class StoreBackedDagSource implements DagSource {
      */
     private ProcessorMetaSupplier sourceVertex(
             SourceVertex vertex, ChainAxes axes, boolean snapshotOnly, long snapshotEpoch, StartFrom freshStart,
-            boolean direct,PipelineCaptureBindings captureBindings,long sourceEpoch) {
+            boolean direct,PipelineCaptureBindings captureBindings, long sourceEpoch) {
         if (vertex == null) {
             throw new IllegalStateException("source vertex binding is missing");
         }

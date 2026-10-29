@@ -30,24 +30,28 @@ class MongoObservationInitialLoadIT {
     }
 
     @Test
-    void newRunReplacesOldFactsAndLegacyDocumentsRemainUnknown() {
+    void legacyWriterNeverAddsInitialLoadAndKeepsHistoricalBytesReadable() {
         try (var client = MongoClients.create(MONGO.getReplicaSetUrl())) {
-            var collection = client.getDatabase("initial_load_observation_it").getCollection("pipeline_observation");
+            var collection = client.getDatabase("retained_legacy_observation_it").getCollection("pipeline_observation");
             var store = new MongoObservationStore(collection);
             var at = Instant.parse("2026-10-28T09:00:00Z");
-            var load = new InitialLoad("execution:p:2:at", at, "snapshot_and_cdc", Map.of(
+            var oldLoad = new InitialLoad("execution:p:2:at", at, "snapshot_and_cdc", Map.of(
                     "orders", new InitialLoad.Table(InitialLoad.Stage.READING, 3L, null)));
-            var first = new Observation("p", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(), null, at, List.of(), load);
+            var first = new Observation("p", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(), null, at, List.of(), oldLoad);
             store.save(first);
+            assertThat(collection.find(new Document("_id", "p")).first()).doesNotContainKey("initialLoad");
+            var historical = MongoObservationStore.toDocument(first);
+            collection.replaceOne(new Document("_id", "p"), historical);
             assertThat(store.read("p")).contains(first);
-            var next = new Observation("p", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(), null, at.plusSeconds(1), List.of(),
-                    new InitialLoad("execution:p:3:next", at.plusSeconds(1), "snapshot_and_cdc", Map.of(
-                            "orders", new InitialLoad.Table(InitialLoad.Stage.PENDING, null, null))));
+            var next = new Observation("p", PipelineState.STOPPED, Map.of(), Map.of(), Map.of(), null,
+                    at.plusSeconds(1), List.of(), new InitialLoad("execution:p:3:next", at.plusSeconds(1),
+                    "snapshot_and_cdc", Map.of("orders", new InitialLoad.Table(InitialLoad.Stage.PENDING, null, null))));
             store.save(next);
+            var retained = collection.find(new Document("_id", "p")).first();
+            assertThat(retained.get("initialLoad")).isEqualTo(historical.get("initialLoad"));
+            assertThat(store.read("p").orElseThrow().initialLoad()).isEqualTo(oldLoad);
+            assertThat(store.read("p").orElseThrow().state()).isEqualTo(PipelineState.STOPPED);
             assertThat(collection.countDocuments()).isEqualTo(1);
-            assertThat(store.read("p")).contains(next);
-            collection.replaceOne(new Document("_id", "p"), new Document("_id", "p").append("state", "RUNNING"));
-            assertThat(store.read("p").orElseThrow().initialLoad()).isNull();
         }
     }
 }

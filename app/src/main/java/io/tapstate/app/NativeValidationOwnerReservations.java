@@ -171,7 +171,9 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
             return new ValidationReportAdmission.Start(task(request),request.configurationRevision(),request.startSequence(),request.command().toString(),identity);
         }finally{local.lock.unlock();unpin(local);}
     }
-    record Pending(boolean stopped,boolean drained) {}
+    record Pending(boolean stopped,boolean drained,ValidationRunState terminal,boolean admitted,String reason) {
+        Pending(boolean stopped,boolean drained){this(stopped,drained,null,false,null);}
+    }
     /** Exact existing handoff only; missing status never creates a Pipeline registry or native authority. */
     Optional<Pending> pending(Request request,ValidationOwner expected,boolean stop){
         requireActive();final Pipeline local;
@@ -181,6 +183,9 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
             var original=local.operations.get(new Operation(request.task(),request.taskGeneration(),request.mode(),request.command()));
             if(original==null||!original.request.equals(request)||original.bound==null||original.owner==null
                     ||!original.bound.budget().identity().owner().equals(expected))return Optional.empty();
+            // This is an immutable local receipt, not authority to resume or control a retired run.
+            if(original.completed&&original.terminal!=null)return Optional.of(new Pending(original.terminal==ValidationRunState.STOPPED,
+                    original.bound.fullyReleased(),original.terminal,original.terminalAdmitted,original.reason));
             original.requireOwner();if(stop&&!original.cancelIfUnused()||!stop&&original.isActivated())return Optional.empty();
             return Optional.of(new Pending(original.cancelled.get(),original.cancelled.get()&&original.bound.fullyReleased()));
         }finally{local.lock.unlock();unpin(local);}
@@ -298,14 +303,18 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         // that original. Only monotonic CONFIG sequence/revision/lifetime evidence supersedes it.
         try (var frame = resources.admitMetadata()) {
             var definitions = configuration.validationTasks(this::requireActive);
-            record Version(UUID generation, boolean closed, long revision, long full, long incremental) {}
+            record Version(UUID generation, boolean closed, long revision, long full, long incremental,
+                    ValidationReportAdmission.Start fullPermission,ValidationReportAdmission.Start incrementalPermission) {}
             var saved = new HashMap<String, Optional<Version>>();
             for (var entry : pipeline.operations.values()) {
                 if (!entry.closedHandoff()) continue;
                 var current = saved.computeIfAbsent(entry.request.task(), task -> definitions.read(pipeline.pipeline, task)
-                        .map(value -> new Version(value.task().generation(), value.closed(), value.revision(), value.full().nextStartSequence(), value.incremental().nextStartSequence())));
+                        .map(value -> new Version(value.task().generation(), value.closed(), value.revision(), value.full().nextStartSequence(), value.incremental().nextStartSequence(),
+                                value.full().permission()==null?null:value.full().permission().start(),value.incremental().permission()==null?null:value.incremental().permission().start())));
                 if (current.isEmpty()) continue;
                 var value = current.orElseThrow();
+                var named=entry.request.mode().equals("FULL")?value.fullPermission():value.incrementalPermission();
+                if(entry.completed&&entry.terminalWithoutReport&&entry.namesOriginal(named))continue;
                 if (!value.generation().equals(entry.request.taskGeneration()) || value.closed()
                         || value.revision() > entry.request.configurationRevision()
                         || (entry.request.mode().equals("FULL") ? value.full() : value.incremental()) > entry.request.startSequence()) entry.superseded = true;
@@ -362,6 +371,7 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         volatile MongoConfigurationDomain.ValidationAccess access;
         volatile ValidationMemberResources.Metadata metadata; volatile ValidationMemberResources.Unbound unbound; volatile ValidationMemberResources.Run bound;
         private volatile Runnable stop;
+        private volatile ValidationRunState terminal;private boolean terminalAdmitted,terminalWithoutReport;
         Reservation(Pipeline pipeline, Request request) { this.pipeline = pipeline; this.request = request; }
         ValidationRunSpec spec() { requireReserved(); return spec; }
         ValidationMemberResources.Run resources() { requireReserved(); return bound; }
@@ -396,6 +406,15 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
             reportPending=false;
             if(completed&&bound!=null&&bound.fullyReleased())clearMetadata();
         }
+        synchronized void rememberTerminal(ValidationRunState state,boolean admitted,String code,boolean reportBorn){
+            if(!state.terminal())throw new IllegalArgumentException("original terminal receipt needs a terminal state");
+            if(terminal!=null){if(terminal!=state||terminalAdmitted!=admitted)throw new IllegalStateException("original terminal receipt changed");return;}
+            terminalAdmitted=admitted;terminalWithoutReport=!reportBorn;if(reason==null)reason=code;terminal=state;
+        }
+        private boolean namesOriginal(ValidationReportAdmission.Start start){
+            return start!=null&&bound!=null&&start.equals(new ValidationReportAdmission.Start(task(request),request.configurationRevision(),
+                    request.startSequence(),request.command().toString(),bound.budget().identity()));
+        }
         void releaseAfterKnownTerminal() {
             if (bound == null) throw invalid("owner.boundResources");
             completed = true; cancelled.set(true);
@@ -423,9 +442,10 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         }
         private boolean reapable() {
             return !preparing && !unknown && cancelled.get() && (!activated || completed || locallyDisposed) && metadata == null
+                    && (!terminalWithoutReport || superseded)
                     && (!accepted || completed || locallyDisposed || superseded) && (bound == null || bound.fullyReleased());
         }
-        private boolean closedHandoff() { return accepted && !activated && !unknown && cancelled.get() && metadata == null && bound != null && bound.fullyReleased(); }
+        private boolean closedHandoff() { return accepted && (!activated || completed&&terminalWithoutReport) && !unknown && cancelled.get() && metadata == null && bound != null && bound.fullyReleased(); }
         private Result reply() {
             if (unknown) return new Result(Outcome.UNKNOWN, null, reason);
             if (cancelled.get()) return new Result(Outcome.REJECTED, null, reason);

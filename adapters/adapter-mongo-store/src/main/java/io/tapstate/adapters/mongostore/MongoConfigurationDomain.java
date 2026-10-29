@@ -33,7 +33,7 @@ import java.util.Objects;
  */
 public final class MongoConfigurationDomain implements AutoCloseable {
     static final String LAYOUT = "three-layer-v1";
-    static final int SCHEMA_VERSION = 2;
+    static final int SCHEMA_VERSION = 3;
     private final MongoConnection connection;
     private final MongoConfigurationArtifactStore artifacts;
     private final MongoConfigurationCatalogStore catalog;
@@ -70,7 +70,8 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                     Map.of("installed", String.valueOf(installed), "supported", String.valueOf(SCHEMA_VERSION)), null);
         }
         this.installedSchemaVersion = installed;
-        if (installed == MongoValidationSchema.VERSION) StoreIo.run(() -> MongoValidationSchema.requireReady(database, true));
+        if (StoreIo.call(() -> MongoValidationSchema.configurationHasValidation(database, schema)))
+            StoreIo.run(() -> MongoValidationSchema.requireReady(database, true));
         Document version = StoreIo.call(() -> durable(SystemCollections.CONFIGURATION_VERSION.on(database))
                 .find(new Document("_id", ConfigurationVersion.ID)).first());
         if (version == null || !(version.get("revision") instanceof Long revision)
@@ -222,9 +223,9 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                 requireOriginal(session);
                 var schemas = SystemCollections.SCHEMA_MIGRATIONS.on(database);
                 var row = schemas.find(session, new Document("_id", "config")).first();
-                if (row != null && Integer.valueOf(1).equals(row.get("installedVersion")) && !row.containsKey("validation")) {
+                if (!MongoValidationSchema.configurationHasValidation(database, row)) {
                     if (!first) throw MongoValidationSchema.refused();
-                    ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database));
+                    ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), connection.client());
                     MongoValidationSchema.requireAbsent(database, MongoValidationSchema.CONFIG);
                     if (SystemCollections.OPERATOR_GENERATIONS.on(database).find(session,
                             new Document("validationPreparation", new Document("$exists", true)))
@@ -236,7 +237,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                             .projection(new Document("_id", 0).append("found", new Document("$literal", true))).limit(1).first() != null)
                         throw MongoValidationSchema.refused();
                     MongoValidationSchema.create(session, database, MongoValidationSchema.CONFIG);
-                    if (schemas.updateOne(session, row, new Document("$set", new Document("installedVersion", MongoValidationSchema.VERSION)
+                    if (schemas.updateOne(session, row, new Document("$set", new Document("installedVersion", MongoValidationSchema.preparedConfigurationVersion(row))
                             .append("validation", MongoValidationSchema.marker(operation.toString(), "PREPARING", 0, scope)))).getMatchedCount() != 1)
                         throw MongoValidationSchema.refused();
                 } else requireOperation(row);
@@ -249,13 +250,13 @@ public final class MongoConfigurationDomain implements AutoCloseable {
             return transaction(session -> {
                 requireOriginal(session);
                 var row = SystemCollections.SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "config")).first();
-                if (row != null && Integer.valueOf(1).equals(row.get("installedVersion")) && !row.containsKey("validation")) {
+                if (!MongoValidationSchema.configurationHasValidation(database, row)) {
                     if (SystemCollections.OPERATOR_GENERATIONS.on(database).find(session).projection(new Document("_id", 1)).limit(1).first() != null)
                         throw MongoValidationSchema.refused();
                     MongoValidationSchema.requireAbsent(database, MongoValidationSchema.CONFIG);
                     return null;
                 }
-                var marker = MongoValidationSchema.requireVersionTwo(row, "READY");
+                var marker = MongoValidationSchema.requireConfiguration(row, "READY");
                 if (!scope.equals(MongoValidationSchema.scope(marker)) || marker.getLong("initializedPipelines") != 0) throw MongoValidationSchema.refused();
                 return new ValidationSchemaStatus(marker.getString("operationId"), true, 0);
             });
@@ -283,14 +284,14 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                 requireOriginal(session);
                 var schemas = SystemCollections.SCHEMA_MIGRATIONS.on(database);
                 var row = schemas.find(session, new Document("_id", "config")).first();
-                if (row != null && Integer.valueOf(1).equals(row.get("installedVersion")) && !row.containsKey("validation")) {
-                    ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database));
+                if (!MongoValidationSchema.configurationHasValidation(database, row)) {
+                    ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), connection.client());
                     if (SystemCollections.OPERATOR_GENERATIONS.on(database).find(session).projection(new Document("_id", 1)).limit(1).first() != null)
                         throw MongoValidationSchema.refused();
                     MongoValidationSchema.requireAbsent(database, MongoValidationSchema.CONFIG);
                     MongoValidationSchema.create(session, database, MongoValidationSchema.CONFIG);
                     var marker = MongoValidationSchema.marker(operation.toString(), "READY", 0, scope);
-                    if (schemas.updateOne(session, row, new Document("$set", new Document("installedVersion", 2).append("validation", marker))).getMatchedCount() != 1)
+                    if (schemas.updateOne(session, row, new Document("$set", new Document("installedVersion", MongoValidationSchema.preparedConfigurationVersion(row)).append("validation", marker))).getMatchedCount() != 1)
                         throw MongoValidationSchema.refused();
                     return status(marker);
                 }
@@ -313,7 +314,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                     requireOriginal(session); var schemas = SystemCollections.SCHEMA_MIGRATIONS.on(database);
                     var row = schemas.find(session, new Document("_id", "config")).first(); var marker = requireOperation(row);
                     if ("READY".equals(marker.get("phase"))) return status(marker);
-                    ConfigurationVersion.advanceValidationPreparation(session, SystemCollections.CONFIGURATION_VERSION.on(database), operation.toString());
+                    ConfigurationVersion.advanceValidationPreparation(session, SystemCollections.CONFIGURATION_VERSION.on(database), operation.toString(), connection.client());
                     var mappings = SystemCollections.OPERATOR_GENERATIONS.on(database);
                     long initialized = marker.getLong("initializedPipelines");
                     if (mappings.countDocuments(session, new Document("validationPreparation", new Document("$exists", true))) != initialized)
@@ -339,7 +340,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                         initialized++; phase = "PREPARING";
                     }
                     var next = MongoValidationSchema.marker(operation.toString(), phase, initialized, scope);
-                    if (schemas.updateOne(session, new Document("_id", "config").append("installedVersion", 2).append("validation", marker),
+                    if (schemas.updateOne(session, new Document("_id", "config").append("installedVersion", row.getInteger("installedVersion")).append("validation", marker),
                             new Document("$set", new Document("validation", next))).getMatchedCount() != 1) throw MongoValidationSchema.refused();
                     return status(next);
                 });
@@ -362,7 +363,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         private void verifyOffline() {
             boolean complete = transaction(session -> {
                 requireOriginal(session); var row = SystemCollections.SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "config")).first();
-                if (row != null && Integer.valueOf(1).equals(row.get("installedVersion")) && !row.containsKey("validation")) return false;
+                if (!MongoValidationSchema.configurationHasValidation(database, row)) return false;
                 return "READY".equals(requireOperation(row).get("phase"));
             });
             var original = bindings.load().orElseThrow(MongoValidationSchema::refused);
@@ -374,9 +375,8 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         }
 
         private Document requireOperation(Document row) {
-            if (row == null || !Integer.valueOf(2).equals(row.get("installedVersion")) || !(row.get("validation") instanceof Document value))
-                throw MongoValidationSchema.unreadable("version");
-            var marker = MongoValidationSchema.validateMarker(value);
+            if (!MongoValidationSchema.configurationHasValidation(database, row)) throw MongoValidationSchema.unreadable("version");
+            var marker = MongoValidationSchema.configurationMarker(row);
             if (!operation.toString().equals(marker.get("operationId")) || !scope.equals(MongoValidationSchema.scope(marker))) throw MongoValidationSchema.refused();
             return marker;
         }
@@ -410,6 +410,12 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         }
 
         @Override public void close() { if (!closed) { closed = true; connection.close(); } }
+    }
+
+    public io.tapstate.spi.store.AiProviderSettingsStore aiProviderSettings() {
+        requireOpen();
+        return new MongoConfigurationAiProviderSettingsStore(connection.client(), connection.database(), clusterId,
+                new PersistentKey(connection.database(), clusterId), this::requireOpen);
     }
 
     public ArtifactStore artifacts() {
@@ -620,8 +626,8 @@ public final class MongoConfigurationDomain implements AutoCloseable {
             return session.withTransaction(() -> {
                 requireInitialOpOperation(session, original);
                 var row = SystemCollections.SCHEMA_MIGRATIONS.on(connection.database()).find(session, new Document("_id", "config")).first();
-                if (row != null && Integer.valueOf(1).equals(row.get("installedVersion")) && !row.containsKey("validation")) return null;
-                var marker = MongoValidationSchema.requireVersionTwo(row, "READY");
+                if (!MongoValidationSchema.configurationHasValidation(connection.database(), row)) return null;
+                var marker = MongoValidationSchema.requireConfiguration(row, "READY");
                 var scope = new io.tapstate.spi.store.CacheBusinessScope(clusterId, original.originalScope().bindingVersion(), original.originalScope().cacheIncarnation());
                 if (!scope.equals(MongoValidationSchema.scope(marker)) || marker.getLong("initializedPipelines") != 0) throw MongoValidationSchema.refused();
                 return new ValidationSchemaStatus(marker.getString("operationId"), true, 0);
@@ -635,11 +641,11 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                 requireOpen(); local.run(); requireInitialOpOperation(session, original);
                 var schemas = SystemCollections.SCHEMA_MIGRATIONS.on(connection.database());
                 var previous = schemas.find(session, new Document("_id", "config")).first();
-                var marker = MongoValidationSchema.requireVersionTwo(previous, "READY");
+                var marker = MongoValidationSchema.requireConfiguration(previous, "READY");
                 var scope = new io.tapstate.spi.store.CacheBusinessScope(clusterId, original.originalScope().bindingVersion(), original.originalScope().cacheIncarnation());
                 if (!scope.equals(MongoValidationSchema.scope(marker)) || marker.getLong("initializedPipelines") != 0) throw MongoValidationSchema.refused();
                 if (!original.operationId().equals(marker.get("operationId"))) {
-                    ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(connection.database()));
+                    ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(connection.database()), connection.client());
                     if (schemas.updateOne(session, previous, new Document("$set", new Document("validation",
                             MongoValidationSchema.marker(original.operationId(), "READY", 0, scope)))).getMatchedCount() != 1) throw MongoValidationSchema.refused();
                 }
@@ -739,7 +745,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                     }
                     var schemas = SystemCollections.SCHEMA_MIGRATIONS.on(connection.database());
                     var original = schemas.find(session, new Document("_id", "config")).first();
-                    var marker = MongoValidationSchema.requireVersionTwo(original, "READY");
+                    var marker = MongoValidationSchema.requireConfiguration(original, "READY");
                     var scope = new io.tapstate.spi.store.CacheBusinessScope(clusterId, running.originalScope().bindingVersion(), running.originalScope().cacheIncarnation());
                     if (scope.equals(MongoValidationSchema.scope(marker)) && !running.operationId().equals(marker.get("operationId"))) throw MongoValidationSchema.refused();
                     if (schemas.updateOne(session, original, new Document("$set", new Document("validation",
@@ -927,7 +933,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         Objects.requireNonNull(local).run(); requireOpen(); MongoPipelineRetirements.requireOriginalPending(original);
         boolean enabled = StoreIo.call(() -> {
             var schema = SystemCollections.SCHEMA_MIGRATIONS.on(connection.database()).find(new Document("_id", "config")).first();
-            if (schema != null && Integer.valueOf(1).equals(schema.get("installedVersion")) && !schema.containsKey("validation")) return false;
+            if (!MongoValidationSchema.configurationHasValidation(connection.database(), schema)) return false;
             MongoValidationSchema.requireReady(connection.database(), true); return true;
         });
         if (!enabled) return true;

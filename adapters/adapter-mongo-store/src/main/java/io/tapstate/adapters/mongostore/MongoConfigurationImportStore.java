@@ -136,7 +136,7 @@ final class MongoConfigurationImportStore implements ConfigurationImportStore {
                     if (!serverNow(session).isBefore(original.expiresAt())) throw refused("expired");
                     if (current.status().phase() != Phase.COMMITTING || current.status().attempts() != attempt.status().attempts()) throw refused("attempt-fenced");
                     if (revision(session) != original.destinationRevision()) throw refused("destination-changed");
-                    ConfigurationVersion.advance(session,versions);
+                    ConfigurationVersion.advance(session, versions, client);
                     validateCandidate(session,frozen,binding);
                     try { artifacts.writeAllInTransaction(session,frozen.writes); }
                     catch (MongoConfigurationArtifactStore.Refused conflict) { throw refused("resource-conflict"); }

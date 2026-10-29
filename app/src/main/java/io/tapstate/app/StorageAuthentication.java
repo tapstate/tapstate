@@ -64,7 +64,7 @@ final class StorageAuthentication implements AutoCloseable {
 
     synchronized void invalidateFormal() {
         current.set(null);
-        pending.invalidate();
+        pending.invalidate(unauthenticated());
         if (bootstrap != null) bootstrap.sessions.close();
     }
 
@@ -103,21 +103,28 @@ final class StorageAuthentication implements AutoCloseable {
         Optional<VerifiedToken> verified;
         Optional<String> organization = Optional.empty();
         if (cloud.cloud()) {
-            original.requireActive(budget);
-            try {
-                var authenticated = original.managed(budget).authenticateWithContext(presented);
-                verified = authenticated.map(AuthenticatedCloudSession::identity);
-                organization = authenticated.map(value -> value.clusterContext().organizationId());
-            } catch (TapstateException failure) {
-                if (failure.code() == IoError.CACHE_AUTH_FENCED) throw StorageRuntime.unavailable();
-                throw failure;
-            }
+            // The fenced session transaction checks CACHE identity and structure before reading.
+            // Check CONFIG first, then publish only after the full final CACHE/index validation.
+            original.requirePublished(budget);
+            var authenticated = authenticateCloud(original, presented, budget);
+            verified = authenticated.map(AuthenticatedCloudSession::identity);
+            organization = authenticated.map(value -> value.clusterContext().organizationId());
             original.requireLocallyActive();
         } else {
             verified = original.authenticate(presented, budget);
         }
-        // A vanished session must not hide a concurrent scope or structure failure as a bad cookie.
-        if (cloud.cloud() || verified.isPresent()) original.requireActive(budget);
+        // The last CACHE transaction validates both scope and this exact session's revocation. A
+        // scope-only check after the first session read would miss a denial committed in between.
+        if (cloud.cloud() && verified.isPresent()) {
+            original.requireActive(budget);
+            var checked = authenticateCloud(original, presented, budget);
+            original.requireLocallyActive();
+            if (!checked.map(AuthenticatedCloudSession::identity).equals(verified)
+                    || !checked.map(value -> value.clusterContext().organizationId()).equals(organization)) return Optional.empty();
+        } else if (cloud.cloud() || verified.isPresent()) {
+            // A vanished session must not hide a concurrent scope or structure failure as a bad cookie.
+            original.requireActive(budget);
+        }
         if (verified.isEmpty()) return Optional.empty();
         if (cloud.cloud() && organization.isEmpty()) return Optional.empty();
         VerifiedToken identity = verified.orElseThrow();
@@ -133,6 +140,17 @@ final class StorageAuthentication implements AutoCloseable {
                             : original.authenticate(presented, revalidation);
                     if (checked.filter(identity::equals).isEmpty()) throw unauthenticated();
                 }));
+    }
+
+    private Optional<AuthenticatedCloudSession> authenticateCloud(Epoch original, String presented, MongoReadBudget budget) {
+        try {
+            return original.managed(budget).authenticateWithContext(presented);
+        } catch (TapstateException failure) {
+            if (failure.code() == IoError.CACHE_AUTH_FENCED || failure.code() == IoError.STORE_UNAVAILABLE)
+                throw StorageRuntime.unavailable();
+            original.requireActive(budget);
+            throw failure;
+        }
     }
 
     private final class Bootstrap {
@@ -218,15 +236,24 @@ final class StorageAuthentication implements AutoCloseable {
         }
         void requireActive() { requireActive(new MongoReadBudget(AUTHORIZATION_READ_BUDGET)); }
         void requireActive(MongoReadBudget budget) {
+            requirePublished(budget);
             requireLocallyActive();
-            String stage = "configuration-publication";
             try {
-                configuration.requireAuthenticationPublished(bound.preparation(), budget);
-                stage = "cache-authentication-scope";
                 bound.cache().loadAuthScope(bound.preparation().authScope(), budget);
             }
             catch (TapstateException unavailable) {
-                LOG.warn("Storage authentication check failed [stage={}, error_code={}]", stage, unavailable.code().code());
+                LOG.warn("Storage authentication check failed [stage=cache-authentication-scope, error_code={}]", unavailable.code().code());
+                throw StorageRuntime.unavailable();
+            }
+            requireLocallyActive();
+        }
+        void requirePublished(MongoReadBudget budget) {
+            requireLocallyActive();
+            try {
+                configuration.requireAuthenticationPublished(bound.preparation(), budget);
+            }
+            catch (TapstateException unavailable) {
+                LOG.warn("Storage authentication check failed [stage=configuration-publication, error_code={}]", unavailable.code().code());
                 throw StorageRuntime.unavailable();
             }
             requireLocallyActive();

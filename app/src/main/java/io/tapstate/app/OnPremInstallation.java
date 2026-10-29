@@ -33,6 +33,18 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
     private volatile boolean closed;
     private final boolean completedBeforeBoot;
     private MongoConfigurationDomain.InitialOpRecovery recoveryInvocation;
+    private boolean credentialRequired = true;
+    void requireCredential(boolean required) { credentialRequired = required; }
+    @Override public boolean automaticAuthorization() { return !credentialRequired; }
+    private Runnable restartRequired = () -> {};
+    private Runnable startupCompleted = () -> {};
+    void onStartupCompleted(Runnable action) { startupCompleted = Objects.requireNonNull(action); }
+    void onRestartRequired(Runnable action) { restartRequired = Objects.requireNonNull(action); }
+    @Override public Map<String,Object> initializationProgress() {
+        var stage = files.stage();
+        return root.initializationProgress().snapshot().filter(value -> value.operationId().equals(stage.scope().operationId()))
+                .map(StorageControlDispatcher::progress).orElse(Map.of());
+    }
 
     OnPremInstallation(StorageRoot root, InstallationFiles files, MongoProperties mongo, StorageSetupService.DefaultTarget target, Clock clock) {
         this.root = root; this.files = files; this.mongo = mongo; this.target = target; this.clock = clock;
@@ -59,7 +71,7 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
         setups = new StorageSetupService(StorageBinding.Mode.OP, bindings, states,
                 new MongoStorageConnectionProbe(mongo.getServerSelectionTimeout()), target, root::configurationEndpoint,
                 new AuditGate(record -> root.runtime().requireConfiguration().audit().record(record), clock), clock, root::requireActive,
-                this::continueSetup, root::coordinateSetup, this::prepareConfiguration);
+                this::continueSetup, root::coordinateSetup, this::prepareConfiguration, root.initializationProgress());
     }
 
     InstallationFiles files() { return files; }
@@ -78,6 +90,20 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
         if (connector == null || connector.getLocalPort() < 1) throw StorageRuntime.unavailable();
         files.locked(() -> { files.saveStage(files.stage().withManagementUrl("http://127.0.0.1:" + connector.getLocalPort())); return null; });
     }
+    @Override public String normalLoginUrl() {
+        if (connector == null || connector.getService() == null) return null;
+        return Arrays.stream(connector.getService().findConnectors())
+                .filter(value -> value != connector && value.getLocalPort() > 0)
+                .filter(value -> Set.of("http", "https").contains(value.getScheme()))
+                .map(value -> {
+                    Object configured = value.getProperty("address");
+                    String address = configured instanceof java.net.InetAddress inet ? inet.getHostAddress()
+                            : configured instanceof String text ? text : null;
+                    if (address == null || Set.of("0.0.0.0", "::", "0:0:0:0:0:0:0:0").contains(address)) address = "127.0.0.1";
+                    try { return new java.net.URI(value.getScheme(), null, address, value.getLocalPort(), "/login", null, null).toString(); }
+                    catch (java.net.URISyntaxException invalid) { throw InstallationFiles.refused(); }
+                }).findFirst().orElse(null);
+    }
     @Override public boolean isManagementRequest(HttpServletRequest request) { return request.getAttribute(CONNECTOR_ATTRIBUTE) == connectorIdentity; }
     @Override public void requireManagementRequest(HttpServletRequest request) {
         boolean shellForward = request.getDispatcherType() == jakarta.servlet.DispatcherType.FORWARD && "/index.html".equals(request.getRequestURI());
@@ -90,7 +116,7 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
         String path = request.getRequestURI();
         boolean write = "POST".equals(request.getMethod()) && (STORAGE_PATHS.contains(path) || path.equals("/installation/first-admin"));
         boolean read = Set.of("GET", "HEAD").contains(request.getMethod()) && (path.equals("/healthz")
-                || path.equals("/auth/storage-entry") || path.equals("/index.html") || path.equals("/installation")
+                || path.equals("/installation-reconnect.js") || path.equals("/auth/storage-entry") || path.equals("/index.html") || path.equals("/installation") || path.equals("/overview")
                 || path.equals("/") || path.startsWith("/assets/"));
         if (!write && !read) throw InstallationFiles.refused();
     }
@@ -105,6 +131,12 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
 
     private synchronized SetupCapabilityService.Permission permission(HttpServletRequest request) {
         requireManagementRequest(request);
+        if (!credentialRequired) {
+            var state = states.load();
+            var purpose = state.phase() == StorageSetupStateStore.Phase.COMPLETE
+                    ? StorageSetupStateStore.Purpose.FIRST_ADMIN : StorageSetupStateStore.Purpose.SETUP;
+            return capabilities.authorizeLocal(state.scope(), purpose);
+        }
         var issued = files.capability().orElseThrow(InstallationFiles::refused);
         if (!issued.equals(restored)) { capabilities.restore(issued); restored = issued; }
         return capabilities.authorize(request.getHeader(CAPABILITY_HEADER), issued.scope(), issued.purpose());
@@ -185,6 +217,7 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
             files.saveStage(current.withScope(states.load().scope()).withHandoff(InstallationFiles.Handoff.RESTART_REQUIRED, current.configurationHash()));
             files.removeCapability(); return null;
         });
+        restartRequired.run();
     }
     void afterNormalStartup() {
         if (!completedBeforeBoot) return;
@@ -195,6 +228,7 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
             if (files.capability().filter(value -> value.purpose() == StorageSetupStateStore.Purpose.SETUP).isPresent()) files.removeCapability();
             return null;
         });
+        startupCompleted.run();
     }
 
     StorageRecoveryService recoveryService() {
@@ -299,7 +333,8 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
                     original.setupGeneration(), original.bindingVersion(), original.authGeneration(), original.stateVersion(), original.setupPhase(),
                     restart ? StorageControlDispatcher.BusinessPhase.RESTART_REQUIRED : complete ? StorageControlDispatcher.BusinessPhase.FIRST_ADMIN_REQUIRED : original.businessPhase(),
                     original.health(), complete ? List.of("storage.status", "storage.setup.status", restart ? "restart" : "first-admin")
-                            : List.of("storage.status", "storage.test", "storage.setup.commit", "storage.setup.status"), restart);
+                            : List.of("storage.status", "storage.test", "storage.setup.commit", "storage.setup.status"), restart,
+                    original.applicationDataVerification());
         }
         return new StorageControlDispatcher.Snapshot(StorageBinding.Mode.OP, state.scope().clusterId(), state.scope().operationId(),
                 state.scope().generation(), 0, 0, 0, state.phase().name(), StorageControlDispatcher.BusinessPhase.NOT_CONFIGURED,

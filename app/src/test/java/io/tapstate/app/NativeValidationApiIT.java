@@ -125,7 +125,7 @@ class NativeValidationApiIT {
                         .<Integer>exchange((request,httpResponse)->httpResponse.getStatusCode().value())).isEqualTo(400);
                 assertThat(http.get().uri("/api/pipelines/validation_flow/validation-tasks/validation_task/reports/absent/roots?generation="+ref.get("generation")+"&sequence=1")
                         .header("Authorization","Bearer "+token).<Integer>exchange((request,httpResponse)->httpResponse.getStatusCode().value())).isEqualTo(404);
-                var report=http.get().uri(reportPath).header("Authorization","Bearer "+token).retrieve().body(Map.class);
+                var report=completedReport(http,token,reportPath);
                 assertThat(report).containsEntry("method","COUNT").containsEntry("result","COMPLETE_NO_ISSUES_OBSERVED").containsEntry("physicalDrain","UNKNOWN").containsEntry("premiseVerifiedBySystem",false);
                 var counts=(List<?>)report.get("counts");var count=(Map<?,?>)counts.getFirst();assertThat(count.get("source")).isEqualTo("1");assertThat(count.get("target")).isEqualTo("1");assertThat(count.get("difference")).isEqualTo("0");
                 org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(2)).until(()->child.getBean(ValidationMemberResources.Member.class).snapshot().metadataFrames()==0);
@@ -171,7 +171,14 @@ class NativeValidationApiIT {
                 var wallSave=Map.of("input",wall,"fingerprint",wallCheck.get("fingerprint"),"commandId",UUID.randomUUID().toString(),"historyLimit",10,"schedule",scheduleInput,"scheduleEnabled",true);
                 var wallSaved=http.post().uri("/api/validation:save").header("Authorization","Bearer "+write).contentType(MediaType.APPLICATION_JSON).body(wallSave).retrieve().body(Map.class);
                 assertThat(wallSaved).containsEntry("outcome","APPLIED");
-                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(25)).pollInterval(Duration.ofMillis(200)).untilAsserted(()->{
+                var nextDue=new java.util.concurrent.atomic.AtomicReference<java.time.Instant>();
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).untilAsserted(()->{
+                    var scheduled=http.get().uri("/api/pipelines/validation_flow/validation-tasks/scheduled_wall").header("Authorization","Bearer "+token).retrieve().body(Map.class);
+                    var observation=(Map<?,?>)scheduled.get("scheduleObservation");assertThat(observation).isNotNull();
+                    nextDue.set(java.time.Instant.parse((String)observation.get("nextDue")));
+                });
+                var remaining=Duration.between(java.time.Instant.now(),nextDue.get());assertThat(remaining).isLessThanOrEqualTo(Duration.ofMinutes(1));
+                org.awaitility.Awaitility.await().atMost((remaining.isNegative()?Duration.ZERO:remaining).plusSeconds(15)).pollInterval(Duration.ofMillis(200)).untilAsserted(()->{
                     var observed=http.get().uri("/api/pipelines/validation_flow/validation-tasks/scheduled_wall/reports").header("Authorization","Bearer "+token).retrieve().body(Map.class);
                     assertThat(observed).containsEntry("total","1");var completed=(Map<?,?>)((List<?>)observed.get("items")).getFirst();assertThat(completed.get("terminal")).isEqualTo("COMPLETED");
                 });
@@ -204,7 +211,17 @@ class NativeValidationApiIT {
             assertThat(progress).containsEntry("state","COMPLETED");
         });
         var path="/api/pipelines/validation_flow/validation-tasks/"+task+"/reports/"+start.get("run")+"?generation="+original.get("taskGeneration")+"&sequence="+original.get("sequence");
-        return http.get().uri(path).header("Authorization","Bearer "+read).retrieve().body(Map.class);
+        return completedReport(http,read,path);
+    }
+
+    private static Map completedReport(RestClient http,String token,String path){
+        var completed=new java.util.concurrent.atomic.AtomicReference<Map>();
+        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(20)).pollInterval(Duration.ofMillis(100))
+                .ignoreExceptionsMatching(failure->failure instanceof org.springframework.web.client.HttpClientErrorException.NotFound||failure instanceof org.springframework.web.client.HttpClientErrorException.TooManyRequests).untilAsserted(()->{
+                    var report=http.get().uri(path).header("Authorization","Bearer "+token).retrieve().body(Map.class);
+                    assertThat(report).containsEntry("terminal","COMPLETED").containsEntry("closed",true);completed.set(report);
+                });
+        return completed.get();
     }
 
 }

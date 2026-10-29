@@ -69,7 +69,7 @@ class NodeSessionStartupTest {
                         null, null, null, null, NestSettings.defaults(), null, null, null,
                         provider(ClusterIdentityStore.class, new MemoryIdentity()),
                         provider(WorkloadClaimStore.class, claims),
-                        new ClusterMembershipGate(cluster), new BootId("boot-startup"), provider(StorePort.class, null),
+                        new ClusterMembershipGate(cluster), new BootId("boot-startup"), provider(StorePort.class, null), provider(io.tapstate.spi.store.ClusterMembershipStore.class, null),
                         config -> { throw new AssertionError("member factory must not run after lease setup fails"); }));
         assertThat(failure).isNotNull();
         assertThat(claims.acquisitions).hasValue(1);
@@ -99,7 +99,7 @@ class NodeSessionStartupTest {
                 properties, cluster, control, null, null, null, null, NestSettings.defaults(),
                 null, null, null, provider(ClusterIdentityStore.class, new MemoryIdentity()),
                 provider(WorkloadClaimStore.class, claims),
-                new ClusterMembershipGate(cluster), new BootId("boot-startup"), provider(StorePort.class, null),
+                new ClusterMembershipGate(cluster), new BootId("boot-startup"), provider(StorePort.class, null), provider(io.tapstate.spi.store.ClusterMembershipStore.class, null),
                 config -> {
                     assertThat(claims.acquisitions).hasValue(1);
                     claims.factoryRunning.set(true);
@@ -241,7 +241,7 @@ class NodeSessionStartupTest {
                     properties, cluster, control, null, null, null, null, NestSettings.defaults(),
                     null, null, null, provider(ClusterIdentityStore.class, new MemoryIdentity()),
                     provider(WorkloadClaimStore.class, claims),
-                    new ClusterMembershipGate(cluster), new BootId("boot-startup"), failingStore,
+                    new ClusterMembershipGate(cluster), new BootId("boot-startup"), failingStore, provider(io.tapstate.spi.store.ClusterMembershipStore.class, null),
                     config -> {
                         NodeSessionStartup startup = config.getListenerConfigs().stream()
                                 .map(listener -> listener.getImplementation())

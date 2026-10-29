@@ -224,8 +224,8 @@ final class MongoValidationPreparations {
 
     static boolean validationEnabled(com.mongodb.client.ClientSession session, MongoDatabase database, String cluster) {
         var schema = SystemCollections.SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "config")).first();
-        if (schema != null && Integer.valueOf(1).equals(schema.get("installedVersion")) && !schema.containsKey("validation")) return false;
-        var marker = MongoValidationSchema.requireVersionTwo(schema, "READY");
+        if (!MongoValidationSchema.configurationHasValidation(database, schema)) return false;
+        var marker = MongoValidationSchema.requireConfiguration(schema, "READY");
         if (!cluster.equals(MongoValidationSchema.scope(marker).clusterId())) throw unreadable(); return true;
     }
 
@@ -278,7 +278,7 @@ final class MongoValidationPreparations {
     static void completeCacheReplacement(com.mongodb.client.ClientSession session, MongoDatabase database, String cluster,
             io.tapstate.spi.store.StorageRecoveryCommands.Plan running, Map<String, UUID> generations) {
         if (!validationEnabled(session, database, cluster)) return;
-        var marker = MongoValidationSchema.requireVersionTwo(SystemCollections.SCHEMA_MIGRATIONS.on(database)
+        var marker = MongoValidationSchema.requireConfiguration(SystemCollections.SCHEMA_MIGRATIONS.on(database)
                 .find(session, new Document("_id", "config")).first(), "READY");
         var target = new CacheBusinessScope(cluster, running.originalScope().bindingVersion(), running.originalScope().cacheIncarnation());
         if (!target.equals(MongoValidationSchema.scope(marker)) || !running.operationId().equals(marker.get("operationId"))) throw fenced();
@@ -424,7 +424,7 @@ final class MongoValidationPreparations {
         return StoreIo.call(() -> { active.run(); MongoValidationSchema.requireReady(database, true); try (var session = client.startSession()) {
             var committed = session.withTransaction(() -> {
                 active.run();
-                var schema = MongoValidationSchema.requireVersionTwo(SystemCollections.SCHEMA_MIGRATIONS.on(database)
+                var schema = MongoValidationSchema.requireConfiguration(SystemCollections.SCHEMA_MIGRATIONS.on(database)
                         .find(session, new Document("_id", "config")).first(), "READY");
                 if (!clusterId.equals(MongoValidationSchema.scope(schema).clusterId())) throw unreadable();
                 var result = work.apply(session); active.run(); return result;

@@ -57,8 +57,8 @@ final class TwoMemberCluster implements AutoCloseable {
 
     private TwoMemberCluster(RealProcessServer first, RealProcessServer second, String storeUri,
             String clusterId, String bindAddress, String seeds, Duration nodeSessionTtl,
-            Map<String, Path> stagingByNode, PreparedNativeStore prepared) {
-        this.prepared = prepared;
+            Map<String, Path> stagingByNode, PreparedNativeStore preparedStore) {
+        this.prepared = preparedStore;
         this.first = first;
         this.second = second;
         this.a = new ControlPlane(first.baseUrl());
@@ -78,6 +78,11 @@ final class TwoMemberCluster implements AutoCloseable {
 
     static TwoMemberCluster startPrepared(PreparedNativeStore storage, Duration nodeSessionTtl) {
         return start(storage.configurationUri(), storage.clusterId(), nodeSessionTtl, true, true, Map.of(), storage);
+    }
+
+    /** Retains the sequential launch contract for lifecycle ordering witnesses. */
+    static TwoMemberCluster startPreparedSequentially(PreparedNativeStore storage) {
+        return start(storage.configurationUri(), storage.clusterId(), null, false, true, Map.of(), storage);
     }
 
     /**
@@ -141,7 +146,7 @@ final class TwoMemberCluster implements AutoCloseable {
     }
 
     private static TwoMemberCluster start(String storeUri, String clusterId, Duration nodeSessionTtl,
-            boolean concurrent, boolean existingAdministrator, Map<String, Path> stagingByNode, PreparedNativeStore prepared) {
+            boolean concurrent, boolean existingAdministrator, Map<String, Path> stagingByNode, PreparedNativeStore preparedStore) {
         String bindAddress = RoutableAddress.ofThisMachine();
         Map<String, Integer> memberPorts = new LinkedHashMap<>();
         Map<String, RealProcessServer.PreparedLaunch> preparedLaunches = new LinkedHashMap<>();
@@ -159,16 +164,16 @@ final class TwoMemberCluster implements AutoCloseable {
                     clusterId, NODE_A, memberPortA, seeds, httpPort, bindAddress, nodeSessionTtl);
             java.util.function.IntFunction<List<String>> secondArguments = httpPort -> arguments(
                     clusterId, NODE_B, memberPortB, seeds, httpPort, bindAddress, nodeSessionTtl);
-            preparedLaunches.put(NODE_A, prepared == null
+            preparedLaunches.put(NODE_A, preparedStore == null
                     ? RealProcessServer.prepare(storeUri, "0.0.0.0", staging(NODE_A, stagingByNode), firstArguments)
-                    : RealProcessServer.prepareNative(storeUri, "0.0.0.0", staging(NODE_A, stagingByNode), firstArguments));
+                    : RealProcessServer.preparePrepared(storeUri, "0.0.0.0", staging(NODE_A, stagingByNode), firstArguments));
             first = preparedLaunches.get(NODE_A).launch();
-            if (!concurrent) { if (prepared == null) first.awaitHealthy(); else first.awaitReady(); }
-            preparedLaunches.put(NODE_B, prepared == null
+            if (!concurrent) first.awaitHealthy();
+            preparedLaunches.put(NODE_B, preparedStore == null
                     ? RealProcessServer.prepare(storeUri, "0.0.0.0", staging(NODE_B, stagingByNode), secondArguments)
-                    : RealProcessServer.prepareNative(storeUri, "0.0.0.0", staging(NODE_B, stagingByNode), secondArguments));
+                    : RealProcessServer.preparePrepared(storeUri, "0.0.0.0", staging(NODE_B, stagingByNode), secondArguments));
             second = preparedLaunches.get(NODE_B).launch();
-            if (!concurrent) { if (prepared == null) second.awaitHealthy(); else second.awaitReady(); }
+            if (!concurrent) second.awaitHealthy();
         } catch (RuntimeException | Error failure) {
             startingFailure = failure;
             try { closeOwned(first, second, preparedLaunches, clusterId); }
@@ -196,15 +201,15 @@ final class TwoMemberCluster implements AutoCloseable {
             }
         }
         TwoMemberCluster cluster = new TwoMemberCluster(
-                first, second, storeUri, clusterId, bindAddress, seeds, nodeSessionTtl, stagingByNode, prepared);
+                first, second, storeUri, clusterId, bindAddress, seeds, nodeSessionTtl, stagingByNode, preparedStore);
         try {
             if (concurrent) {
                 first.awaitReady();
                 second.awaitReady();
             }
-            if (prepared != null) {
-                prepared.loginAndAwaitBusiness(cluster.a);
-                prepared.loginAndAwaitBusiness(cluster.b);
+            if (preparedStore != null) {
+                preparedStore.loginAndAwaitBusiness(cluster.a);
+                preparedStore.loginAndAwaitBusiness(cluster.b);
             } else {
                 if (existingAdministrator) cluster.a.login(ADMIN, PASSWORD);
                 else cluster.a.bootstrapAndLogin(ADMIN, PASSWORD);

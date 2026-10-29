@@ -192,6 +192,23 @@ class PipelineApiTest {
     // ---- the four verbs round-trip through the service ----
 
     @Test
+    void creatingAPipelineWithSpacesReturnsAnEncodedUsableLocation() {
+        String token = machineToken(Scope.WRITE);
+        ResponseEntity<Map> created = client().post().uri("/api/pipelines")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("id", "atlas pipeline", "sources", List.of(), "transforms", List.of()))
+                .exchange((req, res) -> ResponseEntity.status(res.getStatusCode()).headers(res.getHeaders())
+                        .body(res.bodyTo(Map.class)));
+        assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(created.getHeaders().getLocation().toASCIIString()).isEqualTo("/api/pipelines/atlas%20pipeline");
+        Map fetched = client().get()
+                .uri(java.net.URI.create("http://127.0.0.1:" + port).resolve(created.getHeaders().getLocation()))
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token).retrieve().body(Map.class);
+        assertThat(fetched).containsEntry("id", "atlas pipeline");
+    }
+
+    @Test
     void browserPipelineMetadataRoundTripsWithoutDerivedBeanProperties() {
         String token = machineToken(Scope.WRITE);
         Map<String, Object> input = new LinkedHashMap<>(Map.of(

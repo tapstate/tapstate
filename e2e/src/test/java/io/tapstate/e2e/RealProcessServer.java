@@ -341,22 +341,32 @@ final class RealProcessServer implements ServerHandle {
     private static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar,
             String listenAddress, List<String> jvmOptions, Path stagingDirectory,
             IntFunction<List<String>> extraArguments) {
-        return launching(storeUri,operatorStateDatabase,jar,listenAddress,jvmOptions,stagingDirectory,extraArguments,null);
+        return launching(storeUri, operatorStateDatabase, jar, listenAddress, jvmOptions, stagingDirectory,
+                extraArguments, null);
     }
-    private static RealProcessServer launching(String storeUri,String operatorStateDatabase,Path jar,
-            String listenAddress,List<String> jvmOptions,Path stagingDirectory,
-            IntFunction<List<String>> extraArguments,String fixtureMain) {
+
+    private static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar,
+            String listenAddress, List<String> jvmOptions, Path stagingDirectory,
+            IntFunction<List<String>> extraArguments, String fixtureMain) {
         try (PreparedLaunch prepared = prepare(storeUri, operatorStateDatabase, jar, listenAddress,
                 jvmOptions, stagingDirectory, extraArguments, fixtureMain)) {
             return prepared.launch();
         }
     }
 
+    static PreparedLaunch preparePrepared(String configurationUri, String listenAddress, Path stagingDirectory,
+            IntFunction<List<String>> extraArguments) {
+        return prepare(configurationUri, null, bootJar(), listenAddress,
+                List.of("-Xmx768m", "-XX:ActiveProcessorCount=2"), stagingDirectory, extraArguments, null);
+    }
+
     private static PreparedLaunch prepare(String storeUri, String operatorStateDatabase, Path jar,
             String listenAddress, List<String> jvmOptions, Path stagingDirectory,
             IntFunction<List<String>> extraArguments) {
-        return prepare(storeUri,operatorStateDatabase,jar,listenAddress,jvmOptions,stagingDirectory,extraArguments,null);
+        return prepare(storeUri, operatorStateDatabase, jar, listenAddress, jvmOptions, stagingDirectory,
+                extraArguments, null);
     }
+
     private static PreparedLaunch prepare(String storeUri, String operatorStateDatabase, Path jar,
             String listenAddress, List<String> jvmOptions, Path stagingDirectory,
             IntFunction<List<String>> extraArguments, String fixtureMain) {

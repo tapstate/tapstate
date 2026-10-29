@@ -434,6 +434,7 @@ class ManagedMongoStoreIsolationIT {
             try (var process = installationProcess(files, seeds, "admin-response")) {
                 var issued = InstallationCommand.authorize(files, new MongoProperties(), java.time.Clock.systemUTC());
                 var database = admin.getDatabase(config);
+                var administratorAudit = new Document("operationId", io.tapstate.control.core.ControlOperations.USER_CREATE.id());
                 if (!database.listCollectionNames().into(new ArrayList<>()).contains("audit")) database.createCollection("audit");
                 database.runCommand(new Document("collMod", "audit").append("validator", new Document("$expr", new Document("$eq", List.of(1, 0)))).append("validationLevel", "strict"));
                 var management = process.management(files, issued.token());
@@ -442,7 +443,7 @@ class ManagedMongoStoreIsolationIT {
                                 failure -> assertThat(failure.getResponseBodyAsString()).contains("control.audit-blocked"));
                 assertThat(database.getCollection("users").countDocuments()).isZero();
                 assertThat(database.getCollection("op_bootstrap").find().first().getString("phase")).isEqualTo("PENDING");
-                assertThat(database.getCollection("audit").countDocuments()).isZero();
+                assertThat(database.getCollection("audit").countDocuments(administratorAudit)).isZero();
                 database.runCommand(new Document("collMod", "audit").append("validator", new Document()));
                 var address = java.net.URI.create(files.stage().managementUrl());
                 byte[] body = io.tapstate.core.common.JsonWriter.write(Map.of("username", "admin", "password", "original-admin-password")).getBytes(StandardCharsets.UTF_8);
@@ -458,7 +459,7 @@ class ManagedMongoStoreIsolationIT {
                 var saved = database.getCollection("users").find().first();
                 assertThat(new BCryptPasswordHasher().matches("original-admin-password", saved.getString("passwordHash"))).isTrue();
                 assertThat(database.getCollection("op_bootstrap").find().first().getString("phase")).isEqualTo("COMPLETE");
-                assertThat(database.getCollection("audit").countDocuments()).isOne();
+                assertThat(database.getCollection("audit").countDocuments(administratorAudit)).isOne();
                 assertThatThrownBy(() -> management.post().uri("/installation/first-admin").body(Map.of("username", "admin", "password", "replacement-password"))
                         .retrieve().toBodilessEntity()).isInstanceOf(org.springframework.web.client.RestClientResponseException.class);
                 assertThat(database.getCollection("users").find().first()).isEqualTo(saved);
@@ -1493,10 +1494,14 @@ class ManagedMongoStoreIsolationIT {
                         var loginEntered = new java.util.concurrent.CountDownLatch(1);
                         var login = callers.submit(() -> { loginEntered.countDown(); return root.managedAuthentication(); });
                         assertThat(loginEntered.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
-                        assertThatThrownBy(() -> login.get(1, java.util.concurrent.TimeUnit.SECONDS)).isInstanceOf(java.util.concurrent.TimeoutException.class);
+                        var whileCommitting = login.get(5, java.util.concurrent.TimeUnit.SECONDS);
+                        assertThat(whileCommitting.service()).isSameAs(oldContext.service());
+                        whileCommitting.requireActive().run();
+                        assertThat(admin.getDatabase(cacheDb).listCollectionNames().into(new ArrayList<>())).isEmpty();
                         deliverGrant.countDown();
                         assertThat(commit.get(60, java.util.concurrent.TimeUnit.SECONDS)).containsEntry("setupPhase", "COMPLETE");
-                        login.get(10, java.util.concurrent.TimeUnit.SECONDS).requireActive().run();
+                        assertThatThrownBy(() -> whileCommitting.requireActive().run()).isInstanceOf(TapstateException.class);
+                        root.managedAuthentication().requireActive().run();
                         assertThat(root.runtime().current().orElseThrow().preparation().authScope().authGeneration()).isEqualTo(1);
                     } finally { deliverGrant.countDown(); }
                 }

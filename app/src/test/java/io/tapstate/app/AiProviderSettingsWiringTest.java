@@ -46,9 +46,7 @@ class AiProviderSettingsWiringTest {
 
         AiProviderSettingsStore store = new StoreConfiguration().aiProviderSettingsStore(connection);
         AuditStore audit = record -> { };
-        var stores = new org.springframework.beans.factory.support.StaticListableBeanFactory();
-        stores.addBean("providerSettings", store);
-        AiProviderService service = new ControlPlaneConfiguration().aiProviderService(stores.getBeanProvider(AiProviderSettingsStore.class),
+        AiProviderService service = new ControlPlaneConfiguration().aiProviderService(settingsProvider(store),
                 new AuditGate(audit, Clock.fixed(Instant.EPOCH, ZoneOffset.UTC)));
 
         assertThat(store).isInstanceOf(MongoAiProviderSettingsStore.class);
@@ -101,4 +99,19 @@ class AiProviderSettingsWiringTest {
     private interface Invocation {
         Object invoke(Object self, java.lang.reflect.Method method, Object[] args) throws Throwable;
     }
+    @org.junit.jupiter.api.Test
+    void anUnconfiguredOptionalProviderDoesNotPreventTheNativeRuntimeFromStarting() {
+        var audit = org.mockito.Mockito.mock(io.tapstate.control.core.AuditGate.class);
+        org.assertj.core.api.Assertions.assertThat(new ControlPlaneConfiguration().aiProviderService(
+                new org.springframework.beans.factory.support.StaticListableBeanFactory()
+                        .getBeanProvider(io.tapstate.spi.store.AiProviderSettingsStore.class), audit)).isNull();
+    }
+
+    private static org.springframework.beans.factory.ObjectProvider<io.tapstate.spi.store.AiProviderSettingsStore>
+            settingsProvider(io.tapstate.spi.store.AiProviderSettingsStore store) {
+        var factory = new org.springframework.beans.factory.support.StaticListableBeanFactory();
+        factory.addBean("settings", store);
+        return factory.getBeanProvider(io.tapstate.spi.store.AiProviderSettingsStore.class);
+    }
+
 }

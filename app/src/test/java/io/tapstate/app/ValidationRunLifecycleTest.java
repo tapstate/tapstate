@@ -128,6 +128,33 @@ class ValidationRunLifecycleTest {
         assertThat(status.admitted()).isTrue(); assertThat(f.created).isZero(); assertThat(f.execution.starts).isZero();
     }
 
+    @Test void localMetadataFramePressureWaitsOnTheSameJoinedOriginalBeforeAnyReportOrJobBirth(){
+        var f=new Fixture();f.metadataFull=true;
+        var waiting=f.lifecycle.advance();assertThat(waiting.state()).isEqualTo(ValidationRunState.STARTING);
+        assertThat(waiting.admitted()).isTrue();assertThat(waiting.controlUnknown()).isTrue();assertThat(f.open).isFalse();assertThat(f.created).isZero();
+        assertThat(((TapstateException)waiting.failure()).args()).containsEntry("limit","validation.metadataFrames");
+        f.metadataFull=false;assertThat(f.lifecycle.advance().state()).isEqualTo(ValidationRunState.RUNNING);
+        assertThat(f.starts).hasSize(1);assertThat(f.joinCalls).isEqualTo(1);assertThat(f.birthCalls).isEqualTo(1);assertThat(f.localJoins).isEqualTo(2);assertThat(f.created).isOne();assertThat(f.execution.starts).isOne();
+        f.lifecycle.advance();assertThat(f.localJoins).isEqualTo(2);assertThat(f.execution.starts).isOne();
+    }
+
+    @Test void stopWhileLocalAdmissionIsBlockedDoesNotAttemptAdmissionOrConstructExecutionAgain(){
+        var f=new Fixture();f.metadataFull=true;f.lifecycle.advance();f.lifecycle.stop();var stopped=f.lifecycle.advance();
+        assertThat(stopped.state()).isEqualTo(ValidationRunState.STOPPED);assertThat(stopped.retired()).isTrue();
+        assertThat(f.localJoins).isOne();assertThat(f.joinCalls).isOne();assertThat(f.birthCalls).isZero();assertThat(f.created).isZero();
+    }
+
+    @Test void lostOwnerWhileLocalAdmissionIsBlockedDoesNotPermitAQuotaRetryOrAnotherJoin(){
+        var f=new Fixture();f.metadataFull=true;f.lifecycle.advance();f.ownerLive=false;var lost=f.lifecycle.advance();
+        assertThat(lost.controlUnknown()).isTrue();assertThat(lost.retired()).isFalse();assertThat(f.closed).isFalse();
+        assertThat(f.localJoins).isOne();assertThat(f.joinCalls).isOne();assertThat(f.birthCalls).isZero();assertThat(f.created).isZero();
+    }
+
+    @Test void otherLocalCapacityFailuresRemainFailuresRatherThanRetryingLocalAdmission(){
+        var f=new Fixture();f.metadataFull=true;f.capacityKind="validation.otherCapacity";var failed=f.lifecycle.advance();
+        assertThat(failed.state()).isEqualTo(ValidationRunState.FAILED);assertThat(failed.retired()).isTrue();assertThat(f.localJoins).isOne();assertThat(f.created).isZero();
+    }
+
     private static final class Fixture implements ValidationRunLifecycle.Activation, ValidationRunLifecycle.Local, ValidationReportAdmission, ValidationControlStore {
         final ValidationRunIdentity identity = new ValidationRunIdentity(new ValidationOwner("cluster", "flow", "node", "boot", 1, 1, 1),
                 "task", UUID.randomUUID().toString(), ValidationMode.FULL, spec().fingerprint(), 1, "rules");
@@ -137,7 +164,8 @@ class ValidationRunLifecycleTest {
         final ValidationRunLifecycle lifecycle = new ValidationRunLifecycle(original, this, this, this, this);
         ValidationRunState actual = ValidationRunState.STARTING;
         boolean proofUnknown,waiting, open, closed, sealed, loseRunningReply, loseCloseReply, loseRetireReply, joinClosesConfigAndThrows, closeAfterJoin, ownerLive = true; int created, processorsReturned, dataReturned, abandoned;
-        Join joinAnswer = Join.JOINED;
+        Join joinAnswer = Join.JOINED;boolean metadataFull;int localJoins,joinCalls,birthCalls;String capacityKind="validation.metadataFrames";
+        @Override public void joined(){localJoins++;if(metadataFull)throw new TapstateException(ValidationError.VALUE_LIMIT_EXCEEDED,Map.of("limit",capacityKind),null);}
         @Override public ValidationRunLifecycle.Readiness readiness() { return proofUnknown?ValidationRunLifecycle.Readiness.UNKNOWN:waiting ? ValidationRunLifecycle.Readiness.WAITING_FOR_INITIAL_LOAD : ValidationRunLifecycle.Readiness.READY; }
         @Override public ValidationRunLifecycle.Execution create() { created++; return execution; }
         @Override public void requireOwner() { if (!ownerLive) throw unknown(); }
@@ -148,9 +176,9 @@ class ValidationRunLifecycleTest {
         @Override public void drained() { dataReturned++; }
         @Override public Reservation reserve(Start start) { assertThat(start).isEqualTo(original.admission()); if (closed) return Reservation.CLOSED; if (starts.isEmpty()) starts.add(start); return Reservation.RESERVED; }
         @Override public Birth open(Start start) { throw new AssertionError("snapshot required"); }
-        @Override public Birth open(Open command) { assertThat(command.start()).isEqualTo(original.admission()); if (closed) return Birth.CLOSED; open = true; return Birth.CREATED; }
+        @Override public Birth open(Open command) { birthCalls++;assertThat(command.start()).isEqualTo(original.admission()); if (closed) return Birth.CLOSED; open = true; return Birth.CREATED; }
         @Override public Closure close(Start start) { assertThat(start).isEqualTo(original.admission()); closed = true; if (loseCloseReply) { loseCloseReply = false; throw unknown(); } return Closure.CLOSED; }
-        @Override public Join join(ValidationControlStore.Run run) { assertThat(run).isEqualTo(original); if (joinClosesConfigAndThrows) throw unknown(); if (closeAfterJoin) closed = true; return joinAnswer; }
+        @Override public Join join(ValidationControlStore.Run run) { joinCalls++;assertThat(run).isEqualTo(original); if (joinClosesConfigAndThrows) throw unknown(); if (closeAfterJoin) closed = true; return joinAnswer; }
         @Override public Optional<ValidationControlStore.Status> read(ValidationOwner owner, ValidationControlStore.Run run) {
             assertThat(run).isEqualTo(original); return Optional.of(new ValidationControlStore.Status(original, actual, abandoned > 0));
         }

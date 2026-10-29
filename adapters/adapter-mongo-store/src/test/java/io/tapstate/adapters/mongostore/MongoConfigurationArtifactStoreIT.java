@@ -602,7 +602,7 @@ class MongoConfigurationArtifactStoreIT {
                     .containsEntry("operationId", "setup-a").containsEntry("generation", 1L);
             assertThat(database.listCollectionNames().into(new java.util.ArrayList<>()))
                     .containsExactlyInAnyOrder("storage_setup", "cluster_identity", "cluster_keys",
-                            "schema_migrations", "configuration_version", "sources", "pdk_note_origins", "pdk_note_carries", "pipeline_drafts", "configuration_imports", "nest_dead_letters", "capture_preparations");
+                            "schema_migrations", "configuration_version", "sources", "pdk_note_origins", "pdk_note_carries", "pipeline_drafts", "configuration_imports", "nest_dead_letters", "capture_preparations", "ai_provider_settings");
             assertThat(SystemCollections.CAPTURE_PREPARATIONS.on(database).countDocuments()).isZero();
             assertThat(SystemCollections.PDK_NOTE_ORIGINS.on(database).countDocuments()).isZero();
             assertThat(SystemCollections.PDK_NOTE_CARRIES.on(database).countDocuments()).isZero();
