@@ -25,7 +25,6 @@ import com.hazelcast.jet.core.Watermark;
 import com.hazelcast.jet.core.processor.Processors;
 import com.hazelcast.jet.core.processor.SinkProcessors;
 import com.hazelcast.jet.core.test.TestOutbox;
-import com.hazelcast.jet.core.test.TestProcessorContext;
 import com.hazelcast.jet.core.test.TestProcessorMetaSupplierContext;
 import com.hazelcast.jet.core.test.TestProcessorSupplierContext;
 import io.tapstate.core.event.ChainPosition;
@@ -591,8 +590,17 @@ class SrsSourceProcessorTest {
         supplier.init(new TestProcessorSupplierContext().setHazelcastInstance(hz));
         Processor processor = supplier.get(1).iterator().next();
         TestOutbox outbox = new TestOutbox(1);
+        var node = ((com.hazelcast.instance.impl.HazelcastInstanceProxy) hz).getOriginal().node.nodeEngine;
+        var context = new com.hazelcast.jet.impl.execution.init.Contexts.ProcCtx(node, 1, 1,
+                new com.hazelcast.jet.config.JobConfig(), hz.getLoggingService().getLogger("source"), "source",
+                0, 0, false, Map.of(), 1, 0, 1, new java.util.concurrent.ConcurrentHashMap<>(),
+                (com.hazelcast.internal.serialization.InternalSerializationService) node.getSerializationService(),
+                null, getClass().getClassLoader());
+        var thread = com.hazelcast.jet.impl.execution.init.Contexts.container();
+        var previous = thread.getContext();
+        thread.setContext(context);
         try {
-            processor.init(outbox, new TestProcessorContext().setHazelcastInstance(hz));
+            processor.init(outbox, context);
 
             // The row takes the only slot, refusing its bound without relying on worker scheduling.
             assertThat(processor.complete()).isFalse();
@@ -619,6 +627,7 @@ class SrsSourceProcessorTest {
                 meta.close(null);
             } finally {
                 hz.getUserContext().remove(SnapshotBuffer.USER_CONTEXT_KEY);
+                thread.setContext(previous);
             }
         }
     }
