@@ -60,7 +60,7 @@ final class ValidationMemberResources implements AutoCloseable {
         private Member(State state, Runnable active, boolean compatible) { this.state = state; this.active = active; this.compatible = compatible; }
         Metadata admitMetadata() {
             require(); if (!metadata.tryAcquire()) throw limit("validation.metadataFrames");
-            try { require(); return new Metadata(); } catch (RuntimeException | Error failed) { metadata.release(); throw failed; }
+            try { require(); return new Metadata(this); } catch (RuntimeException | Error failed) { metadata.release(); throw failed; }
         }
         /** Independent metadata discovery has no fictitious validation owner, run or cooperative processor. */
         Probe admitProbe(){return admitProbe(false);}
@@ -75,6 +75,17 @@ final class ValidationMemberResources implements AutoCloseable {
                 return probe;
             }
             catch(RuntimeException|Error refused){if(allocation!=null)allocation.close();frame.close();throw refused;}
+        }
+        /** One pre-owner control body, with no fictitious run or cooperative processor. */
+        Control admitControl(){
+            var frame=admitMetadata();try{return control(frame,true);}catch(RuntimeException|Error failed){frame.close();throw failed;}
+        }
+        /** The request scope, not this worker, retains and eventually returns this exact member's frame. */
+        Control admitControl(Metadata frame){frame.requireRetained(this);return control(frame,false);}
+        private Control control(Metadata frame,boolean ownsFrame){
+            Unbound allocation=null;
+            try{allocation=reserve(new ValidationLocalBudget.Amount(4L*1024*1024,1,1,1),0);return new Control(this,frame,allocation,ownsFrame);}
+            catch(RuntimeException|Error failed){if(allocation!=null)allocation.close();throw failed;}
         }
         Run admit(ValidationRunIdentity identity, ValidationLocalBudget.Amount envelope, int processors, Runnable owner) {
             try (var reserved = reserve(envelope, processors)) { return reserved.bind(identity, owner); }
@@ -134,10 +145,44 @@ final class ValidationMemberResources implements AutoCloseable {
 
     final class Metadata implements AutoCloseable {
         private final AtomicBoolean returned = new AtomicBoolean();
+        private final Member owner;
+        private Metadata(Member owner){this.owner=owner;}
         long reservedBytes() { return ValidationTaskStore.Inputs.WORK_RESERVATION_BYTES; }
-        void requireRetained(Member member){if(member.process()!=ValidationMemberResources.this||returned.get())throw invalid("resources.metadataOwner");member.require();}
+        void requireRetained(Member member){if(member!=owner||member.process()!=ValidationMemberResources.this||returned.get())throw invalid("resources.metadataOwner");member.require();}
         /** Return after the actual read/planner and every retained definition have relinquished ownership. */
         @Override public void close() { if (returned.compareAndSet(false, true)) metadata.release(); }
+    }
+
+    /** A queued or running original control body retains its allocation until actual exit. */
+    final class Control implements AutoCloseable {
+        private final Member member;private final Metadata frame;private final Unbound allocation;private final boolean ownsFrame;
+        private final CompletableFuture<Void> released=new CompletableFuture<>();
+        private boolean submitted,retiring,exited,returned;private Throwable bodyFailure;
+        private Control(Member member,Metadata frame,Unbound allocation,boolean ownsFrame){this.member=member;this.frame=frame;this.allocation=allocation;this.ownsFrame=ownsFrame;}
+        synchronized void require(){frame.requireRetained(member);if(retiring)throw invalid("resources.controlClosed");}
+        CompletionStage<Void> released(){return released.minimalCompletionStage();}
+        void execute(Runnable command){
+            Objects.requireNonNull(command);
+            synchronized(this){require();if(submitted)throw invalid("resources.controlSubmitted");submitted=true;}
+            Runnable original=()->{
+                Throwable failure=null;
+                try{require();command.run();}catch(RuntimeException|Error failed){failure=failed;throw failed;}
+                finally{finish(failure);}
+            };
+            try{controls.execute(original);}
+            catch(RejectedExecutionException refused){finish(refused);throw refused;}
+            catch(RuntimeException|Error unknown){if(((ThreadPoolExecutor)controls).remove(original))finish(unknown);throw unknown;}
+        }
+        private void finish(Throwable failure){
+            synchronized(this){bodyFailure=failure;exited=true;retiring=true;}
+            release();
+        }
+        private void release(){
+            final Throwable failure;
+            synchronized(this){if(returned||!retiring||submitted&&!exited)return;returned=true;failure=bodyFailure;}
+            allocation.close();if(ownsFrame)frame.close();if(failure==null)released.complete(null);else released.completeExceptionally(failure);
+        }
+        @Override public void close(){synchronized(this){retiring=true;}release();}
     }
 
     /** One metadata-query lifetime plus its complete retained request/response frame, until explicitly relinquished. */

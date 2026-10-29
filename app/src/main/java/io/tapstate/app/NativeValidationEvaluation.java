@@ -6,8 +6,9 @@ import java.util.*;
 
 /** Independent server-derived evaluation. The outer metadata frame also owns its response projection. */
 final class NativeValidationEvaluation implements ValidationEvaluationProbe {
-    private final NativeValidationMetadata metadata;
-    NativeValidationEvaluation(NativeValidationMetadata metadata){this.metadata=Objects.requireNonNull(metadata);}
+    private final NativeValidationMetadata metadata;private final java.util.function.Supplier<ValidationOperation.Context> context;
+    NativeValidationEvaluation(NativeValidationMetadata metadata){this(metadata,()->null);}
+    NativeValidationEvaluation(NativeValidationMetadata metadata,java.util.function.Supplier<ValidationOperation.Context> context){this.metadata=Objects.requireNonNull(metadata);this.context=Objects.requireNonNull(context); }
     @Override public ValidationEvaluation evaluate(ValidationEvaluation.Request request){
         var confirmations=new LinkedHashMap<String,ValidationTaskCompiler.Confirmation>();
         request.confirmations().forEach((id,value)->confirmations.put(id,new ValidationTaskCompiler.Confirmation(value.id(),
@@ -32,7 +33,7 @@ final class NativeValidationEvaluation implements ValidationEvaluationProbe {
             }
             var view=new ValidationEvaluation.View(request.method().name(),Long.toString(scope.declarations().original().configurationRevision()),
                     compiled==null?null:Long.toString(compiled.comparison().mappingRevision()),compiled==null?null:compiled.fingerprint(),mappings,
-                    "INITIAL_SYNC_FINISHED_AND_BOTH_SIDES_STABLE","READ_OBSERVATIONS_NO_COMMON_TIME_SNAPSHOT");
+                    "INITIAL_SYNC_FINISHED_AND_BOTH_SIDES_STABLE","READ_OBSERVATIONS_NO_COMMON_TIME_SNAPSHOT",context.get());
             return new Evaluated(scope,view,compiled==null?null:compiled.comparison());
         }catch(RuntimeException|Error failed){scope.close();throw failed;}
     }

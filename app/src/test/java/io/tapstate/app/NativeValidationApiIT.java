@@ -96,6 +96,34 @@ class NativeValidationApiIT {
                 assertThat(preview).containsEntry("inputRevision","9007199254740993");assertThat((List<?>)preview.get("occurrences")).hasSize(5);
                 org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(2)).untilAsserted(()->assertThat(child.getBean(ValidationMemberResources.Member.class).snapshot().metadataFrames()).isZero());
                 assertThat(child.getBean(com.hazelcast.core.HazelcastInstance.class).getJet().getJobs()).isEmpty();
+                var operation=Map.of("context",evaluated.get("context"),"pipeline","validation_flow","task","validation_task","taskGeneration",input.get("taskGeneration"),
+                        "revision","1","sequence","1","command",UUID.randomUUID().toString());
+                assertThat(http.post().uri("/api/validation:start").header("Authorization","Bearer "+token).contentType(MediaType.APPLICATION_JSON).body(operation)
+                        .<Integer>exchange((request,httpResponse)->httpResponse.getStatusCode().value())).isEqualTo(403);
+                var started=http.post().uri("/api/validation:start").header("Authorization","Bearer "+write).contentType(MediaType.APPLICATION_JSON).body(operation).retrieve().body(Map.class);
+                assertThat(started.get("outcome")).isIn("PENDING","ACCEPTED");
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(20)).pollInterval(Duration.ofMillis(100)).untilAsserted(()->{
+                    var progress=http.post().uri("/api/validation:progress").header("Authorization","Bearer "+token).contentType(MediaType.APPLICATION_JSON).body(operation).retrieve().body(Map.class);
+                    assertThat(progress).containsEntry("state","COMPLETED");
+                });
+                var retried=http.post().uri("/api/validation:start").header("Authorization","Bearer "+write).contentType(MediaType.APPLICATION_JSON).body(operation).retrieve().body(Map.class);
+                assertThat(retried).containsEntry("state","COMPLETED");
+                var stopped=http.post().uri("/api/validation:stop").header("Authorization","Bearer "+write).contentType(MediaType.APPLICATION_JSON).body(operation).retrieve().body(Map.class);
+                assertThat(stopped).containsEntry("state","COMPLETED");
+                var after=http.get().uri("/api/pipelines/validation_flow/validation-tasks/validation_task").header("Authorization","Bearer "+token).retrieve().body(Map.class);
+                assertThat(after).containsEntry("nextStartSequence","2");
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).untilAsserted(()->{
+                    assertThat(child.getBean(ValidationMemberResources.Member.class).snapshot().metadataFrames()).isZero();
+                    assertThat(child.getBean(ValidationMemberResources.Member.class).snapshot().processReserved().bytes()).isEqualTo(2L*1024*1024);
+                });
+                assertThat(child.getBean(com.hazelcast.core.HazelcastInstance.class).getJet().getJobs()).hasSize(1);
+                var occupied=new ArrayList<ValidationMemberResources.Metadata>();
+                try{
+                    for(int index=0;index<4;index++)occupied.add(child.getBean(ValidationMemberResources.Member.class).admitMetadata());
+                    assertThat(http.post().uri("/api/validation:progress").header("Authorization","Bearer "+token).contentType(MediaType.APPLICATION_JSON).body(operation)
+                            .<Integer>exchange((request,httpResponse)->httpResponse.getStatusCode().value())).isEqualTo(429);
+                }finally{occupied.forEach(ValidationMemberResources.Metadata::close);}
+
             }finally{
                 for(var name:List.of(sourceDb,targetDb,storage.configurationDatabase(),storage.cacheDatabase(),storage.masterDatabase()))observer.getDatabase(name).drop();
             }

@@ -41,6 +41,12 @@ public final class ControlOperations {
             "Evaluate direct full validation choices through independent connector metadata without saving or starting.", CLI_AND_REST);
     public static final Operation VALIDATION_SAVE = new Operation("validation.save", Scope.WRITE, true, null,
             "Reevaluate and save a direct full validation definition using the expected fingerprint and task revision.", CLI_AND_REST);
+    public static final Operation VALIDATION_START = new Operation("validation.start", Scope.WRITE, true, null,
+            "Start only the fixed full validation command and query uncertain original admission without redispatch.", CLI_AND_REST);
+    public static final Operation VALIDATION_PROGRESS = new Operation("validation.progress", Scope.READ, false, null,
+            "Read the original validation run without recreating missing execution handles.", CLI_AND_REST);
+    public static final Operation VALIDATION_STOP = new Operation("validation.stop", Scope.WRITE, true, null,
+            "Stop only the original full validation command without changing its schedule or the Pipeline.", CLI_AND_REST);
     public static final Operation VALIDATION_GET = new Operation("validation.get", Scope.READ, false, null,
             "Read one saved full validation definition without allocating execution state.", CLI_AND_REST);
     public static final Operation VALIDATION_SCHEDULE_PREVIEW = new Operation("validation.schedule-preview", Scope.READ, false, null,
@@ -389,7 +395,7 @@ public final class ControlOperations {
     public static final Operation TOKEN_LIST = new Operation("token.list", Scope.ADMIN, false, null, CLI_ONLY);
 
     private static final List<Operation> ALL = List.of(
-            VALIDATION_EVALUATE, VALIDATION_SAVE, VALIDATION_GET, VALIDATION_SCHEDULE_PREVIEW,
+            VALIDATION_EVALUATE, VALIDATION_SAVE, VALIDATION_GET, VALIDATION_SCHEDULE_PREVIEW, VALIDATION_START, VALIDATION_PROGRESS, VALIDATION_STOP,
             AI_PROVIDER_GET,
             AI_PROVIDER_REPLACE,
             AI_PROVIDER_DELETE,

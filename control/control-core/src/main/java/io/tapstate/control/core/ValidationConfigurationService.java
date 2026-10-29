@@ -22,13 +22,13 @@ public final class ValidationConfigurationService {
             String countOperation,List<Field> fields,List<Candidate> candidates,boolean pipelineWriteKeyUnknown) {}
     public record Mapping(String id,Side source,Side target) {}
     public record View(String method,String configurationRevision,String mappingRevision,String fingerprint,List<Mapping> mappings,
-            String premise,String conclusionScope) {}
+            String premise,String conclusionScope,ValidationExecutionService.Context context) {}
     /** Owns all projected metadata until HTTP serialization has completed or failed. */
     public static final class Evaluation implements AutoCloseable {
         private final ValidationEvaluation owner;private View view;
         private Evaluation(ValidationEvaluation owner){this.owner=owner;var value=owner.view();
             view=new View(value.method(),value.configurationRevision(),value.mappingRevision(),value.fingerprint(),value.mappings().stream()
-                    .map(mapping->new Mapping(mapping.id(),side(mapping.source()),side(mapping.target()))).toList(),value.premise(),value.conclusionScope());}
+                    .map(mapping->new Mapping(mapping.id(),side(mapping.source()),side(mapping.target()))).toList(),value.premise(),value.conclusionScope(),ValidationExecutionService.Context.from(value.context()));}
         public View view(){owner.requireCurrent();return view;}
         @Override public void close(){view=null;owner.close();}
     }

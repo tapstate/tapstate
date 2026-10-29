@@ -31,7 +31,7 @@ class ValidationConfigurationServiceTest {
             calls++;active=true;
             assertThat(request.previous()).satisfiesAnyOf(value->assertThat(value).isNull(),value->assertThat(value.pipelineId()).isEqualTo("flow"));
             return new ValidationEvaluation(){
-                @Override public View view(){requireCurrent();return new View("COUNT","9007199254740993","1",fingerprint,List.of(),"INITIAL_SYNC_FINISHED_AND_BOTH_SIDES_STABLE","READ_OBSERVATIONS_NO_COMMON_TIME_SNAPSHOT");}
+                @Override public View view(){requireCurrent();return new View("COUNT","9007199254740993","1",fingerprint,List.of(),"INITIAL_SYNC_FINISHED_AND_BOTH_SIDES_STABLE","READ_OBSERVATIONS_NO_COMMON_TIME_SNAPSHOT",null);}
                 @Override public Optional<ValidationTaskSpec> comparison(){requireCurrent();return Optional.of(spec);}
                 @Override public void requireCurrent(){assertThat(active).isTrue();}
                 @Override public void close(){active=false;closes++;}

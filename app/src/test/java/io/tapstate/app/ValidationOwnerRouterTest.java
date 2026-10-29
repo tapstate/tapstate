@@ -204,7 +204,7 @@ class ValidationOwnerRouterTest {
         return new WorkloadClaimReading(claim, Duration.ofSeconds(30));
     }
 
-    private static final class Fixture implements AutoCloseable {
+    static final class Fixture implements AutoCloseable {
         final HazelcastInstance a;
         HazelcastInstance b;
         final ClusterMembershipGate ga = gate(), gb = gate();
@@ -215,12 +215,13 @@ class ValidationOwnerRouterTest {
         final Map<String,Function<Command,CommandReply>> commands=new ConcurrentHashMap<>();
         final AtomicReference<WorkloadClaimReading> reading = new AtomicReference<>();
         final ValidationOwnerRouter left, right;
-        Fixture(Duration timeout) {
+        Fixture(Duration timeout) { this(timeout,2); }
+        Fixture(Duration timeout,int executorWorkers) {
             ga.observeNodeSession(live.get("a")::get);gb.observeNodeSession(live.get("b")::get);
             String cluster = "validation-routing-" + UUID.randomUUID();
-            a = Hazelcast.newHazelcastInstance(config(cluster, "a", null));
+            a = Hazelcast.newHazelcastInstance(config(cluster, "a", null,executorWorkers));
             try {
-                b = Hazelcast.newHazelcastInstance(config(cluster, "b", "127.0.0.1:" + a.getCluster().getLocalMember().getAddress().getPort()));
+                b = Hazelcast.newHazelcastInstance(config(cluster, "b", "127.0.0.1:" + a.getCluster().getLocalMember().getAddress().getPort(),executorWorkers));
                 org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> a.getCluster().getMembers().size() == 2 && b.getCluster().getMembers().size() == 2);
                 install(1, Set.of("a", "b"));
                 for (String id : List.of("a", "b")) {
@@ -252,10 +253,10 @@ class ValidationOwnerRouterTest {
         private static ClusterMembershipGate gate() {
             var properties = new ClusterProperties(); properties.setProfile(ClusterProperties.Profile.PROCESS_FAILURE_ONLY); return new ClusterMembershipGate(properties);
         }
-        private static Config config(String cluster, String id, String seed) {
+        private static Config config(String cluster, String id, String seed,int executorWorkers) {
             var config = new Config().setClusterName(cluster);
             config.getMemberAttributeConfig().setAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE, id).setAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE, "boot-" + id);
-            config.addExecutorConfig(new ExecutorConfig(EXECUTOR).setPoolSize(2).setQueueCapacity(16));
+            config.addExecutorConfig(new ExecutorConfig(EXECUTOR).setPoolSize(executorWorkers).setQueueCapacity(16));
             config.getJetConfig().setCooperativeThreadCount(2);
             config.setProperty("hazelcast.partition.count", "17").setProperty("hazelcast.phone.home.enabled", "false")
                     .setProperty("hazelcast.shutdownhook.enabled", "false").setProperty("hazelcast.logging.type", System.getProperty("test.validation.routing.logging", "none"))

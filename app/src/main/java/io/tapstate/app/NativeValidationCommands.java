@@ -26,7 +26,11 @@ final class NativeValidationCommands implements Commands {
             start=owners.original(command.request(),command.owner());var reservation=owners.take(start);
             runs.start(start,new NativeValidationFullJob(reservation,processors,member,process,runs,factory));
         }
-        if(start==null)return commandUnavailable(command,Outcome.REJECTED,null);
+        if(start==null){
+            var pending=owners.pending(command.request(),command.owner(),command.action()==Action.STOP).orElse(null);
+            if(pending!=null)return new CommandReply(Outcome.ACCEPTED,command,pending.stopped()?"STOPPED":"STARTING",false,false,false,false,pending.drained(),null);
+            return commandUnavailable(command,Outcome.REJECTED,null);
+        }
         if(command.action()==Action.STOP)runs.stop(start.run());
         var status=runs.read(start.run());
         String code=status.failure() instanceof TapstateException coded?coded.code().code():null;

@@ -51,7 +51,10 @@ class ApiExceptionHandler {
         MessageCatalog.Rendered rendered = catalog.render(e.code(), e.args());
         // Sorted so the params render identically regardless of throw-site order (a stable machine contract).
         ApiError body = new ApiError(e.code().code(), new TreeMap<>(e.args()), rendered.message());
-        return ResponseEntity.status(statusFor(e.code())).cacheControl(CacheControl.noStore()).body(body);
+        HttpStatus status=statusFor(e.code());
+        if(e.code()==io.tapstate.core.validation.ValidationError.VALUE_LIMIT_EXCEEDED
+                &&java.util.Set.of("validation.metadataFrames","validation.processEnvelope","validation.cooperativeHeadroom").contains(e.args().get("limit")))status=HttpStatus.TOO_MANY_REQUESTS;
+        return ResponseEntity.status(status).cacheControl(CacheControl.noStore()).body(body);
     }
 
     @ExceptionHandler(io.tapstate.control.core.ValidationConfigurationService.StaleDefinition.class)

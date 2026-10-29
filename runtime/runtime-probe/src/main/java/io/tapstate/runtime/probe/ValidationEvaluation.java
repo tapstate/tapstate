@@ -45,7 +45,7 @@ public abstract class ValidationEvaluation implements AutoCloseable {
     }
     public record Mapping(String id,Side source,Side target) {}
     public record View(String method,String configurationRevision,String mappingRevision,String fingerprint,List<Mapping> mappings,
-            String premise,String conclusionScope) {
+            String premise,String conclusionScope,ValidationOperation.Context context) {
         public View { mappings=List.copyOf(mappings); }
     }
     public abstract View view();

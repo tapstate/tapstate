@@ -71,6 +71,22 @@ class NativeValidationCommandsIT {
             }
         }
     }
+    @Test void stoppingAnUnusedOriginalReservationNeverCreatesAPermissionOrJob()throws Exception{
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+                var processors=new ValidationProcessorRegistry(f.member,()->{})){
+            NativeValidationFullJob.Factory factory=original->{throw new AssertionError("unused stop cannot construct a plan");};
+            var commands=new NativeValidationCommands(f.owners,runs,f.member,processors,f.process,factory);
+            try(var router=new ValidationOwnerRouter(f.member,f.gate,()->WorkloadClaimFence.from(f.node),f.owners::readOwner,f.owners,commands,()->{},Duration.ofSeconds(5))){
+                var request=f.request("FULL",1);var reserved=router.reserve(request);assertThat(reserved.outcome()).isEqualTo(Outcome.ACCEPTED);var owner=owner(reserved);
+                var pending=router.command(Command.of(Action.STATUS,request,owner));assertThat(pending.outcome()).isEqualTo(Outcome.ACCEPTED);assertThat(pending.admitted()).isFalse();
+                var stopped=router.command(Command.of(Action.STOP,request,owner));assertThat(stopped.outcome()).isEqualTo(Outcome.ACCEPTED);assertThat(stopped.state()).isEqualTo("STOPPED");
+                assertThat(stopped.admitted()).isFalse();assertThat(stopped.retired()).isFalse();assertThat(stopped.drained()).isTrue();
+                assertThat(router.command(Command.of(Action.ACTIVATE,request,owner)).outcome()).isNotEqualTo(Outcome.ACCEPTED);
+                assertThat(f.tasks.read("flow","task").orElseThrow().full().permission()).isNull();assertThat(f.tasks.read("flow","task").orElseThrow().full().nextStartSequence()).isEqualTo(1);
+                assertThat(f.member.getJet().getJobs()).isEmpty();assertThat(f.resources.snapshot().metadataFrames()).isZero();
+            }
+        }
+    }
     private static ValidationOwner owner(Reply reply){return new ValidationOwner("cluster","flow",reply.receiver().node(),reply.receiver().boot(),reply.claimGeneration(),reply.executionGeneration(),reply.topologyRevision());}
     private static ValidationCountScan.Scalar scalar(ValidationTaskSpec.Table table,long value){return new ValidationCountScan.Scalar(table,value,new ValidationCheckEvent.ReadBoundary("fixture-count","v1",Instant.EPOCH,Instant.EPOCH));}
     private static void await(java.util.function.BooleanSupplier condition)throws Exception{

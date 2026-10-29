@@ -2,6 +2,7 @@ package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.ControlError;
 import io.tapstate.control.core.ValidationConfigurationService;
+import io.tapstate.control.core.ValidationExecutionService;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.validation.ValidationError;
 import jakarta.servlet.http.HttpServletRequest;
@@ -17,8 +18,8 @@ import java.util.Map;
 @RestController
 class ValidationConfigurationController {
     private static final int MAX_REQUEST_BYTES=256*1024;
-    private final ObjectProvider<ValidationConfigurationService> services;private final ObjectMapper json;private final ObjectMapper requests;
-    ValidationConfigurationController(ObjectProvider<ValidationConfigurationService> services,ObjectMapper json){this.services=services;this.json=json;
+    private final ObjectProvider<ValidationConfigurationService> services;private final ObjectProvider<ValidationExecutionService> executions;private final ObjectMapper json;private final ObjectMapper requests;
+    ValidationConfigurationController(ObjectProvider<ValidationConfigurationService> services,ObjectProvider<ValidationExecutionService> executions,ObjectMapper json){this.services=services;this.executions=executions;this.json=json;
         requests=json.rebuild().enable(tools.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES,
                     tools.jackson.databind.DeserializationFeature.FAIL_ON_NULL_FOR_PRIMITIVES,
                     tools.jackson.databind.DeserializationFeature.FAIL_ON_READING_DUP_TREE_KEY)
@@ -58,6 +59,28 @@ class ValidationConfigurationController {
     ResponseEntity<ValidationConfigurationService.Preview> preview(HttpServletRequest request)throws IOException{
         var input=body(request,PreviewRequest.class);
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(input(()->service().preview(input.schedule(),input.inputRevision())));
+    }
+    @Verb("validation.start") @PostMapping(value="/validation:start",consumes="application/json",produces="application/json")
+    void start(HttpServletRequest request,HttpServletResponse response)throws IOException{
+        var original=body(request,ValidationExecutionService.Input.class);input(()->{ValidationExecutionService.validate(original);return null;});
+        try(var result=execution().start(AuthenticatedCaller.subject(),original)){write(response,result.view());}
+    }
+    @Verb("validation.progress") @PostMapping(value="/validation:progress",consumes="application/json",produces="application/json")
+    void progress(HttpServletRequest request,HttpServletResponse response)throws IOException{
+        var original=body(request,ValidationExecutionService.Input.class);input(()->{ValidationExecutionService.validate(original);return null;});
+        try(var result=execution().read(original)){write(response,result.view());}
+    }
+    @Verb("validation.stop") @PostMapping(value="/validation:stop",consumes="application/json",produces="application/json")
+    void stop(HttpServletRequest request,HttpServletResponse response)throws IOException{
+        var original=body(request,ValidationExecutionService.Input.class);input(()->{ValidationExecutionService.validate(original);return null;});
+        try(var result=execution().stop(AuthenticatedCaller.subject(),original)){write(response,result.view());}
+    }
+    private void write(HttpServletResponse response,ValidationExecutionService.View value)throws IOException{
+        response.setHeader(HttpHeaders.CACHE_CONTROL,"no-store");response.setContentType(MediaType.APPLICATION_JSON_VALUE);json.writeValue(response.getOutputStream(),value);
+    }
+    private ValidationExecutionService execution(){
+        try{var service=executions.getIfAvailable();if(service==null)throw new TapstateException(ControlError.STORAGE_UNAVAILABLE,Map.of(),null);return service;}
+        catch(org.springframework.beans.BeansException failed){for(Throwable cause=failed;cause!=null;cause=cause.getCause())if(cause instanceof TapstateException coded)throw coded;throw failed;}
     }
     private <T>T body(HttpServletRequest request,Class<T> type)throws IOException{
         if(request.getContentLengthLong()>MAX_REQUEST_BYTES)throw MalformedRequest.rejecting("validation request exceeds 256 KiB",null);

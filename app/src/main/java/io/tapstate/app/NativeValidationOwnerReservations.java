@@ -171,6 +171,20 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
             return new ValidationReportAdmission.Start(task(request),request.configurationRevision(),request.startSequence(),request.command().toString(),identity);
         }finally{local.lock.unlock();unpin(local);}
     }
+    record Pending(boolean stopped,boolean drained) {}
+    /** Exact existing handoff only; missing status never creates a Pipeline registry or native authority. */
+    Optional<Pending> pending(Request request,ValidationOwner expected,boolean stop){
+        requireActive();final Pipeline local;
+        synchronized(pipelines){local=pipelines.get(request.pipeline());if(local==null)return Optional.empty();local.references++;}
+        if(!local.lock.tryLock()){unpin(local);throw unauthorized(local.pipeline);}
+        try{
+            var original=local.operations.get(new Operation(request.task(),request.taskGeneration(),request.mode(),request.command()));
+            if(original==null||!original.request.equals(request)||original.activated||original.bound==null||original.owner==null
+                    ||!original.bound.budget().identity().owner().equals(expected))return Optional.empty();
+            original.requireOwner();if(stop)original.close();
+            return Optional.of(new Pending(original.cancelled.get(),original.cancelled.get()&&original.bound.fullyReleased()));
+        }finally{local.lock.unlock();unpin(local);}
+    }
     Reservation take(ValidationReportAdmission.Start start) {
         requireActive(); var local = pipeline(start.task().pipelineId());
         if (!local.lock.tryLock()) { unpin(local); throw unauthorized(local.pipeline); }

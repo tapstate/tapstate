@@ -10,6 +10,91 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import static org.assertj.core.api.Assertions.*;
 
 class ValidationMemberResourcesTest {
+    @Test void preOwnerControlKeepsBudgetUntilOriginalBodyExitsAcrossContextClosure()throws Exception{
+        var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
+        try(var process=new ValidationMemberResources()){
+            var member=process.bind("cluster","node","boot",4,()->{});var control=member.admitControl();
+            control.execute(()->{entered.countDown();try{release.await();}catch(InterruptedException interrupted){throw new AssertionError(interrupted);}});
+            try{
+                assertThat(entered.await(2,TimeUnit.SECONDS)).isTrue();control.close();member.close();
+                assertThat(member.snapshot().processReserved()).isEqualTo(new ValidationLocalBudget.Amount(4L*1024*1024,1,1,1));
+                assertThat(member.snapshot().data().runs()).isZero();assertThat(member.snapshot().processors()).isZero();
+                assertThat(member.snapshot().metadataFrames()).isOne();assertThat(control.released().toCompletableFuture()).isNotDone();
+                var next=process.bind("cluster","node","boot",4,()->{});
+                assertThatThrownBy(control::require).isInstanceOf(TapstateException.class);
+                release.countDown();control.released().toCompletableFuture().get(2,TimeUnit.SECONDS);
+                assertThat(next.snapshot().processReserved().isEmpty()).isTrue();assertThat(next.snapshot().metadataFrames()).isZero();
+            }finally{release.countDown();control.close();}
+        }finally{release.countDown();}
+    }
+    @Test void anUnsubmittedOrPreSubmissionRefusedControlReturnsOnlyItsOwnAllocation()throws Exception{
+        try(var process=new ValidationMemberResources()){
+            var member=process.bind("cluster","node","boot",4,()->{});var unsubmitted=member.admitControl();unsubmitted.close();
+            unsubmitted.released().toCompletableFuture().get(2,TimeUnit.SECONDS);
+            assertThat(member.snapshot().processReserved().isEmpty()).isTrue();assertThat(member.snapshot().metadataFrames()).isZero();
+            var rejected=member.admitControl();process.close();
+            assertThatThrownBy(()->rejected.execute(()->{throw new AssertionError("closed process cannot execute");})).isInstanceOf(TapstateException.class);
+            rejected.close();assertThat(member.snapshot().processReserved().isEmpty()).isTrue();assertThat(member.snapshot().metadataFrames()).isZero();
+        }
+    }
+    @Test void saturatedControlExecutorProvesNonSubmissionBeforeReturningTheControlBudget()throws Exception{
+        var entered=new CountDownLatch(4);var release=new CountDownLatch(1);var called=new AtomicBoolean();
+        try(var process=new ValidationMemberResources()){
+            var member=process.bind("cluster","node","boot",4,()->{});
+            var io=(ExecutorService)org.springframework.test.util.ReflectionTestUtils.getField(process,"controls");
+            for(int index=0;index<4;index++)io.execute(()->{entered.countDown();try{release.await();}catch(InterruptedException interrupted){throw new AssertionError(interrupted);}});
+            try{
+                assertThat(entered.await(2,TimeUnit.SECONDS)).isTrue();for(int index=0;index<64;index++)io.execute(()->{});
+                var control=member.admitControl();assertThatThrownBy(()->control.execute(()->called.set(true))).isInstanceOf(RejectedExecutionException.class);
+                assertThatThrownBy(()->control.released().toCompletableFuture().get(2,TimeUnit.SECONDS)).isInstanceOf(ExecutionException.class).hasCauseInstanceOf(RejectedExecutionException.class);
+                assertThat(called).isFalse();assertThat(member.snapshot().processReserved().isEmpty()).isTrue();assertThat(member.snapshot().metadataFrames()).isZero();
+            }finally{release.countDown();}
+        }finally{release.countDown();}
+    }
+    @Test void queuedControlKeepsItsOwnEnvelopeThroughProcessShutdownUntilItsWrapperActuallyExits()throws Exception{
+        var entered=new CountDownLatch(4);var release=new CountDownLatch(1);var called=new AtomicBoolean();
+        try(var process=new ValidationMemberResources()){
+            var member=process.bind("cluster","node","boot",4,()->{});
+            var io=(ExecutorService)org.springframework.test.util.ReflectionTestUtils.getField(process,"controls");
+            for(int index=0;index<4;index++)io.execute(()->{entered.countDown();try{release.await();}catch(InterruptedException interrupted){throw new AssertionError(interrupted);}});
+            try{
+                assertThat(entered.await(2,TimeUnit.SECONDS)).isTrue();var control=member.admitControl();control.execute(()->called.set(true));
+                process.close();control.close();assertThat(control.released().toCompletableFuture()).isNotDone();
+                assertThat(member.snapshot().processReserved().isEmpty()).isFalse();assertThat(member.snapshot().metadataFrames()).isOne();
+                release.countDown();assertThatThrownBy(()->control.released().toCompletableFuture().get(2,TimeUnit.SECONDS))
+                        .isInstanceOf(ExecutionException.class).hasCauseInstanceOf(TapstateException.class);
+                assertThat(called).isFalse();assertThat(member.snapshot().processReserved().isEmpty()).isTrue();assertThat(member.snapshot().metadataFrames()).isZero();
+            }finally{release.countDown();}
+        }finally{release.countDown();}
+    }
+    @Test @org.junit.jupiter.api.Timeout(30) void closingAnActuallyExitedControlCannotEraseItsOriginalFatalFailure()throws Exception{
+        var fatal=new AssertionError("original control body failed");
+        try(var process=new ValidationMemberResources();var closer=Executors.newSingleThreadExecutor()){
+            var member=process.bind("cluster","node","boot",4,()->{});
+            for(int attempt=0;attempt<20000;attempt++){
+                var control=member.admitControl();var go=new AtomicBoolean();
+                control.execute(()->{Thread.currentThread().setUncaughtExceptionHandler((thread,failure)->{});while(!go.get())Thread.onSpinWait();throw fatal;});
+                var closed=closer.submit(()->{go.set(true);while(true){
+                    synchronized(control){if(Boolean.TRUE.equals(org.springframework.test.util.ReflectionTestUtils.getField(control,"exited"))){control.close();return;}}
+                    Thread.onSpinWait();
+                }});
+                closed.get(2,TimeUnit.SECONDS);
+                assertThatThrownBy(()->control.released().toCompletableFuture().get(2,TimeUnit.SECONDS)).isInstanceOf(ExecutionException.class).hasCause(fatal);
+            }
+        }
+    }
+    @Test void borrowedControlDoesNotReturnItsOwnersFrameOrBorrowAnotherContextFrame()throws Exception{
+        try(var process=new ValidationMemberResources()){
+            var original=process.bind("cluster","node","boot",4,()->{});var other=process.bind("cluster","node","boot",4,()->{});
+            try(var frame=original.admitMetadata()){
+                var control=original.admitControl(frame);control.close();control.released().toCompletableFuture().get(2,TimeUnit.SECONDS);
+                assertThat(original.snapshot().metadataFrames()).isOne();assertThat(original.snapshot().processReserved().isEmpty()).isTrue();
+                assertThatThrownBy(()->other.admitControl(frame)).isInstanceOf(TapstateException.class).hasMessageContaining("metadataOwner");
+                assertThat(original.snapshot().metadataFrames()).isOne();
+            }
+            assertThat(original.snapshot().metadataFrames()).isZero();
+        }
+    }
     @Test void aBlockingMetadataConsumerHasAnExplicitThirdWorkerAndNoRunProcessors()throws Exception{
         var entered=new CountDownLatch(3);var release=new CountDownLatch(1);
         try(var process=new ValidationMemberResources()){
