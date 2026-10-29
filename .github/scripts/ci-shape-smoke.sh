@@ -123,7 +123,7 @@ def check(workflows, contexts, inputs):
     assert 'if-no-files-found: error' in shards, 'missing shard artifact must fail'
     assert 'Prepare pinned public inputs for Cloud startup witnesses' in shards
     assert 'if [ "$SHARD" = rest ]; then' in shards, 'the REST shard must prepare pinned Cloud inputs'
-    assert 'cloud_context_test = "io.tapstate.e2e.CloudClusterContextCarriesTheCurrentEgressAddressIT"' in shards
+    assert 'cloud_context_test = "io.tapstate.app.CloudClusterContextCarriesTheCurrentEgressAddressIT"' in shards
     assert 'test["class"] == cloud_context_test for test in shard["tests"]' in shards, \
         'any shard assigned the Cloud context test must prepare its pinned inputs'
     assert 'prepare-test-inputs.py --output "$RUNNER_TEMP/cloud-test-release"' in shards
