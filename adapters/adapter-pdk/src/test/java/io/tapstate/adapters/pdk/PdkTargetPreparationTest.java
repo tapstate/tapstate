@@ -26,6 +26,28 @@ class PdkTargetPreparationTest {
     private static final PipelineNode NODE = new PipelineNode("pipeline", "sink");
 
     @Test
+    void preparationReportsOnlyTheActualTargetCapabilities() throws Throwable {
+        var calls=new ArrayList<String>();var observed=new ArrayList<io.tapstate.spi.capture.SourceOperationObserver.Capability>();
+        var functions=functions(true,calls);
+        functions.supportCountByPartitionFilterFunction((context,table,filter)->0L);
+        var preparation=new PdkTargetPreparation(null,functions,OnFullLoad.FAIL,true,NODE,new State())
+                .withOperationObserver((capability,failure)->{assertThat(failure).isNull();observed.add(capability);});
+        preparation.prepare(TARGET,TargetTapTable.build(TARGET));
+        assertThat(observed).containsExactly(io.tapstate.spi.capture.SourceOperationObserver.Capability.TARGET_WRITE,
+                io.tapstate.spi.capture.SourceOperationObserver.Capability.TARGET_READ,
+                io.tapstate.spi.capture.SourceOperationObserver.Capability.TARGET_WRITE);
+    }
+    @Test
+    void aHostGuardFailureIsNotReportedAsATargetFailure() {
+        var observed=new ArrayList<Throwable>();
+        var preparation=new PdkTargetPreparation("demo",null,functions(true,new ArrayList<>()),OnFullLoad.CLEAR,true,
+                NODE,new State(),false,PipelineNode.Purpose.SYNC,()->{throw new IllegalStateException(new java.net.SocketTimeoutException("host store"));})
+                .withOperationObserver((capability,failure)->observed.add(failure));
+        assertThatThrownBy(()->preparation.prepare(TARGET,TargetTapTable.build(TARGET))).isInstanceOf(IllegalStateException.class);
+        assertThat(observed).isEmpty();
+    }
+
+    @Test
     void aNewEmptyTableIsCreatedWithoutClearFailOrDuplicatePrimaryKey() throws Throwable {
         for (OnFullLoad policy : OnFullLoad.values()) {
             List<String> calls = new ArrayList<>();

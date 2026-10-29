@@ -9,6 +9,7 @@ import io.tapdata.pdk.apis.entity.TapAdvanceFilter;
 import io.tapdata.pdk.apis.entity.TapExecuteCommand;
 import io.tapstate.core.model.PipelineNode;
 import io.tapstate.spi.sink.OnFullLoad;
+import io.tapstate.spi.capture.SourceOperationObserver;
 import io.tapstate.spi.sink.SinkPreparationNamespace;
 import io.tapstate.spi.sink.TargetTable;
 import io.tapstate.spi.store.KeyedStateStore;
@@ -42,6 +43,19 @@ final class PdkTargetPreparation {
     private final Runnable requireActive;
     private final Set<String> prepared = new HashSet<>();
     private final PdkSinkPreparations receipts;
+
+    private SourceOperationObserver observer=SourceOperationObserver.NONE;
+    PdkTargetPreparation withOperationObserver(SourceOperationObserver observer){this.observer=java.util.Objects.requireNonNull(observer);return this;}
+    private <T> T operation(SourceOperationObserver.Capability capability,PdkConnector.Action<T> action) throws Throwable {
+        T result;
+        try {result=action.run();} catch(Throwable failure){report(capability,failure);throw failure;}
+        report(capability,null);return result;
+    }
+    private void report(SourceOperationObserver.Capability capability,Throwable failure){
+        try {observer.completed(capability,failure);}catch(RuntimeException unavailable){
+            org.slf4j.LoggerFactory.getLogger(getClass()).warn("Target operation collection is degraded");
+        }
+    }
 
     PdkTargetPreparation(TapConnectorContext context, ConnectorFunctions functions, OnFullLoad onFullLoad,
             boolean fullLoad, PipelineNode node, KeyedStateStore stateStore) {
@@ -139,7 +153,7 @@ final class PdkTargetPreparation {
             if (event != null) {
                 event.setTableId(table.getId());
                 requireActive.run();
-                functions.getCreateIndexFunction().createIndex(context, table, event);
+                operation(SourceOperationObserver.Capability.TARGET_WRITE,()->{functions.getCreateIndexFunction().createIndex(context, table, event);return null;});
             }
         }
         // A failed index call is not success: retry it before the next write without clearing again.
@@ -183,7 +197,7 @@ final class PdkTargetPreparation {
         }
         if(functions.getCreateIndexFunction()!=null) {
             var event=TargetTapTable.createIndexEvent(target,created);
-            if(event!=null){event.setTableId(table.getId());requireActive.run();functions.getCreateIndexFunction().createIndex(context,table,event);}
+            if(event!=null){event.setTableId(table.getId());requireActive.run();operation(SourceOperationObserver.Capability.TARGET_WRITE,()->{functions.getCreateIndexFunction().createIndex(context,table,event);return null;});}
         }
         requireActive.run();prepared.add(target.name());
     }
@@ -195,11 +209,12 @@ final class PdkTargetPreparation {
         TapCreateTableEvent event = new TapCreateTableEvent().table(table);
         event.setTableId(table.getId());
         requireActive.run();
-        var options = functions.getCreateTableV2Function().createTable(context, event);
-        if (options == null || options.getTableExists() == null) {
-            throw new IllegalStateException("create-table did not report existence for target table " + table.getId());
-        }
-        return !options.getTableExists();
+        return operation(SourceOperationObserver.Capability.TARGET_WRITE,()->{
+            var options=functions.getCreateTableV2Function().createTable(context,event);
+            if(options==null || options.getTableExists()==null)
+                throw new IllegalStateException("create-table did not report existence for target table " + table.getId());
+            return !options.getTableExists();
+        });
     }
 
     private void prepareExisting(TapTable table) throws Throwable {
@@ -217,7 +232,7 @@ final class PdkTargetPreparation {
                 TapClearTableEvent event = new TapClearTableEvent();
                 event.setTableId(table.getId());
                 requireActive.run();
-                functions.getClearTableFunction().clearTable(context, event);
+                operation(SourceOperationObserver.Capability.TARGET_WRITE,()->{functions.getClearTableFunction().clearTable(context, event);return null;});
             }
             case FAIL -> {
                 if (functions.getCountByPartitionFilterFunction() == null) {
@@ -225,11 +240,11 @@ final class PdkTargetPreparation {
                             + " cannot honor on_full_load fail: connector provides no row-count function");
                 }
                 requireActive.run();
-                long rows = functions.getCountByPartitionFilterFunction()
-                        .countByPartitionFilter(context, table, TapAdvanceFilter.create());
-                if (rows < 0) {
-                    throw new IllegalStateException("row count is unknown for target table " + table.getId());
-                }
+                long rows = operation(SourceOperationObserver.Capability.TARGET_READ,()->{
+                    long count=functions.getCountByPartitionFilterFunction().countByPartitionFilter(context,table,TapAdvanceFilter.create());
+                    if(count<0)throw new IllegalStateException("row count is unknown for target table " + table.getId());
+                    return count;
+                });
                 if (rows > 0) {
                     throw new IllegalStateException("target table " + table.getId()
                             + " is not empty; on_full_load is fail");
@@ -249,21 +264,24 @@ final class PdkTargetPreparation {
         AtomicReference<Throwable> failure = new AtomicReference<>();
         AtomicBoolean completed = new AtomicBoolean();
         requireActive.run();
-        functions.getExecuteCommandFunction().execute(context,
-                TapExecuteCommand.create().command("execute").params(params), result -> {
-                    if (result != null) {
-                        if (result.getError() != null) {
-                            failure.compareAndSet(null, result.getError());
-                        } else if (result.getResult() instanceof Number rows && rows.longValue() >= 0) {
-                            completed.set(true);
+        operation(SourceOperationObserver.Capability.TARGET_WRITE,()->{
+            functions.getExecuteCommandFunction().execute(context,
+                    TapExecuteCommand.create().command("execute").params(params), result -> {
+                        if (result != null) {
+                            if (result.getError() != null) {
+                                failure.compareAndSet(null, result.getError());
+                            } else if (result.getResult() instanceof Number rows && rows.longValue() >= 0) {
+                                completed.set(true);
+                            }
                         }
-                    }
-                });
-        if (failure.get() != null) {
-            throw failure.get();
-        }
-        if (!completed.get()) {
-            throw new IllegalStateException("clear command did not report success for target table " + table.getId());
-        }
+                    });
+            if (failure.get() != null) {
+                throw failure.get();
+            }
+            if (!completed.get()) {
+                throw new IllegalStateException("clear command did not report success for target table " + table.getId());
+            }
+            return null;
+        });
     }
 }

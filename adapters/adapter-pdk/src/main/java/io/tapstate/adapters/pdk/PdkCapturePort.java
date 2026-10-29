@@ -1178,6 +1178,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                     position(connector, startOffset).ifPresent(started::onStart);
                 }
                 Map<String, PdkRowSchema> declared = declaredTypes(tables);
+                var callbackFailed = new java.util.concurrent.atomic.AtomicBoolean();
                 StreamReadConsumer consumer = StreamReadConsumer.create((events, offset) -> {
                     // Every delivery is the moment to hand the connector what its source may release: this
                     // is the connector's own delivery thread, the one thread any connector can safely be
@@ -1188,13 +1189,21 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                     // and outside the delivery a close cancels, so a close wakes the hand-over and never the
                     // source's own call.
                     reportOperation(SourceOperationObserver.Capability.STREAM_READ, null);
-                    acknowledgements.applyIfDue();
-                    delivery.accept(() -> handOver(connector, declared, listener, events, offset));
+                    try {
+                        acknowledgements.applyIfDue();
+                        delivery.accept(() -> handOver(connector, declared, listener, events, offset));
+                    } catch (RuntimeException | Error downstreamFailure) {
+                        callbackFailed.set(true);
+                        throw downstreamFailure;
+                    }
                 });
                 Object readerOffset = readerOffset(connector, startOffset, resumeAt != null);
                 if (delivery.closed) return null;
                 try { stream.streamRead(connector.context(), config.streams(), readerOffset, BATCH_SIZE, consumer); }
-                catch (Throwable failure) { if (!delivery.closed) reportOperation(SourceOperationObserver.Capability.STREAM_READ, failure); throw failure; }
+                catch (Throwable failure) {
+                    if (!delivery.closed && !callbackFailed.get()) reportOperation(SourceOperationObserver.Capability.STREAM_READ, failure);
+                    throw failure;
+                }
                 return null;
             });
         } catch (Throwable t) {

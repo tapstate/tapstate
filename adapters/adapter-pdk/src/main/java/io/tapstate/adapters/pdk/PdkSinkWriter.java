@@ -188,7 +188,7 @@ final class PdkSinkWriter implements SinkWriter {
     }
 
     private io.tapstate.spi.capture.SourceOperationObserver operationObserver=io.tapstate.spi.capture.SourceOperationObserver.NONE;
-    PdkSinkWriter withOperationObserver(io.tapstate.spi.capture.SourceOperationObserver observer){operationObserver=observer;return this;}
+    PdkSinkWriter withOperationObserver(io.tapstate.spi.capture.SourceOperationObserver observer){operationObserver=java.util.Objects.requireNonNull(observer);preparation.withOperationObserver(observer);return this;}
     private void operation(Throwable failure){
         try{operationObserver.completed(io.tapstate.spi.capture.SourceOperationObserver.Capability.TARGET_WRITE,failure);}
         catch(RuntimeException unavailable){org.slf4j.LoggerFactory.getLogger(getClass()).warn("Target operation collection is degraded");}

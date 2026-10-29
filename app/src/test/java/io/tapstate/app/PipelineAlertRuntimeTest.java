@@ -174,4 +174,107 @@ class PipelineAlertRuntimeTest {
         finally{release.countDown();runtime.close();}
     }
 
+    private AlertConfiguration.Rule resourceRule() {
+        var original=AlertEvaluationHostTest.definition("pipeline.failed");
+        return new AlertConfiguration.Rule(original.header(),"Source health","source.connection-failed",1,
+                new AlertConfiguration.Resources(Set.of("source"),true,Set.of()),Map.of(),null,true,null)
+                .validated(BuiltinAlarmTypes.catalog());
+    }
+    private AlertConfiguration.Rule useResourceRule() {
+        var rule=resourceRule();
+        when(fixture.store.evaluationRules(any(),anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule),null));
+        return rule;
+    }
+    private void resource(PipelineAlertRuntime runtime,String id,Instant at,boolean success,Runnable guard) {
+        runtime.resourceInput(new AlarmKey.Resource("source",id,"uuid"),"source.connection-failed",1,"producer",guard,
+                new AlertInput.Operational(at,"a".repeat(64),OperationalEvidence.Capability.STREAM_READ,success));
+    }
+    private AlertStateRecord.Head resourceHead(String id) {
+        return rows.values().stream().map(AlertStore.Stored::value).filter(h->h.snapshot().rule().key().resource().id().equals(id)).findFirst().orElseThrow();
+    }
+    private void drained(PipelineAlertRuntime runtime) {
+        await().atMost(Duration.ofSeconds(3)).until(()->runtime.health().queuedInputs()==0);
+    }
+    @Test void resourceFailureAndRecoveryStayOrderedWhileAnotherResourceCanProceed() throws Exception {
+        useResourceRule();var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
+        try(var runtime=runtime()) {
+            runtime.tick();drained(runtime);
+            resource(runtime,"a",T,false,()->{entered.countDown();try{assertThat(release.await(5,TimeUnit.SECONDS)).isTrue();}catch(InterruptedException e){Thread.currentThread().interrupt();}});
+            assertThat(entered.await(3,TimeUnit.SECONDS)).isTrue();fixture.now.set(T.plusSeconds(1));
+            resource(runtime,"a",T.plusSeconds(1),true,()->{});
+            resource(runtime,"b",T,false,()->{});
+            try {await().atMost(Duration.ofSeconds(2)).until(()->rows.keySet().stream().anyMatch(k->k.resource().id().equals("b")));}
+            finally {release.countDown();}
+            drained(runtime);var head=resourceHead("a");
+            assertThat(head.snapshot().episodeSequence()).isOne();
+            assertThat(head.snapshot().status()).isEqualTo(AlertSnapshot.Status.RESOLVED);
+            assertThat(head.episode().value().endReason()).isEqualTo(AlertSnapshot.EndReason.RECOVERED);
+        }finally{release.countDown();}
+    }
+    @Test void aRefusedResourceTickCanBeRetriedAfterTheSharedQueueDrains() throws Exception {
+        useResourceRule();var entered=new CountDownLatch(2);var release=new CountDownLatch(1);
+        Runnable block=()->{entered.countDown();try{assertThat(release.await(5,TimeUnit.SECONDS)).isTrue();}catch(InterruptedException e){Thread.currentThread().interrupt();}};
+        try(var runtime=runtime()) {
+            runtime.tick();drained(runtime);resource(runtime,"observed",T,false,()->{});drained(runtime);
+            resource(runtime,"a",T,false,block);resource(runtime,"b",T,false,block);
+            assertThat(entered.await(3,TimeUnit.SECONDS)).isTrue();
+            for(int i=0;i<62;i++)resource(runtime,"a",T,false,()->{});
+            assertThat(runtime.health().queuedInputs()).isEqualTo(64);runtime.tick();
+            assertThat(runtime.health().rejected()).isPositive();release.countDown();drained(runtime);
+            fixture.now.set(T.plusSeconds(16));runtime.tick();drained(runtime);
+            assertThat(resourceHead("observed").snapshot().quality()).isEqualTo(AlertSnapshot.Quality.STALE);
+        }finally{release.countDown();}
+    }
+    @Test void repeatedSameCapabilityEvidenceRefreshesAgeWithoutChangingTheFailure() {
+        useResourceRule();try(var runtime=runtime()) {
+            runtime.tick();drained(runtime);resource(runtime,"observed",T,false,()->{});drained(runtime);
+            fixture.now.set(T.plusSeconds(10));resource(runtime,"observed",fixture.now.get(),false,()->{});drained(runtime);
+            fixture.now.set(T.plusSeconds(16));runtime.tick();drained(runtime);
+            var head=resourceHead("observed");
+            assertThat(head.snapshot().lastObservedAt()).isEqualTo(T.plusSeconds(10));
+            assertThat(head.snapshot().quality()).isEqualTo(AlertSnapshot.Quality.VALID);
+            assertThat(head.snapshot().status()).isEqualTo(AlertSnapshot.Status.FIRING);
+        }
+    }
+    @Test void resourceRuleChangesTakeEffectWithoutAnotherOperationCallback() {
+        var original=useResourceRule();try(var runtime=runtime()) {
+            runtime.tick();drained(runtime);resource(runtime,"observed",T,false,()->{});drained(runtime);
+            fixture.now.set(T.plusSeconds(1));
+            var changed=new AlertConfiguration.Rule(original.header().next(fixture.now.get(),"admin"),original.name(),original.typeId(),1,
+                    original.resources(),original.parameters(),AlarmSeverity.CRITICAL,true,null);
+            when(fixture.store.evaluationRules(any(),anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(changed),null));
+            runtime.tick();drained(runtime);runtime.tick();drained(runtime);
+            var head=resourceHead("observed");assertThat(head.snapshot().rule().revision()).isEqualTo(changed.header().revision());
+            assertThat(head.episode().value().endReason()).isEqualTo(AlertSnapshot.EndReason.SUPERSEDED);
+            assertThat(head.snapshot().lastObservedAt()).isNull();
+            assertThat(head.snapshot().quality()).isIn(AlertSnapshot.Quality.UNKNOWN,AlertSnapshot.Quality.STALE);
+            assertThat(head.snapshot().status()).isEqualTo(AlertSnapshot.Status.CLEAR);
+        }
+    }
+
+    @Test void anEndedOperationCannotBeAcceptedAfterItWasQueued() {
+        useResourceRule();try(var runtime=runtime()) {
+            runtime.tick();drained(runtime);
+            resource(runtime,"ended",T,false,()->{throw new io.tapstate.core.common.TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);});
+            drained(runtime);assertThat(rows).isEmpty();assertThat(runtime.health().rejected()).isPositive();
+        }
+    }
+
+    @Test void concurrentPipelineAndResourceAdmissionShareOneObjectLimit() throws Exception {
+        var initial=new ArrayList<PipelineConvergencePass>();
+        for(int i=0;i<255;i++)initial.add(pass("existing-"+i));
+        var next=pass("next");var pool=Executors.newFixedThreadPool(2);
+        when(fixture.store.evaluationRules(any(),anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(),null));
+        try {
+            for(int round=0;round<64;round++)try(var runtime=runtime()) {
+                runtime.tick();drained(runtime);initial.forEach(runtime::expecting);
+                var gate=new CyclicBarrier(3);
+                var pipeline=pool.submit(()->{gate.await(3,TimeUnit.SECONDS);runtime.expecting(next);return null;});
+                var resource=pool.submit(()->{gate.await(3,TimeUnit.SECONDS);resource(runtime,"last-resource",T,true,()->{});return null;});
+                gate.await(3,TimeUnit.SECONDS);pipeline.get(3,TimeUnit.SECONDS);resource.get(3,TimeUnit.SECONDS);drained(runtime);
+                assertThat(runtime.health().rejected()).as("mixed admission round %s",round).isOne();
+            }
+        } finally {pool.shutdownNow();}
+    }
+
 }

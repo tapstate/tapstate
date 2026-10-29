@@ -39,6 +39,11 @@ public final class PdkSinkPort implements SinkPort {
     private void operation(io.tapstate.spi.capture.SourceOperationObserver.Capability capability,Throwable failure){
         try{operationObserver.completed(capability,failure);}catch(RuntimeException unavailable){org.slf4j.LoggerFactory.getLogger(getClass()).warn("Target operation collection is degraded");}
     }
+    private void initialize(PdkConnector connector) throws Throwable {
+        try {connector.connector().init(connector.context());}
+        catch(Throwable failure){operation(io.tapstate.spi.capture.SourceOperationObserver.Capability.INITIALIZE,failure);throw failure;}
+        operation(io.tapstate.spi.capture.SourceOperationObserver.Capability.INITIALIZE,null);
+    }
     /** The exact assessed models frozen into this run's preparation roster, separate from input lineage. */
     public PdkSinkPort withTargetIdentities(Map<String, TargetIdentityPlan> identities) {
         return new PdkSinkPort(provisioner, stateStore, sharing, purpose, noteScopes, execution, preparations,
@@ -178,9 +183,7 @@ public final class PdkSinkPort implements SinkPort {
                 config.connectorId(), ref, config.settings(), config.node(), stateStore, null, drive.scopes(), purpose);
         try {
             connector.underLoader(() -> {
-                try {connector.connector().init(connector.context());}
-                catch(Throwable failure){operation(io.tapstate.spi.capture.SourceOperationObserver.Capability.INITIALIZE,failure);throw failure;}
-                operation(io.tapstate.spi.capture.SourceOperationObserver.Capability.INITIALIZE,null);
+                initialize(connector);
                 return null;
             });
             return connector;
@@ -208,10 +211,10 @@ public final class PdkSinkPort implements SinkPort {
                 config.node(), stateStore, null, drive.scopes(), purpose);
         try {
             connector.underLoader(() -> {
-                connector.connector().init(connector.context());
+                initialize(connector);
                 PdkTargetPreparation preparation = new PdkTargetPreparation(connector.connectorId(),
                         connector.context(), connector.functions(), config.onFullLoad(), config.fullLoad(),
-                        config.node(), stateStore, false, purpose, connector::requireActive,preparations);
+                        config.node(), stateStore, false, purpose, connector::requireActive,preparations).withOperationObserver(operationObserver);
                 Map<String, TargetIdentityPlan> identities = PdkTargetIdentityPlanner.assess(connector, config, targets);
                 identities.values().forEach(TargetIdentityProjection::requireUsable);
                 PdkTargetIdentityPlanner.requireSame(config, plannedIdentities, identities);
@@ -247,7 +250,7 @@ public final class PdkSinkPort implements SinkPort {
         var connector=PdkConnector.open(config.connectorId(),ref,config.settings(),config.node(),stateStore,null,drive.scopes(),purpose);
         try {
             return connector.underLoader(() -> {
-                connector.connector().init(connector.context());
+                initialize(connector);
                 var identities=PdkTargetIdentityPlanner.assess(connector,config,targets);
                 identities.values().forEach(TargetIdentityProjection::requireUsable);
                 connector.requireActive();
@@ -275,9 +278,7 @@ public final class PdkSinkPort implements SinkPort {
         }
         try {
             connector.underLoader(() -> {
-                try {connector.connector().init(connector.context());}
-                catch(Throwable failure){operation(io.tapstate.spi.capture.SourceOperationObserver.Capability.INITIALIZE,failure);throw failure;}
-                operation(io.tapstate.spi.capture.SourceOperationObserver.Capability.INITIALIZE,null);
+                initialize(connector);
                 return null;
             });
             PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, preparedAhead, null, purpose,preparations,plannedIdentities).withOperationObserver(operationObserver);

@@ -45,7 +45,7 @@ class ViewEventAgeIT {
                     view:
                       id: order_state
                       from: orders
-                      primary_key: id
+                      primary_key: _id
                     """);
             control.apply(resources);control.discoverSchema("src_age","mongodb",Map.of("uri",sourceUri,"database",sourceDb));
             control.lifecycle("view_age",LifecycleVerb.START);

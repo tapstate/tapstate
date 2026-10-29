@@ -55,6 +55,37 @@ class PdkCapturePortTest {
         return new CaptureConfig("demo", Map.of(), List.of(streams));
     }
 
+    @Test
+    void aDownstreamSocketFailureIsNotReportedAsASourceReadFailure(@TempDir Path dir) throws Exception {
+        Path jar=Synthetic.positionedSource(dir);
+        var observed=new CopyOnWriteArrayList<Throwable>();
+        var port=new PdkCapturePort(provisioner(jar,"synthetic.PositionedSource",null))
+                .withOperationObserver((capability,failure)->{if(capability==io.tapstate.spi.capture.SourceOperationObserver.Capability.STREAM_READ && failure!=null)observed.add(failure);});
+        var settled=new CountDownLatch(1);var downstream=new IllegalStateException(new java.net.SocketTimeoutException("target timeout"));
+        var reported=new AtomicReference<Throwable>();
+        try(var subscription=port.cdc(config("t1"),CaptureStart.present(),new CaptureListener(){
+            public void onBatch(List<Envelope> events,Optional<SourcePosition> position){throw downstream;}
+            public void onError(Throwable error){reported.set(error);settled.countDown();}
+        })) {
+            assertThat(settled.await(5,TimeUnit.SECONDS)).isTrue();
+        }
+        assertThat(reported.get()).isNotNull();
+        assertThat(observed).as("a successful Source callback failed only in its downstream consumer").isEmpty();
+    }
+
+    @Test
+    void aSourceReadFailureStillReachesTheOperationObserver(@TempDir Path dir) throws Exception {
+        Path jar=Synthetic.throwingStreamSource(dir);var observed=new CopyOnWriteArrayList<Throwable>();
+        var port=new PdkCapturePort(provisioner(jar,"synthetic.ThrowingStream",null))
+                .withOperationObserver((capability,failure)->{if(capability==io.tapstate.spi.capture.SourceOperationObserver.Capability.STREAM_READ && failure!=null)observed.add(failure);});
+        var settled=new CountDownLatch(1);
+        try(var subscription=port.cdc(config("t1"),CaptureStart.present(),new CaptureListener(){
+            public void onBatch(List<Envelope> events,Optional<SourcePosition> position){}
+            public void onError(Throwable error){settled.countDown();}
+        })) {assertThat(settled.await(5,TimeUnit.SECONDS)).isTrue();}
+        assertThat(observed).hasSize(1);
+    }
+
     // ---- structural failures (resolved before any connector data flows) --------------------------
 
     @Test

@@ -31,17 +31,15 @@ final class BuiltinResourceSignals {
         }
         String digest=digest(id.sourceId(),id.incarnation(),Long.toString(id.bindingRevision()));
         return (capability,failure)->{
-            try { originalOperation.run(); }
-            catch(TapstateException ended){return;}
             if(failure!=null&&!connectionFailure(failure))return;
             var input=new AlertInput.Operational(clock.instant(),digest,
                     OperationalEvidence.Capability.valueOf(capability.name()),failure==null);
             runtime.get().resourceInput(new AlarmKey.Resource("source",id.sourceId(),id.incarnation()),
-                    "source.connection-failed",id.bindingRevision(),digest,active,input);
+                    "source.connection-failed",id.bindingRevision(),digest,originalOperation,input);
             StorageBinding bound=storage.get();
             if(bound.defaultSourceId().equals(id.sourceId())){
                 runtime.get().resourceInput(new AlarmKey.Resource("cluster-storage",id.sourceId(),id.incarnation()+":"+id.bindingRevision()),
-                        "cluster.storage-unavailable",0,digest,active,input);
+                        "cluster.storage-unavailable",0,digest,originalOperation,input);
             }
         };
     }

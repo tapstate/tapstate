@@ -21,7 +21,7 @@ class BuiltinResourceSignalsTest {
         assertThat(BuiltinResourceSignals.connectionFailure(new IllegalStateException("private"))).isFalse();
         assertThat(BuiltinResourceSignals.connectionFailure(new com.mongodb.MongoCommandException(org.bson.BsonDocument.parse("{\"ok\":0,\"code\":13,\"errmsg\":\"private\"}"),new com.mongodb.ServerAddress()))).isTrue();
     }
-    @Test void sourceResultUsesTheCapturedLifetimeAndRejectsAnEndedOperation(){
+    @Test void sourceResultUsesTheCapturedLifetimeWithoutExecutingTheGuardOnTheCallback(){
         var runtime=mock(PipelineAlertRuntime.class);var binding=mock(StorageBinding.class);when(binding.defaultSourceId()).thenReturn("other");
         var signals=new BuiltinResourceSignals(()->runtime,()->binding,new CacheAuthScope("cluster",1,StorageBinding.Mode.OP,"cache",1),()->{},Clock.fixed(Instant.EPOCH,ZoneOffset.UTC));
         var id=new SourceBindingIdentity("erp","e6e8d616-985e-49cc-a0f4-9802897abf95",2);
@@ -31,8 +31,12 @@ class BuiltinResourceSignalsTest {
         verify(runtime).resourceInput(eq(new AlarmKey.Resource("source","erp",id.incarnation())),eq("source.connection-failed"),eq(2L),anyString(),any(),argThat(v->v instanceof AlertInput.Operational o&&!o.succeeded()&&o.capability()==OperationalEvidence.Capability.STREAM_READ));
         clearInvocations(runtime);
         callback.completed(SourceOperationObserver.Capability.STREAM_READ,new java.sql.SQLException("data","22003"));
-        signals.source(source,()->{throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);}).completed(SourceOperationObserver.Capability.STREAM_READ,null);
         verifyNoInteractions(runtime);
+        Runnable ended=()->{throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);};
+        signals.source(source,ended).completed(SourceOperationObserver.Capability.STREAM_READ,null);
+        var captured=org.mockito.ArgumentCaptor.forClass(Runnable.class);
+        verify(runtime).resourceInput(any(),eq("source.connection-failed"),eq(2L),anyString(),captured.capture(),any());
+        assertThatThrownBy(()->captured.getValue().run()).isInstanceOf(TapstateException.class);
     }
     @Test void conditionalWriteConflictsAreNotStorageFailuresAndTheWrapperAddsNoProbe(){
         var claims=mock(WorkloadClaimStore.class);var outcomes=new ArrayList<Throwable>();var writes=new ArrayList<Boolean>();

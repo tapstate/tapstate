@@ -73,6 +73,24 @@ class AlertEvaluationHostTest {
         assertThat(rows.get(binding.key()).value().operationalEvidence().failedCapabilities()).isZero();
         assertThat(restarted.accept(binding,6,new AlertInput.Operational(T,digest,OperationalEvidence.Capability.STREAM_READ,false))).isEqualTo(AlertEvaluationHost.Result.IGNORED);
     }
+    @Test void successesForOtherCapabilitiesCannotKeepAFailedOperationFresh() {
+        var header=definition("pipeline.failed").header();
+        var rule=new AlertConfiguration.Rule(header,"Source failure","source.connection-failed",1,
+                new AlertConfiguration.Resources(Set.of("source"),true,Set.of()),Map.of(),null,true,null).validated(BuiltinAlarmTypes.catalog());
+        var binding=new AlertEvaluationHost.Binding(rule,new AlarmKey.Resource("source","erp","source-uuid"),"source-binding",1,()->{});
+        String digest="a".repeat(64);
+        host.accept(binding,1,new AlertInput.Operational(T,digest,OperationalEvidence.Capability.STREAM_READ,false));
+        now.set(T.plusSeconds(6));
+        assertThat(host.accept(binding,2,new AlertInput.Operational(now.get(),digest,OperationalEvidence.Capability.INITIALIZE,true))).isEqualTo(AlertEvaluationHost.Result.IGNORED);
+        now.set(T.plusSeconds(12));
+        assertThat(host.accept(binding,3,new AlertInput.Operational(now.get(),digest,OperationalEvidence.Capability.METADATA_READ,true))).isEqualTo(AlertEvaluationHost.Result.IGNORED);
+        now.set(T.plusSeconds(16));host.tick(binding);
+        var head=rows.get(binding.key()).value();
+        assertThat(head.snapshot().lastObservedAt()).isEqualTo(T);
+        assertThat(head.snapshot().status()).isEqualTo(AlertSnapshot.Status.FIRING);
+        assertThat(head.snapshot().quality()).isEqualTo(AlertSnapshot.Quality.STALE);
+    }
+
     @Test void conditionAndIndependentTickPersistOriginalStateWithoutDispatch() {
         var b = binding(definition("pipeline.failed"), "producer-a");
         condition(b, 1, 0, AlertSignal.Condition.BAD);

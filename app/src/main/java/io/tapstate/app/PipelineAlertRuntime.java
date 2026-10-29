@@ -62,6 +62,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         var thread=new Thread(task,"alert-freshness");thread.setDaemon(true);return thread;
     });
     private final AtomicBoolean started=new AtomicBoolean();
+    private final Object objectAdmission=new Object();
     private final ConcurrentMap<String, Slot> slots = new ConcurrentHashMap<>();
     private final AtomicInteger queuedBytes = new AtomicInteger();
     private final AtomicInteger queuedTasks = new AtomicInteger();
@@ -98,10 +99,10 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     private Slot slot(PipelineConvergencePass pass) {
         var producer = new Producer(pass.scope(), pass.claim(), pass.intent());
         String id = pass.scope().pipelineId();
-        synchronized (slots) {
+        synchronized (objectAdmission) {
             var existing = slots.get(id);
             if (existing != null && existing.producer.equals(producer)) return existing;
-            if (existing == null && slots.size() >= MAX_OBJECTS) { reject(null, "object-budget"); return null; }
+            if (existing == null && slots.size() + resourceSlots.size() >= MAX_OBJECTS) { reject(null, "object-budget"); return null; }
             var created = new Slot(producer, clock.instant(), existing); slots.put(id, created); return created;
         }
     }
@@ -162,8 +163,17 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             var slot=entry.getValue();if(!slot.tickQueued.compareAndSet(false,true))continue;
             submitResource(slot,0,()->{try{
                 if(resourceSlots.get(entry.getKey())!=slot)return;
-                for(var binding:slot.bindings.values())AlertEvaluationHost.requireResult(services.evaluator().tick(binding));
-            }finally{slot.tickQueued.set(false);}});
+                for(var entryBinding:slot.bindings.entrySet()) {
+                    var previous=entryBinding.getValue();
+                    var current=rules.stream().filter(rule->rule.header().identity().equals(previous.definition().header().identity())
+                            &&rule.matches(entryBinding.getKey())).findFirst();
+                    if(current.isEmpty())continue;
+                    var binding=new AlertEvaluationHost.Binding(current.orElseThrow(),previous.resource(),previous.producer(),
+                            previous.sourceBindingRevision(),previous.requireCurrent(),previous.proof());
+                    entryBinding.setValue(binding);
+                    AlertEvaluationHost.requireResult(services.evaluator().tick(binding));
+                }
+            }finally{slot.tickQueued.set(false);}},()->slot.tickQueued.set(false));
         }
         var capturedRules = rules;
         for (Slot slot : slots.values()) {
@@ -231,7 +241,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             Runnable originalGuard, AlertInput input) {
         if(closed.get())return;
         ResourceSlot slot;
-        synchronized(resourceSlots){
+        synchronized(objectAdmission){
             if(!resourceSlots.containsKey(resource)&&resourceSlots.size()+slots.size()>=MAX_OBJECTS){reject(null,"object-budget");return;}
             slot=resourceSlots.computeIfAbsent(resource,ignored->new ResourceSlot());
         }
@@ -243,7 +253,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             var matching=captured.stream().filter(r->r.typeId().equals(typeId)&&r.resources().matches(resource)).toList();
             if(matching.size()>MAX_MATCHES)throw refused("matching-rule-budget");
             for(var rule:matching){
-                var binding=new AlertEvaluationHost.Binding(rule,resource,producer,sourceRevision,()->{active.run();originalGuard.run();});
+                var binding=new AlertEvaluationHost.Binding(rule,resource,producer,sourceRevision,active);
                 slot.bindings.put(binding.key(),binding);
                 var before=resolved.store().state(binding.key(),new AlertStore.ReadAccess(true,Set.of(),active));
                 long next=before.map(v->Math.incrementExact(v.value().snapshot().lastSequence())).orElse(0L);
@@ -254,17 +264,21 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
                             &&evidence!=null&&evidence.bindingDigest().equals(op.bindingDigest())
                             &&evidence.equals(evidence.observe(op.capability(),op.succeeded()))
                             &&head.snapshot().status()!=AlertSnapshot.Status.PENDING
-                            &&head.snapshot().recoverySince()==null)continue;
+                            &&head.snapshot().recoverySince()==null
+                            &&head.snapshot().quality()==AlertSnapshot.Quality.VALID
+                            &&head.snapshot().lastObservedAt()!=null
+                            &&op.observedAt().isBefore(head.snapshot().lastObservedAt().plusSeconds(5)))continue;
                 }
                 accept(binding,next,input);
             }
         });
     }
-    private void submitResource(ResourceSlot slot,int bytes,Runnable action){
-        if(closed.get())return;
-        if(queuedTasks.incrementAndGet()>QUEUE_SIZE){queuedTasks.decrementAndGet();reject(null,"queue-capacity");return;}
-        if(queuedBytes.addAndGet(bytes)>MAX_QUEUED_BYTES){queuedTasks.decrementAndGet();queuedBytes.addAndGet(-bytes);reject(null,"queue-byte-budget");return;}
-        var work=new Work(null,bytes,action,()->{});boolean start;
+    private void submitResource(ResourceSlot slot,int bytes,Runnable action){submitResource(slot,bytes,action,()->{});}
+    private void submitResource(ResourceSlot slot,int bytes,Runnable action,Runnable refused){
+        if(closed.get()){refused.run();return;}
+        if(queuedTasks.incrementAndGet()>QUEUE_SIZE){queuedTasks.decrementAndGet();reject(null,"queue-capacity");refused.run();return;}
+        if(queuedBytes.addAndGet(bytes)>MAX_QUEUED_BYTES){queuedTasks.decrementAndGet();queuedBytes.addAndGet(-bytes);reject(null,"queue-byte-budget");refused.run();return;}
+        var work=new Work(null,bytes,action,refused);boolean start;
         synchronized(slot.pending){slot.pending.addLast(work);start=!slot.scheduled;slot.scheduled=true;}
         if(start)dispatchResource(slot);
     }

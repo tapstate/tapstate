@@ -33,6 +33,17 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class PdkSinkPortTest {
 
     @Test
+    void targetPreparationReportsItsActualInitializationFailure(@TempDir Path dir) throws Exception {
+        var jar=Synthetic.lifecycleSinkThatFailsToStart(dir,dir.resolve("lifecycle.txt"));
+        var observed=new java.util.ArrayList<Throwable>();
+        var port=new PdkSinkPort(provisioner(jar,"synthetic.FailingLifecycleSink"))
+                .withOperationObserver((capability,failure)->{if(capability==io.tapstate.spi.capture.SourceOperationObserver.Capability.INITIALIZE)observed.add(failure);});
+        assertThatThrownBy(()->port.prepare(configWithTarget(target()),Map.of("t1",target())))
+                .isInstanceOf(TapstateException.class);
+        assertThat(observed).hasSize(1);assertThat(observed.getFirst()).hasMessageContaining("the target refused the connection");
+    }
+
+    @Test
     void a_renamed_target_is_used_by_both_the_table_model_and_written_record(@TempDir Path dir) throws Throwable {
         Path jar = Synthetic.countingSink(dir);
         PdkConnector connector = PdkConnector.open("demo", provisioner(jar, "synthetic.CountingSink")

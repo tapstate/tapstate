@@ -93,6 +93,8 @@ final class AlertEvaluationHost {
                                 Map.of("field","operationalEvidence","reason","missing-original-capabilities"),null);
                     }
                     if (operation != null && !operation.bindingDigest().equals(op.bindingDigest())) return Result.IGNORED;
+                    if (operation != null && operation.failedCapabilities() != 0 && op.succeeded()
+                            && (operation.failedCapabilities() & (1 << op.capability().ordinal())) == 0) return Result.IGNORED;
                     operation = (operation == null ? new OperationalEvidence(op.bindingDigest(),0) : operation)
                             .observe(op.capability(),op.succeeded());
                     condition = operation.condition();
