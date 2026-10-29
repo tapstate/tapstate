@@ -16,11 +16,13 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * this is bounded admission, not physical CPU isolation or a performance acceptance claim.
  */
 final class ValidationMemberResources implements AutoCloseable {
-    private static final int METADATA_FRAMES = 4;
+
     private static final ValidationLocalBudget.Amount CAPACITY = new ValidationLocalBudget.Amount(256L * 1024 * 1024, 64, 16, 16);
     private record Key(String cluster, String node, String boot) {}
     record Snapshot(ValidationLocalBudget.Snapshot data, ValidationLocalBudget.Amount processReserved, int processors, int processorCapacity, int metadataFrames) {}
-    private final Semaphore metadata = new Semaphore(METADATA_FRAMES);
+    private final io.tapstate.core.validation.ValidationMetadataBudget metadata;
+    ValidationMemberResources(){this(new io.tapstate.core.validation.ValidationMetadataBudget());}
+    ValidationMemberResources(io.tapstate.core.validation.ValidationMetadataBudget metadata){this.metadata=Objects.requireNonNull(metadata); }
     private final Map<Key, State> members = new HashMap<>();
     private final Set<Probe> probes=new HashSet<>();
     private ValidationLocalBudget.Amount reserved = new ValidationLocalBudget.Amount(0, 0, 0, 0);
@@ -59,8 +61,8 @@ final class ValidationMemberResources implements AutoCloseable {
         private volatile boolean retired;
         private Member(State state, Runnable active, boolean compatible) { this.state = state; this.active = active; this.compatible = compatible; }
         Metadata admitMetadata() {
-            require(); if (!metadata.tryAcquire()) throw limit("validation.metadataFrames");
-            try { require(); return new Metadata(this); } catch (RuntimeException | Error failed) { metadata.release(); throw failed; }
+            require();var lease=metadata.acquire(this);
+            try { require(); return new Metadata(lease); } catch (RuntimeException | Error failed) { lease.close(); throw failed; }
         }
         /** Independent metadata discovery has no fictitious validation owner, run or cooperative processor. */
         Probe admitProbe(){return admitProbe(false);}
@@ -103,7 +105,7 @@ final class ValidationMemberResources implements AutoCloseable {
             }
             return unbound;
         }
-        Snapshot snapshot() { synchronized (ValidationMemberResources.this) { return new Snapshot(state.budget.snapshot(), reserved, processors, processorCapacity, METADATA_FRAMES - metadata.availablePermits()); } }
+        Snapshot snapshot() { synchronized (ValidationMemberResources.this) { return new Snapshot(state.budget.snapshot(), reserved, processors, processorCapacity, metadata.inUse()); } }
         private void require() { if (closed || retired) throw invalid("resources.contextClosed"); active.run(); }
         private ValidationMemberResources process(){return ValidationMemberResources.this;}
         @Override public void close() { retired = true; }
@@ -144,13 +146,14 @@ final class ValidationMemberResources implements AutoCloseable {
     }
 
     final class Metadata implements AutoCloseable {
-        private final AtomicBoolean returned = new AtomicBoolean();
-        private final Member owner;
-        private Metadata(Member owner){this.owner=owner;}
+        private final io.tapstate.core.validation.ValidationMetadataBudget.Lease lease;
+        private Metadata(io.tapstate.core.validation.ValidationMetadataBudget.Lease lease){this.lease=lease;}
         long reservedBytes() { return ValidationTaskStore.Inputs.WORK_RESERVATION_BYTES; }
-        void requireRetained(Member member){if(member!=owner||member.process()!=ValidationMemberResources.this||returned.get())throw invalid("resources.metadataOwner");member.require();}
+        void requireRetained(Member member){
+            if(member.process()!=ValidationMemberResources.this)throw invalid("resources.metadataOwner");lease.requireRetained(member);member.require();
+        }
         /** Return after the actual read/planner and every retained definition have relinquished ownership. */
-        @Override public void close() { if (returned.compareAndSet(false, true)) metadata.release(); }
+        @Override public void close(){lease.close();}
     }
 
     /** A queued or running original control body retains its allocation until actual exit. */

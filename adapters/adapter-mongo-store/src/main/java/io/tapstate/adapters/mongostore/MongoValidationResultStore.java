@@ -11,6 +11,7 @@ import io.tapstate.spi.store.ValidationResultStore;
 import io.tapstate.spi.store.ValidationReports;
 import io.tapstate.core.validation.*;
 import org.bson.Document;
+import org.bson.RawBsonDocument;
 import org.bson.BsonBinaryWriter;
 import org.bson.codecs.DocumentCodec;
 import org.bson.codecs.EncoderContext;
@@ -27,6 +28,7 @@ import java.util.ArrayList;
 final class MongoValidationResultStore implements ValidationResultStore,ValidationReports {
     static final long MAX_REPORT_BYTES = 64L * 1024 * 1024;
     static final int MAX_ROOT_BYTES = 1024 * 1024;
+    static final int MAX_REPORT_HEADER_BYTES=2*1024*1024;
     static final long MAX_STORED_ROOTS = 4096;
     private final MongoValidationAdmissionStore admission;
     private final MongoDatabase database;
@@ -50,10 +52,10 @@ final class MongoValidationResultStore implements ValidationResultStore,Validati
         return admission.transaction(session->{
             var filter=new Document("_id.clusterId",clusterId).append("_id.pipelineId",pipeline).append("_id.taskId",task).append("admission.mode",mode.name());
             var items=new ArrayList<Summary>();
-            try(var cursor=reports.find(session,filter).sort(new Document("terminalMetadata.endedAt.seconds",-1).append("terminalMetadata.endedAt.nanos",-1).append("_id.runId",1))
+            try(var cursor=reports.withDocumentClass(RawBsonDocument.class).find(session,filter).batchSize(1).sort(new Document("terminalMetadata.endedAt.seconds",-1).append("terminalMetadata.endedAt.nanos",-1).append("_id.runId",1))
                     .skip(page.offset()).limit(page.limit()).iterator()){
                 while(cursor.hasNext()){
-                    var value=snapshot(cursor.next());int mismatches=(int)value.counts().stream().filter(count->count.sourceCount()!=count.targetCount()).count();
+                    var value=snapshot(decodeBounded(cursor.next(),reports.getCodecRegistry().get(Document.class),MAX_REPORT_HEADER_BYTES,"report-bson-size"));int mismatches=(int)value.counts().stream().filter(count->count.sourceCount()!=count.targetCount()).count();
                     items.add(new Summary(value.reference(),value.specification().method(),value.closed(),value.terminal(),value.terminalKnownAt(),
                             value.endedAt(),value.window(),value.rootCount(),value.retainedBytes(),value.counts().size(),mismatches));
                 }
@@ -71,9 +73,9 @@ final class MongoValidationResultStore implements ValidationResultStore,Validati
             var report=referenced(session,reference);if(report==null)return new Page<>(List.of(),0,page);
             var filter=new Document("_id.report",report.get("_id")).append("openVersion",reference.sequence());
             var specification=snapshot(report).specification();var items=new ArrayList<RootSummary>();
-            try(var cursor=differences.find(session,filter).sort(new Document("_id.rootHash",1)).skip(page.offset()).limit(page.limit()).iterator()){
+            try(var cursor=differences.withDocumentClass(RawBsonDocument.class).find(session,filter).batchSize(1).sort(new Document("_id.rootHash",1)).skip(page.offset()).limit(page.limit()).iterator()){
                 while(cursor.hasNext()){
-                    var row=cursor.next();var root=validateRoot(row,reference,specification);
+                    var row=decodeBounded(cursor.next(),differences.getCodecRegistry().get(Document.class),MAX_ROOT_BYTES,"root-bson-size");var root=validateRoot(row,reference,specification);
                     var payload=row.get("payload",Document.class);var summary=new Document();
                     for(var field:List.of("method","counts","checks","targetPresence","samplesTruncated","confirmation"))summary.put(field,payload.get(field));
                     items.add(new RootSummary(rootHash(row),root,portable(summary)));
@@ -88,7 +90,8 @@ final class MongoValidationResultStore implements ValidationResultStore,Validati
         return admission.transaction(this::requireDifferences,session->{
             var report=referenced(session,reference);if(report==null)return java.util.Optional.empty();
             var id=new Document("report",report.get("_id")).append("rootHash",new Binary(java.util.HexFormat.of().parseHex(rootHash)));
-            var row=differences.find(session,new Document("_id",id).append("openVersion",reference.sequence())).first();
+            var row=decodeBounded(differences.withDocumentClass(RawBsonDocument.class).find(session,new Document("_id",id).append("openVersion",reference.sequence())).batchSize(1).first(),
+                    differences.getCodecRegistry().get(Document.class),MAX_ROOT_BYTES,"root-bson-size");
             if(row==null)return java.util.Optional.empty();var root=validateRoot(row,reference,snapshot(report).specification());
             return java.util.Optional.of(new RootDetail(rootHash,number(row,"revision"),root,portable(row.get("payload",Document.class))));
         });
@@ -338,9 +341,14 @@ final class MongoValidationResultStore implements ValidationResultStore,Validati
     private Document referenced(ClientSession session,Reference reference){
         var id=new Document("clusterId",clusterId).append("pipelineId",reference.pipelineId()).append("taskId",reference.taskId())
                 .append("runId",reference.runId());
-        var row=reports.find(session,new Document("_id",id).append("openVersion",reference.sequence())
-                .append("admission.taskGeneration",reference.taskGeneration().toString()).append("admission.mode",reference.mode().name())).first();
+        var row=decodeBounded(reports.withDocumentClass(RawBsonDocument.class).find(session,new Document("_id",id).append("openVersion",reference.sequence())
+                .append("admission.taskGeneration",reference.taskGeneration().toString()).append("admission.mode",reference.mode().name())).batchSize(1).first(),
+                reports.getCodecRegistry().get(Document.class),MAX_REPORT_HEADER_BYTES,"report-bson-size");
         if(row!=null&&!reference(start(row)).equals(reference))throw unreadable("report-reference");return row;
+    }
+    /** One raw document is admitted before materializing nested BSON values; the existing collection codec is preserved. */
+    static Document decodeBounded(RawBsonDocument raw,org.bson.codecs.Codec<Document> codec,int limit,String field){
+        if(raw==null)return null;if(raw.getByteLength()>limit)throw unreadable(field);return raw.decode(codec);
     }
     private static io.tapstate.spi.store.ValidationReportAdmission.Start start(Document row){
         if(row==null||!Integer.valueOf(1).equals(row.get("formatVersion"))||!(row.get("admission") instanceof Document identity)

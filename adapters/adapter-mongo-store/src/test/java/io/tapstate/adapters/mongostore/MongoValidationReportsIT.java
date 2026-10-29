@@ -204,6 +204,19 @@ class MongoValidationReportsIT {
             assertThat(collection.find(id).first().getLong("resultBytes")).isEqualTo(occupied);
         }
     }
+    @Test void boundedRawPagesRetainAllLargeValidRootFacts(){
+        try(var f=new MongoValidationTaskStoreIT.Fixture()){
+            var proposal=f.create(rowComparison(f));var create=new ValidationTaskStore.Create(proposal.task(),proposal.comparison(),ValidationTaskStore.Settings.defaults(ValidationMethod.FULL_COLUMN,0),proposal.commandId());
+            assertThat(f.tasks.create(create)).isEqualTo(ValidationTaskStore.Write.APPLIED);var original=open(f,create.task(),"large-root-page");var start=original.reservation().start();
+            var writer=original.reservation().access().results();var text="x".repeat(12*1024);
+            for(int index=0;index<20;index++)assertThat(writer.publish(new ValidationResultStore.RootWrite(start.report(),rowCheck(start.run(),index,1,Map.of("amount",text)))))
+                    .isEqualTo(ValidationResultStore.Publication.APPLIED);
+            var reports=f.configuration.validationReports(()->{});var page=reports.roots(reference(start),new ValidationReports.Paging(0,20));
+            assertThat(page.total()).isEqualTo(20);assertThat(page.items()).hasSize(20);
+            for(var item:page.items())assertThat(reports.root(reference(start),item.id()).orElseThrow().observation().toString()).contains(text);
+            assertThat(reports.history("flow",create.task().taskId(),ValidationMode.FULL,new ValidationReports.Paging(0,20)).items()).hasSize(1);
+        }
+    }
     private static int bsonBytes(Document value){
         try(var output=new org.bson.io.BasicOutputBuffer();var writer=new org.bson.BsonBinaryWriter(output)){
             new org.bson.codecs.DocumentCodec().encode(writer,value,org.bson.codecs.EncoderContext.builder().build());return output.getSize();

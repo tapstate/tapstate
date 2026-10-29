@@ -277,6 +277,10 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         @Bean io.tapstate.runtime.probe.ValidationEvaluationProbe validationEvaluationProbe(NativeValidationMetadata metadata,org.springframework.beans.factory.ObjectProvider<NativeValidationStartCoordinator> controls){
             return new NativeValidationEvaluation(metadata,()->controls.getObject().context());
         }
+        @Bean @Lazy io.tapstate.control.core.ValidationReportService validationReportService(NativeBusinessContext owner,
+                io.tapstate.core.validation.ValidationMetadataBudget budget){
+            return new io.tapstate.control.core.ValidationReportService(owner.configuration.validationReports(owner.memberStorage::requireNode),budget);
+        }
         @Bean(destroyMethod="close") @Lazy NativeValidationStartCoordinator nativeValidationStartCoordinator(NativeBusinessContext owner,HazelcastInstance member,
                 ValidationOwnerRouter router,ValidationMemberResources.Member resources,ValidationMemberResources process){
             return new NativeValidationStartCoordinator(member,owner.configuration,router,resources,process,owner.memberStorage::requireNode);

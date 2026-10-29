@@ -27,7 +27,7 @@ import static org.assertj.core.api.Assertions.*;
 class NativeValidationApiIT {
     @Container static final MongoDBContainer MONGO=NativeValidationOwnerReservationsIT.MONGO;
     @TempDir Path work;
-    @Test @Timeout(120) void countEvaluationAndSaveUseTheActiveChildAndRealRegisteredPdk()throws Exception{
+    @Test @Timeout(120) void fullMethodsAndObservedDifferencesUseTheActiveChildAndRealRegisteredPdk()throws Exception{
         var storage=NativeAppStorage.createOnPremWithAdmin(MONGO,"validation_http","admin","validation-password");
         try(var schema=io.tapstate.adapters.mongostore.MongoConfigurationDomain.prepareValidationSchema(
                 new io.tapstate.adapters.mongostore.MongoConnectionSettings(storage.configurationUri(),null,Duration.ofSeconds(5)),storage.clusterId(),UUID.randomUUID());
@@ -45,8 +45,9 @@ class NativeValidationApiIT {
                 var artifact=Path.of(Objects.requireNonNull(System.getProperty("tapstate.pdk.it.mongodb-jar")));
                 var registered=child.getBean(ConnectorArtifactRegistrar.class).register(artifact,RegistrationSource.REGISTER);
                 var connector=registered.registration().connectorId();
-                observer.getDatabase(sourceDb).getCollection("orders").insertOne(new Document("id",1L).append("payload","same"));
-                observer.getDatabase(targetDb).getCollection("checked_orders").insertOne(new Document("id",1L).append("payload","same"));
+                var stableRow=new Document("id",1L).append("payload","same");
+                observer.getDatabase(sourceDb).getCollection("orders").insertOne(stableRow);
+                observer.getDatabase(targetDb).getCollection("checked_orders").insertOne(new Document(stableRow));
                 var artifacts=child.getBean(ArtifactStore.class);
                 artifacts.create(new SourceResource("validation_input",null,connector,Map.of("uri",MONGO.getReplicaSetUrl(sourceDb),"database",sourceDb,"isUri",true),
                         SourceMode.SNAPSHOT,List.of(TableRef.literal("orders")),null,null));
@@ -117,16 +118,67 @@ class NativeValidationApiIT {
                     assertThat(child.getBean(ValidationMemberResources.Member.class).snapshot().processReserved().bytes()).isEqualTo(2L*1024*1024);
                 });
                 assertThat(child.getBean(com.hazelcast.core.HazelcastInstance.class).getJet().getJobs()).hasSize(1);
+                var history=http.get().uri("/api/pipelines/validation_flow/validation-tasks/validation_task/reports").header("Authorization","Bearer "+token).retrieve().body(Map.class);
+                assertThat(history).containsEntry("total","1");var items=(List<?>)history.get("items");var first=(Map<?,?>)items.getFirst();var ref=(Map<?,?>)first.get("reference");
+                var reportPath="/api/pipelines/validation_flow/validation-tasks/validation_task/reports/"+ref.get("run")+"?generation="+ref.get("generation")+"&sequence="+ref.get("sequence");
+                assertThat(http.get().uri(reportPath.substring(0,reportPath.indexOf('?'))).header("Authorization","Bearer "+token)
+                        .<Integer>exchange((request,httpResponse)->httpResponse.getStatusCode().value())).isEqualTo(400);
+                assertThat(http.get().uri("/api/pipelines/validation_flow/validation-tasks/validation_task/reports/absent/roots?generation="+ref.get("generation")+"&sequence=1")
+                        .header("Authorization","Bearer "+token).<Integer>exchange((request,httpResponse)->httpResponse.getStatusCode().value())).isEqualTo(404);
+                var report=http.get().uri(reportPath).header("Authorization","Bearer "+token).retrieve().body(Map.class);
+                assertThat(report).containsEntry("method","COUNT").containsEntry("result","COMPLETE_NO_ISSUES_OBSERVED").containsEntry("physicalDrain","UNKNOWN").containsEntry("premiseVerifiedBySystem",false);
+                var counts=(List<?>)report.get("counts");var count=(Map<?,?>)counts.getFirst();assertThat(count.get("source")).isEqualTo("1");assertThat(count.get("target")).isEqualTo("1");assertThat(count.get("difference")).isEqualTo("0");
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(2)).until(()->child.getBean(ValidationMemberResources.Member.class).snapshot().metadataFrames()==0);
                 var occupied=new ArrayList<ValidationMemberResources.Metadata>();
                 try{
                     for(int index=0;index<4;index++)occupied.add(child.getBean(ValidationMemberResources.Member.class).admitMetadata());
                     assertThat(http.post().uri("/api/validation:progress").header("Authorization","Bearer "+token).contentType(MediaType.APPLICATION_JSON).body(operation)
                             .<Integer>exchange((request,httpResponse)->httpResponse.getStatusCode().value())).isEqualTo(429);
+                    assertThat(http.get().uri(reportPath).header("Authorization","Bearer "+token).<Integer>exchange((request,httpResponse)->httpResponse.getStatusCode().value())).isEqualTo(429);
                 }finally{occupied.forEach(ValidationMemberResources.Metadata::close);}
+                for(var method:List.of("UNIQUE_KEY","FULL_COLUMN")){
+                    var task=method.equals("UNIQUE_KEY")?"validation_keys":"validation_columns";
+                    var confirmed=Map.of("orders",Map.of("id",UUID.randomUUID().toString(),"fields",List.of(Map.of("source","id","target","id"))));
+                    var selected=new LinkedHashMap<String,Object>(input);selected.put("taskId",task);selected.put("taskGeneration",UUID.randomUUID().toString());
+                    selected.put("method",method);selected.put("confirmations",confirmed);
+                    var checked=http.post().uri("/api/validation:evaluate").header("Authorization","Bearer "+write).contentType(MediaType.APPLICATION_JSON).body(selected).retrieve().body(Map.class);
+                    var saveSelected=Map.of("input",selected,"fingerprint",checked.get("fingerprint"),"commandId",UUID.randomUUID().toString(),"historyLimit",10,"scheduleEnabled",false);
+                    assertThat(http.post().uri("/api/validation:save").header("Authorization","Bearer "+write).contentType(MediaType.APPLICATION_JSON).body(saveSelected).retrieve().body(Map.class))
+                            .containsEntry("outcome","APPLIED");
+                    var original=Map.of("context",checked.get("context"),"pipeline","validation_flow","task",task,"taskGeneration",selected.get("taskGeneration"),
+                            "revision","1","sequence","1","command",UUID.randomUUID().toString());
+                    var complete=runAndReport(http,write,token,original,task);
+                    assertThat(complete).containsEntry("method",method).containsEntry("result","COMPLETE_NO_ISSUES_OBSERVED");
+                    if(method.equals("FULL_COLUMN")){
+                        observer.getDatabase(targetDb).getCollection("checked_orders").updateOne(new Document("id",1L),new Document("$set",new Document("payload","changed")));
+                        var changed=new HashMap<String,Object>(original);changed.put("sequence","2");changed.put("command",UUID.randomUUID().toString());
+                        var differences=runAndReport(http,write,token,changed,task);assertThat(differences).containsEntry("result","COMPLETE_WITH_OBSERVATIONS").containsEntry("rootCount","1");
+                        var reference=(Map<?,?>)differences.get("reference");
+                        var rootPath="/api/pipelines/validation_flow/validation-tasks/"+task+"/reports/"+reference.get("run")+"/roots";
+                        var query="?generation="+reference.get("generation")+"&sequence="+reference.get("sequence");
+                        var roots=http.get().uri(rootPath+query).header("Authorization","Bearer "+token).retrieve().body(Map.class);
+                        assertThat(roots).containsEntry("total","1");var root=(Map<?,?>)((List<?>)roots.get("items")).getFirst();
+                        String detail=http.get().uri(rootPath+"/"+root.get("id")+query).header("Authorization","Bearer "+token).retrieve().body(String.class);
+                        assertThat(detail).contains("same","changed","codecBinding","observation");
+                    }
+                }
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).until(()->child.getBean(ValidationMemberResources.Member.class).snapshot().metadataFrames()==0);
+                assertThat(child.getBean(com.hazelcast.core.HazelcastInstance.class).getJet().getJobs()).hasSize(4);
 
             }finally{
                 for(var name:List.of(sourceDb,targetDb,storage.configurationDatabase(),storage.cacheDatabase(),storage.masterDatabase()))observer.getDatabase(name).drop();
             }
         }
     }
+    private static Map runAndReport(RestClient http,String write,String read,Map<String,?> original,String task){
+        var start=http.post().uri("/api/validation:start").header("Authorization","Bearer "+write).contentType(MediaType.APPLICATION_JSON).body(original).retrieve().body(Map.class);
+        assertThat(start.get("outcome")).isIn("PENDING","ACCEPTED");
+        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(20)).pollInterval(Duration.ofMillis(100)).untilAsserted(()->{
+            var progress=http.post().uri("/api/validation:progress").header("Authorization","Bearer "+read).contentType(MediaType.APPLICATION_JSON).body(original).retrieve().body(Map.class);
+            assertThat(progress).containsEntry("state","COMPLETED");
+        });
+        var path="/api/pipelines/validation_flow/validation-tasks/"+task+"/reports/"+start.get("run")+"?generation="+original.get("taskGeneration")+"&sequence="+original.get("sequence");
+        return http.get().uri(path).header("Authorization","Bearer "+read).retrieve().body(Map.class);
+    }
+
 }

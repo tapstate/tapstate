@@ -74,7 +74,7 @@ public interface ValidationTaskStore {
     final class Inputs {
         public static final int MAX_STORED_BYTES = 256 * 1024;
         public static final int MAX_CANONICAL_CHARACTERS = 2 * 1024 * 1024;
-        public static final long WORK_RESERVATION_BYTES = 64L * 1024 * 1024;
+        public static final long WORK_RESERVATION_BYTES = io.tapstate.core.validation.ValidationMetadataBudget.RESERVED_BYTES;
         private final Snapshot task;
         private final long configurationRevision;
         private final Map<String, String> canonicalResources;

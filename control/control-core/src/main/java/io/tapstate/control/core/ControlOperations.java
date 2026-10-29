@@ -47,6 +47,14 @@ public final class ControlOperations {
             "Read the original validation run without recreating missing execution handles.", CLI_AND_REST);
     public static final Operation VALIDATION_STOP = new Operation("validation.stop", Scope.WRITE, true, null,
             "Stop only the original full validation command without changing its schedule or the Pipeline.", CLI_AND_REST);
+    public static final Operation VALIDATION_HISTORY = new Operation("validation.history", Scope.READ, false, null,
+            "Read bounded full validation history without creating a run or a missing report.", CLI_AND_REST);
+    public static final Operation VALIDATION_REPORT = new Operation("validation.report", Scope.READ, false, null,
+            "Read one original full validation report with exact counts and its observation premise.", CLI_AND_REST);
+    public static final Operation VALIDATION_ROOTS = new Operation("validation.roots", Scope.READ, false, null,
+            "Read a bounded page of the original report root observations with explicit value types.", CLI_AND_REST);
+    public static final Operation VALIDATION_ROOT = new Operation("validation.root", Scope.READ, false, null,
+            "Read one retained root observation without truncating its exact values or claiming physical drain.", CLI_AND_REST);
     public static final Operation VALIDATION_GET = new Operation("validation.get", Scope.READ, false, null,
             "Read one saved full validation definition without allocating execution state.", CLI_AND_REST);
     public static final Operation VALIDATION_SCHEDULE_PREVIEW = new Operation("validation.schedule-preview", Scope.READ, false, null,
@@ -395,7 +403,7 @@ public final class ControlOperations {
     public static final Operation TOKEN_LIST = new Operation("token.list", Scope.ADMIN, false, null, CLI_ONLY);
 
     private static final List<Operation> ALL = List.of(
-            VALIDATION_EVALUATE, VALIDATION_SAVE, VALIDATION_GET, VALIDATION_SCHEDULE_PREVIEW, VALIDATION_START, VALIDATION_PROGRESS, VALIDATION_STOP,
+            VALIDATION_EVALUATE, VALIDATION_SAVE, VALIDATION_GET, VALIDATION_SCHEDULE_PREVIEW, VALIDATION_START, VALIDATION_PROGRESS, VALIDATION_STOP, VALIDATION_HISTORY, VALIDATION_REPORT, VALIDATION_ROOTS, VALIDATION_ROOT,
             AI_PROVIDER_GET,
             AI_PROVIDER_REPLACE,
             AI_PROVIDER_DELETE,
