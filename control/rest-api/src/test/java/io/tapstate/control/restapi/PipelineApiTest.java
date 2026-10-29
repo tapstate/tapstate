@@ -450,6 +450,56 @@ class PipelineApiTest {
     }
 
     @Test
+    void deletingAWebPipelineWithoutADraftAcceptsTheNonePrecondition() {
+        String hash = CanonicalHash.of(context.getBean(FakeArtifactStore.class).get("pl1").orElseThrow());
+        ResponseEntity<Void> deleted = client().method(HttpMethod.DELETE).uri("/api/pipelines/pl1")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.WRITE))
+                .header(HttpHeaders.IF_MATCH, "\"" + hash + "\"")
+                .header("If-Draft-Match", "\"none\"")
+                .retrieve().toBodilessEntity();
+
+        assertThat(deleted.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        assertThat(context.getBean(FakeArtifactStore.class).get("pl1")).isEmpty();
+        assertThat(context.getBean(FakePipelineDraftStore.class).get("pl1")).isEmpty();
+    }
+
+    @Test
+    void wholePipelineDeletionRejectsMissingMalformedAndOverflowingDraftPreconditions() {
+        String hash = seedDeletionDraft();
+        ApiError missing = client().method(HttpMethod.DELETE).uri("/api/pipelines/pl1")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.WRITE))
+                .header(HttpHeaders.IF_MATCH, "\"" + hash + "\"")
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.PRECONDITION_REQUIRED);
+                    return response.bodyTo(ApiError.class);
+                });
+        ApiError malformed = deleteWebPipeline(hash, "1x", Scope.WRITE, HttpStatus.PRECONDITION_REQUIRED);
+        ApiError overflow = deleteWebPipeline(hash, "9".repeat(20), Scope.WRITE, HttpStatus.PRECONDITION_REQUIRED);
+
+        assertThat(missing.code()).isEqualTo("pipeline-draft.precondition-required");
+        assertThat(malformed.code()).isEqualTo("pipeline-draft.precondition-required");
+        assertThat(overflow.code()).isEqualTo("pipeline-draft.precondition-required");
+        assertThat(context.getBean(FakeArtifactStore.class).get("pl1")).isPresent();
+        assertThat(context.getBean(FakePipelineDraftStore.class).get("pl1")).isPresent();
+    }
+
+    @Test
+    void wholePipelineDeletionDoesNotDeleteAnArtifactOfAnotherKind() {
+        String hash = CanonicalHash.of(context.getBean(FakeArtifactStore.class).get("src_x").orElseThrow());
+        ApiError refusal = client().method(HttpMethod.DELETE).uri("/api/pipelines/src_x")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + machineToken(Scope.WRITE))
+                .header(HttpHeaders.IF_MATCH, "\"" + hash + "\"")
+                .header("If-Draft-Match", "\"none\"")
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+                    return response.bodyTo(ApiError.class);
+                });
+
+        assertThat(refusal.code()).isEqualTo("pipeline.not-found");
+        assertThat(context.getBean(FakeArtifactStore.class).get("src_x")).isPresent();
+    }
+
+    @Test
     void aLifecycleRefusalLeavesTheArtifactAndDraftUntouched() {
         String token = machineToken(Scope.WRITE);
         String artifactHash = CanonicalHash.of(context.getBean(FakeArtifactStore.class)

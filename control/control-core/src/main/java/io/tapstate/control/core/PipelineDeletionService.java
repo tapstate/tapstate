@@ -36,12 +36,12 @@ public final class PipelineDeletionService {
         Objects.requireNonNull(principal, "principal");
         Objects.requireNonNull(pipelineId, "pipelineId");
 
-        artifacts.getResource(pipelineId)
+        if (artifacts.getResource(pipelineId)
                 .map(StoredResource::resource)
                 .filter(PipelineResource.class::isInstance)
-                .map(PipelineResource.class::cast)
-                .orElseThrow(() -> new TapstateException(
-                        PipelineError.NOT_FOUND, Map.of("id", pipelineId), null));
+                .isEmpty()) {
+            throw new TapstateException(PipelineError.NOT_FOUND, Map.of("id", pipelineId), null);
+        }
 
         PipelineDraft currentDraft = drafts.find(pipelineId).orElse(null);
         if ((currentDraft == null) != (expectedDraftRevision == null)
@@ -50,30 +50,42 @@ public final class PipelineDeletionService {
                     PipelineDraftError.REVISION_CONFLICT, Map.of("id", pipelineId), null);
         }
 
-        TapstateException artifactCleanupFailure = null;
-        try {
-            mutations.deletePipeline(principal, pipelineId, expectedArtifactHash);
-        } catch (TapstateException failure) {
-            if (!ArtifactError.RECLAIM_INCOMPLETE.code().equals(failure.code().code())) {
-                throw failure;
-            }
-            artifactCleanupFailure = failure;
-        }
-
+        TapstateException artifactCleanupFailure = deleteArtifact(principal, pipelineId, expectedArtifactHash);
         if (artifactCleanupFailure != null && "pipeline-live".equals(artifactCleanupFailure.args().get("reason"))) {
-            try {
-                if (drafts.find(pipelineId).isEmpty()) {
-                    throw artifactCleanupFailure;
-                }
-            } catch (TapstateException unreadable) {
-                if (unreadable == artifactCleanupFailure) throw unreadable;
-                artifactCleanupFailure.addSuppressed(unreadable);
-            }
-            throw withDraftResidue(pipelineId, artifactCleanupFailure);
+            reportLivePipelineResidue(pipelineId, artifactCleanupFailure);
         }
 
         TapstateException draftCleanupFailure = discardDraft(
                 principal, pipelineId, expectedDraftRevision, currentDraft != null);
+        reportCleanupFailures(pipelineId, artifactCleanupFailure, draftCleanupFailure);
+    }
+
+    private TapstateException deleteArtifact(String principal, String pipelineId, String expectedArtifactHash) {
+        try {
+            mutations.deletePipeline(principal, pipelineId, expectedArtifactHash);
+            return null;
+        } catch (TapstateException failure) {
+            if (!ArtifactError.RECLAIM_INCOMPLETE.code().equals(failure.code().code())) {
+                throw failure;
+            }
+            return failure;
+        }
+    }
+
+    private void reportLivePipelineResidue(String pipelineId, TapstateException artifactFailure) {
+        try {
+            if (drafts.find(pipelineId).isEmpty()) {
+                throw artifactFailure;
+            }
+        } catch (TapstateException unreadable) {
+            if (unreadable == artifactFailure) throw unreadable;
+            artifactFailure.addSuppressed(unreadable);
+        }
+        throw withDraftResidue(pipelineId, artifactFailure);
+    }
+
+    private static void reportCleanupFailures(String pipelineId, TapstateException artifactCleanupFailure,
+            TapstateException draftCleanupFailure) {
         if (artifactCleanupFailure != null) {
             if (draftCleanupFailure == null) {
                 throw artifactCleanupFailure;

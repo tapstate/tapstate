@@ -19,7 +19,7 @@ import java.util.Objects;
 class PipelineDeletionController {
 
     private static final String NO_DRAFT_ETAG = "\"none\"";
-    private static final String QUOTED_REVISION = "\"[1-9][0-9]*\"";
+    private static final String QUOTED_REVISION = "\"[1-9]\\d*\"";
 
     private final ObjectProvider<PipelineDeletionService> deletion;
 
