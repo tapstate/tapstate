@@ -601,6 +601,62 @@ class PipelineApiTest {
     }
 
     @Test
+    void aFailedReclaimReportsItsResidueAfterTheDraftIsRemoved() {
+        String hash = seedDeletionDraft();
+        DeletionReclaims reclaim = context.getBean(DeletionReclaims.class);
+        reclaim.seed("pl1");
+        reclaim.failStateDelete = true;
+
+        ApiError partial = deleteWebPipeline(hash, "1", Scope.WRITE, HttpStatus.INTERNAL_SERVER_ERROR);
+
+        assertThat(partial.code()).isEqualTo("artifact.reclaim-incomplete");
+        assertThat(partial.params().get("reason")).isEqualTo("step-failed");
+        assertThat(((List<?>) partial.params().get("residue")).stream().map(String::valueOf).toList())
+                .contains("state");
+        assertThat(context.getBean(FakeArtifactStore.class).get("pl1")).isEmpty();
+        assertThat(context.getBean(FakePipelineDraftStore.class).get("pl1")).isEmpty();
+    }
+
+    @Test
+    void aFailedReclaimAndConcurrentDraftEditReportBothResidues() {
+        String hash = seedDeletionDraft();
+        DeletionReclaims reclaim = context.getBean(DeletionReclaims.class);
+        reclaim.seed("pl1");
+        reclaim.failStateDelete = true;
+        FakePipelineDraftStore drafts = context.getBean(FakePipelineDraftStore.class);
+        context.getBean(FakeArtifactStore.class).afterDelete = () -> {
+            PipelineDraft current = drafts.get("pl1").orElseThrow();
+            assertThat(drafts.replace("pl1", current.revision(),
+                    FakePipelineDraftStore.withRevision(current, current.revision() + 1)))
+                    .isEqualTo(PipelineDraftMutation.REPLACED);
+        };
+
+        ApiError partial = deleteWebPipeline(hash, "1", Scope.WRITE, HttpStatus.INTERNAL_SERVER_ERROR);
+
+        assertThat(partial.code()).isEqualTo("artifact.reclaim-incomplete");
+        assertThat(((List<?>) partial.params().get("residue")).stream().map(String::valueOf).toList())
+                .contains("state", "pipeline-draft:pl1");
+        assertThat(context.getBean(FakeArtifactStore.class).get("pl1")).isEmpty();
+        assertThat(drafts.get("pl1").orElseThrow().revision()).isEqualTo(2);
+    }
+
+    @Test
+    void aConcurrentStartWithoutADraftReportsOnlyTheRuntimeResidue() {
+        String hash = CanonicalHash.of(context.getBean(FakeArtifactStore.class).get("pl1").orElseThrow());
+        context.getBean(FakeArtifactStore.class).afterDelete = () ->
+                context.getBean(FakeDesiredStore.class).save(new DesiredState("pl1", PipelineState.RUNNING, hash));
+
+        ApiError partial = deleteWebPipeline(hash, "none", Scope.WRITE, HttpStatus.INTERNAL_SERVER_ERROR);
+
+        assertThat(partial.code()).isEqualTo("artifact.reclaim-incomplete");
+        assertThat(partial.params().get("reason")).isEqualTo("pipeline-live");
+        assertThat(((List<?>) partial.params().get("residue")).stream().map(String::valueOf).toList())
+                .contains("desired").doesNotContain("pipeline-draft:pl1");
+        assertThat(context.getBean(FakeArtifactStore.class).get("pl1")).isEmpty();
+        assertThat(context.getBean(FakePipelineDraftStore.class).get("pl1")).isEmpty();
+    }
+
+    @Test
     void aConcurrentStartAndNewDraftAfterArtifactRemovalReportsThePreservedDraft() {
         String hash = CanonicalHash.of(context.getBean(FakeArtifactStore.class).get("pl1").orElseThrow());
         FakePipelineDraftStore drafts = context.getBean(FakePipelineDraftStore.class);
@@ -2382,8 +2438,9 @@ class PipelineApiTest {
     /** Seeded bookkeeping whose removal is observed through the real reclaim sequence. */
     static final class DeletionReclaims {
         final Set<String> records = new java.util.LinkedHashSet<>();
+        boolean failStateDelete;
 
-        void clear() { records.clear(); }
+        void clear() { records.clear(); failStateDelete = false; }
 
         void seed(String id) {
             for (String kind : List.of("state", "observation", "consumer", "derived", "rate")) {
@@ -2397,7 +2454,11 @@ class PipelineApiTest {
                         ? Optional.of(io.tapstate.core.lifecycle.CheckpointDoc.initial((String) args[0],
                                 io.tapstate.core.lifecycle.StateJson.of(PipelineState.STOPPED), NOW))
                         : Optional.empty();
-                case "delete" -> { records.remove("state:" + args[0]); yield null; }
+                case "delete" -> {
+                    if (failStateDelete) throw new IllegalStateException("state reclaim failed");
+                    records.remove("state:" + args[0]);
+                    yield null;
+                }
                 default -> throw new AssertionError("unexpected state operation " + method);
             });
         }
