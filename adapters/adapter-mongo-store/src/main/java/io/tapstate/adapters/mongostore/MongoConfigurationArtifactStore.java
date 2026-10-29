@@ -179,17 +179,8 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         var headers = versionsInTransaction(session, expected.keySet());
         if (!headers.keySet().equals(expected.keySet()) || headers.entrySet().stream().anyMatch(entry -> !entry.getValue().hash().equals(expected.get(entry.getKey()))))
             return Optional.empty();
-        var requested = List.copyOf(expected.keySet()); long stored = 0;
-        for (var collection : collections.values()) {
-            var size = collection.aggregate(session, List.of(new Document("$match", new Document("_id", new Document("$in", requested))),
-                    new Document("$group", new Document("_id", null).append("bytes", new Document("$sum", new Document("$bsonSize", "$$ROOT")))))).first();
-            if (size != null) {
-                var number = size.get("bytes"); long bytes;
-                if (number instanceof Integer value) bytes = value; else if (number instanceof Long value) bytes = value; else throw unreadable("validation", "input-size");
-                if (bytes < 0 || bytes > io.tapstate.spi.store.ValidationTaskStore.Inputs.MAX_STORED_BYTES - stored) throw validationInputLimit();
-                stored += bytes;
-            }
-        }
+        requireValidationInputSize(session,expected.keySet());
+        var requested = List.copyOf(expected.keySet());
         var result = new LinkedHashMap<String, String>(); long characters = 0;
         for (var collection : collections.values()) {
             try (var rows = collection.find(session, new Document("_id", new Document("$in", requested))).batchSize(64).iterator()) {
@@ -204,6 +195,55 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         if (!result.keySet().equals(expected.keySet())) throw unreadable("validation", "input-snapshot");
         return Optional.of(Map.copyOf(result));
     }
+    /** Includes all bodies already retained by lazy discovery before decoding the next one. */
+    private void requireValidationInputSize(ClientSession session,java.util.Collection<String> ids){
+        var requested = List.copyOf(ids); long stored = 0;
+        for (var collection : collections.values()) {
+            var size = collection.aggregate(session, List.of(new Document("$match", new Document("_id", new Document("$in", requested))),
+                    new Document("$group", new Document("_id", null).append("bytes", new Document("$sum", new Document("$bsonSize", "$$ROOT")))))).first();
+            if (size != null) {
+                var number = size.get("bytes"); long bytes;
+                if (number instanceof Integer value) bytes = value; else if (number instanceof Long value) bytes = value; else throw unreadable("validation", "input-size");
+                if (bytes < 0 || bytes > io.tapstate.spi.store.ValidationTaskStore.Inputs.MAX_STORED_BYTES - stored) throw validationInputLimit();
+                stored += bytes;
+            }
+        }
+    }
+
+    io.tapstate.spi.store.ValidationTaskStore.DeclarationInputs validationDeclarationsInTransaction(ClientSession session,
+            io.tapstate.spi.store.ValidationTaskStore.Selection selection,long configurationRevision){
+        var hashes=new LinkedHashMap<String,String>();var canonical=new LinkedHashMap<String,String>();
+        var known=new LinkedHashMap<String,Resource>();var parser=new io.tapstate.core.dsl.DslParser();
+        var snapshot=new java.util.AbstractMap<String,Resource>(){
+            private long characters;
+            @Override public Resource get(Object key){
+                if(!(key instanceof String id))return null;
+                if(known.containsKey(id))return known.get(id);
+                if(hashes.size()==1024)throw validationInputLimit();
+                var header=versionsInTransaction(session,List.of(id)).get(id);if(header==null)return null;
+                hashes.put(id,header.hash());requireValidationInputSize(session,hashes.keySet());
+                var body=validationInputsInTransaction(session,Map.of(id,header.hash())).orElseThrow(()->unreadable("validation","input-snapshot")).get(id);
+                characters+=body.length();if(characters>io.tapstate.spi.store.ValidationTaskStore.Inputs.MAX_CANONICAL_CHARACTERS)throw validationInputLimit();
+                var resource=parser.parse(body);known.put(id,resource);canonical.put(id,body);return resource;
+            }
+            @Override public Set<Map.Entry<String,Resource>> entrySet(){throw new UnsupportedOperationException("selected discovery uses named lookup only");}
+        };
+        var resource=snapshot.get(selection.pipelineId());
+        if(!(resource instanceof PipelineResource pipeline))throw new TapstateException(io.tapstate.core.validation.ValidationError.INVALID_CONTRACT,
+                Map.of("field","selection.pipeline"),null);
+        var required=new java.util.LinkedHashSet<String>();required.add(pipeline.id());long traversal=0;
+        var defaults=io.tapstate.core.dsl.ValidationDeclarations.Limits.defaults();
+        for(var output:selection.outputIds()){
+            long remaining=8L*1024*1024-traversal;if(remaining<=0)throw validationInputLimit();
+            var inspection=io.tapstate.core.dsl.ValidationDeclarations.inspect(pipeline,snapshot,
+                    new io.tapstate.core.dsl.ValidationDeclarations.Output(io.tapstate.core.dsl.ValidationDeclarations.OutputKind.SYNC,output),
+                    new io.tapstate.core.dsl.ValidationDeclarations.Limits(defaults.nodes(),defaults.references(),defaults.routes(),defaults.depth(),Math.min(defaults.metadataBytes(),remaining)));
+            traversal+=inspection.accountedMetadataBytes();required.addAll(inspection.requiredResourceIds());
+        }
+        hashes.keySet().retainAll(required);canonical.keySet().retainAll(required);
+        return new io.tapstate.spi.store.ValidationTaskStore.DeclarationInputs(selection,configurationRevision,hashes,canonical);
+    }
+
     private static TapstateException validationInputLimit() {
         return new TapstateException(io.tapstate.core.validation.ValidationError.VALUE_LIMIT_EXCEEDED, Map.of("limit", "validation.configurationInputs"), null);
     }

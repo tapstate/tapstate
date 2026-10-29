@@ -52,6 +52,124 @@ class MongoValidationTaskStoreIT {
         }
     }
 
+    @Test void selectedDeclarationsExistBeforeAnyTaskAndDoNotLoadUnselectedDestinations() {
+        try(var f=new Fixture()){
+            f.configuration.artifacts().create(new SourceResource("unselected",null,"mongodb",
+                    Map.of("uri","mongodb://business.invalid/unselected","metadata","x".repeat(Inputs.MAX_STORED_BYTES*2)),null,null,null,null));
+            var flow=(PipelineResource)f.configuration.artifacts().get("flow").orElseThrow();
+            f.configuration.artifacts().replace("flow",CanonicalHash.of(flow),new PipelineResource(flow.id(),flow.metadata(),flow.sources(),flow.transforms(),flow.view(),
+                    new ServeBlock.Inline("serve",FromRef.literal("orders"),List.of(new SyncElement("out","views",null,null,null),
+                            new SyncElement("other","unselected",null,null,null)),null,null),flow.settings(),flow.experimental()));
+            long revision=f.configuration.configurationRevision();f.cacheDb.drop();
+            var selection=new Selection("flow",List.of("out"));var inputs=f.tasks.declarations(selection);
+            assertThat(inputs.selection()).isEqualTo(selection);assertThat(inputs.configurationRevision()).isEqualTo(revision);
+            assertThat(inputs.dependencyHashes()).containsOnlyKeys("flow","input","views");
+            assertThat(inputs.canonicalResources()).containsOnlyKeys("flow","input","views");
+            for(var entry:inputs.canonicalResources().entrySet())
+                assertThat(CanonicalHash.of(new DslParser().parse(entry.getValue()))).isEqualTo(inputs.dependencyHashes().get(entry.getKey()));
+            assertThat(inputs.toString()).doesNotContain("business.invalid","uri","orders");
+            assertThatThrownBy(()->inputs.canonicalResources().put("other","body")).isInstanceOf(UnsupportedOperationException.class);
+            assertThat(f.tasks.list("flow",0,20).total()).isZero();assertThat(f.configuration.configurationRevision()).isEqualTo(revision);
+            assertThat(f.configuration.preparations().read("flow").orElseThrow().phase()).isEqualTo(PipelinePreparation.Phase.UNASSIGNED);
+            assertThat(f.cacheDb.listCollectionNames()).isEmpty();
+            assertThatThrownBy(()->f.tasks.declarations(new Selection("flow",List.of("other"))))
+                    .isInstanceOf(TapstateException.class).hasMessageContaining("configurationInputs");
+        }
+    }
+    @Test void selectedPipelineSizeIsCheckedBeforeMaterializingAnySourceSecret() {
+        try(var f=new Fixture()){
+            var flow=(PipelineResource)f.configuration.artifacts().get("flow").orElseThrow();
+            f.configuration.artifacts().replace("flow",CanonicalHash.of(flow),new PipelineResource(flow.id(),new Metadata(Map.of(),"x".repeat(Inputs.MAX_STORED_BYTES)),
+                    flow.sources(),flow.transforms(),flow.view(),flow.serve(),flow.settings(),flow.experimental()));
+            var forbidden=new SourceConfigCipherProvider(){
+                @Override public SourceConfigCipher current(){throw new AssertionError("unadmitted selection decrypted a secret");}
+                @Override public SourceConfigCipher refresh(){throw new AssertionError("unadmitted selection decrypted a secret");}
+            };
+            var artifacts=new MongoConfigurationArtifactStore(f.configClient,f.configDb,forbidden);
+            var bounded=MongoValidationAdmissionStore.taskDefinitions(f.configClient,f.configDb,"cluster",()->{},artifacts);
+            assertThatThrownBy(()->bounded.declarations(new Selection("flow",List.of("out"))))
+                    .isInstanceOf(TapstateException.class).hasMessageContaining("configurationInputs");
+        }
+    }
+    @Test void cumulativeSelectedBytesRejectTheNextSourceBeforeDecryptingIt() {
+        try(var f=new Fixture()){
+            var source=(SourceResource)f.configuration.artifacts().get("input").orElseThrow();
+            f.configuration.artifacts().replace(source.id(),CanonicalHash.of(source),new SourceResource(source.id(),source.metadata(),source.connector(),
+                    Map.of("uri","mongodb://business.invalid/source","metadata","x".repeat(120_000)),source.mode(),source.tables(),source.srs(),source.execution(),source.experimental()));
+            var flow=(PipelineResource)f.configuration.artifacts().get("flow").orElseThrow();
+            f.configuration.artifacts().replace("flow",CanonicalHash.of(flow),new PipelineResource(flow.id(),new Metadata(Map.of(),"x".repeat(120_000)),
+                    flow.sources(),flow.transforms(),flow.view(),flow.serve(),flow.settings(),flow.experimental()));
+            for(var entry:Map.of(SystemCollections.SOURCES,"input",SystemCollections.PIPELINES,"flow").entrySet())
+                assertThat(MongoValidationTaskCodec.bsonBytes(entry.getKey().on(f.configDb).find(new Document("_id",entry.getValue())).first())).isLessThan(Inputs.MAX_STORED_BYTES);
+            byte[] material=Base64.getUrlDecoder().decode(SystemCollections.CLUSTER_KEYS.on(f.configDb).find().first().getString("material"));
+            SourceConfigCipher cipher;try{cipher=new SourceConfigCipher(material);}finally{Arrays.fill(material,(byte)0);}
+            var decryptions=new java.util.concurrent.atomic.AtomicInteger();
+            var guarded=new SourceConfigCipherProvider(){
+                @Override public SourceConfigCipher current(){if(decryptions.incrementAndGet()!=1)throw new AssertionError("over-budget next Source decrypted");return cipher;}
+                @Override public SourceConfigCipher refresh(){throw new AssertionError("over-budget next Source retried decryption");}
+            };
+            var artifacts=new MongoConfigurationArtifactStore(f.configClient,f.configDb,guarded);
+            var bounded=MongoValidationAdmissionStore.taskDefinitions(f.configClient,f.configDb,"cluster",()->{},artifacts);
+            assertThatThrownBy(()->bounded.declarations(new Selection("flow",List.of("out"))))
+                    .isInstanceOf(TapstateException.class).hasMessageContaining("configurationInputs");
+            assertThat(decryptions).hasValue(1);
+        }
+    }
+    @Test void lazySelectedDeclarationsKeepOneSnapshotAcrossAnOverlappingResourceEdit()throws Exception{
+        try(var f=new Fixture();var workers=Executors.newSingleThreadExecutor()){
+            var expected=f.comparison("flow").dependencyHashes();long revision=f.configuration.configurationRevision();
+            var sampled=new CountDownLatch(1);var resume=new CountDownLatch(1);var once=new java.util.concurrent.atomic.AtomicBoolean(true);
+            var pending=java.util.concurrent.ConcurrentHashMap.<Integer>newKeySet();
+            var listener=new com.mongodb.event.CommandListener(){
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event){
+                    if(!event.getCommandName().equals("find")||!event.getDatabaseName().equals(f.configDb.getName()))return;
+                    var command=event.getCommand();var projection=command.getDocument("projection",new org.bson.BsonDocument());
+                    if(command.getString("find").getValue().equals(SystemCollections.SOURCES.collectionName())&&projection.containsKey("contentHash")
+                            &&once.compareAndSet(true,false))pending.add(event.getRequestId());
+                }
+                @Override public void commandSucceeded(com.mongodb.event.CommandSucceededEvent event){
+                    if(!pending.remove(event.getRequestId()))return;sampled.countDown();
+                    try{if(!resume.await(15,TimeUnit.SECONDS))throw new AssertionError("selected snapshot barrier timeout");}
+                    catch(InterruptedException e){Thread.currentThread().interrupt();throw new AssertionError(e);}
+                }
+            };
+            var options=com.mongodb.MongoClientSettings.builder().applyConnectionString(new com.mongodb.ConnectionString(CONFIG.getReplicaSetUrl(f.configDb.getName())))
+                    .addCommandListener(listener).build();
+            try(var client=MongoClients.create(options)){
+                byte[] material=Base64.getUrlDecoder().decode(SystemCollections.CLUSTER_KEYS.on(f.configDb).find().first().getString("material"));
+                SourceConfigCipher cipher;try{cipher=new SourceConfigCipher(material);}finally{Arrays.fill(material,(byte)0);}
+                var artifacts=new MongoConfigurationArtifactStore(client,client.getDatabase(f.configDb.getName()),cipher);
+                var actual=MongoValidationAdmissionStore.taskDefinitions(client,client.getDatabase(f.configDb.getName()),"cluster",()->{},artifacts);
+                var query=workers.submit(()->actual.declarations(new Selection("flow",List.of("out"))));
+                try{
+                    assertThat(sampled.await(10,TimeUnit.SECONDS)).isTrue();
+                    var source=(SourceResource)f.configuration.artifacts().get("input").orElseThrow();
+                    f.configuration.artifacts().replace(source.id(),CanonicalHash.of(source),new SourceResource(source.id(),new Metadata(Map.of(),"overlapping edit"),
+                            source.connector(),source.config(),source.mode(),source.tables(),source.srs(),source.execution(),source.experimental()));
+                }finally{resume.countDown();}
+                var original=query.get(10,TimeUnit.SECONDS);assertThat(original.configurationRevision()).isEqualTo(revision);
+                assertThat(original.dependencyHashes()).isEqualTo(expected);
+                for(var entry:original.canonicalResources().entrySet())
+                    assertThat(CanonicalHash.of(new DslParser().parse(entry.getValue()))).isEqualTo(expected.get(entry.getKey()));
+                assertThat(f.tasks.declarations(original.selection()).dependencyHashes().get("input")).isNotEqualTo(expected.get("input"));
+                assertThat(f.tasks.list("flow",0,20).total()).isZero();
+            }finally{resume.countDown();}
+        }
+    }
+
+    @Test void selectedDependencyChangeRejectsSavingTheEarlierEvaluationWithoutCreatingATask() {
+        try(var f=new Fixture()){
+            var original=f.tasks.declarations(new Selection("flow",List.of("out")));var base=f.comparison("flow");
+            var candidate=f.create(new ValidationTaskSpec("flow",original.dependencyHashes(),base.mappingRevision(),base.comparisonRulesVersion(),base.mappings()));
+            var source=(SourceResource)f.configuration.artifacts().get("input").orElseThrow();
+            f.configuration.artifacts().replace("input",CanonicalHash.of(source),new SourceResource(source.id(),new Metadata(Map.of(),"edited after evaluation"),
+                    source.connector(),source.config(),source.mode(),source.tables(),source.srs(),source.execution(),source.experimental()));
+            long revision=f.configuration.configurationRevision();assertThat(f.tasks.create(candidate)).isEqualTo(Write.CONFLICT);
+            assertThat(f.tasks.list("flow",0,20).total()).isZero();assertThat(f.configuration.configurationRevision()).isEqualTo(revision);
+            var fresh=f.tasks.declarations(original.selection());assertThat(fresh.dependencyHashes().get("input")).isNotEqualTo(original.dependencyHashes().get("input"));
+        }
+    }
+
     @Test void preflightInputsFreezeOnlyTheExactSavedResourcePinsWithoutTouchingCache() {
         try (var f = new Fixture()) {
             var create = f.create("flow"); f.tasks.create(create); f.cacheDb.drop();

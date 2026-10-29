@@ -109,6 +109,15 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
             });
         }
 
+        @Override public DeclarationInputs declarations(Selection selection){
+            Objects.requireNonNull(selection);
+            return call(session->{
+                MongoValidationPreparations.requireTaskAuthoringParent(session,owner.database,owner.clusterId,selection.pipelineId());
+                long current=ConfigurationVersion.read(session,SystemCollections.CONFIGURATION_VERSION.on(owner.database));
+                return artifacts.validationDeclarationsInTransaction(session,selection,current);
+            });
+        }
+
         @Override public java.util.Optional<Inputs> inputs(Task task, long revision) {
             Objects.requireNonNull(task); scope(task);
             if (revision < 1 || revision == Long.MAX_VALUE) throw unreadable("task-revision");
