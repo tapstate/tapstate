@@ -52,6 +52,7 @@ import io.tapstate.control.core.StartCheckEvaluator;
 import io.tapstate.control.core.StartChecks;
 import io.tapstate.control.core.StartPlanner;
 import io.tapstate.control.core.PipelineDraftService;
+import io.tapstate.control.core.PipelineDeletionService;
 import io.tapstate.control.core.PipelineCatalogService;
 import io.tapstate.control.core.PipelineLayoutService;
 import io.tapstate.control.core.PipelineLogQueryService;
@@ -719,6 +720,14 @@ class ControlPlaneConfiguration {
     PipelineDraftService pipelineDraftService(
             StorePort storePort, ArtifactQueryService artifacts, AuditGate auditGate, ApplyService applyService) {
         return new PipelineDraftService(storePort.drafts(), artifacts, auditGate, applyService);
+    }
+
+    @Bean
+    PipelineDeletionService pipelineDeletionService(
+            ArtifactQueryService artifacts,
+            ArtifactMutationService mutations,
+            PipelineDraftService drafts) {
+        return new PipelineDeletionService(artifacts, mutations, drafts);
     }
 
     @Bean
