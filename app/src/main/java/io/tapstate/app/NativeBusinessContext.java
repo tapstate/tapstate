@@ -73,6 +73,9 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         }, port.connectionTestResults(), parent.getBean(Clock.class)));
         var overrides = new LinkedHashMap<String,Object>();
         overrides.put("tokenStore", configuration.tokens());
+        overrides.put("aiProviderSettingsStore", configuration.aiProviderSettings());
+        var providerClient = parent.getBeanProvider(AiProviderClient.class).getIfAvailable();
+        if (providerClient != null) overrides.put("aiProviderClient", providerClient);
         overrides.put("auditStore", configuration.audit());
         overrides.put("clusterIdentityStore", configuration.clusterIdentity());
         overrides.put("clusterIdentityService", parent.getBean(ClusterIdentityService.class));

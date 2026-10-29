@@ -130,6 +130,7 @@ class ApiExceptionHandler {
             Map.entry("io.pipeline-state-rebuild-required", HttpStatus.CONFLICT),
             Map.entry("io.pipeline-table-selection-rebuild-required", HttpStatus.CONFLICT),
             Map.entry("store.initialization-refused", HttpStatus.CONFLICT),
+            Map.entry("store.ai-provider-schema-unsupported", HttpStatus.CONFLICT),
             Map.entry("store.invalid-uri", HttpStatus.BAD_REQUEST),
             Map.entry("store.storage-connection-unsupported", HttpStatus.BAD_REQUEST),
             Map.entry("store.tls-trust-invalid", HttpStatus.BAD_REQUEST),

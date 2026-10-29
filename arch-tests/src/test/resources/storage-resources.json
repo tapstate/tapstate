@@ -522,6 +522,17 @@
         "Existing optional initialLoad may be read for historical compatibility, but new initialLoad writes are permitted only through the approved scoped CACHE store.",
         "Missing, stale or mismatched legacy facts remain unknown and never start a Pipeline, create storage or substitute for durable recovery state."
       ]
+    },
+    "native-ai-config-v1": {
+      "goal": "Retain the current Cloud workspace provider metadata and purpose-bound encrypted API key across normal restarts and CACHE loss.",
+      "entry": "Fresh controlled CONFIG schema 2 initialization, then existing authenticated Cloud get/replace/delete/check and assistant routes. Schema 1 keeps non-AI capabilities but refuses AI access without automatic upgrade. Recover the original Cluster from its CONFIG backup and matching original key, or explicit user re-entry when a structurally valid owner row is absent. No legacy system_meta migration or cross-Cluster transfer of owner-bound settings.",
+      "prerequisites": [
+        "One dedicated CONFIG ai_provider_settings collection with only its implicit unique _id index, no TTL and at most one current row for the fixed canonical Cloud organization/Cluster owner. No prompts, dialogue, request log or version history.",
+        "Format 1 has exactly _id, formatVersion, owner, providerId, baseUrl, model and secret. The id is ai-provider: plus SHA-256 of canonical server-derived owner JSON [cloud, organizationId, clusterId]. Request JSON cannot choose owner. Unsupported schema, missing collection/index, malformed fields, owner/hash mismatch or bad ciphertext refuse without lazy DDL or overwriting corruption.",
+        "The existing CONFIG key supplies the existing tsai:1 provider AES/GCM ciphertext with owner and provider/baseUrl/model authenticated. No replacement key, rotation, node ACK, lease or CACHE/MASTER fallback. No plaintext key in database, API, logs, draft or browser storage.",
+        "Provider remains openai-compatible with existing HTTPS public endpoint policy. Owner/baseUrl are each at most 4096 UTF-8 bytes, model at most 200 UTF-16 code units, API key at most 8192 characters without controls, and complete encoded BSON at most 256 KiB before any mutation.",
+        "Absence of the owner row under verified schema/collection/indexes returns unconfigured, including explicit delete. No separate tombstone distinguishes arbitrary external whole-row deletion. Normal restart never recreates missing known structures or imports old settings."
+      ]
     }
   },
   "consistencyProfiles": {
@@ -588,6 +599,10 @@
     "legacy-observation-retained-v2": {
       "atomicDomain": "LEGACY STORE",
       "fencing": "Retain original single-document observation writes for legacy internal fixtures; do not widen their authority or copy them to CONFIG. New initialLoad is excluded from this writer. Existing historical bytes remain intact and readable. Production writes use the approved CACHE transaction with original scope and claim fence."
+    },
+    "native-ai-config-v1": {
+      "atomicDomain": "CONFIG",
+      "fencing": "Each replace/delete uses the original CONFIG client/session to verify Cluster identity/schema, advance the existing configuration version and fence the same original persisted key before the single owner row mutation. Strict current-row decoding refuses corruption rather than repairing it. Existing audit-first and replacement semantics remain. The same captured authenticated Cloud context supplies organization/Cluster and is checked before and after the operation. Provider network calls and CACHE are outside this CONFIG transaction."
     }
   },
   "resources": [
@@ -3092,6 +3107,31 @@
       "growth": "Bounded by the selected connector input set.",
       "evidence": [
         "tools/catalog-derive/src/test/java/io/tapstate/tools/catalog/derive/CatalogDeriveTest.java"
+      ]
+    },
+    {
+      "id": "mongo.config.ai_provider_settings",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CONFIG",
+      "database": "CONFIG",
+      "physicalNames": [
+        "ai_provider_settings"
+      ],
+      "responsibility": "One current authenticated Cloud workspace provider configuration and encrypted API key, without conversation or execution state.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationAiProviderSettingsStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoConfigurationAiProviderSettingsStore"
+      ],
+      "recovery": "native-ai-config-v1",
+      "consistency": "native-ai-config-v1",
+      "growth": "At most one current owner row per CONFIG Cluster, at most 256 KiB encoded BSON plus the fixed unique _id index; replacement does not accumulate history and no prompts, request bodies or dialogue are retained.",
+      "evidence": [
+        "e2e/src/test/java/io/tapstate/e2e/PipelineBuilderAssistantProviderSettingsIT.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoConfigurationAiProviderSettingsIT.java"
       ]
     }
   ]

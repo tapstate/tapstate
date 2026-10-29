@@ -36,6 +36,9 @@ public enum StoreError implements TapstateErrorCode {
      */
     INVALID_URI("store.invalid-uri", Set.of()),
 
+    /** This initialized CONFIG schema does not support provider settings. */
+    AI_PROVIDER_SCHEMA_UNSUPPORTED("store.ai-provider-schema-unsupported", Set.of("required")),
+
     /** The metadata-backed Source config keyring is absent, malformed, or internally inconsistent. */
     SOURCE_CONFIG_KEYRING_INVALID("store.source-config-keyring-invalid", Set.of()),
 

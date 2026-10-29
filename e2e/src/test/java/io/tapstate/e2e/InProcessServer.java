@@ -52,10 +52,18 @@ final class InProcessServer implements ServerHandle {
     }
 
     static InProcessServer startPrepared(PreparedNativeStore storage, List<String> additionalArguments) {
-        var arguments = new java.util.ArrayList<>(List.of("--tapstate.cluster.id=" + storage.clusterId(),
-                "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2"));
+        return startPrepared(storage, additionalArguments, null);
+    }
+    static InProcessServer startPrepared(PreparedNativeStore storage, List<String> additionalArguments,
+            io.tapstate.control.core.AiProviderClient provider) {
+        var arguments = new java.util.ArrayList<String>();
+        for (String value : List.of("--tapstate.cluster.id=" + storage.clusterId(),
+                "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2")) {
+            String key = value.substring(0, value.indexOf('=') + 1);
+            if (additionalArguments.stream().noneMatch(argument -> argument.startsWith(key))) arguments.add(value);
+        }
         arguments.addAll(additionalArguments);
-        return start(storage.configurationUri(), null, arguments);
+        return start(storage.configurationUri(), null, arguments, provider);
     }
 
     /** Boots the assembly with an explicit operator-state database. */
@@ -112,11 +120,12 @@ final class InProcessServer implements ServerHandle {
         if (provider != null) {
             builder.initializers(context -> context.addBeanFactoryPostProcessor(factory -> {
                 var registry = (org.springframework.beans.factory.support.BeanDefinitionRegistry) factory;
-                if (!registry.containsBeanDefinition("aiProviderClient"))
-                    throw new IllegalStateException("the application does not define aiProviderClient");
-                registry.removeBeanDefinition("aiProviderClient");
-                registry.registerBeanDefinition("aiProviderClient", new org.springframework.beans.factory.support.RootBeanDefinition(
-                        io.tapstate.control.core.AiProviderClient.class, () -> provider));
+                if (registry.containsBeanDefinition("aiProviderClient")) registry.removeBeanDefinition("aiProviderClient");
+                var definition = new org.springframework.beans.factory.support.RootBeanDefinition(
+                        io.tapstate.control.core.AiProviderClient.class, () -> provider);
+                definition.setPrimary(true);
+                if (provider instanceof AutoCloseable) definition.setDestroyMethodName("close");
+                registry.registerBeanDefinition("aiProviderClient", definition);
             }));
         }
         return builder

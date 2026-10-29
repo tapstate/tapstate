@@ -261,7 +261,8 @@ public enum SystemCollections {
             new IndexSpec(List.of("_id.clusterId","_id.bindingVersion","_id.capture"),false,"capture_preparation_history")),
     CACHE_SNAPSHOT_ORDERS("snapshot_orders",Database.CACHE,MongoSnapshotStateStore.class,Strategy.MIGRATED,1),
     CACHE_SNAPSHOT_COUNTS("snapshot_counts",Database.CACHE,MongoSnapshotStateStore.class,Strategy.MIGRATED,1,
-            new IndexSpec(List.of("_id.scope"),false,"snapshot_scope"));
+            new IndexSpec(List.of("_id.scope"),false,"snapshot_scope")),
+    CONFIG_AI_PROVIDER_SETTINGS("ai_provider_settings", Database.CONFIG, MongoConfigurationAiProviderSettingsStore.class, Strategy.MIGRATED, 2);
 
     /** What happens to a collection's documents as the product's shape moves on. */
     public enum Strategy {

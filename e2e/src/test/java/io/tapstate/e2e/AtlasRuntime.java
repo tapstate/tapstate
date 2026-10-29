@@ -40,6 +40,8 @@ final class AtlasRuntime implements AutoCloseable {
     private static final String TOKEN = "controlled-atlas-sdk-token";
     private static final String KID = "atlas-data-key";
     private final Mode mode;
+    private final PreparedNativeStore prepared;
+    private final String clusterId;
     private final String storeUri;
     private final String metadata;
     private final HttpServer cloud;
@@ -51,10 +53,18 @@ final class AtlasRuntime implements AutoCloseable {
     private String cookie;
 
     AtlasRuntime(Mode mode, String storeUri) throws IOException, GeneralSecurityException {
+        this(mode, storeUri, null);
+    }
+    AtlasRuntime(PreparedNativeStore prepared) throws IOException, GeneralSecurityException {
+        this(Mode.CLOUD, prepared.configurationUri(), prepared);
+    }
+    private AtlasRuntime(Mode mode, String storeUri, PreparedNativeStore prepared) throws IOException, GeneralSecurityException {
+        this.prepared = prepared;
+        this.clusterId = prepared == null ? CLUSTER : prepared.clusterId();
         this.mode = mode;
         this.storeUri = storeUri;
         metadata = new ConnectionString(storeUri).getDatabase();
-        if (metadata == null || !metadata.startsWith("ts_plan_")) {
+        if (metadata == null || prepared == null && !metadata.startsWith("ts_plan_")) {
             throw new IllegalArgumentException("this fixture requires its own isolated metadata database");
         }
         KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA");
@@ -99,12 +109,14 @@ final class AtlasRuntime implements AutoCloseable {
         if (mode == Mode.CLOUD) {
             arguments.addAll(List.of("--tapstate.cloud.base-url=" + issuer,
                     "--tapstate.cloud.token=" + TOKEN, "--tapstate.cloud.atlas-uri=" + storeUri,
-                    "--tapstate.cloud.cluster-id=" + CLUSTER,
+                    "--tapstate.cloud.cluster-id=" + clusterId,
                     "--tapstate.connectors.seed-dir=" + seedDirectory()));
         }
-        ServerHandle server = tier == Tiers.IN_PROCESS
-                ? InProcessServer.start(storeUri, metadata + "_operator", arguments, provider)
-                : RealProcessServer.start(storeUri, metadata + "_operator", arguments);
+        ServerHandle server = prepared == null
+                ? tier == Tiers.IN_PROCESS ? InProcessServer.start(storeUri, metadata + "_operator", arguments, provider)
+                        : RealProcessServer.start(storeUri, metadata + "_operator", arguments)
+                : tier == Tiers.IN_PROCESS ? InProcessServer.startPrepared(prepared, arguments, provider)
+                        : RealProcessServer.startPrepared(storeUri, "127.0.0.1", port -> arguments);
         try {
             if (server instanceof RealProcessServer process) process.awaitReady();
             return new ServerHandle() {
@@ -134,6 +146,7 @@ final class AtlasRuntime implements AutoCloseable {
         } else {
             control.useCloudSessionCookie(cookie);
         }
+        if (prepared != null) prepared.awaitBusiness(control);
         return control;
     }
 
@@ -175,7 +188,7 @@ final class AtlasRuntime implements AutoCloseable {
         Object parsed = JsonReader.parse(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
         if (!(parsed instanceof Map<?, ?> body) || !"POST".equals(exchange.getRequestMethod())
                 || !TOKEN.equals(exchange.getRequestHeaders().getFirst("X-Cluster-Identity-Secret"))
-                || !CLUSTER.equals(body.get("clusterId"))) {
+                || !clusterId.equals(body.get("clusterId"))) {
             respond(exchange, 401, Map.of("code", "fixture.invalid-service-identity"));
             return;
         }
@@ -188,7 +201,7 @@ final class AtlasRuntime implements AutoCloseable {
         Instant expires = Instant.now().plusSeconds(900);
         respond(exchange, 200, Map.of("opId", "atlas-exchange", "code", "ok", "msg", "ok", "data", Map.of(
                 "jwt", jwt(audience, jti, expires), "expiresAt", expires.toString(), "jti", jti,
-                "userEmail", "atlas-user@example.test", "orgId", "atlas-data-org", "clusterId", CLUSTER,
+                "userEmail", "atlas-user@example.test", "orgId", "atlas-data-org", "clusterId", clusterId,
                 "organizationName", "Atlas Test Organization", "clusterName", "Atlas Test Cluster",
                 "region", "test-region")));
     }
@@ -198,7 +211,7 @@ final class AtlasRuntime implements AutoCloseable {
         String payload = base64(JsonWriter.write(Map.of(
                 "iss", issuer, "sub", "atlas-user@example.test", "aud", List.of(audience),
                 "iat", Instant.now().getEpochSecond(), "exp", expires.getEpochSecond(), "jti", jti,
-                "user_id", USER, "org_id", "atlas-data-org", "cluster_id", CLUSTER,
+                "user_id", USER, "org_id", "atlas-data-org", "cluster_id", clusterId,
                 "scope", List.of("workload:read", "workload:write"))).getBytes(StandardCharsets.UTF_8));
         String unsigned = header + "." + payload;
         try {
@@ -226,6 +239,7 @@ final class AtlasRuntime implements AutoCloseable {
 
     @Override public void close() {
         cloud.stop(0);
+        if (prepared != null) return;
         // Only fixture-owned local databases; the actual Atlas source/target are cleaned by their witness.
         try (var raw = MongoClients.create(storeUri)) {
             RuntimeException failed = null;
