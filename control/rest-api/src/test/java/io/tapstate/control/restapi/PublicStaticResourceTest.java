@@ -67,6 +67,7 @@ class PublicStaticResourceTest {
 
         assertThatThrownBy(() -> PublicStaticResource.loadPublicImages(resolver))
                 .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("classpath*:/static/*")
                 .hasCause(cause);
     }
 
@@ -78,6 +79,7 @@ class PublicStaticResourceTest {
             addEntry(jar, "static/brand.png", "png fixture");
             addEntry(jar, "static/brand.svg", "svg fixture");
             addEntry(jar, "static/index.html", "html fixture");
+            addEntry(jar, "static/config.txt", "non-image fixture");
             addEntry(jar, "static/nested/", "");
             addEntry(jar, "static/nested/hidden.png", "nested fixture");
         }

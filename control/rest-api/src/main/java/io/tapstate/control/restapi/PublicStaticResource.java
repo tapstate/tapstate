@@ -48,7 +48,7 @@ final class PublicStaticResource {
                     .filter(PublicStaticResource::hasPublicRootImageName)
                     .collect(Collectors.toUnmodifiableSet());
         } catch (IOException failure) {
-            throw new IllegalStateException("Unable to enumerate packaged public images", failure);
+            throw new IllegalStateException("Unable to enumerate packaged public images from classpath*:/static/*", failure);
         }
     }
 }
