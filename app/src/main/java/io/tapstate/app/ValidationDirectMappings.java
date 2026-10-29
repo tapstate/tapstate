@@ -49,11 +49,18 @@ final class ValidationDirectMappings {
     /** Static direct declarations only. Native table existence and selection are still read obligations. */
     static List<Declared> declare(ValidationSavedDeclarations saved) {
         Objects.requireNonNull(saved);
+        return declare(saved.artifacts(),saved.original().task().comparison().mappings(),mapping->saved.mapping(mapping.mappingId()));
+    }
+
+    /** Server-derived candidates and saved definitions share the same direct-path restrictions. */
+    static List<Declared> declare(io.tapstate.spi.store.ArtifactStore artifacts,List<ValidationTaskSpec.Mapping> mappings,
+            Function<ValidationTaskSpec.Mapping,io.tapstate.core.dsl.ValidationDeclarations.Inspection> inspections){
+        Objects.requireNonNull(artifacts);Objects.requireNonNull(mappings);Objects.requireNonNull(inspections);
         var declarations = new ArrayList<Declared>();
         var targets=new java.util.HashSet<List<Object>>();
         var resources=new java.util.HashMap<String,SourceResource>();
-        for (var mapping : saved.original().task().comparison().mappings()) {
-            var selected = saved.mapping(mapping.mappingId());
+        for (var mapping : mappings) {
+            var selected = Objects.requireNonNull(inspections.apply(mapping));
             if (mapping.outputKind() != ValidationTaskSpec.OutputKind.SYNC || selected.sync() == null
                     || selected.view() != null) throw unsupported(mapping.outputId(), "from", "direct.source-to-destination-required");
             if (!selected.steps().isEmpty()) {
@@ -66,8 +73,8 @@ final class ValidationDirectMappings {
             if (!selected.pending().isEmpty())
                 throw unsupported(mapping.outputId(), "from", "direct.table-scope-unknown");
             // These are private, read-only declarations. Native reads decode their own settings.
-            var source = resources.computeIfAbsent(mapping.source().sourceId(),id->StoredArtifacts.requireSource(saved.artifacts(),id));
-            var target = resources.computeIfAbsent(mapping.target().sourceId(),id->StoredArtifacts.requireSource(saved.artifacts(),id));
+            var source = resources.computeIfAbsent(mapping.source().sourceId(),id->StoredArtifacts.requireSource(artifacts,id));
+            var target = resources.computeIfAbsent(mapping.target().sourceId(),id->StoredArtifacts.requireSource(artifacts,id));
             if (!mapping.source().nodeId().equals(source.id()) || !mapping.target().nodeId().equals(mapping.outputId()))
                 throw invalid("nodeBinding");
             if (!TableRename.apply(mapping.source().table(), selected.sync().rename()).equals(mapping.target().table()))

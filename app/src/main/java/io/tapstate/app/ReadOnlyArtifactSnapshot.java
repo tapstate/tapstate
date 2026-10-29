@@ -39,8 +39,15 @@ final class ReadOnlyArtifactSnapshot implements ArtifactStore {
     /** An already bounded native validation reading; it never broadens to an ambient store list. */
     static ReadOnlyArtifactSnapshot validation(io.tapstate.spi.store.ValidationTaskStore.Inputs inputs, String managedDefault) {
         Objects.requireNonNull(inputs);
-        var parser = new io.tapstate.core.dsl.DslParser(); var expected = inputs.task().comparison().dependencyHashes();
-        var owned = new java.util.TreeMap<String, String>(inputs.canonicalResources());
+        return validation(inputs.canonicalResources(),inputs.task().comparison().dependencyHashes(),managedDefault);
+    }
+
+    static ReadOnlyArtifactSnapshot validation(io.tapstate.spi.store.ValidationTaskStore.DeclarationInputs inputs,String managedDefault){
+        Objects.requireNonNull(inputs);return validation(inputs.canonicalResources(),inputs.dependencyHashes(),managedDefault);
+    }
+    private static ReadOnlyArtifactSnapshot validation(Map<String,String> canonical,Map<String,String> expected,String managedDefault){
+        var parser = new io.tapstate.core.dsl.DslParser();
+        var owned = new java.util.TreeMap<String, String>(canonical);
         for (var entry : owned.entrySet()) {
             Resource resource;
             try { resource = parser.parse(entry.getValue()); }
