@@ -51,6 +51,7 @@ final class ValidationOwnerQuota {
     synchronized void retired(ValidationControlStore.Run run,ValidationRunState terminal) {
         quota.retireSealedTerminalRun(run.identity(),terminal);stops.remove(run.identity());
     }
+    synchronized void expired(ValidationRunIdentity run){quota.discardExpiredSealedRun(run);stops.remove(run);}
     void ownerLost() {
         List<Runnable> ending;synchronized(this){quota.close();ending=List.copyOf(stops.values());}
         var failures=new ValidationFailureLatch();for(var stop:ending)try{stop.run();}catch(RuntimeException|Error failed){failures.record(failed);ValidationFailureLatch.addContext(failures.get(),failed);}

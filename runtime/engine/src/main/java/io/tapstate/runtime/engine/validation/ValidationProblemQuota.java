@@ -155,6 +155,12 @@ public final class ValidationProblemQuota {
         Objects.requireNonNull(terminal, "terminal");
         if (!terminal.terminal() || terminal == ValidationRunState.COMPLETED
                 && run.mode() == io.tapstate.core.validation.ValidationMode.INCREMENTAL) throw invalid("run.terminal");
+        discardSealed(run);
+    }
+
+    /** Caller proves irreversible original birth closure and expired stores; this is local disposal, not a terminal claim. */
+    public synchronized void discardExpiredSealedRun(ValidationRunIdentity run){identity(run);discardSealed(run);}
+    private void discardSealed(ValidationRunIdentity run){
         RunSlots active = runs.get(run);
         if (active == null) return;
         if (!active.sealed) throw new IllegalStateException("local publication must be sealed before retirement");

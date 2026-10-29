@@ -61,6 +61,16 @@ public interface ValidationControlStore {
         }
         public WorkloadClaimFence fence() { return ValidationClaims.fence(authority); }
     }
+    /** Only originals already expired by the configured CONFIG history policy may be supplied. */
+    record Expiration(ValidationOwner authority,Status original){
+        public Expiration{Objects.requireNonNull(authority);Objects.requireNonNull(original);
+            if(!original.retired()||original.endedAt()==null||original.run().admission()==null
+                    ||!authority.clusterId().equals(original.run().identity().owner().clusterId())
+                    ||!authority.pipelineId().equals(original.run().identity().owner().pipelineId()))throw invalid("control.expiration");}
+    }
+    /** Original CONFIG closure and absent report are independently rechecked; no cross-store transaction is claimed. */
+    default Mutation expire(Expiration command){throw invalid("control.expirationUnsupported");}
+
     enum Join { JOINED, ALREADY_JOINED, MODE_BUSY, GENERATION_CLOSED }
     enum Mutation { APPLIED, ALREADY_APPLIED, STALE }
     record Status(Run run, ValidationRunState state, boolean retired, java.time.Instant endedAt) {

@@ -95,6 +95,15 @@ public interface ValidationTaskStore {
         @Override public String toString() { return "ValidationTaskInputs[resources=" + canonicalResources.size() + ", revision=" + configurationRevision + "]"; }
     }
 
+    record Page(java.util.List<Snapshot> items,long total,int offset,int limit){
+        public Page{items=java.util.List.copyOf(items);if(total<0||offset<0||offset>1024||limit<1||limit>20||items.size()>limit)throw invalid("task.page");}
+    }
+    /** Bounded CONFIG browsing; these descriptors confer no execution or model-reading authority. */
+    default Page list(String pipelineId,int offset,int limit){throw invalid("task.listUnsupported");}
+    default java.util.List<String> pipelines(String afterPipeline,int limit){throw invalid("task.pipelineListUnsupported");}
+    /** Identity-only cursor lets maintenance preserve a damaged definition without starving later tasks. */
+    default java.util.List<String> taskIds(String pipelineId,String afterTask,int limit){throw invalid("task.idListUnsupported");}
+
     /** Missing definitions are not initialized on read. Returned descriptors never grant execution. */
     Optional<Snapshot> read(String pipelineId, String taskId);
     /** Exact saved lifetime/revision and pinned resources in one snapshot; stale/closed returns empty. */

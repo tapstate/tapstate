@@ -898,6 +898,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         public void requireCurrent() { configuration.requireOpen(); local.run(); original.requireComplete(); }
         public io.tapstate.spi.store.WorkloadClaimStore claims() { requireCurrent(); return cache.validationClaims(original, local); }
         public io.tapstate.spi.store.ValidationControlStore control() { requireCurrent(); return cache.validationControl(original, local); }
+        public io.tapstate.spi.store.ValidationRunHistory history(){requireCurrent();return cache.validationHistory(original,local);}
         public io.tapstate.spi.store.ValidationReportAdmission admissions() {
             requireCurrent(); return new MongoValidationAdmissionStore(configuration.connection.client(), configuration.connection.database(), configuration.clusterId,
                     () -> { configuration.requireOpen(); local.run(); }, new MongoValidationPreparations.Authority(original));

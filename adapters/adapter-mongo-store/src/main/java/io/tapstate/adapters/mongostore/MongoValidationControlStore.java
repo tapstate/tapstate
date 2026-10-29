@@ -21,7 +21,7 @@ import java.util.*;
 import java.util.function.Function;
 
 /** CACHE-only validation control. Normal operations require an original jointly prepared claim/control. */
-final class MongoValidationControlStore implements ValidationControlStore {
+final class MongoValidationControlStore implements ValidationControlStore,ValidationRunHistory {
     static final int MAX_ACTIVE_RUNS = 128;
     static final long MAX_RETAINED_RUNS = 4096;
     private static final int MAX_CONTROL_BYTES = 1024 * 1024;
@@ -151,6 +151,72 @@ final class MongoValidationControlStore implements ValidationControlStore {
         });
     }
 
+    @Override public Terminals terminals(WorkloadClaimFence node,Selection selection){
+        Objects.requireNonNull(selection);if(!scope.clusterId().equals(selection.task().clusterId()))throw fenced();
+        return readHistory(node,selection.task().pipelineId(),session->{
+            var order=Comparator.comparing(Status::endedAt,Comparator.reverseOrder()).thenComparing(status->status.run().identity().runId());
+            var recent=new PriorityQueue<Status>(order.reversed());var oldest=new PriorityQueue<Status>(order);
+            long known=0,unknown=0,unsettled=0;
+            var filter=new Document("_id.kind","run").append("_id.clusterId",scope.clusterId()).append("_id.pipelineId",selection.task().pipelineId())
+                    .append("_id.taskId",selection.task().taskId()).append("_id.mode",selection.mode().name())
+                    .append("admission.taskGeneration",selection.task().generation().toString());
+            try(var cursor=rows.find(session,filter).projection(controlHeader()).limit((int)MAX_RETAINED_RUNS+1).iterator()){
+                long seen=0;
+                while(cursor.hasNext()){
+                    if(++seen>MAX_RETAINED_RUNS)throw limit();var row=cursor.next();bounded(row,32*1024);
+                    var run=decodeRun(row);requireRow(row,run,false);
+                    if(run.admission()==null||!run.admission().task().equals(selection.task())||run.identity().mode()!=selection.mode())throw unreadable("history-scope");
+                    var status=new Status(run,state(row),row.getBoolean("retired"),endedAt(row));
+                    if(!status.retired()){unsettled++;continue;}
+                    if(status.endedAt()==null){unknown++;continue;}
+                    known++;recent.add(status);if(recent.size()>selection.recent())recent.remove();
+                    oldest.add(status);if(oldest.size()>selection.oldest())oldest.remove();
+                }
+            }
+            var newest=new ArrayList<>(recent);newest.sort(order);var first=new ArrayList<>(oldest);first.sort(order.reversed());
+            return new Terminals(newest,first,known,unknown,unsettled);
+        });
+    }
+    @Override public Optional<Status> terminal(WorkloadClaimFence node,Run original){
+        Objects.requireNonNull(original);
+        return readHistory(node,original.identity().owner().pipelineId(),session->{
+            var row=row(session,original,true);if(row==null||!Boolean.TRUE.equals(row.getBoolean("retired")))return Optional.empty();
+            return Optional.of(new Status(decodeRun(row),state(row),true,endedAt(row)));
+        });
+    }
+    @Override public boolean expired(WorkloadClaimFence node,Run original){
+        Objects.requireNonNull(original);
+        if(validation==null)return false;
+        boolean absent=readHistory(node,original.identity().owner().pipelineId(),session->row(session,original,false)==null);
+        return absent&&validation.closedWithoutReport(original.admission());
+    }
+    private <T>T readHistory(WorkloadClaimFence node,String pipeline,Function<ClientSession,T> action){
+        Objects.requireNonNull(node);
+        if(validation==null||!pipeline.equals(validation.pipelineId())||node.key().type()!=WorkloadClaimType.NODE_SESSION
+                ||!scope.clusterId().equals(node.key().clusterId()))throw fenced();
+        return StoreIo.call(()->{
+            requireActive.run();validation.require(false);requireCollection(database);MongoValidationSchema.requireReady(database,false);
+            try(var session=client.startSession()){
+                var answer=session.withTransaction(()->{
+                    requireActive.run();requireReadingNode(session,node);
+                    new MongoCacheBusinessIdentity(database,scope).requireAdmissionState(session);
+                    var control=control(session,pipeline);
+                    var key=ValidationClaims.key(scope.clusterId(),pipeline);
+                    var claim=SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session,new Document("_id",MongoWorkloadClaimStore.id(key))).first();
+                    requirePreparedClaim(session,database,claim,key,scope,validation.subject(),false);
+                    long actual=rows.countDocuments(session,new Document("_id.kind","run").append("_id.clusterId",scope.clusterId()).append("_id.pipelineId",pipeline));
+                    if(actual!=control.getLong("retainedRuns"))throw unreadable("history-retained-controls");
+                    var result=action.apply(session);requireReadingNode(session,node);requireActive.run();return result;
+                },TRANSACTION);
+                validation.require(false);requireActive.run();return answer;
+            }
+        });
+    }
+    private void requireReadingNode(ClientSession session,WorkloadClaimFence expected){
+        var found=new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database)).inStrictSession(session).read(expected.key());
+        if(found.isEmpty()||!found.orElseThrow().leased()||!WorkloadClaimFence.from(found.orElseThrow().claim()).equals(expected))throw fenced();
+    }
+
     @Override public Mutation requestDelay(Delay change) { return changeDelay(change, false); }
     @Override public Mutation acknowledgeDelay(Delay change) { return changeDelay(change, true); }
 
@@ -271,6 +337,23 @@ final class MongoValidationControlStore implements ValidationControlStore {
             return Mutation.APPLIED;
         });
         requireAdmission(run, true); return retired;
+    }
+
+    @Override public Mutation expire(Expiration command){
+        Objects.requireNonNull(command);var known=command.original();var original=known.run();
+        if(validation==null||!validation.closedWithoutReport(original.admission()))return Mutation.STALE;
+        var result=transaction(command.authority(),false,session->{
+            var control=control(session,command.authority().pipelineId());var row=row(session,original,false);
+            if(row==null)return Mutation.ALREADY_APPLIED;
+            if(!Boolean.TRUE.equals(row.getBoolean("retired"))||state(row)!=known.state()||!Objects.equals(endedAt(row),known.endedAt()))return Mutation.STALE;
+            if(slots(control).containsValue(runId(original)))throw unreadable("expired-run-slot");
+            long retained=control.getLong("retainedRuns");if(retained<1)throw unreadable("retained-run-count");
+            var exact=new Document("_id",runId(original)).append("identity",row.get("identity")).append("admission",row.get("admission"))
+                    .append("state",row.get("state")).append("retired",true).append("endedAt",row.get("endedAt"));
+            if(rows.deleteOne(session,exact).getDeletedCount()!=1)throw unreadable("expired-run-fence");
+            control.put("retainedRuns",retained-1);writeControl(session,control);return Mutation.APPLIED;
+        });
+        if(!validation.closedWithoutReport(original.admission()))throw fenced();return result;
     }
 
     @Override public Mutation terminateLostOwner(LostOwner command) {

@@ -273,6 +273,11 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         return new MongoValidationControlStore(client, database, authority.subject().scope(), () -> { businessActive(); local.run(); }, authority);
     }
 
+    io.tapstate.spi.store.ValidationRunHistory validationHistory(MongoValidationPreparations.Permission original,Runnable local){
+        var authority=new MongoValidationPreparations.Authority(original);requireValidationPreparation(authority);
+        return new MongoValidationControlStore(client,database,authority.subject().scope(),()->{businessActive();local.run();},authority);
+    }
+
     WorkloadClaimStore validationClaims(MongoValidationPreparations.Closing original) {
         return validationClaims(new MongoValidationPreparations.Authority(original));
     }

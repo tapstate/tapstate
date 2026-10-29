@@ -72,7 +72,7 @@ final class NativeValidationRuns implements AutoCloseable {
         volatile ValidationRunLifecycle.Status observed;
         volatile ValidationControlStore.Status terminalKnown;
         java.time.Instant terminalKnownAt,readingStarted,readingFinished;
-        boolean reportSettled,retirementReleased;
+        boolean reportSettled,retirementReleased,expired;
         volatile ValidationReportMetadata.Failure reportFailure;
         final AtomicBoolean mirrorWaiting=new AtomicBoolean();
         volatile boolean mirrorReady;
@@ -114,10 +114,12 @@ final class NativeValidationRuns implements AutoCloseable {
                     }else{
                         if(execution instanceof ValidationJobExecution job){try{job.maintain();}catch(TapstateException cleanupUnknown){if(!lifecycle.status().retired()&&!owners.closed())throw cleanupUnknown;}}
                         owners.control(original.identity().owner().pipelineId(),()->{
-                            if(!lifecycle.status().retired()&&!reservation.originalOwnerAvailable()){
+                            if(!lifecycle.status().retired()&&(!reservation.originalOwnerAvailable()||observed.controlUnknown()&&observed.admitted())){
                                 var known=reservation.retainedTerminal(original);
                                 if(known.isPresent()){terminalKnown=known.orElseThrow();terminalKnownAt=clock.instant();lifecycle.knownRetirement(terminalKnown);}
+                                else if(reservation.expired(original)){expired=true;lifecycle.stop();}
                             }
+                            if(expired)return;
                             if(shared!=null&&!lifecycle.status().retired())shared.quota.reconcileLimit();
                             observed=lifecycle.advance();
                             if(observed.state()==ValidationRunState.RUNNING&&!sealed.get()&&delays!=null)applySavedDelay();
@@ -128,7 +130,8 @@ final class NativeValidationRuns implements AutoCloseable {
                 }catch(RuntimeException|Error failed){lifecycle.fail(failed);throw failed;}
                 finally{try{
                     lifecycle.observePhysicalDrain();observed=lifecycle.status();
-                    if(closed&&observed.drained()&&(owners.closed()||observed.retired()&&retirementReleased))disposeClosedContext();
+                    if(expired&&observed.drained())disposeExpiredOriginal();
+                    else if(closed&&observed.drained()&&(owners.closed()||observed.retired()&&retirementReleased))disposeClosedContext();
                     else if(!metadata&&observed.retired()&&observed.drained()&&retirementReleased)prepareMirror();
                 }finally{inFlight.set(false);}}
             };
@@ -146,6 +149,11 @@ final class NativeValidationRuns implements AutoCloseable {
         private void disposeClosedContext(){
             // This is local context disposal, never a new durable retirement or a completed mirror claim.
             var value=shared;if(value!=null){value.quota.ownerLost();value.members.remove(original.identity());releaseShared(value);}
+            reservation.releaseClosedContextMetadata();
+            if(execution instanceof ValidationJobExecution job)job.releaseFactories();runs.remove(original.identity(),this);
+        }
+        private void disposeExpiredOriginal(){
+            var value=shared;if(value!=null){value.quota.expired(original.identity());value.members.remove(original.identity());releaseShared(value);}
             reservation.releaseClosedContextMetadata();
             if(execution instanceof ValidationJobExecution job)job.releaseFactories();runs.remove(original.identity(),this);
         }

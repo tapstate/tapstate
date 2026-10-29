@@ -75,6 +75,40 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
             return call(session -> java.util.Optional.ofNullable(document(session, pipeline, task)).map(row -> MongoValidationTaskCodec.snapshot(row, owner.clusterId)));
         }
 
+        @Override public Page list(String pipeline,int offset,int limit){
+            identifier(pipeline);if(offset<0||offset>MAX_TASKS_PER_PIPELINE||limit<1||limit>20)throw taskLimit("validation.taskPage");
+            return call(session->{
+                var filter=new Document("_id.clusterId",owner.clusterId).append("_id.pipelineId",pipeline);var result=new java.util.ArrayList<Snapshot>();
+                try(var cursor=owner.tasks.find(session,filter).sort(new Document("_id.taskId",1)).skip(offset).limit(limit).iterator()){
+                    while(cursor.hasNext())result.add(MongoValidationTaskCodec.snapshot(cursor.next(),owner.clusterId));
+                }
+                long total=owner.tasks.countDocuments(session,filter);if(total>MAX_TASKS_PER_PIPELINE)throw taskLimit("validation.taskCount");
+                return new Page(result,total,offset,limit);
+            });
+        }
+        @Override public java.util.List<String> taskIds(String pipeline,String after,int limit){
+            identifier(pipeline);if(after!=null)identifier(after);if(limit<1||limit>20)throw taskLimit("validation.taskPage");
+            return call(session->{
+                var filter=new Document("_id.clusterId",owner.clusterId).append("_id.pipelineId",pipeline);
+                if(after!=null)filter.put("_id.taskId",new Document("$gt",after));var result=new java.util.ArrayList<String>();
+                for(var row:owner.tasks.find(session,filter).projection(new Document("_id.taskId",1)).sort(new Document("_id.taskId",1)).limit(limit)){
+                    var id=row.get("_id",Document.class).getString("taskId");identifier(id);result.add(id);
+                }
+                return java.util.List.copyOf(result);
+            });
+        }
+        @Override public java.util.List<String> pipelines(String after,int limit){
+            if(after!=null)identifier(after);if(limit<1||limit>64)throw taskLimit("validation.pipelinePage");
+            return call(session->{
+                var filter=new Document("_id.clusterId",owner.clusterId);if(after!=null)filter.put("_id.pipelineId",new Document("$gt",after));
+                var stages=java.util.List.of(new Document("$match",filter),new Document("$group",new Document("_id","$_id.pipelineId")),
+                        new Document("$sort",new Document("_id",1)),new Document("$limit",limit));
+                var result=new java.util.ArrayList<String>();
+                for(var row:owner.tasks.aggregate(session,stages)){var pipeline=row.getString("_id");identifier(pipeline);result.add(pipeline);}
+                return java.util.List.copyOf(result);
+            });
+        }
+
         @Override public java.util.Optional<Inputs> inputs(Task task, long revision) {
             Objects.requireNonNull(task); scope(task);
             if (revision < 1 || revision == Long.MAX_VALUE) throw unreadable("task-revision");

@@ -126,6 +126,15 @@ final class MongoValidationPreparations {
             var owner = owner(); var store = new MongoValidationAdmissionStore(owner.client, owner.database, owner.clusterId, owner.active, this);
             store.transaction(session -> { store.requireRunSnapshotInTransaction(session, start, snapshot); return null; });
         }
+        boolean closedWithoutReport(io.tapstate.spi.store.ValidationReportAdmission.Start start){
+            if(start==null||!pipelineId().equals(start.task().pipelineId())||!owner().clusterId.equals(start.task().clusterId()))throw fenced();
+            var owner=owner();var store=new MongoValidationAdmissionStore(owner.client,owner.database,owner.clusterId,owner.active,this);
+            return store.transaction(session->{
+                store.requireOriginalInTransaction(session,start,true);
+                return SystemCollections.VALIDATION_REPORTS.on(owner.database).find(session,new Document("_id",MongoValidationAdmissionStore.reportId(start.run())))
+                        .projection(new Document("_id",1)).first()==null;
+            });
+        }
         private void requireStart(io.tapstate.spi.store.ValidationReportAdmission.Start start, boolean closed, boolean born) {
             if (start == null || !pipelineId().equals(start.task().pipelineId()) || !owner().clusterId.equals(start.task().clusterId())) throw fenced();
             var owner = owner();
