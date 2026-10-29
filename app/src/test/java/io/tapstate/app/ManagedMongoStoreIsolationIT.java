@@ -272,7 +272,7 @@ class ManagedMongoStoreIsolationIT {
                 var committed = management.post().uri("/api/storage/setup/commit").body(Map.of("operationId", setup.scope().operationId(),
                         "generation", setup.scope().generation(), "candidate", candidate, "testStamps", stamps)).retrieve().body(Map.class);
                 assertThat(committed.get("setupPhase")).isEqualTo("COMPLETE");
-                assertThat(admin.getDatabase(configDb).getCollection("schema_migrations").find(new Document("_id", "config")).first().getInteger("installedVersion")).isEqualTo(2);
+                assertComposedConfiguration(admin.getDatabase(configDb), admin.getDatabase(cacheDb), null);
                 assertThat(admin.getDatabase(cacheDb).getCollection("schema_migrations").find(new Document("_id", "business")).first().getInteger("installedVersion")).isEqualTo(2);
                 assertThat(admin.getDatabase(cacheDb).listCollectionNames()).contains("validation_runs");
                 assertThat(process.publicClient().get().uri("/auth/storage-entry").retrieve().body(Map.class))
@@ -527,7 +527,7 @@ class ManagedMongoStoreIsolationIT {
                 var completed = management.post().uri("/api/storage/recovery/confirm").body(confirm).retrieve().body(Map.class);
                 assertThat(completed.get("phase")).isEqualTo("COMPLETE");
                 assertThat(files.stage().handoff()).isEqualTo(InstallationFiles.Handoff.RESTART_REQUIRED);
-                assertThat(admin.getDatabase(config).getCollection("schema_migrations").find(new Document("_id", "config")).first().getInteger("installedVersion")).isEqualTo(2);
+                assertComposedConfiguration(admin.getDatabase(config), admin.getDatabase(cache), (String) planned.get("operationId"));
                 assertThat(admin.getDatabase(cache).getCollection("schema_migrations").find(new Document("_id", "business")).first().getInteger("installedVersion")).isEqualTo(2);
                 assertThat(admin.getDatabase(cache).listCollectionNames()).contains("validation_runs");
                 assertThat(files.capability()).isEmpty();
@@ -1506,7 +1506,7 @@ class ManagedMongoStoreIsolationIT {
                     } finally { deliverGrant.countDown(); }
                 }
                 assertThat(configuration.setupStates().load().phase()).isEqualTo(StorageSetupStateStore.Phase.COMPLETE);
-                assertThat(admin.getDatabase(configDb).getCollection("schema_migrations").find(new Document("_id", "config")).first().getInteger("installedVersion")).isEqualTo(2);
+                assertComposedConfiguration(admin.getDatabase(configDb), admin.getDatabase(cacheDb), null);
                 assertThat(admin.getDatabase(cacheDb).getCollection("schema_migrations").find(new Document("_id", "business")).first().getInteger("installedVersion")).isEqualTo(2);
                 assertThat(admin.getDatabase(cacheDb).listCollectionNames()).contains("validation_runs");
                 assertThat(admin.getDatabase(cacheDb).getCollection("cloud_sessions").countDocuments()).isZero();
@@ -2695,4 +2695,24 @@ class ManagedMongoStoreIsolationIT {
         return "mongodb://" + user + ":" + password + "@" + MONGO.getHost() + ":" + MONGO.getMappedPort(27017)
                 + "/" + database + "?replicaSet=" + REPLICA_SET + "&directConnection=true&authSource=admin";
     }
+    private static void assertComposedConfiguration(MongoDatabase configuration, MongoDatabase cache, String operation) {
+        var schema = configuration.getCollection("schema_migrations").find(new Document("_id", "config")).first();
+        assertThat(schema.getInteger("installedVersion")).isEqualTo(3);
+        var marker = schema.get("validation", Document.class);
+        assertThat(marker).containsEntry("phase", "READY").containsEntry("initializedPipelines", 0L);
+        assertThat(UUID.fromString(marker.getString("operationId")).toString()).isEqualTo(marker.getString("operationId"));
+        if (operation != null) assertThat(marker.getString("operationId")).isEqualTo(operation);
+        var identity = cache.getCollection("cache_identity").find().first();
+        assertThat(marker.get("scope", Document.class)).containsExactlyInAnyOrderEntriesOf(
+                new Document("clusterId", identity.getString("clusterId"))
+                        .append("bindingVersion", identity.getLong("bindingVersion"))
+                        .append("cacheIncarnation", identity.getString("cacheIncarnation")));
+        assertThat(configuration.listCollectionNames()).contains("ai_provider_settings");
+        assertThat(configuration.getCollection("ai_provider_settings").listIndexes().into(new ArrayList<>()))
+                .singleElement().satisfies(index -> {
+                    assertThat(index).containsEntry("name", "_id_").containsEntry("key", new Document("_id", 1));
+                    assertThat(index).doesNotContainKey("expireAfterSeconds");
+                });
+    }
+
 }
