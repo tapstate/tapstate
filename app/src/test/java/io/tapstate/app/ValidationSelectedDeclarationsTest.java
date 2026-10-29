@@ -53,7 +53,7 @@ class ValidationSelectedDeclarationsTest {
     @Test void selectedBodiesAndExactDependencyClosureAreValidatedIndependentlyOfTheirInternalDescriptor(){
         var inputs=inputs("serve: { from: input.orders, sync: [{ id: out, source: target }] }",false);
         var changed=new HashMap<>(inputs.canonicalResources());changed.put("input",changed.get("input").replace("source-secret","changed-secret"));
-        var forged=new ValidationTaskStore.DeclarationInputs(inputs.selection(),inputs.configurationRevision(),inputs.dependencyHashes(),changed);
+        var forged=new ValidationTaskStore.DeclarationInputs(inputs.selection(),inputs.configurationRevision(),inputs.dependencyHashes(),changed,inputs.parentGeneration());
         assertThatThrownBy(()->ValidationSelectedDeclarations.inspect(forged,List.of(choice("orders"))))
                 .isInstanceOf(TapstateException.class).hasMessageContaining("validationInputs");
         assertThatThrownBy(()->ValidationSelectedDeclarations.inspect(inputs("serve: { from: input.orders, sync: [{ id: out, source: target }] }",true),List.of(choice("orders"))))
@@ -68,6 +68,6 @@ class ValidationSelectedDeclarationsTest {
         if(extra)resources.add(new SourceResource("unrelated",null,"fixture",Map.of("password","unrelated-secret"),null,null,null,null));
         var hashes=new TreeMap<String,String>();var canonical=new TreeMap<String,String>();
         for(var resource:resources){hashes.put(resource.id(),CanonicalHash.of(resource));canonical.put(resource.id(),new CanonicalWriter().write(resource));}
-        return new ValidationTaskStore.DeclarationInputs(new ValidationTaskStore.Selection("flow",List.of("out")),5,hashes,canonical);
+        return new ValidationTaskStore.DeclarationInputs(new ValidationTaskStore.Selection("flow",List.of("out")),5,hashes,canonical,UUID.randomUUID());
     }
 }

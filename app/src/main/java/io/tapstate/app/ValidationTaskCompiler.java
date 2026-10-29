@@ -54,7 +54,7 @@ final class ValidationTaskCompiler {
         long revision=previous==null?1:previous.mappingRevision();
         if(previous!=null&&!previous.mappings().equals(mappings)){if(revision>=Long.MAX_VALUE-1)throw invalid("mappingRevision");revision++;}
         var comparison=new ValidationTaskSpec(selected.original().selection().pipelineId(),selected.original().dependencyHashes(),revision,RULES_VERSION,mappings);
-        comparison.requireFor(method,ValidationMode.FULL);metadata.require();return new Compiled(comparison,fingerprint(comparison,method,metadata.mappings()),method);
+        comparison.requireFor(method,ValidationMode.FULL);metadata.require();return new Compiled(comparison,fingerprint(comparison,method,metadata.mappings(),selected.original().parentGeneration()),method);
     }
     private static ValidationTaskSpec.Table bind(ValidationTaskSpec.Table table,NativeValidationMetadata.Side observed){
         var metadata=Objects.requireNonNull(observed.model());if(!table.table().equals(metadata.model().name()))throw invalid("modelTable");
@@ -63,11 +63,12 @@ final class ValidationTaskCompiler {
     private static ValidationKeyBinding.Component component(ValidationKeyMetadata.Rules rules,String field,String mapping){
         var selected=rules.fields().get(field);if(selected==null)throw unsupported(mapping,field,rules.unavailable().getOrDefault(field,"key-field-missing"));return selected;
     }
-    static String fingerprint(ValidationTaskSpec comparison,ValidationMethod method,List<NativeValidationMetadata.Mapping> observed){
+    static String fingerprint(ValidationTaskSpec comparison,ValidationMethod method,List<NativeValidationMetadata.Mapping> observed){return fingerprint(comparison,method,observed,null);}
+    private static String fingerprint(ValidationTaskSpec comparison,ValidationMethod method,List<NativeValidationMetadata.Mapping> observed,UUID parent){
         try{
             var hash=MessageDigest.getInstance("SHA-256");
             try(var data=new DataOutputStream(new DigestOutputStream(OutputStream.nullOutputStream(),hash))){
-                text(data,"validation-evaluation-v1");text(data,comparison.fingerprint());text(data,method.name());
+                text(data,"validation-evaluation-v1");text(data,parent==null?"unbound-parent":parent.toString());text(data,comparison.fingerprint());text(data,method.name());
                 for(var mapping:observed){text(data,mapping.id());
                     for(var side:List.of(mapping.source(),mapping.target())){text(data,side.artifactHash());text(data,side.countOperation()==null?"ROWS":side.countOperation().name());}
                 }

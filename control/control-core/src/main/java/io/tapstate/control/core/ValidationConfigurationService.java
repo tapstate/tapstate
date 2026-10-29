@@ -34,7 +34,7 @@ public final class ValidationConfigurationService {
     }
     public record Schedule(String kind,String every,String unit,String anchor,String expression,String zoneId) {}
     public record Save(Input input,String fingerprint,String commandId,int historyLimit,Schedule schedule,boolean scheduleEnabled) {}
-    public record Saved(String outcome,String fingerprint) {}
+    public record Saved(String outcome,String fingerprint,String taskGeneration) {}
     public record SavedPair(List<String> source,List<String> target) {}
     public record Key(String confirmationId,List<SavedPair> fields) {}
     public record SavedMapping(String mappingId,String outputId,String sourceId,String sourceTable,String targetSourceId,String targetTable,Key keys) {}
@@ -58,17 +58,21 @@ public final class ValidationConfigurationService {
         if(command==null||command.input()==null||command.fingerprint()==null||!command.fingerprint().matches("[a-f0-9]{64}"))throw invalid("save");
         var checked=check(command.input());var id=uuid(command.commandId());
         return audit.dispatch(ControlOperations.VALIDATION_SAVE,new AuditContext(principal,checked.task.pipelineId()+"/"+checked.task.taskId()),()->{
-            var previous=previous(checked,id);var configured=schedule(command.schedule());
+            final ValidationTaskStore.Snapshot previous;try{previous=previous(checked,id);}catch(StaleDefinition stale){return new Saved("CONFLICT",null,null);}
+            var configured=schedule(command.schedule());
             if(configured!=null)schedules.preview(configured,clock.instant(),Math.max(1,checked.revision),ValidationSchedule.SearchBudget.DEFAULT);
             var settings=new ValidationTaskStore.Settings(new ValidationTaskStore.Full(checked.method,1,configured,command.scheduleEnabled(),command.historyLimit()),
                     previous==null?new ValidationTaskStore.Incremental(0,10):previous.settings().incremental());
             try(var evaluated=evaluations.evaluate(request(checked,previous))){
-                if(evaluated.comparison().isEmpty())return new Saved("PRECHECK_REQUIRED",null);
-                var view=evaluated.view();if(!command.fingerprint().equals(view.fingerprint()))return new Saved("CONFLICT",view.fingerprint());
+                if(evaluated.comparison().isEmpty())return new Saved("PRECHECK_REQUIRED",null,null);
+                var view=evaluated.view();if(!command.fingerprint().equals(view.fingerprint()))return new Saved("CONFLICT",view.fingerprint(),null);
                 evaluated.requireCurrent();
-                var result=checked.revision==0?tasks.create(new ValidationTaskStore.Create(checked.task,evaluated.comparison().orElseThrow(),settings,id))
-                        :tasks.update(new ValidationTaskStore.Update(checked.task,checked.revision,evaluated.comparison().orElseThrow(),settings,id));
-                return new Saved(result.name(),view.fingerprint());
+                if(checked.revision==0){
+                    var created=tasks.createFresh(new ValidationTaskStore.FreshCreate(checked.task.pipelineId(),checked.task.taskId(),evaluated.parentGeneration(),evaluated.comparison().orElseThrow(),settings,id));
+                    return new Saved(created.outcome().name(),view.fingerprint(),created.generation()==null?null:created.generation().toString());
+                }
+                var result=tasks.update(new ValidationTaskStore.Update(checked.task,checked.revision,evaluated.comparison().orElseThrow(),settings,id));
+                return new Saved(result.name(),view.fingerprint(),result==ValidationTaskStore.Write.APPLIED||result==ValidationTaskStore.Write.DUPLICATE?checked.task.generation().toString():null);
             }
         });
     }
@@ -89,7 +93,9 @@ public final class ValidationConfigurationService {
     private Checked check(Input input){
         if(input==null||input.mappings()==null||input.mappings().isEmpty()||input.mappings().size()>ValidationTaskSpec.MAX_MAPPINGS
                 ||input.confirmations()==null||input.confirmations().size()>ValidationTaskSpec.MAX_MAPPINGS)throw invalid("input");
-        name(input.pipelineId());name(input.taskId());var generation=uuid(input.taskGeneration());
+        name(input.pipelineId());name(input.taskId());long expected=number(input.expectedRevision(),true);
+        if(expected==0&&input.taskGeneration()!=null)uuid(input.taskGeneration());
+        var generation=expected==0?UUID.randomUUID():uuid(input.taskGeneration());
         ValidationMethod method;try{method=ValidationMethod.valueOf(input.method());}catch(IllegalArgumentException|NullPointerException bad){throw invalid("method");}
         var choices=input.mappings().stream().map(choice->{if(choice==null)throw invalid("mapping");
             return new ValidationEvaluation.Choice(choice.mappingId(),choice.outputId(),choice.sourceId(),choice.table());}).toList();
@@ -99,7 +105,7 @@ public final class ValidationConfigurationService {
             keys.put(mapping,new ValidationEvaluation.Confirmation(uuid(confirmation.id()),confirmation.fields().stream().map(pair->{
                 if(pair==null)throw invalid("pair");return new ValidationEvaluation.Pair(pair.source(),pair.target());}).toList()));
         });
-        return new Checked(new ValidationReportAdmission.Task(cluster,input.pipelineId(),input.taskId(),generation),number(input.expectedRevision(),true),method,choices,Map.copyOf(keys));
+        return new Checked(new ValidationReportAdmission.Task(cluster,input.pipelineId(),input.taskId(),generation),expected,method,choices,Map.copyOf(keys));
     }
     public static final class StaleDefinition extends TapstateException {
         private StaleDefinition(){super(ValidationError.INVALID_CONTRACT,Map.of("field","configuration.taskRevision"),null);}
@@ -107,10 +113,12 @@ public final class ValidationConfigurationService {
     private ValidationTaskStore.Snapshot previous(Checked checked){return previous(checked,null);}
     private ValidationTaskStore.Snapshot previous(Checked checked,UUID command){
         var current=tasks.read(checked.task.pipelineId(),checked.task.taskId()).orElse(null);
-        // A new create replay is left to the original store command/body deduplication.
-        if(current!=null&&(!current.task().equals(checked.task)||current.closed()||checked.revision!=0&&current.revision()!=checked.revision
-                    &&!(command!=null&&command.equals(current.commandId())&&current.revision()==checked.revision+1))
-                ||current==null&&checked.revision!=0)throw new StaleDefinition();
+        if(checked.revision==0){
+            if(current!=null&&(current.closed()||command==null||current.revision()!=1||!command.equals(current.commandId())))throw new StaleDefinition();
+            return current;
+        }
+        if(current==null||!current.task().equals(checked.task)||current.closed()||current.revision()!=checked.revision
+                &&!(command!=null&&command.equals(current.commandId())&&current.revision()==checked.revision+1))throw new StaleDefinition();
         return current;
     }
     private ValidationEvaluation.Request request(Checked checked,ValidationTaskStore.Snapshot previous){

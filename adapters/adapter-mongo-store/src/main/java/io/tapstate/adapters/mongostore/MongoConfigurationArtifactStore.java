@@ -211,7 +211,7 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
     }
 
     io.tapstate.spi.store.ValidationTaskStore.DeclarationInputs validationDeclarationsInTransaction(ClientSession session,
-            io.tapstate.spi.store.ValidationTaskStore.Selection selection,long configurationRevision){
+            io.tapstate.spi.store.ValidationTaskStore.Selection selection,long configurationRevision,java.util.UUID parentGeneration){
         var hashes=new LinkedHashMap<String,String>();var canonical=new LinkedHashMap<String,String>();
         var known=new LinkedHashMap<String,Resource>();var parser=new io.tapstate.core.dsl.DslParser();
         var snapshot=new java.util.AbstractMap<String,Resource>(){
@@ -241,7 +241,7 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
             traversal+=inspection.accountedMetadataBytes();required.addAll(inspection.requiredResourceIds());
         }
         hashes.keySet().retainAll(required);canonical.keySet().retainAll(required);
-        return new io.tapstate.spi.store.ValidationTaskStore.DeclarationInputs(selection,configurationRevision,hashes,canonical);
+        return new io.tapstate.spi.store.ValidationTaskStore.DeclarationInputs(selection,configurationRevision,hashes,canonical,parentGeneration);
     }
 
     private static TapstateException validationInputLimit() {

@@ -112,9 +112,9 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         @Override public DeclarationInputs declarations(Selection selection){
             Objects.requireNonNull(selection);
             return call(session->{
-                MongoValidationPreparations.requireTaskAuthoringParent(session,owner.database,owner.clusterId,selection.pipelineId());
+                var parent=MongoValidationPreparations.taskParentGeneration(session,owner.database,owner.clusterId,selection.pipelineId());
                 long current=ConfigurationVersion.read(session,SystemCollections.CONFIGURATION_VERSION.on(owner.database));
-                return artifacts.validationDeclarationsInTransaction(session,selection,current);
+                return artifacts.validationDeclarationsInTransaction(session,selection,current,parent);
             });
         }
 
@@ -148,6 +148,27 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
                 ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(owner.database));
                 capacity(session, command.task().pipelineId(), null, row);
                 owner.tasks.insertOne(session, row); return Write.APPLIED;
+            });
+        }
+
+        @Override public Created createFresh(FreshCreate command){
+            Objects.requireNonNull(command);var candidate=java.util.UUID.randomUUID();
+            var task=new Task(owner.clusterId,command.pipelineId(),command.taskId(),candidate);
+            return call(session->{
+                var parent=MongoValidationPreparations.taskParentGeneration(session,owner.database,owner.clusterId,command.pipelineId());
+                if(!parent.equals(command.parentGeneration()))return new Created(Write.CONFLICT,null);
+                var existing=document(session,command.pipelineId(),command.taskId());
+                if(existing!=null){
+                    var current=MongoValidationTaskCodec.snapshot(existing,owner.clusterId);
+                    if(current.closed())return new Created(Write.CLOSED,null);
+                    return current.revision()==1&&current.commandId().equals(command.commandId())&&same(current,command.comparison(),command.settings())
+                            ?new Created(Write.DUPLICATE,current.task().generation()):new Created(Write.CONFLICT,null);
+                }
+                if(!currentResources(session,command.comparison()))return new Created(Write.CONFLICT,null);
+                if(!MongoValidationPreparations.taskParentGeneration(session,owner.database,owner.clusterId,command.pipelineId(),true).equals(parent))throw MongoValidationPreparations.fenced();
+                var row=MongoValidationTaskCodec.initial(new Create(task,command.comparison(),command.settings(),command.commandId()));
+                ConfigurationVersion.advance(session,SystemCollections.CONFIGURATION_VERSION.on(owner.database));capacity(session,task.pipelineId(),null,row);
+                owner.tasks.insertOne(session,row);return new Created(Write.APPLIED,candidate);
             });
         }
 

@@ -174,14 +174,15 @@ class NativeValidationMetadataIT {
                     });assertThat(f.resources.snapshot().metadataFrames()).isOne();
                 }
                 var save=new io.tapstate.control.core.ValidationConfigurationService.Save(input,fingerprint,command,10,null,false);
-                assertThat(service.save("alice",save).outcome()).isEqualTo("APPLIED");assertThat(service.save("alice",save).outcome()).isEqualTo("DUPLICATE");
+                var created=service.save("alice",save);assertThat(created.outcome()).isEqualTo("APPLIED");assertThat(created.taskGeneration()).isNotEqualTo(generation);
+                var replay=service.save("alice",save);assertThat(replay.outcome()).isEqualTo("DUPLICATE");assertThat(replay.taskGeneration()).isEqualTo(created.taskGeneration());
                 var firstStored=service.read("flow","api-count").orElseThrow();assertThat(firstStored.revision()).isEqualTo("1");
-                var updateInput=new io.tapstate.control.core.ValidationConfigurationService.Input("flow","api-count",generation,"1","COUNT",input.mappings(),Map.of());
+                var updateInput=new io.tapstate.control.core.ValidationConfigurationService.Input("flow","api-count",created.taskGeneration(),"1","COUNT",input.mappings(),Map.of());
                 var update=new io.tapstate.control.core.ValidationConfigurationService.Save(updateInput,fingerprint,UUID.randomUUID().toString(),8,null,false);
                 assertThat(service.save("alice",update).outcome()).isEqualTo("APPLIED");
                 assertThat(service.save("alice",update).outcome()).isEqualTo("DUPLICATE");
                 var stored=service.read("flow","api-count").orElseThrow();assertThat(stored.revision()).isEqualTo("2");assertThat(stored.nextStartSequence()).isEqualTo("1");
-                assertThat(stored.taskGeneration()).isEqualTo(generation);assertThat(stored.mappings().getFirst().keys()).isNull();
+                assertThat(stored.taskGeneration()).isEqualTo(created.taskGeneration());assertThat(stored.mappings().getFirst().keys()).isNull();
                 var existing=(SourceResource)f.configuration.artifacts().get("input").orElseThrow();
                 var config=new HashMap<>(existing.config());config.put("configurationMarker","changed");
                 f.configuration.artifacts().replace("input",CanonicalHash.of(existing),new SourceResource(existing.id(),existing.metadata(),existing.connector(),config,existing.mode(),existing.tables(),existing.srs(),existing.execution(),existing.experimental()));

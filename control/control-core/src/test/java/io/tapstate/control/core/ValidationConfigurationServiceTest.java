@@ -22,6 +22,10 @@ class ValidationConfigurationServiceTest {
         Snapshot current;int creates,updates;
         @Override public Optional<Snapshot> read(String pipeline,String task){return Optional.ofNullable(current);}
         @Override public Write create(Create command){creates++;return Write.APPLIED;}
+        @Override public Created createFresh(FreshCreate command){
+            var generation=UUID.randomUUID();var outcome=create(new Create(new ValidationReportAdmission.Task("cluster",command.pipelineId(),command.taskId(),generation),command.comparison(),command.settings(),command.commandId()));
+            return new Created(outcome,generation);
+        }
         @Override public Write update(Update command){updates++;return Write.APPLIED;}
         @Override public ValidationReportAdmission.Closure close(ValidationReportAdmission.Task task){throw new AssertionError("close not called");}
     }
@@ -33,6 +37,7 @@ class ValidationConfigurationServiceTest {
             return new ValidationEvaluation(){
                 @Override public View view(){requireCurrent();return new View("COUNT","9007199254740993","1",fingerprint,List.of(),"INITIAL_SYNC_FINISHED_AND_BOTH_SIDES_STABLE","READ_OBSERVATIONS_NO_COMMON_TIME_SNAPSHOT",null);}
                 @Override public Optional<ValidationTaskSpec> comparison(){requireCurrent();return Optional.of(spec);}
+                @Override public UUID parentGeneration(){requireCurrent();return UUID.fromString("00000000-0000-0000-0000-000000000001");}
                 @Override public void requireCurrent(){assertThat(active).isTrue();}
                 @Override public void close(){active=false;closes++;}
             };
@@ -68,6 +73,13 @@ class ValidationConfigurationServiceTest {
         var probe=new Probe();var service=service(store,probe,ignored->{});
         assertThat(service.save("alice",new ValidationConfigurationService.Save(input("0"),probe.fingerprint,UUID.randomUUID().toString(),10,null,false)).outcome()).isEqualTo("APPLIED");
         assertThat(store.creates).isOne();assertThat(probe.calls).isOne();assertThat(probe.active).isFalse();
+    }
+    @Test void aNewClientCannotChooseTheStoredTaskLifetime(){
+        var chosen=new java.util.concurrent.atomic.AtomicReference<UUID>();
+        var store=new Store(){@Override public Write create(Create command){chosen.set(command.task().generation());return super.create(command);}};
+        var probe=new Probe();var service=service(store,probe,ignored->{});
+        service.save("alice",new ValidationConfigurationService.Save(input("0"),probe.fingerprint,UUID.randomUUID().toString(),10,null,false));
+        assertThat(chosen.get()).isNotNull().isNotEqualTo(GENERATION);
     }
     @Test void malformedScheduleInputsAreCodedRefusals(){
         var probe=new Probe();var store=new Store();var service=service(store,probe,ignored->{});

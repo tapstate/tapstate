@@ -36,6 +36,15 @@ public interface ValidationTaskStore {
     record Create(ValidationReportAdmission.Task task, ValidationTaskSpec comparison, Settings settings, UUID commandId) {
         public Create { definition(task, comparison, settings); Objects.requireNonNull(commandId); }
     }
+    record FreshCreate(String pipelineId,String taskId,UUID parentGeneration,ValidationTaskSpec comparison,Settings settings,UUID commandId){
+        public FreshCreate{
+            selectionId(pipelineId,"task.pipeline");selectionId(taskId,"task.id");Objects.requireNonNull(parentGeneration);Objects.requireNonNull(comparison);Objects.requireNonNull(settings);Objects.requireNonNull(commandId);
+            if(!pipelineId.equals(comparison.pipelineId()))throw invalid("task.pipeline");comparison.requireFor(settings.full().method(),ValidationMode.FULL);
+        }
+    }
+    record Created(Write outcome,UUID generation){
+        public Created{Objects.requireNonNull(outcome);if((outcome==Write.APPLIED||outcome==Write.DUPLICATE)!=(generation!=null))throw invalid("task.createdIdentity");}
+    }
     record Update(ValidationReportAdmission.Task task, long expectedRevision, ValidationTaskSpec comparison, Settings settings, UUID commandId) {
         public Update {
             definition(task, comparison, settings); Objects.requireNonNull(commandId);
@@ -107,10 +116,10 @@ public interface ValidationTaskStore {
     }
     /** Selected CONFIG closure, owned under the caller's metadata frame; never serialize its secret-bearing bodies. */
     final class DeclarationInputs {
-        private final Selection selection;private final long configurationRevision;
+        private final Selection selection;private final long configurationRevision;private final UUID parentGeneration;
         private final Map<String,String> hashes,canonical;
-        public DeclarationInputs(Selection selection,long configurationRevision,Map<String,String> hashes,Map<String,String> canonical){
-            this.selection=Objects.requireNonNull(selection);Objects.requireNonNull(hashes);Objects.requireNonNull(canonical);
+        public DeclarationInputs(Selection selection,long configurationRevision,Map<String,String> hashes,Map<String,String> canonical,UUID parentGeneration){
+            this.selection=Objects.requireNonNull(selection);this.parentGeneration=Objects.requireNonNull(parentGeneration);Objects.requireNonNull(hashes);Objects.requireNonNull(canonical);
             if(configurationRevision<0||configurationRevision==Long.MAX_VALUE||hashes.isEmpty()||hashes.size()>1024
                     ||!hashes.containsKey(selection.pipelineId())||!hashes.keySet().equals(canonical.keySet()))throw invalid("selection.inputs");
             long characters=0;
@@ -123,6 +132,7 @@ public interface ValidationTaskStore {
             this.configurationRevision=configurationRevision;this.hashes=Map.copyOf(hashes);this.canonical=Map.copyOf(canonical);
         }
         public Selection selection(){return selection;}
+        public UUID parentGeneration(){return parentGeneration;}
         public long configurationRevision(){return configurationRevision;}
         public Map<String,String> dependencyHashes(){return hashes;}
         public Map<String,String> canonicalResources(){return canonical;}
@@ -146,6 +156,8 @@ public interface ValidationTaskStore {
     default Optional<Inputs> inputs(ValidationReportAdmission.Task task, long revision) { throw invalid("task.inputsUnsupported"); }
     /** Explicit first create; a conflicting task lifetime is never overwritten. Replay uses the same command and body. */
     Write create(Create command);
+    /** Public authoring chooses no task lifetime; the store assigns it under the exact existing parent lifetime. */
+    default Created createFresh(FreshCreate command){throw invalid("task.freshCreateUnsupported");}
     /** Exact task lifetime/revision CAS. Existing start sequences and permissions remain unchanged. */
     Write update(Update command);
     /** CONFIG only: blocks new starts and seals original permissions/reports; CACHE termination remains separate. */

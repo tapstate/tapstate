@@ -42,6 +42,7 @@ final class NativeValidationEvaluation implements ValidationEvaluationProbe {
         private Evaluated(NativeValidationMetadata.Scope scope,View view,ValidationTaskSpec comparison){this.scope=scope;this.retained=view;this.comparison=comparison;}
         @Override public View view(){requireCurrent();return retained;}
         @Override public Optional<ValidationTaskSpec> comparison(){requireCurrent();return Optional.ofNullable(comparison);}
+        @Override public UUID parentGeneration(){requireCurrent();return scope.declarations().original().parentGeneration();}
         @Override public void requireCurrent(){scope.require();}
         @Override public void close(){retained=null;comparison=null;scope.close();}
     }

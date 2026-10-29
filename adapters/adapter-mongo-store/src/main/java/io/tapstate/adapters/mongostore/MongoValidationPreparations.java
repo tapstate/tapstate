@@ -238,6 +238,20 @@ final class MongoValidationPreparations {
         decode(row.get("validationPreparation", Document.class), cluster, pipeline);
     }
 
+    static UUID taskParentGeneration(com.mongodb.client.ClientSession session,MongoDatabase database,String cluster,String pipeline){return taskParentGeneration(session,database,cluster,pipeline,false);}
+    static UUID taskParentGeneration(com.mongodb.client.ClientSession session,MongoDatabase database,String cluster,String pipeline,boolean fence){
+        requireTaskAuthoringParent(session,database,cluster,pipeline);
+        var row=SystemCollections.OPERATOR_GENERATIONS.on(database).find(session,new Document("_id",pipeline)).first();
+        var current=decode(row.get("validationPreparation",Document.class),cluster,pipeline);
+        if(current.phase()==Phase.CLOSED||current.closingOperationId()!=null)throw fenced();
+        if(fence){
+            var next=current.change(current.phase(),current.subject(),null,current.previous());
+            var exact=new Document("_id",pipeline).append("validationPreparation",row.get("validationPreparation",Document.class));
+            if(SystemCollections.OPERATOR_GENERATIONS.on(database).updateOne(session,exact,new Document("$set",new Document("validationPreparation",encode(next)))).getMatchedCount()!=1)throw fenced();
+        }
+        return current.generation();
+    }
+
     static void beginCacheReplacement(com.mongodb.client.ClientSession session, MongoDatabase database, String cluster,
             Document original, Document replacement, io.tapstate.spi.store.StorageRecoveryCommands.Plan running) {
         if (!validationEnabled(session, database, cluster)) return;

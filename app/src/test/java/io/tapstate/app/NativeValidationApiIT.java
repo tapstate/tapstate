@@ -82,7 +82,7 @@ class NativeValidationApiIT {
                     assertThat(http.post().uri("/api/validation:save").header("Authorization","Bearer "+write).contentType(MediaType.APPLICATION_JSON).body(invalid)
                             .<Integer>exchange((request,httpResponse)->httpResponse.getStatusCode().value())).isEqualTo(400);
                 }
-                var stale=new HashMap<String,Object>(input);stale.put("expectedRevision","2");
+                var stale=new HashMap<String,Object>(input);stale.put("taskGeneration",read.get("taskGeneration"));stale.put("expectedRevision","2");
                 assertThat(http.post().uri("/api/validation:evaluate").header("Authorization","Bearer "+write).contentType(MediaType.APPLICATION_JSON).body(stale)
                         .<Integer>exchange((request,httpResponse)->httpResponse.getStatusCode().value())).isEqualTo(409);
                 for(var malformed:List.of("{\"pipelineId\":\"first\",\"pipelineId\":\"second\"}"," ".repeat(256*1024+1))){
@@ -97,7 +97,7 @@ class NativeValidationApiIT {
                 assertThat(preview).containsEntry("inputRevision","9007199254740993");assertThat((List<?>)preview.get("occurrences")).hasSize(5);
                 org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(2)).untilAsserted(()->assertThat(child.getBean(ValidationMemberResources.Member.class).snapshot().metadataFrames()).isZero());
                 assertThat(child.getBean(com.hazelcast.core.HazelcastInstance.class).getJet().getJobs()).isEmpty();
-                var operation=Map.of("context",evaluated.get("context"),"pipeline","validation_flow","task","validation_task","taskGeneration",input.get("taskGeneration"),
+                var operation=Map.of("context",evaluated.get("context"),"pipeline","validation_flow","task","validation_task","taskGeneration",read.get("taskGeneration"),
                         "revision","1","sequence","1","command",UUID.randomUUID().toString());
                 assertThat(http.post().uri("/api/validation:start").header("Authorization","Bearer "+token).contentType(MediaType.APPLICATION_JSON).body(operation)
                         .<Integer>exchange((request,httpResponse)->httpResponse.getStatusCode().value())).isEqualTo(403);
@@ -143,9 +143,9 @@ class NativeValidationApiIT {
                     selected.put("method",method);selected.put("confirmations",confirmed);
                     var checked=http.post().uri("/api/validation:evaluate").header("Authorization","Bearer "+write).contentType(MediaType.APPLICATION_JSON).body(selected).retrieve().body(Map.class);
                     var saveSelected=Map.of("input",selected,"fingerprint",checked.get("fingerprint"),"commandId",UUID.randomUUID().toString(),"historyLimit",10,"scheduleEnabled",false);
-                    assertThat(http.post().uri("/api/validation:save").header("Authorization","Bearer "+write).contentType(MediaType.APPLICATION_JSON).body(saveSelected).retrieve().body(Map.class))
-                            .containsEntry("outcome","APPLIED");
-                    var original=Map.of("context",checked.get("context"),"pipeline","validation_flow","task",task,"taskGeneration",selected.get("taskGeneration"),
+                    var serverSaved=http.post().uri("/api/validation:save").header("Authorization","Bearer "+write).contentType(MediaType.APPLICATION_JSON).body(saveSelected).retrieve().body(Map.class);
+                    assertThat(serverSaved).containsEntry("outcome","APPLIED");assertThat(serverSaved.get("taskGeneration")).isNotEqualTo(selected.get("taskGeneration"));
+                    var original=Map.of("context",checked.get("context"),"pipeline","validation_flow","task",task,"taskGeneration",serverSaved.get("taskGeneration"),
                             "revision","1","sequence","1","command",UUID.randomUUID().toString());
                     var complete=runAndReport(http,write,token,original,task);
                     assertThat(complete).containsEntry("method",method).containsEntry("result","COMPLETE_NO_ISSUES_OBSERVED");

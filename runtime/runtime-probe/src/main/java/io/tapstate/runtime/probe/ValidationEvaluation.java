@@ -51,6 +51,7 @@ public abstract class ValidationEvaluation implements AutoCloseable {
     public abstract View view();
     /** Available only after every non-count mapping has explicit, independently checked key confirmation. */
     public abstract Optional<ValidationTaskSpec> comparison();
+    public abstract UUID parentGeneration();
     public abstract void requireCurrent();
     @Override public abstract void close();
     private static void name(String value){if(value==null||value.isBlank())throw invalid("identity");ValidationError.fieldName(value,"evaluation.identity");}
