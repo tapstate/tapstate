@@ -58,6 +58,10 @@ public interface ValidationReports {
             if(!known.retired()||!known.state().terminal()||known.run().admission()==null||known.run().snapshot()==null)
                 throw invalid("report.terminalMirror");}
     }
+    /** Original in-progress observation facts; this carries no terminal claim or publication reopening. */
+    record Observation(ValidationResultStore.Report report,ValidationReportMetadata.Window window,ValidationReportMetadata.Failure failure){
+        public Observation{Objects.requireNonNull(report);}
+    }
     enum Mirror { APPLIED,DUPLICATE,CLOSED_OR_EXPIRED }
     /** Known immutable CACHE terminal copies occupy the same pool while their CONFIG mirror is pending. */
     record Retention(ValidationReportAdmission.Task task,ValidationMode mode,int keep,List<ValidationControlStore.Status> pending){
@@ -75,6 +79,7 @@ public interface ValidationReports {
     Page<RootSummary> roots(Reference reference,Paging page);
     Optional<RootDetail> root(Reference reference,String rootHash);
     Mirror mirror(TerminalMirror command);
+    Mirror observe(Observation command);
     Cleanup retain(Retention command);
 
     private static io.tapstate.core.common.TapstateException invalid(String field){return new io.tapstate.core.common.TapstateException(

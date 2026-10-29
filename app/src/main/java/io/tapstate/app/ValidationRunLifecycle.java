@@ -45,6 +45,8 @@ final class ValidationRunLifecycle {
         void sealPublication();
         /** Known CFG refusal/closure and CACHE retirement/closed-start fencing; no physical drain claim. */
         void retired(ValidationRunState terminal);
+        /** Called on admitted control I/O before original CONFIG closure, never on the stop/deadline path. */
+        default void beforeClosure(){}
         void processorsExited();
         /** Actual reader/row/task ownership has ended. Idempotent; no cancellation-as-drain. */
         void drained();
@@ -79,6 +81,8 @@ final class ValidationRunLifecycle {
     /** Deadline/owner-loss safe: local fences and cancellation signal do not perform durable I/O. */
     void stop() { stopping.set(true); local.sealPublication(); var current = execution; if (current != null) current.cancel(); }
     void fail(Throwable reported) { failure.record(Objects.requireNonNull(reported)); stop(); }
+
+    synchronized Throwable executionFailure(){return failure.get();}
 
     synchronized Status status() { return new Status(state, joined, waiting, unknown, retired, drained, failure.get() != null ? failure.get() : controlFailure); }
 
@@ -173,6 +177,7 @@ final class ValidationRunLifecycle {
     private void finish() {
         waiting = false; local.sealPublication();
         if (admissionRejected) { state = ValidationRunState.FAILED; retired = true; return; }
+        local.beforeClosure();
         if (joinRejected) {
             if (admissions.close(original.admission()) == ValidationReportAdmission.Closure.STALE) throw invalid("run.originalClosure");
             var terminal = failure.get() == null ? ValidationRunState.STOPPED : ValidationRunState.FAILED;
@@ -221,8 +226,15 @@ final class ValidationRunLifecycle {
     private void observeDrain() {
         if ((!retired && !stopping.get()) || drained) return;
         var progress = execution == null ? new Progress(false, true, true, null) : execution.progress();
+        if(progress.failure()!=null)failure.record(progress.failure());
         if (!processorReceipt && progress.processorsExited()) { local.processorsExited(); processorReceipt = true; }
         if (processorReceipt && progress.readersReleased()) { local.drained(); drained = true; }
+    }
+    /** Passive reconciliation under a current trusted fence. This never creates or resumes execution. */
+    synchronized void knownRetirement(ValidationControlStore.Status known){
+        Objects.requireNonNull(known);
+        if(!known.retired()||!known.run().equals(original)||retired&&known.state()!=state)throw invalid("run.originalTerminalReceipt");
+        stop();state=known.state();terminalChoice=state;pendingTransition=null;retired=true;waiting=false;unknown=false;
     }
     /** Passive physical facts remain observable after failed/unknown control IO or owner loss. */
     synchronized void observePhysicalDrain(){observeDrain();}

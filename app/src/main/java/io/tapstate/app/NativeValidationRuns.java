@@ -18,10 +18,17 @@ final class NativeValidationRuns implements AutoCloseable {
     private final ScheduledFuture<?> polling;
     private final AtomicInteger rotation=new AtomicInteger();
     private volatile boolean closed;
+    private final java.time.Clock clock;
+    private final io.tapstate.core.logging.SecretRedactor redactor;
     NativeValidationRuns(NativeValidationOwnerReservations owners,ValidationMemberResources.Member resources,
             ValidationMemberResources process,ValidationOwnerTimers timers) {
+        this(owners,resources,process,timers,java.time.Clock.systemUTC(),new io.tapstate.core.logging.SecretRedactor());
+    }
+    NativeValidationRuns(NativeValidationOwnerReservations owners,ValidationMemberResources.Member resources,
+            ValidationMemberResources process,ValidationOwnerTimers timers,java.time.Clock clock,io.tapstate.core.logging.SecretRedactor redactor){
+        this.clock=Objects.requireNonNull(clock);this.redactor=Objects.requireNonNull(redactor);
         this.owners=Objects.requireNonNull(owners);this.resources=Objects.requireNonNull(resources);this.process=Objects.requireNonNull(process);
-        polling=timers.deadlines.scheduleWithFixedDelay(this::tick,10,100,TimeUnit.MILLISECONDS);
+        polling=process.controlTicks(this::tick);
     }
     ValidationRunLifecycle.Status start(ValidationReportAdmission.Start original,ValidationRunLifecycle.Activation activation) {
         if(closed)throw invalid("runs.contextClosed");
@@ -32,11 +39,13 @@ final class NativeValidationRuns implements AutoCloseable {
         synchronized(runs) {
             if(closed)throw invalid("runs.contextClosed");existing=runs.get(original.run());
             if(existing!=null)return existing.observed;if(runs.size()==128)throw capacity();
-            reservation.activate(candidate.lifecycle::stop);runs.put(original.run(),candidate);
+            reservation.activate(candidate.lifecycle::stop);reservation.retainReportMetadata();runs.put(original.run(),candidate);
         }
         var admitted=candidate.observed;candidate.dispatch();return admitted;
     }
     ValidationRunLifecycle.Status read(ValidationRunIdentity original) {var run=runs.get(original);if(run==null)throw invalid("runs.originalUnavailable");return run.observed;}
+    boolean controlIdle(ValidationRunIdentity original){var actor=runs.get(original);return actor==null||!actor.inFlight.get();}
+    Optional<ValidationReportMetadata.Failure> reportFailure(ValidationRunIdentity original){var actor=runs.get(original);return actor==null?Optional.empty():Optional.ofNullable(actor.reportFailure);}
     void stop(ValidationRunIdentity original) {var run=runs.get(original);if(run==null)throw invalid("runs.originalUnavailable");run.lifecycle.stop();run.dispatch();}
     private void tick(){var ordered=List.copyOf(runs.values());if(ordered.isEmpty()){if(closed)polling.cancel(false);return;}int offset=Math.floorMod(rotation.getAndIncrement(),ordered.size());for(int index=0;index<ordered.size();index++)ordered.get((offset+index)%ordered.size()).dispatch();}
     private Shared shared(Actor actor) {
@@ -61,15 +70,26 @@ final class NativeValidationRuns implements AutoCloseable {
         io.tapstate.runtime.engine.validation.ValidationDelayController delays;
         ValidationControlStore.Delay confirmedDelay;
         volatile ValidationRunLifecycle.Status observed;
+        volatile ValidationControlStore.Status terminalKnown;
+        java.time.Instant terminalKnownAt,readingStarted,readingFinished;
+        boolean reportSettled,retirementReleased;
+        volatile ValidationReportMetadata.Failure reportFailure;
+        final AtomicBoolean mirrorWaiting=new AtomicBoolean();
+        volatile boolean mirrorReady;
+        final ValidationReports reports;
+        final io.tapstate.core.logging.SecretRedactor reportRedactor;
         Actor(ValidationControlStore.Run original,NativeValidationOwnerReservations.Reservation reservation,ValidationRunLifecycle.Activation activation) {
             this.original=original;this.reservation=reservation;allocation=reservation.resources();control=allocation.controlExecutor();
+            reports=reservation.access().reports();var secrets=new ArrayList<String>();var sources=new ArrayList<String>();
+            for(var resource:reservation.declarations.artifacts().list())if(resource instanceof io.tapstate.core.model.SourceResource source){sources.add(source.id());secretScalars(source.config(),secrets);}
+            reportRedactor=redactor.fork(sources);reportRedactor.replace("original-inputs",secrets);
             var factory=new ValidationRunLifecycle.Activation(){
                 public ValidationRunLifecycle.Readiness readiness(){var nativeReady=reservation.readiness();return nativeReady==ValidationRunLifecycle.Readiness.READY?activation.readiness():nativeReady;}
                 public ValidationRunLifecycle.Readiness prepare(){
                     var ready=reservation.readiness();if(ready!=ValidationRunLifecycle.Readiness.READY)return ready;
                     ready=activation.prepare();return ready==ValidationRunLifecycle.Readiness.READY?reservation.beginExecution():ready;
                 }
-                public ValidationRunLifecycle.Execution create(){var created=activation.create();execution=created;return created;}
+                public ValidationRunLifecycle.Execution create(){readingStarted=clock.instant();var created=activation.create();execution=created;return created;}
                 public void prepared(ValidationRunLifecycle.Execution created){
                     activation.prepared(created);
                     if(original.identity().mode()==ValidationMode.INCREMENTAL){
@@ -83,27 +103,78 @@ final class NativeValidationRuns implements AutoCloseable {
             observed=lifecycle.status();
         }
         void dispatch() {
+            if(mirrorWaiting.get()&&!mirrorReady)return;
             if(!inFlight.compareAndSet(false,true))return;
+            boolean metadata=mirrorReady;
             Runnable action=()->{
                 try {
-                    owners.control(original.identity().owner().pipelineId(),()->{
-                    if(shared!=null)shared.quota.reconcileLimit();
-                    if(execution instanceof ValidationJobExecution job)job.maintain();
-                    var state=lifecycle.advance();
-                    observed=state;
-                    if(state.state()==ValidationRunState.RUNNING&&!sealed.get()&&delays!=null)applySavedDelay();
-                    if(state.retired()&&state.drained()) {
-                        if(execution instanceof ValidationJobExecution job)job.releaseFactories();
-                        runs.remove(original.identity(),this);
+                    if(metadata){
+                        mirror(lifecycle.status());reportFailure=null;
+                        if(reportSettled)runs.remove(original.identity(),this);
+                    }else{
+                        if(execution instanceof ValidationJobExecution job){try{job.maintain();}catch(TapstateException cleanupUnknown){if(!lifecycle.status().retired()&&!owners.closed())throw cleanupUnknown;}}
+                        owners.control(original.identity().owner().pipelineId(),()->{
+                            if(!lifecycle.status().retired()&&!reservation.originalOwnerAvailable()){
+                                var known=reservation.retainedTerminal(original);
+                                if(known.isPresent()){terminalKnown=known.orElseThrow();terminalKnownAt=clock.instant();lifecycle.knownRetirement(terminalKnown);}
+                            }
+                            if(shared!=null&&!lifecycle.status().retired())shared.quota.reconcileLimit();
+                            observed=lifecycle.advance();
+                            if(observed.state()==ValidationRunState.RUNNING&&!sealed.get()&&delays!=null)applySavedDelay();
+                        });
                     }
-                    });
-                } catch(TapstateException unresolved) { /* Original operation and actual reservations remain retained. */ }
-                catch(RuntimeException|Error failed){lifecycle.fail(failed);throw failed;}
-                finally{try{lifecycle.observePhysicalDrain();observed=lifecycle.status();}finally{inFlight.set(false);}}
+                }catch(TapstateException unresolved){
+                    if(metadata)reportFailure=NativeValidationReportFailure.capture(unresolved,reportRedactor);
+                }catch(RuntimeException|Error failed){lifecycle.fail(failed);throw failed;}
+                finally{try{
+                    lifecycle.observePhysicalDrain();observed=lifecycle.status();
+                    if(closed&&observed.drained()&&(owners.closed()||observed.retired()&&retirementReleased))disposeClosedContext();
+                    else if(!metadata&&observed.retired()&&observed.drained()&&retirementReleased)prepareMirror();
+                }finally{inFlight.set(false);}}
             };
-            if(closed||control.isShutdown())process.cleanup(action).whenComplete((ignored,failed)->{if(failed!=null)inFlight.set(false);});
+            if(metadata||closed||control.isShutdown())process.cleanup(action).whenComplete((ignored,failed)->{if(failed!=null)inFlight.set(false);});
             else try{control.execute(action);}catch(RejectedExecutionException|TapstateException unavailable){inFlight.set(false);}
         }
+        private void prepareMirror(){
+            if(readingStarted!=null&&readingFinished==null){var finished=clock.instant();if(!finished.isBefore(readingStarted))readingFinished=finished;}
+            if(execution instanceof ValidationJobExecution job)job.releaseFactories();
+            if(mirrorWaiting.compareAndSet(false,true))allocation.allReleased().whenComplete((ignored,failed)->{
+                if(failed==null){mirrorReady=true;dispatch();}
+                else reportFailure=NativeValidationReportFailure.capture(failed,reportRedactor);
+            });
+        }
+        private void disposeClosedContext(){
+            // This is local context disposal, never a new durable retirement or a completed mirror claim.
+            var value=shared;if(value!=null){value.quota.ownerLost();value.members.remove(original.identity());releaseShared(value);}
+            reservation.releaseClosedContextMetadata();
+            if(execution instanceof ValidationJobExecution job)job.releaseFactories();runs.remove(original.identity(),this);
+        }
+        private void mirror(ValidationRunLifecycle.Status state){
+            var start=original.admission();
+            var reference=new ValidationReports.Reference(start.task().pipelineId(),start.task().taskId(),original.identity().mode(),original.identity().runId(),start.task().generation(),start.sequence());
+            if(reports.find(reference).isEmpty()){settleReport();return;}
+            if(terminalKnown==null){
+                var known=reservation.retainedTerminal(original).orElseThrow(()->invalid("runs.terminalUnknown"));
+                if(!known.retired()||known.state()!=state.state())throw invalid("runs.terminalUnknown");
+                terminalKnown=known;terminalKnownAt=clock.instant();
+            }
+            var window=readingStarted==null?null:new ValidationReportMetadata.Window(readingStarted,readingFinished);
+            var answer=reports.mirror(new ValidationReports.TerminalMirror(terminalKnown,terminalKnownAt,window,NativeValidationReportFailure.capture(lifecycle.executionFailure(),reportRedactor)));
+            if(answer==ValidationReports.Mirror.CLOSED_OR_EXPIRED){settleReport();return;}
+            if(!state.drained())return;
+            var saved=reservation.retainedTask().orElse(null);
+            if(saved!=null&&saved.task().equals(start.task())&&!saved.closed()){
+                var pending=new ArrayList<ValidationControlStore.Status>();
+                for(var actor:runs.values()){
+                    var known=actor.terminalKnown;
+                    if(known!=null&&known.run().admission().task().equals(start.task())&&known.run().identity().mode()==original.identity().mode())pending.add(known);
+                }
+                int keep=original.identity().mode()==ValidationMode.FULL?saved.settings().full().historyLimit():saved.settings().incremental().historyLimit();
+                reports.retain(new ValidationReports.Retention(start.task(),original.identity().mode(),keep,pending));
+            }
+            settleReport();
+        }
+        private void settleReport(){reportSettled=true;reservation.reportSettled();}
         @Override public void joined(){shared=NativeValidationRuns.this.shared(this);shared.quota.joined(original,this::requireRun,lifecycle::stop);shared.members.add(original.identity());}
         @Override public void requireOwner(){reservation.requireOwner();}
         @Override public void requireRun(){reservation.requireReserved();if(sealed.get())throw invalid("runs.publicationClosed");}
@@ -117,9 +188,21 @@ final class NativeValidationRuns implements AutoCloseable {
             if(change.equals(confirmedDelay))return;
             if(delays.apply(change)==io.tapstate.runtime.engine.validation.ValidationDelayController.Application.ACKNOWLEDGED)confirmedDelay=change;
         }
+        @Override public void beforeClosure(){
+            if(readingStarted!=null&&readingFinished==null&&(execution==null||execution.progress().readersReleased())){
+                var finished=clock.instant();if(!finished.isBefore(readingStarted))readingFinished=finished;
+            }
+            reports.observe(new ValidationReports.Observation(original.report(),readingStarted==null?null:
+                    new ValidationReportMetadata.Window(readingStarted,readingFinished),NativeValidationReportFailure.capture(lifecycle.executionFailure(),reportRedactor)));
+        }
         @Override public void retired(ValidationRunState terminal){
+            // Obtain the original CACHE receipt while this original tenure is still retained.
+            if(terminalKnown==null){
+                var known=reservation.retainedTerminal(original).orElse(null);
+                if(known!=null){if(!known.retired()||known.state()!=terminal)throw invalid("runs.terminalUnknown");terminalKnown=known;terminalKnownAt=clock.instant();}
+            }
             var value=shared;if(value!=null){value.quota.retired(original,terminal);value.members.remove(original.identity());releaseShared(value);}
-            reservation.releaseAfterKnownTerminal();
+            reservation.releaseAfterKnownTerminal();retirementReleased=true;
         }
         @Override public void processorsExited(){allocation.processorsExited();}
         @Override public void drained(){allocation.close();}
@@ -207,6 +290,16 @@ final class NativeValidationRuns implements AutoCloseable {
                 write=null;
                 try{payload.close();}finally{actor.pendingPublications.decrementAndGet();}
             }
+        }
+    }
+    private static void secretScalars(Object value,List<String> values){
+        var pending=new ArrayDeque<Object>();if(value!=null)pending.add(value);
+        while(!pending.isEmpty()){
+            var current=pending.removeLast();
+            if(current instanceof Map<?,?> map){for(var item:map.values())if(item!=null)pending.add(item);}
+            else if(current instanceof List<?> list){for(var item:list)if(item!=null)pending.add(item);}
+            else if(current instanceof String text)values.add(text);
+            else if(current instanceof Number||current instanceof Boolean)values.add(current.toString());
         }
     }
     private static TapstateException cancelled(ValidationRunIdentity identity){

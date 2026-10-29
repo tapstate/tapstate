@@ -189,6 +189,27 @@ class MongoValidationReportsIT {
         }
     }
 
+    @Test void observationAndTerminalReserveOnlyOneMetadataAllowanceAtTheReportLimit(){
+        try(var f=new MongoValidationTaskStoreIT.Fixture()){
+            var proposal=f.create(rowComparison(f));var create=new ValidationTaskStore.Create(proposal.task(),proposal.comparison(),ValidationTaskStore.Settings.defaults(ValidationMethod.FULL_COLUMN,1000),proposal.commandId());f.tasks.create(create);
+            var original=open(f,create.task(),"metadata-capacity");var start=original.reservation().start();var writer=original.reservation().access().results();var reports=original.reservation().access().reports();
+            writer.publish(new ValidationResultStore.RootWrite(start.report(),rowCheck(start.run(),7,1,Map.of())));
+            var collection=SystemCollections.VALIDATION_REPORTS.on(f.configDb);var id=new Document("_id",MongoValidationAdmissionStore.reportId(start.run()));var before=collection.find(id).first();
+            // Model already accounted retained payload at the limit without allocating a 64 MiB data fixture.
+            long occupied=MongoValidationResultStore.MAX_REPORT_BYTES-bsonBytes(before)-80L*1024;
+            collection.updateOne(id,new Document("$set",new Document("resultBytes",occupied)));
+            var failure=new ValidationReportMetadata.Failure(ValidationError.READ_FAILED.code(),Map.of("table","orders"),"Failure","first cause","x".repeat(6000),false);
+            assertThat(reports.observe(new ValidationReports.Observation(start.report(),null,failure))).isEqualTo(ValidationReports.Mirror.APPLIED);
+            assertThat(writer.publish(new ValidationResultStore.RootWrite(start.report(),rowCheck(start.run(),7,2,Map.of())))).isEqualTo(ValidationResultStore.Publication.APPLIED);
+            assertThat(collection.find(id).first().getLong("resultBytes")).isEqualTo(occupied);
+        }
+    }
+    private static int bsonBytes(Document value){
+        try(var output=new org.bson.io.BasicOutputBuffer();var writer=new org.bson.BsonBinaryWriter(output)){
+            new org.bson.codecs.DocumentCodec().encode(writer,value,org.bson.codecs.EncoderContext.builder().build());return output.getSize();
+        }
+    }
+
     private static ValidationTaskSpec rowComparison(MongoValidationTaskStoreIT.Fixture f){
         var base=f.denseComparison("flow",1);var mapping=base.mappings().getFirst();
         var fields=List.of(new ValidationKeyBinding.Component(List.of("id"),ValidationKey.Kind.EXACT_NUMBER,Set.of("number")));

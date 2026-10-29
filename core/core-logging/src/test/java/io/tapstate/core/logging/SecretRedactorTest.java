@@ -30,6 +30,17 @@ class SecretRedactorTest {
     }
 
     @Test
+    void retainedOperationsKeepOriginalSecretsAfterSourceReplacementAndDeletion(){
+        var original=new SecretRedactor();original.replace("source",List.of("old-secret"));original.replace("unrelated",List.of("other-secret"));var retained=original.fork(List.of("source"));
+        original.replace("source",List.of("new-secret"));original.remove("source");
+        assertThat(retained.redact("old-secret")).isEqualTo("********");
+        assertThat(retained.redact("other-secret")).isEqualTo("other-secret");
+        assertThat(original.redact("old-secret")).isEqualTo("old-secret");
+        retained.replace("retained-inputs",List.of("saved-secret"));
+        assertThat(original.redact("saved-secret")).isEqualTo("saved-secret");
+    }
+
+    @Test
     void ignoresEmptyValuesAndLeavesNullTextNull() {
         SecretRedactor redactor = new SecretRedactor();
         redactor.replace("source", List.of("", "  "));

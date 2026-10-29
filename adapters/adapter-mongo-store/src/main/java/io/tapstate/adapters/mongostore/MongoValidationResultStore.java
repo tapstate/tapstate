@@ -113,6 +113,38 @@ final class MongoValidationResultStore implements ValidationResultStore,Validati
                     throw invalid("report.conflictingTerminal");
                 next.put("knownAt",previous.get("knownAt"));
                 if(!Objects.equals(previous.get("endedAt"),next.get("endedAt")))throw invalid("report.conflictingTerminalTime");
+                mergeFacts(next,previous);
+                if(previous.equals(next))return Mirror.DUPLICATE;
+            }
+            if(previous==null)mergeFacts(next,observation(report));
+            if(encoded(next).length>80*1024)throw MongoValidationObservationCodec.limit();
+            var replacement=new Document(report);replacement.remove("observationMetadata");replacement.put("terminalMetadata",next);requireReportCapacity(replacement);
+            if(reports.updateOne(session,original(expected,report).append("closed",true),new Document("$set",new Document("terminalMetadata",next))
+                    .append("$unset",new Document("observationMetadata",""))).getMatchedCount()!=1)
+                throw unreadable("terminal-mirror-fence");
+            return Mirror.APPLIED;
+        });
+    }
+    @Override public Mirror observe(Observation command){
+        Objects.requireNonNull(command);requireCluster(command.report());var next=new Document("formatVersion",1);
+        if(command.window()!=null)next.put("window",window(command.window()));
+        if(command.failure()!=null)next.put("failure",failure(command.failure()));
+        return admission.transaction(session->{
+            var report=report(session,command.report());
+            if(report==null||Boolean.TRUE.equals(report.getBoolean("closed")))return Mirror.CLOSED_OR_EXPIRED;
+            var start=MongoValidationAdmissionStore.decodeIdentity(report.get("admission",Document.class));
+            if(!admission.bornInTransaction(session,start))return Mirror.CLOSED_OR_EXPIRED;
+            var previous=observation(report);mergeFacts(next,previous);
+            if(next.equals(previous))return Mirror.DUPLICATE;
+            if(encoded(next).length>80*1024)throw MongoValidationObservationCodec.limit();
+            var replacement=new Document(report);replacement.put("observationMetadata",next);requireReportCapacity(replacement);
+            if(reports.updateOne(session,original(command.report(),report).append("closed",false),new Document("$set",new Document("observationMetadata",next))).getMatchedCount()!=1)
+                throw unreadable("observation-metadata-fence");
+            return Mirror.APPLIED;
+        });
+    }
+    private static void mergeFacts(Document next,Document previous){
+        if(previous==null)return;
                 if(previous.containsKey("window")){
                     var old=previous.get("window",Document.class);var incoming=next.get("window",Document.class);
                     if(incoming==null)next.put("window",old);
@@ -125,14 +157,17 @@ final class MongoValidationResultStore implements ValidationResultStore,Validati
                     else next.put("failure",old);
                 }
                 if(previous.containsKey("earlierFailure"))next.put("earlierFailure",previous.get("earlierFailure"));
-                if(previous.equals(next))return Mirror.DUPLICATE;
-            }
-            if(encoded(next).length>80*1024)throw MongoValidationObservationCodec.limit();
-            var replacement=new Document(report);replacement.put("terminalMetadata",next);requireReportCapacity(replacement);
-            if(reports.updateOne(session,original(expected,report).append("closed",true),new Document("$set",new Document("terminalMetadata",next))).getMatchedCount()!=1)
-                throw unreadable("terminal-mirror-fence");
-            return Mirror.APPLIED;
-        });
+    }
+    private static Document observation(Document report){
+        if(!report.containsKey("observationMetadata"))return null;
+        if(!(report.get("observationMetadata") instanceof Document value)||!Integer.valueOf(1).equals(value.get("formatVersion"))
+                ||!java.util.Set.of("formatVersion","window","failure","earlierFailure").containsAll(value.keySet())||encoded(value).length>80*1024)
+            throw unreadable("observation-metadata");
+        try{
+            window(value);if(value.containsKey("failure"))failure(value.get("failure",Document.class));
+            if(value.containsKey("earlierFailure"))failure(value.get("earlierFailure",Document.class));
+        }catch(RuntimeException bad){throw unreadable("observation-metadata");}
+        return value;
     }
     @Override public Cleanup retain(Retention command){
         Objects.requireNonNull(command);if(!clusterId.equals(command.task().clusterId()))throw invalid("report.clusterId");
@@ -210,7 +245,8 @@ final class MongoValidationResultStore implements ValidationResultStore,Validati
                 throw unreadable("report-accounting");
             long count = oldCount + (previous == null ? 1 : 0), total = used - oldBytes + bytes;
             // Keep the existing total bound, including fixed report metadata and its bounded final summary.
-            if (count > MAX_STORED_ROOTS || total + encoded(report).length + 80L * 1024 > MAX_REPORT_BYTES || version == Long.MAX_VALUE)
+            var fixed=new Document(report);fixed.remove("observationMetadata");fixed.remove("terminalMetadata");
+            if (count > MAX_STORED_ROOTS || total + encoded(fixed).length + 80L * 1024 > MAX_REPORT_BYTES || version == Long.MAX_VALUE)
                 throw MongoValidationObservationCodec.limit();
             var filter = original(write.report(), report).append("closed", false).append("publicationRevision", version);
             if (reports.updateOne(session, filter, new Document("$set", new Document("rootCount", count).append("resultBytes", total)
@@ -319,7 +355,7 @@ final class MongoValidationResultStore implements ValidationResultStore,Validati
     private Snapshot snapshot(Document row){
         try{
             var start=start(row);var spec=row.get("specSnapshot",Document.class);if(spec==null)throw unreadable("report-specification");
-            var specification=MongoValidationTaskCodec.run(spec);var terminal=terminal(row);var counts=new ArrayList<ValidationCountCheck>();
+            var specification=MongoValidationTaskCodec.run(spec);var terminal=terminal(row);var facts=terminal==null?observation(row):terminal;var counts=new ArrayList<ValidationCountCheck>();
             if(!specification.fingerprint().equals(start.run().specHash()))throw unreadable("report-specification");
             countSummaryBytes(row);var seen=new java.util.HashSet<String>();
             if(row.containsKey("countSummaries")){
@@ -337,8 +373,8 @@ final class MongoValidationResultStore implements ValidationResultStore,Validati
             if(terminal!=null&&"COMPLETED".equals(terminal.get("state"))&&specification.method()==ValidationMethod.COUNT&&counts.size()!=specification.task().mappings().size())throw unreadable("incomplete-count-report");
             if(number(row,"rootCount")>MAX_STORED_ROOTS||number(row,"resultBytes")>MAX_REPORT_BYTES)throw unreadable("report-accounting");
             return new Snapshot(start,specification,row.getBoolean("closed"),terminal==null?null:ValidationRunState.valueOf(terminal.getString("state")),
-                    terminal==null?null:java.time.Instant.parse(terminal.getString("knownAt")),terminalEnd(terminal),window(terminal),
-                    terminal==null||!terminal.containsKey("failure")?null:failure(terminal.get("failure",Document.class)),number(row,"rootCount"),number(row,"resultBytes"),counts);
+                    terminal==null?null:java.time.Instant.parse(terminal.getString("knownAt")),terminalEnd(terminal),window(facts),
+                    facts==null||!facts.containsKey("failure")?null:failure(facts.get("failure",Document.class)),number(row,"rootCount"),number(row,"resultBytes"),counts);
         }catch(RuntimeException bad){throw unreadable("report-snapshot");}
     }
     private static java.time.Instant end(Document row,Map<Reference,io.tapstate.spi.store.ValidationControlStore.Status> pending){

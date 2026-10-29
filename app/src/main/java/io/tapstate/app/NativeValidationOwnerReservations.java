@@ -319,7 +319,7 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
     final class Reservation implements AutoCloseable {
         final Pipeline pipeline; final Request request; final long created = handoffClock.getAsLong();
         final AtomicBoolean cancelled = new AtomicBoolean(), stopSignalled = new AtomicBoolean();
-        volatile boolean preparing, activated, accepted, superseded, completed, claimUncertain, unknown; volatile String reason;
+        volatile boolean preparing, activated, accepted, superseded, completed, claimUncertain, unknown, reportPending; volatile String reason;
         volatile Owner owner; volatile ValidationSavedDeclarations declarations; volatile ValidationRunSpec spec;
         volatile StartupGate startup;volatile ValidationLocalBudget.Amount dataEnvelope;
         volatile MongoConfigurationDomain.ValidationAccess access;
@@ -350,10 +350,38 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         synchronized void activate(Runnable stop) {
             requireReserved(); if (activated) throw invalid("owner.alreadyActivated"); this.stop = Objects.requireNonNull(stop); activated = true;
         }
+        synchronized void retainReportMetadata(){requireReserved();reportPending=true;}
+        synchronized void reportSettled(){
+            reportPending=false;
+            if(completed&&bound!=null&&bound.fullyReleased())clearMetadata();
+        }
         void releaseAfterKnownTerminal() {
             if (bound == null) throw invalid("owner.boundResources");
             completed = true; cancelled.set(true);
-            bound.close(); bound.allReleased().whenComplete((ignored, failed) -> { if (failed == null) { stop = null; clearMetadata(); } });
+            bound.close(); bound.allReleased().whenComplete((ignored, failed) -> {
+                if(failed==null)synchronized(this){stop=null;if(!reportPending)clearMetadata();}
+            });
+        }
+        boolean originalOwnerAvailable(){
+            var value=owner;return value!=null&&!value.retired.get()&&value.lease.authorized();
+        }
+        Optional<ValidationControlStore.Status> retainedTerminal(ValidationControlStore.Run original){
+            requireActive();var current=pipeline.owner;
+            if(current==null||current.retired.get())throw invalid("owner.currentTerminalAuthorityUnavailable");
+            current.lease.require();
+            // The current trusted fence may inspect an immutable original; it never adopts or resumes its work.
+            var known=access().control().read(current.lease.owner(),original);
+            requireActive();current.lease.require();return known.filter(ValidationControlStore.Status::retired);
+        }
+        void releaseClosedContextMetadata(){
+            // Only local ownership is relinquished. Durable unknown/terminal records remain for fenced cleanup.
+            if(bound==null)throw invalid("owner.boundResources");
+            bound.allReleased().whenComplete((ignored,failed)->{
+                if(failed==null)synchronized(this){reportPending=false;stop=null;clearMetadata();}
+            });
+        }
+        Optional<ValidationTaskStore.Snapshot> retainedTask(){
+            requireActive();return configuration.validationTasks(NativeValidationOwnerReservations.this::requireActive).read(request.pipeline(),request.task());
         }
         private boolean reapable() {
             return !preparing && !unknown && cancelled.get() && (!activated || completed) && metadata == null
@@ -407,6 +435,7 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
             throwFailure(failures);
         }
     }
+    boolean closed(){return closed;}
     @Override public void close() {
         if (closed) return; closed = true; expiry.cancel(false); member.getUserContext().remove(CONTEXT, this);
         var failures = new ValidationFailureLatch();

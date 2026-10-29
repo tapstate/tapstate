@@ -29,6 +29,16 @@ final class ValidationMemberResources implements AutoCloseable {
     private final ExecutorService checks = pool("validation-check", 4, 32);
     private final ExecutorService controls = pool("validation-control-io", 4, 64);
     private final ExecutorService cleanup = pool("validation-cleanup", 4, 32);
+    private final ScheduledThreadPoolExecutor controlTicks = ticks();
+    /** Dispatch only; actual control/cleanup I/O stays on admitted executors and may outlive a business context. */
+    ScheduledFuture<?> controlTicks(Runnable dispatch){
+        return controlTicks.scheduleWithFixedDelay(dispatch,10,100,TimeUnit.MILLISECONDS);
+    }
+    private static ScheduledThreadPoolExecutor ticks(){
+        var executor=new ScheduledThreadPoolExecutor(1,task->{var thread=new Thread(task,"validation-control-tick");thread.setDaemon(true);return thread;});
+        executor.setRemoveOnCancelPolicy(true);executor.setContinueExistingPeriodicTasksAfterShutdownPolicy(false);
+        executor.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);return executor;
+    }
     private volatile boolean closed;
 
     synchronized Member bind(String cluster, String node, String boot, int cooperativeThreads, Runnable active) {
@@ -250,7 +260,7 @@ final class ValidationMemberResources implements AutoCloseable {
         synchronized (this) { if (closed) return; closed = true; retiring = List.copyOf(members.values()); }
         retiring.forEach(state -> state.budget.close());
         // Queued wrappers still run/exit their own original bodies. Removing them would lose ownership.
-        queries.shutdown(); decoders.shutdown(); checks.shutdown(); controls.shutdown(); cleanup.shutdown();
+        controlTicks.shutdown();queries.shutdown(); decoders.shutdown(); checks.shutdown(); controls.shutdown(); cleanup.shutdown();
     }
     private static ExecutorService pool(String name, int workers, int queue) {
         return new ThreadPoolExecutor(workers, workers, 0, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(queue), task -> {

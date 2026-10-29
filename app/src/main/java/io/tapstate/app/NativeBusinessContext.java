@@ -283,8 +283,8 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             return new io.tapstate.runtime.engine.validation.ValidationProcessorRegistry(member,owner.memberStorage::requireNode);
         }
         @Bean(destroyMethod="close") NativeValidationRuns nativeValidationRuns(NativeValidationOwnerReservations owners,ValidationMemberResources.Member resources,
-                ValidationMemberResources process,ValidationOwnerTimers timers) {
-            return new NativeValidationRuns(owners,resources,process,timers);
+                ValidationMemberResources process,ValidationOwnerTimers timers,Clock clock,io.tapstate.core.logging.SecretRedactor redactor) {
+            return new NativeValidationRuns(owners,resources,process,timers,clock,redactor);
         }
         @Bean NativeValidationFullJob.Factory nativeValidationFullPlans(ConnectorProvisioner provisioner,Clock clock){
             return new NativeValidationPdkPlans(provisioner,clock);
