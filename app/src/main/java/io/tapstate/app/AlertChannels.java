@@ -19,7 +19,7 @@ import javax.net.ssl.*;
 final class AlertChannels implements AlertDeliveryRuntime.Channels {
     interface Resolver { InetAddress[] resolve(String host) throws UnknownHostException; }
     private final AlertChannelPolicy.Deployment deployment;private final CloudRuntimeSettings cloud;
-    private final Clock clock;private final Resolver resolver;private final Runnable active;private final String expectedOrg;private final SSLContext systemTls;private final boolean outboundEnabled;
+    private final Clock clock;private final Resolver resolver;private final Runnable active;private final String expectedOrg;private final SSLContext systemTls;private final boolean outboundEnabled;private final AlertChannelRegistry registry;
     // Completed workers may not yet be idle; retain one following lookup for each of the four dispatch slots.
     private final ThreadPoolExecutor dns=new ThreadPoolExecutor(2,2,0,TimeUnit.SECONDS,new ArrayBlockingQueue<>(4),r->{var t=new Thread(r,"alert-dns");t.setDaemon(true);return t;});
     AlertChannels(AlertChannelPolicy.Deployment deployment,CloudRuntimeSettings cloud,Clock clock,Runnable active,String expectedOrg){
@@ -35,7 +35,10 @@ final class AlertChannels implements AlertDeliveryRuntime.Channels {
         this(deployment,cloud,clock,active,expectedOrg,resolver,systemTls,true);
     }
     private AlertChannels(AlertChannelPolicy.Deployment deployment,CloudRuntimeSettings cloud,Clock clock,Runnable active,String expectedOrg,Resolver resolver,SSLContext systemTls,boolean outboundEnabled){
-        this.deployment=deployment;this.cloud=cloud;this.clock=clock;this.active=active;this.expectedOrg=expectedOrg;this.resolver=resolver;this.systemTls=systemTls;this.outboundEnabled=outboundEnabled;
+        this(deployment,cloud,clock,active,expectedOrg,resolver,systemTls,outboundEnabled,AlertChannelRegistry.defaults());
+    }
+    AlertChannels(AlertChannelPolicy.Deployment deployment,CloudRuntimeSettings cloud,Clock clock,Runnable active,String expectedOrg,Resolver resolver,SSLContext systemTls,boolean outboundEnabled,AlertChannelRegistry registry){
+        this.deployment=deployment;this.cloud=cloud;this.clock=clock;this.active=active;this.expectedOrg=expectedOrg;this.resolver=resolver;this.systemTls=systemTls;this.outboundEnabled=outboundEnabled;this.registry=Objects.requireNonNull(registry);
     }
     static boolean outboundEnabled(String value){
         if(value==null || value.equalsIgnoreCase("true"))return true;
@@ -45,8 +48,9 @@ final class AlertChannels implements AlertDeliveryRuntime.Channels {
     static Set<AlertChannelPolicy.Capability> capabilities(AlertChannelPolicy.Deployment deployment,CloudRuntimeSettings cloud,boolean enabled){
         return enabled?capabilities(deployment,cloud):Set.of();
     }
-    static Set<AlertChannelPolicy.Capability> capabilities(AlertChannelPolicy.Deployment deployment,CloudRuntimeSettings cloud) {
-        if(deployment==AlertChannelPolicy.Deployment.ON_PREM)return Set.of(new AlertChannelPolicy.Capability("email",1,AlertChannelPolicy.Family.OP_EXTERNAL),new AlertChannelPolicy.Capability("webhook",1,AlertChannelPolicy.Family.OP_EXTERNAL));
+    static Set<AlertChannelPolicy.Capability> capabilities(AlertChannelPolicy.Deployment deployment,CloudRuntimeSettings cloud) {return capabilities(deployment,cloud,AlertChannelRegistry.defaults());}
+    static Set<AlertChannelPolicy.Capability> capabilities(AlertChannelPolicy.Deployment deployment,CloudRuntimeSettings cloud,AlertChannelRegistry registry) {
+        if(deployment==AlertChannelPolicy.Deployment.ON_PREM)return Set.copyOf(registry.catalog().descriptors().stream().map(AlertChannelCatalog.Descriptor::capability).toList());
         if(deployment!=AlertChannelPolicy.Deployment.CLOUD_MANAGED || cloud==null || !cloud.cloud())return Set.of();
         var origin=cloud.baseUrl();var token=cloud.token();
         if(origin==null || !"https".equalsIgnoreCase(origin.getScheme()) || origin.getHost()==null || origin.getRawUserInfo()!=null
@@ -56,14 +60,22 @@ final class AlertChannels implements AlertDeliveryRuntime.Channels {
         return Set.of(new AlertChannelPolicy.Capability("cloud-sdk",2,AlertChannelPolicy.Family.CLOUD_SDK));
     }
     @Override public boolean supports(AlertIntent.Frozen frozen){return outboundEnabled && frozen.retention().deployment()==deployment
-            && capabilities(deployment,cloud).contains(frozen.channel())
+            && capabilities(deployment,cloud,registry).contains(frozen.channel())
+            && registeredTransport(frozen)
             && (deployment!=AlertChannelPolicy.Deployment.CLOUD_MANAGED || expectedOrg!=null && expectedOrg.matches("[a-fA-F0-9]{24}")
                     && expectedOrg.equals(frozen.identity().scope().authorityId()) && cloud.clusterId().equals(frozen.identity().scope().clusterId()));}
+    private boolean registeredTransport(AlertIntent.Frozen frozen){
+        if(frozen.target() instanceof AlertIntent.SdkTarget)return true;
+        if(!(transport(frozen) instanceof AlertReceiver.HttpsJson generic))return true;
+        try{var descriptor=registry.require(generic.channelType()).descriptor();return descriptor.capability().equals(frozen.channel())
+                &&descriptor.transportVersion()==generic.transportVersion()&&descriptor.parameters(generic.parameters()).equals(generic.parameters());}
+        catch(TapstateException unavailable){return false;}
+    }
     @Override public Object prepare(AlertIntent.Frozen frozen)throws InterruptedException {
         active.run();if(!supports(frozen))throw invalid("capability");
         String host;
         if(frozen.target() instanceof AlertIntent.SdkTarget)host=cloud.baseUrl().getHost();
-        else {var transport=transport(frozen);host=transport instanceof AlertReceiver.Email email?email.host():((AlertReceiver.Webhook)transport).origin().getHost();}
+        else {var transport=transport(frozen);host=transport instanceof AlertReceiver.Email email?email.host():AlertReceiver.https(transport).origin().getHost();}
         Future<InetAddress[]> lookup;
         try{lookup=dns.submit(()->resolver.resolve(host));}catch(RejectedExecutionException busy){return new NotificationChannel.Result(DeliveryEvidence.Outcome.NOT_ACCEPTED,NotificationChannel.Action.RETRY,null,NotificationChannel.Phase.CONNECT,0,"dns-capacity");}
         try{
@@ -90,8 +102,17 @@ final class AlertChannels implements AlertDeliveryRuntime.Channels {
                         SmtpChannel.Encryption.valueOf(email.encryption().name()),ssl,SmtpChannel.Authentication.valueOf(email.authentication().name()),
                         email.username(),password,email.from(),frozen.identity().targetId(),clock);
             }
-            var webhook=(AlertReceiver.Webhook)transport;var endpoint=material.endpoint();
+            var webhook=AlertReceiver.https(transport);var endpoint=material.endpoint();
             if(endpoint==null||!webhook.matchesEndpoint(endpoint))throw invalid("frozen-endpoint");
+            if(transport instanceof AlertReceiver.HttpsJson generic){
+                var registration=registry.require(generic.channelType());
+                if(!registration.descriptor().capability().equals(frozen.channel())||registration.descriptor().transportVersion()!=generic.transportVersion()
+                        ||!registration.descriptor().parameters(generic.parameters()).equals(generic.parameters()))throw invalid("frozen-descriptor");
+                var channel=registration.factory().open(new AlertChannelRegistry.Context(deployment,frozen.channel(),binding,generic,endpoint,ssl,
+                        generic.authentication()==AlertReceiver.Authentication.BEARER?new String(Objects.requireNonNull(authentication),StandardCharsets.UTF_8):null,
+                        generic.authentication()==AlertReceiver.Authentication.HMAC_SHA256?authentication:null,clock,addresses));
+                if(!channel.capability().equals(frozen.channel())){channel.close();throw invalid("adapter-capability");}return channel;
+            }
             return new WebhookChannel(deployment,binding,endpoint,Set.of(new WebhookChannel.Origin(endpoint.getHost(),endpoint.getPort()<0?443:endpoint.getPort())),ssl,
                     webhook.authentication()==AlertReceiver.Authentication.BEARER?new String(Objects.requireNonNull(authentication),StandardCharsets.UTF_8):null,
                     webhook.authentication()==AlertReceiver.Authentication.HMAC_SHA256?authentication:null,clock,addresses);

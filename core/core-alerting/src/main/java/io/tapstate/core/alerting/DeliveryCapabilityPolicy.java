@@ -55,8 +55,11 @@ public final class DeliveryCapabilityPolicy {
         Objects.requireNonNull(expectedScope, "expectedScope"); Objects.requireNonNull(header, "header");
         Objects.requireNonNull(deployment, "deployment"); Objects.requireNonNull(now, "now");
         if (header.recordVersion() == null) { return decision(Disposition.ISOLATED, Reason.MISSING_RECORD_VERSION); }
-        if (header.recordVersion() != AlarmTypeCatalog.RECORD_FORMAT_VERSION && header.recordVersion() != 2) {
+        if (header.recordVersion() != AlarmTypeCatalog.RECORD_FORMAT_VERSION && header.recordVersion() != 2 && header.recordVersion() != 3) {
             return decision(Disposition.ISOLATED, Reason.UNSUPPORTED_RECORD_VERSION);
+        }
+        if(header.recordVersion()==3&&(header.channelType()==null||Set.of("email","webhook","cloud-sdk").contains(header.channelType()))) {
+            return decision(Disposition.ISOLATED,Reason.UNSUPPORTED_RECORD_VERSION);
         }
         if (header.scope() == null || header.deliveryId() == null
                 || !header.deliveryId().matches("[A-Za-z0-9._-]{1,256}")) {

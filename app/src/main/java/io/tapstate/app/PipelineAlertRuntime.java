@@ -18,11 +18,12 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     record Health(boolean closed, boolean degraded, long rejected, String code,Map<String,Object> parameters,int queuedInputs,int queuedBytes,Long evaluationLagMillis,Instant lastEvaluatedAt,Map<String,Object> maintenance) {
         Health(boolean closed,boolean degraded,long rejected,String code,Map<String,Object> parameters,int inputs,int bytes){this(closed,degraded,rejected,code,parameters,inputs,bytes,null,null,Map.of());}
     }
-    record Services(AlertStore store, AlertEvaluationHost evaluator, AlarmTypeCatalog catalog, AlertPlanningRuntime planner, AlertDeliveryRuntime delivery, Set<String> providers,io.tapstate.adapters.alerting.AlarmTypeText descriptions,AlertMaintenanceRuntime maintenance) {
+    record Services(AlertStore store, AlertEvaluationHost evaluator, AlarmTypeCatalog catalog, AlertPlanningRuntime planner, AlertDeliveryRuntime delivery, Set<String> providers,io.tapstate.adapters.alerting.AlarmTypeText descriptions,AlertMaintenanceRuntime maintenance,AlertChannelCatalog channels) {
+        Services(AlertStore store,AlertEvaluationHost evaluator,AlarmTypeCatalog catalog,AlertPlanningRuntime planner,AlertDeliveryRuntime delivery,Set<String> providers,io.tapstate.adapters.alerting.AlarmTypeText descriptions,AlertMaintenanceRuntime maintenance){this(store,evaluator,catalog,planner,delivery,providers,descriptions,maintenance,AlertChannelRegistry.defaults().catalog());}
         Services(AlertStore store,AlertEvaluationHost evaluator,AlarmTypeCatalog catalog,AlertPlanningRuntime planner,AlertDeliveryRuntime delivery,Set<String> providers,io.tapstate.adapters.alerting.AlarmTypeText descriptions){this(store,evaluator,catalog,planner,delivery,providers,descriptions,null);}
         Services(AlertStore store,AlertEvaluationHost evaluator,AlarmTypeCatalog catalog,AlertPlanningRuntime planner,AlertDeliveryRuntime delivery,Set<String> providers){this(store,evaluator,catalog,planner,delivery,providers,io.tapstate.adapters.alerting.AlarmTypeText.english());}
         Services(AlertStore store,AlertEvaluationHost evaluator,AlarmTypeCatalog catalog,AlertPlanningRuntime planner,AlertDeliveryRuntime delivery){this(store,evaluator,catalog,planner,delivery,Set.of("pipeline-lifecycle","pipeline-observations"));}
-        Services { providers=Set.copyOf(providers);Objects.requireNonNull(descriptions); }
+        Services { providers=Set.copyOf(providers);Objects.requireNonNull(descriptions);Objects.requireNonNull(channels); }
         Services(AlertStore store,AlertEvaluationHost evaluator,AlarmTypeCatalog catalog,AlertPlanningRuntime planner){this(store,evaluator,catalog,planner,null);}
         Services(AlertStore store,AlertEvaluationHost evaluator,AlarmTypeCatalog catalog){this(store,evaluator,catalog,null,null);}
         Services(AlertStore store,AlertEvaluationHost evaluator){this(store,evaluator,BuiltinAlarmTypes.catalog());}

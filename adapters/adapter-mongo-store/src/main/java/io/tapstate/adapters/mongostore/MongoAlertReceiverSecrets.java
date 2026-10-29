@@ -141,7 +141,7 @@ final class MongoAlertReceiverSecrets {
                         .allMatch(certificate -> certificate instanceof java.security.cert.X509Certificate x509 && x509.getBasicConstraints() >= 0), "invalid-private-ca");
             } catch (java.security.cert.CertificateException malformed) { throw invalid("invalid-private-ca"); }
         }
-        if (transport instanceof AlertReceiver.Webhook webhook) { require(endpoint != null && webhook.matchesEndpoint(endpoint), "endpoint-mismatch"); }
+        if (!(transport instanceof AlertReceiver.Email)) { require(endpoint != null && AlertReceiver.https(transport).matchesEndpoint(endpoint), "endpoint-mismatch"); }
         else { require(endpoint == null, "unexpected-endpoint"); }
     }
     private static byte[] binary(Object value) {

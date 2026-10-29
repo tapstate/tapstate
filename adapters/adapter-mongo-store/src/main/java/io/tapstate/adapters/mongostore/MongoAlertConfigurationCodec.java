@@ -63,6 +63,7 @@ final class MongoAlertConfigurationCodec {
             row.put("formatVersion", AlertConfiguration.SUBSCRIPTION_FORMAT_VERSION);
         }
         if (definition instanceof AlertReceiver) { row.append("privateSlot", null); }
+        if (definition instanceof AlertReceiver receiver && receiver.transport() instanceof AlertReceiver.HttpsJson) { row.put("formatVersion",2); }
         if (size(row) > (definition instanceof AlertReceiver ? MAX_RECEIVER_BYTES : MAX_BYTES)) {
             throw new TapstateException(AlertError.INVALID_CONFIGURATION,
                     Map.of("field", "configurationBytes", "reason", "encoded-record-too-large"), null);
@@ -77,7 +78,8 @@ final class MongoAlertConfigurationCodec {
             require(row.get("formatVersion") instanceof Integer);
             int version = row.getInteger("formatVersion");
             require(version == AlertConfiguration.FORMAT_VERSION
-                    || expectedKind == Kind.SUBSCRIPTION && version == AlertConfiguration.SUBSCRIPTION_FORMAT_VERSION);
+                    || expectedKind == Kind.SUBSCRIPTION && version == AlertConfiguration.SUBSCRIPTION_FORMAT_VERSION
+                    || expectedKind == Kind.RECEIVER && version == 2);
             Document key = doc(row, "_id"); fields(key, Set.of("authorityId", "clusterId", "id"));
             require(key(expectedScope, expectedId).equals(key));
             require(text(row, "kind").equals(expectedKind.name()));
@@ -97,6 +99,7 @@ final class MongoAlertConfigurationCodec {
                 case RECEIVER -> MongoAlertReceiverCodec.read(header, body);
             };
             if (definition instanceof AlertReceiver receiver) {
+                require(version==(receiver.transport() instanceof AlertReceiver.HttpsJson?2:1));
                 MongoAlertReceiverSecrets.validateSlot(receiver, row.get("privateSlot") == null ? null : doc(row, "privateSlot"));
             }
             return new Stored(definition, number(row, "writeFence", 0));

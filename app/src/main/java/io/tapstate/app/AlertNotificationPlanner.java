@@ -64,6 +64,7 @@ final class AlertNotificationPlanner {
         for(var head:heads.values()){
             if(!firing(head)||head.binding()==null)continue;
             for(var destination:destinations(view,head)){
+                if(!installed(view.host(),destination))continue;
                 String group=group(destination,head.binding());
                 if(roots.values().stream().anyMatch(r->sameDestination(r,destination)&&r.members().stream().anyMatch(m->m.episodeMember().equals(head.binding().episodeMember()))))continue;
                 var existing=roots.values().stream().filter(r->sameDestination(r,destination)&&r.retention().equals(head.episode().policy())&&r.members().stream().anyMatch(m->group(destination,m).equals(group))
@@ -94,6 +95,7 @@ final class AlertNotificationPlanner {
         var root=stored.value();Instant now=clock.instant();var ownership=claim(root.owner(),now);
         if(ownership==null)return new Changes(List.of(),List.of());
         var destinations=destinations(view,null);var destination=destinations.stream().filter(d->sameDestination(root,d)).findFirst().orElse(null);
+        boolean canCreate=destination!=null&&installed(view.host(),destination);
         var edits=new LinkedHashMap<DeliveryKey,AlertStore.IntentChange>();var schedules=new ArrayList<AlertStore.ScheduleChange>();
         var refs=new ArrayList<>(root.protectedIntents());var summaries=new LinkedHashMap<FrozenGroupPolicy.Member,AlertSchedule.Previous>();
         root.summaries().forEach(s->summaries.put(new FrozenGroupPolicy.Member(s.alarm(),s.episode()),s));
@@ -143,7 +145,7 @@ final class AlertNotificationPlanner {
                     if(successor==null&&decision.action()==FrozenGroupPolicy.Action.STOP_PENDING){
                         pendingSuccessor=now.isBefore(intent.frozen().deadline());
                         Instant qualification=root.clock().lastPlannedAt()==null?root.createdAt():root.clock().lastPlannedAt().plus(root.grouping().changeInterval());
-                        if(!planned&&pendingSuccessor&&!now.isBefore(qualification)&&destination!=null&&targetReady(view,destination,now)){
+                        if(!planned&&pendingSuccessor&&!now.isBefore(qualification)&&canCreate&&targetReady(view,destination,now)){
                             var candidate=new AlertGroupingClock.Candidate(AlertGroupingClock.Reason.CHANGE,Math.incrementExact(clockValue.round()),qualification);
                             successor=delivery(root,DeliveryKey.Kind.FAULT,candidate.round(),Math.incrementExact(batchSequence));
                             var next=create(view,destination,successor,pending,null,now,intent.frozen().deadline(),intent.frozen().retry(),intent.frozen().retention());
@@ -194,7 +196,7 @@ final class AlertNotificationPlanner {
             var ep=episode(view,member);boolean revoked=destination==null||!bindingCurrent(view,member)||ep.value().endReason()!=AlertSnapshot.EndReason.RECOVERED;
             boolean silenced=view.definitions().stream().filter(d->d instanceof AlertConfiguration.Silence).map(d->(AlertConfiguration.Silence)d).anyMatch(s->s.matches(member.evaluation().key(),now));
             var recovery=DeliveryEvidence.recovery(previous,now,revoked,silenced);
-            if(recovery.kind()!=DeliveryEvidence.RecoveryKind.NONE&&destination!=null&&!targetReady(view,destination,now)||recovery.kind()==DeliveryEvidence.RecoveryKind.WAIT||planned&&recovery.kind()!=DeliveryEvidence.RecoveryKind.NONE){waiting.add(member);continue;}
+            if(recovery.kind()!=DeliveryEvidence.RecoveryKind.NONE&&(!canCreate||!targetReady(view,destination,now))||recovery.kind()==DeliveryEvidence.RecoveryKind.WAIT||planned&&recovery.kind()!=DeliveryEvidence.RecoveryKind.NONE){waiting.add(member);continue;}
             if(recovery.kind()!=DeliveryEvidence.RecoveryKind.NONE){
                 var candidate=new AlertGroupingClock.Candidate(AlertGroupingClock.Reason.CHANGE,Math.incrementExact(clockValue.round()),now);
                 var key=delivery(root,DeliveryKey.Kind.RECOVERY,candidate.round(),Math.incrementExact(batchSequence));
@@ -203,7 +205,7 @@ final class AlertNotificationPlanner {
             }
         }
         retainedMembers.addAll(waiting);
-        if(!planned&&!waitingSuccessor&&destination!=null&&!eligible.isEmpty()){
+        if(!planned&&!waitingSuccessor&&canCreate&&!eligible.isEmpty()){
             boolean unfinished=refs.stream().anyMatch(k->k.notification().kind()!=DeliveryKey.Kind.RECOVERY&&changedIntent(view,edits,k).state().retained().stoppedAt()==null);
             var due=clockValue.due(root.grouping(),now,true,unfinished);
             if(due.isPresent()&&targetReady(view,destination,now)){
@@ -236,7 +238,8 @@ final class AlertNotificationPlanner {
             for(var channel:route.channels())for(var receiverId:channel.receivers()){
                 var receiver=view.definitions().stream().filter(d->d instanceof AlertReceiver&&d.header().identity().equals(receiverId)).map(d->(AlertReceiver)d)
                         .filter(r->r.header().active()&&r.enabled()&&r.transport().channelType().equals(channel.channelType())).findFirst();
-                if(receiver.isEmpty())continue;var target=AlertIntent.ReceiverTarget.capture(receiver.get());
+                if(receiver.isEmpty())continue;
+                var target=AlertIntent.ReceiverTarget.capture(receiver.get());
                 var targets=AlertTargetIdentity.domains(host.scope(),target.transport()).keySet();
                 for(var id:targets)result.add(new Destination(new AlertIntent.ConfiguredRoute(route.header().identity(),route.bindingRevision()),target,
                         channel.channelType(),receiverId.incarnation(),id,channel.messages(),route.header().revision(),route.grouping(),route.groupBy(),route));
@@ -259,6 +262,10 @@ final class AlertNotificationPlanner {
         }return false;
     }
     private static boolean firing(AlertStateRecord.Head head){return head.retiredAt()==null&&head.snapshot().enabled()&&head.snapshot().status()==AlertSnapshot.Status.FIRING&&head.episode()!=null&&head.episode().value().endedAt()==null;}
+    private static boolean installed(AlertStore.Host host,Destination destination){
+        return !(destination.target() instanceof AlertIntent.ReceiverTarget receiver&&receiver.transport() instanceof AlertReceiver.HttpsJson generic)
+                ||host.availableChannels().contains(new AlertChannelPolicy.Capability(generic.channelType(),1,AlertChannelPolicy.Family.OP_EXTERNAL));
+    }
     private static String occurrence(AlertIntent.Member m){var k=m.evaluation().key();return hash(List.of(k.scope().authorityId(),k.scope().clusterId(),k.resource().kind(),k.resource().id(),k.resource().incarnation(),k.typeId(),k.qualifier(),Long.toString(m.episode())));}
     private static String group(Destination d,AlertIntent.Member m){
         var key=m.evaluation().key();var fields=new ArrayList<String>(List.of(d.route().id(),d.route().incarnation(),d.channel(),d.receiver(),d.targetId()));
@@ -285,7 +292,7 @@ final class AlertNotificationPlanner {
         if(policy.deployment()!=view.host().deployment())throw invalid("foreign-retention-profile");
         var identity=new AlertIntent.Business(key);var capability=new AlertChannelPolicy.Capability(d.channel(),d.channel().equals("cloud-sdk")?2:1,
                 d.channel().equals("cloud-sdk")?AlertChannelPolicy.Family.CLOUD_SDK:AlertChannelPolicy.Family.OP_EXTERNAL);
-        var retry=originalPolicy!=null?originalPolicy:d.channel().equals("email")?ChannelRetryPolicy.emailDefaults():d.channel().equals("webhook")?ChannelRetryPolicy.webhookDefaults():new ChannelRetryPolicy(1,0,List.of(),Duration.ofDays(1),Duration.ofSeconds(30));
+        var retry=originalPolicy!=null?originalPolicy:d.channel().equals("email")?ChannelRetryPolicy.emailDefaults():d.target() instanceof AlertIntent.SdkTarget?new ChannelRetryPolicy(1,0,List.of(),Duration.ofDays(1),Duration.ofSeconds(30)):ChannelRetryPolicy.webhookDefaults();
         Instant deadline=originalDeadline==null?now.plus(retry.maximumAge()):originalDeadline;
         var template=new AlertIntent.Template("fixed-alert",1,d.settingsRevision(),"en",d.messages());byte[] bytes=null;
         boolean recoveryMessage=key.notification().kind()==DeliveryKey.Kind.RECOVERY;

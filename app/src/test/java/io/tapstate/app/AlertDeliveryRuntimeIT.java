@@ -23,8 +23,9 @@ class AlertDeliveryRuntimeIT {
     static final class Channels implements AlertDeliveryRuntime.Channels {
         final AlertStore store;final AtomicInteger calls=new AtomicInteger();final List<NotificationChannel.Request> requests=new CopyOnWriteArrayList<>();
         volatile boolean supported=true;volatile Function<NotificationChannel.Request,NotificationChannel.Result> answer=r->accepted();
+        volatile java.util.function.Predicate<AlertIntent.Frozen> available=f->true;
         Channels(AlertStore store){this.store=store;}
-        public boolean supports(AlertIntent.Frozen f){return supported;}
+        public boolean supports(AlertIntent.Frozen f){return supported&&available.test(f);}
         public Object prepare(AlertIntent.Frozen f){return this;}
         public NotificationChannel open(AlertIntent.Frozen f,AlertStore.PrivateMaterial material,Object prepared){return new NotificationChannel(){
             public AlertChannelPolicy.Capability capability(){return f.channel();}
@@ -204,6 +205,49 @@ class AlertDeliveryRuntimeIT {
             store.saveDefinition(route,route.edit(route.name(),route.match(),false,route.channels(),route.groupBy(),route.grouping(),route.inhibition(),T,"operator"),access());
             try(var a=runtime(f,store,channels,"worker-a")){a.tick();settled(a);assertThat(channels.calls).hasValue(0);}
             for(var id:ids(f))assertThat(store.intent(id,null).orElseThrow().value().state().attemptsConsumed()).isZero();
+        });
+    }
+    @Test void missingCapabilitySurvivesReopenAndMaintenanceWithoutBlockingCompatibleWorkOrRevivingRevocation(){
+        AlertEvaluationHostIT.withFixture(f->{var route=route(f,Duration.ZERO);var store=sendingStore(f);
+            AlertManagementIT.call(AlertManagementIT.service(f),"configuration.save",AlertHttpModel.map("kind","RECEIVER","id","compatible-webhook","etag","0","form",
+                    AlertHttpModel.map("name","Compatible webhook","enabled",true,"transport",AlertHttpModel.map("channelType","webhook","authentication","NONE","trust","SYSTEM"),"endpoint","https://notify.example.test/hook")));
+            var receiver=(AlertReceiver)store.definition(AlertConfiguration.Kind.RECEIVER,"compatible-webhook",access()).orElseThrow();
+            var routes=new ArrayList<>(route.channels());routes.add(new AlertConfiguration.RouteChannel("webhook",List.of(receiver.header().identity()),MessageSettings.empty()));
+            store.saveDefinition(route,route.edit(route.name(),route.match(),true,routes,route.groupBy(),route.grouping(),route.inhibition(),T,"operator"),access());
+            var planner=planner(f,"capability-planner");f.evaluator().withPlanner(planner);bad(f);planner.tick();
+            var original=intents(f).stream().filter(row->row.value().frozen().identity().channelType().equals("email")).toList();assertThat(original).hasSize(2);
+            var absent=f.configuration().alerts(f.storeHost().withChannels(Set.of(new AlertChannelPolicy.Capability("webhook",1,AlertChannelPolicy.Family.OP_EXTERNAL))),BuiltinAlarmTypes.catalog(),f.clock());
+            var channels=new Channels(absent);channels.available=frozen->frozen.identity().channelType().equals("webhook");
+            try(var worker=runtime(f,absent,channels,"partial-capability")){worker.tick();settled(worker);assertThat(channels.calls).hasValue(1);}
+            assertThat(channels.requests.getFirst().destination().channelType()).isEqualTo("webhook");
+            for(var row:original)assertThat(absent.intent(row.value().frozen().identity(),null).orElseThrow()).isEqualTo(row);
+            var paused=original.getFirst();var unavailable=paused.value().frozen().identity();
+            var permit=DeliveryAttempt.grant(unavailable.scope(),unavailable.deliveryId(),"unsupported-attempt",1,1,"unsupported-worker",paused.value().frozen().retry(),T,paused.value().frozen().deadline(),T).orElseThrow();
+            var state=paused.value().state();
+            var pending=new AlertIntent.Record(paused.value().frozen(),new AlertIntent.State(new AlertOwnership(1,"unsupported-worker",T.plusSeconds(120)),0,false,null,null,1,
+                    List.of(AlertIntent.Attempt.pending(permit)),DeliveryEvidence.Outcome.UNKNOWN,state.retained(),state.payload(),null,null,null,null));
+            assertThatThrownBy(()->absent.commit(new AlertStore.Commit(AlertStore.CommitKind.PERMIT,null,List.of(new AlertStore.IntentChange(paused,pending)),List.of())))
+                    .isInstanceOfSatisfying(TapstateException.class,error->assertThat(error.code()).isEqualTo(AlertError.CHANNEL_UNAVAILABLE));
+            f.now().set(T.plusSeconds(31));
+            for(int collection=0;collection<12;collection++)absent.maintenance().orElseThrow()
+                    .maintain(new io.tapstate.spi.store.AlertMaintenance.Cursor(collection,null,null),200,4L*1024*1024,Duration.ofSeconds(5));
+            try(var reopened=io.tapstate.adapters.mongostore.MongoConfigurationDomain.open(f.settings(),f.storeHost().scope().clusterId())){
+                var view=reopened.alerts(f.storeHost().withChannels(Set.of(new AlertChannelPolicy.Capability("email",1,AlertChannelPolicy.Family.OP_EXTERNAL))),BuiltinAlarmTypes.catalog(),f.clock());
+                assertThat(view.intent(unavailable,null).orElseThrow()).isEqualTo(paused);
+                var restored=new Channels(view);
+                try(var worker=runtime(f,view,restored,"restored-capability")){worker.tick();settled(worker);assertThat(restored.calls).hasValue(2);}
+                var request=restored.requests.stream().filter(value->value.deliveryId().equals(unavailable.deliveryId())).findFirst().orElseThrow();
+                assertThat(request.payload()).isEqualTo(paused.value().state().payload().bytes());
+                assertThat(view.intent(unavailable,null).orElseThrow().value().state().summary()).isEqualTo(DeliveryEvidence.Outcome.ACCEPTED);
+            }
+        });
+        AlertEvaluationHostIT.withFixture(f->{seed(f);var store=sendingStore(f);var channels=new Channels(store);channels.supported=false;
+            var original=intents(f);try(var worker=runtime(f,store,channels,"missing-before-revocation")){worker.tick();settled(worker);}
+            var route=(AlertConfiguration.Subscription)store.definition(AlertConfiguration.Kind.SUBSCRIPTION,"route",access()).orElseThrow();
+            store.saveDefinition(route,route.edit(route.name(),route.match(),false,route.channels(),route.groupBy(),route.grouping(),route.inhibition(),T,"operator"),access());
+            channels.supported=true;try(var worker=runtime(f,store,channels,"restored-after-revocation")){worker.tick();settled(worker);}
+            assertThat(channels.calls).hasValue(0);
+            for(var row:original)assertThat(store.intent(row.value().frozen().identity(),null).orElseThrow().value().state().attemptsConsumed()).isZero();
         });
     }
     @Test void orphanAttemptWaitsOnlyOriginalDeadlineAndCannotBeReissuedOnTakeover(){

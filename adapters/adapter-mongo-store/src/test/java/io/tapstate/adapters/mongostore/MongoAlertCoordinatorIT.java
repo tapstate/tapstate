@@ -20,6 +20,25 @@ import static org.assertj.core.api.Assertions.*;
 
 @RequiresDocker
 class MongoAlertCoordinatorIT {
+    @Test void unsupportedBuiltinFormatThreeCannotBlockCompatibleDeliveryPages(){
+        withStore(f->{var facts=businessFacts(f);accept(f,facts);var unknown=MongoAlertDeliveryCodec.write(facts.intent(),1);
+            unknown.get("_id",Document.class).put("deliveryId","future-builtin-format-three");unknown.put("formatVersion",3);
+            SystemCollections.ALERT_DELIVERY_INTENTS.on(f.db).insertOne(unknown);
+            var due=f.store.dueIntents(T.plusSeconds(1),null,10);assertThat(due.rows()).hasSize(1);assertThat(due.isolatedRecords()).isTrue();
+            var page=f.store.deliveries(null,10,null,null,readAll());assertThat(page.rows()).hasSize(1);assertThat(page.isolatedRecords()).isTrue();
+        });
+    }
+    @Test void unsupportedBuiltinFormatThreeStillProtectsUnknownReferencesDuringDefinitionCleanup(){
+        withStore(f->{var facts=businessFacts(f);var unknown=MongoAlertDeliveryCodec.write(facts.intent(),1);
+            unknown.get("_id",Document.class).put("deliveryId","future-opaque-reference");unknown.put("formatVersion",3);
+            SystemCollections.ALERT_DELIVERY_INTENTS.on(f.db).insertOne(unknown);
+            var receiver=new AlertReceiver(header(Kind.RECEIVER,"unreferenced",f.access.subject()),"Retired",true,1,email("other@example.test"),null);
+            f.store.saveReceiver(null,receiver,null,false,f.access);f.store.saveReceiver(receiver,receiver.retire(T,f.access.subject()),null,true,f.access);
+            f.time.set(T.plus(Duration.ofDays(8)));clean(f,6,null);
+            assertThat(f.store.definition(Kind.RECEIVER,"unreferenced",f.access)).isPresent();
+            assertThat(SystemCollections.ALERT_DELIVERY_INTENTS.on(f.db).find(new Document("_id",unknown.get("_id"))).first()).isEqualTo(unknown);
+        });
+    }
     @Test void evaluationRecoveryUsesOriginalIdKeysetWithoutMissingOrRepeatingHeads() {
         withStore(f->{
             var facts=businessFacts(f);accept(f,facts);

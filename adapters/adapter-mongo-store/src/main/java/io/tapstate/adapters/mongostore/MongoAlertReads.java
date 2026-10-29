@@ -85,7 +85,7 @@ final class MongoAlertReads {
         var raw=SystemCollections.ALERT_DELIVERY_INTENTS.on(db).find(s,new Document("_id",new Document(after==null?"$gte":"$gt",low).append("$lte",high)))
                 .hintString("_id_").sort(new Document("_id",1)).limit(limit+1).into(new ArrayList<>());
         boolean more=raw.size()>limit;if(more)raw.removeLast();boolean isolated=false;var rows=new ArrayList<Stored<AlertIntent.Record>>();
-        for(var doc:raw){if(!Set.of(1,2).contains(doc.get("formatVersion"))){isolated=true;continue;}
+        for(var doc:raw){if(!MongoAlertEnvelopeSupport.intent(doc)){isolated=true;continue;}
             var value=MongoAlertDeliveryCodec.readAny(scope,doc);var r=visibleDelivery(value.value());if(!clock.instant().isBefore(r.state().retained().resultUntil()))continue;if(r.frozen().members().stream().anyMatch(m->!access.permits(m.evaluation().key())))continue;
             if((channel==null||channel.equals(r.frozen().channel().typeId()))&&(outcome==null||outcome==r.state().summary()))rows.add(new Stored<>(value.recordRevision(),r));}
         return new DeliveryPage(rows,more?raw.getLast().get("_id",Document.class).getString("deliveryId"):null,isolated);
@@ -104,13 +104,14 @@ final class MongoAlertReads {
         return new TransitionPage(values,next,isolated);
     }
     DuePage due(ClientSession s,Instant through,DueCursor after,int limit){
-        limit(limit);var filter=scopeFilter().append("formatVersion",new Document("$in",List.of(1,2))).append("nextCheckAt",new Document("$type","date").append("$lte",Date.from(through)));
+        limit(limit);var filter=scopeFilter().append("formatVersion",new Document("$in",List.of(1,2,3))).append("nextCheckAt",new Document("$type","date").append("$lte",Date.from(through)));
+        filter=and(filter,MongoAlertEnvelopeSupport.intentFilter());
         if(after!=null){var id=MongoAlertDeliveryCodec.scope(scope).append("purpose",after.purpose()).append("deliveryId",after.deliveryId());filter=and(filter,lexAfter(List.of("nextCheckAt","_id"),List.of(Date.from(after.candidateAt()),id)));}
         var raw=SystemCollections.ALERT_DELIVERY_INTENTS.on(db).find(s,filter).sort(new Document("nextCheckAt",1).append("_id",1)).limit(limit+1).into(new ArrayList<>());
         boolean more=raw.size()>limit;if(more)raw.removeLast();var values=new ArrayList<Stored<AlertIntent.Record>>();
         for(var row:raw){try{var v=MongoAlertDeliveryCodec.readAny(scope,row);values.add(new Stored<>(v.recordRevision(),v.value()));}catch(IllegalArgumentException ex){throw unreadable("intent-format");}}
         DueCursor next=null;if(more){var r=raw.getLast();var id=r.get("_id",Document.class);next=new DueCursor(r.getDate("nextCheckAt").toInstant(),id.getString("purpose"),id.getString("deliveryId"));}
-        return new DuePage(values,next,isolated(s,SystemCollections.ALERT_DELIVERY_INTENTS,Set.of(1,2),null));
+        return new DuePage(values,next,isolated(s,SystemCollections.ALERT_DELIVERY_INTENTS,Set.of(1,2,3),null));
     }
     SchedulePage schedules(ClientSession s,Instant through,ScheduleCursor after,int limit){
         limit(limit);var filter=scopeFilter().append("formatVersion",1).append("nextCheckAt",new Document("$type","date").append("$lte",Date.from(through)));
@@ -160,7 +161,7 @@ final class MongoAlertReads {
         for(var row:raw)values.add(states.loadEnvelope(s,MongoAlertStateCodec.readKey(row.get("_id",Document.class))).orElseThrow(()->unreadable("inhibition-head")).value());return List.copyOf(values);
     }
     private boolean isolated(ClientSession s,SystemCollections c,Set<Integer> supported,ReadAccess access){
-        var filter=scopeFilter().append("formatVersion",new Document("$nin",supported.stream().sorted().toList()));
+        var filter=c==SystemCollections.ALERT_DELIVERY_INTENTS?and(scopeFilter(),new Document("$nor",List.of(MongoAlertEnvelopeSupport.intentFilter()))):scopeFilter().append("formatVersion",new Document("$nin",supported.stream().sorted().toList()));
         if(access!=null&&!access.allResources()){
             var resources=access.resources().stream().map(r->new Document("_id.resourceKind",r.kind()).append("_id.resourceId",r.id()).append("_id.resourceIncarnation",r.incarnation())).toList();
             filter=and(filter,resources.isEmpty()?new Document("_id",new Document("$exists",false)):new Document("$or",resources));

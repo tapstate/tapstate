@@ -24,8 +24,18 @@ final class MongoAlertReceiverCodec {
             case Webhook webhook -> new Document("channelType", "webhook").append("origin", webhook.origin().toASCIIString())
                     .append("endpointDigest", webhook.endpointDigest()).append("authentication", webhook.authentication().name())
                     .append("principal", webhook.principal()).append("trust", webhook.trust().name());
+            case HttpsJson https -> generic(https);
         };
     }
+    private static Document generic(HttpsJson value){
+        var parameters=new Document();value.parameters().forEach(parameters::append);transportBudget(MongoAlertConfigurationCodec.size(parameters)<=4096,"parameters");
+        var encoded=new Document("channelType",value.channelType()).append("family","HTTPS_JSON").append("transportVersion",value.transportVersion())
+                .append("origin",value.origin().toASCIIString()).append("endpointDigest",value.endpointDigest()).append("authentication",value.authentication().name())
+                .append("principal",value.principal()).append("trust",value.trust().name()).append("parameters",parameters);
+        transportBudget(MongoAlertConfigurationCodec.size(encoded)<=5120,"transport");return encoded;
+    }
+    private static void transportBudget(boolean allowed,String field){if(!allowed)throw new io.tapstate.core.common.TapstateException(io.tapstate.core.alerting.AlertError.INVALID_CONFIGURATION,
+            java.util.Map.of("field",field,"reason","encoded-record-too-large"),null);}
     static Document credentials(CredentialReference value) {
         return value == null ? null : new Document("credentialId", value.credentialId()).append("authenticationIdentity", value.authenticationIdentity());
     }
@@ -37,6 +47,14 @@ final class MongoAlertReceiverCodec {
                 body.get("credentials") == null ? null : readCredentials(header.identity(), document(body.get("credentials"))));
     }
     static Transport readTransport(Document t) {
+        if(t.containsKey("family")){
+            fields(t,Set.of("channelType","family","transportVersion","origin","endpointDigest","authentication","principal","trust","parameters"));
+            require("HTTPS_JSON".equals(t.get("family"))&&Integer.valueOf(1).equals(t.get("transportVersion"))&&MongoAlertConfigurationCodec.size(t)<=5120);
+            var raw=document(t.get("parameters"));require(MongoAlertConfigurationCodec.size(raw)<=4096);var parameters=new java.util.TreeMap<String,String>();
+            raw.forEach((key,value)->{require(value instanceof String);parameters.put(key,(String)value);});
+            return new HttpsJson(text(t,"channelType"),1,URI.create(text(t,"origin")),text(t,"endpointDigest"),enumValue(Authentication.values(),text(t,"authentication")),
+                    nullableText(t,"principal"),enumValue(Trust.values(),text(t,"trust")),parameters);
+        }
         return switch (text(t, "channelType")) {
             case "email" -> {
                 fields(t, Set.of("channelType", "host", "port", "encryption", "authentication", "username", "from", "recipients", "trust"));

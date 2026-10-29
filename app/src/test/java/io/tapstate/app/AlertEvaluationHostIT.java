@@ -98,12 +98,16 @@ class AlertEvaluationHostIT {
     static void withFixture(boolean withSource,java.util.function.Consumer<Fixture> test){withFixture(withSource,false,test);}
     static void withFixture(boolean withSource,boolean cloud,java.util.function.Consumer<Fixture> test){withFixture(withSource,cloud,SCOPE,test);}
     static void withFixture(boolean withSource,boolean cloud,AlarmKey.Scope fixtureScope,java.util.function.Consumer<Fixture> test){
-        var deployment=cloud?AlertChannelPolicy.Deployment.CLOUD_MANAGED:AlertChannelPolicy.Deployment.ON_PREM;
         String suffix=UUID.randomUUID().toString().replace("-","");String configName="alert_host_config_"+suffix,cacheName="alert_host_cache_"+suffix;
-        try(var client=MongoClients.create(MONGO.getReplicaSetUrl())){
-            var configDb=client.getDatabase(configName);var cacheDb=client.getDatabase(cacheName);
-            var settings=new MongoConnectionSettings(MONGO.getReplicaSetUrl(configName),null,Duration.ofSeconds(5));
-            var connection=new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,MONGO.getReplicaSetUrl(cacheName),cacheName,null);
+        withFixture(withSource,cloud,fixtureScope,MONGO.getReplicaSetUrl(configName),MONGO.getReplicaSetUrl(cacheName),test);
+    }
+    static void withFixture(boolean withSource,boolean cloud,AlarmKey.Scope fixtureScope,String configUri,String cacheUri,java.util.function.Consumer<Fixture> test){
+        var deployment=cloud?AlertChannelPolicy.Deployment.CLOUD_MANAGED:AlertChannelPolicy.Deployment.ON_PREM;
+        String configName=new com.mongodb.ConnectionString(configUri).getDatabase(),cacheName=new com.mongodb.ConnectionString(cacheUri).getDatabase();
+        try(var client=MongoClients.create(configUri);var cacheClient=MongoClients.create(cacheUri)){
+            var configDb=client.getDatabase(configName);var cacheDb=cacheClient.getDatabase(cacheName);
+            var settings=new MongoConnectionSettings(configUri,null,Duration.ofSeconds(5));
+            var connection=new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,cacheUri,cacheName,null);
             try(var configuration=MongoConfigurationBootstrap.prepare(settings,fixtureScope.clusterId(),"installation-a","setup-a",1);
                     var cache=MongoCacheDomain.connect(connection,Duration.ofSeconds(5),"alert-host-test")){
                 var setup=new StorageSetupScope(fixtureScope.clusterId(),"installation-a","setup-a",1);

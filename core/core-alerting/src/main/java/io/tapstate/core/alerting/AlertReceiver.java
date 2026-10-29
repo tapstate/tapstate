@@ -6,6 +6,8 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.TreeMap;
 import java.util.Objects;
 import java.util.UUID;
 
@@ -15,10 +17,46 @@ public record AlertReceiver(AlertConfiguration.Header header, String name, boole
     public enum Encryption { IMPLICIT_TLS, STARTTLS_REQUIRED }
     public enum Authentication { NONE, PLAIN, LOGIN, BEARER, HMAC_SHA256 }
     public enum Trust { SYSTEM, PRIVATE_CA }
-    public sealed interface Transport permits Email, Webhook {
+    public sealed interface Transport permits Email, Webhook, HttpsJson {
         String channelType();
         Authentication authentication();
         Trust trust();
+    }
+    /** A closed HTTPS transport envelope; its public text fields are further constrained by static registration. */
+    public record HttpsJson(String channelType, int transportVersion, URI origin, String endpointDigest,
+            Authentication authentication, String principal, Trust trust, Map<String,String> parameters) implements Transport {
+        public HttpsJson {
+            new AlertChannelPolicy.Capability(channelType,1,AlertChannelPolicy.Family.OP_EXTERNAL);
+            AlertValidation.require(!java.util.Set.of("email","webhook","cloud-sdk").contains(channelType),"channelType","reserved-id");
+            AlertValidation.require(transportVersion==1,"transportVersion","unsupported");
+            new Webhook(origin,endpointDigest,authentication,principal,trust);
+            AlertValidation.require(parameters!=null&&parameters.size()<=16,"parameters","too-many");
+            var normalized=new TreeMap<String,String>();
+            parameters.forEach((key,value)->{
+                AlertValidation.require(key!=null&&key.matches("[a-z][a-z0-9-]{0,63}")&&value!=null
+                        &&value.getBytes(StandardCharsets.UTF_8).length<=256&&value.codePoints().noneMatch(Character::isISOControl),"parameters","invalid-text-field");
+                normalized.put(key,value);
+            });
+            parameters=java.util.Collections.unmodifiableMap(normalized);
+            AlertValidation.require(JsonWriter.write(parameters).getBytes(StandardCharsets.UTF_8).length<=4096,"parameters","encoded-budget");
+            var envelope=new TreeMap<String,Object>();envelope.put("channelType",channelType);envelope.put("family","HTTPS_JSON");envelope.put("transportVersion",transportVersion);
+            envelope.put("origin",origin.toASCIIString());envelope.put("endpointDigest",endpointDigest);envelope.put("authentication",authentication.name());
+            envelope.put("principal",principal);envelope.put("trust",trust.name());envelope.put("parameters",parameters);
+            AlertValidation.require(JsonWriter.write(envelope).getBytes(StandardCharsets.UTF_8).length<=5120,"transport","encoded-budget");
+        }
+        public static HttpsJson fromEndpoint(String type,int version,URI endpoint,Authentication auth,String principal,Trust trust,Map<String,String> parameters){
+            var original=Webhook.fromEndpoint(endpoint,auth,principal,trust);
+            return new HttpsJson(type,version,original.origin(),original.endpointDigest(),auth,principal,trust,parameters);
+        }
+    }
+    public static Webhook https(Transport transport){
+        if(transport instanceof Webhook webhook)return webhook;
+        var value=(HttpsJson)transport;
+        return new Webhook(value.origin(),value.endpointDigest(),value.authentication(),value.principal(),value.trust());
+    }
+    public static String httpsTargetId(Transport transport){
+        var value=https(transport);
+        return transport instanceof Webhook?"webhook-"+value.endpointDigest():"https-"+DeliveryKey.fingerprint(java.util.List.of(transport.channelType(),value.endpointDigest()));
     }
     public record Email(String host, int port, Encryption encryption, Authentication authentication,
             String username, String from, List<String> recipients, Trust trust) implements Transport {
@@ -83,7 +121,7 @@ public record AlertReceiver(AlertConfiguration.Header header, String name, boole
         AlertValidation.require(header.deployment() == AlertChannelPolicy.Deployment.ON_PREM, "deployment", "receiver-not-permitted");
         name = AlertValidation.text(name, "receiverName", 128);
         AlertValidation.require(bindingRevision > 0 && bindingRevision <= header.revision(), "bindingRevision", "invalid-revision");
-        boolean privateSlot = transport instanceof Webhook || transport.authentication() != Authentication.NONE || transport.trust() == Trust.PRIVATE_CA;
+        boolean privateSlot = !(transport instanceof Email) || transport.authentication() != Authentication.NONE || transport.trust() == Trust.PRIVATE_CA;
         AlertValidation.require(privateSlot == (credentials != null), "credentials", "private-slot-required-or-unexpected");
         if (credentials != null) {
             AlertValidation.require(credentials.receiver().equals(header.identity()), "credentials", "wrong-receiver");
@@ -106,7 +144,7 @@ public record AlertReceiver(AlertConfiguration.Header header, String name, boole
     }
     public static String authenticationIdentity(Transport transport) {
         return transport instanceof Email email ? JsonWriter.write(List.of("smtp", email.authentication().name(), email.username() == null ? "" : email.username()))
-                : JsonWriter.write(List.of("webhook", transport.authentication().name(), ((Webhook) transport).principal() == null ? "" : ((Webhook) transport).principal()));
+                : JsonWriter.write(List.of(transport.channelType(), transport.authentication().name(), https(transport).principal() == null ? "" : https(transport).principal()));
     }
     public static URI originOf(URI endpoint) {
         canonicalEndpoint(endpoint);

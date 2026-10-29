@@ -23,6 +23,28 @@ class AlertManagementIT {
     }
     static Map<String,Object> call(AlertManagement s,String op,Map<String,Object> input){return s.dispatch("alert."+op,caller(Scope.ADMIN,ACTIVE),input);}
     static Map<String,Object> email(){return map("name","SMTP","enabled",true,"transport",map("channelType","email","host","smtp.example.test","port",465,"encryption","IMPLICIT_TLS","authentication","PLAIN","username","operator","from","alerts@example.test","recipients",List.of("a@example.test"),"trust","SYSTEM"),"secret","private-test-password");}
+    @Test void everyBuiltinSeverityAndAuthorizedOverrideUsesTheCatalogInBothDeployments(){
+        var expected=Map.of("pipeline.failed","MAJOR","pipeline.observation-stale","WARNING","source.connection-failed","MAJOR",
+                "cluster.node-unavailable","MAJOR","cluster.storage-unavailable","CRITICAL");
+        for(boolean cloud:List.of(false,true))AlertEvaluationHostIT.withFixture(false,cloud,f->{
+            var service=service(f);var types=(List<?>)call(service,"catalog",Map.of()).get("types");
+            assertThat(types).hasSize(5);
+            for(Object value:types){var type=object(value);String id=text(type,"id");
+                assertThat(type).containsEntry("severity",expected.get(id));
+                var form=map("name",id,"typeId",id,"resourceKinds",type.get("resourceKinds"),"allResources",true,"resources",List.of(),"parameters",Map.of(),"enabled",true);
+                assertThat(call(service,"rule-preview",map("form",form,"sample","BAD"))).containsEntry("severity",expected.get(id));
+                form.put("severity","MINOR");
+                assertThat(call(service,"rule-preview",map("form",form,"sample","BAD"))).containsEntry("severity","MINOR");
+                assertThat(call(service,"configuration.save",map("kind","RULE","id","severity-"+id,"etag","0","form",form))).containsEntry("severity","MINOR");
+                assertThatThrownBy(()->service.dispatch("alert.configuration.save",caller(Scope.READ,ACTIVE),map("kind","RULE","id","unauthorized-"+id,"etag","0","form",form)))
+                        .isInstanceOf(TapstateException.class);
+                form.put("severity","INDETERMINATE");
+                assertThatThrownBy(()->call(service,"rule-preview",map("form",form,"sample","BAD"))).isInstanceOf(TapstateException.class);
+                form.put("severity","DEFAULT");
+                assertThat(call(service,"rule-preview",map("form",form,"sample","BAD"))).containsEntry("severity",expected.get(id));
+            }
+        });
+    }
     @Test void readerGetsReadOnlyActiveCenterAndCannotMutateConfiguration(){
         AlertEvaluationHostIT.withFixture(f->{bad(f);var s=service(f);var before=f.store().evaluationStates(null,100).rows();
             var result=s.dispatch("alert.center",caller(Scope.READ,ACTIVE),Map.of("limit",5));assertThat(result.get("total")).isEqualTo(1L);assertThat((List<?>)result.get("rows")).hasSize(1);

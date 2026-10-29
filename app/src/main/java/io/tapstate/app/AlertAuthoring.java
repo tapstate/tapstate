@@ -10,8 +10,9 @@ import static io.tapstate.app.AlertHttpModel.*;
 
 /** Request-only forms over the existing typed configuration contract. */
 final class AlertAuthoring {
-    private final AlertStore store;private final AlarmKey.Scope scope;private final AlertChannelPolicy.Deployment deployment;private final AlarmTypeCatalog catalog;private final Clock clock;
-    AlertAuthoring(AlertStore store,AlarmKey.Scope scope,AlertChannelPolicy.Deployment deployment,AlarmTypeCatalog catalog,Clock clock){this.store=store;this.scope=scope;this.deployment=deployment;this.catalog=catalog;this.clock=clock;}
+    private final AlertStore store;private final AlarmKey.Scope scope;private final AlertChannelPolicy.Deployment deployment;private final AlarmTypeCatalog catalog;private final Clock clock;private final AlertChannelCatalog channels;
+    AlertAuthoring(AlertStore store,AlarmKey.Scope scope,AlertChannelPolicy.Deployment deployment,AlarmTypeCatalog catalog,Clock clock){this(store,scope,deployment,catalog,clock,AlertChannelRegistry.defaults().catalog());}
+    AlertAuthoring(AlertStore store,AlarmKey.Scope scope,AlertChannelPolicy.Deployment deployment,AlarmTypeCatalog catalog,Clock clock,AlertChannelCatalog channels){this.store=store;this.scope=scope;this.deployment=deployment;this.catalog=catalog;this.clock=clock;this.channels=channels;}
     AlertConfiguration.Definition save(Map<String,Object> input,AlertStore.Access access,boolean retire){
         fields(input,"kind","id","etag","form");var kind=value(AlertConfiguration.Kind.class,text(input,"kind"));external(kind);
         String id=text(input,"id");var before=store.definition(kind,id,access).orElse(null);long expected=number(input,"etag",0);
@@ -29,7 +30,7 @@ final class AlertAuthoring {
         }
         var form=object(input.get("form"));AlertConfiguration.Definition after;
         if(kind==AlertConfiguration.Kind.RECEIVER){
-            var old=(AlertReceiver)before;var transport=transport(form,old);
+            var old=(AlertReceiver)before;var transport=transport(form,old,channels);
             boolean retain=bool(form,"retainMaterial",false);if(retain&&(old==null||!old.transport().equals(transport)))throw invalid("retainMaterial");
             var credentials=needsPrivate(transport)?old!=null&&(retain||transport.equals(old.transport()))?old.credentials():AlertReceiver.CredentialReference.create(header.identity(),AlertReceiver.authenticationIdentity(transport)):null;
             var receiver=before==null?new AlertReceiver(header,text(form,"name"),bool(form,"enabled",true),1,transport,credentials)
@@ -60,14 +61,18 @@ final class AlertAuthoring {
     static Set<AlarmKey.Resource> selected(Map<String,Object> m){var r=new LinkedHashSet<AlarmKey.Resource>();for(var v:list(m,"resources"))r.add(resource(object(v)));return Set.copyOf(r);}
     static Set<AlarmSeverity> severities(Map<String,Object> m){var s=new LinkedHashSet<AlarmSeverity>();for(var v:strings(m,"severities"))s.add(value(AlarmSeverity.class,v));return Set.copyOf(s);}
     static Instant parseTime(Map<String,Object> m,String key){try{return Instant.parse(text(m,key));}catch(java.time.format.DateTimeParseException e){throw invalid(key);}}
-    static boolean needsPrivate(AlertReceiver.Transport t){return t instanceof AlertReceiver.Webhook||t.authentication()!=AlertReceiver.Authentication.NONE||t.trust()==AlertReceiver.Trust.PRIVATE_CA;}
-    static AlertReceiver.Transport transport(Map<String,Object> form,AlertReceiver old){
+    static boolean needsPrivate(AlertReceiver.Transport t){return !(t instanceof AlertReceiver.Email)||t.authentication()!=AlertReceiver.Authentication.NONE||t.trust()==AlertReceiver.Trust.PRIVATE_CA;}
+    static AlertReceiver.Transport transport(Map<String,Object> form,AlertReceiver old){return transport(form,old,AlertChannelRegistry.defaults().catalog());}
+    static AlertReceiver.Transport transport(Map<String,Object> form,AlertReceiver old,AlertChannelCatalog channels){
         var t=object(form.get("transport"));var auth=value(AlertReceiver.Authentication.class,text(t,"authentication"));var trust=value(AlertReceiver.Trust.class,text(t,"trust"));
         if(text(t,"channelType").equals("email"))return new AlertReceiver.Email(text(t,"host"),integer(t,"port",465),value(AlertReceiver.Encryption.class,text(t,"encryption")),auth,optional(t,"username"),text(t,"from"),new ArrayList<>(strings(t,"recipients")),trust);
-        if(!text(t,"channelType").equals("webhook"))throw invalid("channelType");
-        var endpoint=privateInput(form,"endpoint");if(endpoint==null&&old!=null&&old.transport() instanceof AlertReceiver.Webhook w){
-            if(!w.authentication().equals(auth)||!Objects.equals(w.principal(),optional(t,"principal"))||!w.trust().equals(trust))throw invalid("endpoint-required-for-binding-change");return w;}
-        try{return AlertReceiver.Webhook.fromEndpoint(URI.create(Objects.requireNonNull(endpoint)),auth,optional(t,"principal"),trust);}catch(IllegalArgumentException|NullPointerException ex){throw invalid("endpoint");}
+        var descriptor=channels.require(text(t,"channelType"));
+        if(integer(t,"transportVersion",descriptor.transportVersion())!=descriptor.transportVersion()||t.get("family")!=null&&!"HTTPS_JSON".equals(t.get("family")))throw invalid("transportVersion");
+        var values=new TreeMap<String,String>();object(t.getOrDefault("parameters",Map.of())).forEach((key,value)->{if(!(value instanceof String))throw invalid("parameters");values.put(key,(String)value);});
+        var parameters=descriptor.parameters(values);
+        var endpoint=privateInput(form,"endpoint");if(endpoint==null&&old!=null&&!(old.transport() instanceof AlertReceiver.Email)){
+            if(!old.transport().channelType().equals(text(t,"channelType")))throw invalid("endpoint-required-for-binding-change");var w=AlertReceiver.https(old.transport());if(!w.authentication().equals(auth)||!Objects.equals(w.principal(),optional(t,"principal"))||!w.trust().equals(trust))throw invalid("endpoint-required-for-binding-change");return old.transport() instanceof AlertReceiver.HttpsJson original?new AlertReceiver.HttpsJson(text(t,"channelType"),descriptor.transportVersion(),w.origin(),w.endpointDigest(),auth,w.principal(),trust,parameters):w;}
+        try{return text(t,"channelType").equals("webhook")?AlertReceiver.Webhook.fromEndpoint(URI.create(Objects.requireNonNull(endpoint)),auth,optional(t,"principal"),trust):AlertReceiver.HttpsJson.fromEndpoint(text(t,"channelType"),descriptor.transportVersion(),URI.create(Objects.requireNonNull(endpoint)),auth,optional(t,"principal"),trust,parameters);}catch(IllegalArgumentException|NullPointerException ex){throw invalid("endpoint");}
     }
     static AlertStore.PrivateMaterial material(Map<String,Object> m){
         byte[] auth=null,ca=null;try{var secret=privateInput(m,"secret");if(secret!=null)auth=secret.getBytes(StandardCharsets.UTF_8);var pem=privateInput(m,"privateCa");if(pem!=null)ca=pem.getBytes(StandardCharsets.UTF_8);
@@ -79,7 +84,7 @@ final class AlertAuthoring {
         if(d instanceof AlertConfiguration.Rule r){m.putAll(map("name",r.name(),"typeId",r.typeId(),"typeVersion",r.typeVersion(),"parameters",r.parameters(),"severity",r.severityOverride()==null?"DEFAULT":r.severityOverride().name(),"enabled",r.enabled()));putResources(m,r.resources());}
         if(d instanceof AlertReceiver r){m.putAll(map("name",r.name(),"enabled",r.enabled(),"retainMaterial",r.credentials()!=null));var t=r.transport();var transport=map("channelType",t.channelType(),"authentication",t.authentication().name(),"trust",t.trust().name());
             if(t instanceof AlertReceiver.Email e)transport.putAll(map("host",e.host(),"port",e.port(),"encryption",e.encryption().name(),"username",e.username(),"from",e.from(),"recipients",e.recipients()));
-            else transport.putAll(map("origin",((AlertReceiver.Webhook)t).origin().toString(),"principal",((AlertReceiver.Webhook)t).principal()));m.put("transport",transport);}
+            else transport.putAll(map("origin",AlertReceiver.https(t).origin().toString(),"principal",AlertReceiver.https(t).principal()));if(t instanceof AlertReceiver.HttpsJson generic)transport.putAll(map("family","HTTPS_JSON","transportVersion",generic.transportVersion(),"parameters",generic.parameters()));m.put("transport",transport);}
         if(d instanceof AlertConfiguration.Subscription r){m.putAll(map("name",r.name(),"enabled",r.enabled(),"typeIds",r.match().typeIds().stream().sorted().toList(),"severities",r.match().severities().stream().map(Enum::name).toList(),"groupBy",r.groupBy().stream().map(Enum::name).toList(),"initialWaitSeconds",r.grouping().initialWait().toSeconds(),"changeIntervalSeconds",r.grouping().changeInterval().toSeconds(),"repeatIntervalSeconds",r.grouping().repeatInterval().toSeconds(),"inhibition",r.inhibition().stream().map(e->map("rootType",e.rootType(),"dependentType",e.dependentType())).toList(),"channels",r.channels().stream().map(c->map("channelType",c.channelType(),"receivers",c.receivers().stream().map(AlertConfiguration.Identity::id).toList(),"messages",messages(c.messages()))).toList()));putResources(m,r.match().resources());}
         if(d instanceof AlertConfiguration.Silence s){var w=s.window();m.putAll(map("reason",s.reason(),"allResources",w.allResources(),"resources",w.resources().stream().map(AlertHttpModel::resource).toList(),"typeIds",w.typeIds().stream().sorted().toList(),"startsAt",instant(w.startsAt()),"durationSeconds",w.duration().toSeconds(),"periodSeconds",w.period()==null?null:w.period().toSeconds(),"endsAt",instant(w.endsAt())));}
         return m;

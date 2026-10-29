@@ -145,7 +145,7 @@ final class MongoAlertMaintenance implements AlertMaintenance {
     }
     private static Document candidateHeader(SystemCollections collection) {
         var tests=new ArrayList<Object>();
-        var versions=collection==SystemCollections.ALERT_INSTANCES?List.of(2,3,4):collection==SystemCollections.ALERT_DELIVERY_INTENTS||collection==SystemCollections.ALERT_SUBSCRIPTIONS?List.of(1,2):
+        var versions=collection==SystemCollections.ALERT_INSTANCES?List.of(2,3,4):collection==SystemCollections.ALERT_DELIVERY_INTENTS?List.of(1,2,3):collection==SystemCollections.ALERT_SUBSCRIPTIONS||collection==SystemCollections.ALERT_RECEIVERS?List.of(1,2):
                 collection==SystemCollections.ALERT_EPISODES||collection==SystemCollections.ALERT_TRANSITIONS?List.of(2):List.of(1);
         tests.add(new Document("$lte",List.of(new Document("$bsonSize",new Document("key","$_id")),16*1024)));
         if(collection==SystemCollections.ALERT_NODE_LIFECYCLES){
@@ -167,7 +167,10 @@ final class MongoAlertMaintenance implements AlertMaintenance {
             };
             tests.add(objectKeys("$_id",fields));for(String field:fields)tests.add(textKey("$_id."+field,256));
         }
-        return new Document("formatVersion",new Document("$in",versions)).append("$expr",new Document("$and",tests));
+        var header=new Document("formatVersion",new Document("$in",versions)).append("$expr",new Document("$and",tests));
+        if(collection==SystemCollections.ALERT_DELIVERY_INTENTS)return and(header,MongoAlertEnvelopeSupport.intentFilter());
+        if(collection==SystemCollections.ALERT_RECEIVERS)return and(header,MongoAlertEnvelopeSupport.receiverFilter());
+        return header;
     }
     private static Document objectKeys(String path,List<String> fields) {
         return new Document("$cond",List.of(new Document("$eq",List.of(new Document("$type",path),"object")),
@@ -319,11 +322,11 @@ final class MongoAlertMaintenance implements AlertMaintenance {
             if(scan.after!=null)filter.append("_id",new Document("$gt",scan.after));
             var result=handles.apply(SystemCollections.ALERT_DELIVERY_INTENTS).aggregate(session,List.of(
                     new Document("$match",filter),new Document("$sort",new Document("_id",1)),new Document("$limit",1),
-                    new Document("$project",new Document("_id",1).append("formatVersion",1).append("frozen.identity",1).append("frozen.target",1)),
+                    new Document("$project",new Document("_id",1).append("formatVersion",1).append("channelType",1).append("frozen.identity",1).append("frozen.target",1)),
                     new Document("$project",new Document("row",new Document("$cond",Arrays.asList(new Document("$lte",List.of(new Document("$bsonSize","$$ROOT"),64*1024)),"$$ROOT",null)))))).first();
             budget.use(4096L+(result==null?0:MongoAlertConfigurationCodec.size(result)));
             if(result==null){scan.complete=true;return false;}
-            Document row=result.get("row",Document.class);if(row==null || !Set.of(1,2).contains(row.get("formatVersion")))return true;
+            Document row=result.get("row",Document.class);if(row==null || !MongoAlertEnvelopeSupport.intent(row))return true;
             var frozen=row.get("frozen",Document.class);var identity=MongoAlertDeliveryCodec.readIdentity(frozen.get("identity",Document.class));
             var target=MongoAlertDeliveryCodec.readTarget(frozen.get("target",Document.class));
             if(!identity.scope().equals(scope))return true;
@@ -368,7 +371,9 @@ final class MongoAlertMaintenance implements AlertMaintenance {
         return false;
     }
     private boolean unknown(ClientSession s,SystemCollections c,Budget b) {
-        var versions=c==SystemCollections.ALERT_INSTANCES?List.of(2,3,4):c==SystemCollections.ALERT_DELIVERY_INTENTS||c==SystemCollections.ALERT_SUBSCRIPTIONS?List.of(1,2):
+        if(c==SystemCollections.ALERT_DELIVERY_INTENTS)return exists(s,c,new Document("$nor",List.of(MongoAlertEnvelopeSupport.intentFilter())),b);
+        if(c==SystemCollections.ALERT_RECEIVERS)return exists(s,c,new Document("$nor",List.of(MongoAlertEnvelopeSupport.receiverFilter())),b);
+        var versions=c==SystemCollections.ALERT_INSTANCES?List.of(2,3,4):c==SystemCollections.ALERT_DELIVERY_INTENTS?List.of(1,2,3):c==SystemCollections.ALERT_SUBSCRIPTIONS||c==SystemCollections.ALERT_RECEIVERS?List.of(1,2):
                 c==SystemCollections.ALERT_EPISODES||c==SystemCollections.ALERT_TRANSITIONS?List.of(2):List.of(1);
         return exists(s,c,new Document("formatVersion",new Document("$nin",versions)),b);
     }

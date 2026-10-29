@@ -12,6 +12,33 @@ import static org.assertj.core.api.Assertions.*;
 class AlertReceiverTest {
     private static final Instant AT = Instant.parse("2026-10-27T00:00:00.123456789Z");
     private static final AlarmKey.Scope SCOPE = new AlarmKey.Scope("org-a", "cluster-a");
+    @Test void staticHttpsJsonFieldsAreBoundedAndParameterChangesDoNotResetTheOriginalTargetDomain(){
+        var capability=new AlertChannelPolicy.Capability("test.sink",1,AlertChannelPolicy.Family.OP_EXTERNAL);
+        var descriptor=new AlertChannelCatalog.Descriptor(capability,"Test sink",AlertChannelCatalog.TransportFamily.HTTPS_JSON,1,
+                List.of(new AlertChannelCatalog.Field("topic","Topic",64,true,null)));
+        var catalog=AlertChannelCatalog.defaults().with(List.of(descriptor));
+        var header=new DeliveryCapabilityPolicy.Header(3,SCOPE,"test-delivery","test.sink",1,AT.plusSeconds(60));
+        assertThat(new DeliveryCapabilityPolicy(List.of(capability),List.of(capability)).assess(SCOPE,header,false,AlertChannelPolicy.Deployment.ON_PREM,AT).disposition())
+                .isEqualTo(DeliveryCapabilityPolicy.Disposition.COMPATIBLE);
+        assertThat(new DeliveryCapabilityPolicy(List.of(capability),List.of()).assess(SCOPE,header,false,AlertChannelPolicy.Deployment.ON_PREM,AT).disposition())
+                .isEqualTo(DeliveryCapabilityPolicy.Disposition.PAUSED);
+        assertThat(catalog.require("test.sink").parameters(java.util.Map.of("topic","orders"))).containsEntry("topic","orders");
+        assertThatThrownBy(()->descriptor.parameters(java.util.Map.of())).isInstanceOf(TapstateException.class);
+        assertThatThrownBy(()->descriptor.parameters(java.util.Map.of("secret","unsupported"))).isInstanceOf(TapstateException.class);
+        assertThatThrownBy(()->descriptor.parameters(java.util.Map.of("topic","x".repeat(65)))).isInstanceOf(TapstateException.class);
+        assertThatThrownBy(()->descriptor.parameters(java.util.Map.of("topic",new String(Character.toChars(0x1f680)).repeat(17)))).isInstanceOf(TapstateException.class);
+        var endpoint=URI.create("https://notify.example.test/private-path?token=private-query");
+        var first=HttpsJson.fromEndpoint("test.sink",1,endpoint,Authentication.NONE,null,Trust.SYSTEM,java.util.Map.of("topic","orders"));
+        var changed=HttpsJson.fromEndpoint("test.sink",1,endpoint,Authentication.NONE,null,Trust.SYSTEM,java.util.Map.of("topic","other"));
+        assertThat(first.toString()).doesNotContain("private-path","private-query");
+        assertThat(AlertTargetIdentity.domains(SCOPE,changed)).isEqualTo(AlertTargetIdentity.domains(SCOPE,first));
+        assertThat(AlertTargetIdentity.domains(SCOPE,first)).isNotEqualTo(AlertTargetIdentity.domains(SCOPE,Webhook.fromEndpoint(endpoint,Authentication.NONE,null,Trust.SYSTEM)));
+        assertThatThrownBy(()->HttpsJson.fromEndpoint("test.sink",2,endpoint,Authentication.NONE,null,Trust.SYSTEM,java.util.Map.of())).isInstanceOf(TapstateException.class);
+        assertThatThrownBy(()->HttpsJson.fromEndpoint("test.sink",1,endpoint,Authentication.NONE,null,Trust.SYSTEM,java.util.Map.of("topic","x".repeat(257)))).isInstanceOf(TapstateException.class);
+        var tooMany=new java.util.TreeMap<String,String>();for(int i=0;i<17;i++)tooMany.put("field-"+i,"");
+        assertThatThrownBy(()->HttpsJson.fromEndpoint("test.sink",1,endpoint,Authentication.NONE,null,Trust.SYSTEM,tooMany)).isInstanceOf(TapstateException.class);
+        assertThatThrownBy(()->HttpsJson.fromEndpoint("test.sink",1,URI.create("http://notify.example.test/hook"),Authentication.NONE,null,Trust.SYSTEM,java.util.Map.of())).isInstanceOf(TapstateException.class);
+    }
     @Test void publicWebhookDefinitionNeverContainsItsPrivatePathQueryOrMaterial() {
         URI endpoint = URI.create("https://HOOKS.example.invalid:443/private-token?secret=secret-query");
         Webhook webhook = Webhook.fromEndpoint(endpoint, Authentication.BEARER, "account-a", Trust.SYSTEM);

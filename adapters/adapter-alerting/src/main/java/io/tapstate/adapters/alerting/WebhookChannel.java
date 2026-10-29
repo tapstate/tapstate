@@ -34,7 +34,7 @@ public final class WebhookChannel implements NotificationChannel {
     public record Origin(String host,int port) {
         public Origin { if(host==null||host.isBlank()||host.length()>253||port<1||port>65535)throw invalid("origin");host=host.toLowerCase(Locale.ROOT); }
     }
-    private final TargetBinding binding; private final URI endpoint; private final SSLContext ssl;
+    private final AlertChannelPolicy.Capability capability;private final TargetBinding binding; private final URI endpoint; private final SSLContext ssl;
     private final Clock clock; private final String bearer; private final byte[] signingKey; private final InetAddress[] addresses;
     private final Semaphore slots=new Semaphore(2);
     private final Set<CloseableHttpClient> clients=ConcurrentHashMap.newKeySet();
@@ -47,7 +47,13 @@ public final class WebhookChannel implements NotificationChannel {
     /** The host supplies its freshly approved DNS answer; connections never resolve a second address set. */
     public WebhookChannel(AlertChannelPolicy.Deployment deployment,TargetBinding binding,URI endpoint,Set<Origin> allowed,
             SSLContext ssl,String bearer,byte[] signingKey,Clock clock,InetAddress[] approved) {
-        AlertChannelPolicy.requireDeliverable(deployment,CAPABILITY);
+        this(deployment,binding,endpoint,allowed,ssl,bearer,signingKey,clock,approved,CAPABILITY);
+    }
+    public WebhookChannel(AlertChannelPolicy.Deployment deployment,TargetBinding binding,URI endpoint,Set<Origin> allowed,
+            SSLContext ssl,String bearer,byte[] signingKey,Clock clock,InetAddress[] approved,AlertChannelPolicy.Capability capability) {
+        AlertChannelPolicy.requireDeliverable(deployment,capability);
+        if(capability.family()!=AlertChannelPolicy.Family.OP_EXTERNAL||capability.typeId().equals("email"))throw invalid("https-capability");
+        this.capability=capability;
         this.binding=Objects.requireNonNull(binding);this.ssl=Objects.requireNonNull(ssl);this.clock=Objects.requireNonNull(clock);
         if(endpoint==null||!"https".equalsIgnoreCase(endpoint.getScheme())||endpoint.getHost()==null||endpoint.getUserInfo()!=null
                 ||endpoint.getFragment()!=null||endpoint.toASCIIString().length()>2048
@@ -58,7 +64,7 @@ public final class WebhookChannel implements NotificationChannel {
         this.endpoint=endpoint;this.bearer=bearer;this.signingKey=signingKey==null?null:signingKey.clone();this.addresses=approved==null?null:approved.clone();
         timers.setRemoveOnCancelPolicy(true);
     }
-    @Override public AlertChannelPolicy.Capability capability(){return CAPABILITY;}
+    @Override public AlertChannelPolicy.Capability capability(){return capability;}
     @Override public Result send(Request request)throws InterruptedException {
         if(Thread.currentThread().isInterrupted())throw new InterruptedException();
         if(!binding.matches(request)||!request.destination().channelType().equals(typeId())||!request.contentType().equals("application/json")||request.payload().length>65536)throw invalid("frozenRequest");

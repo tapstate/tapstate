@@ -438,7 +438,7 @@ public final class AlertIntent {
                         "renderFailure", "must-be-nonsendable-original-intent");
             } else if (state.payload() != null) {
                 AlertValidation.require(state.payloadPrunedAt() == null && state.payload().sha256().equals(frozen.content().payloadSha256())
-                        && (frozen.identity().channelType().equals("webhook") ? state.payload().size() <= 64 * 1024 : true),
+                        && (!frozen.identity().channelType().equals("email") ? state.payload().size() <= 64 * 1024 : true),
                         "payload", "changed-or-oversized-frozen-content");
             } else {
                 AlertValidation.require(state.payloadPrunedAt() != null && retained.stoppedAt() != null && pending == 0
@@ -456,12 +456,12 @@ public final class AlertIntent {
         }
     }
     public static boolean needsPrivate(AlertReceiver.Transport transport) {
-        return transport instanceof AlertReceiver.Webhook || transport.authentication() != AlertReceiver.Authentication.NONE
+        return !(transport instanceof AlertReceiver.Email) || transport.authentication() != AlertReceiver.Authentication.NONE
                 || transport.trust() == AlertReceiver.Trust.PRIVATE_CA;
     }
     public static boolean targetMatches(AlertReceiver.Transport transport, String targetId) {
         return transport instanceof AlertReceiver.Email email ? email.recipients().contains(targetId)
-                : targetId.equals("webhook-" + ((AlertReceiver.Webhook) transport).endpointDigest());
+                : targetId.equals(AlertReceiver.httpsTargetId(transport));
     }
     private static DeliveryRetention.Kind kind(Identity identity, Deployment deployment) {
         return identity instanceof Test ? DeliveryRetention.Kind.CHANNEL_TEST

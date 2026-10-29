@@ -21,6 +21,21 @@ import static io.tapstate.adapters.mongostore.AlertDeliveryFixtures.*;
 import static org.assertj.core.api.Assertions.*;
 
 class MongoAlertDeliveryCodecTest {
+    @Test void genericHttpsTransportMatchesItsClosedGoldenAndRejectsUnknownFamilyAndVersion()throws Exception{
+        var original=new AlertReceiver.HttpsJson("test.sink",1,java.net.URI.create("https://notify.example.test"),"a".repeat(64),AlertReceiver.Authentication.NONE,null,AlertReceiver.Trust.SYSTEM,java.util.Map.of("topic","orders"));
+        var encoded=MongoAlertReceiverCodec.transport(original);
+        try(var input=getClass().getResourceAsStream("/alert-https-json-transport-v1.golden.json")){assertThat(input).isNotNull();assertThat(encoded).isEqualTo(Document.parse(new String(input.readAllBytes(),StandardCharsets.UTF_8)));}
+        assertThat(MongoAlertReceiverCodec.readTransport(bson(encoded))).isEqualTo(original);
+        var future=bson(encoded);future.put("transportVersion",2);assertThatThrownBy(()->MongoAlertReceiverCodec.readTransport(future)).isInstanceOf(IllegalArgumentException.class);
+        var unknown=bson(encoded);unknown.put("family","ARBITRARY");assertThatThrownBy(()->MongoAlertReceiverCodec.readTransport(unknown)).isInstanceOf(IllegalArgumentException.class);
+    }
+    @Test void genericTransportBsonOverheadIsRejectedWithACodedConfigurationError(){
+        var parameters=new java.util.TreeMap<String,String>();for(int i=0;i<15;i++)parameters.put("p"+String.format("%02d",i),"x".repeat(256));parameters.put("p15","x".repeat(110));
+        var transport=AlertReceiver.HttpsJson.fromEndpoint("test.sink",1,java.net.URI.create("https://notify.example.test/hook"),AlertReceiver.Authentication.NONE,null,AlertReceiver.Trust.SYSTEM,parameters);
+        assertThat(io.tapstate.core.common.JsonWriter.write(parameters).getBytes(StandardCharsets.UTF_8)).hasSize(4095);
+        assertThatThrownBy(()->MongoAlertReceiverCodec.transport(transport)).isInstanceOfSatisfying(TapstateException.class,
+                error->assertThat(error.code()).isEqualTo(AlertError.INVALID_CONFIGURATION));
+    }
     @Test void originalBusinessEnvelopeMatchesItsAuthoredGoldenAndPreservesBsonTypesAndNanos() throws Exception {
         var original = business(); Document actual = MongoAlertDeliveryCodec.write(original, 1);
         try (var input = getClass().getResourceAsStream("/alert-delivery-v1.golden.json")) {

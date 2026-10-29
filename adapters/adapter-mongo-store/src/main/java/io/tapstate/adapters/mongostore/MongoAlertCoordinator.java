@@ -187,10 +187,11 @@ final class MongoAlertCoordinator implements AlertStore {
     }
     @Override public Outcome saveReceiver(AlertReceiver before,AlertReceiver after,PrivateMaterial replacement,boolean retain,Access access) {
         Objects.requireNonNull(access);management(after,access);
+        if(after.transport() instanceof AlertReceiver.HttpsJson generic)extensionCapability(new AlertChannelPolicy.Capability(generic.channelType(),1,AlertChannelPolicy.Family.OP_EXTERNAL));
         MongoAlertReceiverSecrets.Prepared prepared;
         if(retain){var captured=tx(access,false,false,s->definitions.captureReceiverForManagement(s,after.header().identity()));prepared=definitions.retainReceiverMaterial(after,captured);}
         else{try(var material=material(replacement)){prepared=definitions.prepareReceiver(after,material);}}
-        try{return tx(access,true,true,s->{if(before==null)definitionCapacity(s,after);return outcome(definitions.stageReceiver(s,before,prepared));});}catch(Conflict conflict){maintenance.conflict();return Outcome.CONFLICT;}
+        try{return tx(access,true,true,s->{if(after.transport() instanceof AlertReceiver.HttpsJson generic)extensionCapability(new AlertChannelPolicy.Capability(generic.channelType(),1,AlertChannelPolicy.Family.OP_EXTERNAL));if(before==null)definitionCapacity(s,after);return outcome(definitions.stageReceiver(s,before,prepared));});}catch(Conflict conflict){maintenance.conflict();return Outcome.CONFLICT;}
     }
     private void management(Definition after,Access access){scope(after.header().identity().scope());if(after.header().deployment()!=host.deployment()
             ||!after.header().updatedBy().equals(access.subject()))throw stale("configuration-author");
@@ -313,6 +314,7 @@ final class MongoAlertCoordinator implements AlertStore {
                 boolean grants=after.state().attemptsConsumed()>prior;
                 if(grants&&c.kind()!=CommitKind.PERMIT||c.kind()==CommitKind.PERMIT&&before==null)throw stale("permit-command");
                 if(before!=null&&after.state().manualCycles()!=before.value().state().manualCycles()&&access==null)throw stale("manual-retry-actor");
+                if(before==null && extension(after.frozen()))extensionCapability(after.frozen().channel());
                 if(before==null||grants||before.value().state().manualCycles()!=after.state().manualCycles())validateIntent(s,after.frozen(),grants||before!=null&&before.value().state().manualCycles()!=after.state().manualCycles(),access);
                 if(grants&&host.deployment()==AlertChannelPolicy.Deployment.ON_PREM){var limit=notifications.limit(s,target(after.frozen()));if(limit.isPresent()&&!limit.get().value().restrictionElapsed(clock.instant()))throw stale("target-not-before");}
                 if(c.kind()==CommitKind.END&&(before==null||grants||!after.state().permitsStopped()))throw stale("administrative-stop");
@@ -437,6 +439,9 @@ final class MongoAlertCoordinator implements AlertStore {
         if(previous<1 || revision<previous)throw unreadable("storage-binding-went-backwards");
         return revision>previous;
     }
+    private static boolean extension(AlertIntent.Frozen frozen){return frozen.target() instanceof AlertIntent.ReceiverTarget r&&r.transport() instanceof AlertReceiver.HttpsJson
+            ||frozen.target() instanceof AlertIntent.CandidateTarget c&&c.transport() instanceof AlertReceiver.HttpsJson;}
+    private void extensionCapability(AlertChannelPolicy.Capability channel){if(!host.availableChannels().contains(channel))throw new TapstateException(AlertError.CHANNEL_UNAVAILABLE,Map.of("channel",channel.typeId(),"phase","format-admission"),null);}
     private void validateIntent(ClientSession s,AlertIntent.Frozen f,boolean grant,Access access) {
         scope(f.identity().scope());if(f.retention().deployment()!=host.deployment())throw stale("intent-profile");
         if(f.route() instanceof AlertIntent.ConfiguredRoute r&&!definitions.fenceSubscriptionBinding(s,r.identity(),r.bindingRevision()))throw stale("subscription-binding");
@@ -613,8 +618,8 @@ final class MongoAlertCoordinator implements AlertStore {
                     if(c!=null||captured.receiver().transport().trust()!=AlertReceiver.Trust.PRIVATE_CA||transport.trust()!=AlertReceiver.Trust.PRIVATE_CA)throw stale("retained-trust-binding");c=original.privateCa();
                 }
                 if(retain.contains(PrivateField.ENDPOINT) && (replacement!=null&&replacement.endpoint()!=null
-                        || !(transport instanceof AlertReceiver.Webhook webhook) || original.webhookEndpoint()==null
-                        || !webhook.matchesEndpoint(original.webhookEndpoint()))) throw stale("retained-endpoint-binding");
+                        || transport instanceof AlertReceiver.Email || original.webhookEndpoint()==null
+                        || !AlertReceiver.https(transport).matchesEndpoint(original.webhookEndpoint()))) throw stale("retained-endpoint-binding");
                 var endpoint=replacement!=null&&replacement.endpoint()!=null?replacement.endpoint():original.webhookEndpoint();
                 return new ReceiverSecretMaterial(a,c,endpoint);
             }finally{if(a!=null)Arrays.fill(a,(byte)0);if(c!=null)Arrays.fill(c,(byte)0);}

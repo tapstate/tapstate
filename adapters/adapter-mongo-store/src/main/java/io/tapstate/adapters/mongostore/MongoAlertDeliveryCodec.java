@@ -29,10 +29,15 @@ final class MongoAlertDeliveryCodec {
         return scope(identity.scope()).append("purpose", identity instanceof Business ? "business" : "channel-test")
                 .append("deliveryId", identity.deliveryId());
     }
+    private static int format(Frozen frozen){
+        var target=frozen.target();
+        var transport=target instanceof ReceiverTarget r?r.transport():target instanceof CandidateTarget c?c.transport():null;
+        return transport instanceof AlertReceiver.HttpsJson?3:frozen.testAuthority()==null?1:2;
+    }
     static Document write(AlertIntent.Record value, long revision) {
         if (revision < 1) { throw new IllegalArgumentException("stored revision must be positive"); }
         Frozen frozen = value.frozen(); State state = value.state();
-        var encoded = new Document("_id", key(frozen.identity())).append("formatVersion", frozen.testAuthority() == null ? AlertIntent.FORMAT_VERSION : 2)
+        var encoded = new Document("_id", key(frozen.identity())).append("formatVersion", format(frozen))
                 .append("recordRevision", revision).append("channelType", frozen.channel().typeId()).append("channelVersion", frozen.channel().version())
                 .append("deadline", time(frozen.deadline())).append("quotaMinute", frozen.identity() instanceof Test test
                         ? time(AlertTestQuota.minute(test.command().acceptedAt())) : null)
@@ -44,10 +49,10 @@ final class MongoAlertDeliveryCodec {
     static Stored read(Identity expected, Document row) {
         try {
             fields(row, FIELDS); require(MongoAlertConfigurationCodec.size(row) <= AlertIntent.MAX_BYTES);
-            sameKey(key(expected), doc(row, "_id")); require(Integer.valueOf(1).equals(row.get("formatVersion")) || Integer.valueOf(2).equals(row.get("formatVersion")));
+            sameKey(key(expected), doc(row, "_id")); require(Set.of(1,2,3).contains(row.get("formatVersion")));
             long revision = number(row, "recordRevision", 1);
             Frozen frozen = readFrozen(doc(row, "frozen")); require(sameIdentity(frozen.identity(), expected));
-            require(Integer.valueOf(frozen.testAuthority() == null ? 1 : 2).equals(row.get("formatVersion")));
+            require(Integer.valueOf(format(frozen)).equals(row.get("formatVersion")));
             require(frozen.channel().typeId().equals(text(row, "channelType")) && frozen.channel().version() == integer(row, "channelVersion", 1));
             require(frozen.deadline().equals(instant(row, "deadline", false)));
             require(Objects.equals(row.get("quotaMinute"), expected instanceof Test test ? time(AlertTestQuota.minute(test.command().acceptedAt())) : null));

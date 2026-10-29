@@ -46,7 +46,7 @@ final class AlertHttpModel {
     }
     private static String deliveryTarget(AlertIntent.Frozen frozen){
         var transport=frozen.target() instanceof AlertIntent.ReceiverTarget receiver?receiver.transport():frozen.target() instanceof AlertIntent.CandidateTarget candidate?candidate.transport():null;
-        return transport instanceof AlertReceiver.Email?frozen.identity().targetId():transport instanceof AlertReceiver.Webhook webhook?webhook.origin().toASCIIString():null;
+        return transport instanceof AlertReceiver.Email?frozen.identity().targetId():transport==null?null:AlertReceiver.https(transport).origin().toASCIIString();
     }
     private static String displayState(AlertIntent.Record record){var s=record.state();
         if(s.summary()==DeliveryEvidence.Outcome.ACCEPTED)return "ACCEPTED";

@@ -207,6 +207,35 @@ class ScopedConvergenceDriverTest {
             assertThat(captured.getLast().state()).isEqualTo(PipelineState.RUNNING);
         }
     }
+    @Test void unreachableExportCannotPreventEvaluationOrTheIndependentFreshnessClock() throws Exception {
+        int unusedPort;
+        try(var socket=new java.net.ServerSocket(0,1,java.net.InetAddress.getLoopbackAddress())){unusedPort=socket.getLocalPort();}
+        var settings=io.tapstate.adapters.otel.ExportSettings.otlpTo("http://127.0.0.1:"+unusedPort+"/v1/metrics",
+                io.tapstate.adapters.otel.ExportSettings.Protocol.HTTP_PROTOBUF,Duration.ofHours(1));
+        var harness=new PipelineAlertRuntimeTest();var rule=AlertEvaluationHostTest.definition("pipeline.observation-stale");
+        org.mockito.Mockito.when(harness.fixture.store.evaluationRules(org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.anyInt()))
+                .thenReturn(new io.tapstate.spi.store.AlertStore.DefinitionPage(List.of(rule),null));
+        harness.fixture.now.set(Instant.now().plusSeconds(10));harness.intents.put("orders",intents.snapshot);
+        try(var exporter=io.tapstate.adapters.otel.OtelMetricsExport.start(settings);var runtime=harness.runtime()){
+            runtime.tick();org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->!runtime.health().degraded());
+            metricsExport=exporter;sampleMetrics=true;alertFeed=runtime;driver().reconcile();
+            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->runtime.health().queuedInputs()==0);
+            runtime.tick();
+            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->!harness.rows.isEmpty());
+            var initial=harness.rows.values().iterator().next().value().snapshot();
+            assertThat(initial.status()).isEqualTo(io.tapstate.core.alerting.AlertSnapshot.Status.CLEAR);
+            var original=views.observations(FIRST).read("orders").orElseThrow();
+            assertThat(exporter.flush(Duration.ofSeconds(2))).isFalse();
+            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->runtime.health().queuedInputs()==0);
+            harness.fixture.now.set(initial.lastObservedAt().plusSeconds(121));runtime.tick();
+            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).untilAsserted(()->{
+                var stale=harness.rows.values().iterator().next().value().snapshot();
+                assertThat(stale.status()).isEqualTo(io.tapstate.core.alerting.AlertSnapshot.Status.FIRING);
+                assertThat(stale.lastObservedAt()).isEqualTo(harness.fixture.now.get());
+            });
+            assertThat(views.observations(FIRST).read("orders").orElseThrow()).isSameAs(original);
+        }
+    }
 
     private void advance(PipelineConvergencePass pass) {
         assertThat(pass.claim()).isEqualTo(WorkloadClaimFence.from(claims.read(KEY).orElseThrow().claim()));

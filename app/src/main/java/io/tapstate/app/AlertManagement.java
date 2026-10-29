@@ -29,12 +29,13 @@ final class AlertManagement implements AlertControlDispatcher {
     }
     private Map<String,Object> invoke(String op,Map<String,Object> input,PipelineAlertRuntime.Services resolved,AlertStore.Access access,CredentialAuthentication caller){
         var store=resolved.store();var reads=new AlertStore.ReadAccess(true,Set.of(),access.locallyActive());
-        var author=new AlertAuthoring(store,scope,deployment,resolved.catalog(),clock);var commands=new AlertDeliveryCommands(store,scope,deployment,clock,resolved.evaluator().retentionPolicy());
+        var author=new AlertAuthoring(store,scope,deployment,resolved.catalog(),clock,resolved.channels());var commands=new AlertDeliveryCommands(store,scope,deployment,clock,resolved.evaluator().retentionPolicy());
         int limit=integer(input,"limit",25);if(limit<1||limit>100)throw invalid("limit");
         switch(op){
             case "alert.catalog": {
                 fields(input);return map("deployment",deployment.name(),"clusterId",scope.clusterId(),"refreshedAt",instant(clock.instant()),
-                        "channelPolicies",deployment==AlertChannelPolicy.Deployment.ON_PREM?map("email",policy(ChannelRetryPolicy.emailDefaults()),"webhook",policy(ChannelRetryPolicy.webhookDefaults())):Map.of(),
+                        "channelPolicies",deployment==AlertChannelPolicy.Deployment.ON_PREM?channelPolicies(resolved.channels()):Map.of(),
+                        "channels",deployment==AlertChannelPolicy.Deployment.ON_PREM?resolved.channels().descriptors().stream().map(AlertManagement::channelDescriptor).toList():List.of(),
                         "types",resolved.catalog().types().stream().map(t->type(t,resolved.providers(),resolved.descriptions())).toList());
             }
             case "alert.resources": {
@@ -67,7 +68,7 @@ final class AlertManagement implements AlertControlDispatcher {
             }
             case "alert.deliveries": {
                 fields(input,"cursor","limit","channel","result","id","key","episode");var id=optional(input,"id");if(id!=null)return projectDelivery(store.delivery(id,reads).orElseThrow(()->stale("delivery-not-found")),true,resolved);
-                var channel=optional(input,"channel");if(channel!=null&&!Set.of("email","webhook","cloud-sdk").contains(channel))throw invalid("channel");
+                var channel=optional(input,"channel");if(channel!=null&&!"cloud-sdk".equals(channel))resolved.channels().require(channel);
                 if(deployment==AlertChannelPolicy.Deployment.CLOUD_MANAGED&&channel!=null&&!channel.equals("cloud-sdk"))throw stale("managed-channel");
                 var outcome=optional(input,"result");if(outcome!=null&&!Set.of("NOT_ATTEMPTED","NOT_ACCEPTED","UNKNOWN","ACCEPTED","WAITING_RETRY","QUEUED","IN_FLIGHT","PAUSED","CANCELLED","EXHAUSTED","EXPIRED").contains(outcome))throw invalid("result");var alarm=input.get("key")==null?null:key(text(input,"key"),scope);long episode=number(input,"episode",0);String filter=JsonWriter.write(java.util.Arrays.asList(channel,outcome,input.get("key"),episode));String token=optional(input,"cursor");String after=token==null?null:text(cursor(token,"deliveries:"+filter),"after");
                 var p=store.deliveries(after,limit,channel,null,reads);var rows=p.rows().stream().filter(r->alarm==null||r.value().frozen().members().stream().anyMatch(m->m.evaluation().key().equals(alarm)&&(episode==0||m.episode()==episode))).map(r->projectDelivery(r,false,resolved)).filter(r->outcome==null||outcome.equals(r.get("outcome"))||outcome.equals(r.get("displayState"))).toList();
@@ -88,13 +89,13 @@ final class AlertManagement implements AlertControlDispatcher {
                 var rows=p.rows().stream().map(r->{var row=head(r.value());var key=r.value().snapshot().rule().key();boolean muted=snapshot.definitions().stream().filter(AlertConfiguration.Silence.class::isInstance).map(AlertConfiguration.Silence.class::cast).anyMatch(s->s.matches(key,now));boolean inhibited=snapshot.states().stream().map(v->v.value().snapshot()).anyMatch(root->policy.suppresses(root,r.value().snapshot(),snapshot.dependencies().contains(new AlertStore.Dependency(root.rule().key(),key))));row.put("silenced",muted);row.put("inhibited",inhibited);return row;}).toList();var n=p.next();
                 return map("rows",rows,"total",p.total(),"nextCursor",n==null?null:cursorToken(context,map("rank",n.severityRank(),"second",n.secondOrder(),"nano",n.nanoOrder(),"key",key(n.key()))),"isolated",p.isolatedRecords(),"previewOnly",true,"refreshedAt",instant(now));
             }
-            case "alert.preview":return preview(input);
+            case "alert.preview":resolved.channels().require(text(input,"channel"));return preview(input);
             case "alert.test": {
                 fields(input,"commandId","candidateId","form","existingId","etag","target","routeId");requireOp();var form=object(input.get("form"));AlertReceiver existing=null;
                 if(input.get("existingId")!=null){existing=(AlertReceiver)store.definition(AlertConfiguration.Kind.RECEIVER,text(input,"existingId"),access).orElseThrow(()->stale("receiver-not-found"));if(existing.header().revision()!=number(input,"etag",0))throw stale("receiver-etag");}
-                var transport=AlertAuthoring.transport(form,existing);var retain=new LinkedHashSet<AlertStore.PrivateField>();if(bool(form,"retainMaterial",false)&&existing!=null){if(transport.authentication()!=AlertReceiver.Authentication.NONE)retain.add(AlertStore.PrivateField.AUTHENTICATION);if(transport.trust()==AlertReceiver.Trust.PRIVATE_CA)retain.add(AlertStore.PrivateField.PRIVATE_CA);if(transport instanceof AlertReceiver.Webhook&&privateInput(form,"endpoint")==null)retain.add(AlertStore.PrivateField.ENDPOINT);}
+                var transport=AlertAuthoring.transport(form,existing,resolved.channels());var retain=new LinkedHashSet<AlertStore.PrivateField>();if(bool(form,"retainMaterial",false)&&existing!=null){if(transport.authentication()!=AlertReceiver.Authentication.NONE)retain.add(AlertStore.PrivateField.AUTHENTICATION);if(transport.trust()==AlertReceiver.Trust.PRIVATE_CA)retain.add(AlertStore.PrivateField.PRIVATE_CA);if(!(transport instanceof AlertReceiver.Email)&&privateInput(form,"endpoint")==null)retain.add(AlertStore.PrivateField.ENDPOINT);}
                 AlertConfiguration.Subscription route=null;if(input.get("routeId")!=null)route=(AlertConfiguration.Subscription)store.definition(AlertConfiguration.Kind.SUBSCRIPTION,text(input,"routeId"),access).orElseThrow(()->stale("route-not-found"));
-                try(var material=AlertAuthoring.material(form)){return projectDelivery(commands.test(AlertTestCommand.ClientId.parse(text(input,"commandId")),text(input,"candidateId"),transport,transport instanceof AlertReceiver.Webhook w?"webhook-"+w.endpointDigest():emailTarget(text(input,"target")),existing,material,retain,route,access),false,resolved);}
+                try(var material=AlertAuthoring.material(form)){return projectDelivery(commands.test(AlertTestCommand.ClientId.parse(text(input,"commandId")),text(input,"candidateId"),transport,transport instanceof AlertReceiver.Email?emailTarget(text(input,"target")):AlertReceiver.httpsTargetId(transport),existing,material,retain,route,access),false,resolved);}
             }
             case "alert.test-result": {fields(input,"commandId");requireOp();return projectDelivery(commands.result(new AlertTestCommand.Key(scope,access.actor().principalKey(),AlertTestCommand.ClientId.parse(text(input,"commandId"))),access),false,resolved);}
             case "alert.retry": {fields(input,"id","etag");requireOp();var current=store.delivery(text(input,"id"),reads).orElseThrow(()->stale("delivery-not-found"));AlertAuthoring.check(commands.retry(current.value().frozen().identity(),number(input,"etag",0),access));return map("queued",true);}
@@ -103,7 +104,7 @@ final class AlertManagement implements AlertControlDispatcher {
     }
     private static String emailTarget(String value){int at=value.lastIndexOf('@');return at<0?value:value.substring(0,at+1)+value.substring(at+1).toLowerCase(Locale.ROOT);}
     private Map<String,Object> preview(Map<String,Object> input){
-        fields(input,"messages","kind","channel");requireOp();var kind=value(NotificationRenderer.Kind.class,text(input,"kind"));var channel=text(input,"channel");if(!Set.of("email","webhook").contains(channel))throw invalid("channel");var now=clock.instant();
+        fields(input,"messages","kind","channel");requireOp();var kind=value(NotificationRenderer.Kind.class,text(input,"kind"));var channel=text(input,"channel");var now=clock.instant();
         var key=new AlarmKey(scope,new AlarmKey.Resource("pipeline","preview","preview"),"pipeline.failed","preview");boolean recovered=kind==NotificationRenderer.Kind.RECOVERY||kind==NotificationRenderer.Kind.RECOVERY_SUMMARY;
         var item=new NotificationRenderer.Item(key,1L,recovered?NotificationRenderer.State.RESOLVED:NotificationRenderer.State.FIRING,AlarmSeverity.MAJOR,"Example Pipeline","Example failure evidence",now,now,recovered?now:null);
         var result=new NotificationRenderer().render(new NotificationRenderer.Facts(kind,"preview",kind==NotificationRenderer.Kind.CHANNEL_TEST?0:1,now,kind==NotificationRenderer.Kind.CHANNEL_TEST?List.of():List.of(item),kind==NotificationRenderer.Kind.CHANNEL_TEST?0:1,null,List.of(),kind==NotificationRenderer.Kind.CHANNEL_TEST?"preview":null,kind==NotificationRenderer.Kind.CHANNEL_TEST?channel:null),messages(object(input.get("messages"))));
@@ -117,6 +118,8 @@ final class AlertManagement implements AlertControlDispatcher {
             try{AlertDeliveryProgress.manual(stored.value(),clock.instant());retry=true;}catch(io.tapstate.core.common.TapstateException refused){}}
         row.put("canRetry",retry);return row;
     }
+    private static Map<String,Object> channelPolicies(AlertChannelCatalog catalog){var policies=new LinkedHashMap<String,Object>();for(var descriptor:catalog.descriptors())policies.put(descriptor.capability().typeId(),policy(descriptor.transportFamily()==AlertChannelCatalog.TransportFamily.EMAIL?ChannelRetryPolicy.emailDefaults():ChannelRetryPolicy.webhookDefaults()));return policies;}
+    private static Map<String,Object> channelDescriptor(AlertChannelCatalog.Descriptor d){return map("id",d.capability().typeId(),"version",d.capability().version(),"label",d.label(),"transportFamily",d.transportFamily().name(),"transportVersion",d.transportVersion(),"fields",d.fields().stream().map(f->map("key",f.key(),"label",f.label(),"maximumBytes",f.maximumBytes(),"required",f.required(),"defaultValue",f.defaultValue())).toList());}
     private static Map<String,Object> policy(ChannelRetryPolicy p){return map("timeoutSeconds",p.attemptTimeout().toSeconds(),"attempts",p.attemptsPerCycle(),"maximumAgeSeconds",p.maximumAge().toSeconds(),"retryDelaysSeconds",p.retryDelays().stream().map(Duration::toSeconds).toList());}
     private static Map<String,Object> type(AlarmTypeCatalog.Type t,Set<String> providers,io.tapstate.adapters.alerting.AlarmTypeText descriptions){var d=descriptions.describe(t);
         return map("id",t.id(),"version",t.version(),"resourceKinds",t.resourceKinds().stream().sorted().toList(),"severity",t.defaultSeverity().name(),"enabledByDefault",t.enabledByDefault(),"condition",d.condition(),"recovery",d.recovery(),"guidance",d.guidance(),"inputAvailable",providers.contains(t.providerId()),"parameters",t.parameters().stream().map(p->map("name",p.name(),"kind",p.kind().name(),"unit",p.unit(),"minimum",p.minimum(),"maximum",p.maximum(),"defaultValue",p.defaultValue())).toList());
