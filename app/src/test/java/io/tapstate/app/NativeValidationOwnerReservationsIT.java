@@ -218,6 +218,7 @@ class NativeValidationOwnerReservationsIT {
             long nodeAskedAt = System.nanoTime();
             node = cache.workloadClaims(scope).acquire(new WorkloadClaimKey("cluster", WorkloadClaimType.NODE_SESSION, "node"), new WorkloadOwner("node", "boot"), 1, Duration.ofMinutes(5)).claim();
             var config = new Config().setClusterName("native-owner-" + suffix); config.getJetConfig().setEnabled(true).setCooperativeThreadCount(4);
+            config.addExecutorConfig(new com.hazelcast.config.ExecutorConfig(ValidationOwnerRouter.EXECUTOR).setPoolSize(2).setQueueCapacity(16));
             config.getMemberAttributeConfig().setAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE, "node").setAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE, "boot");
             config.setProperty("hazelcast.logging.type", "none").setProperty("hazelcast.phone.home.enabled", "false").setProperty("hazelcast.shutdownhook.enabled", "false")
                     .setProperty("hazelcast.operation.thread.count", "2").setProperty("hazelcast.operation.generic.thread.count", "2")

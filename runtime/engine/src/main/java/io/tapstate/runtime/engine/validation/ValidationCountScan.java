@@ -24,6 +24,8 @@ public final class ValidationCountScan {
     private final Consumer<ValidationCountCheck> publish;
     private final AtomicBoolean attempted = new AtomicBoolean(), cancelled = new AtomicBoolean();
     private volatile boolean complete;
+    private volatile int completedMappings;
+    private volatile String readingMapping;
 
     public ValidationCountScan(ValidationRunIdentity identity, ValidationRunSpec spec, List<Mapping> mappings,
             Runnable requireCurrent, Consumer<ValidationCountCheck> publish) {
@@ -36,16 +38,20 @@ public final class ValidationCountScan {
     }
     public void cancel() { cancelled.set(true); }
     public boolean complete() { return complete; }
+    public int completedMappings(){return completedMappings;}
+    public String readingMapping(){return readingMapping;}
     public void run() {
         if (!attempted.compareAndSet(false, true)) throw invalid("alreadyAttempted");
         for (int index = 0; index < mappings.size(); index++) {
             check(); var mapping = mappings.get(index); var declared = spec.task().mappings().get(index);
+            readingMapping=mapping.id();
             var source = Objects.requireNonNull(mapping.source().read(this::check)); check();
             if (!source.table().equals(declared.source())) throw invalid("sourceTable");
             var target = Objects.requireNonNull(mapping.target().read(this::check)); check();
             if (!target.table().equals(declared.target())) throw invalid("targetTable");
             publish.accept(new ValidationCountCheck(identity, mapping.id(), declared.outputId(), source.count(), target.count(), source.read(), target.read()));
             check();
+            completedMappings=index+1;readingMapping=null;
         }
         check(); complete = true;
     }

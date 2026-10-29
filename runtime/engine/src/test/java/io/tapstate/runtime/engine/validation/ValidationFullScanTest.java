@@ -18,6 +18,7 @@ class ValidationFullScanTest {
         var mapping=new ValidationFullScan.Mapping("mapping",guard->merge(new Rows(25001),new Rows(25002)),(observation,guard)->{guard.run();checked.incrementAndGet();return result(observation);});
         var scan=new ValidationFullScan(f.identity,f.spec,List.of(mapping),()->{},check->{published.incrementAndGet();});
         scan.run();assertThat(checked).hasValue(25002);assertThat(published).hasValue(25002);assertThat(scan.complete()).isTrue();
+        assertThat(scan.completedMappings()).isOne();assertThat(scan.readingMapping()).isNull();
         assertThatThrownBy(scan::run).isInstanceOf(TapstateException.class).hasMessageContaining("alreadyAttempted");
     }
     @Test void aLostPublicationReplyCannotCompleteOrSkipToTheNextRoot() {
@@ -26,6 +27,7 @@ class ValidationFullScanTest {
                 (observation,guard)->{checked.incrementAndGet();return result(observation);})),()->{},check->{writes.incrementAndGet();throw unknown();});
         assertThatThrownBy(scan::run).isInstanceOf(TapstateException.class).hasMessageContaining("unknown");
         assertThat(checked).hasValue(1);assertThat(writes).hasValue(1);assertThat(scan.complete()).isFalse();
+        assertThat(scan.completedMappings()).isZero();assertThat(scan.readingMapping()).isEqualTo("mapping");
     }
     @Test void aForeignRootResultNeverPublishesAndBothReadersClose() {
         var f=new Fixture();var source=new Rows(2);var target=new Rows(2);var writes=new AtomicInteger();

@@ -20,11 +20,13 @@ class ValidationCountScanTest {
     @Test void completePublicationIsRequiredAndExactCountsDoNotBecomeRowOrContentClaims() {
         var observed=new ArrayList<ValidationCountCheck>();
         var scan=new ValidationCountScan(RUN,SPEC,List.of(new ValidationCountScan.Mapping("mapping",guard->scalar(SOURCE,9007199254740993L),guard->scalar(TARGET,9007199254740992L))),()->{},observed::add);
-        scan.run();assertThat(scan.complete()).isTrue();assertThat(observed).singleElement().satisfies(value->{
+        assertThat(scan.completedMappings()).isZero();assertThat(scan.readingMapping()).isNull();
+        scan.run();assertThat(scan.complete()).isTrue();assertThat(scan.completedMappings()).isOne();assertThat(scan.readingMapping()).isNull();assertThat(observed).singleElement().satisfies(value->{
             assertThat(value.sourceCount()).isEqualTo(9007199254740993L);assertThat(value.difference()).isOne();assertThat(value.sameCount()).isFalse();
         });
         var failed=new ValidationCountScan(RUN,SPEC,List.of(new ValidationCountScan.Mapping("mapping",guard->scalar(SOURCE,0),guard->scalar(TARGET,0))),()->{},value->{throw new IllegalStateException("unknown publication");});
         assertThatThrownBy(failed::run).hasMessage("unknown publication");assertThat(failed.complete()).isFalse();
+        assertThat(failed.completedMappings()).isZero();assertThat(failed.readingMapping()).isEqualTo("mapping");
         assertThatThrownBy(scan::run).isInstanceOf(TapstateException.class);
     }
     @Test void aForeignPhysicalScalarCannotBePublishedOrAdvanceToTheTargetRead() {

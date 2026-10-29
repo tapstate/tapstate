@@ -275,9 +275,11 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                     new NativeValidationStartup(engine,initials,owner.configuration,owner.original.cache(),owner.original.preparation().businessScope(),owner.memberStorage::requireNode));
         }
         @Bean(destroyMethod = "close") ValidationOwnerRouter validationOwnerRouter(HazelcastInstance member, NodeSessionLease node,
-                ClusterMembershipGate membership, NativeValidationOwnerReservations owners, NativeBusinessContext owner) {
+                ClusterMembershipGate membership, NativeValidationOwnerReservations owners, NativeBusinessContext owner,
+                NativeValidationRuns runs,io.tapstate.runtime.engine.validation.ValidationProcessorRegistry processors,
+                ValidationMemberResources process,NativeValidationFullJob.Factory factory) {
             return new ValidationOwnerRouter(member, membership, () -> node.currentFence().orElseThrow(ThreeLayerStorePort::refused),
-                    owners::readOwner, owners, owner.memberStorage::requireNode, Duration.ofSeconds(5));
+                    owners::readOwner, owners,new NativeValidationCommands(owners,runs,member,processors,process,factory),owner.memberStorage::requireNode, Duration.ofSeconds(5));
         }
         @Bean(destroyMethod="close") io.tapstate.runtime.engine.validation.ValidationProcessorRegistry validationProcessorRegistry(HazelcastInstance member,NativeBusinessContext owner) {
             return new io.tapstate.runtime.engine.validation.ValidationProcessorRegistry(member,owner.memberStorage::requireNode);

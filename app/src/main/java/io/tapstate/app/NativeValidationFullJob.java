@@ -129,6 +129,16 @@ final class NativeValidationFullJob implements ValidationRunLifecycle.Activation
             boolean drained=prepared==null||cleanupExited&&prepared.drained();recordPlanFailure();
             return finished&&drained&&(current!=null&&current.complete()||scalar!=null&&scalar.complete())&&failures.get()==null;
         }
+        @Override public List<ValidationRunLifecycle.Table> tables(){
+            var row=scan;var scalar=counts;int completed=row!=null?row.completedMappings():scalar!=null?scalar.completedMappings():0;
+            String reading=row!=null?row.readingMapping():scalar!=null?scalar.readingMapping():null;
+            var result=new ArrayList<ValidationRunLifecycle.Table>();
+            for(int index=0;index<spec.task().mappings().size();index++){
+                var id=spec.task().mappings().get(index).mappingId();result.add(new ValidationRunLifecycle.Table(id,index<completed?ValidationRunLifecycle.ReadPhase.READ_COMPLETE:
+                        id.equals(reading)?ValidationRunLifecycle.ReadPhase.READING:ValidationRunLifecycle.ReadPhase.PENDING));
+            }
+            return List.copyOf(result);
+        }
         @Override public boolean readersReleased(){
             boolean done=!workerOutstanding&&runs.publicationsDrained(identity)&&(plan==null||cleanupExited&&plan.drained());
             recordPlanFailure();if(done)releasePlan();return done;

@@ -19,6 +19,43 @@ import static org.assertj.core.api.Assertions.*;
 
 /** Real member RPC/identity tests. The local lease port is a fixture, not durable acquisition proof. */
 class ValidationOwnerRouterTest {
+    @Test void originalCommandsUseOnlyTheExactOwnerAndNeverReserveOrRerank(){
+        try(var f=new Fixture(Duration.ofSeconds(5))){
+            var request=request();var seen=new CopyOnWriteArrayList<Command>();
+            f.commands.put("b",command->{seen.add(command);return new CommandReply(Outcome.ACCEPTED,command,"STARTING",true,true,false,false,false,null);});
+            for(var action:Action.values()){
+                var command=Command.of(action,request,accepted("b",request).owner());
+                assertThat(f.left.command(command)).satisfies(reply->{assertThat(reply.outcome()).isEqualTo(Outcome.ACCEPTED);assertThat(reply.original()).isEqualTo(command);assertThat(reply.waiting()).isTrue();});
+            }
+            assertThat(seen).extracting(Command::action).containsExactly(Action.ACTIVATE,Action.STATUS,Action.STOP);
+            assertThat(f.calls.get("a")).hasValue(0);assertThat(f.calls.get("b")).hasValue(0);
+            var wrongBoot=new Command(Action.ACTIVATE,request,"cluster","b","other-boot",3,4,1);
+            assertThat(f.left.command(wrongBoot).outcome()).isEqualTo(Outcome.REJECTED);assertThat(seen).hasSize(3);
+        }
+    }
+    @Test void aLateOriginalCommandNeverFallsBackToAnotherMember()throws Exception{
+        var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var finished=new CountDownLatch(1);
+        try(var f=new Fixture(Duration.ofMillis(200))){
+            var request=request();var command=Command.of(Action.ACTIVATE,request,accepted("b",request).owner());var calls=new AtomicInteger();
+            f.commands.put("b",original->{calls.incrementAndGet();entered.countDown();try{if(!release.await(5,TimeUnit.SECONDS))throw new AssertionError("command gate timeout");}
+                catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}finished.countDown();return new CommandReply(Outcome.ACCEPTED,original,"STARTING",false,false,false,false,false,null);});
+            try{assertThat(f.left.command(command).outcome()).isEqualTo(Outcome.UNKNOWN);assertThat(entered.await(2,TimeUnit.SECONDS)).isTrue();}
+            finally{release.countDown();}
+            assertThat(finished.await(5,TimeUnit.SECONDS)).isTrue();assertThat(calls).hasValue(1);assertThat(f.calls.get("a")).hasValue(0);assertThat(f.calls.get("b")).hasValue(0);
+        }finally{release.countDown();}
+    }
+    @Test void aCommandProbedBeforeContextReplacementCannotEnterTheReplacement()throws Exception{
+        try(var f=new Fixture(Duration.ofSeconds(5))){
+            var target=f.b.getCluster().getLocalMember();var expected=new Identity("b","boot-b",target.getUuid());var executor=f.a.getExecutorService(EXECUTOR);
+            var original=executor.submitToMember(new Probe(expected,1),target).get(5,TimeUnit.SECONDS);f.right.close();var calls=new AtomicInteger();
+            f.commands.put("b",command->{calls.incrementAndGet();return commandUnavailable(command,Outcome.REJECTED,null);});
+            try(var replacement=f.router(f.b,f.gb,"b",Duration.ofSeconds(5))){
+                var request=request();var command=Command.of(Action.STOP,request,accepted("b",request).owner());
+                assertThat(executor.submitToMember(new CommandCall(command,expected,1,original.incarnation()),target).get(5,TimeUnit.SECONDS).outcome()).isEqualTo(Outcome.REJECTED);
+                assertThat(calls).hasValue(0);
+            }
+        }
+    }
     @Test void anExistingOwnerIsReusedAndItsCapacityRefusalNeverMovesThePipeline() {
         try (var f = new Fixture(Duration.ofSeconds(5))) {
             var request = request(); var ranked = f.ranked(request); var owner = ranked.getLast();
@@ -175,9 +212,11 @@ class ValidationOwnerRouterTest {
         final Map<String, AtomicBoolean> live = Map.of("a", new AtomicBoolean(true), "b", new AtomicBoolean(true));
         final Map<String, AtomicReference<WorkloadClaimFence>> nodes = new HashMap<>();
         final Map<String, Function<Request, Result>> behaviors = new ConcurrentHashMap<>();
+        final Map<String,Function<Command,CommandReply>> commands=new ConcurrentHashMap<>();
         final AtomicReference<WorkloadClaimReading> reading = new AtomicReference<>();
         final ValidationOwnerRouter left, right;
         Fixture(Duration timeout) {
+            ga.observeNodeSession(live.get("a")::get);gb.observeNodeSession(live.get("b")::get);
             String cluster = "validation-routing-" + UUID.randomUUID();
             a = Hazelcast.newHazelcastInstance(config(cluster, "a", null));
             try {
@@ -188,6 +227,7 @@ class ValidationOwnerRouterTest {
                     nodes.put(id, new AtomicReference<>(new WorkloadClaimFence(new WorkloadClaimKey("cluster", WorkloadClaimType.NODE_SESSION, id),
                             new WorkloadOwner(id, "boot-" + id), 1, 0, 1)));
                     behaviors.put(id, value -> accepted(id, value));
+                    commands.put(id,value->commandUnavailable(value,Outcome.REJECTED,null));
                 }
                 left = router(a, ga, "a", timeout); right = router(b, gb, "b", timeout);
             } catch (RuntimeException | Error failed) {
@@ -198,7 +238,7 @@ class ValidationOwnerRouterTest {
         }
         ValidationOwnerRouter router(HazelcastInstance member, ClusterMembershipGate gate, String id, Duration timeout) {
             return new ValidationOwnerRouter(member, gate, () -> nodes.get(id).get(), ignored -> Optional.ofNullable(reading.get()),
-                    request -> { calls.get(id).incrementAndGet(); return behaviors.get(id).apply(request); }, () -> {
+                    request -> { calls.get(id).incrementAndGet(); return behaviors.get(id).apply(request); }, command->commands.get(id).apply(command),() -> {
                         if (!live.get(id).get()) throw new io.tapstate.core.common.TapstateException(io.tapstate.core.validation.ValidationError.OWNER_NOT_AUTHORIZED,
                                 Map.of("pipeline", "test"), null);
                     }, timeout);

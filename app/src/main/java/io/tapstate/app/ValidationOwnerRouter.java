@@ -73,6 +73,24 @@ final class ValidationOwnerRouter implements AutoCloseable {
         /** CAPACITY/REDIRECT must prove no claim, ticket, Job or unknown allocation was retained. */
         Result reserve(Request request);
     }
+    enum Action { ACTIVATE,STATUS,STOP }
+    /** Immutable original coordinates only. No spec, executable object, model or connection crosses the wire. */
+    record Command(Action action,Request request,String cluster,String node,String boot,long claim,long execution,long topology) implements Serializable {
+        Command{Objects.requireNonNull(action);Objects.requireNonNull(request);id(cluster);id(node);id(boot);
+            if(claim<1||execution<1||topology<0)throw invalid("routing.commandOwner");}
+        ValidationOwner owner(){return new ValidationOwner(cluster,request.pipeline(),node,boot,claim,execution,topology);}
+        static Command of(Action action,Request request,ValidationOwner owner){return new Command(action,request,owner.clusterId(),owner.nodeId(),owner.bootId(),owner.claimGeneration(),owner.executionGeneration(),owner.topologyRevision());}
+    }
+    record CommandReply(Outcome outcome,Command original,String state,boolean admitted,boolean waiting,boolean unknown,boolean retired,boolean drained,String reasonCode,List<ValidationRunLifecycle.Table> tables) implements Serializable {
+        CommandReply{Objects.requireNonNull(outcome);Objects.requireNonNull(original);
+            tables=List.copyOf(tables);if(tables.size()>io.tapstate.core.validation.ValidationTaskSpec.MAX_MAPPINGS)throw invalid("routing.tableProgress");
+            if(outcome==Outcome.ACCEPTED){if(state==null)throw invalid("routing.commandState");io.tapstate.core.validation.ValidationRunState.valueOf(state);}
+            else if(state!=null||admitted||waiting||unknown||retired||drained||!tables.isEmpty())throw invalid("routing.commandReply");
+            if(reasonCode!=null&&!reasonCode.matches("[a-z][a-z0-9.-]{0,127}"))throw invalid("routing.commandReason");}
+        CommandReply(Outcome outcome,Command original,String state,boolean admitted,boolean waiting,boolean unknown,boolean retired,boolean drained,String reasonCode){
+            this(outcome,original,state,admitted,waiting,unknown,retired,drained,reasonCode,List.of());}
+    }
+    @FunctionalInterface interface Commands {CommandReply execute(Command command);}
     private record Roster(String cluster, long revision, Map<String, Identity> identities, Map<String, Member> members) {
         boolean same(Roster other) { return cluster.equals(other.cluster) && revision == other.revision && identities.equals(other.identities); }
     }
@@ -82,6 +100,7 @@ final class ValidationOwnerRouter implements AutoCloseable {
     private final Supplier<WorkloadClaimFence> node;
     private final Function<String, Optional<WorkloadClaimReading>> readOwner;
     private final Local local;
+    private final Commands commands;
     private final Runnable active;
     private final long timeoutNanos;
     private final UUID incarnation = UUID.randomUUID();
@@ -90,9 +109,14 @@ final class ValidationOwnerRouter implements AutoCloseable {
     ValidationOwnerRouter(HazelcastInstance member, ClusterMembershipGate membership,
             Supplier<WorkloadClaimFence> node, Function<String, Optional<WorkloadClaimReading>> readOwner,
             Local local, Runnable active, Duration timeout) {
+        this(member,membership,node,readOwner,local,command->commandUnavailable(command,Outcome.REJECTED,null),active,timeout);
+    }
+    ValidationOwnerRouter(HazelcastInstance member,ClusterMembershipGate membership,Supplier<WorkloadClaimFence> node,
+            Function<String,Optional<WorkloadClaimReading>> readOwner,Local local,Commands commands,Runnable active,Duration timeout){
         this.member = Objects.requireNonNull(member); this.membership = Objects.requireNonNull(membership);
         this.node = Objects.requireNonNull(node); this.readOwner = Objects.requireNonNull(readOwner);
         this.local = Objects.requireNonNull(local); this.active = Objects.requireNonNull(active);
+        this.commands=Objects.requireNonNull(commands);
         if (timeout == null || timeout.isNegative() || timeout.isZero() || timeout.compareTo(Duration.ofSeconds(30)) > 0) throw invalid("routing.timeout");
         timeoutNanos = timeout.toNanos();
         var executor = member.getConfig().findExecutorConfig(EXECUTOR);
@@ -100,6 +124,42 @@ final class ValidationOwnerRouter implements AutoCloseable {
             throw invalid("routing.executorBudget");
         if (member.getUserContext().putIfAbsent(CONTEXT, this) != null) throw invalid("routing.alreadyBound");
     }
+
+    /** One exact original owner only; missing/unknown status never causes a reservation or replacement start. */
+    CommandReply command(Command command){
+        Objects.requireNonNull(command);var before=roster();
+        var target=before.identities.get(command.node());
+        if(!before.cluster.equals(command.cluster())||target==null||!target.boot().equals(command.boot())||command.topology()>before.revision)
+            return commandUnavailable(command,Outcome.REJECTED,null);
+        try{
+            var executor=member.getExecutorService(EXECUTOR);long deadline=System.nanoTime()+timeoutNanos;
+            var destination=before.members.get(target.node());
+            var receiver=executor.submitToMember(new Probe(target,before.revision),destination).get(timeoutNanos,TimeUnit.NANOSECONDS);
+            if(receiver==null||!target.equals(receiver.identity())||before.revision!=receiver.topologyRevision())return commandUnavailable(command,Outcome.REJECTED,null);
+            long remaining=deadline-System.nanoTime();if(remaining<=0)return commandUnavailable(command,Outcome.UNKNOWN,null);
+            var answer=executor.submitToMember(new CommandCall(command,target,before.revision,receiver.incarnation()),destination).get(remaining,TimeUnit.NANOSECONDS);
+            requireActive();if(!before.same(roster())||answer==null||!command.equals(answer.original()))return commandUnavailable(command,Outcome.UNKNOWN,null);
+            return answer;
+        }catch(InterruptedException interrupted){Thread.currentThread().interrupt();return commandUnavailable(command,Outcome.UNKNOWN,null);}
+        catch(TimeoutException|CancellationException|RejectedExecutionException|HazelcastInstanceNotActiveException|MemberLeftException
+                |TargetDisconnectedException|TargetNotMemberException|OperationTimeoutException unavailable){return commandUnavailable(command,Outcome.UNKNOWN,null);}
+        catch(ExecutionException failed){
+            var cause=failed.getCause();if(cause instanceof TapstateException coded)return commandUnavailable(command,Outcome.UNKNOWN,coded.code().code());
+            if(cause instanceof MemberLeftException||cause instanceof TargetDisconnectedException||cause instanceof TargetNotMemberException
+                    ||cause instanceof OperationTimeoutException||cause instanceof HazelcastInstanceNotActiveException||cause instanceof RejectedExecutionException)
+                return commandUnavailable(command,Outcome.UNKNOWN,null);
+            if(cause instanceof Error fatal)throw fatal;throw new IllegalStateException("validation original command failed",cause);
+        }catch(TapstateException unavailable){return commandUnavailable(command,Outcome.UNKNOWN,unavailable.code().code());}
+    }
+    private CommandReply receive(Command command,Identity expected,long revision){
+        var current=roster();
+        if(current.revision!=revision||!expected.matches(member.getCluster().getLocalMember())||!expected.equals(current.identities.get(expected.node))
+                ||!command.cluster().equals(current.cluster)||!command.node().equals(expected.node)||!command.boot().equals(expected.boot)
+                ||command.topology()>current.revision)return commandUnavailable(command,Outcome.REJECTED,null);
+        var answer=Objects.requireNonNull(commands.execute(command));requireActive();
+        return current.same(roster())&&command.equals(answer.original())?answer:commandUnavailable(command,Outcome.UNKNOWN,null);
+    }
+    static CommandReply commandUnavailable(Command command,Outcome outcome,String reason){return new CommandReply(outcome,command,null,false,false,false,false,false,reason);}
 
     Reply reserve(Request request) {
         Objects.requireNonNull(request); var before = roster(); long deadline = System.nanoTime() + timeoutNanos;
@@ -247,5 +307,14 @@ final class ValidationOwnerRouter implements AutoCloseable {
             Object receiver = member.getUserContext().get(CONTEXT);
             return receiver instanceof ValidationOwnerRouter router ? router.probe(expected, revision) : null;
         }
+    }
+    static final class CommandCall implements Callable<CommandReply>,Serializable,HazelcastInstanceAware{
+        private static final long serialVersionUID=1L;
+        private final Command command;private final Identity expected;private final long revision;private final UUID receiver;
+        private transient HazelcastInstance member;
+        CommandCall(Command command,Identity expected,long revision,UUID receiver){this.command=Objects.requireNonNull(command);this.expected=Objects.requireNonNull(expected);this.revision=revision;this.receiver=Objects.requireNonNull(receiver);}
+        @Override public void setHazelcastInstance(HazelcastInstance member){this.member=member;}
+        @Override public CommandReply call(){var context=member.getUserContext().get(CONTEXT);
+            return context instanceof ValidationOwnerRouter router&&receiver.equals(router.incarnation)?router.receive(command,expected,revision):commandUnavailable(command,Outcome.REJECTED,null);}
     }
 }

@@ -31,6 +31,8 @@ public final class ValidationFullScan {
     private final AtomicBoolean attempted=new AtomicBoolean(),cancelled=new AtomicBoolean();
     private volatile ValidationOrderedMerge active;
     private volatile boolean complete;
+    private volatile int completedMappings;
+    private volatile String readingMapping;
     private final ValidationFailureLatch failure=new ValidationFailureLatch();
 
     public ValidationFullScan(ValidationRunIdentity identity,ValidationRunSpec spec,List<Mapping> mappings,
@@ -48,10 +50,13 @@ public final class ValidationFullScan {
     /** May block in the original readers; never invoke on a tasklet or deadline thread. */
     public void closeActive(){var current=active;if(current!=null)current.close();}
     public boolean complete(){return complete;}
+    public int completedMappings(){return completedMappings;}
+    public String readingMapping(){return readingMapping;}
     public void run() {
         if(!attempted.compareAndSet(false,true))throw invalid("alreadyAttempted");
         for(int index=0;index<mappings.size();index++) {
             check();var mapping=mappings.get(index);var declared=spec.task().mappings().get(index);
+            readingMapping=mapping.id();
             var merge=Objects.requireNonNull(mapping.open().apply(this::check),"ordered readers");
             try {
                 active=merge;check();
@@ -77,6 +82,7 @@ public final class ValidationFullScan {
                 finally{active=null;}
                 throwFailure();
             }
+            completedMappings=index+1;readingMapping=null;
         }
         check();complete=true;
     }

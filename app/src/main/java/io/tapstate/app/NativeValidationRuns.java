@@ -44,6 +44,21 @@ final class NativeValidationRuns implements AutoCloseable {
         var admitted=candidate.observed;candidate.dispatch();return admitted;
     }
     ValidationRunLifecycle.Status read(ValidationRunIdentity original) {var run=runs.get(original);if(run==null)throw invalid("runs.originalUnavailable");return run.observed;}
+    List<ValidationRunLifecycle.Table> tables(ValidationRunIdentity original){
+        var actor=runs.get(original);if(actor==null)throw invalid("runs.originalUnavailable");var current=actor.execution;
+        if(current!=null)return current.tables();
+        return actor.original.snapshot().task().mappings().stream().map(mapping->new ValidationRunLifecycle.Table(mapping.mappingId(),ValidationRunLifecycle.ReadPhase.PENDING)).toList();
+    }
+    Optional<ValidationReportAdmission.Start> original(ValidationOwnerRouter.Request request,ValidationOwner owner){
+        for(var actor:runs.values()){
+            var start=actor.original.admission();var identity=start.run();
+            if(!identity.owner().equals(owner)||!identity.taskId().equals(request.task())||!identity.runId().equals(request.run())||!identity.mode().name().equals(request.mode()))continue;
+            if(!start.task().generation().equals(request.taskGeneration())||start.configurationRevision()!=request.configurationRevision()
+                    ||start.sequence()!=request.startSequence()||!start.commandId().equals(request.command().toString()))throw invalid("runs.originalCommand");
+            return Optional.of(start);
+        }
+        return Optional.empty();
+    }
     boolean controlIdle(ValidationRunIdentity original){var actor=runs.get(original);return actor==null||!actor.inFlight.get();}
     Optional<ValidationReportMetadata.Failure> reportFailure(ValidationRunIdentity original){var actor=runs.get(original);return actor==null?Optional.empty():Optional.ofNullable(actor.reportFailure);}
     void stop(ValidationRunIdentity original) {var run=runs.get(original);if(run==null)throw invalid("runs.originalUnavailable");run.lifecycle.stop();run.dispatch();}

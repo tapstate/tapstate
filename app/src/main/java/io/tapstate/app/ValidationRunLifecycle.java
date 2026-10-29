@@ -15,12 +15,18 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 final class ValidationRunLifecycle {
     enum Readiness { WAITING_FOR_INITIAL_LOAD, UNKNOWN, READY }
+    enum ReadPhase { PENDING,READING,READ_COMPLETE }
+    /** Logical read/publication progress only; READ_COMPLETE does not claim physical drain or a successful run. */
+    record Table(String mappingId,ReadPhase phase) implements java.io.Serializable {
+        Table{ValidationError.fieldName(mappingId,"run.tableProgress");Objects.requireNonNull(phase);}
+    }
     interface Execution {
         ValidationRunIdentity identity();
         /** Submission is single attempt. A thrown response may still have created the original Job. */
         void start();
         /** Passive facts from the original execution; Jet completion alone is insufficient. */
         Progress progress();
+        default java.util.List<Table> tables(){return java.util.List.of();}
         /** The actual admitted owner-local queue; absent for a full scan. No query runs here. */
         default java.util.Optional<io.tapstate.runtime.engine.validation.ValidationCandidateQueue> candidates() { return java.util.Optional.empty(); }
         /** Nonblocking local cancellation signal only, idempotent even before start. */

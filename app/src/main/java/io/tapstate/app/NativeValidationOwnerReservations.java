@@ -160,6 +160,17 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         }
     }
 
+    ValidationReportAdmission.Start original(Request request,ValidationOwner expected){
+        requireActive();var local=pipeline(request.pipeline());
+        if(!local.lock.tryLock()){unpin(local);throw unauthorized(local.pipeline);}
+        try{
+            var reservation=local.operations.get(new Operation(request.task(),request.taskGeneration(),request.mode(),request.command()));
+            if(reservation==null||!reservation.request.equals(request))throw invalid("owner.originalReservation");
+            reservation.requireReserved();var identity=reservation.bound.budget().identity();
+            if(!identity.owner().equals(expected))throw invalid("owner.originalReservationOwner");
+            return new ValidationReportAdmission.Start(task(request),request.configurationRevision(),request.startSequence(),request.command().toString(),identity);
+        }finally{local.lock.unlock();unpin(local);}
+    }
     Reservation take(ValidationReportAdmission.Start start) {
         requireActive(); var local = pipeline(start.task().pipelineId());
         if (!local.lock.tryLock()) { unpin(local); throw unauthorized(local.pipeline); }

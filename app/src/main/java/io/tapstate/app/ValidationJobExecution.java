@@ -20,6 +20,7 @@ final class ValidationJobExecution implements ValidationRunLifecycle.Execution {
         /** Actual native readers/rows/callbacks released, never Future.cancel or connector.stop alone. */
         boolean readersReleased();
         Throwable failure();
+        default java.util.List<ValidationRunLifecycle.Table> tables(){return java.util.List.of();}
         /** Pure local cancellation signal; no transport, native stop or waiting here. */
         void cancel();
         /** Retry original cleanup only, on admitted control I/O, including after known retirement. */
@@ -46,6 +47,7 @@ final class ValidationJobExecution implements ValidationRunLifecycle.Execution {
         if(!identity.equals(processors.identity()))throw invalid("job.executionIdentity");
     }
     @Override public ValidationRunIdentity identity(){return identity;}
+    @Override public java.util.List<ValidationRunLifecycle.Table> tables(){return work.tables();}
     @Override public java.util.Optional<io.tapstate.runtime.engine.validation.ValidationCandidateQueue> candidates(){return work.candidates();}
     @Override public void start() {
         if(!attempted.compareAndSet(false,true))throw invalid("job.executionAlreadyAttempted");
