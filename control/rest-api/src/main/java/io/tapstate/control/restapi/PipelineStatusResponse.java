@@ -51,7 +51,7 @@ record PipelineStatusResponse(
                 failure(status.failure(), catalog), observedAt,
                 observedAt == null ? null
                         : Math.max(0, Duration.between(observedAt, clock.instant()).toMillis()),
-                null, status.observedState(), true, ExecutionPlanResponse.of(status.plan()),
+                null, status.observedState(), false, ExecutionPlanResponse.of(status.plan()),
                 status.awaitingRebalance().isEmpty() ? null : status.awaitingRebalance(), null);
     }
 

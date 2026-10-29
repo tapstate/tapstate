@@ -68,6 +68,8 @@ class CloudSdkLiveContractTest {
         });
         server.start();
         Logger logger = (Logger) LoggerFactory.getLogger(CloudSdkBridge.class);
+        var previousLevel = logger.getLevel();
+        logger.setLevel(ch.qos.logback.classic.Level.WARN);
         ListAppender<ILoggingEvent> captured = new ListAppender<>();
         captured.start();
         logger.addAppender(captured);
@@ -88,6 +90,7 @@ class CloudSdkLiveContractTest {
         } finally {
             logger.detachAppender(captured);
             captured.stop();
+            logger.setLevel(previousLevel);
             server.stop(0);
         }
     }
@@ -153,6 +156,8 @@ class CloudSdkLiveContractTest {
         server.createContext("/v1/api/jwks.json", exchange -> respond(exchange, jwks(keyPair)));
         server.start();
         Logger logger = (Logger) LoggerFactory.getLogger(CloudSdkBridge.class);
+        var previousLevel = logger.getLevel();
+        logger.setLevel(ch.qos.logback.classic.Level.WARN);
         ListAppender<ILoggingEvent> captured = new ListAppender<>();
         captured.start();
         logger.addAppender(captured);
@@ -182,6 +187,7 @@ class CloudSdkLiveContractTest {
         } finally {
             logger.detachAppender(captured);
             captured.stop();
+            logger.setLevel(previousLevel);
             server.stop(0);
         }
     }
@@ -214,6 +220,8 @@ class CloudSdkLiveContractTest {
         });
         server.start();
         Logger logger = (Logger) LoggerFactory.getLogger(CloudSdkBridge.class);
+        var previousLevel = logger.getLevel();
+        logger.setLevel(ch.qos.logback.classic.Level.WARN);
         ListAppender<ILoggingEvent> captured = new ListAppender<>();
         captured.start();
         logger.addAppender(captured);
@@ -262,6 +270,7 @@ class CloudSdkLiveContractTest {
         } finally {
             logger.detachAppender(captured);
             captured.stop();
+            logger.setLevel(previousLevel);
             server.stop(0);
         }
     }
@@ -275,6 +284,8 @@ class CloudSdkLiveContractTest {
                 "data", Map.of("jwt", "provider-jwt-secret-sentinel"))));
         server.start();
         Logger logger = (Logger) LoggerFactory.getLogger(CloudSdkBridge.class);
+        var previousLevel = logger.getLevel();
+        logger.setLevel(ch.qos.logback.classic.Level.WARN);
         ListAppender<ILoggingEvent> captured = new ListAppender<>();
         captured.start();
         logger.addAppender(captured);
@@ -303,6 +314,7 @@ class CloudSdkLiveContractTest {
         } finally {
             logger.detachAppender(captured);
             captured.stop();
+            logger.setLevel(previousLevel);
             server.stop(0);
         }
     }
