@@ -1,0 +1,4 @@
+<component-set><components>
+  <component><role>org.apache.maven.eventspy.EventSpy</role><role-hint>tapstate-build-input-spy</role-hint><implementation>io.tapstate.ci.BuildInputSpy</implementation><instantiation-strategy>singleton</instantiation-strategy></component>
+  <component><role>org.apache.maven.execution.MojoExecutionListener</role><role-hint>tapstate-configured-build-input</role-hint><implementation>io.tapstate.ci.ConfiguredBuildInputListener</implementation><requirements><requirement><role>org.apache.maven.eventspy.EventSpy</role><role-hint>tapstate-build-input-spy</role-hint><field-name>observer</field-name></requirement></requirements></component>
+</components></component-set>

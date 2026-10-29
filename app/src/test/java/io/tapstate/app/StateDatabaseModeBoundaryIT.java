@@ -206,7 +206,8 @@ class StateDatabaseModeBoundaryIT {
                     "--tapstate.cloud.atlas-uri=" + storage.configurationUri(),
                     "--tapstate.cloud.cluster-id=" + storage.clusterId()));
         }
-        context = new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated())
+        context = new SpringApplicationBuilder(Bootstrap.class)
+                .initializers(CloudConnectorTestInputs::reportCapabilityFailures).environment(CloudFixtureEnvironment.isolated())
                 .run(args.toArray(String[]::new));
     }
 

@@ -1008,6 +1008,8 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
             throw new IllegalStateException(
                     "stream " + stream + " was requested but the connector did not discover it");
         }
+        LOG.info("Snapshot read started for table {}", stream);
+        java.util.concurrent.atomic.LongAdder eventsRead = new java.util.concurrent.atomic.LongAdder();
         batch.batchRead(connector.context(), table, null, BATCH_SIZE, (events, offset) -> {
             if (events.isEmpty()) {
                 return;
@@ -1015,7 +1017,10 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
             // A copy: the list is the connector's, and is decoded only once somebody takes it.
             List<TapEvent> handed = new ArrayList<>(events);
             reading.rowsRead(() -> decodeSnapshotRows(connector, handed, snapshot.declared()));
+            eventsRead.add(handed.size());
         });
+        LOG.info("Snapshot read finished for table {} ({} events read; awaiting target confirmation)",
+                stream, eventsRead.sum());
     }
 
     private record PreparedSnapshot(Map<String, TapTable> discovered,

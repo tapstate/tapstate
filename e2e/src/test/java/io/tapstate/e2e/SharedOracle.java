@@ -193,6 +193,28 @@ final class SharedOracle {
     /** Retains live initialization state before a failed fixture is stopped. */
     private static boolean captureInitializationState(OracleContainer server, Exception failure) {
         var capture = new FutureTask<>(() -> server.execInContainer("bash", "-c", """
+                for probe_log in /tmp/tapstate-initialization-stage.log /tmp/tapstate-initialization.log /tmp/tapstate-transaction.log; do
+                  if [ -f "$probe_log" ]; then
+                    printf '\\nOracle test probe log (last 120 lines): %s\\n' "$probe_log"
+                    tail -n 120 "$probe_log"
+                  fi
+                done
+                for probe_pid_file in /tmp/tapstate-main-sqlplus.pid /tmp/tapstate-transaction.pid; do
+                  if [ -f "$probe_pid_file" ]; then
+                    probe_pid=$(cat "$probe_pid_file")
+                    case "$probe_pid" in
+                      ''|*[!0-9]*) printf 'Invalid Oracle test probe PID: %s\\n' "$probe_pid_file" ;;
+                      *)
+                        printf 'Oracle test probe process: %s PID=%s\\n' "$probe_pid_file" "$probe_pid"
+                        if kill -0 "$probe_pid" 2>/dev/null; then
+                          awk '/^(Name|State|PPid):/ { print }' "/proc/$probe_pid/status"
+                        else
+                          printf 'Oracle test probe process has exited.\\n'
+                        fi
+                        ;;
+                    esac
+                  fi
+                done
                 for journal in /tmp/tapstate-main-stage-probe.log /tmp/tapstate-holder-stage-probe.log /tmp/tapstate-transaction.log; do
                   [ -f "$journal" ] || continue
                   printf '\nOracle diagnostic journal before cleanup: %s\n' "$journal"

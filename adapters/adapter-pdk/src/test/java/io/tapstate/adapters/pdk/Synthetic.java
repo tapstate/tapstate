@@ -608,6 +608,22 @@ final class Synthetic {
         return pollingSource(dir, "UnacknowledgingSource", channel, "");
     }
 
+    /** Opt-in finite acknowledgement fixture; existing factories retain their close-time delivery. */
+    static Path naturallyCompletingAcknowledgingSource(Path dir, String channel) {
+        return naturallyCompletingPollingSource(dir, "AcknowledgingSource", channel, flushFunction(""));
+    }
+
+    /** The finite fixture whose acknowledgement function still throws after recording the call. */
+    static Path naturallyCompletingRefusingAcknowledgementSource(Path dir, String channel) {
+        return naturallyCompletingPollingSource(dir, "RefusingAcknowledgementSource", channel,
+                flushFunction("throw new IllegalStateException(\"flush boom\");"));
+    }
+
+    /** The finite fixture with the original absence of an acknowledgement function. */
+    static Path naturallyCompletingUnacknowledgingSource(Path dir, String channel) {
+        return naturallyCompletingPollingSource(dir, "UnacknowledgingSource", channel, "");
+    }
+
     /**
      * A source that, as the postgres connector does, creates a slot the first time a drive reads it and keeps
      * the slot's name in its notes under {@code tapdata_pg_slot}; each read answers one row naming the slot it
@@ -745,6 +761,112 @@ final class Synthetic {
                 + "  while (poll.isAlive()) {"
                 + "    try { poll.join(); } catch (InterruptedException stopping) { }"
                 + "  }"
+                + "  consumer.streamReadEnded();"
+                + "});"
+                + flushFunction;
+        String discovery = "TapTable table = new TapTable(\"t1\");"
+                + "table.add(new TapField(\"id\", \"int\"));"
+                + "List<TapTable> tables = new ArrayList<>();"
+                + "tables.add(table);"
+                + "s.accept(tables);";
+        return SyntheticJar.compileToJar(dir, "synthetic." + simpleName,
+                source(simpleName, "", register, members, discovery, "stopped = true;"));
+    }
+
+    /** A test-owned EOF is consumed only after all ordered deliveries and explicit case permission. */
+    private static Path naturallyCompletingPollingSource(Path dir, String simpleName, String channel, String flushFunction) {
+        String members = ""
+                + "public static class Offset implements java.io.Serializable {"
+                + "  public String mark;"
+                + "  public Offset() {}"
+                + "  public Offset(String mark) { this.mark = mark; }"
+                + "  public boolean equals(Object o) {"
+                + "    return o instanceof Offset && java.util.Objects.equals(mark, ((Offset) o).mark);"
+                + "  }"
+                + "  public int hashCode() { return java.util.Objects.hashCode(mark); }"
+                + "  public String toString() { return \"Offset(\" + mark + \")\"; }"
+                + "}"
+                + "private volatile boolean stopped;"
+                + "@SuppressWarnings(\"unchecked\")"
+                + "private static Map<String,Object> channel() {"
+                + "  return (Map<String,Object>) System.getProperties().get(\"" + channel + "\");"
+                + "}";
+        String register = ""
+                + "functions.supportStreamRead((context, tables, offset, size, consumer) -> {"
+                + "  @SuppressWarnings(\"unchecked\") java.util.concurrent.BlockingQueue<String> orders ="
+                + "      (java.util.concurrent.BlockingQueue<String>) channel().get(\"orders\");"
+                + "  @SuppressWarnings(\"unchecked\") List<Object> named = (List<Object>) channel().get(\"named\");"
+                + "  @SuppressWarnings(\"unchecked\") List<Object> deliveredOn ="
+                + "      (List<Object>) channel().get(\"deliveredOn\");"
+                + "  @SuppressWarnings(\"unchecked\") List<Object> handedOver ="
+                + "      (List<Object>) channel().get(\"handedOver\");"
+                + "  @SuppressWarnings(\"unchecked\") java.util.concurrent.atomic.AtomicReference<Thread> worker ="
+                + "      (java.util.concurrent.atomic.AtomicReference<Thread>) channel().get(\"worker\");"
+                + "  @SuppressWarnings(\"unchecked\") java.util.concurrent.atomic.AtomicReference<Thread> polling ="
+                + "      (java.util.concurrent.atomic.AtomicReference<Thread>) channel().get(\"polling\");"
+                + "  @SuppressWarnings(\"unchecked\") java.util.concurrent.atomic.AtomicReference<ClassLoader> loader ="
+                + "      (java.util.concurrent.atomic.AtomicReference<ClassLoader>) channel().get(\"loader\");"
+                + "  @SuppressWarnings(\"unchecked\") java.util.concurrent.atomic.AtomicReference<Throwable> failure ="
+                + "      (java.util.concurrent.atomic.AtomicReference<Throwable>) channel().get(\"failure\");"
+                + "  java.util.concurrent.atomic.AtomicBoolean allowed ="
+                + "      (java.util.concurrent.atomic.AtomicBoolean) channel().get(\"completionAllowed\");"
+                + "  worker.set(Thread.currentThread());"
+                + "  loader.set(Thread.currentThread().getContextClassLoader());"
+                + "  consumer.streamReadStarted();"
+                + "  Thread poll = new Thread(() -> {"
+                + "    try {"
+                + "    boolean completed = false;"
+                + "    int rows = 0;"
+                + "    while (!stopped) {"
+                + "      String order;"
+                + "      try {"
+                + "        order = orders.poll(10, java.util.concurrent.TimeUnit.MILLISECONDS);"
+                + "      } catch (InterruptedException e) {"
+                + "        Thread.currentThread().interrupt();"
+                + "        failure.set(e);"
+                + "        return;"
+                + "      }"
+                + "      if (order == null) continue;"
+                + "      if (order.equals(\"complete\")) {"
+                + "        if (!allowed.get()) throw new IllegalStateException(\"completion preceded the case assertions\");"
+                + "        completed = true;"
+                + "        break;"
+                + "      }"
+                + "      if (order.equals(\"fail\")) throw new IllegalStateException(\"poll boom\");"
+                + "      List<TapEvent> batch = new ArrayList<>();"
+                + "      Offset at = null;"
+                + "      if (order.equals(\"rows\")) {"
+                + "        rows++;"
+                + "        Map<String,Object> row = new LinkedHashMap<>(); row.put(\"id\", rows);"
+                + "        batch.add(TapInsertRecordEvent.create().table(\"t1\").referenceTime((long) rows).after(row));"
+                + "        at = new Offset(\"batch-\" + rows);"
+                + "        named.add(at);"
+                + "      } else {"
+                + "        batch.add(new io.tapdata.entity.event.control.HeartbeatEvent().init());"
+                + "      }"
+                + "      deliveredOn.add(Thread.currentThread());"
+                + "      consumer.accept(batch, at);"
+                + "      handedOver.add(Thread.currentThread());"
+                + "    }"
+                + "    if (!completed) {"
+                + "      List<TapEvent> last = new ArrayList<>();"
+                + "      last.add(new io.tapdata.entity.event.control.HeartbeatEvent().init());"
+                + "      deliveredOn.add(Thread.currentThread());"
+                + "      consumer.accept(last, null);"
+                + "    }"
+                + "    } catch (Throwable failed) { failure.set(failed); }"
+                + "  }, \"synthetic-poll\");"
+                + "  polling.set(poll);"
+                + "  poll.start();"
+                + "  boolean interrupted = false;"
+                + "  while (poll.isAlive()) {"
+                + "    try { poll.join(); } catch (InterruptedException stopping) { interrupted = true; }"
+                + "  }"
+                + "  if (interrupted) Thread.currentThread().interrupt();"
+                + "  Throwable failed = failure.get();"
+                + "  if (failed instanceof RuntimeException) throw (RuntimeException) failed;"
+                + "  if (failed instanceof Error) throw (Error) failed;"
+                + "  if (failed != null) throw new IllegalStateException(\"synthetic polling failed\", failed);"
                 + "  consumer.streamReadEnded();"
                 + "});"
                 + flushFunction;

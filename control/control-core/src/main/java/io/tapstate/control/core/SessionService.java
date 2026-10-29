@@ -20,6 +20,7 @@ public final class SessionService {
     public static final Duration ABSOLUTE_TTL = Duration.ofDays(90);
 
     private static final String TOKEN_PREFIX = "tss_";
+    private static final String EXPECTED_ISSUER_FIELD = "expectedIssuer";
     private static final char SEPARATOR = '.';
 
     private final SessionStore sessions;
@@ -51,7 +52,7 @@ public final class SessionService {
     }
 
     public Optional<AccessTokenGrant> exchange(String presented, String expectedIssuer) {
-        requireText(expectedIssuer, "expectedIssuer");
+        requireText(expectedIssuer, EXPECTED_ISSUER_FIELD);
         return parse(presented).flatMap(parsed -> {
             Instant now = clock.instant();
             Optional<SessionRecord> touched = sessions.exchange(
@@ -61,11 +62,28 @@ public final class SessionService {
     }
 
     public boolean logout(String presented, String expectedIssuer) {
-        requireText(expectedIssuer, "expectedIssuer");
+        requireText(expectedIssuer, EXPECTED_ISSUER_FIELD);
         return parse(presented)
                 .map(parsed -> sessions.revoke(parsed.sessionId(), secrets.hash(parsed.secret()),
                         expectedIssuer, clock.instant()))
                 .orElse(false);
+    }
+
+    /** Atomically revokes a browser credential, including an expired matching session. */
+    public LogoutResult logoutForBrowser(String presented, String expectedIssuer) {
+        requireText(expectedIssuer, EXPECTED_ISSUER_FIELD);
+        Optional<ParsedSessionToken> parsed = parse(presented);
+        if (parsed.isEmpty()) return LogoutResult.INVALID;
+        ParsedSessionToken token = parsed.get();
+        if (sessions.revokeBrowserSession(token.sessionId(), secrets.hash(token.secret()), expectedIssuer)) {
+            return LogoutResult.REVOKED;
+        }
+        return LogoutResult.INVALID;
+    }
+
+    public enum LogoutResult {
+        REVOKED,
+        INVALID
     }
 
     public static boolean isSessionToken(String presented) {

@@ -102,6 +102,9 @@ enum BootError implements TapstateErrorCode {
     /** Another live boot already holds this stable node id. */
     NODE_ID_IN_USE("boot.node-id-in-use", Set.of("nodeId")),
 
+    /** The reserved identity stopped being provably owned before member startup completed. */
+    NODE_SESSION_LOST("boot.node-session-lost", Set.of()),
+
     /** A development-only embedded Web artifact needs explicit runtime confirmation. */
     WEB_DEVELOPMENT_CONFIRMATION_REQUIRED("boot.web-development-confirmation-required", Set.of()),
 

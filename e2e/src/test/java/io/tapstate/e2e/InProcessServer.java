@@ -65,11 +65,16 @@ final class InProcessServer implements ServerHandle {
 
     /** Additional settings let a focused witness select the actual Cloud assembly. */
     static InProcessServer start(String storeUri, String operatorStateDatabase, List<String> additionalArguments) {
+        return start(storeUri, operatorStateDatabase, additionalArguments, null);
+    }
+
+    static InProcessServer start(String storeUri, String operatorStateDatabase, List<String> additionalArguments,
+            io.tapstate.control.core.AiProviderClient provider) {
         Path stagingDirectory = ServerHandle.privateStagingDirectory();
         ConfigurableApplicationContext context;
         var refreshed = new java.util.concurrent.CopyOnWriteArrayList<ConfigurableApplicationContext>();
         try {
-            context = boot(storeUri, operatorStateDatabase, stagingDirectory, additionalArguments, refreshed);
+            context = boot(storeUri, operatorStateDatabase, stagingDirectory, additionalArguments, refreshed, provider);
         } catch (RuntimeException e) {
             // Nothing is handed back to close, so nothing else will ever clear this up. Attached rather
             // than thrown: why the assembly did not boot is the thing a reader needs.
@@ -88,7 +93,8 @@ final class InProcessServer implements ServerHandle {
 
     private static ConfigurableApplicationContext boot(String storeUri, String operatorStateDatabase,
             Path stagingDirectory, List<String> additionalArguments,
-            java.util.concurrent.CopyOnWriteArrayList<ConfigurableApplicationContext> refreshedContexts) {
+            java.util.concurrent.CopyOnWriteArrayList<ConfigurableApplicationContext> refreshedContexts,
+            io.tapstate.control.core.AiProviderClient provider) {
         java.util.ArrayList<String> arguments = new java.util.ArrayList<>(List.of(
                 "--server.address=127.0.0.1", "--server.port=0"));
         arguments.addAll(additionalArguments);
@@ -102,7 +108,18 @@ final class InProcessServer implements ServerHandle {
                         ServerHandle.PLUGINS_DIRECTORY_SETTING + "=" + stagingDirectory,
                         ServerHandle.ALSO_ACCEPT_IDS_SETTING + "=" + E2eConnectorJar.CONNECTOR_ID));
         if (operatorStateDatabase != null) defaults.add(ServerHandle.OPERATOR_STATE_DATABASE_SETTING + "=" + operatorStateDatabase);
-        return new SpringApplicationBuilder(Bootstrap.class)
+        var builder = new SpringApplicationBuilder(Bootstrap.class);
+        if (provider != null) {
+            builder.initializers(context -> context.addBeanFactoryPostProcessor(factory -> {
+                var registry = (org.springframework.beans.factory.support.BeanDefinitionRegistry) factory;
+                if (!registry.containsBeanDefinition("aiProviderClient"))
+                    throw new IllegalStateException("the application does not define aiProviderClient");
+                registry.removeBeanDefinition("aiProviderClient");
+                registry.registerBeanDefinition("aiProviderClient", new org.springframework.beans.factory.support.RootBeanDefinition(
+                        io.tapstate.control.core.AiProviderClient.class, () -> provider));
+            }));
+        }
+        return builder
                 .listeners((ApplicationListener<ContextRefreshedEvent>) event -> {
                     if (event.getApplicationContext() instanceof ConfigurableApplicationContext refreshed)
                         refreshedContexts.addIfAbsent(refreshed);

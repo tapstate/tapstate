@@ -22,6 +22,11 @@ public enum ControlError implements TapstateErrorCode {
      * client-attributable input error, deliberately distinct from a service-layer invariant violation (a
      * programmer bug), which stays a bare crash rather than being laundered into a coded error.
      */
+    AI_NOT_CONFIGURED("control.ai-not-configured", Set.of()),
+    AI_PROVIDER_AUTH_FAILED("control.ai-provider-auth-failed", Set.of()),
+    AI_PROVIDER_FAILED("control.ai-provider-failed", Set.of()),
+    AI_INVALID_PROPOSAL("control.ai-invalid-proposal", Set.of()),
+    AI_OVERLOADED("control.ai-overloaded", Set.of()),
     MALFORMED_REQUEST("control.malformed-request", Set.of("reason")),
 
     /** A valid preview request could not enter the bounded candidate-compilation pool. */
@@ -62,6 +67,9 @@ public enum ControlError implements TapstateErrorCode {
 
     /** The caller reached an authentication flow that the selected deployment mode does not expose. */
     AUTH_MODE_UNAVAILABLE("control.auth-mode-unavailable", Set.of("mode")),
+
+    /** The configured browser authentication public-origin allow-list is invalid. */
+    BROWSER_AUTH_CONFIG_INVALID("control.browser-auth-config-invalid", Set.of()),
 
     /** Managed authentication was reached before its real SDK/validated deployment binding was installed. */
     CLOUD_AUTH_UNAVAILABLE("control.cloud-auth-unavailable", Set.of()),

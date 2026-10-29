@@ -170,6 +170,8 @@ final class NodeSessionLease implements AutoCloseable {
     }
 
     /** A non-blocking local predicate; an observed expiry is irreversible even if shutdown blocks. */
+    boolean isCurrent() { return active(); }
+
     boolean active() {
         if (closed.get()) return false;
         if (nanoTime.getAsLong() - provenUntil >= 0) {
@@ -213,13 +215,36 @@ final class NodeSessionLease implements AutoCloseable {
 
     @Override
     public void close() {
-        if (store == null) {
-            return;
+        stopAndClose(() -> { });
+    }
+
+    /** Fence locally before stopping, and never put coordination I/O ahead of the member stop. */
+    void stopAndClose(Runnable stop) {
+        boolean release = store != null && closed.compareAndSet(false, true);
+        try {
+            stop.run();
+        } finally {
+            if (release) {
+                renewer.shutdownNow();
+                releaseCurrent();
+            }
         }
-        if (!closed.compareAndSet(false, true)) {
-            return;
-        }
-        renewer.shutdownNow();
+    }
+
+    /** A library lifecycle listener cannot wait for coordination-store I/O. */
+    void closeAfterMemberStops() {
+        if (store == null || !closed.compareAndSet(false, true)) return;
+        renewer.execute(() -> {
+            try {
+                releaseCurrent();
+            } finally {
+                renewer.shutdownNow();
+            }
+        });
+        renewer.shutdown();
+    }
+
+    private void releaseCurrent() {
         WorkloadClaim ending = current.get();
         try {
             store.release(ending);

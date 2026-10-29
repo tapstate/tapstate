@@ -103,6 +103,17 @@ class PipelineStatusResponseTest {
     }
 
     @Test
+    void runtimeOnlyNewObservationDoesNotClaimAnArtifactOrAnActionableLifecycleLabel() {
+        PipelineStatus status = new PipelineStatus("orphan", PipelineState.NEW);
+
+        PipelineStatusResponse response = PipelineStatusResponse.of(status, catalog);
+
+        assertThat(response.state()).isEqualTo(PipelineState.NEW);
+        assertThat(response.hasArtifact()).isFalse();
+        assertThat(response.displayState()).isNull();
+    }
+
+    @Test
     void projectsAnUnobservedDraftAsNewWhilePreservingItsDraftDisplayState() {
         PipelineCatalogItem item = catalogItem(PipelineCatalogItem.UiState.DRAFT, null, null);
 

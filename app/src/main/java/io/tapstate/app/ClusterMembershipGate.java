@@ -33,7 +33,7 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
     /** A publication changes the revision even when the visible members have not changed. */
     record VisibleSnapshot(long revision, Set<String> nodeIds, boolean originalSingleVisible) {}
     private volatile WorkloadOwner singleOwner;
-    private final AtomicReference<BooleanSupplier> nodeSession = new AtomicReference<>(() -> false);
+    private final AtomicReference<BooleanSupplier> nodeSession = new AtomicReference<>(() -> true);
 
     /** A fixed deployment predicate, not a persisted majority decision or recovery epoch. */
     void bindSingle(WorkloadClaim original) {
@@ -41,17 +41,18 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
                 || !original.key().clusterId().equals(original.owner().nodeId()) || !original.key().resourceId().equals(original.owner().nodeId())) {
             throw new IllegalArgumentException("invalid single-node admission");
         }
+        nodeSession.set(() -> false);
         singleOwner = original.owner();
         committed.set(new ClusterMembership(original.key().clusterId(), 1, Set.of(original.owner().nodeId())));
     }
 
-    void observeNodeSession(BooleanSupplier active) { nodeSession.set(Objects.requireNonNull(active, "active")); }
 
     /**
      * The data plane's own answer to this same predicate. Until a member binds one, nothing is asked -
      * a build with no member has no data plane to disagree with.
      */
     private final AtomicReference<BooleanSupplier> dataPlane = new AtomicReference<>(() -> true);
+
 
     ClusterMembershipGate(ClusterProperties properties) {
         this.profile = properties.getProfile();
@@ -141,8 +142,14 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
         dataPlane.set(Objects.requireNonNull(admits, "admits"));
     }
 
+    /** The pre-join identity must remain proved while the member is starting or carrying work. */
+    void observeNodeSession(BooleanSupplier current) {
+        nodeSession.set(Objects.requireNonNull(current, "current"));
+    }
+
     boolean canCommit(Set<String> visibleNodeIds) {
         rememberVisible(visibleNodeIds);
+        if (!nodeSession.get().getAsBoolean()) return false;
         ClusterMembership current = committed.get();
         if (profile == ClusterProperties.Profile.SINGLE) {
             return singleOwner == null;
@@ -204,6 +211,7 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
 
     private boolean eligible(VisibleSnapshot snapshot) {
         Set<String> visibleNodeIds = snapshot.nodeIds();
+        if (!nodeSession.get().getAsBoolean()) return false;
         if (profile == ClusterProperties.Profile.SINGLE) {
             return singleOwner == null || singleEligible(snapshot);
         }

@@ -22,6 +22,7 @@ import org.junit.jupiter.api.Timeout;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Proxy;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Callable;
@@ -82,6 +83,20 @@ class HazelcastLivePipelineRunsTest {
                                 Map.of("shop", 1200L),
                                 // A stream that had rows waiting and has none now reads zero, and is left out.
                                 Map.of("shop.orders", 30L), Map.of("orders", 512L))));
+    }
+
+    @Test
+    void theRunUsesTheNewestMeasurementEvenWhenAnOlderOneFollowsIt() {
+        JobMetrics collected = JobMetrics.of(Map.of(MetricNames.EMITTED_COUNT, List.of(
+                Measurement.of(MetricNames.EMITTED_COUNT, 1, 1_000L, Map.of()),
+                Measurement.of(MetricNames.EMITTED_COUNT, 2, 2_000L, Map.of()),
+                Measurement.of(MetricNames.EMITTED_COUNT, 3, 1_500L, Map.of()))));
+
+        LivePipelineRun run = HazelcastLivePipelineRuns.runOf("orders", collected);
+
+        assertThat(run.measuredAt())
+                .describedAs("the newest reading replaces the first, and a later older reading cannot replace it")
+                .isEqualTo(Instant.ofEpochMilli(2_000L));
     }
 
     private static Measurement processorReading(String metric, long value, String vertex, String processor,

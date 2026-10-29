@@ -86,10 +86,35 @@ class NativeBusinessCandidateLifecycleIT {
                             beans.destroySingleton("seedSweepRunner");beans.registerSingleton("seedSweepRunner",held);
                         });
                     }).run("--server.address=127.0.0.1","--server.port=0","--logging.level.root=ERROR",
+                            "--tapstate.browser-auth.allow-insecure-loopback=true",
                             "--tapstate.store.mongo.uri="+storage.configurationUri(),"--tapstate.hz.member-port=0",
                             "--tapstate.hz.jet.cooperative-thread-count=2","--tapstate.connectors.seed-dir="+work.resolve("no-seeds"),
                             "--tapstate.connectors.plugins-dir="+work.resolve("plugins"),"--tapstate.control.auth.jwt-secret=candidate-test-signing-key")) {
                 NativeAppStorage.awaitBusiness(application);assertThat(exercised.get()).isEqualTo(1);
+                int httpPort = ((org.springframework.boot.web.server.context.WebServerApplicationContext) application).getWebServer().getPort();
+                String origin = "http://127.0.0.1:" + httpPort;
+                try (var http = java.net.http.HttpClient.newHttpClient()) {
+                    var request = java.net.http.HttpRequest.newBuilder(java.net.URI.create(origin + "/auth/browser/login"))
+                            .header("Origin", origin).header("X-Tapstate-Browser-Request", "1")
+                            .header("Content-Type", "application/json").POST(java.net.http.HttpRequest.BodyPublishers.ofString(
+                                    "{\"username\":\"admin\",\"password\":\"candidate-password\"}")).build();
+                    var response = http.send(request, java.net.http.HttpResponse.BodyHandlers.ofString());
+                    assertThat(response.statusCode()).isEqualTo(200);
+                    assertThat(response.headers().firstValue("Set-Cookie")).hasValueSatisfying(cookie ->
+                            assertThat(cookie).contains("HttpOnly", "SameSite=Lax"));
+                    assertThat(response.body()).contains("\"principal\":\"admin\"");
+                    String cookie = response.headers().firstValue("Set-Cookie").orElseThrow().split(";", 2)[0];
+                    for (String action : List.of("session", "logout")) {
+                        var followup = java.net.http.HttpRequest.newBuilder(java.net.URI.create(origin + "/auth/browser/" + action))
+                                .header("Origin", origin).header("X-Tapstate-Browser-Request", "1")
+                                .header("Cookie", cookie).POST(java.net.http.HttpRequest.BodyPublishers.noBody()).build();
+                        var result = http.send(followup, java.net.http.HttpResponse.BodyHandlers.ofString());
+                        assertThat(result.statusCode()).as("native browser %s", action).isEqualTo(action.equals("logout") ? 204 : 200);
+                    }
+
+                } catch (java.io.IOException failure) { throw new java.io.UncheckedIOException(failure); }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new AssertionError(interrupted); }
+
                 assertThat(candidate.get().available()).isTrue();int before=reads.get();
                 NativeAppStorage.business(application).getBean(ConvergenceDriver.class).reconcile();
                 assertThat(reads.get()).as("the same real store is enumerated once the candidate has finished startup").isGreaterThan(before);

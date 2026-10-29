@@ -15,7 +15,9 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
@@ -610,6 +612,58 @@ class ConnectorInstancePoolTest {
         assertThat(pool.liveInstances())
                 .as("and the instance it hands back is still counted against the host-wide ceiling")
                 .isEqualTo(1);
+    }
+
+    @Test
+    void retriesWhenSweepReclaimsTheSlotBeforeClaim() throws Exception {
+        CountDownLatch acquired = new CountDownLatch(1);
+        CountDownLatch resume = new CountDownLatch(1);
+        AtomicInteger attempts = new AtomicInteger();
+        ConnectorInstancePool<FakeInstance> pool = new ConnectorInstancePool<>(
+                instances::open, instances::dispose, limits().withIdle(Duration.ZERO), clock, () -> {
+                    if (attempts.getAndIncrement() == 0) {
+                        acquired.countDown();
+                        try {
+                            if (!resume.await(10, TimeUnit.SECONDS)) {
+                                throw new AssertionError("claim was not resumed");
+                            }
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            throw new AssertionError("claim control was interrupted", e);
+                        }
+                    }
+                });
+        pools.add(pool);
+        FutureTask<FakeInstance> result = new FutureTask<>(
+                () -> pool.call(config("conn-1", "mongodb://host/db"), instance -> instance));
+        Thread caller = new Thread(result, "pool-stale-slot-caller");
+        threads.add(caller);
+        caller.start();
+        try {
+            assertThat(acquired.await(10, TimeUnit.SECONDS)).isTrue();
+            assertThat(pool.trackedConnections()).isEqualTo(1);
+            assertThat(pool.liveInstances()).isZero();
+            assertThat(instances.opened).isEmpty();
+
+            pool.sweep();
+            assertThat(pool.trackedConnections()).isZero();
+            resume.countDown();
+            FakeInstance returned = result.get(10, TimeUnit.SECONDS);
+
+            assertThat(attempts.get()).as("the reclaimed slot is rejected before opening an instance").isEqualTo(2);
+            assertThat(instances.opened).containsExactly(returned);
+            assertThat(pool.liveInstances()).isEqualTo(1);
+            assertThat(pool.trackedConnections()).isEqualTo(1);
+
+            pool.sweep();
+            assertThat(instances.disposed).containsExactly(returned);
+            assertThat(pool.liveInstances()).isZero();
+            assertThat(pool.trackedConnections()).isZero();
+        } finally {
+            resume.countDown();
+            caller.join(TimeUnit.SECONDS.toMillis(10));
+            assertThat(caller.isAlive()).as("the controlled caller has exited").isFalse();
+        }
     }
 
     @Test

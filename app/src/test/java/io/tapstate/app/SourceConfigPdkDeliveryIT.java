@@ -221,6 +221,7 @@ class SourceConfigPdkDeliveryIT {
                 "--tapstate.cloud.cluster-id=shared-source-cluster"));
         else args.add("--tapstate.store.mongo.uri=" + uri);
         ConfigurableApplicationContext context = new SpringApplicationBuilder(Assembly.class)
+                .initializers(CloudConnectorTestInputs::reportCapabilityFailures)
                 .environment(CloudFixtureEnvironment.isolated()).run(args.toArray(String[]::new));
         MongoClient raw = null;
         try {

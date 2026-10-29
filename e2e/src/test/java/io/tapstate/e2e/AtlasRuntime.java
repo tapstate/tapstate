@@ -83,6 +83,13 @@ final class AtlasRuntime implements AutoCloseable {
     }
 
     ServerHandle launch(Tiers tier, List<String> additionalArguments) {
+        return launch(tier, additionalArguments, null);
+    }
+
+    ServerHandle launch(Tiers tier, List<String> additionalArguments, io.tapstate.control.core.AiProviderClient provider) {
+        if (provider != null && tier != Tiers.IN_PROCESS) {
+            throw new IllegalArgumentException("a controlled provider requires the in-process tier");
+        }
         List<String> arguments = new ArrayList<>(List.of(
                 "--spring.config.location=optional:classpath:/application.properties",
                 "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2",
@@ -96,7 +103,7 @@ final class AtlasRuntime implements AutoCloseable {
                     "--tapstate.connectors.seed-dir=" + seedDirectory()));
         }
         ServerHandle server = tier == Tiers.IN_PROCESS
-                ? InProcessServer.start(storeUri, metadata + "_operator", arguments)
+                ? InProcessServer.start(storeUri, metadata + "_operator", arguments, provider)
                 : RealProcessServer.start(storeUri, metadata + "_operator", arguments);
         try {
             if (server instanceof RealProcessServer process) process.awaitReady();

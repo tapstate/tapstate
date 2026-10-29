@@ -34,29 +34,34 @@ class MongoCloudSessionStoreTest {
     @Test
     void egressContextRoundTripsAndPreEgressSessionDocumentsRemainReadable() {
         var context = new CloudSessionContext("org-one", "cluster-one", "Organization", "Cluster", "us-east-1",
-                "203.0.113.42", "STABLE");
+                "203.0.113.42", "STABLE", "user@example.test");
         var session = new CloudSessionRecord(IDENTITY, "jwt-one", "cookie-hash", "user-one", "workload:read",
                 false, CREATED, CREATED, CREATED.plusSeconds(1800), context);
         Document document = MongoCloudSessionStore.toDocument(session);
         assertThat(MongoCloudSessionStore.toRecord(document)).contains(session);
         Document storedContext = document.get("clusterContext", Document.class);
+        assertThat(storedContext.getString("userEmail")).isEqualTo("user@example.test");
+        storedContext.remove("userEmail");
         storedContext.remove("ec2PublicIp");
         storedContext.remove("egressAddressStatus");
         var legacy = MongoCloudSessionStore.toRecord(document).orElseThrow();
+        assertThat(legacy.clusterContext().userEmail()).isNull();
         assertThat(legacy.clusterContext().ec2PublicIp()).isNull();
         assertThat(legacy.clusterContext().egressAddressStatus()).isNull();
         assertThat(legacy.clusterContext().clusterId()).isEqualTo("cluster-one");
         assertThat(legacy.secretHash()).isEqualTo(session.secretHash());
 
+        storedContext.put("userEmail", "   ");
         storedContext.put("ec2PublicIp", "");
         storedContext.put("egressAddressStatus", "   ");
         var blankOptionalFields = MongoCloudSessionStore.toRecord(document).orElseThrow();
+        assertThat(blankOptionalFields.clusterContext().userEmail()).isNull();
         assertThat(blankOptionalFields.clusterContext().ec2PublicIp()).isNull();
         assertThat(blankOptionalFields.clusterContext().egressAddressStatus()).isNull();
     }
 
     @Test
-    void onlyMinimalLoginFactsAndTheCookieHashRoundTrip() {
+    void loginWithoutContextStoresNoEmailOrRawCredentials() {
         CloudSessionRecord record = record();
         Document raw = MongoCloudSessionStore.toDocument(record);
 
