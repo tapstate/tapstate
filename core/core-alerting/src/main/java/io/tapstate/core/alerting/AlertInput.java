@@ -30,9 +30,11 @@ public sealed interface AlertInput permits AlertInput.Conditions, AlertInput.Met
         public Freshness { Objects.requireNonNull(observedAt); }
     }
     record Operational(Instant observedAt, String bindingDigest, OperationalEvidence.Capability capability,
-            boolean succeeded) implements AlertInput {
+            boolean succeeded,String domainToken) implements AlertInput {
+        public Operational(Instant at,String digest,OperationalEvidence.Capability capability,boolean succeeded){this(at,digest,capability,succeeded,null);}
         public Operational { Objects.requireNonNull(observedAt); Objects.requireNonNull(capability);
-            new OperationalEvidence(bindingDigest, 0); }
+            new OperationalEvidence(bindingDigest, 0);
+            if(domainToken!=null)AlertOperationDomain.qualifier("rule",domainToken); }
     }
     record Discontinuity(Instant observedAt) implements AlertInput {
         public Discontinuity { Objects.requireNonNull(observedAt); }

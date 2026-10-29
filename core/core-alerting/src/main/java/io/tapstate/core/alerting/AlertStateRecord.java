@@ -68,6 +68,10 @@ public final class AlertStateRecord {
                     || snapshot.episode().equals(episode.value()) && snapshot.rule().key().equals(episode.originalBinding().key())
                     && deployment == episode.policy().deployment()), "stateEpisode", "incomplete-or-foreign");
             AlertValidation.require(binding == null || binding.evaluation().equals(snapshot.rule()) && binding.episode() == snapshot.episodeSequence(), "stateBinding", "foreign-evaluation");
+            if(operationalEvidence!=null && operationalEvidence.version()==2) {
+                AlertValidation.require(binding!=null && !binding.ruleIdentity().incarnation().equals(snapshot.rule().key().qualifier())
+                        && AlertOperationDomain.belongs(binding.ruleIdentity().incarnation(),snapshot.rule().key()),"operationalDomain","foreign-rule-or-key");
+            }
             AlertValidation.require(retiredAt == null || snapshot.status() != AlertSnapshot.Status.FIRING
                     && (episode == null || episode.value().endedAt() != null && !retiredAt.isBefore(episode.value().endedAt())),
                     "stateRetirement", "active-or-before-end");

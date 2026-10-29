@@ -469,7 +469,7 @@ final class StoreBackedDagSource implements DagSource {
             io.tapstate.spi.store.RequiredNoteStore notes,io.tapstate.adapters.pdk.ConnectorProvisioner connectors,ArtifactStore artifacts,
             java.util.function.Predicate<io.tapstate.spi.store.PipelineIntentScope> recoveryPinned,
             java.util.function.BiFunction<ExecutionFence,Map<String,Long>,SinkAckFactory> boundedLoads,CapturedStartGuard capturedStartGuard) {
-        return new StoreBackedDagSource(store,new PdkSinkWriterBinder(notes,connectors,recoveryPinned),nests,reachability,
+        return new StoreBackedDagSource(store,new PdkSinkWriterBinder(notes,connectors,recoveryPinned,artifacts),nests,reachability,
                 placement,artifacts,marked,members,budget,unscopedModelRecords(store),source -> SourceDiscovery.model(store,source),boundedLoads,capturedStartGuard);
     }
 
@@ -3676,16 +3676,29 @@ final class StoreBackedDagSource implements DagSource {
         private final io.tapstate.spi.store.RequiredNoteStore notes;
         private final io.tapstate.adapters.pdk.ConnectorProvisioner provisioner;
         private final java.util.function.Predicate<io.tapstate.spi.store.PipelineIntentScope> recoveryPinned;
-        PdkSinkWriterBinder(){this.notes=null;this.provisioner=null;this.recoveryPinned=ignored -> false;}
+        private final ArtifactStore artifacts;
+        PdkSinkWriterBinder(){this.notes=null;this.provisioner=null;this.recoveryPinned=ignored -> false;this.artifacts=null;}
         PdkSinkWriterBinder(io.tapstate.spi.store.RequiredNoteStore notes,io.tapstate.adapters.pdk.ConnectorProvisioner provisioner){this(notes,provisioner,ignored -> false);}
-        PdkSinkWriterBinder(io.tapstate.spi.store.RequiredNoteStore notes,io.tapstate.adapters.pdk.ConnectorProvisioner provisioner,java.util.function.Predicate<io.tapstate.spi.store.PipelineIntentScope> recoveryPinned){this.notes=Objects.requireNonNull(notes,"notes");this.provisioner=Objects.requireNonNull(provisioner,"provisioner");this.recoveryPinned=Objects.requireNonNull(recoveryPinned);}
+        PdkSinkWriterBinder(io.tapstate.spi.store.RequiredNoteStore notes,io.tapstate.adapters.pdk.ConnectorProvisioner provisioner,java.util.function.Predicate<io.tapstate.spi.store.PipelineIntentScope> recoveryPinned){this(notes,provisioner,recoveryPinned,null);}
+        PdkSinkWriterBinder(io.tapstate.spi.store.RequiredNoteStore notes,io.tapstate.adapters.pdk.ConnectorProvisioner provisioner,java.util.function.Predicate<io.tapstate.spi.store.PipelineIntentScope> recoveryPinned,ArtifactStore artifacts){this.notes=Objects.requireNonNull(notes,"notes");this.provisioner=Objects.requireNonNull(provisioner,"provisioner");this.recoveryPinned=Objects.requireNonNull(recoveryPinned);this.artifacts=artifacts;}
         @Override public SupplierEx<? extends SinkWriter> scoped(SupplierEx<? extends SinkWriter> factory,ExecutionFence original,
                 List<io.tapstate.spi.store.SinkPreparationStore.Input> roster,Runnable requireActive) {
             if(original==null || original.scope()==null)return factory;
             if(!(factory instanceof PdkSinkWriterFactory sink))throw new IllegalStateException("the configured binder requires a concrete target factory");
             if(notes==null || provisioner==null)throw new TapstateException(io.tapstate.spi.store.IoError.NOTE_SCOPE_UNAVAILABLE,Map.of(),null);
             var run=ConfiguredSinkRun.prepare(original,sink.config(),sink.purpose(),notes,provisioner,requireActive,recoveryPinned.test(original.scope()));
-            var bound=sink.forRun(run,run.assessTargets(sink.config(),sink.targets(),notes,provisioner,requireActive));
+            if(artifacts!=null) {
+                var identity=artifacts.managedDefaultSourceId().flatMap(artifacts::sourceBinding)
+                        .filter(value->value.source().connector().equals(sink.config().connectorId()) && value.source().config().equals(sink.config().settings()));
+                if(identity.isPresent())run=run.withSource(identity.orElseThrow());
+            }
+            var observer=io.tapstate.spi.capture.SourceOperationObserver.NONE;
+            if(run.source()!=null)observer=ScopedSinkStateProvider.local()
+                    .observeOriginal(run,sink.config(),"assessment",requireActive,requireActive);
+            Map<String,io.tapstate.adapters.pdk.TargetIdentityPlan> assessed;
+            try {assessed=run.assessTargets(sink.config(),sink.targets(),notes,provisioner,requireActive,observer);}
+            finally {observer.close();}
+            var bound=sink.forRun(run,assessed);
             requireActive.run();roster.addAll(bound.preparationInputs(original.scope()));return bound;
         }
 

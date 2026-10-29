@@ -20,7 +20,7 @@ final class AlertChannels implements AlertDeliveryRuntime.Channels {
     interface Resolver { InetAddress[] resolve(String host) throws UnknownHostException; }
     private final AlertChannelPolicy.Deployment deployment;private final CloudRuntimeSettings cloud;
     private final Clock clock;private final Resolver resolver;private final Runnable active;private final String expectedOrg;private final SSLContext systemTls;private final boolean outboundEnabled;
-    private final ThreadPoolExecutor dns=new ThreadPoolExecutor(2,2,0,TimeUnit.SECONDS,new SynchronousQueue<>(),r->{var t=new Thread(r,"alert-dns");t.setDaemon(true);return t;});
+    private final ThreadPoolExecutor dns=new ThreadPoolExecutor(2,2,0,TimeUnit.SECONDS,new ArrayBlockingQueue<>(2),r->{var t=new Thread(r,"alert-dns");t.setDaemon(true);return t;});
     AlertChannels(AlertChannelPolicy.Deployment deployment,CloudRuntimeSettings cloud,Clock clock,Runnable active,String expectedOrg){
         this(deployment,cloud,clock,active,expectedOrg,InetAddress::getAllByName);
     }
@@ -74,7 +74,7 @@ final class AlertChannels implements AlertDeliveryRuntime.Channels {
             if(unavailable.getCause() instanceof UnknownHostException)return new NotificationChannel.Result(DeliveryEvidence.Outcome.NOT_ACCEPTED,NotificationChannel.Action.RETRY,null,NotificationChannel.Phase.CONNECT,0,"dns-unavailable");
             if(unavailable.getCause() instanceof RuntimeException bug)throw bug;
             throw new IllegalStateException(unavailable.getCause());
-        }finally{if(!lookup.isDone())lookup.cancel(true);}
+        }finally{if(!lookup.isDone())lookup.cancel(true);if(lookup.isCancelled() && lookup instanceof Runnable queued)dns.remove(queued);}
     }
     @Override public NotificationChannel open(AlertIntent.Frozen frozen,AlertStore.PrivateMaterial material,Object prepared){
         active.run();var addresses=(InetAddress[])prepared;var destination=AlertDeliveryRuntime.destination(frozen);

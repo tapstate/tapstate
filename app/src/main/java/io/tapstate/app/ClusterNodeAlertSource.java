@@ -3,59 +3,118 @@ package io.tapstate.app;
 import com.hazelcast.cluster.*;
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.core.alerting.*;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.*;
+import io.tapstate.spi.store.AlertNodeLifecycleStore.*;
 import java.time.*;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.*;
 
-/** Only a failure-detector removal of a previously committed original member is a failure input. */
+/** Combines CONFIG expectation with the original failure detector, never an unexplained leave callback. */
 final class ClusterNodeAlertSource implements MembershipListener, AutoCloseable {
-    private record MemberState(AlarmKey.Resource resource,UUID memberId,boolean removed) { }
+    private record Snapshot(Map<AlarmKey.Resource,Row> rows,Map<String,Row> latest,Map<AlarmKey.Resource,UUID> live,
+            ClusterMembership membership,long epoch,long deadline,Instant observedAt) { }
     private final HazelcastInstance member;
     private final ClusterMembershipGate membership;
     private final PipelineAlertRuntime runtime;
-    private final BuiltinResourceSignals signals;
+    private final Supplier<AlertNodeLifecycleStore> stores;
+    private final Supplier<Registration> registration;
+    private final Function<Registration,Runnable> proof;
     private final Runnable active;
     private final Clock clock;
-    private final Map<AlarmKey.Resource,MemberState> monitored=new LinkedHashMap<>();
-    private final UUID registration;
-    private boolean closed;
+    private final AtomicBoolean refreshing=new AtomicBoolean();
+    private final UUID listener;
+    private volatile boolean closed;
+    private volatile AlertNodeLifecycleStore store;
+    private volatile Row own;
+    private volatile Snapshot snapshot;
+    private long epoch;
+    private final String retirementCommand=UUID.randomUUID().toString();
+    private Instant retirementAt;
     ClusterNodeAlertSource(HazelcastInstance member,ClusterMembershipGate membership,PipelineAlertRuntime runtime,
-            BuiltinResourceSignals signals,Runnable active,Clock clock){
-        this.member=member;this.membership=membership;this.runtime=runtime;this.signals=signals;this.active=active;this.clock=clock;
-        registration=member.getCluster().addMembershipListener(this);
+            BuiltinResourceSignals signals,Runnable active,Clock clock,Supplier<AlertNodeLifecycleStore> stores,
+            Supplier<Registration> registration,Function<Registration,Runnable> proof) {
+        this.member=member;this.membership=membership;this.runtime=runtime;this.active=active;this.clock=clock;
+        this.stores=stores;this.registration=registration;this.proof=proof;
+        signals.nodeProofs(this::evidence);listener=member.getCluster().addMembershipListener(this);
     }
-    @Override public synchronized void memberAdded(MembershipEvent event){ }
-    @Override public synchronized void memberRemoved(MembershipEvent event){
-        Member peer=event.getMember();var key=resource(peer);if(key==null)return;
-        var previous=monitored.get(key);
-        if(previous!=null&&previous.memberId().equals(peer.getUuid())){
-            monitored.put(key,new MemberState(key,peer.getUuid(),true));publish(monitored.get(key));
-        }
+    /** Listener callbacks perform no CONFIG IO; the bounded host independently reads the authoritative member snapshot. */
+    @Override public void memberAdded(MembershipEvent event) { }
+    @Override public void memberRemoved(MembershipEvent event) { }
+    void admitted(){tick();}
+    void tick() {
+        if(closed || !refreshing.compareAndSet(false,true))return;
+        try {
+            active.run();var committed=membership.committed();
+            if(committed==null || membership.visibleNodeIds().isEmpty())throw ThreeLayerStorePort.refused();
+            if(store==null)store=stores.get();
+            if(own==null) {
+                var original=registration.get();own=store.register(original,clock.instant(),proof.apply(original));
+            }
+            proof.apply(own.registration()).run();
+            var rows=new HashMap<AlarmKey.Resource,Row>();var newest=new HashMap<String,Row>();
+            for(var row:store.list()) {
+                var r=row.registration();
+                if(!r.setup().equals(own.registration().setup()) || !r.cache().equals(own.registration().cache()))continue;
+                if(row.registeredAt().isAfter(clock.instant()))throw ThreeLayerStorePort.refused();
+                rows.put(r.key().resource(),row);
+                newest.merge(r.key().nodeId(),row,(a,b)->{
+                    long first=a.registration().session().claimGeneration(),second=b.registration().session().claimGeneration();
+                    if(first==second && !a.registration().key().bootId().equals(b.registration().key().bootId()))throw ThreeLayerStorePort.refused();
+                    return first>second?a:b;
+                });
+            }
+            if(!rows.containsKey(own.registration().key().resource()))throw ThreeLayerStorePort.refused();
+            var live=new HashMap<AlarmKey.Resource,UUID>();
+            for(Member peer:member.getCluster().getMembers()) {
+                var resource=resource(peer);if(resource!=null)live.put(resource,peer.getUuid());
+            }
+            var previous=snapshot;
+            if(previous==null || !previous.rows().equals(rows) || !previous.live().equals(live) || !previous.membership().equals(committed))epoch=Math.incrementExact(epoch);
+            var captured=new Snapshot(Map.copyOf(rows),Map.copyOf(newest),Map.copyOf(live),committed,epoch,
+                    System.nanoTime()+Duration.ofSeconds(10).toNanos(),clock.instant());
+            snapshot=captured;
+            for(var entry:captured.rows().entrySet()) {
+                var evidence=evidence(entry.getKey());if(evidence.isEmpty() || !evidence.orElseThrow().expected())continue;
+                var row=entry.getValue();if(row.phase()!=Phase.EXPECTED)continue;
+                boolean present=row.registration().memberId().equals(
+                        Optional.ofNullable(captured.live().get(entry.getKey())).map(UUID::toString).orElse(null));
+                runtime.resourceInput(entry.getKey(),"cluster.node-unavailable",0,row.registration().producerIncarnation(),
+                        evidence.orElseThrow().requireCurrent(),new AlertInput.Conditions(captured.observedAt(),
+                                present?AlertSignal.Condition.GOOD:AlertSignal.Condition.BAD,null));
+            }
+        }catch(TapstateException unavailable){snapshot=null;runtime.collectionUnavailable("node-lifecycle-unavailable");}
+        finally{refreshing.set(false);}
     }
-    synchronized void tick(){
-        if(closed)return;
-        var committed=membership.committed();if(committed==null)return;
-        for(Member peer:member.getCluster().getMembers()){
-            var key=resource(peer);if(key==null||!committed.activeNodeIds().contains(key.id()))continue;
-            if(!monitored.containsKey(key)&&monitored.size()>=256){runtime.collectionUnavailable("member-budget");return;}
-            var old=monitored.get(key);
-            if(old==null||old.memberId().equals(peer.getUuid()))monitored.put(key,new MemberState(key,peer.getUuid(),false));
-        }
-        for(var state:List.copyOf(monitored.values()))publish(state);
+    private Optional<AlertStore.NodeEvidence> evidence(AlarmKey.Resource resource) {
+        var captured=snapshot;if(closed || captured==null)return Optional.empty();
+        var row=captured.rows().get(resource);if(row==null)return Optional.empty();
+        var r=row.registration();var latest=captured.latest().get(r.key().nodeId());
+        boolean superseded=latest!=null && !latest.registration().key().bootId().equals(r.key().bootId())
+                && latest.registration().session().claimGeneration()>r.session().claimGeneration();
+        boolean present=r.memberId().equals(Optional.ofNullable(captured.live().get(resource)).map(UUID::toString).orElse(null));
+        boolean expected=!superseded && (row.phase()==Phase.EXPECTED || present);
+        Runnable guard=()->{
+            active.run();
+            var current=snapshot;
+            if(closed || current==null || current.epoch()!=captured.epoch() || System.nanoTime()-captured.deadline()>=0
+                    || !captured.membership().equals(membership.committed()) || membership.visibleNodeIds().isEmpty())throw ThreeLayerStorePort.refused();
+        };
+        return Optional.of(new AlertStore.NodeEvidence(resource,resource.id(),resource.incarnation(),captured.membership().revision(),
+                r.producerIncarnation(),guard,expected,row.revision(),superseded?latest.registration().key().bootId():null));
     }
-    private void publish(MemberState state){
-        var original=membership.committed();if(original==null)return;
-        boolean expected=original.activeNodeIds().contains(state.resource().id());
-        String producer=BuiltinResourceSignals.digest(state.resource().id(),state.resource().incarnation());
-        Runnable guard=()->{active.run();var current=membership.committed();
-            if(closed||current==null||!current.equals(original)||membership.visibleNodeIds().isEmpty())throw ThreeLayerStorePort.refused();};
-        signals.nodeEvidence(new AlertStore.NodeEvidence(state.resource(),state.resource().id(),state.resource().incarnation(),original.revision(),producer,guard,expected));
-        if(expected)runtime.resourceInput(state.resource(),"cluster.node-unavailable",0,producer,guard,
-                new AlertInput.Conditions(clock.instant(),state.removed()?AlertSignal.Condition.BAD:AlertSignal.Condition.GOOD,null));
+    /** Only the main application close event calls this before invalidating its original runtime owner. */
+    synchronized void orderlyShutdown() {
+        if(closed || own==null || store==null)return;
+        if(retirementAt==null)retirementAt=clock.instant();
+        var original=own.registration();
+        own=store.retire(original,own.revision(),retirementCommand,retirementAt,proof.apply(original));
     }
-    private static AlarmKey.Resource resource(Member peer){
+    private static AlarmKey.Resource resource(Member peer) {
         String node=peer.getAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE),boot=peer.getAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE);
-        return node==null||node.isBlank()||boot==null||boot.isBlank()||peer.getUuid()==null?null:new AlarmKey.Resource("cluster-node",node,boot);
+        return node==null || node.isBlank() || boot==null || boot.isBlank() || peer.getUuid()==null ? null
+                : new AlarmKey.Resource("cluster-node",node,boot);
     }
-    @Override public synchronized void close(){closed=true;member.getCluster().removeMembershipListener(registration);monitored.clear();}
+    @Override public void close(){closed=true;member.getCluster().removeMembershipListener(listener);snapshot=null;}
 }

@@ -86,6 +86,30 @@ class PdkCapturePortTest {
         assertThat(observed).hasSize(1);
     }
 
+    @Test
+    void finishingASnapshotSessionDoesNotCloseTheSamePortsPhysicalStreamObserver(@TempDir Path dir) throws Exception {
+        var closed=new java.util.concurrent.ConcurrentHashMap<String,AtomicBoolean>();var streamRead=new CountDownLatch(1);
+        var factory=new io.tapstate.spi.capture.SourceOperationObserver() {
+            public void completed(Capability capability,Throwable failure){throw new AssertionError("a physical observer is required");}
+            public io.tapstate.spi.capture.SourceOperationObserver fork(String phase) {
+                var ended=new AtomicBoolean();closed.put(phase,ended);
+                return new io.tapstate.spi.capture.SourceOperationObserver() {
+                    public void completed(Capability capability,Throwable failure){if(phase.equals("stream") && capability==Capability.STREAM_READ){assertThat(ended).isFalse();streamRead.countDown();}}
+                    public void close(){ended.set(true);}
+                };
+            }
+        };
+        var jar=Synthetic.positionedSource(dir);var port=new PdkCapturePort(provisioner(jar,"synthetic.PositionedSource",null)).withOperationObserver(factory);
+        try(var snapshot=port.snapshotSession(config("t1"))) {
+            try(var rows=snapshot.read("t1")){while(rows.hasNext())rows.next();}
+            try(var subscription=port.cdc(config("t1"),CaptureStart.present(),(events,position)->{})) {
+                snapshot.close();assertThat(closed.get("snapshot")).isTrue();assertThat(closed.get("stream")).isFalse();
+                assertThat(streamRead.await(5,TimeUnit.SECONDS)).isTrue();
+            }
+            assertThat(closed.get("stream")).isTrue();
+        }finally{port.close();}
+    }
+
     // ---- structural failures (resolved before any connector data flows) --------------------------
 
     @Test

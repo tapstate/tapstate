@@ -22,10 +22,11 @@ public interface AlertStore {
     sealed interface ResourceEvidence permits NodeEvidence,StorageEvidence { AlarmKey.Resource resource(); }
     /** Captured from the actual membership/lease event; the guard is pure and must refuse expired or foreign producer evidence. */
     record NodeEvidence(AlarmKey.Resource resource,String nodeId,String bootId,long expectedMembershipRevision,
-            String producerIncarnation,Runnable requireCurrent,boolean expected) implements ResourceEvidence {
-        public NodeEvidence(AlarmKey.Resource resource,String nodeId,String bootId,long revision,String producer,Runnable guard){this(resource,nodeId,bootId,revision,producer,guard,true);}
+            String producerIncarnation,Runnable requireCurrent,boolean expected,long lifecycleRevision,String supersedingBootId) implements ResourceEvidence {
+        public NodeEvidence(AlarmKey.Resource resource,String nodeId,String bootId,long revision,String producer,Runnable guard){this(resource,nodeId,bootId,revision,producer,guard,true,0,null);}
+        public NodeEvidence(AlarmKey.Resource resource,String nodeId,String bootId,long revision,String producer,Runnable guard,boolean expected){this(resource,nodeId,bootId,revision,producer,guard,expected,0,null);}
         public NodeEvidence { Objects.requireNonNull(resource);Objects.requireNonNull(nodeId);Objects.requireNonNull(bootId);Objects.requireNonNull(producerIncarnation);Objects.requireNonNull(requireCurrent);
-            if(expectedMembershipRevision<1||!resource.kind().equals("cluster-node")||!resource.id().equals(nodeId)||!resource.incarnation().equals(bootId))throw new IllegalArgumentException("foreign member evidence"); }
+            if(expectedMembershipRevision<1||lifecycleRevision<0||!resource.kind().equals("cluster-node")||!resource.id().equals(nodeId)||!resource.incarnation().equals(bootId))throw new IllegalArgumentException("foreign member evidence"); }
     }
     enum StorageRole { CACHE,MASTER }
     /** Original CONFIG-backed identity only; unavailable CACHE is never queried to infer a replacement resource. */
@@ -42,7 +43,8 @@ public interface AlertStore {
     }
     /** Ephemeral producer proof. The guard is pure; its lease was read before entering CONFIG. */
     record EvaluationProof(PipelineIntentSnapshot pipeline,Runnable requireCurrent) {
-        public EvaluationProof { Objects.requireNonNull(pipeline);Objects.requireNonNull(requireCurrent);if(pipeline.deleted())throw new IllegalArgumentException("deleted producer intent"); }
+        public static EvaluationProof operation(Runnable pureOriginal){return new EvaluationProof(null,pureOriginal);}
+        public EvaluationProof { Objects.requireNonNull(requireCurrent);if(pipeline!=null && pipeline.deleted())throw new IllegalArgumentException("deleted producer intent"); }
     }
     record StateChange(long revision,AlertStateRecord.Head before,AlertStateRecord.Head after,List<AlertStateRecord.Transition> transitions,AlertSignal diagnosticSignal,EvaluationProof proof) {
         public StateChange(long revision,AlertStateRecord.Head before,AlertStateRecord.Head after,List<AlertStateRecord.Transition> transitions,AlertSignal diagnosticSignal){this(revision,before,after,transitions,diagnosticSignal,null);}
@@ -98,9 +100,10 @@ public interface AlertStore {
     record EpisodeCursor(AlarmKey key,long number,long secondOrder,int nanoOrder) { }
     record EndedPage(List<AlertStateRecord.Episode> rows,EpisodeCursor next,boolean isolatedRecords){public EndedPage{rows=List.copyOf(rows);}}
     record DeliveryPage(List<Stored<AlertIntent.Record>> rows,String nextId,boolean isolatedRecords){public DeliveryPage{rows=List.copyOf(rows);}}
-    record EvaluationPage(List<Stored<AlertStateRecord.Head>> rows,AlarmKey next,Set<AlarmKey.Resource> removedResources){
-        public EvaluationPage(List<Stored<AlertStateRecord.Head>> rows,AlarmKey next){this(rows,next,Set.of());}
-        public EvaluationPage{rows=List.copyOf(rows);removedResources=Set.copyOf(removedResources);}
+    record EvaluationPage(List<Stored<AlertStateRecord.Head>> rows,AlarmKey next,Set<AlarmKey.Resource> removedResources,Set<AlarmKey> obsoleteBindings){
+        public EvaluationPage(List<Stored<AlertStateRecord.Head>> rows,AlarmKey next){this(rows,next,Set.of(),Set.of());}
+        public EvaluationPage(List<Stored<AlertStateRecord.Head>> rows,AlarmKey next,Set<AlarmKey.Resource> removedResources){this(rows,next,removedResources,Set.of());}
+        public EvaluationPage{rows=List.copyOf(rows);removedResources=Set.copyOf(removedResources);obsoleteBindings=Set.copyOf(obsoleteBindings);}
     }
 
     Optional<Stored<AlertStateRecord.Head>> state(AlarmKey key,ReadAccess access);

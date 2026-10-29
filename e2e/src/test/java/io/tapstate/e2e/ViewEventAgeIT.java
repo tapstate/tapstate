@@ -48,6 +48,8 @@ class ViewEventAgeIT {
                       primary_key: _id
                     """);
             control.apply(resources);control.discoverSchema("src_age","mongodb",Map.of("uri",sourceUri,"database",sourceDb));
+            control.alert("configuration/save",Map.of("kind","RULE","id","view-observation-stale","etag","0","form",Map.of("name","View observation freshness","typeId","pipeline.observation-stale",
+                    "resourceKinds",List.of("pipeline"),"allResources",true,"resources",List.of(),"parameters",Map.of("max-age",5,"startup-grace",0),"enabled",true)));
             control.lifecycle("view_age",LifecycleVerb.START);
             var landed=targetClient.getDatabase(targetDb).getCollection("order_state");
             Await.until("the real managed View snapshot",Duration.ofSeconds(90),()->landed.countDocuments()==1,()->control.viewsJson());
@@ -65,14 +67,19 @@ class ViewEventAgeIT {
             assertThat(server.stopPublishingObservations()).isEqualTo(1);
             Await.until("the retained observation to age beyond the read freshness window",Duration.ofSeconds(90),()->control.observedAgeMillis("view_age").orElse(0L)>=65000,()->control.viewsJson());
             String after=control.viewsJson();
+            var staleAlerts=control.alert("center",Map.of());assertThat(JsonWriter.write(staleAlerts)).contains("pipeline.observation-stale");
             browserReview(server,"stale");
             var receipt=new LinkedHashMap<String,Object>();receipt.put("sourceChangeRequestedAt",changedAt.toString());receipt.put("targetConfirmedAt",targetConfirmedAt.toString());
             receipt.put("sourceWriteServerTime",Instant.ofEpochSecond(Integer.toUnsignedLong(sourceOperationTime.getTime())).toString());
             receipt.put("sourceWriteServerTimePrecision","s");receipt.put("sourceWriteLogicalIncrement",sourceOperationTime.getInc());
             receipt.put("readBackAt",Instant.now().toString());receipt.put("observationAgeMillis",control.observedAgeMillis("view_age").orElseThrow());
             receipt.put("actualTargetDocument",landed.find(new Document("name","after")).first().toJson());receipt.put("sourcePositionPresent",true);
-            receipt.put("before",JsonReader.parse(before));receipt.put("after",JsonReader.parse(after));receipt.put("metrics",JsonReader.parse(metrics));
+            receipt.put("before",JsonReader.parse(before));receipt.put("after",JsonReader.parse(after));receipt.put("metrics",JsonReader.parse(metrics));receipt.put("staleAlerts",staleAlerts);
             Path evidence=Path.of(System.getProperty("tapstate.t8.view-receipt","/tmp/w4-t8-view-receipt.json"));Files.writeString(evidence,JsonWriter.write(receipt));
+            assertThat(server.publishObservationsOnce()).isEqualTo(1);
+            Await.until("same-pipeline freshness recovery from the original producer",Duration.ofSeconds(15),
+                    ()->!JsonWriter.write(control.alert("center",Map.of())).contains("pipeline.observation-stale"),()->JsonWriter.write(control.alert("center",Map.of())));
+            assertThat(control.alert("center",Map.of("view","history")).toString()).contains("pipeline.observation-stale","RECOVERED");
             assertThat(after).as("the actual View API after the publisher stopped: %s",after).contains("\"state\":\"stale\"", "\"reason\":\"observation-stale\"", "\"unit\":\"s\"");
         }finally{
             try(var cleanup=MongoClients.create(sourceUri)){cleanup.getDatabase(sourceDb).drop();cleanup.getDatabase(targetDb).drop();}

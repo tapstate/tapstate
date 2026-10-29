@@ -102,6 +102,13 @@ final class ControlPlane {
         if(response.statusCode()!=200)throw new AssertionError("Metrics read failed: "+response.statusCode()+" "+response.body());
         return response.body();
     }
+    Map<String,Object> alert(String operation,Map<String,?> input) {
+        var response=send(authed("/api/alerts/"+operation,JsonWriter.write(input)));
+        expect(response,200,"alert "+operation);
+        Object parsed=JsonReader.parse(response.body());
+        if(!(parsed instanceof Map<?,?> map))throw new AssertionError("alert response is not an object");
+        var value=new LinkedHashMap<String,Object>();map.forEach((key,item)->value.put(String.valueOf(key),item));return value;
+    }
     /** Whether the product answers its health probe; the readiness signal a launcher waits on. */
     boolean healthy() {
         try {

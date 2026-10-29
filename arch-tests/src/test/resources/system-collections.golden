@@ -101,3 +101,4 @@ alert_notification_schedules | config | MongoAlertNotificationStore | migrated |
 alert_delivery_intents | config | MongoAlertNotificationStore | migrated | 2 | _id.authorityId+_id.clusterId+cleanupAt+_id, _id.authorityId+_id.clusterId+formatVersion+nextCheckAt+_id, _id.authorityId+_id.clusterId+_id.purpose+quotaMinute
 alert_target_limits | config | MongoAlertNotificationStore | migrated | 2 | _id.authorityId+_id.clusterId+cleanupAt+_id
 alert_test_quotas | config | MongoAlertNotificationStore | migrated | 2 | _id.authorityId+_id.clusterId+cleanupAt+_id
+alert_node_lifecycles | config | MongoAlertNodeLifecycleStore | migrated | 1 | authorityId+clusterId+phase+nodeId+bootId

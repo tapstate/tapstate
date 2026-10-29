@@ -122,6 +122,8 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
     Optional<org.springframework.boot.availability.ApplicationAvailability> availability() {
         return active.get() ? Optional.ofNullable(availability) : Optional.empty();
     }
+    /** CONFIG-backed monitoring remains available while an expired data-member lease fences business IO. */
+    private void requireAlertHost() {if(!active.get())throw StorageRuntime.unavailable();original.requireBusiness();}
     Optional<PipelineAlertRuntime.Health> alertHealth() {
         Object runtime=context==null?null:context.getBeanFactory().getSingleton("pipelineAlertRuntime");
         return runtime instanceof PipelineAlertRuntime alerts?Optional.of(alerts.health()):Optional.empty();
@@ -213,6 +215,11 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             var handler = mapping.getHandler(request); if (handler != null) return handler;
         }
         return null;
+    }
+    @Override public void beforeOrderlyClose() {
+        if(!active.get() || context==null)return;
+        Object source=context.getBeanFactory().getSingleton("clusterNodeAlertSource");
+        if(source instanceof ClusterNodeAlertSource nodes)nodes.orderlyShutdown();
     }
     @Override public synchronized void close() {
         active.set(false); handlers = List.of();
@@ -408,33 +415,60 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         @Bean BuiltinResourceSignals builtinResourceSignals(NativeBusinessContext owner,
                 org.springframework.beans.factory.ObjectProvider<PipelineAlertRuntime> runtime,Clock clock){
             return new BuiltinResourceSignals(runtime::getObject,owner.original::binding,owner.original.preparation().authScope(),
-                    owner.memberStorage::requireNode,clock);
+                    owner::requireAlertHost,clock);
         }
         @Bean(destroyMethod="close") ClusterNodeAlertSource clusterNodeAlertSource(NativeBusinessContext owner,HazelcastInstance member,
-                ClusterMembershipGate membership,PipelineAlertRuntime runtime,BuiltinResourceSignals signals,Clock clock){
-            ScopedSinkStateProvider.of(member).observeOperations((config,guard)->{
+                ClusterMembershipGate membership,PipelineAlertRuntime runtime,BuiltinResourceSignals signals,Clock clock,
+                NodeSessionLease node,CloudRuntimeSettings cloud){
+            ScopedSinkStateProvider.of(member).observeOperations((run,config,slot,guard,local)->{
                 var source=owner.configuration.artifacts().sourceBinding(owner.original.binding().defaultSourceId());
+                org.slf4j.LoggerFactory.getLogger(NativeBusinessContext.class).debug("Target monitoring identity [source={},captured={},connector={},settings={},binding={}]",source.isPresent(),run.source()!=null,
+                        source.map(value->value.source().connector().equals(config.connectorId())).orElse(false),
+                        source.map(value->value.source().config().equals(config.settings())).orElse(false),
+                        source.map(value->run.source()!=null && run.source().matches(value)).orElse(false));
                 return source.filter(s->s.source().connector().equals(config.connectorId())&&s.source().config().equals(config.settings()))
-                        .map(s->signals.source(s,guard)).orElse(io.tapstate.spi.capture.SourceOperationObserver.NONE);
+                        .filter(s->run.source()!=null && run.source().matches(s))
+                        .map(s->signals.source(s,"target:"+run.original().pipelineId()+":"+run.original().scope().stateGeneration()+":"+run.node().nodeId()+":"+run.purpose()+":"+run.original().topologyRevision()+":"+slot,
+                                guard,slot.equals("assessment")?()->{
+                                    owner.memberStorage.requireNode();owner.context.getBean(ExecutionAuthorization.class).requireLocal(run.original());
+                                }:local)).orElse(io.tapstate.spi.capture.SourceOperationObserver.NONE);
             });
-            var source=new ClusterNodeAlertSource(member,membership,runtime,signals,owner.memberStorage::requireNode,clock);
+            java.util.function.Supplier<AlertNodeLifecycleStore.Registration> registration=()->{
+                owner.memberStorage.requireNode();var committed=membership.committed();
+                if(committed==null || !membership.businessEligible())throw ThreeLayerStorePort.refused();
+                var fence=node.currentFence().orElseThrow(ThreeLayerStorePort::refused);
+                return new AlertNodeLifecycleStore.Registration(new AlertNodeLifecycleStore.Key(alertScope(owner,cloud),fence.owner().nodeId(),fence.owner().bootId()),
+                        owner.original.binding().setup(),owner.original.preparation().authScope(),fence,
+                        member.getCluster().getLocalMember().getUuid().toString(),committed.revision());
+            };
+            var source=new ClusterNodeAlertSource(member,membership,runtime,signals,owner.memberStorage::requireNode,clock,
+                    ()->owner.configuration.alertNodeLifecycles(alertScope(owner,cloud),owner.original.binding().setup(),owner.memberStorage::requireNode),
+                    registration,original->()->{
+                        owner.memberStorage.requireNode();
+                        if(!node.currentFence().filter(original.session()::equals).isPresent()
+                                || !member.getCluster().getLocalMember().getUuid().toString().equals(original.memberId())
+                                || !original.setup().equals(owner.original.binding().setup())
+                                || !original.cache().equals(owner.original.preparation().authScope()))throw ThreeLayerStorePort.refused();
+                    });
             runtime.observerTick(source::tick);return source;
+        }
+        private static io.tapstate.core.alerting.AlarmKey.Scope alertScope(NativeBusinessContext owner,CloudRuntimeSettings cloud) {
+            var setup=owner.original.binding().setup();
+            return cloud.cloud()?owner.parent.getBean(CloudSdkBridge.class).alertScope().orElseThrow(ThreeLayerStorePort::refused)
+                    :new io.tapstate.core.alerting.AlarmKey.Scope(setup.installationId(),setup.clusterId());
         }
         @Bean(initMethod = "start",destroyMethod = "close") PipelineAlertRuntime pipelineAlertRuntime(NativeBusinessContext owner,
                 PipelineActuationOwnership ownership, NodeSessionLease node, CloudRuntimeSettings cloud, Clock clock,BuiltinResourceSignals signals) {
+            var types=owner.parent.getBeanProvider(AlertTypeAssembly.class).getIfAvailable(AlertTypeAssembly::builtin);
             String evaluatorId = java.util.UUID.randomUUID().toString();
-            Runnable active = () -> {
-                if (!owner.active.get() || !node.active()) throw ThreeLayerStorePort.refused();
-                owner.original.requireBusiness();
-            };
+            Runnable active=owner::requireAlertHost;
             return new PipelineAlertRuntime(() -> {
                 active.run();
                 var setup = owner.original.binding().setup();
-                var scope = cloud.cloud() ? owner.parent.getBean(CloudSdkBridge.class).alertScope().orElseThrow(ThreeLayerStorePort::refused)
-                        : new io.tapstate.core.alerting.AlarmKey.Scope(setup.installationId(), setup.clusterId());
+                var scope=alertScope(owner,cloud);
                 var deployment = cloud.cloud() ? io.tapstate.core.alerting.AlertChannelPolicy.Deployment.CLOUD_MANAGED
                         : io.tapstate.core.alerting.AlertChannelPolicy.Deployment.ON_PREM;
-                var catalog = io.tapstate.core.alerting.BuiltinAlarmTypes.catalog();
+                var catalog=types.catalog();
                 var managedBinding = cloud.cloud() ? AlertNotificationPlanner.managedBinding(cloud.baseUrl(),scope,setup) : null;
                 var route = cloud.cloud() ? new io.tapstate.core.alerting.AlertIntent.SystemRoute("managed-alert-events",managedBinding,1) : null;
                 var target = cloud.cloud() ? new io.tapstate.core.alerting.AlertIntent.SdkTarget(managedBinding,scope.clusterId(),managedBinding) : null;
@@ -444,7 +478,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 var planner = new AlertNotificationPlanner(store,clock,evaluatorId+":planning",cloud.cloud()?cloud.baseUrl():null,active);
                 return new PipelineAlertRuntime.Services(store, new AlertEvaluationHost(store, catalog, deployment, clock, evaluatorId, active).withPlanner(planner),catalog,new AlertPlanningRuntime(planner),
                         new AlertDeliveryRuntime(store,clock,evaluatorId+":delivery",active,new AlertChannels(deployment,cloud,clock,active,cloud.cloud()?scope.authorityId():null,outbound),
-                                owner.root.authentication()::continueAlertTest),Set.of("pipeline-lifecycle","pipeline-observations","source-operational-health","cluster-member-health","cluster-storage-health"));
+                                owner.root.authentication()::continueAlertTest),types.providers(),types.descriptions());
             }, owner.configuration.intents(), ownership::evaluationProof, active, clock);
         }
         @Bean io.tapstate.control.core.AlertControlDispatcher alertControlDispatcher(NativeBusinessContext owner,
@@ -452,8 +486,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             return (operation, caller, input) -> {
                 owner.original.requireBusiness();
                 var setup = owner.original.binding().setup();
-                var scope = cloud.cloud() ? owner.parent.getBean(CloudSdkBridge.class).alertScope().orElseThrow(ThreeLayerStorePort::refused)
-                        : new io.tapstate.core.alerting.AlarmKey.Scope(setup.installationId(), setup.clusterId());
+                var scope=alertScope(owner,cloud);
                 var deployment = cloud.cloud() ? io.tapstate.core.alerting.AlertChannelPolicy.Deployment.CLOUD_MANAGED
                         : io.tapstate.core.alerting.AlertChannelPolicy.Deployment.ON_PREM;
                 return new AlertManagement(runtime::managementServices, originalCaller -> {

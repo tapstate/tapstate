@@ -7,9 +7,11 @@ public record AlertQueryPreparation(int installedVersion, String operationId, Ph
     public enum Phase { PREPARING, READY }
     public AlertQueryPreparation {
         Objects.requireNonNull(operationId, "operationId"); Objects.requireNonNull(phase, "phase");
-        if (operationId.isBlank() || operationId.length() > 256 || indexContractVersion != 1 || nextIndex < 0 || nextIndex > 5
-                || (phase == Phase.READY ? (installedVersion != 3 && installedVersion != 4) || nextIndex != 5 : installedVersion != 2)) {
+        boolean legacy=indexContractVersion==1 && nextIndex>=0 && nextIndex<=5
+                && (phase==Phase.READY ? (installedVersion==3 || installedVersion==4) && nextIndex==5 : installedVersion==2);
+        boolean nodes=indexContractVersion==2 && nextIndex>=5 && nextIndex<=6
+                && (phase==Phase.READY ? (installedVersion==5 || installedVersion==6) && nextIndex==6 : installedVersion==4);
+        if(operationId.isBlank() || operationId.length()>256 || !legacy && !nodes)
             throw new IllegalArgumentException("unsupported bounded query-preparation state");
-        }
     }
 }

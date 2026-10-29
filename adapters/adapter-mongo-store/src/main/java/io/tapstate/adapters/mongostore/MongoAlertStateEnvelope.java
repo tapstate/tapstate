@@ -20,13 +20,13 @@ final class MongoAlertStateEnvelope {
     private MongoAlertStateEnvelope() { }
     static Document head(Head value, long revision) {
         Document row = MongoAlertStateCodec.head(value.snapshot(), revision);
-        row.put("formatVersion", value.operationalEvidence() == null ? AlertStateRecord.FORMAT_VERSION : 3);
+        row.put("formatVersion", value.operationalEvidence() == null ? AlertStateRecord.FORMAT_VERSION : value.operationalEvidence().version()==1?3:4);
         row.append("deployment", value.deployment().name()).append("owner", owner(value.owner()))
                 .append("retiredAt", time(value.retiredAt())).append("summariesHandedOff", value.summariesHandedOff())
                 .append("cleanupAt", cleanup(value.cleanupAt())).append("binding", value.binding() == null ? null : member(value.binding()));
         if (value.operationalEvidence() != null) {
             var evidence = value.operationalEvidence();
-            var encoded = new Document("version", 1).append("bindingDigest", evidence.bindingDigest())
+            var encoded = new Document("version", evidence.version()).append("bindingDigest", evidence.bindingDigest())
                     .append("failedCapabilities", evidence.failedCapabilities());
             require(MongoAlertConfigurationCodec.size(new Document("operationalEvidence", encoded)) <= 192);
             row.append("operationalEvidence", encoded);
@@ -57,14 +57,15 @@ final class MongoAlertStateEnvelope {
     }
     static Stored read(AlarmKey key, Document head, Document episode) {
         try {
-            boolean operational = Integer.valueOf(3).equals(head.get("formatVersion"));
+            boolean operational = Integer.valueOf(3).equals(head.get("formatVersion")) || Integer.valueOf(4).equals(head.get("formatVersion"));
             Document compatibleHead = new Document(head);
             OperationalEvidence evidence = null;
             if (operational) {
                 Document encoded = doc(head, "operationalEvidence");
                 fields(encoded, Set.of("version", "bindingDigest", "failedCapabilities"));
-                require(Integer.valueOf(1).equals(encoded.get("version")) && encoded.get("failedCapabilities") instanceof Integer);
-                evidence = new OperationalEvidence(text(encoded,"bindingDigest"), encoded.getInteger("failedCapabilities"));
+                int expected=Integer.valueOf(4).equals(head.get("formatVersion"))?2:1;
+                require(Integer.valueOf(expected).equals(encoded.get("version")) && encoded.get("failedCapabilities") instanceof Integer);
+                evidence = new OperationalEvidence(text(encoded,"bindingDigest"), encoded.getInteger("failedCapabilities"),expected);
                 compatibleHead.remove("operationalEvidence"); compatibleHead.put("formatVersion", AlertStateRecord.FORMAT_VERSION);
             }
             Document commonHead = legacy(compatibleHead, HEAD_EXTRA);

@@ -290,7 +290,9 @@ public enum SystemCollections {
     ALERT_TARGET_LIMITS("alert_target_limits", Database.CONFIG, MongoAlertNotificationStore.class, Strategy.MIGRATED, 2,
             new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup")),
     ALERT_TEST_QUOTAS("alert_test_quotas", Database.CONFIG, MongoAlertNotificationStore.class, Strategy.MIGRATED, 2,
-            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup"));
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup")),
+    ALERT_NODE_LIFECYCLES("alert_node_lifecycles", Database.CONFIG, MongoAlertNodeLifecycleStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("authorityId","clusterId","phase","nodeId","bootId"), false, "alert_query_node_lifecycle"));
 
     /** What happens to a collection's documents as the product's shape moves on. */
     public enum Strategy {
@@ -400,6 +402,12 @@ public enum SystemCollections {
         database.createCollection(session, collectionName);
     }
 
+    /** Controlled feature preparation outside document transactions, after its operation is durable. */
+    void prepareCollectionOn(MongoDatabase database) {
+        if(kind!=Kind.COLLECTION)throw new IllegalStateException("only plain collections have this preparation path");
+        database.createCollection(collectionName);
+    }
+
     /**
      * A unique, uncommitted startup probe rather than a collection the product keeps.
      * The connection uses this handle only inside transactions it always aborts.
@@ -439,7 +447,7 @@ public enum SystemCollections {
         return switch (this) {
             case ALERT_RULES, ALERT_RECEIVERS, ALERT_SUBSCRIPTIONS, ALERT_SILENCES, ALERT_INSTANCES,
                     ALERT_EPISODES, ALERT_TRANSITIONS, ALERT_NOTIFICATION_SCHEDULES, ALERT_DELIVERY_INTENTS,
-                    ALERT_TARGET_LIMITS, ALERT_TEST_QUOTAS -> collectionName;
+                    ALERT_TARGET_LIMITS, ALERT_TEST_QUOTAS, ALERT_NODE_LIFECYCLES -> collectionName;
             default -> "mongo." + database.name().toLowerCase(Locale.ROOT) + "." + collectionName;
         };
     }

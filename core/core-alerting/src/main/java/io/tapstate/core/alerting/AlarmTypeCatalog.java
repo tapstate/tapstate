@@ -71,15 +71,40 @@ public final class AlarmTypeCatalog {
             return Map.copyOf(result);
         }
     }
+    /** Fixed metric coordinates and the two existing bounded numeric controls used by rule authoring. */
+    public record MetricPreset(MetricAlertEvaluator.Rule template,String thresholdParameter,String recoveryParameter) {
+        public MetricPreset {Objects.requireNonNull(template);id(thresholdParameter,"thresholdParameter");id(recoveryParameter,"recoveryParameter");
+            AlertValidation.require(!thresholdParameter.equals(recoveryParameter),"metricParameters","duplicate-name");}
+        public MetricAlertEvaluator.Rule rule(Map<String,BigDecimal> parameters) {
+            return new MetricAlertEvaluator.Rule(template.name(),template.type(),template.unit(),template.attributes(),template.direction(),
+                    parameters.get(thresholdParameter),parameters.get(recoveryParameter));
+        }
+    }
     private final Map<String, Type> types;
-    public AlarmTypeCatalog(Collection<Type> descriptors) {
+    private final Map<String,MetricPreset> metrics;
+    public AlarmTypeCatalog(Collection<Type> descriptors) {this(descriptors,Map.of());}
+    public AlarmTypeCatalog(Collection<Type> descriptors,Map<String,MetricPreset> metrics) {
         AlertValidation.require(descriptors.size() <= 128, "types", "too-many");
         Map<String, Type> registered = new LinkedHashMap<>();
         for (Type type : descriptors) {
             AlertValidation.require(registered.putIfAbsent(type.id(), type) == null, "typeId", "duplicate-id");
         }
-        types = Map.copyOf(registered);
+        types = Map.copyOf(registered);this.metrics=Map.copyOf(metrics);
+        metrics.forEach((typeId,preset)->{
+            Type type=types.get(typeId);
+            AlertValidation.require(type!=null && type.evaluatorId().equals("threshold") && type.kind()==Kind.STATEFUL,"metricPreset","foreign-type");
+            var parameters=type.validatedParameters(Map.of());
+            AlertValidation.require(parameters.containsKey(preset.thresholdParameter()) && parameters.containsKey(preset.recoveryParameter()),"metricPreset","missing-controls");
+            var threshold=type.parameters().stream().filter(parameter->parameter.name().equals(preset.thresholdParameter())).findFirst().orElseThrow();
+            var recovery=type.parameters().stream().filter(parameter->parameter.name().equals(preset.recoveryParameter())).findFirst().orElseThrow();
+            AlertValidation.require(threshold.unit().equals(preset.template().unit()) && recovery.unit().equals(preset.template().unit()),"metricPreset","parameter-unit-mismatch");
+            preset.rule(parameters);
+        });
     }
+    public MetricAlertEvaluator.Rule metric(String typeId,Map<String,BigDecimal> parameters) {
+        var preset=metrics.get(typeId);return preset==null?null:preset.rule(types.get(typeId).validatedParameters(parameters));
+    }
+    public MetricPreset metricPreset(String typeId){return metrics.get(typeId);}
     public List<Type> types() { return types.values().stream().sorted(java.util.Comparator.comparing(Type::id)).toList(); }
     public Availability availability(String id, int typeVersion, int recordVersion, Set<String> providers, Set<String> evaluators) {
         if (recordVersion != RECORD_FORMAT_VERSION) { return Availability.UNSUPPORTED_RECORD_VERSION; }

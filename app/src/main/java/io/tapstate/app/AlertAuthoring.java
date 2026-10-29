@@ -38,7 +38,7 @@ final class AlertAuthoring {
         }
         if(kind==AlertConfiguration.Kind.RULE){
             var parameters=new LinkedHashMap<String,java.math.BigDecimal>();object(form.getOrDefault("parameters",Map.of())).forEach((k,v)->{try{if(v==null)throw invalid("parameters");parameters.put(k,new java.math.BigDecimal(v.toString()));}catch(NumberFormatException ex){throw invalid("parameters");}});
-            after=new AlertConfiguration.Rule(header,text(form,"name"),text(form,"typeId"),integer(form,"typeVersion",1),resources(form),parameters,form.get("severity")==null||"DEFAULT".equals(form.get("severity"))?null:value(AlarmSeverity.class,text(form,"severity")),bool(form,"enabled",true),null).validated(catalog);
+            after=new AlertConfiguration.Rule(header,text(form,"name"),text(form,"typeId"),integer(form,"typeVersion",1),resources(form),parameters,form.get("severity")==null||"DEFAULT".equals(form.get("severity"))?null:value(AlarmSeverity.class,text(form,"severity")),bool(form,"enabled",true),catalog.metric(text(form,"typeId"),parameters)).validated(catalog);
         }else if(kind==AlertConfiguration.Kind.SILENCE){
             var window=new AlertSilenceWindow(scope,bool(form,"allResources",true),selected(form),strings(form,"typeIds"),parseTime(form,"startsAt"),Duration.ofSeconds(number(form,"durationSeconds",3600)),form.get("periodSeconds")==null?null:Duration.ofSeconds(number(form,"periodSeconds",0)),form.get("endsAt")==null?null:parseTime(form,"endsAt"));
             after=new AlertConfiguration.Silence(header,text(form,"reason"),window);

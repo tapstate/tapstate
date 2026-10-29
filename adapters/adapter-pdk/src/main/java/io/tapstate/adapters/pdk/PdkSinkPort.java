@@ -35,9 +35,12 @@ public final class PdkSinkPort implements SinkPort {
     private final Map<String, TargetIdentityPlan> plannedIdentities;
 
     private io.tapstate.spi.capture.SourceOperationObserver operationObserver=io.tapstate.spi.capture.SourceOperationObserver.NONE;
+    private java.util.function.Supplier<io.tapstate.spi.capture.SourceOperationObserver> sharedInitialization=()->operationObserver;
+    public PdkSinkPort withSharedInitialization(java.util.function.Supplier<io.tapstate.spi.capture.SourceOperationObserver> observer){sharedInitialization=Objects.requireNonNull(observer);return this;}
     public PdkSinkPort withOperationObserver(io.tapstate.spi.capture.SourceOperationObserver observer){operationObserver=Objects.requireNonNull(observer);return this;}
-    private void operation(io.tapstate.spi.capture.SourceOperationObserver.Capability capability,Throwable failure){
-        try{operationObserver.completed(capability,failure);}catch(RuntimeException unavailable){org.slf4j.LoggerFactory.getLogger(getClass()).warn("Target operation collection is degraded");}
+    private void operation(io.tapstate.spi.capture.SourceOperationObserver.Capability capability,Throwable failure){report(operationObserver,capability,failure);}
+    private void report(io.tapstate.spi.capture.SourceOperationObserver observer,io.tapstate.spi.capture.SourceOperationObserver.Capability capability,Throwable failure){
+        try{observer.completed(capability,failure);}catch(RuntimeException unavailable){org.slf4j.LoggerFactory.getLogger(getClass()).warn("Target operation collection is degraded");}
     }
     private void initialize(PdkConnector connector) throws Throwable {
         try {connector.connector().init(connector.context());}
@@ -47,7 +50,7 @@ public final class PdkSinkPort implements SinkPort {
     /** The exact assessed models frozen into this run's preparation roster, separate from input lineage. */
     public PdkSinkPort withTargetIdentities(Map<String, TargetIdentityPlan> identities) {
         return new PdkSinkPort(provisioner, stateStore, sharing, purpose, noteScopes, execution, preparations,
-                Objects.requireNonNull(identities, "identities")).withOperationObserver(operationObserver);
+                Objects.requireNonNull(identities, "identities")).withOperationObserver(operationObserver).withSharedInitialization(sharedInitialization);
     }
 
     /** Configured writes use already prepared CONFIG notes and the caller's fixed run authority. */
@@ -167,7 +170,7 @@ public final class PdkSinkPort implements SinkPort {
             Runnable letGo) {
         WriteRecordFunction write = requireWriteFunction(connector.functions().getWriteRecordFunction());
         try {
-            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, true, letGo, purpose,preparations,plannedIdentities).withOperationObserver(operationObserver);
+            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, true, letGo, purpose,preparations,plannedIdentities,operationObserver).withOperationObserver(operationObserver);
             writer.prepareTargets();
             return writer;
         } catch (TapstateException e) {
@@ -181,9 +184,12 @@ public final class PdkSinkPort implements SinkPort {
     private PdkConnector started(SinkConfig config, ConnectorRef ref, ConfiguredDrive drive) {
         PdkConnector connector = PdkConnector.open(
                 config.connectorId(), ref, config.settings(), config.node(), stateStore, null, drive.scopes(), purpose);
+        var initializing=sharedInitialization.get();
         try {
             connector.underLoader(() -> {
-                initialize(connector);
+                try {connector.connector().init(connector.context());}
+                catch(Throwable failure){report(initializing,io.tapstate.spi.capture.SourceOperationObserver.Capability.INITIALIZE,failure);throw failure;}
+                report(initializing,io.tapstate.spi.capture.SourceOperationObserver.Capability.INITIALIZE,null);
                 return null;
             });
             return connector;
@@ -192,7 +198,7 @@ public final class PdkSinkPort implements SinkPort {
             connector.close();
             throw t instanceof TapstateException coded
                     ? coded : PdkSinkWriter.writeFailed(connector.connectorId(), t);
-        }
+        }finally{if(initializing!=operationObserver)initializing.close();}
     }
 
     /**
@@ -215,7 +221,7 @@ public final class PdkSinkPort implements SinkPort {
                 PdkTargetPreparation preparation = new PdkTargetPreparation(connector.connectorId(),
                         connector.context(), connector.functions(), config.onFullLoad(), config.fullLoad(),
                         config.node(), stateStore, false, purpose, connector::requireActive,preparations).withOperationObserver(operationObserver);
-                Map<String, TargetIdentityPlan> identities = PdkTargetIdentityPlanner.assess(connector, config, targets);
+                Map<String, TargetIdentityPlan> identities = PdkTargetIdentityPlanner.assess(connector, config, targets,operationObserver);
                 identities.values().forEach(TargetIdentityProjection::requireUsable);
                 PdkTargetIdentityPlanner.requireSame(config, plannedIdentities, identities);
                 for (TargetIdentityPlan identity : identities.values()) {
@@ -224,7 +230,7 @@ public final class PdkSinkPort implements SinkPort {
                     connector.resolveTargetTypes(table);
                     preparation.prepare(target, table);
                 }
-                PdkTargetIdentityPlanner.verifyPrepared(connector, config, targets, identities);
+                PdkTargetIdentityPlanner.verifyPrepared(connector, config, targets, identities,operationObserver);
                 return null;
             });
         } catch (TapstateException e) {
@@ -232,8 +238,7 @@ public final class PdkSinkPort implements SinkPort {
         } catch (Throwable t) {
             throw PdkSinkWriter.writeFailed(connector.connectorId(), t);
         } finally {
-            connector.stopQuietly();
-            connector.close();
+            try {connector.stopQuietly();connector.close();}finally{operationObserver.close();}
         }
     }
 
@@ -251,7 +256,7 @@ public final class PdkSinkPort implements SinkPort {
         try {
             return connector.underLoader(() -> {
                 initialize(connector);
-                var identities=PdkTargetIdentityPlanner.assess(connector,config,targets);
+                var identities=PdkTargetIdentityPlanner.assess(connector,config,targets,operationObserver);
                 identities.values().forEach(TargetIdentityProjection::requireUsable);
                 connector.requireActive();
                 return Map.copyOf(identities);
@@ -261,7 +266,7 @@ public final class PdkSinkPort implements SinkPort {
         } catch(Throwable failure) {
             throw PdkSinkWriter.writeFailed(config.connectorId(),failure);
         } finally {
-            connector.stopQuietly();connector.close();
+            try {connector.stopQuietly();connector.close();}finally{operationObserver.close();}
         }
     }
 
@@ -281,15 +286,15 @@ public final class PdkSinkPort implements SinkPort {
                 initialize(connector);
                 return null;
             });
-            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, preparedAhead, null, purpose,preparations,plannedIdentities).withOperationObserver(operationObserver);
+            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, preparedAhead, null, purpose,preparations,plannedIdentities,operationObserver).withOperationObserver(operationObserver);
             writer.prepareTargets();
             return writer;
         } catch (TapstateException e) {
-            connector.stopQuietly();
+            operationObserver.close();connector.stopQuietly();
             connector.close();
             throw e;
         } catch (Throwable t) {
-            connector.stopQuietly();
+            operationObserver.close();connector.stopQuietly();
             connector.close();
             throw PdkSinkWriter.writeFailed(connector.connectorId(), t);
         }

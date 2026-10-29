@@ -151,6 +151,8 @@ final class InProcessServer implements ServerHandle {
      *
      * @return how many scheduled tasks were cancelled; a caller must refuse anything but what it expects
      */
+    private final java.util.List<Runnable> stoppedPublishers=new java.util.concurrent.CopyOnWriteArrayList<>();
+    int publishObservationsOnce(){stoppedPublishers.forEach(Runnable::run);return stoppedPublishers.size();}
     int stopPublishingObservations() {
         int cancelled = 0;
         for (var owner : refreshedContexts) {
@@ -159,7 +161,7 @@ final class InProcessServer implements ServerHandle {
                 for (ScheduledTask task : holder.getScheduledTasks()) {
                     // The runnable is wrapped by the scheduler; its rendering names the scheduled method.
                     if (PUBLISHING_PASS.equals(String.valueOf(task.getTask().getRunnable()))) {
-                        task.cancel();
+                        stoppedPublishers.add(task.getTask().getRunnable());task.cancel();
                         cancelled++;
                     }
                 }

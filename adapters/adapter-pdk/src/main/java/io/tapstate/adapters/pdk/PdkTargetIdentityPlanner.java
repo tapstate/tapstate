@@ -49,9 +49,23 @@ public final class PdkTargetIdentityPlanner {
 
     static Map<String, TargetIdentityPlan> assess(PdkConnector connector, SinkConfig config,
             Map<String, TargetTable> targets) {
+        return assess(connector,config,targets,io.tapstate.spi.capture.SourceOperationObserver.NONE);
+    }
+    static Map<String,TargetIdentityPlan> assess(PdkConnector connector,SinkConfig config,Map<String,TargetTable> targets,
+            io.tapstate.spi.capture.SourceOperationObserver observer) {
         Map<String, TargetIdentityPlan> plans = new LinkedHashMap<>();
-        targets.forEach((stream, target) -> plans.put(stream, assess(connector, config, target, true)));
+        targets.forEach((stream,target)->{
+            try {
+                var plan=assess(connector,config,target,true);
+                if(target.unwindIdentity()!=null)report(observer,target.name(),null);
+                plans.put(stream,plan);
+            }catch(RuntimeException | Error failure){if(target.unwindIdentity()!=null)report(observer,target.name(),failure);throw failure;}
+        });
         return TargetIdentityResolver.reconcile(plans);
+    }
+    private static void report(io.tapstate.spi.capture.SourceOperationObserver observer,String table,Throwable failure) {
+        try {observer.completed(table,io.tapstate.spi.capture.SourceOperationObserver.Capability.TARGET_READ,failure);}
+        catch(RuntimeException unavailable){org.slf4j.LoggerFactory.getLogger(PdkTargetIdentityPlanner.class).warn("Target identity observation is degraded");}
     }
 
     private static TargetIdentityPlan assess(PdkConnector connector, SinkConfig config, TargetTable target, boolean allowPreparation) {
@@ -174,10 +188,14 @@ public final class PdkTargetIdentityPlanner {
     }
 
     static void verifyPrepared(PdkConnector connector, SinkConfig config, Map<String, TargetTable> targets,
-            Map<String, TargetIdentityPlan> expected) {
+            Map<String, TargetIdentityPlan> expected) {verifyPrepared(connector,config,targets,expected,io.tapstate.spi.capture.SourceOperationObserver.NONE);}
+    static void verifyPrepared(PdkConnector connector,SinkConfig config,Map<String,TargetTable> targets,
+            Map<String,TargetIdentityPlan> expected,io.tapstate.spi.capture.SourceOperationObserver observer) {
         targets.forEach((stream, target) -> {
             if (!TargetIdentityPlan.AUTOMATIC.equals(expected.get(stream).status())) return;
-            TargetIdentityPlan checked = assess(connector, config, target, false);
+            TargetIdentityPlan checked;
+            try {checked=assess(connector,config,target,false);report(observer,target.name(),null);}
+            catch(RuntimeException | Error failure){report(observer,target.name(),failure);throw failure;}
             TargetIdentityProjection.requireUsable(checked);
             if (!TargetIdentityPlan.AUTOMATIC.equals(checked.status()) || !checked.writeKey().equals(expected.get(stream).writeKey())) {
                 throw failed(config.connectorId(), target.name(),

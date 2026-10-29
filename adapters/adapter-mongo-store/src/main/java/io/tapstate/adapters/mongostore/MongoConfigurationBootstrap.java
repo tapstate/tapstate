@@ -119,7 +119,9 @@ public final class MongoConfigurationBootstrap {
             MongoConfigurationDraftStore.prepareIndexes(database);
             MongoConfigurationImportStore.prepareIndexes(database);
             MongoRequiredDeadLetterStore.prepareIndexes(database);
-            return new MongoConfigurationDomain(connection, clusterId);
+            var prepared=new MongoConfigurationDomain(connection,clusterId);
+            prepared.prepareAlertStorage(operationId);
+            return prepared;
         } catch (RuntimeException | Error failure) {
             connection.close();
             throw failure;

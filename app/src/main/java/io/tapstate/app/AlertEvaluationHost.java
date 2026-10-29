@@ -12,11 +12,14 @@ import java.util.concurrent.ConcurrentHashMap;
 final class AlertEvaluationHost {
     enum Result { ACCEPTED, IGNORED, BUSY, CONFLICT }
     record Binding(AlertConfiguration.Rule definition, AlarmKey.Resource resource, String producer,
-            long sourceBindingRevision, Runnable requireCurrent, java.util.function.Supplier<AlertStore.EvaluationProof> proof) {
+            long sourceBindingRevision, Runnable requireCurrent, java.util.function.Supplier<AlertStore.EvaluationProof> proof,String domainToken) {
+        Binding(AlertConfiguration.Rule definition,AlarmKey.Resource resource,String producer,long revision,Runnable current,java.util.function.Supplier<AlertStore.EvaluationProof> proof){this(definition,resource,producer,revision,current,proof,null);}
+        Binding(AlertConfiguration.Rule definition,AlarmKey.Resource resource,String producer,long revision,Runnable current,String domain){this(definition,resource,producer,revision,current,domain==null?()->null:()->AlertStore.EvaluationProof.operation(current),domain);}
         Binding(AlertConfiguration.Rule definition, AlarmKey.Resource resource, String producer,long revision,Runnable current){this(definition,resource,producer,revision,current,()->null);}
         Binding { Objects.requireNonNull(definition); Objects.requireNonNull(resource); Objects.requireNonNull(producer); Objects.requireNonNull(requireCurrent);Objects.requireNonNull(proof); }
         AlarmKey key() { return new AlarmKey(definition.header().identity().scope(), resource,
-                definition.typeId(), definition.header().identity().incarnation()); }
+                definition.typeId(), domainToken==null?definition.header().identity().incarnation()
+                        :AlertOperationDomain.qualifier(definition.header().identity().incarnation(),domainToken)); }
     }
     private record Previous(AlertRule rule, MetricPoint point) { }
     private final AlertStore store;
@@ -59,13 +62,18 @@ final class AlertEvaluationHost {
             var retained = store.state(binding.key(), read);
             var before = retained.map(AlertStore.Stored::value).orElse(null);
             if (before != null && before.retiredAt() != null) return Result.IGNORED;
+            if(input instanceof AlertInput.Operational op && op.domainToken()!=null) {
+                if(!Objects.equals(binding.domainToken(),op.domainToken()) || !AlertOperationDomain.supported(binding.key()))return Result.IGNORED;
+                if(before==null && op.succeeded())return Result.IGNORED;
+            }
             AlertOwnership ownership = ownership(before, now);
             if (ownership == null) return Result.BUSY;
             AlertRule rule = rule(binding, before);
             if (before != null && !rule.equals(before.snapshot().rule())) {
                 var replaced = AlertLifecycle.replace(before.snapshot(), rule, now);
                 var after = head(binding, before, replaced, ownership, null, null);
-                if(before.binding().sourceBindingRevision()!=binding.sourceBindingRevision())
+                if(before.binding().sourceBindingRevision()!=binding.sourceBindingRevision()
+                        || !before.snapshot().rule().producerIncarnation().equals(binding.producer()))
                     after=new AlertStateRecord.Head(after.snapshot(),after.deployment(),after.owner(),after.retiredAt(),after.summariesHandedOff(),after.episode(),after.binding(),null);
                 var outcome = commit(retained, before, after, replaced, null, binding);
                 if (outcome == AlertStore.Outcome.CONFLICT) continue;
@@ -95,7 +103,7 @@ final class AlertEvaluationHost {
                     if (operation != null && !operation.bindingDigest().equals(op.bindingDigest())) return Result.IGNORED;
                     if (operation != null && operation.failedCapabilities() != 0 && op.succeeded()
                             && (operation.failedCapabilities() & (1 << op.capability().ordinal())) == 0) return Result.IGNORED;
-                    operation = (operation == null ? new OperationalEvidence(op.bindingDigest(),0) : operation)
+                    operation = (operation == null ? new OperationalEvidence(op.bindingDigest(),0,op.domainToken()==null?1:2) : operation)
                             .observe(op.capability(),op.succeeded());
                     condition = operation.condition();
                 } else if (input instanceof AlertInput.Freshness f) {
@@ -189,6 +197,7 @@ final class AlertEvaluationHost {
         return Result.CONFLICT;
     }
 
+    Result supersede(AlarmKey key,Runnable requireCurrent){return end(key,AlertSnapshot.EndReason.SUPERSEDED,requireCurrent,true);}
     Result end(AlarmKey key, AlertSnapshot.EndReason reason, Runnable requireCurrent) {
         return end(key,reason,requireCurrent,reason==AlertSnapshot.EndReason.RESOURCE_REMOVED);
     }

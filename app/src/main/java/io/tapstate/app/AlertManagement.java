@@ -35,7 +35,7 @@ final class AlertManagement implements AlertControlDispatcher {
             case "alert.catalog": {
                 fields(input);return map("deployment",deployment.name(),"clusterId",scope.clusterId(),"refreshedAt",instant(clock.instant()),
                         "channelPolicies",deployment==AlertChannelPolicy.Deployment.ON_PREM?map("email",policy(ChannelRetryPolicy.emailDefaults()),"webhook",policy(ChannelRetryPolicy.webhookDefaults())):Map.of(),
-                        "types",resolved.catalog().types().stream().map(t->type(t,resolved.providers())).toList());
+                        "types",resolved.catalog().types().stream().map(t->type(t,resolved.providers(),resolved.descriptions())).toList());
             }
             case "alert.resources": {
                 fields(input,"kind","cursor","limit");var p=store.resources(text(input,"kind"),optional(input,"cursor"),limit,access);return map("rows",p.rows().stream().map(AlertHttpModel::resource).toList(),"nextCursor",p.nextId());
@@ -59,7 +59,7 @@ final class AlertManagement implements AlertControlDispatcher {
                 var rule=current?h.value().snapshot().rule():e.originalBinding();
                 var observed=current?h.value().snapshot().lastObservedAt():e.diagnostics().latest()==null?null:e.diagnostics().latest().observedAt();
                 var descriptor=resolved.catalog().types().stream().filter(t->t.id().equals(key.typeId())).findFirst();
-                descriptor.ifPresent(t->{var description=io.tapstate.adapters.alerting.AlarmTypeText.english().describe(t);m.put("condition",description.condition());m.put("recovery",description.recovery());m.put("guidance",description.guidance());});
+                descriptor.ifPresent(t->{var description=resolved.descriptions().describe(t);m.put("condition",description.condition());m.put("recovery",description.recovery());m.put("guidance",description.guidance());});
                 m.put("thresholds",store.originalRule(rule,reads).map(AlertConfiguration.Rule::parameters).orElse(null));
                 m.put("durationSeconds",Duration.between(e.value().firedAt(),e.value().endedAt()==null?clock.instant():e.value().endedAt()).toSeconds());
                 m.put("basis",map("typeId",key.typeId(),"quality",current?h.value().snapshot().quality().name():"HISTORICAL", "observedAt",instant(observed),"triggerForSeconds",rule.triggerFor().toSeconds(),"recoverForSeconds",rule.resolveFor().toSeconds()));return m;
@@ -73,7 +73,7 @@ final class AlertManagement implements AlertControlDispatcher {
                 return map("rows",rows,"isolated",p.isolatedRecords(),"nextCursor",p.nextId()==null?null:cursorToken("deliveries:"+filter,map("after",p.nextId())));
             }
             case "alert.health": {
-                fields(input);var h=health.get();return map("deployment",deployment.name(),"degraded",h.degraded(),"closed",h.closed(),"rejected",h.rejected(),"code",h.code(),"queuedInputs",h.queuedInputs(),"coverage",List.of("pipeline.failed","pipeline.observation-stale"),"cleanupAvailable",false,"refreshedAt",instant(clock.instant()));
+                fields(input);var h=health.get();return map("deployment",deployment.name(),"degraded",h.degraded(),"closed",h.closed(),"rejected",h.rejected(),"code",h.code(),"queuedInputs",h.queuedInputs(),"coverage",resolved.catalog().types().stream().filter(t->resolved.providers().contains(t.providerId())).map(AlarmTypeCatalog.Type::id).toList(),"cleanupAvailable",false,"refreshedAt",instant(clock.instant()));
             }
             case "alert.configuration.list": {
                 fields(input,"kind","cursor","limit");var kind=value(AlertConfiguration.Kind.class,text(input,"kind"));author.external(kind);var p=store.definitions(kind,optional(input,"cursor"),limit,access);return map("rows",p.rows().stream().filter(d->d.header().active()).map(AlertAuthoring::project).toList(),"nextCursor",p.nextId());
@@ -117,8 +117,8 @@ final class AlertManagement implements AlertControlDispatcher {
         row.put("canRetry",retry);return row;
     }
     private static Map<String,Object> policy(ChannelRetryPolicy p){return map("timeoutSeconds",p.attemptTimeout().toSeconds(),"attempts",p.attemptsPerCycle(),"maximumAgeSeconds",p.maximumAge().toSeconds(),"retryDelaysSeconds",p.retryDelays().stream().map(Duration::toSeconds).toList());}
-    private static Map<String,Object> type(AlarmTypeCatalog.Type t,Set<String> providers){var d=io.tapstate.adapters.alerting.AlarmTypeText.english().describe(t);
-        return map("id",t.id(),"version",t.version(),"resourceKinds",t.resourceKinds().stream().sorted().toList(),"severity",t.defaultSeverity().name(),"enabledByDefault",t.enabledByDefault(),"condition",d.condition(),"recovery",d.recovery(),"guidance",d.guidance(),"inputAvailable",providers.contains(t.providerId()),"parameters",t.parameters().stream().map(p->map("name",p.name(),"unit",p.unit(),"minimum",p.minimum(),"maximum",p.maximum(),"defaultValue",p.defaultValue())).toList());
+    private static Map<String,Object> type(AlarmTypeCatalog.Type t,Set<String> providers,io.tapstate.adapters.alerting.AlarmTypeText descriptions){var d=descriptions.describe(t);
+        return map("id",t.id(),"version",t.version(),"resourceKinds",t.resourceKinds().stream().sorted().toList(),"severity",t.defaultSeverity().name(),"enabledByDefault",t.enabledByDefault(),"condition",d.condition(),"recovery",d.recovery(),"guidance",d.guidance(),"inputAvailable",providers.contains(t.providerId()),"parameters",t.parameters().stream().map(p->map("name",p.name(),"kind",p.kind().name(),"unit",p.unit(),"minimum",p.minimum(),"maximum",p.maximum(),"defaultValue",p.defaultValue())).toList());
     }
     private String cursorToken(String view,Map<String,Object> payload){payload.put("view",view);payload.put("authorityId",scope.authorityId());payload.put("clusterId",scope.clusterId());return encode(payload);}
     private Map<String,Object> cursor(String token,String view){var m=decode(token);if(!view.equals(m.get("view"))||!scope.authorityId().equals(m.get("authorityId"))||!scope.clusterId().equals(m.get("clusterId")))throw invalid("cursor-context");return m;}

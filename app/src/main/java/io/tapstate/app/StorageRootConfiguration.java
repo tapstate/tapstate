@@ -57,6 +57,16 @@ class StorageRootConfiguration {
         return new StorageRoot(mongo, cloud, bridge.getIfAvailable(), boot, history, secrets, clock, signing.bytes(),
                 () -> installationOwner.ifPresent(InstallationFiles.RuntimeOwner::requireActive));
     }
+    @Bean org.springframework.context.ApplicationListener<org.springframework.context.event.ContextClosedEvent> alertNodeOrderlyStop(
+            StorageRoot root,org.springframework.context.ApplicationContext owner) {
+        return event->{
+            if(event.getApplicationContext()!=owner)return;
+            try {root.runtime().businessForLiveness().ifPresent(StorageRuntime.Business::beforeOrderlyClose);}
+            catch(io.tapstate.core.common.TapstateException unavailable) {
+                org.slf4j.LoggerFactory.getLogger(StorageRootConfiguration.class).warn("Orderly node monitoring could not be confirmed [{}]",unavailable.code().code());
+            }
+        };
+    }
     @Bean AuthenticationMode authenticationMode(CloudRuntimeSettings cloud) {
         return cloud.cloud() ? AuthenticationMode.CLOUD : AuthenticationMode.ON_PREM;
     }

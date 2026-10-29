@@ -180,6 +180,14 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         return new MongoAlertCoordinator(this,connection.database(),configurationKey,artifacts,security,bindings,host,catalog,clock);
     }
 
+    /** Original trusted assembly only; ordinary construction never prepares lifecycle storage. */
+    public io.tapstate.spi.store.AlertNodeLifecycleStore alertNodeLifecycles(io.tapstate.core.alerting.AlarmKey.Scope scope,
+            io.tapstate.spi.store.StorageSetupScope setup,Runnable locallyActive) {
+        requireOpen();
+        if(!clusterId.equals(scope.clusterId()) || alertSchemaVersion()!=MongoAlertStorageSchema.VERSION)throw unreadable("alert-node-lifecycle","capability");
+        return new MongoAlertNodeLifecycleStore(this,connection.database(),configurationKey,bindings,scope,setup,locallyActive);
+    }
+
     <T> T alertTransaction(MongoReadBudget budget, java.util.function.Function<com.mongodb.client.ClientSession, T> action) {
         requireOpen();
         return budget.transaction(connection.client(), session -> { requireOpen(); T value = action.apply(session); requireOpen(); return value; });

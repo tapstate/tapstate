@@ -32,6 +32,46 @@ class MongoAlertStorageSchemaIT {
     @Container static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
             .withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");
 
+    @Test void operationalVersionFourNeedsExplicitNodeAndDomainPreparationWithOriginalFactsPreserved() {
+        withConfiguration(false,f->{
+            SystemCollections.ALERT_NODE_LIFECYCLES.on(f.database()).drop();
+            var marker=schema(f).get("alerting",Document.class);marker.put("installedVersion",4);
+            var query=marker.get("queryPreparation",Document.class);query.put("indexContractVersion",1);query.put("nextIndex",5);
+            SystemCollections.SCHEMA_MIGRATIONS.on(f.database()).updateOne(new Document("_id","config"),new Document("$set",new Document("alerting",marker)));
+            var counter=versions(f).find().first();var source=schema(f).get(MongoSourceIdentitySchema.FIELD);
+            assertThat(f.domain().alertSchemaVersion()).isEqualTo(4);
+            try(var reopen=MongoConfigurationDomain.open(f.settings(),"cluster-a")){assertThat(reopen.alertSchemaVersion()).isEqualTo(4);}
+            assertThat(names(f)).doesNotContain("alert_node_lifecycles");
+            assertThat(f.domain().prepareAlertStorage("separate-maintenance-invocation")).isEqualTo(6);
+            var after=schema(f).get("alerting",Document.class);
+            assertThat(after.getString("operationId")).isEqualTo(marker.getString("operationId"));
+            assertThat(after.get("queryPreparation",Document.class)).isEqualTo(new Document(query).append("indexContractVersion",2).append("nextIndex",6));
+            assertThat(versions(f).find().first()).isEqualTo(counter);assertThat(schema(f).get(MongoSourceIdentitySchema.FIELD)).isEqualTo(source);
+            assertThat(SystemCollections.ALERT_NODE_LIFECYCLES.on(f.database()).countDocuments()).isZero();assertAllTables(f);
+        });
+    }
+
+    @Test void interruptedNodeIndexPreparationIsCodedAndRetainsItsOriginalProgress() {
+        withConfiguration(false,f->{
+            SystemCollections.ALERT_NODE_LIFECYCLES.on(f.database()).drop();
+            var marker=schema(f).get("alerting",Document.class);marker.put("installedVersion",4);
+            var query=marker.get("queryPreparation",Document.class);query.put("indexContractVersion",1);query.put("nextIndex",5);
+            SystemCollections.SCHEMA_MIGRATIONS.on(f.database()).updateOne(new Document("_id","config"),new Document("$set",new Document("alerting",marker)));
+            var admin=f.client().getDatabase("admin");
+            admin.runCommand(new Document("configureFailPoint","failCommand").append("mode",new Document("times",1))
+                    .append("data",new Document("failCommands",List.of("createIndexes")).append("errorCode",8)));
+            try {assertThatThrownBy(()->f.domain().prepareAlertStorage("node-maintenance"))
+                    .isInstanceOfSatisfying(TapstateException.class,e->assertThat(e.code()).isEqualTo(IoError.STORE_UNAVAILABLE));}
+            finally{admin.runCommand(new Document("configureFailPoint","failCommand").append("mode","off"));}
+            var progress=f.domain().alertQueryPreparation().orElseThrow();
+            assertThat(progress.installedVersion()).isEqualTo(4);assertThat(progress.indexContractVersion()).isEqualTo(2);
+            assertThat(progress.phase()).isEqualTo(io.tapstate.spi.store.AlertQueryPreparation.Phase.PREPARING);
+            assertThat(progress.nextIndex()).isEqualTo(5);assertThat(progress.operationId()).isEqualTo(query.getString("operationId"));
+            assertThat(f.domain().prepareAlertStorage("retry-node-maintenance")).isEqualTo(6);
+            assertThat(f.domain().alertQueryPreparation().orElseThrow().operationId()).isEqualTo(progress.operationId());
+        });
+    }
+
     @Test void firstInstallationPublishesTheWholeFeatureWithoutChangingTheGlobalConfigVersion() {
         withConfiguration(false, fixture -> {
             assertThat(fixture.domain().schemaVersion()).isEqualTo(1);
@@ -373,23 +413,24 @@ class MongoAlertStorageSchemaIT {
         withConfiguration(false, f -> {
             versionTwo(f);
             versions(f).updateOne(new Document(), new Document("$set", new Document("revision", 20L).append(ConfigurationVersion.ALERT_FENCE, 100L)));
-            for (var collection : MongoAlertStorageSchema.QUERY_INDEXES.stream().map(MongoAlertStorageSchema.QueryIndex::collection).distinct().toList()) {
+            for (var collection : MongoAlertStorageSchema.QUERY_INDEXES.stream().map(MongoAlertStorageSchema.QueryIndex::collection).filter(collection->collection!=SystemCollections.ALERT_NODE_LIFECYCLES).distinct().toList()) {
                 // Structure preparation must not decode, reinterpret or repair an existing record body.
                 collection.on(f.database()).insertOne(new Document("_id", "original-record").append("legacyPayload", "unchanged"));
             }
             Document before = schema(f); Document counters = versions(f).find().first();
             assertThat(f.domain().alertSchemaVersion()).isEqualTo(2);
             assertThat(f.domain().alertQueryPreparation()).isEmpty();
-            assertThat(f.domain().prepareAlertStorage("query-upgrade-a")).isEqualTo(3);
+            assertThat(f.domain().prepareAlertStorage("query-upgrade-a")).isEqualTo(MongoAlertStorageSchema.VERSION);
             assertThat(versions(f).find().first()).isEqualTo(counters);
             assertThat(schema(f).get(MongoSourceIdentitySchema.FIELD)).isEqualTo(before.get(MongoSourceIdentitySchema.FIELD));
             Document marker = schema(f).get("alerting", Document.class);
             assertThat(marker.getString("operationId")).isEqualTo("setup-a");
             assertThat(marker.getString("authorityPreparationOperationId")).isEqualTo("setup-a");
             assertThat(marker.get("queryPreparation", Document.class)).isEqualTo(new Document("operationId", "query-upgrade-a")
-                    .append("phase", "READY").append("nextIndex", 5).append("indexContractVersion", 1));
+                    .append("phase", "READY").append("nextIndex", 6).append("indexContractVersion", 2));
             for (var index : MongoAlertStorageSchema.QUERY_INDEXES) {
-                assertThat(index.collection().on(f.database()).find().first()).isEqualTo(new Document("_id", "original-record").append("legacyPayload", "unchanged"));
+                if(index.collection()==SystemCollections.ALERT_NODE_LIFECYCLES)assertThat(index.collection().on(f.database()).countDocuments()).isZero();
+                else assertThat(index.collection().on(f.database()).find().first()).isEqualTo(new Document("_id", "original-record").append("legacyPayload", "unchanged"));
                 assertThat(IndexEnsure.existing(index.collection().on(f.database()), index.index())).isNotNull();
             }
             assertThat(MongoAlertConfigurationCodec.size(marker)).isLessThanOrEqualTo(2048);
@@ -414,12 +455,12 @@ class MongoAlertStorageSchemaIT {
             MongoAlertStateStore.prepareQueryIndex(f.database(), first.collection(), first.index());
             // This is the crash boundary after successful DDL and before its progress acknowledgement.
             assertThat(schema(f).get("alerting", Document.class).get("queryPreparation", Document.class)).isEqualTo(progress);
-            assertThat(f.domain().prepareAlertStorage("original-query-operation")).isEqualTo(3);
-            assertThat(f.domain().alertQueryPreparation().orElseThrow().nextIndex()).isEqualTo(5);
+            assertThat(f.domain().prepareAlertStorage("original-query-operation")).isEqualTo(MongoAlertStorageSchema.VERSION);
+            assertThat(f.domain().alertQueryPreparation().orElseThrow().nextIndex()).isEqualTo(6);
             assertThat(versions(f).find().first()).isEqualTo(counters);
             assertThat(schema(f).get(MongoSourceIdentitySchema.FIELD)).isEqualTo(before.get(MongoSourceIdentitySchema.FIELD));
             Document completed = schema(f);
-            assertThat(f.domain().prepareAlertStorage("retry-after-completion-keeps-original-operation")).isEqualTo(3);
+            assertThat(f.domain().prepareAlertStorage("retry-after-completion-keeps-original-operation")).isEqualTo(MongoAlertStorageSchema.VERSION);
             assertThat(schema(f)).isEqualTo(completed);
         });
     }
@@ -429,7 +470,7 @@ class MongoAlertStorageSchemaIT {
             versionTwo(f); versions(f).updateOne(new Document(), new Document("$set", new Document(ConfigurationVersion.ALERT_FENCE, 100L)));
             failCommit(f, new Document("writeConcernError", new Document("code", 64).append("errmsg", "test commit reply lost"))
                     .append("errorLabels", List.of("UnknownTransactionCommitResult")));
-            try { assertThat(f.domain().prepareAlertStorage("unknown-query-operation")).isEqualTo(3); }
+            try { assertThat(f.domain().prepareAlertStorage("unknown-query-operation")).isEqualTo(MongoAlertStorageSchema.VERSION); }
             finally { clearFailPoint(f); }
             assertThat(versions(f).find().first().getLong(ConfigurationVersion.ALERT_FENCE)).isEqualTo(100L);
             assertThat(schema(f).get("alerting", Document.class).get("queryPreparation", Document.class).getString("operationId"))
@@ -479,10 +520,10 @@ class MongoAlertStorageSchemaIT {
                 var first = executor.submit(() -> { await(start); return f.domain().prepareAlertStorage("concurrent-query-operation"); });
                 var second = executor.submit(() -> { await(start); return f.domain().prepareAlertStorage("concurrent-query-operation"); });
                 start.countDown();
-                assertThat(first.get(20, TimeUnit.SECONDS)).isEqualTo(3);
-                assertThat(second.get(20, TimeUnit.SECONDS)).isEqualTo(3);
-                assertThat(f.domain().alertQueryPreparation().orElseThrow()).isEqualTo(new io.tapstate.spi.store.AlertQueryPreparation(3,
-                        "concurrent-query-operation", io.tapstate.spi.store.AlertQueryPreparation.Phase.READY, 5, 1));
+                assertThat(first.get(20, TimeUnit.SECONDS)).isEqualTo(MongoAlertStorageSchema.VERSION);
+                assertThat(second.get(20, TimeUnit.SECONDS)).isEqualTo(MongoAlertStorageSchema.VERSION);
+                assertThat(f.domain().alertQueryPreparation().orElseThrow()).isEqualTo(new io.tapstate.spi.store.AlertQueryPreparation(MongoAlertStorageSchema.VERSION,
+                        "concurrent-query-operation", io.tapstate.spi.store.AlertQueryPreparation.Phase.READY, 6, 2));
                 assertThat(versions(f).find().first().getLong(ConfigurationVersion.ALERT_FENCE)).isEqualTo(100L);
             } catch (Exception failure) { throw new AssertionError(failure); }
             finally { start.countDown(); }
@@ -504,6 +545,7 @@ class MongoAlertStorageSchemaIT {
     }
     private static void dropQueryIndexes(Fixture f) {
         for (var index : MongoAlertStorageSchema.QUERY_INDEXES) { index.collection().on(f.database()).dropIndex(index.index().indexName()); }
+        SystemCollections.ALERT_NODE_LIFECYCLES.on(f.database()).drop();
     }
     private static <T> T transaction(Fixture f, java.util.function.Function<com.mongodb.client.ClientSession, T> body) {
         return new MongoReadBudget(Duration.ofSeconds(30)).transaction(f.client(), body);

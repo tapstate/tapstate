@@ -61,17 +61,18 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     private final ConnectorProvisioner connectors;
     private final Ports ports;
     private Function<String,Optional<SourceBindingSnapshot>> sourceIdentities=id->Optional.empty();
-    private BiFunction<SourceBindingSnapshot,Runnable,SourceOperationObserver> operations=(identity,guard)->SourceOperationObserver.NONE;
+    @FunctionalInterface interface Operations {SourceOperationObserver open(SourceBindingSnapshot identity,String domain,Runnable guard,Runnable local);}
+    private Operations operations=(identity,domain,guard,local)->SourceOperationObserver.NONE;
     ScopedPipelineCaptureCoordinator withSourceOperations(Function<String,Optional<SourceBindingSnapshot>> identities,
-            BiFunction<SourceBindingSnapshot,Runnable,SourceOperationObserver> observers){
+            Operations observers){
         this.sourceIdentities=Objects.requireNonNull(identities);this.operations=Objects.requireNonNull(observers);return this;
     }
     private CapturePort observedPort(SourceBindingSnapshot identity,ConfiguredCaptureRun notes,CaptureConfig config,
-            Runnable guard,io.tapstate.adapters.pdk.PdkCapturePort.SnapshotPreparer snapshot,
+            String domain,Runnable guard,Runnable local,io.tapstate.adapters.pdk.PdkCapturePort.SnapshotPreparer snapshot,
             io.tapstate.adapters.pdk.PdkCapturePort.StreamPreparer stream){
         CapturePort port=ports.open(notes,config,guard,snapshot,stream);
         return identity!=null&&port instanceof io.tapstate.adapters.pdk.PdkCapturePort pdk
-                ?pdk.withOperationObserver(operations.apply(identity,guard)):port;
+                ?pdk.withOperationObserver(operations.open(identity,domain,guard,local)):port;
     }
     private final Map<ExecutionFence,Session> sessions=new LinkedHashMap<>();
     private final Map<String,Owner> owners=new LinkedHashMap<>();
@@ -347,7 +348,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                     long firstEpoch=source.freshFull==null?binding.snapshotEpoch():source.freshFull.originalChain().epoch();
                     Function<SrsSnapshotPreparation,CapturePort> prepareSnapshot=preparation -> {
                         source.snapshotEpoch=preparation.request().snapshotEpoch();source.readTables=Set.copyOf(preparation.stillOwed());
-                        return observedPort(source.identity,notes,fixedConfig,guard,(request,seam,actual) -> {
+                        return observedPort(source.identity,notes,fixedConfig,source.prepared.captureId()+":snapshot:"+session.original.pipelineId()+":"+session.original.scope().stateGeneration(),guard,()->requireSessionLocal(session),(request,seam,actual) -> {
                             requireSnapshotModels(source,actual);preparation.prepare(request,seam,actual);
                         },null);
                     };
@@ -359,11 +360,11 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                 } else if(!session.bounded && session.snapshot) {
                     source.run=runtime.beginDirectSnapshot(config,source.direct,source.channels,preparation -> {
                         source.snapshotEpoch=preparation.request().snapshotEpoch();source.readTables=Set.copyOf(preparation.stillOwed());
-                        return observedPort(source.identity,notes,fixedConfig,guard,preparation::prepare,null);
+                        return observedPort(source.identity,notes,fixedConfig,source.prepared.captureId()+":snapshot:"+session.original.pipelineId()+":"+session.original.scope().stateGeneration(),guard,()->requireSessionLocal(session),preparation::prepare,null);
                     },output,buffer.capacity(),guard);
                     source.direct=source.channels.load(source.direct.context());direct.put(source.id,DirectSourceRun.of(run.original,source.direct));
                 } else {
-                    var port=observedPort(source.identity,notes,config,guard,null,null);
+                    var port=observedPort(source.identity,notes,config,source.prepared.captureId()+":direct:"+session.original.pipelineId()+":"+session.original.scope().stateGeneration(),guard,()->requireSessionLocal(session),null,null);
                     source.run=session.bounded?runtime.beginSnapshotOnly(config,epoch,port,output,guard):
                             runtime.startDirect(config,source.direct,source.channels,source.start,port,output,buffer.capacity(),guard);
                 }
@@ -492,6 +493,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         final AtomicBoolean live=new AtomicBoolean(true);final Owner owner;NativeSrsCaptureRunUnit.Tail tail;final Runnable guard=this::require;
         Physical(Owner owner){this.owner=owner;}
         void require(){owner.require();if(!live.get())throw refused();}
+        void requireLocal(){active();if(!live.get() || owner.ended.get())throw refused();execution.authorization().requireCaptureLocal(stores.scope(),owner.fence);}
         void close(){live.set(false);if(tail!=null)tail.close();runtime.stopOpenings(guard);}
     }
     private boolean needed(Owner owner) {
@@ -545,7 +547,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         var config=new CaptureConfig(owner.config.connectorId(),owner.config.settings(),opened.servingTables().stream().sorted().toList(),owner.config.node(),owner.config.sharedNotes());
         var start=opened.resumeToken()==null?CaptureStart.present():CaptureStart.resume(new SourcePosition(opened.resumeToken()));
         var physical=new Physical(owner);owner.physical=physical;var notes=owner.configured;
-        try {physical.tail=runtime.startTail(stores.scope(),opened,owner.fence,config,start,writer -> observedPort(owner.identity,notes,config,physical.guard,null,writer::prepare),physical.guard,owner.positionEditsRestricted);}
+        try {physical.tail=runtime.startTail(stores.scope(),opened,owner.fence,config,start,writer -> observedPort(owner.identity,notes,config,owner.prepared.captureId()+":stream",physical.guard,physical::requireLocal,null,writer::prepare),physical.guard,owner.positionEditsRestricted);}
         catch(RuntimeException|Error failure) {
             try {physical.close();owner.physical=null;}catch(RuntimeException|Error cleanup){if(cleanup!=failure)failure.addSuppressed(cleanup);}
             throw failure;
@@ -644,6 +646,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             case StartFrom.At at -> CaptureStart.at(at.instant());
         };
     }
+    private void requireSessionLocal(Session session) {active();if(session.ended.get())throw refused();execution.authorization().requireLocal(session.original);}
     private void requireSession(Session session) { active(); if(session.ended.get())throw refused(); requirePipeline(session.original); }
     private void requirePipeline(ExecutionFence original) { active(); if(!claim(original).equals(execution.authorization().require(original)))throw refused(); }
     private void active() { execution.active().run(); if(closed.get())throw refused(); }

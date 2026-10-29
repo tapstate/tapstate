@@ -18,7 +18,7 @@ final class AlertRulePreview {
         });
         var header=AlertConfiguration.Header.create(AlertConfiguration.Identity.create(AlertConfiguration.Kind.RULE,scope,"synthetic-preview"),deployment,now,actor);
         var severity=form.get("severity")==null||"DEFAULT".equals(form.get("severity"))?null:value(AlarmSeverity.class,text(form,"severity"));
-        var definition=new AlertConfiguration.Rule(header,"Synthetic example",text(form,"typeId"),integer(form,"typeVersion",1),AlertAuthoring.resources(form),parameters,severity,true,null).validated(catalog);
+        var definition=new AlertConfiguration.Rule(header,"Synthetic example",text(form,"typeId"),integer(form,"typeVersion",1),AlertAuthoring.resources(form),parameters,severity,true,catalog.metric(text(form,"typeId"),parameters)).validated(catalog);
         var key=new AlarmKey(scope,new AlarmKey.Resource(definition.resources().kinds().stream().sorted().findFirst().orElseThrow(),"synthetic-example","synthetic-example"),definition.typeId(),header.identity().incarnation());
         long trigger=definition.parameters().getOrDefault("trigger-for",BigDecimal.ZERO).longValueExact();long recover=definition.parameters().getOrDefault("resolve-for",BigDecimal.ZERO).longValueExact();
         var rule=new AlertRule(key,1,1,"synthetic-example",Duration.ofSeconds(trigger),Duration.ofSeconds(recover),Duration.ofSeconds(15),Duration.ofSeconds(5));

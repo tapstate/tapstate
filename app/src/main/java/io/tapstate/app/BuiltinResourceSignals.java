@@ -22,28 +22,55 @@ final class BuiltinResourceSignals {
             CacheAuthScope cache,Runnable active,Clock clock){
         this.runtime=runtime;this.storage=storage;this.cache=cache;this.active=active;this.clock=clock;
     }
-    SourceOperationObserver source(SourceBindingSnapshot original,Runnable originalOperation){
+    private static final class Connection {
+        final String id=UUID.randomUUID().toString();boolean closed;int pending;
+    }
+    private final Map<String,Connection> connections=new java.util.concurrent.ConcurrentHashMap<>();
+    SourceOperationObserver source(SourceBindingSnapshot original,Runnable operation){return source(original,"legacy-source",operation,active);}
+    SourceOperationObserver source(SourceBindingSnapshot original,String logical,Runnable operation,Runnable localProof) {
         var id=original.identity();
-        if(storage.get().defaultSourceId().equals(id.sourceId())){
-            var resource=new AlarmKey.Resource("cluster-storage",id.sourceId(),id.incarnation()+":"+id.bindingRevision());
-            if(!evidence.containsKey(resource)&&evidence.size()>=256){runtime.get().collectionUnavailable("resource-proof-budget");return SourceOperationObserver.NONE;}
-            evidence.put(resource,new AlertStore.StorageEvidence(resource,AlertStore.StorageRole.MASTER,null,id));
+        boolean master=storage.get().defaultSourceId().equals(id.sourceId());
+        var sourceResource=new AlarmKey.Resource("source",id.sourceId(),id.incarnation());
+        var storageResource=new AlarmKey.Resource("cluster-storage",id.sourceId(),id.incarnation()+":"+id.bindingRevision());
+        if(master) {
+            if(!evidence.containsKey(storageResource) && evidence.size()>=256){runtime.get().collectionUnavailable("resource-proof-budget");return SourceOperationObserver.NONE;}
+            evidence.put(storageResource,new AlertStore.StorageEvidence(storageResource,AlertStore.StorageRole.MASTER,null,id));
         }
-        String digest=digest(id.sourceId(),id.incarnation(),Long.toString(id.bindingRevision()));
-        return (capability,failure)->{
-            if(failure!=null&&!connectionFailure(failure))return;
-            var input=new AlertInput.Operational(clock.instant(),digest,
-                    OperationalEvidence.Capability.valueOf(capability.name()),failure==null);
-            runtime.get().resourceInput(new AlarmKey.Resource("source",id.sourceId(),id.incarnation()),
-                    "source.connection-failed",id.bindingRevision(),digest,originalOperation,input);
-            StorageBinding bound=storage.get();
-            if(bound.defaultSourceId().equals(id.sourceId())){
-                runtime.get().resourceInput(new AlarmKey.Resource("cluster-storage",id.sourceId(),id.incarnation()+":"+id.bindingRevision()),
-                        "cluster.storage-unavailable",0,digest,originalOperation,input);
+        String base=digest(id.sourceId(),id.incarnation(),Long.toString(id.bindingRevision()),logical);
+        var connection=new Connection();
+        synchronized(connections) {
+            if(!connections.containsKey(base) && connections.size()>=8192){runtime.get().collectionUnavailable("connection-proof-budget");return SourceOperationObserver.NONE;}
+            connections.put(base,connection);
+        }
+        Runnable local=()->{
+            active.run();localProof.run();
+            if(connections.get(base)!=connection)throw ThreeLayerStorePort.refused();
+        };
+        Runnable settled=()->{synchronized(connection){if(--connection.pending<0)throw new IllegalStateException("negative pending operation count");
+            if(connection.closed && connection.pending==0)connections.remove(base,connection);}};
+        return new SourceOperationObserver() {
+            @Override public void completed(Capability capability,Throwable failure){completed("connection",capability,failure);}
+            @Override public void completed(String access,Capability capability,Throwable failure) {
+                if(failure!=null)org.slf4j.LoggerFactory.getLogger(BuiltinResourceSignals.class).debug("Operational failure classification [master={},capability={},classified={}]",master,capability,connectionFailure(failure));
+                if(failure!=null && !connectionFailure(failure))return;
+                synchronized(connection){
+                    if(connection.closed || connections.get(base)!=connection)return;
+                    connection.pending+=master?2:1;
+                }
+                String domain=digest(base,access);
+                String binding=digest(id.sourceId(),id.incarnation(),Long.toString(id.bindingRevision()),domain);
+                var input=new AlertInput.Operational(clock.instant(),binding,OperationalEvidence.Capability.valueOf(capability.name()),failure==null,domain);
+                runtime.get().resourceInput(sourceResource,"source.connection-failed",id.bindingRevision(),binding,operation,local,input,settled);
+                if(master)runtime.get().resourceInput(storageResource,"cluster.storage-unavailable",0,binding,operation,local,input,settled);
             }
+            @Override public SourceOperationObserver fork(String phase){close();return BuiltinResourceSignals.this.source(original,logical+":"+phase,operation,localProof);}
+            @Override public void close(){synchronized(connection){connection.closed=true;if(connection.pending==0)connections.remove(base,connection);}}
         };
     }
+    private volatile Function<AlarmKey.Resource,Optional<AlertStore.NodeEvidence>> nodeProofs=resource->Optional.empty();
+    void nodeProofs(Function<AlarmKey.Resource,Optional<AlertStore.NodeEvidence>> proofs){nodeProofs=Objects.requireNonNull(proofs);}
     Optional<AlertStore.ResourceEvidence> resourceEvidence(AlarmKey.Resource resource){
+        if(resource.kind().equals("cluster-node"))return nodeProofs.apply(resource).map(value->value);
         if(resource.kind().equals("cluster-storage")&&resource.id().equals("cache")){
             var proof=new AlertStore.StorageEvidence(new AlarmKey.Resource("cluster-storage","cache",cache.cacheIncarnation()+":"+cache.bindingVersion()),AlertStore.StorageRole.CACHE,cache,null);
             return proof.resource().equals(resource)?Optional.of(proof):Optional.empty();
@@ -64,6 +91,8 @@ final class BuiltinResourceSignals {
     static boolean connectionFailure(Throwable failure){
         var seen=Collections.newSetFromMap(new IdentityHashMap<Throwable,Boolean>());
         for(Throwable cause=failure;cause!=null&&seen.size()<16&&seen.add(cause);cause=cause.getCause()){
+            if(cause instanceof TapstateException coded && (coded.code() instanceof IoError
+                    || coded.code() instanceof io.tapstate.runtime.engine.EngineError || coded.code() instanceof ActuationError))return false;
             if(cause instanceof java.sql.SQLException sql){String state=sql.getSQLState();
                 if(state!=null&&(state.startsWith("08")||state.startsWith("28")||state.equals("42501")))return true;
             }

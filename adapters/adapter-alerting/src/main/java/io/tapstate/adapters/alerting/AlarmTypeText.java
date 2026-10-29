@@ -34,6 +34,10 @@ public final class AlarmTypeText {
         words.forEach((key, value) -> values.put((String) key, (String) value));
         return new AlarmTypeText(values);
     }
+    /** Statically assembled locale additions for registered types; no expression or template execution. */
+    public AlarmTypeText with(Map<String,String> additions) {
+        var combined=new HashMap<>(text);combined.putAll(additions);return new AlarmTypeText(combined);
+    }
     public Description describe(AlarmTypeCatalog.Type type) {
         Objects.requireNonNull(type, "type");
         return new Description(required(type.conditionTextKey()), type.kind() == AlarmTypeCatalog.Kind.EVENT ? null : required(type.recoveryTextKey()),
