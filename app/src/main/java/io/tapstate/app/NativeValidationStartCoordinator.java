@@ -31,7 +31,7 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
     private final MongoConfigurationDomain configuration;
     private final ValidationOwnerRouter router;
     private final ValidationMemberResources.Member resources;
-    private final Runnable active;private final long ioTimeoutNanos;
+    private final Runnable active;private final long ioTimeoutNanos;private final java.time.Clock clock;
     private final Context context;
     private final ValidationMemberResources.Unbound registryBudget;
     private final ScheduledFuture<?> stops;
@@ -44,6 +44,11 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
     }
     NativeValidationStartCoordinator(HazelcastInstance member,MongoConfigurationDomain configuration,ValidationOwnerRouter router,
             ValidationMemberResources.Member resources,ValidationMemberResources process,Runnable active,Duration ioTimeout){
+        this(member,configuration,router,resources,process,active,ioTimeout,java.time.Clock.systemUTC());
+    }
+    NativeValidationStartCoordinator(HazelcastInstance member,MongoConfigurationDomain configuration,ValidationOwnerRouter router,
+            ValidationMemberResources.Member resources,ValidationMemberResources process,Runnable active,Duration ioTimeout,java.time.Clock clock){
+        this.clock=Objects.requireNonNull(clock);
         if(ioTimeout==null||ioTimeout.isZero()||ioTimeout.isNegative()||ioTimeout.compareTo(Duration.ofSeconds(30))>0)throw invalid("entry.ioTimeout");
         ioTimeoutNanos=ioTimeout.toNanos();
         this.member=Objects.requireNonNull(member);this.configuration=Objects.requireNonNull(configuration);this.router=Objects.requireNonNull(router);
@@ -58,13 +63,14 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
         }catch(RuntimeException|Error failed){member.getUserContext().remove(BINDING,this);registryBudget.close();throw failed;}
     }
     Context context(){require();return context;}
-    Response start(ValidationOperation original){return response(original,Verb.START);}
-    Response read(ValidationOperation original){return response(original,Verb.READ);}
-    Response stop(ValidationOperation original){return response(original,Verb.STOP);}
+    Response start(ValidationOperation original){return response(original,Verb.START,null);}
+    Response startScheduled(ValidationOperation original,java.time.Instant latest){return response(original,Verb.START,Objects.requireNonNull(latest));}
+    Response read(ValidationOperation original){return response(original,Verb.READ,null);}
+    Response stop(ValidationOperation original){return response(original,Verb.STOP,null);}
 
-    private Response response(ValidationOperation original,Verb verb){
+    private Response response(ValidationOperation original,Verb verb,java.time.Instant latest){
         var scope=new ResponseScope();
-        try{return new RetainedResponse(scope,route(original,verb,scope));}
+        try{return new RetainedResponse(scope,route(original,verb,scope,latest));}
         catch(RuntimeException|Error failed){scope.close();throw failed;}
     }
     private final class ResponseScope implements AutoCloseable {
@@ -92,7 +98,7 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
         @Override public Status value(){scope.require();return value;}
         @Override public void close(){value=null;scope.close();}
     }
-    private Status route(ValidationOperation original,Verb verb,ResponseScope scope){
+    private Status route(ValidationOperation original,Verb verb,ResponseScope scope,java.time.Instant latest){
         require();Objects.requireNonNull(original);
         if(!context.cluster().equals(original.context().cluster()))return status(original,Outcome.REJECTED,null);
         // CONFIG is consulted before either a fresh entry or an original command. Missing facts grant nothing.
@@ -101,17 +107,17 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
         if(verb==Verb.START&&!checked.eligible())return checked.refusal();
         var target=member.getCluster().getMembers().stream().filter(value->matches(original.context(),value)).findFirst().orElse(null);
         if(target==null)return status(original,verb==Verb.START?Outcome.REJECTED:Outcome.UNKNOWN,null);
-        if(target.localMember())return accept(original,verb,checked.fence());
+        if(target.localMember())return accept(original,verb,checked.fence(),latest);
         try{
             var result=member.getExecutorService(ValidationOwnerRouter.EXECUTOR)
-                    .submitToMember(new EntryCall(original,verb,checked.fence()),target).get(2,TimeUnit.SECONDS);
+                    .submitToMember(new EntryCall(original,verb,checked.fence(),latest),target).get(2,TimeUnit.SECONDS);
             require();return result!=null&&original.equals(result.original())?result:status(original,Outcome.UNKNOWN,null);
         }catch(InterruptedException interrupted){Thread.currentThread().interrupt();return status(original,Outcome.UNKNOWN,null);}
         catch(TimeoutException|CancellationException|RejectedExecutionException|HazelcastInstanceNotActiveException|MemberLeftException
                 |com.hazelcast.spi.exception.TargetDisconnectedException|com.hazelcast.spi.exception.TargetNotMemberException|OperationTimeoutException unavailable){return status(original,Outcome.UNKNOWN,null);}
         catch(ExecutionException failed){return failed(original,failed.getCause());}
     }
-    private Status accept(ValidationOperation original,Verb verb,Fence fence){
+    private Status accept(ValidationOperation original,Verb verb,Fence fence,java.time.Instant latest){
         require();if(!context.equals(original.context()))return status(original,Outcome.REJECTED,null);
         Entry entry;
         synchronized(entries){
@@ -121,8 +127,9 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
             if(entry==null){
                 if(verb!=Verb.START)return status(original,Outcome.UNKNOWN,null);
                 long bytes=bytes(original);if(entries.size()==MAX_ENTRIES||bytes>MAX_BYTES-retainedBytes)return status(original,Outcome.CAPACITY,null);
-                entry=new Entry(original,bytes);entries.put(Key.of(original),entry);retainedBytes+=bytes;
+                entry=new Entry(original,bytes,latest);entries.put(Key.of(original),entry);retainedBytes+=bytes;
             }
+            if(verb==Verb.START&&!Objects.equals(entry.latest,latest))return status(original,Outcome.REJECTED,null);
             if(verb==Verb.STOP)entry.stop=true;
             if(entry.observed.drain()!=Drain.DRAINED&&(verb!=Verb.READ||entry.owner!=null))dispatch(entry,verb);return entry.observed;
         }
@@ -155,7 +162,7 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
     }
     private void advance(Entry entry,Verb verb){
         try{
-            require();entry.body.require();var checked=lookup(entry.original);
+            require();entry.body.require();if(expired(entry)){publish(entry,status(entry.original,Outcome.REJECTED,ValidationError.EXECUTION_CANCELLED.code()));return;}var checked=lookup(entry.original);
             if(checked.known()!=null){publish(entry,original(entry.original,entry.stop?Verb.STOP:verb,checked.known()));return;}
             synchronized(entries){
                 if(entry.stop&&!entry.reservationAttempted){entry.observed=status(entry.original,Outcome.REJECTED,ValidationError.EXECUTION_CANCELLED.code());return;}
@@ -172,6 +179,7 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
                         reply.claimGeneration(),reply.executionGeneration(),reply.topologyRevision());}
             }
             require();entry.body.require();
+            if(expired(entry)){router.command(ValidationOwnerRouter.Command.of(ValidationOwnerRouter.Action.CANCEL_UNUSED,request(entry.original),entry.owner));publish(entry,status(entry.original,Outcome.REJECTED,ValidationError.EXECUTION_CANCELLED.code()));return;}
             boolean stop;synchronized(entries){if(closed)return;stop=entry.stop;}
             var command=ValidationOwnerRouter.Command.of(stop?ValidationOwnerRouter.Action.STOP:verb==Verb.READ?ValidationOwnerRouter.Action.STATUS:ValidationOwnerRouter.Action.ACTIVATE,request(entry.original),entry.owner);
             publish(entry,project(entry.original,router.command(command)));
@@ -179,6 +187,7 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
         catch(RuntimeException|Error defect){publish(entry,status(entry.original,Outcome.UNKNOWN,null));throw defect;}
         finally{synchronized(entries){entry.inFlight=false;entry.body=null;}}
     }
+    private boolean expired(Entry entry){return !entry.stop&&entry.latest!=null&&clock.instant().isAfter(entry.latest);}
     private void publish(Entry entry,Status result){synchronized(entries){entry.observed=compact(result);}}
     private Status original(ValidationOperation operation,Verb verb,Known known){
             var command=ValidationOwnerRouter.Command.of(verb==Verb.STOP?ValidationOwnerRouter.Action.STOP:
@@ -227,9 +236,9 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
         stops.cancel(false);member.getUserContext().remove(BINDING,this);owned.forEach(ValidationMemberResources.Control::close);registryBudget.close();
     }
     private static final class Entry {
-        final ValidationOperation original;final long bytes;volatile Status observed;boolean inFlight,reservationAttempted,stop;
+        final ValidationOperation original;final long bytes;final java.time.Instant latest;volatile Status observed;boolean inFlight,reservationAttempted,stop;
         ValidationOwner owner;ValidationMemberResources.Control body;
-        Entry(ValidationOperation original,long bytes){this.original=original;this.bytes=bytes;observed=status(original,Outcome.PENDING,null);}
+        Entry(ValidationOperation original,long bytes,java.time.Instant latest){this.original=original;this.bytes=bytes;this.latest=latest;observed=status(original,Outcome.PENDING,null);}
     }
     private void dispatchStops(){
         synchronized(entries){if(closed)return;for(var entry:entries.values())
@@ -237,13 +246,13 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
     }
     private static final class EntryCall implements Callable<Status>,Serializable,HazelcastInstanceAware {
         private static final long serialVersionUID=1L;
-        private final ValidationOperation original;private final Verb verb;private final Fence fence;private transient HazelcastInstance member;
-        private EntryCall(ValidationOperation original,Verb verb,Fence fence){this.original=original;this.verb=verb;this.fence=fence;}
+        private final ValidationOperation original;private final Verb verb;private final Fence fence;private final java.time.Instant latest;private transient HazelcastInstance member;
+        private EntryCall(ValidationOperation original,Verb verb,Fence fence,java.time.Instant latest){this.original=original;this.verb=verb;this.fence=fence;this.latest=latest;}
         @Override public void setHazelcastInstance(HazelcastInstance value){member=value;}
         @Override public Status call(){
             if(member==null)return status(original,Outcome.REJECTED,null);
             var bound=member.getUserContext().get(BINDING);
-            return bound instanceof NativeValidationStartCoordinator coordinator?coordinator.accept(original,verb,fence):status(original,Outcome.REJECTED,null);
+            return bound instanceof NativeValidationStartCoordinator coordinator?coordinator.accept(original,verb,fence,latest):status(original,Outcome.REJECTED,null);
         }
     }
     private static Status passive(ValidationOperation operation,ValidationReportAdmission.Start start,boolean closed,ValidationReports.Snapshot retained){

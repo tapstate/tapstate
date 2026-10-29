@@ -197,6 +197,24 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
             });
         }
 
+        @Override public Write disableSchedule(DisableSchedule command){
+            Objects.requireNonNull(command);scope(command.task());
+            return call(session->{
+                var raw=owner.tasks.withDocumentClass(org.bson.RawBsonDocument.class).find(session,new Document("_id",taskId(command.task()))).batchSize(1).first();
+                if(raw==null)return Write.CONFLICT;
+                if(raw.getByteLength()>Inputs.MAX_STORED_BYTES)throw taskLimit("validation.taskDefinitionBytes");
+                var previous=raw.decode(owner.tasks.getCodecRegistry().get(Document.class));var current=MongoValidationTaskCodec.snapshot(previous,owner.clusterId);
+                if(!current.task().equals(command.task()))return Write.CONFLICT;if(current.closed())return Write.CLOSED;
+                if(current.commandId().equals(command.commandId()))return current.revision()==command.expectedRevision()+1&&!current.settings().full().scheduleEnabled()?Write.DUPLICATE:Write.CONFLICT;
+                if(current.revision()!=command.expectedRevision())return Write.CONFLICT;
+                var full=current.settings().full();var settings=new Settings(new Full(full.method(),full.maxConcurrentTables(),full.schedule(),false,full.historyLimit()),current.settings().incremental());
+                var next=MongoValidationTaskCodec.update(previous,current,new Update(current.task(),current.revision(),current.comparison(),settings,command.commandId()));
+                ConfigurationVersion.advance(session,SystemCollections.CONFIGURATION_VERSION.on(owner.database));capacity(session,current.task().pipelineId(),previous,next);
+                if(owner.tasks.replaceOne(session,new Document("_id",previous.get("_id")).append("taskGeneration",previous.get("taskGeneration")).append("revision",current.revision()),next).getMatchedCount()!=1)throw unreadable("task-schedule-cas");
+                return Write.APPLIED;
+            });
+        }
+
         @Override public Closure close(Task task) {
             Objects.requireNonNull(task); scope(task);
             return call(session -> {

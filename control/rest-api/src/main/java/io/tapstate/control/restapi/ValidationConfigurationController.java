@@ -60,6 +60,11 @@ class ValidationConfigurationController {
         var input=body(request,PreviewRequest.class);
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(input(()->service().preview(input.schedule(),input.inputRevision())));
     }
+    @Verb("validation.schedule-disable") @PostMapping(value="/validation:schedule-disable",consumes="application/json",produces="application/json")
+    ResponseEntity<ValidationConfigurationService.Disabled> disable(HttpServletRequest request)throws IOException{
+        var command=body(request,ValidationConfigurationService.Disable.class);var result=input(()->service().disable(AuthenticatedCaller.subject(),command));
+        return ResponseEntity.status(switch(result.outcome()){case "APPLIED","DUPLICATE"->HttpStatus.OK;default->HttpStatus.CONFLICT;}).cacheControl(CacheControl.noStore()).body(result);
+    }
     @Verb("validation.start") @PostMapping(value="/validation:start",consumes="application/json",produces="application/json")
     void start(HttpServletRequest request,HttpServletResponse response)throws IOException{
         var original=body(request,ValidationExecutionService.Input.class);input(()->{ValidationExecutionService.validate(original);return null;});

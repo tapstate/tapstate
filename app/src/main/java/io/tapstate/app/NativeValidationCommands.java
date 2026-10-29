@@ -22,6 +22,11 @@ final class NativeValidationCommands implements Commands {
     @Override public CommandReply execute(Command command){
         if(!command.request().mode().equals("FULL"))return commandUnavailable(command,Outcome.REJECTED,null);
         var start=runs.original(command.request(),command.owner()).orElse(null);
+        if(command.action()==Action.CANCEL_UNUSED){
+            var pending=owners.pending(command.request(),command.owner(),true).orElse(null);
+            if(pending!=null)return new CommandReply(Outcome.ACCEPTED,command,pending.stopped()?"STOPPED":"STARTING",false,false,false,false,pending.drained(),null);
+            if(start==null)return commandUnavailable(command,Outcome.REJECTED,null);
+        }
         if(command.action()==Action.ACTIVATE&&start==null){
             start=owners.original(command.request(),command.owner());var reservation=owners.take(start);
             runs.start(start,new NativeValidationFullJob(reservation,processors,member,process,runs,factory));

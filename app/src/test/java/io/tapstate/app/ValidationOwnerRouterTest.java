@@ -27,10 +27,10 @@ class ValidationOwnerRouterTest {
                 var command=Command.of(action,request,accepted("b",request).owner());
                 assertThat(f.left.command(command)).satisfies(reply->{assertThat(reply.outcome()).isEqualTo(Outcome.ACCEPTED);assertThat(reply.original()).isEqualTo(command);assertThat(reply.waiting()).isTrue();});
             }
-            assertThat(seen).extracting(Command::action).containsExactly(Action.ACTIVATE,Action.STATUS,Action.STOP);
+            assertThat(seen).extracting(Command::action).containsExactly(Action.ACTIVATE,Action.STATUS,Action.STOP,Action.CANCEL_UNUSED);
             assertThat(f.calls.get("a")).hasValue(0);assertThat(f.calls.get("b")).hasValue(0);
             var wrongBoot=new Command(Action.ACTIVATE,request,"cluster","b","other-boot",3,4,1);
-            assertThat(f.left.command(wrongBoot).outcome()).isEqualTo(Outcome.REJECTED);assertThat(seen).hasSize(3);
+            assertThat(f.left.command(wrongBoot).outcome()).isEqualTo(Outcome.REJECTED);assertThat(seen).hasSize(4);
         }
     }
     @Test void aLateOriginalCommandNeverFallsBackToAnotherMember()throws Exception{

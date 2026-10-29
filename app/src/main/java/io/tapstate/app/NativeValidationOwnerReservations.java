@@ -179,9 +179,9 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         if(!local.lock.tryLock()){unpin(local);throw unauthorized(local.pipeline);}
         try{
             var original=local.operations.get(new Operation(request.task(),request.taskGeneration(),request.mode(),request.command()));
-            if(original==null||!original.request.equals(request)||original.activated||original.bound==null||original.owner==null
+            if(original==null||!original.request.equals(request)||original.bound==null||original.owner==null
                     ||!original.bound.budget().identity().owner().equals(expected))return Optional.empty();
-            original.requireOwner();if(stop)original.close();
+            original.requireOwner();if(stop&&!original.cancelIfUnused()||!stop&&original.isActivated())return Optional.empty();
             return Optional.of(new Pending(original.cancelled.get(),original.cancelled.get()&&original.bound.fullyReleased()));
         }finally{local.lock.unlock();unpin(local);}
     }
@@ -383,6 +383,10 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         void requireOwner() {
             requireActive(); if (owner == null || owner.retired.get()) throw invalid("owner.reservationClosed");
             owner.lease.require();
+        }
+        synchronized boolean isActivated(){return activated;}
+        synchronized boolean cancelIfUnused(){
+            requireOwner();if(activated)return false;cancelled.set(true);disposeUnused();return true;
         }
         synchronized void activate(Runnable stop) {
             requireReserved(); if (activated) throw invalid("owner.alreadyActivated"); this.stop = Objects.requireNonNull(stop); activated = true;

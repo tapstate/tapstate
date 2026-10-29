@@ -51,6 +51,9 @@ public interface ValidationTaskStore {
             if (expectedRevision < 1 || expectedRevision >= Long.MAX_VALUE - 1) throw invalid("task.expectedRevision");
         }
     }
+    record DisableSchedule(ValidationReportAdmission.Task task,long expectedRevision,UUID commandId){
+        public DisableSchedule{Objects.requireNonNull(task);Objects.requireNonNull(commandId);if(expectedRevision<1||expectedRevision>=Long.MAX_VALUE-1)throw invalid("task.expectedRevision");}
+    }
     enum Phase { OPEN, BORN, CLOSED }
     record Permission(ValidationReportAdmission.Start start, Phase phase) {
         public Permission { Objects.requireNonNull(start); Objects.requireNonNull(phase); }
@@ -160,6 +163,8 @@ public interface ValidationTaskStore {
     default Created createFresh(FreshCreate command){throw invalid("task.freshCreateUnsupported");}
     /** Exact task lifetime/revision CAS. Existing start sequences and permissions remain unchanged. */
     Write update(Update command);
+    /** Restrictive original CONFIG CAS only; this cannot stop a run or grant a start despite stale dependencies. */
+    default Write disableSchedule(DisableSchedule command){throw invalid("task.scheduleDisableUnsupported");}
     /** CONFIG only: blocks new starts and seals original permissions/reports; CACHE termination remains separate. */
     ValidationReportAdmission.Closure close(ValidationReportAdmission.Task task);
 

@@ -203,8 +203,10 @@ class NativeValidationOwnerReservationsIT {
         volatile Runnable localGuard = () -> {};
         volatile NativeValidationOwnerReservations.Startup startup=(saved,spec)->NativeValidationOwnerReservations.StartupGate.ready();
         Fixture() { this(64, 128); }
+        Fixture(boolean peers){this(64,128,System::nanoTime,peers);}
         Fixture(int maxPipelines, int maxOperations) { this(maxPipelines, maxOperations, System::nanoTime); }
-        Fixture(int maxPipelines, int maxOperations, LongSupplier handoffClock) {
+        Fixture(int maxPipelines, int maxOperations, LongSupplier handoffClock) {this(maxPipelines,maxOperations,handoffClock,false);}
+        Fixture(int maxPipelines,int maxOperations,LongSupplier handoffClock,boolean peers){
             this.maxPipelines = maxPipelines; this.maxOperations = maxOperations;
             this.handoffClock = handoffClock;
             var binding = configuration.bindings().commitWithFirstCache(new StorageSetupScope("cluster", "installation", "setup", 1), StorageBinding.Mode.OP, endpoint,
@@ -224,7 +226,7 @@ class NativeValidationOwnerReservationsIT {
                     .setProperty("hazelcast.operation.thread.count", "2").setProperty("hazelcast.operation.generic.thread.count", "2")
                     .setProperty("hazelcast.io.input.thread.count", "1").setProperty("hazelcast.io.output.thread.count", "1").setProperty("hazelcast.partition.count", "17");
             config.getNetworkConfig().setPort(0).setPortAutoIncrement(false).getInterfaces().setEnabled(true).addInterface("127.0.0.1");
-            var join = config.getNetworkConfig().getJoin(); join.getMulticastConfig().setEnabled(false); join.getTcpIpConfig().setEnabled(false); join.getAutoDetectionConfig().setEnabled(false);
+            var join = config.getNetworkConfig().getJoin(); join.getMulticastConfig().setEnabled(false); join.getTcpIpConfig().setEnabled(peers); join.getAutoDetectionConfig().setEnabled(false);
             member = Hazelcast.newHazelcastInstance(config); var properties = new ClusterProperties(); properties.setProfile(ClusterProperties.Profile.PROCESS_FAILURE_ONLY);
             nodeLease = new NodeSessionLease(cache.workloadClaims(scope), node, nodeAskedAt,
                     Duration.ofMinutes(5), Duration.ofMinutes(1), member::shutdown);

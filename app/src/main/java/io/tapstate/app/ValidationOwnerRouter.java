@@ -73,7 +73,7 @@ final class ValidationOwnerRouter implements AutoCloseable {
         /** CAPACITY/REDIRECT must prove no claim, ticket, Job or unknown allocation was retained. */
         Result reserve(Request request);
     }
-    enum Action { ACTIVATE,STATUS,STOP }
+    enum Action { ACTIVATE,STATUS,STOP,CANCEL_UNUSED }
     /** Immutable original coordinates only. No spec, executable object, model or connection crosses the wire. */
     record Command(Action action,Request request,String cluster,String node,String boot,long claim,long execution,long topology) implements Serializable {
         Command{Objects.requireNonNull(action);Objects.requireNonNull(request);id(cluster);id(node);id(boot);

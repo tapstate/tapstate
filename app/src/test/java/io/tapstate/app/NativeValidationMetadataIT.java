@@ -217,7 +217,7 @@ class NativeValidationMetadataIT {
     }
     private static List<ValidationSelectedDeclarations.Choice> choices(){return List.of(new ValidationSelectedDeclarations.Choice("orders","out","input","orders"),
             new ValidationSelectedDeclarations.Choice("items","out","input","items"));}
-    private static void seed(NativeValidationOwnerReservationsIT.Fixture f,String sourceDb,String targetDb){
+    static void seed(NativeValidationOwnerReservationsIT.Fixture f,String sourceDb,String targetDb){
         for(var name:List.of("orders","items")){
             f.raw.getDatabase(sourceDb).getCollection(name).insertOne(new Document("id",1L).append("payload","source").append("approximate",0.1d));
             f.raw.getDatabase(targetDb).getCollection("checked_"+name).insertOne(new Document("id",1L).append("payload","target").append("approximate",0.1d));

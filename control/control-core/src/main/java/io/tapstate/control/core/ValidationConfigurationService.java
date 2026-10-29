@@ -39,13 +39,22 @@ public final class ValidationConfigurationService {
     public record Key(String confirmationId,List<SavedPair> fields) {}
     public record SavedMapping(String mappingId,String outputId,String sourceId,String sourceTable,String targetSourceId,String targetTable,Key keys) {}
     public record Task(String pipelineId,String taskId,String taskGeneration,String revision,String nextStartSequence,boolean closed,String method,
-            int historyLimit,Schedule schedule,boolean scheduleEnabled,List<SavedMapping> mappings) {}
+            int historyLimit,Schedule schedule,boolean scheduleEnabled,List<SavedMapping> mappings,ValidationExecutionService.Context context,Permission permission,ScheduleObservation scheduleObservation) {}
+    public record Permission(String phase,String taskGeneration,String revision,String sequence,String command,String run) {}
+    public record ScheduleObservation(String node,String boot,String member,String context,String observedAt,String nextDue,String lastDue,String state,String reason,String command,String run,String sequence) {}
     public record Occurrence(String at,String local,String offset,String weekday) {}
     public record Preview(String base,String inputRevision,String zoneId,String rulesVersion,List<Occurrence> occurrences) {}
     private final String cluster;private final ValidationTaskStore tasks;private final ValidationEvaluationProbe evaluations;
     private final ValidationSchedule.Calculator schedules;private final AuditGate audit;private final Clock clock;
+    private final io.tapstate.runtime.probe.ValidationOperation.Context context;private final io.tapstate.spi.store.ValidationScheduleObservations observations;
     public ValidationConfigurationService(String cluster,ValidationTaskStore tasks,ValidationEvaluationProbe evaluations,
             ValidationSchedule.Calculator schedules,AuditGate audit,Clock clock){
+        this(cluster,tasks,evaluations,schedules,audit,clock,null,io.tapstate.spi.store.ValidationScheduleObservations.EMPTY);
+    }
+    public ValidationConfigurationService(String cluster,ValidationTaskStore tasks,ValidationEvaluationProbe evaluations,
+            ValidationSchedule.Calculator schedules,AuditGate audit,Clock clock,io.tapstate.runtime.probe.ValidationOperation.Context context,
+            io.tapstate.spi.store.ValidationScheduleObservations observations){
+        this.context=context;this.observations=Objects.requireNonNull(observations);
         this.cluster=Objects.requireNonNull(cluster);this.tasks=Objects.requireNonNull(tasks);this.evaluations=Objects.requireNonNull(evaluations);
         this.schedules=Objects.requireNonNull(schedules);this.audit=Objects.requireNonNull(audit);this.clock=Objects.requireNonNull(clock);
     }
@@ -76,13 +85,32 @@ public final class ValidationConfigurationService {
             }
         });
     }
+    public record Disable(String pipeline,String task,String taskGeneration,String expectedRevision,String command) {}
+    public record Disabled(String outcome,String taskGeneration,String receiptRevision,String command,Boolean scheduleEnabled) {}
+    public Disabled disable(String principal,Disable input){
+        if(input==null)throw invalid("disable");name(input.pipeline());name(input.task());var generation=uuid(input.taskGeneration());
+        long revision=number(input.expectedRevision(),false);var command=uuid(input.command());
+        var original=new ValidationReportAdmission.Task(cluster,input.pipeline(),input.task(),generation);
+        return audit.dispatch(ControlOperations.VALIDATION_SCHEDULE_DISABLE,new AuditContext(principal,input.pipeline()+"/"+input.task()),()->{
+            var result=tasks.disableSchedule(new ValidationTaskStore.DisableSchedule(original,revision,command));
+            boolean accepted=result==ValidationTaskStore.Write.APPLIED||result==ValidationTaskStore.Write.DUPLICATE;
+            return new Disabled(result.name(),accepted?generation.toString():null,accepted?Long.toString(revision+1):null,command.toString(),accepted?false:null);
+        });
+    }
     public Optional<Task> read(String pipeline,String task){
         name(pipeline);name(task);return tasks.read(pipeline,task).map(value->new Task(pipeline,task,value.task().generation().toString(),Long.toString(value.revision()),
                 Long.toString(value.full().nextStartSequence()),value.closed(),value.settings().full().method().name(),value.settings().full().historyLimit(),
                 schedule(value.settings().full().schedule()),value.settings().full().scheduleEnabled(),value.comparison().mappings().stream().map(mapping->new SavedMapping(
                     mapping.mappingId(),mapping.outputId(),mapping.source().sourceId(),mapping.source().table(),mapping.target().sourceId(),mapping.target().table(),
                     mapping.keys()==null?null:new Key(mapping.keys().confirmationId(),java.util.stream.IntStream.range(0,mapping.keys().source().size())
-                            .mapToObj(index->new SavedPair(mapping.keys().source().get(index).path(),mapping.keys().target().get(index).path())).toList()))).toList()));
+                            .mapToObj(index->new SavedPair(mapping.keys().source().get(index).path(),mapping.keys().target().get(index).path())).toList()))).toList(),ValidationExecutionService.Context.from(context),permission(value.full().permission()),observation(observations.read(value.task(),value.revision()).orElse(null))));
+    }
+    private static Permission permission(ValidationTaskStore.Permission value){
+        if(value==null)return null;var original=value.start();return new Permission(value.phase().name(),original.task().generation().toString(),Long.toString(original.configurationRevision()),Long.toString(original.sequence()),original.commandId(),original.run().runId());
+    }
+    private static ScheduleObservation observation(io.tapstate.spi.store.ValidationScheduleObservations.Fact value){
+        if(value==null)return null;var origin=value.origin();return new ScheduleObservation(origin.node(),origin.boot(),origin.member().toString(),origin.context().toString(),value.observedAt().toString(),
+                value.nextDue()==null?null:value.nextDue().toString(),value.lastDue()==null?null:value.lastDue().toString(),value.state().name(),value.reason(),value.command()==null?null:value.command().toString(),value.run(),value.sequence()==0?null:Long.toString(value.sequence()));
     }
     public Preview preview(Schedule schedule,String revision){
         var value=schedules.preview(requiredSchedule(schedule),clock.instant(),number(revision,false),ValidationSchedule.SearchBudget.DEFAULT);

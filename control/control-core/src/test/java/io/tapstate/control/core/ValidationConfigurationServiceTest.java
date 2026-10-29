@@ -81,6 +81,25 @@ class ValidationConfigurationServiceTest {
         service.save("alice",new ValidationConfigurationService.Save(input("0"),probe.fingerprint,UUID.randomUUID().toString(),10,null,false));
         assertThat(chosen.get()).isNotNull().isNotEqualTo(GENERATION);
     }
+    @Test void disablingDoesNotEvaluateConnectorsAndReturnsOnlyTheOriginalOffReceipt(){
+        var probe=new Probe();var calls=new java.util.concurrent.atomic.AtomicInteger();var audits=new ArrayList<AuditRecord>();
+        var store=new Store(){@Override public Write disableSchedule(DisableSchedule command){calls.incrementAndGet();return Write.APPLIED;}};
+        var service=service(store,probe,audits::add);var command=UUID.randomUUID().toString();
+        var result=service.disable("alice",new ValidationConfigurationService.Disable("flow","task",GENERATION.toString(),"7",command));
+        assertThat(result.outcome()).isEqualTo("APPLIED");assertThat(result.receiptRevision()).isEqualTo("8");assertThat(result.scheduleEnabled()).isFalse();
+        assertThat(probe.calls).isZero();assertThat(calls).hasValue(1);assertThat(audits).singleElement().satisfies(value->assertThat(value.operationId()).isEqualTo("validation.schedule-disable"));
+    }
+    @Test void taskReadRetainsAnOriginalPermissionAcrossDefinitionChangesWithoutExecutingMetadata(){
+        var store=new Store();var probe=new Probe();var comparison=comparison("a".repeat(64));
+        var task=new ValidationReportAdmission.Task("cluster","flow","task",GENERATION);var owner=new ValidationOwner("cluster","flow","node","boot",1,1,1);
+        var spec=new ValidationRunSpec(comparison,ValidationMode.FULL,ValidationMethod.COUNT);var run=new ValidationRunIdentity(owner,"task","original",ValidationMode.FULL,spec.fingerprint(),1,comparison.comparisonRulesVersion());
+        var start=new ValidationReportAdmission.Start(task,1,1,UUID.randomUUID().toString(),run);
+        store.current=new ValidationTaskStore.Snapshot(task,2,UUID.randomUUID(),comparison,ValidationTaskStore.Settings.defaults(ValidationMethod.COUNT,0),1,UUID.randomUUID(),false,
+                new ValidationTaskStore.Mode(2,new ValidationTaskStore.Permission(start,ValidationTaskStore.Phase.OPEN)),new ValidationTaskStore.Mode(1,null));
+        var read=service(store,probe,ignored->{}).read("flow","task").orElseThrow();
+        assertThat(read.revision()).isEqualTo("2");assertThat(read.permission().revision()).isEqualTo("1");assertThat(read.permission().sequence()).isEqualTo("1");
+        assertThat(read.permission().command()).isEqualTo(start.commandId());assertThat(read.permission().phase()).isEqualTo("OPEN");assertThat(probe.calls).isZero();
+    }
     @Test void malformedScheduleInputsAreCodedRefusals(){
         var probe=new Probe();var store=new Store();var service=service(store,probe,ignored->{});
         assertThatThrownBy(()->service.preview(null,"1")).isInstanceOf(TapstateException.class);

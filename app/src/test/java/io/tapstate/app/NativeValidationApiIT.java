@@ -164,6 +164,32 @@ class NativeValidationApiIT {
                 }
                 org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).until(()->child.getBean(ValidationMemberResources.Member.class).snapshot().metadataFrames()==0);
                 assertThat(child.getBean(com.hazelcast.core.HazelcastInstance.class).getJet().getJobs()).hasSize(4);
+                var wall=new LinkedHashMap<String,Object>(input);wall.put("taskId","scheduled_wall");wall.put("taskGeneration",UUID.randomUUID().toString());
+                var wallCheck=http.post().uri("/api/validation:evaluate").header("Authorization","Bearer "+write).contentType(MediaType.APPLICATION_JSON).body(wall).retrieve().body(Map.class);
+                var anchor=java.time.Instant.now().minusSeconds(50).toString();
+                var scheduleInput=Map.of("kind","INTERVAL","every","1","unit","MINUTES","anchor",anchor,"zoneId","UTC");
+                var wallSave=Map.of("input",wall,"fingerprint",wallCheck.get("fingerprint"),"commandId",UUID.randomUUID().toString(),"historyLimit",10,"schedule",scheduleInput,"scheduleEnabled",true);
+                var wallSaved=http.post().uri("/api/validation:save").header("Authorization","Bearer "+write).contentType(MediaType.APPLICATION_JSON).body(wallSave).retrieve().body(Map.class);
+                assertThat(wallSaved).containsEntry("outcome","APPLIED");
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(25)).pollInterval(Duration.ofMillis(200)).untilAsserted(()->{
+                    var observed=http.get().uri("/api/pipelines/validation_flow/validation-tasks/scheduled_wall/reports").header("Authorization","Bearer "+token).retrieve().body(Map.class);
+                    assertThat(observed).containsEntry("total","1");var completed=(Map<?,?>)((List<?>)observed.get("items")).getFirst();assertThat(completed.get("terminal")).isEqualTo("COMPLETED");
+                });
+                var wallOff=Map.of("pipeline","validation_flow","task","scheduled_wall","taskGeneration",wallSaved.get("taskGeneration"),"expectedRevision","1","command",UUID.randomUUID().toString());
+                assertThat(http.post().uri("/api/validation:schedule-disable").header("Authorization","Bearer "+write).contentType(MediaType.APPLICATION_JSON).body(wallOff).retrieve().body(Map.class))
+                        .containsEntry("outcome","APPLIED");
+                var columns=http.get().uri("/api/pipelines/validation_flow/validation-tasks/validation_columns").header("Authorization","Bearer "+token).retrieve().body(Map.class);
+                var configured=(SourceResource)artifacts.get("validation_input").orElseThrow();var unavailable=new HashMap<>(configured.config());unavailable.put("uri","mongodb://127.0.0.1:1/unavailable?serverSelectionTimeoutMS=10");
+                artifacts.replace(configured.id(),io.tapstate.core.model.canonical.CanonicalHash.of(configured),new SourceResource(configured.id(),configured.metadata(),configured.connector(),unavailable,
+                        configured.mode(),configured.tables(),configured.srs(),configured.execution(),configured.experimental()));
+                var off=Map.of("pipeline","validation_flow","task","validation_columns","taskGeneration",columns.get("taskGeneration"),"expectedRevision","1","command",UUID.randomUUID().toString());
+                assertThat(http.post().uri("/api/validation:schedule-disable").header("Authorization","Bearer "+token).contentType(MediaType.APPLICATION_JSON).body(off)
+                        .<Integer>exchange((request,httpResponse)->httpResponse.getStatusCode().value())).isEqualTo(403);
+                var disabled=http.post().uri("/api/validation:schedule-disable").header("Authorization","Bearer "+write).contentType(MediaType.APPLICATION_JSON).body(off).retrieve().body(Map.class);
+                assertThat(disabled).containsEntry("outcome","APPLIED").containsEntry("receiptRevision","2").containsEntry("scheduleEnabled",false);
+                assertThat(http.post().uri("/api/validation:schedule-disable").header("Authorization","Bearer "+write).contentType(MediaType.APPLICATION_JSON).body(off).retrieve().body(Map.class))
+                        .containsEntry("outcome","DUPLICATE");
+                assertThat(child.getBean(com.hazelcast.core.HazelcastInstance.class).getJet().getJobs()).hasSize(5);
 
             }finally{
                 for(var name:List.of(sourceDb,targetDb,storage.configurationDatabase(),storage.cacheDatabase(),storage.masterDatabase()))observer.getDatabase(name).drop();

@@ -47,6 +47,8 @@ public final class ControlOperations {
             "Read the original validation run without recreating missing execution handles.", CLI_AND_REST);
     public static final Operation VALIDATION_STOP = new Operation("validation.stop", Scope.WRITE, true, null,
             "Stop only the original full validation command without changing its schedule or the Pipeline.", CLI_AND_REST);
+    public static final Operation VALIDATION_SCHEDULE_DISABLE = new Operation("validation.schedule-disable", Scope.WRITE, true, null,
+            "Disable future scheduled validation through the original configuration CAS without querying connectors or stopping an admitted run.", CLI_AND_REST);
     public static final Operation VALIDATION_HISTORY = new Operation("validation.history", Scope.READ, false, null,
             "Read bounded full validation history without creating a run or a missing report.", CLI_AND_REST);
     public static final Operation VALIDATION_REPORT = new Operation("validation.report", Scope.READ, false, null,
@@ -403,7 +405,7 @@ public final class ControlOperations {
     public static final Operation TOKEN_LIST = new Operation("token.list", Scope.ADMIN, false, null, CLI_ONLY);
 
     private static final List<Operation> ALL = List.of(
-            VALIDATION_EVALUATE, VALIDATION_SAVE, VALIDATION_GET, VALIDATION_SCHEDULE_PREVIEW, VALIDATION_START, VALIDATION_PROGRESS, VALIDATION_STOP, VALIDATION_HISTORY, VALIDATION_REPORT, VALIDATION_ROOTS, VALIDATION_ROOT,
+            VALIDATION_EVALUATE, VALIDATION_SAVE, VALIDATION_GET, VALIDATION_SCHEDULE_PREVIEW, VALIDATION_START, VALIDATION_PROGRESS, VALIDATION_STOP, VALIDATION_HISTORY, VALIDATION_REPORT, VALIDATION_ROOTS, VALIDATION_ROOT, VALIDATION_SCHEDULE_DISABLE,
             AI_PROVIDER_GET,
             AI_PROVIDER_REPLACE,
             AI_PROVIDER_DELETE,

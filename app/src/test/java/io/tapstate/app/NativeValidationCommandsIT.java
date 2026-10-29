@@ -45,6 +45,8 @@ class NativeValidationCommandsIT {
                 await(()->router.command(Command.of(Action.STATUS,request,owner)).waiting());
                 assertThat(router.command(Command.of(Action.STATUS,request,owner)).tables()).singleElement().satisfies(table->assertThat(table.phase()).isEqualTo(ValidationRunLifecycle.ReadPhase.PENDING));
                 for(int retry=0;retry<3;retry++)assertThat(router.command(activate).outcome()).isEqualTo(Outcome.ACCEPTED);
+                assertThat(router.command(Command.of(Action.CANCEL_UNUSED,request,owner)).outcome()).isEqualTo(Outcome.ACCEPTED);
+                assertThat(router.command(Command.of(Action.STATUS,request,owner)).waiting()).isTrue();
                 assertThat(prepared).hasValue(0);assertThat(f.member.getJet().getJobs()).isEmpty();
                 var wrong=new Request(request.pipeline(),request.task(),request.taskGeneration(),1,1,"FULL",UUID.randomUUID(),request.run());
                 assertThat(router.command(Command.of(Action.ACTIVATE,wrong,owner)).outcome()).isEqualTo(Outcome.UNKNOWN);
@@ -84,6 +86,29 @@ class NativeValidationCommandsIT {
                 assertThat(router.command(Command.of(Action.ACTIVATE,request,owner)).outcome()).isNotEqualTo(Outcome.ACCEPTED);
                 assertThat(f.tasks.read("flow","task").orElseThrow().full().permission()).isNull();assertThat(f.tasks.read("flow","task").orElseThrow().full().nextStartSequence()).isEqualTo(1);
                 assertThat(f.member.getJet().getJobs()).isEmpty();assertThat(f.resources.snapshot().metadataFrames()).isZero();
+            }
+        }
+    }
+    @Test void cancellingOnlyAnUnusedHandoffCannotStopActivationThatWonItsReservationMonitor()throws Exception{
+        var stopped=new AtomicInteger();
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+                var processors=new ValidationProcessorRegistry(f.member,()->{});var caller=java.util.concurrent.Executors.newSingleThreadExecutor()){
+            NativeValidationFullJob.Factory factory=original->{throw new AssertionError("handoff race creates no Job");};
+            try(var router=new ValidationOwnerRouter(f.member,f.gate,()->WorkloadClaimFence.from(f.node),f.owners::readOwner,f.owners,
+                    new NativeValidationCommands(f.owners,runs,f.member,processors,f.process,factory),()->{},Duration.ofSeconds(5))){
+                var request=f.request("FULL",1);var reserved=router.reserve(request);var owner=owner(reserved);var start=f.owners.original(request,owner);var original=f.owners.take(start);var allocation=original.resources();
+                try{
+                    java.util.concurrent.Future<CommandReply> cancellation;
+                    synchronized(original){
+                        cancellation=caller.submit(()->router.command(Command.of(Action.CANCEL_UNUSED,request,owner)));
+                        var bean=java.lang.management.ManagementFactory.getThreadMXBean();int identity=System.identityHashCode(original);long holding=Thread.currentThread().threadId();
+                        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(2)).pollInterval(Duration.ofMillis(10)).until(()->{
+                            for(var info:bean.dumpAllThreads(false,false))if(info.getThreadState()==Thread.State.BLOCKED&&info.getLockOwnerId()==holding&&info.getLockInfo()!=null&&info.getLockInfo().getIdentityHashCode()==identity)return true;return false;
+                        });
+                        original.activate(stopped::incrementAndGet);
+                    }
+                    cancellation.get(5,java.util.concurrent.TimeUnit.SECONDS);assertThat(stopped).hasValue(0);
+                }finally{original.releaseClosedContextMetadata();allocation.close();allocation.processorsExited();}
             }
         }
     }
