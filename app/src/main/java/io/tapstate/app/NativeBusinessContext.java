@@ -269,6 +269,14 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 ConnectorProvisioner provisioner,Clock clock){
             return new NativeValidationMetadata(owner.configuration,resources,provisioner,clock);
         }
+        @Bean @Lazy io.tapstate.control.core.ValidationConfigurationService validationConfigurationService(NativeBusinessContext owner,
+                io.tapstate.runtime.probe.ValidationEvaluationProbe evaluations,io.tapstate.control.core.AuditGate audit,Clock clock){
+            return new io.tapstate.control.core.ValidationConfigurationService(owner.configuration.clusterId(),
+                    owner.configuration.validationTasks(owner.memberStorage::requireNode),evaluations,new ValidationScheduleCalculator(),audit,clock);
+        }
+        @Bean io.tapstate.runtime.probe.ValidationEvaluationProbe validationEvaluationProbe(NativeValidationMetadata metadata){
+            return new NativeValidationEvaluation(metadata);
+        }
         @Bean(destroyMethod = "close") NativeValidationOwnerReservations nativeValidationOwnerReservations(
                 NativeBusinessContext owner, HazelcastInstance member, NodeSessionLease node, ClusterMembershipGate membership,
                 ValidationMemberResources.Member resources, ValidationMemberResources process, ValidationOwnerTimers timers, ClusterProperties cluster,

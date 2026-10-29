@@ -154,6 +154,66 @@ class NativeValidationMetadataIT {
             }finally{f.raw.getDatabase(sourceDb).drop();f.raw.getDatabase(targetDb).drop();}
         }
     }
+    @Test @Timeout(90) void configurationApiServiceReevaluatesRealPdkAndUsesTheOriginalConfigCas()throws Exception{
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture()){
+            var sourceDb="api_source_"+f.suffix;var targetDb="api_target_"+f.suffix;
+            try{
+                seed(f,sourceDb,targetDb);var clock=Clock.systemUTC();var artifact=NativeValidationPdkCountIT.artifact("mongodb");
+                var evaluations=new NativeValidationEvaluation(new NativeValidationMetadata(f.configuration,f.resources,id->artifact,clock));
+                var audit=new ArrayList<AuditRecord>();var service=new io.tapstate.control.core.ValidationConfigurationService("cluster",f.tasks,evaluations,
+                        new ValidationScheduleCalculator(),new io.tapstate.control.core.AuditGate(audit::add,clock),clock);
+                var generation=UUID.randomUUID().toString();var command=UUID.randomUUID().toString();
+                var input=new io.tapstate.control.core.ValidationConfigurationService.Input("flow","api-count",generation,"0","COUNT",List.of(
+                        new io.tapstate.control.core.ValidationConfigurationService.Choice("orders","out","input","orders")),Map.of());
+                String fingerprint;
+                try(var result=service.evaluate(input)){
+                    fingerprint=result.view().fingerprint();assertThat(fingerprint).isNotBlank();
+                    assertThat(result.view().mappings()).singleElement().satisfies(mapping->{
+                        assertThat(mapping.target().table()).isEqualTo("checked_orders");assertThat(mapping.source().countOperation()).isEqualTo("DOCUMENT_COUNT");
+                        assertThat(mapping.source().fields()).isEmpty();
+                    });assertThat(f.resources.snapshot().metadataFrames()).isOne();
+                }
+                var save=new io.tapstate.control.core.ValidationConfigurationService.Save(input,fingerprint,command,10,null,false);
+                assertThat(service.save("alice",save).outcome()).isEqualTo("APPLIED");assertThat(service.save("alice",save).outcome()).isEqualTo("DUPLICATE");
+                var firstStored=service.read("flow","api-count").orElseThrow();assertThat(firstStored.revision()).isEqualTo("1");
+                var updateInput=new io.tapstate.control.core.ValidationConfigurationService.Input("flow","api-count",generation,"1","COUNT",input.mappings(),Map.of());
+                var update=new io.tapstate.control.core.ValidationConfigurationService.Save(updateInput,fingerprint,UUID.randomUUID().toString(),8,null,false);
+                assertThat(service.save("alice",update).outcome()).isEqualTo("APPLIED");
+                assertThat(service.save("alice",update).outcome()).isEqualTo("DUPLICATE");
+                var stored=service.read("flow","api-count").orElseThrow();assertThat(stored.revision()).isEqualTo("2");assertThat(stored.nextStartSequence()).isEqualTo("1");
+                assertThat(stored.taskGeneration()).isEqualTo(generation);assertThat(stored.mappings().getFirst().keys()).isNull();
+                var existing=(SourceResource)f.configuration.artifacts().get("input").orElseThrow();
+                var config=new HashMap<>(existing.config());config.put("configurationMarker","changed");
+                f.configuration.artifacts().replace("input",CanonicalHash.of(existing),new SourceResource(existing.id(),existing.metadata(),existing.connector(),config,existing.mode(),existing.tables(),existing.srs(),existing.execution(),existing.experimental()));
+                assertThat(service.save("alice",save).outcome()).isEqualTo("CONFLICT");assertThat(service.read("flow","api-count").orElseThrow()).isEqualTo(stored);
+                assertThat(audit).hasSize(5).allSatisfy(record->assertThat(record.operationId()).isEqualTo("validation.save"));
+                var preview=service.preview(new io.tapstate.control.core.ValidationConfigurationService.Schedule("CRON",null,null,null,"*/5 * * * *","Asia/Shanghai"),"9007199254740993");
+                assertThat(preview.inputRevision()).isEqualTo("9007199254740993");assertThat(preview.occurrences()).hasSize(5);
+                assertThat(f.resources.snapshot().metadataFrames()).isZero();assertThat(f.resources.snapshot().data().runs()).isZero();assertThat(f.member.getJet().getJobs()).isEmpty();
+            }finally{f.raw.getDatabase(sourceDb).drop();f.raw.getDatabase(targetDb).drop();}
+        }
+    }
+    @Test @Timeout(90) void closingAnEvaluationReleasesItsProjectionEvenWhenTheClosedHandleIsRetained()throws Exception{
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture()){
+            var sourceDb="lease_source_"+f.suffix;var targetDb="lease_target_"+f.suffix;
+            try{
+                seed(f,sourceDb,targetDb);var artifact=NativeValidationPdkCountIT.artifact("mongodb");var clock=Clock.systemUTC();
+                var evaluator=new NativeValidationEvaluation(new NativeValidationMetadata(f.configuration,f.resources,id->artifact,clock));
+                var held=new ArrayList<io.tapstate.runtime.probe.ValidationEvaluation>();
+                var weak=closedView(evaluator,held,clock);
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).pollInterval(Duration.ofMillis(100)).untilAsserted(()->{System.gc();assertThat(weak.get()).isNull();});
+                assertThat(held).hasSize(1);assertThat(f.resources.snapshot().metadataFrames()).isZero();
+                assertThatThrownBy(held.getFirst()::view).isInstanceOf(io.tapstate.core.common.TapstateException.class);
+                java.lang.ref.Reference.reachabilityFence(held);
+            }finally{f.raw.getDatabase(sourceDb).drop();f.raw.getDatabase(targetDb).drop();}
+        }
+    }
+    private static java.lang.ref.WeakReference<io.tapstate.runtime.probe.ValidationEvaluation.View> closedView(NativeValidationEvaluation evaluator,
+            List<io.tapstate.runtime.probe.ValidationEvaluation> retained,Clock clock){
+        var lease=evaluator.evaluate(new io.tapstate.runtime.probe.ValidationEvaluation.Request(new ValidationTaskStore.Selection("flow",List.of("out")),
+                List.of(new io.tapstate.runtime.probe.ValidationEvaluation.Choice("orders","out","input","orders")),ValidationMethod.COUNT,Map.of(),null,clock.instant().plusSeconds(30)));
+        var weak=new java.lang.ref.WeakReference<>(lease.view());lease.close();retained.add(lease);return weak;
+    }
     private static List<ValidationSelectedDeclarations.Choice> choices(){return List.of(new ValidationSelectedDeclarations.Choice("orders","out","input","orders"),
             new ValidationSelectedDeclarations.Choice("items","out","input","items"));}
     private static void seed(NativeValidationOwnerReservationsIT.Fixture f,String sourceDb,String targetDb){

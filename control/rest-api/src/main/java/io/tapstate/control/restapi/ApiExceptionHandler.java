@@ -54,6 +54,13 @@ class ApiExceptionHandler {
         return ResponseEntity.status(statusFor(e.code())).cacheControl(CacheControl.noStore()).body(body);
     }
 
+    @ExceptionHandler(io.tapstate.control.core.ValidationConfigurationService.StaleDefinition.class)
+    ResponseEntity<ApiError> handleValidationConflict(io.tapstate.control.core.ValidationConfigurationService.StaleDefinition failure){
+        MessageCatalog.Rendered rendered=catalog.render(failure.code(),failure.args());
+        return ResponseEntity.status(HttpStatus.CONFLICT).cacheControl(CacheControl.noStore())
+                .body(new ApiError(failure.code().code(),new TreeMap<>(failure.args()),rendered.message()));
+    }
+
     /**
      * A start that did not go ahead answers with the coded error a client already knows how to read, and
      * beside it what the start checks said and what the start had already changed in the definition.

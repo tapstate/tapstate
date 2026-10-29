@@ -401,38 +401,20 @@ class RingDependencyRulesTest {
     }
 
     @Test
-    @DisplayName("R5 (exactness): the control-to-runtime sync whitelist is exactly the seven named probes "
-            + "— no further channel")
+    @DisplayName("R5 (exactness): the control-to-runtime sync whitelist is exactly eleven named probes")
     void r5_controlToRuntimeSyncWhitelistHasNoFurtherChannel() {
-        // A control-to-runtime sync channel is a runtime interface control reaches for. The whitelist is
-        // a closed set of exactly seven such interfaces: connection test, schema discovery, the four
-        // data-browser channels, and finite Pipeline preview. The probes' value types are storage-port
-        // types (the connection config or query request they take, the result they return), carried as
-        // payload, not channels of their own. This gate bans a further channel — another probe interface
-        // control depends on. Widening the whitelist must change this gate and the sync-whitelist
-        // decision, not slip in beside it (an eighth probe interface control reaches for turns this red).
-        //
-        // The set is spelled out here because the decision is what the names encode; the four query
-        // channels are named ahead of the code that implements them, so until then this gate is green
-        // without proving anything. What it does from the first day is refuse an eighth.
-        DescribedPredicate<JavaClass> aRuntimeSyncChannelOutsideTheWhitelist =
-                resideInAPackage("io.tapstate.runtime.probe..")
-                        .and(DescribedPredicate.describe("interfaces", JavaClass::isInterface))
-                        .and(DescribedPredicate.not(name("io.tapstate.runtime.probe.ConnectionProbe")))
-                        .and(DescribedPredicate.not(name("io.tapstate.runtime.probe.SchemaDiscoveryProbe")))
-                        .and(DescribedPredicate.not(name("io.tapstate.runtime.probe.DataBrowserCollectionsProbe")))
-                        .and(DescribedPredicate.not(name("io.tapstate.runtime.probe.DataBrowserFindProbe")))
-                        .and(DescribedPredicate.not(name("io.tapstate.runtime.probe.DataBrowserStatsProbe")))
-                        .and(DescribedPredicate.not(name("io.tapstate.runtime.probe.DataBrowserTailProbe")))
-                        .and(DescribedPredicate.not(name("io.tapstate.runtime.probe.PipelinePreviewProbe")))
-                        .as("a control-to-runtime sync channel outside the whitelist");
+        // Payload records and admitted leases are not additional runtime operations.
+        DescribedPredicate<JavaClass> outside = resideInAPackage("io.tapstate.runtime.probe..")
+                .and(DescribedPredicate.describe("interfaces", JavaClass::isInterface));
+        for (String probe : java.util.List.of("ConnectionProbe", "SchemaDiscoveryProbe", "DataBrowserCollectionsProbe",
+                "DataBrowserFindProbe", "DataBrowserStatsProbe", "DataBrowserTailProbe", "PipelinePreviewProbe",
+                "ValidationEvaluationProbe", "ValidationStartProbe", "ValidationProgressProbe", "ValidationStopProbe")) {
+            outside = outside.and(DescribedPredicate.not(name("io.tapstate.runtime.probe." + probe)));
+        }
         noClasses().that().resideInAPackage("io.tapstate.control..")
-                .should().dependOnClassesThat(aRuntimeSyncChannelOutsideTheWhitelist)
+                .should().dependOnClassesThat(outside.as("a runtime sync channel outside the closed whitelist"))
                 .allowEmptyShould(true)
-                .because("the control-to-runtime sync whitelist is a closed set of exactly seven members "
-                        + "— connection, discovery, four data-browser, and Pipeline preview probes; "
-                        + "a further synchronous channel must change this gate and the sync-whitelist "
-                        + "decision, not slip in beside it")
+                .because("exactly eleven named, single-operation channels are admitted")
                 .check(tapstateClasses);
     }
 

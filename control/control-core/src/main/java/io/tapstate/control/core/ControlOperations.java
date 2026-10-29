@@ -37,6 +37,15 @@ public final class ControlOperations {
     public static final Operation PIPELINE_DRAFT_ASSISTANT = new Operation("pipeline-draft.assistant", Scope.WRITE, false, null, "Stream a validated Pipeline Builder proposal without saving it.", CLI_AND_REST);
     public static final Operation PIPELINE_DRAFT_ASSISTANT_VALIDATE = new Operation("pipeline-draft.assistant-validate", Scope.READ, false, null, "Validate a Pipeline Builder proposal against the current draft revision.", CLI_AND_REST);
 
+    public static final Operation VALIDATION_EVALUATE = new Operation("validation.evaluate", Scope.WRITE, false, null,
+            "Evaluate direct full validation choices through independent connector metadata without saving or starting.", CLI_AND_REST);
+    public static final Operation VALIDATION_SAVE = new Operation("validation.save", Scope.WRITE, true, null,
+            "Reevaluate and save a direct full validation definition using the expected fingerprint and task revision.", CLI_AND_REST);
+    public static final Operation VALIDATION_GET = new Operation("validation.get", Scope.READ, false, null,
+            "Read one saved full validation definition without allocating execution state.", CLI_AND_REST);
+    public static final Operation VALIDATION_SCHEDULE_PREVIEW = new Operation("validation.schedule-preview", Scope.READ, false, null,
+            "Preview five future full validation occurrences in the selected time zone.", CLI_AND_REST);
+
     // system domain
     public static final Operation SYSTEM_VERSION = new Operation(
             "system.version", Scope.READ, false, ControlApiSchema.ref("system.version"),
@@ -380,6 +389,7 @@ public final class ControlOperations {
     public static final Operation TOKEN_LIST = new Operation("token.list", Scope.ADMIN, false, null, CLI_ONLY);
 
     private static final List<Operation> ALL = List.of(
+            VALIDATION_EVALUATE, VALIDATION_SAVE, VALIDATION_GET, VALIDATION_SCHEDULE_PREVIEW,
             AI_PROVIDER_GET,
             AI_PROVIDER_REPLACE,
             AI_PROVIDER_DELETE,
