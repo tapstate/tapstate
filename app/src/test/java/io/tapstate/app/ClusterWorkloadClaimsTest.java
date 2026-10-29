@@ -49,7 +49,7 @@ class ClusterWorkloadClaimsTest {
 
     @Test
     void preJoinNodeSessionDoesNotDependOnAMembershipThatCannotExistYet() {
-        ClusterMembershipGate gate = productionGate();
+        ClusterMembershipGate gate = unboundProductionGate();
         RecordingClaims raw = new RecordingClaims();
         ClusterWorkloadClaims claims = new ClusterWorkloadClaims(raw, gate);
         WorkloadClaimKey key =
@@ -163,6 +163,12 @@ class ClusterWorkloadClaimsTest {
     }
 
     private static ClusterMembershipGate productionGate() {
+        var gate = unboundProductionGate();
+        gate.observeNodeSession(() -> true);
+        return gate;
+    }
+
+    private static ClusterMembershipGate unboundProductionGate() {
         ClusterProperties properties = new ClusterProperties();
         properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
         return new ClusterMembershipGate(properties);

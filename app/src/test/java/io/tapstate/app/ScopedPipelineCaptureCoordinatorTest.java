@@ -93,7 +93,7 @@ class ScopedPipelineCaptureCoordinatorTest {
     @Test void anAbsentLocalOwnerDoesNotProveItsExactCaptureTenureEnded() {
         try(var f=new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
             var properties=new ClusterProperties();properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
-            var gate=new ClusterMembershipGate(properties);gate.install(new ClusterMembership("cluster",1,Set.of("node","node-b","node-c")));
+            var gate=new ClusterMembershipGate(properties);gate.observeNodeSession(() -> true);gate.install(new ClusterMembership("cluster",1,Set.of("node","node-b","node-c")));
             gate.canCommit(Set.of("node","node-b"));var raw=new InMemoryWorkloadClaimStore();
             var ownership=new CaptureOwnership("cluster",OWNER,gate,new ClusterWorkloadClaims(raw,gate),Duration.ofSeconds(60));
             var permit=ownership.acquire(new CaptureId("mck-key"));

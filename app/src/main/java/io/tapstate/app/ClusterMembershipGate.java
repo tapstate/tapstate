@@ -33,7 +33,7 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
     /** A publication changes the revision even when the visible members have not changed. */
     record VisibleSnapshot(long revision, Set<String> nodeIds, boolean originalSingleVisible) {}
     private volatile WorkloadOwner singleOwner;
-    private final AtomicReference<BooleanSupplier> nodeSession = new AtomicReference<>(() -> true);
+    private final AtomicReference<BooleanSupplier> nodeSession = new AtomicReference<>(() -> false);
 
     /** A fixed deployment predicate, not a persisted majority decision or recovery epoch. */
     void bindSingle(WorkloadClaim original) {

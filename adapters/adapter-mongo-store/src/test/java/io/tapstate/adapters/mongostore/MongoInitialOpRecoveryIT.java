@@ -98,7 +98,16 @@ class MongoInitialOpRecoveryIT {
             var invocation = f.configuration.startInitialOpRecovery(commands.confirm(f.plan(null)), () -> {});
             f.configuration.prepareInitialOpRecovery(f.cache, invocation, () -> {});
             try (var ready = MongoConfigurationDomain.openExisting(f.settings); var raw = MongoClients.create(MONGO.getReplicaSetUrl())) {
-                assertThat(ready.schemaVersion()).isEqualTo(2);
+                assertThat(ready.schemaVersion()).isEqualTo(3);
+                var configDb = raw.getDatabase(f.configName);
+                MongoConfigurationAiProviderSettingsStore.verifyStructure(configDb);
+                MongoValidationSchema.requireReady(configDb, true);
+                var marker = MongoValidationSchema.requireConfiguration(
+                        SystemCollections.SCHEMA_MIGRATIONS.on(configDb).find(new Document("_id", "config")).first(), "READY");
+                assertThat(marker.getString("phase")).isEqualTo("READY");
+                assertThat(marker.getString("operationId")).isEqualTo(invocation.plan().operationId());
+                assertThat(marker.getLong("initializedPipelines")).isZero();
+                assertThat(MongoValidationSchema.scope(marker)).isEqualTo(f.binding.preparation().businessScope());
                 assertThat(raw.getDatabase(f.cacheName).getCollection("schema_migrations").find(new Document("_id", "business")).first().getInteger("installedVersion"))
                         .isEqualTo(2);
                 assertThat(raw.getDatabase(f.cacheName).listCollectionNames()).contains("validation_runs");
@@ -147,6 +156,24 @@ class MongoInitialOpRecoveryIT {
             assertThat(raw.getDatabase(f.cacheName).listCollectionNames()).doesNotContain("validation_runs");
             raw.getDatabase(f.configName).getCollection("schema_migrations").deleteOne(new Document("_id", "config"));
             assertThatThrownBy(() -> f.configuration.prepareInitialOpRecovery(f.cache, retained, () -> {})).isInstanceOf(TapstateException.class);
+        }
+    }
+
+    @Test void completedInitialRecoveryNeverRecreatesMissingAiConfiguration() {
+        try (var f = new Fixture(); var raw = MongoClients.create(MONGO.getReplicaSetUrl())) {
+            var commands = f.configuration.recoveryCommands();
+            var invocation = f.configuration.startInitialOpRecovery(commands.confirm(f.plan(null)), () -> {});
+            f.configuration.prepareInitialOpRecovery(f.cache, invocation, () -> {});
+            var retained = f.configuration.startInitialOpRecovery(commands.complete(invocation.plan()), () -> {});
+            var configDb = raw.getDatabase(f.configName);
+            var key = new Document("_id", "config");
+            var original = SystemCollections.SCHEMA_MIGRATIONS.on(configDb).find(key).first();
+            SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(configDb).drop();
+            assertThatThrownBy(() -> f.configuration.prepareInitialOpRecovery(f.cache, retained, () -> {}))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(configDb.listCollectionNames()).doesNotContain(SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.collectionName());
+            assertThat(SystemCollections.SCHEMA_MIGRATIONS.on(configDb).find(key).first()).isEqualTo(original);
+            assertThat(raw.getDatabase(f.cacheName).listCollectionNames()).contains("validation_runs");
         }
     }
 

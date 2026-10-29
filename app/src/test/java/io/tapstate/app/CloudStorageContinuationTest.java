@@ -46,6 +46,11 @@ class CloudStorageContinuationTest {
             when(configuration.bindings()).thenReturn(bindings); when(configuration.setupStates()).thenReturn(states);
             when(configuration.recoveryCommands()).thenReturn(mock(StorageRecoveryCommands.class));
             when(configuration.databaseName()).thenReturn("config");
+            when(configuration.prepareInitialValidationSchema(eq(PREPARATION), same(cache), any()))
+                    .thenAnswer(invocation -> {
+                        invocation.<Runnable>getArgument(2).run();
+                        return new MongoConfigurationDomain.ValidationSchemaStatus("original-validation", true, 0);
+                    });
             when(bindings.load()).thenReturn(Optional.of(CONNECTION)); when(bindings.cachePreparation()).thenReturn(Optional.of(PREPARATION));
             when(bindings.guardedBy(any())).thenReturn(bindings);
             when(states.load()).thenAnswer(ignored -> new StorageSetupStateStore.Status(SETUP, phase.get(), 1));
@@ -152,12 +157,13 @@ class CloudStorageContinuationTest {
             assertThat(f.root.runtime().businessStarted()).isTrue();
             assertThatThrownBy(temporary.requireActive()::run).isInstanceOf(TapstateException.class);
             assertThatCode(f.root.managedAuthentication().requireActive()::run).doesNotThrowAnyException();
-            var order = inOrder(f.target, f.cache, f.bindings, business);
+            var order = inOrder(f.target, f.cache, f.configuration, f.bindings, business);
             order.verify(f.target).test(new StorageBinding.Connection(StorageBinding.Connection.Kind.ATLAS,
                     "mongodb://target/master?tls=true", "master", "saved-master-ca"), SOURCE,
                     new StorageSetupService.ConnectorIdentity("a".repeat(64), "b".repeat(64)));
             order.verify(f.cache).prepareFirstAuth(f.grant);
-            order.verify(f.cache).prepareInitialBusiness(eq(PREPARATION), any());
+            order.verify(f.configuration).prepareInitialValidationSchema(eq(PREPARATION), same(f.cache), any());
+            order.verify(f.cache).verifyBusinessReady(PREPARATION.businessScope());
             order.verify(f.bindings).complete(SETUP); order.verify(business).start();
             verify(business, times(1)).start(); verify(f.cache, times(1)).prepareFirstAuth(f.grant);
             verify(f.cache, never()).close();
@@ -172,6 +178,32 @@ class CloudStorageContinuationTest {
             verify(f.cache, never()).prepareFirstAuth(any()); verify(f.bindings, never()).complete(any());
             assertThat(f.root.runtime().business()).isEmpty();
             f.continueWith(business); verify(f.cache, times(1)).prepareFirstAuth(f.grant);
+        }
+    }
+
+    @Test void failedComposedPreparationNeverCompletesSetupOrStartsBusiness() {
+        try (var f = new Fixture()) {
+            var business = f.business();
+            when(f.configuration.prepareInitialValidationSchema(eq(PREPARATION), same(f.cache), any()))
+                    .thenThrow(StorageRuntime.unavailable());
+            assertThatThrownBy(() -> f.continueWith(business)).isInstanceOf(TapstateException.class);
+            assertThat(f.phase.get()).isEqualTo(StorageSetupStateStore.Phase.STORAGE_BOUND);
+            verify(f.bindings, never()).complete(any());
+            verify(business, never()).start();
+            verify(f.cache, never()).prepareInitialBusiness(any(), any());
+        }
+    }
+
+    @Test void failedBusinessReadinessAfterCompositionNeverCompletesSetupOrStartsBusiness() {
+        try (var f = new Fixture()) {
+            var business = f.business();
+            doThrow(StorageRuntime.unavailable()).when(f.cache)
+                    .verifyBusinessReady(PREPARATION.businessScope());
+            assertThatThrownBy(() -> f.continueWith(business)).isInstanceOf(TapstateException.class);
+            verify(f.configuration).prepareInitialValidationSchema(eq(PREPARATION), same(f.cache), any());
+            assertThat(f.phase.get()).isEqualTo(StorageSetupStateStore.Phase.STORAGE_BOUND);
+            verify(f.bindings, never()).complete(any());
+            verify(business, never()).start();
         }
     }
 
@@ -204,7 +236,8 @@ class CloudStorageContinuationTest {
             assertThatCode(f.root.managedAuthentication().requireActive()::run).doesNotThrowAnyException();
             var successor = f.business(); f.continueWith(successor);
             verify(failed, times(1)).close(); verify(f.cache, never()).close();
-            verify(f.cache, times(1)).prepareInitialBusiness(eq(PREPARATION), any());
+            verify(f.configuration, atLeastOnce()).prepareInitialValidationSchema(eq(PREPARATION), same(f.cache), any());
+            verify(f.cache, never()).prepareInitialBusiness(any(), any());
             verify(f.target, times(1)).test(any(), any(), any()); verify(successor).start();
         }
     }
