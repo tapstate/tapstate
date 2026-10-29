@@ -3462,7 +3462,8 @@
         "core/core-alerting/src/test/java/io/tapstate/core/alerting/AlertReceiverTest.java",
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertReceiverSecretsTest.java",
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertReceiverStoreIT.java",
-        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertCoordinatorIT.java"
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertCoordinatorIT.java",
+        "app/src/test/java/io/tapstate/app/AlertHttpsJsonExtensionIT.java"
       ]
     },
     {
@@ -3689,7 +3690,8 @@
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertDeliveryStoreIT.java",
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertCoordinatorIT.java",
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertCandidateSecretsTest.java",
-        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertTestAuthorityTest.java"
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAlertTestAuthorityTest.java",
+        "app/src/test/java/io/tapstate/app/AlertHttpsJsonExtensionIT.java"
       ]
     },
     {
