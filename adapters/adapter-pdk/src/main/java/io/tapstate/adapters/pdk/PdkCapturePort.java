@@ -25,8 +25,6 @@ import io.tapdata.entity.event.TapBaseEvent;
 import io.tapdata.entity.event.TapEvent;
 import io.tapdata.entity.event.control.ControlEvent;
 import io.tapdata.entity.schema.TapTable;
-import io.tapdata.entity.utils.InstanceFactory;
-import io.tapdata.entity.utils.JsonParser;
 import io.tapdata.entity.utils.cache.Entry;
 import io.tapdata.entity.utils.cache.Iterator;
 import io.tapdata.entity.utils.cache.KVReadOnlyMap;
@@ -1215,9 +1213,9 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
 
     private static Object readerOffset(PdkConnector connector, Object startOffset, boolean resumed) {
         Object reader = MysqlResumeOffset.forReader(connector.connectorId(), startOffset,
-                connector.context().getStateMap(), () -> InstanceFactory.instance(JsonParser.class));
+                connector.context().getStateMap(), PdkJsonProvider::parser);
         return resumed ? PostgresResumeOffset.forReader(connector.connectorId(), reader,
-                () -> InstanceFactory.instance(JsonParser.class)) : reader;
+                PdkJsonProvider::parser) : reader;
     }
 
     /**
@@ -1472,7 +1470,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
         // A snapshot renders its seam after the read's loader scope has ended. The
         // connector's native JSON service must still resolve under that same loader.
         Object represented = read(connector, () -> SqlServerOffset.forStorage(
-                connector.connectorId(), offset, () -> InstanceFactory.instance(JsonParser.class)));
+                connector.connectorId(), offset, PdkJsonProvider::parser));
         return Optional.of(new SourcePosition(
                 ConnectorOffsetCodec.toToken(connector.connectorId(), represented)));
     }

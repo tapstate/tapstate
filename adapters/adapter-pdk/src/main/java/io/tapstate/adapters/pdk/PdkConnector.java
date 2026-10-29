@@ -201,8 +201,9 @@ final class PdkConnector implements AutoCloseable {
 
         ConnectorClassLoader loader;
         try {
+            PdkJsonProvider.prepareRuntime();
             loader = ConnectorClassLoader.shared(ref.classpath());
-        } catch (RuntimeException e) {
+        } catch (RuntimeException | LinkageError e) {
             throw loadFailed(connectorId, e);
         }
         boolean opened = false;
