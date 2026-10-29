@@ -16,6 +16,14 @@ class AlertConfigurationTest {
     private static final AlarmKey.Scope SCOPE = new AlarmKey.Scope("organization", "cluster");
     private static final Instant AT = Instant.parse("2026-10-27T00:00:00.123456789Z");
     private static final AlarmKey.Resource SOURCE = new AlarmKey.Resource("source", "orders", "source-lifetime-1");
+    @Test void anEventWithoutRecoveryCannotBeAuthoredAsAStatefulRule(){
+        var descriptor=new AlarmTypeCatalog.Type("test.one-shot",1,AlarmTypeCatalog.Kind.EVENT,Set.of("source"),"test.events","event",List.of(),
+                AlarmSeverity.WARNING,false,"test.event.condition",null,"test.event.guidance");
+        var catalog=new AlarmTypeCatalog(List.of(descriptor));
+        var eventRule=new Rule(header(Kind.RULE,"event-rule"),"One-shot",descriptor.id(),1,sources(),Map.of(),null,true,null);
+        assertThatThrownBy(()->eventRule.validated(catalog)).isInstanceOfSatisfying(TapstateException.class,
+                error->assertThat(error.code()).isEqualTo(AlertError.INVALID_CONFIGURATION));
+    }
 
     @Test void editingAndRetirementKeepCreationIdentityAndCannotReopenAnOldObject() {
         Header first = header(Kind.RULE, "rule");

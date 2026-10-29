@@ -150,6 +150,10 @@ class ChannelContractTest {
         assertThat(ChannelFailureClassifier.smtp(Phase.FINAL_RESPONSE, 250).orElseThrow().outcome()).isEqualTo(Outcome.ACCEPTED);
         assertThat(ChannelFailureClassifier.smtp(Phase.FINAL_RESPONSE, 451).orElseThrow().action()).isEqualTo(Action.RETRY);
         assertThat(ChannelFailureClassifier.smtp(Phase.AUTHENTICATION, 535).orElseThrow().action()).isEqualTo(Action.STOP);
+        var busy=ChannelFailureClassifier.smtp(Phase.CONNECT,421).orElseThrow();
+        assertThat(busy.outcome()).isEqualTo(Outcome.NOT_ACCEPTED);assertThat(busy.action()).isEqualTo(Action.RETRY);
+        var rejected=ChannelFailureClassifier.smtp(Phase.ENVELOPE,550).orElseThrow();
+        assertThat(rejected.outcome()).isEqualTo(Outcome.NOT_ACCEPTED);assertThat(rejected.action()).isEqualTo(Action.STOP);
         for (int status : new int[]{200, 202}) { assertThat(ChannelFailureClassifier.http(status, null).outcome()).isEqualTo(Outcome.ACCEPTED); }
         for (int status : new int[]{408, 429, 500, 503}) { assertThat(ChannelFailureClassifier.http(status, T).action()).isEqualTo(Action.RETRY); }
         for (int status : new int[]{302, 400, 401, 403, 409, 501, 505}) { assertThat(ChannelFailureClassifier.http(status, null).action()).isEqualTo(Action.STOP); }

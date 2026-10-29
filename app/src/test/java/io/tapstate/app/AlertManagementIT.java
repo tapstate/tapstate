@@ -23,6 +23,22 @@ class AlertManagementIT {
     }
     static Map<String,Object> call(AlertManagement s,String op,Map<String,Object> input){return s.dispatch("alert."+op,caller(Scope.ADMIN,ACTIVE),input);}
     static Map<String,Object> email(){return map("name","SMTP","enabled",true,"transport",map("channelType","email","host","smtp.example.test","port",465,"encryption","IMPLICIT_TLS","authentication","PLAIN","username","operator","from","alerts@example.test","recipients",List.of("a@example.test"),"trust","SYSTEM"),"secret","private-test-password");}
+    @Test void catalogKeepsOneShotKindVisibleAndStatefulAuthoringRejectsItWithoutAcceptingAFault(){
+        AlertEvaluationHostIT.withFixture(f->{
+            var types=new ArrayList<>(BuiltinAlarmTypes.catalog().types());types.add(new AlarmTypeCatalog.Type("test.one-shot",1,AlarmTypeCatalog.Kind.EVENT,Set.of("pipeline"),"test.events","event",List.of(),
+                    AlarmSeverity.WARNING,false,"test.event.condition",null,"test.event.guidance"));var catalog=new AlarmTypeCatalog(types);
+            var texts=io.tapstate.adapters.alerting.AlarmTypeText.english().with(Map.of("test.event.condition","A bounded one-shot event","test.event.guidance","No stateful recovery is declared"));
+            var evaluator=new AlertEvaluationHost(f.store(),catalog,f.storeHost().deployment(),f.clock(),"event-contract",ACTIVE);
+            var service=new AlertManagement(()->new PipelineAlertRuntime.Services(f.store(),evaluator,catalog,null,null,Set.of("test.events"),texts),c->access(),
+                    ()->new PipelineAlertRuntime.Health(false,false,0,null,Map.of(),0,0),f.storeHost().scope(),f.storeHost().deployment(),f.clock(),new AuditGate(r->{},f.clock()));
+            var event=((List<?>)call(service,"catalog",Map.of()).get("types")).stream().map(AlertHttpModel::object).filter(type->type.get("id").equals("test.one-shot")).findFirst().orElseThrow();
+            assertThat(event).containsEntry("kind","EVENT").containsEntry("recovery",null);
+            var form=map("name","Not a stateful fault","typeId","test.one-shot","resourceKinds",List.of("pipeline"),"allResources",true,"resources",List.of(),"parameters",Map.of());
+            assertThatThrownBy(()->call(service,"rule-preview",map("form",form,"sample","BAD"))).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(()->call(service,"configuration.save",map("kind","RULE","id","event-rule","etag","0","form",form))).isInstanceOf(TapstateException.class);
+            assertThat(f.store().definition(AlertConfiguration.Kind.RULE,"event-rule",access())).isEmpty();assertThat(f.store().active(null,10,f.reads()).total()).isZero();assertThat(intents(f)).isEmpty();
+        });
+    }
     @Test void everyBuiltinSeverityAndAuthorizedOverrideUsesTheCatalogInBothDeployments(){
         var expected=Map.of("pipeline.failed","MAJOR","pipeline.observation-stale","WARNING","source.connection-failed","MAJOR",
                 "cluster.node-unavailable","MAJOR","cluster.storage-unavailable","CRITICAL");

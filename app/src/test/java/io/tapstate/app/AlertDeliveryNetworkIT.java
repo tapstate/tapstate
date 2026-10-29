@@ -114,9 +114,67 @@ class AlertDeliveryNetworkIT {
             }finally{worker.close();}
         });}
     }
+    @Test void rejectedRecipientDoesNotResendTheIndependentlyAcceptedRecipient()throws Exception{
+        try(var smtp=new SmtpPeer(true)){smtp.rejectedRecipient="a@example.test";
+            AlertEvaluationHostIT.withFixture(f->{route(f,Duration.ZERO);
+                var email=new AlertReceiver.Email("localhost",smtp.port(),AlertReceiver.Encryption.IMPLICIT_TLS,AlertReceiver.Authentication.NONE,null,"alerts@example.test",List.of("a@example.test","b@example.test"),AlertReceiver.Trust.PRIVATE_CA);
+                receiver(f,email,null);var planner=planner(f,"independent-targets");f.evaluator().withPlanner(planner);bad(f);planner.tick();var store=sendingStore(f);
+                try(var worker=new AlertDeliveryRuntime(store,f.clock(),"independent-smtp",ACTIVE,channels(f,new AtomicInteger()),a->access())){worker.tick();AlertDeliveryRuntimeIT.settled(worker);worker.tick();AlertDeliveryRuntimeIT.settled(worker);}
+                var deliveries=store.deliveries(null,10,null,null,f.reads()).rows();assertThat(deliveries).hasSize(2);
+                var refused=deliveries.stream().filter(row->row.value().frozen().identity().targetId().equals("a@example.test")).findFirst().orElseThrow().value();
+                var accepted=deliveries.stream().filter(row->row.value().frozen().identity().targetId().equals("b@example.test")).findFirst().orElseThrow().value();
+                assertThat(refused.state().summary()).isEqualTo(DeliveryEvidence.Outcome.NOT_ACCEPTED);assertThat(refused.state().attempts().getFirst().protocol().status()).isEqualTo(550);
+                assertThat(accepted.state().summary()).isEqualTo(DeliveryEvidence.Outcome.ACCEPTED);assertThat(accepted.state().attemptsConsumed()).isOne();
+                assertThat(smtp.bodies).hasSize(1);assertThat(smtp.recipients).hasSize(2);
+                f.now().set(T.plusSeconds(4000));try(var worker=new AlertDeliveryRuntime(store,f.clock(),"later-independent-smtp",ACTIVE,channels(f,new AtomicInteger()),a->access())){worker.tick();AlertDeliveryRuntimeIT.settled(worker);}
+                assertThat(smtp.bodies).hasSize(1);assertThat(smtp.recipients).hasSize(2);
+            });
+        }
+    }
+    @Test void routeEditsAndConfigReopenKeepActualRetryMimeAndMessageIdWhileTheNextRoundUsesNewSettings()throws Exception{
+        try(var smtp=new SmtpPeer(true)){smtp.dropFinal=true;
+            AlertEvaluationHostIT.withFixture(f->{var route=route(f,Duration.ZERO);
+                var email=new AlertReceiver.Email("localhost",smtp.port(),AlertReceiver.Encryption.IMPLICIT_TLS,AlertReceiver.Authentication.NONE,null,"alerts@example.test",List.of("a@example.test"),AlertReceiver.Trust.PRIVATE_CA);
+                receiver(f,email,null);var channel=route.channels().getFirst();
+                var old=route.edit(route.name(),route.match(),true,List.of(new AlertConfiguration.RouteChannel("email",channel.receivers(),new MessageSettings("[original] ","","",""))),route.groupBy(),route.grouping(),route.inhibition(),T,"operator");
+                f.store().saveDefinition(route,old,access());var planner=planner(f,"snapshot-planner");f.evaluator().withPlanner(planner);bad(f);planner.tick();
+                var store=sendingStore(f);var identity=intents(f).getFirst().value().frozen().identity();
+                try(var worker=new AlertDeliveryRuntime(store,f.clock(),"lost-smtp-receipt",ACTIVE,channels(f,new AtomicInteger()),a->access())){worker.tick();AlertDeliveryRuntimeIT.settled(worker);}
+                var original=store.intent(identity,null).orElseThrow().value();assertThat(original.state().summary()).isEqualTo(DeliveryEvidence.Outcome.UNKNOWN);
+                assertThat(smtp.bodies).hasSize(1);var firstBody=smtp.bodies.getFirst();var retryAt=original.state().nextAttemptAt();assertThat(retryAt).isNotNull();
+                assertThat(subject(firstBody)).startsWith("[original] ");
+                var edited=old.edit(old.name(),old.match(),true,List.of(new AlertConfiguration.RouteChannel("email",channel.receivers(),new MessageSettings("[updated] ","","",""))),old.groupBy(),old.grouping(),old.inhibition(),T.plusSeconds(1),"operator");
+                f.now().set(T.plusSeconds(1));store.saveDefinition(old,edited,access());smtp.dropFinal=false;
+                try(var reopened=io.tapstate.adapters.mongostore.MongoConfigurationDomain.open(f.settings(),f.storeHost().scope().clusterId())){
+                    var view=reopened.alerts(f.storeHost().withChannels(AlertChannels.capabilities(f.storeHost().deployment(),null)),BuiltinAlarmTypes.catalog(),f.clock());
+                    f.now().set(retryAt.minusNanos(1));try(var worker=new AlertDeliveryRuntime(view,f.clock(),"early-smtp-reopen",ACTIVE,channels(f,new AtomicInteger()),a->access())){worker.tick();AlertDeliveryRuntimeIT.settled(worker);}
+                    assertThat(smtp.bodies).hasSize(1);f.now().set(retryAt);
+                    try(var worker=new AlertDeliveryRuntime(view,f.clock(),"snapshot-smtp-reopen",ACTIVE,channels(f,new AtomicInteger()),a->access())){worker.tick();AlertDeliveryRuntimeIT.settled(worker);}
+                    assertThat(smtp.bodies).hasSize(2);assertThat(smtp.bodies.get(1)).isEqualTo(firstBody);
+                    assertThat(subject(smtp.bodies.get(1))).startsWith("[original] ");
+                    var accepted=view.intent(identity,null).orElseThrow().value();assertThat(accepted.frozen()).isEqualTo(original.frozen());assertThat(accepted.state().summary()).isEqualTo(DeliveryEvidence.Outcome.ACCEPTED);
+                }
+                planner.tick();f.now().set(retryAt.plus(Duration.ofHours(1)));planner.tick();
+                var next=store.dueIntents(f.clock().instant(),null,10).rows().stream().filter(row->!row.value().frozen().identity().equals(identity)).findFirst().orElseThrow().value();
+                assertThat(next.frozen().content().template().settings().titlePrefix()).isEqualTo("[updated] ");
+                try(var worker=new AlertDeliveryRuntime(store,f.clock(),"new-round-smtp",ACTIVE,channels(f,new AtomicInteger()),a->access())){worker.tick();AlertDeliveryRuntimeIT.settled(worker);}
+                assertThat(smtp.bodies).hasSize(3);assertThat(smtp.bodies.getLast()).isNotEqualTo(firstBody);
+                assertThat(subject(smtp.bodies.getLast())).startsWith("[updated] ").doesNotContain("[original] ");
+                assertThat(messageId(smtp.bodies.getLast())).isNotEqualTo(messageId(firstBody));
+            });
+        }
+    }
+    private static String messageId(String mime){return mime.lines().filter(line->line.startsWith("Message-ID:")).findFirst().orElseThrow();}
+    private static String subject(String mime){
+        int start=mime.indexOf("Subject: "),end=mime.indexOf("\r\nMIME-Version:",start);assertThat(start).isNotNegative();assertThat(end).isGreaterThan(start);
+        var words=java.util.regex.Pattern.compile("=\\?UTF-8\\?B\\?([^?]+)\\?=").matcher(mime.substring(start,end));var text=new StringBuilder();
+        while(words.find())text.append(new String(Base64.getDecoder().decode(words.group(1)),StandardCharsets.UTF_8));
+        assertThat(text).isNotEmpty();return text.toString();
+    }
     static long channelThreads(){return Thread.getAllStackTraces().keySet().stream().filter(Thread::isAlive).filter(t->t.getName().startsWith("alert-delivery")||t.getName().startsWith("alert-dns")||t.getName().startsWith("tapstate-alert-smtp")).count();}
     static final class SmtpPeer implements AutoCloseable {
-        final java.net.ServerSocket server;final ExecutorService executor=Executors.newFixedThreadPool(2);final List<String> bodies=new CopyOnWriteArrayList<>();final AtomicInteger active=new AtomicInteger();final boolean implicit,stallFinal;
+        final java.net.ServerSocket server;final ExecutorService executor=Executors.newFixedThreadPool(2);final List<String> bodies=new CopyOnWriteArrayList<>(),recipients=new CopyOnWriteArrayList<>();final AtomicInteger active=new AtomicInteger();final boolean implicit,stallFinal;
+        volatile boolean dropFinal;volatile String rejectedRecipient;
         SmtpPeer(boolean implicit)throws Exception{this(implicit,false);}
         SmtpPeer(boolean implicit,boolean stallFinal)throws Exception{this.implicit=implicit;this.stallFinal=stallFinal;server=implicit?serverTls.getServerSocketFactory().createServerSocket(0,2,InetAddress.getLoopbackAddress()):new java.net.ServerSocket(0,2,InetAddress.getLoopbackAddress());executor.submit(()->{while(!server.isClosed())try{var socket=server.accept();executor.submit(()->serve(socket));}catch(java.io.IOException closed){break;}});}
         int port(){return server.getLocalPort();}
@@ -124,8 +182,9 @@ class AlertDeliveryNetworkIT {
             while(true){String line=line(input);if(line==null)break;
                 if(line.startsWith("EHLO"))write(out,implicit||socket instanceof SSLSocket?"250 ready\r\n":"250-localhost\r\n250 STARTTLS\r\n");
                 else if(line.equals("STARTTLS")){write(out,"220 begin\r\n");var tls=(SSLSocket)serverTls.getSocketFactory().createSocket(socket,"localhost",port(),true);tls.setUseClientMode(false);tls.startHandshake();socket=tls;input=socket.getInputStream();out=socket.getOutputStream();}
-                else if(line.startsWith("MAIL FROM")||line.startsWith("RCPT TO"))write(out,"250 ok\r\n");
-                else if(line.equals("DATA")){write(out,"354 continue\r\n");var body=new StringBuilder();while(true){var part=line(input);if(part==null||part.equals("."))break;body.append(part.startsWith("..")?part.substring(1):part).append("\r\n");}bodies.add(body.toString());if(stallFinal){while(input.read()>=0){}break;}write(out,"250 accepted\r\n");}
+                else if(line.startsWith("MAIL FROM"))write(out,"250 ok\r\n");
+                else if(line.startsWith("RCPT TO")){recipients.add(line);write(out,line.equals("RCPT TO:<"+rejectedRecipient+">")?"550 rejected\r\n":"250 ok\r\n");}
+                else if(line.equals("DATA")){write(out,"354 continue\r\n");var body=new StringBuilder();while(true){var part=line(input);if(part==null||part.equals("."))break;body.append(part.startsWith("..")?part.substring(1):part).append("\r\n");}bodies.add(body.toString());if(dropFinal)break;if(stallFinal){while(input.read()>=0){}break;}write(out,"250 accepted\r\n");}
                 else if(line.equals("QUIT")){write(out,"221 bye\r\n");break;}
                 else throw new AssertionError("unexpected SMTP command");
             }

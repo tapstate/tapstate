@@ -107,6 +107,42 @@ class AlertHttpsJsonExtensionIT {
             assertThat(store.definitions(AlertConfiguration.Kind.RECEIVER,null,10,access()).rows()).isEmpty();assertThat(store.active(null,10,f.reads()).total()).isZero();
         });
     }
+    @Test void genericManualRetryUsesOriginalBytesAndBudgetAcrossTakeoverAndCleanupButNeverRevivesRevocation(){
+        for(boolean revoke:List.of(false,true))AlertEvaluationHostIT.withFixture(f->{var host=f.storeHost().withChannels(AlertChannels.capabilities(f.storeHost().deployment(),null,registry()));
+            var store=f.configuration().alerts(host,BuiltinAlarmTypes.catalog(),f.clock());var receiver=genericReceiver(f,store);
+            var route=new AlertConfiguration.Subscription(AlertConfiguration.Header.create(AlertConfiguration.Identity.create(AlertConfiguration.Kind.SUBSCRIPTION,host.scope(),"manual-generic"),host.deployment(),T,"operator"),"Manual generic",
+                    new AlertConfiguration.Match(f.rule().resources(),Set.of(),Set.of()),true,List.of(new AlertConfiguration.RouteChannel(TYPE,List.of(receiver.header().identity()),MessageSettings.empty())),Set.of(),
+                    new AlertGroupingClock.Policy(Duration.ZERO,Duration.ofSeconds(1),Duration.ofHours(1)),List.of());store.saveDefinition(null,route,access());
+            var planner=new AlertNotificationPlanner(store,f.clock(),"manual-generic-planner",null,ACTIVE);f.evaluator().withPlanner(planner);bad(f);planner.tick();
+            var original=store.deliveries(null,10,TYPE,null,f.reads()).rows().getFirst();var identity=original.value().frozen().identity();var channels=new AlertDeliveryRuntimeIT.Channels(store);
+            channels.answer=request->new io.tapstate.spi.alerting.NotificationChannel.Result(DeliveryEvidence.Outcome.NOT_ACCEPTED,io.tapstate.spi.alerting.NotificationChannel.Action.STOP,null,io.tapstate.spi.alerting.NotificationChannel.Phase.FINAL_RESPONSE,403,"webhook");
+            try(var worker=AlertDeliveryRuntimeIT.runtime(f,store,channels,"generic-rejected")){worker.tick();AlertDeliveryRuntimeIT.settled(worker);}
+            var before=store.intent(identity,null).orElseThrow();var manual=AlertDeliveryProgress.manual(before.value(),f.clock().instant());
+            if(revoke){f.now().set(T.plusSeconds(1));store.saveDefinition(route,route.edit(route.name(),route.match(),false,route.channels(),route.groupBy(),route.grouping(),route.inhibition(),f.clock().instant(),"operator"),access());planner.tick();
+                var cancelled=store.intent(identity,null).orElseThrow();assertThatThrownBy(()->AlertDeliveryProgress.manual(cancelled.value(),f.clock().instant())).isInstanceOf(TapstateException.class);
+                assertThatThrownBy(()->store.commitAsCaller(new AlertStore.Commit(AlertStore.CommitKind.PLAN,null,List.of(new AlertStore.IntentChange(cancelled,manual)),List.of()),access())).isInstanceOf(TapstateException.class);
+                assertThat(store.intent(identity,null).orElseThrow().value().state().attemptsConsumed()).isOne();return;
+            }
+            var absent=f.configuration().alerts(host.withChannels(Set.of()),BuiltinAlarmTypes.catalog(),f.clock());
+            assertThatThrownBy(()->absent.commitAsCaller(new AlertStore.Commit(AlertStore.CommitKind.PLAN,null,List.of(new AlertStore.IntentChange(before,manual)),List.of()),access()))
+                    .isInstanceOfSatisfying(TapstateException.class,error->assertThat(error.code()).isEqualTo(AlertError.CHANNEL_UNAVAILABLE));
+            assertThat(store.intent(identity,null).orElseThrow().value().state().manualCycles()).isZero();
+            assertThat(store.commitAsCaller(new AlertStore.Commit(AlertStore.CommitKind.PLAN,null,List.of(new AlertStore.IntentChange(before,manual)),List.of()),access())).isEqualTo(AlertStore.Outcome.STAGED);
+            f.now().set(T.plusSeconds(31));
+            try(var domain=MongoConfigurationDomain.open(f.settings(),host.scope().clusterId())){
+                var reopened=domain.alerts(host,BuiltinAlarmTypes.catalog(),f.clock());var sender=new AlertDeliveryRuntimeIT.Channels(reopened);
+                sender.answer=request->new io.tapstate.spi.alerting.NotificationChannel.Result(DeliveryEvidence.Outcome.ACCEPTED,io.tapstate.spi.alerting.NotificationChannel.Action.STOP,null,io.tapstate.spi.alerting.NotificationChannel.Phase.FINAL_RESPONSE,202,"webhook");
+                try(var worker=AlertDeliveryRuntimeIT.runtime(f,reopened,sender,"generic-manual-takeover")){worker.tick();AlertDeliveryRuntimeIT.settled(worker);}
+                assertThat(sender.calls).hasValue(1);assertThat(sender.requests.getFirst().payload()).isEqualTo(original.value().state().payload().bytes());
+                var accepted=reopened.intent(identity,null).orElseThrow().value();assertThat(accepted.state().manualCycles()).isOne();assertThat(accepted.state().attemptsConsumed()).isEqualTo(2);
+                assertThat(accepted.frozen()).isEqualTo(original.value().frozen());assertThat(accepted.state().summary()).isEqualTo(DeliveryEvidence.Outcome.ACCEPTED);
+                f.now().set(accepted.state().retained().payloadUntil());var withoutAdapter=domain.alerts(host.withChannels(Set.of()),BuiltinAlarmTypes.catalog(),f.clock());
+                withoutAdapter.maintenance().orElseThrow().maintain(new AlertMaintenance.Cursor(0,null,null),200,4L*1024*1024,Duration.ofSeconds(5));
+                var pruned=reopened.intent(identity,null).orElseThrow().value();assertThat(pruned.state().payload()).isNull();assertThat(pruned.state().summary()).isEqualTo(DeliveryEvidence.Outcome.ACCEPTED);
+                assertThat(pruned.state().attemptsConsumed()).isEqualTo(2);
+            }
+        });
+    }
     @Test void registrationOnlyAddsADescriptorAndAdapterWhileOriginalPermitsAndRecoveryRemainDurable() throws Exception {
         var received=new CopyOnWriteArrayList<String>();var failures=new CopyOnWriteArrayList<Throwable>();
         var executor=Executors.newFixedThreadPool(2);var server=HttpsServer.create(new InetSocketAddress("localhost",0),0);

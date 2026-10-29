@@ -149,6 +149,7 @@ public final class AlertConfiguration {
             Objects.requireNonNull(catalog, "catalog");
             AlarmTypeCatalog.Type type = catalog.types().stream().filter(value -> value.id().equals(typeId)).findFirst().orElse(null);
             AlertValidation.require(type != null && type.version() == typeVersion, "ruleType", "unsupported-type-or-version");
+            AlertValidation.require(type.kind()==AlarmTypeCatalog.Kind.STATEFUL,"ruleType","event-cannot-be-stateful-rule");
             return type;
         }
     }
