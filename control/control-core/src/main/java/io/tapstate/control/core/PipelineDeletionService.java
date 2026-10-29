@@ -65,7 +65,7 @@ public final class PipelineDeletionService {
             mutations.deletePipeline(principal, pipelineId, expectedArtifactHash);
             return null;
         } catch (TapstateException failure) {
-            if (!ArtifactError.RECLAIM_INCOMPLETE.code().equals(failure.code().code())) {
+            if (failure.code() == null || !ArtifactError.RECLAIM_INCOMPLETE.code().equals(failure.code().code())) {
                 throw failure;
             }
             return failure;
@@ -103,9 +103,9 @@ public final class PipelineDeletionService {
         try {
             if (draftWasPresent) {
                 PipelineDraftMutation mutation = drafts.discard(principal, pipelineId, expectedRevision);
-                if (mutation != PipelineDraftMutation.DELETED && mutation != PipelineDraftMutation.NOT_FOUND
-                        && mutation != PipelineDraftMutation.REVISION_CONFLICT) {
-                    throw new IllegalStateException("unexpected Pipeline draft deletion outcome: " + mutation);
+                switch (mutation) {
+                    case DELETED, NOT_FOUND, REVISION_CONFLICT -> { }
+                    default -> throw new IllegalStateException("unexpected Pipeline draft deletion outcome: " + mutation);
                 }
             }
             return drafts.find(pipelineId).isPresent()

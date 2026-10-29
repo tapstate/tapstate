@@ -240,6 +240,7 @@ public final class ArtifactMutationService {
         delete(principal, id, expectedContentHash, ControlOperations.ARTIFACT_DELETE);
     }
 
+    /** Shares Artifact guards and reclaim while attributing the whole-Pipeline operation to its own audit verb. */
     void deletePipeline(String principal, String id, String expectedContentHash) {
         delete(principal, id, expectedContentHash, ControlOperations.PIPELINE_DELETE);
     }

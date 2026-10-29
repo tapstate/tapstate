@@ -100,7 +100,8 @@ class ArtifactController {
      * The precondition an unconditional delete is missing. A header that is absent and one that is present
      * but not a quoted hash are the same refusal: passing a malformed value through would reach the store
      * as a hash that simply does not match, answering "someone else changed it" (412) for a request that
-     * never carried a version at all (428).
+     * never carried a version at all (428). Package visibility lets the whole-Pipeline delete endpoint
+     * enforce the same Artifact precondition and coded response.
      */
     static String expectedHash(String id, String ifMatch) {
         if (ifMatch == null || !ifMatch.matches(QUOTED_HASH)) {

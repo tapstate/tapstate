@@ -56,6 +56,7 @@ import io.tapstate.control.core.TokenService;
 import io.tapstate.control.core.TokenSigner;
 import io.tapstate.control.core.VerifiedToken;
 import io.tapstate.core.catalog.TapstateCatalog;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.lifecycle.DesiredState;
 import io.tapstate.core.lifecycle.PipelineState;
@@ -125,6 +126,7 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * The Pipeline write verbs projected onto the authenticated {@code /api} surface: structured replacement
@@ -598,6 +600,16 @@ class PipelineApiTest {
                 .contains("pipeline-draft:pl1");
         assertThat(context.getBean(FakeArtifactStore.class).get("pl1")).isEmpty();
         assertThat(drafts.get("pl1").orElseThrow().revision()).isEqualTo(2);
+    }
+
+    @Test
+    void anUncodedArtifactFailureIsRethrownWithoutMaskingIt() {
+        String hash = seedDeletionDraft();
+        TapstateException failure = new TapstateException(null, Map.of(), null);
+        context.getBean(FakeArtifactStore.class).afterDelete = () -> { throw failure; };
+
+        assertThatThrownBy(() -> context.getBean(PipelineDeletionService.class).delete("test", "pl1", hash, 1L))
+                .isSameAs(failure);
     }
 
     @Test

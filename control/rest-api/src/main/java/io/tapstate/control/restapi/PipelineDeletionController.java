@@ -39,18 +39,18 @@ class PipelineDeletionController {
         return ResponseEntity.noContent().build();
     }
 
-    private static Long expectedDraftRevision(String id, String ifMatch) {
-        if (ifMatch == null) {
+    private static Long expectedDraftRevision(String id, String ifDraftMatch) {
+        if (ifDraftMatch == null) {
             throw new TapstateException(PipelineDraftError.PRECONDITION_REQUIRED, Map.of("id", id), null);
         }
-        if (NO_DRAFT_ETAG.equals(ifMatch)) {
+        if (NO_DRAFT_ETAG.equals(ifDraftMatch)) {
             return null;
         }
-        if (!ifMatch.matches(QUOTED_REVISION)) {
+        if (!ifDraftMatch.matches(QUOTED_REVISION)) {
             throw new TapstateException(PipelineDraftError.PRECONDITION_REQUIRED, Map.of("id", id), null);
         }
         try {
-            return Long.parseLong(ifMatch.substring(1, ifMatch.length() - 1));
+            return Long.parseLong(ifDraftMatch.substring(1, ifDraftMatch.length() - 1));
         } catch (NumberFormatException error) {
             throw new TapstateException(PipelineDraftError.PRECONDITION_REQUIRED, Map.of("id", id), error);
         }
