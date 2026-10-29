@@ -34,6 +34,12 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         static StartupGate ready(){return new StartupGate(false,()->ValidationRunLifecycle.Readiness.READY);}
     }
     private record Operation(String task, UUID generation, String mode, UUID command) {}
+    private record TerminalReceipt(Request request,ValidationReportAdmission.Start start,Pending status) {}
+    private record Handoff(Operation key,Reservation displaced,TerminalReceipt receipt,Set<UUID> blocked) {}
+    private static boolean sameBlock(Request left,Request right){
+        return left.pipeline().equals(right.pipeline())&&left.task().equals(right.task())&&left.taskGeneration().equals(right.taskGeneration())
+                &&left.mode().equals(right.mode())&&left.configurationRevision()==right.configurationRevision()&&left.startSequence()==right.startSequence();
+    }
     private final HazelcastInstance member;
     private final MongoConfigurationDomain configuration;
     private final MongoCacheDomain cache;
@@ -104,10 +110,12 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
     @Override public Result reserve(Request request) {
         requireActive(); var local = pipeline(request.pipeline());
         if (!local.lock.tryLock()) { unpin(local); return new Result(Outcome.BUSY, null, null); }
-        Reservation operation = null;
+        Reservation operation = null;Handoff handoff=null;
         try {
             refreshLifetime(local);
             reap(local);
+            for(var previous:local.operations.values())if(sameBlock(previous.request,request)&&previous.blocked.contains(request.command()))
+                return new Result(Outcome.REJECTED,null,ValidationError.EXECUTION_CANCELLED.code());
             var key = new Operation(request.task(), request.taskGeneration(), request.mode(), request.command());
             operation = local.operations.get(key);
             if (operation != null) {
@@ -115,8 +123,11 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
                 return operation.reply();
             }
             if (local.operations.size() == maxOperations) reapSupersededHandoffs(local);
-            if (local.operations.size() == maxOperations) return Result.capacity();
-            operation = new Reservation(local, request); local.operations.put(key, operation);
+            if (local.operations.size() == maxOperations) {
+                handoff=compactPredecessor(local,request);if(handoff==null)return Result.capacity();
+                local.operations.remove(handoff.key(),handoff.displaced());
+            }
+            operation = new Reservation(local, request);operation.previous=handoff==null?null:handoff.receipt();operation.blocked=handoff==null?Set.of():handoff.blocked();local.operations.put(key, operation);
             operation.preparing = true; operation.metadata = resources.admitMetadata();
             var task = task(request); var definitions = configuration.validationTasks(this::requireActive);
             var inputs = definitions.inputs(task, request.configurationRevision());
@@ -154,9 +165,20 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         } catch (RuntimeException | Error defect) {
             if (operation != null) operation.cancelled.set(true); throw defect;
         } finally {
-            if (operation != null) { operation.preparing = false; if (operation.bound == null || operation.cancelled.get()) operation.disposeUnused(); }
-            local.lock.unlock();
-            unpin(local);
+            try {
+                if (operation != null) {
+                    operation.preparing = false;
+                    try { if (operation.bound == null || operation.cancelled.get()) operation.disposeUnused(); }
+                    catch(RuntimeException|Error uncertainCleanup){operation.unknown=true;throw uncertainCleanup;}
+                }
+            } finally {
+                try {
+                    if(handoff!=null&&(operation==null||!operation.accepted&&!operation.unknown&&!operation.claimUncertain)){
+                        if(operation!=null)local.operations.remove(new Operation(request.task(),request.taskGeneration(),request.mode(),request.command()),operation);
+                        local.operations.put(handoff.key(),handoff.displaced());
+                    }
+                } finally {local.lock.unlock();unpin(local);}
+            }
         }
     }
 
@@ -181,6 +203,13 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         if(!local.lock.tryLock()){unpin(local);throw unauthorized(local.pipeline);}
         try{
             var original=local.operations.get(new Operation(request.task(),request.taskGeneration(),request.mode(),request.command()));
+            if(original==null){
+                for(var candidate:local.operations.values()){
+                    var previous=candidate.previous;
+                    if(previous!=null&&previous.request().equals(request)&&previous.start().run().owner().equals(expected))return Optional.of(previous.status());
+                }
+                return Optional.empty();
+            }
             if(original==null||!original.request.equals(request)||original.bound==null||original.owner==null
                     ||!original.bound.budget().identity().owner().equals(expected))return Optional.empty();
             // This is an immutable local receipt, not authority to resume or control a retired run.
@@ -307,19 +336,51 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
                     ValidationReportAdmission.Start fullPermission,ValidationReportAdmission.Start incrementalPermission) {}
             var saved = new HashMap<String, Optional<Version>>();
             for (var entry : pipeline.operations.values()) {
-                if (!entry.closedHandoff()) continue;
+                if (!entry.closedHandoff()&&entry.previous==null) continue;
                 var current = saved.computeIfAbsent(entry.request.task(), task -> definitions.read(pipeline.pipeline, task)
                         .map(value -> new Version(value.task().generation(), value.closed(), value.revision(), value.full().nextStartSequence(), value.incremental().nextStartSequence(),
                                 value.full().permission()==null?null:value.full().permission().start(),value.incremental().permission()==null?null:value.incremental().permission().start())));
                 if (current.isEmpty()) continue;
                 var value = current.orElseThrow();
                 var named=entry.request.mode().equals("FULL")?value.fullPermission():value.incrementalPermission();
-                if(entry.completed&&entry.terminalWithoutReport&&entry.namesOriginal(named))continue;
+                var previous=entry.previous;
+                if(previous!=null&&(value.closed()||!value.generation().equals(previous.request().taskGeneration())
+                        ||!previous.start().equals(named)&&(value.revision()>previous.request().configurationRevision()
+                        ||(previous.request().mode().equals("FULL")?value.full():value.incremental())>previous.request().startSequence())))entry.previous=null;
+                if(value.closed()||!value.generation().equals(entry.request.taskGeneration())||value.revision()>entry.request.configurationRevision()
+                        ||(entry.request.mode().equals("FULL")?value.full():value.incremental())>entry.request.startSequence())entry.blocked=Set.of();
+                if (!entry.closedHandoff()) continue;
+                if(!value.closed()&&entry.completed&&entry.terminalWithoutReport&&entry.namesOriginal(named))continue;
                 if (!value.generation().equals(entry.request.taskGeneration()) || value.closed()
                         || value.revision() > entry.request.configurationRevision()
                         || (entry.request.mode().equals("FULL") ? value.full() : value.incremental()) > entry.request.startSequence()) entry.superseded = true;
             }
             reap(pipeline);
+        }
+    }
+    /** Reuse one existing slot with one compact predecessor, never a retained Reservation or a history chain. */
+    private Handoff compactPredecessor(Pipeline pipeline,Request next){
+        try(var frame=resources.admitMetadata()){
+            var saved=configuration.validationTasks(this::requireActive).read(next.pipeline(),next.task()).orElse(null);
+            if(saved==null||saved.closed()||!saved.task().generation().equals(next.taskGeneration())||saved.revision()!=next.configurationRevision())return null;
+            var mode=saved.mode(ValidationMode.valueOf(next.mode()));var permission=mode.permission();
+            if(mode.nextStartSequence()!=next.startSequence()||permission==null||permission.phase()!=ValidationTaskStore.Phase.CLOSED)return null;
+            for(var candidate:pipeline.operations.entrySet()){
+                var original=candidate.getValue();
+                if(!original.closedHandoff()||!original.request.task().equals(next.task())||!original.request.taskGeneration().equals(next.taskGeneration())||!original.request.mode().equals(next.mode()))continue;
+                if(original.previous!=null){
+                    if((original.superseded||sameBlock(original.request,next))&&original.previous.start().equals(permission.start())){
+                        var blocked=new HashSet<UUID>();if(sameBlock(original.request,next)){blocked.addAll(original.blocked);blocked.add(original.request.command());}
+                        int used=pipeline.operations.values().stream().mapToInt(value->value.blocked.size()).sum();
+                        if(used-original.blocked.size()+blocked.size()>maxOperations)return null;
+                        return new Handoff(candidate.getKey(),original,original.previous,Set.copyOf(blocked));
+                    }
+                }else if(original.completed&&original.terminalWithoutReport&&original.namesOriginal(permission.start())){
+                    var receipt=new TerminalReceipt(original.request,permission.start(),new Pending(original.terminal==ValidationRunState.STOPPED,true,original.terminal,original.terminalAdmitted,original.reason));
+                    return new Handoff(candidate.getKey(),original,receipt,Set.of());
+                }
+            }
+            return null;
         }
     }
     private void evictQuiescent() {
@@ -371,7 +432,7 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         volatile MongoConfigurationDomain.ValidationAccess access;
         volatile ValidationMemberResources.Metadata metadata; volatile ValidationMemberResources.Unbound unbound; volatile ValidationMemberResources.Run bound;
         private volatile Runnable stop;
-        private volatile ValidationRunState terminal;private boolean terminalAdmitted,terminalWithoutReport;
+        private volatile ValidationRunState terminal;private boolean terminalAdmitted,terminalWithoutReport;private volatile TerminalReceipt previous;private Set<UUID> blocked=Set.of();
         Reservation(Pipeline pipeline, Request request) { this.pipeline = pipeline; this.request = request; }
         ValidationRunSpec spec() { requireReserved(); return spec; }
         ValidationMemberResources.Run resources() { requireReserved(); return bound; }
@@ -415,6 +476,10 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
             return start!=null&&bound!=null&&start.equals(new ValidationReportAdmission.Start(task(request),request.configurationRevision(),
                     request.startSequence(),request.command().toString(),bound.budget().identity()));
         }
+        synchronized void joinedOriginal(ValidationReportAdmission.Start start){
+            if(!namesOriginal(start))throw invalid("owner.originalJoinReceipt");
+            previous=null;blocked=Set.of();
+        }
         void releaseAfterKnownTerminal() {
             if (bound == null) throw invalid("owner.boundResources");
             completed = true; cancelled.set(true);
@@ -442,6 +507,7 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         }
         private boolean reapable() {
             return !preparing && !unknown && cancelled.get() && (!activated || completed || locallyDisposed) && metadata == null
+                    && previous==null
                     && (!terminalWithoutReport || superseded)
                     && (!accepted || completed || locallyDisposed || superseded) && (bound == null || bound.fullyReleased());
         }

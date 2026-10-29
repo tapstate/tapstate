@@ -173,6 +173,85 @@ class NativeValidationCommandsIT {
             }
         }
     }
+    @Test void aFullTerminalRegistryCanAdmitItsSuccessorWithoutErasingTheCurrentOriginalReceipt()throws Exception{
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture(64,2);var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+                var processors=new ValidationProcessorRegistry(f.member,()->{})){
+            var saved=f.tasks.read("flow","task").orElseThrow();var other=new ValidationReportAdmission.Task("cluster","flow","other",UUID.randomUUID());
+            var third=new ValidationReportAdmission.Task("cluster","flow","third",UUID.randomUUID());
+            for(var task:List.of(other,third))assertThat(f.tasks.create(new ValidationTaskStore.Create(task,saved.comparison(),saved.settings(),UUID.randomUUID()))).isEqualTo(ValidationTaskStore.Write.APPLIED);
+            NativeValidationFullJob.Factory factory=original->{throw new AssertionError("capacity-controlled stops never construct a Job");};
+            try(var router=new ValidationOwnerRouter(f.member,f.gate,()->WorkloadClaimFence.from(f.node),f.owners::readOwner,f.owners,
+                    new NativeValidationCommands(f.owners,runs,f.member,processors,f.process,factory),()->{},Duration.ofSeconds(5));
+                    var first=f.resources.admitMetadata();var second=f.resources.admitMetadata();var fourth=f.resources.admitMetadata()){
+                var originals=List.of(f.request("FULL",1),new Request("flow",other.taskId(),other.generation(),1,1,"FULL",UUID.randomUUID(),UUID.randomUUID().toString()));
+                var owners=new ArrayList<ValidationOwner>();
+                for(var request:originals){
+                    var accepted=router.reserve(request);assertThat(accepted.outcome()).isEqualTo(Outcome.ACCEPTED);var owner=owner(accepted);owners.add(owner);
+                    stopBeforeBirth(f,runs,router,request,owner);
+                }
+                var unrelated=new Request("flow",third.taskId(),third.generation(),1,1,"FULL",UUID.randomUUID(),UUID.randomUUID().toString());
+                assertThat(router.reserve(unrelated).outcome()).isEqualTo(Outcome.CAPACITY);
+                f.startup=(input,spec)->{throw new io.tapstate.core.common.TapstateException(ValidationError.INVALID_CONTRACT,Map.of("field","fixture.refusedSuccessor"),null);};
+                assertThat(router.reserve(f.request("FULL",2)).outcome()).isEqualTo(Outcome.REJECTED);
+                assertThat(router.command(Command.of(Action.STATUS,originals.getFirst(),owners.getFirst())).state()).isEqualTo("STOPPED");
+                f.startup=(input,spec)->NativeValidationOwnerReservations.StartupGate.ready();
+                var successor=f.request("FULL",2);var accepted=router.reserve(successor);assertThat(accepted.outcome()).isEqualTo(Outcome.ACCEPTED);
+                for(int index=0;index<originals.size();index++){
+                    var receipt=router.command(Command.of(Action.STATUS,originals.get(index),owners.get(index)));assertThat(receipt.outcome()).isEqualTo(Outcome.ACCEPTED);
+                    assertThat(receipt.state()).isEqualTo("STOPPED");assertThat(receipt.drained()).isTrue();
+                }
+                stopBeforeBirth(f,runs,router,successor,owner(accepted));
+                var again=f.request("FULL",3);var repeated=router.reserve(again);assertThat(repeated.outcome()).isEqualTo(Outcome.ACCEPTED);
+                assertThat(router.command(Command.of(Action.STATUS,successor,owner(accepted))).state()).isEqualTo("STOPPED");
+                router.command(Command.of(Action.CANCEL_UNUSED,again,owner(repeated)));
+                var sameRevision=f.request("FULL",3);var replacement=router.reserve(sameRevision);assertThat(replacement.outcome()).isEqualTo(Outcome.ACCEPTED);
+                assertThat(router.reserve(again).outcome()).isEqualTo(Outcome.REJECTED);
+                assertThat(router.command(Command.of(Action.ACTIVATE,again,owner(repeated))).outcome()).isNotEqualTo(Outcome.ACCEPTED);
+                router.command(Command.of(Action.CANCEL_UNUSED,sameRevision,owner(replacement)));
+                var secondReplacement=f.request("FULL",3);var secondAccepted=router.reserve(secondReplacement);assertThat(secondAccepted.outcome()).isEqualTo(Outcome.ACCEPTED);
+                assertThat(router.reserve(sameRevision).outcome()).isEqualTo(Outcome.REJECTED);
+                router.command(Command.of(Action.CANCEL_UNUSED,secondReplacement,owner(secondAccepted)));
+                assertThat(router.reserve(f.request("FULL",3)).outcome()).isEqualTo(Outcome.CAPACITY);
+                assertThat(f.tasks.update(new ValidationTaskStore.Update(f.task,1,saved.comparison(),saved.settings(),UUID.randomUUID()))).isEqualTo(ValidationTaskStore.Write.APPLIED);
+                var revised=new Request("flow","task",f.task.generation(),2,3,"FULL",UUID.randomUUID(),UUID.randomUUID().toString());
+                var current=router.reserve(revised);assertThat(current.outcome()).isEqualTo(Outcome.ACCEPTED);
+                assertThat(router.command(Command.of(Action.STATUS,successor,owner(accepted))).state()).isEqualTo("STOPPED");
+                router.command(Command.of(Action.CANCEL_UNUSED,revised,owner(current)));
+                assertThat(f.tasks.close(other)).isEqualTo(ValidationReportAdmission.Closure.CLOSED);
+                var released=router.reserve(unrelated);assertThat(released.outcome()).isEqualTo(Outcome.ACCEPTED);
+                router.command(Command.of(Action.CANCEL_UNUSED,unrelated,owner(released)));
+                assertThat(f.member.getJet().getJobs()).isEmpty();assertThat(f.tasks.read("flow","task").orElseThrow().full().nextStartSequence()).isEqualTo(3);
+                assertThat(f.configuration.validationReports(()->{}).history("flow","task",ValidationMode.FULL,new ValidationReports.Paging(0,10)).total()).isZero();
+            }
+        }
+    }
+    @Test void closingTheTaskReleasesACarrierWhosePredecessorIsStillNamedByConfiguration()throws Exception{
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture(64,2);var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+                var processors=new ValidationProcessorRegistry(f.member,()->{})){
+            var saved=f.tasks.read("flow","task").orElseThrow();var other=new ValidationReportAdmission.Task("cluster","flow","other",UUID.randomUUID());
+            var third=new ValidationReportAdmission.Task("cluster","flow","third",UUID.randomUUID());
+            for(var task:List.of(other,third))assertThat(f.tasks.create(new ValidationTaskStore.Create(task,saved.comparison(),saved.settings(),UUID.randomUUID()))).isEqualTo(ValidationTaskStore.Write.APPLIED);
+            NativeValidationFullJob.Factory factory=original->{throw new AssertionError("closed carrier never constructs a Job");};
+            try(var router=new ValidationOwnerRouter(f.member,f.gate,()->WorkloadClaimFence.from(f.node),f.owners::readOwner,f.owners,
+                    new NativeValidationCommands(f.owners,runs,f.member,processors,f.process,factory),()->{},Duration.ofSeconds(5));
+                    var first=f.resources.admitMetadata();var second=f.resources.admitMetadata();var fourth=f.resources.admitMetadata()){
+                var original=f.request("FULL",1);var accepted=router.reserve(original);stopBeforeBirth(f,runs,router,original,owner(accepted));
+                var otherRequest=new Request("flow",other.taskId(),other.generation(),1,1,"FULL",UUID.randomUUID(),UUID.randomUUID().toString());
+                var otherAccepted=router.reserve(otherRequest);stopBeforeBirth(f,runs,router,otherRequest,owner(otherAccepted));
+                var successor=f.request("FULL",2);var replacement=router.reserve(successor);assertThat(replacement.outcome()).isEqualTo(Outcome.ACCEPTED);
+                router.command(Command.of(Action.CANCEL_UNUSED,successor,owner(replacement)));
+                assertThat(f.tasks.close(f.task)).isEqualTo(ValidationReportAdmission.Closure.CLOSED);
+                var unrelated=new Request("flow",third.taskId(),third.generation(),1,1,"FULL",UUID.randomUUID(),UUID.randomUUID().toString());
+                var freed=router.reserve(unrelated);assertThat(freed.outcome()).isEqualTo(Outcome.ACCEPTED);
+                router.command(Command.of(Action.CANCEL_UNUSED,unrelated,owner(freed)));assertThat(f.member.getJet().getJobs()).isEmpty();
+            }
+        }
+    }
+    private static void stopBeforeBirth(NativeValidationOwnerReservationsIT.Fixture f,NativeValidationRuns runs,ValidationOwnerRouter router,Request request,ValidationOwner owner)throws Exception{
+        var identity=f.owners.original(request,owner).run();router.command(Command.of(Action.ACTIVATE,request,owner));
+        await(()->runs.read(identity).controlUnknown());router.command(Command.of(Action.STOP,request,owner));
+        await(()->f.tasks.read("flow",request.task()).orElseThrow().full().permission().phase()==ValidationTaskStore.Phase.CLOSED&&runs.original(request,owner).isEmpty());
+    }
     private static ValidationOwner owner(Reply reply){return new ValidationOwner("cluster","flow",reply.receiver().node(),reply.receiver().boot(),reply.claimGeneration(),reply.executionGeneration(),reply.topologyRevision());}
     private static ValidationCountScan.Scalar scalar(ValidationTaskSpec.Table table,long value){return new ValidationCountScan.Scalar(table,value,new ValidationCheckEvent.ReadBoundary("fixture-count","v1",Instant.EPOCH,Instant.EPOCH));}
     private static void await(java.util.function.BooleanSupplier condition)throws Exception{

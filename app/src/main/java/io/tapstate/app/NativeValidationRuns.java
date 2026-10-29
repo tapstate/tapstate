@@ -198,7 +198,7 @@ final class NativeValidationRuns implements AutoCloseable {
             settleReport();
         }
         private void settleReport(){reportSettled=true;reservation.reportSettled();}
-        @Override public void joined(){shared=NativeValidationRuns.this.shared(this);shared.quota.joined(original,this::requireRun,lifecycle::stop);shared.members.add(original.identity());}
+        @Override public void joined(){reservation.joinedOriginal(original.admission());shared=NativeValidationRuns.this.shared(this);shared.quota.joined(original,this::requireRun,lifecycle::stop);shared.members.add(original.identity());}
         @Override public void requireOwner(){reservation.requireOwner();}
         @Override public void requireRun(){reservation.requireReserved();if(sealed.get())throw invalid("runs.publicationClosed");}
         @Override public void sealPublication(){sealed.set(true);var queue=candidates;if(queue!=null)queue.close();var value=shared;if(value!=null)value.quota.seal(original.identity());}
