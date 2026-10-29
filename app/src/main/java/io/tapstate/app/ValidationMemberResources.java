@@ -22,6 +22,7 @@ final class ValidationMemberResources implements AutoCloseable {
     record Snapshot(ValidationLocalBudget.Snapshot data, ValidationLocalBudget.Amount processReserved, int processors, int processorCapacity, int metadataFrames) {}
     private final Semaphore metadata = new Semaphore(METADATA_FRAMES);
     private final Map<Key, State> members = new HashMap<>();
+    private final Set<Probe> probes=new HashSet<>();
     private ValidationLocalBudget.Amount reserved = new ValidationLocalBudget.Amount(0, 0, 0, 0);
     private int processors, processorCapacity = Integer.MAX_VALUE;
     private final ExecutorService queries = pool("validation-query", 16, 64);
@@ -60,6 +61,16 @@ final class ValidationMemberResources implements AutoCloseable {
         Metadata admitMetadata() {
             require(); if (!metadata.tryAcquire()) throw limit("validation.metadataFrames");
             try { require(); return new Metadata(); } catch (RuntimeException | Error failed) { metadata.release(); throw failed; }
+        }
+        /** Independent metadata discovery has no fictitious validation owner, run or cooperative processor. */
+        Probe admitProbe(){
+            var frame=admitMetadata();Unbound allocation=null;
+            try{
+                allocation=reserve(new ValidationLocalBudget.Amount(16L*1024*1024,2,1,1),0);var probe=new Probe(this,frame,allocation);
+                synchronized(ValidationMemberResources.this){if(closed||retired)throw invalid("resources.contextClosed");probes.add(probe);}
+                return probe;
+            }
+            catch(RuntimeException|Error refused){if(allocation!=null)allocation.close();frame.close();throw refused;}
         }
         Run admit(ValidationRunIdentity identity, ValidationLocalBudget.Amount envelope, int processors, Runnable owner) {
             try (var reserved = reserve(envelope, processors)) { return reserved.bind(identity, owner); }
@@ -123,6 +134,101 @@ final class ValidationMemberResources implements AutoCloseable {
         void requireRetained(Member member){if(member.process()!=ValidationMemberResources.this||returned.get())throw invalid("resources.metadataOwner");member.require();}
         /** Return after the actual read/planner and every retained definition have relinquished ownership. */
         @Override public void close() { if (returned.compareAndSet(false, true)) metadata.release(); }
+    }
+
+    /** One metadata-query lifetime plus its complete retained request/response frame, until explicitly relinquished. */
+    final class Probe implements AutoCloseable {
+        private final Member member;private final Metadata frame;private final Unbound allocation;
+        private final Set<Handle> handles=new HashSet<>();
+        private final CompletableFuture<Void> released=new CompletableFuture<>();
+        private final io.tapstate.core.validation.ValidationFailureLatch failure=new io.tapstate.core.validation.ValidationFailureLatch();
+        private final ExecutorService query=new ProbeExecutor(queries),decode=new ProbeExecutor(decoders);
+        private int workers;private boolean retiring,returned;private ScheduledFuture<?> retry;
+        Probe(Member member,Metadata frame,Unbound allocation){this.member=member;this.frame=frame;this.allocation=allocation;}
+        CompletionStage<Void> released(){return released.minimalCompletionStage();}
+        ExecutorService queryExecutor(){require();return query;}
+        ExecutorService decodeExecutor(){require();return decode;}
+        void require(){member.require();synchronized(this){if(retiring)throw invalid("resources.probeClosed");}}
+        /** Construction must remain deferred until this handle is remembered; one independent connection at a time. */
+        void retain(AutoCloseable original,CompletionStage<Void> workersExited,CompletionStage<Void> rowsReleased){
+            Objects.requireNonNull(original);Objects.requireNonNull(workersExited);Objects.requireNonNull(rowsReleased);require();
+            var handle=new Handle(original);
+            synchronized(this){if(retiring)throw invalid("resources.probeClosed");if(!handles.isEmpty())throw limit("validation.metadataReaders");handles.add(handle);}
+            // Exceptional completion still proves physical exit; the reader retains its diagnosis.
+            workersExited.whenComplete((ignored,failed)->{if(failed!=null)recordFailure(failed);receipt(handle);});
+            rowsReleased.whenComplete((ignored,failed)->{if(failed==null)receipt(handle);});
+        }
+        private void recordFailure(Throwable reported){
+            while(reported instanceof CompletionException&&reported.getCause()!=null)reported=reported.getCause();
+            failure.record(reported);
+        }
+        private void receipt(Handle handle){synchronized(this){handle.receipts++;settle(handle);}releaseIfDone();}
+        private void settle(Handle handle){if(handle.receipts==2&&(!handle.closing||handle.closeExited))handles.remove(handle);}
+        private void releaseIfDone(){
+            boolean release;ScheduledFuture<?> cancel=null;
+            synchronized(this){
+                release=retiring&&!returned&&workers==0&&handles.isEmpty();if(release)returned=true;
+                if(retry!=null&&handles.stream().noneMatch(handle->handle.closing&&!handle.closeSucceeded)){
+                    cancel=retry;retry=null;
+                }
+            }
+            if(cancel!=null)cancel.cancel(false);
+            if(release){
+                allocation.close();probeReleased(this);frame.close();var diagnosis=failure.get();
+                if(diagnosis==null)released.complete(null);else released.completeExceptionally(diagnosis);
+            }
+        }
+        @Override public void close(){
+            synchronized(this){
+                if(!retiring){retiring=true;for(var handle:handles)handle.closing=true;}
+                // Dispatch only on the process timer; rejected or failed original closes stay retryable.
+                if(retry==null&&handles.stream().anyMatch(handle->!handle.closeSucceeded))retry=controlTicks(this::retryCleanup);
+            }
+            query.shutdown();decode.shutdown();retryCleanup();releaseIfDone();
+        }
+        private void retryCleanup(){
+            List<Handle> originals;
+            synchronized(this){
+                originals=handles.stream().filter(handle->handle.closing&&!handle.submitted&&!handle.closeSucceeded).toList();
+                for(var handle:originals){handle.submitted=true;handle.closeExited=false;}
+            }
+            for(var handle:originals)cleanup(()->{
+                try{handle.original.close();synchronized(Probe.this){handle.closeSucceeded=true;}}
+                catch(RuntimeException|Error failed){failure.record(failed);throw failed;}
+                catch(Exception failed){var coded=new TapstateException(ValidationError.READ_FAILED,Map.of("table","metadata-cleanup"),failed);failure.record(coded);throw coded;}
+                finally{synchronized(Probe.this){handle.closeExited=true;settle(handle);}releaseIfDone();}
+            }).whenComplete((ignored,failed)->{
+                if(failed!=null)recordFailure(failed);
+                synchronized(Probe.this){handle.submitted=false;}
+                releaseIfDone();
+            });
+        }
+        private final class Handle {
+            final AutoCloseable original;int receipts;boolean closing,submitted,closeExited,closeSucceeded;
+            Handle(AutoCloseable original){this.original=original;}
+        }
+        private final class ProbeExecutor extends AbstractExecutorService {
+            private final ExecutorService delegate;private boolean closed;private int outstanding;
+            ProbeExecutor(ExecutorService delegate){this.delegate=delegate;}
+            @Override public void execute(Runnable command){
+                Objects.requireNonNull(command);require();
+                synchronized(Probe.this){if(retiring||closed)throw new RejectedExecutionException("metadata executor is closed");
+                    if(workers==2)throw limit("validation.metadataWorkers");workers++;outstanding++;}
+                Runnable retained=()->{try{command.run();}finally{exited();}};
+                try{delegate.execute(retained);}
+                catch(RejectedExecutionException refused){exited();throw refused;}
+                catch(RuntimeException|Error unknown){if(((ThreadPoolExecutor)delegate).remove(retained))exited();throw unknown;}
+            }
+            private void exited(){synchronized(Probe.this){workers--;outstanding--;Probe.this.notifyAll();}releaseIfDone();}
+            @Override public void shutdown(){synchronized(Probe.this){closed=true;Probe.this.notifyAll();}}
+            @Override public List<Runnable> shutdownNow(){shutdown();return List.of();}
+            @Override public boolean isShutdown(){synchronized(Probe.this){return closed;}}
+            @Override public boolean isTerminated(){synchronized(Probe.this){return closed&&outstanding==0;}}
+            @Override public boolean awaitTermination(long timeout,TimeUnit unit)throws InterruptedException{
+                long until=System.nanoTime()+unit.toNanos(timeout);synchronized(Probe.this){long left;
+                    while(!isTerminated()&&(left=until-System.nanoTime())>0)TimeUnit.NANOSECONDS.timedWait(Probe.this,left);return isTerminated();}
+            }
+        }
     }
 
     final class Run implements AutoCloseable {
@@ -255,12 +361,21 @@ final class ValidationMemberResources implements AutoCloseable {
         }
     }
 
+    private void probeReleased(Probe original){
+        boolean stopCleanup;
+        synchronized(this){probes.remove(original);stopCleanup=closed&&probes.isEmpty();}
+        if(stopCleanup){controlTicks.shutdown();cleanup.shutdown();}
+    }
     @Override public void close() {
-        List<State> retiring;
-        synchronized (this) { if (closed) return; closed = true; retiring = List.copyOf(members.values()); }
+        List<State> retiring;List<Probe> originals;
+        synchronized (this) { if (closed) return; closed = true; retiring = List.copyOf(members.values());originals=List.copyOf(probes); }
         retiring.forEach(state -> state.budget.close());
+        // Original metadata handles still need bounded retry dispatch after native pool shutdown.
+        originals.forEach(Probe::close);
         // Queued wrappers still run/exit their own original bodies. Removing them would lose ownership.
-        controlTicks.shutdown();queries.shutdown(); decoders.shutdown(); checks.shutdown(); controls.shutdown(); cleanup.shutdown();
+        queries.shutdown(); decoders.shutdown(); checks.shutdown(); controls.shutdown();
+        boolean stopCleanup;synchronized(this){stopCleanup=probes.isEmpty();}
+        if(stopCleanup){controlTicks.shutdown();cleanup.shutdown();}
     }
     private static ExecutorService pool(String name, int workers, int queue) {
         return new ThreadPoolExecutor(workers, workers, 0, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(queue), task -> {

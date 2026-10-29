@@ -10,6 +10,147 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import static org.assertj.core.api.Assertions.*;
 
 class ValidationMemberResourcesTest {
+    @Test void aMinimalWorkerReceiptPreservesFatalDiagnosisPriority()throws Exception{
+        var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
+        try(var process=new ValidationMemberResources()){
+            var member=process.bind("cluster","node","boot",4,()->{});var probe=member.admitProbe();
+            var workers=new CompletableFuture<Void>();var rows=new CompletableFuture<Void>();var attempts=new java.util.concurrent.atomic.AtomicInteger();
+            probe.retain(()->{if(attempts.incrementAndGet()==1)throw new IllegalStateException("earlier metadata cleanup failure");
+                entered.countDown();if(!release.await(5,TimeUnit.SECONDS))throw new AssertionError("fatal worker fixture timeout");},workers.minimalCompletionStage(),rows);
+            try{
+                probe.close();assertThat(entered.await(2,TimeUnit.SECONDS)).isTrue();workers.completeExceptionally(new AssertionError("fatal metadata worker"));rows.complete(null);
+                assertThat(member.snapshot().metadataFrames()).isOne();release.countDown();
+                assertThatThrownBy(()->probe.released().toCompletableFuture().get(2,TimeUnit.SECONDS)).isInstanceOf(ExecutionException.class)
+                        .hasRootCauseInstanceOf(AssertionError.class).hasRootCauseMessage("fatal metadata worker");
+            }finally{release.countDown();probe.close();}
+        }finally{release.countDown();}
+    }
+    @Test void processShutdownKeepsOriginalProbeCleanupAliveUntilPhysicalDrain()throws Exception{
+        var entered=new CountDownLatch(4);var release=new CountDownLatch(1);
+        try(var process=new ValidationMemberResources()){
+            var member=process.bind("cluster","node","boot",4,()->{});var probe=member.admitProbe();
+            var workers=new CompletableFuture<Void>();var rows=new CompletableFuture<Void>();var closed=new CountDownLatch(1);
+            probe.retain(()->{closed.countDown();workers.complete(null);rows.complete(null);},workers,rows);
+            Runnable blocked=()->{entered.countDown();try{if(!release.await(5,TimeUnit.SECONDS))throw new AssertionError("shutdown cleanup saturation timeout");}catch(InterruptedException e){throw new AssertionError(e);}};
+            for(int index=0;index<36;index++)process.cleanup(blocked);
+            try{
+                assertThat(entered.await(2,TimeUnit.SECONDS)).isTrue();process.close();
+                assertThat(member.snapshot().metadataFrames()).isOne();assertThat(closed.getCount()).isOne();release.countDown();
+                assertThat(closed.await(2,TimeUnit.SECONDS)).isTrue();
+                assertThatThrownBy(()->probe.released().toCompletableFuture().get(2,TimeUnit.SECONDS)).isInstanceOf(ExecutionException.class)
+                        .hasRootCauseInstanceOf(RejectedExecutionException.class);
+                assertThat(member.snapshot().processReserved().isEmpty()).isTrue();assertThat(member.snapshot().metadataFrames()).isZero();
+                assertThatThrownBy(member::admitProbe).isInstanceOf(TapstateException.class);
+            }finally{release.countDown();}
+        }finally{release.countDown();}
+    }
+    @Test void cleanupFailureCannotPublishASuccessfulReleaseReceipt()throws Exception{
+        try(var process=new ValidationMemberResources()){
+            var member=process.bind("cluster","node","boot",4,()->{});var probe=member.admitProbe();
+            var workers=new CompletableFuture<Void>();var rows=new CompletableFuture<Void>();
+            probe.retain(()->{workers.complete(null);rows.complete(null);throw new IllegalStateException("native close failed after receipts");},workers,rows);
+            probe.close();
+            assertThatThrownBy(()->probe.released().toCompletableFuture().get(2,TimeUnit.SECONDS)).isInstanceOf(ExecutionException.class)
+                    .hasRootCauseMessage("native close failed after receipts");
+            assertThat(member.snapshot().processReserved().isEmpty()).isTrue();assertThat(member.snapshot().metadataFrames()).isZero();
+        }
+    }
+    @Test void aCleanupRetryNeedsItsOwnPhysicalExitReceipt()throws Exception{
+        var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
+        try(var process=new ValidationMemberResources()){
+            var member=process.bind("cluster","node","boot",4,()->{});var probe=member.admitProbe();
+            var workers=new CompletableFuture<Void>();var rows=new CompletableFuture<Void>();var attempts=new java.util.concurrent.atomic.AtomicInteger();
+            probe.retain(()->{
+                if(attempts.incrementAndGet()==1)throw new IllegalStateException("first metadata close failed");
+                entered.countDown();if(!release.await(5,TimeUnit.SECONDS))throw new AssertionError("cleanup retry timeout");
+            },workers,rows);
+            try{
+                probe.close();assertThat(entered.await(2,TimeUnit.SECONDS)).isTrue();workers.complete(null);rows.complete(null);
+                assertThat(member.snapshot().processReserved().isEmpty()).isFalse();assertThat(member.snapshot().metadataFrames()).isOne();
+                release.countDown();assertThatThrownBy(()->probe.released().toCompletableFuture().get(2,TimeUnit.SECONDS))
+                        .isInstanceOf(ExecutionException.class).hasRootCauseMessage("first metadata close failed");
+                assertThat(member.snapshot().processReserved().isEmpty()).isTrue();assertThat(member.snapshot().metadataFrames()).isZero();
+            }finally{release.countDown();probe.close();}
+        }finally{release.countDown();}
+    }
+    @Test void failedMetadataWorkerReceiptStillProvesPhysicalExit()throws Exception{
+        try(var process=new ValidationMemberResources()){
+            var member=process.bind("cluster","node","boot",4,()->{});var probe=member.admitProbe();
+            var workers=new CompletableFuture<Void>();var rows=new CompletableFuture<Void>();var closed=new CountDownLatch(1);
+            probe.retain(closed::countDown,workers,rows);probe.close();assertThat(closed.await(2,TimeUnit.SECONDS)).isTrue();
+            workers.completeExceptionally(new IllegalStateException("metadata query failed after worker exit"));
+            assertThat(member.snapshot().processReserved().isEmpty()).isFalse();rows.complete(null);
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(2)).until(()->member.snapshot().processReserved().isEmpty()&&member.snapshot().metadataFrames()==0);
+            assertThat(member.snapshot().metadataFrames()).isZero();assertThat(workers.isCompletedExceptionally()).isTrue();
+            assertThatThrownBy(()->probe.released().toCompletableFuture().get(2,TimeUnit.SECONDS)).isInstanceOf(ExecutionException.class)
+                    .hasRootCauseMessage("metadata query failed after worker exit");
+        }
+    }
+    @Test void rejectedMetadataCleanupRetriesTheOriginalAfterCapacityReturns()throws Exception{
+        var entered=new CountDownLatch(4);var release=new CountDownLatch(1);
+        try(var process=new ValidationMemberResources()){
+            var member=process.bind("cluster","node","boot",4,()->{});var probe=member.admitProbe();
+            var workers=new CompletableFuture<Void>();var rows=new CompletableFuture<Void>();var closed=new CountDownLatch(1);
+            probe.retain(()->{closed.countDown();workers.complete(null);rows.complete(null);},workers,rows);
+            Runnable blocked=()->{entered.countDown();try{if(!release.await(5,TimeUnit.SECONDS))throw new AssertionError("cleanup saturation timeout");}catch(InterruptedException e){throw new AssertionError(e);}};
+            for(int index=0;index<36;index++)process.cleanup(blocked);
+            try{
+                assertThat(entered.await(2,TimeUnit.SECONDS)).isTrue();probe.close();
+                assertThat(member.snapshot().metadataFrames()).isOne();assertThat(closed.getCount()).isOne();
+                release.countDown();assertThat(closed.await(2,TimeUnit.SECONDS)).isTrue();
+                org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(2)).until(()->member.snapshot().processReserved().isEmpty()&&member.snapshot().metadataFrames()==0);
+                assertThat(member.snapshot().metadataFrames()).isZero();
+                assertThatThrownBy(()->probe.released().toCompletableFuture().get(2,TimeUnit.SECONDS)).isInstanceOf(ExecutionException.class)
+                        .hasRootCauseInstanceOf(RejectedExecutionException.class);
+            }finally{release.countDown();probe.close();}
+        }finally{release.countDown();}
+    }
+    @Test void metadataProbeNeedsNoRunAndKeepsWorkerReceiptsAndBlockedCleanupCharged()throws Exception{
+        var work=new CountDownLatch(1);var workRelease=new CountDownLatch(1);var cleanup=new CountDownLatch(1);var cleanupRelease=new CountDownLatch(1);
+        try(var process=new ValidationMemberResources()){
+            var member=process.bind("cluster","node","boot",4,()->{});var probe=member.admitProbe();
+            var workers=new CompletableFuture<Void>();var rows=new CompletableFuture<Void>();
+            probe.retain(()->{cleanup.countDown();if(!cleanupRelease.await(5,TimeUnit.SECONDS))throw new AssertionError("metadata close timeout");},workers,rows);
+            var actual=probe.queryExecutor().submit(()->{work.countDown();if(!workRelease.await(5,TimeUnit.SECONDS))throw new AssertionError("metadata query timeout");return null;});
+            try{
+                assertThat(work.await(2,TimeUnit.SECONDS)).isTrue();assertThat(member.snapshot().data().runs()).isZero();assertThat(member.snapshot().processors()).isZero();
+                assertThat(member.snapshot().processReserved()).isEqualTo(new ValidationLocalBudget.Amount(16L*1024*1024,2,1,1));assertThat(member.snapshot().metadataFrames()).isOne();
+                probe.close();assertThat(cleanup.await(2,TimeUnit.SECONDS)).isTrue();workers.complete(null);rows.complete(null);
+                assertThat(member.snapshot().processReserved().isEmpty()).isFalse();workRelease.countDown();actual.get(2,TimeUnit.SECONDS);
+                assertThat(member.snapshot().processReserved().isEmpty()).isFalse();assertThat(member.snapshot().metadataFrames()).isOne();
+                cleanupRelease.countDown();org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(2)).until(()->member.snapshot().processReserved().isEmpty()&&member.snapshot().metadataFrames()==0);
+                assertThat(member.snapshot().metadataFrames()).isZero();assertThatThrownBy(probe::queryExecutor).isInstanceOf(TapstateException.class);
+            }finally{workRelease.countDown();cleanupRelease.countDown();probe.close();}
+        }finally{workRelease.countDown();cleanupRelease.countDown();}
+    }
+    @Test void cancellingMetadataFuturesDoesNotReleaseAnIgnoringNativeBodyOrPermitAThirdWorker()throws Exception{
+        var entered=new CountDownLatch(2);var release=new CountDownLatch(1);
+        try(var process=new ValidationMemberResources()){
+            var member=process.bind("cluster","node","boot",4,()->{});var probe=member.admitProbe();
+            Runnable blocked=()->{entered.countDown();while(release.getCount()!=0)try{release.await();}catch(InterruptedException ignored){/* Native calls can ignore an interruption. */}};
+            var first=probe.queryExecutor().submit(blocked);var second=probe.decodeExecutor().submit(blocked);
+            try{
+                assertThat(entered.await(2,TimeUnit.SECONDS)).isTrue();
+                assertThatThrownBy(()->probe.queryExecutor().submit(()->{})).isInstanceOf(TapstateException.class).hasMessageContaining("metadataWorkers");
+                assertThat(first.cancel(true)).isTrue();assertThat(first.isDone()).isTrue();probe.close();
+                assertThat(member.snapshot().processReserved().isEmpty()).isFalse();assertThat(member.snapshot().metadataFrames()).isOne();
+                release.countDown();second.get(2,TimeUnit.SECONDS);
+                org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(2)).until(()->member.snapshot().processReserved().isEmpty()&&member.snapshot().metadataFrames()==0);assertThat(member.snapshot().metadataFrames()).isZero();
+            }finally{release.countDown();probe.close();}
+        }finally{release.countDown();}
+    }
+    @Test void replacingAMemberCannotReturnItsOldMetadataReadOrDropARejectedLifetime()throws Exception{
+        try(var process=new ValidationMemberResources()){
+            var old=process.bind("cluster","node","boot",4,()->{});var probe=old.admitProbe();var nativeExit=new CompletableFuture<Void>();var rowExit=new CompletableFuture<Void>();var closed=new CountDownLatch(1);
+            probe.retain(closed::countDown,nativeExit,rowExit);old.close();
+            var fresh=process.bind("cluster","node","boot",4,()->{});var next=fresh.admitProbe();
+            assertThat(fresh.snapshot().data().runs()).isZero();assertThat(fresh.snapshot().processReserved().bytes()).isEqualTo(32L*1024*1024);assertThat(fresh.snapshot().metadataFrames()).isEqualTo(2);
+            assertThatThrownBy(probe::queryExecutor).isInstanceOf(TapstateException.class);probe.close();assertThat(closed.await(2,TimeUnit.SECONDS)).isTrue();
+            nativeExit.complete(null);assertThat(fresh.snapshot().processReserved().bytes()).isEqualTo(32L*1024*1024);
+            rowExit.complete(null);org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(2)).until(()->fresh.snapshot().processReserved().bytes()==16L*1024*1024&&fresh.snapshot().metadataFrames()==1);
+            next.close();assertThat(fresh.snapshot().processReserved().isEmpty()).isTrue();assertThat(fresh.snapshot().metadataFrames()).isZero();
+        }
+    }
     @Test void closeAfterPreparationRollsBackTheProcessChargeWhenMemberCommitRefuses()throws Exception{
         var entered=new CountDownLatch(1);var leave=new CountDownLatch(1);var done=new CountDownLatch(1);
         try(var process=new ValidationMemberResources()){
