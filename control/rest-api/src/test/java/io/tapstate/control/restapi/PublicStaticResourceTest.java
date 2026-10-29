@@ -33,5 +33,8 @@ class PublicStaticResourceTest {
         request.setRequestURI("/readme.txt");
         request.setServletPath("/readme.txt");
         assertThat(PublicStaticResource.matches(request)).isFalse();
+
+        assertThat(PublicStaticResource.hasPublicRootImageName("/..image.svg")).isFalse();
+        assertThat(PublicStaticResource.hasPublicRootImageName("/nested/image.svg")).isFalse();
     }
 }
