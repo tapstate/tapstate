@@ -327,19 +327,27 @@ final class MongoAlertCoordinator implements AlertStore {
         }else if(resource.kind().equals("cluster-storage")){
             if(resource.id().equals("cache")) {
                 var current=bindings.cachePreparationForTransaction(s).orElseThrow(()->stale("cache-binding"));
-                return !resource.incarnation().equals(current.authScope().cacheIncarnation()+":"+current.authScope().bindingVersion());
+                return bindingRemoved(resource.incarnation(),current.authScope().cacheIncarnation(),current.authScope().bindingVersion());
             }
             var current=bindings.loadForTransaction(s).orElseThrow(()->stale("master-binding"));
             if(!current.defaultSourceId().equals(resource.id()))return true;
             var row=SystemCollections.SOURCES.on(db).find(s,new Document("_id",resource.id())).first();
             if(row==null)return true;
             var actual=MongoSourceIdentity.read(row).binding();
-            return !resource.incarnation().equals(actual.incarnation()+":"+actual.bindingRevision());
+            return bindingRemoved(resource.incarnation(),actual.incarnation(),actual.bindingRevision());
         }else if(resource.kind().equals("cluster-node")){
             var proof=host.resourceEvidence().apply(resource).orElse(null);
             if(proof instanceof NodeEvidence node){nodeResource(s,resource,node);return !node.expected();}
             throw stale("node-lifecycle-unavailable");
         }else return false;
+    }
+    private static boolean bindingRemoved(String recorded,String incarnation,long revision) {
+        String prefix=incarnation+":";if(!recorded.startsWith(prefix))return true;
+        long previous;
+        try{previous=Long.parseLong(recorded.substring(prefix.length()));}
+        catch(NumberFormatException invalid){throw unreadable("storage-binding-revision");}
+        if(previous<1 || revision<previous)throw unreadable("storage-binding-went-backwards");
+        return revision>previous;
     }
     private void validateIntent(ClientSession s,AlertIntent.Frozen f,boolean grant,Access access) {
         scope(f.identity().scope());if(f.retention().deployment()!=host.deployment())throw stale("intent-profile");

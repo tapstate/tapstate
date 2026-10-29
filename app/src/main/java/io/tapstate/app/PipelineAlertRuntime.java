@@ -85,6 +85,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     private record Failure(String code,Map<String,Object> parameters){}
     private final AtomicReference<Failure> failure = new AtomicReference<>(new Failure(null,Map.of()));
     private volatile AlarmKey reconciliationCursor;
+    private boolean legacyBindingsInScan,legacyBindingsUnavailable,legacyScanComplete;
     private final String runtimeId = UUID.randomUUID().toString();
 
     PipelineAlertRuntime(Supplier<Services> open, PipelineIntentStore intents,
@@ -225,6 +226,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             if(services==null&&resolved.planner()!=null)resolved.planner().start(); if(services==null&&resolved.delivery()!=null)resolved.delivery().start(); services = resolved; rules = List.copyOf(all);
         }
         observerTick.run();
+        if(reconciliationCursor==null)legacyBindingsInScan=false;
         var retained = resolved.store().evaluationStates(reconciliationCursor, 50);
         for(var row:retained.rows())if(retained.removedResources().contains(row.value().snapshot().rule().key().resource())){
             AlertEvaluationHost.requireResult(resolved.evaluator().end(row.value().snapshot().rule().key(),AlertSnapshot.EndReason.RESOURCE_REMOVED,active));
@@ -235,9 +237,11 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         boolean legacyBindingUnavailable=false;
         for(var key:retained.obsoleteBindings()) {
             var original=retained.rows().stream().filter(row->row.value().snapshot().rule().key().equals(key)).findFirst().orElseThrow().value();
-            if(original.operationalEvidence()!=null && original.operationalEvidence().version()==2 && AlertOperationDomain.supported(key))
-                AlertEvaluationHost.requireResult(resolved.evaluator().supersede(key,active));
-            else legacyBindingUnavailable=true;
+            if(original.retiredAt()==null && original.snapshot().enabled()) {
+                if(original.operationalEvidence()!=null && original.operationalEvidence().version()==2 && AlertOperationDomain.supported(key))
+                    AlertEvaluationHost.requireResult(resolved.evaluator().supersede(key,active));
+                else legacyBindingUnavailable=true;
+            }
             synchronized(objectAdmission){var slot=resourceSlots.get(key.resource());
                 if(slot!=null && slot.bindings.remove(key)!=null)retainedResourceBindings.decrementAndGet();}
         }
@@ -260,10 +264,13 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
                         && slot.bindings.remove(entry.getKey(),entry.getValue()))retainedResourceBindings.decrementAndGet();
             }
         }
+        legacyBindingsInScan|=legacyBindingUnavailable;
+        if(legacyBindingUnavailable)legacyBindingsUnavailable=true;
+        if(retained.next()==null){legacyBindingsUnavailable=legacyBindingsInScan;legacyScanComplete=true;}
         reconciliationCursor = retained.next();
         boolean missing=all.stream().anyMatch(r->r.header().active()&&r.enabled()&&r.metric()==null
                 &&!resolved.providers().contains(resolved.catalog().types().stream().filter(t->t.id().equals(r.typeId())).findFirst().orElseThrow().providerId()));
-        if(missing || legacyBindingUnavailable)failure.compareAndSet(previousFailure,new Failure(AlertError.INVALID_CONFIGURATION.code(),Map.of("field","evaluationHost","reason","input-unavailable")));
+        if(missing || legacyBindingsUnavailable || !legacyScanComplete)failure.compareAndSet(previousFailure,new Failure(AlertError.INVALID_CONFIGURATION.code(),Map.of("field","evaluationHost","reason","input-unavailable")));
         else if (slots.values().stream().noneMatch(Slot::discontinuous)) failure.compareAndSet(previousFailure,null);
     }
     /** The original operation has already occurred; enqueueing alone is never durable acceptance. */

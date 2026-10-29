@@ -44,6 +44,26 @@ class AlarmTypeCatalogTest {
         }
         assertThatThrownBy(() -> stale.validatedParameters(Map.of("made-up", BigDecimal.ONE))).isInstanceOf(TapstateException.class);
     }
+    @Test void staticMetricPresetsUseGenericControlsAndRejectInvalidUnitsOrRecoveryOrdering() {
+        var threshold=new Parameter("threshold",ParameterKind.DECIMAL,"1",BigDecimal.ZERO,BigDecimal.valueOf(100),BigDecimal.TEN);
+        var recovery=new Parameter("recovery",ParameterKind.DECIMAL,"1",BigDecimal.ZERO,BigDecimal.valueOf(100),BigDecimal.valueOf(5));
+        var descriptor=new Type("test.queue",1,Kind.STATEFUL,Set.of("pipeline"),"pipeline-observations","threshold",List.of(threshold,recovery),
+                AlarmSeverity.MINOR,false,"test.queue.condition","test.queue.recovery","test.queue.guidance");
+        var template=new MetricAlertEvaluator.Rule("queue.depth",io.tapstate.core.lifecycle.MetricType.GAUGE,"1",Map.of(),
+                MetricAlertEvaluator.Direction.ABOVE,BigDecimal.TEN,BigDecimal.valueOf(5));
+        var preset=new MetricPreset(template,"threshold","recovery");
+        var catalog=new AlarmTypeCatalog(List.of(descriptor),Map.of(descriptor.id(),preset));
+        var rule=catalog.metric(descriptor.id(),Map.of("threshold",new BigDecimal("12.5"),"recovery",new BigDecimal("4.5")));
+        assertThat(rule.name()).isEqualTo("queue.depth");assertThat(rule.trigger()).isEqualByComparingTo("12.5");
+        assertThat(rule.recover()).isEqualByComparingTo("4.5");
+        assertThatThrownBy(()->catalog.metric(descriptor.id(),Map.of("threshold",BigDecimal.ONE))).isInstanceOf(TapstateException.class);
+        assertThatThrownBy(()->new AlarmTypeCatalog(List.of(descriptor),Map.of(descriptor.id(),new MetricPreset(template,"missing","recovery"))))
+                .isInstanceOf(TapstateException.class);
+        var seconds=new MetricAlertEvaluator.Rule("queue.depth",io.tapstate.core.lifecycle.MetricType.GAUGE,"s",Map.of(),
+                MetricAlertEvaluator.Direction.ABOVE,BigDecimal.TEN,BigDecimal.valueOf(5));
+        assertThatThrownBy(()->new AlarmTypeCatalog(List.of(descriptor),Map.of(descriptor.id(),new MetricPreset(seconds,"threshold","recovery"))))
+                .isInstanceOf(TapstateException.class);
+    }
     private static Type type(String id, Kind kind, String provider, String evaluator, String recovery) {
         return new Type(id, 1, kind, Set.of("pipeline"), provider, evaluator, List.of(), AlarmSeverity.MINOR, false,
                 id + ".condition", recovery, id + ".guidance");

@@ -140,4 +140,56 @@ class AlertOperationDomainsIT {
         });
     }
 
+    @Test void aMasterBindingRollbackIsCorruptionAndCannotAdministrativelyEndItsNewerFault() {
+        AlertEvaluationHostIT.withFixture(f->{
+            var artifacts=f.configuration().artifacts();
+            try(var client=com.mongodb.client.MongoClients.create(f.settings().uri())) {
+                client.getDatabase(new com.mongodb.ConnectionString(f.settings().uri()).getDatabase()).getCollection("sources").updateOne(new org.bson.Document("_id","views"),
+                        new org.bson.Document("$set",new org.bson.Document("sourceIdentity.bindingRevision",2L)));
+            }
+            var identity=artifacts.sourceBinding("views").orElseThrow().identity();
+            assertThat(identity.bindingRevision()).isEqualTo(2);
+            var resource=new AlarmKey.Resource("cluster-storage","views",identity.incarnation()+":"+identity.bindingRevision());
+            var originalHost=f.storeHost();
+            var host=new AlertStore.Host(originalHost.scope(),originalHost.setup(),originalHost.deployment(),()->{},null,null,
+                    r->r.equals(resource)?Optional.of(new AlertStore.StorageEvidence(resource,AlertStore.StorageRole.MASTER,null,identity)):Optional.empty(),Set.of());
+            var store=f.configuration().alerts(host,BuiltinAlarmTypes.catalog(),f.clock());
+            var header=AlertConfiguration.Header.create(AlertConfiguration.Identity.create(AlertConfiguration.Kind.RULE,host.scope(),"master-rule"),host.deployment(),f.clock().instant(),"operator");
+            var rule=new AlertConfiguration.Rule(header,"MASTER","cluster.storage-unavailable",1,new AlertConfiguration.Resources(Set.of("cluster-storage"),true,Set.of()),Map.of(),null,true,null).validated(BuiltinAlarmTypes.catalog());
+            store.saveDefinition(null,rule,AlertNotificationPlannerIT.access());
+            String token="9".repeat(64);var binding=new AlertEvaluationHost.Binding(rule,resource,"master",0,()->{},token);
+            new AlertEvaluationHost(store,BuiltinAlarmTypes.catalog(),host.deployment(),f.clock(),"master-owner",()->{}).accept(binding,1,input(f.clock().instant(),token,false));
+            var before=store.state(binding.key(),f.reads()).orElseThrow();
+            try(var client=com.mongodb.client.MongoClients.create(f.settings().uri())) {
+                client.getDatabase(new com.mongodb.ConnectionString(f.settings().uri()).getDatabase()).getCollection("sources").updateOne(new org.bson.Document("_id","views"),
+                        new org.bson.Document("$set",new org.bson.Document("sourceIdentity.bindingRevision",1L)));
+            }
+            assertThatThrownBy(()->store.evaluationStates(null,50)).isInstanceOf(TapstateException.class);
+            assertThat(store.state(binding.key(),f.reads()).orElseThrow()).isEqualTo(before);
+        });
+    }
+
+    @Test void concurrentLastSlotAdmissionCannotCreateASixtyFifthDomain() {
+        AlertEvaluationHostIT.withFixture(f->{
+            var source=source(f);
+            for(int i=0;i<63;i++) {
+                String token=String.format("%064x",i);f.evaluator().accept(binding(source,token),1,input(f.clock().instant(),token,false));
+            }
+            var start=new java.util.concurrent.CountDownLatch(1);var ready=new java.util.concurrent.CountDownLatch(2);
+            var workers=java.util.concurrent.Executors.newFixedThreadPool(2);
+            try {
+                var calls=new ArrayList<java.util.concurrent.Future<Object>>();
+                for(String token:List.of("e".repeat(64),"f".repeat(64)))calls.add(workers.submit(()->{
+                    ready.countDown();start.await();try{return f.evaluator().accept(binding(source,token),1,input(f.clock().instant(),token,false));}
+                    catch(TapstateException refusal){return refusal;}
+                }));
+                assertThat(ready.await(3,java.util.concurrent.TimeUnit.SECONDS)).isTrue();start.countDown();
+                var outcomes=new ArrayList<Object>();for(var call:calls)outcomes.add(call.get(15,java.util.concurrent.TimeUnit.SECONDS));
+                assertThat(outcomes.stream().filter(AlertEvaluationHost.Result.ACCEPTED::equals).count()).isOne();
+                assertThat(f.store().active(null,100,f.reads()).total()).isEqualTo(64);
+            }catch(Exception failure){throw new AssertionError(failure);}
+            finally{start.countDown();workers.shutdownNow();}
+        });
+    }
+
 }

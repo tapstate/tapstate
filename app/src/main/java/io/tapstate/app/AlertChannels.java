@@ -20,7 +20,8 @@ final class AlertChannels implements AlertDeliveryRuntime.Channels {
     interface Resolver { InetAddress[] resolve(String host) throws UnknownHostException; }
     private final AlertChannelPolicy.Deployment deployment;private final CloudRuntimeSettings cloud;
     private final Clock clock;private final Resolver resolver;private final Runnable active;private final String expectedOrg;private final SSLContext systemTls;private final boolean outboundEnabled;
-    private final ThreadPoolExecutor dns=new ThreadPoolExecutor(2,2,0,TimeUnit.SECONDS,new ArrayBlockingQueue<>(2),r->{var t=new Thread(r,"alert-dns");t.setDaemon(true);return t;});
+    // Completed workers may not yet be idle; retain one following lookup for each of the four dispatch slots.
+    private final ThreadPoolExecutor dns=new ThreadPoolExecutor(2,2,0,TimeUnit.SECONDS,new ArrayBlockingQueue<>(4),r->{var t=new Thread(r,"alert-dns");t.setDaemon(true);return t;});
     AlertChannels(AlertChannelPolicy.Deployment deployment,CloudRuntimeSettings cloud,Clock clock,Runnable active,String expectedOrg){
         this(deployment,cloud,clock,active,expectedOrg,InetAddress::getAllByName);
     }

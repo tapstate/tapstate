@@ -277,4 +277,27 @@ class PipelineAlertRuntimeTest {
         } finally {pool.shutdownNow();}
     }
 
+    @Test void legacyBindingDegradationSurvivesOtherPagesUntilACompleteCleanScan() {
+        var header=AlertEvaluationHostTest.definition("pipeline.failed").header();
+        var rule=new AlertConfiguration.Rule(header,"Source","source.connection-failed",1,
+                new AlertConfiguration.Resources(Set.of("source"),true,Set.of()),Map.of(),null,true,null).validated(BuiltinAlarmTypes.catalog());
+        var binding=new AlertEvaluationHost.Binding(rule,new AlarmKey.Resource("source","erp","original"),"producer",1,()->{});
+        fixture.host.accept(binding,1,new AlertInput.Operational(T,"a".repeat(64),OperationalEvidence.Capability.STREAM_READ,false));
+
+        when(fixture.store.evaluationRules(any(),anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule),null));
+        when(fixture.store.evaluationStates(any(),anyInt())).thenAnswer(call->call.getArgument(0)==null
+                ?new AlertStore.EvaluationPage(List.of(rows.get(binding.key())),binding.key(),Set.of(),Set.of(binding.key()))
+                :new AlertStore.EvaluationPage(List.of(),null));
+        try(var runtime=new PipelineAlertRuntime(()->new PipelineAlertRuntime.Services(fixture.store,fixture.host,BuiltinAlarmTypes.catalog(),null,null,Set.of("source-operational-health")),
+                intentStore,(scope,claim)->Optional.empty(),()->{},fixture.clock)) {
+            for(int page=0;page<4;page++) {
+                if(page==2)fixture.host.end(binding.key(),AlertSnapshot.EndReason.RESOURCE_REMOVED,()->{});
+                runtime.tick();await().atMost(Duration.ofSeconds(3)).until(()->runtime.health().queuedInputs()==0);
+                assertThat(runtime.health().degraded()).as("page %s",page).isEqualTo(page<3);
+            }
+            assertThat(rows.get(binding.key()).value().retiredAt()).isNotNull();
+            assertThat(rows.get(binding.key()).value().episode().value().endReason()).isEqualTo(AlertSnapshot.EndReason.RESOURCE_REMOVED);
+        }
+    }
+
 }
