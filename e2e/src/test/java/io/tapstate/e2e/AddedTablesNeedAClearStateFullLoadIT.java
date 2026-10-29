@@ -97,6 +97,7 @@ class AddedTablesNeedAClearStateFullLoadIT {
 
             control.stop(PIPELINE, true);
             awaitState(control, PipelineState.STOPPED);
+            awaitCompletedClear(storage, originalIntent.scope().stateGeneration() + 1);
             control.lifecycle(PIPELINE, LifecycleVerb.START);
             awaitState(control, PipelineState.RUNNING);
             awaitPriority(control, target, ORDERS, "1", "while-stopped");
@@ -125,6 +126,24 @@ class AddedTablesNeedAClearStateFullLoadIT {
             CdcRecoveryFixture.change(source, 3, ORDERS, "2", "", "after-full");
             awaitPriority(control, target, ORDERS, "2", "after-full");
             assertThat(control.state(PIPELINE)).contains(PipelineState.RUNNING);
+        }
+    }
+
+    private static void awaitCompletedClear(PreparedNativeStore storage, long generation) {
+        try (var configuration = MongoConfigurationDomain.openExisting(new MongoConnectionSettings(
+                storage.configurationUri(), null, Duration.ofSeconds(5)))) {
+            Await.until("the original clear to publish its completed successor and consume the purge intent", BOUND,
+                    () -> {
+                        var mapping = configuration.pipelineStates().read(PIPELINE).orElseThrow();
+                        if (mapping.phase() != io.tapstate.spi.store.PipelineStateMapping.Phase.ACTIVE
+                                || mapping.stateGeneration() != generation) return false;
+                        var preparation = configuration.preparations().read(PIPELINE).orElseThrow();
+                        var current = configuration.intents().load(PIPELINE).orElseThrow();
+                        return preparation.phase() == io.tapstate.spi.store.PipelinePreparation.Phase.COMPLETE
+                                && preparation.stateGeneration() == generation && preparation.scope().equals(current.scope())
+                                && current.desired() != null && current.desired().targetState() == PipelineState.STOPPED
+                                && !current.desired().purgeState();
+                    }, () -> String.valueOf(configuration.pipelineStates().read(PIPELINE)));
         }
     }
 

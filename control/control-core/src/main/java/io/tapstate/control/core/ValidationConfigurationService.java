@@ -21,13 +21,13 @@ public final class ValidationConfigurationService {
     public record Side(String nodeId,String sourceId,String database,String schema,String table,String modelVersion,String codecBinding,
             String countOperation,List<Field> fields,List<Candidate> candidates,boolean pipelineWriteKeyUnknown) {}
     public record Mapping(String id,Side source,Side target) {}
-    public record View(String method,String configurationRevision,String mappingRevision,String fingerprint,List<Mapping> mappings,
+    public record View(String method,String configurationRevision,String mappingRevision,String fingerprint,String comparisonFingerprint,List<Mapping> mappings,
             String premise,String conclusionScope,ValidationExecutionService.Context context) {}
     /** Owns all projected metadata until HTTP serialization has completed or failed. */
     public static final class Evaluation implements AutoCloseable {
         private final ValidationEvaluation owner;private View view;
         private Evaluation(ValidationEvaluation owner){this.owner=owner;var value=owner.view();
-            view=new View(value.method(),value.configurationRevision(),value.mappingRevision(),value.fingerprint(),value.mappings().stream()
+            view=new View(value.method(),value.configurationRevision(),value.mappingRevision(),value.fingerprint(),owner.comparison().map(ValidationTaskSpec::fingerprint).orElse(null),value.mappings().stream()
                     .map(mapping->new Mapping(mapping.id(),side(mapping.source()),side(mapping.target()))).toList(),value.premise(),value.conclusionScope(),ValidationExecutionService.Context.from(value.context()));}
         public View view(){owner.requireCurrent();return view;}
         @Override public void close(){view=null;owner.close();}
@@ -38,7 +38,7 @@ public final class ValidationConfigurationService {
     public record SavedPair(List<String> source,List<String> target) {}
     public record Key(String confirmationId,List<SavedPair> fields) {}
     public record SavedMapping(String mappingId,String outputId,String sourceId,String sourceTable,String targetSourceId,String targetTable,Key keys) {}
-    public record Task(String pipelineId,String taskId,String taskGeneration,String revision,String nextStartSequence,boolean closed,String method,
+    public record Task(String pipelineId,String taskId,String taskGeneration,String revision,String nextStartSequence,boolean closed,String method,String comparisonFingerprint,
             int historyLimit,Schedule schedule,boolean scheduleEnabled,List<SavedMapping> mappings,ValidationExecutionService.Context context,Permission permission,ScheduleObservation scheduleObservation) {}
     public record Permission(String phase,String taskGeneration,String revision,String sequence,String command,String run) {}
     public record ScheduleObservation(String node,String boot,String member,String context,String observedAt,String nextDue,String lastDue,String state,String reason,String command,String run,String sequence) {}
@@ -99,7 +99,7 @@ public final class ValidationConfigurationService {
     }
     public Optional<Task> read(String pipeline,String task){
         name(pipeline);name(task);return tasks.read(pipeline,task).map(value->new Task(pipeline,task,value.task().generation().toString(),Long.toString(value.revision()),
-                Long.toString(value.full().nextStartSequence()),value.closed(),value.settings().full().method().name(),value.settings().full().historyLimit(),
+                Long.toString(value.full().nextStartSequence()),value.closed(),value.settings().full().method().name(),value.comparison().fingerprint(),value.settings().full().historyLimit(),
                 schedule(value.settings().full().schedule()),value.settings().full().scheduleEnabled(),value.comparison().mappings().stream().map(mapping->new SavedMapping(
                     mapping.mappingId(),mapping.outputId(),mapping.source().sourceId(),mapping.source().table(),mapping.target().sourceId(),mapping.target().table(),
                     mapping.keys()==null?null:new Key(mapping.keys().confirmationId(),java.util.stream.IntStream.range(0,mapping.keys().source().size())

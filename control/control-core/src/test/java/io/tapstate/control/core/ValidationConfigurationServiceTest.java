@@ -52,6 +52,7 @@ class ValidationConfigurationServiceTest {
     @Test void projectionKeepsLeaseUntilConsumerFinishesAndPreservesExactWireRevision(){
         var probe=new Probe();var store=new Store();var service=service(store,probe,ignored->{});
         var evaluated=service.evaluate(input("0"));assertThat(probe.active).isTrue();assertThat(evaluated.view().configurationRevision()).isEqualTo("9007199254740993");
+        assertThat(evaluated.view().comparisonFingerprint()).isEqualTo(probe.spec.fingerprint()).isNotEqualTo(evaluated.view().fingerprint());
         assertThat(store.creates+store.updates).isZero();evaluated.close();assertThat(probe.active).isFalse();assertThat(probe.closes).isOne();
     }
     @Test void saveReevaluatesRatherThanAcceptingClientFingerprintAsAuthority(){
@@ -97,6 +98,7 @@ class ValidationConfigurationServiceTest {
         store.current=new ValidationTaskStore.Snapshot(task,2,UUID.randomUUID(),comparison,ValidationTaskStore.Settings.defaults(ValidationMethod.COUNT,0),1,UUID.randomUUID(),false,
                 new ValidationTaskStore.Mode(2,new ValidationTaskStore.Permission(start,ValidationTaskStore.Phase.OPEN)),new ValidationTaskStore.Mode(1,null));
         var read=service(store,probe,ignored->{}).read("flow","task").orElseThrow();
+        assertThat(read.comparisonFingerprint()).isEqualTo(comparison.fingerprint());
         assertThat(read.revision()).isEqualTo("2");assertThat(read.permission().revision()).isEqualTo("1");assertThat(read.permission().sequence()).isEqualTo("1");
         assertThat(read.permission().command()).isEqualTo(start.commandId());assertThat(read.permission().phase()).isEqualTo("OPEN");assertThat(probe.calls).isZero();
     }

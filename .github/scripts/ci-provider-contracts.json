@@ -132,6 +132,17 @@
       },
       "source": "e2e/src/test/java/io/tapstate/e2e/JoinConformanceIT.java",
       "source_sha256": "2cf8697d4c05b5668280e993dfb3908a4a3019fadd840690b1cbb9cb61df5b64"
+    },
+    "io.tapstate.adapters.mongostore.MongoValidationIndependentPreparationIT": {
+      "module": "adapters/adapter-mongo-store",
+      "providers": {
+        "damagedControlFields": {
+          "kind": "source",
+          "projection": "strict"
+        }
+      },
+      "source": "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationIndependentPreparationIT.java",
+      "source_sha256": "cddcad7eba786d3ccf97e60d6fa5712ed5b7d947ab1273c4ce1dce3e8491fc38"
     }
   },
   "contract": "Only these source-hash-bound local providers are enumerated before test selection. Streams, filesystem corpus and catalog resources are read without executing test assertions, functions or processes. Changed source, unknown providers and unsupported arguments remain incomplete.",
