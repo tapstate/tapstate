@@ -95,6 +95,15 @@ public final class PipelineObservationQueryService {
                 .map(this::statusOf);
     }
 
+    /** One read keeps state, measurement times and snapshot progress on the same publication. */
+    public record Read(PipelineStatus status, PipelineMetrics metrics, PipelineSnapshot snapshot) { }
+    public Optional<Read> findRead(String pipelineId) {
+        Objects.requireNonNull(pipelineId,PIPELINE_ID_ARGUMENT);
+        return observations.read(pipelineId).map(value->new Read(statusOf(value),
+                new PipelineMetrics(value.pipelineId(),value.metrics(),value.positions(),value.facts()),
+                new PipelineSnapshot(value.pipelineId(),value.snapshot())));
+    }
+
     /** Returns an observed status with its current execution plan, without requiring an observation to exist. */
     public Optional<PipelineStatus> findStatusWithPlan(String pipelineId) {
         Objects.requireNonNull(pipelineId, PIPELINE_ID_ARGUMENT);

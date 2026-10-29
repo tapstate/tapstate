@@ -1,6 +1,9 @@
 package io.tapstate.control.core;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.dsl.PipelineInputs;
+import io.tapstate.core.model.FromClause;
+import java.util.Set;
 import io.tapstate.core.lifecycle.MetricAttributes;
 import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
@@ -61,17 +64,24 @@ public final class ViewCatalogService {
         List<ViewCatalogItem> result = new ArrayList<>();
         for (Resource resource : resources.values()) {
             if (!(resource instanceof PipelineResource pipeline)) continue;
-            PipelineStatus status = observations.findStatus(pipeline.id()).orElse(null);
-            PipelineMetrics metrics = status == null ? null : observations.metrics(pipeline.id());
-            PipelineSnapshot snapshot = status == null ? null : observations.snapshot(pipeline.id());
+            var publication=observations.findRead(pipeline.id()).orElse(null);
+            PipelineStatus status = publication == null ? null : publication.status();
+            PipelineMetrics metrics = publication == null ? null : publication.metrics();
+            PipelineSnapshot snapshot = publication == null ? null : publication.snapshot();
             ViewBlock.Inline view = inlineView(pipeline.view(), resources);
             if (view != null) {
                 String collection = view.storage() != null && view.storage().warm() != null
                         ? view.storage().warm().collection() : view.id();
                 result.add(item("view", pipeline.id(), pipeline.id() + ":" + view.id(), storeId, collection,
-                        status, metrics, snapshot, resources));
+                        status, metrics, snapshot, resources,PipelineInputs.reaching(pipeline,resources,FromClause.list(view.from()))));
             }
             List<SyncElement> sync = syncElements(pipeline.serve(), resources);
+            FromClause served=switch(pipeline.serve()) {
+                case ServeBlock.Inline inline -> inline.from();
+                case ServeBlock.Use use -> use.from();
+                case null -> null;
+            };
+            var servedInputs=served==null?Set.<PipelineInputs.Input>of():PipelineInputs.reaching(pipeline,resources,served);
             for (SyncElement element : sync) {
                 Map<String, String> explicitNames = element.rename() == null ? null : element.rename().map();
                 List<String> outputTables = explicitNames != null && !explicitNames.isEmpty()
@@ -82,7 +92,9 @@ public final class ViewCatalogService {
                     String collection = element.rename() != null && element.rename().map() != null
                             ? element.rename().map().getOrDefault(table, table) : table;
                     result.add(item(kind, pipeline.id(), pipeline.id() + ":" + element.id() + ":" + table,
-                            element.source(), collection, status, metrics, snapshot, resources));
+                            element.source(), collection, status, metrics, snapshot, resources,
+                            servedInputs.stream().filter(input->input.table()==null || input.table().equals(table)
+                                    || (input.source()+"."+input.table()).equals(table)).collect(java.util.stream.Collectors.toUnmodifiableSet())));
                 }
             }
         }
@@ -92,7 +104,7 @@ public final class ViewCatalogService {
 
     private ViewCatalogItem item(String kind, String pipelineId, String id, String sourceId,
             String collection, PipelineStatus pipelineStatus, PipelineMetrics metrics,
-            PipelineSnapshot snapshot, Map<String, Resource> resources) {
+            PipelineSnapshot snapshot, Map<String, Resource> resources,Set<PipelineInputs.Input> inputs) {
         Resource resource = resources.get(sourceId);
         String database = resource instanceof SourceResource source ? database(source) : null;
         Long documents = null;
@@ -108,36 +120,72 @@ public final class ViewCatalogService {
         }
         return new ViewCatalogItem(id, kind,
                 new ViewCatalogItem.Location(sourceId, database, collection), pipelineId,
-                freshness(pipelineStatus, metrics, snapshot), documents, sizeBytes, null);
+                freshness(pipelineStatus, metrics, snapshot,inputs), documents, sizeBytes, null);
     }
 
     private ViewCatalogItem.Freshness freshness(PipelineStatus status, PipelineMetrics metrics,
-            PipelineSnapshot snapshot) {
-        if (status == null || status.state() == PipelineState.NEW) {
-            return new ViewCatalogItem.Freshness("not-loaded", null, null, null);
-        }
-        if (status.state() == PipelineState.RUNNING) {
-            Integer progress = snapshot == null ? null : snapshot.snapshot().values().stream()
-                    .map(TableSnapshot::donePct).filter(Objects::nonNull).min(Integer::compareTo).orElse(null);
-            if (progress != null && progress < 100) {
-                return new ViewCatalogItem.Freshness("loading", null, null, progress);
-            }
-            Long lag = lag(metrics);
-            if (lag != null && lag <= FRESH_LIMIT_SECONDS && status.state() == PipelineState.RUNNING) {
-                return new ViewCatalogItem.Freshness("fresh", lag, null, null);
-            }
-        }
-        Long stale = status.observedAt() == null ? null
-                : Math.max(0, Duration.between(status.observedAt(), Instant.now(clock)).toSeconds());
-        return new ViewCatalogItem.Freshness("stale", null, stale, null);
+            PipelineSnapshot snapshot,Set<PipelineInputs.Input> inputs) {
+        Instant now=clock.instant();
+        if(status==null || status.state()==PipelineState.NEW)
+            return freshness("not-loaded",null,null,null,now,null,"not-loaded");
+        var measurement=eventAge(metrics,inputs,now);
+        Instant observed=status.observedAt();
+        if(measurement!=null && measurement.clockInvalid())
+            return freshness("stale",null,null,measurement.observedAt(),now,null,"clock-or-time-unavailable");
+        if(observed==null || observed.isAfter(now))
+            return freshness("stale",measurement==null?null:measurement.seconds(),null,observed,now,null,"clock-or-time-unavailable");
+        if(measurement!=null && (observed==null || measurement.observedAt().isBefore(observed)))observed=measurement.observedAt();
+        Long age=observed==null || observed.isAfter(now)?null:Duration.between(observed,now).toSeconds();
+        Long eventAge=measurement==null?null:measurement.seconds();
+        if(age==null)return freshness("stale",eventAge,null,observed,now,null,"clock-or-time-unavailable");
+        if(status.state()!=PipelineState.RUNNING)
+            return freshness("stale",eventAge,age,observed,now,null,"pipeline-inactive");
+        if(age>FRESH_LIMIT_SECONDS)return freshness("stale",eventAge,age,observed,now,null,"observation-stale");
+        var tables=inputTables(inputs);
+        Integer progress=snapshot==null?null:snapshot.snapshot().entrySet().stream()
+                .filter(entry->tables.contains(entry.getKey())).map(entry->entry.getValue().donePct())
+                .filter(Objects::nonNull).min(Integer::compareTo).orElse(null);
+        if(progress!=null && progress<100)return freshness("loading",null,age,observed,now,progress,"snapshot-loading");
+        if(measurement==null)return freshness("stale",null,age,observed,now,null,"measurement-unavailable");
+        return freshness("fresh",eventAge,age,observed,now,null,"observed");
     }
-
-    private static Long lag(PipelineMetrics metrics) {
-        if (metrics == null) return null;
-        return metrics.facts().stream().filter(fact -> LAG_METRIC.equals(fact.name()))
-                .map(MetricFact::points).flatMap(List::stream)
-                .filter(point -> point.attributes().containsKey(MetricAttributes.TABLE_ID))
-                .map(MetricPoint::value).filter(Objects::nonNull).max(Long::compareTo).orElse(null);
+    private static ViewCatalogItem.Freshness freshness(String state,Long eventAge,Long age,Instant observed,
+            Instant now,Integer progress,String reason) {
+        return new ViewCatalogItem.Freshness(state,state.equals("fresh")?eventAge:null,state.equals("stale")?age:null,
+                progress,eventAge,observed,now,age,"s","max-input-table-event-age",reason);
+    }
+    private record EventAge(Long seconds,Instant observedAt,boolean clockInvalid) { }
+    private static Set<String> inputTables(Set<PipelineInputs.Input> inputs) {
+        var tables=new java.util.HashSet<String>();
+        for(var input:inputs)if(input.table()!=null){tables.add(input.table());tables.add(input.source()+"."+input.table());}
+        return Set.copyOf(tables);
+    }
+    private static EventAge eventAge(PipelineMetrics metrics,Set<PipelineInputs.Input> inputs,Instant now) {
+        if(metrics==null || inputs.isEmpty() || inputs.stream().anyMatch(input->input.table()==null))return null;
+        var points=new LinkedHashMap<String,MetricPoint>();
+        var tables=inputTables(inputs);
+        for(var fact:metrics.facts())if(LAG_METRIC.equals(fact.name()) && fact.type()==io.tapstate.core.lifecycle.MetricType.GAUGE && fact.unit().equals("s"))
+            for(var point:fact.points()) {
+                String table=point.attributes().get(MetricAttributes.TABLE_ID);
+                if(table!=null && tables.contains(table) && point.value()!=null && point.value()>=0) {
+                    if(points.putIfAbsent(table,point)!=null)return null;
+                }
+            }
+        long maximum=0;Instant measured=null;
+        for(var input:inputs) {
+            var point=points.get(input.source()+"."+input.table());
+            if(point==null) {
+                if(inputs.stream().filter(other->input.table().equals(other.table())).count()>1)return null;
+                point=points.get(input.table());
+            }
+            if(point==null)return null;
+            if(point.observedAt()==null || point.observedAt().isAfter(now))return new EventAge(null,point.observedAt(),true);
+            long elapsed=Duration.between(point.observedAt(),now).toSeconds();
+            long seconds=point.value()>Long.MAX_VALUE-elapsed?Long.MAX_VALUE:point.value()+elapsed;
+            maximum=Math.max(maximum,seconds);
+            if(measured==null || point.observedAt().isBefore(measured))measured=point.observedAt();
+        }
+        return new EventAge(maximum,measured,false);
     }
 
     private static String storeId(Map<String, Resource> resources) {

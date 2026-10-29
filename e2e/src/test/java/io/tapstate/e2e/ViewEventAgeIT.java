@@ -51,21 +51,40 @@ class ViewEventAgeIT {
             control.lifecycle("view_age",LifecycleVerb.START);
             var landed=targetClient.getDatabase(targetDb).getCollection("order_state");
             Await.until("the real managed View snapshot",Duration.ofSeconds(90),()->landed.countDocuments()==1,()->control.viewsJson());
-            Instant changedAt=Instant.now();collection.updateOne(new Document("_id",1),new Document("$set",new Document("name","after")));
+            Instant changedAt=Instant.now();org.bson.BsonTimestamp sourceOperationTime;
+            try(var session=source.startSession()) {
+                collection.updateOne(session,new Document("_id",1),new Document("$set",new Document("name","after")));
+                sourceOperationTime=session.getOperationTime();
+            }
+            assertThat(sourceOperationTime).isNotNull();
             Await.until("the real source change to reach the managed View",Duration.ofSeconds(90),()->landed.countDocuments(new Document("name","after"))==1,()->control.viewsJson());
             Await.until("the target-acked source position",Duration.ofSeconds(90),()->control.durablePosition("view_age","orders").isPresent(),()->control.metricsJson("view_age"));
             Instant targetConfirmedAt=Instant.now();
             String before=control.viewsJson(),metrics=control.metricsJson("view_age");
+            browserReview(server,"fresh");
             assertThat(server.stopPublishingObservations()).isEqualTo(1);
             Await.until("the retained observation to age beyond the read freshness window",Duration.ofSeconds(90),()->control.observedAgeMillis("view_age").orElse(0L)>=65000,()->control.viewsJson());
             String after=control.viewsJson();
+            browserReview(server,"stale");
             var receipt=new LinkedHashMap<String,Object>();receipt.put("sourceChangeRequestedAt",changedAt.toString());receipt.put("targetConfirmedAt",targetConfirmedAt.toString());
+            receipt.put("sourceWriteServerTime",Instant.ofEpochSecond(Integer.toUnsignedLong(sourceOperationTime.getTime())).toString());
+            receipt.put("sourceWriteServerTimePrecision","s");receipt.put("sourceWriteLogicalIncrement",sourceOperationTime.getInc());
+            receipt.put("readBackAt",Instant.now().toString());receipt.put("observationAgeMillis",control.observedAgeMillis("view_age").orElseThrow());
             receipt.put("actualTargetDocument",landed.find(new Document("name","after")).first().toJson());receipt.put("sourcePositionPresent",true);
             receipt.put("before",JsonReader.parse(before));receipt.put("after",JsonReader.parse(after));receipt.put("metrics",JsonReader.parse(metrics));
             Path evidence=Path.of(System.getProperty("tapstate.t8.view-receipt","/tmp/w4-t8-view-receipt.json"));Files.writeString(evidence,JsonWriter.write(receipt));
-            assertThat(after).as("the actual View API after the publisher stopped: %s",after).contains("\"state\":\"stale\"");
+            assertThat(after).as("the actual View API after the publisher stopped: %s",after).contains("\"state\":\"stale\"", "\"reason\":\"observation-stale\"", "\"unit\":\"s\"");
         }finally{
             try(var cleanup=MongoClients.create(sourceUri)){cleanup.getDatabase(sourceDb).drop();cleanup.getDatabase(targetDb).drop();}
         }
     }
+    private static void browserReview(InProcessServer server,String phase) throws Exception {
+        String selected=System.getProperty("tapstate.t8.view-browser-review");
+        if(selected==null)return;
+        Path directory=Path.of(selected);Files.createDirectories(directory);
+        Files.writeString(directory.resolve(phase+".json"),JsonWriter.write(Map.of("baseUrl",server.baseUrl().toString(),"phase",phase)));
+        Await.until("the explicit browser review of "+phase,Duration.ofMinutes(5),
+                ()->Files.exists(directory.resolve(phase+".done")),()->server.baseUrl().toString());
+    }
+
 }
