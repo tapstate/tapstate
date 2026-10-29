@@ -50,6 +50,23 @@ class AlertEvaluationHostIT {
             }
         });
     }
+    @Test void nameAndSeverityEditsKeepTheOriginalActiveEpisodeAndItsAcceptedFrontier(){
+        withFixture(f->{var originalBinding=f.binding(()->new AlertStore.EvaluationProof(f.intent,ACTIVE));
+            f.evaluator.accept(originalBinding,1,new AlertInput.Conditions(T,AlertSignal.Condition.BAD,null));
+            var before=f.store.state(originalBinding.key(),f.reads()).orElseThrow().value();f.now.set(T.plusSeconds(1));
+            var changed=new AlertConfiguration.Rule(f.rule.header().next(f.clock.instant(),"operator"),"Renamed only",f.rule.typeId(),1,f.rule.resources(),f.rule.parameters(),AlarmSeverity.CRITICAL,true,null);
+            assertThat(f.store.saveDefinition(f.rule,changed,AlertNotificationPlannerIT.access())).isEqualTo(AlertStore.Outcome.STAGED);
+            var saved=(AlertConfiguration.Rule)f.store.definition(AlertConfiguration.Kind.RULE,"rule",AlertNotificationPlannerIT.access()).orElseThrow();
+            var current=new AlertEvaluationHost.Binding(saved,originalBinding.resource(),originalBinding.producer(),originalBinding.sourceBindingRevision(),ACTIVE,()->new AlertStore.EvaluationProof(f.intent,ACTIVE));
+            f.evaluator.tick(current);var after=f.store.state(current.key(),f.reads()).orElseThrow().value();
+            assertThat(after.snapshot().status()).isEqualTo(AlertSnapshot.Status.FIRING);
+            assertThat(after.snapshot().episode().number()).isEqualTo(before.snapshot().episode().number());
+            assertThat(after.snapshot().episode().firedAt()).isEqualTo(before.snapshot().episode().firedAt());
+            assertThat(after.snapshot().episode().severity()).isEqualTo(AlarmSeverity.CRITICAL);
+            assertThat(after.snapshot().lastSequence()).isEqualTo(before.snapshot().lastSequence());
+            assertThat(after.snapshot().lastObservedAt()).isEqualTo(before.snapshot().lastObservedAt());
+        });
+    }
     @Test void stalePipelineIntentIsRejectedInsideTheConfigurationTransaction() {
         withFixture(f->{
             var binding=f.binding(()->new AlertStore.EvaluationProof(f.intent,ACTIVE));
