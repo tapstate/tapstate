@@ -219,6 +219,10 @@ public final class ControlOperations {
             "pipeline.catalog", Scope.READ, false, null,
             "List a bounded page of Pipelines from the unified artifact-and-draft catalog, including lifecycle status.",
             CLI_AND_REST);
+    public static final Operation PIPELINE_DELETE = new Operation(
+            "pipeline.delete", Scope.WRITE, true, null,
+            "Remove one applied Pipeline and the authoring draft revision the caller read, preserving the existing lifecycle, reference, and version guards.",
+            Map.of(Frontend.REST, Maturity.CURRENT));
     public static final Operation VIEW_LIST = new Operation(
             "view.list", Scope.READ, false, null,
             "List materialized views and replicas with their location, maintaining pipeline, and freshness.",
@@ -421,6 +425,7 @@ public final class ControlOperations {
             CLUSTER_CONTEXT,
             PIPELINE_LIST,
             PIPELINE_CATALOG,
+            PIPELINE_DELETE,
             VIEW_LIST,
             PIPELINE_GET,
             PIPELINE_LAYOUT_GET,

@@ -831,6 +831,50 @@ final class ControlPlane {
         return asObject(map);
     }
 
+    /** Reads a durable authoring draft, distinguishing an absent draft from a failed read. */
+    Optional<Map<String, Object>> pipelineDraft(String id) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + urlSegment(id) + "/draft"));
+        if (response.statusCode() == 404) return Optional.empty();
+        expect(response, 200, "read pipeline draft " + id);
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> map)) {
+            throw new AssertionError("the pipeline draft read was not an object: " + response.body());
+        }
+        return Optional.of(asObject(map));
+    }
+
+    /** The merged catalog that backs the Web list. */
+    List<String> pipelineCatalogIds() {
+        HttpResponse<String> response = send(authedGet("/api/pipelines?limit=200&offset=0"));
+        expect(response, 200, "read the Pipeline catalog");
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> map)
+                || !(map.get("items") instanceof List<?> items)) {
+            throw new AssertionError("the pipeline catalog was not a list: " + response.body());
+        }
+        return items.stream().map(item -> {
+            if (!(item instanceof Map<?, ?> entry) || !(entry.get("id") instanceof String id)) {
+                throw new AssertionError("the pipeline catalog contained an invalid entry: " + item);
+            }
+            return id;
+        }).toList();
+    }
+
+    /** Removes the applied Pipeline and the exact authoring revision the caller read. */
+    void deletePipeline(String id, String artifactHash, long draftRevision) {
+        expect(send(pipelineDelete(id, artifactHash, draftRevision)), 204, "delete the whole Pipeline " + id);
+    }
+
+    Refusal deletePipelineExpectingRefusal(String id, String artifactHash, long draftRevision) {
+        HttpResponse<String> response = send(pipelineDelete(id, artifactHash, draftRevision));
+        return interpretRefusal(response.statusCode(), response.body(), "deleting the whole Pipeline " + id);
+    }
+
+    private HttpRequest pipelineDelete(String id, String artifactHash, long draftRevision) {
+        return authenticate(HttpRequest.newBuilder(baseUrl.resolve("/api/pipelines/" + urlSegment(id)))
+                .timeout(TIMEOUT).DELETE())
+                .header("If-Match", "\"" + artifactHash + "\"")
+                .header("If-Draft-Match", "\"" + draftRevision + "\"").build();
+    }
+
     /** Reads the aggregate lifecycle projection for a known pipeline draft. */
     Map<String, Object> pipelineStatus(String id) {
         HttpResponse<String> response = send(authedGet("/api/pipelines/" + urlSegment(id) + "/status"));
