@@ -130,6 +130,7 @@ class ArtifactMutationServiceTest {
 
     @Test void nativeDeletionBindsBeforeAuditAndAuditFailureCannotInvokeItsMutation() {
         var events=new ArrayList<String>(); var failed=new java.util.concurrent.atomic.AtomicBoolean(true);
+        var operations=new ArrayList<String>();
         var original=pipeline("native"); store.save(original);
         var unreadableState=new StateStore() {
             @Override public java.util.Optional<CheckpointDoc> read(String id) { throw new AssertionError("native lifecycle validation"); }
@@ -137,7 +138,7 @@ class ArtifactMutationServiceTest {
             @Override public io.tapstate.core.lifecycle.CasOutcome compareAndSwap(String id,long epoch,String json,Instant at) { throw new AssertionError("native CAS"); }
             @Override public void delete(String id) { throw new AssertionError("native reclamation"); }
         };
-        AuditStore audit=record -> { events.add("audit"); if(failed.get())throw new IllegalStateException("audit down"); };
+        AuditStore audit=record -> { events.add("audit"); operations.add(record.operationId()); if(failed.get())throw new IllegalStateException("audit down"); };
         var nativeService=new ArtifactMutationService(store,desired,unreadableState,observations,layouts,srsMeta,derivedSchemas,rateHistory,
                 new AuditGate(audit,FIXED_CLOCK),DataBrowserFollows.NONE,(captured,expected) -> {
                     assertThat(captured).isEqualTo(original); assertThat(expected).isEqualTo(hash(original)); events.add("bind");
@@ -148,6 +149,9 @@ class ArtifactMutationServiceTest {
         assertThat(events).containsExactly("bind","audit");
         failed.set(false); nativeService.delete(PRINCIPAL,"native",hash(original));
         assertThat(events).containsExactly("bind","audit","bind","audit","retire");
+        nativeService.deletePipeline(PRINCIPAL,"native",hash(original));
+        assertThat(operations).containsExactly("artifact.delete","artifact.delete","pipeline.delete");
+        assertThat(events).containsExactly("bind","audit","bind","audit","retire","bind","audit","retire");
         assertThat(store.get("native")).isPresent();
     }
 

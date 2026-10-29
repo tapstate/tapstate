@@ -74,5 +74,43 @@ class Ownership(unittest.TestCase):
         self.assertEqual(docker.removed, [])
 
 
+class HttpDiagnostics(unittest.TestCase):
+    def test_only_phase_status_and_a_catalog_code_leave_a_failed_response(self):
+        response = b'{"code":"control.unauthenticated","message":"private-token","params":{"password":"private-password"}}\n401'
+        with patch.object(SMOKE, "command", return_value=response):
+            with self.assertRaisesRegex(RuntimeError, "test-CACHE failed.*HTTP 401, code control.unauthenticated") as failure:
+                SMOKE.request("fixture", "/api/storage/test", label="test-CACHE")
+        self.assertNotIn("private", str(failure.exception))
+
+    def test_unknown_codes_and_non_json_responses_never_leave_the_body(self):
+        for response in (b'{"code":"private-token"}\n500', b'private-token\n502'):
+            with self.subTest(response=response), patch.object(SMOKE, "command", return_value=response):
+                with self.assertRaisesRegex(RuntimeError, "code unavailable") as failure:
+                    SMOKE.request("fixture", "/api/storage/setup/commit")
+                self.assertNotIn("private", str(failure.exception))
+
+    def test_success_keeps_the_original_json_and_does_not_retry_the_request(self):
+        with patch.object(SMOKE, "command", return_value=b'{"phase":"COMPLETE"}\n200') as called:
+            self.assertEqual(SMOKE.request("fixture", "/installation/first-admin"), {"phase": "COMPLETE"})
+        called.assert_called_once()
+
+    def test_transport_failure_keeps_the_phase_and_hides_arguments_and_output(self):
+        failed = subprocess.CompletedProcess([], 7, b"private-token", b"private-password")
+        with patch.object(SMOKE.subprocess, "run", return_value=failed):
+            with self.assertRaisesRegex(RuntimeError, "test-MASTER failed.*exit 7") as failure:
+                SMOKE.request("fixture", "/api/storage/test", label="test-MASTER")
+        self.assertNotIn("private", str(failure.exception))
+
+    def test_request_exceptions_cannot_expose_the_capability_or_captured_output(self):
+        errors = (subprocess.TimeoutExpired(["curl", "private-token"], 70, output=b"private-password"),
+                OSError("private-token"))
+        for error in errors:
+            with self.subTest(error=type(error).__name__), patch.object(SMOKE, "command", side_effect=error):
+                with self.assertRaisesRegex(RuntimeError, "test-CACHE") as failure:
+                    SMOKE.request("fixture", "/api/storage/test", label="test-CACHE")
+                self.assertNotIn("private", str(failure.exception))
+                self.assertTrue(failure.exception.__suppress_context__)
+
+
 if __name__ == "__main__":
     unittest.main()

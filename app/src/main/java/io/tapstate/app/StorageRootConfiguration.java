@@ -108,7 +108,9 @@ class StorageRootConfiguration {
                     } else if (phase == StorageRoot.Phase.AUTH_READY || phase == StorageRoot.Phase.BUSINESS_READY) {
                         entry = io.tapstate.control.restapi.StorageEntryStatus.Entry.LOGIN;
                         if (installation != null && configuration.firstAdmin().load().orElseThrow(StorageRuntime::unavailable).phase() == FirstAdminStore.Phase.PENDING)
-                            entry = phase == StorageRoot.Phase.BUSINESS_READY ? io.tapstate.control.restapi.StorageEntryStatus.Entry.FIRST_ADMIN_REQUIRED
+                            entry = phase == StorageRoot.Phase.BUSINESS_READY && root.runtime().businessStarted()
+                                    && installation.files().stage().handoff() == InstallationFiles.Handoff.RESTARTED
+                                    ? io.tapstate.control.restapi.StorageEntryStatus.Entry.FIRST_ADMIN_REQUIRED
                                     : io.tapstate.control.restapi.StorageEntryStatus.Entry.UNAVAILABLE;
                     }
                 }

@@ -53,6 +53,7 @@ import java.util.List;
         StateStoreController.class, StorageControlController.class,
         ConnectorIconController.class,
         PipelineViewController.class,
+        PipelineDeletionController.class,
         PipelineLayoutController.class,
         PipelineDraftController.class,
         AiProviderController.class, PipelineAssistantController.class,
