@@ -6,6 +6,7 @@ import org.springframework.core.io.support.PathMatchingResourcePatternResolver;
 
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.regex.Pattern;
@@ -13,7 +14,7 @@ import java.util.regex.Pattern;
 /** Allows reads of packaged root-level image resources without exposing application endpoints. */
 final class PublicStaticResource {
     private static final Pattern ROOT_IMAGE =
-            Pattern.compile("/[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*\\.(?i:svg|png|ico|jpg|jpeg|webp|gif|avif|bmp)");
+            Pattern.compile("/(?![^/]*\\.\\.)[A-Za-z0-9_-][A-Za-z0-9._-]*\\.(?i:svg|png|ico|jpg|jpeg|webp|gif|avif|bmp)");
     private static final Set<String> PUBLIC_IMAGES = loadPublicImages(
             new PathMatchingResourcePatternResolver(PublicStaticResource.class.getClassLoader()));
 
@@ -42,7 +43,7 @@ final class PublicStaticResource {
         try {
             return Arrays.stream(resolver.getResources("classpath*:/static/*"))
                     .map(Resource::getFilename)
-                    .filter(filename -> filename != null)
+                    .filter(Objects::nonNull)
                     .map(filename -> "/" + filename)
                     .filter(PublicStaticResource::hasPublicRootImageName)
                     .collect(Collectors.toUnmodifiableSet());

@@ -51,6 +51,7 @@ class PublicStaticResourceTest {
         assertThat(PublicStaticResource.matches(request)).isFalse();
 
         assertThat(PublicStaticResource.hasPublicRootImageName("/..image.svg")).isFalse();
+        assertThat(PublicStaticResource.hasPublicRootImageName("/image..svg")).isFalse();
         assertThat(PublicStaticResource.hasPublicRootImageName("/nested/image.svg")).isFalse();
     }
 
