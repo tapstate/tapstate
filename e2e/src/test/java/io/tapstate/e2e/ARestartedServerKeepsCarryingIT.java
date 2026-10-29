@@ -80,6 +80,9 @@ class ARestartedServerKeepsCarryingIT {
                 ControlPlane control = new ControlPlane(second.baseUrl());
                 storage.loginAndAwaitBusiness(control);
 
+                Await.until("the restarted server to adopt its retained Pipeline",
+                        () -> control.state(running.pipelineId()).filter(PipelineState.RUNNING::equals).isPresent(),
+                        () -> String.valueOf(control.state(running.pipelineId())));
                 assertThat(control.state(running.pipelineId()))
                         .as("the pipeline the restarted server adopted from the store it read")
                         .contains(PipelineState.RUNNING);

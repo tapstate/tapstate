@@ -23,6 +23,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * both readings itself, waiting for the server to publish a newer observation, and prints rows per second
  * in the one answer -- with a number, which may be nought when nothing moved, but only ever after two
  * readings.
+ * A run may initially have no published counter; rows move only after the watch holds its first
+ * concrete reading, so the following sample must observe that movement.
  *
  * <p>The first line of the watch is what decides the first half: a watch that printed {@code 0.0 rows/s}
  * there would read as a pipeline moving nothing, which is what a stalled one looks like, and the two call
@@ -57,7 +59,7 @@ class RateIsUnknownUntilThereAreTwoSamplesIT {
             try (CliProcess watch = CliProcess.onAPipe(Map.of("TAPSTATE_PASSWORD", PASSWORD),
                     "-c", server.baseUrl().toString(), "-u", USER,
                     "status", pipelineId, "--watch")) {
-                String opened = watch.awaitOutput(seen -> seen.contains(pipelineId + "  moving  not known"), TIMEOUT,
+                String opened = watch.awaitOutput(seen -> seen.contains(pipelineId + "  moving  not known yet -- one reading"), TIMEOUT,
                         "the watch's first movement line, which has one reading and says so");
                 assertThat(opened).as("one reading is not a rate of nought").doesNotContain("rows/s");
 

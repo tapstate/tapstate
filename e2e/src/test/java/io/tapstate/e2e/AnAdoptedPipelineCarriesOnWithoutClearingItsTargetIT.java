@@ -90,6 +90,9 @@ class AnAdoptedPipelineCarriesOnWithoutClearingItsTargetIT {
             try (ServerHandle second = tier.launch(storage)) {
                 ControlPlane control = new ControlPlane(second.baseUrl());
                 storage.loginAndAwaitBusiness(control);
+                Await.until("the restarted server to adopt its retained Pipeline",
+                        () -> control.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent(),
+                        () -> String.valueOf(control.state(PIPELINE)));
                 assertThat(control.state(PIPELINE))
                         .as("the pipeline the restarted server carried on, with nobody asked")
                         .contains(PipelineState.RUNNING);
