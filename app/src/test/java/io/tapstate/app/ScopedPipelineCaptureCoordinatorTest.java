@@ -123,6 +123,29 @@ class ScopedPipelineCaptureCoordinatorTest {
         }
     }
 
+    @Test void nativeInitialLoadUsesCurrentRunRowsAndTheOriginalLandingProof() throws Exception {
+        try (var f = new Fixture()) {
+            var run = f.coordinator.forRun(SCOPE, PIPELINE, ORIGINAL);
+            run.startCapture("flow", f.snapshot(), f.models());
+            verify(f.snapshots, timeout(3000)).recordCount("input", "orders", 1, 1);
+            var at = Instant.now();
+            var plan = new ExecutionPlan("flow", 2L, 3L, 1L, List.of("node"), List.of(), at);
+            var pending = run.initialLoad("flow", plan, at);
+            assertThat(pending).isNotNull();
+            assertThat(pending.runKey()).isEqualTo(InitialLoad.executionKey(plan));
+            assertThat(pending.tables().get("orders").rowsRead()).isOne();
+            assertThat(pending.tables().get("orders").stage()).isNotEqualTo(InitialLoad.Stage.LANDED);
+            when(f.snapshots.count("input", "orders", 1)).thenReturn(OptionalLong.of(20));
+            when(f.boundedLoads.complete(ORIGINAL)).thenReturn(true);
+            var completed = run.initialLoad("flow", plan, at);
+            assertThat(completed.tables().get("orders")).isEqualTo(new InitialLoad.Table(InitialLoad.Stage.LANDED, 1L, null));
+            assertThat(completed.phase(PipelineState.COMPLETED)).isEqualTo(InitialLoad.Phase.COMPLETED);
+            assertThat(run.initialLoad("flow", new ExecutionPlan("flow", 2L, 4L, 1L, List.of(), List.of(), at), at)).isNull();
+            run.stopCapture("flow", false);
+            assertThat(run.initialLoad("flow", plan, at)).isNull();
+        }
+    }
+
     @Test void streamingSnapshotProgressRequiresItsOwnDurableCompletionMarker() throws Exception {
         try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
             var run = f.coordinator.forRun(SCOPE, PIPELINE, ORIGINAL);
@@ -130,12 +153,31 @@ class ScopedPipelineCaptureCoordinatorTest {
             assertThat(run.loadDelivered("flow")).isFalse();
             assertThat(run.snapshotProgress("flow").byTable().get("orders"))
                     .isEqualTo(new TableSnapshot(0, null, null, false));
+            var at = Instant.now();
+            var plan = new ExecutionPlan("flow", 2L, 3L, 1L, List.of("node"), List.of(), at);
+            assertThat(run.initialLoad("flow", plan, at).tables().get("orders").stage()).isNotEqualTo(InitialLoad.Stage.LANDED);
             f.streamingProgress.set(f.progress(true, 1, 1));
             assertThat(run.loadDelivered("flow")).isTrue();
+            var load = run.initialLoad("flow", plan, at);
+            assertThat(load.readMode()).isEqualTo("snapshot_and_cdc");
+            assertThat(load.tables().get("orders").stage()).isEqualTo(InitialLoad.Stage.LANDED);
+            assertThat(load.phase(PipelineState.RUNNING)).isEqualTo(InitialLoad.Phase.STREAMING);
             assertThat(run.snapshotProgress("flow").byTable().get("orders"))
                     .isEqualTo(new TableSnapshot(0, 0L, 100, true));
             assertThat(run.runSnapshotProgress("flow").byTable().get("orders"))
                     .isEqualTo(new TableSnapshot(0, 0L, 100, true));
+        }
+    }
+
+    @Test void cdcOnlyLoadReportsNoInventedSnapshotTables() {
+        try (var f = new Fixture(ReadMode.CDC_ONLY)) {
+            var run = f.coordinator.forRun(SCOPE, PIPELINE, ORIGINAL);
+            run.startCapture("flow", f.snapshot(), f.models());
+            var at = Instant.now();
+            var load = run.initialLoad("flow", new ExecutionPlan("flow", 2L, 3L, 1L, List.of("node"), List.of(), at), at);
+            assertThat(load.readMode()).isEqualTo("cdc_only");
+            assertThat(load.tables()).isEmpty();
+            assertThat(load.phase(PipelineState.RUNNING)).isEqualTo(InitialLoad.Phase.STREAMING);
         }
     }
 
@@ -148,6 +190,9 @@ class ScopedPipelineCaptureCoordinatorTest {
                     : f.progress(true, "membership".equals(damage) ? 2 : 1, "snapshot".equals(damage) ? 2 : 1));
             assertThatThrownBy(() -> run.snapshotProgress("flow")).isInstanceOf(TapstateException.class);
             assertThatThrownBy(() -> run.runSnapshotProgress("flow")).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> run.initialLoad("flow",
+                    new ExecutionPlan("flow", 2L, 3L, 1L, List.of("node"), List.of(), Instant.now()), Instant.now()))
+                    .isInstanceOf(TapstateException.class);
         }
     }
 
@@ -484,6 +529,7 @@ class ScopedPipelineCaptureCoordinatorTest {
         final ExecutionAuthorization authorization=mock(ExecutionAuthorization.class);
         final CaptureOwnership ownership=mock(CaptureOwnership.class);
         final ConnectorProvisioner connectors=mock(ConnectorProvisioner.class);
+        final ScopedPipelineCaptureCoordinator.BoundedLoads boundedLoads=mock(ScopedPipelineCaptureCoordinator.BoundedLoads.class);
         final ScopedPipelineCaptureCoordinator.CompletedFullLookup completedFull=mock(ScopedPipelineCaptureCoordinator.CompletedFullLookup.class);
         final SnapshotBuffer buffer;
         final NativeSrsCaptureRunUnit runtime;
@@ -534,7 +580,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             runtime=spy(new NativeSrsCaptureRunUnit(BUSINESS,new SrsStores(mock(SrsChainStore.class),mock(SrsModelStore.class),mock(SrsLogStore.class),mock(SrsConsumerStore.class)),mock(HazelcastInstance.class)));
             var node=new WorkloadClaimFence(new WorkloadClaimKey("cluster",WorkloadClaimType.NODE_SESSION,"node"),OWNER,1,0,1);
             coordinator=new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(BUSINESS,pipelines,sources,configuration,cache,notes,ignored -> false,
-                            ScopedPipelineCaptureCoordinator.BoundedLoads.NONE,completedFull),
+                            boundedLoads,completedFull),
                     new ScopedPipelineCaptureCoordinator.Execution(() -> Optional.of(node),authorization,ownership,renewal,() -> {},Clock.systemUTC()),
                     runtime,buffer,connectors,(original,config,guard,preparation,stream) -> { guard.run(); opened.incrementAndGet(); return new Port(config.node().nodeId(),guard,closedPorts,readRows,rowCount.get(),closeFailure); });
             if (!bounded) streaming();

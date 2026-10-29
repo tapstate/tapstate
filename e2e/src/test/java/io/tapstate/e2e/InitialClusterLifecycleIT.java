@@ -26,8 +26,8 @@ class InitialClusterLifecycleIT {
         Map<String, ProcessHandle> processes = new LinkedHashMap<>();
         String id;
         try (ClusterLifecycleProbe.Scope ignored = ClusterLifecycleProbe.install(event -> collect(event, events, processes))) {
-            String store = SharedMongo.replicaSetUrl(database("two"));
-            try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "observed-two")) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                    TwoMemberCluster cluster = TwoMemberCluster.startPreparedSequentially(storage)) {
                 id = cluster.first().clusterId();
                 assertThat(cluster.awaitBothMembers()).containsExactly(TwoMemberCluster.NODE_A, TwoMemberCluster.NODE_B);
                 assertThat(cluster.second().clusterMemberNodeIds())
@@ -48,8 +48,8 @@ class InitialClusterLifecycleIT {
         Map<String, ProcessHandle> processes = new LinkedHashMap<>();
         String id;
         try (ClusterLifecycleProbe.Scope ignored = ClusterLifecycleProbe.install(event -> collect(event, events, processes))) {
-            String store = SharedMongo.replicaSetUrl(database("three"));
-            try (PartitionableCluster cluster = PartitionableCluster.start(store, "observed-three", nodes)) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                    PartitionableCluster cluster = PartitionableCluster.startPrepared(storage, nodes)) {
                 id = cluster.clusterId();
                 assertThat(cluster.awaitMembers("node-a", 3)).containsExactlyInAnyOrderElementsOf(nodes);
                 for (String node : nodes) {

@@ -46,7 +46,7 @@ class PdkTargetIdentityPlannerTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"names", "indexes"})
+    @ValueSource(strings = {"names", "indexes", "indexes-clear"})
     void losingAuthorityDuringMetadataStopsTheNextExternalCall(String lastAllowed) throws Throwable {
         var active = new java.util.concurrent.atomic.AtomicBoolean(true);
         List<String> calls = new ArrayList<>();
@@ -59,15 +59,19 @@ class PdkTargetIdentityPlannerTest {
                 out.accept(List.of("orders"));
                 if (lastAllowed.equals("names")) active.set(false);
             });
-            connector.functions().supportExecuteCommandFunction((context, command, out) -> {
+            connector.functions().supportQueryIndexes((context, table, out) -> {
                 calls.add("indexes");
-                out.accept(new ExecuteResult<>().result(IdentityConnectorFixture.mongoIndexes()));
-                active.set(false);
+                out.accept(List.of(new TapIndex().name("_id_").unique(true)
+                        .indexField(new TapIndexField().name("_id"))));
+                if (lastAllowed.startsWith("indexes")) active.set(false);
             });
             connector.functions().supportCountByPartitionFilterFunction((context, table, filter) -> {
                 calls.add("count"); return 0L;
             });
-            assertThatThrownBy(() -> PdkTargetIdentityPlanner.assess(connector, config("mongodb", Map.of()),
+            var assessment = lastAllowed.equals("indexes-clear")
+                    ? new SinkConfig("mongodb", Map.of(), WriteMode.UPSERT, DdlPolicy.FAIL, null, null, OnFullLoad.CLEAR, true)
+                    : config("mongodb", Map.of());
+            assertThatThrownBy(() -> PdkTargetIdentityPlanner.assess(connector, assessment,
                     Map.of("orders", target("_id")))).isSameAs(lost);
             assertThat(calls).containsExactlyElementsOf(lastAllowed.equals("names")
                     ? List.of("names") : List.of("names", "indexes"));

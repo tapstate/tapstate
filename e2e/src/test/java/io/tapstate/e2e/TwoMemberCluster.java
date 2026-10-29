@@ -80,6 +80,11 @@ final class TwoMemberCluster implements AutoCloseable {
         return start(storage.configurationUri(), storage.clusterId(), nodeSessionTtl, true, true, Map.of(), storage);
     }
 
+    /** Retains the sequential launch contract for lifecycle ordering witnesses. */
+    static TwoMemberCluster startPreparedSequentially(PreparedNativeStore storage) {
+        return start(storage.configurationUri(), storage.clusterId(), null, false, true, Map.of(), storage);
+    }
+
     /**
      * Launches both members over {@code storeUri} and signs in on each.
      *
