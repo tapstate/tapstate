@@ -15,12 +15,17 @@ import java.util.regex.Pattern;
 final class PublicStaticResource {
     private static final Pattern ROOT_IMAGE =
             Pattern.compile("/(?![^/]*\\.\\.)[A-Za-z0-9_-][A-Za-z0-9._-]*\\.(?i:svg|png|ico|jpg|jpeg|webp|gif|avif|bmp)");
-    private static final Set<String> PUBLIC_IMAGES = loadPublicImages(
-            new PathMatchingResourcePatternResolver(PublicStaticResource.class.getClassLoader()));
+    private final Set<String> publicImages;
 
-    private PublicStaticResource() { }
+    private PublicStaticResource(Set<String> publicImages) {
+        this.publicImages = publicImages;
+    }
 
-    static boolean matches(HttpServletRequest request) {
+    static PublicStaticResource create(PathMatchingResourcePatternResolver resolver) {
+        return new PublicStaticResource(loadPublicImages(resolver));
+    }
+
+    boolean matches(HttpServletRequest request) {
         String method = request.getMethod();
         if (!("GET".equals(method) || "HEAD".equals(method))) {
             return false;
@@ -28,11 +33,11 @@ final class PublicStaticResource {
         return matchesPath(request.getServletPath());
     }
 
-    static boolean matchesPath(String path) {
+    boolean matchesPath(String path) {
         if (!hasPublicRootImageName(path)) {
             return false;
         }
-        return PUBLIC_IMAGES.contains(path);
+        return publicImages.contains(path);
     }
 
     static boolean hasPublicRootImageName(String path) {

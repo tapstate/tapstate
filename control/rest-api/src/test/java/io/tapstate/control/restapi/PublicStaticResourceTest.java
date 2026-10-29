@@ -19,36 +19,38 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class PublicStaticResourceTest {
+    private final PublicStaticResource images = PublicStaticResource.create(
+            new PathMatchingResourcePatternResolver(getClass().getClassLoader()));
     @Test
     void packagedImagesArePublicForGetAndHead() {
         MockHttpServletRequest request = new MockHttpServletRequest("GET", "/tapstate-lockup-dark.svg");
         request.setServletPath("/tapstate-lockup-dark.svg");
-        assertThat(PublicStaticResource.matches(request)).isTrue();
+        assertThat(images.matches(request)).isTrue();
         assertThat(PublicStaticResource.hasPublicRootImageName("/brand.png")).isTrue();
         assertThat(PublicStaticResource.hasPublicRootImageName("/brand.webp")).isTrue();
         assertThat(PublicStaticResource.hasPublicRootImageName("/brand.PNG")).isTrue();
 
         request.setMethod("HEAD");
-        assertThat(PublicStaticResource.matches(request)).isTrue();
+        assertThat(images.matches(request)).isTrue();
     }
 
     @Test
     void nonImageMethodsPathsAndUnpackagedImagesAreNotPublic() {
         MockHttpServletRequest request = new MockHttpServletRequest("POST", "/tapstate-lockup-dark.svg");
-        assertThat(PublicStaticResource.matches(request)).isFalse();
+        assertThat(images.matches(request)).isFalse();
 
         request.setMethod("GET");
         request.setRequestURI("/api/tapstate-lockup-dark.svg");
         request.setServletPath("/api/tapstate-lockup-dark.svg");
-        assertThat(PublicStaticResource.matches(request)).isFalse();
+        assertThat(images.matches(request)).isFalse();
 
         request.setRequestURI("/not-packaged.svg");
         request.setServletPath("/not-packaged.svg");
-        assertThat(PublicStaticResource.matches(request)).isFalse();
+        assertThat(images.matches(request)).isFalse();
 
         request.setRequestURI("/readme.txt");
         request.setServletPath("/readme.txt");
-        assertThat(PublicStaticResource.matches(request)).isFalse();
+        assertThat(images.matches(request)).isFalse();
 
         assertThat(PublicStaticResource.hasPublicRootImageName("/..image.svg")).isFalse();
         assertThat(PublicStaticResource.hasPublicRootImageName("/image..svg")).isFalse();
@@ -68,6 +70,9 @@ class PublicStaticResourceTest {
         assertThatThrownBy(() -> PublicStaticResource.loadPublicImages(resolver))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("classpath*:/static/*")
+                .hasCause(cause);
+        assertThatThrownBy(() -> PublicStaticResource.create(resolver))
+                .isInstanceOf(IllegalStateException.class)
                 .hasCause(cause);
     }
 

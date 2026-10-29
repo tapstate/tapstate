@@ -85,6 +85,9 @@ class RestApiSecurityConfiguration {
     @Bean
     @Order(2)
     SecurityFilterChain rootSecurityFilterChain(HttpSecurity http, ApiSecurityErrorWriter errors) {
+        PublicStaticResource images = PublicStaticResource.create(
+                new org.springframework.core.io.support.PathMatchingResourcePatternResolver(
+                        PublicStaticResource.class.getClassLoader()));
         CodedAuthenticationEntryPoint entryPoint = new CodedAuthenticationEntryPoint(errors);
         http
                 .securityMatcher(new NegatedRequestMatcher(PathPatternRequestMatcher.pathPattern("/api/**")))
@@ -102,7 +105,7 @@ class RestApiSecurityConfiguration {
                                 CloudAuthController.INVALIDATE_PATH, "/auth/bootstrap", "/connector-icons/*",
                                 "/index.html", "/assets/**", "/favicon.ico", "/tapstate-mark.svg",
                                 "/tapstate-mark-light.svg", "/error").permitAll()
-                        .requestMatchers(PublicStaticResource::matches).permitAll()
+                        .requestMatchers(images::matches).permitAll()
                         .requestMatchers(SpaNavigationRequest::matches).permitAll()
                         .anyRequest().denyAll());
         try {
