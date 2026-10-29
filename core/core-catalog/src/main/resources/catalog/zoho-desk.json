@@ -139,7 +139,7 @@
   ],
   "provenance": {
     "specPath": "connectors/zoho-desk-connector/src/main/resources/spec.json",
-    "specContentHash": "43d2f4245cf9efcb",
+    "specContentHash": "097a0012beb5b6a6",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

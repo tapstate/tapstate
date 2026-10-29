@@ -279,7 +279,7 @@
   ],
   "provenance": {
     "specPath": "connectors/dws-connector/src/main/resources/spec_dws.json",
-    "specContentHash": "4fe067208dfa2264",
+    "specContentHash": "20c31a66192a025a",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

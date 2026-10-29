@@ -352,7 +352,7 @@
   ],
   "provenance": {
     "specPath": "connectors/oceanbase-mysql-connector/src/main/resources/oceanbase-spec.json",
-    "specContentHash": "765f04cda41dd81a",
+    "specContentHash": "0db177a449218162",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {
