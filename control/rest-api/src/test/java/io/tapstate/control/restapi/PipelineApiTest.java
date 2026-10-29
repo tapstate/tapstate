@@ -484,6 +484,42 @@ class PipelineApiTest {
     }
 
     @Test
+    void aStaleArtifactPreconditionLeavesTheArtifactAndDraftUntouched() {
+        String currentHash = seedDeletionDraft();
+        String staleHash = "0".repeat(64);
+        assertThat(staleHash).isNotEqualTo(currentHash);
+
+        ApiError refusal = deleteWebPipeline(staleHash, "1", Scope.WRITE, HttpStatus.PRECONDITION_FAILED);
+
+        assertThat(refusal.code()).isEqualTo("artifact.version-conflict");
+        assertThat(context.getBean(FakeArtifactStore.class).get("pl1")).isPresent();
+        assertThat(context.getBean(FakePipelineDraftStore.class).get("pl1")).hasValueSatisfying(
+                draft -> assertThat(draft.revision()).isEqualTo(1));
+    }
+
+    @Test
+    void aReferencedPipelineCannotBeDeletedAndItsArtifactAndDraftStayIntact() {
+        String hash = seedDeletionDraft();
+        context.getBean(FakeArtifactStore.class).seed("""
+                version: tapstate/v1
+                kind: pipeline
+                id: downstream
+                source: pl1
+                """);
+
+        ApiError refusal = deleteWebPipeline(hash, "1", Scope.WRITE, HttpStatus.CONFLICT);
+
+        assertThat(refusal.code()).isEqualTo("artifact.in-use");
+        assertThat(refusal.params().get("referrers").toString()).contains("downstream");
+        assertThat(context.getBean(FakeArtifactStore.class).get("pl1")).isPresent();
+        assertThat(context.getBean(FakePipelineDraftStore.class).get("pl1")).isPresent();
+        assertThat(context.getBean(FakeArtifactStore.class).get("downstream")).isPresent();
+        assertThat(context.getBean(RecordingAuditStore.class).records)
+                .extracting(AuditRecord::operationId)
+                .doesNotContain("pipeline.delete", "pipeline-draft.delete", "artifact.delete");
+    }
+
+    @Test
     void wholePipelineDeletionRequiresWriteScopeAndTheDraftRevisionThatWasRead() {
         String hash = seedDeletionDraft();
         ApiError forbidden = deleteWebPipeline(hash, "1", Scope.READ, HttpStatus.FORBIDDEN);
