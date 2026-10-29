@@ -142,7 +142,9 @@ public final class MongoConfigurationDomain implements AutoCloseable {
 
     /** Feature schema validation is load-only and does not change the global CONFIG version. */
     public int alertSchemaVersion() {
-        var budget = new MongoReadBudget(java.time.Duration.ofSeconds(5));
+        return alertSchemaVersion(new MongoReadBudget(java.time.Duration.ofSeconds(5)));
+    }
+    int alertSchemaVersion(MongoReadBudget budget) {
         requireOpen();
         return new MongoAlertStorageSchema(connection.client(), connection.database(), clusterId,
                 configurationKey.refresh(budget).activeKeyId(), this::requireOpen).load(budget);
@@ -154,6 +156,10 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         requireOpen();
         return new MongoAlertStorageSchema(connection.client(), connection.database(), clusterId,
                 configurationKey.refresh(budget).activeKeyId(), this::requireOpen).prepare(operationId, budget);
+    }
+
+    <T> T alertMaintenanceTransaction(MongoReadBudget budget,java.util.function.Function<com.mongodb.client.ClientSession,T> action) {
+        requireOpen();return budget.maintenanceTransaction(connection.client(),session->{requireOpen();T result=action.apply(session);requireOpen();return result;});
     }
 
     /** Load-only maintenance status; an unfinished operation is never presented as query capability 3. */

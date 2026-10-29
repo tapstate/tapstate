@@ -89,6 +89,13 @@ final class FactsMetricProducer implements MetricProducer {
     private final Instant started;
     private final CardinalityBudget.Folder folder = CardinalityBudget.folder();
     private final Map<String, Offered> latest = new ConcurrentHashMap<>();
+    private volatile List<MetricFact> runtimeFacts=List.of();
+    void offerRuntime(Instant observedAt,List<MetricFact> facts) {
+        if(facts.size()>64 || facts.stream().anyMatch(f->!f.name().startsWith("tapstate.alerting.") || f.type()!=MetricType.GAUGE
+                || f.points().size()!=1 || !f.points().getFirst().attributes().isEmpty() || !f.points().getFirst().observedAt().equals(observedAt)))
+            throw new IllegalArgumentException("outside bounded runtime metrics contract");
+        runtimeFacts=List.copyOf(facts);
+    }
 
     /** Per instrument, the attribute sets that hold a series of their own past the export limit, in first-seen order. */
     private final Map<String, Set<Map<String, String>>> named = new HashMap<>();
@@ -152,6 +159,7 @@ final class FactsMetricProducer implements MetricProducer {
                         .points.addAll(fact.points());
             }
         }
+        for(var fact:runtimeFacts)byInstrument.computeIfAbsent(fact.name(),name->new Series(fact.type(),fact.unit())).points.addAll(fact.points());
         List<MetricData> out = new ArrayList<>();
         byInstrument.forEach((name, series) ->
                 out.add(metric(resource, name, series.type, series.unit, backstop(name, series.type, series.points))));

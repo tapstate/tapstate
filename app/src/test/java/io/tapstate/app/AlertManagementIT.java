@@ -197,4 +197,31 @@ class AlertManagementIT {
             assertThatThrownBy(()->service(f).dispatch("alert.center",caller(Scope.READ,guard),Map.of())).isInstanceOf(TapstateException.class);
         });
     }
+    @Test void defaultDetailRespectsStackAndHistoryExpiryWithoutRunningPhysicalCleanup() {
+        AlertEvaluationHostIT.withFixture(f->{var binding=f.binding(()->new AlertStore.EvaluationProof(f.intent(),ACTIVE));
+            f.evaluator().accept(binding,1,new AlertInput.Conditions(T,AlertSignal.Condition.BAD,new AlarmDiagnostics.SafeTrace("java.lang.IllegalStateException: retained trace",1,false,false)));
+            var row=object(((List<?>)call(service(f),"center",Map.of()).get("rows")).getFirst());
+            f.now().set(T.plusSeconds(1));f.evaluator().accept(binding,2,new AlertInput.Conditions(f.clock().instant(),AlertSignal.Condition.GOOD,null));
+            f.now().set(T.plus(Duration.ofDays(8)));var detail=call(service(f),"detail",map("key",row.get("key")));
+            assertThat(object(detail.get("diagnostics"))).containsEntry("status","PRUNED").doesNotContainKey("text");
+            f.now().set(T.plus(Duration.ofDays(31)));assertThatThrownBy(()->call(service(f),"detail",map("key",row.get("key")))).isInstanceOf(TapstateException.class);
+            assertThat(f.store().state(binding.key(),f.reads()).orElseThrow().value().episode()).isNotNull();
+        });
+    }
+
+    @Test void configuredRetentionIsFrozenInEpisodesAndTestsAndIsNotRecomputedAfterReopen() {
+        AlertEvaluationHostIT.withFixture(f->{var properties=new AlertRetentionSettings();properties.setRetention(Map.of("ended-episode","P7D","test-payload","PT5M"));var policy=properties.resolve(f.storeHost().deployment());
+            var creator=new AlertEvaluationHost(f.store(),BuiltinAlarmTypes.catalog(),f.storeHost().deployment(),f.clock(),"retention-creator",ACTIVE,policy);
+            var binding=f.binding(()->new AlertStore.EvaluationProof(f.intent(),ACTIVE));assertThat(creator.accept(binding,1,new AlertInput.Conditions(T,AlertSignal.Condition.BAD,null))).isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
+            f.now().set(T.plusSeconds(31));var reopened=new AlertEvaluationHost(f.store(),BuiltinAlarmTypes.catalog(),f.storeHost().deployment(),f.clock(),"retention-reopened",ACTIVE);
+            assertThat(reopened.accept(binding,2,new AlertInput.Conditions(f.clock().instant(),AlertSignal.Condition.GOOD,null))).isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
+            var episode=f.store().state(binding.key(),f.reads()).orElseThrow().value().episode();assertThat(episode.policy().value().duration(AlertRetentionPolicy.Setting.ENDED_EPISODE)).isEqualTo(Duration.ofDays(7));
+            var commands=new AlertDeliveryCommands(sendingStore(f),f.storeHost().scope(),f.storeHost().deployment(),f.clock(),policy);
+            var transport=new AlertReceiver.Email("smtp.example.test",465,AlertReceiver.Encryption.IMPLICIT_TLS,AlertReceiver.Authentication.NONE,null,"alerts@example.test",List.of("only@example.test"),AlertReceiver.Trust.SYSTEM);
+            var created=commands.test(new AlertTestCommand.ClientId(f.clock().instant(),"a".repeat(32)),"retention-candidate",transport,"only@example.test",null,null,Set.of(),null,access());
+            assertThat(created.value().frozen().retention().value().duration(AlertRetentionPolicy.Setting.TEST_PAYLOAD)).isEqualTo(Duration.ofMinutes(5));
+            f.now().set(T.plus(Duration.ofDays(8)));assertThat(f.store().history(binding.key(),null,10,f.reads()).rows()).isEmpty();
+        });
+    }
+
 }

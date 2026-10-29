@@ -13,8 +13,20 @@ import org.bson.types.MinKey;
 
 /** Bounded keyset reads over declared indexes. Unknown formats remain visible as an isolation indication. */
 final class MongoAlertReads {
-    private final MongoDatabase db;private final AlarmKey.Scope scope;private final MongoAlertStateStore states;
-    MongoAlertReads(MongoDatabase db,AlarmKey.Scope scope,MongoAlertStateStore states){this.db=db;this.scope=scope;this.states=states;}
+    private final MongoDatabase db;private final AlarmKey.Scope scope;private final MongoAlertStateStore states;private final java.time.Clock clock;
+    MongoAlertReads(MongoDatabase db,AlarmKey.Scope scope,MongoAlertStateStore states){this(db,scope,states,java.time.Clock.systemUTC());}
+    MongoAlertReads(MongoDatabase db,AlarmKey.Scope scope,MongoAlertStateStore states,java.time.Clock clock){this.db=db;this.scope=scope;this.states=states;this.clock=clock;}
+    private AlertStateRecord.Episode visibleEpisode(AlertStateRecord.Episode value){
+        if(value.historyUntil()!=null&&!clock.instant().isBefore(value.historyUntil()))return null;
+        if(value.diagnostics().status()==AlertStateRecord.DiagnosticStatus.CAPTURED&&value.diagnosticUntil()!=null&&!clock.instant().isBefore(value.diagnosticUntil()))
+            return new AlertStateRecord.Episode(value.originalBinding(),value.value(),value.policy(),value.diagnostics().prune(value.diagnosticUntil()),value.summariesHandedOff());
+        return value;
+    }
+    private AlertIntent.Record visibleDelivery(AlertIntent.Record value) {
+        // Projection only: use the original control facts, never stop an eligible request in a read.
+        if(value.state().retained().stoppedAt()!=null)return AlertMaintenancePolicy.prune(value,clock.instant());
+        return value;
+    }
     ActivePage active(ClientSession session,ActiveCursor after,int limit,ReadAccess access){
         return active(session,after,limit,access,null);
     }
@@ -51,7 +63,7 @@ final class MongoAlertReads {
                 .append("$lte",new Document("alarm",alarm).append("number",Long.MAX_VALUE));
         var raw=SystemCollections.ALERT_EPISODES.on(db).find(s,new Document("_id",range)).sort(new Document("_id",1)).limit(limit+1).into(new ArrayList<>());
         boolean more=raw.size()>limit;if(more)raw.removeLast();boolean isolated=false;var values=new ArrayList<AlertStateRecord.Episode>();
-        for(var row:raw){if(!Integer.valueOf(2).equals(row.get("formatVersion"))){isolated=true;continue;}values.add(MongoAlertStateEnvelope.readEpisode(key,row.get("_id",Document.class).getLong("number"),row));}
+        for(var row:raw){if(!Integer.valueOf(2).equals(row.get("formatVersion"))){isolated=true;continue;}var visible=visibleEpisode(MongoAlertStateEnvelope.readEpisode(key,row.get("_id",Document.class).getLong("number"),row));if(visible!=null)values.add(visible);}
         return new HistoryPage(values,more?raw.getLast().get("_id",Document.class).getLong("number"):null,isolated);
     }
     EndedPage ended(ClientSession s,EpisodeCursor after,int limit,ReadAccess access,AlertSnapshot.EndReason reason){
@@ -61,7 +73,7 @@ final class MongoAlertReads {
         if(after!=null)filter=and(filter,lexAfter(List.of("endedSecondOrder","endedNanoOrder","_id"),List.of(after.secondOrder(),after.nanoOrder(),new Document("alarm",MongoAlertStateCodec.key(after.key())).append("number",after.number()))));
         var raw=SystemCollections.ALERT_EPISODES.on(db).find(s,filter).hintString("alert_query_ended").sort(new Document("endedSecondOrder",1).append("endedNanoOrder",1).append("_id",1)).limit(limit+1).into(new ArrayList<>());
         boolean more=raw.size()>limit;if(more)raw.removeLast();var rows=new ArrayList<AlertStateRecord.Episode>();EpisodeCursor cursor=null;
-        for(var doc:raw){var id=doc.get("_id",Document.class);var key=MongoAlertStateCodec.readKey(id.get("alarm",Document.class));cursor=new EpisodeCursor(key,id.getLong("number"),doc.getLong("endedSecondOrder"),doc.getInteger("endedNanoOrder"));rows.add(MongoAlertStateEnvelope.readEpisode(key,cursor.number(),doc));}
+        for(var doc:raw){var id=doc.get("_id",Document.class);var key=MongoAlertStateCodec.readKey(id.get("alarm",Document.class));cursor=new EpisodeCursor(key,id.getLong("number"),doc.getLong("endedSecondOrder"),doc.getInteger("endedNanoOrder"));var visible=visibleEpisode(MongoAlertStateEnvelope.readEpisode(key,cursor.number(),doc));if(visible!=null)rows.add(visible);}
         var unsupported=new Document("_id.alarm.authorityId",scope.authorityId()).append("_id.alarm.clusterId",scope.clusterId()).append("formatVersion",new Document("$ne",2));
         if(!access.allResources()){var allowed=access.resources().stream().map(r->new Document("_id.alarm.resourceKind",r.kind()).append("_id.alarm.resourceId",r.id()).append("_id.alarm.resourceIncarnation",r.incarnation())).toList();unsupported=and(unsupported,allowed.isEmpty()?new Document("_id",new Document("$exists",false)):new Document("$or",allowed));}
         boolean isolated=SystemCollections.ALERT_EPISODES.on(db).find(s,unsupported).projection(new Document("_id",1)).limit(1).first()!=null;
@@ -74,20 +86,20 @@ final class MongoAlertReads {
                 .hintString("_id_").sort(new Document("_id",1)).limit(limit+1).into(new ArrayList<>());
         boolean more=raw.size()>limit;if(more)raw.removeLast();boolean isolated=false;var rows=new ArrayList<Stored<AlertIntent.Record>>();
         for(var doc:raw){if(!Set.of(1,2).contains(doc.get("formatVersion"))){isolated=true;continue;}
-            var value=MongoAlertDeliveryCodec.readAny(scope,doc);var r=value.value();if(r.frozen().members().stream().anyMatch(m->!access.permits(m.evaluation().key())))continue;
+            var value=MongoAlertDeliveryCodec.readAny(scope,doc);var r=visibleDelivery(value.value());if(!clock.instant().isBefore(r.state().retained().resultUntil()))continue;if(r.frozen().members().stream().anyMatch(m->!access.permits(m.evaluation().key())))continue;
             if((channel==null||channel.equals(r.frozen().channel().typeId()))&&(outcome==null||outcome==r.state().summary()))rows.add(new Stored<>(value.recordRevision(),r));}
         return new DeliveryPage(rows,more?raw.getLast().get("_id",Document.class).getString("deliveryId"):null,isolated);
     }
     Optional<Stored<AlertIntent.Record>> delivery(ClientSession s,String id,ReadAccess access){
         var raw=SystemCollections.ALERT_DELIVERY_INTENTS.on(db).find(s,new Document("_id",MongoAlertDeliveryCodec.scope(scope).append("purpose","business").append("deliveryId",id))).first();
-        if(raw==null)return Optional.empty();var value=MongoAlertDeliveryCodec.readAny(scope,raw);if(value.value().frozen().members().stream().anyMatch(m->!access.permits(m.evaluation().key())))return Optional.empty();return Optional.of(new Stored<>(value.recordRevision(),value.value()));
+        if(raw==null)return Optional.empty();var value=MongoAlertDeliveryCodec.readAny(scope,raw);if(!clock.instant().isBefore(value.value().state().retained().resultUntil()))return Optional.empty();if(value.value().frozen().members().stream().anyMatch(m->!access.permits(m.evaluation().key())))return Optional.empty();return Optional.of(new Stored<>(value.recordRevision(),visibleDelivery(value.value())));
     }
     TransitionPage transitions(ClientSession s,AlarmKey key,TransitionCursor after,int limit){
         limit(limit);var alarm=MongoAlertStateCodec.key(key);var low=new Document("alarm",alarm).append("recordRevision",after==null?1L:after.revision()).append("ordinal",after==null?0:after.ordinal());
         var high=new Document("alarm",alarm).append("recordRevision",Long.MAX_VALUE).append("ordinal",Integer.MAX_VALUE);
         var raw=SystemCollections.ALERT_TRANSITIONS.on(db).find(s,new Document("_id",new Document(after==null?"$gte":"$gt",low).append("$lte",high))).sort(new Document("_id",1)).limit(limit+1).into(new ArrayList<>());
         boolean more=raw.size()>limit;if(more)raw.removeLast();boolean isolated=false;var values=new ArrayList<AlertStateRecord.Transition>();
-        for(var row:raw){if(!Integer.valueOf(2).equals(row.get("formatVersion"))){isolated=true;continue;}var id=row.get("_id",Document.class);values.add(MongoAlertStateEnvelope.readTransition(key,id.getLong("recordRevision"),id.getInteger("ordinal"),row));}
+        for(var row:raw){if(!Integer.valueOf(2).equals(row.get("formatVersion"))){isolated=true;continue;}var id=row.get("_id",Document.class);var value=MongoAlertStateEnvelope.readTransition(key,id.getLong("recordRevision"),id.getInteger("ordinal"),row);if(clock.instant().isBefore(value.cleanupAt()))values.add(value);}
         TransitionCursor next=null;if(more){var id=raw.getLast().get("_id",Document.class);next=new TransitionCursor(id.getLong("recordRevision"),id.getInteger("ordinal"));}
         return new TransitionPage(values,next,isolated);
     }

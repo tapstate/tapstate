@@ -23,12 +23,15 @@ class MongoAlertCoordinatorIT {
     @Test void evaluationRecoveryUsesOriginalIdKeysetWithoutMissingOrRepeatingHeads() {
         withStore(f->{
             var facts=businessFacts(f);accept(f,facts);
-            var original=facts.head.snapshot().rule();var key=new AlarmKey(original.key().scope(),original.key().resource(),original.key().typeId(),"other-rule");
+            var original=facts.head.snapshot().rule();var secondIdentity=new Identity(Kind.RULE,SCOPE,"rule-b","22222222-2222-4222-8222-222222222222");
+            var definition=(Rule)f.store.definition(Kind.RULE,"rule-a",f.access).orElseThrow();
+            f.store.saveDefinition(null,new Rule(Header.create(secondIdentity,POLICY.deployment(),T,f.access.subject()),"Second",definition.typeId(),1,definition.resources(),definition.parameters(),null,true,null),f.access);
+            var key=new AlarmKey(original.key().scope(),original.key().resource(),original.key().typeId(),secondIdentity.incarnation());
             var rule=new AlertRule(key,original.revision(),original.generation(),original.producerIncarnation(),original.triggerFor(),original.resolveFor(),original.maxAge(),original.maxGap());
             var signal=new AlertSignal(key,rule.revision(),rule.generation(),rule.producerIncarnation(),1,T,AlertSignal.Condition.BAD,AlarmSeverity.MAJOR);
             var snapshot=AlertLifecycle.evaluate(AlertSnapshot.initial(rule),signal,T).snapshot();
             var episode=new AlertStateRecord.Episode(rule,snapshot.episode(),POLICY,AlertStateRecord.Diagnostics.empty(true),false);
-            var binding=new AlertIntent.Member(rule,1,facts.head.binding().ruleIdentity(),facts.head.binding().sourceBindingRevision());
+            var binding=new AlertIntent.Member(rule,1,secondIdentity,facts.head.binding().sourceBindingRevision());
             var head=new AlertStateRecord.Head(snapshot,POLICY.deployment(),AlertOwnership.unclaimed(),null,false,episode,binding);
             f.store.commit(new Commit(CommitKind.STATE_AND_PLAN,new StateChange(0,null,head,List.of(),null),List.of(),List.of()));
             var first=f.store.evaluationStates(null,1);assertThat(first.rows()).hasSize(1);assertThat(first.next()).isNotNull();
@@ -75,7 +78,7 @@ class MongoAlertCoordinatorIT {
             assertThat(f.store.state(facts.head.snapshot().rule().key(), readAll()).orElseThrow()).isEqualTo(before);
         });
     }
-    @Container static final MongoDBContainer MONGO=new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
+    @Container static final MongoDBContainer MONGO=new MongoDBContainer(DockerImageName.parse("mongo:7.0")).withCommand("--replSet","docker-rs","--setParameter","enableTestCommands=1");
     static final Instant T=Instant.parse("2026-10-28T00:00:00Z");static final AlarmKey.Scope SCOPE=new AlarmKey.Scope("installation-a","cluster-a");
     static final AlertIntent.Payload PAYLOAD=new AlertIntent.Payload("hello".getBytes(java.nio.charset.StandardCharsets.UTF_8));
     static final AlertIntent.Policy POLICY=AlertIntent.Policy.capture(AlertRetentionPolicy.defaults(AlertChannelPolicy.Deployment.ON_PREM));
@@ -319,7 +322,7 @@ class MongoAlertCoordinatorIT {
             f.domain.artifacts().create(source("cloud-orders"));var binding=f.domain.artifacts().sourceBinding("cloud-orders").orElseThrow().identity();var resource=new AlarmKey.Resource("source","cloud-orders",binding.incarnation());
             var identity=new Identity(Kind.RULE,scope,"cloud-rule",UUID_A);var header=Header.create(identity,host.deployment(),T,"cloud-writer");
             var rule=new Rule(header,"Connection","source.connection-failed",1,new Resources(Set.of("source"),false,Set.of(resource)),Map.of(),null,true,null).validated(BuiltinAlarmTypes.catalog());view.saveDefinition(null,rule,access);
-            var key=new AlarmKey(scope,resource,rule.typeId(),"cloud-rule");var evaluation=new AlertRule(key,1,1,"producer-a",Duration.ZERO,Duration.ZERO,Duration.ofSeconds(30),Duration.ofSeconds(30));
+            var key=new AlarmKey(scope,resource,rule.typeId(),UUID_A);var evaluation=new AlertRule(key,1,1,"producer-a",Duration.ZERO,Duration.ZERO,Duration.ofSeconds(30),Duration.ofSeconds(30));
             var signal=new AlertSignal(key,1,1,"producer-a",1,T,AlertSignal.Condition.BAD,AlarmSeverity.MAJOR);var snapshot=AlertLifecycle.evaluate(AlertSnapshot.initial(evaluation),signal,T).snapshot();
             var policy=AlertIntent.Policy.capture(AlertRetentionPolicy.defaults(host.deployment()));var member=new AlertIntent.Member(evaluation,1,identity,binding.bindingRevision());
             var head=new AlertStateRecord.Head(snapshot,host.deployment(),AlertOwnership.unclaimed(),null,false,new AlertStateRecord.Episode(evaluation,snapshot.episode(),policy,AlertStateRecord.Diagnostics.empty(true),false),member);
@@ -333,7 +336,262 @@ class MongoAlertCoordinatorIT {
             assertThat(view.commit(new Commit(CommitKind.RESULT,null,List.of(new IntentChange(prior,accepted)),List.of()))).isEqualTo(Outcome.STAGED);
             var saved=view.intent(frozen.identity(),access).orElseThrow().value();assertThat(saved.state().acceptedReceipt().source()).isEqualTo("sdk-event-center");assertThat(saved.state().acceptedReceipt().remoteId()).isEqualTo("event-a");
             assertThat(SystemCollections.ALERT_TARGET_LIMITS.on(f.db).countDocuments()).isZero();assertThat(SystemCollections.ALERT_TEST_QUOTAS.on(f.db).countDocuments()).isZero();
+            f.time.set(T.plus(Duration.ofHours(2)));view.maintenance().orElseThrow().maintain(new AlertMaintenance.Cursor(0,null,null),200,4L*1024*1024,Duration.ofSeconds(5));
+            var pruned=view.intent(frozen.identity(),access).orElseThrow().value();assertThat(pruned.state().payload()).isNull();assertThat(pruned.state().summary()).isEqualTo(DeliveryEvidence.Outcome.ACCEPTED);assertThat(pruned.state().attempts()).hasSize(1);
         });
+    }
+
+    @Test void maintenanceSettlesOriginalDeadlinePrunesPayloadAndKeepsActiveAlarmAndTargetLimit() {
+        withStore(f->{var facts=businessFacts(f);accept(f,facts);var port=f.store.maintenance().orElseThrow();
+            var before=f.store.intent(facts.intent.frozen().identity(),f.access).orElseThrow();
+            var pending=AlertDeliveryFixtures.pending(before.value(),"worker-a","maintenance-attempt");
+            f.store.commit(new Commit(CommitKind.PERMIT,null,List.of(new IntentChange(before,pending)),List.of()));
+            f.time.set(T.plusSeconds(61));var batch=clean(f,0,null);
+            assertThat(f.store.intent(facts.intent.frozen().identity(),f.access).orElseThrow().value().state().retained().stoppedAt()).isNull();
+            assertThat(f.store.state(facts.head.snapshot().rule().key(),readAll()).orElseThrow().value().snapshot().status()).isEqualTo(AlertSnapshot.Status.FIRING);
+            f.time.set(T.plus(Duration.ofDays(5)));clean(f,0,null);var stopped=f.store.intent(facts.intent.frozen().identity(),f.access).orElseThrow().value();
+            assertThat(stopped.state().retained().stoppedAt()).isEqualTo(facts.intent.frozen().deadline());
+            assertThat(stopped.state().attempts().getFirst().outcome()).isEqualTo(DeliveryEvidence.Outcome.UNKNOWN);
+            assertThat(stopped.state().payload()).isNull();assertThat(stopped.state().payloadPrunedAt()).isEqualTo(f.time.get());
+            clean(f,4,null);assertThat(f.store.active(null,5,readAll()).total()).isOne();
+            var inventory=port.inventory();assertThat(inventory.logicalBytes()).isPositive();assertThat(inventory.resources()).hasSize(12);
+        });
+    }
+    @Test void acceptedPayloadExpiresEarlyAndResultHandoffPreservesRecoveryEvidence() {
+        withStore(f->{var facts=businessFacts(f);accept(f,facts);var before=f.store.intent(facts.intent.frozen().identity(),f.access).orElseThrow();
+            var pending=AlertDeliveryFixtures.pending(before.value(),"worker-a","maintenance-accepted");f.store.commit(new Commit(CommitKind.PERMIT,null,List.of(new IntentChange(before,pending)),List.of()));
+            f.time.set(T.plusSeconds(1));var accepted=AlertDeliveryFixtures.accepted(pending,f.time.get());
+            f.store.commit(new Commit(CommitKind.RESULT,null,List.of(new IntentChange(f.store.intent(pending.frozen().identity(),f.access).orElseThrow(),accepted)),List.of()));
+            f.time.set(T.plus(Duration.ofDays(2)));clean(f,0,null);
+            var pruned=f.store.intent(accepted.frozen().identity(),f.access).orElseThrow().value();assertThat(pruned.state().payload()).isNull();assertThat(pruned.state().attempts()).hasSize(1);
+            f.time.set(T.plus(Duration.ofDays(8)));for(int i=0;i<3;i++)clean(f,0,null);
+            assertThat(f.store.intent(accepted.frozen().identity(),f.access)).isEmpty();
+            var schedule=SystemCollections.ALERT_NOTIFICATION_SCHEDULES.on(f.db).find().first();var row=MongoAlertScheduleCodec.read(facts.schedule.key(),schedule).value();
+            assertThat(row.summaries()).singleElement().satisfies(summary->assertThat(summary.outcome()).isEqualTo(DeliveryEvidence.Outcome.ACCEPTED));
+            assertThat(row.protectedIntents()).isEmpty();assertThat(row.summariesHandedOff()).isFalse();
+            assertThat(f.store.active(null,5,readAll()).total()).isOne();
+        });
+    }
+    @Test void expiredHistoryReleasesOnlyItsOriginalPointerAndPreservesNextEpisodeSequence() {
+        withStore(f->{var facts=businessFacts(f);accept(f,facts);SystemCollections.ALERT_NOTIFICATION_SCHEDULES.on(f.db).deleteMany(new Document());SystemCollections.ALERT_DELIVERY_INTENTS.on(f.db).deleteMany(new Document());
+            var key=facts.head.snapshot().rule().key();var original=facts.head.snapshot();f.time.set(T.plusSeconds(1));
+            var result=AlertLifecycle.evaluate(original,new AlertSignal(key,1,1,"producer-a",2,f.time.get(),AlertSignal.Condition.GOOD,AlarmSeverity.MAJOR),f.time.get());
+            var episode=new AlertStateRecord.Episode(original.rule(),result.snapshot().episode(),POLICY,AlertStateRecord.Diagnostics.empty(true),false);
+            var head=new AlertStateRecord.Head(result.snapshot(),POLICY.deployment(),AlertOwnership.unclaimed(),null,false,episode,facts.head.binding());
+            var headRow=MongoAlertStateEnvelope.head(head,2);SystemCollections.ALERT_INSTANCES.on(f.db).replaceOne(new Document("_id",headRow.get("_id")),headRow);
+            var epRow=MongoAlertStateEnvelope.episode(episode);SystemCollections.ALERT_EPISODES.on(f.db).replaceOne(new Document("_id",epRow.get("_id")),epRow);
+            f.time.set(T.plus(Duration.ofDays(31)));clean(f,2,null);
+            var after=f.store.state(key,readAll()).orElseThrow().value();assertThat(after.snapshot().episode()).isNull();assertThat(after.snapshot().episodeSequence()).isOne();
+            assertThat(f.store.history(key,null,10,readAll()).rows()).isEmpty();
+            var next=AlertLifecycle.evaluate(after.snapshot(),new AlertSignal(key,1,1,"producer-a",3,f.time.get(),AlertSignal.Condition.BAD,AlarmSeverity.MAJOR),f.time.get());assertThat(next.snapshot().episode().number()).isEqualTo(2);
+        });
+    }
+    @Test void maintenanceCursorAdvancesAcrossUnknownRowsAndObeysIoBudget() {
+        withStore(f->{var unknown=new Document("_id",new Document("authorityId",SCOPE.authorityId()).append("clusterId",SCOPE.clusterId()).append("purpose","business").append("deliveryId","a-unknown"))
+                    .append("formatVersion",999).append("cleanupAt",Date.from(T.minusSeconds(100)));
+            var candidate=test(f,"1",email("one@example.test"));f.store.admitTest(candidate,f.access);
+            SystemCollections.ALERT_DELIVERY_INTENTS.on(f.db).insertOne(unknown);f.time.set(T.plus(Duration.ofDays(5)));
+            var first=f.store.maintenance().orElseThrow().maintain(new AlertMaintenance.Cursor(0,null,null),100,1024*1024,Duration.ofSeconds(2));
+            assertThat(first.scanned()).isLessThanOrEqualTo(100);assertThat(first.bytes()).isLessThanOrEqualTo(1024*1024);assertThat(first.next()).isNotNull();
+            var second=clean(f,0,first.next());clean(f,0,null);clean(f,0,null);assertThat(SystemCollections.ALERT_DELIVERY_INTENTS.on(f.db).find(new Document("_id",unknown.get("_id"))).first()).isEqualTo(unknown);
+            assertThat(f.store.test(((AlertIntent.Test)candidate.frozen().identity()).command().key(),f.access)).isEmpty();
+            assertThat(second.skipped()).containsKey("unreadable");
+        });
+    }
+    @Test void maintenanceExcludesTestsFromRealPendingAndFailureCountsAndExpiredReplayCannotResend() {
+        withStore(f->{var candidate=test(f,"1",email("one@example.test"));f.store.admitTest(candidate,f.access);var port=f.store.maintenance().orElseThrow();
+            assertThat(port.inventory().pending()).isZero();f.time.set(T.plus(Duration.ofDays(5)));clean(f,0,null);clean(f,0,null);
+            assertThat(port.inventory().failed()).isZero();assertThatThrownBy(()->f.store.admitTest(candidate,f.access)).isInstanceOfSatisfying(TapstateException.class,e->assertThat(e.code()).isEqualTo(AlertError.COMMAND_EXPIRED));
+            assertThat(SystemCollections.ALERT_DELIVERY_INTENTS.on(f.db).countDocuments()).isZero();
+        });
+    }
+    @Test void maintenanceRetainsRetiredReceiverUntilItsSubscriptionReleasesTheExactReference() {
+        withStore(f->{var facts=businessFacts(f);var receiver=(AlertReceiver)f.store.definition(Kind.RECEIVER,"receiver-a",f.access).orElseThrow();
+            f.time.set(T.plusSeconds(1));f.store.saveReceiver(receiver,receiver.retire(f.time.get(),f.access.subject()),null,true,f.access);
+            f.time.set(T.plus(Duration.ofDays(8)));clean(f,6,null);
+            assertThat(f.store.definition(Kind.RECEIVER,"receiver-a",f.access)).isPresent();
+            var route=(Subscription)f.store.definition(Kind.SUBSCRIPTION,"route-a",f.access).orElseThrow();
+            f.store.saveDefinition(route,route.retire(f.time.get(),f.access.subject()),f.access);
+            f.time.set(T.plus(Duration.ofDays(16)));clean(f,7,null);clean(f,6,null);
+            assertThat(f.store.definition(Kind.RECEIVER,"receiver-a",f.access)).isEmpty();
+        });
+    }
+    @Test void expiredTargetLimitIsNotPinnedByUnrelatedEmailTraffic() {
+        withStore(f->{var candidate=test(f,"1",email("one@example.test"));f.store.admitTest(candidate,f.access);
+            var other=AlertTargetIdentity.domains(SCOPE,email("other@example.test")).values().iterator().next();
+            SystemCollections.ALERT_TARGET_LIMITS.on(f.db).insertOne(MongoAlertNotificationCodec.limit(new AlertTargetLimit(other,T.minusSeconds(4000)),1));
+            var batch=clean(f,9,null);assertThat(SystemCollections.ALERT_TARGET_LIMITS.on(f.db).find(new Document("_id",MongoAlertNotificationCodec.limitKey(other))).first()).as("%s",batch).isNull();
+            var original=AlertTargetIdentity.domains(SCOPE,email("one@example.test")).values().iterator().next();
+            var old=SystemCollections.ALERT_TARGET_LIMITS.on(f.db).find(new Document("_id",MongoAlertNotificationCodec.limitKey(original))).first();
+            assertThat(old).isNotNull();
+        });
+    }
+    @Test void maintenanceConservativeBudgetBoundsObservedMongoCommandsIncludingAuthorityAndCommit() {
+        withStore(f->{var candidate=test(f,"1",email("one@example.test"));f.store.admitTest(candidate,f.access);f.time.set(T.plus(Duration.ofDays(5)));
+            var commands=new ArrayList<String>();MongoCommandObservation.CURRENT.set(commands::add);
+            AlertMaintenance.Batch batch;
+            try{batch=clean(f,0,null);}finally{MongoCommandObservation.CURRENT.remove();}
+            assertThat(commands).contains("find","update","commitTransaction");
+            assertThat(commands.size()).isLessThanOrEqualTo(batch.scanned()).isLessThanOrEqualTo(200);
+        });
+    }
+    @Test void maximalScheduleReferencesMakeBoundedProgressWithoutStarvingTheFollowingCandidate() {
+        withStore(f->{var facts=businessFacts(f);var members=new ArrayList<AlertIntent.Member>();var summaries=new ArrayList<AlertSchedule.Previous>();
+            for(int i=0;i<100;i++) {
+                var key=new AlarmKey(SCOPE,new AlarmKey.Resource("source","historical-"+i,"creation-"+i),"source.connection-failed",UUID_A);
+                var binding=new AlertRule(key,1,1,"original",Duration.ZERO,Duration.ZERO,Duration.ofSeconds(30),Duration.ofSeconds(30));
+                members.add(new AlertIntent.Member(binding,1,facts.head.binding().ruleIdentity(),1));
+                summaries.add(new AlertSchedule.Previous(key,2,DeliveryEvidence.Outcome.ACCEPTED,false));
+                for(long episode=1;episode<=2;episode++) {
+                    var ended=new AlertSnapshot.Episode(episode,T,AlarmSeverity.MAJOR,T.plusSeconds(1),T.plusSeconds(1),AlertSnapshot.EndReason.RECOVERED);
+                    SystemCollections.ALERT_EPISODES.on(f.db).insertOne(MongoAlertStateEnvelope.episode(new AlertStateRecord.Episode(binding,ended,POLICY,AlertStateRecord.Diagnostics.empty(false),false)));
+                }
+            }
+            var key=facts.schedule.key();var schedule=new AlertSchedule.Record(key,facts.schedule.route(),POLICY,T,AlertOwnership.unclaimed(),facts.schedule.grouping(),facts.schedule.clock(),0,List.of(),null,null,summaries,List.of(),T.plusSeconds(2),true,members);
+            var row=MongoAlertScheduleCodec.write(schedule,1);SystemCollections.ALERT_NOTIFICATION_SCHEDULES.on(f.db).insertOne(row);f.time.set(T.plus(Duration.ofDays(40)));
+            boolean removed=false;int visits=0;
+            for(int i=0;i<8&&!removed;i++){var page=clean(f,1,null);visits++;assertThat(page.scanned()).isLessThanOrEqualTo(200);removed=SystemCollections.ALERT_NOTIFICATION_SCHEDULES.on(f.db).find(new Document("_id",row.get("_id"))).first()==null;}
+            assertThat(removed).isTrue();assertThat(visits).isLessThanOrEqualTo(3);
+        });
+    }
+
+    @Test void pressureRefusesFreshTestsButPreservesAcceptedResultsAndRequiresTwoFreshReliefSamples() {
+        withStore(f->{var facts=businessFacts(f);accept(f,facts);var original=f.store.intent(facts.intent.frozen().identity(),f.access).orElseThrow();
+            var pending=AlertDeliveryFixtures.pending(original.value(),"worker-a","pressure-result");f.store.commit(new Commit(CommitKind.PERMIT,null,List.of(new IntentChange(original,pending)),List.of()));
+            var port=f.store.maintenance().orElseThrow();port.enableCapacityProtection();
+            f.time.set(T.plusSeconds(60));capacity(f,AlertMaintenancePolicy.CAPACITY_BYTES);
+            assertThatThrownBy(()->f.store.admitTest(test(f,"1",email("other@example.test")),f.access)).isInstanceOfSatisfying(TapstateException.class,e->assertThat(e.args()).containsEntry("reason","storage-pressure"));
+            var accepted=AlertDeliveryFixtures.accepted(pending,f.time.get());var before=f.store.intent(pending.frozen().identity(),f.access).orElseThrow();
+            assertThat(f.store.commit(new Commit(CommitKind.RESULT,null,List.of(new IntentChange(before,accepted)),List.of()))).isEqualTo(Outcome.STAGED);
+            f.time.set(T.plusSeconds(120));capacity(f,0);
+            assertThatThrownBy(()->f.store.admitTest(test(f,"1",email("other@example.test")),f.access)).isInstanceOf(TapstateException.class);
+            f.time.set(T.plusSeconds(180));capacity(f,0);assertThat(f.store.admitTest(test(f,"1",email("other@example.test")),f.access).revision()).isOne();
+            f.time.set(T.plusSeconds(301));assertThatThrownBy(()->f.store.admitTest(test(f,"2",email("third@example.test")),f.access)).isInstanceOfSatisfying(TapstateException.class,e->assertThat(e.args()).containsEntry("reason","capacity-unavailable"));
+        });
+    }
+    private static void capacity(Fixture f,long bytes) {
+        try{var method=f.store.getClass().getDeclaredMethod("observedCapacity",AlertMaintenance.Inventory.class);method.setAccessible(true);
+            method.invoke(f.store,new AlertMaintenance.Inventory(f.time.get(),List.of(new AlertMaintenance.Usage("alert_instances",1,bytes,0,0,null)),0,null,0,0));
+        }catch(ReflectiveOperationException failure){throw new AssertionError(failure);}
+    }
+    @Test void oneTimeExpiredSilenceIsReclaimedButAnUnboundedPeriodicWindowRemains() {
+        withStore(f->{var once=new Silence(header(Kind.SILENCE,"one-time",f.access.subject()),"Once",new AlertSilenceWindow(SCOPE,true,Set.of(),Set.of(),T,Duration.ofMinutes(1),null,null));
+            var periodic=new Silence(header(Kind.SILENCE,"periodic",f.access.subject()),"Periodic",new AlertSilenceWindow(SCOPE,true,Set.of(),Set.of(),T,Duration.ofMinutes(1),Duration.ofDays(1),null));
+            f.store.saveDefinition(null,once,f.access);f.store.saveDefinition(null,periodic,f.access);f.time.set(T.plus(Duration.ofDays(8)));
+            clean(f,8,null);assertThat(f.store.definition(Kind.SILENCE,"one-time",f.access)).isEmpty();assertThat(f.store.definition(Kind.SILENCE,"periodic",f.access)).isPresent();
+        });
+    }
+
+    @Test void moreLargeSchedulesThanProofCacheSlotsStillFinishTheirOriginalCandidates() {
+        withStore(f->{var facts=businessFacts(f);var members=new ArrayList<AlertIntent.Member>();var summaries=new ArrayList<AlertSchedule.Previous>();
+            for(int i=0;i<100;i++){
+                var key=new AlarmKey(SCOPE,new AlarmKey.Resource("source","retained-"+i,"creation-"+i),"source.connection-failed",UUID_A);
+                var rule=new AlertRule(key,1,1,"original",Duration.ZERO,Duration.ZERO,Duration.ofSeconds(30),Duration.ofSeconds(30));
+                members.add(new AlertIntent.Member(rule,1,facts.head.binding().ruleIdentity(),1));
+                summaries.add(new AlertSchedule.Previous(key,2,DeliveryEvidence.Outcome.ACCEPTED,false));
+                for(long number=1;number<=2;number++){var ended=new AlertSnapshot.Episode(number,T,AlarmSeverity.MAJOR,T.plusSeconds(1),T.plusSeconds(1),AlertSnapshot.EndReason.RECOVERED);
+                    SystemCollections.ALERT_EPISODES.on(f.db).insertOne(MongoAlertStateEnvelope.episode(new AlertStateRecord.Episode(rule,ended,POLICY,AlertStateRecord.Diagnostics.empty(false),false)));}
+            }
+            for(int i=0;i<17;i++){
+                var old=facts.schedule.key();var key=new AlertSchedule.Key(SCOPE,old.kind(),old.subjectId()+"-"+i,old.subjectIncarnation(),old.routeId(),old.routeIncarnation(),old.channelType(),old.receiverIncarnation(),old.targetId());
+                var schedule=new AlertSchedule.Record(key,facts.schedule.route(),POLICY,T,AlertOwnership.unclaimed(),facts.schedule.grouping(),facts.schedule.clock(),0,List.of(),null,null,summaries,List.of(),T.plusSeconds(2),true,members);
+                SystemCollections.ALERT_NOTIFICATION_SCHEDULES.on(f.db).insertOne(MongoAlertScheduleCodec.write(schedule,1));
+            }
+            f.time.set(T.plus(Duration.ofDays(40)));AlertMaintenance.Cursor cursor=null;int batches=0;
+            while(SystemCollections.ALERT_NOTIFICATION_SCHEDULES.on(f.db).countDocuments()>0&&batches++<60){var batch=clean(f,1,cursor);cursor=batch.next();assertThat(batch.scanned()).isLessThanOrEqualTo(200);}
+            assertThat(SystemCollections.ALERT_NOTIFICATION_SCHEDULES.on(f.db).countDocuments()).isZero();
+        });
+    }
+    @Test void manyLimitCandidatesCannotEvictTheirInProgressNegativeTargetScans() {
+        withStore(f->{var original=test(f,"1",email("one@example.test"));f.store.admitTest(original,f.access);
+            for(int i=0;i<100;i++){
+                var at=T.minusSeconds((i/10+1)*60L);var old=(AlertIntent.Test)original.frozen().identity();
+                var command=new AlertTestCommand.Accepted(new AlertTestCommand.Key(SCOPE,old.command().key().actorPrincipal(),new AlertTestCommand.ClientId(at,String.format("%032x",i+10))),old.command().parameters(),at,at.plusSeconds(300));
+                var frozen=original.frozen();var copy=new AlertIntent.Frozen(new AlertIntent.Test(command),frozen.channel(),null,frozen.target(),frozen.content(),List.of(),frozen.retry(),frozen.retention(),at,command.deadline(),frozen.testAuthority());
+                SystemCollections.ALERT_DELIVERY_INTENTS.on(f.db).insertOne(MongoAlertDeliveryCodec.write(AlertDeliveryFixtures.initial(copy,PAYLOAD,null),1));
+            }
+            for(int i=0;i<17;i++){
+                var domain=AlertTargetIdentity.domains(SCOPE,email("other-"+i+"@example.test")).values().iterator().next();
+                SystemCollections.ALERT_TARGET_LIMITS.on(f.db).insertOne(MongoAlertNotificationCodec.limit(new AlertTargetLimit(domain,T.minusSeconds(4000)),1));
+            }
+            f.time.set(T.plusSeconds(4000));AlertMaintenance.Cursor cursor=null;int batches=0;
+            while(SystemCollections.ALERT_TARGET_LIMITS.on(f.db).countDocuments()>1&&batches++<60){var batch=clean(f,9,cursor);cursor=batch.next();assertThat(batch.scanned()).isLessThanOrEqualTo(200);}
+            assertThat(SystemCollections.ALERT_TARGET_LIMITS.on(f.db).countDocuments()).isOne();
+        });
+    }
+    @Test void actualLargeConditionalWriteBytesStayInsideTheSameBatchAllowance() {
+        withStore(f->{var facts=businessFacts(f);byte[] bytes=new byte[256*1024];Arrays.fill(bytes,(byte)'a');var payload=new AlertIntent.Payload(bytes);var frozen=facts.intent.frozen();
+            var large=new AlertIntent.Frozen(frozen.identity(),frozen.channel(),frozen.route(),frozen.target(),new AlertIntent.Content(frozen.content().contentType(),payload.sha256(),frozen.content().template(),false),frozen.members(),frozen.retry(),frozen.retention(),T,frozen.deadline());
+            var initial=AlertDeliveryFixtures.initial(large,payload,null);f.store.commit(new Commit(CommitKind.STATE_AND_PLAN,new StateChange(0,null,facts.head,List.of(),null),List.of(new IntentChange(null,initial)),List.of(new ScheduleChange(null,facts.schedule))));
+            var pending=AlertDeliveryFixtures.pending(initial,"worker","large-attempt");var before=f.store.intent(large.identity(),f.access).orElseThrow();f.store.commit(new Commit(CommitKind.PERMIT,null,List.of(new IntentChange(before,pending)),List.of()));
+            f.time.set(T.plusSeconds(1));var accepted=AlertDeliveryFixtures.accepted(pending,f.time.get());before=f.store.intent(large.identity(),f.access).orElseThrow();f.store.commit(new Commit(CommitKind.RESULT,null,List.of(new IntentChange(before,accepted)),List.of()));
+            f.time.set(T.plus(Duration.ofDays(2)));var observed=new java.util.concurrent.atomic.AtomicLong();MongoCommandObservation.BYTES.set(observed::addAndGet);AlertMaintenance.Batch batch;
+            try{batch=clean(f,0,null);}finally{MongoCommandObservation.BYTES.remove();}
+            assertThat(batch.changed()).isPositive();assertThat(observed.get()).isGreaterThan(payload.size()).isLessThanOrEqualTo(batch.bytes());assertThat(batch.bytes()).isLessThanOrEqualTo(4L*1024*1024);
+        });
+    }
+    @Test void transientSchemaFailureDoesNotRunUnbilledVerificationCallbacks() {
+        withStore(f->{var admin=f.db.getName();try(var client=MongoClients.create(MONGO.getReplicaSetUrl())){
+            var control=client.getDatabase("admin");control.runCommand(new Document("configureFailPoint","failCommand").append("mode",new Document("times",100)).append("data",new Document("failCommands",List.of("find")).append("namespace",admin+".schema_migrations").append("errorCode",112).append("errorLabels",List.of("TransientTransactionError"))));
+            var count=new java.util.concurrent.atomic.AtomicInteger();MongoCommandObservation.COLLECTIONS.set((name,collection)->{if(name.equals("find")&&collection.equals("schema_migrations"))count.incrementAndGet();});
+            try{assertThatThrownBy(()->f.store.maintenance().orElseThrow().maintain(new AlertMaintenance.Cursor(0,null,null),200,4L*1024*1024,Duration.ofSeconds(2))).isInstanceOf(TapstateException.class);assertThat(count.get()).isOne();}
+            finally{MongoCommandObservation.COLLECTIONS.remove();control.runCommand(new Document("configureFailPoint","failCommand").append("mode","off"));}
+        }});
+    }
+
+    @Test void unsampledAdmissionReservationsBoundBurstsAndClearOnlyAfterFreshObservations() {
+        withStore(f->{var port=f.store.maintenance().orElseThrow();port.inventory();port.enableCapacityProtection();
+            try{var method=f.store.getClass().getDeclaredMethod("admission",String.class,int.class);method.setAccessible(true);method.invoke(f.store,"alert_notification_schedules",320);}
+            catch(ReflectiveOperationException failure){throw new AssertionError(failure);}
+            assertThat(port.diagnostics().get("admissionReservedBytes")).isEqualTo(320L*(AlertSchedule.MAX_BYTES+AlertIntent.MAX_BYTES));
+            assertThatThrownBy(()->f.store.admitTest(test(f,"1",email("other@example.test")),f.access)).isInstanceOfSatisfying(TapstateException.class,e->assertThat(e.args()).containsEntry("reason","storage-pressure"));
+            var facts=businessFacts(f);assertThat(accept(f,facts)).isEqualTo(Outcome.STAGED);
+            f.time.set(T.plusSeconds(60));port.inventory();assertThatThrownBy(()->f.store.admitTest(test(f,"1",email("other@example.test")),f.access)).isInstanceOf(TapstateException.class);
+            f.time.set(T.plusSeconds(120));port.inventory();assertThat(f.store.admitTest(test(f,"1",email("other@example.test")),f.access).revision()).isOne();
+        });
+    }
+
+    @Test void aTransientCandidateWriteRetriesOnlyInsideItsBilledBatch() {
+        withStore(f->{var minute=T.minusSeconds(7200);var row=MongoAlertNotificationCodec.quota(new AlertTestQuota.Bucket(SCOPE,minute,Map.of("original-actor",1)),1);
+            SystemCollections.ALERT_TEST_QUOTAS.on(f.db).insertOne(row);
+            try(var client=MongoClients.create(MONGO.getReplicaSetUrl())){var admin=client.getDatabase("admin");
+                admin.runCommand(new Document("configureFailPoint","failCommand").append("mode",new Document("times",1)).append("data",new Document("failCommands",List.of("update")).append("namespace",f.db.getName()+".configuration_version").append("errorCode",112).append("errorLabels",List.of("TransientTransactionError"))));
+                try{var batch=clean(f,10,null);assertThat(batch.skipped()).containsEntry("conflict",1L);assertThat(batch.scanned()).isLessThanOrEqualTo(200);assertThat(SystemCollections.ALERT_TEST_QUOTAS.on(f.db).countDocuments()).isZero();}
+                finally{admin.runCommand(new Document("configureFailPoint","failCommand").append("mode","off"));}
+            }
+        });
+    }
+
+    @Test void anOversizedUnknownIdentityIsRetainedWithoutBlockingOrdinaryCleanup() {
+        withStore(f->{var candidate=test(f,"1",email("one@example.test"));f.store.admitTest(candidate,f.access);
+            var bad=new Document("_id",new Document("authorityId",SCOPE.authorityId()).append("clusterId",SCOPE.clusterId()).append("purpose","business").append("deliveryId","a".repeat(10000)))
+                    .append("formatVersion",999).append("cleanupAt",Date.from(T.minusSeconds(3600)));
+            SystemCollections.ALERT_DELIVERY_INTENTS.on(f.db).insertOne(bad);f.time.set(T.plus(Duration.ofDays(5)));
+            for(int i=0;i<3;i++){var batch=clean(f,0,null);assertThat(batch.skipped()).containsKey("unreadable");}
+            assertThat(f.store.test(((AlertIntent.Test)candidate.frozen().identity()).command().key(),f.access)).isEmpty();
+            assertThat(SystemCollections.ALERT_DELIVERY_INTENTS.on(f.db).find(new Document("_id",bad.get("_id"))).first()).isEqualTo(bad);
+        });
+    }
+    @Test void fullOrStaleCapacityStillAllowsOriginalRecoveryStateIntentAndRequiredSchedule() {
+        for(boolean stale:List.of(false,true))withStore(f->{var facts=businessFacts(f);accept(f,facts);var port=f.store.maintenance().orElseThrow();port.enableCapacityProtection();
+            f.time.set(T.plusSeconds(1));capacity(f,AlertMaintenancePolicy.CAPACITY_BYTES);if(stale)f.time.set(T.plusSeconds(122));
+            var before=f.store.state(facts.head.snapshot().rule().key(),readAll()).orElseThrow();var old=before.value();var binding=old.snapshot().rule();
+            var signal=new AlertSignal(binding.key(),binding.revision(),binding.generation(),binding.producerIncarnation(),2,f.time.get(),AlertSignal.Condition.GOOD,AlarmSeverity.MAJOR);
+            var resolved=AlertLifecycle.evaluate(old.snapshot(),signal,f.time.get());var ep=new AlertStateRecord.Episode(old.episode().originalBinding(),resolved.snapshot().episode(),POLICY,old.episode().diagnostics(),false);
+            var head=new AlertStateRecord.Head(resolved.snapshot(),POLICY.deployment(),old.owner(),null,false,ep,old.binding());
+            var original=((AlertIntent.Business)facts.intent.frozen().identity()).key();var round=DeliveryKey.NotificationRound.forEpisode(binding.key(),1,original.notification().routeId(),original.notification().routeIncarnation(),DeliveryKey.Kind.RECOVERY,1);
+            var key=new DeliveryKey(round,original.channelType(),original.receiverIncarnation(),original.targetId());var frozen=facts.intent.frozen();
+            var recoveryFrozen=new AlertIntent.Frozen(new AlertIntent.Business(key),frozen.channel(),frozen.route(),frozen.target(),frozen.content(),frozen.members(),frozen.retry(),POLICY,f.time.get(),f.time.get().plusSeconds(86400));
+            var recovery=AlertDeliveryFixtures.initial(recoveryFrozen,PAYLOAD,null);
+            var schedule=new AlertSchedule.Record(AlertSchedule.Key.forDelivery(AlertSchedule.SubjectKind.GROUP,key),frozen.route(),POLICY,f.time.get(),AlertOwnership.unclaimed(),facts.schedule.grouping(),AlertGroupingClock.empty(),0,List.of(),null,null,List.of(),List.of(key),null,false,frozen.members());
+            var commit=new Commit(CommitKind.STATE_AND_PLAN,new StateChange(before.revision(),old,head,List.of(),signal),List.of(new IntentChange(null,recovery)),List.of(new ScheduleChange(null,schedule)));
+            assertThat(f.store.commit(commit)).isEqualTo(Outcome.STAGED);assertThat(f.store.state(binding.key(),readAll()).orElseThrow().value().snapshot().status()).isEqualTo(AlertSnapshot.Status.RESOLVED);
+            assertThat(f.store.intent(recoveryFrozen.identity(),f.access)).isPresent();
+        });
+    }
+
+    private static AlertMaintenance.Batch clean(Fixture f,int collection,AlertMaintenance.Cursor cursor) {
+        return f.store.maintenance().orElseThrow().maintain(cursor==null?new AlertMaintenance.Cursor(collection,null,null):cursor,200,4L*1024*1024,Duration.ofSeconds(5));
     }
 
     private static Outcome accept(Fixture f,Facts facts){return f.store.commit(new Commit(CommitKind.STATE_AND_PLAN,new StateChange(0,null,facts.head,List.of(),null),List.of(new IntentChange(null,facts.intent)),List.of(new ScheduleChange(null,facts.schedule))));}
@@ -347,7 +605,7 @@ class MongoAlertCoordinatorIT {
         assertThat(f.store.saveReceiver(null,receiver,null,false,f.access)).isEqualTo(Outcome.STAGED);
         var route=new Subscription(header(Kind.SUBSCRIPTION,"route-a",f.access.actor().subject()),"Route",new Match(resources,Set.of(),Set.of()),true,List.of(new RouteChannel("email",List.of(receiver.header().identity()),MessageSettings.empty())),Set.of(),new AlertGroupingClock.Policy(Duration.ZERO,Duration.ofSeconds(30),Duration.ofSeconds(120)),List.of());
         assertThat(f.store.saveDefinition(null,route,f.access)).isEqualTo(Outcome.STAGED);
-        var key=new AlarmKey(SCOPE,resource,"source.connection-failed","rule-a");var eval=new AlertRule(key,1,1,"producer-a",Duration.ZERO,Duration.ZERO,Duration.ofSeconds(30),Duration.ofSeconds(30));
+        var key=new AlarmKey(SCOPE,resource,"source.connection-failed",UUID_A);var eval=new AlertRule(key,1,1,"producer-a",Duration.ZERO,Duration.ZERO,Duration.ofSeconds(30),Duration.ofSeconds(30));
         var signal=new AlertSignal(key,1,1,"producer-a",1,T,AlertSignal.Condition.BAD,AlarmSeverity.MAJOR);var snapshot=AlertLifecycle.evaluate(AlertSnapshot.initial(eval),signal,T).snapshot();
         var member=new AlertIntent.Member(eval,1,rule.header().identity(),binding.bindingRevision());
         var ep=new AlertStateRecord.Episode(eval,snapshot.episode(),POLICY,AlertStateRecord.Diagnostics.empty(true),false);
@@ -360,15 +618,16 @@ class MongoAlertCoordinatorIT {
         return new Facts(head,intent,schedule);
     }
     private static AlertIntent.Record test(Fixture f,String nonce,AlertReceiver.Email transport){
-        var key=new AlertTestCommand.Key(SCOPE,f.access.actor().principalKey(),new AlertTestCommand.ClientId(T,nonce.repeat(32)));
+        Instant created=f.time.get();
+        var key=new AlertTestCommand.Key(SCOPE,f.access.actor().principalKey(),new AlertTestCommand.ClientId(created,nonce.repeat(32)));
         String target=AlertTargetIdentity.domains(SCOPE,transport).keySet().iterator().next();
         var base=new AlertTestCommand.Parameters("email",new AlertTestCommand.Candidate("candidate-"+nonce,"a".repeat(64)),null,target,"binding-a",null,PAYLOAD.sha256());
         PreparedCandidate p;
         try(var material=transport.authentication()==AlertReceiver.Authentication.NONE?null:new PrivateMaterial("isolated-test-password".getBytes(java.nio.charset.StandardCharsets.UTF_8),null,null)){
             p=f.store.prepareCandidate(key,base,transport,null,0,material,f.access);
         }
-        var accepted=new AlertTestCommand.Accepted(key,p.parameters(),T,T.plusSeconds(300));
-        var frozen=new AlertIntent.Frozen(new AlertIntent.Test(accepted),EMAIL,null,p.target(),content(),List.of(),ChannelRetryPolicy.singleAttempt(Duration.ofMinutes(5),Duration.ofSeconds(60)),POLICY,T,T.plusSeconds(300),f.access.actor());
+        var accepted=new AlertTestCommand.Accepted(key,p.parameters(),created,created.plusSeconds(300));
+        var frozen=new AlertIntent.Frozen(new AlertIntent.Test(accepted),EMAIL,null,p.target(),content(),List.of(),ChannelRetryPolicy.singleAttempt(Duration.ofMinutes(5),Duration.ofSeconds(60)),POLICY,created,created.plusSeconds(300),f.access.actor());
         return AlertDeliveryFixtures.initial(frozen,PAYLOAD,p.encrypted());
     }
     private static AlertIntent.Content content(){return new AlertIntent.Content("message/rfc822",PAYLOAD.sha256(),new AlertIntent.Template("fault",1,1,"en",MessageSettings.empty()),false);}

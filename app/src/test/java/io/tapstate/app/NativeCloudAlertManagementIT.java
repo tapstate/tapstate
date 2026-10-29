@@ -29,7 +29,7 @@ class NativeCloudAlertManagementIT {
                     "--server.address=127.0.0.1","--server.port="+Integer.getInteger("tapstate.alert.cloud-browser-port",0),"--logging.level.root=ERROR",
                     "--tapstate.store.mongo.uri="+storage.configurationUri(),"--tapstate.cloud.atlas-uri="+storage.configurationUri(),
                     "--tapstate.cloud.base-url="+CLOUD,"--tapstate.cloud.token=controlled-cloud-machine-token","--tapstate.cloud.cluster-id="+CLUSTER,
-                    "--tapstate.hz.member-port=0","--tapstate.hz.jet.cooperative-thread-count=2","--SDK_STATUS_SENDER_ENABLED=false",
+                    "--tapstate.hz.member-port=0","--tapstate.hz.jet.cooperative-thread-count=2","--tapstate.alerting.retention.ended-episode=P3D","--SDK_STATUS_SENDER_ENABLED=false",
                     "--tapstate.connectors.seed-dir="+CloudConnectorTestInputs.seedDirectory(),"--tapstate.connectors.plugins-dir="+work.resolve("plugins"),
                     "--spring.web.resources.static-locations="+System.getProperty("tapstate.alert.cloud-browser-assets","classpath:/static/"))){
                 org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(30)).untilAsserted(()->assertThat(application.getBean(StorageRoot.class).runtime().business()).as("phase="+application.getBean(StorageRoot.class).phase()).isPresent());
@@ -40,10 +40,15 @@ class NativeCloudAlertManagementIT {
                 java.util.function.BiFunction<String,Map<String,Object>,HttpResponse<String>> post=(path,body)->{try{return client.send(HttpRequest.newBuilder(URI.create(base+"/api/alerts/"+path)).header("Cookie",cookie).header("Content-Type","application/json").POST(HttpRequest.BodyPublishers.ofString(JsonWriter.write(body))).build(),HttpResponse.BodyHandlers.ofString());}catch(Exception failure){throw new AssertionError(failure);}};
                 org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(30)).untilAsserted(()->{var reply=post.apply("catalog",Map.of());assertThat(reply.statusCode()).isEqualTo(200);assertThat(reply.body()).contains("CLOUD_MANAGED");});
                 assertThat(post.apply("center",Map.of()).statusCode()).isEqualTo(200);
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(30)).untilAsserted(()->{
+                    var read=post.apply("health",Map.of());assertThat(read.statusCode()).isEqualTo(200);
+                    assertThat(AlertHttpModel.object(AlertHttpModel.object(io.tapstate.core.common.JsonReader.parse(read.body())).get("maintenance"))).containsEntry("capacitySampleStale",false);
+                });
                 var saved=post.apply("configuration/save",Map.of("kind","RULE","id","managed-rule","etag","0","form",Map.of("name","Managed rule","typeId","pipeline.failed","resourceKinds",List.of("pipeline"),"allResources",true,"resources",List.of(),"parameters",Map.of(),"enabled",true)));
                 assertThat(saved.statusCode()).as(saved.body()).isEqualTo(200);
                 assertThat(post.apply("configuration/list",Map.of("kind","RULE")).body()).contains("Managed rule");
                 var denied=post.apply("configuration/list",Map.of("kind","RECEIVER"));assertThat(denied.statusCode()).isEqualTo(409);assertThat(denied.body()).contains("alert.stale-action","managed-external-configuration").doesNotContain("credentialId","ciphertext");
+                assertThat(NativeAppStorage.business(application).getBean(PipelineAlertRuntime.class).managementServices().evaluator().retentionPolicy().duration(io.tapstate.core.alerting.AlertRetentionPolicy.Setting.ENDED_EPISODE)).isEqualTo(Duration.ofDays(3));
                 String control=System.getProperty("tapstate.alert.cloud-browser-control");if(control!=null){var directory=Path.of(control);Files.createDirectories(directory);Files.writeString(directory.resolve("ready.json"),JsonWriter.write(Map.of("port",port,"mode","actual-native-cloud","sdk","controlled-local-authentication","clusterId",CLUSTER,"organizationId",ORG)));
                     long until=System.nanoTime()+Duration.ofMinutes(45).toNanos();while(!Files.exists(directory.resolve("stop"))&&System.nanoTime()<until)Thread.sleep(100);}
             }finally{observer.getDatabase(storage.configurationDatabase()).drop();observer.getDatabase(storage.cacheDatabase()).drop();observer.getDatabase(storage.masterDatabase()).drop();}

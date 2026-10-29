@@ -259,4 +259,19 @@ final class MongoAlertStateStore {
             throw new IllegalStateException("alert state staging requires an active CONFIG transaction");
         }
     }
+    boolean removeForMaintenance(ClientSession session, SystemCollections collection, Document original) {
+        MongoAlertStateStore.requireTransaction(session); requireActive.run();
+        if (!COLLECTIONS.contains(collection)) throw new IllegalArgumentException("foreign maintenance resource");
+        return maintenanceCollection(collection).deleteOne(session, original).getDeletedCount() == 1;
+    }
+    boolean replaceForMaintenance(ClientSession session, SystemCollections collection, Document original, Document replacement) {
+        MongoAlertStateStore.requireTransaction(session); requireActive.run();
+        if (!COLLECTIONS.contains(collection) || !original.get("_id").equals(replacement.get("_id"))) throw new IllegalArgumentException("foreign maintenance identity");
+        return maintenanceCollection(collection).replaceOne(session, MongoAlertMaintenance.versionFilter(original), replacement).getModifiedCount() == 1;
+    }
+
+    private MongoCollection<Document> maintenanceCollection(SystemCollections collection) {
+        return switch(collection) { case ALERT_INSTANCES -> heads; case ALERT_EPISODES -> episodes; case ALERT_TRANSITIONS -> transitions; default -> throw new IllegalArgumentException("foreign state resource"); };
+    }
+
 }

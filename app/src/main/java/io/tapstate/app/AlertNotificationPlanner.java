@@ -66,7 +66,7 @@ final class AlertNotificationPlanner {
             for(var destination:destinations(view,head)){
                 String group=group(destination,head.binding());
                 if(roots.values().stream().anyMatch(r->sameDestination(r,destination)&&r.members().stream().anyMatch(m->m.episodeMember().equals(head.binding().episodeMember()))))continue;
-                var existing=roots.values().stream().filter(r->sameDestination(r,destination)&&r.members().stream().anyMatch(m->group(destination,m).equals(group))
+                var existing=roots.values().stream().filter(r->sameDestination(r,destination)&&r.retention().equals(head.episode().policy())&&r.members().stream().anyMatch(m->group(destination,m).equals(group))
                         &&r.members().stream().noneMatch(m->m.evaluation().key().equals(head.binding().evaluation().key())&&m.episode()!=head.binding().episode())).findFirst();
                 AlertSchedule.Record root;
                 if(existing.isPresent())root=existing.get();
@@ -146,7 +146,7 @@ final class AlertNotificationPlanner {
                         if(!planned&&pendingSuccessor&&!now.isBefore(qualification)&&destination!=null&&targetReady(view,destination,now)){
                             var candidate=new AlertGroupingClock.Candidate(AlertGroupingClock.Reason.CHANGE,Math.incrementExact(clockValue.round()),qualification);
                             successor=delivery(root,DeliveryKey.Kind.FAULT,candidate.round(),Math.incrementExact(batchSequence));
-                            var next=create(view,destination,successor,pending,null,now,intent.frozen().deadline(),intent.frozen().retry());
+                            var next=create(view,destination,successor,pending,null,now,intent.frozen().deadline(),intent.frozen().retry(),intent.frozen().retention());
                             edits.put(successor,new AlertStore.IntentChange(null,next));refs.add(successor);
                             clockValue=clockValue.planned(candidate,now);batchSequence++;planned=true;pendingSuccessor=false;
                             var nextKey=AlertSchedule.Key.forDelivery(AlertSchedule.SubjectKind.GROUP,successor);
@@ -198,7 +198,7 @@ final class AlertNotificationPlanner {
             if(recovery.kind()!=DeliveryEvidence.RecoveryKind.NONE){
                 var candidate=new AlertGroupingClock.Candidate(AlertGroupingClock.Reason.CHANGE,Math.incrementExact(clockValue.round()),now);
                 var key=delivery(root,DeliveryKey.Kind.RECOVERY,candidate.round(),Math.incrementExact(batchSequence));
-                var intent=create(view,destination,key,List.of(member),recovery.kind(),now,null,null);edits.put(key,new AlertStore.IntentChange(null,intent));refs.add(key);
+                var intent=create(view,destination,key,List.of(member),recovery.kind(),now,null,null,root.retention());edits.put(key,new AlertStore.IntentChange(null,intent));refs.add(key);
                 clockValue=clockValue.planned(candidate,now);batchSequence++;planned=true;
             }
         }
@@ -209,7 +209,7 @@ final class AlertNotificationPlanner {
             if(due.isPresent()&&targetReady(view,destination,now)){
                 var candidate=due.get();DeliveryKey.Kind kind=candidate.reason()==AlertGroupingClock.Reason.REPEAT?DeliveryKey.Kind.REMINDER:DeliveryKey.Kind.FAULT;
                 var key=delivery(root,kind,candidate.round(),Math.incrementExact(batchSequence));
-                var intent=create(view,destination,key,eligible,null,now,null,null);edits.put(key,new AlertStore.IntentChange(null,intent));refs.add(key);
+                var intent=create(view,destination,key,eligible,null,now,null,null,root.retention());edits.put(key,new AlertStore.IntentChange(null,intent));refs.add(key);
                 clockValue=clockValue.planned(candidate,now);batchSequence++;
                 var batchKey=AlertSchedule.Key.forDelivery(AlertSchedule.SubjectKind.GROUP,key);
                 var batch=new AlertSchedule.Batch(key,1,eligible);
@@ -281,8 +281,8 @@ final class AlertNotificationPlanner {
         return limit==null||limit.restrictionElapsed(now);
     }
     private AlertIntent.Record create(AlertStore.Planning view,Destination d,DeliveryKey key,List<AlertIntent.Member> members,
-            DeliveryEvidence.RecoveryKind recovery,Instant now,Instant originalDeadline,ChannelRetryPolicy originalPolicy){
-        var policy=AlertIntent.Policy.capture(AlertRetentionPolicy.defaults(view.host().deployment()));
+            DeliveryEvidence.RecoveryKind recovery,Instant now,Instant originalDeadline,ChannelRetryPolicy originalPolicy,AlertIntent.Policy policy){
+        if(policy.deployment()!=view.host().deployment())throw invalid("foreign-retention-profile");
         var identity=new AlertIntent.Business(key);var capability=new AlertChannelPolicy.Capability(d.channel(),d.channel().equals("cloud-sdk")?2:1,
                 d.channel().equals("cloud-sdk")?AlertChannelPolicy.Family.CLOUD_SDK:AlertChannelPolicy.Family.OP_EXTERNAL);
         var retry=originalPolicy!=null?originalPolicy:d.channel().equals("email")?ChannelRetryPolicy.emailDefaults():d.channel().equals("webhook")?ChannelRetryPolicy.webhookDefaults():new ChannelRetryPolicy(1,0,List.of(),Duration.ofDays(1),Duration.ofSeconds(30));

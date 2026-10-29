@@ -183,4 +183,9 @@ final class MongoAlertNodeLifecycleStore implements AlertNodeLifecycleStore {
     private static long nextRevision(long current){if(current>=Long.MAX_VALUE-1)throw unreadable("revision-exhausted");return current+1;}
     private static TapstateException invalid(String reason){return new TapstateException(AlertError.INVALID_CONFIGURATION,Map.of("field","nodeLifecycle","reason",reason),null);}
     private static TapstateException unreadable(String field){return new TapstateException(IoError.DOCUMENT_UNREADABLE,Map.of("id","alert-node-lifecycle","field",field),null);}
+    boolean removeForMaintenance(ClientSession session, Document original) {
+        MongoAlertStateStore.requireTransaction(session); active.run();
+        return SystemCollections.ALERT_NODE_LIFECYCLES.on(db).deleteOne(session, original).getDeletedCount() == 1;
+    }
+
 }

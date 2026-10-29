@@ -15,8 +15,11 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     private static final org.slf4j.Logger LOG = org.slf4j.LoggerFactory.getLogger(PipelineAlertRuntime.class);
     static final int MAX_OBJECTS = 256, MAX_MATCHES = 32, MAX_INPUT_BYTES = 128 * 1024;
     static final int QUEUE_SIZE = 64, MAX_QUEUED_BYTES = 8 * 1024 * 1024;
-    record Health(boolean closed, boolean degraded, long rejected, String code,Map<String,Object> parameters,int queuedInputs,int queuedBytes) { }
-    record Services(AlertStore store, AlertEvaluationHost evaluator, AlarmTypeCatalog catalog, AlertPlanningRuntime planner, AlertDeliveryRuntime delivery, Set<String> providers,io.tapstate.adapters.alerting.AlarmTypeText descriptions) {
+    record Health(boolean closed, boolean degraded, long rejected, String code,Map<String,Object> parameters,int queuedInputs,int queuedBytes,Long evaluationLagMillis,Instant lastEvaluatedAt,Map<String,Object> maintenance) {
+        Health(boolean closed,boolean degraded,long rejected,String code,Map<String,Object> parameters,int inputs,int bytes){this(closed,degraded,rejected,code,parameters,inputs,bytes,null,null,Map.of());}
+    }
+    record Services(AlertStore store, AlertEvaluationHost evaluator, AlarmTypeCatalog catalog, AlertPlanningRuntime planner, AlertDeliveryRuntime delivery, Set<String> providers,io.tapstate.adapters.alerting.AlarmTypeText descriptions,AlertMaintenanceRuntime maintenance) {
+        Services(AlertStore store,AlertEvaluationHost evaluator,AlarmTypeCatalog catalog,AlertPlanningRuntime planner,AlertDeliveryRuntime delivery,Set<String> providers,io.tapstate.adapters.alerting.AlarmTypeText descriptions){this(store,evaluator,catalog,planner,delivery,providers,descriptions,null);}
         Services(AlertStore store,AlertEvaluationHost evaluator,AlarmTypeCatalog catalog,AlertPlanningRuntime planner,AlertDeliveryRuntime delivery,Set<String> providers){this(store,evaluator,catalog,planner,delivery,providers,io.tapstate.adapters.alerting.AlarmTypeText.english());}
         Services(AlertStore store,AlertEvaluationHost evaluator,AlarmTypeCatalog catalog,AlertPlanningRuntime planner,AlertDeliveryRuntime delivery){this(store,evaluator,catalog,planner,delivery,Set.of("pipeline-lifecycle","pipeline-observations"));}
         Services { providers=Set.copyOf(providers);Objects.requireNonNull(descriptions); }
@@ -81,6 +84,8 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     private volatile java.util.function.Consumer<AlarmKey.Resource> resourceRetired=r->{};
     void resourceRetired(java.util.function.Consumer<AlarmKey.Resource> listener){resourceRetired=listener;}
     private volatile Services services;
+    private volatile Instant lastEvaluatedAt;
+    private final ConcurrentMap<Work,Instant> inputTimes=new ConcurrentHashMap<>();
     private volatile List<AlertConfiguration.Rule> rules = List.of();
     private record Failure(String code,Map<String,Object> parameters){}
     private final AtomicReference<Failure> failure = new AtomicReference<>(new Failure(null,Map.of()));
@@ -222,8 +227,8 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             if (all.size() > 1000 || all.size() == 1000 && cursor != null) throw refused("rule-snapshot-budget");
         } while (cursor != null);
         active.run(); synchronized(this){
-            if(closed.get()){if(resolved.planner()!=null)resolved.planner().close();if(resolved.delivery()!=null)resolved.delivery().close();return;}
-            if(services==null&&resolved.planner()!=null)resolved.planner().start(); if(services==null&&resolved.delivery()!=null)resolved.delivery().start(); services = resolved; rules = List.copyOf(all);
+            if(closed.get()){if(resolved.planner()!=null)resolved.planner().close();if(resolved.delivery()!=null)resolved.delivery().close();if(resolved.maintenance()!=null)resolved.maintenance().close();return;}
+            if(services==null&&resolved.planner()!=null)resolved.planner().start(); if(services==null&&resolved.delivery()!=null)resolved.delivery().start(); if(services==null&&resolved.maintenance()!=null){resolved.maintenance().evaluation(this::health);resolved.maintenance().start();} services = resolved; rules = List.copyOf(all);
         }
         observerTick.run();
         if(reconciliationCursor==null)legacyBindingsInScan=false;
@@ -399,17 +404,17 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     }
     private final class Work implements Runnable {
         final Slot slot; final int bytes; final Runnable action, refused; final AtomicBoolean finished = new AtomicBoolean();
-        Work(Slot slot, int bytes, Runnable action, Runnable refused) { this.slot=slot;this.bytes=bytes;this.action=action;this.refused=refused; }
+        Work(Slot slot, int bytes, Runnable action, Runnable refused) { this.slot=slot;this.bytes=bytes;this.action=action;this.refused=refused; inputTimes.put(this,clock.instant()); }
         public void run() {
             if (closed.get()) { cancel(); return; }
-            try { action.run(); }
+            try { action.run(); lastEvaluatedAt=clock.instant(); }
             catch (RuntimeException unavailable) {
                 if(unavailable instanceof TapstateException coded)reject(slot,coded);else reject(slot,"evaluation-failed");
                 if(!(unavailable instanceof TapstateException))throw unavailable;
             }
             finally { release(); }
         }
-        void release() { if(finished.compareAndSet(false,true)){queuedBytes.addAndGet(-bytes);queuedTasks.decrementAndGet();} }
+        void release() { if(finished.compareAndSet(false,true)){queuedBytes.addAndGet(-bytes);queuedTasks.decrementAndGet();inputTimes.remove(this);} }
         void cancel() { if(!finished.get()){reject(slot,"closed-or-capacity");refused.run();release();} }
     }
     private void dispatch(Slot slot) {
@@ -459,7 +464,9 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         var delivery=resolved==null||resolved.delivery()==null?null:resolved.delivery().failure();
         if(current==null&&delivery!=null)current=new Failure(delivery.code(),delivery.parameters());
         if(current==null&&planning!=null)current=new Failure(planning.code(),planning.parameters());
-        return new Health(closed.get(),current!=null,rejected.get(),current==null?null:current.code(),current==null?Map.of():current.parameters(),queuedTasks.get(),queuedBytes.get());
+        var maintenance=resolved==null||resolved.maintenance()==null?Map.<String,Object>of():resolved.maintenance().health();
+        Long lag=lastEvaluatedAt==null?null:inputTimes.values().stream().min(Instant::compareTo).map(at->Math.max(0,Duration.between(at,clock.instant()).toMillis())).orElse(0L);
+        return new Health(closed.get(),current!=null||Boolean.TRUE.equals(maintenance.get("degraded")),rejected.get(),current==null?null:current.code(),current==null?Map.of():current.parameters(),queuedTasks.get(),queuedBytes.get(),lag,lastEvaluatedAt,maintenance);
     }
     static int inputBytes(Observation observation) {
         long bytes = 128; int points = 0;
@@ -492,7 +499,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     @Override public void close() {
         if(closed.compareAndSet(false,true)){
             freshness.shutdownNow();
-            synchronized(this){if(services!=null&&services.planner()!=null)services.planner().close();if(services!=null&&services.delivery()!=null)services.delivery().close();}
+            synchronized(this){if(services!=null&&services.planner()!=null)services.planner().close();if(services!=null&&services.delivery()!=null)services.delivery().close();if(services!=null&&services.maintenance()!=null)services.maintenance().close();}
             for(Runnable task:workers.shutdownNow()){
                 if(task instanceof Work work)work.cancel();
                 else if(task instanceof Dispatcher dispatcher)cancelPending(dispatcher.slot);

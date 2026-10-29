@@ -25,18 +25,42 @@ class NativeAlertManagementIT {
     @Test void originalNativeHumanSessionOwnsAlertAuthoringWithoutCallerSelectedScope() throws Exception {
         var storage=NativeAppStorage.createOnPremWithAdmin(MONGO,"native_alert","alert-operator","isolated-native-password");
         try(var observer=MongoClients.create(storage.configurationUri())){
+            var configuration=observer.getDatabase(storage.configurationDatabase());
+            var setup=configuration.getCollection("storage_setup").find(new Document("_id","cluster")).first();
+            var oldMinute=java.time.Instant.now().minusSeconds(7200).truncatedTo(java.time.temporal.ChronoUnit.MINUTES);
+            var expiredQuotaId=new Document("authorityId",setup.getString("installationId")).append("clusterId",storage.clusterId()).append("minute",oldMinute.toString());
+            configuration.getCollection("alert_test_quotas").insertOne(new Document("_id",expiredQuotaId).append("formatVersion",1).append("recordRevision",1L)
+                    .append("cleanupAt",java.util.Date.from(oldMinute.plusSeconds(3660))).append("body",new Document("actors",List.of(new Document("actor","retention-probe").append("accepted",1)))));
             try(var application=new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated()).run(
                     "--server.address=127.0.0.1","--server.port="+Integer.getInteger("tapstate.alert.native-browser-port",0),"--logging.level.root=ERROR","--tapstate.store.mongo.uri="+storage.configurationUri(),
-                    "--tapstate.hz.member-port=0","--tapstate.hz.jet.cooperative-thread-count=2","--tapstate.connectors.seed-dir="+work.resolve("no-seeds"),
+                    "--tapstate.hz.member-port=0","--tapstate.hz.jet.cooperative-thread-count=2","--tapstate.alerting.retention.ended-episode=P7D","--tapstate.connectors.seed-dir="+work.resolve("no-seeds"),
                     "--tapstate.connectors.plugins-dir="+work.resolve("plugins"),"--tapstate.control.auth.jwt-secret=native-alert-test-signing-key")){
                 NativeAppStorage.awaitBusiness(application);int port=((WebServerApplicationContext)application).getWebServer().getPort();var client=HttpClient.newHttpClient();String root="http://127.0.0.1:"+port;
                 var login=post(client,root,"/auth/login",null,Map.of("username","alert-operator","password","isolated-native-password"));assertThat(login.statusCode()).isEqualTo(200);String token=(String)AlertHttpModel.object(JsonReader.parse(login.body())).get("token");assertThat(token).isNotBlank();
                 await().atMost(Duration.ofSeconds(20)).untilAsserted(()->{var catalog=post(client,root,"/api/alerts/catalog",token,Map.of());assertThat(catalog.statusCode()).isEqualTo(200);assertThat(AlertHttpModel.object(JsonReader.parse(catalog.body()))).containsEntry("clusterId",storage.clusterId()).containsEntry("deployment","ON_PREM");});
+                await().atMost(Duration.ofSeconds(30)).untilAsserted(()->{
+                    var read=post(client,root,"/api/alerts/health",token,Map.of());assertThat(read.statusCode()).isEqualTo(200);
+                    assertThat(AlertHttpModel.object(AlertHttpModel.object(JsonReader.parse(read.body())).get("maintenance"))).containsEntry("capacitySampleStale",false);
+                });
                 var form=Map.of("name","Native UI rule","typeId","pipeline.failed","typeVersion",1,"resourceKinds",List.of("pipeline"),"allResources",true,"resources",List.of(),"parameters",Map.of(),"severity","DEFAULT","enabled",true);
                 var saved=post(client,root,"/api/alerts/configuration/save",token,Map.of("kind","RULE","id","native-rule","etag","0","form",form));assertThat(saved.statusCode()).isEqualTo(200);
                 var list=post(client,root,"/api/alerts/configuration/list",token,Map.of("kind","RULE"));assertThat(list.statusCode()).isEqualTo(200);assertThat(list.body()).contains("Native UI rule").doesNotContain("isolated-native-password",token);
                 var raw=observer.getDatabase(storage.configurationDatabase()).getCollection("alert_rules").find(new Document("_id.id","native-rule")).first();assertThat(raw).isNotNull();assertThat(raw.toJson()).contains("alert-operator");
                 assertThat(post(client,root,"/api/alerts/center",token,Map.of("authorityId","foreign")).statusCode()).isEqualTo(400);
+                await().atMost(Duration.ofSeconds(30)).untilAsserted(()->{
+                    var health=post(client,root,"/api/alerts/health",token,Map.of());assertThat(health.statusCode()).isEqualTo(200);
+                    var body=AlertHttpModel.object(JsonReader.parse(health.body()));assertThat(body).containsEntry("cleanupAvailable",true);
+                    var maintenance=AlertHttpModel.object(body.get("maintenance"));assertThat(maintenance.get("lastSuccess")).isNotNull();
+                    assertThat(((Number)maintenance.get("changed")).longValue()).isPositive();
+                    assertThat(configuration.getCollection("alert_test_quotas").find(new Document("_id",expiredQuotaId)).first()).isNull();
+                    assertThat(maintenance).containsEntry("capacitySampleStale",false);assertThat(((Number)maintenance.get("logicalBytes")).longValue()).isGreaterThanOrEqualTo(0);
+                });
+                assertThat(NativeAppStorage.business(application).getBean(PipelineAlertRuntime.class).managementServices().evaluator().retentionPolicy().duration(io.tapstate.core.alerting.AlertRetentionPolicy.Setting.ENDED_EPISODE)).isEqualTo(Duration.ofDays(7));
+                assertThat(NativeAppStorage.business(application).getBean(PipelineAlertRuntime.class).managementServices().store().maintenance().orElseThrow().inventory().logicalBytes()).isPositive();
+                String receipt=System.getProperty("tapstate.alert.maintenance-receipt");
+                if(receipt!=null){var read=post(client,root,"/api/alerts/health",token,Map.of());var evidence=new LinkedHashMap<String,Object>();
+                    evidence.put("mode","actual-native-op");evidence.put("clusterId",storage.clusterId());evidence.put("expiredQuotaAbsent",configuration.getCollection("alert_test_quotas").find(new Document("_id",expiredQuotaId)).first()==null);
+                    evidence.put("maintenance",AlertHttpModel.object(JsonReader.parse(read.body())).get("maintenance"));java.nio.file.Files.writeString(Path.of(receipt),JsonWriter.write(evidence));}
                 String control=System.getProperty("tapstate.alert.native-browser-control");
                 if(control!=null){var directory=Path.of(control);java.nio.file.Files.createDirectories(directory);AlertDeliveryNetworkIT.temp=work;AlertDeliveryNetworkIT.tls();
                     try(var smtp=new AlertDeliveryNetworkIT.SmtpPeer(true)){

@@ -251,7 +251,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
     @Configuration(proxyBeanMethods = false)
     @Conditional(ChildOnly.class)
     @EnableScheduling
-    @org.springframework.boot.context.properties.EnableConfigurationProperties({MetricsExportProperties.class})
+    @org.springframework.boot.context.properties.EnableConfigurationProperties({MetricsExportProperties.class,AlertRetentionSettings.class})
     static class Wiring {
         @Bean StoreBackedDerivedSchemas nativeDerivedSchemas(NativeBusinessContext owner, AuditGate audit,
                 PipelineActuationOwnership ownership) {
@@ -458,7 +458,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                     :new io.tapstate.core.alerting.AlarmKey.Scope(setup.installationId(),setup.clusterId());
         }
         @Bean(initMethod = "start",destroyMethod = "close") PipelineAlertRuntime pipelineAlertRuntime(NativeBusinessContext owner,
-                PipelineActuationOwnership ownership, NodeSessionLease node, CloudRuntimeSettings cloud, Clock clock,BuiltinResourceSignals signals) {
+                PipelineActuationOwnership ownership, NodeSessionLease node, CloudRuntimeSettings cloud, Clock clock,BuiltinResourceSignals signals, MetricsExport export,AlertRetentionSettings retentions) {
             var types=owner.parent.getBeanProvider(AlertTypeAssembly.class).getIfAvailable(AlertTypeAssembly::builtin);
             String evaluatorId = java.util.UUID.randomUUID().toString();
             Runnable active=owner::requireAlertHost;
@@ -468,7 +468,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 var scope=alertScope(owner,cloud);
                 var deployment = cloud.cloud() ? io.tapstate.core.alerting.AlertChannelPolicy.Deployment.CLOUD_MANAGED
                         : io.tapstate.core.alerting.AlertChannelPolicy.Deployment.ON_PREM;
-                var catalog=types.catalog();
+                var catalog=types.catalog();var retention=retentions.resolve(deployment);
                 var managedBinding = cloud.cloud() ? AlertNotificationPlanner.managedBinding(cloud.baseUrl(),scope,setup) : null;
                 var route = cloud.cloud() ? new io.tapstate.core.alerting.AlertIntent.SystemRoute("managed-alert-events",managedBinding,1) : null;
                 var target = cloud.cloud() ? new io.tapstate.core.alerting.AlertIntent.SdkTarget(managedBinding,scope.clusterId(),managedBinding) : null;
@@ -476,9 +476,10 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 var host = new io.tapstate.spi.store.AlertStore.Host(scope,setup,deployment,active,route,target,signals::resourceEvidence,AlertChannels.capabilities(deployment,cloud,outbound));
                 var store = owner.configuration.alerts(host, catalog, clock);
                 var planner = new AlertNotificationPlanner(store,clock,evaluatorId+":planning",cloud.cloud()?cloud.baseUrl():null,active);
-                return new PipelineAlertRuntime.Services(store, new AlertEvaluationHost(store, catalog, deployment, clock, evaluatorId, active).withPlanner(planner),catalog,new AlertPlanningRuntime(planner),
+                var maintenance=new AlertMaintenanceRuntime(store.maintenance().orElseThrow(),clock,active);maintenance.reporting(export);
+                return new PipelineAlertRuntime.Services(store, new AlertEvaluationHost(store, catalog, deployment, clock, evaluatorId, active,retention).withPlanner(planner),catalog,new AlertPlanningRuntime(planner),
                         new AlertDeliveryRuntime(store,clock,evaluatorId+":delivery",active,new AlertChannels(deployment,cloud,clock,active,cloud.cloud()?scope.authorityId():null,outbound),
-                                owner.root.authentication()::continueAlertTest),types.providers(),types.descriptions());
+                                owner.root.authentication()::continueAlertTest),types.providers(),types.descriptions(),maintenance);
             }, owner.configuration.intents(), ownership::evaluationProof, active, clock);
         }
         @Bean io.tapstate.control.core.AlertControlDispatcher alertControlDispatcher(NativeBusinessContext owner,

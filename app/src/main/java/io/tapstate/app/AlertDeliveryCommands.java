@@ -9,8 +9,10 @@ import java.util.*;
 
 /** Application commands shared by configuration tests and the eventual authenticated HTTP surface. */
 final class AlertDeliveryCommands {
-    private final AlertStore store;private final AlarmKey.Scope scope;private final AlertChannelPolicy.Deployment deployment;private final Clock clock;
-    AlertDeliveryCommands(AlertStore store,AlarmKey.Scope scope,AlertChannelPolicy.Deployment deployment,Clock clock){this.store=store;this.scope=scope;this.deployment=deployment;this.clock=clock;}
+    private final AlertStore store;private final AlarmKey.Scope scope;private final AlertChannelPolicy.Deployment deployment;private final Clock clock;private final AlertRetentionPolicy retentionPolicy;
+    AlertDeliveryCommands(AlertStore store,AlarmKey.Scope scope,AlertChannelPolicy.Deployment deployment,Clock clock){this(store,scope,deployment,clock,AlertRetentionPolicy.defaults(deployment));}
+    AlertDeliveryCommands(AlertStore store,AlarmKey.Scope scope,AlertChannelPolicy.Deployment deployment,Clock clock,AlertRetentionPolicy retention){this.store=store;this.scope=scope;this.deployment=deployment;this.clock=clock;
+        if(retention.deployment()!=deployment)throw new TapstateException(AlertError.INVALID_CONFIGURATION,Map.of("field","retention","reason","foreign-deployment"),null);this.retentionPolicy=retention;}
     AlertStore.Stored<AlertIntent.Record> test(AlertTestCommand.ClientId command,String candidateId,AlertReceiver.Transport transport,
             String target,AlertReceiver existing,AlertStore.PrivateMaterial material,Set<AlertStore.PrivateField> retain,
             AlertConfiguration.Subscription messageRoute,AlertStore.Access access){
@@ -51,7 +53,7 @@ final class AlertDeliveryCommands {
                 target,"candidate",route,payload.sha256());
         var prepared=store.prepareCandidate(key,form,transport,existing==null?null:existing.header().identity(),existing==null?0:existing.bindingRevision(),material,retain,access);
         var admitted=AlertTestCommand.admit(deployment,new AlertChannelPolicy.Capability(transport.channelType(),1,AlertChannelPolicy.Family.OP_EXTERNAL),key,prepared.parameters(),null,now).command();
-        var retention=AlertIntent.Policy.capture(AlertRetentionPolicy.defaults(deployment));
+        var retention=AlertIntent.Policy.capture(retentionPolicy);
         var frozen=new AlertIntent.Frozen(new AlertIntent.Test(admitted),new AlertChannelPolicy.Capability(transport.channelType(),1,AlertChannelPolicy.Family.OP_EXTERNAL),null,prepared.target(),
                 new AlertIntent.Content(transport.channelType().equals("email")?"message/rfc822":"application/json",payload.sha256(),new AlertIntent.Template("channel-test",1,revision,"en",settings),false),
                 List.of(),ChannelRetryPolicy.singleAttempt(Duration.ofMinutes(5),Duration.ofSeconds(transport.channelType().equals("email")?60:30)),retention,now,admitted.deadline(),access.actor());

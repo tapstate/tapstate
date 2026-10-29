@@ -267,6 +267,13 @@ class AlertIntentTest {
         assertThat(value.state().manualCycles()).isOne();assertThat(value.state().attemptsConsumed()).isEqualTo(6);
     }
 
+    @Test void stoppedPrunedIntentKeepsItsOriginalSettlementWhenThePlannerRevisitsIt() {
+        var original=AlertIntentControl.claim(initial(frozen(false)),"sender",C,C.plusSeconds(120));var pending=AlertDeliveryProgress.grant(original,"sender","pruned-attempt",C);
+        var accepted=AlertDeliveryProgress.result(pending,pending.state().attempts().getFirst().permit(),Outcome.ACCEPTED,new Protocol(Phase.FINAL_RESPONSE,Action.STOP,250,"smtp",null),new Receipt("channel-protocol","accepted",null),C.plusSeconds(1),0);
+        var now=C.plus(Duration.ofDays(8));var pruned=AlertMaintenancePolicy.prune(accepted,now);assertThat(pruned.state().detailsPrunedAt()).isNotNull();
+        assertThat(AlertIntentControl.stop(pruned,pruned.state().stopReason(),now.plusSeconds(1))).isEqualTo(pruned);
+    }
+
     private static Frozen frozen(boolean cloud) {
         var ruleId = new AlertConfiguration.Identity(AlertConfiguration.Kind.RULE, SCOPE, "rule-a", UUID);
         var routeId = new AlertConfiguration.Identity(AlertConfiguration.Kind.SUBSCRIPTION, SCOPE, "route-a", UUID);

@@ -262,4 +262,15 @@ final class MongoAlertConfigurationStore {
     private static TapstateException unreadable(String field) {
         return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "alert-configuration", "field", field), null);
     }
+    boolean removeForMaintenance(ClientSession session, SystemCollections collection, Document original) {
+        MongoAlertStateStore.requireTransaction(session); requireActive.run();
+        if (!COLLECTIONS.contains(collection)) throw new IllegalArgumentException("foreign maintenance resource");
+        return collection.on(configuration).deleteOne(session, original).getDeletedCount() == 1;
+    }
+    boolean replaceForMaintenance(ClientSession session, SystemCollections collection, Document original, Document replacement) {
+        MongoAlertStateStore.requireTransaction(session); requireActive.run();
+        if (!COLLECTIONS.contains(collection) || !original.get("_id").equals(replacement.get("_id"))) throw new IllegalArgumentException("foreign maintenance identity");
+        return collection.on(configuration).replaceOne(session, MongoAlertMaintenance.versionFilter(original), replacement).getModifiedCount() == 1;
+    }
+
 }

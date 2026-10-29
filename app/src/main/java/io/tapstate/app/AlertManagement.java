@@ -29,7 +29,7 @@ final class AlertManagement implements AlertControlDispatcher {
     }
     private Map<String,Object> invoke(String op,Map<String,Object> input,PipelineAlertRuntime.Services resolved,AlertStore.Access access,CredentialAuthentication caller){
         var store=resolved.store();var reads=new AlertStore.ReadAccess(true,Set.of(),access.locallyActive());
-        var author=new AlertAuthoring(store,scope,deployment,resolved.catalog(),clock);var commands=new AlertDeliveryCommands(store,scope,deployment,clock);
+        var author=new AlertAuthoring(store,scope,deployment,resolved.catalog(),clock);var commands=new AlertDeliveryCommands(store,scope,deployment,clock,resolved.evaluator().retentionPolicy());
         int limit=integer(input,"limit",25);if(limit<1||limit>100)throw invalid("limit");
         switch(op){
             case "alert.catalog": {
@@ -52,7 +52,8 @@ final class AlertManagement implements AlertControlDispatcher {
             case "alert.detail": {
                 fields(input,"key","episode");var key=key(text(input,"key"),scope);long number=number(input,"episode",0);
                 var retained=store.state(key,reads);var h=retained.orElse(null);
-                AlertStateRecord.Episode e=number==0?(h==null?null:h.value().episode()):store.history(key,number-1,1,reads).rows().stream().filter(v->v.value().number()==number).findFirst().orElseThrow(()->stale("episode-not-found"));
+                long selected=number==0&&h!=null&&h.value().episode()!=null?h.value().episode().value().number():number;
+                AlertStateRecord.Episode e=selected==0?null:store.history(key,selected-1,1,reads).rows().stream().filter(v->v.value().number()==selected).findFirst().orElseThrow(()->stale("episode-not-found"));
                 if(e==null)throw stale("alarm-not-found");
                 boolean current=e.value().endedAt()==null&&h!=null&&e.equals(h.value().episode());
                 var m=current?head(h.value()):episode(e);m.put("diagnostics",diagnostics(e.diagnostics()));
@@ -73,7 +74,7 @@ final class AlertManagement implements AlertControlDispatcher {
                 return map("rows",rows,"isolated",p.isolatedRecords(),"nextCursor",p.nextId()==null?null:cursorToken("deliveries:"+filter,map("after",p.nextId())));
             }
             case "alert.health": {
-                fields(input);var h=health.get();return map("deployment",deployment.name(),"degraded",h.degraded(),"closed",h.closed(),"rejected",h.rejected(),"code",h.code(),"queuedInputs",h.queuedInputs(),"coverage",resolved.catalog().types().stream().filter(t->resolved.providers().contains(t.providerId())).map(AlarmTypeCatalog.Type::id).toList(),"cleanupAvailable",false,"refreshedAt",instant(clock.instant()));
+                fields(input);var h=health.get();return map("deployment",deployment.name(),"degraded",h.degraded(),"closed",h.closed(),"rejected",h.rejected(),"code",h.code(),"parameters",h.parameters(),"queuedInputs",h.queuedInputs(),"coverage",resolved.catalog().types().stream().filter(t->resolved.providers().contains(t.providerId())).map(AlarmTypeCatalog.Type::id).toList(),"queuedBytes",h.queuedBytes(),"evaluationLagMillis",h.evaluationLagMillis(),"lastEvaluatedAt",instant(h.lastEvaluatedAt()),"maintenance",h.maintenance(),"cleanupAvailable",Boolean.TRUE.equals(h.maintenance().get("available")),"refreshedAt",instant(clock.instant()));
             }
             case "alert.configuration.list": {
                 fields(input,"kind","cursor","limit");var kind=value(AlertConfiguration.Kind.class,text(input,"kind"));author.external(kind);var p=store.definitions(kind,optional(input,"cursor"),limit,access);return map("rows",p.rows().stream().filter(d->d.header().active()).map(AlertAuthoring::project).toList(),"nextCursor",p.nextId());

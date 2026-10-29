@@ -15,7 +15,7 @@ public final class AlertIntentControl {
             return ended.endedAt() == a.endedAt() ? a : new AlertIntent.Attempt(a.permit(), ended.outcome(), ended.endedAt(),
                     a.acceptedRecordedAt(), a.protocol(), a.receipt());
         }).toList();
-        Instant last = attempts.stream().map(AlertIntent.Attempt::endedAt).filter(java.util.Objects::nonNull).max(Instant::compareTo).orElse(null);
+        Instant last = s.detailsPrunedAt()!=null ? s.lastAttemptEnd() : attempts.stream().map(AlertIntent.Attempt::endedAt).filter(java.util.Objects::nonNull).max(Instant::compareTo).orElse(null);
         var retained = s.retained().value(record.frozen());
         if (attempts.stream().noneMatch(a -> a.endedAt() == null) && retained.stoppedAt() == null) {
             Instant fixed = last != null && last.isAfter(at) ? last : at;

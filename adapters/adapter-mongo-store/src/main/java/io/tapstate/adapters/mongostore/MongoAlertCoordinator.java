@@ -18,6 +18,52 @@ final class MongoAlertCoordinator implements AlertStore {
     private final MongoStorageBindingStore bindings;private final Host host;private final Clock clock;
     private final MongoAlertConfigurationStore definitions;private final MongoAlertStateStore states;private final MongoAlertNotificationStore notifications;
     private final MongoAlertNodeLifecycleStore nodes;
+    private final MongoAlertMaintenance maintenance;
+    private volatile AlertMaintenancePolicy.Capacity capacity=AlertMaintenancePolicy.Capacity.initial();
+    private volatile Instant capacityMeasuredAt;
+    private volatile boolean capacityProtection;
+    private final Map<String,Integer> admissionRates=new HashMap<>();
+    private Instant admissionMinute;
+    private long admissionTotal,lastSampleAdmissionTotal,carriedAdmissionBytes,measuredCapacityBytes;
+    private synchronized long pendingAdmissionBytes(){return carriedAdmissionBytes+admissionTotal-lastSampleAdmissionTotal;}
+    private static long admissionBytes(String resource){return switch(resource){
+        case "alert_instances" -> 64L*1024;
+        case "alert_transitions" -> 16L*1024;
+        case "alert_notification_schedules" -> (long)AlertSchedule.MAX_BYTES+AlertIntent.MAX_BYTES;
+        case "alert_delivery_intents" -> AlertIntent.MAX_BYTES;
+        case "alert_receivers" -> 64L*1024;
+        default -> 256L*1024;
+    };}
+
+    private synchronized void admission(String resource,int count) {
+        if(count<1)return;Instant minute=clock.instant().truncatedTo(java.time.temporal.ChronoUnit.MINUTES);
+        if(!minute.equals(admissionMinute)){admissionMinute=minute;admissionRates.clear();}
+        int current=admissionRates.getOrDefault(resource,0);
+        if(count>1000-current)throw new TapstateException(AlertError.INVALID_CONFIGURATION,Map.of("field",resource,"reason","admission-rate"),null);
+        admissionRates.put(resource,current+count);
+        long growth=Math.multiplyExact(admissionBytes(resource),count);
+        if(capacityProtection){requireCapacity(false,true);
+            if(growth>AlertMaintenancePolicy.CAPACITY_BYTES-measuredCapacityBytes-pendingAdmissionBytes())
+                throw new TapstateException(AlertError.INVALID_CONFIGURATION,Map.of("field","alertCapacity","reason","storage-pressure"),null);}
+        admissionTotal=Math.addExact(admissionTotal,growth);maintenance.writeAttempt(resource,count);
+    }
+
+    private synchronized void observedCapacity(AlertMaintenance.Inventory inventory) {
+        if(capacityMeasuredAt==null || !inventory.measuredAt().isBefore(capacityMeasuredAt.plusSeconds(60))) {
+            carriedAdmissionBytes=admissionTotal-lastSampleAdmissionTotal;lastSampleAdmissionTotal=admissionTotal;
+            measuredCapacityBytes=inventory.logicalBytes();capacity=capacity.sample(inventory.logicalBytes());capacityMeasuredAt=inventory.measuredAt();
+        }
+    }
+    private void requireCapacity(boolean lowPriority,boolean newFact) {
+        if((lowPriority||newFact) && capacityProtection && (capacityMeasuredAt==null || capacityMeasuredAt.isAfter(clock.instant()) || java.time.Duration.between(capacityMeasuredAt,clock.instant()).compareTo(Duration.ofSeconds(120))>0))
+            throw new TapstateException(AlertError.INVALID_CONFIGURATION,Map.of("field","alertCapacity","reason","capacity-unavailable"),null);
+        long estimate=measuredCapacityBytes+pendingAdmissionBytes();
+        if(lowPriority&&(!capacity.admitsTestOrReminder() || capacityProtection && estimate>=AlertMaintenancePolicy.CAPACITY_BYTES*9/10)
+                || newFact&&(!capacity.admitsNewFact() || capacityProtection && estimate>=AlertMaintenancePolicy.CAPACITY_BYTES))
+            throw new TapstateException(AlertError.INVALID_CONFIGURATION,Map.of("field","alertCapacity","reason","storage-pressure"),null);
+    }
+    @Override public Optional<AlertMaintenance> maintenance(){return Optional.of(maintenance);}
+
     MongoAlertCoordinator(MongoConfigurationDomain domain,MongoDatabase db,SourceConfigCipherProvider keys,MongoConfigurationArtifactStore artifacts,
             MongoConfigurationSecurityStores security,MongoStorageBindingStore bindings,Host host,AlarmTypeCatalog catalog,Clock clock) {
         this.domain=domain;this.db=db;this.keys=keys;this.artifacts=artifacts;this.security=security;this.bindings=bindings;this.host=host;this.clock=clock;
@@ -25,6 +71,21 @@ final class MongoAlertCoordinator implements AlertStore {
         if(host.deployment()==AlertChannelPolicy.Deployment.ON_PREM&&!host.scope().authorityId().equals(host.setup().installationId()))throw stale("installation-authority");
         this.notifications=new MongoAlertNotificationStore(db,host.scope(),host.deployment(),host.locallyActive(),clock);
         this.nodes=new MongoAlertNodeLifecycleStore(domain,db,keys,bindings,host.scope(),host.setup(),host.locallyActive());
+        this.maintenance=new MongoAlertMaintenance(c->c.on(db),host.scope(),clock,new MongoAlertMaintenance.Transactions(){
+            public void verify(Duration remaining){host.locallyActive().run();try{if(domain.alertSchemaVersion(new MongoReadBudget(remaining).withoutCallbackRetries())!=MongoAlertStorageSchema.VERSION)throw unreadable("schema-capability");}
+                catch(MongoReadBudget.MaintenanceConflict conflict){throw new TapstateException(IoError.STORE_UNAVAILABLE,Map.of("detail","maintenance-contention"),null);}}
+            public <T>T run(boolean write,Duration remaining,Function<ClientSession,T> action){try{return maintenanceTx(write,remaining,action);}
+                catch(MongoReadBudget.MaintenanceConflict conflict){if(write)throw conflict;throw new TapstateException(IoError.STORE_UNAVAILABLE,Map.of("detail","maintenance-contention"),null);}}
+        },this::maintenanceMutation,this::observedCapacity,this::pendingAdmissionBytes,()->capacityProtection=true,(session,row)->{
+            if(!nodes.currentRegistration(session,row.registration()))return false;
+            var proof=host.resourceEvidence().apply(row.registration().key().resource());
+            if(proof.isEmpty() || !(proof.orElseThrow() instanceof NodeEvidence n))return true;
+            n.requireCurrent().run();
+            if(n.lifecycleRevision()!=row.revision() || !n.producerIncarnation().equals(row.registration().producerIncarnation()))throw stale("cleanup-node-proof");
+            if(n.expected())return true;
+            if(row.phase()==AlertNodeLifecycleStore.Phase.EXPECTED && nodes.successor(session,row).isEmpty())return true;
+            return false;
+        });
     }
     private <T>T tx(Access access,boolean write,boolean authoring,Function<ClientSession,T> action) {
         if(access!=null){access.revalidate().run();access.locallyActive().run();}
@@ -37,6 +98,16 @@ final class MongoAlertCoordinator implements AlertStore {
                 else ConfigurationVersion.advanceAlert(session,SystemCollections.CONFIGURATION_VERSION.on(db));
             }
             T result=action.apply(session);host.locallyActive().run();if(access!=null)access.locallyActive().run();return result;
+        }));
+    }
+    private <T>T maintenanceTx(boolean write,Duration remaining,Function<ClientSession,T> action) {
+        host.locallyActive().run();return StoreIo.call(()->domain.alertMaintenanceTransaction(new MongoReadBudget(remaining),session->{
+            currentHost(session);
+            Document schema=SystemCollections.SCHEMA_MIGRATIONS.on(db).find(session,new Document("_id","config")).first();
+            if(schema==null || !Integer.valueOf(MongoAlertStorageSchema.VERSION).equals(schema.get("alerting",Document.class).get("installedVersion")))throw unreadable("schema-capability");
+            if(write){if(!keys.fenceWrite(new SourceConfigWriteScope(session),keys.currentForWrite().activeKeyId()))throw stale("configuration-key");
+                ConfigurationVersion.advanceAlert(session,SystemCollections.CONFIGURATION_VERSION.on(db));}
+            T result=action.apply(session);host.locallyActive().run();return result;
         }));
     }
     private void currentHost(ClientSession session) {
@@ -89,7 +160,7 @@ final class MongoAlertCoordinator implements AlertStore {
     @Override public Optional<Definition> definition(Kind kind,String id,Access access) {
         return tx(access,false,false,s->definitions.load(s,kind,id).map(MongoAlertConfigurationCodec.Stored::definition));
     }
-    @Override public DefinitionPage definitions(Kind kind,String after,int limit,Access access){return tx(access,false,false,s->new MongoAlertReads(db,host.scope(),states).definitions(s,kind,after,limit));}
+    @Override public DefinitionPage definitions(Kind kind,String after,int limit,Access access){return tx(access,false,false,s->new MongoAlertReads(db,host.scope(),states,clock).definitions(s,kind,after,limit));}
     @Override public ResourcePage resources(String kind,String after,int limit,Access access){
         if(limit<1||limit>100)throw stale("resource-page-limit");
         if(!Set.of("source","pipeline").contains(kind))return new ResourcePage(List.of(),null);
@@ -104,22 +175,22 @@ final class MongoAlertCoordinator implements AlertStore {
             return new ResourcePage(rows,more?raw.getLast().getString("_id"):null);
         });
     }
-    @Override public DefinitionPage evaluationRules(String after,int limit){return tx(null,false,false,s->new MongoAlertReads(db,host.scope(),states).definitions(s,Kind.RULE,after,limit));}
+    @Override public DefinitionPage evaluationRules(String after,int limit){return tx(null,false,false,s->new MongoAlertReads(db,host.scope(),states,clock).definitions(s,Kind.RULE,after,limit));}
     @Override public EvaluationPage evaluationStates(AlarmKey after,int limit){return tx(null,false,false,s->{
-        var page=new MongoAlertReads(db,host.scope(),states).evaluationStates(s,after,limit);var removed=new HashSet<AlarmKey.Resource>();var superseded=new HashSet<AlarmKey>();
+        var page=new MongoAlertReads(db,host.scope(),states,clock).evaluationStates(s,after,limit);var removed=new HashSet<AlarmKey.Resource>();var superseded=new HashSet<AlarmKey>();
         for(var row:page.rows()){var resource=row.value().snapshot().rule().key().resource();if(resourceRemoved(s,resource))removed.add(resource);else if(sourceBindingChanged(s,row.value()))superseded.add(row.value().snapshot().rule().key());}
         return new EvaluationPage(page.rows(),page.next(),removed,superseded);
     });}
     @Override public Outcome saveDefinition(Definition before,Definition after,Access access) {
         Objects.requireNonNull(access);management(after,access);
-        try{return tx(access,true,true,s->{validateDefinitionReferences(s,after);return outcome(definitions.stage(s,before,after));});}catch(Conflict conflict){return Outcome.CONFLICT;}
+        try{return tx(access,true,true,s->{if(before==null)definitionCapacity(s,after);if(after.header().active())validateDefinitionReferences(s,after);return outcome(definitions.stage(s,before,after));});}catch(Conflict conflict){maintenance.conflict();return Outcome.CONFLICT;}
     }
     @Override public Outcome saveReceiver(AlertReceiver before,AlertReceiver after,PrivateMaterial replacement,boolean retain,Access access) {
         Objects.requireNonNull(access);management(after,access);
         MongoAlertReceiverSecrets.Prepared prepared;
         if(retain){var captured=tx(access,false,false,s->definitions.captureReceiverForManagement(s,after.header().identity()));prepared=definitions.retainReceiverMaterial(after,captured);}
         else{try(var material=material(replacement)){prepared=definitions.prepareReceiver(after,material);}}
-        try{return tx(access,true,true,s->outcome(definitions.stageReceiver(s,before,prepared)));}catch(Conflict conflict){return Outcome.CONFLICT;}
+        try{return tx(access,true,true,s->{if(before==null)definitionCapacity(s,after);return outcome(definitions.stageReceiver(s,before,prepared));});}catch(Conflict conflict){maintenance.conflict();return Outcome.CONFLICT;}
     }
     private void management(Definition after,Access access){scope(after.header().identity().scope());if(after.header().deployment()!=host.deployment()
             ||!after.header().updatedBy().equals(access.subject()))throw stale("configuration-author");
@@ -156,6 +227,7 @@ final class MongoAlertCoordinator implements AlertStore {
             var old=replay.get();AlertTestCommand.admit(host.deployment(),candidate.frozen().channel(),test.command().key(),test.command().parameters(),
                     ((AlertIntent.Test)old.value().frozen().identity()).command(),clock.instant());return new Stored<>(old.recordRevision(),old.value());
         }
+        AlertTestCommand.admit(host.deployment(),candidate.frozen().channel(),test.command().key(),test.command().parameters(),null,clock.instant());
         if(!(candidate.frozen().target() instanceof AlertIntent.CandidateTarget candidateTarget))throw stale("test-candidate");
         try(var verified=MongoAlertCandidateSecrets.resolve(test.command(),candidateTarget,candidate.state().candidate(),keys.refresh(new MongoReadBudget(Duration.ofSeconds(5))))){ }
         return tx(access,true,false,s->{
@@ -163,11 +235,13 @@ final class MongoAlertCoordinator implements AlertStore {
             var admission=AlertTestCommand.admit(host.deployment(),candidate.frozen().channel(),test.command().key(),test.command().parameters(),
                     old.isEmpty()?null:((AlertIntent.Test)old.get().value().frozen().identity()).command(),test.command().acceptedAt());
             if(admission.replay()){var v=old.orElseThrow();return new Stored<>(v.recordRevision(),v.value());}
+            AlertTestCommand.admit(host.deployment(),candidate.frozen().channel(),test.command().key(),test.command().parameters(),null,clock.instant());
+            requireCapacity(true,true);admission("alert_delivery_intents",1);
             if(!admission.command().equals(test.command())||test.command().acceptedAt().isAfter(clock.instant())
                     ||Duration.between(test.command().acceptedAt(),clock.instant()).compareTo(Duration.ofSeconds(30))>0)throw stale("test-admission-time");
             validateIntent(s,candidate.frozen(),true,access);
             var minute=AlertTestQuota.minute(test.command().acceptedAt());var quota=notifications.quota(s,minute);
-            List<AlertIntent.Record> recent=new MongoAlertReads(db,host.scope(),states).testWindow(s,clock.instant());
+            List<AlertIntent.Record> recent=new MongoAlertReads(db,host.scope(),states,clock).testWindow(s,clock.instant());
             if(quota.isEmpty()&&recent.stream().anyMatch(v->AlertTestQuota.minute(v.frozen().createdAt()).equals(minute)))throw unreadable("missing-test-quota");
             var target=target(candidate.frozen());
             for(var v:recent)if(v.state().retained().stoppedAt()==null&&clock.instant().isBefore(v.frozen().deadline())) {
@@ -190,7 +264,13 @@ final class MongoAlertCoordinator implements AlertStore {
                 if(version==null||!Long.valueOf(c.version().configurationRevision()).equals(version.get("revision"))
                         ||!Long.valueOf(Math.incrementExact(c.version().alertFence())).equals(version.get(ConfigurationVersion.ALERT_FENCE)))throw new Conflict();
             }
-            if(c.state()!=null){var v=c.state();scope(v.after().snapshot().rule().key().scope());
+            if(c.state()!=null){var v=c.state();
+                boolean recovery=v.before()!=null && v.before().episode()!=null && v.before().episode().value().endedAt()==null
+                        && (v.after().snapshot().recoverySince()!=null || v.after().episode()!=null && v.after().episode().value().endReason()==AlertSnapshot.EndReason.RECOVERED
+                        || v.diagnosticSignal()!=null && v.diagnosticSignal().condition()==AlertSignal.Condition.GOOD);
+                boolean newOccurrence=v.before()==null || v.before().snapshot().episodeSequence()<v.after().snapshot().episodeSequence();
+                requireCapacity(false,newOccurrence || !recovery && c.kind()!=CommitKind.END && !v.transitions().isEmpty());
+                if(!recovery && c.kind()!=CommitKind.END && !v.transitions().isEmpty())admission("alert_transitions",v.transitions().size());scope(v.after().snapshot().rule().key().scope());
                 if(v.proof()!=null){
                     v.proof().requireCurrent().run();var original=v.proof().pipeline();var key=v.after().snapshot().rule().key();
                     if(original==null) {
@@ -218,12 +298,16 @@ final class MongoAlertCoordinator implements AlertStore {
                     if(v.after().binding()==null)throw stale("state-rule-binding");
                     validateMember(s,v.after().binding(),true);
                 }
-                if(v.before()==null && v.after().binding()!=null)requireDomainCapacity(s,v.after());
+                if(v.before()==null){admission("alert_instances",1);if(v.after().binding()!=null)requireDomainCapacity(s,v.after());}
                 changed|=outcome(states.stageEnvelope(s,v.revision(),v.before(),v.after(),v.transitions(),v.diagnosticSignal(),clock))==Outcome.STAGED;
                 if(v.proof()!=null)v.proof().requireCurrent().run();
             }
             for(var change:c.intents()){
                 var before=change.before();var after=change.after();scope(after.frozen().identity().scope());
+                if(before==null){boolean reminder=after.frozen().identity() instanceof AlertIntent.Business b && b.key().notification().kind()==DeliveryKey.Kind.REMINDER;
+                    boolean recovery=after.frozen().identity() instanceof AlertIntent.Business b && b.key().notification().kind()==DeliveryKey.Kind.RECOVERY;
+                    if(recovery)maintenance.writeAttempt("alert_delivery_intents",1);else admission("alert_delivery_intents",1);
+                    requireCapacity(reminder,!recovery);}
                 if(before==null&&!(after.frozen().identity() instanceof AlertIntent.Business))throw stale("test-requires-admission");
                 int prior=before==null?0:before.value().state().attemptsConsumed();
                 boolean grants=after.state().attemptsConsumed()>prior;
@@ -239,9 +323,13 @@ final class MongoAlertCoordinator implements AlertStore {
                     outcome(notifications.stageLimit(s,current.orElse(null),value));
                 }
             }
-            for(var v:c.schedules())changed|=outcome(notifications.stageSchedule(s,v.before()==null?null:new MongoAlertScheduleCodec.Stored(v.before().revision(),v.before().value()),v.after()))==Outcome.STAGED;
+            for(var v:c.schedules()){if(v.before()==null){
+                boolean recovery=c.intents().stream().anyMatch(i->i.after().frozen().identity() instanceof AlertIntent.Business b
+                        && b.key().notification().kind()==DeliveryKey.Kind.RECOVERY && v.after().key().contains(b.key()));
+                if(recovery)maintenance.writeAttempt("alert_notification_schedules",1);else admission("alert_notification_schedules",1);
+            }changed|=outcome(notifications.stageSchedule(s,v.before()==null?null:new MongoAlertScheduleCodec.Stored(v.before().revision(),v.before().value()),v.after()))==Outcome.STAGED;}
             return changed?Outcome.STAGED:Outcome.UNCHANGED;
-        });}catch(Conflict conflict){return Outcome.CONFLICT;}
+        });}catch(Conflict conflict){maintenance.conflict();return Outcome.CONFLICT;}
     }
     @Override public Planning planning(){return tx(null,false,false,s->{
         var version=SystemCollections.CONFIGURATION_VERSION.on(db).find(s,new Document("_id",ConfigurationVersion.ID)).first();
@@ -249,7 +337,7 @@ final class MongoAlertCoordinator implements AlertStore {
         var defs=new ArrayList<Definition>();for(var kind:Kind.values()){defs.addAll(definitionSnapshot(s,kind));if(defs.size()>1000)throw unreadable("planning-definitions-budget");}
         for(var definition:defs)budget.charge(MongoAlertConfigurationCodec.write(definition,0));
         var heads=new ArrayList<Stored<AlertStateRecord.Head>>();AlarmKey cursor=null;
-        do{var page=new MongoAlertReads(db,host.scope(),states).evaluationStates(s,cursor,100);heads.addAll(page.rows());cursor=page.next();
+        do{var page=new MongoAlertReads(db,host.scope(),states,clock).evaluationStates(s,cursor,100);heads.addAll(page.rows());cursor=page.next();
             if(heads.size()>1000||heads.size()==1000&&cursor!=null)throw unreadable("planning-states-budget");}while(cursor!=null);
         for(var head:heads){budget.charge(MongoAlertStateEnvelope.head(head.value(),head.revision()));if(head.value().episode()!=null)budget.charge(MongoAlertStateEnvelope.episode(head.value().episode()));}
         var schedules=new LinkedHashMap<AlertSchedule.Key,Stored<AlertSchedule.Record>>();boolean isolated=false;
@@ -398,8 +486,9 @@ final class MongoAlertCoordinator implements AlertStore {
                 Map.of("field","operationDomains","reason","capacity"),null);
     }
     private void ensureTargetHead(ClientSession s,AlertIntent.Frozen value){
-        var d=target(value);if(notifications.limit(s,d).isPresent())return;
-        for(var original:new MongoAlertReads(db,host.scope(),states).intentSnapshot(s,1000))if(target(original.frozen()).equals(d))throw unreadable("missing-original-target-limit");
+        var d=target(value);var retained=notifications.limit(s,d);
+        if(retained.isPresent()){if(!notifications.fenceLimit(s,retained.orElseThrow()))throw new Conflict();return;}
+        for(var original:new MongoAlertReads(db,host.scope(),states,clock).intentSnapshot(s,1000))if(target(original.frozen()).equals(d))throw unreadable("missing-original-target-limit");
         outcome(notifications.stageLimit(s,null,new AlertTargetLimit(d,value.createdAt())));
     }
     private AlertTargetLimit.Domain target(AlertIntent.Frozen f) {
@@ -474,7 +563,7 @@ final class MongoAlertCoordinator implements AlertStore {
                 if(!subscription.matches(member.evaluation().key(),severity))throw stale("subscription-no-longer-matches");
             }
             if(!subscription.inhibition().isEmpty()){
-                var active=new MongoAlertReads(db,host.scope(),states).activeSnapshot(s,1000);
+                var active=new MongoAlertReads(db,host.scope(),states,clock).activeSnapshot(s,1000);
                 var policy=new AlertInhibitionPolicy(host.scope(),subscription.inhibition());
                 for(var member:value.members()){
                     var dependent=states.loadEnvelope(s,member.evaluation().key()).orElseThrow(()->stale("dependent-state")).value().snapshot();
@@ -485,7 +574,7 @@ final class MongoAlertCoordinator implements AlertStore {
     }
     private List<Definition> definitionSnapshot(ClientSession s,Kind kind){
         var values=new ArrayList<Definition>();String cursor=null;
-        do{var page=new MongoAlertReads(db,host.scope(),states).definitions(s,kind,cursor,100);values.addAll(page.rows());cursor=page.nextId();
+        do{var page=new MongoAlertReads(db,host.scope(),states,clock).definitions(s,kind,cursor,100);values.addAll(page.rows());cursor=page.nextId();
             if(values.size()>1000||values.size()==1000&&cursor!=null)throw unreadable("policy-read-budget");}while(cursor!=null);return List.copyOf(values);
     }
     private boolean dependency(ClientSession s,AlarmKey root,AlarmKey dependent){return dependency(s,root,dependent,true);}
@@ -499,15 +588,15 @@ final class MongoAlertCoordinator implements AlertStore {
         }
         return false;
     }
-    @Override public EndedPage ended(EpisodeCursor after,int limit,ReadAccess access,AlertSnapshot.EndReason reason){access.requireActive().run();var result=tx(null,false,false,s->new MongoAlertReads(db,host.scope(),states).ended(s,after,limit,access,reason));access.requireActive().run();return result;}
-    @Override public DeliveryPage deliveries(String after,int limit, String channel,DeliveryEvidence.Outcome outcome,ReadAccess access){access.requireActive().run();var result=tx(null,false,false,s->new MongoAlertReads(db,host.scope(),states).deliveries(s,after,limit,channel,outcome,access));access.requireActive().run();return result;}
-    @Override public Optional<Stored<AlertIntent.Record>> delivery(String id,ReadAccess access){access.requireActive().run();var result=tx(null,false,false,s->new MongoAlertReads(db,host.scope(),states).delivery(s,id,access));access.requireActive().run();return result;}
-    @Override public ActivePage active(ActiveCursor after,int limit,ReadAccess access){access.requireActive().run();return tx(null,false,false,s->new MongoAlertReads(db,host.scope(),states).active(s,after,limit,access));}
-    @Override public ActivePage activeFiltered(ActiveCursor after,int limit,ReadAccess access,AlarmFilter filter){access.requireActive().run();return tx(null,false,false,s->new MongoAlertReads(db,host.scope(),states).active(s,after,limit,access,filter));}
-    @Override public HistoryPage history(AlarmKey key,Long after,int limit,ReadAccess access){visible(key,access);var result=tx(null,false,false,s->new MongoAlertReads(db,host.scope(),states).history(s,key,after,limit));access.requireActive().run();return result;}
-    @Override public TransitionPage transitions(AlarmKey key,TransitionCursor after,int limit,ReadAccess access){visible(key,access);var result=tx(null,false,false,s->new MongoAlertReads(db,host.scope(),states).transitions(s,key,after,limit));access.requireActive().run();return result;}
-    @Override public DuePage dueIntents(Instant through,DueCursor after,int limit){return tx(null,false,false,s->new MongoAlertReads(db,host.scope(),states).due(s,through,after,limit));}
-    @Override public SchedulePage dueSchedules(Instant through,ScheduleCursor after,int limit){return tx(null,false,false,s->new MongoAlertReads(db,host.scope(),states).schedules(s,through,after,limit));}
+    @Override public EndedPage ended(EpisodeCursor after,int limit,ReadAccess access,AlertSnapshot.EndReason reason){access.requireActive().run();var result=tx(null,false,false,s->new MongoAlertReads(db,host.scope(),states,clock).ended(s,after,limit,access,reason));access.requireActive().run();return result;}
+    @Override public DeliveryPage deliveries(String after,int limit, String channel,DeliveryEvidence.Outcome outcome,ReadAccess access){access.requireActive().run();var result=tx(null,false,false,s->new MongoAlertReads(db,host.scope(),states,clock).deliveries(s,after,limit,channel,outcome,access));access.requireActive().run();return result;}
+    @Override public Optional<Stored<AlertIntent.Record>> delivery(String id,ReadAccess access){access.requireActive().run();var result=tx(null,false,false,s->new MongoAlertReads(db,host.scope(),states,clock).delivery(s,id,access));access.requireActive().run();return result;}
+    @Override public ActivePage active(ActiveCursor after,int limit,ReadAccess access){access.requireActive().run();return tx(null,false,false,s->new MongoAlertReads(db,host.scope(),states,clock).active(s,after,limit,access));}
+    @Override public ActivePage activeFiltered(ActiveCursor after,int limit,ReadAccess access,AlarmFilter filter){access.requireActive().run();return tx(null,false,false,s->new MongoAlertReads(db,host.scope(),states,clock).active(s,after,limit,access,filter));}
+    @Override public HistoryPage history(AlarmKey key,Long after,int limit,ReadAccess access){visible(key,access);var result=tx(null,false,false,s->new MongoAlertReads(db,host.scope(),states,clock).history(s,key,after,limit));access.requireActive().run();return result;}
+    @Override public TransitionPage transitions(AlarmKey key,TransitionCursor after,int limit,ReadAccess access){visible(key,access);var result=tx(null,false,false,s->new MongoAlertReads(db,host.scope(),states,clock).transitions(s,key,after,limit));access.requireActive().run();return result;}
+    @Override public DuePage dueIntents(Instant through,DueCursor after,int limit){return tx(null,false,false,s->new MongoAlertReads(db,host.scope(),states,clock).due(s,through,after,limit));}
+    @Override public SchedulePage dueSchedules(Instant through,ScheduleCursor after,int limit){return tx(null,false,false,s->new MongoAlertReads(db,host.scope(),states,clock).schedules(s,through,after,limit));}
     private void visible(AlarmKey key,ReadAccess access){scope(key.scope());access.requireActive().run();if(!access.permits(key))throw stale("resource-visibility");}
     private void scope(AlarmKey.Scope scope){if(!host.scope().equals(scope))throw stale("scope");}
     private static ReceiverSecretMaterial retainedMaterial(MongoAlertConfigurationStore.ReceiverCapture captured,AlertReceiver.Transport transport,
@@ -537,4 +626,18 @@ final class MongoAlertCoordinator implements AlertStore {
     private static final class Conflict extends RuntimeException { }
     private static TapstateException stale(String action){return new TapstateException(AlertError.STALE_ACTION,Map.of("action",action),null);}
     private static TapstateException unreadable(String field){return new TapstateException(IoError.DOCUMENT_UNREADABLE,Map.of("id","alert-store","field",field),null);}
+    private void definitionCapacity(ClientSession session,Definition value) {
+        var collection=switch(value.header().identity().kind()){case RULE->SystemCollections.ALERT_RULES;case RECEIVER->SystemCollections.ALERT_RECEIVERS;case SUBSCRIPTION->SystemCollections.ALERT_SUBSCRIPTIONS;case SILENCE->SystemCollections.ALERT_SILENCES;};
+        long count=collection.on(db).countDocuments(session,new Document("_id.authorityId",host.scope().authorityId()).append("_id.clusterId",host.scope().clusterId()),new com.mongodb.client.model.CountOptions().limit(1001));
+        if(count>=1000)throw new TapstateException(AlertError.INVALID_CONFIGURATION,Map.of("field",collection.collectionName(),"reason","definition-capacity"),null);
+        admission(collection.collectionName(),1);
+    }
+    private boolean maintenanceMutation(ClientSession session,SystemCollections c,Document original,Document replacement) {
+        if(MongoAlertConfigurationStore.COLLECTIONS.contains(c))return replacement==null?definitions.removeForMaintenance(session,c,original):definitions.replaceForMaintenance(session,c,original,replacement);
+        if(MongoAlertStateStore.COLLECTIONS.contains(c))return replacement==null?states.removeForMaintenance(session,c,original):states.replaceForMaintenance(session,c,original,replacement);
+        if(MongoAlertNotificationStore.COLLECTIONS.contains(c))return replacement==null?notifications.removeForMaintenance(session,c,original):notifications.replaceForMaintenance(session,c,original,replacement);
+        if(c==SystemCollections.ALERT_NODE_LIFECYCLES && replacement==null)return nodes.removeForMaintenance(session,original);
+        throw new IllegalArgumentException("foreign maintenance resource");
+    }
+
 }

@@ -36,12 +36,19 @@ final class AlertEvaluationHost {
 
     AlertEvaluationHost(AlertStore store, AlarmTypeCatalog catalog, AlertChannelPolicy.Deployment deployment,
             Clock clock, String owner, Runnable active) {
+        this(store,catalog,deployment,clock,owner,active,AlertRetentionPolicy.defaults(deployment));
+    }
+    AlertEvaluationHost(AlertStore store,AlarmTypeCatalog catalog,AlertChannelPolicy.Deployment deployment,
+            Clock clock,String owner,Runnable active,AlertRetentionPolicy retention) {
+        if(retention.deployment()!=deployment)throw new TapstateException(AlertError.INVALID_CONFIGURATION,Map.of("field","retention","reason","foreign-deployment"),null);
         this.store = Objects.requireNonNull(store); this.catalog = Objects.requireNonNull(catalog);
         this.deployment = Objects.requireNonNull(deployment); this.clock = Objects.requireNonNull(clock);
         this.owner = Objects.requireNonNull(owner);
-        this.policy = AlertIntent.Policy.capture(AlertRetentionPolicy.defaults(deployment));
+        this.policy = AlertIntent.Policy.capture(retention);
         this.read = new AlertStore.ReadAccess(true, Set.of(), active);
     }
+
+    AlertRetentionPolicy retentionPolicy(){return policy.value();}
 
     Result accept(Binding binding, long sequence, AlertInput input) {
         binding.requireCurrent().run();

@@ -69,6 +69,7 @@ public interface AlertStore {
             intents=Map.copyOf(intents);episodes=Map.copyOf(episodes);limits=Map.copyOf(limits);dependencies=Set.copyOf(dependencies); }
     }
     Planning planning();
+    default Optional<AlertMaintenance> maintenance() { return Optional.empty(); }
     record Commit(CommitKind kind,StateChange state,List<IntentChange> intents,List<ScheduleChange> schedules,PlanVersion version) {
         public Commit(CommitKind kind,StateChange state,List<IntentChange> intents,List<ScheduleChange> schedules){this(kind,state,intents,schedules,null);}
         public Commit { Objects.requireNonNull(kind);intents=List.copyOf(intents);schedules=List.copyOf(schedules);

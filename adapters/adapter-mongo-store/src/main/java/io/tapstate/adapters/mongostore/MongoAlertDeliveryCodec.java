@@ -144,7 +144,7 @@ final class MongoAlertDeliveryCodec {
         return value instanceof Business business ? new Document("purpose", "business").append("key", deliveryKey(business.key()))
                 : new Document("purpose", "channel-test").append("command", command(((Test) value).command()));
     }
-    private static Identity readIdentity(Document value) {
+    static Identity readIdentity(Document value) {
         return switch (text(value, "purpose")) {
             case "business" -> { fields(value, Set.of("purpose", "key")); yield new Business(readDeliveryKey(doc(value, "key"))); }
             case "channel-test" -> { fields(value, Set.of("purpose", "command")); yield new Test(readCommand(doc(value, "command"))); }
@@ -194,7 +194,7 @@ final class MongoAlertDeliveryCodec {
                     .append("bindingRevision", c.receiverBindingRevision()).append("materialSha256", c.encryptedMaterialSha256());
         };
     }
-    private static Target readTarget(Document value) {
+    static Target readTarget(Document value) {
         return switch (text(value, "kind")) {
             case "receiver" -> {
                 fields(value, Set.of("kind", "identity", "bindingRevision", "transport", "credentials"));

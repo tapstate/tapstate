@@ -300,4 +300,31 @@ class AlertNotificationPlannerIT {
         });
     }
 
+    @Test void fullCapacityDoesNotBlockARealGoodInputOrItsOriginalRecoveryPlan() {
+        AlertEvaluationHostIT.withFixture(f->{route(f,Duration.ZERO);var planner=planner(f,"pressure-recovery");f.evaluator().withPlanner(planner);bad(f);planner.tick();
+            var original=intents(f).getFirst();grant(f,original);f.now().set(T.plusSeconds(1));accepted(f,original.value().frozen().identity());
+            f.store().maintenance().orElseThrow().enableCapacityProtection();
+            org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.store(),"observedCapacity",new AlertMaintenance.Inventory(f.clock().instant(),List.of(new AlertMaintenance.Usage("alert_instances",1,AlertMaintenancePolicy.CAPACITY_BYTES,0,0,null)),0,null,0,0));
+            recover(f);planner.tick();assertThat(intents(f)).hasSize(1).allMatch(row->((AlertIntent.Business)row.value().frozen().identity()).key().notification().kind()==DeliveryKey.Kind.RECOVERY);
+            assertThat(f.store().state(f.store().evaluationStates(null,100).rows().getFirst().value().snapshot().rule().key(),f.reads()).orElseThrow().value().snapshot().status()).isEqualTo(AlertSnapshot.Status.RESOLVED);
+        });
+    }
+
+    @Test void businessFaultAndRecoveryInheritTheOriginallyAcceptedProfileAcrossHostChanges() {
+        AlertEvaluationHostIT.withFixture(f->{route(f,Duration.ZERO);var properties=new AlertRetentionSettings();properties.setRetention(Map.of("accepted-payload","PT15M","accepted-result","PT6H"));
+            var configured=properties.resolve(f.storeHost().deployment());var planner=planner(f,"profile-planner");
+            var creator=new AlertEvaluationHost(f.store(),BuiltinAlarmTypes.catalog(),f.storeHost().deployment(),f.clock(),"profile-creator",ACTIVE,configured).withPlanner(planner);
+            var binding=f.binding(()->new AlertStore.EvaluationProof(f.intent(),ACTIVE));assertThat(creator.accept(binding,1,new AlertInput.Conditions(T,AlertSignal.Condition.BAD,null))).isEqualTo(AlertEvaluationHost.Result.ACCEPTED);planner.tick();
+            var originals=intents(f);assertThat(originals).hasSize(2).allMatch(row->row.value().frozen().retention().value().acceptedPayload().equals(Duration.ofMinutes(15)));
+            var first=originals.getFirst();grant(f,first);f.now().set(T.plusSeconds(1));accepted(f,first.value().frozen().identity());
+            var receipt=f.store().intent(first.value().frozen().identity(),access()).orElseThrow().value();assertThat(receipt.state().retained().payloadUntil()).isEqualTo(f.clock().instant().plus(Duration.ofMinutes(15)));
+            assertThat(receipt.state().retained().resultUntil()).isEqualTo(f.clock().instant().plus(Duration.ofHours(6)));
+            f.now().set(T.plus(Duration.ofHours(7)));f.store().maintenance().orElseThrow().maintain(new AlertMaintenance.Cursor(0,null,null),200,4L*1024*1024,Duration.ofSeconds(5));
+            assertThat(f.store().intent(first.value().frozen().identity(),access()).orElseThrow().value().state().detailsPrunedAt()).isNotNull();var newHost=new AlertEvaluationHost(f.store(),BuiltinAlarmTypes.catalog(),f.storeHost().deployment(),f.clock(),"profile-reopened",ACTIVE).withPlanner(planner);
+            assertThat(newHost.accept(binding,2,new AlertInput.Conditions(f.clock().instant(),AlertSignal.Condition.GOOD,null))).isEqualTo(AlertEvaluationHost.Result.ACCEPTED);planner.tick();
+            assertThat(intents(f)).hasSize(1).allMatch(row->((AlertIntent.Business)row.value().frozen().identity()).key().notification().kind()==DeliveryKey.Kind.RECOVERY
+                    && row.value().frozen().retention().value().acceptedPayload().equals(Duration.ofMinutes(15)));
+        });
+    }
+
 }
