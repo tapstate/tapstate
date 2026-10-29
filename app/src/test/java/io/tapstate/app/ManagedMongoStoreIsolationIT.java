@@ -1519,6 +1519,9 @@ class ManagedMongoStoreIsolationIT {
                 assertThat(admin.getDatabase(configDb).getCollection("storage_binding").countDocuments()).isOne();
                 assertThat(admin.getDatabase(configDb).getCollection("users").countDocuments()).isZero();
                 assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims").countDocuments()).isOne();
+                Document originalNodeClaim = admin.getDatabase(cacheDb).getCollection("workload_claims")
+                        .find().projection(new Document("ownerNodeId", 1).append("ownerBootId", 1)
+                                .append("claimGeneration", 1).append("executionGeneration", 1)).first();
                 try (MongoClient limited = MongoClients.create(uri(configUser, configDb))) {
                     assertDenied(limited, cacheDb); assertDenied(limited, masterDb);
                     assertDenied(limited, configDb + "_operator"); assertDenied(limited, configDb + "_views");
@@ -1567,10 +1570,19 @@ class ManagedMongoStoreIsolationIT {
                 var member = child.getBean(com.hazelcast.core.HazelcastInstance.class);
                 root.close(); assertThat(member.getLifecycleService().isRunning()).isFalse();
                 assertThat(rootClient(application).get().uri("/healthz").retrieve().toBodilessEntity().getStatusCode().value()).isEqualTo(200);
-                var claims = admin.getDatabase(cacheDb).getCollection("workload_claims").aggregate(List.of(
-                        new Document("$project", new Document("leased", new Document("$gt", List.of("$leaseUntil", "$$NOW")))))).into(new ArrayList<>());
-                assertThat(claims).hasSize(1);
-                assertThat(claims.getFirst().get("leased")).isEqualTo(false);
+                // Losing CACHE permission stops the member without releasing a claim it can no
+                // longer prove. Its original lease expires; shutdown must not reacquire it to release it.
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+                    var claims = admin.getDatabase(cacheDb).getCollection("workload_claims").aggregate(List.of(
+                            new Document("$project", new Document("ownerNodeId", 1).append("ownerBootId", 1)
+                                    .append("claimGeneration", 1).append("executionGeneration", 1)
+                                    .append("leased", new Document("$gt", List.of("$leaseUntil", "$$NOW"))))))
+                            .into(new ArrayList<>());
+                    assertThat(claims).hasSize(1);
+                    Document claim = new Document(claims.getFirst());
+                    assertThat(claim.remove("leased")).isEqualTo(false);
+                    assertThat(claim).isEqualTo(originalNodeClaim);
+                });
             }
             // A new process context reconstructs clients from the same persisted bundle, never a probe file.
             if (failAfterCompletion) admin.getDatabase("admin").runCommand(new Document("updateUser", configUser).append("roles", List.of()));
