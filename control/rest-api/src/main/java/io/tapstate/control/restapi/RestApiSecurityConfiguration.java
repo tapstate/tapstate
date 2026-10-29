@@ -84,7 +84,8 @@ class RestApiSecurityConfiguration {
 
     @Bean
     @Order(2)
-    SecurityFilterChain rootSecurityFilterChain(HttpSecurity http, ApiSecurityErrorWriter errors) throws Exception {
+    SecurityFilterChain rootSecurityFilterChain(HttpSecurity http, ApiSecurityErrorWriter errors,
+            ObjectProvider<HandlerMappingIntrospector> handlers) throws Exception {
         CodedAuthenticationEntryPoint entryPoint = new CodedAuthenticationEntryPoint(errors);
         http
                 .securityMatcher(new NegatedRequestMatcher(PathPatternRequestMatcher.pathPattern("/api/**")))
@@ -102,6 +103,7 @@ class RestApiSecurityConfiguration {
                                 CloudAuthController.INVALIDATE_PATH, "/auth/bootstrap", "/connector-icons/*",
                                 "/index.html", "/assets/**", "/favicon.ico", "/tapstate-mark.svg",
                                 "/tapstate-mark-light.svg", "/error").permitAll()
+                        .requestMatchers(request -> PublicStaticResource.matches(request, handlers.getObject())).permitAll()
                         .requestMatchers(SpaNavigationRequest::matches).permitAll()
                         .anyRequest().denyAll());
         return http.build();
