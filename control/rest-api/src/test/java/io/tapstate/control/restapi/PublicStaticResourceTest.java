@@ -5,6 +5,8 @@ import org.junit.jupiter.api.io.TempDir;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.core.io.Resource;
 import org.springframework.core.io.support.PathMatchingResourcePatternResolver;
+import org.springframework.context.annotation.AnnotationConfigApplicationContext;
+import org.springframework.beans.factory.support.RootBeanDefinition;
 
 import java.io.IOException;
 import java.net.URL;
@@ -74,6 +76,26 @@ class PublicStaticResourceTest {
         assertThatThrownBy(() -> PublicStaticResource.create(resolver))
                 .isInstanceOf(IllegalStateException.class)
                 .hasCause(cause);
+    }
+
+    @Test
+    void scanFailureStopsApplicationContextStartup() {
+        IOException cause = new IOException("resource scan failed");
+        var resolver = new PathMatchingResourcePatternResolver(getClass().getClassLoader()) {
+            @Override
+            public Resource[] getResources(String pattern) throws IOException {
+                throw cause;
+            }
+        };
+        try (var context = new AnnotationConfigApplicationContext()) {
+            context.getBeanFactory().registerSingleton("securityConfig", new RestApiSecurityConfiguration());
+            var definition = new RootBeanDefinition(PublicStaticResource.class);
+            definition.setFactoryBeanName("securityConfig");
+            definition.setFactoryMethodName("publicStaticResource");
+            definition.getConstructorArgumentValues().addIndexedArgumentValue(0, resolver);
+            context.registerBeanDefinition("publicStaticResource", definition);
+            assertThatThrownBy(context::refresh).hasRootCause(cause);
+        }
     }
 
     @Test

@@ -9,6 +9,7 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.annotation.Order;
+import org.springframework.core.io.support.PathMatchingResourcePatternResolver;
 import org.springframework.security.authentication.AuthenticationManager;
 import org.springframework.security.authentication.ProviderManager;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
@@ -83,11 +84,19 @@ class RestApiSecurityConfiguration {
     }
 
     @Bean
+    PublicStaticResource publicStaticResource(PathMatchingResourcePatternResolver publicImageResolver) {
+        return PublicStaticResource.create(publicImageResolver);
+    }
+
+    @Bean
+    PathMatchingResourcePatternResolver publicImageResolver() {
+        return new PathMatchingResourcePatternResolver(PublicStaticResource.class.getClassLoader());
+    }
+
+    @Bean
     @Order(2)
-    SecurityFilterChain rootSecurityFilterChain(HttpSecurity http, ApiSecurityErrorWriter errors) {
-        PublicStaticResource images = PublicStaticResource.create(
-                new org.springframework.core.io.support.PathMatchingResourcePatternResolver(
-                        PublicStaticResource.class.getClassLoader()));
+    SecurityFilterChain rootSecurityFilterChain(HttpSecurity http, ApiSecurityErrorWriter errors,
+            PublicStaticResource images) {
         CodedAuthenticationEntryPoint entryPoint = new CodedAuthenticationEntryPoint(errors);
         http
                 .securityMatcher(new NegatedRequestMatcher(PathPatternRequestMatcher.pathPattern("/api/**")))
