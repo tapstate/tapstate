@@ -8,7 +8,7 @@ import java.util.Objects;
 
 /** Original typed evidence. None of these values authenticates a producer or grants a store write. */
 public sealed interface AlertInput permits AlertInput.Conditions, AlertInput.Metric, AlertInput.Freshness,
-        AlertInput.Discontinuity {
+        AlertInput.Discontinuity, AlertInput.Operational {
     Instant observedAt();
 
     record Conditions(Instant observedAt, AlertConditionGroup.Operator operator,
@@ -28,6 +28,11 @@ public sealed interface AlertInput permits AlertInput.Conditions, AlertInput.Met
     record Freshness(Instant observedAt, boolean expected, Instant expectedSince, Instant lastPublication,
             Duration startupGrace, Duration maxAge) implements AlertInput {
         public Freshness { Objects.requireNonNull(observedAt); }
+    }
+    record Operational(Instant observedAt, String bindingDigest, OperationalEvidence.Capability capability,
+            boolean succeeded) implements AlertInput {
+        public Operational { Objects.requireNonNull(observedAt); Objects.requireNonNull(capability);
+            new OperationalEvidence(bindingDigest, 0); }
     }
     record Discontinuity(Instant observedAt) implements AlertInput {
         public Discontinuity { Objects.requireNonNull(observedAt); }

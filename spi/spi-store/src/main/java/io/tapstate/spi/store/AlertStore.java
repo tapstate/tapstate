@@ -22,7 +22,8 @@ public interface AlertStore {
     sealed interface ResourceEvidence permits NodeEvidence,StorageEvidence { AlarmKey.Resource resource(); }
     /** Captured from the actual membership/lease event; the guard is pure and must refuse expired or foreign producer evidence. */
     record NodeEvidence(AlarmKey.Resource resource,String nodeId,String bootId,long expectedMembershipRevision,
-            String producerIncarnation,Runnable requireCurrent) implements ResourceEvidence {
+            String producerIncarnation,Runnable requireCurrent,boolean expected) implements ResourceEvidence {
+        public NodeEvidence(AlarmKey.Resource resource,String nodeId,String bootId,long revision,String producer,Runnable guard){this(resource,nodeId,bootId,revision,producer,guard,true);}
         public NodeEvidence { Objects.requireNonNull(resource);Objects.requireNonNull(nodeId);Objects.requireNonNull(bootId);Objects.requireNonNull(producerIncarnation);Objects.requireNonNull(requireCurrent);
             if(expectedMembershipRevision<1||!resource.kind().equals("cluster-node")||!resource.id().equals(nodeId)||!resource.incarnation().equals(bootId))throw new IllegalArgumentException("foreign member evidence"); }
     }

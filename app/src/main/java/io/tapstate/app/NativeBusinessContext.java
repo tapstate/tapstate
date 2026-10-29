@@ -254,7 +254,12 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             return owner.original.cache().srs(owner.original.preparation().businessScope(), owner.original::requireBusiness);
         }
         @Bean SrsLogStore srsLogStore(SrsStores stores) { return stores.log(); }
-        @Bean WorkloadClaimStore workloadClaimStore(NativeBusinessContext owner) { return owner.port.workloadClaims(); }
+        @Bean WorkloadClaimStore workloadClaimStore(NativeBusinessContext owner) {
+            return new ObservedWorkloadClaims(owner.port.workloadClaims(),(write,failure)->{
+                Object observer=owner.context==null?null:owner.context.getBeanFactory().getSingleton("builtinResourceSignals");
+                if(observer instanceof BuiltinResourceSignals signals)signals.cacheOperation(write,failure);
+            });
+        }
         @Bean MemberStorage memberStorage(NativeBusinessContext owner, ClusterProperties cluster, WorkloadClaimStore claims, SrsStores sources) {
             owner.memberStorage = new NativeMemberStorage(owner.original, owner.configuration, cluster, claims, sources);
             return owner.memberStorage;
@@ -313,14 +318,14 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         }
         @Bean(destroyMethod = "close") PipelineCaptureCoordinator pipelineCaptureCoordinator(NativeBusinessContext owner,
                 NodeSessionLease node, ExecutionAuthorization authorization, CaptureOwnership ownership, ClusterProperties cluster,
-                NativeSrsCaptureRunUnit runtime, SnapshotBuffer buffer, ConnectorProvisioner connectors, Clock clock, SnapshotLoadReceipts boundedLoads) {
+                NativeSrsCaptureRunUnit runtime, SnapshotBuffer buffer, ConnectorProvisioner connectors, Clock clock, SnapshotLoadReceipts boundedLoads,BuiltinResourceSignals signals) {
             var scope = owner.original.preparation().businessScope();
             return new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(scope, owner.original.cache(),
                     owner.memberStorage.sourceViews(), owner.configuration.capturePreparations(),
                     owner.original.cache().capturePreparations(scope, owner.memberStorage::requireNode), owner.configuration.requiredNotes(),owner::recoveryPinned,boundedLoads,
                     owner.configuration.rebuilds().guardedBy(owner.memberStorage::requireNode)::completedFull),
                     new ScopedPipelineCaptureCoordinator.Execution(node::currentFence, authorization, ownership,
-                            cluster.getWorkloadClaimRenewInterval(), owner.memberStorage::requireNode, clock), runtime, buffer, connectors);
+                            cluster.getWorkloadClaimRenewInterval(), owner.memberStorage::requireNode, clock), runtime, buffer, connectors).withSourceOperations(owner.configuration.artifacts()::sourceBinding,signals::source);
         }
         @Bean NativePipelineRecovery nativePipelineRecovery(NativeBusinessContext owner,PipelineFirstStatePreparer preparer,
                 ConnectorProvisioner connectors,Engine engine,PipelineCaptureCoordinator captures,ExecutionAuthorization authorization) {
@@ -400,8 +405,23 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         @Bean(destroyMethod = "close") MetricsExport metricsExport(MetricsExportProperties properties) {
             return RuntimeConvergenceConfiguration.metricsExportFor(properties);
         }
+        @Bean BuiltinResourceSignals builtinResourceSignals(NativeBusinessContext owner,
+                org.springframework.beans.factory.ObjectProvider<PipelineAlertRuntime> runtime,Clock clock){
+            return new BuiltinResourceSignals(runtime::getObject,owner.original::binding,owner.original.preparation().authScope(),
+                    owner.memberStorage::requireNode,clock);
+        }
+        @Bean(destroyMethod="close") ClusterNodeAlertSource clusterNodeAlertSource(NativeBusinessContext owner,HazelcastInstance member,
+                ClusterMembershipGate membership,PipelineAlertRuntime runtime,BuiltinResourceSignals signals,Clock clock){
+            ScopedSinkStateProvider.of(member).observeOperations((config,guard)->{
+                var source=owner.configuration.artifacts().sourceBinding(owner.original.binding().defaultSourceId());
+                return source.filter(s->s.source().connector().equals(config.connectorId())&&s.source().config().equals(config.settings()))
+                        .map(s->signals.source(s,guard)).orElse(io.tapstate.spi.capture.SourceOperationObserver.NONE);
+            });
+            var source=new ClusterNodeAlertSource(member,membership,runtime,signals,owner.memberStorage::requireNode,clock);
+            runtime.observerTick(source::tick);return source;
+        }
         @Bean(initMethod = "start",destroyMethod = "close") PipelineAlertRuntime pipelineAlertRuntime(NativeBusinessContext owner,
-                PipelineActuationOwnership ownership, NodeSessionLease node, CloudRuntimeSettings cloud, Clock clock) {
+                PipelineActuationOwnership ownership, NodeSessionLease node, CloudRuntimeSettings cloud, Clock clock,BuiltinResourceSignals signals) {
             String evaluatorId = java.util.UUID.randomUUID().toString();
             Runnable active = () -> {
                 if (!owner.active.get() || !node.active()) throw ThreeLayerStorePort.refused();
@@ -419,12 +439,12 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 var route = cloud.cloud() ? new io.tapstate.core.alerting.AlertIntent.SystemRoute("managed-alert-events",managedBinding,1) : null;
                 var target = cloud.cloud() ? new io.tapstate.core.alerting.AlertIntent.SdkTarget(managedBinding,scope.clusterId(),managedBinding) : null;
                 boolean outbound=AlertChannels.outboundEnabled(owner.parent.getEnvironment().getProperty("tapstate.alerting.outbound-enabled"));
-                var host = new io.tapstate.spi.store.AlertStore.Host(scope,setup,deployment,active,route,target,r->java.util.Optional.empty(),AlertChannels.capabilities(deployment,cloud,outbound));
+                var host = new io.tapstate.spi.store.AlertStore.Host(scope,setup,deployment,active,route,target,signals::resourceEvidence,AlertChannels.capabilities(deployment,cloud,outbound));
                 var store = owner.configuration.alerts(host, catalog, clock);
                 var planner = new AlertNotificationPlanner(store,clock,evaluatorId+":planning",cloud.cloud()?cloud.baseUrl():null,active);
                 return new PipelineAlertRuntime.Services(store, new AlertEvaluationHost(store, catalog, deployment, clock, evaluatorId, active).withPlanner(planner),catalog,new AlertPlanningRuntime(planner),
                         new AlertDeliveryRuntime(store,clock,evaluatorId+":delivery",active,new AlertChannels(deployment,cloud,clock,active,cloud.cloud()?scope.authorityId():null,outbound),
-                                owner.root.authentication()::continueAlertTest));
+                                owner.root.authentication()::continueAlertTest),Set.of("pipeline-lifecycle","pipeline-observations","source-operational-health","cluster-member-health","cluster-storage-health"));
             }, owner.configuration.intents(), ownership::evaluationProof, active, clock);
         }
         @Bean io.tapstate.control.core.AlertControlDispatcher alertControlDispatcher(NativeBusinessContext owner,
@@ -451,7 +471,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 ObservationPublisher observations, RateSampler samples, MetricsExport export, NodeSessionLease node,
                 ClusterMembershipGate membership, PipelineActuationOwnership ownership, EngineLifecycleActuator actuator,
                 HazelcastInstance member, HazelcastExecutionPlans plans, RebuildAdmission admission, Clock clock, ClusterProperties cluster,
-                ConnectorProvisioner connectors, Engine engine, PipelineCaptureCoordinator captures, PipelineAlertRuntime alerts) {
+                ConnectorProvisioner connectors, Engine engine, PipelineCaptureCoordinator captures, PipelineAlertRuntime alerts,ClusterNodeAlertSource resourceAlerts) {
             var operators = new HazelcastOperatorReadiness(member, Duration.ofSeconds(60));
             var scope = owner.original.preparation().businessScope();
             var changes = owner.configuration.rebuilds();

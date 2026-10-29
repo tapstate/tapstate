@@ -91,6 +91,17 @@ final class ControlPlane {
         this.baseUrl = baseUrl;
     }
 
+    /** Actual View projection, read with this scenario's original authenticated session. */
+    String viewsJson(){
+        var response=send(authedGet("/api/views"));
+        if(response.statusCode()!=200)throw new AssertionError("View read failed: "+response.statusCode()+" "+response.body());
+        return response.body();
+    }
+    String metricsJson(String pipeline){
+        var response=send(authedGet("/api/pipelines/"+pipeline+"/metrics"));
+        if(response.statusCode()!=200)throw new AssertionError("Metrics read failed: "+response.statusCode()+" "+response.body());
+        return response.body();
+    }
     /** Whether the product answers its health probe; the readiness signal a launcher waits on. */
     boolean healthy() {
         try {

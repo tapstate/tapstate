@@ -303,6 +303,10 @@ final class MongoAlertCoordinator implements AlertStore {
         }else if(resource.kind().equals("source")){
             var row=SystemCollections.SOURCES.on(db).find(s,new Document("_id",resource.id())).first();
             return row==null||!MongoSourceIdentity.read(row).binding().incarnation().equals(resource.incarnation());
+        }else if(resource.kind().equals("cluster-node")){
+            var proof=host.resourceEvidence().apply(resource).orElse(null);
+            if(proof instanceof NodeEvidence node){node.requireCurrent().run();return !node.expected();}
+            return false;
         }else return false;
     }
     private void validateIntent(ClientSession s,AlertIntent.Frozen f,boolean grant,Access access) {
@@ -364,7 +368,7 @@ final class MongoAlertCoordinator implements AlertStore {
         } else if(r.kind().equals("cluster")){if(!r.id().equals(host.scope().clusterId())||!r.incarnation().equals(host.setup().installationId()))throw stale("cluster-incarnation");}
         else if(r.kind().equals("cluster-node")||r.kind().equals("cluster-storage")) {
             var proof=host.resourceEvidence().apply(r).orElseThrow(()->stale("resource-capability-unavailable"));if(!r.equals(proof.resource()))throw stale("foreign-resource-proof");
-            if(proof instanceof NodeEvidence n){n.requireCurrent().run();}
+            if(proof instanceof NodeEvidence n){n.requireCurrent().run();if(!n.expected())throw stale("retired-member");}
             else if(proof instanceof StorageEvidence storage){
                 if(storage.role()==StorageRole.CACHE){var prepared=bindings.cachePreparationForTransaction(s).orElseThrow(()->stale("cache-binding"));
                     if(!storage.cache().equals(prepared.authScope())||!r.id().equals("cache")||!r.incarnation().equals(storage.cache().cacheIncarnation()+":"+storage.cache().bindingVersion()))throw stale("cache-binding");}

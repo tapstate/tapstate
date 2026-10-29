@@ -19,7 +19,7 @@ final class MongoAlertReads {
         return active(session,after,limit,access,null);
     }
     ActivePage active(ClientSession session,ActiveCursor after,int limit,ReadAccess access,AlarmFilter query){
-        limit(limit);Document base=scopeFilter().append("formatVersion",2).append("status","FIRING");
+        limit(limit);Document base=scopeFilter().append("formatVersion",new Document("$in",List.of(2,3))).append("status","FIRING");
         if(query!=null){
             if(query.severity()!=null)base=and(base,new Document("severityRank",rank(query.severity())));
             if(query.search()!=null&&!query.search().isBlank()){
@@ -44,7 +44,7 @@ final class MongoAlertReads {
         boolean more=raw.size()>limit;if(more)raw.removeLast();var values=new ArrayList<Stored<AlertStateRecord.Head>>();
         for(var row:raw){var key=MongoAlertStateCodec.readKey(row.get("_id",Document.class));var stored=states.loadEnvelope(session,key).orElseThrow(()->unreadable("missing-head"));values.add(new Stored<>(stored.revision(),stored.value()));}
         ActiveCursor next=null;if(more){var r=raw.getLast();next=new ActiveCursor(r.getInteger("severityRank"),r.getLong("recentSecondOrder"),r.getInteger("recentNanoOrder"),values.getLast().value().snapshot().rule().key());}
-        access.requireActive().run();return new ActivePage(count,values,next,isolated(session,SystemCollections.ALERT_INSTANCES,Set.of(2),access));
+        access.requireActive().run();return new ActivePage(count,values,next,isolated(session,SystemCollections.ALERT_INSTANCES,Set.of(2,3),access));
     }
     HistoryPage history(ClientSession s,AlarmKey key,Long after,int limit){
         limit(limit);var alarm=MongoAlertStateCodec.key(key);var range=new Document(after==null?"$gte":"$gt",new Document("alarm",alarm).append("number",after==null?1L:after))
@@ -141,8 +141,8 @@ final class MongoAlertReads {
         for(var row:raw){try{values.add(MongoAlertDeliveryCodec.readAny(scope,row).value());}catch(IllegalArgumentException invalid){throw unreadable("target-proof-isolated");}}return List.copyOf(values);
     }
     List<AlertStateRecord.Head> activeSnapshot(ClientSession s,int maximum){
-        if(isolated(s,SystemCollections.ALERT_INSTANCES,Set.of(2),null))throw unreadable("inhibition-state-isolated");
-        var raw=SystemCollections.ALERT_INSTANCES.on(db).find(s,scopeFilter().append("formatVersion",2).append("status","FIRING"))
+        if(isolated(s,SystemCollections.ALERT_INSTANCES,Set.of(2,3),null))throw unreadable("inhibition-state-isolated");
+        var raw=SystemCollections.ALERT_INSTANCES.on(db).find(s,scopeFilter().append("formatVersion",new Document("$in",List.of(2,3))).append("status","FIRING"))
                 .hintString("alert_query_active").limit(maximum+1).into(new ArrayList<>());
         if(raw.size()>maximum)throw unreadable("inhibition-read-budget");var values=new ArrayList<AlertStateRecord.Head>();
         for(var row:raw)values.add(states.loadEnvelope(s,MongoAlertStateCodec.readKey(row.get("_id",Document.class))).orElseThrow(()->unreadable("inhibition-head")).value());return List.copyOf(values);

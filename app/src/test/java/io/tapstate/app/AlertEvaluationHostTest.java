@@ -51,6 +51,28 @@ class AlertEvaluationHostTest {
         assertThat(host.accept(binding, sequence, new AlertInput.Conditions(now.get(), condition, null)))
                 .isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
     }
+    @Test void operationalFailuresRequireEachOriginalCapabilityEvenAfterHostRestart() {
+        var header=definition("pipeline.failed").header();
+        var rule=new AlertConfiguration.Rule(header,"Source failure","source.connection-failed",1,
+                new AlertConfiguration.Resources(Set.of("source"),true,Set.of()),Map.of(),null,true,null).validated(BuiltinAlarmTypes.catalog());
+        var binding=new AlertEvaluationHost.Binding(rule,new AlarmKey.Resource("source","erp","source-uuid"),"source-binding",1,()->{});
+        String digest="a".repeat(64);
+        assertThat(host.accept(binding,1,new AlertInput.Operational(T,digest,OperationalEvidence.Capability.STREAM_READ,false))).isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
+        now.set(T.plusSeconds(1));
+        host.accept(binding,2,new AlertInput.Operational(now.get(),digest,OperationalEvidence.Capability.SNAPSHOT_READ,false));
+        var restarted=new AlertEvaluationHost(store,BuiltinAlarmTypes.catalog(),AlertChannelPolicy.Deployment.ON_PREM,clock,"owner-a",()->{});
+        now.set(T.plusSeconds(2));restarted.accept(binding,3,new AlertInput.Operational(now.get(),digest,OperationalEvidence.Capability.INITIALIZE,true));
+        assertThat(rows.get(binding.key()).value().snapshot().status()).isEqualTo(AlertSnapshot.Status.FIRING);
+        now.set(T.plusSeconds(3));restarted.accept(binding,4,new AlertInput.Operational(now.get(),digest,OperationalEvidence.Capability.STREAM_READ,true));
+        assertThat(rows.get(binding.key()).value().operationalEvidence().failedCapabilities()).isEqualTo(1<<OperationalEvidence.Capability.SNAPSHOT_READ.ordinal());
+        assertThat(rows.get(binding.key()).value().snapshot().status()).isEqualTo(AlertSnapshot.Status.FIRING);
+        now.set(T.plusSeconds(4));
+        assertThat(restarted.accept(binding,5,new AlertInput.Operational(now.get(),"b".repeat(64),OperationalEvidence.Capability.SNAPSHOT_READ,true))).isEqualTo(AlertEvaluationHost.Result.IGNORED);
+        restarted.accept(binding,5,new AlertInput.Operational(now.get(),digest,OperationalEvidence.Capability.SNAPSHOT_READ,true));
+        assertThat(rows.get(binding.key()).value().snapshot().status()).isEqualTo(AlertSnapshot.Status.RESOLVED);
+        assertThat(rows.get(binding.key()).value().operationalEvidence().failedCapabilities()).isZero();
+        assertThat(restarted.accept(binding,6,new AlertInput.Operational(T,digest,OperationalEvidence.Capability.STREAM_READ,false))).isEqualTo(AlertEvaluationHost.Result.IGNORED);
+    }
     @Test void conditionAndIndependentTickPersistOriginalStateWithoutDispatch() {
         var b = binding(definition("pipeline.failed"), "producer-a");
         condition(b, 1, 0, AlertSignal.Condition.BAD);

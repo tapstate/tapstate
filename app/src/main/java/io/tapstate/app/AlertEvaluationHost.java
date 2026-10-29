@@ -65,6 +65,8 @@ final class AlertEvaluationHost {
             if (before != null && !rule.equals(before.snapshot().rule())) {
                 var replaced = AlertLifecycle.replace(before.snapshot(), rule, now);
                 var after = head(binding, before, replaced, ownership, null, null);
+                if(before.binding().sourceBindingRevision()!=binding.sourceBindingRevision())
+                    after=new AlertStateRecord.Head(after.snapshot(),after.deployment(),after.owner(),after.retiredAt(),after.summariesHandedOff(),after.episode(),after.binding(),null);
                 var outcome = commit(retained, before, after, replaced, null, binding);
                 if (outcome == AlertStore.Outcome.CONFLICT) continue;
                 points.remove(binding.key());
@@ -75,6 +77,7 @@ final class AlertEvaluationHost {
             AlertSignal signal = null;
             MetricPoint point = null;
             AlarmDiagnostics.SafeTrace trace = null;
+            OperationalEvidence operation = before == null ? null : before.operationalEvidence();
             if (input instanceof AlertInput.Discontinuity) {
                 update = AlertLifecycle.discontinuity(original, now);
             } else {
@@ -82,6 +85,17 @@ final class AlertEvaluationHost {
                 Instant observed = input.observedAt();
                 if (input instanceof AlertInput.Conditions c) {
                     condition = AlertConditionGroup.evaluate(c.operator(), c.values()); trace = c.trace();
+                } else if (input instanceof AlertInput.Operational op) {
+                    if (original.lastObservedAt() != null && !observed.isAfter(original.lastObservedAt())) return Result.IGNORED;
+                    if (observed.isAfter(now) || observed.plus(rule.maxAge()).isBefore(now)) return Result.IGNORED;
+                    if (operation == null && original.status() == AlertSnapshot.Status.FIRING) {
+                        throw new TapstateException(AlertError.INVALID_CONFIGURATION,
+                                Map.of("field","operationalEvidence","reason","missing-original-capabilities"),null);
+                    }
+                    if (operation != null && !operation.bindingDigest().equals(op.bindingDigest())) return Result.IGNORED;
+                    operation = (operation == null ? new OperationalEvidence(op.bindingDigest(),0) : operation)
+                            .observe(op.capability(),op.succeeded());
+                    condition = operation.condition();
                 } else if (input instanceof AlertInput.Freshness f) {
                     condition = ObservationFreshness.evaluate(f.expected(), f.expectedSince(), f.lastPublication(),
                             f.observedAt(), f.startupGrace(), f.maxAge());
@@ -112,6 +126,8 @@ final class AlertEvaluationHost {
             }
             if (update.ignored()) return Result.IGNORED;
             var after = head(binding, before, update, ownership, signal, trace);
+            after = new AlertStateRecord.Head(after.snapshot(),after.deployment(),after.owner(),after.retiredAt(),
+                    after.summariesHandedOff(),after.episode(),after.binding(),operation);
             var outcome = commit(retained, before, after, update, signal, binding);
             if (outcome == AlertStore.Outcome.CONFLICT) continue;
             if (input instanceof AlertInput.Discontinuity) points.remove(binding.key());
@@ -188,7 +204,7 @@ final class AlertEvaluationHost {
                     update.snapshot().episode(), before.episode().policy(), before.episode().diagnostics(), before.episode().summariesHandedOff());
             var after = new AlertStateRecord.Head(update.snapshot(), deployment, ownership,
                     retire ? clock.instant() : before.retiredAt(),
-                    before.summariesHandedOff(), episode, before.binding());
+                    before.summariesHandedOff(), episode, before.binding(),before.operationalEvidence());
             var changes = transitions(update, episode, policy);
             requireCurrent.run();
             var outcome = persist(new AlertStore.Commit(AlertStore.CommitKind.END,
@@ -241,7 +257,7 @@ final class AlertEvaluationHost {
         var member = new AlertIntent.Member(update.snapshot().rule(), update.snapshot().episodeSequence(),
                 b.definition().header().identity(), b.sourceBindingRevision());
         return new AlertStateRecord.Head(update.snapshot(), deployment, ownership, before == null ? null : before.retiredAt(),
-                before != null && before.summariesHandedOff(), episode, member);
+                before != null && before.summariesHandedOff(), episode, member,before == null ? null : before.operationalEvidence());
     }
     private AlertStore.Outcome commit(Optional<AlertStore.Stored<AlertStateRecord.Head>> retained,
             AlertStateRecord.Head before, AlertStateRecord.Head after, AlertUpdate update, AlertSignal signal, Binding binding) {

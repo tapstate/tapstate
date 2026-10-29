@@ -13,6 +13,7 @@ import io.tapstate.spi.capture.ConnectionReport;
 import io.tapstate.spi.capture.DiscoveredSchema;
 import io.tapstate.spi.capture.FieldSchema;
 import io.tapstate.spi.capture.SourcePosition;
+import io.tapstate.spi.capture.SourceOperationObserver;
 import io.tapstate.spi.capture.SharedNotes;
 import io.tapstate.spi.capture.SnapshotSession;
 import io.tapstate.spi.capture.SnapshotPreparation;
@@ -165,6 +166,23 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
     }
     private final Set<PendingPreflight> pendingPreflights;
 
+    private SourceOperationObserver operationObserver = SourceOperationObserver.NONE;
+
+    /** Installed only by an original running-source assembly, never by a manual connection test. */
+    public PdkCapturePort withOperationObserver(SourceOperationObserver observer) {
+        this.operationObserver = Objects.requireNonNull(observer); return this;
+    }
+    private <T> T operation(SourceOperationObserver.Capability capability, PdkConnector.Action<T> action) throws Throwable {
+        T result;
+        try { result = action.run(); }
+        catch (Throwable failure) { reportOperation(capability, failure); throw failure; }
+        reportOperation(capability, null); return result;
+    }
+    private void reportOperation(SourceOperationObserver.Capability capability, Throwable failure) {
+        try { operationObserver.completed(capability, failure); }
+        catch (RuntimeException unavailable) { LOG.warn("Source operation collection is degraded"); }
+    }
+
     /** Accepts exact metadata from this open connector session before its first source row is read. */
     @FunctionalInterface
     public interface SnapshotPreparer {
@@ -180,14 +198,14 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
     /** The returned port keeps both preparation owners and the same connector and note configuration. */
     public PdkCapturePort withSnapshotPreparation(SnapshotPreparer prepare) {
         return new PdkCapturePort(provisioner, stateStore, preflightTimeout, Duration.ofNanos(acknowledgeIntervalNanos),
-                nanoClock, releaseTimeout, noteScopes, Objects.requireNonNull(prepare, "prepare"), streamPreparer, pendingPreflights);
+                nanoClock, releaseTimeout, noteScopes, Objects.requireNonNull(prepare, "prepare"), streamPreparer, pendingPreflights).withOperationObserver(operationObserver);
     }
 
 
     /** The host callback runs outside the connector loader and completes before CDC preflight succeeds. */
     public PdkCapturePort withStreamPreparation(StreamPreparer prepare) {
         return new PdkCapturePort(provisioner, stateStore, preflightTimeout, Duration.ofNanos(acknowledgeIntervalNanos),
-                nanoClock, releaseTimeout, noteScopes, snapshotPreparer, Objects.requireNonNull(prepare, "prepare"), pendingPreflights);
+                nanoClock, releaseTimeout, noteScopes, snapshotPreparer, Objects.requireNonNull(prepare, "prepare"), pendingPreflights).withOperationObserver(operationObserver);
     }
 
     /** Configured capture notes use the configuration domain, independently of generic operator state. */
@@ -988,10 +1006,10 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
 
     private PreparedSnapshot prepareSnapshot(PdkConnector connector, CaptureConfig config, boolean sampleSeam)
             throws Throwable {
-        connector.connector().init(connector.context());
+        operation(SourceOperationObserver.Capability.INITIALIZE, () -> { connector.connector().init(connector.context()); return null; });
         // A connector builds its read from the table's own columns, so it is handed the table as
         // discovered - with its fields - not a bare name. Discovery does not re-init: init has run.
-        Map<String, TapTable> discovered = byId(discoverTables(connector, config.streams()));
+        Map<String, TapTable> discovered = byId(operation(SourceOperationObserver.Capability.METADATA_READ, () -> discoverTables(connector, config.streams())));
         discovered.values().forEach(connector::fillFieldTypes);
         connector.context().setTableMap(tableMap(discovered));
         // Position discovery may inspect the selected tables too. Populate their context first, while
@@ -1008,14 +1026,14 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
             throw new IllegalStateException(
                     "stream " + stream + " was requested but the connector did not discover it");
         }
-        batch.batchRead(connector.context(), table, null, BATCH_SIZE, (events, offset) -> {
+        operation(SourceOperationObserver.Capability.SNAPSHOT_READ, () -> { batch.batchRead(connector.context(), table, null, BATCH_SIZE, (events, offset) -> {
             if (events.isEmpty()) {
                 return;
             }
             // A copy: the list is the connector's, and is decoded only once somebody takes it.
             List<TapEvent> handed = new ArrayList<>(events);
             reading.rowsRead(() -> decodeSnapshotRows(connector, handed, snapshot.declared()));
-        });
+        }); return null; });
     }
 
     private record PreparedSnapshot(Map<String, TapTable> discovered,
@@ -1108,8 +1126,8 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
 
     /** Initializes a stream connector and places its discovered, typed tables on its context. */
     private Map<String, TapTable> prepareStream(PdkConnector connector, CaptureConfig config) throws Throwable {
-        connector.connector().init(connector.context());
-        List<TapTable> discovered = discoverTables(connector, config.streams());
+        operation(SourceOperationObserver.Capability.INITIALIZE, () -> { connector.connector().init(connector.context()); return null; });
+        List<TapTable> discovered = operation(SourceOperationObserver.Capability.METADATA_READ, () -> discoverTables(connector, config.streams()));
         OracleLogMinerIdentifiers.validateDiscovered(config, discovered);
         Map<String, TapTable> tables = byId(discovered);
         tables.values().forEach(connector::fillFieldTypes);
@@ -1169,12 +1187,14 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                     // thread for as long as the recipient needs room, and the release is due regardless --
                     // and outside the delivery a close cancels, so a close wakes the hand-over and never the
                     // source's own call.
+                    reportOperation(SourceOperationObserver.Capability.STREAM_READ, null);
                     acknowledgements.applyIfDue();
                     delivery.accept(() -> handOver(connector, declared, listener, events, offset));
                 });
                 Object readerOffset = readerOffset(connector, startOffset, resumeAt != null);
                 if (delivery.closed) return null;
-                stream.streamRead(connector.context(), config.streams(), readerOffset, BATCH_SIZE, consumer);
+                try { stream.streamRead(connector.context(), config.streams(), readerOffset, BATCH_SIZE, consumer); }
+                catch (Throwable failure) { if (!delivery.closed) reportOperation(SourceOperationObserver.Capability.STREAM_READ, failure); throw failure; }
                 return null;
             });
         } catch (Throwable t) {

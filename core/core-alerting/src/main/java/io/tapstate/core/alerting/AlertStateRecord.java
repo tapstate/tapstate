@@ -53,9 +53,12 @@ public final class AlertStateRecord {
         public Instant diagnosticUntil() { return AlarmDiagnostics.cutoff(policy.value(), value).orElse(null); }
     }
     public record Head(AlertSnapshot snapshot, AlertChannelPolicy.Deployment deployment,
-            AlertOwnership owner, Instant retiredAt, boolean summariesHandedOff, Episode episode, AlertIntent.Member binding) {
+            AlertOwnership owner, Instant retiredAt, boolean summariesHandedOff, Episode episode, AlertIntent.Member binding, OperationalEvidence operationalEvidence) {
+        public Head(AlertSnapshot snapshot,AlertChannelPolicy.Deployment deployment,AlertOwnership owner,Instant retiredAt,boolean handedOff,Episode episode,AlertIntent.Member binding) {
+            this(snapshot,deployment,owner,retiredAt,handedOff,episode,binding,null);
+        }
         public Head(AlertSnapshot snapshot,AlertChannelPolicy.Deployment deployment,AlertOwnership owner,Instant retiredAt,boolean handedOff,Episode episode) {
-            this(snapshot,deployment,owner,retiredAt,handedOff,episode,null);
+            this(snapshot,deployment,owner,retiredAt,handedOff,episode,null,null);
         }
         public Head {
             Objects.requireNonNull(snapshot, "snapshot"); Objects.requireNonNull(deployment, "deployment"); Objects.requireNonNull(owner, "owner");

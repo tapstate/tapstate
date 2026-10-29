@@ -16,7 +16,9 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     static final int MAX_OBJECTS = 256, MAX_MATCHES = 32, MAX_INPUT_BYTES = 128 * 1024;
     static final int QUEUE_SIZE = 64, MAX_QUEUED_BYTES = 8 * 1024 * 1024;
     record Health(boolean closed, boolean degraded, long rejected, String code,Map<String,Object> parameters,int queuedInputs,int queuedBytes) { }
-    record Services(AlertStore store, AlertEvaluationHost evaluator, AlarmTypeCatalog catalog, AlertPlanningRuntime planner, AlertDeliveryRuntime delivery) {
+    record Services(AlertStore store, AlertEvaluationHost evaluator, AlarmTypeCatalog catalog, AlertPlanningRuntime planner, AlertDeliveryRuntime delivery, Set<String> providers) {
+        Services(AlertStore store,AlertEvaluationHost evaluator,AlarmTypeCatalog catalog,AlertPlanningRuntime planner,AlertDeliveryRuntime delivery){this(store,evaluator,catalog,planner,delivery,Set.of("pipeline-lifecycle","pipeline-observations"));}
+        Services { providers=Set.copyOf(providers); }
         Services(AlertStore store,AlertEvaluationHost evaluator,AlarmTypeCatalog catalog,AlertPlanningRuntime planner){this(store,evaluator,catalog,planner,null);}
         Services(AlertStore store,AlertEvaluationHost evaluator,AlarmTypeCatalog catalog){this(store,evaluator,catalog,null,null);}
         Services(AlertStore store,AlertEvaluationHost evaluator){this(store,evaluator,BuiltinAlarmTypes.catalog());}
@@ -66,6 +68,15 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     private final AtomicLong rejected = new AtomicLong();
     private final AtomicBoolean closed = new AtomicBoolean(), refreshing = new AtomicBoolean();
     private final AtomicLong lastLogged = new AtomicLong(Long.MIN_VALUE);
+    private static final class ResourceSlot {
+        final ArrayDeque<Work> pending=new ArrayDeque<>();
+        final Map<AlarmKey,AlertEvaluationHost.Binding> bindings=new HashMap<>();
+        final AtomicBoolean tickQueued=new AtomicBoolean();
+        boolean scheduled;
+    }
+    private final ConcurrentMap<AlarmKey.Resource,ResourceSlot> resourceSlots = new ConcurrentHashMap<>();
+    private volatile java.util.function.Consumer<AlarmKey.Resource> resourceRetired=r->{};
+    void resourceRetired(java.util.function.Consumer<AlarmKey.Resource> listener){resourceRetired=listener;}
     private volatile Services services;
     private volatile List<AlertConfiguration.Rule> rules = List.of();
     private record Failure(String code,Map<String,Object> parameters){}
@@ -137,12 +148,22 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         if(closed.get()||!started.compareAndSet(false,true))throw new IllegalStateException("evaluation host already started or closed");
         freshness.setRemoveOnCancelPolicy(true);freshness.scheduleWithFixedDelay(this::tick,0,1,TimeUnit.SECONDS);
     }
+    private volatile Runnable observerTick=()->{};
+    void observerTick(Runnable observer){observerTick=Objects.requireNonNull(observer);}
     void tick() {
         if (closed.get()) return;
         if (refreshing.compareAndSet(false, true)) {
             submit(null, 0, () -> {
                 try { refresh(); } finally { refreshing.set(false); }
             }, () -> refreshing.set(false));
+        }
+        try {observerTick.run();}catch(RuntimeException unavailable){reject(null,"member-observation-unavailable");}
+        for(var entry:resourceSlots.entrySet()){
+            var slot=entry.getValue();if(!slot.tickQueued.compareAndSet(false,true))continue;
+            submitResource(slot,0,()->{try{
+                if(resourceSlots.get(entry.getKey())!=slot)return;
+                for(var binding:slot.bindings.values())AlertEvaluationHost.requireResult(services.evaluator().tick(binding));
+            }finally{slot.tickQueued.set(false);}});
         }
         var capturedRules = rules;
         for (Slot slot : slots.values()) {
@@ -195,14 +216,70 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         var retained = resolved.store().evaluationStates(reconciliationCursor, 50);
         for(var row:retained.rows())if(retained.removedResources().contains(row.value().snapshot().rule().key().resource())){
             AlertEvaluationHost.requireResult(resolved.evaluator().end(row.value().snapshot().rule().key(),AlertSnapshot.EndReason.RESOURCE_REMOVED,active));
+            var resource=row.value().snapshot().rule().key().resource();var obsolete=resourceSlots.remove(resource);
+            if(obsolete!=null)cancelResource(obsolete);resourceRetired.accept(resource);
         }
         resolved.evaluator().reconcileRules(all, retained.rows(), active);
         reconciliationCursor = retained.next();
         boolean missing=all.stream().anyMatch(r->r.header().active()&&r.enabled()&&r.metric()==null
-                &&!Set.of("pipeline.failed","pipeline.observation-stale").contains(r.typeId()));
+                &&!resolved.providers().contains(resolved.catalog().types().stream().filter(t->t.id().equals(r.typeId())).findFirst().orElseThrow().providerId()));
         if(missing)failure.compareAndSet(previousFailure,new Failure(AlertError.INVALID_CONFIGURATION.code(),Map.of("field","evaluationHost","reason","input-unavailable")));
         else if (slots.values().stream().noneMatch(Slot::discontinuous)) failure.compareAndSet(previousFailure,null);
     }
+    /** The original operation has already occurred; enqueueing alone is never durable acceptance. */
+    void resourceInput(AlarmKey.Resource resource, String typeId, long sourceRevision, String producer,
+            Runnable originalGuard, AlertInput input) {
+        if(closed.get())return;
+        ResourceSlot slot;
+        synchronized(resourceSlots){
+            if(!resourceSlots.containsKey(resource)&&resourceSlots.size()+slots.size()>=MAX_OBJECTS){reject(null,"object-budget");return;}
+            slot=resourceSlots.computeIfAbsent(resource,ignored->new ResourceSlot());
+        }
+        var captured=rules;
+        submitResource(slot,512,()->{
+            if(resourceSlots.get(resource)!=slot)throw refused("retired-resource");
+            active.run();originalGuard.run();var resolved=services;
+            if(resolved==null)throw refused("storage-not-ready");
+            var matching=captured.stream().filter(r->r.typeId().equals(typeId)&&r.resources().matches(resource)).toList();
+            if(matching.size()>MAX_MATCHES)throw refused("matching-rule-budget");
+            for(var rule:matching){
+                var binding=new AlertEvaluationHost.Binding(rule,resource,producer,sourceRevision,()->{active.run();originalGuard.run();});
+                slot.bindings.put(binding.key(),binding);
+                var before=resolved.store().state(binding.key(),new AlertStore.ReadAccess(true,Set.of(),active));
+                long next=before.map(v->Math.incrementExact(v.value().snapshot().lastSequence())).orElse(0L);
+                if(input instanceof AlertInput.Operational op && before.isPresent()){
+                    var head=before.orElseThrow().value();var evidence=head.operationalEvidence();
+                    if(head.snapshot().rule().revision()==rule.header().revision()&&head.snapshot().rule().producerIncarnation().equals(producer)
+                            &&head.binding().sourceBindingRevision()==sourceRevision&&head.snapshot().enabled()
+                            &&evidence!=null&&evidence.bindingDigest().equals(op.bindingDigest())
+                            &&evidence.equals(evidence.observe(op.capability(),op.succeeded()))
+                            &&head.snapshot().status()!=AlertSnapshot.Status.PENDING
+                            &&head.snapshot().recoverySince()==null)continue;
+                }
+                accept(binding,next,input);
+            }
+        });
+    }
+    private void submitResource(ResourceSlot slot,int bytes,Runnable action){
+        if(closed.get())return;
+        if(queuedTasks.incrementAndGet()>QUEUE_SIZE){queuedTasks.decrementAndGet();reject(null,"queue-capacity");return;}
+        if(queuedBytes.addAndGet(bytes)>MAX_QUEUED_BYTES){queuedTasks.decrementAndGet();queuedBytes.addAndGet(-bytes);reject(null,"queue-byte-budget");return;}
+        var work=new Work(null,bytes,action,()->{});boolean start;
+        synchronized(slot.pending){slot.pending.addLast(work);start=!slot.scheduled;slot.scheduled=true;}
+        if(start)dispatchResource(slot);
+    }
+    private void dispatchResource(ResourceSlot slot){
+        try{workers.execute(new ResourceDispatcher(slot));}catch(RejectedExecutionException unavailable){cancelResource(slot);}
+    }
+    private final class ResourceDispatcher implements Runnable {
+        final ResourceSlot slot;ResourceDispatcher(ResourceSlot slot){this.slot=slot;}
+        public void run(){Work work;synchronized(slot.pending){work=slot.pending.pollFirst();}
+            try{if(work!=null)work.run();}finally{boolean more;synchronized(slot.pending){more=!slot.pending.isEmpty();if(!more)slot.scheduled=false;}if(more)dispatchResource(slot);}
+        }
+    }
+    private void cancelResource(ResourceSlot slot){List<Work> pending;synchronized(slot.pending){pending=List.copyOf(slot.pending);slot.pending.clear();slot.scheduled=false;}pending.forEach(Work::cancel);}
+    void collectionUnavailable(String reason){reject(null,reason);}
+
     private List<AlertConfiguration.Rule> matching(Slot slot, List<AlertConfiguration.Rule> snapshot) {
         var resource = resource(slot);
         var matches = snapshot.stream().filter(r -> r.resources().matches(resource)
@@ -353,8 +430,9 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             for(Runnable task:workers.shutdownNow()){
                 if(task instanceof Work work)work.cancel();
                 else if(task instanceof Dispatcher dispatcher)cancelPending(dispatcher.slot);
+                else if(task instanceof ResourceDispatcher dispatcher)cancelResource(dispatcher.slot);
             }
-            slots.values().forEach(this::cancelPending);slots.clear();rules=List.of();
+            slots.values().forEach(this::cancelPending);slots.clear();resourceSlots.values().forEach(this::cancelResource);resourceSlots.clear();rules=List.of();
         }
     }
 }

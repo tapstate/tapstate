@@ -8,7 +8,7 @@ public record AlertQueryPreparation(int installedVersion, String operationId, Ph
     public AlertQueryPreparation {
         Objects.requireNonNull(operationId, "operationId"); Objects.requireNonNull(phase, "phase");
         if (operationId.isBlank() || operationId.length() > 256 || indexContractVersion != 1 || nextIndex < 0 || nextIndex > 5
-                || (phase == Phase.READY ? installedVersion != 3 || nextIndex != 5 : installedVersion != 2)) {
+                || (phase == Phase.READY ? (installedVersion != 3 && installedVersion != 4) || nextIndex != 5 : installedVersion != 2)) {
             throw new IllegalArgumentException("unsupported bounded query-preparation state");
         }
     }

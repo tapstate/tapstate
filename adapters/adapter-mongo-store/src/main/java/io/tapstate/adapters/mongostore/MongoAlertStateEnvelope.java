@@ -20,10 +20,17 @@ final class MongoAlertStateEnvelope {
     private MongoAlertStateEnvelope() { }
     static Document head(Head value, long revision) {
         Document row = MongoAlertStateCodec.head(value.snapshot(), revision);
-        row.put("formatVersion", AlertStateRecord.FORMAT_VERSION);
+        row.put("formatVersion", value.operationalEvidence() == null ? AlertStateRecord.FORMAT_VERSION : 3);
         row.append("deployment", value.deployment().name()).append("owner", owner(value.owner()))
                 .append("retiredAt", time(value.retiredAt())).append("summariesHandedOff", value.summariesHandedOff())
                 .append("cleanupAt", cleanup(value.cleanupAt())).append("binding", value.binding() == null ? null : member(value.binding()));
+        if (value.operationalEvidence() != null) {
+            var evidence = value.operationalEvidence();
+            var encoded = new Document("version", 1).append("bindingDigest", evidence.bindingDigest())
+                    .append("failedCapabilities", evidence.failedCapabilities());
+            require(MongoAlertConfigurationCodec.size(new Document("operationalEvidence", encoded)) <= 192);
+            row.append("operationalEvidence", encoded);
+        }
         var snapshot = value.snapshot();
         Instant recent = snapshot.episode() == null ? snapshot.lastObservedAt() : snapshot.episode().firedAt();
         if (recent == null) { row.append("severityRank", null).append("recentSecondOrder", null).append("recentNanoOrder", null); }
@@ -50,12 +57,22 @@ final class MongoAlertStateEnvelope {
     }
     static Stored read(AlarmKey key, Document head, Document episode) {
         try {
-            Document commonHead = legacy(head, HEAD_EXTRA);
+            boolean operational = Integer.valueOf(3).equals(head.get("formatVersion"));
+            Document compatibleHead = new Document(head);
+            OperationalEvidence evidence = null;
+            if (operational) {
+                Document encoded = doc(head, "operationalEvidence");
+                fields(encoded, Set.of("version", "bindingDigest", "failedCapabilities"));
+                require(Integer.valueOf(1).equals(encoded.get("version")) && encoded.get("failedCapabilities") instanceof Integer);
+                evidence = new OperationalEvidence(text(encoded,"bindingDigest"), encoded.getInteger("failedCapabilities"));
+                compatibleHead.remove("operationalEvidence"); compatibleHead.put("formatVersion", AlertStateRecord.FORMAT_VERSION);
+            }
+            Document commonHead = legacy(compatibleHead, HEAD_EXTRA);
             Document commonEpisode = episode == null ? null : legacy(episode, EPISODE_EXTRA);
             var common = MongoAlertStateCodec.read(key, commonHead, commonEpisode);
             Episode detail = episode == null ? null : readEpisode(key, common.snapshot().episode().number(), episode);
             Head value = new Head(common.snapshot(), enumeration(AlertChannelPolicy.Deployment.values(), text(head, "deployment")),
-                    readOwner(doc(head, "owner")), instant(head, "retiredAt", true), bool(head, "summariesHandedOff"), detail, head.get("binding") == null ? null : readMember(doc(head,"binding")));
+                    readOwner(doc(head, "owner")), instant(head, "retiredAt", true), bool(head, "summariesHandedOff"), detail, head.get("binding") == null ? null : readMember(doc(head,"binding")), evidence);
             require(head.equals(head(value, common.recordRevision()))); return new Stored(common.recordRevision(), value);
         } catch (IllegalArgumentException | NullPointerException | java.time.DateTimeException | TapstateException invalid) { throw unreadable(); }
     }

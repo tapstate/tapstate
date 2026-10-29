@@ -35,7 +35,7 @@ final class AlertManagement implements AlertControlDispatcher {
             case "alert.catalog": {
                 fields(input);return map("deployment",deployment.name(),"clusterId",scope.clusterId(),"refreshedAt",instant(clock.instant()),
                         "channelPolicies",deployment==AlertChannelPolicy.Deployment.ON_PREM?map("email",policy(ChannelRetryPolicy.emailDefaults()),"webhook",policy(ChannelRetryPolicy.webhookDefaults())):Map.of(),
-                        "types",resolved.catalog().types().stream().map(AlertManagement::type).toList());
+                        "types",resolved.catalog().types().stream().map(t->type(t,resolved.providers())).toList());
             }
             case "alert.resources": {
                 fields(input,"kind","cursor","limit");var p=store.resources(text(input,"kind"),optional(input,"cursor"),limit,access);return map("rows",p.rows().stream().map(AlertHttpModel::resource).toList(),"nextCursor",p.nextId());
@@ -117,8 +117,8 @@ final class AlertManagement implements AlertControlDispatcher {
         row.put("canRetry",retry);return row;
     }
     private static Map<String,Object> policy(ChannelRetryPolicy p){return map("timeoutSeconds",p.attemptTimeout().toSeconds(),"attempts",p.attemptsPerCycle(),"maximumAgeSeconds",p.maximumAge().toSeconds(),"retryDelaysSeconds",p.retryDelays().stream().map(Duration::toSeconds).toList());}
-    private static Map<String,Object> type(AlarmTypeCatalog.Type t){var d=io.tapstate.adapters.alerting.AlarmTypeText.english().describe(t);
-        return map("id",t.id(),"version",t.version(),"resourceKinds",t.resourceKinds().stream().sorted().toList(),"severity",t.defaultSeverity().name(),"enabledByDefault",t.enabledByDefault(),"condition",d.condition(),"recovery",d.recovery(),"guidance",d.guidance(),"inputAvailable",Set.of("pipeline.failed","pipeline.observation-stale").contains(t.id()),"parameters",t.parameters().stream().map(p->map("name",p.name(),"unit",p.unit(),"minimum",p.minimum(),"maximum",p.maximum(),"defaultValue",p.defaultValue())).toList());
+    private static Map<String,Object> type(AlarmTypeCatalog.Type t,Set<String> providers){var d=io.tapstate.adapters.alerting.AlarmTypeText.english().describe(t);
+        return map("id",t.id(),"version",t.version(),"resourceKinds",t.resourceKinds().stream().sorted().toList(),"severity",t.defaultSeverity().name(),"enabledByDefault",t.enabledByDefault(),"condition",d.condition(),"recovery",d.recovery(),"guidance",d.guidance(),"inputAvailable",providers.contains(t.providerId()),"parameters",t.parameters().stream().map(p->map("name",p.name(),"unit",p.unit(),"minimum",p.minimum(),"maximum",p.maximum(),"defaultValue",p.defaultValue())).toList());
     }
     private String cursorToken(String view,Map<String,Object> payload){payload.put("view",view);payload.put("authorityId",scope.authorityId());payload.put("clusterId",scope.clusterId());return encode(payload);}
     private Map<String,Object> cursor(String token,String view){var m=decode(token);if(!view.equals(m.get("view"))||!scope.authorityId().equals(m.get("authorityId"))||!scope.clusterId().equals(m.get("clusterId")))throw invalid("cursor-context");return m;}

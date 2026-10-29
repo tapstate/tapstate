@@ -187,6 +187,12 @@ final class PdkSinkWriter implements SinkWriter {
         return connector;
     }
 
+    private io.tapstate.spi.capture.SourceOperationObserver operationObserver=io.tapstate.spi.capture.SourceOperationObserver.NONE;
+    PdkSinkWriter withOperationObserver(io.tapstate.spi.capture.SourceOperationObserver observer){operationObserver=observer;return this;}
+    private void operation(Throwable failure){
+        try{operationObserver.completed(io.tapstate.spi.capture.SourceOperationObserver.Capability.TARGET_WRITE,failure);}
+        catch(RuntimeException unavailable){org.slf4j.LoggerFactory.getLogger(getClass()).warn("Target operation collection is degraded");}
+    }
     @Override
     public CompletionStage<WriteResult> write(List<Envelope> records) {
         synchronized (lifecycle) {
@@ -299,8 +305,10 @@ final class PdkSinkWriter implements SinkWriter {
             // The frozen PDK API stores alternatives by the current thread name.
             writeAlternatives.forEach(connector.context().getConnectorCapabilities()::alternative);
             connector.requireActive();
-            write.writeRecord(connector.context(), rows, table,
-                    result -> accepted[0] += accepted(result));
+            try {write.writeRecord(connector.context(), rows, table,
+                    result -> accepted[0] += accepted(result));}
+            catch(Throwable failure){operation(failure);throw failure;}
+            operation(null);
         }
         return new WriteResult(accepted[0]);
     }

@@ -34,10 +34,15 @@ public final class PdkSinkPort implements SinkPort {
     private final PdkSinkPreparations preparations;
     private final Map<String, TargetIdentityPlan> plannedIdentities;
 
+    private io.tapstate.spi.capture.SourceOperationObserver operationObserver=io.tapstate.spi.capture.SourceOperationObserver.NONE;
+    public PdkSinkPort withOperationObserver(io.tapstate.spi.capture.SourceOperationObserver observer){operationObserver=Objects.requireNonNull(observer);return this;}
+    private void operation(io.tapstate.spi.capture.SourceOperationObserver.Capability capability,Throwable failure){
+        try{operationObserver.completed(capability,failure);}catch(RuntimeException unavailable){org.slf4j.LoggerFactory.getLogger(getClass()).warn("Target operation collection is degraded");}
+    }
     /** The exact assessed models frozen into this run's preparation roster, separate from input lineage. */
     public PdkSinkPort withTargetIdentities(Map<String, TargetIdentityPlan> identities) {
         return new PdkSinkPort(provisioner, stateStore, sharing, purpose, noteScopes, execution, preparations,
-                Objects.requireNonNull(identities, "identities"));
+                Objects.requireNonNull(identities, "identities")).withOperationObserver(operationObserver);
     }
 
     /** Configured writes use already prepared CONFIG notes and the caller's fixed run authority. */
@@ -157,7 +162,7 @@ public final class PdkSinkPort implements SinkPort {
             Runnable letGo) {
         WriteRecordFunction write = requireWriteFunction(connector.functions().getWriteRecordFunction());
         try {
-            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, true, letGo, purpose,preparations,plannedIdentities);
+            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, true, letGo, purpose,preparations,plannedIdentities).withOperationObserver(operationObserver);
             writer.prepareTargets();
             return writer;
         } catch (TapstateException e) {
@@ -173,7 +178,9 @@ public final class PdkSinkPort implements SinkPort {
                 config.connectorId(), ref, config.settings(), config.node(), stateStore, null, drive.scopes(), purpose);
         try {
             connector.underLoader(() -> {
-                connector.connector().init(connector.context());
+                try {connector.connector().init(connector.context());}
+                catch(Throwable failure){operation(io.tapstate.spi.capture.SourceOperationObserver.Capability.INITIALIZE,failure);throw failure;}
+                operation(io.tapstate.spi.capture.SourceOperationObserver.Capability.INITIALIZE,null);
                 return null;
             });
             return connector;
@@ -268,10 +275,12 @@ public final class PdkSinkPort implements SinkPort {
         }
         try {
             connector.underLoader(() -> {
-                connector.connector().init(connector.context());
+                try {connector.connector().init(connector.context());}
+                catch(Throwable failure){operation(io.tapstate.spi.capture.SourceOperationObserver.Capability.INITIALIZE,failure);throw failure;}
+                operation(io.tapstate.spi.capture.SourceOperationObserver.Capability.INITIALIZE,null);
                 return null;
             });
-            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, preparedAhead, null, purpose,preparations,plannedIdentities);
+            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, preparedAhead, null, purpose,preparations,plannedIdentities).withOperationObserver(operationObserver);
             writer.prepareTargets();
             return writer;
         } catch (TapstateException e) {

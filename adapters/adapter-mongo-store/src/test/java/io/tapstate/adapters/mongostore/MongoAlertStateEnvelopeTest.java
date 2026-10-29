@@ -10,6 +10,17 @@ import static io.tapstate.adapters.mongostore.AlertStateEnvelopeFixtures.*;
 import static org.assertj.core.api.Assertions.*;
 
 class MongoAlertStateEnvelopeTest {
+    @Test void operationFormatRetainsFailedCapabilitiesWithinTheOriginalRowBudgetAndKeepsV2Readable(){
+        var old=fired();var value=new Head(old.snapshot(),old.deployment(),old.owner(),old.retiredAt(),old.summariesHandedOff(),old.episode(),old.binding(),new OperationalEvidence("a".repeat(64),255));
+        var row=MongoAlertStateEnvelope.head(value,4);var legacy=MongoAlertStateEnvelope.head(old,4);
+        assertThat(row.getInteger("formatVersion")).isEqualTo(3);
+        assertThat(MongoAlertConfigurationCodec.size(row)-MongoAlertConfigurationCodec.size(legacy)).isLessThanOrEqualTo(192);
+        assertThat(MongoAlertStateEnvelope.read(KEY,row,MongoAlertStateEnvelope.episode(value.episode())).value()).isEqualTo(value);
+        assertThat(MongoAlertStateEnvelope.read(KEY,legacy,MongoAlertStateEnvelope.episode(old.episode())).value().operationalEvidence()).isNull();
+        row.get("operationalEvidence",Document.class).put("failedCapabilities",256);
+        assertThatThrownBy(()->MongoAlertStateEnvelope.read(KEY,row,MongoAlertStateEnvelope.episode(value.episode()))).isInstanceOf(TapstateException.class);
+    }
+
     @Test void fullMetadataGoldenRetainsOriginalBindingAndOnlyOneCopyForTheSameCapture() throws Exception {
         var value = fired(); var row = MongoAlertStateEnvelope.head(value, 3); var ep = MongoAlertStateEnvelope.episode(value.episode());
         assertThat(MongoAlertStateEnvelope.read(KEY, row, ep)).isEqualTo(new MongoAlertStateEnvelope.Stored(3, value));
