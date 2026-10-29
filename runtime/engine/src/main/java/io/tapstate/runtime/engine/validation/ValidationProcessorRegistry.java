@@ -152,7 +152,7 @@ public final class ValidationProcessorRegistry implements AutoCloseable {
             finally { if (entered && !exited) { exited = true; run.exit(token.vertex()); } }
         }
     }
-    private static final class Guarded implements Processor {
+    private static final class Guarded implements io.tapstate.runtime.engine.TransparentProcessor {
         private final Processor delegate;
         private final Run run;
         private Guarded(Processor delegate, Run run) { this.delegate = delegate; this.run = run; }

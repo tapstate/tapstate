@@ -225,9 +225,9 @@ class ControlOperationsTest {
     void theRegistryOpensEveryUsableOperationOnCliAndKeepsTheRevealReservationClosed() {
         // The cluster context is REST-only. The reveal reservation stays unpublished until its
         // dedicated authorizer exists.
-        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(96);
+        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(84);
         assertThat(registry.all()).filteredOn(op -> !"source.reveal-config".equals(op.id())
-                && !"cluster.context".equals(op.id()) && !"pipeline.delete".equals(op.id())).allSatisfy(op ->
+                && !"cluster.context".equals(op.id()) && !"pipeline.delete".equals(op.id()) && !op.id().startsWith("validation.")).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
         assertThat(registry.resolve("source.reveal-config").exposure()).isEmpty();
         assertThat(registry.resolve("cluster.context").exposure())
@@ -351,7 +351,7 @@ class ControlOperationsTest {
                 "validation.start", "validation.progress", "validation.stop", "validation.history", "validation.report",
                 "validation.roots", "validation.root", "validation.schedule-disable")) {
             assertThat(registry.resolve(id).exposure()).as(id).containsEntry(Frontend.REST, Maturity.CURRENT)
-                    .containsEntry(Frontend.CLI, Maturity.CURRENT).doesNotContainKey(Frontend.MCP);
+                    .doesNotContainKey(Frontend.CLI).doesNotContainKey(Frontend.MCP);
         }
     }
 

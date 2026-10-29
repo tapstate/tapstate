@@ -43,10 +43,10 @@ class WhereInTheGraphTimeIsSpentTest {
     }
 
     @Test
-    @DisplayName("the stages are the five processor families the engine draws a vertex with")
+    @DisplayName("the stages are the production and independent validation processor families")
     void theStagesAreTheProcessorFamilies() {
         assertThat(Stage.attributeValues())
-                .containsExactlyInAnyOrder("source", "transform", "nest", "join", "sink");
+                .containsExactlyInAnyOrder("source", "transform", "nest", "join", "sink", "validation");
         assertThat(Stage.SINK.attributeValue()).isEqualTo("sink");
     }
 

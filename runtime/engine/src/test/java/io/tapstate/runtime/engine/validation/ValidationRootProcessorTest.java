@@ -177,4 +177,43 @@ class ValidationRootProcessorTest {
         try { if (!latch.await(5, TimeUnit.SECONDS)) throw new AssertionError("fixture latch timed out"); }
         catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new AssertionError(interrupted); }
     }
+
+    @Test void rootTimingCountsTheAcceptedLifetimeOnceAcrossBackpressure() throws Exception {
+        try (var executor = executor()) {
+            var outbox = new TestOutbox(new int[]{1}, 1); outbox.offer("occupied");
+            var processor = processor(executor, ignored -> {}, outbox);
+            var inbox = new TestInbox(); inbox.add(observation(1)); processor.process(0, inbox); barrier(executor);
+            var timer = processor.timing();
+            for (int poll=0; poll<32; poll++) assertThat(processor.complete()).isFalse();
+            assertThat(timer.value().count()).isZero(); outbox.queue(0).remove(); outbox.reset();
+            assertThat(processor.complete()).isTrue(); assertThat(timer.value().count()).isEqualTo(1);
+            for (int poll=0; poll<32; poll++) assertThat(processor.complete()).isTrue();
+            processor.close(); assertThat(timer.value().count()).isEqualTo(1);
+        }
+    }
+
+    @Test void failureAndCloseBeforeInitializationDoNotLoseOrInventAcceptedUnits() throws Exception {
+        var expected = new TapstateException(ValidationError.READ_FAILED, Map.of("table", "root"), null);
+        var unopened = new ValidationRootProcessor(observation(1).run(), (scope, guard, bytes) -> {throw expected;}, ignored -> {}, 32768);
+        unopened.close(); unopened.close(); assertThat(unopened.timing().value().count()).isZero();
+        var processor = new ValidationRootProcessor(observation(1).run(), (scope, guard, bytes) -> {throw expected;}, ignored -> {}, 32768);
+        processor.init(new TestOutbox(1), new TestProcessorContext());
+        var inbox = new TestInbox(); inbox.add(observation(1));
+        assertThat(catchThrowable(() -> processor.process(0, inbox))).isSameAs(expected);
+        assertThat(processor.timing().value().count()).isEqualTo(1); processor.close(); assertThat(processor.timing().value().count()).isEqualTo(1);
+    }
+
+    @Test void cancelledRootTimingIsNotAPhysicalReleaseReceipt() throws Exception {
+        var entered = new CountDownLatch(1); var release = new CountDownLatch(1); var released = new AtomicInteger();
+        try (var executor = executor()) {
+            var processor = new ValidationRootProcessor(observation(1).run(), (scope, guard, bytes) -> ValidationRootWork.submit(scope, executor,
+                    (value, active) -> {entered.countDown(); await(release); return ValidationRootWorkTest.result(value);}, guard, () -> {}, released::incrementAndGet, bytes), ignored -> {}, 32768);
+            var outbox = new TestOutbox(1); processor.init(outbox, new TestProcessorContext());
+            var inbox = new TestInbox(); inbox.add(observation(1)); processor.process(0, inbox);
+            assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue(); processor.close(); processor.close();
+            assertThat(processor.timing().value().count()).isEqualTo(1); assertThat(released).hasValue(0);
+            release.countDown(); barrier(executor); assertThat(released).hasValue(1);
+            assertThat(outbox.queue(0)).isEmpty(); assertThat(processor.timing().value().count()).isEqualTo(1);
+        } finally { release.countDown(); }
+    }
 }

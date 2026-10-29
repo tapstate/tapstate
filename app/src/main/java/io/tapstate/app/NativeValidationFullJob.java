@@ -4,6 +4,9 @@ import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.ProcessorSupplier;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.Stage;
+import io.tapstate.core.lifecycle.Staged;
+import io.tapstate.runtime.engine.StageTimer;
 import io.tapstate.core.validation.*;
 import io.tapstate.runtime.engine.validation.*;
 import io.tapstate.spi.store.ValidationResultStore;
@@ -49,17 +52,52 @@ final class NativeValidationFullJob implements ValidationRunLifecycle.Activation
             var vertex="full-scan";processors=registry.register(identity,Set.of(vertex),original::requireReserved);
             var local=member.getCluster().getLocalMember();
             var graph=new ValidationJobGraph(identity,local.getAddress(),local.getUuid(),new ValidationJobGraph.Limits(1,0,1),processors);
-            graph.vertex(vertex,ProcessorSupplier.of(()->new AbstractProcessor(){
-                @Override public boolean complete(){work.launch();work.throwFailure();return work.finished;}
-                @Override public void close(){work.cancel();}
-            }));
+            graph.vertex(vertex,ProcessorSupplier.of(()->new FullScanProcessor(work)));
             return new ValidationJobExecution(identity,graph,processors,member.getJet(),work,original::requireReserved,()->{});
         }catch(RuntimeException|Error failed){
             if(processors!=null){processors.seal();if(processors.processorsExited())processors.forget();}
             work.cancel();throw failed;
         }
     }
-    private final class Work implements ValidationJobExecution.Work {
+    interface ScanWork {
+        void launch(java.util.function.Consumer<Runnable> measured);
+        boolean finished();
+        void throwFailure();
+        void cancel();
+    }
+
+    /** One entered worker attempt is one unit; queue delay and cooperative polls are not measured. */
+    static final class FullScanProcessor extends AbstractProcessor implements Staged {
+        private final ScanWork work;
+        private StageTimer timer = StageTimer.none(Stage.VALIDATION);
+        private Context context;
+        private boolean bound;
+        FullScanProcessor(ScanWork work) { this.work = Objects.requireNonNull(work); }
+        @Override public Stage stage() { return Stage.VALIDATION; }
+        @Override protected void init(Context context) { this.context = context; }
+        @Override public boolean complete() {
+            if (!bound) {
+                timer = StageTimer.of(stage(), context, StageTimer.Publication.WORKER); bound = true;
+            }
+            work.launch(this::measured);
+            work.throwFailure(); return work.finished();
+        }
+        private void measured(Runnable action) {
+            var failed = new ValidationFailureLatch();
+            long started = timer.begin();
+            try { action.run(); } catch (RuntimeException | Error workFailure) { failed.record(workFailure); }
+            try { timer.end(started); }
+            catch (RuntimeException | Error timingFailure) {
+                failed.record(timingFailure); ValidationFailureLatch.addContext(failed.get(), timingFailure);
+            }
+            if (failed.get() instanceof Error fatal) throw fatal;
+            if (failed.get() instanceof RuntimeException failure) throw failure;
+        }
+        StageTimer timing() { return timer; }
+        @Override public void close() { work.cancel(); }
+    }
+
+    private final class Work implements ValidationJobExecution.Work, ScanWork {
         final ValidationRunIdentity identity;final ValidationRunSpec spec;final ValidationMemberResources.Run allocation;
         final ValidationFailureLatch failures=new ValidationFailureLatch();
         final AtomicBoolean attempted=new AtomicBoolean(),cancelled=new AtomicBoolean(),cleanupRequested=new AtomicBoolean();
@@ -68,35 +106,40 @@ final class NativeValidationFullJob implements ValidationRunLifecycle.Activation
         Work(ValidationRunIdentity identity,ValidationRunSpec spec,ValidationMemberResources.Run allocation) {
             this.identity=identity;this.spec=spec;this.allocation=allocation;
         }
-        void launch(){
+        @Override public boolean finished() { return finished; }
+        @Override public void launch(java.util.function.Consumer<Runnable> measured){
+            Objects.requireNonNull(measured);
             if(!attempted.compareAndSet(false,true))return;
             if(cancelled.get())return;
             workerOutstanding=true;
             try {allocation.executeCheck(()->{
-                try{
-                    require();planLease=allocation.budget().reserve(new ValidationLocalBudget.Amount(8L*1024*1024,0,0,0));
-                    plan=Objects.requireNonNull(factory.prepare(original),"full scan plan");require();
-                    if(spec.method()==ValidationMethod.COUNT){
-                        counts=new ValidationCountScan(identity,spec,plan.counts(),this::require,check->{
-                            var result=original.access().results().publishCount(new ValidationResultStore.CountWrite(
-                                    new ValidationResultStore.Report(identity,original.request.startSequence()),spec,check));
-                            if(result!=ValidationResultStore.Publication.APPLIED&&result!=ValidationResultStore.Publication.DUPLICATE)throw invalid("countPublicationClosed");
-                        });
-                        require();counts.run();
-                    }else{
-                    scan=new ValidationFullScan(identity,spec,plan.mappings(),this::require,this::publishRoot);
-                    require();scan.run();
-                    }
-                }
+                try { measured.accept(this::scan); }
                 catch(RuntimeException|Error failed){record(failed);}
-                finally{
-                    try{closePlan();}catch(RuntimeException|Error failed){record(failed);}
-                    finally{workerOutstanding=false;finished=true;releasePlan();}
-                }
+                finally{workerOutstanding=false;finished=true;releasePlan();}
                 if(failures.get() instanceof Error fatal)throw fatal;
             },()->workerOutstanding=false);}
             catch(RejectedExecutionException rejected){workerOutstanding=false;var failed=new TapstateException(ValidationError.READ_FAILED,Map.of("table","validation-full-scan"),rejected);record(failed);cancel();throw failed;}
             catch(RuntimeException|Error uncertain){record(uncertain);cancel();throw uncertain;}
+        }
+        private void scan() {
+            try{
+                require();planLease=allocation.budget().reserve(new ValidationLocalBudget.Amount(8L*1024*1024,0,0,0));
+                plan=Objects.requireNonNull(factory.prepare(original),"full scan plan");require();
+                if(spec.method()==ValidationMethod.COUNT){
+                    counts=new ValidationCountScan(identity,spec,plan.counts(),this::require,check->{
+                        var result=original.access().results().publishCount(new ValidationResultStore.CountWrite(
+                                new ValidationResultStore.Report(identity,original.request.startSequence()),spec,check));
+                        if(result!=ValidationResultStore.Publication.APPLIED&&result!=ValidationResultStore.Publication.DUPLICATE)throw invalid("countPublicationClosed");
+                    });
+                    require();counts.run();
+                }else{
+                    scan=new ValidationFullScan(identity,spec,plan.mappings(),this::require,this::publishRoot);
+                    require();scan.run();
+                }
+            }
+            catch(RuntimeException|Error failed){record(failed);}
+            finally{try{closePlan();}catch(RuntimeException|Error failed){record(failed);}}
+            if(failures.get() instanceof Error fatal)throw fatal;
         }
         void require(){
             throwFailure();if(cancelled.get())throw new TapstateException(ValidationError.EXECUTION_CANCELLED,Map.of("node",identity.owner().nodeId()),null);
@@ -167,7 +210,7 @@ final class NativeValidationFullJob implements ValidationRunLifecycle.Activation
         }
         void record(Throwable failed){failures.record(failed);ValidationFailureLatch.addContext(failures.get(),failed);}
         void recordPlanFailure(){var current=plan;if(current!=null){var failed=current.failure();if(failed!=null)record(failed);}}
-        void throwFailure(){recordPlanFailure();if(failures.get() instanceof Error fatal)throw fatal;if(failures.get() instanceof RuntimeException failed)throw failed;}
+        @Override public void throwFailure(){recordPlanFailure();if(failures.get() instanceof Error fatal)throw fatal;if(failures.get() instanceof RuntimeException failed)throw failed;}
     }
     private static TapstateException invalid(String field){return new TapstateException(ValidationError.INVALID_CONTRACT,Map.of("field","fullJob."+field),null);}
 }

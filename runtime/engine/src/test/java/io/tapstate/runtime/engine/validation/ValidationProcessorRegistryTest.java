@@ -8,6 +8,7 @@ import com.hazelcast.jet.config.JobConfig;
 import com.hazelcast.jet.config.ProcessingGuarantee;
 import com.hazelcast.jet.core.*;
 import io.tapstate.core.validation.*;
+import io.tapstate.core.common.TapstateException;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
@@ -21,6 +22,107 @@ import static org.assertj.core.api.Assertions.*;
 /** Actual loopback Jet tasklets; these tests do not establish a connector's native drain contract. */
 class ValidationProcessorRegistryTest {
     private static final Map<String, Probe> PROBES = new ConcurrentHashMap<>();
+
+    private static final Map<String, WorkerTiming> TIMINGS = new ConcurrentHashMap<>();
+
+    @Test @Timeout(40) void actualGuardedJetWorkerPublishesOneUnitWithoutThreadContextOrPollUnits() throws Exception {
+        try (var fixture = new Fixture()) {
+            for (boolean failing : List.of(false, true)) {
+                String id = UUID.randomUUID().toString(); var timing = new WorkerTiming(failing); TIMINGS.put(id, timing);
+                var run = fixture.registry.register(identity(id), Set.of("check"), () -> {if (!timing.authorized.get()) throw invalid();});
+                var local = fixture.member.getCluster().getLocalMember();
+                var graph = new ValidationJobGraph(identity(id), local.getAddress(), local.getUuid(), new ValidationJobGraph.Limits(1,0,1), run);
+                graph.vertex("check", ProcessorSupplier.of(() -> new WorkerTimingProcessor(id)));
+                Job job = graph.submit(fixture.member.getJet(), () -> {});
+                try {
+                    awaitJobProgress(job, () -> timing.polls.get() > 2);
+                    assertThat(metricCount(job)).isZero();
+                    timing.allowWork.countDown();
+                    assertThat(timing.exited.await(10, TimeUnit.SECONDS)).isTrue();
+                    if (failing) assertThat(timing.failed.get()).isInstanceOf(TapstateException.class);
+                    else assertThat(timing.failed.get()).isNull();
+                    await(() -> metricCount(job) == 1);
+                    assertThat(timing.polls.get()).isGreaterThan(2);
+                    timing.allowComplete.set(true);
+                    if (failing) assertThatThrownBy(() -> job.getFuture().get(10, TimeUnit.SECONDS))
+                            .isInstanceOf(ExecutionException.class).hasMessageContaining(ValidationError.READ_FAILED.code());
+                    else job.getFuture().get(10, TimeUnit.SECONDS);
+                    run.seal(); await(run::processorsExited); run.forget();
+                } finally {timing.allowWork.countDown();timing.allowComplete.set(true);job.cancel();TIMINGS.remove(id);}
+            }
+        }
+    }
+
+    @Test @Timeout(40) void authorityLossStopsDelegationBeforeQueuedWorkAndCreatesNoTimingUnit() throws Exception {
+        try (var fixture = new Fixture()) {
+            String id = UUID.randomUUID().toString(); var timing = new WorkerTiming(false); TIMINGS.put(id, timing);
+            var run = fixture.registry.register(identity(id), Set.of("check"), () -> {if (!timing.authorized.get()) throw invalid();});
+            var local = fixture.member.getCluster().getLocalMember();
+            var graph = new ValidationJobGraph(identity(id), local.getAddress(), local.getUuid(), new ValidationJobGraph.Limits(1,0,1), run);
+            graph.vertex("check", ProcessorSupplier.of(() -> new WorkerTimingProcessor(id)));
+            Job job = graph.submit(fixture.member.getJet(), () -> {});
+            try {
+                awaitJobProgress(job, () -> timing.polls.get() > 2);timing.authorized.set(false);
+                assertThatThrownBy(() -> job.getFuture().get(10, TimeUnit.SECONDS))
+                        .isInstanceOf(ExecutionException.class).hasMessageContaining(ValidationError.INVALID_CONTRACT.code());
+                run.seal(); await(run::processorsExited);run.forget();
+                assertThat(timing.exited.await(10, TimeUnit.SECONDS)).isTrue();
+                assertThat(timing.units.get()).isZero();
+            } finally {timing.allowWork.countDown();job.cancel();TIMINGS.remove(id);}
+        }
+    }
+
+    private static void awaitJobProgress(Job job, BooleanSupplier progress) throws Exception {
+        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (!progress.getAsBoolean() && System.nanoTime() < until) {
+            if (job.getFuture().isDone()) job.getFuture().get();
+            Thread.sleep(10);
+        }
+        assertThat(progress.getAsBoolean()).isTrue();
+    }
+
+    private static long metricCount(Job job) {
+        return job.getMetrics().get("stage.validation.count").stream().mapToLong(com.hazelcast.jet.core.metrics.Measurement::value).sum();
+    }
+    private static final class WorkerTiming {
+        final CountDownLatch allowWork = new CountDownLatch(1), exited = new CountDownLatch(1);
+        final AtomicBoolean authorized = new AtomicBoolean(true), allowComplete = new AtomicBoolean();
+        final AtomicInteger polls = new AtomicInteger(); final AtomicLong units = new AtomicLong();
+        final AtomicReference<Throwable> failed = new AtomicReference<>(); final boolean failing;
+        WorkerTiming(boolean failing) {this.failing=failing;}
+    }
+    private static final class WorkerTimingProcessor extends AbstractProcessor implements io.tapstate.core.lifecycle.Staged {
+        private final String id; private WorkerTiming timing; private ExecutorService worker;
+        private io.tapstate.runtime.engine.StageTimer timer;
+        private Processor.Context context;
+        WorkerTimingProcessor(String id) {this.id=id;}
+        @Override public io.tapstate.core.lifecycle.Stage stage() {return io.tapstate.core.lifecycle.Stage.VALIDATION;}
+        @Override protected void init(Processor.Context context) {
+            timing = Objects.requireNonNull(TIMINGS.get(id)); this.context = context;
+        }
+        private void launch() {
+            if (worker != null) return;
+            timer = io.tapstate.runtime.engine.StageTimer.of(stage(),context,io.tapstate.runtime.engine.StageTimer.Publication.WORKER);
+            worker = Executors.newSingleThreadExecutor();
+            worker.submit(() -> {
+                try {
+                    timing.allowWork.await();
+                    long start = timer.begin();
+                    try {if (timing.failing) throw new TapstateException(ValidationError.READ_FAILED,Map.of("table","worker-fixture"),null);}
+                    finally {timer.end(start);timing.units.set(timer.value().count());}
+                } catch (Throwable failed) {timing.failed.set(failed);}
+                finally {timing.exited.countDown();}
+            });
+        }
+        @Override public boolean complete() {
+            launch(); timing.polls.incrementAndGet();
+            if (!timing.allowComplete.get() || timing.exited.getCount()!=0) return false;
+            if (timing.failed.get() instanceof Error fatal) throw fatal;
+            if (timing.failed.get() instanceof RuntimeException failed) throw failed;
+            return true;
+        }
+        @Override public void close() {if (worker != null) worker.shutdownNow();}
+    }
 
     @Test @Timeout(40) void actualSupplierExitIsSeparateFromCancellationAndWaitsForProcessorClose() throws Exception {
         try (var fixture = new Fixture()) {

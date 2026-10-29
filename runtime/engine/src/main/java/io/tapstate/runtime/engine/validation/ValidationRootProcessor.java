@@ -2,6 +2,9 @@ package io.tapstate.runtime.engine.validation;
 
 import com.hazelcast.jet.core.AbstractProcessor;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.lifecycle.Stage;
+import io.tapstate.core.lifecycle.Staged;
+import io.tapstate.runtime.engine.StageTimer;
 import io.tapstate.core.validation.ValidationError;
 import io.tapstate.core.validation.ValidationFailureLatch;
 import io.tapstate.core.validation.ValidationObservation;
@@ -19,7 +22,7 @@ import java.util.function.Consumer;
  * result bytes and all edge queues before starting the graph; graph completion is not run completion.
  * Downstream confirmation/publication must still verify original run, report and observation fences.
  */
-public final class ValidationRootProcessor extends AbstractProcessor {
+public final class ValidationRootProcessor extends AbstractProcessor implements Staged {
     @FunctionalInterface
     public interface Factory {
         /** Starts exactly this original observation, with no blocking admission or implicit retry. */
@@ -34,6 +37,21 @@ public final class ValidationRootProcessor extends AbstractProcessor {
     private ValidationRootWork work;
     private ValidationRootCheck pending;
     private boolean closed;
+    private StageTimer timer = StageTimer.none(Stage.VALIDATION);
+    private boolean timed;
+    private long startedNanos;
+    private Context context;
+    private boolean bound;
+
+    @Override public Stage stage() { return Stage.VALIDATION; }
+    @Override protected void init(Context context) { this.context = context; }
+
+    /** One accepted root through emission or failed/cancelled termination, including backpressure. */
+    private void finishTiming() {
+        if (!timed) return;
+        timed = false; timer.end(startedNanos);
+    }
+
 
     public ValidationRootProcessor(ValidationRunIdentity run, Factory factory, Consumer<ValidationObservation> requireCurrent, long maxResultBytes) {
         this.run = Objects.requireNonNull(run, "run");
@@ -51,6 +69,10 @@ public final class ValidationRootProcessor extends AbstractProcessor {
             }
             if (!drain()) return false;
             requireCurrent.accept(observation);
+            if (!bound) {
+                timer = StageTimer.of(stage(), context, StageTimer.Publication.WORKER); bound = true;
+            }
+            startedNanos = timer.begin(); timed = true;
             var started = Objects.requireNonNull(factory.start(observation, () -> requireCurrent.accept(observation), maxResultBytes), "root work");
             // A misrouted handle may belong to another live observation; never adopt or cancel it.
             if (!started.observation().equals(observation)) throw invalid("rootProcessor.workObservation");
@@ -77,6 +99,7 @@ public final class ValidationRootProcessor extends AbstractProcessor {
             requireCurrent.accept(pending.observation());
             if (!tryEmit(pending)) return false;
             pending = null;
+            finishTiming();
         }
         return true;
     }
@@ -95,6 +118,10 @@ public final class ValidationRootProcessor extends AbstractProcessor {
                     ValidationFailureLatch.addContext(failure.get(), cleanup);
                 }
             }
+            try { finishTiming(); }
+            catch (RuntimeException | Error timingFailure) {
+                failure.record(timingFailure); ValidationFailureLatch.addContext(failure.get(), timingFailure);
+            }
             throwFailure();
             throw new IllegalStateException("failed root processor has no diagnosis");
         }
@@ -105,13 +132,21 @@ public final class ValidationRootProcessor extends AbstractProcessor {
         if (closed) return;
         closed = true;
         pending = null;
+        var closing = new ValidationFailureLatch();
         if (work != null) {
-            var active = work;
-            work = null;
-            active.cancel(failure.get() != null ? failure.get() : new TapstateException(ValidationError.EXECUTION_CANCELLED,
-                    Map.of("node", run.owner().nodeId()), null));
+            var active = work; work = null;
+            try {
+                active.cancel(failure.get() != null ? failure.get() : new TapstateException(ValidationError.EXECUTION_CANCELLED,
+                        Map.of("node", run.owner().nodeId()), null));
+            } catch (RuntimeException | Error cleanup) { closing.record(cleanup); }
         }
+        try { finishTiming(); }
+        catch (RuntimeException | Error timingFailure) { closing.record(timingFailure); }
+        if (closing.get() instanceof Error fatal) throw fatal;
+        if (closing.get() instanceof RuntimeException failed) throw failed;
     }
+    StageTimer timing() { return timer; }
+
     private void throwFailure() {
         if (failure.get() instanceof Error error) throw error;
         if (failure.get() instanceof RuntimeException error) throw error;
