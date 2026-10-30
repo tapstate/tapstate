@@ -56,6 +56,30 @@ final class MongoAlertConfigurationStore {
         }
     }
 
+    static List<AlertConfiguration.Rule> initialRules(AlarmKey.Scope scope,
+            io.tapstate.core.alerting.AlertChannelPolicy.Deployment deployment, java.time.Instant at) {
+        var catalog = io.tapstate.core.alerting.BuiltinAlarmTypes.catalog();
+        return catalog.types().stream().map(type -> {
+            var identity = AlertConfiguration.Identity.create(Kind.RULE, scope, "builtin-" + type.id());
+            var header = AlertConfiguration.Header.create(identity, deployment, at, "system:cluster-initialization");
+            return new AlertConfiguration.Rule(header, type.id(), type.id(), type.version(),
+                    new AlertConfiguration.Resources(type.resourceKinds(), true, java.util.Set.of()),
+                    Map.of(), null, type.enabledByDefault(), null).validated(catalog);
+        }).toList();
+    }
+
+    /** Called only inside the original CONFIG identity-creation transaction, never on reopen. */
+    static void initializeRules(ClientSession session, MongoDatabase database, List<AlertConfiguration.Rule> rules) {
+        if (rules.isEmpty()) return;
+        var store = new MongoAlertConfigurationStore(database, rules.getFirst().header().identity().scope(),
+                io.tapstate.core.alerting.BuiltinAlarmTypes.catalog(), () -> {});
+        for (var rule : rules) {
+            if (store.stage(session, null, rule) != Stage.STAGED) {
+                throw new IllegalStateException("a fresh CONFIG transaction already contains an initial rule");
+            }
+        }
+    }
+
     Optional<MongoAlertConfigurationCodec.Stored> load(ClientSession session, Kind kind, String id) {
         MongoAlertStateStore.requireTransaction(session); requireActive.run();
         Document row = collection(kind).find(session, new Document("_id", MongoAlertConfigurationCodec.key(scope, id))).first();

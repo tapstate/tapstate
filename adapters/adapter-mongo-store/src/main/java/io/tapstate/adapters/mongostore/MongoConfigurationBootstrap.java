@@ -34,6 +34,20 @@ public final class MongoConfigurationBootstrap {
         return prepare(settings, clusterId, installationId, operationId, generation, true);
     }
 
+    /** The application supplies its original trusted organization or installation identity. */
+    public static MongoConfigurationDomain prepareWithAlerts(MongoConnectionSettings settings, String clusterId,
+            String installationId, String operationId, long generation,
+            io.tapstate.core.alerting.AlarmKey.Scope alertScope,
+            io.tapstate.core.alerting.AlertChannelPolicy.Deployment deployment) {
+        Objects.requireNonNull(alertScope); Objects.requireNonNull(deployment);
+        if (!clusterId.equals(alertScope.clusterId())
+                || deployment == io.tapstate.core.alerting.AlertChannelPolicy.Deployment.ON_PREM
+                        && !installationId.equals(alertScope.authorityId())
+                || deployment == io.tapstate.core.alerting.AlertChannelPolicy.Deployment.UNRESOLVED) throw refused();
+        var rules = MongoAlertConfigurationStore.initialRules(alertScope, deployment, java.time.Instant.now());
+        return prepare(settings, clusterId, installationId, operationId, generation, true, rules);
+    }
+
     /** A replacement process may finish the original retained preparation, but never recreate missing authority. */
     public static MongoConfigurationDomain resume(MongoConnectionSettings settings, String clusterId,
             String installationId, String operationId, long generation) {
@@ -42,6 +56,12 @@ public final class MongoConfigurationBootstrap {
 
     private static MongoConfigurationDomain prepare(MongoConnectionSettings settings, String clusterId,
             String installationId, String operationId, long generation, boolean mayCreate) {
+        return prepare(settings, clusterId, installationId, operationId, generation, mayCreate, java.util.List.of());
+    }
+
+    private static MongoConfigurationDomain prepare(MongoConnectionSettings settings, String clusterId,
+            String installationId, String operationId, long generation, boolean mayCreate,
+            java.util.List<io.tapstate.core.alerting.AlertConfiguration.Rule> initialRules) {
         requireText(clusterId);
         requireText(installationId);
         requireText(operationId);
@@ -104,6 +124,7 @@ public final class MongoConfigurationBootstrap {
                                                     clusterId, SourceConfigCipher.fingerprint(key), operationId)));
                             SystemCollections.CONFIGURATION_VERSION.on(database).insertOne(session,
                                     ConfigurationVersion.initial());
+                            MongoAlertConfigurationStore.initializeRules(session, database, initialRules);
                             return null;
                         }, TRANSACTION);
                         break;

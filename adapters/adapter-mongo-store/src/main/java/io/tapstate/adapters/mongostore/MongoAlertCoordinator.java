@@ -111,9 +111,8 @@ final class MongoAlertCoordinator implements AlertStore {
     private void currentHost(ClientSession session) {
         host.locallyActive().run();var scope=host.setup();
         Document setup=SystemCollections.STORAGE_SETUP.on(db).find(session,new Document("_id","cluster")).first();
-        if(setup==null||!scope.clusterId().equals(setup.get("clusterId"))||!scope.installationId().equals(setup.get("installationId"))
-                ||!scope.operationId().equals(setup.get("operationId"))||!Long.valueOf(scope.generation()).equals(setup.get("generation")))throw stale("host-installation");
         var binding=bindings.loadForTransaction(session);
+        if(!MongoAlertHostIdentity.current(setup,scope,binding.orElse(null)))throw stale("host-installation");
         if(binding.isPresent()&&(binding.get().mode()==StorageBinding.Mode.OP)!=(host.deployment()==AlertChannelPolicy.Deployment.ON_PREM))throw stale("deployment");
         Document schema=SystemCollections.SCHEMA_MIGRATIONS.on(db).find(session,new Document("_id","config")).first();
         Document version=SystemCollections.CONFIGURATION_VERSION.on(db).find(session,new Document("_id",ConfigurationVersion.ID)).first();

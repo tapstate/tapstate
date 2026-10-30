@@ -37,9 +37,8 @@ final class MongoAlertNodeLifecycleStore implements AlertNodeLifecycleStore {
     }
     private CacheAuthScope currentHost(ClientSession session) {
         var row=SystemCollections.STORAGE_SETUP.on(db).find(session,new Document("_id","cluster")).first();
-        if(row==null || !setup.clusterId().equals(row.get("clusterId")) || !setup.installationId().equals(row.get("installationId"))
-                || !setup.operationId().equals(row.get("operationId")) || !Long.valueOf(setup.generation()).equals(row.get("generation")))throw unreadable("host-installation");
         var binding=bindings.loadForTransaction(session).orElseThrow(()->unreadable("binding"));
+        if(!MongoAlertHostIdentity.current(row,setup,binding))throw unreadable("host-installation");
         if(!setup.equals(binding.setup()) || binding.mode()==StorageBinding.Mode.OP && !scope.authorityId().equals(setup.installationId()))throw unreadable("host-binding");
         var prepared=bindings.cachePreparationForTransaction(session).orElseThrow(()->unreadable("cache-preparation"));
         var schema=SystemCollections.SCHEMA_MIGRATIONS.on(db).find(session,new Document("_id","config")).first();
