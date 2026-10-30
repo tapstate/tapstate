@@ -21,6 +21,8 @@ import io.tapstate.testsupport.DockerGate;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.sql.Connection;
 import java.sql.Statement;
@@ -50,8 +52,10 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
         RealConnectorGate.require("mysql", "mongodb");
     }
 
-    @Test
-    void equalPipelineNamesInIndependentInstallationsDoNotInheritEachOthersAssembly() throws Exception {
+    @ParameterizedTest(name = "configured state.database={0}")
+    @ValueSource(booleans = {false, true})
+    void equalPipelineNamesInIndependentInstallationsDoNotInheritEachOthersAssembly(boolean configuredDatabase)
+            throws Exception {
         var firstSource = SharedMySql.settings("nest_inherit_src_one");
         var secondSource = SharedMySql.settings("nest_inherit_src_two");
         seed(firstSource);
@@ -59,31 +63,51 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
         try (PreparedNativeStore first = PreparedNativeStore.create();
                 PreparedNativeStore second = PreparedNativeStore.create();
                 MongoEndpoints mongo = new MongoEndpoints()) {
-            assertThat(first.clusterId()).isNotEqualTo(second.clusterId());
-            assertThat(first.cacheDatabase()).isNotEqualTo(second.cacheDatabase());
-            try (ServerHandle server = Tiers.IN_PROCESS.launch(first)) {
-                start(server, first, firstSource);
-                awaitCustomer(mongo, first, SEEDED, "the first installation's own assembly");
-                update(firstSource, ONLY_THE_FIRST_RUN);
-                awaitCustomer(mongo, first, ONLY_THE_FIRST_RUN, "the first installation's own change");
+            String firstDatabase = first.cacheDatabase() + (configuredDatabase ? "_selected" : "");
+            String secondDatabase = second.cacheDatabase() + (configuredDatabase ? "_selected" : "");
+            try {
+                assertThat(first.clusterId()).isNotEqualTo(second.clusterId());
+                assertThat(first.cacheDatabase()).isNotEqualTo(second.cacheDatabase());
+                try (ServerHandle server = Tiers.IN_PROCESS.launch(first)) {
+                    start(server, first, firstSource, configuredDatabase ? firstDatabase : null);
+                    awaitCustomer(mongo, first, SEEDED, "the first installation's own assembly");
+                    update(firstSource, ONLY_THE_FIRST_RUN);
+                    awaitCustomer(mongo, first, ONLY_THE_FIRST_RUN, "the first installation's own change");
+                }
+                var original = stateRows(first, firstDatabase);
+                assertThat(original).as("the first installation retains actual native state").isNotEmpty();
+                var originalShapes = shapeRows(first, firstDatabase);
+                assertThat(originalShapes).isNotEmpty();
+                assertThat(stateRows(second, secondDatabase)).isEmpty();
+                assertThat(shapeRows(second, secondDatabase)).isEmpty();
+                if (configuredDatabase) assertNoDefaultNestPayload(first);
+                assertThat(mongo.documents(EndpointAddress.uri(second.masterUri()), VIEW)).isEmpty();
+                try (ServerHandle server = Tiers.IN_PROCESS.launch(second)) {
+                    start(server, second, secondSource, configuredDatabase ? secondDatabase : null);
+                    awaitCustomer(mongo, second, SEEDED, "the second installation to serve its own source");
+                    Document served = only(mongo.documents(EndpointAddress.uri(second.masterUri()), VIEW));
+                    assertThat(served.getString("customer")).isEqualTo(SEEDED).isNotEqualTo(ONLY_THE_FIRST_RUN);
+                    assertThat(served.getList("items", Document.class)).extracting(item -> item.getString("sku"))
+                            .containsExactlyInAnyOrder("sku-1", "sku-2");
+                    assertThat(stateRows(second, secondDatabase)).isNotEmpty();
+                    assertThat(shapeRows(second, secondDatabase)).isNotEmpty();
+                }
+                assertThat(stateRows(first, firstDatabase)).as("the second installation never mutates the retained first state")
+                        .containsExactlyElementsOf(original);
+                assertThat(shapeRows(first, firstDatabase)).as("the second installation never mutates the retained first shapes")
+                        .containsExactlyElementsOf(originalShapes);
+                if (configuredDatabase) {
+                    assertNoDefaultNestPayload(first);
+                    assertNoDefaultNestPayload(second);
+                }
+            } finally {
+                if (configuredDatabase) {
+                    try (var client = MongoClients.create(first.cacheUri())) {
+                        client.getDatabase(firstDatabase).drop();
+                        client.getDatabase(secondDatabase).drop();
+                    }
+                }
             }
-            var original = stateRows(first);
-            assertThat(original).as("the first installation retains actual native state").isNotEmpty();
-            assertThat(shapeRows(first)).isNotEmpty();
-            assertThat(stateRows(second)).isEmpty();
-            assertThat(mongo.documents(EndpointAddress.uri(second.masterUri()), VIEW)).isEmpty();
-            try (ServerHandle server = Tiers.IN_PROCESS.launch(second)) {
-                start(server, second, secondSource);
-                awaitCustomer(mongo, second, SEEDED, "the second installation to serve its own source");
-                Document served = only(mongo.documents(EndpointAddress.uri(second.masterUri()), VIEW));
-                assertThat(served.getString("customer")).isEqualTo(SEEDED).isNotEqualTo(ONLY_THE_FIRST_RUN);
-                assertThat(served.getList("items", Document.class)).extracting(item -> item.getString("sku"))
-                        .containsExactlyInAnyOrder("sku-1", "sku-2");
-                assertThat(stateRows(second)).isNotEmpty();
-                assertThat(shapeRows(second)).isNotEmpty();
-            }
-            assertThat(stateRows(first)).as("the second installation never mutates the retained first state")
-                    .containsExactlyElementsOf(original);
         }
     }
 
@@ -230,6 +254,11 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
     }
 
     private static ControlPlane start(ServerHandle server, PreparedNativeStore storage, Map<String, Object> source) {
+        return start(server, storage, source, null);
+    }
+
+    private static ControlPlane start(ServerHandle server, PreparedNativeStore storage, Map<String, Object> source,
+            String stateDatabase) {
         ControlPlane control = new ControlPlane(server.baseUrl());
         storage.loginAndAwaitBusiness(control);
         control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
@@ -237,7 +266,7 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
         var resources = new LinkedHashMap<String, String>();
         resources.put("parents.tap.yml", sourceYaml("src_parents", source, PARENTS));
         resources.put("children.tap.yml", sourceYaml("src_children", source, CHILDREN));
-        resources.put("pipeline.tap.yml", pipelineYaml());
+        resources.put("pipeline.tap.yml", pipelineYaml(stateDatabase));
         control.apply(resources);
         control.discoverSchema("src_parents", "mysql", source);
         control.discoverSchema("src_children", "mysql", source);
@@ -271,13 +300,26 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
     }
 
     private static List<Document> stateRows(PreparedNativeStore storage) {
-        return rows(storage.cacheUri(), storage.cacheDatabase(), SystemCollections.CACHE_NEST_STATE,
+        return stateRows(storage, storage.cacheDatabase());
+    }
+
+    private static List<Document> stateRows(PreparedNativeStore storage, String database) {
+        return rows(storage.cacheUri(), database, SystemCollections.CACHE_NEST_STATE,
                 new Document("_id.placement.scope.pipelineId", PIPELINE));
     }
 
     private static List<Document> shapeRows(PreparedNativeStore storage) {
-        return rows(storage.cacheUri(), storage.cacheDatabase(), SystemCollections.CACHE_NEST_SHAPES,
+        return shapeRows(storage, storage.cacheDatabase());
+    }
+
+    private static List<Document> shapeRows(PreparedNativeStore storage, String database) {
+        return rows(storage.cacheUri(), database, SystemCollections.CACHE_NEST_SHAPES,
                 new Document("_id.scope.pipelineId", PIPELINE));
+    }
+
+    private static void assertNoDefaultNestPayload(PreparedNativeStore storage) {
+        assertThat(stateRows(storage)).as("custom placement leaves default CACHE without Nest state").isEmpty();
+        assertThat(shapeRows(storage)).as("custom placement leaves default CACHE without Nest shapes").isEmpty();
     }
 
     private static List<Document> deadLetterRows(PreparedNativeStore storage) {
@@ -382,7 +424,7 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
                         config.get("username"), config.get("password"), table);
     }
 
-    private static String pipelineYaml() {
+    private static String pipelineYaml(String stateDatabase) {
         return """
                 version: tapstate/v1
                 kind: pipeline
@@ -393,6 +435,7 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
                   - id: order_doc
                     type: nest
                     from: { o: orders, i: order_items }
+                %s\
                     root:
                       from: o
                       key: [ id ]
@@ -402,6 +445,7 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
                   id: %s
                   from: order_doc
                   primary_key: id
-                """.formatted(PIPELINE, VIEW);
+                """.formatted(PIPELINE,
+                        stateDatabase == null ? "" : "    state: { database: " + stateDatabase + " }\n", VIEW);
     }
 }
