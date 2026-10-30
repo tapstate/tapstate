@@ -138,7 +138,7 @@ public final class PipelineCatalogService {
         // The current failure and the later intent projection remain separate even if STOP arrived
         // after diagnosis. Converting this item must not infer runtime truth from the UI transition.
         PipelineCatalogItem.DisplayState runtimeState = observation != null && observed != effective
-                ? PipelineCatalogItem.DisplayState.valueOf(effective.name()) : state;
+                ? PipelineCatalogItem.DisplayState.valueOf(observation.state().name()) : state;
         return new PipelineCatalogItem(
                 id,
                 name,

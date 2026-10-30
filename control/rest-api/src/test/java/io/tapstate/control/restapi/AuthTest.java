@@ -639,6 +639,11 @@ class AuthTest {
     }
 
     @Test
+    void theControlFaceUsesThreeStatelessSecurityChainsInsteadOfTheLegacyInterceptor() {
+        assertThat(context.getBeansOfType(SecurityFilterChain.class)).hasSize(3);
+    }
+
+    @Test
     void securityConfigurationRefusesToStartWithoutTheSelectedCredentialVerifier() {
         assertThatThrownBy(() -> new SpringApplicationBuilder(MissingHumanVerifierApp.class)
                 .properties("server.port=0")

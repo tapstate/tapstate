@@ -20,6 +20,18 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class ConnectorNoteOriginTest {
     @Test
+    void floatingPointSettingsKeepTheirExactEncodingAndRejectNonFiniteValues() {
+        var retained = ConnectorNoteOrigin.capture("mongo", "a".repeat(64), Map.of("double", 1.5d, "float", 1.25f));
+        assertThat(new String(retained.settings(), java.nio.charset.StandardCharsets.UTF_8))
+                .isEqualTo("[\"connector-settings-v1\",[\"map\",{\"double\":[\"double\",\"1.5\"],\"float\":[\"float\",\"1.25\"]}]]");
+        for (Number invalid : List.of(Double.NaN, Double.POSITIVE_INFINITY, Float.NaN, Float.NEGATIVE_INFINITY)) {
+            assertThatThrownBy(() -> ConnectorNoteOrigin.capture("mongo", "a".repeat(64), Map.of("number", invalid)))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(IoError.NOTE_ORIGIN_MISMATCH));
+        }
+    }
+
+    @Test
     void completeSettingsAreStableAcrossMapOrderingAndDetachedFromMutation() {
         Map<String, Object> nested = new LinkedHashMap<>();
         nested.put("tls", true);

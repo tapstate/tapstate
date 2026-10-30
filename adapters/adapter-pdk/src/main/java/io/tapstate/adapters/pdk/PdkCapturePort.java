@@ -601,6 +601,8 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
     }
 
     /** The caller waits within its old budget; this original owner retains every still-running callback. */
+    // Cleanup retains the original worker and restores interruption only after it and its deliveries finish.
+    @SuppressWarnings("java:S2142")
     private static void finishCdc(PdkConnector connector, Thread worker, CdcDelivery delivery, CompletableFuture<Void> ended) {
         Throwable failure = null;
         try {
@@ -638,6 +640,8 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
             return true;
         }
 
+        // An interrupted cleanup still owns active callbacks; restore the flag after the drain barrier.
+        @SuppressWarnings("java:S2142")
         void awaitDrained() {
             boolean interrupted = false;
             synchronized (this) {

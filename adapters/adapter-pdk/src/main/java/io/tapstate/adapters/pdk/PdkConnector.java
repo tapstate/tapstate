@@ -141,6 +141,8 @@ final class PdkConnector implements AutoCloseable {
                 PipelineNode.Purpose.CAPTURE);
     }
 
+    // Success transfers trust material to the returned handle; the finally path closes every failed open.
+    @SuppressWarnings("java:S2095")
     static PdkConnector open(String connectorId, ConnectorRef ref, Map<String, Object> settings,
                              PipelineNode node, KeyedStateStore stateStore, SharedNotes notes,
                              ConnectorNoteScopes noteScopes, PipelineNode.Purpose purpose) {

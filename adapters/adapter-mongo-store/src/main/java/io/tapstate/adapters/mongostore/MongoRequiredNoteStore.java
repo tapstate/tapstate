@@ -962,7 +962,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
             throw unreadable("writeFence");
         }
         if (!(document.get("originGeneration") instanceof Long originGeneration)
-                || (originGeneration != 0 && originGeneration != generation)
+                || (originGeneration != 0 && originGeneration.longValue() != generation.longValue())
                 || (owner.kind() == RequiredNoteOwner.Kind.GLOBAL && originGeneration != 0)) throw unreadable("originGeneration");
         if (document.containsKey("lastRetirement")) {
             if (!(document.get("lastRetirement") instanceof Document result)

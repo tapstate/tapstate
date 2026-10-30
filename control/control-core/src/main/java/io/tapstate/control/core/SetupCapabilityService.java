@@ -23,6 +23,8 @@ public final class SetupCapabilityService {
     private final Runnable requireManagementChannel;
     private final Runnable requireFirstAdminReadiness;
     private final SecureRandom random = new SecureRandom();
+    // Publishes an immutable authority snapshot; replacement and revocation synchronize.
+    @SuppressWarnings("java:S3077")
     private volatile Current current;
     private volatile long localRevision;
 
@@ -33,7 +35,13 @@ public final class SetupCapabilityService {
         }
         @Override public String toString() { return "SetupCapability[redacted]"; }
     }
-    private record Current(Issued issued, byte[] digest) {}
+    private record Current(Issued issued, byte[] digest) {
+        @Override public boolean equals(Object value) {
+            return value instanceof Current other && issued.equals(other.issued) && MessageDigest.isEqual(digest, other.digest);
+        }
+        @Override public int hashCode() { return 31 * issued.hashCode() + java.util.Arrays.hashCode(digest); }
+        @Override public String toString() { return "Current[redacted]"; }
+    }
 
     /** Created only after the installation authority and real management channel were verified. */
     public static final class Permission implements Runnable {

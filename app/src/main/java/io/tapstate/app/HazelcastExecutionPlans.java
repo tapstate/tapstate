@@ -46,7 +46,7 @@ final class HazelcastExecutionPlans implements ExecutionPlans, ExecutionPlanReco
                 if (!original.pipelineId().equals(plan.pipelineId())
                         || !Long.valueOf(original.claimGeneration()).equals(plan.claimGeneration())
                         || !Long.valueOf(original.executionGeneration()).equals(plan.executionGeneration())
-                        || !Long.valueOf(original.topologyRevision()).equals(plan.topologyRevision())) throw ThreeLayerStorePort.refused();
+                        || !original.topologyRevision().equals(plan.topologyRevision())) throw ThreeLayerStorePort.refused();
                 publish(LAST_MAP_NAME, new ScopedPlan(original, plan, true), active);
                 publish(MAP_NAME, new ScopedPlan(original, plan, true), active);
             }
@@ -64,7 +64,7 @@ final class HazelcastExecutionPlans implements ExecutionPlans, ExecutionPlanReco
                 if (!original.pipelineId().equals(expected.pipelineId())
                         || !Long.valueOf(original.claimGeneration()).equals(expected.claimGeneration())
                         || !Long.valueOf(original.executionGeneration()).equals(expected.executionGeneration())
-                        || !Long.valueOf(original.topologyRevision()).equals(expected.topologyRevision())) throw ThreeLayerStorePort.refused();
+                        || !original.topologyRevision().equals(expected.topologyRevision())) throw ThreeLayerStorePort.refused();
                 var map = member.<String,Object>getMap(MAP_NAME); Object held = map.get(expected.pipelineId());
                 if (held == null) return;
                 if (!(held instanceof ScopedPlan prior)) throw ThreeLayerStorePort.refused();

@@ -24,7 +24,11 @@ final class StorageRuntime implements AutoCloseable {
     }
     private final MongoConfigurationDomain configuration;
     private final Function<StorageBinding, MongoCacheDomain> connections;
+    // Lifecycle writers synchronize; readers capture one identity whose readiness flags are volatile.
+    @SuppressWarnings("java:S3077")
     private volatile Bound bound;
+    // Liveness reads publish only the owner reference; the owner guards its own lifecycle.
+    @SuppressWarnings("java:S3077")
     private volatile AutoCloseable business;
     private volatile boolean closed;
     private volatile boolean cleanupUnknown;
@@ -99,13 +103,17 @@ final class StorageRuntime implements AutoCloseable {
             failure = stopped;
             throw stopped;
         } finally {
-            try { candidate.close(); } catch (RuntimeException | Error cleanup) {
-                cleanupUnknown = true;
-                if (failure != null) { if (failure != cleanup) failure.addSuppressed(cleanup); }
-                else throw cleanup;
-            }
+            closeCandidate(candidate, failure);
         }
         return loadBound().orElseThrow(StorageRuntime::unavailable);
+    }
+
+    private void closeCandidate(MongoCacheDomain candidate, Throwable primary) {
+        try { candidate.close(); } catch (RuntimeException | Error cleanup) {
+            cleanupUnknown = true;
+            if (primary != null) { if (primary != cleanup) primary.addSuppressed(cleanup); }
+            else throw cleanup;
+        }
     }
 
     private void retireBound() {

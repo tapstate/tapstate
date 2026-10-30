@@ -33,13 +33,17 @@ final class SrsConsumerProgressReads {
             // Keep the original failure intact even when it is itself a CompletionException.
             batch.result.completeExceptionally(new CompletionException(failure)); throw failure;
         } finally {
-            pending.compute(run, (ignored, queue) -> {
-                if (queue == null || queue.running != batch) throw new IllegalStateException("progress read lost its original queue");
-                if (queue.waiting == null) return null;
-                queue.running = queue.waiting; queue.waiting = null;
-                queue.running.ready.complete(null); return queue;
-            });
+            completeBatch(run, batch);
         }
+    }
+
+    private void completeBatch(SrsConsumerRun run, Batch batch) {
+        pending.compute(run, (ignored, queue) -> {
+            if (queue == null || queue.running != batch) throw new IllegalStateException("progress read lost its original queue");
+            if (queue.waiting == null) return null;
+            queue.running = queue.waiting; queue.waiting = null;
+            queue.running.ready.complete(null); return queue;
+        });
     }
 
     private static final class Queue {

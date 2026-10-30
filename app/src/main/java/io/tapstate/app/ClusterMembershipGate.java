@@ -32,6 +32,8 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
 
     /** A publication changes the revision even when the visible members have not changed. */
     record VisibleSnapshot(long revision, Set<String> nodeIds, boolean originalSingleVisible) {}
+    // The single member bootstrap publishes one immutable owner identity.
+    @SuppressWarnings("java:S3077")
     private volatile WorkloadOwner singleOwner;
     private final AtomicReference<BooleanSupplier> nodeSession = new AtomicReference<>(() -> false);
 

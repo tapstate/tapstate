@@ -163,6 +163,8 @@ public final class SnapshotPhase {
     public static Load openPrepared(CapturePort port,CaptureConfig config,SrsSnapshotPreparation preparation) {
         return openPrepared(port,config,preparation,java.util.function.UnaryOperator.identity());
     }
+    // The returned Load owns the session wrapper; failure paths close the first batch and session.
+    @SuppressWarnings("java:S2095")
     public static Load openPrepared(CapturePort port,CaptureConfig config,SrsSnapshotPreparation preparation,
             java.util.function.UnaryOperator<SnapshotSession> owner) {
         Objects.requireNonNull(port,"port"); Objects.requireNonNull(config,"config"); Objects.requireNonNull(preparation,"preparation");
@@ -198,6 +200,8 @@ public final class SnapshotPhase {
     public static Load openDirectPrepared(CapturePort port,CaptureConfig config,DirectSnapshotPreparation preparation) {
         return openDirectPrepared(port,config,preparation,java.util.function.UnaryOperator.identity());
     }
+    // The returned Load owns the session wrapper; failure paths close the first batch and session.
+    @SuppressWarnings("java:S2095")
     public static Load openDirectPrepared(CapturePort port,CaptureConfig config,DirectSnapshotPreparation preparation,
             java.util.function.UnaryOperator<SnapshotSession> owner) {
         Objects.requireNonNull(port,"port");Objects.requireNonNull(config,"config");Objects.requireNonNull(preparation,"preparation");
