@@ -597,6 +597,22 @@ class AuthTest {
     }
 
     @Test
+    void packagedRootImagesArePublicWithoutIndividualAllowlistEntries() {
+        HttpStatusCode status = client().get().uri("/tapstate-lockup-dark.svg")
+                .exchange((request, response) -> response.getStatusCode());
+        assertThat(status).isEqualTo(HttpStatus.OK);
+        HttpStatusCode head = client().head().uri("/tapstate-lockup-dark.svg")
+                .exchange((request, response) -> response.getStatusCode());
+        assertThat(head).isEqualTo(HttpStatus.OK);
+        HttpStatusCode post = client().post().uri("/tapstate-lockup-dark.svg")
+                .exchange((request, response) -> response.getStatusCode());
+        assertThat(post).isEqualTo(HttpStatus.UNAUTHORIZED);
+        HttpStatusCode missing = client().get().uri("/unpackaged-image.svg")
+                .exchange((request, response) -> response.getStatusCode());
+        assertThat(missing).isEqualTo(HttpStatus.UNAUTHORIZED);
+    }
+
+    @Test
     void theControlFaceUsesTwoStatelessSecurityChainsInsteadOfTheLegacyInterceptor() {
         assertThat(context.getBeansOfType(SecurityFilterChain.class)).hasSize(2);
     }
