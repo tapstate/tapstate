@@ -638,6 +638,16 @@ class HttpControlPlaneClientTest {
         return server;
     }
 
+    @Test
+    void deletionWaitsForRetirementWithinTheHeavyBudget() throws Exception {
+        HttpServer server = slowServer("/api/artifacts/flow", 400);
+        try {
+            var client = new HttpControlPlaneClient(Duration.ofMillis(100), Duration.ofSeconds(2));
+            assertThat(client.delete(baseOf(server), "secret", "flow", "a".repeat(64)))
+                    .isInstanceOf(DeleteOutcome.Removed.class);
+        } finally { server.stop(0); }
+    }
+
     // ---- the removal verb over the real transport ----
 
     /**

@@ -115,6 +115,21 @@ class HttpControlClientTest {
     }
 
     @Test
+    void deletionWaitsForRetirementWithinTheHeavyBudgetWithoutRetrying() throws Exception {
+        var calls = new java.util.concurrent.atomic.AtomicInteger();
+        HttpServer server = server(exchange -> {
+            calls.incrementAndGet();
+            try { Thread.sleep(400); } catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
+            answer(exchange, 204, "");
+        });
+        try (var client = new HttpControlClient(Duration.ofMillis(100), Duration.ofSeconds(2))) {
+            assertThat(client.delete(baseOf(server), "secret", "/api/artifacts/flow", "a".repeat(64)))
+                    .isInstanceOf(ControlResponse.Success.class);
+            assertThat(calls.get()).isEqualTo(1);
+        } finally { server.stop(0); }
+    }
+
+    @Test
     void codedHttpFailureRetainsStatusCodeMessageAndParams() throws Exception {
         HttpServer server = server(exchange -> answer(exchange, 403,
                 "{\"code\":\"control.forbidden\",\"message\":\"Forbidden.\","

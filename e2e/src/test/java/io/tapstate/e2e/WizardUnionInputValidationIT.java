@@ -30,9 +30,10 @@ class WizardUnionInputValidationIT {
             mongo.withCreateContainerCmdModifier(command -> command.getHostConfig()
                     .withMemory(1L << 30).withNanoCPUs(1_000_000_000L));
             mongo.start();
-            try (ServerHandle server = tier.launch(mongo.getReplicaSetUrl("wizard_union_validation"))) {
+            try (PreparedNativeStore storage = PreparedNativeStore.createOn(mongo);
+                    ServerHandle server = tier.launch(storage)) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
-                control.bootstrapAndLogin("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
                 String id = "wizard_union_validation";
                 Map<String, Object> saved = control.createPipelineDraft(id, Map.of(
                         "pipelineId", id, "mode", "wizard", "name", "Union input validation",
@@ -75,9 +76,10 @@ class WizardUnionInputValidationIT {
             mongo.withCreateContainerCmdModifier(command -> command.getHostConfig()
                     .withMemory(1L << 30).withNanoCPUs(1_000_000_000L));
             mongo.start();
-            try (ServerHandle server = tier.launch(mongo.getReplicaSetUrl("wizard_cross_branch_union"))) {
+            try (PreparedNativeStore storage = PreparedNativeStore.createOn(mongo);
+                    ServerHandle server = tier.launch(storage)) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
-                control.bootstrapAndLogin("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
                 String id = "wizard_cross_branch_union";
                 Map<String, Object> saved = control.createPipelineDraft(id, Map.of(
                         "pipelineId", id, "mode", "wizard", "name", "Cross-branch union validation",

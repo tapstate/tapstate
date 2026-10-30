@@ -48,9 +48,9 @@ class BothVersionsInPlayAreReportedIT {
 
     @Test
     void theServerLineCarriesWhatTheServerItselfAnswered() {
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(SharedMongo.replicaSetUrl("e2e_cli_version"))) {
+        try (var storage = PreparedNativeStore.create(USER, PASSWORD); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin(USER, PASSWORD);
+            storage.loginAndAwaitBusiness(control);
 
             // Read straight from the server first, so what the CLI prints is checked against a second,
             // independent reader of the same endpoint rather than against a constant this test holds.
@@ -96,10 +96,9 @@ class BothVersionsInPlayAreReportedIT {
 
     @Test
     void aConnectedStopRefusalNamesTheServersVersion(@TempDir Path home) {
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(
-                SharedMongo.replicaSetUrl("e2e_cli_diagnostic_version"))) {
+        try (var storage = PreparedNativeStore.create(USER, PASSWORD); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin(USER, PASSWORD);
+            storage.loginAndAwaitBusiness(control);
             String reportedByTheServer = control.version();
             assertThat(reportedByTheServer).isNotBlank();
 

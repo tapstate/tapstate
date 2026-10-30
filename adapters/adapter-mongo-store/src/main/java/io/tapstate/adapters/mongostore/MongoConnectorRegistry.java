@@ -269,13 +269,13 @@ public final class MongoConnectorRegistry implements ConnectorRegistry {
     }
 
     /** One exact allocation avoids both geometric expansion and a second full-size return copy. */
-    private static final class ExactArtifactBytes extends OutputStream {
+    static final class ExactArtifactBytes extends OutputStream {
         private final String contentHash;
         private final byte[] bytes;
         private int position;
         private RuntimeException writeFailure;
 
-        private ExactArtifactBytes(String contentHash, long length) {
+        ExactArtifactBytes(String contentHash, long length) {
             // Stay within the conservative Java array bound, including the VM header reserve.
             if (length < 0 || length > Integer.MAX_VALUE - 8L) throw unreadable(contentHash, "artifact");
             this.contentHash = contentHash;
@@ -311,7 +311,7 @@ public final class MongoConnectorRegistry implements ConnectorRegistry {
             return failure;
         }
 
-        private byte[] complete() {
+        byte[] complete() {
             if (position != bytes.length) throw unreadable(contentHash, "artifact");
             return bytes;
         }

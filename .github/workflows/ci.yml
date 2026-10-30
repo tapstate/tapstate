@@ -56,6 +56,14 @@ jobs:
             ${{ runner.temp }}/ci-event-inputs.json
           if-no-files-found: error
           retention-days: 7
+      - name: Prepare the verified Mongo dependency for managed-target examples
+        run: python3 deploy/cloud/prepare-test-inputs.py --mongodb-only --output "$RUNNER_TEMP/managed-mongo"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: managed-mongo-test-input
+          path: ${{ runner.temp }}/managed-mongo/
+          if-no-files-found: error
+          retention-days: 7
 
   test-shards:
     name: test-shards (${{ matrix.shard }})
@@ -72,6 +80,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        if: startsWith(matrix.shard, 'e2e-')
+        with:
+          name: managed-mongo-test-input
+          path: ${{ runner.temp }}/managed-mongo/
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -113,7 +126,7 @@ jobs:
           shard = next((item for item in plan["shards"] if item["id"] == sys.argv[2]), None)
           if shard is None:
               raise SystemExit("unknown test shard")
-          cloud_context_test = "io.tapstate.e2e.CloudClusterContextCarriesTheCurrentEgressAddressIT"
+          cloud_context_test = "io.tapstate.app.CloudClusterContextCarriesTheCurrentEgressAddressIT"
           print("true" if any(test["class"] == cloud_context_test for test in shard["tests"]) else "false")
           PY
           )"
@@ -149,6 +162,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p "$RUNNER_TEMP/test-tmp"
+          if [[ "$SHARD" == e2e-* ]]; then
+            export MAVEN_ARGS="$MAVEN_ARGS -Dtapstate.e2e.managed-mongo-jar=$RUNNER_TEMP/managed-mongo/mongodb-connector.jar"
+          fi
           .github/scripts/ci-pr-work.sh --root . --event-inputs "$RUNNER_TEMP/ci-event-inputs.json" --output "$RUNNER_TEMP/ci-inputs/pr-work-verify.json" --phase verify -- .github/scripts/ci-shard.sh run --plan "$RUNNER_TEMP/shards.json" --shard "$SHARD" --repo-local "$RUNNER_TEMP/m2" --case-evidence --build-inputs "$RUNNER_TEMP/ci-inputs/build-inputs.json" --class-gate-dir "$RUNNER_TEMP/ci-inputs/class-gates" --runtime-class-dir "$RUNNER_TEMP/ci-runtime-bytecode"
       - name: Record the observed test identity hashes
         if: always()
@@ -578,12 +594,15 @@ jobs:
         run: |
           bash deploy/docker/image-smoke-test.sh
           bash deploy/docker/image-smoke-fixture-test.sh
+          PYTHONDONTWRITEBYTECODE=1 python3 deploy/docker/native-install-smoke-test.py
       - name: Web asset packaging cases
         run: bash scripts/prepare-web-assets-smoke.sh
       - name: Web release provenance cases
         run: python3 .github/scripts/web-provenance-smoke.py
       - name: Cloud connector input and test-preparation cases
-        run: python3 deploy/cloud/stage-connectors-test.py
+        run: |
+          python3 deploy/cloud/stage-connectors-test.py
+          PYTHONDONTWRITEBYTECODE=1 python3 deploy/cloud/prepare-test-inputs-test.py
       - name: Cloud image runtime helper cases
         run: |
           node --test deploy/cloud/image-runtime-probe.test.mjs
@@ -826,4 +845,8 @@ jobs:
         run: |
           java -XshowSettings:properties -version 2>&1 | grep -Fx '    java.runtime.version = 21.0.13+9-LTS'
       - name: image smoke (builds the boot jar + image, then runs the black-box checks)
-        run: bash deploy/docker/image-smoke.sh --build
+        env:
+          TAPSTATE_TEST_CLOUD_RELEASE_DIR: ${{ runner.temp }}/image-test-release
+        run: |
+          python3 deploy/cloud/prepare-test-inputs.py --output "$TAPSTATE_TEST_CLOUD_RELEASE_DIR"
+          bash deploy/docker/image-smoke.sh --build

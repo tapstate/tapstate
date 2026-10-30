@@ -45,7 +45,7 @@ class VocabularyTest {
 
     @Test
     void bodiedStepWordsAreTheOnesTheParserAccepts() {
-        assertThat(Vocabulary.BODIED_STEPS).containsExactly("assert", "await", "cdc");
+        assertThat(Vocabulary.BODIED_STEPS).containsExactly("assert", "await", "cdc", "start_refused");
     }
 
     @Test
@@ -59,12 +59,13 @@ class VocabularyTest {
     /**
      * The order is the dependency order, and it is asserted rather than assumed: {@code databases} is the
      * harness's own and must come first, because a resource cannot be applied before the endpoint whose
-     * address it interpolates exists. The remaining three are the product's own verbs, in their order.
+     * address it interpolates exists. The managed target is installation input; the remaining three
+     * are the product's own verbs, in their order.
      */
     @Test
     void setupKeysAreTheSetupsOwnComponents() {
         assertThat(Vocabulary.SETUP_KEYS)
-                .containsExactly("databases", "connectors", "apply", "discover");
+                .containsExactly("databases", "managed_target", "connectors", "apply", "discover");
     }
 
     @Test

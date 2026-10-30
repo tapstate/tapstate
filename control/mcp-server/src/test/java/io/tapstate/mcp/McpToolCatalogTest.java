@@ -18,7 +18,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class McpToolCatalogTest {
 
     private static final List<String> READ_TOOLS = List.of(
-            "system_version",
+            "storage_status", "storage_setup_status", "storage_recovery_status", "configuration_import_status", "system_version",
             "connector_list", "connector_get",
             "source_draft", "source_list",
             "connection_test_result", "connection_schema", "artifact_validate", "artifact_get",
@@ -27,7 +27,7 @@ class McpToolCatalogTest {
             "data_browser_collections", "data_browser_find", "data_browser_stats");
 
     private static final List<String> WRITE_TOOLS = List.of(
-            "artifact_apply", "artifact_delete", "connection_test", "connection_discover_schema",
+            "storage_test", "storage_setup_commit", "storage_recovery_plan", "storage_recovery_confirm", "configuration_export", "configuration_import_preflight", "configuration_import_commit", "artifact_apply", "artifact_delete", "connection_test", "connection_discover_schema",
             "pipeline_start", "pipeline_stop", "pipeline_pause", "pipeline_resume");
 
     /**
@@ -118,7 +118,7 @@ class McpToolCatalogTest {
     }
 
     @Test
-    void allowWriteAddsExactlyTheEightWriteTools() {
+    void allowWriteAddsExactlyTheRegisteredWriteTools() {
         assertThat(McpToolCatalog.operations(true).stream().map(McpToolCatalog::toolName))
                 .containsExactlyInAnyOrderElementsOf(concat(READ_TOOLS, WRITE_TOOLS));
     }

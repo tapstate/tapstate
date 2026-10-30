@@ -7,13 +7,12 @@ import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
-import io.tapstate.adapters.mongostore.MongoSrsLogStore;
-import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.adapters.mongostore.SystemCollections;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.runtime.srs.CaptureError;
 import io.tapstate.runtime.srs.SrsRingbuffer;
-import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.testsupport.DockerGate;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -55,25 +54,25 @@ class IndependentCdcRecoveryIT {
     void mailConfirmedAfterAPendingHighCannotMakeAProcessRestartSkipThatHigh(
             String readMode, @TempDir Path temporary) throws Exception {
         Fixture fixture = fixture(temporary, "shared_restart_" + readMode);
-        try (MongoClient reader = MongoClients.create(fixture.storeUri())) {
-            MongoDatabase database = database(reader, fixture.storeUri());
+        try (fixture; MongoClient reader = MongoClients.create(fixture.storage().cacheUri())) {
+            MongoDatabase database = database(reader, fixture.storage().cacheUri());
             Document high;
             List<Path> originalStreams;
-            try (RealProcessServer first = RealProcessServer.start(fixture.storeUri())) {
+            try (RealProcessServer first = launch(fixture, List.of("-Xmx768m", "-XX:ActiveProcessorCount=2"))) {
                 ControlPlane control = start(first, fixture, readMode, true, false);
                 high = pendingWindow(control, fixture, database, MAIL);
                 originalStreams = CdcRecoveryFixture.streams(fixture.source());
                 assertThat(activeStreams(originalStreams)).as("one physical capture serves both nodes").isEqualTo(1);
-                assertThat(consumer(database, ROOT_PIPELINE, ROOT_SOURCE).getString("miningChainId"))
-                        .isEqualTo(consumer(database, MAIL_PIPELINE, MAIL_SOURCE).getString("miningChainId"));
+                assertThat(consumer(fixture, database, ROOT_PIPELINE, ROOT_SOURCE).getString("miningChainId"))
+                        .isEqualTo(consumer(fixture, database, MAIL_PIPELINE, MAIL_SOURCE).getString("miningChainId"));
                 assertThat(priority(fixture.rootTarget(), ROOT, "1")).isEqualTo("Low");
                 first.kill();
             }
 
             Files.writeString(fixture.signals().resolve("release"), "");
             long restartedFrom = System.nanoTime();
-            try (RealProcessServer second = RealProcessServer.start(fixture.storeUri())) {
-                ControlPlane control = loggedIn(second);
+            try (RealProcessServer second = launch(fixture, List.of("-Xmx768m", "-XX:ActiveProcessorCount=2"))) {
+                ControlPlane control = loggedIn(second, fixture);
                 awaitPriority(control, fixture, fixture.rootTarget(), ROOT, "1", "High");
                 long recoveryMillis = Duration.ofNanos(System.nanoTime() - restartedFrom).toMillis();
                 Await.until("the replacement capture to resume after the already logged mail batch", TIMEOUT,
@@ -90,10 +89,10 @@ class IndependentCdcRecoveryIT {
                 long originalSequence = number(high.get("_id", Document.class), "seq");
                 Await.until("the replayed High to retain its original capture generation at confirmation", TIMEOUT,
                         () -> {
-                            Document confirmed = tableConfirmation(consumer(database, ROOT_PIPELINE, ROOT_SOURCE), ROOT);
-                            return confirmed != null && number(confirmed, "sinkAckedEpoch") == originalEpoch
-                                    && number(confirmed, "sinkAckedSeq") >= originalSequence;
-                        }, () -> String.valueOf(consumer(database, ROOT_PIPELINE, ROOT_SOURCE)));
+                            Document confirmed = tableConfirmation(consumer(fixture, database, ROOT_PIPELINE, ROOT_SOURCE), ROOT);
+                            return confirmed != null && number(confirmed, "epoch") == originalEpoch
+                                    && number(confirmed, "sequence") >= originalSequence;
+                        }, () -> String.valueOf(consumer(fixture, database, ROOT_PIPELINE, ROOT_SOURCE)));
                 long wroteFrom = System.nanoTime();
                 CdcRecoveryFixture.change(fixture.source(), 6, ROOT, "3", "", "after-restart");
                 awaitPriority(control, fixture, fixture.rootTarget(), ROOT, "3", "after-restart");
@@ -120,12 +119,12 @@ class IndependentCdcRecoveryIT {
     private static void independentDirectChannels(String readMode, Path temporary, boolean retainStopEvidence)
             throws Exception {
         Fixture fixture = fixture(temporary, "direct_channels_" + readMode);
-        try (MongoClient reader = MongoClients.create(fixture.storeUri());
+        try (fixture; MongoClient reader = MongoClients.create(fixture.storage().cacheUri());
                 // Match the failing runner's CPU count, which also sizes the JVM's shared async pool.
                 RealProcessServer server = retainStopEvidence
-                        ? RealProcessServer.startInJvm(fixture.storeUri(), List.of("-XX:ActiveProcessorCount=4"))
-                        : RealProcessServer.start(fixture.storeUri())) {
-            MongoDatabase database = database(reader, fixture.storeUri());
+                        ? launch(fixture, List.of("-XX:ActiveProcessorCount=4"))
+                        : launch(fixture, List.of("-Xmx768m", "-XX:ActiveProcessorCount=2"))) {
+            MongoDatabase database = database(reader, fixture.storage().cacheUri());
             ControlPlane control = start(server, fixture, readMode, false, true);
             CdcRecoveryFixture.change(fixture.source(), 1, ROOT, "1", "Low", "Low");
             awaitSourceBatch(fixture, 1, 2);
@@ -135,12 +134,12 @@ class IndependentCdcRecoveryIT {
             awaitPriority(control, fixture, fixture.rootTarget(), ROOT, "2", "baseline");
             awaitPriority(control, fixture, fixture.mailTarget(), ROOT, "2", "baseline");
             Await.until("both direct channels to confirm their first source batch", TIMEOUT,
-                    () -> sourceSequence(consumer(database, ROOT_PIPELINE, ROOT_SOURCE)) >= 1
-                            && sourceSequence(consumer(database, MAIL_PIPELINE, MAIL_SOURCE)) >= 1,
-                    () -> consumersText(database));
-            assertThat(consumer(database, ROOT_PIPELINE, ROOT_SOURCE).getString("miningChainId"))
+                    () -> sourceSequence(directConsumer(fixture, database, ROOT_PIPELINE, ROOT_SOURCE)) >= 1
+                            && sourceSequence(directConsumer(fixture, database, MAIL_PIPELINE, MAIL_SOURCE)) >= 1,
+                    () -> consumersText(fixture, database));
+            assertThat(directConsumer(fixture, database, ROOT_PIPELINE, ROOT_SOURCE).get("_id", Document.class).getString("channelId"))
                     .as("identical physical-source configuration must not mix independent channel recovery records")
-                    .isNotEqualTo(consumer(database, MAIL_PIPELINE, MAIL_SOURCE).getString("miningChainId"));
+                    .isNotEqualTo(directConsumer(fixture, database, MAIL_PIPELINE, MAIL_SOURCE).get("_id", Document.class).getString("channelId"));
             assertThat(activeStreams(CdcRecoveryFixture.streams(fixture.source()))).isEqualTo(2);
 
             hold(fixture);
@@ -151,9 +150,9 @@ class IndependentCdcRecoveryIT {
             CdcRecoveryFixture.change(fixture.source(), 4, ROOT, "3", "", "later");
             awaitPriority(control, fixture, fixture.mailTarget(), ROOT, "3", "later");
             Await.until("the fast channel to confirm High without confirming the held channel", TIMEOUT,
-                    () -> sourceSequence(consumer(database, MAIL_PIPELINE, MAIL_SOURCE)) >= 3
-                            && sourceSequence(consumer(database, ROOT_PIPELINE, ROOT_SOURCE)) < 3,
-                    () -> consumersText(database));
+                    () -> sourceSequence(directConsumer(fixture, database, MAIL_PIPELINE, MAIL_SOURCE)) >= 3
+                            && sourceSequence(directConsumer(fixture, database, ROOT_PIPELINE, ROOT_SOURCE)) < 3,
+                    () -> consumersText(fixture, database));
 
             if (retainStopEvidence) {
                 // Mail has confirmed the reported later change. Fill the held channel's remaining writers
@@ -215,16 +214,27 @@ class IndependentCdcRecoveryIT {
                         .append("writeReleased", Files.exists(fixture.signals().resolve("release")));
                 for (String pipeline : List.of(ROOT_PIPELINE, MAIL_PIPELINE)) {
                     Document state = new Document();
-                    for (String collection : List.of(MongoStorePort.PIPELINE_DESIRED,
-                            MongoStorePort.PIPELINE_STATE, MongoStorePort.PIPELINE_OBSERVATION)) {
-                        state.append(collection, database.getCollection(collection)
-                                .find(new Document("_id", pipeline)).first());
+                    try (var configuration = MongoClients.create(fixture.storage().configurationUri())) {
+                        var intent = SystemCollections.PIPELINE_INTENTS.on(configuration.getDatabase(fixture.storage().configurationDatabase()))
+                                .find(new Document("_id", pipeline)).first();
+                        state.append("pipeline_intents", intent);
+                        for (var collection : List.of(SystemCollections.CACHE_PIPELINE_STATE, SystemCollections.CACHE_PIPELINE_OBSERVATION)) {
+                            var row = collection.on(database).find(new Document("_id", pipeline)).first();
+                            if (row != null) {
+                                var scope = row.get("scope", Document.class);
+                                assertThat(scope.getString("clusterId")).isEqualTo(fixture.srs().scope().clusterId());
+                                assertThat(scope.getLong("bindingVersion")).isEqualTo(fixture.srs().scope().bindingVersion());
+                                assertThat(scope.getString("cacheIncarnation")).isEqualTo(fixture.srs().scope().cacheIncarnation());
+                                assertThat(scope.getLong("stateGeneration")).isEqualTo(intent.getLong("stateGeneration"));
+                            }
+                            state.append(collection.name(), row);
+                        }
                     }
                     snapshot.append(pipeline, state);
                 }
                 Files.writeString(sample.resolve("state.json"), snapshot.toJson());
                 Files.writeString(sample.resolve("streams.txt"), streamText(fixture));
-                Files.writeString(sample.resolve("consumers.txt"), consumersText(database));
+                Files.writeString(sample.resolve("consumers.txt"), consumersText(fixture, database));
                 Files.copy(server.output(), sample.resolve("server.log"));
                 Process dump = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "jcmd").toString(),
                         Long.toString(server.pid()), "Thread.print", "-l")
@@ -255,9 +265,9 @@ class IndependentCdcRecoveryIT {
     void aPausedConsumerDoesNotPinDurableCaptureAtTheHotRingCapacity(@TempDir Path temporary)
             throws Exception {
         Fixture fixture = fixture(temporary, "paused_consumer_headroom");
-        try (MongoClient reader = MongoClients.create(fixture.storeUri());
-                RealProcessServer server = RealProcessServer.start(fixture.storeUri())) {
-            MongoDatabase database = database(reader, fixture.storeUri());
+        try (fixture; MongoClient reader = MongoClients.create(fixture.storage().cacheUri());
+                RealProcessServer server = launch(fixture, List.of("-Xmx768m", "-XX:ActiveProcessorCount=2"))) {
+            MongoDatabase database = database(reader, fixture.storage().cacheUri());
             ControlPlane control = start(server, fixture, "snapshot_and_cdc", true, false);
             CdcRecoveryFixture.change(fixture.source(), 1, ROOT, "1", "Low", "Low");
             awaitSourceBatch(fixture, 1, 1);
@@ -265,7 +275,7 @@ class IndependentCdcRecoveryIT {
             awaitPriority(control, fixture, fixture.rootTarget(), ROOT, "2", "Low");
             control.lifecycle(ROOT_PIPELINE, LifecycleVerb.PAUSE);
             awaitState(control, ROOT_PIPELINE, PipelineState.PAUSED);
-            Document paused = consumer(database, ROOT_PIPELINE, ROOT_SOURCE);
+            Document paused = consumer(fixture, database, ROOT_PIPELINE, ROOT_SOURCE);
             assertThat(paused).isNotNull();
             long readBefore = tableSequence(paused, "perTableSeq", ROOT);
             long confirmedBefore = tableSequence(paused, "perTableRingDone", ROOT);
@@ -275,11 +285,11 @@ class IndependentCdcRecoveryIT {
             CdcRecoveryFixture.change(fixture.source(), 2051, MAIL, "1", "", "capture-barrier");
             awaitPriority(control, fixture, fixture.mailTarget(), MAIL, "1", "capture-barrier");
             long elapsedMillis = Duration.ofNanos(System.nanoTime() - started).toMillis();
-            Document stillPaused = consumer(database, ROOT_PIPELINE, ROOT_SOURCE);
+            Document stillPaused = consumer(fixture, database, ROOT_PIPELINE, ROOT_SOURCE);
             assertThat(tableSequence(stillPaused, "perTableSeq", ROOT)).isEqualTo(readBefore);
             assertThat(tableSequence(stillPaused, "perTableRingDone", ROOT)).isEqualTo(confirmedBefore);
             String ring = ring(stillPaused, ROOT);
-            assertThat(database.getCollection(MongoStorePort.SRS_LOG).countDocuments(new Document("_id.ring", ring)))
+            assertThat(SystemCollections.SRS_EVENTS.on(database).countDocuments(new Document("_id.ring", ring)))
                     .as("unprocessed changes are retained beyond the configured 1024-slot hot ring")
                     .isGreaterThan(1024);
             List<String> batches = streams.stream().flatMap(path -> CdcRecoveryFixture.lines(path).stream())
@@ -307,9 +317,9 @@ class IndependentCdcRecoveryIT {
     void aFullReloadDoesNotReplayRetainedLowOverItsNewerHighSnapshot(@TempDir Path temporary)
             throws Exception {
         Fixture fixture = fixture(temporary, "reload_snapshot_seam");
-        try (MongoClient reader = MongoClients.create(fixture.storeUri());
-                RealProcessServer server = RealProcessServer.start(fixture.storeUri())) {
-            MongoDatabase database = database(reader, fixture.storeUri());
+        try (fixture; MongoClient reader = MongoClients.create(fixture.storage().cacheUri());
+                RealProcessServer server = launch(fixture, List.of("-Xmx768m", "-XX:ActiveProcessorCount=2"))) {
+            MongoDatabase database = database(reader, fixture.storage().cacheUri());
             Path retainingTarget = Files.createDirectory(temporary.resolve("retaining-target"));
             ControlPlane control = start(server, fixture, "snapshot_and_cdc", true, false, retainingTarget);
             control.lifecycle(RETAINING_PIPELINE, LifecycleVerb.PAUSE);
@@ -318,14 +328,14 @@ class IndependentCdcRecoveryIT {
             CdcRecoveryFixture.change(fixture.source(), 2, ROOT, "2", "", "barrier");
             awaitPriority(control, fixture, fixture.rootTarget(), ROOT, "2", "barrier");
             Document retainedLow = Await.answered("the captured Low retained on the shared log", TIMEOUT,
-                    () -> java.util.Optional.ofNullable(logRecord(database, ROOT, "1", "Low")));
+                    () -> java.util.Optional.ofNullable(logRecord(fixture, database, ROOT, "1", "Low")));
             control.stop(ROOT_PIPELINE, true);
             awaitState(control, ROOT_PIPELINE, PipelineState.STOPPED);
             FileEndpoints.replaceTable(fixture.source().resolve(ROOT + ".csv"), "id,priority\n1,High\n");
             Files.deleteIfExists(fixture.rootTarget().resolve(ROOT + ".csv"));
             control.lifecycle(ROOT_PIPELINE, LifecycleVerb.START);
             awaitPriority(control, fixture, fixture.rootTarget(), ROOT, "1", "High");
-            assertThat(database.getCollection(MongoStorePort.SRS_LOG)
+            assertThat(SystemCollections.SRS_EVENTS.on(database)
                     .find(new Document("_id", retainedLow.get("_id"))).first())
                     .as("the older value is still available to a wrongly positioned replay reader")
                     .isNotNull();
@@ -346,50 +356,71 @@ class IndependentCdcRecoveryIT {
     void aRestartRefusesMissingOrUnprovenRecoveryHistory(LostHistory loss, @TempDir Path temporary)
             throws Exception {
         Fixture fixture = fixture(temporary, "lost_history_" + loss.name().toLowerCase(java.util.Locale.ROOT));
-        try (MongoClient reader = MongoClients.create(fixture.storeUri())) {
-            MongoDatabase database = database(reader, fixture.storeUri());
+        try (fixture; MongoClient reader = MongoClients.create(fixture.storage().cacheUri())) {
+            MongoDatabase database = database(reader, fixture.storage().cacheUri());
             Document high;
-            try (RealProcessServer first = RealProcessServer.start(fixture.storeUri())) {
+            try (RealProcessServer first = launch(fixture, List.of("-Xmx768m", "-XX:ActiveProcessorCount=2"))) {
                 high = pendingWindow(start(first, fixture, "snapshot_and_cdc", true, false), fixture, database, MAIL);
                 first.kill();
             }
-            MongoCollection<Document> log = database.getCollection(MongoStorePort.SRS_LOG);
+            MongoCollection<Document> log = SystemCollections.SRS_EVENTS.on(database);
+            Document damagedProgress = null;
             switch (loss) {
-                case HOLE -> log.deleteOne(new Document("_id", high.get("_id")));
-                case TRIMMED -> new MongoSrsLogStore(log).trim(
-                        high.get("_id", Document.class).getString("ring"),
-                        number(high.get("_id", Document.class), "seq"));
-                case OLD_GENERATION -> log.updateOne(new Document("_id", high.get("_id")),
-                        new Document("$unset", new Document("epoch", "")));
-                case OLD_PROGRESS -> {
-                    Document old = consumer(database, ROOT_PIPELINE, ROOT_SOURCE);
-                    database.getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS)
-                            .deleteOne(new Document("_id", old.get("_id")));
-                    old.put("_id", new Document("chain", old.getString("miningChainId"))
-                            .append("pipeline", ROOT_PIPELINE));
-                    old.put("pipelineId", ROOT_PIPELINE);
-                    for (String field : List.of("ownerPipelineId", "sourceNodeId", "progressKind", "sinkAckedByTable")) {
-                        old.remove(field);
+                case HOLE -> assertThat(log.deleteOne(new Document("_id", high.get("_id"))).getDeletedCount()).isEqualTo(1);
+                case TRIMMED -> {
+                    var key = high.get("_id", Document.class);
+                    String ring = key.getString("ring"); long through = number(key, "seq");
+                    var bounds = SystemCollections.SRS_LOG_BOUNDS.on(database);
+                    var original = bounds.find(new Document("_id", "srs-log-bounds:" + ring)).first();
+                    assertThat(original).isNotNull();
+                    assertThat(number(original, "largestSequence")).isGreaterThanOrEqualTo(through);
+                    assertThat(number(original, "trimmedThrough")).isLessThan(through);
+                    try (var session = reader.startSession()) {
+                        session.withTransaction(() -> {
+                            assertThat(bounds.updateOne(session, new Document("_id", original.get("_id")),
+                                    new Document("$set", new Document("trimmedThrough", through))).getModifiedCount()).isEqualTo(1);
+                            assertThat(log.deleteMany(session, new Document("_id.ring", ring)
+                                    .append("_id.seq", new Document("$lte", through))).getDeletedCount()).isPositive();
+                            return null;
+                        });
                     }
-                    database.getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS).insertOne(old);
+                    assertThat(log.find(new Document("_id", high.get("_id"))).first()).isNull();
+                }
+                case OLD_GENERATION -> assertThat(log.updateOne(new Document("_id", high.get("_id")),
+                        new Document("$unset", new Document("epoch", ""))).getModifiedCount()).isEqualTo(1);
+                case OLD_PROGRESS -> {
+                    Document original = consumer(fixture, database, ROOT_PIPELINE, ROOT_SOURCE);
+                    assertThat(original).isNotNull();
+                    damagedProgress = SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(database)
+                            .find(new Document("_id", original.get("_id"))).first();
+                    assertThat(damagedProgress).isNotNull();
+                    damagedProgress.remove("progress");
+                    // Current progress is mandatory; no unscoped legacy row can replace its original cursor.
+                    assertThat(SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(database).updateOne(
+                            new Document("_id", original.get("_id")), new Document("$unset", new Document("progress", "")))
+                            .getModifiedCount()).isEqualTo(1);
                 }
             }
             Files.writeString(fixture.signals().resolve("release"), "");
-            try (RealProcessServer second = RealProcessServer.start(fixture.storeUri())) {
-                ControlPlane control = loggedIn(second);
+            try (RealProcessServer second = launch(fixture, List.of("-Xmx768m", "-XX:ActiveProcessorCount=2"))) {
+                ControlPlane control = loggedIn(second, fixture);
                 awaitState(control, ROOT_PIPELINE, PipelineState.FAILED);
-                String code = loss == LostHistory.OLD_PROGRESS
-                        ? CaptureError.RECOVERY_PROGRESS_UNPROVEN.code() : CaptureError.RECOVERY_LOG_GAP.code();
+                String code = switch (loss) {
+                    case OLD_PROGRESS -> IoError.DOCUMENT_UNREADABLE.code();
+                    case OLD_GENERATION -> IoError.SRS_EVENT_MODEL_UNAVAILABLE.code();
+                    case TRIMMED -> CaptureError.RECOVERY_LOG_GAP.code();
+                    case HOLE -> IoError.SRS_CHECKPOINT_UNPROVEN.code();
+                };
                 Await.until("the failed pipeline to expose its recovery diagnostic", TIMEOUT,
                         () -> control.logs(ROOT_PIPELINE).contains(code),
                         () -> control.logs(ROOT_PIPELINE));
                 assertThat(priority(fixture.rootTarget(), ROOT, "1")).isEqualTo("Low");
-                assertThat(database.getCollection(MongoStorePort.SRS_META).countDocuments()).isPositive();
+                assertThat(SystemCollections.SRS_CHAINS.on(database).countDocuments()).isPositive();
                 if (loss == LostHistory.OLD_PROGRESS) {
-                    assertThat(database.getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS)
-                            .find(new Document("pipelineId", ROOT_PIPELINE)).first())
-                            .as("refusing ambiguous old progress preserves the user's retained state")
-                            .isNotNull();
+                    assertThat(SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(database)
+                            .find(new Document("_id", damagedProgress.get("_id"))).first())
+                            .as("refusing incomplete native progress preserves the original cursor identity")
+                            .isEqualTo(damagedProgress);
                 }
             }
         }
@@ -402,8 +433,8 @@ class IndependentCdcRecoveryIT {
         CdcRecoveryFixture.change(fixture.source(), 2, ROOT, "2", "", "baseline");
         awaitPriority(control, fixture, fixture.rootTarget(), ROOT, "2", "baseline");
         Await.until("the root's first change to be safely confirmed", TIMEOUT,
-                () -> tableSequence(consumer(database, ROOT_PIPELINE, ROOT_SOURCE), "perTableRingDone", ROOT) >= 0,
-                () -> consumersText(database));
+                () -> tableSequence(consumer(fixture, database, ROOT_PIPELINE, ROOT_SOURCE), "perTableRingDone", ROOT) >= 0,
+                () -> consumersText(fixture, database));
         hold(fixture);
         CdcRecoveryFixture.change(fixture.source(), 3, ROOT, "1", "Low", "High");
         Await.until("High to reach the held target write", TIMEOUT,
@@ -413,17 +444,17 @@ class IndependentCdcRecoveryIT {
         CdcRecoveryFixture.change(fixture.source(), 5, secondTable, "2", "", "mail-barrier");
         awaitPriority(control, fixture, fixture.mailTarget(), secondTable, "2", "mail-barrier");
         Document high = Await.answered("the unconfirmed High durably captured before mail", TIMEOUT,
-                () -> java.util.Optional.ofNullable(logRecord(database, ROOT, "1", "High")));
+                () -> java.util.Optional.ofNullable(logRecord(fixture, database, ROOT, "1", "High")));
         long highSequence = number(high.get("_id", Document.class), "seq");
         Await.until("mail to be confirmed while High has only been read", TIMEOUT,
-                () -> tableSequence(consumer(database, ROOT_PIPELINE, ROOT_SOURCE), "perTableSeq", ROOT) >= highSequence
-                        && tableSequence(consumer(database, ROOT_PIPELINE, ROOT_SOURCE), "perTableRingDone", ROOT) < highSequence
-                        && tableSequence(consumer(database, MAIL_PIPELINE, MAIL_SOURCE), "perTableRingDone", secondTable) >= 0,
-                () -> consumersText(database));
-        Document source = database.getCollection(MongoStorePort.SRS_META)
-                .find(new Document("_id", consumer(database, ROOT_PIPELINE, ROOT_SOURCE).getString("miningChainId"))).first();
-        assertThat(source).containsEntry("sourceReadDurable", true);
-        assertThat(sourceSequence(source, "sourceReadOffset"))
+                () -> tableSequence(consumer(fixture, database, ROOT_PIPELINE, ROOT_SOURCE), "perTableSeq", ROOT) >= highSequence
+                        && tableSequence(consumer(fixture, database, ROOT_PIPELINE, ROOT_SOURCE), "perTableRingDone", ROOT) < highSequence
+                        && tableSequence(consumer(fixture, database, MAIL_PIPELINE, MAIL_SOURCE), "perTableRingDone", secondTable) >= 0,
+                () -> consumersText(fixture, database));
+        Document source = SystemCollections.SRS_CHAINS.on(database)
+                .find(new Document("_id", consumer(fixture, database, ROOT_PIPELINE, ROOT_SOURCE).getString("miningChainId"))).first();
+        assertThat(source.get("checkpoint", Document.class)).isNotNull();
+        assertThat(sourceSequence(source.get("checkpoint", Document.class)))
                 .as("the shared source checkpoint names the complete durable batch, despite root High pending")
                 .isEqualTo(5L);
         return high;
@@ -438,10 +469,14 @@ class IndependentCdcRecoveryIT {
         FileEndpoints.replaceTable(source.resolve(ROOT + ".csv"), "id,priority\n1,Low\n");
         FileEndpoints.replaceTable(source.resolve(MAIL + ".csv"), "id,priority\n");
         Path delegate = E2eConnectorJar.buildInto(Files.createDirectory(temporary.resolve("connector")));
-        // Independent invocations may share a scenario name, but must not inherit its users or checkpoints.
-        String isolatedDatabase = database + "_" + java.util.UUID.randomUUID().toString().replace("-", "").substring(0, 16);
-        return new Fixture(source, rootTarget, mailTarget, signals, SharedMongo.replicaSetUrl(isolatedDatabase),
-                CdcRecoveryFixture.connectorJar(delegate));
+        var connector = CdcRecoveryFixture.connectorJar(delegate);
+        var storage = PreparedNativeStore.create();
+        try {
+            return new Fixture(source, rootTarget, mailTarget, signals, storage, new NativeSrsDocuments(storage), connector);
+        } catch (RuntimeException | Error failed) {
+            try { storage.close(); } catch (RuntimeException cleanup) { failed.addSuppressed(cleanup); }
+            throw failed;
+        }
     }
 
     private static ControlPlane start(ServerHandle server, Fixture fixture, String readMode,
@@ -452,7 +487,7 @@ class IndependentCdcRecoveryIT {
     private static ControlPlane start(ServerHandle server, Fixture fixture, String readMode,
             boolean srs, boolean secondReadsRoot, Path retainingTarget) {
         ControlPlane control = new ControlPlane(server.baseUrl());
-        control.bootstrapAndLogin("e2e", "e2e-password");
+        fixture.storage().loginAndAwaitBusiness(control);
         control.registerConnector(E2eConnectorJar.CONNECTOR_ID, fixture.connector());
         Map<String, String> resources = new LinkedHashMap<>();
         resources.put(ROOT_SOURCE + ".tap.yml", source(ROOT_SOURCE, fixture.source()));
@@ -536,37 +571,50 @@ class IndependentCdcRecoveryIT {
         return client.getDatabase(new ConnectionString(uri).getDatabase());
     }
 
-    private static ControlPlane loggedIn(ServerHandle server) {
+    private static ControlPlane loggedIn(ServerHandle server, Fixture fixture) {
         ControlPlane control = new ControlPlane(server.baseUrl());
-        control.login("e2e", "e2e-password");
+        fixture.storage().loginAndAwaitBusiness(control);
         return control;
     }
 
-    private static Document consumer(MongoDatabase database, String pipeline, String source) {
-        return database.getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS)
-                .find(new Document("pipelineId", SrsConsumerId.of(pipeline, source).value())).first();
+    private static Document consumer(Fixture fixture, MongoDatabase database, String pipeline, String source) {
+        var member = fixture.srs().pipelineMembership(pipeline, source);
+        if (member == null) return null;
+        var key = member.get("_id", Document.class);
+        var cursor = fixture.srs().consumerOffset(key.getString("chain"), key.getString("consumer"));
+        // This is a read-only joined observation, never a replacement persisted cursor.
+        return cursor == null ? null : new Document(cursor).append("miningChainId", key.getString("chain"));
+    }
+
+    private static Document directConsumer(Fixture fixture, MongoDatabase database, String pipeline, String source) {
+        return fixture.srs().directChannel(pipeline, source);
     }
 
     private static Document tableConfirmation(Document consumer, String table) {
-        if (consumer == null || !(consumer.get("sinkAckedByTable") instanceof Document byTable)) return null;
-        return byTable.get(table, Document.class);
+        if (consumer == null || !(consumer.get("progress") instanceof Document progress)) return null;
+        for (Document entry : progress.getList("sinkAckedByTable", Document.class))
+            if (table.equals(entry.getString("table"))) return entry.get("position", Document.class);
+        return null;
     }
 
     private static long tableSequence(Document consumer, String field, String table) {
-        if (consumer == null || !(consumer.get(field) instanceof Document positions)) return -1L;
-        return number(positions, table);
+        if (consumer == null) return -1;
+        var positions = "perTableRingDone".equals(field) ? consumer.getList("ringDoneThrough", Document.class)
+                : consumer.get("progress", Document.class).getList(field, Document.class);
+        for (var position : positions) if (table.equals(position.getString("table"))) return number(position, "sequence");
+        return -1;
     }
 
-    private static long sourceSequence(Document consumer) {
-        return sourceSequence(consumer, "sinkAckedSrcpos");
-    }
-
-    private static long sourceSequence(Document consumer, String field) {
-        if (consumer == null || consumer.getString(field) == null) return -1L;
-        byte[] bytes = java.util.Base64.getDecoder().decode(consumer.getString(field));
+    private static long sourceSequence(Document row) {
+        if (row == null) return -1;
+        Document position = row;
+        if (row.get("cursor") instanceof Document cursor) position = cursor.get("sinkAcked", Document.class);
+        else if (row.get("progress") instanceof Document progress) position = progress.get("sinkAcked", Document.class);
+        if (position == null || position.getString("token") == null) return -1;
+        byte[] bytes = java.util.Base64.getDecoder().decode(position.getString("token"));
         try (var in = new java.io.ObjectInputStream(new java.io.ByteArrayInputStream(bytes))) {
-            Object position = in.readObject();
-            return ((Number) ((Map<?, ?>) position).get("sequence")).longValue();
+            Object sourceOffset = in.readObject();
+            return ((Number) ((Map<?, ?>) sourceOffset).get("sequence")).longValue();
         } catch (java.io.IOException | ClassNotFoundException malformed) {
             throw new AssertionError("the fixture's recorded source position must be readable", malformed);
         }
@@ -580,10 +628,11 @@ class IndependentCdcRecoveryIT {
         return SrsRingbuffer.ringName(consumer.getString("miningChainId"), table);
     }
 
-    private static Document logRecord(MongoDatabase database, String table, String id, String priority) {
-        for (Document document : database.getCollection(MongoStorePort.SRS_LOG).find(new Document("_id", new Document("$type", "object")))) {
-            Document key = document.get("_id", Document.class);
-            if (!key.getString("ring").endsWith("." + table)) continue;
+    private static Document logRecord(Fixture fixture, MongoDatabase database, String table, String id, String priority) {
+        var original = consumer(fixture, database, ROOT_PIPELINE, ROOT_SOURCE);
+        if (original == null) return null;
+        String originalRing = ring(original, table);
+        for (Document document : SystemCollections.SRS_EVENTS.on(database).find(new Document("_id.ring", originalRing))) {
             Document after = document.get("after", Document.class);
             if (after != null && id.equals(value(after.get("id"))) && priority.equals(value(after.get("priority")))) {
                 return document;
@@ -652,12 +701,55 @@ class IndependentCdcRecoveryIT {
                 .map(path -> path.getFileName() + ":" + CdcRecoveryFixture.lines(path)).toList().toString();
     }
 
-    private static String consumersText(MongoDatabase database) {
-        return database.getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS).find().into(new java.util.ArrayList<>()).toString();
+    private static String consumersText(Fixture fixture, MongoDatabase database) {
+        return "shared=" + SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(database).find(
+                new Document("_id.cacheIncarnation", fixture.srs().scope().cacheIncarnation())).into(new java.util.ArrayList<>())
+                + ", direct=" + SystemCollections.DIRECT_CHANNEL_OFFSETS.on(database).find(
+                        new Document("_id.scope.cacheIncarnation", fixture.srs().scope().cacheIncarnation())).into(new java.util.ArrayList<>());
+    }
+
+    private static RealProcessServer launch(Fixture fixture, List<String> jvmOptions) {
+        long deadline = System.nanoTime() + TIMEOUT.toNanos();
+        while (true) {
+            var server = RealProcessServer.launchingPreparedInJvm(fixture.storage().configurationUri(), jvmOptions,
+                    port -> List.of("--tapstate.cluster.id=" + fixture.storage().clusterId(), "--tapstate.hz.member-port=0"));
+            var refused = new java.util.concurrent.atomic.AtomicBoolean();
+            try {
+                Await.until("the prepared boot to complete or refuse a leased identity or occupied port",
+                        Duration.ofNanos(Math.max(1, deadline - System.nanoTime())), () -> {
+                            String output;
+                            try { output = Files.readString(server.output()); }
+                            catch (java.io.IOException unreadable) { throw new java.io.UncheckedIOException(unreadable); }
+                            boolean ready = output.contains("Tapstate application is ready");
+                            boolean occupiedPort = output.contains("Web server failed to start. Port "
+                                    + server.baseUrl().getPort() + " was already in use.");
+                            if (!ready && (output.contains("boot.node-id-in-use") || occupiedPort)) {
+                                refused.set(true); return true;
+                            }
+                            if (!server.isAlive()) throw new AssertionError("the prepared boot exited: " + output);
+                            return output.contains("Tapstate application is ready");
+                        }, server::tail);
+                if (!refused.get()) {
+                    server.awaitReady(Duration.ofNanos(Math.max(1, deadline - System.nanoTime())));
+                    if (System.nanoTime() >= deadline) throw new AssertionError("the prepared startup exceeded " + TIMEOUT);
+                    return server;
+                }
+            } catch (RuntimeException | Error failed) {
+                try { server.close(); } catch (RuntimeException | Error cleanup) { failed.addSuppressed(cleanup); }
+                throw failed;
+            }
+            server.close();
+            if (System.nanoTime() >= deadline)
+                throw new AssertionError("the prepared boot remained refused within " + TIMEOUT);
+        }
     }
 
     private record Fixture(Path source, Path rootTarget, Path mailTarget, Path signals,
-            String storeUri, byte[] connector) {}
+            PreparedNativeStore storage, NativeSrsDocuments srs, byte[] connector) implements AutoCloseable {
+        @Override public void close() {
+            try { srs.close(); } finally { storage.close(); }
+        }
+    }
 
     private enum LostHistory { HOLE, TRIMMED, OLD_GENERATION, OLD_PROGRESS }
 }

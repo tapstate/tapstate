@@ -335,8 +335,17 @@ public final class CdcPhase {
      * connector hands over is the connector's to decide.
      */
     private static Admitted admit(TableRoute route, String table, List<SrsItem> items, boolean durable) {
-        SrsWriteGate gate = route.chain().gate();
-        int capacity = (int) Math.min(capacityOnceTheClusterAllowsIt(gate, table), Integer.MAX_VALUE);
+        return admit(route.chain().gate(), route.consumers(), table, items, durable, () -> {});
+    }
+
+    /** Uses the same bounded ring admission path for a native durable capture without legacy metadata. */
+    static long admitDurable(SrsWriteGate gate, String table, List<SrsItem> items, Runnable requireActive) {
+        return admit(gate, List::of, table, items, true, requireActive).lastSeq();
+    }
+
+    private static Admitted admit(SrsWriteGate gate, Supplier<Collection<ConsumerOffset>> consumers,
+                                   String table, List<SrsItem> items, boolean durable, Runnable requireActive) {
+        int capacity = (int) Math.min(capacityOnceTheClusterAllowsIt(gate, table, requireActive), Integer.MAX_VALUE);
         long lastSeq = -1;
         Collection<ConsumerOffset> offsets = List.of();
         for (int from = 0; from < items.size(); from += capacity) {
@@ -346,11 +355,15 @@ public final class CdcPhase {
                 // Re-read on every attempt, not once for the run: this is the only thing that can tell a
                 // parked write that a consumer has moved, so a bound hoisted out of the loop would park
                 // for ever waiting for room it could no longer see being freed.
-                offsets = route.consumers().get();
+                requireActive.run();
+                offsets = consumers.get();
                 OptionalLong appended;
                 try {
+                    requireActive.run();
                     appended = gate.appendAll(piece, durable ? Long.MAX_VALUE : headroomBound(offsets, table));
+                    requireActive.run();
                 } catch (RingWriteRefusedException refused) {
+                    requireActive.run();
                     // The cluster refused, not the headroom: nothing was written, and what refused clears
                     // itself as the members' verdicts converge. Waiting here is what pauses the source
                     // read, which is the same answer a full ring already gets.
@@ -377,11 +390,14 @@ public final class CdcPhase {
      * capture on precisely the refusal the wait exists to absorb -- and would do so before a single change
      * had been offered, which is the moment just after a cluster forms.
      */
-    private static long capacityOnceTheClusterAllowsIt(SrsWriteGate gate, String table) {
+    private static long capacityOnceTheClusterAllowsIt(SrsWriteGate gate, String table, Runnable requireActive) {
         OptionalLong refusedUntil = OptionalLong.empty();
         while (true) {
+            requireActive.run();
             try {
-                return gate.capacity();
+                long capacity = gate.capacity();
+                requireActive.run();
+                return capacity;
             } catch (RingWriteRefusedException refused) {
                 refusedUntil = OptionalLong.of(waitOutTheRefusal(refused, refusedUntil, table));
             }

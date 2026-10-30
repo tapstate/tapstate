@@ -34,6 +34,10 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -57,6 +61,19 @@ class ExecutionAuthorizationTest {
     private final InMemoryWorkloadClaimStore claims = new InMemoryWorkloadClaimStore();
     private final ClusterMembershipGate membership = eligibleGate();
     private final AtomicLong nanos = new AtomicLong();
+
+    @Test void aLocalCompletionCheckNeverRefreshesAnAbsentOrExpiredProof() {
+        var fence=submittedRun();var observed=org.mockito.Mockito.spy(claims);
+        try(var guard=new ExecutionAuthorization("cluster-a",observed,Duration.ofDays(1),nanos::get)) {
+            assertThatThrownBy(() -> guard.requireLocal(fence)).isInstanceOf(TapstateException.class);
+            org.mockito.Mockito.verifyNoInteractions(observed);
+            var proof=guard.require(fence);org.mockito.Mockito.clearInvocations(observed);
+            assertThat(guard.requireLocal(fence)).isEqualTo(proof);
+            nanos.set(TTL.plusSeconds(1).toNanos());
+            assertThatThrownBy(() -> guard.requireLocal(fence)).isInstanceOf(TapstateException.class);
+            org.mockito.Mockito.verifyNoInteractions(observed);
+        }
+    }
 
     @Test
     void everySubmissionTakesTheNextExecutionGenerationEvenWhenNobodyElseTookTheClaim() {
@@ -482,6 +499,68 @@ class ExecutionAuthorizationTest {
         assertThat(prepared).as("nothing prepared for the run that was rebuilt over").hasSize(1);
     }
 
+    @Test
+    void aCurrentRunOpensAndUsesItsSinkWriter() throws Exception {
+        ExecutionFence fence = submittedRun();
+        CountingWriter target = new CountingWriter();
+        try (ExecutionAuthorization authorization = guard(claims);
+                var hazelcast = org.mockito.Mockito.mockStatic(com.hazelcast.core.Hazelcast.class)) {
+            HazelcastInstance member = mock(HazelcastInstance.class);
+            when(member.getUserContext()).thenReturn(new ConcurrentHashMap<>(Map.of(ExecutionAuthorization.USER_CONTEXT_KEY, authorization)));
+            hazelcast.when(com.hazelcast.core.Hazelcast::getAllHazelcastInstances).thenReturn(Set.of(member));
+            try (SinkWriter writer = FencedSinkWriterFactory.heldTo(() -> target, fence).get()) {
+                writer.write(List.of());
+            }
+            assertThat(target.batches).hasValue(1);
+        }
+    }
+
+    @Test
+    void aSupersededRunCannotOpenItsSinkConnector() {
+        PipelineActuationOwnership nodeA = ownership(NODE_A);
+        assertThat(nodeA.permit("orders").granted()).isTrue();
+        ExecutionFence old = nodeA.beginExecution("orders").fence();
+        nodeA.beginExecution("orders");
+        AtomicInteger opened = new AtomicInteger();
+        try (ExecutionAuthorization authorization = guard(claims);
+                var hazelcast = org.mockito.Mockito.mockStatic(com.hazelcast.core.Hazelcast.class)) {
+            HazelcastInstance member = mock(HazelcastInstance.class);
+            when(member.getUserContext()).thenReturn(new ConcurrentHashMap<>(Map.of(ExecutionAuthorization.USER_CONTEXT_KEY, authorization)));
+            hazelcast.when(com.hazelcast.core.Hazelcast::getAllHazelcastInstances).thenReturn(Set.of(member));
+            SupplierEx<? extends SinkWriter> factory = FencedSinkWriterFactory.heldTo(() -> {
+                opened.incrementAndGet();
+                return new CountingWriter();
+            }, old);
+            assertThatThrownBy(factory::get).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED));
+            assertThat(opened).as("plugin construction and init belong behind the run guard").hasValue(0);
+        }
+    }
+
+    @Test
+    void losingAuthorityDuringSinkOpenClosesTheUnpublishedWriter() {
+        ExecutionFence fence = submittedRun();
+        AtomicInteger closed = new AtomicInteger();
+        try (ExecutionAuthorization authorization = guard(claims);
+                var hazelcast = org.mockito.Mockito.mockStatic(com.hazelcast.core.Hazelcast.class)) {
+            HazelcastInstance member = mock(HazelcastInstance.class);
+            when(member.getUserContext()).thenReturn(new ConcurrentHashMap<>(Map.of(ExecutionAuthorization.USER_CONTEXT_KEY, authorization)));
+            hazelcast.when(com.hazelcast.core.Hazelcast::getAllHazelcastInstances).thenReturn(Set.of(member));
+            SupplierEx<? extends SinkWriter> factory = FencedSinkWriterFactory.heldTo(() -> {
+                elapse(TTL.plusSeconds(1));
+                return new SinkWriter() {
+                    @Override public CompletionStage<WriteResult> write(List<Envelope> records) {
+                        throw new AssertionError("an unpublished writer must not write");
+                    }
+                    @Override public void close() { closed.incrementAndGet(); }
+                };
+            }, fence);
+            assertThatThrownBy(factory::get).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED));
+            assertThat(closed).as("a blocked open cannot leak its connector after losing the run").hasValue(1);
+        }
+    }
+
     /** Writers of tables prepared for them, recording each preparing. */
     private static final class PreparingWriters implements SupplierEx<SinkWriter>, PreparesTargets {
 
@@ -629,6 +708,92 @@ class ExecutionAuthorizationTest {
         PipelineActuationOwnership.Execution execution = nodeA.beginExecution("orders");
         assertThat(execution.allowed()).isTrue();
         return execution.fence();
+    }
+
+    @Test void aReadReturningAfterItsLocalWindowDoesNotAuthorizeEvenOneBatch() {
+        WorkloadClaimKey key = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+        var run = claims.advanceExecution(claims.acquire(key, NODE_A, 7, TTL).claim(), 7, Set.of("node-a")).orElseThrow();
+        WorkloadClaimStore slow = mock(WorkloadClaimStore.class);
+        when(slow.read(key)).thenAnswer(call -> {
+            var captured = claims.read(key);
+            nanos.addAndGet(WINDOW.plusSeconds(1).toNanos()); claims.elapse(WINDOW.plusSeconds(1));
+            return captured;
+        });
+        try (var authorization = new ExecutionAuthorization("cluster-a", slow, WINDOW, nanos::get)) {
+            assertThat(authorization.authorized(new ExecutionFence("orders", run.claimGeneration(), run.executionGeneration()))).isFalse();
+        }
+    }
+
+    @Test void aReplyArrivingAfterItsOwnersLeaseBoundDoesNotAuthorizeEvenOneBatch() {
+        WorkloadClaimKey key = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+        var run = claims.advanceExecution(claims.acquire(key, NODE_A, 7, Duration.ofMillis(100)).claim(), 7, Set.of("node-a")).orElseThrow();
+        WorkloadClaimStore slow = mock(WorkloadClaimStore.class);
+        when(slow.read(key)).thenAnswer(call -> {
+            var captured = claims.read(key);
+            nanos.addAndGet(Duration.ofMillis(200).toNanos()); claims.elapse(Duration.ofMillis(200));
+            return captured;
+        });
+        try (var authorization = new ExecutionAuthorization("cluster-a", slow, WINDOW, nanos::get)) {
+            assertThat(authorization.authorized(new ExecutionFence("orders", run.claimGeneration(), run.executionGeneration()))).isFalse();
+        }
+    }
+
+    @Test
+    void aConcurrentReplacementCannotLeaveTheOldRunAuthorized() throws Exception {
+        recheckAfterFinalGuard("replace");
+    }
+
+    @Test
+    void aConcurrentRevocationCannotLeaveTheOldRunAuthorized() throws Exception {
+        recheckAfterFinalGuard("revoke");
+    }
+
+    @Test
+    void aConcurrentRefreshOfTheSameRunRemainsAuthorized() throws Exception {
+        recheckAfterFinalGuard("refresh");
+    }
+
+    private void recheckAfterFinalGuard(String action) throws Exception {
+        WorkloadClaimKey key = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+        var run = claims.advanceExecution(claims.acquire(key, NODE_A, 7, TTL).claim(), 7, Set.of("node-a")).orElseThrow();
+        ExecutionFence first = new ExecutionFence("orders", run.claimGeneration(), run.executionGeneration());
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch released = new CountDownLatch(1);
+        AtomicReference<Thread> waitingThread = new AtomicReference<>();
+        AtomicInteger checks = new AtomicInteger();
+        try (var authorization = new ExecutionAuthorization("cluster-a", claims, WINDOW, nanos::get, () -> {
+            if (Thread.currentThread() == waitingThread.get() && checks.incrementAndGet() == 2) {
+                entered.countDown();
+                try {
+                    if (!released.await(5, TimeUnit.SECONDS)) throw new AssertionError("final guard was not released");
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError(interrupted);
+                }
+            }
+            return true;
+        }); var executor = Executors.newSingleThreadExecutor()) {
+            assertThat(authorization.authorized(first)).isTrue();
+            var waiting = executor.submit(() -> {
+                waitingThread.set(Thread.currentThread());
+                return authorization.authorized(first);
+            });
+            try {
+                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+                if (action.equals("refresh")) {
+                    elapse(WINDOW);
+                    assertThat(authorization.authorized(first)).isTrue();
+                } else {
+                    var next = claims.advanceExecution(run, 7, Set.of("node-a")).orElseThrow();
+                    if (action.equals("revoke")) assertThat(claims.release(next)).isTrue();
+                    assertThat(authorization.authorized(new ExecutionFence("orders", next.claimGeneration(),
+                            next.executionGeneration()))).isEqualTo(action.equals("replace"));
+                }
+            } finally {
+                released.countDown();
+            }
+            assertThat(waiting.get(5, TimeUnit.SECONDS)).isEqualTo(action.equals("refresh"));
+        }
     }
 
     private ExecutionAuthorization guard(WorkloadClaimStore store) {

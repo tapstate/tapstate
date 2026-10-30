@@ -5,7 +5,6 @@ import io.tapdata.entity.codec.FromTapValueCodec;
 import io.tapdata.entity.codec.filter.TapCodecsFilterManager;
 import io.tapdata.entity.schema.TapField;
 import io.tapdata.entity.schema.value.*;
-import io.tapdata.entity.utils.InstanceFactory;
 import io.tapdata.entity.utils.JsonParser;
 import io.tapstate.core.event.Bytes;
 import io.tapstate.core.event.ConvertedValue;
@@ -313,7 +312,7 @@ final class PdkValueConversions {
     }
 
     private static JsonParser parser() {
-        return java.util.Objects.requireNonNull(InstanceFactory.instance(JsonParser.class), "PDK JSON provider");
+        return PdkJsonProvider.parser();
     }
 
     private static boolean positionalElement(String path) {

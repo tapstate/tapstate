@@ -53,10 +53,12 @@ final class TwoMemberCluster implements AutoCloseable {
     private final String seeds;
     private final Duration nodeSessionTtl;
     private final Map<String, Path> stagingByNode;
+    private final PreparedNativeStore prepared;
 
     private TwoMemberCluster(RealProcessServer first, RealProcessServer second, String storeUri,
             String clusterId, String bindAddress, String seeds, Duration nodeSessionTtl,
-            Map<String, Path> stagingByNode) {
+            Map<String, Path> stagingByNode, PreparedNativeStore preparedStore) {
+        this.prepared = preparedStore;
         this.first = first;
         this.second = second;
         this.a = new ControlPlane(first.baseUrl());
@@ -67,6 +69,20 @@ final class TwoMemberCluster implements AutoCloseable {
         this.seeds = seeds;
         this.nodeSessionTtl = nodeSessionTtl;
         this.stagingByNode = Map.copyOf(stagingByNode);
+    }
+
+    /** The caller retains the same native installation across every member replacement. */
+    static TwoMemberCluster startPrepared(PreparedNativeStore storage) {
+        return startPrepared(storage, null);
+    }
+
+    static TwoMemberCluster startPrepared(PreparedNativeStore storage, Duration nodeSessionTtl) {
+        return start(storage.configurationUri(), storage.clusterId(), nodeSessionTtl, true, true, Map.of(), storage);
+    }
+
+    /** Retains the sequential launch contract for lifecycle ordering witnesses. */
+    static TwoMemberCluster startPreparedSequentially(PreparedNativeStore storage) {
+        return start(storage.configurationUri(), storage.clusterId(), null, false, true, Map.of(), storage);
     }
 
     /**
@@ -103,7 +119,7 @@ final class TwoMemberCluster implements AutoCloseable {
         if (first.isAlive() || second.isAlive()) {
             throw new IllegalStateException("both original processes must stop before a cluster restart");
         }
-        return start(storeUri, clusterId, nodeSessionTtl, true, true, stagingByNode);
+        return start(storeUri, clusterId, nodeSessionTtl, true, true, stagingByNode, prepared);
     }
 
     /**
@@ -118,8 +134,19 @@ final class TwoMemberCluster implements AutoCloseable {
                 Map.of(requireKnown(nodeId), stagingDirectory));
     }
 
+    /** Keeps the staged-failure scenario sequential while reusing one explicit native installation. */
+    static TwoMemberCluster startStaging(PreparedNativeStore storage, String nodeId, Path stagingDirectory) {
+        return start(storage.configurationUri(), storage.clusterId(), null, false, true,
+                Map.of(requireKnown(nodeId), stagingDirectory), storage);
+    }
+
     private static TwoMemberCluster start(String storeUri, String clusterId, Duration nodeSessionTtl,
             boolean concurrent, boolean existingAdministrator, Map<String, Path> stagingByNode) {
+        return start(storeUri, clusterId, nodeSessionTtl, concurrent, existingAdministrator, stagingByNode, null);
+    }
+
+    private static TwoMemberCluster start(String storeUri, String clusterId, Duration nodeSessionTtl,
+            boolean concurrent, boolean existingAdministrator, Map<String, Path> stagingByNode, PreparedNativeStore preparedStore) {
         String bindAddress = RoutableAddress.ofThisMachine();
         Map<String, Integer> memberPorts = new LinkedHashMap<>();
         Map<String, RealProcessServer.PreparedLaunch> prepared = new LinkedHashMap<>();
@@ -137,12 +164,14 @@ final class TwoMemberCluster implements AutoCloseable {
                     clusterId, NODE_A, memberPortA, seeds, httpPort, bindAddress, nodeSessionTtl);
             java.util.function.IntFunction<List<String>> secondArguments = httpPort -> arguments(
                     clusterId, NODE_B, memberPortB, seeds, httpPort, bindAddress, nodeSessionTtl);
-            prepared.put(NODE_A, RealProcessServer.prepare(
-                    storeUri, "0.0.0.0", staging(NODE_A, stagingByNode), firstArguments));
+            prepared.put(NODE_A, preparedStore == null
+                    ? RealProcessServer.prepare(storeUri, "0.0.0.0", staging(NODE_A, stagingByNode), firstArguments)
+                    : RealProcessServer.preparePrepared(storeUri, "0.0.0.0", staging(NODE_A, stagingByNode), firstArguments));
             first = prepared.get(NODE_A).launch();
             if (!concurrent) first.awaitHealthy();
-            prepared.put(NODE_B, RealProcessServer.prepare(
-                    storeUri, "0.0.0.0", staging(NODE_B, stagingByNode), secondArguments));
+            prepared.put(NODE_B, preparedStore == null
+                    ? RealProcessServer.prepare(storeUri, "0.0.0.0", staging(NODE_B, stagingByNode), secondArguments)
+                    : RealProcessServer.preparePrepared(storeUri, "0.0.0.0", staging(NODE_B, stagingByNode), secondArguments));
             second = prepared.get(NODE_B).launch();
             if (!concurrent) second.awaitHealthy();
         } catch (RuntimeException | Error failure) {
@@ -172,16 +201,21 @@ final class TwoMemberCluster implements AutoCloseable {
             }
         }
         TwoMemberCluster cluster = new TwoMemberCluster(
-                first, second, storeUri, clusterId, bindAddress, seeds, nodeSessionTtl, stagingByNode);
+                first, second, storeUri, clusterId, bindAddress, seeds, nodeSessionTtl, stagingByNode, preparedStore);
         try {
             if (concurrent) {
                 first.awaitReady();
                 second.awaitReady();
             }
-            if (existingAdministrator) cluster.a.login(ADMIN, PASSWORD);
-            else cluster.a.bootstrapAndLogin(ADMIN, PASSWORD);
-            // The administrator lives in the store both of them share, so the second does not create one.
-            cluster.b.login(ADMIN, PASSWORD);
+            if (preparedStore != null) {
+                preparedStore.loginAndAwaitBusiness(cluster.a);
+                preparedStore.loginAndAwaitBusiness(cluster.b);
+            } else {
+                if (existingAdministrator) cluster.a.login(ADMIN, PASSWORD);
+                else cluster.a.bootstrapAndLogin(ADMIN, PASSWORD);
+                // The second member reads the same existing administrator.
+                cluster.b.login(ADMIN, PASSWORD);
+            }
         } catch (RuntimeException | Error failure) {
             try { cluster.close(); }
             catch (RuntimeException | Error cleanup) {
@@ -190,6 +224,15 @@ final class TwoMemberCluster implements AutoCloseable {
             throw failure;
         }
         return cluster;
+    }
+
+    private static RealProcessServer launchMember(String uri, Path staging,
+            java.util.function.IntFunction<List<String>> arguments, boolean concurrent, PreparedNativeStore prepared) {
+        if (prepared != null) return concurrent
+                ? RealProcessServer.launchingPrepared(uri, "0.0.0.0", staging, arguments)
+                : RealProcessServer.startPrepared(uri, "0.0.0.0", staging, arguments);
+        return concurrent ? RealProcessServer.launching(uri, "0.0.0.0", staging, arguments)
+                : RealProcessServer.start(uri, "0.0.0.0", staging, arguments);
     }
 
     /** The control plane of the member carrying {@link #NODE_A}. Every read face answers the same. */
@@ -246,9 +289,14 @@ final class TwoMemberCluster implements AutoCloseable {
      */
     RealProcessServer launching(String nodeId) {
         int memberPort = RealProcessServer.reservePort();
-        return RealProcessServer.launching(storeUri, "0.0.0.0", staging(nodeId, stagingByNode),
-                httpPort -> arguments(
-                        clusterId, nodeId, memberPort, seeds, httpPort, bindAddress, nodeSessionTtl));
+        return launchMember(storeUri, staging(nodeId, stagingByNode),
+                httpPort -> arguments(clusterId, nodeId, memberPort, seeds, httpPort, bindAddress, nodeSessionTtl),
+                true, prepared);
+    }
+
+    /** Uses the same identity, discovery and quorum settings for a test-owned startup-failure process. */
+    List<String> joiningArguments(String nodeId,int httpPort,int memberPort) {
+        return arguments(clusterId,nodeId,memberPort,seeds,httpPort,bindAddress,nodeSessionTtl);
     }
 
     /**
@@ -260,7 +308,8 @@ final class TwoMemberCluster implements AutoCloseable {
      */
     ControlPlane signedInAt(RealProcessServer member) {
         ControlPlane control = new ControlPlane(member.baseUrl());
-        control.login(ADMIN, PASSWORD);
+        if (prepared == null) control.login(ADMIN, PASSWORD);
+        else prepared.loginAndAwaitBusiness(control);
         return control;
     }
 

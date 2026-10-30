@@ -65,6 +65,24 @@ class SrsRingSourceTest {
         }
     }
 
+    @Test void nativePipelineSourceCannotReadAHotRingWithoutItsDurableLog() throws Exception {
+        String ring="srs.native-unbound-pipeline.orders",sink="native-unbound-pipeline-target"; fill(ring,1);
+        Pipeline pipeline=Pipeline.create(); pipeline.readFrom(SrsRingSource.create(ring,StartFrom.earliest(),new NativePublisher(),null))
+                .withoutTimestamps().writeTo(Sinks.list(sink));
+        Job job=hz.getJet().newJob(pipeline); IList<SrsItem> target=hz.getList(sink);
+        try {
+            long until=System.nanoTime()+Duration.ofSeconds(10).toNanos();
+            while(target.isEmpty() && !job.getFuture().isDone() && System.nanoTime()<until) Thread.sleep(10);
+            assertThat(job.getFuture().isCompletedExceptionally()).isTrue();
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> job.getFuture().join()).hasStackTraceContaining(CaptureError.SRS_NOT_RECOVERABLE.code());
+            assertThat(target).isEmpty();
+        } finally { if(!job.getFuture().isDone()) job.cancel(); target.destroy(); }
+    }
+    private record NativePublisher() implements SrsReadCursorPublisherFactory {
+        @Override public boolean requiresDurableLog() { return true; }
+        @Override public java.util.function.LongConsumer resolve(HazelcastInstance member) { return ignored -> {}; }
+    }
+
     /** Pre-fills a ring with {@code count} inserts at sequences {@code 0..count-1}. */
     private static void fill(String ringName, int count) {
         SrsRingbuffer ring = new SrsRingbuffer(hz.getRingbuffer(ringName));
@@ -106,6 +124,25 @@ class SrsRingSourceTest {
                 throw new AssertionError("timed out waiting for " + size + " changes, got " + list.size());
             }
             Thread.sleep(50);
+        }
+    }
+
+    @Test
+    void modelVerifierMustRunBeforeRawItemsReachThePipeline() throws Exception {
+        String ring="srs.chain.raw-model-rejection",sink="out-raw-model-rejection";fill(ring,1);
+        var checks=new java.util.concurrent.atomic.AtomicInteger();var cursor=new java.util.concurrent.atomic.AtomicLong(-1);
+        hz.getUserContext().put(SrsSourceProcessorTest.MODEL_CHECKS,checks);hz.getUserContext().put(SrsSourceProcessorTest.MODEL_CURSOR,cursor);
+        Pipeline pipeline=Pipeline.create();pipeline.readFrom(SrsRingSource.create(ring,StartFrom.earliest(),new SrsSourceProcessorTest.ModelVerifyingPublisher(),null))
+                .withoutTimestamps().writeTo(Sinks.list(sink));
+        var out=hz.<SrsItem>getList(sink);Job job=hz.getJet().newJob(pipeline);
+        try {
+            long deadline=System.nanoTime()+java.util.concurrent.TimeUnit.SECONDS.toNanos(10);
+            while(out.isEmpty()&&!job.getFuture().isDone()&&System.nanoTime()<deadline)Thread.sleep(10);
+            assertThat(checks.get()).as("the member model check ran before downstream delivery").isPositive();
+            org.assertj.core.api.Assertions.assertThatThrownBy(() -> job.getFuture().get(10,java.util.concurrent.TimeUnit.SECONDS)).hasStackTraceContaining("io.srs-event-model-unavailable");
+            assertThat(out).isEmpty();assertThat(cursor.get()).isEqualTo(-1);
+        } finally {
+            if(!job.getFuture().isDone())job.cancel();hz.getUserContext().remove(SrsSourceProcessorTest.MODEL_CHECKS);hz.getUserContext().remove(SrsSourceProcessorTest.MODEL_CURSOR);out.destroy();
         }
     }
 

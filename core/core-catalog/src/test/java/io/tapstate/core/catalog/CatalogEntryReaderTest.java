@@ -113,6 +113,27 @@ class CatalogEntryReaderTest {
     }
 
     @Test
+    void persistenceShapeValidationPreservesReleasePolicyOnRuntimeReads() {
+        Map<String, Object> stored = CatalogEntryWriter.toTree(CatalogEntryReader.read(MYSQL_ENTRY));
+        stored.put("id", "db2");
+        assertThat(CatalogEntryReader.isCanonicalPersistenceTree(stored)).isTrue();
+        assertThat(CatalogEntryReader.fromTree(stored).sink().capable()).isFalse();
+        assertThat(stored.get("sink")).isEqualTo(Map.of("capable", true, "writeSemantics", List.of("upsert", "append")));
+    }
+
+    @Test
+    void persistenceShapeValidationRejectsCoercionUnknownFieldsAndMissingCanonicalFields() {
+        Map<String, Object> stored = CatalogEntryWriter.toTree(CatalogEntryReader.read(MYSQL_ENTRY));
+        var wrongBoolean = new LinkedHashMap<>(stored);
+        wrongBoolean.put("sink", Map.of("capable", "true", "writeSemantics", List.of("upsert")));
+        assertThat(CatalogEntryReader.isCanonicalPersistenceTree(wrongBoolean)).isFalse();
+        var unknown = new LinkedHashMap<>(stored); unknown.put("extra", "ignored");
+        assertThat(CatalogEntryReader.isCanonicalPersistenceTree(unknown)).isFalse();
+        var missing = new LinkedHashMap<>(stored); missing.remove("icon");
+        assertThat(CatalogEntryReader.isCanonicalPersistenceTree(missing)).isFalse();
+    }
+
+    @Test
     void aSourceOnlyPolicyDoesNotHideAnUnreadableStoredSink() {
         String unreadable = MYSQL_ENTRY.replace("\"id\": \"mysql\"", "\"id\": \"db2\"")
                 .replace("\"capable\": true", "\"capable\": \"true\"");

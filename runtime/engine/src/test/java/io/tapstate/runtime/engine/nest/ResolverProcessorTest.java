@@ -154,33 +154,41 @@ class ResolverProcessorTest {
     }
 
     @Test
-    void aChildOfADeletedParentGoesToTheDeadLetterRatherThanNowhere() {
-        feed(OWN_ROWS, policy(1, "P1", "C1"));
-        feed(OWN_ROWS, event(Op.DELETE, "policy", 5,
-                "policy_id", "P1", "customer_id", "C1", "policy_no", "PN-P1"));
-
-        assertThat(feed(CLAIMS, claim(6, "CL1", "P1")))
-                .describedAs("it can never reach a document, so it is not held either")
-                .isEmpty();
-        assertThat(dead).hasSize(1);
-        assertThat(dead.get(0).child().ref().elementKey()).containsExactly("CL1");
+    void conservativeSharedReplayMustNotLoseAPostSeamChildBetweenEarlierParentDeletionAndRecreation() {
+        feed(OWN_ROWS, policy(SourceOrder.SNAPSHOT_SEQ,"P1","C1"));
+        feed(CLAIMS, event(Op.INSERT,"claim",SourceOrder.SNAPSHOT_SEQ,
+                "claim_id","CL1","policy_id","P1","value",0));
+        // Both parent changes preceded the snapshot seam, but independent rings can deliver this
+        // real later child update before the already-captured parent recreation is drained.
+        feed(OWN_ROWS, event(Op.DELETE,"policy",1,
+                "policy_id","P1","customer_id","C1","policy_no","PN-P1"));
+        var delivered=new ArrayList<KeyedElement>();
+        delivered.addAll(feed(CLAIMS,event(Op.INSERT,"claim",3,
+                "claim_id","CL1","policy_id","P1","value",1)));
+        delivered.addAll(feed(OWN_ROWS,policy(2,"P1","C1")));
+        assertThat(dead).as("a real post-seam update must not become an orphan because old replay temporarily removed its parent").isEmpty();
+        assertThat(delivered).anySatisfy(value -> assertThat(value.element().fields()).containsEntry("value",1));
     }
 
     @Test
-    void deletingTheParentReleasesWhatWasWaitingIntoTheDeadLetter() {
-        feed(CLAIMS, claim(2, "CL1", "P1"));
+    void aChildOfADeletedParentWaitsAndIsReleasedWhenThatParentReturns() {
+        feed(OWN_ROWS,policy(1,"P1","C1"));
+        feed(OWN_ROWS,event(Op.DELETE,"policy",5,"policy_id","P1","customer_id","C1","policy_no","PN-P1"));
+        assertThat(feed(CLAIMS,claim(6,"CL1","P1"))).isEmpty();assertThat(dead).isEmpty();
+        assertThat(store.load(List.of("P1")).pending()).isEqualTo(1);
+        var released=feed(OWN_ROWS,policy(7,"P1","C1"));
+        assertThat(released).hasSize(2).anySatisfy(value -> assertThat(value.element().fields()).containsEntry("claim_id","CL1"));
+        assertThat(store.load(List.of("P1")).waiting()).isEmpty();assertThat(dead).isEmpty();
+    }
 
-        List<KeyedElement> out = feed(OWN_ROWS, event(Op.DELETE, "policy", 5,
-                "policy_id", "P1", "customer_id", "C1", "policy_no", "PN-P1"));
-
-        assertThat(out)
-                .describedAs("the deletion of the policy element itself still travels to the document")
-                .hasSize(1);
-        assertThat(out.get(0).element().deletion()).isTrue();
-        assertThat(dead)
-                .describedAs("those children were waiting for a row now known to be gone")
-                .hasSize(1);
-        assertThat(dead.get(0).child().ref().elementKey()).containsExactly("CL1");
+    @Test
+    void deletingTheParentKeepsItsEarlierWaitingChildren() {
+        feed(CLAIMS,claim(2,"CL1","P1"));
+        var deletion=feed(OWN_ROWS,event(Op.DELETE,"policy",5,"policy_id","P1","customer_id","C1","policy_no","PN-P1"));
+        assertThat(deletion).hasSize(1);assertThat(deletion.getFirst().element().deletion()).isTrue();
+        assertThat(store.load(List.of("P1")).pending()).isEqualTo(1);assertThat(dead).isEmpty();
+        var released=feed(OWN_ROWS,policy(6,"P1","C1"));
+        assertThat(released).hasSize(2).anySatisfy(value -> assertThat(value.element().order()).isEqualTo(new SourceOrder(1,2)));
     }
 
     @Test

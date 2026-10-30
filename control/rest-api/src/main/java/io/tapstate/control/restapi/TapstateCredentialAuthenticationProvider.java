@@ -5,6 +5,8 @@ import io.tapstate.control.core.CloudSessionService;
 import io.tapstate.control.core.TapstatePrincipal;
 import io.tapstate.control.core.TokenService;
 import io.tapstate.control.core.VerifiedToken;
+import io.tapstate.control.core.ControlError;
+import io.tapstate.core.common.TapstateException;
 import org.springframework.security.authentication.AuthenticationProvider;
 import org.springframework.security.authentication.BadCredentialsException;
 import org.springframework.security.core.Authentication;
@@ -22,14 +24,25 @@ final class TapstateCredentialAuthenticationProvider implements AuthenticationPr
 
     @Override
     public Authentication authenticate(Authentication authentication) {
+        try { return verify(authentication); }
+        catch (TapstateException failure) {
+            if (failure.code() == ControlError.UNAUTHENTICATED || failure.code() == ControlError.AUTH_FAILED)
+                throw new BadCredentialsException("invalid bearer credential");
+            throw new CodedAuthenticationFailure(failure.code() == ControlError.CLOUD_AUTH_UNAVAILABLE
+                    ? ControlError.CLOUD_AUTH_UNAVAILABLE : ControlError.STORAGE_UNAVAILABLE);
+        }
+    }
+
+    private Authentication verify(Authentication authentication) {
         TapstateCredentialAuthenticationToken credential = (TapstateCredentialAuthenticationToken) authentication;
-        VerifiedToken verified = credentials.authenticate(credential.credential())
+        var original = credentials.authenticateContext(credential.credential())
                 .orElseThrow(() -> new BadCredentialsException("invalid bearer credential"));
+        VerifiedToken verified = original.token();
         TapstatePrincipal principal = TokenService.isMachineToken(credential.credential())
                 ? TapstatePrincipal.machineToken(verified)
                 : CloudSessionService.isSessionToken(credential.credential())
                         ? TapstatePrincipal.cloudSession(verified) : TapstatePrincipal.humanJwt(verified);
-        return new TapstateAuthentication(principal);
+        return new TapstateAuthentication(principal, original);
     }
 
     @Override

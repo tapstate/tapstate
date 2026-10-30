@@ -46,10 +46,10 @@ class ViewsReportTheSyncRenamedCollectionsIT {
     void replicasWithDifferentPrefixesReportDifferentTargetCollections(Tiers tier) {
         String suffix = tier.name().toLowerCase(Locale.ROOT);
         String database = "views_target_" + suffix;
-        try (ServerHandle server = tier.launch(mongo.getReplicaSetUrl("views_catalog_" + suffix),
-                "views_operators_" + suffix)) {
+        try (PreparedNativeStore storage = PreparedNativeStore.createOn(mongo);
+                ServerHandle server = tier.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             Map<String, String> workspace = new LinkedHashMap<>();
             workspace.put("source.tap.yml", """
                     version: tapstate/v1

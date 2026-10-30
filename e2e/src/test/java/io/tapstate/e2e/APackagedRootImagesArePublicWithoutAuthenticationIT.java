@@ -17,7 +17,8 @@ class APackagedRootImagesArePublicWithoutAuthenticationIT {
 
     @Test
     void aNewRootImageReachesTheStaticHandlerWithoutOpeningTheApi() throws Exception {
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(SharedMongo.replicaSetUrl("public_root_image"))) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+             ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             var image = http.send(HttpRequest.newBuilder(server.baseUrl().resolve("/future-brand-image.svg"))
                             .timeout(Duration.ofSeconds(10)).header("Accept", "image/svg+xml").GET().build(),
                     HttpResponse.BodyHandlers.ofString());

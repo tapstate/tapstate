@@ -8,7 +8,6 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
 import java.nio.file.Path;
-import java.util.Locale;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -37,10 +36,10 @@ class DeletingAPipelineTakesItsRateHistoryWithItIT {
     @ParameterizedTest
     @EnumSource(Tiers.class)
     void aStopLeavesTheHistoryStandingAndARemovalTakesIt(Tiers tier, @TempDir Path directory) throws Exception {
-        String storeUri = storeUri("delete_history", tier);
-        try (ServerHandle server = tier.launch(storeUri);
-                StoreDocuments documents = StoreDocuments.at(storeUri)) {
-            RunningPipeline running = RunningPipeline.started(server, directory);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = tier.launch(storage);
+                StoreDocuments documents = StoreDocuments.at(storage.cacheUri())) {
+            RunningPipeline running = RunningPipeline.started(server, directory, storage);
             ControlPlane control = running.control();
             String pipelineId = running.pipelineId();
 
@@ -61,14 +60,10 @@ class DeletingAPipelineTakesItsRateHistoryWithItIT {
             control.deleteArtifact(pipelineId, control.contentHash(pipelineId));
 
             assertThat(control.artifact(pipelineId)).as("the artifact itself").isEmpty();
-            assertThat(documents.rateSamplesOf(pipelineId))
-                    .as("the samples of a removed pipeline - left behind, they are the past of whatever is "
-                            + "applied under the id next")
-                    .isZero();
+            Await.until("the retired pipeline's bounded payload cleanup to remove its history",
+                    () -> documents.rateSamplesOf(pipelineId) == 0,
+                    () -> "remaining samples=" + documents.rateSamplesOf(pipelineId));
         }
     }
 
-    private static String storeUri(String name, Tiers tier) {
-        return SharedMongo.replicaSetUrl(name + "_" + tier.name().toLowerCase(Locale.ROOT));
-    }
 }

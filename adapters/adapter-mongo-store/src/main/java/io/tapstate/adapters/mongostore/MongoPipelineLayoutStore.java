@@ -1,6 +1,10 @@
 package io.tapstate.adapters.mongostore;
 
 import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoClient;
+import com.mongodb.ReadConcern;
+import com.mongodb.WriteConcern;
+import com.mongodb.TransactionOptions;
 import com.mongodb.client.model.ReplaceOptions;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.IoError;
@@ -18,10 +22,25 @@ import java.util.Optional;
 /** MongoDB storage for editor-only Pipeline node positions and viewport state. */
 public final class MongoPipelineLayoutStore implements PipelineLayoutStore {
 
+    private static final TransactionOptions TRANSACTION = TransactionOptions.builder()
+            .readConcern(ReadConcern.SNAPSHOT).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
     private final MongoCollection<Document> collection;
+    private final MongoClient client;
+    private final MongoCollection<Document> versions;
 
     public MongoPipelineLayoutStore(MongoCollection<Document> collection) {
         this.collection = Objects.requireNonNull(collection, "collection");
+        this.client = null;
+        this.versions = null;
+    }
+
+    /** A layout writer in the independently initialized configuration domain. */
+    public MongoPipelineLayoutStore(MongoClient client, MongoCollection<Document> collection,
+            MongoCollection<Document> versions) {
+        this.client = Objects.requireNonNull(client, "client");
+        this.collection = Objects.requireNonNull(collection, "collection")
+                .withReadConcern(ReadConcern.MAJORITY).withWriteConcern(WriteConcern.MAJORITY.withJournal(true));
+        this.versions = Objects.requireNonNull(versions, "versions");
     }
 
     @Override
@@ -34,14 +53,35 @@ public final class MongoPipelineLayoutStore implements PipelineLayoutStore {
     @Override
     public void save(PipelineLayout layout) {
         Objects.requireNonNull(layout, "layout");
-        StoreIo.run(() -> collection.replaceOne(
-                new Document("_id", layout.pipelineId()), toDocument(layout), new ReplaceOptions().upsert(true)));
+        if (client == null) {
+            StoreIo.run(() -> collection.replaceOne(new Document("_id", layout.pipelineId()),
+                    toDocument(layout), new ReplaceOptions().upsert(true)));
+        } else {
+            mutate(session -> collection.replaceOne(session, new Document("_id", layout.pipelineId()),
+                    toDocument(layout), new ReplaceOptions().upsert(true)));
+        }
     }
 
     @Override
     public void delete(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        StoreIo.run(() -> collection.deleteOne(new Document("_id", pipelineId)));
+        if (client == null) {
+            StoreIo.run(() -> collection.deleteOne(new Document("_id", pipelineId)));
+        } else {
+            mutate(session -> collection.deleteOne(session, new Document("_id", pipelineId)));
+        }
+    }
+
+    private void mutate(java.util.function.Consumer<com.mongodb.client.ClientSession> write) {
+        StoreIo.run(() -> {
+            try (var session = client.startSession()) {
+                session.withTransaction(() -> {
+                    ConfigurationVersion.advance(session, versions);
+                    write.accept(session);
+                    return null;
+                }, TRANSACTION);
+            }
+        });
     }
 
     static Document toDocument(PipelineLayout layout) {

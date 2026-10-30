@@ -123,7 +123,7 @@ def check(workflows, contexts, inputs):
     assert 'if-no-files-found: error' in shards, 'missing shard artifact must fail'
     assert 'Prepare pinned public inputs for Cloud startup witnesses' in shards
     assert 'if [ "$SHARD" = rest ]; then' in shards, 'the REST shard must prepare pinned Cloud inputs'
-    assert 'cloud_context_test = "io.tapstate.e2e.CloudClusterContextCarriesTheCurrentEgressAddressIT"' in shards
+    assert 'cloud_context_test = "io.tapstate.app.CloudClusterContextCarriesTheCurrentEgressAddressIT"' in shards
     assert 'test["class"] == cloud_context_test for test in shard["tests"]' in shards, \
         'any shard assigned the Cloud context test must prepare its pinned inputs'
     assert 'prepare-test-inputs.py --output "$RUNNER_TEMP/cloud-test-release"' in shards
@@ -161,10 +161,10 @@ def check(workflows, contexts, inputs):
     assert 'bash deploy/docker/image-smoke.sh --build' in ci['image-smoke'] \
         and 'mvn -q -pl app -am -DskipTests package' in inputs['deploy/docker/image-smoke.sh'], \
         'image-smoke must build the actual application through Maven dependency resolution'
-    cloud_context_test = 'io.tapstate.e2e.CloudClusterContextCarriesTheCurrentEgressAddressIT'
+    cloud_context_test = 'io.tapstate.app.CloudClusterContextCarriesTheCurrentEgressAddressIT'
     assert cloud_context_test in shards, 'the Cloud context e2e shard must prepare its release inputs'
-    cloud_context_source = inputs['e2e/src/test/java/io/tapstate/e2e/CloudClusterContextCarriesTheCurrentEgressAddressIT.java']
-    assert 'package io.tapstate.e2e;' in cloud_context_source \
+    cloud_context_source = inputs['app/src/test/java/io/tapstate/app/CloudClusterContextCarriesTheCurrentEgressAddressIT.java']
+    assert 'package io.tapstate.app;' in cloud_context_source \
         and re.search(r'\bclass\s+CloudClusterContextCarriesTheCurrentEgressAddressIT\b', cloud_context_source), \
         'the Cloud context test class named by CI must still exist at its declared package'
     cloud_dev = jobs(workflows['cloud-cluster-dev.yml']).get('image', '')
@@ -211,7 +211,7 @@ workflows = {p.name: p.read_text() for p in root.glob('*.yml')}
 repository = root.parents[1]
 inputs = {name: (repository / name).read_text()
           for name in ('pom.xml', 'app/pom.xml', 'deploy/docker/image-smoke.sh',
-                       'e2e/src/test/java/io/tapstate/e2e/CloudClusterContextCarriesTheCurrentEgressAddressIT.java')}
+                       'app/src/test/java/io/tapstate/app/CloudClusterContextCarriesTheCurrentEgressAddressIT.java')}
 # Snapshot of the protected branch's context names; the live list can be supplied as argv[1].
 contexts = Path(sys.argv[2]).read_text().splitlines() if sys.argv[2] else [
     'build', 'no-cjk', 'no-agent-footprint', 'sonarqube', 'e2e-admission',
@@ -303,8 +303,8 @@ for name, original, replacement in [
         mutations += 1
         continue
     raise AssertionError(f'SDK input mutation escaped: {replacement}')
-mutated_test = {**inputs, 'e2e/src/test/java/io/tapstate/e2e/CloudClusterContextCarriesTheCurrentEgressAddressIT.java':
-                inputs['e2e/src/test/java/io/tapstate/e2e/CloudClusterContextCarriesTheCurrentEgressAddressIT.java']
+mutated_test = {**inputs, 'app/src/test/java/io/tapstate/app/CloudClusterContextCarriesTheCurrentEgressAddressIT.java':
+                inputs['app/src/test/java/io/tapstate/app/CloudClusterContextCarriesTheCurrentEgressAddressIT.java']
                 .replace('CloudClusterContextCarriesTheCurrentEgressAddressIT', 'RenamedCloudContextIT')}
 try:
     check(workflows, contexts, mutated_test)

@@ -29,10 +29,11 @@ class ABoundedLoadKeepsItsMonitoringProgressIT {
         Path source = Files.createDirectory(directory.resolve("source"));
         Path target = Files.createDirectory(directory.resolve("target"));
         FileEndpoints.replaceTable(source.resolve("orders.csv"), "id,seq\n10,1\n11,2\n");
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(SharedMongo.replicaSetUrl("bounded_monitoring"));
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage);
                 FileEndpoints files = new FileEndpoints()) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID,
                     Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
             Map<String, String> resources = new LinkedHashMap<>();

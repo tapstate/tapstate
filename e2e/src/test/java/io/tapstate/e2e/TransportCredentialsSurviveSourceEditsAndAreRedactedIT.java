@@ -10,7 +10,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -31,11 +30,10 @@ class TransportCredentialsSurviveSourceEditsAndAreRedactedIT {
     void aRedactedSavedSourceRetainsTlsAndSshCredentialsAcrossAnEdit(@TempDir Path directory) throws Exception {
         Path data = Files.createDirectory(directory.resolve("data"));
         Path jar = E2eConnectorJar.buildInto(directory);
-        String database = "e2e_transport_credentials_" + UUID.randomUUID().toString().replace("-", "");
 
-        try (ServerHandle server = InProcessServer.start(SharedMongo.replicaSetUrl(database))) {
+        try (var storage = PreparedNativeStore.create(); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID, Files.readAllBytes(jar));
 
             Map<String, Object> config = new LinkedHashMap<>();

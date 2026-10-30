@@ -159,6 +159,98 @@ public final class SnapshotPhase {
         }
     }
 
+    /** Opens only a host-prepared session; its original model-pin receipt must exist before a load may proceed. */
+    public static Load openPrepared(CapturePort port,CaptureConfig config,SrsSnapshotPreparation preparation) {
+        return openPrepared(port,config,preparation,java.util.function.UnaryOperator.identity());
+    }
+    // The returned Load owns the session wrapper; failure paths close the first batch and session.
+    @SuppressWarnings("java:S2095")
+    public static Load openPrepared(CapturePort port,CaptureConfig config,SrsSnapshotPreparation preparation,
+            java.util.function.UnaryOperator<SnapshotSession> owner) {
+        Objects.requireNonNull(port,"port"); Objects.requireNonNull(config,"config"); Objects.requireNonNull(preparation,"preparation");
+        var run = preparation.run(); var owed = preparation.stillOwed(); var tables = preparation.tables();
+        var order = SourceOrder.snapshotRow(preparation.request().snapshotEpoch());
+        preparation.beginRead(); SnapshotSession session = null; CaptureBatch first = null;
+        try {
+            if (owed.isEmpty()) { preparation.close(); return new Load(null,run.miningChainId(),tables,owed,order,null,null,false); }
+            var opened = owner.apply(SnapshotSession.openPrepared(port,readOf(config,owed),preparation.request()).orElseThrow(() ->
+                    new TapstateException(io.tapstate.spi.store.IoError.SRS_CONSUMER_UNAVAILABLE,Map.of("chain",run.miningChainId()),null)));
+            session = new SnapshotSession() {
+                @Override public CaptureBatch read(String table) {
+                    preparation.requireReading();
+                    var batch = opened.read(table);
+                    try { preparation.requireReading(); return guardedBatch(batch,preparation); }
+                    catch (RuntimeException | Error failure) { closing(failure,batch::close); throw failure; }
+                }
+                @Override public void close() { preparation.close(); opened.close(); }
+            };
+            first = session.read(owed.getFirst());
+            seamOf(first,run.miningChainId());
+            var pin = preparation.accepted();
+            return new Load(session,run.miningChainId(),tables,owed,order,pin.sourcePosition(),first,false);
+        } catch (RuntimeException | Error failure) {
+            preparation.close();
+            if (first != null) closing(failure,first::close);
+            if (session != null) closing(failure,session::close);
+            throw failure;
+        }
+    }
+
+    /** A private load pins only its own existing channel and never creates an SRS consumer or model. */
+    public static Load openDirectPrepared(CapturePort port,CaptureConfig config,DirectSnapshotPreparation preparation) {
+        return openDirectPrepared(port,config,preparation,java.util.function.UnaryOperator.identity());
+    }
+    // The returned Load owns the session wrapper; failure paths close the first batch and session.
+    @SuppressWarnings("java:S2095")
+    public static Load openDirectPrepared(CapturePort port,CaptureConfig config,DirectSnapshotPreparation preparation,
+            java.util.function.UnaryOperator<SnapshotSession> owner) {
+        Objects.requireNonNull(port,"port");Objects.requireNonNull(config,"config");Objects.requireNonNull(preparation,"preparation");
+        var owed=preparation.stillOwed();var tables=preparation.tables();var order=SourceOrder.snapshotRow(preparation.request().snapshotEpoch());
+        preparation.beginRead();SnapshotSession session=null;CaptureBatch first=null;
+        try {
+            if(owed.isEmpty()) {
+                preparation.prepareRetained();String seam=preparation.accepted().token();preparation.close();
+                return new Load(null,preparation.channel(),tables,owed,order,seam,null,false);
+            }
+            var opened=owner.apply(SnapshotSession.openPrepared(port,readOf(config,owed),preparation.request()).orElseThrow(() ->
+                    new TapstateException(io.tapstate.spi.store.IoError.DIRECT_CHANNEL_UNAVAILABLE,Map.of("channel",preparation.channel()),null)));
+            session=new SnapshotSession() {
+                @Override public CaptureBatch read(String table) {
+                    preparation.requireReading();var batch=opened.read(table);
+                    try {preparation.requireReading();return guardedBatch(batch,preparation::requireReading);}
+                    catch(RuntimeException|Error failure){closing(failure,batch::close);throw failure;}
+                }
+                @Override public void close(){preparation.close();opened.close();}
+            };
+            first=session.read(owed.getFirst());seamOf(first,preparation.channel());String anchor=preparation.accepted().token();
+            return new Load(session,preparation.channel(),tables,owed,order,anchor,first,false);
+        } catch(RuntimeException|Error failure) {
+            preparation.close();if(first!=null)closing(failure,first::close);if(session!=null)closing(failure,session::close);throw failure;
+        }
+    }
+
+    private static CaptureBatch guardedBatch(CaptureBatch original,SrsSnapshotPreparation preparation) {
+        return guardedBatch(original,preparation::requireReading);
+    }
+    private static CaptureBatch guardedBatch(CaptureBatch original,Runnable requireReading) {
+        return new CaptureBatch() {
+            private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
+            @Override public Optional<SourcePosition> seam() { requireReading.run(); return original.seam(); }
+            @Override public boolean hasNext() { requireReading.run(); return original.hasNext(); }
+            @Override public Envelope next() { requireReading.run(); return original.next(); }
+            @Override public synchronized void close() { if (!closed.get()) {original.close();closed.set(true);} }
+        };
+    }
+
+    private static Throwable closing(Throwable primary,Runnable close) {
+        try { close.run(); }
+        catch (RuntimeException | Error cleanup) {
+            if (primary == null) return cleanup;
+            if (cleanup != primary) primary.addSuppressed(cleanup);
+        }
+        return primary;
+    }
+
     private static String recordedTailStart(Optional<SrsMeta> record, String pipelineId) {
         return record.map(stored -> stored.sourceReadOffset() != null
                         ? stored.sourceReadOffset()
@@ -286,6 +378,10 @@ public final class SnapshotPhase {
      * through -- one read covers them all, so no table is through before the last row of the batch is.
      */
     public static Load openChainless(CapturePort port, CaptureConfig config, long snapshotEpoch) {
+        return openChainless(port,config,snapshotEpoch,java.util.function.UnaryOperator.identity());
+    }
+    public static Load openChainless(CapturePort port,CaptureConfig config,long snapshotEpoch,
+            java.util.function.UnaryOperator<CaptureBatch> owner) {
         Objects.requireNonNull(port, "port");
         Objects.requireNonNull(config, "config");
         if (snapshotEpoch < 1) {
@@ -295,7 +391,7 @@ public final class SnapshotPhase {
         SourceOrder order = SourceOrder.snapshotRow(snapshotEpoch);
         // Construct the owner before opening a source read that it must release.
         Load load = new Load(null, null, config.streams(), config.streams(), order, null, null, true);
-        load.open = SnapshotOnlyCapture.open(port, config);
+        load.open = owner.apply(SnapshotOnlyCapture.open(port, config));
         return load;
     }
 
@@ -320,6 +416,7 @@ public final class SnapshotPhase {
         private final boolean oneBatch;
         private CaptureBatch open;
         private boolean closed;
+        private boolean disposed;
 
         private Load(SnapshotSession session, String miningChainId, List<String> tables,
                 List<String> owed, SourceOrder order, String tailSeam, CaptureBatch open, boolean oneBatch) {
@@ -381,19 +478,16 @@ public final class SnapshotPhase {
         public void close() {
             CaptureBatch batch;
             synchronized (this) {
+                if (disposed) return;
                 closed = true;
                 batch = open;
-                open = null;
             }
-            try {
-                if (session != null) {
-                    session.close();
-                }
-            } finally {
-                if (batch != null) {
-                    batch.close();
-                }
-            }
+            Throwable failure = null;
+            if (session != null) failure = closing(failure,session::close);
+            if (batch != null) failure = closing(failure,batch::close);
+            if (failure instanceof RuntimeException runtime) throw runtime;
+            if (failure instanceof Error error) throw error;
+            synchronized (this) { if (open == batch) open = null; disposed = true; }
         }
 
         private long readOpenBatch(Consumer<Envelope> sink) {
@@ -409,12 +503,10 @@ public final class SnapshotPhase {
                     count++;
                 }
             } finally {
-                synchronized (this) {
-                    if (open == batch) {
-                        open = null;
-                    }
-                }
                 batch.close();
+                synchronized (this) {
+                    if (open == batch) open = null;
+                }
             }
             return count;
         }

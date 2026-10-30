@@ -12,6 +12,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.Set;
 import java.util.stream.Stream;
 
 /**
@@ -41,7 +42,13 @@ public final class SeedConnectorSweep {
 
     /** Sweeps {@code seedDir}, returning one outcome per {@code *.jar} file, sorted by file name. */
     public List<SeedOutcome> sweep(Path seedDir) {
+        return sweep(seedDir, null);
+    }
+
+    /** Sweeps only explicitly selected file names; the caller validates its immutable release first. */
+    public List<SeedOutcome> sweep(Path seedDir, Set<String> selectedFileNames) {
         Objects.requireNonNull(seedDir, "seedDir");
+        Set<String> selected = selectedFileNames == null ? null : Set.copyOf(selectedFileNames);
         if (Files.notExists(seedDir)) {
             return List.of();
         }
@@ -53,6 +60,7 @@ public final class SeedConnectorSweep {
         }
         List<SeedOutcome> outcomes = new ArrayList<>();
         for (Path artifact : seedJars(seedDir)) {
+            if (selected != null && !selected.contains(artifact.getFileName().toString())) continue;
             try {
                 outcomes.add(new SeedOutcome.Seeded(
                         artifact, registrar.register(artifact, RegistrationSource.SEED)));

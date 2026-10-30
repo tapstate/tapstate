@@ -1,6 +1,9 @@
 package io.tapstate.runtime.scheduler;
 
 import io.tapstate.core.event.Op;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.FlatMetricProjection;
@@ -730,8 +733,23 @@ public final class ObservationPublisher {
      * the reason its previous run died of the moment it leaves FAILED.
      */
     public Optional<Observation> publish(String pipelineId, ObservationFailure failure) {
+        return publish(pipelineId, failure, state, observations, false);
+    }
+
+    /** Projects through the fixed state and original-claim observation views captured by this pass. */
+    public Optional<Observation> publishScoped(PipelineIntentScope scope, StateStore scopedState,
+            ObservationStore scopedObservations, ObservationFailure failure) {
+        Objects.requireNonNull(scope, "scope");
+        return publish(scope.pipelineId(), failure, Objects.requireNonNull(scopedState, "scopedState"),
+                Objects.requireNonNull(scopedObservations, "scopedObservations"), true);
+    }
+
+    private Optional<Observation> publish(String pipelineId, ObservationFailure failure, StateStore state,
+            ObservationStore observations, boolean requirePreparedState) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        return state.read(pipelineId).map(checkpoint -> {
+        var current = state.read(pipelineId);
+        if (requirePreparedState && current.isEmpty()) throw missingCheckpoint(pipelineId);
+        return current.map(checkpoint -> {
             PipelineState actual = StateJson.parse(checkpoint.stateJson());
             if (actual == PipelineState.COMPLETED) {
                 Optional<Observation> previous = observations.read(pipelineId);
@@ -759,41 +777,46 @@ public final class ObservationPublisher {
                         .computeIfAbsent(pipelineId, id -> new ConcurrentHashMap<>())
                         .merge(failure.code(), 1L, Long::sum);
             }
-            Map<String, NestStateReading> readings = nestStateReadings.apply(pipelineId);
-            // Both frontier readings are taken once and used twice - published as metrics and judged by
-            // the watch. Asking each source again for the watch would pay for a second collection of the
-            // run's statistics per pass, and would let the two answers disagree: what an operator reads
-            // and what raised the alarm they are reading would then be different passes of the same run.
-            Map<String, Long> gaps = frontierGaps.apply(pipelineId);
-            Map<String, Long> pinned = frontierStalls.apply(pipelineId);
-            // One instant for the whole pass, shared by the observation and by every point in it. Asking
-            // the clock again per metric would stamp one pass with a spread of times, and a consumer
-            // computing a rate across two passes would divide by a difference that is partly this
-            // publisher's own loop.
             Instant at = observedNow();
-            // The stored document carries these facts twice, from this one measurement: whole, as the
-            // facts themselves, and as the flat numeric view of them. The flat view is a projection and it
-            // drops what it cannot hold; what it drops is still on the document as a fact, so a reader who
-            // finds a metric missing from the flat view finds it whole next to it rather than nowhere. What
-            // the flat view drops today is pinned by this publisher's own test, so that the first metric it
-            // cannot carry is a decision somebody makes rather than a metric that quietly fails to appear.
-            // Taken once and used twice, like the frontier readings above: the load is published as two
-            // metrics and as the observation's own snapshot dataset, and asking its source again for the
-            // second use would let the two faces of one load describe different passes of it.
-            SnapshotReading loaded = snapshots.apply(pipelineId);
-            SnapshotReading readThisRun = runSnapshots.apply(pipelineId);
-            List<MetricFact> measured = facts(pipelineId, actual, at, readings, gaps, pinned,
-                    nestDeadLetters.apply(pipelineId), joinRecomputeDone.apply(pipelineId),
-                    joinRecomputeExpected.apply(pipelineId), loaded, readThisRun);
-            Observation published = new Observation(pipelineId, actual,
-                    FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(),
-                    loaded.byTable(), positions.apply(pipelineId), carried, at, measured, initialLoadAt(pipelineId, at));
+            Map<String, NestStateReading> readings = Map.of();
+            Map<String, Long> gaps = Map.of();
+            Map<String, Long> pinned = Map.of();
+            boolean measuredSuccessfully = false;
+            Observation published;
+            try {
+                // Share each measurement between the observation and its alert watches. A second read
+                // could describe a different pass, especially while a failed execution is being released.
+                readings = nestStateReadings.apply(pipelineId);
+                gaps = frontierGaps.apply(pipelineId);
+                pinned = frontierStalls.apply(pipelineId);
+                SnapshotReading loaded = snapshots.apply(pipelineId);
+                SnapshotReading readThisRun = runSnapshots.apply(pipelineId);
+                List<MetricFact> measured = facts(pipelineId, actual, at, readings, gaps, pinned,
+                        nestDeadLetters.apply(pipelineId), joinRecomputeDone.apply(pipelineId),
+                        joinRecomputeExpected.apply(pipelineId), loaded, readThisRun);
+                published = new Observation(pipelineId, actual,
+                        FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(),
+                        loaded.byTable(), positions.apply(pipelineId), carried, at, measured, initialLoadAt(pipelineId, at));
+                measuredSuccessfully = true;
+            } catch (TapstateException unavailable) {
+                if (actual != PipelineState.FAILED) throw unavailable;
+                // A durable failure must remain visible when its own damaged recovery data cannot be
+                // measured. Retain only the previous positions/load and the locally witnessed failures;
+                // neither an empty reading nor the measurement error is a new execution fact.
+                Observation previous = observations.read(pipelineId).orElse(null);
+                List<MetricFact> known = failures(pipelineId, at).stream().toList();
+                published = new Observation(pipelineId, actual,
+                        FlatMetricProjection.of(known, FLAT_REDUCTIONS).metrics(),
+                        previous != null ? previous.snapshot() : Map.of(),
+                        previous != null ? previous.positions() : Map.of(), carried, at, known, previous != null ? previous.initialLoad() : null);
+            }
+            // Both paths use the original observation port. Its scope, checkpoint and claim checks
+            // remain authoritative, and a refusal here cannot be mistaken for unreadable telemetry.
             observations.save(published);
-            // Fed after the observation is written and never before. The observation is the contract and
-            // the alert is a courtesy on top of it, so a fault in the alerting path must not be able to
-            // cost a pipeline the read face that says it is alive at all.
-            coldLayer.saw(pipelineId, readings);
-            frontierStall.saw(pipelineId, pinned, gaps);
+            if (measuredSuccessfully) {
+                coldLayer.saw(pipelineId, readings);
+                frontierStall.saw(pipelineId, pinned, gaps);
+            }
             // Handed back so that whoever runs the pass can take a sample off exactly what was published,
             // at the time it was published, rather than reading it back or measuring it again.
             return published;
@@ -822,17 +845,32 @@ public final class ObservationPublisher {
      * retained fact, especially once completion has released the capture that could report it again.
      */
     public void publishReconcileFailure(String pipelineId, long consecutiveFailures) {
-        Objects.requireNonNull(pipelineId, "pipelineId");
-        Observation previous = observations.read(pipelineId).orElse(null);
-        PipelineState lastState = previous != null ? previous.state() : PipelineState.NEW;
+        PipelineState current = PipelineState.NEW;
         try {
             if (state.read(pipelineId).map(checkpoint -> StateJson.parse(checkpoint.stateJson()))
-                    .filter(PipelineState.COMPLETED::equals).isPresent()) {
-                lastState = PipelineState.COMPLETED;
-            }
+                    .filter(PipelineState.COMPLETED::equals).isPresent()) current = PipelineState.COMPLETED;
         } catch (RuntimeException unavailable) {
             // This path must still report when the state store itself is what the pass could not read.
         }
+        publishReconcileFailure(pipelineId, consecutiveFailures, observations, current);
+    }
+
+    /** A failed pass still uses its original ports, including when no projection has been made yet. */
+    public void publishReconcileFailureScoped(PipelineIntentScope scope, StateStore scopedState,
+            ObservationStore scopedObservations, long consecutiveFailures) {
+        Objects.requireNonNull(scope, "scope");
+        Objects.requireNonNull(scopedState, "scopedState");
+        Objects.requireNonNull(scopedObservations, "scopedObservations");
+        var current = scopedState.read(scope.pipelineId()).orElseThrow(() -> missingCheckpoint(scope.pipelineId()));
+        publishReconcileFailure(scope.pipelineId(), consecutiveFailures, scopedObservations, StateJson.parse(current.stateJson()));
+    }
+
+    private void publishReconcileFailure(String pipelineId, long consecutiveFailures, ObservationStore observations,
+            PipelineState unpublishedState) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        Observation previous = observations.read(pipelineId).orElse(null);
+        PipelineState lastState = unpublishedState == PipelineState.COMPLETED ? PipelineState.COMPLETED
+                : previous != null ? previous.state() : unpublishedState;
         Map<String, String> lastPositions = previous != null ? previous.positions() : Map.of();
         ObservationFailure lastFailure = previous != null ? previous.failure() : null;
         Instant at = observedNow();
@@ -851,6 +889,10 @@ public final class ObservationPublisher {
                 FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(),
                 keepLoad ? previous.snapshot() : null, lastPositions, lastFailure, at, measured,
                 keepLoad ? previous.initialLoad() : null));
+    }
+
+    private static TapstateException missingCheckpoint(String pipelineId) {
+        return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", pipelineId, "field", "checkpoint"), null);
     }
 
     /**

@@ -249,6 +249,8 @@ class ConvergenceDriverTest {
         // pipeline id, proving the driver sets the pipeline attribution slot around each pipeline's work.
         RingBufferLogSink sink = new RingBufferLogSink(8, 8);
         Logger driverLogger = (Logger) LoggerFactory.getLogger(ConvergenceDriver.class);
+        var previousLevel = driverLogger.getLevel();
+        driverLogger.setLevel(ch.qos.logback.classic.Level.WARN);
         PipelineLogAppender appender = new PipelineLogAppender(sink, new io.tapstate.core.logging.SecretRedactor());
         appender.setContext(driverLogger.getLoggerContext());
         appender.start();
@@ -261,6 +263,7 @@ class ConvergenceDriverTest {
         } finally {
             driverLogger.detachAppender(appender);
             appender.stop();
+            driverLogger.setLevel(previousLevel);
         }
 
         assertThat(sink.tail("broken")).extracting(LogLine::level).containsExactly("WARN");
@@ -275,6 +278,8 @@ class ConvergenceDriverTest {
         // silent "found 0" it used to be, and the observable state reflects the failure.
         RingBufferLogSink sink = new RingBufferLogSink(8, 8);
         Logger driverLogger = (Logger) LoggerFactory.getLogger(ConvergenceDriver.class);
+        var previousLevel = driverLogger.getLevel();
+        driverLogger.setLevel(ch.qos.logback.classic.Level.WARN);
         PipelineLogAppender appender = new PipelineLogAppender(sink, new io.tapstate.core.logging.SecretRedactor());
         appender.setContext(driverLogger.getLoggerContext());
         appender.start();
@@ -294,6 +299,7 @@ class ConvergenceDriverTest {
         } finally {
             driverLogger.detachAppender(appender);
             appender.stop();
+            driverLogger.setLevel(previousLevel);
         }
 
         assertThat(sink.tail("orders")).extracting(LogLine::level).contains("WARN");

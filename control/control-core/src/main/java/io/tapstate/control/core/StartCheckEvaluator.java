@@ -105,12 +105,13 @@ public final class StartCheckEvaluator {
         } catch (TapstateException coded) {
             planUnavailable = coded;
         }
+        Instant checkDeadline = clock.instant().plus(budget);
         ExecutorService probes = Executors.newVirtualThreadPerTaskExecutor();
         Map<StartCheck, Future<List<StartFinding>>> running = new LinkedHashMap<>();
         try {
             List<StartCheck> applicable = checks.stream().filter(check -> check.mayApply(definition)).toList();
             StartCheckContext context = new StartCheckContext(pipelineId, intent, definition, contentHash, plan,
-                    planUnavailable, probe, probes, clock, clock.instant().plus(budget), perTarget, this::describe);
+                    planUnavailable, probe, probes, clock, checkDeadline, perTarget, this::describe);
 
             for (StartCheck check : applicable) {
                 running.put(check, executor.submit(() -> check.evaluate(context)));

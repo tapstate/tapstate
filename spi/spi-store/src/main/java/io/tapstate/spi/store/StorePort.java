@@ -15,6 +15,9 @@ package io.tapstate.spi.store;
  */
 public interface StorePort {
 
+    /** Read-only admission: this Pipeline must use its explicit full recovery instead of an ordinary start. */
+    default boolean pipelineRecoveryRequired(String pipelineId) { return false; }
+
     /** The canonical, authoritative store of applied resources. */
     ArtifactStore artifacts();
 

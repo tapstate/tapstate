@@ -24,9 +24,8 @@ class PipelineBuilderAssistantProviderSettingsIT {
 
     @Test
     void aCloudWorkspaceCanSaveProviderSettingsWithoutReadingBackTheKey() throws Exception {
-        String database = "ts_plan_ai_provider_" + UUID.randomUUID().toString().replace("-", "");
-        String storeUri = SharedMongo.replicaSetUrl(database);
-        try (AtlasRuntime runtime = new AtlasRuntime(AtlasRuntime.Mode.CLOUD, storeUri);
+        try (PreparedNativeStore storage = PreparedNativeStore.createCloud();
+                AtlasRuntime runtime = new AtlasRuntime(storage);
                 ServerHandle server = runtime.launch(Tiers.REAL_PROCESS)) {
             ControlPlane control = runtime.control(server, true);
             HttpClient client = HttpClient.newHttpClient();
@@ -55,16 +54,16 @@ class PipelineBuilderAssistantProviderSettingsIT {
 
     @Test
     void aBlankDraftCanValidateAnInputFromADiscoveredSourceWithoutSavingIt() throws Exception {
-        String database = "ts_plan_ai_discovery_" + UUID.randomUUID().toString().replace("-", "");
-        String storeUri = SharedMongo.replicaSetUrl(database);
-        try (AtlasRuntime runtime = new AtlasRuntime(AtlasRuntime.Mode.CLOUD, storeUri);
+        try (PreparedNativeStore storage = PreparedNativeStore.createCloud();
+                AtlasRuntime runtime = new AtlasRuntime(storage);
                 ServerHandle server = runtime.launch(Tiers.REAL_PROCESS);
-                var connection = new io.tapstate.adapters.mongostore.MongoConnection(
-                        new io.tapstate.adapters.mongostore.MongoConnectionSettings(storeUri, null, java.time.Duration.ofSeconds(5)))) {
+                var configuration = io.tapstate.adapters.mongostore.MongoConfigurationDomain.open(
+                        new io.tapstate.adapters.mongostore.MongoConnectionSettings(storage.configurationUri(), null, java.time.Duration.ofSeconds(5)), storage.clusterId());
+                var cache = io.tapstate.adapters.mongostore.MongoCacheDomain.connect(configuration.bindings().load().orElseThrow().cache(),
+                        java.time.Duration.ofSeconds(5), "ai-test-models")) {
             ControlPlane control = runtime.control(server, true);
-            connection.verify();
-            var store = new io.tapstate.adapters.mongostore.MongoStorePort(connection, database + "_operator");
-            Map<String, Object> candidate = seedDraft(store, control);
+            Map<String, Object> candidate = seedDraft(configuration.artifacts(),
+                    cache.schemas(configuration.bindings().cachePreparation().orElseThrow().businessScope(), () -> {}), control);
             HttpRequest request = HttpRequest.newBuilder(server.baseUrl().resolve("/api/pipelines/blank_auto/draft:assistant-validate"))
                     .header("Cookie", control.credential()).header("Origin", server.baseUrl().toString())
                     .header("Content-Type", "application/json")
@@ -73,21 +72,19 @@ class PipelineBuilderAssistantProviderSettingsIT {
             HttpResponse<String> validated = HttpClient.newHttpClient().send(request, HttpResponse.BodyHandlers.ofString());
             assertThat(validated.statusCode()).isEqualTo(200);
             assertThat(object(validated.body())).containsEntry("valid", true);
-            assertThat(store.drafts().get("blank_auto").orElseThrow().wizard().root()).isNull();
+            assertThat(configuration.drafts().get("blank_auto").orElseThrow().wizard().root()).isNull();
             runtime.assertAuthenticationBoundary();
         }
     }
 
     @Test
     void invalidAssistantCandidateCanBeClarifiedWithoutChangingTheDraft() throws Exception {
-        String database = "ts_plan_ai_discovery_" + UUID.randomUUID().toString().replace("-", "");
-        String storeUri = SharedMongo.replicaSetUrl(database);
         var calls = new java.util.concurrent.atomic.AtomicInteger();
         var received = new java.util.concurrent.atomic.AtomicReference<java.util.List<Map<String, String>>>();
         var proposed = new java.util.concurrent.atomic.AtomicReference<Map<String, Object>>();
-        var closed = new java.util.concurrent.atomic.AtomicBoolean();
+        var closed = new java.util.concurrent.atomic.AtomicInteger();
         class ControlledProvider implements io.tapstate.control.core.AiProviderClient, AutoCloseable {
-            public void close() { closed.set(true); }
+            public void close() { closed.incrementAndGet(); }
             public void check(io.tapstate.control.core.AiProviderSettings settings) { }
             public java.util.Optional<Map<String, Object>> propose(io.tapstate.control.core.AiProviderSettings settings,
                     java.util.List<Map<String, String>> messages, Map<String, Object> context,
@@ -98,17 +95,19 @@ class PipelineBuilderAssistantProviderSettingsIT {
             }
         }
         var provider = new ControlledProvider();
-        try (AtlasRuntime runtime = new AtlasRuntime(AtlasRuntime.Mode.CLOUD, storeUri);
+        try (PreparedNativeStore storage = PreparedNativeStore.createCloud();
+                AtlasRuntime runtime = new AtlasRuntime(storage);
                 ServerHandle server = runtime.launch(Tiers.IN_PROCESS, java.util.List.of(), provider);
-                var connection = new io.tapstate.adapters.mongostore.MongoConnection(
-                        new io.tapstate.adapters.mongostore.MongoConnectionSettings(storeUri, null, java.time.Duration.ofSeconds(5)))) {
+                var configuration = io.tapstate.adapters.mongostore.MongoConfigurationDomain.open(
+                        new io.tapstate.adapters.mongostore.MongoConnectionSettings(storage.configurationUri(), null, java.time.Duration.ofSeconds(5)), storage.clusterId());
+                var cache = io.tapstate.adapters.mongostore.MongoCacheDomain.connect(configuration.bindings().load().orElseThrow().cache(),
+                        java.time.Duration.ofSeconds(5), "ai-test-models")) {
             org.assertj.core.api.Assertions.assertThatThrownBy(() -> runtime.launch(Tiers.REAL_PROCESS, java.util.List.of(), provider))
                     .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("in-process tier");
             ControlPlane control = runtime.control(server, true);
-            connection.verify();
-            var store = new io.tapstate.adapters.mongostore.MongoStorePort(connection, database + "_operator");
-            Map<String, Object> candidate = seedDraft(store, control);
-            var originalDraft = store.drafts().get("blank_auto").orElseThrow();
+            Map<String, Object> candidate = seedDraft(configuration.artifacts(),
+                    cache.schemas(configuration.bindings().cachePreparation().orElseThrow().businessScope(), () -> {}), control);
+            var originalDraft = configuration.drafts().get("blank_auto").orElseThrow();
             proposed.set(candidate);
             HttpClient client = HttpClient.newHttpClient();
             var settingsRequest = HttpRequest.newBuilder(server.baseUrl().resolve("/api/ai-provider-settings"))
@@ -120,24 +119,24 @@ class PipelineBuilderAssistantProviderSettingsIT {
             assertThat(first.statusCode()).isEqualTo(200);
             assertThat(first.body()).contains("Which source?", "needs-input", "control.ai-invalid-proposal", "\"finishReason\":\"stop\"")
                     .doesNotContain("data-proposal", "\"type\":\"error\"");
-            assertThat(store.drafts().get("blank_auto")).contains(originalDraft);
+            assertThat(configuration.drafts().get("blank_auto")).contains(originalDraft);
             var second = assistant(client, server, control, java.util.List.of(
                     Map.of("role", "user", "text", "Choose tables"),
                     Map.of("role", "assistant", "text", "Which source?"),
                     Map.of("role", "user", "text", "Use orders_src")));
             assertThat(second.body()).contains("Using orders.", "data-proposal", "\"finishReason\":\"stop\"");
             assertThat(received.get()).contains(Map.of("role", "user", "content", "Use orders_src"));
-            assertThat(store.drafts().get("blank_auto")).contains(originalDraft);
+            assertThat(configuration.drafts().get("blank_auto")).contains(originalDraft);
         }
-        assertThat(closed).isTrue();
+        assertThat(closed).hasValue(1);
     }
 
-    private static Map<String, Object> seedDraft(io.tapstate.adapters.mongostore.MongoStorePort store, ControlPlane control) {
-        store.artifacts().save(new io.tapstate.core.model.SourceResource("orders_src", null, "mysql",
+    private static Map<String, Object> seedDraft(io.tapstate.spi.store.ArtifactStore artifacts, io.tapstate.spi.store.SchemaStore schemas, ControlPlane control) {
+        artifacts.save(new io.tapstate.core.model.SourceResource("orders_src", null, "mysql",
                 Map.of(), io.tapstate.core.model.SourceMode.CDC, null, null, null));
-        store.artifacts().save(new io.tapstate.core.model.SourceResource("destination", null, "mongodb",
+        artifacts.save(new io.tapstate.core.model.SourceResource("destination", null, "mongodb",
                 Map.of(), null, null, null, null));
-        store.schemas().save(new io.tapstate.spi.store.DiscoveredSourceModel("orders_src", "mysql", 1,
+        schemas.save(new io.tapstate.spi.store.DiscoveredSourceModel("orders_src", "mysql", 1,
                 new io.tapstate.spi.store.SourceModel(java.util.List.of(new io.tapstate.spi.store.SourceTable("orders",
                     java.util.List.of(new io.tapstate.spi.store.SourceField("id", "integer")),
                     java.util.List.of("id"), java.util.List.of())))));

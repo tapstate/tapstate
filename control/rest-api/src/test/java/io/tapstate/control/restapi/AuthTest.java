@@ -1,6 +1,7 @@
 package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.ApplyService;
+import io.tapstate.control.core.ControlError;
 import io.tapstate.control.core.AccessTokenService;
 import io.tapstate.control.core.ArtifactMutationService;
 import io.tapstate.control.core.PlanAdvisories;
@@ -176,6 +177,21 @@ class AuthTest {
     /** Mints a machine token of the given grade through the real token service and returns the bearer string. */
     private String machineToken(Scope scope) {
         return context.getBean(TokenService.class).create(scope);
+    }
+
+    @Test void storageRoutesKeepAuthenticationSeparateFromUnassembledDependencies() {
+        var anonymous = client().post().uri("/api/storage/status").contentType(MediaType.APPLICATION_JSON).body(Map.of())
+                .exchange((request,response) -> { assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED); return response.bodyTo(ApiError.class); });
+        assertThat(anonymous.code()).isEqualTo(ControlError.UNAUTHENTICATED.code());
+        var admin = client().post().uri("/api/storage/status").header(HttpHeaders.AUTHORIZATION,"Bearer " + machineToken(Scope.ADMIN))
+                .contentType(MediaType.APPLICATION_JSON).body(Map.of()).exchange((request,response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE); return response.bodyTo(ApiError.class);
+                });
+        assertThat(admin.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE.code());
+        client().post().uri("/api/storage/setup/commit").header(HttpHeaders.AUTHORIZATION,"Bearer " + machineToken(Scope.READ))
+                .contentType(MediaType.APPLICATION_JSON).body(Map.of()).exchange((request,response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN); return null;
+                });
     }
 
     @Test
@@ -585,6 +601,16 @@ class AuthTest {
     }
 
     @Test
+    void theControlFaceKeepsInstallationTrafficSeparateFromPublicSecurityChains() {
+        assertThat(context.getBeansOfType(SecurityFilterChain.class)).containsOnlyKeys(
+                "installationSecurityFilterChain", "apiSecurityFilterChain", "rootSecurityFilterChain");
+        var publicRequest = new org.springframework.mock.web.MockHttpServletRequest("POST", "/api/storage/setup/commit");
+        publicRequest.setLocalAddr("127.0.0.1");
+        publicRequest.addHeader("X-Forwarded-For", "127.0.0.1");
+        assertThat(context.getBean("installationSecurityFilterChain", SecurityFilterChain.class).matches(publicRequest)).isFalse();
+    }
+
+    @Test
     void publicBrandingAssetsReachStaticResourceHandlingWithoutAuthentication() {
         for (String path : List.of("/favicon.ico", "/tapstate-mark.svg", "/tapstate-mark-light.svg")) {
             HttpStatusCode status = client().get().uri(path)
@@ -613,8 +639,8 @@ class AuthTest {
     }
 
     @Test
-    void theControlFaceUsesTwoStatelessSecurityChainsInsteadOfTheLegacyInterceptor() {
-        assertThat(context.getBeansOfType(SecurityFilterChain.class)).hasSize(2);
+    void theControlFaceUsesThreeStatelessSecurityChainsInsteadOfTheLegacyInterceptor() {
+        assertThat(context.getBeansOfType(SecurityFilterChain.class)).hasSize(3);
     }
 
     @Test

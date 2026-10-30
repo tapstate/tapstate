@@ -114,6 +114,22 @@ class SourceApiTest {
     }
 
     @Test
+    void creatingASourceWithSpacesReturnsAnEncodedUsableLocation() throws Exception {
+        ResponseEntity<String> created = request("writer").post().uri("/api/sources")
+                .contentType(MediaType.APPLICATION_JSON).body(sourceJson("atlas source", "location"))
+                .exchange((req, res) -> ResponseEntity.status(res.getStatusCode()).headers(res.getHeaders())
+                        .body(res.bodyTo(String.class)));
+        assertThat(context.getBean(InMemoryArtifactStore.class).get("atlas source")).isPresent();
+        assertThat(created.getStatusCode()).isEqualTo(HttpStatus.CREATED);
+        assertThat(created.getHeaders().getLocation().toASCIIString()).isEqualTo("/api/sources/atlas%20source");
+        String body = request("reader").get()
+                .uri(java.net.URI.create("http://127.0.0.1:" + port).resolve(created.getHeaders().getLocation()))
+                .retrieve().body(String.class);
+        assertThat(JSON.readTree(body).path("id").asText()).isEqualTo("atlas source");
+        assertThat(body).doesNotContain(SECRET);
+    }
+
+    @Test
     void sourceHttpPreservesUnboundedAndEmptyTableSelectionScopes() throws Exception {
         for (boolean explicitlyEmpty : List.of(false, true)) {
             String id = explicitlyEmpty ? "empty_scope" : "open_scope";

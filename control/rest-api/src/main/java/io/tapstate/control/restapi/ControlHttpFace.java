@@ -50,7 +50,7 @@ import java.util.List;
         SourceController.class,
         ViewController.class,
         SampleSourceController.class, SampleInstallJobController.class,
-        StateStoreController.class,
+        StateStoreController.class, StorageControlController.class,
         ConnectorIconController.class,
         PipelineViewController.class,
         PipelineDeletionController.class,

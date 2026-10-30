@@ -8,7 +8,6 @@ import org.junit.jupiter.params.provider.EnumSource;
 
 import java.nio.file.Path;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -25,9 +24,8 @@ class PipelineDeletionIT {
     @EnumSource(Tiers.class)
     void oneDeleteRemovesTheStoppedPipelineAndItsDraftFromTheCatalog(Tiers tier, @TempDir Path directory)
             throws Exception {
-        try (ServerHandle server = tier.launch(SharedMongo.replicaSetUrl(
-                "pipeline_delete_" + tier.name().toLowerCase(Locale.ROOT)))) {
-            RunningPipeline running = RunningPipeline.started(server, directory);
+        try (var storage = PreparedNativeStore.create(); ServerHandle server = tier.launch(storage)) {
+            RunningPipeline running = RunningPipeline.started(server, directory, storage);
             ControlPlane control = running.control();
             String id = running.pipelineId();
             ControlPlane.StoredArtifact before = control.artifact(id).orElseThrow();

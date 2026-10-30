@@ -61,6 +61,7 @@ public final class EnvelopeParser {
         rejectUnknownKeys(mapping.keySet(), Set.copyOf(Vocabulary.SETUP_KEYS), "setup");
         return new Setup(
                 databases(mapping.get("databases")),
+                mapping.containsKey("managed_target") ? string(mapping.get("managed_target"), "setup.managed_target") : null,
                 stringList(mapping.get("connectors"), "setup.connectors"),
                 stringList(mapping.get("apply"), "setup.apply"),
                 stringList(mapping.get("discover"), "setup.discover"));
@@ -290,6 +291,7 @@ public final class EnvelopeParser {
             case AWAIT -> new Step.Await(matcher(only.getValue()));
             case ASSERT -> new Step.Assertion(matcher(only.getValue()));
             case CDC -> cdc(only.getValue());
+            case START_REFUSED -> new Step.StartRefused(failureCode(only.getValue(), "start_refused"));
         };
     }
 
@@ -511,7 +513,11 @@ public final class EnvelopeParser {
      * same document, which is the one thing the schema must never do to an author.
      */
     private static String failureCode(Object node) {
-        String code = string(node, "failure_code");
+        return failureCode(node, "failure_code");
+    }
+
+    private static String failureCode(Object node, String where) {
+        String code = string(node, where);
         if (!code.matches("[a-z0-9]+\\.[a-z0-9-]+")) {
             throw new EnvelopeException(
                     "a failure code reads '<domain>.<symbol>' in lower kebab-case, found: " + code);

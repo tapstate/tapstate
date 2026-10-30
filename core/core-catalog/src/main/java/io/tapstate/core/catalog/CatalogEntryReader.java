@@ -30,7 +30,18 @@ public final class CatalogEntryReader {
     }
 
     public static ConnectorCatalogEntry fromTree(Map<String, Object> m) {
+        return decode(m, true);
+    }
+
+    /** Validates the persistence grammar; runtime capability reads always use {@link #fromTree}. */
+    public static boolean isCanonicalPersistenceTree(Map<String, Object> tree) {
+        try { return CatalogEntryWriter.toTree(decode(tree, false)).equals(tree); }
+        catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) { return false; }
+    }
+
+    private static ConnectorCatalogEntry decode(Map<String, Object> m, boolean applyReleasePolicy) {
         String connectorId = requireString(m, "id");
+        SinkCapability storedSink = sinkOf(asMap(m.get("sink")));
         return new ConnectorCatalogEntry(
                 connectorId,
                 str(m.get("name")),
@@ -40,7 +51,7 @@ public final class CatalogEntryReader {
                 modesOf(m.get("modes")),
                 discoveryOf(str(m.get("discovery"))),
                 // Stored capabilities cannot restore a role withdrawn by the running release.
-                SinkRules.applySupportPolicy(connectorId, sinkOf(asMap(m.get("sink")))),
+                applyReleasePolicy ? SinkRules.applySupportPolicy(connectorId, storedSink) : storedSink,
                 bool(m, "pushOut"),
                 configOf(m.get("config")),
                 provenanceOf(asMap(m.get("provenance"))));

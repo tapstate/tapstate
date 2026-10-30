@@ -614,6 +614,19 @@ def canonical_literal(value, typename):
     return [typename, spelling]
 
 
+def canonical_csv_argument(value, typename, root, source, sources, enum_context):
+    if value is None:
+        return ['null']
+    lookup, offset = enum_context
+    unused_name, target = lookup.resolve(source, typename, offset)
+    if target is not None and target[1]['kind'] == 'enum':
+        path, declaration = target
+        sources[path.relative_to(root).as_posix()] = digest(path.read_bytes())
+        require(value in enum_constants(path.read_text(), declaration), 'CSV enum constant is absent')
+        return ['enum', declaration['name'], value]
+    return canonical_literal(value, typename)
+
+
 def enum_qualified_name(root, source, enum_name, sources, enum_context=None):
     unused_path, declaration = enum_definition(root, source, enum_name, sources, enum_context)
     return declaration['name']
@@ -1140,7 +1153,7 @@ def source_parameters(root, source, declaration, sources, lookup=None):
             values.append([None if value in null_values else value for value in parsed])
         source_types = [typename for typename, injected in zip(declaration['parameter_types'], declaration['parameter_injected']) if not injected]
         require(all(len(row) == len(source_types) for row in values), 'CSV row and source parameter arity differs')
-        declaration['argument_digests'] = [argument_digest(with_injected([canonical_literal(value, typename) for value, typename in zip(row, source_types)], declaration)) for row in values]
+        declaration['argument_digests'] = [argument_digest(with_injected([canonical_csv_argument(value, typename, root, source, sources, enum_context) for value, typename in zip(row, source_types)], declaration)) for row in values]
     elif 'EnumSource' in annotations:
         argument = annotations['EnumSource']
         enum = re.search(r'(?:value\s*=\s*)?([\w.]+)\.class', argument)

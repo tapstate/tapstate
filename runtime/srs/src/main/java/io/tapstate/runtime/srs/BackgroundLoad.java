@@ -2,6 +2,7 @@ package io.tapstate.runtime.srs;
 
 import io.tapstate.core.event.Envelope;
 import io.tapstate.spi.capture.Subscription;
+import io.tapstate.spi.capture.SnapshotSession;
 
 import java.time.Duration;
 import java.util.Map;
@@ -113,7 +114,8 @@ final class BackgroundLoad {
         }
         // The batch being read is closed under the reader and a wait for room is interrupted: those are the
         // two places the thread can be parked for a long time, and neither ends by itself.
-        load.close();
+        Throwable failure = null;
+        try { load.close(); } catch (RuntimeException | Error closeFailure) { failure = closeFailure; }
         if (Thread.currentThread() != thread) {
             // Closed from outside. Closed from the reading thread itself -- by something it calls on the way
             // -- there is nothing to wake and nobody else to wait for: it sees the abandonment as it returns.
@@ -127,11 +129,25 @@ final class BackgroundLoad {
         Subscription subscription;
         synchronized (this) {
             subscription = opened;
-            opened = null;
         }
         if (subscription != null) {
-            subscription.close();
+            try { closeTail(subscription); }
+            catch (RuntimeException | Error closeFailure) {
+                if (failure == null) failure = closeFailure;
+                else if (closeFailure != failure) failure.addSuppressed(closeFailure);
+            }
         }
+        if (Thread.currentThread() != thread && thread.isAlive()) {
+            var ending = new io.tapstate.core.common.TapstateException(CaptureError.STILL_ENDING, Map.of("captureId", thread.getName()), null);
+            if (failure == null) failure = ending; else failure.addSuppressed(ending);
+        }
+        if (failure instanceof RuntimeException runtime) throw runtime;
+        if (failure instanceof Error error) throw error;
+    }
+
+    private void closeTail(Subscription original) {
+        original.close();
+        synchronized (this) { if (opened == original) opened = null; }
     }
 
     /**
@@ -152,6 +168,7 @@ final class BackgroundLoad {
     }
 
     private void run() {
+        boolean normalCompletion = false;
         try {
             readLoad();
             synchronized (this) {
@@ -170,13 +187,12 @@ final class BackgroundLoad {
             boolean keep;
             synchronized (this) {
                 keep = !cancelled;
-                if (keep) {
-                    opened = subscription.orElse(null);
-                }
+                opened = subscription.orElse(null);
+                normalCompletion = keep && !loadLetGo;
             }
             if (!keep) {
                 // Abandoned while the tail was opening: nobody is left to close it but this thread.
-                subscription.ifPresent(Subscription::close);
+                subscription.ifPresent(this::closeTail);
             }
         } catch (RuntimeException | Error failure) {
             // A run closed while it ran was cut short by the stop somebody asked for. Anything else that cuts it
@@ -186,8 +202,30 @@ final class BackgroundLoad {
                 health.fail(failure);
             }
         } finally {
-            load.close();
-            finished.countDown();
+            boolean deferred = false;
+            try { load.close(); }
+            catch (SnapshotSession.PendingClose pending) {
+                if (normalCompletion && !isCancelled() && pending.getSuppressed().length == 0)
+                    deferred = finishWhenClosed(pending);
+                else if (!isCancelled()) health.fail(pending);
+            }
+            catch (RuntimeException | Error failure) { if (!isCancelled()) health.fail(failure); }
+            finally { if (!deferred) finished.countDown(); }
+        }
+    }
+
+    /** Observe the original cleanup attempt without another worker, read, tail or ownership transition. */
+    private boolean finishWhenClosed(SnapshotSession.PendingClose pending) {
+        try {
+            pending.completion().whenComplete((ignored, outcome) -> {
+                try { load.close(); }
+                catch (RuntimeException | Error failure) { if (!isCancelled()) health.fail(failure); }
+                finally { finished.countDown(); }
+            });
+            return true;
+        } catch (RuntimeException | Error failure) {
+            if (!isCancelled()) health.fail(failure);
+            return false;
         }
     }
 

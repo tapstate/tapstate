@@ -443,7 +443,7 @@ public final class MongoSchemaStore implements SchemaStore {
         return number.longValue();
     }
 
-    private static SourceTable toTable(Document table, String id) {
+    static SourceTable toTable(Document table, String id) {
         String name = table.getString("name");
         if (name == null) {
             throw unreadable(id);

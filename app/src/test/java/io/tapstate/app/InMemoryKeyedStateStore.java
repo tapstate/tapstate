@@ -2,7 +2,7 @@ package io.tapstate.app;
 
 import io.tapstate.spi.store.KeyedStateStore;
 
-import java.util.LinkedHashMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.Map;
 import java.util.Optional;
 
@@ -13,7 +13,7 @@ import java.util.Optional;
  */
 final class InMemoryKeyedStateStore implements KeyedStateStore {
 
-    private final Map<String, Map<String, byte[]>> byNamespace = new LinkedHashMap<>();
+    private final Map<String, Map<String, byte[]>> byNamespace = new ConcurrentHashMap<>();
 
     @Override
     public Optional<byte[]> load(String namespace, String key) {
@@ -23,13 +23,13 @@ final class InMemoryKeyedStateStore implements KeyedStateStore {
 
     @Override
     public void save(String namespace, String key, byte[] state) {
-        byNamespace.computeIfAbsent(namespace, ignored -> new LinkedHashMap<>()).put(key, state);
+        byNamespace.computeIfAbsent(namespace, ignored -> new ConcurrentHashMap<>()).put(key, state);
     }
 
     @Override
     public Optional<byte[]> saveIfAbsent(String namespace, String key, byte[] state) {
         return Optional.ofNullable(byNamespace
-                .computeIfAbsent(namespace, ignored -> new LinkedHashMap<>())
+                .computeIfAbsent(namespace, ignored -> new ConcurrentHashMap<>())
                 .putIfAbsent(key, state));
     }
 
