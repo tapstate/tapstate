@@ -370,16 +370,19 @@ class PipelineFirstStatePreparerIT {
                     var pending = new ArrayList<java.util.concurrent.Future<?>>();
                     try {
                         for (var binding : originals) {
-                            var callbacks = mapStore(member, binding);
-                            for (org.assertj.core.api.ThrowableAssert.ThrowingCallable action : List.<org.assertj.core.api.ThrowableAssert.ThrowingCallable>of(
-                                    () -> callbacks.store("key", "late"), () -> callbacks.storeAll(Map.of("key", "late")),
-                                    () -> callbacks.delete("key"), () -> callbacks.deleteAll(List.of("key"))))
+                            for (var action : List.<java.util.function.Consumer<com.hazelcast.map.MapStore<Object, Object>>>of(
+                                    callbacks -> callbacks.store("key", "late"), callbacks -> callbacks.storeAll(Map.of("key", "late")),
+                                    callbacks -> callbacks.delete("key"), callbacks -> callbacks.deleteAll(List.of("key")))) {
+                                // Independent loaders let every callback cross the original guard. Calls on one
+                                // Nest loader intentionally queue behind its in-flight backend write.
+                                var callbacks = mapStore(member, binding);
                                 pending.add(workers.submit(() -> {
                                     callbackThread.set(true);
-                                    try { assertThatThrownBy(action).isInstanceOfSatisfying(TapstateException.class, failure ->
+                                    try { assertThatThrownBy(() -> action.accept(callbacks)).isInstanceOfSatisfying(TapstateException.class, failure ->
                                             assertThat(failure.code()).isIn(IoError.WORKLOAD_CLAIM_FENCED, io.tapstate.runtime.engine.EngineError.EXECUTION_NOT_AUTHORIZED)); }
                                     finally { callbackThread.remove(); }
                                 }));
+                            }
                         }
                         assertThat(entered.await(10, java.util.concurrent.TimeUnit.SECONDS)).as("all twenty actual MapStore callbacks have passed their original binding guard").isTrue();
                         var hot = new HazelcastOperatorReadiness(member, Duration.ofSeconds(10)); hot.releaseHot(manifest);

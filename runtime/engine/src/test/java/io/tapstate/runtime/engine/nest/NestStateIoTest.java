@@ -230,7 +230,7 @@ class NestStateIoTest {
         assertThat(threads).noneMatch(Thread::isAlive);
     }
 
-    private static void awaitAllBlockedInsideIo(List<Thread> threads) {
+    static void awaitAllBlockedInsideIo(List<Thread> threads) {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
         while (System.nanoTime() < deadline) {
             boolean blocked = threads.stream().allMatch(thread -> (thread.getState() == Thread.State.WAITING
