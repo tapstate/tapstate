@@ -115,6 +115,11 @@ class SourceConfigKeyringClusterIT {
                 var configuration = metadataDatabase(raw, storage.configurationDatabase());
                 var cache = metadataDatabase(raw, storage.cacheDatabase());
                 assertThat(cluster.awaitBothMembers()).hasSize(2);
+                Await.until("both original boots to complete monitoring enrollment before the renewal-only interval", WAIT,
+                        () -> configuration.getCollection("alert_node_lifecycles").countDocuments(new Document("phase", "EXPECTED")) == 2,
+                        () -> "the original monitoring facts are incomplete");
+                cluster.first().awaitInitialAlertMaintenance();
+                cluster.second().awaitInitialAlertMaintenance();
                 Resource readable = source("survives_key_conflict", "key-conflict-whole-config-sentinel");
                 cluster.first().apply(Map.of("key.tap.yml", WRITER.write(readable)));
                 Document originalKey = nativeKey(configuration);
