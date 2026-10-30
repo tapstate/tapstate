@@ -9,6 +9,7 @@ import io.tapstate.adapters.transform.MapSpec;
 import io.tapstate.adapters.transform.StatelessTransforms;
 import io.tapstate.adapters.transform.UnwindSpec;
 import io.tapstate.control.core.PipelineWriteTargets;
+import io.tapstate.control.core.PipelineOutputNames;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.dsl.UnwindWriteKeys;
@@ -24,6 +25,7 @@ import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.SyncElement;
+import io.tapstate.core.model.TableRef;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.model.BatchSpec;
@@ -594,7 +596,7 @@ final class StoreBackedDagSource implements DagSource {
                 this::discoveredColumns));
         SyncElement selected = serve.sync().getFirst();
         Map<String, TargetTable> renamed = TargetModelResolver.renameAll(
-                targets, streams, selected.rename(), sourceIdByTable(vertices));
+                targets, streams, selected.rename(), sourceIdByTable(pipeline, vertices));
         Map<String, List<String>> keys = new LinkedHashMap<>();
         for (String stream : streams) {
             TargetTable target = renamed.get(stream);
@@ -770,7 +772,7 @@ final class StoreBackedDagSource implements DagSource {
                         operators == null ? PipelineDagBuilder.nestBlockingVertices(pipeline,
                                 nestTablesByAlias(pipeline,sourceTablesByName(sourceVertices))::get) : operators.coordinates().blockingVertices(),
                         sourceExecutions(sourceVertices)),
-                sinksOf(pipeline, targets, serveLanding, viewLanding, sourceIdByTable(sourceVertices)));
+                sinksOf(pipeline, targets, serveLanding, viewLanding, sourceIdByTable(pipeline, sourceVertices)));
         return new PlannedTopology(planned, fence -> {
             var original = operators == null ? null : operators.bind(fence);
             var capturedSources = original == null ? null : operators.pass().captureBindings(original.claim());
@@ -1076,11 +1078,31 @@ final class StoreBackedDagSource implements DagSource {
      * The source id behind each physical table and stream identity the pipeline reads, used to resolve
      * source-qualified target names.
      */
-    private static Map<String, String> sourceIdByTable(Map<String, SourceVertex> sourceVertices) {
+    private static Map<String, String> sourceIdByTable(PipelineResource pipeline, Map<String, SourceVertex> sourceVertices) {
+        return sourceIdByTable(pipeline, sourceVertices, null);
+    }
+
+    private static Map<String, String> sourceIdByTable(PipelineResource pipeline,
+            Map<String, SourceVertex> sourceVertices, Set<String> resolvedAssemblies) {
         Map<String, String> byTable = new LinkedHashMap<>();
         for (SourceVertex vertex : sourceVertices.values()) {
             byTable.putIfAbsent(vertex.table(), vertex.sourceId());
             byTable.put(vertex.stream(), vertex.sourceId());
+        }
+        Map<String, List<String>> sources = sourceKeysById(sourceVertices);
+        Map<String, String> keys = new LinkedHashMap<>();
+        sourceVertices.forEach((key, vertex) -> keys.putIfAbsent(vertex.table(), key));
+        Set<String> steps = stepIds(pipeline);
+        for (Step step : pipeline.transforms() == null ? List.<Step>of() : pipeline.transforms()) {
+            if (resolvedAssemblies != null && !resolvedAssemblies.contains(step.id())) continue;
+            FromRef root = assemblyRoot(step);
+            if (root != null) {
+                Set<String> streams = streamsReaching(pipeline, root, keys, sources, sourceVertices, steps);
+                if (streams.size() == 1) {
+                    String owner = byTable.get(streams.iterator().next());
+                    if (owner != null) byTable.put(step.id(), owner);
+                }
+            }
         }
         return byTable;
     }
@@ -1127,24 +1149,19 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     private Map<String, SourceVertex> sourceVertices(PipelineResource pipeline, boolean skipUndiscovered) {
+        return sourceVertices(pipeline, skipUndiscovered, null);
+    }
+
+    /** A non-null failure map is used only by name queries; write and start callers remain fail-fast. */
+    private Map<String, SourceVertex> sourceVertices(PipelineResource pipeline, boolean skipUndiscovered,
+            Map<String, List<TapstateException>> failures) {
         Map<String, SourceVertex> vertices = new LinkedHashMap<>();
         for (String sourceId : pipeline.sourceIds()) {
-            if (artifacts().managedDefaultSourceId().filter(sourceId::equals).isPresent())
-                throw new TapstateException(ActuationError.VIEW_STORE_IS_A_CAPTURE_SOURCE, Map.of("store", sourceId), null);
-            SourceResource source = StoredArtifacts.requireSource(artifacts(), sourceId);
-            SourceModel discovered = modelInputs.apply(source);
-            if (skipUndiscovered && discovered == null) {
-                continue;
-            }
-            Optional<SourceCaptureResolution> selected =
-                    SourceCaptureResolution.forPipeline(pipeline, source, discovered);
-            if (selected.isEmpty()) {
-                continue;
-            }
-            SourceCaptureResolution resolution = selected.orElseThrow();
-            for (String table : resolution.tables()) {
-                String key = resolution.tables().size() == 1 ? sourceId : sourceId + "." + table;
-                vertices.put(key, new SourceVertex(pipeline.id(), sourceId, table, resolution, table));
+            try {
+                addSourceVertices(pipeline, sourceId, skipUndiscovered, vertices, failures);
+            } catch (TapstateException unavailable) {
+                if (failures == null) throw unavailable;
+                failures.computeIfAbsent(sourceId, ignored -> new ArrayList<>()).add(unavailable);
             }
         }
         Map<String, Long> counts = vertices.values().stream().collect(java.util.stream.Collectors.groupingBy(
@@ -1154,6 +1171,30 @@ final class StoreBackedDagSource implements DagSource {
                         vertex.sourceId() + "." + vertex.table())
                 : vertex);
         return vertices;
+    }
+
+    private void addSourceVertices(PipelineResource pipeline, String sourceId, boolean skipUndiscovered,
+            Map<String, SourceVertex> vertices, Map<String, List<TapstateException>> failures) {
+        if (artifacts().managedDefaultSourceId().filter(sourceId::equals).isPresent())
+            throw new TapstateException(ActuationError.VIEW_STORE_IS_A_CAPTURE_SOURCE, Map.of("store", sourceId), null);
+        SourceResource source = StoredArtifacts.requireSource(artifacts(), sourceId);
+        SourceModel discovered = modelInputs.apply(source);
+        if (skipUndiscovered && discovered == null) return;
+        Optional<SourceCaptureResolution> selected;
+        if (failures == null) {
+            selected = SourceCaptureResolution.forPipeline(pipeline, source, discovered);
+        } else {
+            SourceTableSelection.Names names = SourceTableSelection.forOutputNames(source, discovered);
+            if (!names.unresolved().isEmpty()) failures.put(sourceId, new ArrayList<>(names.unresolved()));
+            selected = SourceCaptureResolution.forSelectedTables(pipeline, source,
+                    PipelineTableSelection.forOutputNames(pipeline, source, names.tables()));
+        }
+        if (selected.isEmpty()) return;
+        SourceCaptureResolution resolution = selected.orElseThrow();
+        for (String table : resolution.tables()) {
+            String key = resolution.tables().size() == 1 ? sourceId : sourceId + "." + table;
+            vertices.put(key, new SourceVertex(pipeline.id(), sourceId, table, resolution, table));
+        }
     }
 
     private Map<String, String> sourceKeyByTable(Map<String, SourceVertex> sourceVertices) {
@@ -1861,7 +1902,7 @@ final class StoreBackedDagSource implements DagSource {
         return new TargetField(output, null, primaryKey);
     }
 
-    private Map<String, List<String>> sourceKeysById(Map<String, SourceVertex> sourceVertices) {
+    private static Map<String, List<String>> sourceKeysById(Map<String, SourceVertex> sourceVertices) {
         Map<String, List<String>> keys = new LinkedHashMap<>();
         for (Map.Entry<String, SourceVertex> entry : sourceVertices.entrySet()) {
             keys.computeIfAbsent(entry.getValue().sourceId(), ignored -> new java.util.ArrayList<>())
@@ -1965,7 +2006,7 @@ final class StoreBackedDagSource implements DagSource {
             sourceEpochs.forEach((chain, epoch) -> { if (epoch > 0) snapshotEpochs.put(chain, epoch); });
         }
         Map<String, Step.Inline> stepsById = inlineStepsById(pipeline);
-        Map<String, String> sourceIdByTable = sourceIdByTable(sourceVertices);
+        Map<String, String> sourceIdByTable = sourceIdByTable(pipeline, sourceVertices);
         StartFrom freshStart = freshRingStart(pipeline);
         Map<String, StoreBackedSinkAckFactory.SourceProgress> progress = progressByTable(pipeline);
         return new DagBindings(
@@ -3471,6 +3512,286 @@ final class StoreBackedDagSource implements DagSource {
         return writeTargets(definition, (coordinate, stream, model) -> { });
     }
 
+    /** Names declared outputs using the same source selection, stream walk and rename as the sinks. */
+    List<PipelineOutputNames.Output> outputNames(PipelineResource definition) {
+        return outputNameResult(definition).outputs();
+    }
+
+    PipelineOutputNames.Result outputNameResult(PipelineResource definition) {
+        PipelineResource pipeline;
+        try {
+            pipeline = PipelineInlining.inline(definition, artifacts());
+        } catch (TapstateException unavailable) {
+            return new PipelineOutputNames.Result(List.of(), List.of(outputProblem(definition, unavailable)));
+        }
+        List<PipelineOutputNames.Output> outputs = new ArrayList<>();
+        List<PipelineOutputNames.Unresolved> unresolved = new ArrayList<>();
+        try {
+            if (pipeline.view() instanceof ViewBlock.Inline view) {
+                ViewTargetResolver.ViewTarget target = ViewTargetResolver.resolve(view, viewStoreId());
+                outputs.add(new PipelineOutputNames.Output(view.id(), "view", target.sourceId(),
+                        target.collection(), view.id()));
+            }
+        } catch (TapstateException unavailable) {
+            unresolved.add(outputProblem(pipeline, unavailable));
+        }
+        try {
+            outputs.addAll(syncOutputNames(pipeline, unresolved));
+        } catch (TapstateException unavailable) {
+            unresolved.add(outputProblem(pipeline, unavailable));
+        }
+        return new PipelineOutputNames.Result(outputs, unresolved);
+    }
+
+    private List<PipelineOutputNames.Output> syncOutputNames(PipelineResource pipeline,
+            List<PipelineOutputNames.Unresolved> unresolved) {
+        if (!(pipeline.serve() instanceof ServeBlock.Inline serve) || serve.sync() == null || serve.sync().isEmpty()) {
+            return List.of();
+        }
+        PartialOutputStreams partial = new PartialOutputStreams(pipeline, unresolved);
+        Map<String, SourceVertex> vertices = partial.vertices;
+        Set<String> streams = new LinkedHashSet<>();
+        for (FromRef ref : refsOf(serve.from())) partial.collect(ref, streams, new HashSet<>());
+        Map<String, TargetTable> names = outputModelsWithoutColumns(pipeline, vertices, streams);
+        Map<String, String> owners = sourceIdByTable(pipeline, vertices, partial.assemblies);
+        String kind = pipeline.transforms() == null || pipeline.transforms().isEmpty() ? "replica" : "view";
+        List<PipelineOutputNames.Output> outputs = new ArrayList<>();
+        for (SyncElement sync : serve.sync()) {
+            Set<String> seen = new HashSet<>();
+            for (var entry : TargetModelResolver.renameAll(names, streams, sync.rename(), owners).entrySet()) {
+                if (seen.add(entry.getValue().name())) {
+                    String identity = outputIdentity(sync, entry.getKey(), names, owners, vertices);
+                    outputs.add(new PipelineOutputNames.Output(syncNodeId(sync), kind, sync.source(),
+                            entry.getValue().name(), syncNodeId(sync) + ":" + identity));
+                }
+            }
+        }
+        return outputs;
+    }
+
+    /** Isolates unavailable input branches without treating the remaining source universe as complete. */
+    private final class PartialOutputStreams {
+        private final PipelineResource pipeline;
+        private final List<PipelineOutputNames.Unresolved> unresolved;
+        private final Map<String, List<TapstateException>> failures = new LinkedHashMap<>();
+        private final Map<String, Optional<SourceResource>> failedDefinitions = new LinkedHashMap<>();
+        private final Map<String, SourceVertex> vertices;
+        private final Map<String, String> keys;
+        private final Map<String, List<String>> sources;
+        private final Set<String> steps;
+        private final Set<String> assemblies = new HashSet<>();
+        private final Map<String, List<String>> resolvedSteps = new LinkedHashMap<>();
+
+        private PartialOutputStreams(PipelineResource pipeline, List<PipelineOutputNames.Unresolved> unresolved) {
+            this.pipeline = pipeline;
+            this.unresolved = unresolved;
+            vertices = sourceVertices(pipeline, false, failures);
+            keys = sourceKeyByTable(vertices);
+            sources = sourceKeysById(vertices);
+            pipeline.sourceIds().forEach(id -> sources.putIfAbsent(id, List.of()));
+            steps = stepIds(pipeline);
+        }
+
+        private void collect(FromRef ref, Set<String> streams, Set<String> visiting) {
+            try {
+                collectAvailable(ref, streams, visiting);
+            } catch (TapstateException unavailable) {
+                // An empty match against an incomplete universe is not evidence that the selector is empty.
+                if (unavailable.code() != ActuationError.FROM_REGEX_EMPTY || failures.isEmpty()) record(unavailable);
+            }
+        }
+
+        private void collectAvailable(FromRef ref, Set<String> streams, Set<String> visiting) {
+            ViewBlock.Inline view = inlineViewNamed(pipeline, ref);
+            if (view != null) {
+                collect(view.from(), streams, visiting);
+                return;
+            }
+            requireAvailableReference(ref);
+            for (String key : upstreams(ref, keys, sources, vertices, steps)) {
+                SourceVertex source = vertices.get(key);
+                if (source != null) {
+                    streams.add(source.stream());
+                } else {
+                    collectStep(key, streams, visiting);
+                }
+            }
+        }
+
+        private void collectStep(String key, Set<String> streams, Set<String> visiting) {
+            List<String> cached = resolvedSteps.get(key);
+            if (cached != null) {
+                streams.addAll(cached);
+                return;
+            }
+            Step step = stepOf(pipeline, key);
+            if (step == null || !visiting.add(key)) return;
+            Set<String> produced = new LinkedHashSet<>();
+            try {
+                collectStepOutputs(step, produced, visiting);
+                resolvedSteps.put(key, List.copyOf(produced));
+                streams.addAll(produced);
+            } finally {
+                visiting.remove(key);
+            }
+        }
+
+        private void collectStepOutputs(Step step, Set<String> streams, Set<String> visiting) {
+            FromRef root = assemblyRoot(step);
+            if (root != null) {
+                Set<String> roots = new LinkedHashSet<>();
+                collect(root, roots, visiting);
+                if (roots.size() != 1) return;
+                requireStableAssemblyName(step, roots);
+                assemblies.add(step.id());
+                streams.add(step.id());
+            } else {
+                for (FromRef upstream : refsOf(step.from())) collect(upstream, streams, visiting);
+            }
+        }
+
+        private void requireStableAssemblyName(Step step, Set<String> roots) {
+            if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Join) {
+                // Discovery may qualify a join's fact name when another source selects that table.
+                for (SourceVertex vertex : vertices.values()) {
+                    if (roots.contains(vertex.stream())) requireUnambiguousUnavailableSources(vertex.table());
+                }
+            }
+        }
+
+        private void requireAvailableReference(FromRef ref) {
+            if (ref instanceof FromRef.Regex) {
+                failures.values().forEach(errors -> errors.forEach(this::record));
+                return;
+            }
+            String token = ((FromRef.Literal) ref).ref();
+            for (var entry : failures.entrySet()) {
+                if (token.equals(entry.getKey())) {
+                    entry.getValue().forEach(this::record);
+                    return;
+                }
+                String prefix = entry.getKey() + ".";
+                if (token.startsWith(prefix)) {
+                    if (hasKnownTable(entry.getKey(), token.substring(prefix.length()))) return;
+                    entry.getValue().forEach(this::record);
+                    throw entry.getValue().getFirst();
+                }
+            }
+            if (steps.contains(token) || pipeline.sourceIds().contains(token)) return;
+            int dot = token.indexOf('.');
+            if (dot > 0 && pipeline.sourceIds().contains(token.substring(0, dot))) return;
+            requireUnambiguousUnavailableSources(token);
+        }
+
+        private void requireUnambiguousUnavailableSources(String table) {
+            for (var entry : failures.entrySet()) {
+                if (!hasKnownTable(entry.getKey(), table) && maySelect(entry.getKey(), table)) {
+                    entry.getValue().forEach(this::record);
+                    throw entry.getValue().getFirst();
+                }
+            }
+        }
+
+        private boolean hasKnownTable(String sourceId, String table) {
+            return vertices.values().stream().anyMatch(vertex ->
+                    vertex.sourceId().equals(sourceId) && vertex.table().equals(table));
+        }
+
+        private boolean maySelect(String sourceId, String table) {
+            if (!PipelineTableSelection.references(pipeline, sourceId, table)) return false;
+            SourceResource source = failedDefinitions.computeIfAbsent(sourceId, id -> artifacts().get(id)
+                    .filter(SourceResource.class::isInstance).map(SourceResource.class::cast)).orElse(null);
+            if (source == null || source.tables() == null) return true;
+            for (TableRef selector : source.tables()) {
+                if (selectorMayMatch(selector, table)) return true;
+            }
+            return false;
+        }
+
+        private boolean selectorMayMatch(TableRef selector, String table) {
+            return switch (selector) {
+                case TableRef.Literal literal -> literal.name().equals(table);
+                case TableRef.Spec spec -> spec.name().equals(table);
+                case TableRef.Regex regex -> regexMayMatch(regex.pattern(), table);
+            };
+        }
+
+        private boolean regexMayMatch(String pattern, String table) {
+            try {
+                return Pattern.compile(pattern).matcher(table).matches();
+            } catch (PatternSyntaxException invalid) {
+                return true;
+            }
+        }
+
+        private void record(TapstateException error) {
+            var problem = outputProblem(pipeline, error);
+            if (!unresolved.contains(problem)) unresolved.add(problem);
+        }
+    }
+
+    private Map<String, TargetTable> outputModelsWithoutColumns(PipelineResource pipeline,
+            Map<String, SourceVertex> vertices, Set<String> streams) {
+        Map<String, TargetTable> names = new LinkedHashMap<>();
+        vertices.values().forEach(vertex -> names.put(vertex.stream(), new TargetTable(vertex.table(), List.of())));
+        Map<String, SourceVertex> tables = sourceTablesByName(vertices);
+        Map<String, NestTable> roots = nestTablesByAlias(pipeline, tables);
+        for (String stream : streams) {
+            Step step = stepOf(pipeline, stream);
+            String table = null;
+            if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Nest nest) {
+                NestTable root = roots.get(nest.root().from());
+                if (root != null) table = root.name();
+            } else if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Join) {
+                // A join's compiled fact name retains qualification when physical source names repeat.
+                // Preserve that existing write address instead of silently relocating its collection.
+                table = nestTable(assemblyRoot(step), tables).name();
+                names.put(stream, new TargetTable(table, List.of()));
+                continue;
+            }
+            if (table != null) {
+                names.put(stream, names.getOrDefault(table, new TargetTable(table, List.of())));
+            }
+        }
+        return names;
+    }
+
+    /** The source reference that determines an assembly's physical output name and source ownership. */
+    private static FromRef assemblyRoot(Step step) {
+        if (!(step instanceof Step.Inline inline) || !(step.from() instanceof FromClause.Aliases aliases)) {
+            return null;
+        }
+        if (inline.body() instanceof TransformBody.Nest nest) {
+            return aliases.aliases().get(nest.root().from());
+        }
+        if (inline.body() instanceof TransformBody.Join join) {
+            try {
+                String fact = io.tapstate.core.sql.SqlFrontEnd.factSource(join.sql()).name();
+                return aliases.aliases().getOrDefault(fact, FromRef.literal(fact));
+            } catch (io.tapstate.core.sql.SqlFrontEndException invalid) {
+                throw new TapstateException(ActuationError.JOIN_SQL_INVALID,
+                        Map.of("step", step.id(), "detail", diagnosis(invalid)), invalid);
+            }
+        }
+        return null;
+    }
+
+    private static String outputIdentity(SyncElement sync, String stream, Map<String, TargetTable> names,
+            Map<String, String> owners, Map<String, SourceVertex> vertices) {
+        String original = names.get(stream).name();
+        String identity = vertices.values().stream().anyMatch(v -> v.stream().equals(stream)) ? stream : original;
+        String qualified = owners.get(stream) == null ? null : owners.get(stream) + "." + original;
+        if (sync.rename() != null && sync.rename().map() != null && qualified != null
+                && !sync.rename().map().containsKey(original) && sync.rename().map().containsKey(qualified)) {
+            return qualified;
+        }
+        return identity;
+    }
+
+    private static PipelineOutputNames.Unresolved outputProblem(PipelineResource pipeline, TapstateException error) {
+        return new PipelineOutputNames.Unresolved(pipeline.id(), error.code().code(), error.args());
+    }
+
     @FunctionalInterface
     interface TargetModelConsumer {
         void accept(PipelineWriteTargets.WriteTarget coordinate, String stream, TargetTable model);
@@ -3497,7 +3818,7 @@ final class StoreBackedDagSource implements DagSource {
     private void collectSyncWriteTargets(PipelineResource definition, PipelineResource pipeline,
             ServeBlock.Inline serve, TargetModelConsumer models, List<PipelineWriteTargets.WriteTarget> written) {
         Map<String, SourceVertex> vertices = sourceVertices(pipeline);
-        Map<String, String> sourceIdByTable = sourceIdByTable(vertices);
+        Map<String, String> sourceIdByTable = sourceIdByTable(pipeline, vertices);
         Map<String, TargetTable> bySourceTable = sourceTargets(vertices);
         Map<String, TargetTable> assembled = assembledTargets(
                 pipeline, bySourceTable, vertices, compiledJoins(pipeline, sourceTablesByName(vertices)));
