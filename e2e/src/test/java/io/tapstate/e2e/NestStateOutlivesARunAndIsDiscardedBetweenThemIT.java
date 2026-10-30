@@ -19,7 +19,6 @@ import io.tapstate.spi.store.RequiredDeadLetterContext;
 import io.tapstate.spi.store.RequiredDeadLetterFact;
 import io.tapstate.testsupport.DockerGate;
 import org.bson.Document;
-import org.bson.types.Binary;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -160,16 +159,18 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
             assertThat(original.clusterId()).isNotEqualTo(receiving.clusterId());
             assertThat(original.cacheIncarnation()).isNotEqualTo(receiving.cacheIncarnation());
             var retained = placement(original, first.cacheDatabase());
+            var local = placement(receiving, second.cacheDatabase());
             var retargeted = new OperatorPlacement(original, second.cacheDatabase(), retained.resource(),
                     retained.stepId(), retained.pathId(), retained.namespace());
-            byte[] copied = firstRows.getFirst().get("state", Binary.class).getData();
             try (MongoCacheDomain origin = cache(first); MongoCacheDomain target = cache(second)) {
                 assertThat(origin.operatorState(retained).count(retained.mapName()))
                         .as("the source coordinates really hold a retained assembly").isPositive();
-                // Submit copied bytes through the existing guarded port with their unchanged original
-                // identity. No database rows are cloned or rewritten as a relocation feature.
+                assertThat(target.operatorState(local).count(local.mapName()))
+                        .as("a claimless read permits the receiving installation's own identity").isPositive();
+                // Use the same permitted read so rejection isolates the foreign original identity
+                // rather than the missing mutation authority of a claimless handle.
                 assertThatThrownBy(() -> target.operatorState(retargeted)
-                        .save(retargeted.mapName(), "copied-root", copied))
+                        .count(retargeted.mapName()))
                         .isInstanceOfSatisfying(TapstateException.class,
                                 failure -> assertThat(failure.code()).isEqualTo(IoError.CACHE_BUSINESS_FENCED));
             }
