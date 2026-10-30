@@ -95,7 +95,9 @@ class NativeValidationApiIT {
                 var preview=http.post().uri("/api/validation:schedule-preview").header("Authorization","Bearer "+token).contentType(MediaType.APPLICATION_JSON)
                         .body(Map.of("schedule",schedule,"inputRevision","9007199254740993")).retrieve().body(Map.class);
                 assertThat(preview).containsEntry("inputRevision","9007199254740993");assertThat((List<?>)preview.get("occurrences")).hasSize(5);
-                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(2)).untilAsserted(()->assertThat(child.getBean(ValidationMemberResources.Member.class).snapshot().metadataFrames()).isZero());
+                var checkedFrames=ValidationMetadataSlots.acquire(child.getBean(ValidationMemberResources.Member.class),4,Duration.ofSeconds(2));
+                try { assertThat(child.getBean(ValidationMemberResources.Member.class).snapshot().metadataFrames()).isEqualTo(4); }
+                finally { checkedFrames.forEach(ValidationMemberResources.Metadata::close); }
                 assertThat(child.getBean(com.hazelcast.core.HazelcastInstance.class).getJet().getJobs()).isEmpty();
                 var operation=Map.of("context",evaluated.get("context"),"pipeline","validation_flow","task","validation_task","taskGeneration",read.get("taskGeneration"),
                         "revision","1","sequence","1","command",UUID.randomUUID().toString());
@@ -113,10 +115,11 @@ class NativeValidationApiIT {
                 assertThat(stopped).containsEntry("state","COMPLETED");
                 var after=http.get().uri("/api/pipelines/validation_flow/validation-tasks/validation_task").header("Authorization","Bearer "+token).retrieve().body(Map.class);
                 assertThat(after).containsEntry("nextStartSequence","2");
-                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).untilAsserted(()->{
-                    assertThat(child.getBean(ValidationMemberResources.Member.class).snapshot().metadataFrames()).isZero();
+                var returnedFrames=ValidationMetadataSlots.acquire(child.getBean(ValidationMemberResources.Member.class),4,Duration.ofSeconds(5));
+                try {
+                    assertThat(child.getBean(ValidationMemberResources.Member.class).snapshot().metadataFrames()).isEqualTo(4);
                     assertThat(child.getBean(ValidationMemberResources.Member.class).snapshot().processReserved().bytes()).isEqualTo(2L*1024*1024);
-                });
+                } finally { returnedFrames.forEach(ValidationMemberResources.Metadata::close); }
                 assertThat(child.getBean(com.hazelcast.core.HazelcastInstance.class).getJet().getJobs()).hasSize(1);
                 var history=http.get().uri("/api/pipelines/validation_flow/validation-tasks/validation_task/reports").header("Authorization","Bearer "+token).retrieve().body(Map.class);
                 assertThat(history).containsEntry("total","1");var items=(List<?>)history.get("items");var first=(Map<?,?>)items.getFirst();var ref=(Map<?,?>)first.get("reference");
@@ -128,10 +131,8 @@ class NativeValidationApiIT {
                 var report=completedReport(http,token,reportPath);
                 assertThat(report).containsEntry("method","COUNT").containsEntry("result","COMPLETE_NO_ISSUES_OBSERVED").containsEntry("physicalDrain","UNKNOWN").containsEntry("premiseVerifiedBySystem",false);
                 var counts=(List<?>)report.get("counts");var count=(Map<?,?>)counts.getFirst();assertThat(count.get("source")).isEqualTo("1");assertThat(count.get("target")).isEqualTo("1");assertThat(count.get("difference")).isEqualTo("0");
-                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(2)).until(()->child.getBean(ValidationMemberResources.Member.class).snapshot().metadataFrames()==0);
-                var occupied=new ArrayList<ValidationMemberResources.Metadata>();
+                var occupied=ValidationMetadataSlots.acquire(child.getBean(ValidationMemberResources.Member.class),4,Duration.ofSeconds(2));
                 try{
-                    for(int index=0;index<4;index++)occupied.add(child.getBean(ValidationMemberResources.Member.class).admitMetadata());
                     assertThat(http.post().uri("/api/validation:progress").header("Authorization","Bearer "+token).contentType(MediaType.APPLICATION_JSON).body(operation)
                             .<Integer>exchange((request,httpResponse)->httpResponse.getStatusCode().value())).isEqualTo(429);
                     assertThat(http.get().uri(reportPath).header("Authorization","Bearer "+token).<Integer>exchange((request,httpResponse)->httpResponse.getStatusCode().value())).isEqualTo(429);
@@ -162,7 +163,9 @@ class NativeValidationApiIT {
                         assertThat(detail).contains("same","changed","codecBinding","observation");
                     }
                 }
-                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).until(()->child.getBean(ValidationMemberResources.Member.class).snapshot().metadataFrames()==0);
+                var finalFrames=ValidationMetadataSlots.acquire(child.getBean(ValidationMemberResources.Member.class),4,Duration.ofSeconds(5));
+                try { assertThat(child.getBean(ValidationMemberResources.Member.class).snapshot().metadataFrames()).isEqualTo(4); }
+                finally { finalFrames.forEach(ValidationMemberResources.Metadata::close); }
                 assertThat(child.getBean(com.hazelcast.core.HazelcastInstance.class).getJet().getJobs()).hasSize(4);
                 var wall=new LinkedHashMap<String,Object>(input);wall.put("taskId","scheduled_wall");wall.put("taskGeneration",UUID.randomUUID().toString());
                 var wallCheck=http.post().uri("/api/validation:evaluate").header("Authorization","Bearer "+write).contentType(MediaType.APPLICATION_JSON).body(wall).retrieve().body(Map.class);
