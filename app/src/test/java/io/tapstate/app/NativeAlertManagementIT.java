@@ -33,7 +33,7 @@ class NativeAlertManagementIT {
                     .append("cleanupAt",java.util.Date.from(oldMinute.plusSeconds(3660))).append("body",new Document("actors",List.of(new Document("actor","retention-probe").append("accepted",1)))));
             try(var application=new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated()).run(
                     "--server.address=127.0.0.1","--server.port="+Integer.getInteger("tapstate.alert.native-browser-port",0),"--logging.level.root=ERROR","--tapstate.store.mongo.uri="+storage.configurationUri(),
-                    "--tapstate.hz.member-port=0","--tapstate.hz.jet.cooperative-thread-count=2","--tapstate.alerting.retention.ended-episode=P7D","--tapstate.connectors.seed-dir="+work.resolve("no-seeds"),
+                    "--tapstate.browser-auth.allow-insecure-loopback="+(System.getProperty("tapstate.alert.native-browser-control")!=null),"--tapstate.hz.member-port=0","--tapstate.hz.jet.cooperative-thread-count=2","--tapstate.alerting.retention.ended-episode=P7D","--tapstate.connectors.seed-dir="+work.resolve("no-seeds"),
                     "--tapstate.connectors.plugins-dir="+work.resolve("plugins"),"--tapstate.control.auth.jwt-secret=native-alert-test-signing-key")){
                 NativeAppStorage.awaitBusiness(application);int port=((WebServerApplicationContext)application).getWebServer().getPort();var client=HttpClient.newHttpClient();String root="http://127.0.0.1:"+port;
                 var login=post(client,root,"/auth/login",null,Map.of("username","alert-operator","password","isolated-native-password"));assertThat(login.statusCode()).isEqualTo(200);String token=(String)AlertHttpModel.object(JsonReader.parse(login.body())).get("token");assertThat(token).isNotBlank();
@@ -62,7 +62,21 @@ class NativeAlertManagementIT {
                     evidence.put("mode","actual-native-op");evidence.put("clusterId",storage.clusterId());evidence.put("expiredQuotaAbsent",configuration.getCollection("alert_test_quotas").find(new Document("_id",expiredQuotaId)).first()==null);
                     evidence.put("maintenance",AlertHttpModel.object(JsonReader.parse(read.body())).get("maintenance"));java.nio.file.Files.writeString(Path.of(receipt),JsonWriter.write(evidence));}
                 String control=System.getProperty("tapstate.alert.native-browser-control");
-                if(control!=null){var directory=Path.of(control);java.nio.file.Files.createDirectories(directory);AlertDeliveryNetworkIT.temp=work;AlertDeliveryNetworkIT.tls();
+                if(control!=null){
+                    // The interactive fixture is HTTP on loopback; exercise the explicit local
+                    // browser entry without relaxing its same-origin request proof.
+                    var browserBody=JsonWriter.write(Map.of("username","alert-operator","password","isolated-native-password"));
+                    var browserLogin=client.send(HttpRequest.newBuilder(URI.create(root+"/auth/browser/login"))
+                            .header("Content-Type","application/json").header("X-Tapstate-Browser-Request","1").header("Origin",root)
+                            .POST(HttpRequest.BodyPublishers.ofString(browserBody)).build(),HttpResponse.BodyHandlers.ofString());
+                    assertThat(browserLogin.statusCode()).as(browserLogin.body()).isEqualTo(200);
+                    var browserGrant=AlertHttpModel.object(JsonReader.parse(browserLogin.body()));
+                    assertThat(browserGrant.get("principal")).isEqualTo("alert-operator");assertThat(browserGrant.get("token")).isInstanceOf(String.class);
+                    var foreignLogin=client.send(HttpRequest.newBuilder(URI.create(root+"/auth/browser/login"))
+                            .header("Content-Type","application/json").header("X-Tapstate-Browser-Request","1").header("Origin","http://untrusted.invalid")
+                            .POST(HttpRequest.BodyPublishers.ofString(browserBody)).build(),HttpResponse.BodyHandlers.ofString());
+                    assertThat(foreignLogin.statusCode()).isEqualTo(401);
+                    var directory=Path.of(control);java.nio.file.Files.createDirectories(directory);AlertDeliveryNetworkIT.temp=work;AlertDeliveryNetworkIT.tls();
                     try(var smtp=new AlertDeliveryNetworkIT.SmtpPeer(true)){
                         java.nio.file.Files.write(directory.resolve("smtp-ca.pem"),AlertDeliveryNetworkIT.pem);
                         var browserData=new NativeAlertBrowserData(application,storage,(operation,input)->{try{var reply=post(client,root,"/api/alerts/"+operation,token,input);assertThat(reply.statusCode()).as(reply.body()).isEqualTo(200);}catch(Exception failure){throw new AssertionError(failure);}});
