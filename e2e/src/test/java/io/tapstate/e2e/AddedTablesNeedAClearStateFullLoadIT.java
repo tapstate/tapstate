@@ -7,6 +7,7 @@ import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineIntentSnapshot;
+import io.tapstate.spi.store.PipelineStateMapping;
 import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.testsupport.RequiresDocker;
 import java.net.http.HttpClient;
@@ -96,6 +97,9 @@ class AddedTablesNeedAClearStateFullLoadIT {
             assertThat(priority(target, CUSTOMERS, "1")).isNull();
 
             control.stop(PIPELINE, true);
+            // The previous keeping stop already reports STOPPED. Only the requested successor
+            // generation proves this clearing operation completed before another start is admitted.
+            awaitClearedGeneration(storage, 2);
             awaitState(control, PipelineState.STOPPED);
             control.lifecycle(PIPELINE, LifecycleVerb.START);
             awaitState(control, PipelineState.RUNNING);
@@ -129,6 +133,17 @@ class AddedTablesNeedAClearStateFullLoadIT {
     }
 
     private record Saved(Document key, List<String> tables, Document cursor, Document raw) {}
+
+    private static void awaitClearedGeneration(PreparedNativeStore storage, long generation) {
+        try (var configuration = MongoConfigurationDomain.openExisting(new MongoConnectionSettings(
+                storage.configurationUri(), null, Duration.ofSeconds(5)))) {
+            Await.until("the requested clear to publish its completed successor generation", BOUND,
+                    () -> configuration.pipelineStates().read(PIPELINE)
+                            .filter(mapping -> mapping.phase() == PipelineStateMapping.Phase.ACTIVE
+                                    && mapping.stateGeneration() == generation).isPresent(),
+                    () -> String.valueOf(configuration.pipelineStates().read(PIPELINE)));
+        }
+    }
 
     private static PipelineIntentSnapshot intent(PreparedNativeStore storage) {
         try (var configuration = MongoConfigurationDomain.openExisting(new MongoConnectionSettings(
