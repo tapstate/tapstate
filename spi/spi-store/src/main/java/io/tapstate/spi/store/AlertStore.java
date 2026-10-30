@@ -55,19 +55,29 @@ public interface AlertStore {
     record ScheduleChange(Stored<AlertSchedule.Record> before,AlertSchedule.Record after) { public ScheduleChange { Objects.requireNonNull(after); } }
     record PlanVersion(long configurationRevision,long alertFence) { }
     record Dependency(AlarmKey root,AlarmKey dependent) { }
+    /** Read-only capability evidence; an opaque rule id protects every retained incarnation of that id. */
+    record RuleCapability(String ruleId,String typeId,AlarmTypeCatalog.Availability reason,Integer typeVersion,Integer availableVersion,Integer recordVersion) {
+        public RuleCapability {Objects.requireNonNull(ruleId);Objects.requireNonNull(reason);}
+    }
+    default Optional<RuleCapability> unavailableRule(AlertIntent.Frozen frozen,ReadAccess access){return Optional.empty();}
     /** One bounded CONFIG read snapshot. The version must accompany every derived write. */
     record Planning(PlanVersion version,Host host,List<AlertConfiguration.Definition> definitions,
             List<Stored<AlertStateRecord.Head>> states,List<Stored<AlertSchedule.Record>> schedules,
             Map<DeliveryKey,Stored<AlertIntent.Record>> intents,
             Map<FrozenGroupPolicy.Member,AlertStateRecord.Episode> episodes,
-            Map<AlertTargetLimit.Domain,AlertTargetLimit> limits,Set<Dependency> dependencies,boolean isolatedRecords) {
+            Map<AlertTargetLimit.Domain,AlertTargetLimit> limits,Set<Dependency> dependencies,boolean isolatedRecords,Map<String,RuleCapability> unavailableRules) {
+        public Planning(PlanVersion version,Host host,List<AlertConfiguration.Definition> definitions,List<Stored<AlertStateRecord.Head>> states,
+                List<Stored<AlertSchedule.Record>> schedules,Map<DeliveryKey,Stored<AlertIntent.Record>> intents,
+                Map<FrozenGroupPolicy.Member,AlertStateRecord.Episode> episodes,Map<AlertTargetLimit.Domain,AlertTargetLimit> limits,Set<Dependency> dependencies,boolean isolatedRecords){
+            this(version,host,definitions,states,schedules,intents,episodes,limits,dependencies,isolatedRecords,Map.of());
+        }
         public Planning(PlanVersion version,Host host,List<AlertConfiguration.Definition> definitions,List<Stored<AlertStateRecord.Head>> states,
                 List<Stored<AlertSchedule.Record>> schedules,Map<DeliveryKey,Stored<AlertIntent.Record>> intents,
                 Map<FrozenGroupPolicy.Member,AlertStateRecord.Episode> episodes,Map<AlertTargetLimit.Domain,AlertTargetLimit> limits,Set<Dependency> dependencies){
             this(version,host,definitions,states,schedules,intents,episodes,limits,dependencies,false);
         }
         public Planning { definitions=List.copyOf(definitions);states=List.copyOf(states);schedules=List.copyOf(schedules);
-            intents=Map.copyOf(intents);episodes=Map.copyOf(episodes);limits=Map.copyOf(limits);dependencies=Set.copyOf(dependencies); }
+            intents=Map.copyOf(intents);episodes=Map.copyOf(episodes);limits=Map.copyOf(limits);dependencies=Set.copyOf(dependencies);unavailableRules=Map.copyOf(unavailableRules); }
     }
     Planning planning();
     default Optional<AlertMaintenance> maintenance() { return Optional.empty(); }
@@ -96,7 +106,9 @@ public interface AlertStore {
     record DuePage(List<Stored<AlertIntent.Record>> rows,DueCursor next,boolean isolatedRecords){public DuePage{rows=List.copyOf(rows);}}
     record ScheduleCursor(Instant candidateAt,AlertSchedule.Key key){ }
     record SchedulePage(List<Stored<AlertSchedule.Record>> rows,ScheduleCursor next,boolean isolatedRecords){public SchedulePage{rows=List.copyOf(rows);}}
-    record DefinitionPage(List<AlertConfiguration.Definition> rows,String nextId){public DefinitionPage{rows=List.copyOf(rows);}}
+    record DefinitionPage(List<AlertConfiguration.Definition> rows,String nextId,Map<String,RuleCapability> unavailableRules){
+        public DefinitionPage(List<AlertConfiguration.Definition> rows,String nextId){this(rows,nextId,Map.of());}
+        public DefinitionPage{rows=List.copyOf(rows);unavailableRules=Map.copyOf(unavailableRules);}}
     record ResourcePage(List<AlarmKey.Resource> rows,String nextId){public ResourcePage{rows=List.copyOf(rows);}}
     default ResourcePage resources(String kind,String after,int limit,Access access){throw new UnsupportedOperationException();}
     record EpisodeCursor(AlarmKey key,long number,long secondOrder,int nanoOrder) { }

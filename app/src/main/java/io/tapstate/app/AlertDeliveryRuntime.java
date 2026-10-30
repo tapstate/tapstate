@@ -49,6 +49,7 @@ final class AlertDeliveryRuntime implements AutoCloseable {
                 var value=row.value();var id=value.frozen().identity();String key=id.deliveryId();
                 if(running.contains(key)||pending.containsKey(key))continue;
                 if(settle(row))continue;
+                if(store.unavailableRule(value.frozen(),new AlertStore.ReadAccess(true,Set.of(),active)).isPresent()){paused=true;continue;}
                 if(!channels.supports(value.frozen())){paused=true;continue;}
                 if(value.state().permitsStopped()||value.state().nextAttemptAt()==null)continue;
                 if(running.size()+pending.size()>=4||byChannel.getOrDefault(id.channelType(),0)>=2)continue;

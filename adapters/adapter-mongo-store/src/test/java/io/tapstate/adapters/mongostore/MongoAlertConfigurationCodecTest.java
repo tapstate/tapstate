@@ -19,6 +19,16 @@ import static io.tapstate.adapters.mongostore.AlertConfigurationFixtures.*;
 import static org.assertj.core.api.Assertions.*;
 
 class MongoAlertConfigurationCodecTest {
+    @Test void futureRuleProbeUsesOnlyTheExactScopedHeaderAndNeverGuessesMalformedHeaderFacts(){
+        var row=MongoAlertConfigurationCodec.write(rule(),0);row.put("formatVersion",999);row.remove("body");row.remove("incarnation");
+        assertThat(MongoAlertConfigurationCodec.futureRuleFormat(SCOPE,"rule-a",row)).contains(999);
+        for(Consumer<Document> invalid:List.<Consumer<Document>>of(
+                r->r.put("formatVersion",999L),r->r.put("formatVersion",2),r->r.remove("kind"),r->r.put("kind","RECEIVER"),
+                r->r.get("_id",Document.class).put("authorityId","other"),r->r.get("_id",Document.class).put("id","other"),
+                r->r.get("_id",Document.class).put("extra","untrusted"))){
+            var copy=Document.parse(row.toJson());invalid.accept(copy);assertThat(MongoAlertConfigurationCodec.futureRuleFormat(SCOPE,"rule-a",copy)).isEmpty();
+        }
+    }
     @Test void ruleVersionTwoHasExactlyOneBoundedLongAndNeverInfersLostBinding() throws Exception {
         var old=legacyRule();var current=old.enrolled(null);var encoded=bson(MongoAlertConfigurationCodec.write(current,0));
         try(var input=getClass().getResourceAsStream("/alert-rule-v2.golden.json")){assertThat(input).isNotNull();assertThat(encoded).isEqualTo(Document.parse(new String(input.readAllBytes(),StandardCharsets.UTF_8)));}

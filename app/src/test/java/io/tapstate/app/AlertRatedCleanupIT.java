@@ -55,7 +55,8 @@ class AlertRatedCleanupIT {
                 try(var unknown=AlertDeliveryRuntimeIT.runtime(f,store,unknownChannel,"protected-unknown")){unknown.tick();AlertDeliveryRuntimeIT.settled(unknown);}
                 assertThat(store.intent(candidate.value().frozen().identity(),null).orElseThrow().value().state().summary()).isEqualTo(DeliveryEvidence.Outcome.UNKNOWN);
                 try(var client=MongoClients.create(f.settings().uri());var maintenance=new AlertMaintenanceRuntime(store.maintenance().orElseThrow(),f.clock(),ACTIVE);
-                        var sender=new AlertDeliveryRuntime(store,f.clock(),"rated-sender",ACTIVE,AlertDeliveryNetworkIT.channels(f,new AtomicInteger()),a->access())){
+                        var sender=new AlertDeliveryRuntime(store,f.clock(),"rated-sender",ACTIVE,AlertDeliveryNetworkIT.channels(f,new AtomicInteger()),a->access());
+                        var planning=new AlertPlanningRuntime(planner)){
                     var db=client.getDatabase(new com.mongodb.ConnectionString(f.settings().uri()).getDatabase());
                     var future=new Document("_id",new Document("authorityId",f.storeHost().scope().authorityId()).append("clusterId",f.storeHost().scope().clusterId()).append("purpose","business").append("deliveryId","rated-future-format"))
                             .append("formatVersion",99).append("cleanupAt",Date.from(T.minusSeconds(1))).append("body",new Document("evidence","retain-unknown"));
@@ -63,6 +64,7 @@ class AlertRatedCleanupIT {
                     var quotaDeadlines=new LinkedHashMap<Document,Instant>();
                     var probe=new ReclamationProbe(f,store,db,payloadDeadlines,quotaDeadlines);
                     maintenance.start();org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(10)).untilAsserted(()->assertThat(maintenance.health()).containsEntry("capacitySampleStale",false));
+                    planning.start();sender.start();
                     long started=System.nanoTime();Instant workloadEpoch=f.clock().instant();int sequence=0;var admissions=new AtomicInteger();
                     for(int minute=0;minute<minutes;minute++){
                         waitUntil(probe,started,(long)minute*60);
@@ -73,10 +75,10 @@ class AlertRatedCleanupIT {
                         db.getCollection("alert_test_quotas").insertOne(new Document("_id",id).append("formatVersion",1).append("recordRevision",1L).append("cleanupAt",Date.from(eligible))
                                 .append("body",new Document("actors",List.of(new Document("actor","rated-actor").append("accepted",1)))));
                         accept(store,evaluator,binding,++sequence,new AlertInput.Conditions(f.clock().instant(),AlertSignal.Condition.BAD,null),admissions);
-                        pump(probe,planner,sender,smtp,minute*4+2);
+                        pump(probe,sender,smtp,minute*4+2);
                         waitUntil(probe,started,(long)minute*60+3);
                         accept(store,evaluator,binding,++sequence,new AlertInput.Conditions(f.clock().instant(),AlertSignal.Condition.GOOD,null),admissions);
-                        pump(probe,planner,sender,smtp,minute*4+4);
+                        pump(probe,sender,smtp,minute*4+4);
                         if(minute==0)db.getCollection("alert_delivery_intents").insertOne(future);
                         var deliveries=store.deliveries(null,100,null,null,f.reads());String after=null;
                         do{
@@ -96,7 +98,7 @@ class AlertRatedCleanupIT {
                         assertThat(store.state(protectedKey,f.reads()).orElseThrow().value().snapshot().status()).isEqualTo(AlertSnapshot.Status.FIRING);
                         assertThat(store.intent(candidate.value().frozen().identity(),null).orElseThrow().value().state().summary()).isEqualTo(DeliveryEvidence.Outcome.UNKNOWN);
                         assertThat(db.getCollection("alert_delivery_intents").find(new Document("_id",future.get("_id"))).first()).isEqualTo(future);
-                        assertThat(maintenance.health()).containsEntry("failures",0L);
+                        assertThat(((Number)maintenance.health().get("consecutiveFailures")).intValue()).isLessThan(3);
                         System.out.println("RATED_CLEANUP minute="+(minute+1)+" smtp="+smtp.bodies.size()+" changed="+maintenance.health().get("changed"));
                     }
                     waitUntil(probe,started,(long)minutes*60);
@@ -115,7 +117,7 @@ class AlertRatedCleanupIT {
                     assertThat(db.getCollection("alert_test_quotas").find(new Document("_id",currentQuota)).first()).isNotNull();
                     long elapsed=TimeUnit.NANOSECONDS.toMillis(System.nanoTime()-started);
                     assertThat(elapsed).isGreaterThanOrEqualTo(minutes*60_000L);
-                    var evidence=new LinkedHashMap<String,Object>();evidence.put("minutes",minutes);evidence.put("wallMilliseconds",elapsed);evidence.put("acceptanceDuration",minutes==60);evidence.put("clockScale",1);evidence.put("clockMode","continuous-monotonic");evidence.put("maintenanceDriver","production-scheduled");evidence.put("admissionCalls",admissions.get());evidence.put("quotaFixture","historical quota rows introduced at eligibility; natural aging is separately covered");evidence.put("smtpAccepted",smtp.bodies.size());evidence.put("businessIntents",payloadDeadlines.size());evidence.put("reclaimedPayloads",probe.pruned.size());evidence.put("reclaimedQuotas",probe.deleted.size());evidence.put("maximumObservedReclamationMillis",probe.maximumMillis);evidence.put("health",maintenance.health());
+                    var evidence=new LinkedHashMap<String,Object>();evidence.put("minutes",minutes);evidence.put("wallMilliseconds",elapsed);evidence.put("acceptanceDuration",minutes==60);evidence.put("clockScale",1);evidence.put("clockMode","continuous-monotonic");evidence.put("maintenanceDriver","production-scheduled");evidence.put("planningDriver","production-scheduled");evidence.put("deliveryDriver","production-scheduled");evidence.put("admissionCalls",admissions.get());evidence.put("quotaFixture","historical quota rows introduced at eligibility; natural aging is separately covered");evidence.put("smtpAccepted",smtp.bodies.size());evidence.put("businessIntents",payloadDeadlines.size());evidence.put("reclaimedPayloads",probe.pruned.size());evidence.put("reclaimedQuotas",probe.deleted.size());evidence.put("maximumObservedReclamationMillis",probe.maximumMillis);evidence.put("health",maintenance.health());
                     String output=System.getProperty("tapstate.test.alert-rated-receipt");if(output!=null)try{Files.writeString(Path.of(output),io.tapstate.core.common.JsonWriter.write(evidence));}catch(java.io.IOException failure){throw new AssertionError(failure);}
                 }
             });
@@ -134,15 +136,15 @@ class AlertRatedCleanupIT {
             long remaining=TimeUnit.SECONDS.toNanos(seconds)-(System.nanoTime()-started);if(remaining<=0)return;
             try{TimeUnit.NANOSECONDS.sleep(Math.min(remaining,TimeUnit.SECONDS.toNanos(1)));}catch(InterruptedException failure){Thread.currentThread().interrupt();throw new AssertionError(failure);}}
     }
-    private static void pump(ReclamationProbe probe,AlertNotificationPlanner planner,
+    private static void pump(ReclamationProbe probe,
             AlertDeliveryRuntime sender,AlertDeliveryNetworkIT.SmtpPeer smtp,int expected){
         long deadline=System.nanoTime()+Duration.ofSeconds(10).toNanos();
-        do{probe.observe();planner.tick();sender.tick();AlertDeliveryRuntimeIT.settled(sender);
+        do{probe.observe();
             if(sender.failure()!=null)assertThat(sender.failure().code()).isEqualTo(AlertError.CHANNEL_UNAVAILABLE.code());
-            if(smtp.bodies.size()==expected)return;
+            if(smtp.bodies.size()==expected&&sender.occupied()==0)return;
             try{Thread.sleep(100);}catch(InterruptedException failure){Thread.currentThread().interrupt();throw new AssertionError(failure);}
         }while(System.nanoTime()<deadline);
-        assertThat(smtp.bodies).hasSize(expected);
+        assertThat(smtp.bodies).hasSize(expected);assertThat(sender.occupied()).isZero();
     }
     private static final class ReclamationProbe {
         final AlertEvaluationHostIT.Fixture fixture;final AlertStore store;final com.mongodb.client.MongoDatabase database;

@@ -34,25 +34,27 @@ final class AlertNotificationPlanner {
     /** State acceptance registers notification membership in the same commit, without sending or advancing a round. */
     AlertStore.Outcome accept(AlertStore.Commit state) {
         active.run();var view=store.planning();var changes=seed(view,state.state()==null?null:state.state().after());
+        if(state.state()!=null&&state.state().after().binding()!=null&&view.unavailableRules().containsKey(state.state().after().binding().ruleIdentity().id()))throw unavailableRule();
         if(view.isolatedRecords()&&!changes.schedules().isEmpty())throw isolated();
         return store.commit(new AlertStore.Commit(state.kind(),state.state(),changes.intents(),changes.schedules(),view.version()));
     }
     void tick() {
         active.run();
         // Discovery starts from durable state and schedules on every process; no process-local known set is authoritative.
-        var initial=store.planning();boolean isolated=initial.isolatedRecords();var seed=isolated?new Changes(List.of(),List.of()):seed(initial,null);
+        var initial=store.planning();boolean isolated=initial.isolatedRecords(),unavailable=!initial.unavailableRules().isEmpty();var seed=isolated?new Changes(List.of(),List.of()):seed(initial,null);
         if(!seed.schedules().isEmpty())require(store.commit(new AlertStore.Commit(AlertStore.CommitKind.PLAN,null,List.of(),seed.schedules(),initial.version())));
         var keys=store.planning().schedules().stream().map(v->v.value()).filter(v->v.batch()==null&&v.retiredAt()==null).map(AlertSchedule.Record::key).toList();
         int count=Math.min(32,keys.size());
         for(int index=0;index<count;index++){var key=keys.get(Math.floorMod(offset+index,keys.size()));active.run();
             boolean done=false;for(int retry=0;retry<3;retry++){
-                var view=store.planning();isolated|=view.isolatedRecords();var row=view.schedules().stream().filter(v->v.value().key().equals(key)).findFirst();if(row.isEmpty()){done=true;break;}
+                var view=store.planning();isolated|=view.isolatedRecords();unavailable|=!view.unavailableRules().isEmpty();var row=view.schedules().stream().filter(v->v.value().key().equals(key)).findFirst();if(row.isEmpty()||held(view,row.orElseThrow().value())){done=true;break;}
                 var changes=advance(view,row.get());if(changes.intents().isEmpty()&&changes.schedules().isEmpty()){done=true;break;}
                 if(store.commit(new AlertStore.Commit(AlertStore.CommitKind.PLAN,null,changes.intents(),changes.schedules(),view.version()))!=AlertStore.Outcome.CONFLICT){done=true;break;}
             }if(!done)throw new TapstateException(AlertError.COMMAND_CONFLICT,Map.of(),null);
         }
         offset=keys.isEmpty()?0:Math.floorMod(offset+count,keys.size());
         if(isolated)throw isolated();
+        if(unavailable)throw unavailableRule();
     }
     private Changes seed(AlertStore.Planning view,AlertStateRecord.Head replacement) {
         var heads=new LinkedHashMap<AlarmKey,AlertStateRecord.Head>();
@@ -62,12 +64,12 @@ final class AlertNotificationPlanner {
         view.schedules().stream().filter(v->v.value().batch()==null&&v.value().retiredAt()==null).forEach(v->{roots.put(v.value().key(),v.value());original.put(v.value().key(),v);});
         var changed=new LinkedHashSet<AlertSchedule.Key>();
         for(var head:heads.values()){
-            if(!firing(head)||head.binding()==null)continue;
+            if(!firing(head)||head.binding()==null||view.unavailableRules().containsKey(head.binding().ruleIdentity().id()))continue;
             for(var destination:destinations(view,head)){
                 if(!installed(view.host(),destination))continue;
                 String group=group(destination,head.binding());
                 if(roots.values().stream().anyMatch(r->sameDestination(r,destination)&&r.members().stream().anyMatch(m->m.episodeMember().equals(head.binding().episodeMember()))))continue;
-                var existing=roots.values().stream().filter(r->sameDestination(r,destination)&&r.retention().equals(head.episode().policy())&&r.members().stream().anyMatch(m->group(destination,m).equals(group))
+                var existing=roots.values().stream().filter(r->!held(view,r)&&sameDestination(r,destination)&&r.retention().equals(head.episode().policy())&&r.members().stream().anyMatch(m->group(destination,m).equals(group))
                         &&r.members().stream().noneMatch(m->m.evaluation().key().equals(head.binding().evaluation().key())&&m.episode()!=head.binding().episode())).findFirst();
                 AlertSchedule.Record root;
                 if(existing.isPresent())root=existing.get();
@@ -226,6 +228,14 @@ final class AlertNotificationPlanner {
         if(edits.size()>MAX_CHANGES||schedules.size()>MAX_CHANGES)throw invalid("planning-commit-budget");
         return new Changes(List.copyOf(edits.values()),List.copyOf(schedules));
     }
+    private static boolean held(AlertStore.Planning view,AlertSchedule.Record root){
+        if(root.members().stream().anyMatch(member->view.unavailableRules().containsKey(member.ruleIdentity().id()))
+                ||root.pending().stream().anyMatch(member->view.unavailableRules().containsKey(member.ruleIdentity().id()))
+                ||root.disposition()!=null&&root.disposition().pending().stream().anyMatch(member->view.unavailableRules().containsKey(member.ruleIdentity().id())))return true;
+        for(var key:root.protectedIntents()){var intent=view.intents().get(key);if(intent!=null&&intent.value().frozen().members().stream().anyMatch(member->view.unavailableRules().containsKey(member.ruleIdentity().id())))return true;}
+        return false;
+    }
+    private static TapstateException unavailableRule(){return new TapstateException(io.tapstate.spi.store.IoError.DOCUMENT_UNREADABLE,Map.of("id","alert-planning","field","rule-capability"),null);}
     private List<Destination> destinations(AlertStore.Planning view,AlertStateRecord.Head head) {
         var host=view.host();var result=new ArrayList<Destination>();
         if(host.deployment()==AlertChannelPolicy.Deployment.CLOUD_MANAGED){

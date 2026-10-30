@@ -29,7 +29,7 @@ final class AlertManagement implements AlertControlDispatcher {
     }
     private Map<String,Object> invoke(String op,Map<String,Object> input,PipelineAlertRuntime.Services resolved,AlertStore.Access access,CredentialAuthentication caller){
         var store=resolved.store();var reads=new AlertStore.ReadAccess(true,Set.of(),access.locallyActive());
-        var capabilityTypes=new DeliveryTypes(store,resolved.catalog(),reads);
+        var capabilityTypes=new DeliveryTypes(store,reads);
         var author=new AlertAuthoring(store,scope,deployment,resolved.catalog(),clock,resolved.channels());var commands=new AlertDeliveryCommands(store,scope,deployment,clock,resolved.evaluator().retentionPolicy());
         int limit=integer(input,"limit",25);if(limit<1||limit>100)throw invalid("limit");
         switch(op){
@@ -122,27 +122,12 @@ final class AlertManagement implements AlertControlDispatcher {
             try{AlertDeliveryProgress.manual(stored.value(),clock.instant());retry=true;}catch(io.tapstate.core.common.TapstateException refused){}}
         row.put("canRetry",retry);return row;
     }
-    private record RuleVersion(AlertConfiguration.Identity identity,long revision,String type) { }
     private static final class DeliveryTypes {
         private final AlertStore store;private final AlertStore.ReadAccess reads;
-        private final Map<String,AlarmTypeCatalog.Type> descriptors=new HashMap<>();
-        private final Map<RuleVersion,Integer> versions=new HashMap<>();
-        DeliveryTypes(AlertStore store,AlarmTypeCatalog catalog,AlertStore.ReadAccess reads){
-            this.store=store;this.reads=reads;catalog.types().forEach(type->descriptors.put(type.id(),type));
-        }
+        DeliveryTypes(AlertStore store,AlertStore.ReadAccess reads){this.store=store;this.reads=reads;}
         Map<String,Object> unavailable(AlertIntent.Frozen frozen){
-            for(var member:frozen.members()){
-                String type=member.evaluation().key().typeId();var descriptor=descriptors.get(type);
-                if(descriptor==null)return map("reason",AlarmTypeCatalog.Availability.UNKNOWN_TYPE.name(),"typeId",type,"typeVersion",null,"availableVersion",null);
-                var key=new RuleVersion(member.ruleIdentity(),member.evaluation().revision(),type);Integer required=versions.get(key);
-                if(required==null){
-                    var original=store.originalRule(member.evaluation(),reads).filter(rule->rule.header().identity().equals(member.ruleIdentity())
-                            &&rule.evaluationRevision()==member.evaluation().revision()&&rule.typeId().equals(type));
-                    if(original.isPresent()){required=original.orElseThrow().typeVersion();versions.put(key,required);}
-                }
-                if(required!=null&&descriptor.version()!=required)return map("reason",AlarmTypeCatalog.Availability.UNSUPPORTED_TYPE_VERSION.name(),"typeId",type,"typeVersion",required,"availableVersion",descriptor.version());
-            }
-            return null;
+            return store.unavailableRule(frozen,reads).map(issue->map("reason",issue.reason().name(),"typeId",issue.typeId(),
+                    "typeVersion",issue.typeVersion(),"availableVersion",issue.availableVersion(),"recordVersion",issue.recordVersion())).orElse(null);
         }
     }
     private static Map<String,Object> channelPolicies(AlertChannelCatalog catalog){var policies=new LinkedHashMap<String,Object>();for(var descriptor:catalog.descriptors())policies.put(descriptor.capability().typeId(),policy(descriptor.transportFamily()==AlertChannelCatalog.TransportFamily.EMAIL?ChannelRetryPolicy.emailDefaults():ChannelRetryPolicy.webhookDefaults()));return policies;}

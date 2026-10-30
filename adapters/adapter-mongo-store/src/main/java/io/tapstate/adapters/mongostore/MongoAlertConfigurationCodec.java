@@ -14,6 +14,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import org.bson.BsonBinaryWriter;
 import org.bson.Document;
@@ -33,6 +34,13 @@ final class MongoAlertConfigurationCodec {
 
     static Document key(AlarmKey.Scope scope, String id) {
         return new Document("authorityId", scope.authorityId()).append("clusterId", scope.clusterId()).append("id", id);
+    }
+    static Optional<Integer> futureRuleFormat(AlarmKey.Scope scope,String id,Document header){
+        if(header==null||!(header.get("formatVersion") instanceof Integer version)||version<=AlertConfiguration.RULE_FORMAT_VERSION
+                ||!Kind.RULE.name().equals(header.get("kind"))||!(header.get("_id") instanceof Document actual))return Optional.empty();
+        if(id==null||id.isBlank()||id.codePointCount(0,id.length())>256||id.codePoints().anyMatch(Character::isISOControl)
+                ||!new ArrayList<>(actual.keySet()).equals(List.of("authorityId","clusterId","id"))||!key(scope,id).equals(actual))return Optional.empty();
+        return Optional.of(version);
     }
 
     static Document write(Definition definition, long fence) {

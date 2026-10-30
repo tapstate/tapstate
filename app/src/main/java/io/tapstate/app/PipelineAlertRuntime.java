@@ -217,15 +217,17 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         active.run();
         Services resolved = services == null ? Objects.requireNonNull(open.get()) : services;
         var all = new ArrayList<AlertConfiguration.Rule>();
+        var unavailableRules=new HashSet<String>();
         String cursor = null;
         do {
             var page = resolved.store().evaluationRules(cursor, 100);
+            unavailableRules.addAll(page.unavailableRules().keySet());
             for (var definition : page.rows()) {
                 if (!(definition instanceof AlertConfiguration.Rule rule)) throw refused("rule-kind");
                 all.add(rule.validated(resolved.catalog()));
             }
             cursor = page.nextId();
-            if (all.size() > 1000 || all.size() == 1000 && cursor != null) throw refused("rule-snapshot-budget");
+            if (all.size()+unavailableRules.size() > 1000 || all.size()+unavailableRules.size() == 1000 && cursor != null) throw refused("rule-snapshot-budget");
         } while (cursor != null);
         active.run(); synchronized(this){
             if(closed.get()){if(resolved.planner()!=null)resolved.planner().close();if(resolved.delivery()!=null)resolved.delivery().close();if(resolved.maintenance()!=null)resolved.maintenance().close();return;}
@@ -234,7 +236,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         observerTick.run();
         if(reconciliationCursor==null)legacyBindingsInScan=false;
         var retained = resolved.store().evaluationStates(reconciliationCursor, 50);
-        for(var row:retained.rows())if(retained.removedResources().contains(row.value().snapshot().rule().key().resource())){
+        for(var row:retained.rows())if((row.value().binding()==null||!unavailableRules.contains(row.value().binding().ruleIdentity().id()))&&retained.removedResources().contains(row.value().snapshot().rule().key().resource())){
             AlertEvaluationHost.requireResult(resolved.evaluator().end(row.value().snapshot().rule().key(),AlertSnapshot.EndReason.RESOURCE_REMOVED,active));
             var resource=row.value().snapshot().rule().key().resource();ResourceSlot obsolete;
             synchronized(objectAdmission){obsolete=resourceSlots.remove(resource);if(obsolete!=null){retainedResourceBindings.addAndGet(-obsolete.bindings.size());obsolete.bindings.clear();}}
@@ -243,6 +245,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         boolean legacyBindingUnavailable=false;
         for(var key:retained.obsoleteBindings()) {
             var original=retained.rows().stream().filter(row->row.value().snapshot().rule().key().equals(key)).findFirst().orElseThrow().value();
+            if(original.binding()!=null&&unavailableRules.contains(original.binding().ruleIdentity().id()))continue;
             if(original.retiredAt()==null && original.snapshot().enabled()) {
                 if(original.operationalEvidence()!=null && original.operationalEvidence().version()==2 && AlertOperationDomain.supported(key))
                     AlertEvaluationHost.requireResult(resolved.evaluator().supersede(key,active));
@@ -251,7 +254,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             synchronized(objectAdmission){var slot=resourceSlots.get(key.resource());
                 if(slot!=null && slot.bindings.remove(key)!=null)retainedResourceBindings.decrementAndGet();}
         }
-        resolved.evaluator().reconcileRules(all, retained.rows(), active);
+        resolved.evaluator().reconcileRules(all,retained.rows().stream().filter(row->row.value().binding()==null||!unavailableRules.contains(row.value().binding().ruleIdentity().id())).toList(),active);
         for(var row:retained.rows()) {
             var head=row.value();var key=head.snapshot().rule().key();
             if(key.resource().kind().equals("pipeline") || key.resource().kind().equals("cluster-node") || head.retiredAt()!=null
@@ -276,7 +279,8 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         reconciliationCursor = retained.next();
         boolean missing=all.stream().anyMatch(r->r.header().active()&&r.enabled()&&r.metric()==null
                 &&!resolved.providers().contains(resolved.catalog().types().stream().filter(t->t.id().equals(r.typeId())).findFirst().orElseThrow().providerId()));
-        if(missing || legacyBindingsUnavailable || !legacyScanComplete)failure.compareAndSet(previousFailure,new Failure(AlertError.INVALID_CONFIGURATION.code(),Map.of("field","evaluationHost","reason","input-unavailable")));
+        if(!unavailableRules.isEmpty())failure.compareAndSet(previousFailure,new Failure(AlertError.INVALID_CONFIGURATION.code(),Map.of("field","evaluationHost","reason","rule-capability-unavailable")));
+        else if(missing || legacyBindingsUnavailable || !legacyScanComplete)failure.compareAndSet(previousFailure,new Failure(AlertError.INVALID_CONFIGURATION.code(),Map.of("field","evaluationHost","reason","input-unavailable")));
         else if (slots.values().stream().noneMatch(Slot::discontinuous)) failure.compareAndSet(previousFailure,null);
     }
     /** The original operation has already occurred; enqueueing alone is never durable acceptance. */

@@ -15,7 +15,7 @@ import org.bson.Document;
 final class MongoAlertCoordinator implements AlertStore {
     private final MongoConfigurationDomain domain;private final MongoDatabase db;private final SourceConfigCipherProvider keys;
     private final MongoConfigurationArtifactStore artifacts;private final MongoConfigurationSecurityStores security;
-    private final MongoStorageBindingStore bindings;private final Host host;private final Clock clock;
+    private final MongoStorageBindingStore bindings;private final Host host;private final Clock clock;private final AlarmTypeCatalog catalog;
     private final MongoAlertConfigurationStore definitions;private final MongoAlertStateStore states;private final MongoAlertNotificationStore notifications;
     private final MongoAlertNodeLifecycleStore nodes;
     private final MongoAlertMaintenance maintenance;
@@ -66,7 +66,7 @@ final class MongoAlertCoordinator implements AlertStore {
 
     MongoAlertCoordinator(MongoConfigurationDomain domain,MongoDatabase db,SourceConfigCipherProvider keys,MongoConfigurationArtifactStore artifacts,
             MongoConfigurationSecurityStores security,MongoStorageBindingStore bindings,Host host,AlarmTypeCatalog catalog,Clock clock) {
-        this.domain=domain;this.db=db;this.keys=keys;this.artifacts=artifacts;this.security=security;this.bindings=bindings;this.host=host;this.clock=clock;
+        this.domain=domain;this.db=db;this.keys=keys;this.artifacts=artifacts;this.security=security;this.bindings=bindings;this.host=host;this.clock=clock;this.catalog=catalog;
         this.definitions=domain.alertDefinitions(host.scope(),catalog);this.states=new MongoAlertStateStore(db,host.scope(),host.locallyActive());
         if(host.deployment()==AlertChannelPolicy.Deployment.ON_PREM&&!host.scope().authorityId().equals(host.setup().installationId()))throw stale("installation-authority");
         this.notifications=new MongoAlertNotificationStore(db,host.scope(),host.deployment(),host.locallyActive(),clock);
@@ -158,6 +158,32 @@ final class MongoAlertCoordinator implements AlertStore {
                     .filter(rule->rule.header().identity().equals(identity)&&rule.evaluationRevision()==binding.revision());
         });access.requireActive().run();return result;
     }
+    @Override public Optional<RuleCapability> unavailableRule(AlertIntent.Frozen frozen,ReadAccess access){
+        access.requireActive().run();scope(frozen.identity().scope());for(var member:frozen.members())visible(member.evaluation().key(),access);
+        var result=tx(null,false,false,session->{
+            for(var member:frozen.members()){
+                var identity=member.ruleIdentity();scope(identity.scope());
+                String frozenType=member.evaluation().key().typeId();
+                if(catalog.types().stream().noneMatch(type->type.id().equals(frozenType)))return Optional.of(new RuleCapability(identity.id(),frozenType,AlarmTypeCatalog.Availability.UNKNOWN_TYPE,null,null,null));
+                var header=SystemCollections.ALERT_RULES.on(db).find(session,new Document("_id",MongoAlertConfigurationCodec.key(host.scope(),identity.id())))
+                        .projection(new Document("_id",1).append("kind",1).append("formatVersion",1)).first();
+                var future=MongoAlertConfigurationCodec.futureRuleFormat(host.scope(),identity.id(),header);
+                if(future.isPresent())return Optional.of(new RuleCapability(identity.id(),member.evaluation().key().typeId(),AlarmTypeCatalog.Availability.UNSUPPORTED_RECORD_VERSION,null,null,future.orElseThrow()));
+                var current=definitions.load(session,Kind.RULE,identity.id()).map(MongoAlertConfigurationCodec.Stored::definition).filter(Rule.class::isInstance).map(Rule.class::cast);
+                if(current.isPresent()&&current.orElseThrow().header().identity().equals(identity)&&current.orElseThrow().evaluationRevision()==member.evaluation().revision()
+                        &&current.orElseThrow().typeId().equals(member.evaluation().key().typeId())){
+                    var unavailable=ruleCapability(current.orElseThrow());if(unavailable.isPresent())return unavailable;
+                }
+            }
+            return Optional.<RuleCapability>empty();
+        });access.requireActive().run();return result;
+    }
+    private Optional<RuleCapability> ruleCapability(Rule rule){
+        var descriptor=catalog.types().stream().filter(type->type.id().equals(rule.typeId())).findFirst();
+        if(descriptor.isEmpty())return Optional.of(new RuleCapability(rule.header().identity().id(),rule.typeId(),AlarmTypeCatalog.Availability.UNKNOWN_TYPE,rule.typeVersion(),null,null));
+        if(descriptor.orElseThrow().version()!=rule.typeVersion())return Optional.of(new RuleCapability(rule.header().identity().id(),rule.typeId(),AlarmTypeCatalog.Availability.UNSUPPORTED_TYPE_VERSION,rule.typeVersion(),descriptor.orElseThrow().version(),null));
+        return Optional.empty();
+    }
     @Override public Optional<Definition> definition(Kind kind,String id,Access access) {
         return tx(access,false,false,s->definitions.load(s,kind,id).map(MongoAlertConfigurationCodec.Stored::definition));
     }
@@ -176,7 +202,11 @@ final class MongoAlertCoordinator implements AlertStore {
             return new ResourcePage(rows,more?raw.getLast().getString("_id"):null);
         });
     }
-    @Override public DefinitionPage evaluationRules(String after,int limit){return tx(null,false,false,s->new MongoAlertReads(db,host.scope(),states,clock).definitions(s,Kind.RULE,after,limit));}
+    @Override public DefinitionPage evaluationRules(String after,int limit){return tx(null,false,false,s->{
+        var page=new MongoAlertReads(db,host.scope(),states,clock).definitions(s,Kind.RULE,after,limit);var unavailable=new HashMap<>(page.unavailableRules());var available=new ArrayList<Definition>();
+        for(var value:page.rows()){var issue=ruleCapability((Rule)value);if(issue.isPresent())unavailable.put(value.header().identity().id(),issue.orElseThrow());else available.add(value);}
+        return new DefinitionPage(available,page.nextId(),unavailable);
+    });}
     @Override public EvaluationPage evaluationStates(AlarmKey after,int limit){return tx(null,false,false,s->{
         var page=new MongoAlertReads(db,host.scope(),states,clock).evaluationStates(s,after,limit);var removed=new HashSet<AlarmKey.Resource>();var superseded=new HashSet<AlarmKey>();
         for(var row:page.rows()){var resource=row.value().snapshot().rule().key().resource();if(resourceRemoved(s,resource))removed.add(resource);else if(sourceBindingChanged(s,row.value()))superseded.add(row.value().snapshot().rule().key());}
@@ -341,8 +371,9 @@ final class MongoAlertCoordinator implements AlertStore {
     @Override public Planning planning(){return tx(null,false,false,s->{
         var version=SystemCollections.CONFIGURATION_VERSION.on(db).find(s,new Document("_id",ConfigurationVersion.ID)).first();
         ConfigurationVersion.validateAlertState(version,true);var budget=new PlanningBudget();
-        var defs=new ArrayList<Definition>();for(var kind:Kind.values()){defs.addAll(definitionSnapshot(s,kind));if(defs.size()>1000)throw unreadable("planning-definitions-budget");}
+        var unavailable=new HashMap<String,RuleCapability>();var defs=new ArrayList<Definition>();for(var kind:Kind.values()){defs.addAll(definitionSnapshot(s,kind,unavailable));if(defs.size()+unavailable.values().stream().filter(v->v.reason()==AlarmTypeCatalog.Availability.UNSUPPORTED_RECORD_VERSION).count()>1000)throw unreadable("planning-definitions-budget");}
         for(var definition:defs)budget.charge(MongoAlertConfigurationCodec.write(definition,0));
+        for(var issue:unavailable.values())budget.charge(new Document("ruleId",issue.ruleId()).append("reason",issue.reason().name()).append("recordVersion",issue.recordVersion()));
         var heads=new ArrayList<Stored<AlertStateRecord.Head>>();AlarmKey cursor=null;
         do{var page=new MongoAlertReads(db,host.scope(),states,clock).evaluationStates(s,cursor,100);heads.addAll(page.rows());cursor=page.next();
             if(heads.size()>1000||heads.size()==1000&&cursor!=null)throw unreadable("planning-states-budget");}while(cursor!=null);
@@ -382,7 +413,7 @@ final class MongoAlertCoordinator implements AlertStore {
             if(++pairs>10000)throw unreadable("planning-dependency-budget");
             if(dependency(s,root.rule().key(),dependent.rule().key(),false))dependencies.add(new Dependency(root.rule().key(),dependent.rule().key()));
         }
-        return new Planning(new PlanVersion(version.getLong("revision"),version.getLong(ConfigurationVersion.ALERT_FENCE)),host,defs,heads,List.copyOf(schedules.values()),intents,episodes,limits,dependencies,isolated);
+        return new Planning(new PlanVersion(version.getLong("revision"),version.getLong(ConfigurationVersion.ALERT_FENCE)),host,defs,heads,List.copyOf(schedules.values()),intents,episodes,limits,dependencies,isolated,unavailable);
     });}
     private void planningIntent(ClientSession s,DeliveryKey key,Map<DeliveryKey,Stored<AlertIntent.Record>> intents,PlanningBudget budget){
         if(intents.containsKey(key))return;if(intents.size()>=1000)throw unreadable("planning-intents-budget");
@@ -583,9 +614,14 @@ final class MongoAlertCoordinator implements AlertStore {
         }
     }
     private List<Definition> definitionSnapshot(ClientSession s,Kind kind){
+        return definitionSnapshot(s,kind,null);
+    }
+    private List<Definition> definitionSnapshot(ClientSession s,Kind kind,Map<String,RuleCapability> unavailable){
         var values=new ArrayList<Definition>();String cursor=null;
         do{var page=new MongoAlertReads(db,host.scope(),states,clock).definitions(s,kind,cursor,100);values.addAll(page.rows());cursor=page.nextId();
-            if(values.size()>1000||values.size()==1000&&cursor!=null)throw unreadable("policy-read-budget");}while(cursor!=null);return List.copyOf(values);
+            if(!page.unavailableRules().isEmpty()){if(unavailable==null)throw unreadable("unsupported-rule-format");unavailable.putAll(page.unavailableRules());}
+            if(unavailable!=null&&kind==Kind.RULE)for(var definition:page.rows())ruleCapability((Rule)definition).ifPresent(issue->unavailable.put(issue.ruleId(),issue));
+            if(values.size()>1000||values.size()==1000&&cursor!=null||unavailable!=null&&unavailable.size()>1000)throw unreadable("policy-read-budget");}while(cursor!=null);return List.copyOf(values);
     }
     private boolean dependency(ClientSession s,AlarmKey root,AlarmKey dependent){return dependency(s,root,dependent,true);}
     private boolean dependency(ClientSession s,AlarmKey root,AlarmKey dependent,boolean fence){

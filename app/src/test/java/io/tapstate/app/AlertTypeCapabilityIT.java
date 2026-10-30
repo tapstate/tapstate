@@ -32,6 +32,22 @@ class AlertTypeCapabilityIT {
             }
         });
     }
+    @Test void anObsoleteUnknownFrozenTypeDoesNotTakeTheSlotsOfLaterKnownWork(){
+        AlertEvaluationHostIT.withFixture(f->{route(f,Duration.ZERO);var catalog=catalog(1);var host=f.storeHost().withChannels(Set.of(new AlertChannelPolicy.Capability("email",1,AlertChannelPolicy.Family.OP_EXTERNAL)));
+            var capable=f.configuration().alerts(host,catalog,f.clock());
+            var rule=new AlertConfiguration.Rule(AlertConfiguration.Header.create(AlertConfiguration.Identity.create(AlertConfiguration.Kind.RULE,host.scope(),"obsolete-type"),host.deployment(),T,"operator"),"Obsolete type","test.pipeline-condition",1,f.rule().resources(),Map.of(),null,true,null).validated(catalog).enrolled(null);
+            capable.saveDefinition(null,rule,access());var originalPlanner=new AlertNotificationPlanner(capable,f.clock(),"obsolete-planner",null,ACTIVE);
+            var evaluator=new AlertEvaluationHost(capable,catalog,host.deployment(),f.clock(),"obsolete-evaluator",ACTIVE).withPlanner(originalPlanner);
+            var binding=new AlertEvaluationHost.Binding(rule,new AlarmKey.Resource("pipeline","orders","1"),"obsolete-producer",0,ACTIVE,()->new AlertStore.EvaluationProof(f.intent(),ACTIVE));
+            evaluator.accept(binding,1,new AlertInput.Conditions(T,AlertSignal.Condition.BAD,null));originalPlanner.tick();var originals=capable.deliveries(null,10,null,null,f.reads()).rows();assertThat(originals).hasSize(2);
+            f.now().set(T.plusSeconds(1));f.evaluator().withPlanner(originalPlanner);bad(f);originalPlanner.tick();assertThat(capable.deliveries(null,10,null,null,f.reads()).rows()).hasSize(4);
+            f.now().set(T.plusSeconds(2));var replacement=new AlertConfiguration.Rule(rule.header().next(f.clock().instant(),"operator"),"New semantics","pipeline.failed",1,rule.resources(),Map.of(),null,true,null);
+            assertThat(capable.saveDefinition(rule,replacement,access())).isEqualTo(AlertStore.Outcome.STAGED);
+            var old=f.configuration().alerts(host,BuiltinAlarmTypes.catalog(),f.clock());var channels=new AlertDeliveryRuntimeIT.Channels(old);
+            try(var sender=AlertDeliveryRuntimeIT.runtime(f,old,channels,"old-catalog-sender")){sender.tick();AlertDeliveryRuntimeIT.settled(sender);assertThat(channels.calls).hasValue(2);}
+            for(var original:originals)assertThat(old.intent(original.value().frozen().identity(),null).orElseThrow()).isEqualTo(original);
+        });
+    }
     @Test void unsupportedTypeOrVersionCannotGrantAnOriginalTaskAndRestoredSupportUsesItsOriginalIdentity(){
         for(int version:List.of(1,2))for(boolean exhausted:List.of(false,true))AlertEvaluationHostIT.withFixture(f->{route(f,Duration.ZERO);var catalog=catalog(version);var host=f.storeHost().withChannels(Set.of(new AlertChannelPolicy.Capability("email",1,AlertChannelPolicy.Family.OP_EXTERNAL)));
             var supported=f.configuration().alerts(host,catalog,f.clock());

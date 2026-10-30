@@ -124,10 +124,22 @@ final class MongoAlertReads {
     }
     DefinitionPage definitions(ClientSession s,AlertConfiguration.Kind kind,String after,int limit){
         limit(limit);var low=MongoAlertDeliveryCodec.scope(scope).append("id",after==null?new MinKey():after);var high=MongoAlertDeliveryCodec.scope(scope).append("id",new MaxKey());
-        var raw=collection(kind).on(db).find(s,new Document("_id",new Document(after==null?"$gte":"$gt",low).append("$lte",high))).sort(new Document("_id",1)).limit(limit+1).into(new ArrayList<>());
-        boolean more=raw.size()>limit;if(more)raw.removeLast();var values=new ArrayList<AlertConfiguration.Definition>();
-        for(var row:raw){var id=row.get("_id",Document.class).getString("id");values.add(MongoAlertConfigurationCodec.read(kind,scope,id,row).definition());}
-        return new DefinitionPage(values,more?raw.getLast().get("_id",Document.class).getString("id"):null);
+        var versions=kind==AlertConfiguration.Kind.SILENCE?List.of(1):List.of(1,2);
+        int maximum=kind==AlertConfiguration.Kind.RECEIVER?MongoAlertConfigurationCodec.MAX_RECEIVER_BYTES:MongoAlertConfigurationCodec.MAX_BYTES;
+        var known=new Document("$and",List.of(new Document("$in",List.of("$formatVersion",versions)),new Document("$lte",List.of(new Document("$bsonSize","$$ROOT"),maximum))));
+        var projection=new Document("_id",1).append("formatVersion",1).append("kind",1)
+                .append("record",new Document("$cond",Arrays.asList(known,"$$ROOT",null)));
+        var raw=collection(kind).on(db).aggregate(s,List.of(new Document("$match",new Document("_id",new Document(after==null?"$gte":"$gt",low).append("$lte",high))),
+                new Document("$sort",new Document("_id",1)),new Document("$limit",limit+1),new Document("$project",projection))).into(new ArrayList<>());
+        boolean more=raw.size()>limit;if(more)raw.removeLast();var values=new ArrayList<AlertConfiguration.Definition>();var unavailable=new HashMap<String,RuleCapability>();
+        for(var header:raw){
+            if(!(header.get("_id") instanceof Document key)||!(key.get("id") instanceof String id))throw unreadable("definition-identity");
+            var future=kind==AlertConfiguration.Kind.RULE?MongoAlertConfigurationCodec.futureRuleFormat(scope,id,header):Optional.<Integer>empty();
+            if(future.isPresent()){unavailable.put(id,new RuleCapability(id,null,io.tapstate.core.alerting.AlarmTypeCatalog.Availability.UNSUPPORTED_RECORD_VERSION,null,null,future.orElseThrow()));continue;}
+            if(!(header.get("record") instanceof Document row))throw unreadable("definition-format-or-budget");
+            values.add(MongoAlertConfigurationCodec.read(kind,scope,id,row).definition());
+        }
+        return new DefinitionPage(values,more?raw.getLast().get("_id",Document.class).getString("id"):null,unavailable);
     }
     EvaluationPage evaluationStates(ClientSession s,AlarmKey after,int limit){
         limit(limit);if(after!=null&&!scope.equals(after.scope()))throw unreadable("evaluation-cursor-scope");
