@@ -147,7 +147,7 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
                             .anyMatch(component->component.path().getFirst().equals("_id")),
                     value->value instanceof ValidationValues.Typed typed&&typed.logicalType().equals("object-id")&&typed.value() instanceof String);
             return ValidationRootReader.readOrderedDirect(observation,original.spec().method(),ordered,
-                    new ValidationRootCheck.Limits(256*1024,256,256,8,2),()->{require();guard.run();},(pair,result)->{
+                    new ValidationRootCheck.Limits(256L*1024,256,256,8,2),()->{require();guard.run();},(pair,result)->{
                         if(full())ValidationFieldCheck.check(observation,List.of(),pair.source().working(),pair.target().working(),
                                 pair.sourceSample(),pair.targetSample(),generated,String::equals,
                                 new ValidationValueComparison.TraversalLimits(ROW,100000),result);
