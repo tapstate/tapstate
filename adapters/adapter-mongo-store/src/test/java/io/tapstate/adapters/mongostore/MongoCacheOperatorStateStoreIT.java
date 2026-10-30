@@ -48,7 +48,7 @@ class MongoCacheOperatorStateStoreIT {
             var listener = new CommandListener() { @Override public void commandStarted(CommandStartedEvent event) {
                 if (event.getDatabaseName().equals(f.database.getName()) && event.getCommandName().equals("update")
                         && event.getCommand().getString("update").getValue().equals("nest_state")) {
-                    assertThat(event.getCommand().containsKey("txnNumber")).isTrue();
+                    assertThat(event.getCommand()).containsKey("txnNumber");
                     sizes.add(event.getCommand().getArray("updates").size());
                 }
             }};

@@ -20,6 +20,7 @@ import java.util.Optional;
 
 /** Opaque operator bytes, split by resource type and fenced by the original Pipeline execution. */
 final class MongoCacheOperatorStateStore implements NestReleaseStore {
+    private static final String STATE_FIELD = "state";
     private static final int BATCH_KEYS = 256;
     private static final int BATCH_BYTES = 4 * 1024 * 1024;
     private final MongoCachePipelineAccess access;
@@ -92,7 +93,7 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore {
         long bytes = 0;
         for (var entry : states.entrySet()) {
             Document id = id(entry.getKey());
-            byte[] captured = Objects.requireNonNull(entry.getValue(), "state").clone();
+            byte[] captured = Objects.requireNonNull(entry.getValue(), STATE_FIELD).clone();
             long weight = 2 * (addressBytes + 3L * entry.getKey().length()) + captured.length;
             if (!batch.isEmpty() && (batch.size() == BATCH_KEYS || bytes + weight > BATCH_BYTES)) {
                 writeBatch(batch);
@@ -114,7 +115,7 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore {
     }
 
     @Override public void saveWithRelease(String namespace, String key, byte[] state, byte[] routingKey) {
-        requireNamespace(namespace); Document id = id(key); byte[] captured = Objects.requireNonNull(state, "state").clone();
+        requireNamespace(namespace); Document id = id(key); byte[] captured = Objects.requireNonNull(state, STATE_FIELD).clone();
         byte[] fixedKey = routingKey == null ? null : routingKey.clone();
         if (fixedKey != null && table != SystemCollections.CACHE_NEST_STATE) throw MongoCachePipelineAccess.fenced();
         transaction(true, session -> {
@@ -155,7 +156,7 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore {
     }
 
     @Override public Optional<byte[]> saveIfAbsent(String namespace, String key, byte[] state) {
-        requireNamespace(namespace); Document id = id(key); byte[] captured = Objects.requireNonNull(state, "state").clone();
+        requireNamespace(namespace); Document id = id(key); byte[] captured = Objects.requireNonNull(state, STATE_FIELD).clone();
         return transaction(true, session -> {
             Document before = table.on(target).find(session, new Document("_id", id)).first();
             if (before != null) return Optional.of(decode(before, id));
@@ -193,10 +194,10 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore {
 
     private void requireNamespace(String namespace) { if (!mapName.equals(namespace)) throw MongoCachePipelineAccess.fenced(); }
     private Document id(String key) { return new Document("placement", address).append("key", OperatorStateText.encode(Objects.requireNonNull(key, "key"))); }
-    private Document row(Document id, byte[] value) { return new Document("_id", id).append("formatVersion", table == SystemCollections.CACHE_NEST_STATE ? 2 : 1).append("state", new Binary(value)); }
+    private Document row(Document id, byte[] value) { return new Document("_id", id).append("formatVersion", table == SystemCollections.CACHE_NEST_STATE ? 2 : 1).append(STATE_FIELD, new Binary(value)); }
     private byte[] decode(Document row, Document id) {
         if (!id.equals(row.get("_id")) || !Integer.valueOf(table == SystemCollections.CACHE_NEST_STATE ? 2 : 1).equals(row.get("formatVersion"))
-                || !(row.get("state") instanceof Binary binary) || binary.getType() != 0) throw access.unreadable("operator-state");
+                || !(row.get(STATE_FIELD) instanceof Binary binary) || binary.getType() != 0) throw access.unreadable("operator-state");
         if (row.containsKey("pendingRelease") || row.containsKey("releaseKey")) {
             if (table != SystemCollections.CACHE_NEST_STATE || !Boolean.TRUE.equals(row.get("pendingRelease"))
                     || !(row.get("releaseKey") instanceof Binary key) || key.getType() != 0)
