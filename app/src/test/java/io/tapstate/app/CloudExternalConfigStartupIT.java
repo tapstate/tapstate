@@ -9,6 +9,7 @@ import com.sun.net.httpserver.HttpServer;
 import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
 import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
+import io.tapstate.adapters.mongostore.StoreError;
 import io.tapstate.spi.store.StorageBinding;
 import io.tapstate.control.restapi.RuntimeVersion;
 import io.tapstate.core.model.Metadata;
@@ -479,6 +480,44 @@ class CloudExternalConfigStartupIT {
         assertUntouched(ignored);
         assertSafeOutput(running, uri);
         assertAbsent(running, "atlas-uri-password-sentinel");
+    }
+
+    @Test
+    void aRefusedConfigurationPreparationKeepsItsSafeDiagnosticWhenCloudEntryResumes() throws Exception {
+        String selected = uniqueDatabase("diagnostic_selected");
+        String ignored = uniqueDatabase("diagnostic_ignored");
+        String uri = MONGO.getReplicaSetUrl(selected);
+        Document witness = new Document("_id", "retained").append("value", "must-remain");
+        try (var raw = MongoClients.create(MONGO.getReplicaSetUrl())) {
+            raw.getDatabase(selected).getCollection("diagnostic_witness").insertOne(witness);
+        }
+        String claim = "/v1/api/clusters/" + CLUSTER + "/configuration-initialization/claim";
+        cloud.createContext(claim, exchange -> {
+            cloudRequests.incrementAndGet();
+            cloudPaths.add(exchange.getRequestMethod() + " " + exchange.getRequestURI().getPath());
+            assertThat(exchange.getRequestHeaders().getFirst("Authorization")).isEqualTo("Bearer " + TOKEN);
+            var body = JSON.readTree(exchange.getRequestBody());
+            byte[] response = JSON.writeValueAsBytes(Map.of("code", "ok", "data", Map.of(
+                    "clusterId", CLUSTER, "operationId", "fcb93dc8-ae8d-4e6a-9c06-44cc92a9bcf8",
+                    "phase", "CLAIMED", "configurationHash", body.path("configurationHash").asText(), "creationGranted", true)));
+            exchange.getResponseHeaders().set("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, response.length);
+            exchange.getResponseBody().write(response); exchange.close();
+        });
+
+        Running running = start(Carrier.ENVIRONMENT, cloudValues(uri), MONGO.getReplicaSetUrl(ignored));
+        running.awaitUnavailable(StoreError.INITIALIZATION_REFUSED.code(), "UNAVAILABLE");
+        assertThat(running.get("/auth/exchange?code=unconsumed-diagnostic-code").statusCode()).isEqualTo(503);
+        assertThat(running.safeOutput()).contains("stage=prepare", "stage=resume", "creationGranted=true", "creationInvoked=true")
+                .doesNotContain("unconsumed-diagnostic-code");
+        assertSafeOutput(running, uri);
+        assertThat(cloudPaths).containsExactly("POST " + claim);
+        try (var raw = MongoClients.create(MONGO.getReplicaSetUrl())) {
+            var database = raw.getDatabase(selected);
+            assertThat(database.listCollectionNames().into(new ArrayList<>())).containsExactly("diagnostic_witness");
+            assertThat(database.getCollection("diagnostic_witness").find().into(new ArrayList<>())).containsExactly(witness);
+            assertThat(raw.getDatabase(ignored).listCollectionNames().into(new ArrayList<>())).isEmpty();
+        }
     }
 
     @Test
