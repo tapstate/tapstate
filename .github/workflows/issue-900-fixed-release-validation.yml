@@ -1,0 +1,89 @@
+name: Nest fixed Release validation
+
+on:
+  push:
+    branches: [codex/issue-900-release-validation]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue-900-fixed-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nest-fixed-release-targeted:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      EXPECTED_PRODUCT_REVISION: fe6011933c7f4c0e4de726e35a7f8fb7ca2bafdf
+      MAVEN_OPTS: -Xmx1536m -XX:ActiveProcessorCount=2
+      JAVA_TOOL_OPTIONS: -Xmx1536m -XX:ActiveProcessorCount=2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Verify identical product and test sources
+        run: |
+          git diff --exit-code "$EXPECTED_PRODUCT_REVISION" HEAD -- . \
+            ':(exclude).github/scripts/_connector-inputs.py' \
+            ':(exclude).github/workflows/issue-900-fixed-release-validation.yml'
+          printf 'validation_revision=%s\nproduct_revision=%s\n' "$GITHUB_SHA" "$EXPECTED_PRODUCT_REVISION" > "$RUNNER_TEMP/source-identity.txt"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Verify the runner environment
+        run: |
+          docker info --format '{{.ServerVersion}}'
+          java -version
+          lscpu
+          free -m
+      - name: Prepare and verify locked Release inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -B .github/scripts/_connector-inputs.py prepare-release --directory "$RUNNER_TEMP/connectors" --source-sha "$GITHUB_SHA"
+          python3 -B .github/scripts/_connector-inputs.py verify --directory "$RUNNER_TEMP/connectors" --mode release --source-sha "$GITHUB_SHA"
+      - name: Seed isolated Maven dependencies
+        run: .github/scripts/ci-maven-cache.sh seed "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
+      - name: Build the committed runtime
+        run: mvn -B -ntp -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipTests install
+      - name: Run all four original Nest cases in both fidelity tiers
+        run: |
+          mvn -B -ntp -Dmaven.repo.local="$RUNNER_TEMP/m2" -pl e2e -am verify \
+            -Dtest=NoUnitTestsSelected -Dsurefire.failIfNoSpecifiedTests=false \
+            -Dit.test=ANestFirstFilingPublishesEachDocumentOnceIT -Dfailsafe.failIfNoSpecifiedTests=false \
+            -Dapi.version=1.44 -Dtapstate.e2e.connectors-dir="$RUNNER_TEMP/connectors"
+      - name: Require four executed cases with no skips or failures
+        run: |
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          path = 'e2e/target/failsafe-reports/TEST-io.tapstate.e2e.ANestFirstFilingPublishesEachDocumentOnceIT.xml'
+          root = ET.parse(path).getroot()
+          assert int(root.attrib['tests']) == 4, root.attrib
+          assert all(int(root.attrib[key]) == 0 for key in ['failures', 'errors', 'skipped']), root.attrib
+          cases = root.findall('testcase')
+          assert len(cases) == 4
+          for prefix in ['customersReadFirstFromOneSourceStillReachOrdersAfterCdcAndRestart',
+                         'aFiledCustomerAlreadyReadByItsOrderDoesNotPublishThatOrderAgain']:
+              assert sum(case.attrib['name'].startswith(prefix) for case in cases) == 2
+          print('Four original fixed-Release Nest cases executed successfully')
+          PY
+      - name: Retain downloaded third-party dependencies
+        if: always()
+        run: .github/scripts/ci-maven-cache.sh collect "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: issue-900-fixed-release-results
+          path: |
+            ${{ runner.temp }}/source-identity.txt
+            ${{ runner.temp }}/connectors/connector-inputs.json
+            e2e/target/failsafe-reports/
+            e2e/target/failure-scenes/
+            e2e/target/witness-ledger.txt
+            e2e/target/witness-ledgers/
+          if-no-files-found: error
+          retention-days: 7
