@@ -17,6 +17,53 @@ import static org.mockito.Mockito.*;
 /** Real member routing and paid I/O over bounded CONFIG fixtures; not connector or durable admission acceptance. */
 class NativeValidationStartCoordinatorTest {
     private static final UUID GENERATION=UUID.randomUUID();
+    @Test @Timeout(30) void liveAndMissingOwnerClaimsCannotOpenASuccessorAttempt() {
+        for(boolean live:List.of(true,false))try(var routing=new ValidationOwnerRouterTest.Fixture(Duration.ofSeconds(5),1);var process=new ValidationMemberResources()){
+            var resources=process.bind("cluster","a","boot-a",2,()->{});var configuration=configuration();
+            var saved=snapshot("flow","task");var oldOwner=new ValidationOwner("cluster","flow","a","previous-boot",3,4,1);
+            var spec=new ValidationRunSpec(saved.comparison(),ValidationMode.FULL,ValidationMethod.COUNT);
+            var identity=new ValidationRunIdentity(oldOwner,"task","old-born-run",ValidationMode.FULL,spec.fingerprint(),1,"direct-full-v1");
+            var start=new ValidationReportAdmission.Start(saved.task(),1,1,UUID.randomUUID().toString(),identity);
+            var born=new ValidationTaskStore.Snapshot(saved.task(),1,saved.commandId(),saved.comparison(),saved.settings(),1,saved.schedulingCommandId(),false,
+                    new ValidationTaskStore.Mode(2,new ValidationTaskStore.Permission(start,ValidationTaskStore.Phase.BORN)),saved.incremental());
+            when(configuration.validationTasks(()->{}).read("flow","task")).thenReturn(Optional.of(born));
+            if(live)routing.reading.set(new WorkloadClaimReading(new WorkloadClaim(ValidationClaims.key("cluster","flow"),
+                    new WorkloadOwner("a","previous-boot"),3,4,1,java.time.Instant.EPOCH),Duration.ofSeconds(30)));
+            try(var coordinator=new NativeValidationStartCoordinator(routing.a,configuration,routing.left,resources,process,()->{})){
+                assertThat(coordinator.permissionOwnerLease(born)).isEqualTo(live?ValidationOperation.OwnerLease.LIVE:ValidationOperation.OwnerLease.UNKNOWN);
+                var next=new ValidationOperation(coordinator.context(),"flow","task",GENERATION,1,2,UUID.randomUUID());
+                try(var response=coordinator.start(next)){assertThat(response.value().outcome()).isEqualTo(ValidationOperation.Outcome.REJECTED);}
+                assertThat(routing.calls.values()).allSatisfy(count->assertThat(count).hasValue(0));
+                assertThat(resources.snapshot().metadataFrames()).isZero();
+            }
+        }
+    }
+    @Test @Timeout(30) void aSuccessorAttemptReachesTheFencedOwnerBeforeObsoletePermissionClosure() {
+        try(var routing=new ValidationOwnerRouterTest.Fixture(Duration.ofSeconds(5),1);var process=new ValidationMemberResources()){
+            var resources=process.bind("cluster","a","boot-a",2,()->{});var configuration=configuration();
+            var saved=snapshot("flow","task");var oldOwner=new ValidationOwner("cluster","flow","a","previous-boot",3,4,1);
+            routing.reading.set(new WorkloadClaimReading(new WorkloadClaim(ValidationClaims.key("cluster","flow"),
+                    new WorkloadOwner("a","previous-boot"),3,4,1,java.time.Instant.now().plusSeconds(300)),Duration.ofSeconds(-1)));
+            var spec=new ValidationRunSpec(saved.comparison(),ValidationMode.FULL,ValidationMethod.COUNT);
+            var oldIdentity=new ValidationRunIdentity(oldOwner,"task","old-born-run",ValidationMode.FULL,spec.fingerprint(),1,"direct-full-v1");
+            var oldStart=new ValidationReportAdmission.Start(saved.task(),1,1,UUID.randomUUID().toString(),oldIdentity);
+            var born=new ValidationTaskStore.Snapshot(saved.task(),1,saved.commandId(),saved.comparison(),saved.settings(),1,saved.schedulingCommandId(),false,
+                    new ValidationTaskStore.Mode(2,new ValidationTaskStore.Permission(oldStart,ValidationTaskStore.Phase.BORN)),saved.incremental());
+            when(configuration.validationTasks(()->{}).read("flow","task")).thenReturn(Optional.of(born));
+            for(var node:List.of("a","b"))routing.behaviors.put(node,request->{
+                assertThat(request.startSequence()).isEqualTo(2);assertThat(request.run()).isNotEqualTo(oldIdentity.runId());
+                return new ValidationOwnerRouter.Result(ValidationOwnerRouter.Outcome.BUSY,null,null);
+            });
+            try(var coordinator=new NativeValidationStartCoordinator(routing.a,configuration,routing.left,resources,process,()->{})){
+                var next=new ValidationOperation(coordinator.context(),"flow","task",GENERATION,1,2,UUID.randomUUID());
+                try(var response=coordinator.start(next)){
+                    assertThat(response.value().outcome()).isIn(ValidationOperation.Outcome.PENDING,ValidationOperation.Outcome.BUSY);
+                }
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).until(()->routing.calls.values().stream().mapToInt(AtomicInteger::get).sum()==1);
+                assertThat(configuration.validationTasks(()->{}).read("flow","task").orElseThrow().full().permission().phase()).isEqualTo(ValidationTaskStore.Phase.BORN);
+            }
+        }
+    }
     @Test @Timeout(30) void stoppingAnExhaustedCapacityAttemptReadsItsOriginalDisposedReceipt() {
         try(var routing=new ValidationOwnerRouterTest.Fixture(Duration.ofSeconds(5),1);var process=new ValidationMemberResources()){
             var resources=process.bind("cluster","a","boot-a",2,()->{});

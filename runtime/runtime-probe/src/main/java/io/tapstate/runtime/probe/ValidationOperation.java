@@ -18,6 +18,8 @@ public record ValidationOperation(Context context,String pipeline,String task,UU
     }
     public enum Outcome { PENDING,ACCEPTED,CAPACITY,BUSY,REJECTED,UNKNOWN }
     public enum Drain { UNKNOWN,NOT_DRAINED,DRAINED }
+    /** A read observation only; the owner-fenced reservation still decides admission. */
+    public enum OwnerLease { LIVE,NOT_LIVE,UNKNOWN }
     public record Table(String mapping,String phase) implements Serializable {
         public Table {name(mapping);if(phase==null||!Set.of("PENDING","READING","READ_COMPLETE").contains(phase))throw invalid("table");}
     }

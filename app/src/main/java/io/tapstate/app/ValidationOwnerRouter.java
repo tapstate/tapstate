@@ -8,6 +8,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.validation.ValidationError;
 import io.tapstate.core.validation.ValidationOwner;
 import io.tapstate.core.validation.ValidationOwnerRanking;
+import io.tapstate.runtime.probe.ValidationOperation.OwnerLease;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimType;
@@ -113,6 +114,7 @@ final class ValidationOwnerRouter implements AutoCloseable {
     private final ClusterMembershipGate membership;
     private final Supplier<WorkloadClaimFence> node;
     private final Function<String, Optional<WorkloadClaimReading>> readOwner;
+    private final Function<String, Optional<WorkloadClaimReading>> readPreparedOwner;
     private final Local local;
     private final Commands commands;
     private final Runnable active;
@@ -132,8 +134,14 @@ final class ValidationOwnerRouter implements AutoCloseable {
     }
     ValidationOwnerRouter(HazelcastInstance member,ClusterMembershipGate membership,Supplier<WorkloadClaimFence> node,
             Function<String,Optional<WorkloadClaimReading>> readOwner,Local local,Commands commands,Runnable active,Duration timeout,LongSupplier nanoTime){
+        this(member,membership,node,readOwner,local,commands,active,timeout,nanoTime,ignored->Optional.empty());
+    }
+    ValidationOwnerRouter(HazelcastInstance member,ClusterMembershipGate membership,Supplier<WorkloadClaimFence> node,
+            Function<String,Optional<WorkloadClaimReading>> readOwner,Local local,Commands commands,Runnable active,Duration timeout,LongSupplier nanoTime,
+            Function<String,Optional<WorkloadClaimReading>> readPreparedOwner){
         this.member = Objects.requireNonNull(member); this.membership = Objects.requireNonNull(membership);
         this.node = Objects.requireNonNull(node); this.readOwner = Objects.requireNonNull(readOwner);
+        this.readPreparedOwner=Objects.requireNonNull(readPreparedOwner);
         this.local = Objects.requireNonNull(local); this.active = Objects.requireNonNull(active);
         this.commands=Objects.requireNonNull(commands);
         this.nanoTime=Objects.requireNonNull(nanoTime);
@@ -185,6 +193,16 @@ final class ValidationOwnerRouter implements AutoCloseable {
     static CommandReply commandUnavailable(Command command,Outcome outcome,String reason){return new CommandReply(outcome,command,null,false,false,false,false,false,reason);}
 
     Reply reserve(Request request) {return reserveAttempt(request).reply();}
+    OwnerLease ownerLease(ValidationOwner original) {
+        requireActive();var reading=Objects.requireNonNull(readPreparedOwner.apply(original.pipelineId()));requireActive();
+        if(reading.isEmpty())return OwnerLease.UNKNOWN;
+        var value=reading.orElseThrow();var claim=value.claim();
+        if(!claim.key().equals(ValidationClaims.key(original.clusterId(),original.pipelineId()))
+                ||claim.claimGeneration()<original.claimGeneration()
+                ||claim.claimGeneration()==original.claimGeneration()&&(!claim.owner().nodeId().equals(original.nodeId())
+                ||!claim.owner().bootId().equals(original.bootId())||claim.executionGeneration()<original.executionGeneration()))return OwnerLease.UNKNOWN;
+        return value.leased()?OwnerLease.LIVE:OwnerLease.NOT_LIVE;
+    }
     Attempt reserveAttempt(Request request) {
         Objects.requireNonNull(request); var before = roster(); long deadline = nanoTime.getAsLong() + timeoutNanos;
         var tried = new HashSet<Identity>();

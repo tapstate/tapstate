@@ -105,7 +105,10 @@ final class NativeValidationScheduler implements AutoCloseable {
                 if(saved==null||saved.closed()||!saved.task().equals(due.entry().task)||saved.revision()!=due.entry().revision||!saved.settings().full().scheduleEnabled())return;
                 var mode=saved.full();var permission=mode.permission();
                 if(permission!=null&&permission.start().commandId().equals(due.command().toString()))return;
-                if(permission!=null&&permission.phase()!=ValidationTaskStore.Phase.CLOSED){publish(due.entry(),due,ValidationScheduleObservations.State.SKIPPED_BUSY,null,null);return;}
+                if(permission!=null&&permission.phase()!=ValidationTaskStore.Phase.CLOSED
+                        &&coordinator.permissionOwnerLease(saved)!=ValidationOperation.OwnerLease.NOT_LIVE){
+                    publish(due.entry(),due,ValidationScheduleObservations.State.SKIPPED_BUSY,null,null);return;
+                }
                 sequence=mode.nextStartSequence();
             }
             require();if(late(due)){publish(due.entry(),due,ValidationScheduleObservations.State.SKIPPED_LATE,null,null);return;}

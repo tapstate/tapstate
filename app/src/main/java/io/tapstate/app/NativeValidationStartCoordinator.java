@@ -63,6 +63,16 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
         }catch(RuntimeException|Error failed){member.getUserContext().remove(BINDING,this);registryBudget.close();throw failed;}
     }
     Context context(){require();return context;}
+    OwnerLease permissionOwnerLease(ValidationTaskStore.Snapshot saved){
+        try(var scope=new ResponseScope()){return paid(scope,()->observePermissionOwner(saved));}
+        catch(TapstateException unavailable){return OwnerLease.UNKNOWN;}
+    }
+    private OwnerLease observePermissionOwner(ValidationTaskStore.Snapshot saved){
+        require();var permission=saved.full().permission();
+        if(saved.closed()||permission==null||permission.phase()==ValidationTaskStore.Phase.CLOSED
+                ||!permission.start().task().equals(saved.task())||!context.cluster().equals(saved.task().clusterId()))return OwnerLease.UNKNOWN;
+        return router.ownerLease(permission.start().run().owner());
+    }
     Response start(ValidationOperation original){return response(original,Verb.START,null);}
     Response startScheduled(ValidationOperation original,java.time.Instant latest){return response(original,Verb.START,Objects.requireNonNull(latest));}
     Response read(ValidationOperation original){return response(original,Verb.READ,null);}
@@ -348,7 +358,8 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
         if(retained!=null&&matches(operation,retained.admission()))return new Lookup(new Known(retained.admission(),retained.closed(),passive(operation,retained.admission(),retained.closed(),retained)),false,null,fence(saved));
         boolean valid=saved!=null&&!saved.closed()&&saved.task().generation().equals(operation.taskGeneration())&&saved.revision()==operation.revision()
                 &&saved.full().nextStartSequence()==operation.sequence()
-                &&(saved.full().permission()==null||saved.full().permission().phase()==ValidationTaskStore.Phase.CLOSED);
+                &&(saved.full().permission()==null||saved.full().permission().phase()==ValidationTaskStore.Phase.CLOSED
+                ||observePermissionOwner(saved)==OwnerLease.NOT_LIVE);
         return new Lookup(null,valid,status(operation,Outcome.REJECTED,null),fence(saved));
     }
     private static Fence fence(ValidationTaskStore.Snapshot saved){return saved==null?null:new Fence(saved.task().generation(),saved.full().nextStartSequence(),saved.closed());}

@@ -26,6 +26,50 @@ class NativeValidationSchedulerIT {
         final AtomicReference<Instant> now=new AtomicReference<>(Instant.parse("2026-10-29T00:00:01Z"));
         @Override public ZoneId getZone(){return ZoneOffset.UTC;}@Override public Clock withZone(ZoneId zone){return this;}@Override public Instant instant(){return now.get();}
     }
+    @Test @Timeout(90) void aFutureIntervalSealsAnExpiredBornPermissionBeforeStartingANewPdkRun()throws Exception{
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture(Duration.ofSeconds(2))){
+            var source="expired_source_"+f.suffix;var target="expired_target_"+f.suffix;var time=new Time();
+            try{
+                NativeValidationMetadataIT.seed(f,source,target);var artifact=NativeValidationPdkCountIT.artifact("mongodb");
+                var task=create(f,time,new ValidationSchedule.Interval(1,ValidationSchedule.Unit.MINUTES,time.instant(),"UTC"),artifact);
+                var oldRequest=new ValidationOwnerRouter.Request("flow",task.taskId(),task.generation(),1,1,"FULL",UUID.randomUUID(),"old-born-run");
+                var oldOwner=f.owners.reserve(oldRequest);assertThat(oldOwner.outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
+                var saved=f.tasks.read("flow",task.taskId()).orElseThrow();var spec=new ValidationRunSpec(saved.comparison(),ValidationMode.FULL,ValidationMethod.COUNT);
+                var identity=new ValidationRunIdentity(oldOwner.owner(),task.taskId(),oldRequest.run(),ValidationMode.FULL,spec.fingerprint(),spec.task().mappingRevision(),spec.task().comparisonRulesVersion());
+                var original=new ValidationReportAdmission.Start(task,1,1,oldRequest.command().toString(),identity);
+                var access=f.configuration.prepareValidationAccess("flow",f.scope,f.cache,WorkloadClaimFence.from(f.node),()->{});
+                assertThat(access.admissions().reserve(original)).isEqualTo(ValidationReportAdmission.Reservation.RESERVED);
+                assertThat(access.control().join(new ValidationControlStore.Run(identity,1,original,spec))).isEqualTo(ValidationControlStore.Join.JOINED);
+                access.admissions().open(new ValidationReportAdmission.Open(original,spec));
+                f.owners.close();f.resources.close();
+                var resources=f.process.bind("cluster","node","boot",4,()->{});
+                try(var replacement=f.owner(resources)){
+                    await(()->replacement.readPreparedOwner("flow").filter(value->!value.leased()).isPresent());
+                    var prepared=new AtomicInteger();var plans=new NativeValidationPdkPlans(id->artifact,time);
+                    try(var runs=new NativeValidationRuns(replacement,resources,f.process,f.timers,time,new io.tapstate.core.logging.SecretRedactor());
+                            var processors=new ValidationProcessorRegistry(f.member,()->{});
+                            var router=new ValidationOwnerRouter(f.member,f.gate,()->WorkloadClaimFence.from(f.node),replacement::readOwner,replacement,
+                                    new NativeValidationCommands(replacement,runs,f.member,processors,f.process,reservation->{
+                                        assertThat(reservation.request.run()).isNotEqualTo(oldRequest.run());prepared.incrementAndGet();return plans.prepare(reservation);
+                                    }),()->{},Duration.ofSeconds(5),System::nanoTime,replacement::readPreparedOwner);
+                            var coordinator=new NativeValidationStartCoordinator(f.member,f.configuration,router,resources,f.process,()->{},Duration.ofSeconds(12),time)){
+                        var facts=new MemoryValidationSchedules();
+                        try(var scheduler=new NativeValidationScheduler(f.configuration,resources,f.process,()->coordinator,facts,time,new ValidationScheduleCalculator(),()->{})){
+                            scheduler.start();await(()->fact(facts,coordinator,task,1).isPresent());
+                            assertThat(f.tasks.read("flow",task.taskId()).orElseThrow().full().permission().phase()).isEqualTo(ValidationTaskStore.Phase.BORN);
+                            time.now.set(Instant.parse("2026-10-29T00:01:01Z"));
+                            await(()->f.configuration.validationReports(()->{}).history("flow",task.taskId(),ValidationMode.FULL,new ValidationReports.Paging(0,10))
+                                    .items().stream().anyMatch(row->row.terminal()==ValidationRunState.COMPLETED));
+                            assertThat(f.tasks.read("flow",task.taskId()).orElseThrow().full().nextStartSequence()).isEqualTo(3);
+                            assertThat(prepared).hasValue(1);assertThat(f.member.getJet().getJobs()).hasSize(1);
+                            assertThat(f.raw.getDatabase(f.configName).getCollection("validation_reports").find(new org.bson.Document("_id.runId",oldRequest.run())).first()).containsEntry("closed",true);
+                            assertThat(f.configuration.validationReports(()->{}).history("flow",task.taskId(),ValidationMode.FULL,new ValidationReports.Paging(0,10)).total()).isEqualTo(2);
+                        }
+                    }
+                }finally{resources.close();}
+            }finally{f.raw.getDatabase(source).drop();f.raw.getDatabase(target).drop();}
+        }
+    }
     @Test @Timeout(90) void twoActualMembersDetectOneIntervalAndCreateOnePdkRun()throws Exception{
         try(var f=new NativeValidationOwnerReservationsIT.Fixture(true)){
             var source="schedule_source_"+f.suffix;var target="schedule_target_"+f.suffix;var time=new Time();HazelcastInstance peer=null;NodeSessionLease peerLease=null;

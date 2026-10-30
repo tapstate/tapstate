@@ -20,6 +20,25 @@ import static org.assertj.core.api.Assertions.*;
 
 /** Real member RPC/identity tests. The local lease port is a fixture, not durable acquisition proof. */
 class ValidationOwnerRouterTest {
+    @Test void ownerLeaseObservationsUseTheStoreClockAndRetainUnknownForMissingOrOlderClaims() {
+        try(var f=new Fixture(Duration.ofSeconds(5))){
+            var original=new io.tapstate.core.validation.ValidationOwner("cluster","flow","a","boot-a",3,4,1);
+            var key=ValidationClaims.key("cluster","flow");
+            var future=new WorkloadClaim(key,new WorkloadOwner("a","boot-a"),3,4,1,Instant.now().plusSeconds(300));
+            f.reading.set(new WorkloadClaimReading(future,Duration.ofSeconds(-1)));
+            assertThat(f.left.ownerLease(original)).isEqualTo(io.tapstate.runtime.probe.ValidationOperation.OwnerLease.NOT_LIVE);
+            var past=new WorkloadClaim(key,new WorkloadOwner("a","boot-a"),3,4,1,Instant.EPOCH);
+            f.reading.set(new WorkloadClaimReading(past,Duration.ofSeconds(30)));
+            assertThat(f.left.ownerLease(original)).isEqualTo(io.tapstate.runtime.probe.ValidationOperation.OwnerLease.LIVE);
+            f.reading.set(null);
+            assertThat(f.left.ownerLease(original)).isEqualTo(io.tapstate.runtime.probe.ValidationOperation.OwnerLease.UNKNOWN);
+            f.reading.set(new WorkloadClaimReading(new WorkloadClaim(key,new WorkloadOwner("a","boot-a"),2,4,1,Instant.EPOCH),Duration.ofSeconds(-1)));
+            assertThat(f.left.ownerLease(original)).isEqualTo(io.tapstate.runtime.probe.ValidationOperation.OwnerLease.UNKNOWN);
+            f.reading.set(new WorkloadClaimReading(new WorkloadClaim(key,new WorkloadOwner("b","boot-b"),3,4,1,Instant.EPOCH),Duration.ofSeconds(-1)));
+            assertThat(f.left.ownerLease(original)).isEqualTo(io.tapstate.runtime.probe.ValidationOperation.OwnerLease.UNKNOWN);
+            assertThat(f.calls.values()).allSatisfy(count->assertThat(count).hasValue(0));
+        }
+    }
     @Test void anOwnerReadFailureAfterCapacityKeepsTheOriginalReceipt() {
         try (var f = new Fixture(Duration.ofSeconds(5))) {
             var request=request();var chosen=f.ranked(request).getFirst();var reads=new AtomicInteger();
@@ -342,7 +361,7 @@ class ValidationOwnerRouterTest {
                         public LocalReceipt receipt(Request request){var read=receipts.get(id);return read==null?LocalReceipt.unknown():read.apply(request);}}, command->commands.get(id).apply(command),() -> {
                         if (!live.get(id).get()) throw new io.tapstate.core.common.TapstateException(io.tapstate.core.validation.ValidationError.OWNER_NOT_AUTHORIZED,
                                 Map.of("pipeline", "test"), null);
-                    }, timeout,nanoTime);
+                    }, timeout,nanoTime,pipeline->ownerReads.get().apply(pipeline));
         }
         List<String> ranked(Request request) { return ValidationOwnerRanking.rank("cluster", request.pipeline(), List.of("a", "b")); }
         void install(long revision, Set<String> nodes) {

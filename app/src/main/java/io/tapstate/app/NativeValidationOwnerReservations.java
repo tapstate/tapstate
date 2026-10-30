@@ -106,6 +106,10 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         var prepared = configuration.prepareValidationAccess(pipeline, scope, cache, node.get(), this::requireActive);
         var reading = prepared.claims().read(ValidationClaims.key(scope.clusterId(), pipeline)); requireActive(); return reading;
     }
+    Optional<WorkloadClaimReading> readPreparedOwner(String pipeline) {
+        requireActive();var existing=configuration.loadValidationAccess(pipeline,scope,cache,this::requireActive);
+        var reading=existing.claims().read(ValidationClaims.key(scope.clusterId(),pipeline));requireActive();return reading;
+    }
 
     @Override public Result reserve(Request request) {
         requireActive(); var local = pipeline(request.pipeline());

@@ -8,6 +8,8 @@ import io.tapstate.spi.store.ValidationReportAdmission;
 import io.tapstate.spi.store.ValidationTaskStore;
 import java.time.*;
 import java.util.*;
+import java.util.function.Function;
+import io.tapstate.runtime.probe.ValidationOperation.OwnerLease;
 
 /** Direct FULL authoring over independent evaluation and the original CONFIG compare-and-swap. */
 public final class ValidationConfigurationService {
@@ -40,13 +42,18 @@ public final class ValidationConfigurationService {
     public record SavedMapping(String mappingId,String outputId,String sourceId,String sourceTable,String targetSourceId,String targetTable,Key keys) {}
     public record Task(String pipelineId,String taskId,String taskGeneration,String revision,String nextStartSequence,boolean closed,String method,String comparisonFingerprint,
             int historyLimit,Schedule schedule,boolean scheduleEnabled,List<SavedMapping> mappings,ValidationExecutionService.Context context,Permission permission,ScheduleObservation scheduleObservation) {}
-    public record Permission(String phase,String taskGeneration,String revision,String sequence,String command,String run) {}
+    public record Permission(String phase,String taskGeneration,String revision,String sequence,String command,String run,OwnerLease ownerLease) {
+        public Permission(String phase,String taskGeneration,String revision,String sequence,String command,String run){
+            this(phase,taskGeneration,revision,sequence,command,run,OwnerLease.UNKNOWN);
+        }
+    }
     public record ScheduleObservation(String node,String boot,String member,String context,String observedAt,String nextDue,String lastDue,String state,String reason,String command,String run,String sequence) {}
     public record Occurrence(String at,String local,String offset,String weekday) {}
     public record Preview(String base,String inputRevision,String zoneId,String rulesVersion,List<Occurrence> occurrences) {}
     private final String cluster;private final ValidationTaskStore tasks;private final ValidationEvaluationProbe evaluations;
     private final ValidationSchedule.Calculator schedules;private final AuditGate audit;private final Clock clock;
     private final io.tapstate.runtime.probe.ValidationOperation.Context context;private final io.tapstate.spi.store.ValidationScheduleObservations observations;
+    private final Function<ValidationTaskStore.Snapshot,OwnerLease> ownerLeases;
     public ValidationConfigurationService(String cluster,ValidationTaskStore tasks,ValidationEvaluationProbe evaluations,
             ValidationSchedule.Calculator schedules,AuditGate audit,Clock clock){
         this(cluster,tasks,evaluations,schedules,audit,clock,null,io.tapstate.spi.store.ValidationScheduleObservations.EMPTY);
@@ -54,7 +61,13 @@ public final class ValidationConfigurationService {
     public ValidationConfigurationService(String cluster,ValidationTaskStore tasks,ValidationEvaluationProbe evaluations,
             ValidationSchedule.Calculator schedules,AuditGate audit,Clock clock,io.tapstate.runtime.probe.ValidationOperation.Context context,
             io.tapstate.spi.store.ValidationScheduleObservations observations){
+        this(cluster,tasks,evaluations,schedules,audit,clock,context,observations,ignored->OwnerLease.UNKNOWN);
+    }
+    public ValidationConfigurationService(String cluster,ValidationTaskStore tasks,ValidationEvaluationProbe evaluations,
+            ValidationSchedule.Calculator schedules,AuditGate audit,Clock clock,io.tapstate.runtime.probe.ValidationOperation.Context context,
+            io.tapstate.spi.store.ValidationScheduleObservations observations,Function<ValidationTaskStore.Snapshot,OwnerLease> ownerLeases){
         this.context=context;this.observations=Objects.requireNonNull(observations);
+        this.ownerLeases=Objects.requireNonNull(ownerLeases);
         this.cluster=Objects.requireNonNull(cluster);this.tasks=Objects.requireNonNull(tasks);this.evaluations=Objects.requireNonNull(evaluations);
         this.schedules=Objects.requireNonNull(schedules);this.audit=Objects.requireNonNull(audit);this.clock=Objects.requireNonNull(clock);
     }
@@ -103,10 +116,16 @@ public final class ValidationConfigurationService {
                 schedule(value.settings().full().schedule()),value.settings().full().scheduleEnabled(),value.comparison().mappings().stream().map(mapping->new SavedMapping(
                     mapping.mappingId(),mapping.outputId(),mapping.source().sourceId(),mapping.source().table(),mapping.target().sourceId(),mapping.target().table(),
                     mapping.keys()==null?null:new Key(mapping.keys().confirmationId(),java.util.stream.IntStream.range(0,mapping.keys().source().size())
-                            .mapToObj(index->new SavedPair(mapping.keys().source().get(index).path(),mapping.keys().target().get(index).path())).toList()))).toList(),ValidationExecutionService.Context.from(context),permission(value.full().permission()),observation(observations.read(value.task(),value.revision()).orElse(null))));
+                            .mapToObj(index->new SavedPair(mapping.keys().source().get(index).path(),mapping.keys().target().get(index).path())).toList()))).toList(),ValidationExecutionService.Context.from(context),permission(value),observation(observations.read(value.task(),value.revision()).orElse(null))));
     }
-    private static Permission permission(ValidationTaskStore.Permission value){
-        if(value==null)return null;var original=value.start();return new Permission(value.phase().name(),original.task().generation().toString(),Long.toString(original.configurationRevision()),Long.toString(original.sequence()),original.commandId(),original.run().runId());
+    private Permission permission(ValidationTaskStore.Snapshot snapshot){
+        var value=snapshot.full().permission();if(value==null)return null;var original=value.start();
+        var observed=OwnerLease.UNKNOWN;
+        if(!snapshot.closed()&&original.task().equals(snapshot.task())&&value.phase()!=ValidationTaskStore.Phase.CLOSED){
+            try{observed=Objects.requireNonNull(ownerLeases.apply(snapshot));}
+            catch(TapstateException unavailable){observed=OwnerLease.UNKNOWN;}
+        }
+        return new Permission(value.phase().name(),original.task().generation().toString(),Long.toString(original.configurationRevision()),Long.toString(original.sequence()),original.commandId(),original.run().runId(),observed);
     }
     private static ScheduleObservation observation(io.tapstate.spi.store.ValidationScheduleObservations.Fact value){
         if(value==null)return null;var origin=value.origin();return new ScheduleObservation(origin.node(),origin.boot(),origin.member().toString(),origin.context().toString(),value.observedAt().toString(),

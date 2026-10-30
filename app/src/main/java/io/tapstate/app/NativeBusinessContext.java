@@ -293,7 +293,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 NativeValidationStartCoordinator coordinator,MemoryValidationSchedules observations){
             var entry=coordinator.context();var origin=new io.tapstate.spi.store.ValidationScheduleObservations.Origin(entry.node(),entry.boot(),entry.member(),entry.incarnation());
             return new io.tapstate.control.core.ValidationConfigurationService(owner.configuration.clusterId(),
-                    owner.configuration.validationTasks(owner.memberStorage::requireNode),evaluations,new ValidationScheduleCalculator(),audit,clock,entry,observations.view(origin));
+                    owner.configuration.validationTasks(owner.memberStorage::requireNode),evaluations,new ValidationScheduleCalculator(),audit,clock,entry,observations.view(origin),coordinator::permissionOwnerLease);
         }
         @Bean io.tapstate.runtime.probe.ValidationEvaluationProbe validationEvaluationProbe(NativeValidationMetadata metadata,org.springframework.beans.factory.ObjectProvider<NativeValidationStartCoordinator> controls){
             return new NativeValidationEvaluation(metadata,()->controls.getObject().context());
@@ -332,7 +332,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 NativeValidationRuns runs,io.tapstate.runtime.engine.validation.ValidationProcessorRegistry processors,
                 ValidationMemberResources process,NativeValidationFullJob.Factory factory) {
             return new ValidationOwnerRouter(member, membership, () -> node.currentFence().orElseThrow(ThreeLayerStorePort::refused),
-                    owners::readOwner, owners,new NativeValidationCommands(owners,runs,member,processors,process,factory),owner.memberStorage::requireNode, Duration.ofSeconds(5));
+                    owners::readOwner, owners,new NativeValidationCommands(owners,runs,member,processors,process,factory),owner.memberStorage::requireNode, Duration.ofSeconds(5),System::nanoTime,owners::readPreparedOwner);
         }
         @Bean(destroyMethod="close") io.tapstate.runtime.engine.validation.ValidationProcessorRegistry validationProcessorRegistry(HazelcastInstance member,NativeBusinessContext owner) {
             return new io.tapstate.runtime.engine.validation.ValidationProcessorRegistry(member,owner.memberStorage::requireNode);

@@ -44,10 +44,14 @@ class ValidationConfigurationServiceTest {
         }
     }
     private static ValidationConfigurationService service(Store store,Probe probe,AuditStore audit){
+        return service(store,probe,audit,ignored->ValidationOperation.OwnerLease.UNKNOWN);
+    }
+    private static ValidationConfigurationService service(Store store,Probe probe,AuditStore audit,
+            java.util.function.Function<ValidationTaskStore.Snapshot,ValidationOperation.OwnerLease> leases){
         return new ValidationConfigurationService("cluster",store,probe,new ValidationSchedule.Calculator(){
             @Override public ValidationSchedule.Preview preview(ValidationSchedule schedule,Instant base,long revision,ValidationSchedule.SearchBudget budget){throw new AssertionError("no schedule");}
             @Override public Instant nextAfter(ValidationSchedule schedule,Instant after,ValidationSchedule.SearchBudget budget){throw new AssertionError("no scheduler");}
-        },new AuditGate(audit,CLOCK),CLOCK);
+        },new AuditGate(audit,CLOCK),CLOCK,null,ValidationScheduleObservations.EMPTY,leases);
     }
     @Test void projectionKeepsLeaseUntilConsumerFinishesAndPreservesExactWireRevision(){
         var probe=new Probe();var store=new Store();var service=service(store,probe,ignored->{});
@@ -101,6 +105,15 @@ class ValidationConfigurationServiceTest {
         assertThat(read.comparisonFingerprint()).isEqualTo(comparison.fingerprint());
         assertThat(read.revision()).isEqualTo("2");assertThat(read.permission().revision()).isEqualTo("1");assertThat(read.permission().sequence()).isEqualTo("1");
         assertThat(read.permission().command()).isEqualTo(start.commandId());assertThat(read.permission().phase()).isEqualTo("OPEN");assertThat(probe.calls).isZero();
+        assertThat(read.permission().ownerLease()).isEqualTo(ValidationOperation.OwnerLease.UNKNOWN);
+        for(var lease:ValidationOperation.OwnerLease.values()){
+            var service=service(store,probe,ignored->{},snapshot->{assertThat(snapshot).isSameAs(store.current);return lease;});
+            var observed=service.read("flow","task").orElseThrow();
+            assertThat(observed.permission().ownerLease()).isEqualTo(lease);
+            assertThat(observed.permission().command()).isEqualTo(start.commandId());
+            assertThat(observed.permission().revision()).isEqualTo("1");assertThat(observed.revision()).isEqualTo("2");
+        }
+        assertThat(store.creates+store.updates+probe.calls).isZero();
     }
     @Test void malformedScheduleInputsAreCodedRefusals(){
         var probe=new Probe();var store=new Store();var service=service(store,probe,ignored->{});

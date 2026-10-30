@@ -29,6 +29,26 @@ import static org.assertj.core.api.Assertions.*;
 class NativeValidationOwnerReservationsIT {
     @Container static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
 
+    @Test void preparedOwnerObservationDoesNotPrepareOrWriteEitherStorageDomain() {
+        try(var f=new Fixture()){
+            f.owners.readOwner("flow");
+            var before=storedRows(f);
+            assertThat(f.owners.readPreparedOwner("flow")).isPresent();
+            assertThat(storedRows(f)).isEqualTo(before);
+            assertThatThrownBy(()->f.owners.readPreparedOwner("not-prepared")).isInstanceOf(io.tapstate.core.common.TapstateException.class);
+            assertThat(storedRows(f)).isEqualTo(before);
+            assertThat(f.resources.snapshot().metadataFrames()).isZero();
+        }
+    }
+    private static Map<String,List<Document>> storedRows(Fixture f){
+        var result=new TreeMap<String,List<Document>>();
+        for(var database:List.of(f.configName,f.cacheName)){
+            var db=f.raw.getDatabase(database);
+            for(var collection:db.listCollectionNames())result.put(database+"/"+collection,db.getCollection(collection).find().into(new ArrayList<>()));
+        }
+        return result;
+    }
+
     @Test void anActivationWinningItsMonitorCannotBeReportedAsAnUnusedDisposedReceipt()throws Exception{
         var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var stops=new AtomicInteger();
         try(var f=new Fixture()){
@@ -81,7 +101,7 @@ class NativeValidationOwnerReservationsIT {
     }
 
     @Test void aReplacementContextEndsOldMetadataUnderANewTenureWithoutResumingItsRun() {
-        try (var f = new Fixture()) {
+        try (var f = new Fixture(Duration.ofSeconds(2))) {
             var request = f.request("FULL", 1); var accepted = f.owners.reserve(request);
             assertThat(accepted.outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
             var spec = new ValidationRunSpec(f.comparison, ValidationMode.FULL, ValidationMethod.COUNT);
@@ -94,7 +114,24 @@ class NativeValidationOwnerReservationsIT {
             f.owners.close(); f.resources.close();
             var resources = f.process.bind("cluster", "node", "boot", 4, () -> {});
             try (var replacement = f.owner(resources)) {
-                var next = replacement.reserve(f.request("FULL", 2)); assertThat(next.outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).until(()->replacement.readOwner("flow")
+                        .filter(value->!value.leased()).isPresent());
+                var reserved=new java.util.concurrent.atomic.AtomicReference<ValidationOwnerRouter.Result>();
+                try(var router=new ValidationOwnerRouter(f.member,f.gate,()->WorkloadClaimFence.from(f.node),replacement::readOwner,
+                        new ValidationOwnerRouter.Local(){
+                            @Override public ValidationOwnerRouter.Result reserve(ValidationOwnerRouter.Request next){
+                                var result=replacement.reserve(next);reserved.set(result);return result;
+                            }
+                            @Override public ValidationOwnerRouter.LocalReceipt receipt(ValidationOwnerRouter.Request next){return replacement.receipt(next);}
+                        },command->ValidationOwnerRouter.commandUnavailable(command,ValidationOwnerRouter.Outcome.UNKNOWN,null),()->{},Duration.ofSeconds(5),System::nanoTime,replacement::readPreparedOwner);
+                        var coordinator=new NativeValidationStartCoordinator(f.member,f.configuration,router,resources,f.process,()->{})){
+                    var operation=new io.tapstate.runtime.probe.ValidationOperation(coordinator.context(),"flow","task",f.task.generation(),1,2,UUID.randomUUID());
+                    try(var response=coordinator.start(operation)){
+                        assertThat(response.value().outcome()).isIn(io.tapstate.runtime.probe.ValidationOperation.Outcome.PENDING,
+                                io.tapstate.runtime.probe.ValidationOperation.Outcome.ACCEPTED);
+                    }
+                    org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).until(()->reserved.get()!=null);
+                    var next=reserved.get();assertThat(next.outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
                 assertThat(next.owner().claimGeneration()).isGreaterThan(accepted.owner().claimGeneration());
                 assertThat(next.owner().executionGeneration()).isGreaterThan(accepted.owner().executionGeneration());
                 var current = f.configuration.prepareValidationAccess("flow", f.scope, f.cache, WorkloadClaimFence.from(f.node), () -> {});
@@ -102,6 +139,8 @@ class NativeValidationOwnerReservationsIT {
                 assertThat(f.tasks.read("flow", "task").orElseThrow().full().permission().phase()).isEqualTo(ValidationTaskStore.Phase.CLOSED);
                 assertThat(current.control().snapshot(next.owner()).active()).isEmpty();
                 assertThat(f.raw.getDatabase(f.configName).getCollection("validation_reports").find().first()).containsEntry("closed", true);
+                assertThat(f.tasks.read("flow","task").orElseThrow().full().nextStartSequence()).isEqualTo(2);
+                }
             }
         }
     }
@@ -223,13 +262,19 @@ class NativeValidationOwnerReservationsIT {
         final ValidationTaskSpec comparison; final ValidationMemberResources.Member resources; final NativeValidationOwnerReservations owners;
         final int maxPipelines, maxOperations;
         final LongSupplier handoffClock;
+        final Duration ownerTtl;
         volatile Runnable localGuard = () -> {};
         volatile NativeValidationOwnerReservations.Startup startup=(saved,spec)->NativeValidationOwnerReservations.StartupGate.ready();
         Fixture() { this(64, 128); }
+        Fixture(Duration ownerTtl){this(64,128,System::nanoTime,false,ownerTtl);}
         Fixture(boolean peers){this(64,128,System::nanoTime,peers);}
         Fixture(int maxPipelines, int maxOperations) { this(maxPipelines, maxOperations, System::nanoTime); }
         Fixture(int maxPipelines, int maxOperations, LongSupplier handoffClock) {this(maxPipelines,maxOperations,handoffClock,false);}
         Fixture(int maxPipelines,int maxOperations,LongSupplier handoffClock,boolean peers){
+            this(maxPipelines,maxOperations,handoffClock,peers,Duration.ofSeconds(30));
+        }
+        Fixture(int maxPipelines,int maxOperations,LongSupplier handoffClock,boolean peers,Duration ownerTtl){
+            this.ownerTtl=ownerTtl;
             this.maxPipelines = maxPipelines; this.maxOperations = maxOperations;
             this.handoffClock = handoffClock;
             var binding = configuration.bindings().commitWithFirstCache(new StorageSetupScope("cluster", "installation", "setup", 1), StorageBinding.Mode.OP, endpoint,
@@ -267,7 +312,7 @@ class NativeValidationOwnerReservationsIT {
         ValidationOwnerRouter.Request request(String mode, long sequence) { return new ValidationOwnerRouter.Request("flow", "task", task.generation(), 1, sequence, mode, UUID.randomUUID(), UUID.randomUUID().toString()); }
         NativeValidationOwnerReservations owner(ValidationMemberResources.Member resources) {
             return new NativeValidationOwnerReservations(member, configuration, cache, scope, () -> WorkloadClaimFence.from(node), gate, resources, process, timers,
-                    () -> localGuard.run(), Duration.ofSeconds(30), Duration.ofSeconds(5), maxPipelines, maxOperations, handoffClock,(saved,spec)->startup.inspect(saved,spec));
+                    () -> localGuard.run(), ownerTtl,ownerTtl.compareTo(Duration.ofSeconds(15))>=0?Duration.ofSeconds(5):ownerTtl.dividedBy(3), maxPipelines, maxOperations, handoffClock,(saved,spec)->startup.inspect(saved,spec));
         }
         @Override public void close() {
             owners.close(); resources.close(); nodeLease.stopAndClose(member::shutdown); timers.close(); process.close(); configuration.close(); cache.close();
