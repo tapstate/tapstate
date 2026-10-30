@@ -69,6 +69,79 @@ class AlertManagementIT {
             assertThat(call(s,"health",Map.of())).containsEntry("cleanupAvailable",false);
         });
     }
+    @Test void bothDeploymentCentersKeepTheSameTopFiveAndNeverWriteOnRepeatedReads(){
+        for(boolean cloud:List.of(false,true))AlertEvaluationHostIT.withFixture(false,cloud,f->{
+            var bindings=new ArrayList<AlertEvaluationHost.Binding>();
+            var severities=List.of(AlarmSeverity.WARNING,AlarmSeverity.MAJOR,AlarmSeverity.CRITICAL,
+                    AlarmSeverity.MAJOR,AlarmSeverity.MINOR,AlarmSeverity.CRITICAL,AlarmSeverity.WARNING);
+            for(int i=0;i<severities.size();i++){
+                f.now().set(T.plusSeconds(i));
+                var header=AlertConfiguration.Header.create(AlertConfiguration.Identity.create(AlertConfiguration.Kind.RULE,
+                        f.storeHost().scope(),"rank-"+i),f.storeHost().deployment(),f.clock().instant(),"operator");
+                var rule=new AlertConfiguration.Rule(header,"Rank "+i,"pipeline.failed",1,f.rule().resources(),Map.of(),
+                        severities.get(i),true,null).validated(BuiltinAlarmTypes.catalog()).enrolled(null);
+                var writer=cloud?AlertStore.Access.cloud("operator",f.storeHost().scope().authorityId(),"ADMIN",ACTIVE,ACTIVE):access();
+                assertThat(f.store().saveDefinition(null,rule,writer)).isEqualTo(AlertStore.Outcome.STAGED);
+                var binding=new AlertEvaluationHost.Binding(rule,new AlarmKey.Resource("pipeline","orders","1"),"rank-producer-"+i,0,ACTIVE,
+                        ()->new AlertStore.EvaluationProof(f.intent(),ACTIVE));bindings.add(binding);
+                assertThat(f.evaluator().accept(binding,1,new AlertInput.Conditions(f.clock().instant(),AlertSignal.Condition.BAD,
+                        new AlarmDiagnostics.SafeTrace("java.lang.IllegalStateException: original rank "+i,1,false,false))))
+                        .isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
+            }
+            var s=service(f);
+            try(var client=com.mongodb.client.MongoClients.create(f.settings().uri())){
+                var db=client.getDatabase(new com.mongodb.ConnectionString(f.settings().uri()).getDatabase());
+                var before=databaseSnapshot(db);
+                var expected=List.of(5,2,3,1,4).stream().map(i->AlertHttpModel.key(bindings.get(i).key())).toList();
+                for(int repeat=0;repeat<3;repeat++){
+                    var page=s.dispatch("alert.center",caller(Scope.READ,ACTIVE),map("limit",5));
+                    assertThat(page.get("total")).isEqualTo(7L);
+                    assertThat(((List<?>)page.get("rows")).stream().map(AlertHttpModel::object).map(row->row.get("key")))
+                            .containsExactlyElementsOf(expected);
+                    var tail=call(s,"center",map("limit",5,"cursor",page.get("nextCursor")));
+                    assertThat(((List<?>)tail.get("rows")).stream().map(AlertHttpModel::object).map(row->row.get("key")))
+                            .containsExactly(AlertHttpModel.key(bindings.get(6).key()),AlertHttpModel.key(bindings.get(0).key()));
+                    for(var binding:bindings){
+                        var detail=call(s,"detail",map("key",AlertHttpModel.key(binding.key())));
+                        assertThat(object(detail.get("diagnostics"))).containsEntry("status","CAPTURED");
+                        assertThat(call(s,"deliveries",map("key",AlertHttpModel.key(binding.key()),"episode",1)).get("rows")).isEqualTo(List.of());
+                    }
+                    assertThat((List<?>)call(s,"center",map("view","history")).get("rows")).isEmpty();
+                    assertThatThrownBy(()->call(s,"detail",map("key",expected.getFirst(),"authorityId","foreign-authority"))).isInstanceOf(TapstateException.class);
+                    var cursor=AlertHttpModel.decode((String)page.get("nextCursor"));cursor.put("clusterId","foreign-cluster");
+                    assertThatThrownBy(()->call(s,"center",map("cursor",AlertHttpModel.encode(cursor)))).isInstanceOf(TapstateException.class);
+                    assertThat(databaseSnapshot(db)).isEqualTo(before);
+                }
+                // Active faults remain visible after the ordinary ended-history windows.
+                f.now().set(T.plus(Duration.ofDays(91)));
+                assertThat(call(s,"center",map("limit",5)).get("total")).isEqualTo(7L);
+                assertThat(databaseSnapshot(db)).isEqualTo(before);
+            }
+        });
+    }
+    private static Map<String,List<String>> databaseSnapshot(com.mongodb.client.MongoDatabase db){
+        var snapshot=new TreeMap<String,List<String>>();
+        for(String collection:db.listCollectionNames())snapshot.put(collection,db.getCollection(collection).find()
+                .map(org.bson.Document::toJson).into(new ArrayList<>()).stream().sorted().toList());
+        return snapshot;
+    }
+    @Test void acceptedAndRejectedTargetsAndRouteDisableNeverHideTheActiveFault(){
+        AlertEvaluationHostIT.withFixture(f->{var route=route(f,Duration.ZERO);var planner=planner(f,"center-outcomes");f.evaluator().withPlanner(planner);bad(f);planner.tick();
+            var store=sendingStore(f);var channels=new AlertDeliveryRuntimeIT.Channels(store);
+            channels.answer=request->request.destination().targetId().equals("a@example.test")?AlertDeliveryRuntimeIT.accepted():
+                    new io.tapstate.spi.alerting.NotificationChannel.Result(DeliveryEvidence.Outcome.NOT_ACCEPTED,io.tapstate.spi.alerting.NotificationChannel.Action.STOP,null,io.tapstate.spi.alerting.NotificationChannel.Phase.ENVELOPE,550,"smtp");
+            var before=call(service(f),"center",Map.of());
+            try(var worker=AlertDeliveryRuntimeIT.runtime(f,store,channels,"center-results")){worker.tick();AlertDeliveryRuntimeIT.settled(worker);}
+            assertThat(channels.calls).hasValue(2);
+            assertThat(store.deliveries(null,10,null,null,f.reads()).rows().stream().map(row->row.value().state().summary()))
+                    .containsExactlyInAnyOrder(DeliveryEvidence.Outcome.ACCEPTED,DeliveryEvidence.Outcome.NOT_ACCEPTED);
+            assertThat(call(service(f),"center",Map.of()).get("rows")).isEqualTo(before.get("rows"));
+            assertThat(store.saveDefinition(route,route.edit(route.name(),route.match(),false,route.channels(),route.groupBy(),route.grouping(),route.inhibition(),T,"operator"),access())).isEqualTo(AlertStore.Outcome.STAGED);
+            f.now().set(T.plus(Duration.ofDays(91)));
+            var after=call(service(f),"center",Map.of());assertThat(after.get("total")).isEqualTo(1L);assertThat(after.get("rows")).isEqualTo(before.get("rows"));
+            assertThat(call(service(f),"detail",map("key",object(((List<?>)after.get("rows")).getFirst()).get("key")))).containsEntry("status","ACTIVE");
+        });
+    }
     @Test void existingManagedWriteScopeCanAuthorLocalRulesWhileOpStillRequiresAdmin(){
         AlertEvaluationHostIT.withFixture(false,true,f->{var s=service(f);var form=map("name","Managed authoring","typeId","pipeline.failed","resourceKinds",List.of("pipeline"),"allResources",true,"resources",List.of(),"parameters",Map.of(),"enabled",true);
             assertThat(s.dispatch("alert.configuration.save",caller(Scope.WRITE,ACTIVE),map("kind","RULE","id","managed-authoring","etag","0","form",form))).containsEntry("id","managed-authoring");

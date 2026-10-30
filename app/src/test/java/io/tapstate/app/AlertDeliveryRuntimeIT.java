@@ -192,6 +192,27 @@ class AlertDeliveryRuntimeIT {
             assertThatThrownBy(()->AlertChannels.outboundEnabled("invalid")).isInstanceOf(io.tapstate.core.common.TapstateException.class);
         });
     }
+    @Test void managedFactoryNeverRedirectsOriginalOpWorkAndAnOriginalInFlightReceiptKeepsItsIdentity(){
+        AlertEvaluationHostIT.withFixture(f->{seed(f);var store=sendingStore(f);var originals=intents(f);var identity=originals.getFirst().value().frozen().identity();
+            var properties=new CloudProperties();properties.setBaseUrl("https://cloud.example.test");properties.setToken("controlled-machine-token");
+            properties.setClusterId(f.storeHost().scope().clusterId());properties.setAtlasUri("mongodb://config.invalid/config");
+            var resolutions=new java.util.concurrent.atomic.AtomicInteger();
+            try(var factory=new AlertChannels(AlertChannelPolicy.Deployment.CLOUD_MANAGED,CloudRuntimeSettings.resolve(properties),f.clock(),ACTIVE,f.storeHost().scope().authorityId(),
+                    host->{resolutions.incrementAndGet();throw new AssertionError("an OP snapshot cannot resolve a managed destination");});
+                    var worker=new AlertDeliveryRuntime(store,f.clock(),"managed-mode-factory",ACTIVE,factory,a->access())){
+                worker.tick();settled(worker);assertThat(resolutions).hasValue(0);
+                for(var row:originals)assertThat(store.intent(row.value().frozen().identity(),null).orElseThrow()).isEqualTo(row);
+                var pending=grant(f,originals.getFirst());worker.tick();settled(worker);assertThat(resolutions).hasValue(0);
+                assertThat(store.intent(identity,null).orElseThrow().value()).isEqualTo(pending);
+                AlertNotificationPlannerIT.accepted(f,identity);
+                var retained=store.intent(identity,null).orElseThrow().value();assertThat(retained.frozen()).isEqualTo(originals.getFirst().value().frozen());
+                assertThat(retained.state().summary()).isEqualTo(DeliveryEvidence.Outcome.ACCEPTED);assertThat(retained.state().attemptsConsumed()).isOne();
+                worker.tick();settled(worker);assertThat(resolutions).hasValue(0);
+                assertThat(store.deliveries(null,10,null,null,f.reads()).rows()).hasSize(2).allSatisfy(row->assertThat(row.value().frozen().identity().channelType()).isEqualTo("email"));
+                assertThat(store.intent(originals.getLast().value().frozen().identity(),null).orElseThrow()).isEqualTo(originals.getLast());
+            }
+        });
+    }
     @Test void missingAdapterDoesNotConsumeBudgetAndOtherTargetsStillRun(){
         AlertEvaluationHostIT.withFixture(f->{seed(f);var store=sendingStore(f);var channels=new Channels(store);channels.supported=false;var ids=ids(f);
             try(var a=runtime(f,store,channels,"worker-a")){a.tick();settled(a);assertThat(channels.calls).hasValue(0);assertThat(a.failure()).isNotNull();}

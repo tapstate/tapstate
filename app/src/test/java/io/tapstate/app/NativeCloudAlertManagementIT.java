@@ -48,6 +48,25 @@ class NativeCloudAlertManagementIT {
                 assertThat(saved.statusCode()).as(saved.body()).isEqualTo(200);
                 assertThat(post.apply("configuration/list",Map.of("kind","RULE")).body()).contains("Managed rule");
                 var denied=post.apply("configuration/list",Map.of("kind","RECEIVER"));assertThat(denied.statusCode()).isEqualTo(409);assertThat(denied.body()).contains("alert.stale-action","managed-external-configuration").doesNotContain("credentialId","ciphertext");
+                var calls=Map.of(
+                        "configuration/save",AlertHttpModel.map("kind","RECEIVER","id","forged-op","etag","0","form",AlertManagementIT.email()),
+                        "configuration/retire",AlertHttpModel.map("kind","RECEIVER","id","forged-op","etag","1"),
+                        "preview",AlertHttpModel.map("kind","FAULT","channel","email","messages",AlertHttpModel.messages(io.tapstate.core.alerting.MessageSettings.empty())),
+                        "route-preview",AlertHttpModel.map("form",Map.of()),
+                        "test",AlertHttpModel.map("commandId","forged-test","candidateId","candidate","form",AlertManagementIT.email(),"target","a@example.test"),
+                        "test-result",AlertHttpModel.map("commandId","forged-test"),
+                        "retry",AlertHttpModel.map("id","forged-op","etag","1"));
+                for(var request:calls.entrySet()){
+                    var rejected=post.apply(request.getKey(),request.getValue());
+                    assertThat(rejected.statusCode()).as(request.getKey()+": "+rejected.body()).isIn(403,409);
+                    assertThat(rejected.body()).doesNotContain("private-test-password","ciphertext","credentialId");
+                }
+                var catalogue=post.apply("catalog",Map.of());
+                var exposed=AlertHttpModel.object(io.tapstate.core.common.JsonReader.parse(catalogue.body()));
+                assertThat(exposed.get("channels")).isEqualTo(List.of());assertThat(exposed.get("channelPolicies")).isEqualTo(Map.of());
+                var database=observer.getDatabase(storage.configurationDatabase());
+                for(String collection:List.of("alert_receivers","alert_subscriptions","alert_delivery_intents","alert_test_quotas"))
+                    assertThat(database.getCollection(collection).countDocuments()).as(collection).isZero();
                 assertThat(NativeAppStorage.business(application).getBean(PipelineAlertRuntime.class).managementServices().evaluator().retentionPolicy().duration(io.tapstate.core.alerting.AlertRetentionPolicy.Setting.ENDED_EPISODE)).isEqualTo(Duration.ofDays(3));
                 String control=System.getProperty("tapstate.alert.cloud-browser-control");if(control!=null){var directory=Path.of(control);Files.createDirectories(directory);Files.writeString(directory.resolve("ready.json"),JsonWriter.write(Map.of("port",port,"mode","actual-native-cloud","sdk","controlled-local-authentication","clusterId",CLUSTER,"organizationId",ORG)));
                     long until=System.nanoTime()+Duration.ofMinutes(45).toNanos();while(!Files.exists(directory.resolve("stop"))&&System.nanoTime()<until)Thread.sleep(100);}
