@@ -1,12 +1,18 @@
 package io.tapstate.e2e;
 
+import com.mongodb.client.MongoClients;
 import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
+import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.StateJson;
+import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.PipelineIntentSnapshot;
+import io.tapstate.spi.store.PipelinePreparation;
 import io.tapstate.spi.store.PipelineStateMapping;
 import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.testsupport.RequiresDocker;
@@ -19,7 +25,9 @@ import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 import org.bson.Document;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -37,13 +45,24 @@ class AddedTablesNeedAClearStateFullLoadIT {
     @CsvSource({"true, START", "true, RESUME", "false, START", "false, RESUME"})
     void retainedStartsRejectAddedTablesAndOnlyAnExplicitFullLoadAppliesThem(
             boolean shared, LifecycleVerb verb, @TempDir Path temporary) throws Exception {
+        retainedStartsRejectAddedTablesAndOnlyAnExplicitFullLoadAppliesThem(shared, verb, temporary, false);
+    }
+
+    @Test
+    void anOldStoppedObservationDoesNotCompleteTheNewClear(@TempDir Path temporary) throws Exception {
+        retainedStartsRejectAddedTablesAndOnlyAnExplicitFullLoadAppliesThem(true, LifecycleVerb.START, temporary, true);
+    }
+
+    private void retainedStartsRejectAddedTablesAndOnlyAnExplicitFullLoadAppliesThem(
+            boolean shared, LifecycleVerb verb, Path temporary, boolean controlledClear) throws Exception {
         Path source = Files.createDirectory(temporary.resolve("source"));
         Path target = Files.createDirectory(temporary.resolve("target"));
         FileEndpoints.replaceTable(source.resolve(ORDERS + ".csv"), "id,priority\n1,initial\n");
         FileEndpoints.replaceTable(source.resolve(CUSTOMERS + ".csv"), "id,priority\n1,new-customer\n");
         byte[] connector = CdcRecoveryFixture.connectorJar(E2eConnectorJar.buildInto(
                 Files.createDirectory(temporary.resolve("connectors"))));
-        try (PreparedNativeStore storage = PreparedNativeStore.create();
+        try (var mongo = controlledClear ? ClearStateCompletionInterleaving.startMongo() : null;
+                PreparedNativeStore storage = mongo == null ? PreparedNativeStore.create() : PreparedNativeStore.createOn(mongo);
                 NativeSrsDocuments documents = new NativeSrsDocuments(storage);
                 ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
@@ -96,52 +115,108 @@ class AddedTablesNeedAClearStateFullLoadIT {
             assertThat(priority(target, ORDERS, "1")).isEqualTo("confirmed");
             assertThat(priority(target, CUSTOMERS, "1")).isNull();
 
-            control.stop(PIPELINE, true);
-            // The previous keeping stop already reports STOPPED. Only the requested successor
-            // generation proves this clearing operation completed before another start is admitted.
-            awaitClearedGeneration(storage, 2);
-            awaitState(control, PipelineState.STOPPED);
-            control.lifecycle(PIPELINE, LifecycleVerb.START);
-            awaitState(control, PipelineState.RUNNING);
-            awaitPriority(control, target, ORDERS, "1", "while-stopped");
-            awaitPriority(control, target, CUSTOMERS, "1", "new-customer");
-            Await.until("the full load to confirm both selected tables in exactly one successor generation", BOUND,
-                    () -> {
-                        Saved current = state(documents, shared, 2);
-                        return current != null && current.cursor().getList("snapshotCompletedTables", String.class, List.of())
-                                .containsAll(List.of(ORDERS, CUSTOMERS));
-                    }, () -> String.valueOf(state(documents, shared, 2)));
-            Saved rebuilt = state(documents, shared, 2);
-            assertThat(rebuilt.tables()).containsExactlyInAnyOrder(ORDERS, CUSTOMERS);
-            if (shared) assertThat(rebuilt.key()).isEqualTo(before.key());
-            else {
-                assertThat(rebuilt.key().getString("channelId")).isEqualTo(before.key().getString("channelId"));
-                assertThat(rebuilt.key().getString("captureId")).isNotEqualTo(before.key().getString("captureId"));
+            try (var interleaving = controlledClear
+                    ? new ClearStateCompletionInterleaving((InProcessServer) server, storage, PIPELINE) : null) {
+                PipelineIntentScope originalScope = intent(storage).scope();
+                control.stop(PIPELINE, true);
+                if (interleaving != null) interleaving.holdBeforeReplacement();
+                awaitClearCompletion(control, storage, originalScope, interleaving);
+                control.lifecycle(PIPELINE, LifecycleVerb.START);
+                awaitState(control, PipelineState.RUNNING);
+                awaitPriority(control, target, ORDERS, "1", "while-stopped");
+                awaitPriority(control, target, CUSTOMERS, "1", "new-customer");
+                Await.until("the full load to confirm both selected tables in exactly one successor generation", BOUND,
+                        () -> {
+                            Saved current = state(documents, shared, 2);
+                            return current != null && current.cursor().getList("snapshotCompletedTables", String.class, List.of())
+                                    .containsAll(List.of(ORDERS, CUSTOMERS));
+                        }, () -> String.valueOf(state(documents, shared, 2)));
+                Saved rebuilt = state(documents, shared, 2);
+                assertThat(rebuilt.tables()).containsExactlyInAnyOrder(ORDERS, CUSTOMERS);
+                if (shared) assertThat(rebuilt.key()).isEqualTo(before.key());
+                else {
+                    assertThat(rebuilt.key().getString("channelId")).isEqualTo(before.key().getString("channelId"));
+                    assertThat(rebuilt.key().getString("captureId")).isNotEqualTo(before.key().getString("captureId"));
+                }
+                try (var configuration = MongoConfigurationDomain.openExisting(new MongoConnectionSettings(
+                        storage.configurationUri(), null, Duration.ofSeconds(5)))) {
+                    assertThat(configuration.pipelineStates().read(PIPELINE).orElseThrow().stateGeneration()).isEqualTo(2);
+                }
+                Await.until("the new run to publish the two full table reads", BOUND,
+                        () -> Long.valueOf(1).equals(control.snapshotRowsRead(PIPELINE).get(CUSTOMERS)),
+                        () -> String.valueOf(control.snapshotRowsRead(PIPELINE)));
+                assertThat(control.snapshotRowsRead(PIPELINE)).containsEntry(ORDERS, 1L).containsEntry(CUSTOMERS, 1L);
+                CdcRecoveryFixture.change(source, 3, ORDERS, "2", "", "after-full");
+                awaitPriority(control, target, ORDERS, "2", "after-full");
+                assertThat(control.state(PIPELINE)).contains(PipelineState.RUNNING);
             }
-            try (var configuration = MongoConfigurationDomain.openExisting(new MongoConnectionSettings(
-                    storage.configurationUri(), null, Duration.ofSeconds(5)))) {
-                assertThat(configuration.pipelineStates().read(PIPELINE).orElseThrow().stateGeneration()).isEqualTo(2);
-            }
-            Await.until("the new run to publish the two full table reads", BOUND,
-                    () -> Long.valueOf(1).equals(control.snapshotRowsRead(PIPELINE).get(CUSTOMERS)),
-                    () -> String.valueOf(control.snapshotRowsRead(PIPELINE)));
-            assertThat(control.snapshotRowsRead(PIPELINE)).containsEntry(ORDERS, 1L).containsEntry(CUSTOMERS, 1L);
-            CdcRecoveryFixture.change(source, 3, ORDERS, "2", "", "after-full");
-            awaitPriority(control, target, ORDERS, "2", "after-full");
-            assertThat(control.state(PIPELINE)).contains(PipelineState.RUNNING);
         }
     }
 
     private record Saved(Document key, List<String> tables, Document cursor, Document raw) {}
 
-    private static void awaitClearedGeneration(PreparedNativeStore storage, long generation) {
+    private record ClearConfiguration(long revision, CacheBusinessScope business, PipelineStateMapping mapping,
+            PipelinePreparation preparation, PipelineIntentSnapshot intent) {
+        static ClearConfiguration read(MongoConfigurationDomain configuration) {
+            return new ClearConfiguration(configuration.configurationRevision(),
+                    configuration.bindings().cachePreparation().map(value -> value.businessScope()).orElse(null),
+                    configuration.pipelineStates().read(PIPELINE).orElse(null),
+                    configuration.preparations().read(PIPELINE).orElse(null),
+                    configuration.intents().load(PIPELINE).orElse(null));
+        }
+
+        void requireOriginalBusinessAndSingleSuccessor(PipelineIntentScope original) {
+            if (business != null) assertThat(business).isEqualTo(new CacheBusinessScope(original.clusterId(), original.bindingVersion(),
+                    original.cacheIncarnation()));
+            if (mapping == null) return;
+            assertThat(mapping.stateGeneration()).as("clear creates exactly one successor")
+                    .isBetween(original.stateGeneration(), original.stateGeneration() + 1);
+            assertThat(mapping.phase()).isIn(PipelineStateMapping.Phase.ACTIVE, PipelineStateMapping.Phase.REBUILDING);
+        }
+
+        boolean completed(PipelineIntentScope successor) {
+            return business != null && mapping != null && preparation != null && intent != null
+                    && mapping.stateGeneration() == successor.stateGeneration()
+                    && mapping.phase() == PipelineStateMapping.Phase.ACTIVE && mapping.operationId() != null
+                    && preparation.phase() == PipelinePreparation.Phase.COMPLETE
+                    && successor.equals(preparation.scope()) && !intent.deleted() && successor.equals(intent.scope())
+                    && intent.desired().targetState() == PipelineState.STOPPED
+                    && !intent.desired().purgeState() && !intent.desired().reassemble();
+        }
+    }
+
+    private static void awaitClearCompletion(ControlPlane control, PreparedNativeStore storage,
+            PipelineIntentScope original, ClearStateCompletionInterleaving interleaving) {
+        var successor = new PipelineIntentScope(original.clusterId(), original.bindingVersion(), original.cacheIncarnation(),
+                original.pipelineId(), Math.addExact(original.stateGeneration(), 1));
+        var successorScope = new Document("clusterId", successor.clusterId()).append("bindingVersion", successor.bindingVersion())
+                .append("cacheIncarnation", successor.cacheIncarnation()).append("pipelineId", successor.pipelineId())
+                .append("stateGeneration", successor.stateGeneration());
+        var last = new AtomicReference<String>("no clear completion facts read");
         try (var configuration = MongoConfigurationDomain.openExisting(new MongoConnectionSettings(
-                storage.configurationUri(), null, Duration.ofSeconds(5)))) {
-            Await.until("the requested clear to publish its completed successor generation", BOUND,
-                    () -> configuration.pipelineStates().read(PIPELINE)
-                            .filter(mapping -> mapping.phase() == PipelineStateMapping.Phase.ACTIVE
-                                    && mapping.stateGeneration() == generation).isPresent(),
-                    () -> String.valueOf(configuration.pipelineStates().read(PIPELINE)));
+                    storage.configurationUri(), null, Duration.ofSeconds(5)));
+                var cache = MongoClients.create(storage.cacheUri())) {
+            var checkpoints = SystemCollections.CACHE_PIPELINE_STATE.on(cache.getDatabase(storage.cacheDatabase()));
+            Await.until(PIPELINE + " clear to complete in successor generation " + successor.stateGeneration(), BOUND, () -> {
+                boolean stopped = control.state(PIPELINE).filter(PipelineState.STOPPED::equals).isPresent();
+                // Release storage after the old observation, independently of completion or the START response.
+                if (interleaving != null) interleaving.observed(stopped);
+                var before = ClearConfiguration.read(configuration);
+                before.requireOriginalBusinessAndSingleSuccessor(original);
+                last.set("configuration=" + before);
+                if (!before.completed(successor)) return false;
+                var checkpoint = checkpoints.find(new Document("_id", PIPELINE)).first();
+                var after = ClearConfiguration.read(configuration);
+                after.requireOriginalBusinessAndSingleSuccessor(original);
+                last.set("before=" + before + ", checkpoint=" + checkpoint + ", after=" + after);
+                // CONFIG must still describe the same completion after reading its CACHE checkpoint.
+                if (!before.equals(after)) return false;
+                if (checkpoint == null) return false;
+                assertThat(checkpoint.get("scope")).as("the completed successor's checkpoint scope").isEqualTo(successorScope);
+                if (StateJson.parse(checkpoint.getString("stateJson")) != PipelineState.STOPPED) return false;
+                System.out.println("clear completion proven before START: " + last.get());
+                return true;
+            }, last::get);
         }
     }
 
