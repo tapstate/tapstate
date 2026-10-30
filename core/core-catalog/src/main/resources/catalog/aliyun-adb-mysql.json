@@ -267,7 +267,7 @@
   ],
   "provenance": {
     "specPath": "connectors/aliyun-adb-mysql-connector/src/main/resources/aliyun-adb-mysql-spec.json",
-    "specContentHash": "5f9fd672984a3ab6",
+    "specContentHash": "38a347c7f287f9ba",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

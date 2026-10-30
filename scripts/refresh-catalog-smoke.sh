@@ -276,6 +276,14 @@ else
     "the reused bitmap's own revision reaches the regeneration" "$carried"
   failed=$((failed + 1))
 fi
+restricted="$(grep -c -- '-Dtapstate.catalog.spec-only=true' "$scratch/tree/.mvn-args" || true)"
+if [ "$restricted" = 1 ]; then
+  printf '  ok    %s\n' "spec-only restricts regeneration to the existing catalog"
+  passed=$((passed + 1))
+else
+  printf '  FAIL  spec-only restriction did not reach regeneration\n'
+  failed=$((failed + 1))
+fi
 
 # The old index was a bare array of ids and carries no revision at all. Read leniently that is an
 # empty capability-sha, which regenerates a catalog whose only provenance is blank - so it refuses.
@@ -290,6 +298,14 @@ expect "spec-only refuses an index with no capability revision" 2 "capabilitySha
 fresh_tree
 expect "a full refresh reaches its last step" 0 "step 3 (regenerate) ok" \
   --connectors "$scratch/connectors"
+unrestricted="$(grep -c -- '-Dtapstate.catalog.spec-only=false' "$scratch/tree/.mvn-args" || true)"
+if [ "$unrestricted" = 1 ]; then
+  printf '  ok    %s\n' "a full refresh still admits new connectors"
+  passed=$((passed + 1))
+else
+  printf '  FAIL  full refresh did not select unrestricted regeneration\n'
+  failed=$((failed + 1))
+fi
 
 fresh_tree
 expect "a full refresh names what it could not derive" 0 "hazelcast" \

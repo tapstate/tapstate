@@ -253,7 +253,7 @@
   ],
   "provenance": {
     "specPath": "connectors/mongodb-atlas-connector/src/main/resources/atlas-spec.json",
-    "specContentHash": "516ffca5536036a0",
+    "specContentHash": "d646b0f2dd709d0a",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

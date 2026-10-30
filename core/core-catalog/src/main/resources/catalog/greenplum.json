@@ -328,7 +328,7 @@
   ],
   "provenance": {
     "specPath": "connectors/greenplum-connector/src/main/resources/spec_greenplum.json",
-    "specContentHash": "864ebc8a486d448b",
+    "specContentHash": "1b55a7a4fa66900e",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

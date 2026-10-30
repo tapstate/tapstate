@@ -304,7 +304,7 @@
   ],
   "provenance": {
     "specPath": "connectors/snowflake-connector/src/main/resources/spec_snowflake.json",
-    "specContentHash": "8a444f27dfaf1390",
+    "specContentHash": "b934c9f63efed01d",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

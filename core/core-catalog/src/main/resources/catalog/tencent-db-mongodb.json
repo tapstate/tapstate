@@ -241,7 +241,7 @@
   ],
   "provenance": {
     "specPath": "connectors/tencent-db-mongodb-connector/src/main/resources/tencent-db-mongodb-spec.json",
-    "specContentHash": "34b20b9359fceac5",
+    "specContentHash": "e40c3d40a7934ad7",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

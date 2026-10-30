@@ -268,7 +268,7 @@
   ],
   "provenance": {
     "specPath": "connectors/tencent-db-mariadb-connector/src/main/resources/tencent-db-mariadb-spec.json",
-    "specContentHash": "1ce5d263b0d92a2a",
+    "specContentHash": "0006c2b77c4c6673",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

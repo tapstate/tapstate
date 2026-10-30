@@ -30,7 +30,8 @@
 #
 #   scripts/refresh-catalog.sh --connectors ../tapdata-connectors --spec-only
 #       A spec-face refresh, no jars built. Reuses the checked-in bitmap, so it takes seconds. Enough
-#       when only specification files changed - field names, labels, defaults.
+#       when only specification files changed - field names, labels, defaults. Updates only ids
+#       already in the shipped catalog; newly discovered connectors need a full refresh.
 #
 #   scripts/refresh-catalog.sh --connectors ../tapdata-connectors \
 #       --connectors ../tapdata-connectors-enterprise
@@ -280,6 +281,7 @@ run_step "step 3 (regenerate)" "$ASSEMBLER_REPORT" "$workspace/step3.log" \
   -Dsurefire.failIfNoSpecifiedTests=false \
   "${catalog_args[@]}" \
   -Dtapstate.catalog.update=true \
+  "-Dtapstate.catalog.spec-only=$([ "$spec_only" = yes ] && echo true || echo false)" \
   -Dtapstate.catalog.bitmap="$bitmap" \
   -Dtapstate.catalog.sha="$sha" \
   -Dtapstate.catalog.capability-sha="$capability_sha"

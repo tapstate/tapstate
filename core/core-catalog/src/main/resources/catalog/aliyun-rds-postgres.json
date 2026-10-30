@@ -329,7 +329,7 @@
   ],
   "provenance": {
     "specPath": "connectors/aliyun-rds-postgres-connector/src/main/resources/aliyun-rds-postgres-spec.json",
-    "specContentHash": "df98283c80aac0a2",
+    "specContentHash": "c518177426d357fd",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {
