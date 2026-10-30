@@ -1,6 +1,7 @@
 package io.tapstate.e2e;
 
 import io.tapstate.testsupport.RequiresDocker;
+import java.util.LinkedHashMap;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -16,7 +17,7 @@ class RealConnectorNativeStorageSetupIT {
             ControlPlane control = new ControlPlane(server.baseUrl());
             storage.loginAndAwaitBusiness(control);
 
-            assertThat(control.storageStatus().get("businessPhase")).isEqualTo("READY");
+            assertThat(new LinkedHashMap<Object, Object>(control.storageStatus())).containsEntry("businessPhase", "READY");
         }
     }
 }

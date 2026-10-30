@@ -291,8 +291,9 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
 
     private static void assertNoCachedDeadLetters(PreparedNativeStore storage) {
         try (var client = MongoClients.create(storage.cacheUri())) {
-            assertThat(client.getDatabase(storage.cacheDatabase()).listCollectionNames().into(new ArrayList<>()))
-                    .doesNotContain(SystemCollections.CONFIG_NEST_DEAD_LETTERS.collectionName());
+            assertThat(client.getDatabase(storage.cacheDatabase()).listCollections()
+                    .filter(new Document("name", SystemCollections.CONFIG_NEST_DEAD_LETTERS.collectionName())).first())
+                    .isNull();
         }
     }
 
