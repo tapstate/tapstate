@@ -82,12 +82,12 @@ class AttributesAreAttributesNotNameSuffixesIT {
             seed(mysql);
             grantReplication(mysql);
 
-            String storeUri = SharedMongo.replicaSetUrl("attributes_store");
             String targetUri = SharedMongo.replicaSetUrl("attributes_target");
 
-            try (ServerHandle server = Tiers.IN_PROCESS.launch(storeUri)) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                    ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
-                control.bootstrapAndLogin("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
                 control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
                 control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 

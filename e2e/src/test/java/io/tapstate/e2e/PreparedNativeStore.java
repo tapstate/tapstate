@@ -1,11 +1,18 @@
 package io.tapstate.e2e;
 
 import com.mongodb.client.MongoClients;
+import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
+import io.tapstate.adapters.mongostore.MongoConnectionSettings;
+import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.model.SourceResource;
+import io.tapstate.spi.store.RequiredNoteOwner;
 import io.tapstate.spi.store.StorageBinding;
+import java.time.Duration;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.function.Function;
+import org.bson.Document;
 
 /** One explicit native installation per scenario; server restarts reuse it without preparing again. */
 final class PreparedNativeStore implements AutoCloseable {
@@ -97,6 +104,24 @@ final class PreparedNativeStore implements AutoCloseable {
     String clusterId() { return cluster; }
     String username() { return username; }
     String password() { return password; }
+
+    /** Reads the retained connector identity from its original native note scope. */
+    Optional<byte[]> chainNote(String chain, String key) {
+        String namespace = "pdk.chain." + chain;
+        try (var configuration = MongoConfigurationDomain.openExisting(
+                    new MongoConnectionSettings(configurationUri(), null, Duration.ofSeconds(5)));
+                var client = MongoClients.create(configurationUri())) {
+            long binding = configuration.bindings().load().orElseThrow().bindingVersion();
+            var database = client.getDatabase(configurationDatabase);
+            var id = new Document("bindingVersion", binding).append("namespace", namespace);
+            if (SystemCollections.PDK_NOTE_SCOPES.on(database)
+                    .find(new Document("_id", id)).first() == null) return Optional.empty();
+            var owner = new RequiredNoteOwner(binding, namespace, RequiredNoteOwner.Kind.CHAIN, chain, 0);
+            var scope = configuration.requiredNotes().open(owner);
+            return Optional.ofNullable(configuration.requiredNotes().read(scope, key).bytes());
+        }
+    }
+
     void loginAndAwaitBusiness(ControlPlane control) {
         control.login(username, password);
         awaitBusiness(control);

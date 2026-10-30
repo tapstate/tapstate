@@ -81,13 +81,12 @@ class RealMysqlToMongoViewIndexIT {
             seedMysqlOrders(mysql, SEEDED_ROWS);
 
             String suffix = tier.name().toLowerCase(Locale.ROOT);
-            String storeUri = SharedMongo.replicaSetUrl("real_view_store_" + suffix);
             String targetUri = SharedMongo.replicaSetUrl("real_view_target_" + suffix);
 
-            try (ServerHandle server = tier.launch(storeUri);
+            try (PreparedNativeStore storage = PreparedNativeStore.create(); ServerHandle server = tier.launch(storage);
                     MongoEndpoints mongo = new MongoEndpoints()) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
-                control.bootstrapAndLogin("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
 
                 control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
                 control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));

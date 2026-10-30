@@ -68,8 +68,7 @@ class CrossEngineIdleStreamDoesNotStallFrontierIT {
     private static final String CHILD_TABLE = "shipments";
 
     /** Where the product keeps what it would resume from: one record per mining chain, in the store. */
-    private static final String CHAIN_RECORDS = "srs_meta";
-    private static final String OFFSET_FIELD = "sourceReadOffset";
+    private static final String CHAIN_RECORDS = io.tapstate.adapters.mongostore.SystemCollections.SRS_CHAINS.collectionName();
 
     private static final int ROOTS = 40;
 
@@ -96,13 +95,13 @@ class CrossEngineIdleStreamDoesNotStallFrontierIT {
         createTables(orders, shipments);
         seedRoots(orders);
 
-        String storeUri = SharedMongo.replicaSetUrl("idlestream_store_" + suffix);
         String targetUri = SharedMongo.replicaSetUrl("idlestream_target_" + suffix);
 
-        try (ServerHandle server = tier.launch(storeUri);
+        try (PreparedNativeStore storage = PreparedNativeStore.create(); ServerHandle server = tier.launch(storage);
                 MongoEndpoints mongo = new MongoEndpoints()) {
+            String storeUri = storage.cacheUri();
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
 
             control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
             control.registerConnector("postgres", ConnectorJars.bytesFor("postgres"));
@@ -187,7 +186,8 @@ class CrossEngineIdleStreamDoesNotStallFrontierIT {
     private static Map<String, String> offsets(MongoEndpoints mongo, String storeUri) {
         Map<String, String> offsets = new LinkedHashMap<>();
         for (Document record : mongo.documents(EndpointAddress.uri(storeUri), CHAIN_RECORDS)) {
-            Object offset = record.get(OFFSET_FIELD);
+            Document checkpoint = record.get("checkpoint", Document.class);
+            Object offset = checkpoint == null ? null : checkpoint.get("token");
             if (offset != null) {
                 offsets.put(String.valueOf(record.get("_id")), String.valueOf(offset));
             }

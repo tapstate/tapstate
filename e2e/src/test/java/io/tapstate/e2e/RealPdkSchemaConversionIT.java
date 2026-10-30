@@ -70,10 +70,10 @@ class RealPdkSchemaConversionIT {
         String targetUri = SharedMongo.replicaSetUrl("typed_target_" + suffix);
         EndpointAddress target = EndpointAddress.uri(targetUri);
         String pipeline = "typed_" + suffix;
-        try (ServerHandle server = tier.launch(SharedMongo.replicaSetUrl("typed_store_" + suffix));
+        try (PreparedNativeStore storage = PreparedNativeStore.create(); ServerHandle server = tier.launch(storage);
                 MongoEndpoints mongo = new MongoEndpoints()) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(kind, ConnectorJars.bytesFor(kind));
             control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
             Map<String, Object> config = new LinkedHashMap<>(database);

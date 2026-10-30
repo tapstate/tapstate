@@ -115,15 +115,15 @@ class ChangesDuringTheSnapshotSurviveARestartIT {
         String database = suffix + "_src";
         String sourceUri = SharedMongo.replicaSetUrl(database);
         String targetUri = SharedMongo.replicaSetUrl(suffix + "_tgt");
-        String storeUri = SharedMongo.replicaSetUrl(suffix + "_state");
         EndpointAddress target = EndpointAddress.uri(targetUri);
 
-        try (MongoClient source = MongoClients.create(new ConnectionString(sourceUri));
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                MongoClient source = MongoClients.create(new ConnectionString(sourceUri));
                 MongoEndpoints mongo = new MongoEndpoints();
-                ServerHandle server = tier.launch(storeUri)) {
+                ServerHandle server = tier.launch(storage)) {
 
             seed(source, database);
-            ControlPlane control = start(server, suffix, sourceUri, targetUri);
+            ControlPlane control = start(server, storage, suffix, sourceUri, targetUri);
 
             awaitTheLoadIsUnderWay(mongo, target);
 
@@ -188,9 +188,9 @@ class ChangesDuringTheSnapshotSurviveARestartIT {
 
     /** Everything up to and including the start. */
     private static ControlPlane start(
-            ServerHandle server, String pipelineId, String sourceUri, String targetUri) {
+            ServerHandle server, PreparedNativeStore storage, String pipelineId, String sourceUri, String targetUri) {
         ControlPlane control = new ControlPlane(server.baseUrl());
-        control.bootstrapAndLogin("e2e", "e2e-password");
+        storage.loginAndAwaitBusiness(control);
         control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 
         Map<String, String> resources = new LinkedHashMap<>();

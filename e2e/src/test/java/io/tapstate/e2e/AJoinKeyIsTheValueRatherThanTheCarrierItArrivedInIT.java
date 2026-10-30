@@ -85,7 +85,6 @@ class AJoinKeyIsTheValueRatherThanTheCarrierItArrivedInIT {
 
     @Test
     void aDimensionKeyedByTheDriversOwnTypeMatchesTheFactThatNamesItAsText() {
-        String storeUri = SharedMongo.replicaSetUrl("join_carrier_store");
         String dataUri = SharedMongo.replicaSetUrl(DATABASE);
         String targetUri = SharedMongo.replicaSetUrl("join_carrier_target");
         EndpointAddress data = EndpointAddress.uri(dataUri);
@@ -97,8 +96,8 @@ class AJoinKeyIsTheValueRatherThanTheCarrierItArrivedInIT {
         ObjectId bo = new ObjectId();
         ObjectId nobody = new ObjectId();
 
-        try (MongoEndpoints mongo = new MongoEndpoints();
-                ServerHandle server = Tiers.IN_PROCESS.launch(storeUri)) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             mongo.insert(data, CUSTOMERS, new Document("customer_key", ada).append("name", "ada"));
             mongo.insert(data, CUSTOMERS, new Document("customer_key", bo).append("name", "bo"));
             mongo.insert(data, ORDERS,
@@ -110,7 +109,7 @@ class AJoinKeyIsTheValueRatherThanTheCarrierItArrivedInIT {
                     new Document("_id", 12).append("customer_ref", nobody.toHexString()));
 
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 
             Map<String, String> resources = new LinkedHashMap<>();

@@ -86,6 +86,12 @@ final class SharedPostgres {
                             "-c", "wal_level=logical",
                             "-c", "max_wal_senders=32",
                             "-c", "max_replication_slots=32");
+            String owner = System.getProperty("tapstate.e2e.resource-owner");
+            if (owner != null && !owner.isBlank()) {
+                starting.withLabel(System.getProperty("tapstate.e2e.resource-owner-label",
+                        "io.tapstate.e2e.resource-owner"), owner);
+                starting.withTmpFs(Map.of("/var/lib/postgresql/data", "rw,size=1g"));
+            }
             starting.start();
             container = starting;
         }

@@ -2,11 +2,10 @@ package io.tapstate.e2e;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.mongodb.ConnectionString;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
-import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.spi.store.SrsConsumerId;
@@ -54,16 +53,15 @@ class RealPostgresIndependentRecoveryIT {
         }
         EndpointAddress slowTarget = EndpointAddress.uri(SharedMongo.replicaSetUrl(databaseName + "_slow"));
         EndpointAddress fastTarget = EndpointAddress.uri(SharedMongo.replicaSetUrl(databaseName + "_fast"));
-        String storeUri = SharedMongo.replicaSetUrl(databaseName + "_state");
-
-        try (MongoClient reader = MongoClients.create(storeUri);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                MongoClient reader = MongoClients.create(storage.cacheUri());
                 MongoEndpoints targets = new MongoEndpoints();
-                RealProcessServer server = RealProcessServer.start(storeUri, databaseName + "_operators");
+                RealProcessServer server = (RealProcessServer) Tiers.REAL_PROCESS.launch(storage);
                 Connection writer = SharedPostgres.connect(postgres);
                 Statement sql = writer.createStatement()) {
-            MongoDatabase store = reader.getDatabase(new ConnectionString(storeUri).getDatabase());
+            MongoDatabase store = reader.getDatabase(storage.cacheDatabase());
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector("postgres", ConnectorJars.bytesFor("postgres"));
             control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
             control.apply(workspace(postgres, slowTarget, fastTarget, readMode));
@@ -105,17 +103,17 @@ class RealPostgresIndependentRecoveryIT {
                     () -> token(consumer(store, SLOW_PIPELINE, SLOW_SOURCE)) != null
                             && token(consumer(store, FAST_PIPELINE, FAST_SOURCE)) != null
                             && consumer(store, SLOW_PIPELINE, SLOW_SOURCE)
-                                    .getList("directBatches", Document.class).isEmpty()
+                                    .pendingBatches().isEmpty()
                             && consumer(store, FAST_PIPELINE, FAST_SOURCE)
-                                    .getList("directBatches", Document.class).isEmpty(),
+                                    .pendingBatches().isEmpty(),
                     () -> consumers(store));
             control.lifecycle(SLOW_PIPELINE, LifecycleVerb.PAUSE);
             awaitState(control, SLOW_PIPELINE, PipelineState.PAUSED);
-            Document paused = consumer(store, SLOW_PIPELINE, SLOW_SOURCE);
-            long confirmedSequence = paused.get("sinkAckedSeq", Number.class).longValue();
+            ConsumerReading paused = consumer(store, SLOW_PIPELINE, SLOW_SOURCE);
+            long confirmedSequence = paused.confirmation().get("sequence", Number.class).longValue();
             String fastBefore = token(consumer(store, FAST_PIPELINE, FAST_SOURCE));
-            assertThat(paused.getString("miningChainId"))
-                    .isNotEqualTo(consumer(store, FAST_PIPELINE, FAST_SOURCE).getString("miningChainId"));
+            assertThat(paused.channelId())
+                    .isNotEqualTo(consumer(store, FAST_PIPELINE, FAST_SOURCE).channelId());
 
             long deliveredFrom = System.nanoTime();
             sql.execute("UPDATE support_case SET priority = 'Low' WHERE id = 1");
@@ -130,14 +128,15 @@ class RealPostgresIndependentRecoveryIT {
                     () -> !fastBefore.equals(token(consumer(store, FAST_PIPELINE, FAST_SOURCE))),
                     () -> consumers(store));
             Await.until("the paused channel to register pending source changes beyond its confirmed prefix", TIMEOUT,
-                    () -> consumer(store, SLOW_PIPELINE, SLOW_SOURCE).getList("directBatches", Document.class)
-                            .stream().anyMatch(batch -> batch.get("targets", Document.class)
-                                    .get(TABLE, Number.class).longValue() >= confirmedSequence + 3),
+                    () -> consumer(store, SLOW_PIPELINE, SLOW_SOURCE).pendingBatches()
+                            .stream().anyMatch(batch -> batch.getList("targets", Document.class).stream()
+                                    .anyMatch(target -> TABLE.equals(target.getString("table"))
+                                            && target.get("sequence", Number.class).longValue() >= confirmedSequence + 3)),
                     () -> consumers(store));
-            Document held = consumer(store, SLOW_PIPELINE, SLOW_SOURCE);
-            long firstPending = held.getList("directBatches", Document.class).getFirst()
-                    .get("seq", Number.class).longValue();
-            assertThat(held.get("sinkAckedSeq", Number.class).longValue())
+            ConsumerReading held = consumer(store, SLOW_PIPELINE, SLOW_SOURCE);
+            long firstPending = held.pendingBatches().getFirst()
+                    .get("boundary", Document.class).get("sequence", Number.class).longValue();
+            assertThat(held.confirmation().get("sequence", Number.class).longValue())
                     .as("a confirmed recovery prefix cannot pass the first pending source batch")
                     .isLessThan(firstPending);
             assertThat(row(targets, slowTarget, "1")).isEqualTo("Low");
@@ -179,18 +178,17 @@ class RealPostgresIndependentRecoveryIT {
         }
         EndpointAddress slowTarget = EndpointAddress.uri(SharedMongo.replicaSetUrl(databaseName + "_slow"));
         EndpointAddress fastTarget = EndpointAddress.uri(SharedMongo.replicaSetUrl(databaseName + "_fast"));
-        String storeUri = SharedMongo.replicaSetUrl(databaseName + "_state");
-        String operatorDatabase = databaseName + "_operators";
-        try (MongoClient reader = MongoClients.create(storeUri);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                MongoClient reader = MongoClients.create(storage.cacheUri());
                 MongoEndpoints targets = new MongoEndpoints();
                 Connection writer = SharedPostgres.connect(postgres);
                 Statement sql = writer.createStatement()) {
-            MongoDatabase store = reader.getDatabase(new ConnectionString(storeUri).getDatabase());
+            MongoDatabase store = reader.getDatabase(storage.cacheDatabase());
             List<String> originalSlots;
             String stoppedConfirmation;
-            try (RealProcessServer first = RealProcessServer.start(storeUri, operatorDatabase)) {
+            try (RealProcessServer first = (RealProcessServer) Tiers.REAL_PROCESS.launch(storage)) {
                 ControlPlane control = new ControlPlane(first.baseUrl());
-                control.bootstrapAndLogin("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
                 control.registerConnector("postgres", ConnectorJars.bytesFor("postgres"));
                 control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
                 control.apply(workspace(postgres, slowTarget, fastTarget, readMode, true));
@@ -228,10 +226,10 @@ class RealPostgresIndependentRecoveryIT {
                         () -> token(consumer(store, SLOW_PIPELINE, SLOW_SOURCE)) != null
                                 && token(consumer(store, FAST_PIPELINE, FAST_SOURCE)) != null,
                         () -> consumers(store));
-                String chain = consumer(store, SLOW_PIPELINE, SLOW_SOURCE).getString("miningChainId");
-                assertThat(consumer(store, FAST_PIPELINE, FAST_SOURCE).getString("miningChainId"))
+                String chain = consumer(store, SLOW_PIPELINE, SLOW_SOURCE).channelId();
+                assertThat(consumer(store, FAST_PIPELINE, FAST_SOURCE).channelId())
                         .isEqualTo(chain);
-                assertThat(store.getCollection(MongoStorePort.SRS_META).find(new Document("_id", chain)).first())
+                assertThat(SystemCollections.SRS_CHAINS.on(store).find(new Document("_id", chain)).first())
                         .containsEntry("sourceReadDurable", true);
                 originalSlots = slotNames(postgres);
                 assertThat(originalSlots).hasSize(1);
@@ -247,9 +245,9 @@ class RealPostgresIndependentRecoveryIT {
             sql.execute("DELETE FROM support_case WHERE id = 3");
             sql.execute("INSERT INTO support_case VALUES (5, 'written-with-server-down')");
             long recoveredFrom = System.nanoTime();
-            try (RealProcessServer second = RealProcessServer.start(storeUri, operatorDatabase)) {
+            try (RealProcessServer second = (RealProcessServer) Tiers.REAL_PROCESS.launch(storage)) {
                 ControlPlane control = new ControlPlane(second.baseUrl());
-                control.login("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
                 awaitState(control, SLOW_PIPELINE, PipelineState.STOPPED);
                 awaitState(control, FAST_PIPELINE, PipelineState.RUNNING);
                 awaitRow(control, targets, fastTarget, "1", "High");
@@ -347,17 +345,33 @@ class RealPostgresIndependentRecoveryIT {
         }
     }
 
-    private static Document consumer(MongoDatabase store, String pipeline, String source) {
-        return store.getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS)
-                .find(new Document("pipelineId", SrsConsumerId.of(pipeline, source).value())).first();
+    private record ConsumerReading(Document cursor, List<Document> pendingBatches, String channelId) {
+        Document confirmation() { return cursor.get("sinkAcked", Document.class); }
     }
 
-    private static String token(Document consumer) {
-        return consumer == null ? null : consumer.getString("sinkAckedSrcpos");
+    private static ConsumerReading consumer(MongoDatabase store, String pipeline, String source) {
+        Document direct = SystemCollections.DIRECT_CHANNEL_OFFSETS.on(store)
+                .find(new Document("_id.scope.pipelineId", pipeline).append("_id.sourceId", source)).first();
+        if (direct != null) {
+            Document id = direct.get("_id", Document.class);
+            var pending = SystemCollections.DIRECT_BATCHES.on(store).find(new Document("_id.channel", id))
+                    .sort(new Document("boundary.sequence", 1)).into(new ArrayList<>());
+            return new ConsumerReading(direct.get("cursor", Document.class), pending, id.getString("channelId"));
+        }
+        Document shared = SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(store)
+                .find(new Document("_id.consumer", SrsConsumerId.of(pipeline, source).value())).first();
+        return shared == null ? null : new ConsumerReading(shared.get("progress", Document.class), List.of(),
+                shared.get("_id", Document.class).getString("chain"));
+    }
+
+    private static String token(ConsumerReading consumer) {
+        return consumer == null || consumer.confirmation() == null ? null : consumer.confirmation().getString("token");
     }
 
     private static String consumers(MongoDatabase store) {
-        return store.getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS).find().into(new java.util.ArrayList<>()).toString();
+        return "direct=" + SystemCollections.DIRECT_CHANNEL_OFFSETS.on(store).find().into(new ArrayList<>())
+                + ", batches=" + SystemCollections.DIRECT_BATCHES.on(store).find().into(new ArrayList<>())
+                + ", shared=" + SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(store).find().into(new ArrayList<>());
     }
 
     private static String row(MongoEndpoints targets, EndpointAddress target, String id) {

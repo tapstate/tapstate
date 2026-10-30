@@ -80,14 +80,13 @@ class ACdcOnlyPipelineDoesNotBorrowAnotherPipelinesSnapshotSeamIT {
         Path witness = temporary.resolve("mongo-writes");
         Path tail = temporary.resolve("mongo-writes.tail");
         byte[] connector = ObservedMongoConnectorJar.build(ConnectorJars.bytesFor("mongodb"), witness);
-        String storeUri = SharedMongo.replicaSetUrl("cdc_own_start_store_" + suffix);
 
-        try (MongoClient source = MongoClients.create(sourceUri);
+        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoClient source = MongoClients.create(sourceUri);
                 MongoEndpoints mongo = new MongoEndpoints();
-                ServerHandle server = tier.launch(storeUri);
-                StoreDocuments documents = StoreDocuments.at(storeUri)) {
+                ServerHandle server = tier.launch(storage);
+                StoreDocuments documents = StoreDocuments.nativeSrsAt(storage.cacheUri())) {
             seed(source, sourceDatabase, FIRST_COLLECTION, "snapshot-row");
-            ControlPlane control = connected(server, connector);
+            ControlPlane control = connected(server, storage, connector);
 
             control.apply(workspace(
                     FIRST_SOURCE, FIRST_TARGET, FIRST_PIPELINE, FIRST_COLLECTION,
@@ -191,20 +190,22 @@ class ACdcOnlyPipelineDoesNotBorrowAnotherPipelinesSnapshotSeamIT {
     private record Checkpoint(String token, long epoch, long sequence) { }
 
     private static Optional<Checkpoint> checkpoint(Document chain) {
-        if (chain == null || !Boolean.TRUE.equals(chain.get("sourceReadDurable"))
-                || !(chain.get("sourceReadOffset") instanceof String token) || token.isBlank()
-                || !(chain.get("sourceReadEpoch") instanceof Number epoch) || epoch.longValue() < 1L
+        Document checkpoint = chain == null ? null : chain.get("checkpoint", Document.class);
+        if (checkpoint == null || !(checkpoint.get("token") instanceof String token) || token.isBlank()
+                || !(checkpoint.get("epoch") instanceof Number epoch) || epoch.longValue() < 1L
                 || !(chain.get("epoch") instanceof Number active) || active.longValue() != epoch.longValue()
-                || !(chain.get("sourceReadSeq") instanceof Number sequence)) {
+                || !(checkpoint.get("sequence") instanceof Number sequence)) {
             return Optional.empty();
         }
         return Optional.of(new Checkpoint(token, epoch.longValue(), sequence.longValue()));
     }
 
     private static Document ownerConsumer(StoreDocuments documents, String chain) {
-        Document consumer = documents.consumerOffset(chain, SrsConsumerId.of(FIRST_PIPELINE, FIRST_SOURCE).value());
-        if (consumer == null || !FIRST_PIPELINE.equals(consumer.getString("ownerPipelineId"))
-                || !FIRST_SOURCE.equals(consumer.getString("sourceNodeId"))) {
+        String id = SrsConsumerId.of(FIRST_PIPELINE, FIRST_SOURCE).value();
+        Document consumer = documents.consumerOffset(chain, id);
+        Document membership = documents.consumerMembership(chain, id);
+        if (consumer == null || membership == null || !FIRST_PIPELINE.equals(membership.getString("pipelineId"))
+                || !FIRST_SOURCE.equals(membership.getString("sourceId"))) {
             return null;
         }
         return consumer;
@@ -212,18 +213,18 @@ class ACdcOnlyPipelineDoesNotBorrowAnotherPipelinesSnapshotSeamIT {
 
     private static boolean hasOwnedCdcConfirmation(StoreDocuments documents, String chain) {
         Document consumer = ownerConsumer(documents, chain);
-        if (consumer == null || !(consumer.get("sinkAckedByTable") instanceof Document tables)
-                || !(tables.get(FIRST_COLLECTION) instanceof Document confirmed)) {
-            return false;
-        }
-        return confirmed.get("sinkAckedEpoch") instanceof Number epoch && epoch.longValue() > 0L
-                && confirmed.get("sinkAckedSeq") instanceof Number sequence && sequence.longValue() >= 0L
-                && confirmed.get("sinkAckedSrcpos") instanceof String token && !token.isBlank();
+        if (consumer == null) return false;
+        var tables = consumer.get("progress", Document.class).getList("sinkAckedByTable", Document.class);
+        return tables.stream().filter(table -> FIRST_COLLECTION.equals(table.getString("table")))
+                .map(table -> table.get("position", Document.class)).anyMatch(confirmed -> confirmed != null
+                        && confirmed.get("epoch") instanceof Number epoch && epoch.longValue() > 0L
+                        && confirmed.get("sequence") instanceof Number sequence && sequence.longValue() >= 0L
+                        && confirmed.get("token") instanceof String token && !token.isBlank());
     }
 
-    private static ControlPlane connected(ServerHandle server, byte[] connector) {
+    private static ControlPlane connected(ServerHandle server, PreparedNativeStore storage, byte[] connector) {
         ControlPlane control = new ControlPlane(server.baseUrl());
-        control.bootstrapAndLogin("e2e", "e2e-password");
+        storage.loginAndAwaitBusiness(control);
         control.registerConnector("mongodb", connector);
         return control;
     }

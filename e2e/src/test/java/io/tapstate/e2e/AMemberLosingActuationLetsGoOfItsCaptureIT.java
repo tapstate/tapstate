@@ -1,8 +1,8 @@
 package io.tapstate.e2e;
 
-import io.tapstate.adapters.mongostore.MongoConnection;
+import io.tapstate.adapters.mongostore.MongoCacheDomain;
+import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
-import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.TableSnapshot;
@@ -38,16 +38,17 @@ class AMemberLosingActuationLetsGoOfItsCaptureIT {
     void theSuccessorRestartsAfterPurgeWithoutRestartingTheOldCaptureHolder() {
         String sourceUri = SharedMongo.replicaSetUrl("e2e_actuation_handoff_source");
         String targetUri = SharedMongo.replicaSetUrl("e2e_actuation_handoff_target");
-        String storeUri = SharedMongo.replicaSetUrl("e2e_actuation_handoff_store");
-        try (MongoEndpoints mongo = new MongoEndpoints();
-             StoreDocuments documents = StoreDocuments.at(storeUri);
-             MongoConnection connection = new MongoConnection(new MongoConnectionSettings(storeUri, null, BOUND))) {
-            connection.verify();
-            MongoStorePort store = new MongoStorePort(connection, SharedMongo.OPERATOR_STATE_DATABASE);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+             MongoConfigurationDomain configuration = MongoConfigurationDomain.openExisting(
+                     new MongoConnectionSettings(storage.configurationUri(), null, BOUND));
+             MongoCacheDomain cache = MongoCacheDomain.connect(configuration.bindings().load().orElseThrow().cache(), BOUND, "handoff-witness");
+             MongoEndpoints mongo = new MongoEndpoints();
+             StoreDocuments documents = StoreDocuments.nativeSrsAt(storage.cacheUri())) {
+            var claims = cache.workloadClaims(configuration.bindings().cachePreparation().orElseThrow().businessScope());
             EndpointAddress source = EndpointAddress.uri(sourceUri);
             EndpointAddress target = EndpointAddress.uri(targetUri);
             mongo.seed(source, TABLE, List.of(Map.of("id", 1L), Map.of("id", 2L)));
-            try (TwoMemberCluster cluster = TwoMemberCluster.start(storeUri, "e2e-actuation-handoff")) {
+            try (TwoMemberCluster cluster = TwoMemberCluster.startPreparedSequentially(storage)) {
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.first();
                 control.registerConnector(CONNECTOR, ConnectorJars.bytesFor(CONNECTOR));
@@ -72,7 +73,7 @@ class AMemberLosingActuationLetsGoOfItsCaptureIT {
                         ? TwoMemberCluster.NODE_B : TwoMemberCluster.NODE_A;
                 WorkloadClaimKey capture = new WorkloadClaimKey(
                         control.clusterId(), WorkloadClaimType.CAPTURE, captureId);
-                assertThat(store.workloadClaims().read(capture)).hasValueSatisfying(reading -> {
+                assertThat(claims.read(capture)).hasValueSatisfying(reading -> {
                     assertThat(reading.leased()).as("the original capture claim is live").isTrue();
                     assertThat(reading.claim().owner().nodeId()).isEqualTo(oldNode);
                 });
@@ -80,31 +81,31 @@ class AMemberLosingActuationLetsGoOfItsCaptureIT {
                         control.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, PIPELINE);
 
                 documents.handPipelineTo(control.clusterId(), PIPELINE, oldNode, successor);
-                Instant handedOffLease = store.workloadClaims().read(actuation).orElseThrow().claim().leaseUntil();
+                Instant handedOffLease = claims.read(actuation).orElseThrow().claim().leaseUntil();
                 Await.until("the other member to hold actuation", BOUND,
                         () -> control.pipelineControllerOf(PIPELINE).filter(successor::equals).isPresent(),
                         () -> "controller=" + control.pipelineControllerOf(PIPELINE));
                 // Seeing the changed document alone does not mean the old driver's cached permit is gone.
                 Await.until("the successor to adopt its actuation claim", BOUND,
-                        () -> store.workloadClaims().read(actuation)
+                        () -> claims.read(actuation)
                                 .filter(reading -> reading.claim().owner().nodeId().equals(successor)
                                         && !reading.claim().leaseUntil().equals(handedOffLease)).isPresent(),
-                        () -> "actuation=" + store.workloadClaims().read(actuation));
-                Instant adoptedLease = store.workloadClaims().read(actuation).orElseThrow().claim().leaseUntil();
+                        () -> "actuation=" + claims.read(actuation));
+                Instant adoptedLease = claims.read(actuation).orElseThrow().claim().leaseUntil();
                 Await.until("the successor to renew its adopted claim before the stop", BOUND,
-                        () -> store.workloadClaims().read(actuation)
+                        () -> claims.read(actuation)
                                 .filter(reading -> reading.claim().owner().nodeId().equals(successor)
                                         && reading.claim().leaseUntil().isAfter(adoptedLease)).isPresent(),
-                        () -> "actuation=" + store.workloadClaims().read(actuation));
+                        () -> "actuation=" + claims.read(actuation));
                 control.stop(PIPELINE, true);
                 Await.until("the successor to drive the purging stop", BOUND,
                         () -> control.state(PIPELINE).filter(PipelineState.STOPPED::equals).isPresent(),
                         () -> "state=" + control.state(PIPELINE));
                 Await.until("the old member to stop holding the capture", BOUND,
-                        () -> store.workloadClaims().read(capture)
+                        () -> claims.read(capture)
                                 .filter(reading -> reading.leased() && reading.claim().owner().nodeId().equals(oldNode))
                                 .isEmpty(),
-                        () -> "capture=" + store.workloadClaims().read(capture));
+                        () -> "capture=" + claims.read(capture));
                 assertThat(cluster.processCarrying(oldNode).isAlive()).isTrue();
 
                 // Purging capture state requires a full load; retain the target rows from the first run.

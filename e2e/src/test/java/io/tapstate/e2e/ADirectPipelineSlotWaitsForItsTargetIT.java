@@ -64,17 +64,17 @@ class ADirectPipelineSlotWaitsForItsTargetIT {
     void theSlotWaitsForTheTargetAndAKillWhileItIsUnreachableLosesNothing() throws Exception {
         Map<String, Object> source = SharedPostgres.settings("direct_waits_src");
         createTable(source);
-        String storeUri = SharedMongo.replicaSetUrl("direct_waits_store");
 
-        try (NetworkedMongo frozenTarget = NetworkedMongo.start(); MongoEndpoints mongo = new MongoEndpoints()) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                NetworkedMongo frozenTarget = NetworkedMongo.start(); MongoEndpoints mongo = new MongoEndpoints()) {
             String targetUri = frozenTarget.uriForThisHost("direct_waits_target");
             String lastInside;
             String firstBefore;
 
-            RealProcessServer server = RealProcessServer.start(storeUri);
+            RealProcessServer server = (RealProcessServer) Tiers.REAL_PROCESS.launch(storage);
             try {
                 ControlPlane control = new ControlPlane(server.baseUrl());
-                control.bootstrapAndLogin("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
                 control.registerConnector("postgres", ConnectorJars.bytesFor("postgres"));
                 control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
                 Map<String, String> resources = new LinkedHashMap<>();
@@ -118,9 +118,9 @@ class ADirectPipelineSlotWaitsForItsTargetIT {
             }
             frozenTarget.thaw();
 
-            try (RealProcessServer restarted = RealProcessServer.start(storeUri)) {
+            try (RealProcessServer restarted = (RealProcessServer) Tiers.REAL_PROCESS.launch(storage)) {
                 ControlPlane control = new ControlPlane(restarted.baseUrl());
-                control.login("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
                 control.startUnlessRunning(PIPELINE);
                 List<Integer> expected = Stream.concat(Stream.of(1, 2),
                         IntStream.range(1000, 1000 + WHILE_FROZEN).boxed()).toList();

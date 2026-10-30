@@ -34,16 +34,16 @@ class StoppingAMongoCaptureKillsItsSourceCursorIT {
     void stoppingTheLastPipelineKillsItsChangeStreamCursor() throws Exception {
         String sourceUri = SharedMongo.replicaSetUrl(DATABASE);
         String targetUri = SharedMongo.replicaSetUrl(TARGET_DATABASE);
-        String storeUri = SharedMongo.replicaSetUrl("e2e_tail_close_store");
         // Surefire also carries the MCP sidecar's non-web configuration; this witness hosts the REST server.
         String previousWebType = System.getProperty("spring.main.web-application-type");
         System.setProperty("spring.main.web-application-type", "servlet");
-        try (MongoClient observer = MongoClients.create(sourceUri);
-                ServerHandle server = InProcessServer.start(storeUri)) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                MongoClient observer = MongoClients.create(sourceUri);
+                ServerHandle server = InProcessServer.startPrepared(storage)) {
             var orders = observer.getDatabase(DATABASE).getCollection("orders");
             orders.insertOne(new Document("_id", "seed").append("value", 1));
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
             control.apply(Map.of(
                     "source.tap.yml", sourceYaml("src_mongo", sourceUri, DATABASE) + "mode: cdc\n",

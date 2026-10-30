@@ -45,13 +45,13 @@ class ASecondPipelineOverATailedSourceLoadsWhereverItLandsIT {
     @Test
     void thePipelineDrivenAwayFromTheCaptureGetsTheRowsAlreadyThereAndTheChangesAfter() {
         String sourceUri = SharedMongo.replicaSetUrl("e2e_shared_src");
-        String store = SharedMongo.replicaSetUrl("e2e_shared_src_cluster");
 
         try (MongoEndpoints mongo = new MongoEndpoints()) {
             EndpointAddress source = EndpointAddress.uri(sourceUri);
             mongo.seed(source, TABLE, SeedRows.generated(SEEDED_ROWS));
 
-            try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-shared-src")) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                    TwoMemberCluster cluster = TwoMemberCluster.startPreparedSequentially(storage)) {
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.first();
                 control.registerConnector(CONNECTOR, ConnectorJars.bytesFor(CONNECTOR));

@@ -94,11 +94,11 @@ class WatchRedrawsIT {
 
     @Test
     void redrawsInPlaceWhatItHoldsAfterTheUpstreamRowIsEdited() throws Exception {
-        String storeUri = SharedMongo.replicaSetUrl("e2e_watch_store");
         String upstreamUri = SharedMongo.replicaSetUrl(UPSTREAM_DATABASE);
         String viewUri = SharedMongo.replicaSetUrl(VIEW_DATABASE);
 
-        try (ServerHandle server = InProcessServer.start(storeUri);
+        try (PreparedNativeStore storage = PreparedNativeStore.create(USER, PASSWORD);
+                ServerHandle server = InProcessServer.startPrepared(storage);
                 MongoEndpoints mongo = new MongoEndpoints();
                 MongoClient upstream = MongoClients.create(new ConnectionString(upstreamUri))) {
 
@@ -107,7 +107,7 @@ class WatchRedrawsIT {
                     .append("regions", List.of("north", "south")));
 
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin(USER, PASSWORD);
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 
             Map<String, String> resources = new LinkedHashMap<>();

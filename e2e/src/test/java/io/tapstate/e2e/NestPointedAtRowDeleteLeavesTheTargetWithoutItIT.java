@@ -112,13 +112,12 @@ class NestPointedAtRowDeleteLeavesTheTargetWithoutItIT {
             // one already landed and pass without assembling anything.
             String suffix = tier.name().toLowerCase(Locale.ROOT);
             pipelineId = PIPELINE_ID + "_" + suffix;
-            String storeUri = SharedMongo.replicaSetUrl("pointed_at_store_" + suffix);
             String targetUri = SharedMongo.replicaSetUrl("pointed_at_target_" + suffix);
 
-            try (ServerHandle server = tier.launch(storeUri);
+            try (PreparedNativeStore storage = PreparedNativeStore.create(); ServerHandle server = tier.launch(storage);
                     MongoEndpoints mongo = new MongoEndpoints()) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
-                control.bootstrapAndLogin("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
 
                 control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
                 control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));

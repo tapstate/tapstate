@@ -64,7 +64,7 @@ class AStopThatClearsTakesTheAssemblyStateWithItIT {
     private static final String TARGET_ID = "tgt_mongo";
 
     /** The one collection the shared state store keeps every pipeline\u0027s assembly state in. */
-    private static final String ASSEMBLY_STATE = "operator_state";
+    private static final String ASSEMBLY_STATE = io.tapstate.adapters.mongostore.SystemCollections.CACHE_NEST_STATE.collectionName();
 
     private static final int ROOTS = 2;
     private static final int CHILDREN_PER_ROOT = 2;
@@ -87,14 +87,13 @@ class AStopThatClearsTakesTheAssemblyStateWithItIT {
         seed(source);
 
         String targetUri = SharedMongo.replicaSetUrl(suffix + "_tgt");
-        String storeUri = SharedMongo.replicaSetUrl(suffix + "_state");
-        String assemblyStateUri = SharedMongo.assemblyStateUrl();
         EndpointAddress target = EndpointAddress.uri(targetUri);
 
-        try (MongoEndpoints mongo = new MongoEndpoints();
-                ServerHandle server = tier.launch(storeUri)) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints();
+                ServerHandle server = tier.launch(storage)) {
+            String assemblyStateUri = storage.cacheUri();
 
-            ControlPlane control = start(server, suffix, source, targetUri);
+            ControlPlane control = start(server, storage, suffix, source, targetUri);
 
             // Assembled and delivered: only then does this pipeline hold any assembly state at all.
             Await.until("the assembled documents to reach the target", TIMEOUT,
@@ -154,14 +153,13 @@ class AStopThatClearsTakesTheAssemblyStateWithItIT {
         seed(source);
 
         String targetUri = SharedMongo.replicaSetUrl(suffix + "_tgt");
-        String storeUri = SharedMongo.replicaSetUrl(suffix + "_state");
-        String assemblyStateUri = SharedMongo.assemblyStateUrl();
         EndpointAddress target = EndpointAddress.uri(targetUri);
 
-        try (MongoEndpoints mongo = new MongoEndpoints();
-                ServerHandle server = tier.launch(storeUri)) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints();
+                ServerHandle server = tier.launch(storage)) {
+            String assemblyStateUri = storage.cacheUri();
 
-            ControlPlane control = start(server, suffix, source, targetUri);
+            ControlPlane control = start(server, storage, suffix, source, targetUri);
 
             Await.until("the assembled documents to reach the target", TIMEOUT,
                     () -> mongo.count(target, PARENT_TABLE) == ROOTS,
@@ -210,7 +208,7 @@ class AStopThatClearsTakesTheAssemblyStateWithItIT {
      *
      * <p>The store keeps every pipeline's assembly state in one collection, keyed within it rather than
      * split by collection -- measured, after looking for a collection per pipeline and finding a single
-     * {@code operator_state}. So a clearing stop has to take this pipeline's entries out of a collection
+     * {@code nest_state}. So a clearing stop has to take this pipeline's entries out of a collection
      * other pipelines are still using, which is a sharper claim than dropping something of its own.
      *
      * <p>Matched on the pipeline's id appearing anywhere in the entry rather than on a key this case
@@ -227,9 +225,9 @@ class AStopThatClearsTakesTheAssemblyStateWithItIT {
 
     /** Everything up to and including the start. */
     private static ControlPlane start(
-            ServerHandle server, String pipelineId, Map<String, Object> source, String targetUri) {
+            ServerHandle server, PreparedNativeStore storage, String pipelineId, Map<String, Object> source, String targetUri) {
         ControlPlane control = new ControlPlane(server.baseUrl());
-        control.bootstrapAndLogin("e2e", "e2e-password");
+        storage.loginAndAwaitBusiness(control);
         control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
         control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 

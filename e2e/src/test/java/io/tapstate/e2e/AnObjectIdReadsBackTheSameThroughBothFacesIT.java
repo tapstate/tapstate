@@ -62,11 +62,11 @@ class AnObjectIdReadsBackTheSameThroughBothFacesIT {
 
     @Test
     void theSameDocumentCarriesTheSameIdentityOnTheBrowseFaceAndTheFollowFace() {
-        String storeUri = SharedMongo.replicaSetUrl("e2e_both_faces_store");
         String dataUri = SharedMongo.replicaSetUrl(DATABASE);
         EndpointAddress data = EndpointAddress.uri(dataUri);
 
-        try (ServerHandle server = InProcessServer.start(storeUri);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = InProcessServer.startPrepared(storage);
                 MongoEndpoints mongo = new MongoEndpoints()) {
             // Seeded with no identity of its own, so the driver assigns one - which is what an ordinary
             // collection holds and what neither face could agree on.
@@ -76,7 +76,7 @@ class AnObjectIdReadsBackTheSameThroughBothFacesIT {
             assertThat(seededId).as("the driver's own identity, which is the value under test").isNotNull();
 
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
             control.apply(Map.of("src_mongo.tap.yml", sourceYaml(dataUri)));
             control.discoverSchema(SOURCE_ID, "mongodb", Map.of("uri", dataUri, "database", DATABASE));

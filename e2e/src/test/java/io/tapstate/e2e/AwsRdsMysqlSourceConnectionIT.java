@@ -37,10 +37,10 @@ class AwsRdsMysqlSourceConnectionIT {
             statement.execute("INSERT INTO orders (id, name) VALUES (1, 'first')");
         }
 
-        String storeUri = SharedMongo.replicaSetUrl("aws_rds_source_connection_store");
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(storeUri)) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector("aws-rds-mysql", ConnectorJars.bytesFor("aws-rds-mysql"));
             control.apply(Map.of("rds.tap.yml", sourceYaml(settings)));
 
@@ -66,12 +66,12 @@ class AwsRdsMysqlSourceConnectionIT {
             statement.execute("INSERT INTO orders (id, name) VALUES (1, 'seeded')");
         }
 
-        String storeUri = SharedMongo.replicaSetUrl("aws_rds_data_flow_store");
         String targetUri = SharedMongo.replicaSetUrl("aws_rds_data_flow_target");
         EndpointAddress target = EndpointAddress.uri(targetUri);
-        try (MongoEndpoints mongo = new MongoEndpoints(); ServerHandle server = Tiers.IN_PROCESS.launch(storeUri)) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector("aws-rds-mysql", ConnectorJars.bytesFor("aws-rds-mysql"));
             control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 

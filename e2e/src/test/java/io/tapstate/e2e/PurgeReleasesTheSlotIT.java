@@ -62,14 +62,14 @@ class PurgeReleasesTheSlotIT {
         String suffix = tier.name().toLowerCase(Locale.ROOT);
         Map<String, Object> source = SharedPostgres.settings("purge_slot_" + suffix);
         createTables(source);
-        String storeUri = SharedMongo.replicaSetUrl("purge_slot_store_" + suffix);
         String targetUri = SharedMongo.replicaSetUrl("purge_slot_target_" + suffix);
         String p = "purge_p_" + suffix;
         String q = "purge_q_" + suffix;
 
-        try (ServerHandle server = tier.launch(storeUri); MongoEndpoints mongo = new MongoEndpoints()) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = tier.launch(storage); MongoEndpoints mongo = new MongoEndpoints()) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector("postgres", ConnectorJars.bytesFor("postgres"));
             control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
             Map<String, String> resources = new LinkedHashMap<>();

@@ -47,17 +47,17 @@ class DataBrowserMongoTimestampIT {
 
     @Test
     void readsTheTimestampAsTheInstantNamedByItsEpochSeconds() {
-        String storeUri = SharedMongo.replicaSetUrl("e2e_timestamp_store");
         String dataUri = SharedMongo.replicaSetUrl(DATABASE);
 
-        try (ServerHandle server = InProcessServer.start(storeUri);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = InProcessServer.startPrepared(storage);
                 MongoEndpoints mongo = new MongoEndpoints()) {
             mongo.insert(EndpointAddress.uri(dataUri), COLLECTION,
                     new Document("_id", DOCUMENT_ID)
                             .append(TIMESTAMP_FIELD, new BsonTimestamp(1_767_225_600, 7)));
 
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
             control.apply(Map.of("src_mongo.tap.yml", sourceYaml(dataUri)));
 

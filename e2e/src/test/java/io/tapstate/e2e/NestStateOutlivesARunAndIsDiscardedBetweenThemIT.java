@@ -1,84 +1,47 @@
 package io.tapstate.e2e;
 
-import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
-import com.mongodb.client.MongoCollection;
-import io.tapstate.adapters.mongostore.MongoNestDeadLetterStore;
-import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.adapters.mongostore.MongoCacheDomain;
+import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
+import io.tapstate.adapters.mongostore.MongoConnectionSettings;
+import io.tapstate.adapters.mongostore.SystemCollections;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.event.ChainPosition;
+import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.runtime.engine.OperatorMapCoordinates;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.NestDeadLetterRecord;
+import io.tapstate.spi.store.OperatorPlacement;
+import io.tapstate.spi.store.PipelineIntentScope;
+import io.tapstate.spi.store.RequiredDeadLetterContext;
+import io.tapstate.spi.store.RequiredDeadLetterFact;
 import io.tapstate.testsupport.DockerGate;
 import org.bson.Document;
+import org.bson.types.Binary;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import java.sql.Connection;
 import java.sql.Statement;
+import java.time.Duration;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-/**
- * Two runs of one pipeline, each with a source and a store of its own, and the second does not serve the
- * first one's documents.
- *
- * <p>A pipeline is identified by the id its specification gives it, and so are the nest step and the view
- * inside it. Two runs of the same specification therefore agree on every one of those names while
- * agreeing on nothing else - different databases, different stores, different data. Anything the runtime
- * keeps under those names, rather than under something belonging to the run, is inherited by the second
- * run from the first.
- *
- * <p>This is the last surface that could explain a leak measured across two runs of one example: the
- * second run's source held the seeded value, its store began empty, and the step that writes the other
- * value never executed - yet the document it served carried the first run's value. Source scoping was
- * ruled out separately by {@link ACdcSourceReadsOnlyItsOwnDatabaseIT}, and the databases were measured to
- * be distinct, which leaves what the runtime carries between runs.
- *
- * <p>What the assertions have to discriminate:
- * <ul>
- *   <li><b>The second run must actually run.</b> A pipeline that failed to start serves nothing, which
- *       would satisfy "does not show the first run's value" for the wrong reason. So the second run is
- *       first held to serving its own seeded value.</li>
- *   <li><b>The value read back is one only the first run ever writes.</b> A value both runs could produce
- *       would not say which run produced it.</li>
- *   <li><b>The array is read as well as the scalar.</b> Inheriting an assembled document and inheriting a
- *       scalar are different failures, and the second is invisible to an assertion about children.</li>
- * </ul>
- *
- * <p>Gated on Docker and real connector jars. Run it with:
- *
- * <pre>
- *   mvn -pl e2e -am verify -Dapi.version=1.44 \
- *     -Dtapstate.e2e.connectors-dir=/path/to/connectors \
- *     -Dit.test=NestStateOutlivesARunAndIsDiscardedBetweenThemIT -Dfailsafe.failIfNoSpecifiedTests=false
- * </pre>
- */
+/** Native installation identity bounds retained Nest state and its required configuration diagnostics. */
 class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
-
     private static final String PARENTS = "orders";
     private static final String CHILDREN = "order_items";
-    // A pipeline id of its own per test. The two tests would otherwise collide through exactly the
-    // mechanism under examination: each starts by running the shared id once and writing the first run's
-    // value under it, so whichever ran second would inherit before its own first run had begun.
     private static final String VIEW = "order_state";
-    private static final String PIPELINE_ID = "assembled_orders_leak";
-    private static final String BOUNDARY_PIPELINE_ID = "assembled_orders_boundary";
-    private static final String CONFIGURED_PIPELINE_ID = "assembled_orders_configured_database";
-    private static final String CONFIGURED_VIEW = "configured_order_state";
-    private static final String CONFIGURED_STATE_A = "issue431_e2e_state_a";
-    private static final String CONFIGURED_STATE_B = "issue431_e2e_state_b";
-    private static final String MIGRATION_CONTROL = "issue456_migration_control";
-    private static final String MIGRATION_DEFAULT = "issue456_migration_default";
-    private static final String MIGRATION_OLD = "issue456_migration_old";
-    private static final String MIGRATION_NEW = "issue456_migration_new";
-    private static final String MIGRATION_PIPELINE = "assembled_orders_migration";
-    private static final String MIGRATION_VIEW = "migrated_order_state";
-
+    private static final String PIPELINE = "assembled_orders";
+    private static final String STEP = "order_doc";
     private static final String SEEDED = "seeded-customer";
-    /** Written only by the first run, so reading it in the second says where it came from. */
     private static final String ONLY_THE_FIRST_RUN = "written-by-the-first-run";
 
     @BeforeAll
@@ -88,424 +51,311 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
     }
 
     @Test
-    void aSecondRunOfTheSamePipelineInheritsTheFirstsAssemblyWhenTheStateIsLeftInPlace() throws Exception {
-        // The first run assembles, then changes its parent row to a value nothing else ever writes.
-        Map<String, Object> firstSource = SharedMySql.settings("nest_inherit_src_one");
+    void equalPipelineNamesInIndependentInstallationsDoNotInheritEachOthersAssembly() throws Exception {
+        var firstSource = SharedMySql.settings("nest_inherit_src_one");
+        var secondSource = SharedMySql.settings("nest_inherit_src_two");
         seed(firstSource);
-        String firstWarehouse = SharedMongo.replicaSetUrl("nest_inherit_warehouse_one");
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(
-                        SharedMongo.replicaSetUrl("nest_inherit_state_one"));
-                MongoEndpoints mongo = new MongoEndpoints()) {
-            start(server, firstSource, firstWarehouse);
-            EndpointAddress warehouse = EndpointAddress.uri(firstWarehouse);
-            awaitCustomer(mongo, warehouse, SEEDED, "the first run's own assembly");
-
-            update(firstSource, ONLY_THE_FIRST_RUN);
-            awaitCustomer(mongo, warehouse, ONLY_THE_FIRST_RUN, "the first run's own change");
-        }
-
-        // The second run: same pipeline id, same nest step id, same view id - and nothing else in common.
-        Map<String, Object> secondSource = SharedMySql.settings("nest_inherit_src_two");
         seed(secondSource);
-        String secondWarehouse = SharedMongo.replicaSetUrl("nest_inherit_warehouse_two");
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(
-                        SharedMongo.replicaSetUrl("nest_inherit_state_two"));
+        try (PreparedNativeStore first = PreparedNativeStore.create();
+                PreparedNativeStore second = PreparedNativeStore.create();
                 MongoEndpoints mongo = new MongoEndpoints()) {
-            EndpointAddress warehouse = EndpointAddress.uri(secondWarehouse);
-            assertThat(mongo.collections(secondWarehouse))
-                    .as("the second run's store before it starts")
-                    .isEmpty();
-
-            start(server, secondSource, secondWarehouse);
-
-            // What a deployment is promised: the assembly this pipeline id had is still there, so the
-            // second run serves it without having read a single row of its own source.
-            awaitCustomer(mongo, warehouse, ONLY_THE_FIRST_RUN,
-                    "the assembly the first run left under this pipeline id");
-
-            Document served = only(mongo.documents(warehouse, VIEW));
-            assertThat(served.getString("customer"))
-                    .as("the customer the second run serves with nest state left in place - it is the "
-                            + "first run's value, from a source this run never read")
-                    .isEqualTo(ONLY_THE_FIRST_RUN);
+            assertThat(first.clusterId()).isNotEqualTo(second.clusterId());
+            assertThat(first.cacheDatabase()).isNotEqualTo(second.cacheDatabase());
+            try (ServerHandle server = Tiers.IN_PROCESS.launch(first)) {
+                start(server, first, firstSource);
+                awaitCustomer(mongo, first, SEEDED, "the first installation's own assembly");
+                update(firstSource, ONLY_THE_FIRST_RUN);
+                awaitCustomer(mongo, first, ONLY_THE_FIRST_RUN, "the first installation's own change");
+            }
+            var original = stateRows(first);
+            assertThat(original).as("the first installation retains actual native state").isNotEmpty();
+            assertThat(shapeRows(first)).isNotEmpty();
+            assertThat(stateRows(second)).isEmpty();
+            assertThat(mongo.documents(EndpointAddress.uri(second.masterUri()), VIEW)).isEmpty();
+            try (ServerHandle server = Tiers.IN_PROCESS.launch(second)) {
+                start(server, second, secondSource);
+                awaitCustomer(mongo, second, SEEDED, "the second installation to serve its own source");
+                Document served = only(mongo.documents(EndpointAddress.uri(second.masterUri()), VIEW));
+                assertThat(served.getString("customer")).isEqualTo(SEEDED).isNotEqualTo(ONLY_THE_FIRST_RUN);
+                assertThat(served.getList("items", Document.class)).extracting(item -> item.getString("sku"))
+                        .containsExactlyInAnyOrder("sku-1", "sku-2");
+                assertThat(stateRows(second)).isNotEmpty();
+                assertThat(shapeRows(second)).isNotEmpty();
+            }
+            assertThat(stateRows(first)).as("the second installation never mutates the retained first state")
+                    .containsExactlyElementsOf(original);
         }
     }
 
-    /**
-     * Two servers receive different deployment settings while every operator identity stays equal. The
-     * database-location assertions are what make this a wiring witness: fixing the adapter while ignoring
-     * the server setting, or reverting the assembly root to the compatibility default, leaves the named
-     * database empty and fails before later source events could mask the leak.
-     */
     @Test
-    void configuredOperatorStateDatabasesKeepEqualPipelineIdentitiesApart() throws Exception {
-        dropDatabases(CONFIGURED_STATE_A, CONFIGURED_STATE_B, SharedMongo.OPERATOR_STATE_DATABASE);
-
-        Map<String, Object> firstSource = SharedMySql.settings("nest_configured_src_one");
-        seed(firstSource);
-        String firstWarehouse = SharedMongo.replicaSetUrl("nest_configured_warehouse_one");
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(
-                        SharedMongo.replicaSetUrl("nest_configured_control_one"), CONFIGURED_STATE_A);
-                MongoEndpoints mongo = new MongoEndpoints()) {
-            start(server, firstSource, firstWarehouse, CONFIGURED_PIPELINE_ID, CONFIGURED_VIEW);
-            EndpointAddress warehouse = EndpointAddress.uri(firstWarehouse);
-            awaitCustomer(mongo, warehouse, CONFIGURED_VIEW, SEEDED,
-                    "the first configured deployment's assembly");
-            update(firstSource, ONLY_THE_FIRST_RUN);
-            awaitCustomer(mongo, warehouse, CONFIGURED_VIEW, ONLY_THE_FIRST_RUN,
-                    "the first configured deployment's change");
-        }
-
-        assertThat(operatorStateDocuments(CONFIGURED_STATE_A))
-                .as("state written through the first server's deployment setting")
-                .isPositive();
-        assertThat(operatorStateDocuments(CONFIGURED_STATE_B)).isZero();
-        assertThat(operatorStateDocuments(SharedMongo.OPERATOR_STATE_DATABASE))
-                .as("the compatibility default was not selected by either explicit deployment")
-                .isZero();
-
-        Map<String, Object> secondSource = SharedMySql.settings("nest_configured_src_two");
-        seed(secondSource);
-        String secondWarehouse = SharedMongo.replicaSetUrl("nest_configured_warehouse_two");
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(
-                        SharedMongo.replicaSetUrl("nest_configured_control_two"), CONFIGURED_STATE_B);
-                MongoEndpoints mongo = new MongoEndpoints()) {
-            start(server, secondSource, secondWarehouse, CONFIGURED_PIPELINE_ID, CONFIGURED_VIEW);
-            EndpointAddress warehouse = EndpointAddress.uri(secondWarehouse);
-            awaitCustomer(mongo, warehouse, CONFIGURED_VIEW, SEEDED,
-                    "the second configured deployment's own assembly");
-            assertThat(customer(mongo, warehouse, CONFIGURED_VIEW))
-                    .as("the equal pipeline identity does not inherit the first deployment's value")
-                    .isEqualTo(SEEDED);
-        }
-
-        assertThat(operatorStateDocuments(CONFIGURED_STATE_A)).isPositive();
-        assertThat(operatorStateDocuments(CONFIGURED_STATE_B))
-                .as("state written through the second server's deployment setting")
-                .isPositive();
-        assertThat(operatorStateDocuments(SharedMongo.OPERATOR_STATE_DATABASE)).isZero();
-    }
-
-    @Test
-    void aStoppedNestsStateCanBeCopiedAndResumedFromItsNewDatabase() throws Exception {
-        dropDatabases(MIGRATION_CONTROL, MIGRATION_DEFAULT, MIGRATION_OLD, MIGRATION_NEW);
-        Map<String, Object> source = SharedMySql.settings("nest_migration_source");
+    void theSameInstallationRetainsAWaitingChildAcrossAStoppingServer() throws Exception {
+        var source = SharedMySql.settings("nest_continuation_source");
         seedChildWaitingForParent(source);
-        String warehouse = SharedMongo.replicaSetUrl("nest_migration_warehouse");
-        String controlUri = SharedMongo.replicaSetUrl(MIGRATION_CONTROL);
-
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(controlUri, MIGRATION_DEFAULT)) {
-            ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
-            control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
-            control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
-            applyMigrationResources(control, source, warehouse, MIGRATION_OLD);
-            control.discoverSchema("src_parents", "mysql", source);
-            control.discoverSchema("src_children", "mysql", source);
-            control.lifecycle(MIGRATION_PIPELINE, LifecycleVerb.START);
-
-            Await.until("the child waiting for its parent is durable in the old state database",
-                    () -> mapStateDocuments(MIGRATION_OLD, MIGRATION_PIPELINE, "order_doc") > 0,
-                    () -> Long.toString(mapStateDocuments(
-                            MIGRATION_OLD, MIGRATION_PIPELINE, "order_doc")));
-            control.stop(MIGRATION_PIPELINE, false);
-            Await.until("the pipeline is stopped without clearing its continuation",
-                    () -> control.state(MIGRATION_PIPELINE).orElse(null) == PipelineState.STOPPED,
-                    () -> control.state(MIGRATION_PIPELINE).map(Enum::name).orElse("no observation"));
+        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints()) {
+            PipelineIntentScope original;
+            try (ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
+                ControlPlane control = start(server, storage, source);
+                awaitPendingState(storage);
+                original = scope(storage);
+                assertThat(shapeRows(storage)).isNotEmpty();
+                control.stop(PIPELINE, false);
+                awaitState(control, PipelineState.STOPPED);
+                assertThat(stateRows(storage)).isNotEmpty();
+            }
+            var held = stateRows(storage);
+            var shapes = shapeRows(storage);
+            try (ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
+                ControlPlane control = new ControlPlane(server.baseUrl());
+                storage.loginAndAwaitBusiness(control);
+                assertThat(scope(storage)).isEqualTo(original);
+                assertThat(stateRows(storage)).containsExactlyElementsOf(held);
+                assertThat(shapeRows(storage)).containsExactlyElementsOf(shapes);
+                // No reapply, installation preparation, or connector registration on this server.
+                control.lifecycle(PIPELINE, LifecycleVerb.START);
+                awaitState(control, PipelineState.RUNNING);
+                insertParent(source, "arrived-after-restart");
+                Await.until("the retained waiting child to join its parent after restart",
+                        () -> hasWaitingChild(mongo, storage),
+                        () -> mongo.documents(EndpointAddress.uri(storage.masterUri()), VIEW).toString());
+                Document served = only(mongo.documents(EndpointAddress.uri(storage.masterUri()), VIEW));
+                assertThat(served.getString("customer")).isEqualTo("arrived-after-restart");
+                assertThat(served.getList("items", Document.class)).extracting(item -> item.getString("sku"))
+                        .containsExactly("waiting-sku");
+                control.stop(PIPELINE, true);
+                Await.until("the original installation's Nest payload to be cleared",
+                        () -> control.state(PIPELINE).orElse(null) == PipelineState.STOPPED
+                                && stateRows(storage).isEmpty() && shapeRows(storage).isEmpty(),
+                        () -> "state=" + stateRows(storage) + ", shapes=" + shapeRows(storage));
+            }
         }
-
-        seedMigrationDeadLetter(MIGRATION_OLD, MIGRATION_PIPELINE, "order_doc");
-        long sourceStateCount = mapStateDocuments(MIGRATION_OLD, MIGRATION_PIPELINE, "order_doc");
-        long sourceShapeCount = shapeRecordDocuments(MIGRATION_OLD, MIGRATION_PIPELINE, "order_doc");
-        long sourceDeadLetterCount = deadLetterDocuments(MIGRATION_OLD, MIGRATION_PIPELINE, "order_doc");
-        copyNestState(MIGRATION_OLD, MIGRATION_NEW, MIGRATION_PIPELINE, "order_doc");
-        assertThat(mapStateDocuments(MIGRATION_NEW, MIGRATION_PIPELINE, "order_doc"))
-                .as("the migration copied the in-flight child state")
-                .isEqualTo(sourceStateCount);
-        assertThat(shapeRecordDocuments(MIGRATION_NEW, MIGRATION_PIPELINE, "order_doc"))
-                .as("the migration copied the shape record beside the map state")
-                .isEqualTo(sourceShapeCount)
-                .isPositive();
-        assertThat(deadLetterDocuments(MIGRATION_NEW, MIGRATION_PIPELINE, "order_doc"))
-                .as("the migration copied the Nest's dead letters")
-                .isEqualTo(sourceDeadLetterCount)
-                .isPositive();
-
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(controlUri, MIGRATION_DEFAULT);
-                MongoEndpoints mongo = new MongoEndpoints()) {
-            ControlPlane control = new ControlPlane(server.baseUrl());
-            control.login("e2e", "e2e-password");
-            applyMigrationResources(control, source, warehouse, MIGRATION_NEW);
-            control.lifecycle(MIGRATION_PIPELINE, LifecycleVerb.START);
-            Await.until("the migrated pipeline is running before the parent arrives",
-                    () -> control.state(MIGRATION_PIPELINE).orElse(null) == PipelineState.RUNNING,
-                    () -> control.state(MIGRATION_PIPELINE).map(Enum::name).orElse("no observation"));
-
-            insertParent(source, "arrived-after-migration");
-            EndpointAddress target = EndpointAddress.uri(warehouse);
-            Await.until("the migrated child joins the parent that arrived after restart",
-                    () -> migratedDocumentHasChild(mongo, target),
-                    () -> mongo.documents(target, MIGRATION_VIEW).toString());
-
-            Document migrated = only(mongo.documents(target, MIGRATION_VIEW));
-            assertThat(migrated.getString("customer")).isEqualTo("arrived-after-migration");
-            assertThat(migrated.getList("items", Document.class))
-                    .extracting(item -> item.getString("sku"))
-                    .containsExactly("waiting-sku");
-
-            control.stop(MIGRATION_PIPELINE, true);
-            Await.until("the migrated pipeline is purged from its new database",
-                    () -> control.state(MIGRATION_PIPELINE).orElse(null) == PipelineState.STOPPED
-                            && mapStateDocuments(MIGRATION_NEW, MIGRATION_PIPELINE, "order_doc") == 0
-                            && shapeRecordDocuments(MIGRATION_NEW, MIGRATION_PIPELINE, "order_doc") == 0
-                            && deadLetterDocuments(MIGRATION_NEW, MIGRATION_PIPELINE, "order_doc") == 0,
-                    () -> "state=" + mapStateDocuments(
-                            MIGRATION_NEW, MIGRATION_PIPELINE, "order_doc")
-                            + ", shape=" + shapeRecordDocuments(
-                                    MIGRATION_NEW, MIGRATION_PIPELINE, "order_doc")
-                            + ", deadLetters=" + deadLetterDocuments(
-                                    MIGRATION_NEW, MIGRATION_PIPELINE, "order_doc"));
-        }
-
-        assertThat(mapStateDocuments(MIGRATION_OLD, MIGRATION_PIPELINE, "order_doc"))
-                .as("copying, switching, and later purging never delete the rollback source")
-                .isEqualTo(sourceStateCount);
-        assertThat(shapeRecordDocuments(MIGRATION_OLD, MIGRATION_PIPELINE, "order_doc"))
-                .as("the rollback source keeps its shape record too")
-                .isEqualTo(sourceShapeCount);
-        assertThat(deadLetterDocuments(MIGRATION_OLD, MIGRATION_PIPELINE, "order_doc"))
-                .as("the rollback source keeps its dead letters too")
-                .isEqualTo(sourceDeadLetterCount);
     }
 
-    /**
-     * The same two runs, with the second one's pipeline and view named differently - and nothing leaks.
-     *
-     * <p>Its sibling above changes exactly one thing relative to this: whether the two runs agree on those
-     * names. Run as a pair they say where the boundary is, which is what turns "a leak happened" into
-     * something anyone can act on. Neither is worth much alone: this one passing proves only that two
-     * unrelated pipelines do not collide, which nobody doubted.
-     */
     @Test
-    void discardingTheStateBetweenRunsIsWhatMakesTheSecondServeItsOwnData() throws Exception {
-        Map<String, Object> firstSource = SharedMySql.settings("nest_boundary_src_one");
+    void copiedStateCannotBeAdoptedUnderItsForeignOriginalIdentity() throws Exception {
+        var firstSource = SharedMySql.settings("nest_identity_src_one");
+        var secondSource = SharedMySql.settings("nest_identity_src_two");
         seed(firstSource);
-        String firstWarehouse = SharedMongo.replicaSetUrl("nest_boundary_warehouse_one");
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(
-                        SharedMongo.replicaSetUrl("nest_boundary_state_one"));
-                MongoEndpoints mongo = new MongoEndpoints()) {
-            start(server, firstSource, firstWarehouse, BOUNDARY_PIPELINE_ID, VIEW);
-            EndpointAddress warehouse = EndpointAddress.uri(firstWarehouse);
-            awaitCustomer(mongo, warehouse, SEEDED, "the first run's own assembly");
-            update(firstSource, ONLY_THE_FIRST_RUN);
-            awaitCustomer(mongo, warehouse, ONLY_THE_FIRST_RUN, "the first run's own change");
-        }
-
-        // The one line that separates the two runs. Without it this test is its sibling above.
-        SharedMongo.discardNestState();
-
-        Map<String, Object> secondSource = SharedMySql.settings("nest_boundary_src_two");
         seed(secondSource);
-        String secondWarehouse = SharedMongo.replicaSetUrl("nest_boundary_warehouse_two");
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(
-                        SharedMongo.replicaSetUrl("nest_boundary_state_two"));
+        try (PreparedNativeStore first = PreparedNativeStore.create();
+                PreparedNativeStore second = PreparedNativeStore.create();
                 MongoEndpoints mongo = new MongoEndpoints()) {
-            // The one line under test is the discard; everything else, the view identity
-            // included, matches the first run so nothing but the discard separates them.
-            start(server, secondSource, secondWarehouse, BOUNDARY_PIPELINE_ID, VIEW);
-            EndpointAddress warehouse = EndpointAddress.uri(secondWarehouse);
-            awaitCustomer(mongo, warehouse, SEEDED, "the second run's own assembly");
-
-            assertThat(customer(mongo, warehouse, VIEW))
-                    .as("the customer the second run serves once the state has been discarded")
-                    .isEqualTo(SEEDED);
+            try (ServerHandle server = Tiers.IN_PROCESS.launch(first)) {
+                ControlPlane control = start(server, first, firstSource);
+                awaitCustomer(mongo, first, SEEDED, "the original installation's real assembly");
+                awaitPendingState(first);
+                control.stop(PIPELINE, false);
+                awaitState(control, PipelineState.STOPPED);
+            }
+            try (ServerHandle server = Tiers.IN_PROCESS.launch(second)) {
+                ControlPlane control = start(server, second, secondSource);
+                awaitCustomer(mongo, second, SEEDED, "the receiving installation's own real assembly");
+                awaitPendingState(second);
+                control.stop(PIPELINE, false);
+                awaitState(control, PipelineState.STOPPED);
+            }
+            var firstRows = stateRows(first);
+            var secondRows = stateRows(second);
+            var original = scope(first);
+            var receiving = scope(second);
+            assertThat(original.clusterId()).isNotEqualTo(receiving.clusterId());
+            assertThat(original.cacheIncarnation()).isNotEqualTo(receiving.cacheIncarnation());
+            var retained = placement(original, first.cacheDatabase());
+            var retargeted = new OperatorPlacement(original, second.cacheDatabase(), retained.resource(),
+                    retained.stepId(), retained.pathId(), retained.namespace());
+            byte[] copied = firstRows.getFirst().get("state", Binary.class).getData();
+            try (MongoCacheDomain origin = cache(first); MongoCacheDomain target = cache(second)) {
+                assertThat(origin.operatorState(retained).count(retained.mapName()))
+                        .as("the source coordinates really hold a retained assembly").isPositive();
+                // Submit copied bytes through the existing guarded port with their unchanged original
+                // identity. No database rows are cloned or rewritten as a relocation feature.
+                assertThatThrownBy(() -> target.operatorState(retargeted)
+                        .save(retargeted.mapName(), "copied-root", copied))
+                        .isInstanceOfSatisfying(TapstateException.class,
+                                failure -> assertThat(failure.code()).isEqualTo(IoError.CACHE_BUSINESS_FENCED));
+            }
+            assertThat(stateRows(first)).containsExactlyElementsOf(firstRows);
+            assertThat(stateRows(second)).containsExactlyElementsOf(secondRows);
         }
     }
 
-    private static void start(ServerHandle server, Map<String, Object> source, String warehouseUri) {
-        start(server, source, warehouseUri, PIPELINE_ID, VIEW);
+    @Test
+    void requiredDeadLettersRemainInConfigurationUntilTheirOriginalPipelineIsRetired() throws Exception {
+        var source = SharedMySql.settings("nest_required_diagnostic_source");
+        seedChildWaitingForParent(source);
+        try (PreparedNativeStore storage = PreparedNativeStore.create()) {
+            RequiredDeadLetterContext context;
+            RequiredDeadLetterFact fact;
+            try (ServerHandle server = Tiers.IN_PROCESS.launch(storage);
+                    MongoConfigurationDomain configuration = configuration(storage)) {
+                ControlPlane control = start(server, storage, source);
+                awaitPendingState(storage);
+                var at = placement(scope(storage), storage.cacheDatabase());
+                var original = at.scope();
+                context = new RequiredDeadLetterContext(original.clusterId(), original.bindingVersion(), PIPELINE,
+                        STEP, at.pathId(), original.stateGeneration(), at.mapName());
+                fact = new RequiredDeadLetterFact(original.cacheIncarnation(),
+                        Map.of("src_children", new ChainPosition(new SourceOrder(1, 1), "1:1")),
+                        new NestDeadLetterRecord(context.namespace(), "waiting-child", "src_children", "1:1", 0, 9_000,
+                                Map.of("sku", "waiting-sku")));
+                assertThat(configuration.requiredDeadLetters().record(context, 0, fact)).isTrue();
+                assertThat(configuration.requiredDeadLetters().find(context, "waiting-child").orElseThrow().fact())
+                        .isEqualTo(fact);
+                assertThat(deadLetterRows(storage)).hasSize(1);
+                assertNoCachedDeadLetters(storage);
+                control.stop(PIPELINE, false);
+                awaitState(control, PipelineState.STOPPED);
+                assertThat(configuration.requiredDeadLetters().find(context, "waiting-child")).isPresent();
+            }
+            try (ServerHandle server = Tiers.IN_PROCESS.launch(storage);
+                    MongoConfigurationDomain configuration = configuration(storage)) {
+                ControlPlane control = new ControlPlane(server.baseUrl());
+                storage.loginAndAwaitBusiness(control);
+                var retained = configuration.requiredDeadLetters().find(context, "waiting-child").orElseThrow();
+                assertThat(retained.revision()).isEqualTo(1);
+                assertThat(retained.fact()).isEqualTo(fact);
+                assertNoCachedDeadLetters(storage);
+                // Retirement uses the control plane; the test never fabricates a retirement permit.
+                control.deleteArtifact(PIPELINE, control.contentHash(PIPELINE));
+                Await.until("the retired pipeline's required diagnostics and native payload to be reclaimed",
+                        () -> deadLetterRows(storage).isEmpty() && stateRows(storage).isEmpty() && shapeRows(storage).isEmpty(),
+                        () -> "diagnostics=" + deadLetterRows(storage) + ", state=" + stateRows(storage));
+                assertThat(configuration.requiredDeadLetters().find(context, "waiting-child")).isEmpty();
+                assertThatThrownBy(() -> configuration.requiredDeadLetters().record(context, 0, fact))
+                        .isInstanceOfSatisfying(TapstateException.class,
+                                failure -> assertThat(failure.code()).isEqualTo(IoError.REQUIRED_DEAD_LETTER_FENCED));
+            }
+        }
     }
 
-    private static void start(ServerHandle server, Map<String, Object> source, String warehouseUri,
-            String pipelineId, String view) {
+    private static ControlPlane start(ServerHandle server, PreparedNativeStore storage, Map<String, Object> source) {
         ControlPlane control = new ControlPlane(server.baseUrl());
-        control.bootstrapAndLogin("e2e", "e2e-password");
+        storage.loginAndAwaitBusiness(control);
         control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
         control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
-
-        Map<String, String> resources = new LinkedHashMap<>();
-        resources.put("src_parents.tap.yml", sourceYaml("src_parents", source, PARENTS));
-        resources.put("src_children.tap.yml", sourceYaml("src_children", source, CHILDREN));
-        resources.put("views.tap.yml", viewsYaml(warehouseUri));
-        resources.put("pipeline.tap.yml", pipelineYaml(pipelineId, view));
+        var resources = new LinkedHashMap<String, String>();
+        resources.put("parents.tap.yml", sourceYaml("src_parents", source, PARENTS));
+        resources.put("children.tap.yml", sourceYaml("src_children", source, CHILDREN));
+        resources.put("pipeline.tap.yml", pipelineYaml());
         control.apply(resources);
         control.discoverSchema("src_parents", "mysql", source);
         control.discoverSchema("src_children", "mysql", source);
-        control.lifecycle(pipelineId, LifecycleVerb.START);
+        control.lifecycle(PIPELINE, LifecycleVerb.START);
+        return control;
     }
 
-    private static void applyMigrationResources(ControlPlane control, Map<String, Object> source,
-            String warehouseUri, String stateDatabase) {
-        Map<String, String> resources = new LinkedHashMap<>();
-        resources.put("src_parents.tap.yml", sourceYaml("src_parents", source, PARENTS));
-        resources.put("src_children.tap.yml", sourceYaml("src_children", source, CHILDREN));
-        resources.put("views.tap.yml", viewsYaml(warehouseUri));
-        resources.put("pipeline.tap.yml",
-                pipelineYaml(MIGRATION_PIPELINE, MIGRATION_VIEW, stateDatabase));
-        control.apply(resources);
+    private static MongoConfigurationDomain configuration(PreparedNativeStore storage) {
+        return MongoConfigurationDomain.openExisting(new MongoConnectionSettings(
+                storage.configurationUri(), null, Duration.ofSeconds(5)));
     }
 
-    /** One parent with two children, identical in both runs so only the changed value tells them apart. */
+    private static MongoCacheDomain cache(PreparedNativeStore storage) {
+        try (var configuration = configuration(storage)) {
+            return MongoCacheDomain.connect(configuration.bindings().load().orElseThrow().cache(),
+                    Duration.ofSeconds(5), "native-nest-witness");
+        }
+    }
+
+    private static PipelineIntentScope scope(PreparedNativeStore storage) {
+        try (var configuration = configuration(storage)) {
+            var business = configuration.bindings().cachePreparation().orElseThrow().businessScope();
+            var mapping = configuration.pipelineStates().read(PIPELINE).orElseThrow();
+            return new PipelineIntentScope(business.clusterId(), business.bindingVersion(), business.cacheIncarnation(),
+                    PIPELINE, mapping.stateGeneration());
+        }
+    }
+
+    private static OperatorPlacement placement(PipelineIntentScope scope, String database) {
+        return OperatorMapCoordinates.nest(scope, database, STEP, List.of(), OperatorMapCoordinates.NestMap.STATE, null);
+    }
+
+    private static List<Document> stateRows(PreparedNativeStore storage) {
+        return rows(storage.cacheUri(), storage.cacheDatabase(), SystemCollections.CACHE_NEST_STATE,
+                new Document("_id.placement.scope.pipelineId", PIPELINE));
+    }
+
+    private static List<Document> shapeRows(PreparedNativeStore storage) {
+        return rows(storage.cacheUri(), storage.cacheDatabase(), SystemCollections.CACHE_NEST_SHAPES,
+                new Document("_id.scope.pipelineId", PIPELINE));
+    }
+
+    private static List<Document> deadLetterRows(PreparedNativeStore storage) {
+        return rows(storage.configurationUri(), storage.configurationDatabase(), SystemCollections.CONFIG_NEST_DEAD_LETTERS,
+                new Document("_id.pipelineId", PIPELINE));
+    }
+
+    private static List<Document> rows(String uri, String database, SystemCollections table, Document filter) {
+        try (var client = MongoClients.create(uri)) {
+            return table.on(client.getDatabase(database)).find(filter).sort(new Document("_id", 1)).into(new ArrayList<>());
+        }
+    }
+
+    private static void assertNoCachedDeadLetters(PreparedNativeStore storage) {
+        try (var client = MongoClients.create(storage.cacheUri())) {
+            assertThat(client.getDatabase(storage.cacheDatabase()).listCollectionNames().into(new ArrayList<>()))
+                    .doesNotContain(SystemCollections.CONFIG_NEST_DEAD_LETTERS.collectionName());
+        }
+    }
+
+    private static void awaitPendingState(PreparedNativeStore storage) {
+        Await.until("the native Nest to retain its real state", () -> !stateRows(storage).isEmpty(),
+                () -> stateRows(storage).toString());
+    }
+
+    private static void awaitState(ControlPlane control, PipelineState expected) {
+        Await.until("the pipeline to reach " + expected, () -> control.state(PIPELINE).orElse(null) == expected,
+                () -> control.state(PIPELINE).toString());
+    }
+
+    private static void awaitCustomer(MongoEndpoints mongo, PreparedNativeStore storage, String expected, String what) {
+        Await.until(what, () -> {
+            var rows = mongo.documents(EndpointAddress.uri(storage.masterUri()), VIEW);
+            return rows.size() == 1 && expected.equals(rows.getFirst().getString("customer"));
+        }, () -> mongo.documents(EndpointAddress.uri(storage.masterUri()), VIEW).toString());
+    }
+
+    private static boolean hasWaitingChild(MongoEndpoints mongo, PreparedNativeStore storage) {
+        var rows = mongo.documents(EndpointAddress.uri(storage.masterUri()), VIEW);
+        if (rows.size() != 1) return false;
+        var items = rows.getFirst().getList("items", Document.class);
+        return items != null && items.size() == 1 && "waiting-sku".equals(items.getFirst().getString("sku"));
+    }
+
+    private static Document only(List<Document> rows) {
+        assertThat(rows).hasSize(1);
+        return rows.getFirst();
+    }
+
     private static void seed(Map<String, Object> settings) throws Exception {
-        try (Connection connection = SharedMySql.connect(settings);
-                Statement statement = connection.createStatement()) {
+        try (Connection connection = SharedMySql.connect(settings); Statement statement = connection.createStatement()) {
             statement.execute("DROP TABLE IF EXISTS " + CHILDREN);
             statement.execute("DROP TABLE IF EXISTS " + PARENTS);
             statement.execute("CREATE TABLE " + PARENTS + " (id INT PRIMARY KEY, customer VARCHAR(64))");
-            statement.execute("CREATE TABLE " + CHILDREN
-                    + " (id INT PRIMARY KEY, order_id INT, sku VARCHAR(64))");
+            statement.execute("CREATE TABLE " + CHILDREN + " (id INT PRIMARY KEY, order_id INT, sku VARCHAR(64))");
             statement.execute("INSERT INTO " + PARENTS + " (id, customer) VALUES (1, '" + SEEDED + "')");
-            statement.execute("INSERT INTO " + CHILDREN
-                    + " (id, order_id, sku) VALUES (1, 1, 'sku-1'), (2, 1, 'sku-2')");
+            statement.execute("INSERT INTO " + CHILDREN + " (id, order_id, sku) VALUES (1, 1, 'sku-1'), (2, 1, 'sku-2')");
         }
     }
 
     private static void seedChildWaitingForParent(Map<String, Object> settings) throws Exception {
-        try (Connection connection = SharedMySql.connect(settings);
-                Statement statement = connection.createStatement()) {
+        try (Connection connection = SharedMySql.connect(settings); Statement statement = connection.createStatement()) {
             statement.execute("DROP TABLE IF EXISTS " + CHILDREN);
             statement.execute("DROP TABLE IF EXISTS " + PARENTS);
             statement.execute("CREATE TABLE " + PARENTS + " (id INT PRIMARY KEY, customer VARCHAR(64))");
-            statement.execute("CREATE TABLE " + CHILDREN
-                    + " (id INT PRIMARY KEY, order_id INT, sku VARCHAR(64))");
-            statement.execute("INSERT INTO " + CHILDREN
-                    + " (id, order_id, sku) VALUES (1, 1, 'waiting-sku')");
+            statement.execute("CREATE TABLE " + CHILDREN + " (id INT PRIMARY KEY, order_id INT, sku VARCHAR(64))");
+            statement.execute("INSERT INTO " + CHILDREN + " (id, order_id, sku) VALUES (1, 1, 'waiting-sku')");
         }
     }
 
     private static void insertParent(Map<String, Object> settings, String customer) throws Exception {
-        try (Connection connection = SharedMySql.connect(settings);
-                Statement statement = connection.createStatement()) {
+        try (Connection connection = SharedMySql.connect(settings); Statement statement = connection.createStatement()) {
             statement.execute("INSERT INTO " + PARENTS + " (id, customer) VALUES (1, '" + customer + "')");
         }
     }
 
     private static void update(Map<String, Object> settings, String customer) throws Exception {
-        try (Connection connection = SharedMySql.connect(settings);
-                Statement statement = connection.createStatement()) {
+        try (Connection connection = SharedMySql.connect(settings); Statement statement = connection.createStatement()) {
             statement.execute("UPDATE " + PARENTS + " SET customer = '" + customer + "' WHERE id = 1");
         }
-    }
-
-    private static void awaitCustomer(
-            MongoEndpoints mongo, EndpointAddress warehouse, String expected, String what) {
-        awaitCustomer(mongo, warehouse, VIEW, expected, what);
-    }
-
-    private static void awaitCustomer(MongoEndpoints mongo, EndpointAddress warehouse, String view,
-            String expected, String what) {
-        Await.until(what,
-                () -> expected.equals(customer(mongo, warehouse, view)),
-                () -> String.valueOf(customer(mongo, warehouse, view)));
-    }
-
-    private static String customer(MongoEndpoints mongo, EndpointAddress warehouse, String view) {
-        List<Document> documents = mongo.documents(warehouse, view);
-        return documents.isEmpty() ? null : documents.getFirst().getString("customer");
-    }
-
-    private static Document only(List<Document> documents) {
-        assertThat(documents).as("the documents the view holds").hasSize(1);
-        return documents.getFirst();
-    }
-
-    private static void dropDatabases(String... databases) {
-        try (MongoClient client = MongoClients.create(SharedMongo.replicaSetUrl(databases[0]))) {
-            for (String database : databases) {
-                client.getDatabase(database).drop();
-            }
-        }
-    }
-
-    private static long operatorStateDocuments(String database) {
-        try (MongoClient client = MongoClients.create(SharedMongo.replicaSetUrl(database))) {
-            return client.getDatabase(database)
-                    .getCollection(MongoStorePort.OPERATOR_STATE)
-                    .countDocuments();
-        }
-    }
-
-    private static long mapStateDocuments(String database, String pipelineId, String stepId) {
-        String prefix = "^nest\\." + pipelineId + "\\." + stepId + "\\.";
-        try (MongoClient client = MongoClients.create(SharedMongo.replicaSetUrl(database))) {
-            return client.getDatabase(database)
-                    .getCollection(MongoStorePort.OPERATOR_STATE)
-                    .countDocuments(new Document("_id.ns", new Document("$regex", prefix)));
-        }
-    }
-
-    private static long shapeRecordDocuments(String database, String pipelineId, String stepId) {
-        Document shape = new Document("_id.ns", "nest.shape." + pipelineId).append("_id.k", stepId);
-        try (MongoClient client = MongoClients.create(SharedMongo.replicaSetUrl(database))) {
-            return client.getDatabase(database)
-                    .getCollection(MongoStorePort.OPERATOR_STATE)
-                    .countDocuments(shape);
-        }
-    }
-
-    private static long deadLetterDocuments(String database, String pipelineId, String stepId) {
-        String prefix = "^nest\\." + pipelineId + "\\." + stepId + "\\.";
-        try (MongoClient client = MongoClients.create(SharedMongo.replicaSetUrl(database))) {
-            return client.getDatabase(database)
-                    .getCollection(MongoStorePort.NEST_DEAD_LETTERS)
-                    .countDocuments(new Document("_id.ns", new Document("$regex", prefix)));
-        }
-    }
-
-    private static void seedMigrationDeadLetter(String database, String pipelineId, String stepId) {
-        String namespace = "nest." + pipelineId + "." + stepId + ".$root";
-        try (MongoClient client = MongoClients.create(SharedMongo.replicaSetUrl(database))) {
-            new MongoNestDeadLetterStore(client.getDatabase(database)
-                    .getCollection(MongoStorePort.NEST_DEAD_LETTERS))
-                    .record(new NestDeadLetterRecord(
-                            namespace, "waiting-child", "src_children", "1:1", 0L, 9_000L,
-                            Map.of("sku", "waiting-sku")));
-        }
-    }
-
-    private static void copyNestState(
-            String from, String to, String pipelineId, String stepId) {
-        String prefix = "^nest\\." + pipelineId + "\\." + stepId + "\\.";
-        Document mapNamespaces = new Document("_id.ns", new Document("$regex", prefix));
-        Document shape = new Document("_id.ns", "nest.shape." + pipelineId).append("_id.k", stepId);
-        Document stateFilter = new Document("$or", List.of(mapNamespaces, shape));
-        try (MongoClient client = MongoClients.create(SharedMongo.replicaSetUrl(from))) {
-            merge(client.getDatabase(from).getCollection(MongoStorePort.OPERATOR_STATE),
-                    to, MongoStorePort.OPERATOR_STATE, stateFilter);
-            merge(client.getDatabase(from).getCollection(MongoStorePort.NEST_DEAD_LETTERS),
-                    to, MongoStorePort.NEST_DEAD_LETTERS, mapNamespaces);
-        }
-    }
-
-    private static void merge(
-            MongoCollection<Document> source, String targetDatabase, String targetCollection, Document filter) {
-        source.aggregate(List.of(
-                        new Document("$match", filter),
-                        new Document("$merge", new Document("into", new Document("db", targetDatabase)
-                                        .append("coll", targetCollection))
-                                .append("on", "_id")
-                                .append("whenMatched", "replace")
-                                .append("whenNotMatched", "insert"))))
-                .toCollection();
-    }
-
-    private static boolean migratedDocumentHasChild(MongoEndpoints mongo, EndpointAddress target) {
-        List<Document> documents = mongo.documents(target, MIGRATION_VIEW);
-        if (documents.size() != 1) {
-            return false;
-        }
-        List<Document> items = documents.getFirst().getList("items", Document.class);
-        return items != null && items.size() == 1 && "waiting-sku".equals(items.getFirst().getString("sku"));
     }
 
     private static String sourceYaml(String id, Map<String, Object> config, String table) {
@@ -517,30 +367,11 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
                 config: { host: %s, port: %s, database: %s, username: %s, password: %s }
                 mode: cdc
                 tables: [ %s ]
-                """
-                .formatted(id, config.get("host"), config.get("port"), config.get("database"),
+                """.formatted(id, config.get("host"), config.get("port"), config.get("database"),
                         config.get("username"), config.get("password"), table);
     }
 
-    private static String viewsYaml(String uri) {
-        return """
-                version: tapstate/v1
-                kind: source
-                id: views
-                connector: mongodb
-                config: { uri: "%s" }
-                """
-                .formatted(uri);
-    }
-
-    private static String pipelineYaml(String pipelineId, String view) {
-        return pipelineYaml(pipelineId, view, null);
-    }
-
-    private static String pipelineYaml(String pipelineId, String view, String stateDatabase) {
-        String state = stateDatabase == null
-                ? ""
-                : "    state: { database: " + stateDatabase + " }\n";
+    private static String pipelineYaml() {
         return """
                 version: tapstate/v1
                 kind: pipeline
@@ -550,7 +381,6 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
                 transforms:
                   - id: order_doc
                     type: nest
-                %s
                     from: { o: orders, i: order_items }
                     root:
                       from: o
@@ -561,6 +391,6 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
                   id: %s
                   from: order_doc
                   primary_key: id
-                """.formatted(pipelineId, state, view);
+                """.formatted(PIPELINE, VIEW);
     }
 }

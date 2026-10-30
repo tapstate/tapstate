@@ -73,8 +73,8 @@ class KeylessTableIsRefusedAtApplyIT {
     @Test
     @DisplayName("a keyless table is refused for upsert, accepted for append, on a real MySQL")
     void aKeylessTableIsRefusedForUpsertAndAcceptedForAppend() throws Exception {
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(SharedMongo.replicaSetUrl("keyless_refused"))) {
-            ControlPlane control = NumericSource.connected(server);
+        try (PreparedNativeStore storage = PreparedNativeStore.create(); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
+            ControlPlane control = NumericSource.connected(server, storage);
             Map<String, Object> config = NumericSource.config(mysql);
             String target = SharedMongo.replicaSetUrl("keyless_refused_target");
 
@@ -113,8 +113,8 @@ class KeylessTableIsRefusedAtApplyIT {
     @Test
     @DisplayName("a table keyed only by a unique index is refused today, and that is a known limit")
     void aTableKeyedOnlyByAUniqueIndexIsRefusedForNow() throws Exception {
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(SharedMongo.replicaSetUrl("keyless_unique"))) {
-            ControlPlane control = NumericSource.connected(server);
+        try (PreparedNativeStore storage = PreparedNativeStore.create(); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
+            ControlPlane control = NumericSource.connected(server, storage);
             Map<String, Object> config = NumericSource.config(mysql);
             control.discoverSchema(SOURCE_ID, "mysql", config);
 
@@ -141,8 +141,8 @@ class KeylessTableIsRefusedAtApplyIT {
     @Test
     @DisplayName("testing a connection against a real MySQL returns a report, not a crash")
     void testingAConnectionAgainstARealMySqlReturnsAReport() throws Exception {
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(SharedMongo.replicaSetUrl("keyless_probe"))) {
-            ControlPlane control = NumericSource.connected(server);
+        try (PreparedNativeStore storage = PreparedNativeStore.create(); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
+            ControlPlane control = NumericSource.connected(server, storage);
 
             String report = control.testConnectionBody(SOURCE_ID, "mysql", NumericSource.config(mysql));
 

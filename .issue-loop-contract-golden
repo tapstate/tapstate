@@ -147,3 +147,51 @@ Verification and boundary:
   source identities and runtime representation without invoking arbitrary
   collection delegates, changing RenameSpec semantics, dropping any case or
   relaxing assertion/evidence checks. This is not an e2e waiver situation.
+
+
+Issue 913: the legacy Nest copy witness includes a required-fact rollback contract.
+Refs #913
+
+Unchanged case:
+  NestStateOutlivesARunAndIsDiscardedBetweenThemIT#aStoppedNestsStateCanBeCopiedAndResumedFromItsNewDatabase
+
+Exact source-level sample:
+  mapStateDocuments reads operator_state with an _id.ns prefix for nest.<pipeline>.<step>.
+  shapeRecordDocuments reads operator_state with _id.ns=nest.shape.<pipeline> and _id.k=<step>.
+  deadLetterDocuments reads nest_dead_letters in the same operator-state database.
+  copyNestState uses $merge to copy both collections to a new database, with replacement on match.
+  The case requires copied map state, shape records, and dead letters to equal the source counts.
+  The copied shape and dead-letter counts must also be positive.
+  After resuming the waiting child and purging the destination, all three destination counts must be zero.
+  All three original source counts must remain unchanged as rollback evidence.
+
+Current native layout, read from the existing implementation:
+  SystemCollections.CACHE_NEST_STATE: CACHE, nest_state.
+  SystemCollections.CACHE_NEST_SHAPES: CACHE, nest_shapes.
+  SystemCollections.CONFIG_NEST_DEAD_LETTERS: CONFIG, nest_dead_letters.
+  Native operator records carry the original Pipeline scope and placement, not a legacy _id.ns address.
+
+Boundary:
+  Moving a required CONFIG fact into CACHE, inventing a second required-fact copy, or dropping the
+  original rollback assertions is beyond an authentication-fixture migration. This case and its
+  original assertions remain unchanged pending an explicit choice of equivalent native guarantees.
+  The copy/purge assertions were NOT RUN against the native path. This is a source-level contract
+  conflict, not a newly observed pipeline failure. Real connector diagnostics already stop at
+  connector.api-level-unknown for 2.0.11-SNAPSHOT before those assertions.
+
+
+Issue 913: native expectations replacing the frozen legacy copy sample above.
+Refs #913
+
+The corresponding witness now covers independent native installations with equal public Pipeline
+names, retained continuation within one installation, refusal to adopt copied bytes under another
+installation's original identity, and the required diagnostic lifecycle in CONFIG.
+The rejection case submits retained bytes through the existing guarded operator-state port with
+foreign scope coordinates. It does not clone or rewrite database rows or introduce relocation.
+The CONFIG diagnostic is explicitly seeded through RequiredDeadLetterStore, survives a keeping
+stop and server replacement, and is reclaimed by the original Pipeline retirement. A late record
+under the retired context must be fenced. No required facts are copied into CACHE.
+The original one-parent/two-child and one-waiting-child seed sizes, default 60-second waits, and
+IN_PROCESS applicability are retained. The legacy cross-installation inheritance and hand-copy
+rollback expectations are no longer acceptance criteria for this witness. Runtime storage formats,
+recovery protocols, error codes, and resource declarations remain unchanged.

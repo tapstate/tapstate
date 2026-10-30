@@ -43,13 +43,12 @@ class AHeldLoadCannotBecomeARecoveryCursorIT {
                 .mapToObj(id -> Map.<String, Object>of("id", id, "seq", 1L)).toList());
         Holds holds = new Holds(temporary.resolve("holds"));
         holds.read("items");
-        String store = SharedMongo.replicaSetUrl("held_load_cursor_store");
         String target = SharedMongo.replicaSetUrl("held_load_cursor_target");
-        try (ServerHandle server = Tiers.REAL_PROCESS.launch(store);
+        try (PreparedNativeStore storage = PreparedNativeStore.create(); ServerHandle server = Tiers.REAL_PROCESS.launch(storage);
                 MongoEndpoints mongo = new MongoEndpoints();
-                StoreDocuments documents = StoreDocuments.at(store)) {
+                StoreDocuments documents = StoreDocuments.nativeSrsAt(storage.cacheUri())) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID,
                     Files.readAllBytes(E2eConnectorJar.buildInto(temporary)));
             control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
@@ -108,10 +107,12 @@ class AHeldLoadCannotBecomeARecoveryCursorIT {
             assertThat(chains).as("the source has durable consumer accounting").hasSize(1);
             String chain = chains.getFirst();
             Document offset = documents.consumerOffset(chain, consumer);
-            Document done = offset.get("perTableRingDone", Document.class);
+            List<Document> done = offset.getList("ringDoneThrough", Document.class);
             Document log = documents.logBounds(SrsRingbuffer.ringName(chain, table));
             long tail = log == null ? -1 : log.get("largestSequence", Number.class).longValue();
-            if (done != null && done.get(table) instanceof Number cursor) {
+            for (Document confirmed : done) {
+                if (!table.equals(confirmed.getString("table"))) continue;
+                Number cursor = confirmed.get("sequence", Number.class);
                 assertThat(cursor.longValue())
                         .as("the recovery cursor belongs to retained history: consumer=%s, log=%s", offset, log)
                         .isLessThanOrEqualTo(tail);

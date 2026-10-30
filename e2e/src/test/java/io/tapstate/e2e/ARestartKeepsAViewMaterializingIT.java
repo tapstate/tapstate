@@ -67,20 +67,16 @@ class ARestartKeepsAViewMaterializingIT {
         Map<String, Object> mysql = SharedMySql.settings(DATABASE);
         seedOneRow(mysql);
 
-        String storeUri = SharedMongo.replicaSetUrl("restart_view_store");
-        String viewUri = SharedMongo.replicaSetUrl("restart_view_views");
-        EndpointAddress views = EndpointAddress.uri(viewUri);
-
-        try (MongoEndpoints mongo = new MongoEndpoints()) {
-            try (ServerHandle first = Tiers.IN_PROCESS.launch(storeUri)) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints()) {
+            EndpointAddress views = EndpointAddress.uri(storage.masterUri());
+            try (ServerHandle first = Tiers.IN_PROCESS.launch(storage)) {
                 ControlPlane control = new ControlPlane(first.baseUrl());
-                control.bootstrapAndLogin("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
                 control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
                 control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 
                 Map<String, String> resources = new LinkedHashMap<>();
                 resources.put("src_mysql.tap.yml", sourceYaml(mysql));
-                resources.put("views.tap.yml", stateStoreYaml(viewUri));
                 resources.put("pipeline.tap.yml", pipelineYaml());
                 control.apply(resources);
                 control.discoverSchema("src_mysql", "mysql", mysql);
@@ -93,9 +89,9 @@ class ARestartKeepsAViewMaterializingIT {
 
             // The process is gone. The store holding the view's own state, the source database and the
             // materialized view are not, and the jar that comes back up is the one that went down.
-            try (ServerHandle second = Tiers.IN_PROCESS.launch(storeUri)) {
+            try (ServerHandle second = Tiers.IN_PROCESS.launch(storage)) {
                 ControlPlane control = new ControlPlane(second.baseUrl());
-                control.login("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
 
                 assertThat(control.state(PIPELINE_ID))
                         .as("the pipeline the restarted server adopted from the store it read")
@@ -152,17 +148,6 @@ class ARestartKeepsAViewMaterializingIT {
                 """
                 .formatted(config.get("host"), config.get("port"), config.get("database"),
                         config.get("username"), config.get("password"));
-    }
-
-    private static String stateStoreYaml(String viewUri) {
-        return """
-                version: tapstate/v1
-                kind: source
-                id: views
-                connector: mongodb
-                config: { uri: "%s" }
-                """
-                .formatted(viewUri);
     }
 
     private static String pipelineYaml() {

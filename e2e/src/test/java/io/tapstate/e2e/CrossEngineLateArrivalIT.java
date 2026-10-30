@@ -110,13 +110,13 @@ class CrossEngineLateArrivalIT {
         // root wins the race and the case stops discriminating at all.
         insertShipments(shipments, List.of(shipment(7, LATE_ROOT, "dhl"), shipment(8, LATE_ROOT, "ups")));
 
-        String storeUri = SharedMongo.replicaSetUrl("late_store_" + suffix);
         String targetUri = SharedMongo.replicaSetUrl("late_target_" + suffix);
 
-        try (ServerHandle server = tier.launch(storeUri);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = tier.launch(storage);
                 MongoEndpoints mongo = new MongoEndpoints()) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
 
             control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
             control.registerConnector("postgres", ConnectorJars.bytesFor("postgres"));

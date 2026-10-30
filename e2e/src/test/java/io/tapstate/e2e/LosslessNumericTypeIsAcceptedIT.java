@@ -68,9 +68,9 @@ class LosslessNumericTypeIsAcceptedIT {
 
         String targetUri = SharedMongo.replicaSetUrl("lossless_target_" + suffix);
 
-        try (ServerHandle server = tier.launch(SharedMongo.replicaSetUrl("lossless_store_" + suffix));
+        try (PreparedNativeStore storage = PreparedNativeStore.create(); ServerHandle server = tier.launch(storage);
                 MongoEndpoints mongo = new MongoEndpoints()) {
-            ControlPlane control = NumericSource.connected(server);
+            ControlPlane control = NumericSource.connected(server, storage);
 
             control.discoverSchema(NumericSource.SOURCE_ID, "mysql", config);
             control.apply(NumericSource.workspace(

@@ -11,6 +11,7 @@ import io.tapstate.adapters.mongostore.MongoAuthStores;
 import com.mongodb.client.result.UpdateResult;
 import io.tapstate.adapters.mongostore.MongoRateHistoryStore;
 import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.spi.store.WorkloadClaimType;
 import org.bson.Document;
 
@@ -42,22 +43,33 @@ final class StoreDocuments implements AutoCloseable {
     private final ConnectionString connection;
     private final MongoClient client;
     private final MongoDatabase database;
+    private final boolean nativeSrs;
 
-    private StoreDocuments(ConnectionString connection, MongoClient client, MongoDatabase database) {
+    private StoreDocuments(ConnectionString connection, MongoClient client, MongoDatabase database, boolean nativeSrs) {
         this.connection = connection;
         this.client = client;
         this.database = database;
+        this.nativeSrs = nativeSrs;
     }
 
     /** Opens a reader on the same database the product was launched against. */
     static StoreDocuments at(String storeUri) {
+        return at(storeUri, false);
+    }
+
+    /** Reads native SRS records from the installation's declared cache database. */
+    static StoreDocuments nativeSrsAt(String cacheUri) {
+        return at(cacheUri, true);
+    }
+
+    private static StoreDocuments at(String storeUri, boolean nativeSrs) {
         ConnectionString connection = new ConnectionString(storeUri);
         String name = connection.getDatabase();
         if (name == null) {
             throw new AssertionError("the store url names no database, so there is nothing to read: " + storeUri);
         }
         MongoClient client = MongoClients.create(connection);
-        return new StoreDocuments(connection, client, client.getDatabase(name));
+        return new StoreDocuments(connection, client, client.getDatabase(name), nativeSrs);
     }
 
     /** Whether {@code collection} holds a document under {@code id}. */
@@ -102,41 +114,52 @@ final class StoreDocuments implements AutoCloseable {
      * difference matters because removing the shared root while another pipeline remains is forbidden.
      */
     Set<String> consumersOf(String miningChainId) {
-        if (!holds(MongoStorePort.SRS_META, miningChainId)) {
+        if (chain(miningChainId) == null) {
             return Set.of();
         }
-        return StreamSupport.stream(database.getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS)
-                        .find(new Document("miningChainId", miningChainId))
-                        .projection(new Document("pipelineId", 1))
+        return StreamSupport.stream(database.getCollection(nativeSrs ? SystemCollections.SRS_CONSUMERS.collectionName()
+                                : MongoStorePort.SRS_CONSUMER_OFFSETS)
+                        .find(new Document(nativeSrs ? "_id.chain" : "miningChainId", miningChainId))
+                        .projection(new Document(nativeSrs ? "_id.consumer" : "pipelineId", 1))
                         .spliterator(), false)
-                .map(document -> document.getString("pipelineId"))
+                .map(document -> nativeSrs ? document.get("_id", Document.class).getString("consumer")
+                        : document.getString("pipelineId"))
                 .collect(Collectors.toSet());
     }
 
     /** The whole consumer cursor of one pipeline on one chain, for comparing it byte for byte across a removal. */
     Document consumerOffset(String miningChainId, String pipelineId) {
-        if (!holds(MongoStorePort.SRS_META, miningChainId)) {
+        if (chain(miningChainId) == null) {
             return null;
         }
-        return database.getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS)
-                .find(new Document("miningChainId", miningChainId).append("pipelineId", pipelineId))
+        return database.getCollection(nativeSrs ? SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.collectionName()
+                        : MongoStorePort.SRS_CONSUMER_OFFSETS)
+                .find(nativeSrs ? new Document("_id.chain", miningChainId).append("_id.consumer", pipelineId)
+                        : new Document("miningChainId", miningChainId).append("pipelineId", pipelineId))
                 .first();
+    }
+
+    /** Native membership records retain the pipeline and source that own each consumer cursor. */
+    Document consumerMembership(String miningChainId, String consumerId) {
+        if (!nativeSrs) throw new IllegalStateException("native membership requires the cache reader");
+        return SystemCollections.SRS_CONSUMERS.on(database)
+                .find(new Document("_id.chain", miningChainId).append("_id.consumer", consumerId)).first();
     }
 
     /** Every mining chain id the store holds. */
     Set<String> miningChainIds() {
-        return ids(MongoStorePort.SRS_META);
+        return ids(nativeSrs ? SystemCollections.SRS_CHAINS.collectionName() : MongoStorePort.SRS_META);
     }
 
     /** The retained log's bounds, which survive removal of its already confirmed records. */
     Document logBounds(String ringName) {
-        return database.getCollection(MongoStorePort.SRS_LOG)
+        return database.getCollection(nativeSrs ? SystemCollections.SRS_LOG_BOUNDS.collectionName() : MongoStorePort.SRS_LOG)
                 .find(new Document("_id", "srs-log-bounds:" + ringName)).first();
     }
 
     /** The whole chain record, for reporting what a chain actually held when an assertion about it fails. */
     Document chain(String miningChainId) {
-        return database.getCollection(MongoStorePort.SRS_META)
+        return database.getCollection(nativeSrs ? SystemCollections.SRS_CHAINS.collectionName() : MongoStorePort.SRS_META)
                 .find(new Document("_id", miningChainId))
                 .first();
     }
@@ -150,6 +173,10 @@ final class StoreDocuments implements AutoCloseable {
      */
     String sourceReadOffset(String miningChainId) {
         Document chain = chain(miningChainId);
+        if (nativeSrs) {
+            Document checkpoint = chain == null ? null : chain.get("checkpoint", Document.class);
+            return checkpoint == null ? null : checkpoint.getString("token");
+        }
         return chain == null ? null : chain.getString("sourceReadOffset");
     }
 
@@ -163,6 +190,12 @@ final class StoreDocuments implements AutoCloseable {
      */
     long consumerReadSeq(String miningChainId, String pipelineId, String table) {
         Document offset = consumerOffset(miningChainId, pipelineId);
+        if (nativeSrs) {
+            if (offset == null) return -1L;
+            return offset.get("progress", Document.class).getList("perTableSeq", Document.class).stream()
+                    .filter(entry -> table.equals(entry.getString("table")))
+                    .mapToLong(entry -> entry.get("sequence", Number.class).longValue()).findFirst().orElse(-1L);
+        }
         if (offset == null || !(offset.get("perTableSeq") instanceof Document perTable)
                 || !(perTable.get(table) instanceof Number seq)) {
             return -1L;

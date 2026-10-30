@@ -94,13 +94,12 @@ class NestTrackingRefusesASourceWithoutBeforeImagesIT {
 
             String suffix = tier.name().toLowerCase(Locale.ROOT);
             pipelineId = PIPELINE_ID + "_" + suffix;
-            String storeUri = SharedMongo.replicaSetUrl("blind_store_" + suffix);
             String targetUri = SharedMongo.replicaSetUrl("blind_target_" + suffix);
 
             // No reader for the target: the run never reaches it, and that is the point being pinned.
-            try (ServerHandle server = tier.launch(storeUri)) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create(); ServerHandle server = tier.launch(storage)) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
-                control.bootstrapAndLogin("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
 
                 control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
                 control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
