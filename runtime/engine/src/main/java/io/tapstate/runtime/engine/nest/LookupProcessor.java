@@ -144,23 +144,15 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
             processRows(inbox);
             return;
         }
-        Set<Object> filed = switch (ordinal) {
-            case ROWS -> filedKeysIn(inbox, lookup.partitionKey());
-            case REGISTRATIONS -> filedKeysIn(inbox, lookup.referenceFields());
-            default -> new LinkedHashSet<>();
-        };
+        Set<Object> filed = ordinal == REGISTRATIONS
+                ? filedKeysIn(inbox, lookup.referenceFields()) : new LinkedHashSet<>();
         for (Object item; (item = inbox.peek()) != null; ) {
             if (ordinal == REGISTRATIONS && registerSnapshotBatch(inbox, filed)) {
                 if (!flush()) return;
                 continue;
             }
-            if (item instanceof SettledPositions settled) {
-                // Registration copies are spoken for on their assembly path. Only this lookup's own
-                // rows settle here, behind the wakes already queued for earlier rows.
-                if (ordinal == ROWS) {
-                    SettledPositions.fold(owingNothing, settled.positions());
-                }
-            } else {
+            // Registration copies are spoken for on their assembly path; ROWS settled above.
+            if (!(item instanceof SettledPositions)) {
                 handle(ordinal, (Envelope) item, filed);
             }
             inbox.remove();
@@ -174,23 +166,7 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
 
     /** ADD-only snapshot copies share I/O; deletes and departures retain their original ordering. */
     private boolean registerSnapshotBatch(Inbox inbox, Set<Object> filed) {
-        List<Registration> registrations = new ArrayList<>();
-        Set<List<Object>> referrers = new LinkedHashSet<>();
-        long bytes = 0;
-        for (Object item : inbox) {
-            if (!(item instanceof Envelope event) || event.op() != io.tapstate.core.event.Op.READ
-                    || registrations.size() == ROW_BATCH_LIMIT) break;
-            Map<String, Object> row = NestKeys.rowOf(event);
-            List<Object> referrer = NestKeys.valuesOf(row, lookup.referrerIdentity(), lookup.mapName());
-            if (referrers.contains(referrer)) break;
-            long weight = PayloadBytes.of(event);
-            if (!registrations.isEmpty() && weight > ROW_BATCH_BYTES - bytes) break;
-            List<Object> referenced = NestKeys.valuesOf(row, lookup.referenceFields(), lookup.mapName());
-            registrations.add(new Registration(event, referenced, referrer,
-                    NestLookup.bucketKey(referenced, NestLookup.bucketOf(referrer))));
-            referrers.add(referrer);
-            bytes += weight;
-        }
+        List<Registration> registrations = nextRegistrations(inbox);
         if (registrations.size() < 2) return false;
         Map<Object, Set<Object>> additions = new LinkedHashMap<>();
         for (Registration registration : registrations) additions
@@ -200,6 +176,27 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
         references.addAll(additions);
         acknowledgeRegistrations(inbox, filed, registrations);
         return true;
+    }
+
+    private List<Registration> nextRegistrations(Inbox inbox) {
+        List<Registration> registrations = new ArrayList<>();
+        Set<List<Object>> referrers = new LinkedHashSet<>();
+        long bytes = 0;
+        for (Object item : inbox) {
+            if (!(item instanceof Envelope event) || event.op() != io.tapstate.core.event.Op.READ
+                    || registrations.size() == ROW_BATCH_LIMIT) return registrations;
+            Map<String, Object> row = NestKeys.rowOf(event);
+            List<Object> referrer = NestKeys.valuesOf(row, lookup.referrerIdentity(), lookup.mapName());
+            if (referrers.contains(referrer)) return registrations;
+            long weight = PayloadBytes.of(event);
+            if (!registrations.isEmpty() && weight > ROW_BATCH_BYTES - bytes) return registrations;
+            List<Object> referenced = NestKeys.valuesOf(row, lookup.referenceFields(), lookup.mapName());
+            registrations.add(new Registration(event, referenced, referrer,
+                    NestLookup.bucketKey(referenced, NestLookup.bucketOf(referrer))));
+            referrers.add(referrer);
+            bytes += weight;
+        }
+        return registrations;
     }
 
     private void acknowledgeRegistrations(Inbox inbox, Set<Object> filed, List<Registration> registrations) {

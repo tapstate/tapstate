@@ -220,7 +220,7 @@ class RootStateWriteBatchingTest {
         assertThat(documents).extracting(e -> e.after().get("order_id")).doesNotHaveDuplicates();
         for (Envelope document : documents) {
             int id = (Integer) document.after().get("order_id");
-            assertThat(document.after().get("customer")).isEqualTo(row("customer_id", "C1", "name", "Ada"));
+            assertThat(document.after()).containsEntry("customer", row("customer_id", "C1", "name", "Ada"));
             if (!previouslyWritten.contains(List.of(id)) || !document.positions().isEmpty()) {
                 assertThat(document.positions()).containsEntry("order", new ChainPosition(at(id + 1), "offset-" + id));
             }

@@ -51,7 +51,8 @@ class RegistrationGrowthBatchingTest {
     @Test void anOrdinaryPartialFailureEscapesWithoutALocalRetry() {
         Fixture f = new Fixture();
         f.ordinaryFailure = true;
-        assertThatThrownBy(() -> f.store.addAll(Map.of("a", Set.of("first"), "b", Set.of("second"))))
+        Map<Object, Set<Object>> additions = Map.of("a", Set.of("first"), "b", Set.of("second"));
+        assertThatThrownBy(() -> f.store.addAll(additions))
                 .isInstanceOf(IllegalStateException.class).hasMessage("injected store failure");
         assertThat(f.calls).isEqualTo(1);
         assertThat(f.states).hasSize(1);
