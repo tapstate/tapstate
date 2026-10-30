@@ -854,6 +854,31 @@ class SourceIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'escapes'):
             evidence.csv_text_block('"""\n  a\\nb\n  """')
 
+    def test_csv_enum_arguments_remain_source_bound_with_injected_temp_dir(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            definition = root / 'core/src/main/java/sample/LifecycleVerb.java'
+            definition.parent.mkdir(parents=True)
+            definition.write_text('package sample; public enum LifecycleVerb { START, RESUME }')
+            declaration = '@ParameterizedTest @CsvSource({"true, START", "true, RESUME", "false, START", "false, RESUME"}) ' \
+                'void selected(boolean shared, LifecycleVerb verb, @TempDir java.nio.file.Path directory) {}'
+            _, inv = self.inventory(root, declaration)
+            self.assertTrue(inv['complete'], inv['unresolved'])
+            expected = [evidence.argument_digest([['java.lang.Boolean', shared],
+                ['enum', 'sample.LifecycleVerb', verb],
+                ['injected', 'org.junit.jupiter.api.io.TempDir', 'java.nio.file.Path']])
+                for shared in ('true', 'false') for verb in ('START', 'RESUME')]
+            self.assertEqual(inv['methods'][0]['argument_digests'], expected)
+            self.assertEqual(inv['sources'][definition.relative_to(root).as_posix()],
+                hashlib.sha256(definition.read_bytes()).hexdigest())
+            _, invalid = self.inventory(root, declaration.replace('true, START', 'true, UNKNOWN'))
+            self.assertFalse(invalid['complete'])
+            self.assertTrue(any('CSV enum constant is absent' in row['reason'] for row in invalid['unresolved']))
+            definition.write_text('package sample; public class LifecycleVerb { public static final String START = "START"; }')
+            _, non_enum = self.inventory(root, declaration)
+            self.assertFalse(non_enum['complete'])
+            self.assertIsNone(non_enum['methods'][0]['mapping'])
+
     def test_named_hits_and_misses_stop_repeating_filesystem_probes(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

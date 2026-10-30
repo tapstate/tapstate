@@ -8,7 +8,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.UUID;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -39,11 +38,10 @@ class AMixedMapKeyRowFailsBeforeDeliveryIT {
         Files.writeString(source.resolve("orders.csv"), "id,seq,dict\n1,1,ordinary\n");
         Path written = target.resolve("orders.csv");
         Path jar = E2eConnectorJar.buildInto(directory);
-        String database = "e2e_map_keys_" + UUID.randomUUID().toString().replace("-", "");
-
-        try (ServerHandle server = InProcessServer.start(SharedMongo.replicaSetUrl(database), database + "_state")) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = InProcessServer.startPrepared(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID, Files.readAllBytes(jar));
             Map<String, Object> config = Map.of("uri", source.toString(), "mixed_map_keys", mixedKeys);
             control.discoverSchema("src_orders", E2eConnectorJar.CONNECTOR_ID, config);

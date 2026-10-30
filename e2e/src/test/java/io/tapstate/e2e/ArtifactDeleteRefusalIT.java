@@ -15,7 +15,6 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -56,8 +55,9 @@ class ArtifactDeleteRefusalIT {
     @EnumSource(Tiers.class)
     void removingAResourceAPipelineStillNamesIsRefusedAndNothingIsRemoved(Tiers tier, @TempDir Path directory)
             throws Exception {
-        try (ServerHandle server = tier.launch(storeUri("delete_in_use", tier))) {
-            ControlPlane control = connected(server, directory);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = tier.launch(storage)) {
+            ControlPlane control = connected(server, directory, storage);
             control.apply(workspace());
 
             ControlPlane.StoredArtifact before = control.artifact(SOURCE_ID).orElseThrow();
@@ -76,6 +76,11 @@ class ArtifactDeleteRefusalIT {
                     .asInstanceOf(org.assertj.core.api.InstanceOfAssertFactories.LIST)
                     .contains(PIPELINE_ID);
 
+            var sourceRoute = deleteRoute(server, control, "sources", SOURCE_ID, before.contentHash());
+            assertThat(sourceRoute.status()).isEqualTo(409);
+            assertThat(sourceRoute.code()).isEqualTo("source.in-use");
+            assertThat(sourceRoute.params()).isEqualTo(Map.of("id", SOURCE_ID, "referrers", List.of(PIPELINE_ID)));
+
             assertThat(control.artifact(SOURCE_ID))
                     .as("the resource after a refused removal - 'refused' and 'refused, having already "
                             + "deleted it' answer the same code, and only this read tells them apart")
@@ -91,44 +96,47 @@ class ArtifactDeleteRefusalIT {
     @EnumSource(Tiers.class)
     void anInlineViewProtectsItsManagedStoreThroughBothDeleteRoutes(Tiers tier, @TempDir Path directory)
             throws Exception {
-        try (ServerHandle server = tier.launch(storeUri("delete_managed_view_store", tier))) {
-            ControlPlane control = connected(server, directory);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = tier.launch(storage)) {
+            ControlPlane control = connected(server, directory, storage);
             control.apply(viewWorkspace());
             ControlPlane.StoredArtifact before = control.artifact("views").orElseThrow();
-            HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
-            // Pin the existing diagnostic projection of each public route.
-            Map<String, String> inUseCodes = Map.of("sources", "source.in-use", "artifacts", IN_USE);
 
             for (String kind : List.of("sources", "artifacts")) {
-                HttpRequest request = HttpRequest.newBuilder(server.baseUrl().resolve("/api/" + kind + "/views"))
-                        .timeout(Duration.ofSeconds(30))
-                        .header("Authorization", "Bearer " + control.credential())
-                        .header("If-Match", "\"" + before.contentHash() + "\"")
-                        .DELETE().build();
-                HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
-                ControlPlane.Refusal refusal = ControlPlane.interpretRefusal(
-                        response.statusCode(), response.body(), "deleting the managed view store through " + kind);
-
-                assertThat(refusal.status()).isEqualTo(409);
-                assertThat(refusal.code()).isEqualTo(inUseCodes.get(kind));
-                assertThat(refusal.params())
-                        .isEqualTo(Map.of("id", "views", "referrers", List.of(PIPELINE_ID)));
+                var refusal = deleteRoute(server, control, kind, "views", before.contentHash());
+                if (kind.equals("sources")) {
+                    // The native managed-target gate precedes reference checks on Source authoring.
+                    assertThat(refusal.status()).isEqualTo(400);
+                    assertThat(refusal.code()).isEqualTo("control.malformed-request");
+                    assertThat(refusal.params()).isEqualTo(Map.of("reason",
+                            "the managed default target cannot be changed through authoring"));
+                } else {
+                    assertThat(refusal.status()).isEqualTo(409);
+                    assertThat(refusal.code()).isEqualTo(IN_USE);
+                    assertThat(refusal.params()).isEqualTo(Map.of("id", "views", "referrers", List.of(PIPELINE_ID)));
+                }
                 assertThat(control.artifact("views")).contains(before);
                 assertThat(control.artifactIds()).contains(PIPELINE_ID, SOURCE_ID, "views");
             }
         }
     }
 
-    private static ControlPlane connected(ServerHandle server, Path directory) throws Exception {
+    private static ControlPlane.Refusal deleteRoute(ServerHandle server, ControlPlane control,
+            String kind, String id, String hash) throws Exception {
+        var request = HttpRequest.newBuilder(server.baseUrl().resolve("/api/" + kind + "/" + id))
+                .timeout(Duration.ofSeconds(30)).header("Authorization", "Bearer " + control.credential())
+                .header("If-Match", "\"" + hash + "\"").DELETE().build();
+        var response = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()
+                .send(request, HttpResponse.BodyHandlers.ofString());
+        return ControlPlane.interpretRefusal(response.statusCode(), response.body(), "deleting " + id + " through " + kind);
+    }
+
+    private static ControlPlane connected(ServerHandle server, Path directory, PreparedNativeStore storage) throws Exception {
         ControlPlane control = new ControlPlane(server.baseUrl());
-        control.bootstrapAndLogin("e2e", "e2e-password");
+        storage.loginAndAwaitBusiness(control);
         control.registerConnector(
                 E2eConnectorJar.CONNECTOR_ID, Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
         return control;
-    }
-
-    private static String storeUri(String name, Tiers tier) {
-        return SharedMongo.replicaSetUrl(name + "_" + tier.name().toLowerCase(Locale.ROOT));
     }
 
     private static Map<String, String> workspace() {

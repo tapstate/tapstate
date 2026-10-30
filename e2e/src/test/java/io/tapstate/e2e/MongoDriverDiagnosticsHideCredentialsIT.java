@@ -41,10 +41,11 @@ class MongoDriverDiagnosticsHideCredentialsIT {
                 JvmTestEnvironment.configure(builder, Map.of());
                 Process process = builder.start();
                 try {
-                    assertThat(process.waitFor(90, TimeUnit.SECONDS)).as("bounded startup refusal").isTrue();
+                    assertThat(process.waitFor(90, TimeUnit.SECONDS)).as("bounded configuration-unavailable bootstrap").isTrue();
                     String output = Files.readString(console);
-                    assertThat(process.exitValue()).as(output).isEqualTo(1);
-                    assertThat(output).contains("[store.unreachable]");
+                    // The minimum root remains available for storage repair; a non-web process then exits normally.
+                    assertThat(process.exitValue()).as(output).isZero();
+                    assertThat(output).contains("code=store.unreachable", "Tapstate application is ready");
                     String file = Files.readString(work.resolve("logs/tapstate-server.log"));
                     for (String destination : List.of(output, file)) {
                         assertThat(destination).doesNotContain("packaged-user", "packaged-password", "private-auth",

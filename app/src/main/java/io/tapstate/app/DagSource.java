@@ -41,6 +41,11 @@ interface DagSource {
                 sinkConnectors(pipelineId));
     }
 
+    /** Scope-aware assembly must be explicitly implemented; it never falls back to a bare Pipeline id. */
+    default StartPreparation prepareStart(PipelineConvergencePass pass, String defaultDatabase) {
+        throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
+    }
+
     /**
      * The connector each of the pipeline's sinks opens, by id, keyed by the sink's node. A sink opens its connector
      * on whichever member runs it, so these are what every member a run takes part on has to be able to load. A
@@ -181,7 +186,9 @@ interface DagSource {
             Set<OperatorStateLocation> stateLocations,
             Optional<ArtifactStore> artifactSnapshot,
             Planner planner,
-            Map<String, String> sinkConnectors) {
+            Map<String, String> sinkConnectors,
+            Optional<SourceModelSnapshot> sourceModels,
+            Optional<OperatorCoordinatePlan> operatorPlan,Map<String,String> connectorHashes) {
 
         public StartPreparation {
             Objects.requireNonNull(capacity, "capacity");
@@ -189,6 +196,22 @@ interface DagSource {
             Objects.requireNonNull(artifactSnapshot, "artifactSnapshot");
             Objects.requireNonNull(planner, "planner");
             sinkConnectors = Map.copyOf(Objects.requireNonNull(sinkConnectors, "sinkConnectors"));
+            Objects.requireNonNull(sourceModels,"sourceModels");
+            Objects.requireNonNull(operatorPlan,"operatorPlan");
+            connectorHashes=Map.copyOf(connectorHashes);
+            if (sourceModels.isPresent() && artifactSnapshot.isEmpty()) throw new IllegalArgumentException("captured source models require their original artifacts");
+        }
+        StartPreparation(NestCapacity capacity,Set<OperatorStateLocation> stateLocations,Optional<ArtifactStore> artifactSnapshot,
+                Planner planner,Map<String,String> sinkConnectors,Optional<SourceModelSnapshot> sourceModels,Optional<OperatorCoordinatePlan> operatorPlan) {
+            this(capacity,stateLocations,artifactSnapshot,planner,sinkConnectors,sourceModels,operatorPlan,Map.of());
+        }
+        StartPreparation(NestCapacity capacity,Set<OperatorStateLocation> stateLocations,Optional<ArtifactStore> artifactSnapshot,
+                Planner planner,Map<String,String> sinkConnectors,Optional<SourceModelSnapshot> sourceModels) {
+            this(capacity,stateLocations,artifactSnapshot,planner,sinkConnectors,sourceModels,Optional.empty());
+        }
+        StartPreparation(NestCapacity capacity,Set<OperatorStateLocation> stateLocations,Optional<ArtifactStore> artifactSnapshot,
+                Planner planner,Map<String,String> sinkConnectors) {
+            this(capacity,stateLocations,artifactSnapshot,planner,sinkConnectors,Optional.empty());
         }
 
         /** A preparation that works nothing out ahead of the capture: its whole run is planned as it is built. */
@@ -225,12 +248,34 @@ interface DagSource {
         Function<ExecutionFence, PlannedDag> plan();
     }
 
+    /** The exact member snapshot used by a deferred topology, available before its capture opens. */
+    record PlannedTopology(List<String> members, Function<ExecutionFence, PlannedDag> builder)
+            implements Function<ExecutionFence, PlannedDag> {
+        public PlannedTopology {
+            members = List.copyOf(members); Objects.requireNonNull(builder, "builder");
+            if (members.isEmpty() || members.stream().anyMatch(String::isBlank)
+                    || Set.copyOf(members).size() != members.size()) throw new IllegalArgumentException("invalid planned member set");
+        }
+        @Override public PlannedDag apply(ExecutionFence fence) {
+            PlannedDag built = Objects.requireNonNull(builder.apply(fence), "built topology");
+            if (!members.equals(built.members())) throw new IllegalStateException("built topology changed its planned members");
+            return built;
+        }
+    }
+
     /** A start whose run has been planned, and whose topology is built once its capture is open. */
     record PlannedStart(StartPreparation preparation, Function<ExecutionFence, PlannedDag> dagBuilder) {
 
         public PlannedStart {
             Objects.requireNonNull(preparation, "preparation");
             Objects.requireNonNull(dagBuilder, "dagBuilder");
+        }
+
+        /** Scoped preparation cannot certify a topology whose member snapshot was not retained. */
+        List<String> members() {
+            if (!(dagBuilder instanceof PlannedTopology topology))
+                throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+            return topology.members();
         }
 
         /**

@@ -22,6 +22,8 @@ class PipelineLogAppenderTest {
     /** Runs {@code body} with the appender attached to a private logger, then detaches and cleans up. */
     private void withAppender(RingBufferLogSink sink, String loggerName, java.util.function.Consumer<Logger> body) {
         Logger logger = (Logger) LoggerFactory.getLogger(loggerName);
+        var previousLevel = logger.getLevel();
+        logger.setLevel(ch.qos.logback.classic.Level.INFO);
         PipelineLogAppender appender = new PipelineLogAppender(sink, new SecretRedactor());
         appender.setContext(logger.getLoggerContext());
         appender.start();
@@ -32,6 +34,7 @@ class PipelineLogAppenderTest {
             MDC.remove(MDC_KEY);
             logger.detachAppender(appender);
             appender.stop();
+            logger.setLevel(previousLevel);
         }
     }
 
@@ -116,6 +119,8 @@ class PipelineLogAppenderTest {
         SecretRedactor redactor = new SecretRedactor();
         redactor.replace("source-orders", java.util.List.of("sentinel-password"));
         Logger logger = (Logger) LoggerFactory.getLogger("test.logs.redacted");
+        var previousLevel = logger.getLevel();
+        logger.setLevel(ch.qos.logback.classic.Level.INFO);
         PipelineLogAppender appender = new PipelineLogAppender(sink, redactor);
         appender.setContext(logger.getLoggerContext());
         appender.start();
@@ -127,6 +132,7 @@ class PipelineLogAppenderTest {
             MDC.remove(MDC_KEY);
             logger.detachAppender(appender);
             appender.stop();
+            logger.setLevel(previousLevel);
         }
 
         assertThat(sink.tail("orders")).singleElement().satisfies(line ->

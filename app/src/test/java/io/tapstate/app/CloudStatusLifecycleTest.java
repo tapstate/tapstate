@@ -133,8 +133,11 @@ class CloudStatusLifecycleTest {
         }, () -> "nonce"));
         lifecycle.onApplicationEvent(ready(owner));
         Logger logger = (Logger) LoggerFactory.getLogger(CloudStatusLifecycle.class);
+        var previousLevel = logger.getLevel();
         ListAppender<ILoggingEvent> logs = new ListAppender<>();
+        logs.setContext(logger.getLoggerContext());
         logs.start();
+        logger.setLevel(ch.qos.logback.classic.Level.WARN);
         logger.addAppender(logs);
         try {
             scheduled.getFirst().run();
@@ -148,6 +151,7 @@ class CloudStatusLifecycleTest {
         } finally {
             logger.detachAppender(logs);
             logs.stop();
+            logger.setLevel(previousLevel);
         }
     }
 

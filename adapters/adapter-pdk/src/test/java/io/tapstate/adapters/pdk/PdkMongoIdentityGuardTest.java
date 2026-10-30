@@ -78,6 +78,27 @@ class PdkMongoIdentityGuardTest {
         }
     }
 
+    @Test
+    void authorityLostInOneChunkPreventsTheNextChunkQuery() throws Throwable {
+        var active = new java.util.concurrent.atomic.AtomicBoolean(true);
+        var calls = new java.util.concurrent.atomic.AtomicInteger();
+        var lost = new TapstateException(io.tapstate.spi.store.IoError.NOTE_SCOPE_UNAVAILABLE, Map.of(), null);
+        try (var connector = IdentityConnectorFixture.guarded("mongodb", ref, Map.of(), () -> {
+            if (!active.get()) throw lost;
+        })) {
+            connector.functions().supportExecuteCommandFunction((context, command, out) -> {
+                calls.incrementAndGet();
+                out.accept(new ExecuteResult<>().result(envelope(List.of())));
+                active.set(false);
+            });
+            List<Map<String, Object>> keys = new ArrayList<>();
+            for (int i = 0; i < 129; i++) keys.add(Map.of("original", "p", "k", i));
+            assertThatThrownBy(() -> PdkMongoIdentityGuard.verify(connector, MongoIdentityKeysTest.PLAN, keys))
+                    .isSameAs(lost);
+            assertThat(calls).hasValue(1);
+        }
+    }
+
     private static List<Map<String, Object>> envelope(List<?> rows) { return List.of(Map.of("rows", rows)); }
 
     @Test

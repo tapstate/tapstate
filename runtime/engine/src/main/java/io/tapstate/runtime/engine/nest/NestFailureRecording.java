@@ -25,10 +25,10 @@ import io.tapstate.runtime.engine.JobFailureRegistry;
  */
 final class NestFailureRecording {
 
-    private final JobFailureRegistry registry;
+    private final JobFailureRegistry.Recorder registry;
     private final String pipelineId;
 
-    private NestFailureRecording(JobFailureRegistry registry, String pipelineId) {
+    private NestFailureRecording(JobFailureRegistry.Recorder registry, String pipelineId) {
         this.registry = registry;
         this.pipelineId = pipelineId;
     }
@@ -40,7 +40,7 @@ final class NestFailureRecording {
                 ? null
                 : context.jobConfig().getName();
         return new NestFailureRecording(
-                instance == null ? null : JobFailureRegistry.of(instance), pipelineId);
+                instance == null ? null : JobFailureRegistry.of(instance).forJob(context.jobId(), context.jobConfig()), pipelineId);
     }
 
     /**
@@ -55,7 +55,7 @@ final class NestFailureRecording {
             return work.run();
         } catch (RuntimeException | Error failure) {
             if (registry != null && pipelineId != null) {
-                registry.record(pipelineId, failure);
+                registry.record(failure);
             }
             throw failure;
         }

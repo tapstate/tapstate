@@ -834,14 +834,18 @@ class ClusterRebuildAdmissionTest {
     /** What the admission logged while {@code scenario} ran. */
     private static List<String> loggedBy(Runnable scenario) {
         Logger logger = (Logger) LoggerFactory.getLogger(ClusterRebuildAdmission.class);
+        var previousLevel = logger.getLevel();
         ListAppender<ILoggingEvent> written = new ListAppender<>();
+        written.setContext(logger.getLoggerContext());
         written.start();
+        logger.setLevel(ch.qos.logback.classic.Level.INFO);
         logger.addAppender(written);
         try {
             scenario.run();
         } finally {
             logger.detachAppender(written);
             written.stop();
+            logger.setLevel(previousLevel);
         }
         return written.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
     }

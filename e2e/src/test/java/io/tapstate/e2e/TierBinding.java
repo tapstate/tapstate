@@ -69,6 +69,9 @@ public interface TierBinding {
     /** Records a lifecycle intent. Returns once the intent is recorded, not once it converges. */
     void drive(String pipelineId, LifecycleVerb verb);
 
+    /** Asserts one HTTP 409 admission refusal with its exact code, without waiting for a failed run. */
+    void startRefused(String pipelineId, String expectedCode);
+
     /**
      * Holds or releases one source's stream, leaving the pipeline and its other streams alone.
      *

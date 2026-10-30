@@ -1,8 +1,5 @@
 package io.tapstate.app;
 
-import com.hazelcast.config.Config;
-import com.hazelcast.config.JoinConfig;
-import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.internal.util.executor.HazelcastManagedThread;
 import com.hazelcast.jet.Job;
@@ -16,9 +13,23 @@ import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.StateJson;
 import io.tapstate.runtime.engine.Engine;
+import io.tapstate.runtime.engine.EngineError;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.runtime.engine.MemberOutOfMemory;
 import io.tapstate.runtime.scheduler.ObservationPublisher;
 import io.tapstate.runtime.scheduler.PipelineConverger;
+import io.tapstate.spi.metrics.MetricsExport;
+import io.tapstate.spi.store.ClusterIdentity;
+import io.tapstate.spi.store.ClusterIdentityStore;
+import io.tapstate.spi.store.ClusterMembershipStore;
+import io.tapstate.spi.store.WorkloadClaimStore;
+import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimType;
+import io.tapstate.spi.store.StorePort;
+import io.tapstate.runtime.engine.nest.NestSettings;
+import org.springframework.beans.factory.support.DefaultListableBeanFactory;
+import java.util.List;
+import java.util.Optional;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -34,12 +45,17 @@ import static io.tapstate.core.lifecycle.PipelineState.PAUSED;
 import static io.tapstate.core.lifecycle.PipelineState.RUNNING;
 import static io.tapstate.core.lifecycle.PipelineState.STOPPED;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.entry;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+import static org.awaitility.Awaitility.await;
 
 /**
  * A single-node integration of the lifecycle chain the {@code --role=all} process runs: desired intent ->
  * converge loop -> Jet job, and converge loop -> observation -> read faces, over one embedded member and
- * the in-memory store the assembly wires the same way. It drives a pipeline through the four verbs (and a
+ * explicit in-memory store fixtures. The member, node lease, ownership, authorization and driver use their
+ * production factories; this does not establish real CONFIG/CACHE domain assembly. It drives a pipeline through the four verbs (and a
  * re-dig) and witnesses, at each step, that the mapped Jet operation actually took effect, that the actual
  * state converged with a strictly increasing fencing epoch, and that the store-backed read faces serve the
  * converged state. A healthy run publishes no failure metric at all here; the remaining metrics and the
@@ -58,19 +74,37 @@ class SingleNodeLifecycleE2ETest {
     private InMemoryStorePort storePort;
     private ConvergenceDriver driver;
     private PipelineObservationQueryService readFaces;
+    private InMemoryWorkloadClaimStore claims;
+    private NodeSessionLease nodeLease;
+    private ExecutionAuthorization authorization;
+    private ActuationClaimRenewer claimRenewer;
+    private PipelineActuationOwnership ownership;
+    private String clusterId;
+    private ClusterMembershipGate membershipGate;
+
 
     @BeforeEach
-    void wireTheChain() {
-        Config config = new Config();
-        config.getJetConfig().setEnabled(true).setCooperativeThreadCount(2);
-        config.setProperty("hazelcast.phone.home.enabled", "false");
-        config.setProperty("hazelcast.shutdownhook.enabled", "false");
-        JoinConfig join = config.getNetworkConfig().getJoin();
-        join.getMulticastConfig().setEnabled(false);
-        join.getTcpIpConfig().setEnabled(false);
-        join.getAutoDetectionConfig().setEnabled(false);
-        config.getNetworkConfig().getInterfaces().setEnabled(true).addInterface("127.0.0.1");
-        member = Hazelcast.newHazelcastInstance(config);
+    void wireTheChain() throws Exception {
+        clusterId = "single-lifecycle-" + java.util.UUID.randomUUID();
+        var properties = new ClusterProperties();
+        properties.setWorkloadClaimRenewInterval(Duration.ofMillis(100));
+        var hz = new HazelcastProperties(); hz.getJet().setCooperativeThreadCount(2);
+        var identities = mock(ClusterIdentityStore.class); when(identities.find()).thenReturn(Optional.of(new ClusterIdentity(clusterId)));
+        var memberships = mock(ClusterMembershipStore.class); when(memberships.read(clusterId)).thenReturn(Optional.empty());
+        claims = new InMemoryWorkloadClaimStore();
+        var beans = new DefaultListableBeanFactory(); beans.registerSingleton("claims", claims);
+        beans.registerSingleton("identities", identities); beans.registerSingleton("memberships", memberships);
+        var gate = new ClusterMembershipGate(properties); membershipGate = gate; var wiring = new HazelcastConfiguration();
+        member = wiring.hazelcastMember(hz, properties, new ControlEndpointProperties(), null, null, null, null,
+                NestSettings.defaults(), null, null, null, beans.getBeanProvider(ClusterIdentityStore.class),
+                beans.getBeanProvider(WorkloadClaimStore.class), gate, BootId.fresh(), beans.getBeanProvider(StorePort.class),
+                beans.getBeanProvider(ClusterMembershipStore.class));
+        nodeLease = wiring.nodeSessionLease(member);
+        var dataPlane = new DataPlaneActuationConfiguration();
+        authorization = dataPlane.executionAuthorization(member, properties, claims, nodeLease, gate);
+        ownership = dataPlane.pipelineActuationOwnership(member, properties, gate, new ClusterWorkloadClaims(claims, gate));
+        claimRenewer = dataPlane.actuationClaimRenewer(ownership, properties);
+        await().atMost(Duration.ofSeconds(8)).until(gate::businessEligible);
 
         Clock clock = Clock.fixed(T0, ZoneOffset.UTC);
         storePort = new InMemoryStorePort();
@@ -80,16 +114,21 @@ class SingleNodeLifecycleE2ETest {
         EngineLifecycleActuator actuator =
                 new EngineLifecycleActuator(engine, new IdleDagSource(), new NoOpCaptureCoordinator(),
                         new NestStateTeardown(member, storePort.keyedState(), storePort.nestDeadLetters()),
-                        PipelineActuationOwnership.single(), new HazelcastExecutionPlans(member), clock);
+                        ownership, new HazelcastExecutionPlans(member), clock);
         PipelineConverger converger = new PipelineConverger(storePort.desired(), storePort.state(), actuator, clock);
         ObservationPublisher publisher = new ObservationPublisher(storePort.state(), storePort.observations());
-        driver = new ConvergenceDriver(converger, storePort.desired(), publisher);
+        driver = new RuntimeConvergenceConfiguration().convergenceDriver(converger, storePort, publisher, null,
+                MetricsExport.none(), gate, ownership, properties, nodeLease);
         readFaces = new PipelineObservationQueryService(
                 new ArtifactQueryService(storePort.artifacts()), storePort.observations());
     }
 
     @AfterEach
     void stopMember() {
+        if (claimRenewer != null) claimRenewer.close();
+        if (ownership != null) ownership.retain(List.of());
+        if (authorization != null) authorization.close();
+        if (nodeLease != null) nodeLease.close();
         if (member != null) {
             member.shutdown();
         }
@@ -101,6 +140,9 @@ class SingleNodeLifecycleE2ETest {
         desire(RUNNING);
         Job job = member.getJet().getJob(PIPE);
         assertThat(job).as("start submits the pipeline's Jet job").isNotNull();
+        var claimed = claims.read(new WorkloadClaimKey(clusterId, WorkloadClaimType.PIPELINE_ACTUATION, PIPE)).orElseThrow().claim();
+        assertThat(claimed.executionGeneration()).isPositive();
+        assertThat(authorization.require(new ExecutionFence(PIPE, claimed.claimGeneration(), claimed.executionGeneration()))).isNotNull();
         awaitStatus(job, JobStatus.RUNNING);
         assertActualState(RUNNING, 1);
         assertReadFaceReports(PIPE, RUNNING);
@@ -169,10 +211,30 @@ class SingleNodeLifecycleE2ETest {
         assertActualState(PAUSED, 2);
         assertReadFaceReports(PIPE, PAUSED);
 
+        var held = claims.read(new WorkloadClaimKey(clusterId, WorkloadClaimType.PIPELINE_ACTUATION, PIPE)).orElseThrow().claim();
+        var originalExecution = new ExecutionFence(PIPE, held.claimGeneration(), held.executionGeneration());
+        assertThat(authorization.require(originalExecution)).isNotNull();
+        claimRenewer.close();
+        long renewalDue = System.nanoTime() + Duration.ofMillis(100).toNanos();
         runOutOfMemoryOnAMemberThread();
+        await().atMost(Duration.ofSeconds(1)).until(() -> System.nanoTime() - renewalDue >= 0);
+        ownership.renewDue();
+        assertThat(ownership.heldExecutionGeneration(PIPE))
+                .as("the original control claim survives a renewal before the failed engine is observed")
+                .isEqualTo(held.executionGeneration());
         assertThat(MemberOutOfMemory.of(member))
                 .as("the member's own out-of-memory handling took it down, and the held job with it")
                 .isPresent();
+        assertThat(nodeLease.active()).as("the control process still has its original node proof").isTrue();
+        org.junit.jupiter.api.Assertions.assertAll(
+                () -> assertThat(membershipGate.businessEligible()).as("a stopped member cannot admit business work").isFalse(),
+                () -> assertThatThrownBy(() -> authorization.require(originalExecution)).isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED)));
+        assertThat(new ClusterWorkloadClaims(claims, membershipGate).acquire(
+                new WorkloadClaimKey(clusterId, WorkloadClaimType.PIPELINE_ACTUATION, "new-pipeline"),
+                held.owner(), held.topologyRevision(), Duration.ofSeconds(30))).isEmpty();
+        assertThat(new ClusterWorkloadClaims(claims, membershipGate).advanceExecution(
+                held, held.topologyRevision(), java.util.Set.of(held.owner().nodeId()))).isEmpty();
         driver.reconcile();
 
         assertThat(readFaces.status(PIPE))

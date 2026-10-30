@@ -89,10 +89,8 @@ class AStableNodeRestartReplacesOnlyItsExpiredBootSessionIT {
 
     @Test
     void aRestartedNodeIsRefusedUntilItsOwnDeadSessionExpiresAndThenReplacesIt() {
-        String store = SharedMongo.replicaSetUrl("e2e_stable_node_restart");
-
-        try (TwoMemberCluster cluster = TwoMemberCluster.start(
-                store, "e2e-stable-node-restart", NODE_SESSION)) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                TwoMemberCluster cluster = TwoMemberCluster.startPrepared(storage, NODE_SESSION)) {
             cluster.awaitBothMembers();
 
             // Asked of the member that survives all of this. The one being restarted cannot be the

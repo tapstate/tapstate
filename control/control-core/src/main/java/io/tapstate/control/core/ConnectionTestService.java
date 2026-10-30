@@ -24,20 +24,41 @@ import java.util.Objects;
  */
 public final class ConnectionTestService {
 
+    /** Optional runtime-local observation; it never adds fields to the persisted test report. */
+    public interface Observer {
+        Attempt begin(ConnectionConfig connection);
+    }
+    public interface Attempt extends AutoCloseable {
+        Attempt NONE = new Attempt() {
+            @Override public void completed(ConnectionTestResult result) {}
+            @Override public void close() {}
+        };
+        void completed(ConnectionTestResult result);
+        @Override void close();
+    }
+
     private final ConnectionProbe probe;
     private final ConnectionTestResultStore resultStore;
     private final AuditGate auditGate;
     private final ConnectorConfigValidator configValidator;
     private final SourceConnectionResolver sourceConnections;
+    private final Observer observer;
 
     public ConnectionTestService(
             ConnectionProbe probe, ConnectionTestResultStore resultStore, AuditGate auditGate,
             ConnectorConfigValidator configValidator, SourceConnectionResolver sourceConnections) {
+        this(probe, resultStore, auditGate, configValidator, sourceConnections, ignored -> Attempt.NONE);
+    }
+
+    public ConnectionTestService(
+            ConnectionProbe probe, ConnectionTestResultStore resultStore, AuditGate auditGate,
+            ConnectorConfigValidator configValidator, SourceConnectionResolver sourceConnections, Observer observer) {
         this.probe = Objects.requireNonNull(probe, "probe");
         this.resultStore = Objects.requireNonNull(resultStore, "resultStore");
         this.auditGate = Objects.requireNonNull(auditGate, "auditGate");
         this.configValidator = configValidator;
         this.sourceConnections = Objects.requireNonNull(sourceConnections, "sourceConnections");
+        this.observer = Objects.requireNonNull(observer, "observer");
     }
 
     /**
@@ -54,7 +75,7 @@ public final class ConnectionTestService {
                 sourceConnections.resolveWithSecrets(connectionId, connectorId, settings);
         ConnectionConfig config = resolved.config();
         List<String> secretValues = resolved.secretValues();
-        try {
+        try (var attempt = observer.begin(config)) {
             if (configValidator != null) {
                 configValidator.validate(config.connectorId(), config.settings(), resolved.catalogSnapshot());
             }
@@ -65,6 +86,7 @@ public final class ConnectionTestService {
                         ConnectionTestResult result = probe.probe(config);
                         ConnectionTestResult safeResult = ConnectionTestResultRedactor.redact(result, secretValues);
                         resultStore.save(safeResult);
+                        attempt.completed(safeResult);
                         return ConnectionTestReport.from(safeResult);
                     });
         } catch (TapstateException failure) {

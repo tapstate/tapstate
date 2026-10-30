@@ -39,7 +39,9 @@ final class PdkTargetPreparation {
     private final KeyedStateStore stateStore;
     private final boolean preparedAhead;
     private final boolean mongoTarget;
+    private final Runnable requireActive;
     private final Set<String> prepared = new HashSet<>();
+    private final PdkSinkPreparations receipts;
 
     PdkTargetPreparation(TapConnectorContext context, ConnectorFunctions functions, OnFullLoad onFullLoad,
             boolean fullLoad, PipelineNode node, KeyedStateStore stateStore) {
@@ -64,17 +66,44 @@ final class PdkTargetPreparation {
     PdkTargetPreparation(String connectorId, TapConnectorContext context, ConnectorFunctions functions,
             OnFullLoad onFullLoad, boolean fullLoad, PipelineNode node, KeyedStateStore stateStore,
             boolean preparedAhead) {
+        this(connectorId, context, functions, onFullLoad, fullLoad, node, stateStore, preparedAhead,
+                PipelineNode.Purpose.SYNC);
+    }
+
+    PdkTargetPreparation(String connectorId, TapConnectorContext context, ConnectorFunctions functions,
+            OnFullLoad onFullLoad, boolean fullLoad, PipelineNode node, KeyedStateStore stateStore,
+            boolean preparedAhead, PipelineNode.Purpose purpose) {
+        this(connectorId, context, functions, onFullLoad, fullLoad, node, stateStore, preparedAhead, purpose, () -> {});
+    }
+
+    PdkTargetPreparation(String connectorId, TapConnectorContext context, ConnectorFunctions functions,
+            OnFullLoad onFullLoad, boolean fullLoad, PipelineNode node, KeyedStateStore stateStore,
+            boolean preparedAhead, PipelineNode.Purpose purpose, Runnable requireActive) {
+        this(connectorId,context,functions,onFullLoad,fullLoad,node,stateStore,preparedAhead,purpose,requireActive,null);
+    }
+
+    PdkTargetPreparation(String connectorId,TapConnectorContext context,ConnectorFunctions functions,
+            OnFullLoad onFullLoad,boolean fullLoad,PipelineNode node,KeyedStateStore stateStore,
+            boolean preparedAhead,PipelineNode.Purpose purpose,Runnable requireActive,PdkSinkPreparations receipts) {
+        if(receipts!=null)receipts.requireInputs(node,purpose,onFullLoad,fullLoad);
+        this.receipts=receipts;
+        this.requireActive = java.util.Objects.requireNonNull(requireActive, "requireActive");
         this.context = context;
         this.functions = functions;
         this.onFullLoad = onFullLoad;
         this.fullLoad = fullLoad;
-        this.namespace = SinkPreparationNamespace.of(node);
+        this.namespace = SinkPreparationNamespace.of(node, purpose);
         this.stateStore = stateStore;
         this.preparedAhead = preparedAhead;
         this.mongoTarget = connectorId != null && MONGO_TARGETS.contains(connectorId);
     }
 
     void prepare(TargetTable target, TapTable table) throws Throwable {
+        requireActive.run();
+        if (receipts!=null) {
+            if(target==null || preparedAhead || prepared.contains(target.name())){PdkSinkPreparations.host(() -> {receipts.requireReady(target);return null;});return;}
+            prepareScoped(target,table);return;
+        }
         if (target == null || prepared.contains(target.name())) {
             return;
         }
@@ -101,6 +130,7 @@ final class PdkTargetPreparation {
             if (namespace != null && stateStore != null) {
                 // Before any row can land, and only after a successful clear/check. Rerun teardown owns
                 // removing this receipt; a member restart must keep it even when no source ack survived.
+                requireActive.run();
                 stateStore.save(namespace, target.name(), new byte[] {(byte) (created ? 2 : 1)});
             }
         }
@@ -108,6 +138,7 @@ final class PdkTargetPreparation {
             var event = TargetTapTable.createIndexEvent(target, primaryKeyAlreadyCreated);
             if (event != null) {
                 event.setTableId(table.getId());
+                requireActive.run();
                 functions.getCreateIndexFunction().createIndex(context, table, event);
             }
         }
@@ -122,7 +153,12 @@ final class PdkTargetPreparation {
      * receipt is kept at all there is nothing to check.
      */
     static void requirePrepared(PipelineNode node, KeyedStateStore stateStore, Collection<TargetTable> targets) {
-        String namespace = SinkPreparationNamespace.of(node);
+        requirePrepared(node, stateStore, targets, PipelineNode.Purpose.SYNC);
+    }
+
+    static void requirePrepared(PipelineNode node, KeyedStateStore stateStore, Collection<TargetTable> targets,
+            PipelineNode.Purpose purpose) {
+        String namespace = SinkPreparationNamespace.of(node, purpose);
         if (namespace == null || stateStore == null) {
             return;
         }
@@ -134,12 +170,31 @@ final class PdkTargetPreparation {
         }
     }
 
+    private void prepareScoped(TargetTable target,TapTable table)throws Throwable {
+        var held=PdkSinkPreparations.host(() -> receipts.load(target));boolean created;
+        if(held.phase()==io.tapstate.spi.store.SinkPreparationStore.Phase.READY)created=held.result().created();
+        else {
+            var original=PdkSinkPreparations.host(() -> receipts.begin(target));
+            requireActive.run();
+            if(mongoTarget && fullLoad)prepareExisting(table);
+            created=create(table);
+            if(!mongoTarget && !created && fullLoad)prepareExisting(table);
+            requireActive.run();boolean confirmedCreated=created;PdkSinkPreparations.host(() -> {receipts.complete(original,confirmedCreated);return null;});
+        }
+        if(functions.getCreateIndexFunction()!=null) {
+            var event=TargetTapTable.createIndexEvent(target,created);
+            if(event!=null){event.setTableId(table.getId());requireActive.run();functions.getCreateIndexFunction().createIndex(context,table,event);}
+        }
+        requireActive.run();prepared.add(target.name());
+    }
+
     private boolean create(TapTable table) throws Throwable {
         if (functions.getCreateTableV2Function() == null || table.getNameFieldMap().isEmpty()) {
             return false;
         }
         TapCreateTableEvent event = new TapCreateTableEvent().table(table);
         event.setTableId(table.getId());
+        requireActive.run();
         var options = functions.getCreateTableV2Function().createTable(context, event);
         if (options == null || options.getTableExists() == null) {
             throw new IllegalStateException("create-table did not report existence for target table " + table.getId());
@@ -161,6 +216,7 @@ final class PdkTargetPreparation {
                 }
                 TapClearTableEvent event = new TapClearTableEvent();
                 event.setTableId(table.getId());
+                requireActive.run();
                 functions.getClearTableFunction().clearTable(context, event);
             }
             case FAIL -> {
@@ -168,6 +224,7 @@ final class PdkTargetPreparation {
                     throw new IllegalStateException("target table " + table.getId()
                             + " cannot honor on_full_load fail: connector provides no row-count function");
                 }
+                requireActive.run();
                 long rows = functions.getCountByPartitionFilterFunction()
                         .countByPartitionFilter(context, table, TapAdvanceFilter.create());
                 if (rows < 0) {
@@ -191,6 +248,7 @@ final class PdkTargetPreparation {
         // The connector supplies its configured database by updating the mutable parameters.
         AtomicReference<Throwable> failure = new AtomicReference<>();
         AtomicBoolean completed = new AtomicBoolean();
+        requireActive.run();
         functions.getExecuteCommandFunction().execute(context,
                 TapExecuteCommand.create().command("execute").params(params), result -> {
                     if (result != null) {

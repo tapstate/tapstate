@@ -73,6 +73,7 @@ public final class NestStateMapStoreFactory implements MapStoreFactory<Object, O
 
     @Override
     public MapLoader<Object, Object> newMapStore(String mapName, Properties properties) {
-        return new NestStateMapStore(mapName, properties.getProperty(NestMaps.STATE_DATABASE_PROPERTY));
+        return new NestStateMapStore(mapName, properties.getProperty(NestMaps.STATE_DATABASE_PROPERTY),
+                io.tapstate.runtime.engine.OperatorMapBindings.required(properties));
     }
 }

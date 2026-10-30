@@ -58,8 +58,8 @@ class AMemberThatCannotStageTheConnectorRefusesTheStartIT {
         Path staging = inTheWay.resolve("plugins");
 
         try (FileEndpoints files = new FileEndpoints()) {
-            String store = SharedMongo.replicaSetUrl("e2e_unstaged_cluster");
-            try (TwoMemberCluster cluster = TwoMemberCluster.startStaging(store, "e2e-unstaged", UNABLE, staging)) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                    TwoMemberCluster cluster = TwoMemberCluster.startStaging(storage, UNABLE, staging)) {
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.memberOtherThan(UNABLE);
                 control.registerConnector(E2eConnectorJar.CONNECTOR_ID, connector);

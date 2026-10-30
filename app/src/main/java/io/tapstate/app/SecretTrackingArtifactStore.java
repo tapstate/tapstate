@@ -110,9 +110,13 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
     }
 
     @Override
-    public Optional<Resource> get(String id) {
-        return delegate.get(id);
+    public synchronized Optional<Resource> get(String id) {
+        var current = delegate.get(id); current.ifPresent(this::track); return current;
     }
+    @Override public Optional<String> managedDefaultSourceId() { return delegate.managedDefaultSourceId(); }
+
+    /** Native publication supplies only identities; refresh current committed values under the same mutation lock. */
+    synchronized void refreshLoaded(java.util.Set<String> ids) { ids.forEach(this::get); }
 
     /** Registers a store-proven startup winner, never a candidate from a refused write. */
     synchronized void trackLoaded(Resource resource) {
@@ -120,8 +124,8 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
     }
 
     @Override
-    public List<Resource> list() {
-        return delegate.list();
+    public synchronized List<Resource> list() {
+        var current = delegate.list(); current.forEach(this::track); return current;
     }
 
     @Override
@@ -146,16 +150,22 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
     }
 
     private Collection<String> secretValues(SourceResource source) {
+        List<String> secrets = new ArrayList<>();
+        if (("mongodb".equals(source.connector()) || "mongodb-atlas".equals(source.connector()))
+                && source.config().get(io.tapstate.control.core.StorageSetupService.CA_BUNDLE_FIELD) instanceof String ca) {
+            secrets.add(ca);
+            // Structured and multiline logs can escape or indent the original bundle differently.
+            ca.lines().filter(line -> !line.isBlank()).forEach(secrets::add);
+        }
         ConnectorCatalogEntry connector;
         try {
             connector = catalog.get().byId(source.connector());
         } catch (IllegalArgumentException unavailable) {
-            List<String> secrets = new ArrayList<>(namedSecretValues(source.config()));
+            secrets.addAll(namedSecretValues(source.config()));
             SecretConfigPaths.shared().forEach(path -> collectScalars(path.value(source.config()), secrets));
             return secrets;
         }
 
-        List<String> secrets = new ArrayList<>();
         SecretConfigPaths.forConnector(connector).stream()
                 .map(path -> path.value(source.config()))
                 .filter(Objects::nonNull)

@@ -44,7 +44,7 @@ class TheServerChoosesItsTimezoneBeforeStartupIT {
                 Path.of(System.getProperty("java.home"), "bin", "java").toString(), "-Xmx128m"));
         command.addAll(options);
         command.addAll(List.of("-jar", jar.toString(), "--tapstate.store.mongo.enabled=false",
-                "--tapstate.hz.member-port=not-a-number", "--tapstate.log.dir=" + work.resolve("logs")));
+                "--tapstate.cluster.profile=not-a-profile", "--tapstate.log.dir=" + work.resolve("logs")));
         Path output = work.resolve("server.log");
         ProcessBuilder builder = new ProcessBuilder(command).directory(work.toFile())
                 .redirectErrorStream(true).redirectOutput(output.toFile());
@@ -58,7 +58,7 @@ class TheServerChoosesItsTimezoneBeforeStartupIT {
             String text = Files.readString(output);
             assertThat(process.exitValue()).as(text).isEqualTo(1);
             String report = "Server time zone: " + zone + " (" + source + ")";
-            assertThat(text).contains(report, "not-a-number");
+            assertThat(text).contains(report, "not-a-profile");
             String operational = Files.readString(work.resolve("logs/tapstate-server.log"));
             assertThat(operational).contains(report, "--- [] [] []");
             assertThat(text.split("Server time zone:", -1)).hasSize(2);

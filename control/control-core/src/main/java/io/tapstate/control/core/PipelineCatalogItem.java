@@ -73,6 +73,7 @@ public record PipelineCatalogItem(
 
     /** Authoring-aware UI projection carried separately from the existing catalog state vocabulary. */
     public enum UiState {
+        RECOVERY_REQUIRED,
         DRAFT,
         NOT_STARTED,
         NEW,

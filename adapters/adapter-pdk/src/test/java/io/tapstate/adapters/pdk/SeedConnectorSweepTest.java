@@ -28,6 +28,18 @@ import org.junit.jupiter.api.io.TempDir;
 class SeedConnectorSweepTest {
 
     @Test
+    void anExplicitSelectionNeverRegistersOrInspectsOtherSeedFiles(@TempDir Path work, @TempDir Path seedDir) throws Exception {
+        Files.copy(Synthetic.seedableMongodbConnector(work), seedDir.resolve("mongodb.jar"));
+        Files.writeString(seedDir.resolve("db2.jar"), "unselected unreadable artifact");
+        var registry = new InMemoryConnectorRegistry();
+
+        var outcomes = sweepOver(registry).sweep(seedDir, Set.of("mongodb.jar"));
+
+        assertThat(outcomes).hasSize(1).allSatisfy(outcome -> assertThat(outcome).isInstanceOf(SeedOutcome.Seeded.class));
+        assertThat(registry.list()).extracting(ConnectorRegistration::connectorId).containsExactly("mongodb");
+    }
+
+    @Test
     void registersEveryConnectorJarInTheSeedDirectory(@TempDir Path work, @TempDir Path seedDir) throws Exception {
         Files.copy(Synthetic.seedableMongodbConnector(work), seedDir.resolve("mongodb.jar"));
         Files.copy(Synthetic.seedableMysqlConnector(work), seedDir.resolve("mysql.jar"));

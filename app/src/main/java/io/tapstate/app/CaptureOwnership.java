@@ -94,6 +94,26 @@ final class CaptureOwnership {
         }
     }
 
+    /** Confirms the exact original local tenure ended; neither expiry nor a closed renewer proves physical isolation. */
+    void endTenure(WorkloadClaimFence original) {
+        if(!fenced || original==null || original.key().type()!=WorkloadClaimType.CAPTURE
+                || !clusterId.equals(original.key().clusterId()) || !owner.equals(original.owner()))throw fenced();
+        var before=claims.read(original.key()).orElseThrow(CaptureOwnership::fenced);
+        if(!original.equals(WorkloadClaimFence.from(before.claim())))throw fenced();
+        if(before.leased() && !claims.release(before.claim()))throw fenced();
+        requireEnded(original);
+    }
+    /** Read-only durable proof, including when this member has no local owner for the original capture. */
+    void requireEnded(WorkloadClaimFence original) {
+        if(!fenced || original==null || original.key().type()!=WorkloadClaimType.CAPTURE
+                || !clusterId.equals(original.key().clusterId()))throw fenced();
+        var after=claims.read(original.key()).orElseThrow(CaptureOwnership::fenced);
+        if(after.leased() || !original.equals(WorkloadClaimFence.from(after.claim())))throw fenced();
+    }
+    private static io.tapstate.core.common.TapstateException fenced() {
+        return new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.WORKLOAD_CLAIM_FENCED,java.util.Map.of(),null);
+    }
+
     /**
      * How long a claim outlives the member holding it: the lease a holder that stops renewing leaves
      * behind, and so how long it can take a claim to become free to anybody else.

@@ -1,7 +1,6 @@
 package io.tapstate.adapters.mongostore;
 
 import com.mongodb.client.MongoCollection;
-import com.mongodb.client.model.ReplaceOptions;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.HistogramValue;
 import io.tapstate.core.lifecycle.MetricFact;
@@ -58,10 +57,18 @@ public final class MongoObservationStore implements ObservationStore {
     @Override
     public void save(Observation observation) {
         Objects.requireNonNull(observation, "observation");
-        // Upsert by the pipeline id (the document _id): a re-publish overwrites the latest projection in
-        // place (last write wins) rather than accumulating documents. An observation is not fenced.
-        StoreIo.run(() -> collection.replaceOne(
-                new Document("_id", observation.pipelineId()), toDocument(observation), new ReplaceOptions().upsert(true)));
+        // Current scoped execution uses the CACHE store. Preserve any retained legacy display bytes
+        // without allowing an ordinary legacy publication to create or replace initial-load facts.
+        Document fields = toDocument(observation);
+        fields.remove("_id");
+        fields.remove("initialLoad");
+        Document update = new Document("$set", fields);
+        Document absent = new Document();
+        if (observation.observedAt() == null) absent.append("observedAt", "");
+        if (observation.failure() == null) absent.append("failure", "");
+        if (!absent.isEmpty()) update.append("$unset", absent);
+        StoreIo.run(() -> collection.updateOne(new Document("_id", observation.pipelineId()), update,
+                new com.mongodb.client.model.UpdateOptions().upsert(true)));
     }
 
     @Override

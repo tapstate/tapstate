@@ -13,6 +13,10 @@ import java.util.Optional;
  * store. The runtime publishes it after converging; the control read faces read it. {@link #save}
  * upserts the observation for its pipeline; {@link #read} returns the current observation for a
  * pipeline, or empty when none has been published.
+ *
+ * <p>A scope-bound business view also checks its fixed physical state and the original live claim on
+ * every mutation. Last-write-wins applies only inside that admitted scope; a stale scope or run cannot
+ * overwrite its replacement. Ordinary business views refuse physical removal.
  */
 public interface ObservationStore {
 

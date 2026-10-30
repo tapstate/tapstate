@@ -159,6 +159,12 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
         return paths;
     }
 
+    /** The same complete shape addressed by structured paths in an explicitly typed storage layout. */
+    public Set<String> stateIdentityPaths() {
+        return streams.stream().map(stream -> io.tapstate.runtime.engine.OperatorMapCoordinates.path(stream.pathId()))
+                .collect(java.util.stream.Collectors.toUnmodifiableSet());
+    }
+
     /**
      * Every namespace this tree keeps state in: one per vertex, named the same way the vertex asks for its
      * map. A tree being taken down lets go of its state by naming these, which is why they are taken from

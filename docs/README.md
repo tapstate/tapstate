@@ -28,6 +28,7 @@ CLI's: the path for scripts, CI, and machines without a browser or an AI assista
 |---|---|
 | [Quickstart](quickstart-online.md) | The full demo: sample databases, the server, and a live object assembled from two engines - and the same flow by hand, verb by verb, from the CLI. |
 | [First run](first-run/) | The CLI's guided path: answer a few questions and bring a workspace to running - the contract every step is held to. |
+| [Storage setup and recovery](storage/) | OP installation and first administrator, Cloud re-entry, TLS, explicit recovery, configuration transfer and backups. |
 | [Running on your own databases](running-on-your-own-databases.md) | Run the server as a process on your machine, against a MySQL and a MongoDB you already have. |
 | [Tutorials](tutorials/) | Worked scenarios, each with its own sample data, run end to end. |
 

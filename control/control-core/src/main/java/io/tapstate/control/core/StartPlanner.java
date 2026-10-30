@@ -51,10 +51,12 @@ public final class StartPlanner {
         Objects.requireNonNull(definition, "definition");
         Objects.requireNonNull(prior, "prior");
         Objects.requireNonNull(intent, "intent");
+        Runnable current=chains.readingGuard(definition.id());
         StartLoad load = StartLoad.of(readMode(definition), definition.id(), recordsAtStart(definition, prior, intent));
-        return new StartPlan(load, targets.of(definition).stream()
+        var result=new StartPlan(load, targets.of(definition).stream()
                 .map(target -> new StartPlan.Entry(target, load))
                 .toList());
+        current.run();return result;
     }
 
     /** What this pipeline will have recorded on its chains when the predicted start reaches them. */

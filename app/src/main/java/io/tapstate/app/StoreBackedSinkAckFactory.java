@@ -521,7 +521,7 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
             ChainPosition resumable = now.resumableAt();
             if (resumable != null && (before == null || before.resumableAt() == null
                     || resumable.order().compareTo(before.resumableAt().order()) > 0)) {
-                ChainPosition acked = ackedCandidate(source, run, resumable);
+                ChainPosition acked = ackedCandidate(source,run);
                 if (acked != null && !acked.equals(raised.get(source))) {
                     if (!raiseSinkAcked(source, acked, fence)) {
                         return false;
@@ -542,24 +542,8 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
          * how far another has got; and nowhere for a direct channel, whose position the store moves as its
          * recorded batches complete.
          */
-        private ChainPosition ackedCandidate(SourceProgress source, WriterRun run, ChainPosition resumable) {
-            if (source.kind() == ConsumerProgressKind.DIRECT_SOURCE) {
-                return null;
-            }
-            if (run.expected().size() == 1) {
-                return resumable;
-            }
-            ChainPosition lowest = null;
-            for (String table : run.expected().keySet()) {
-                ChainPosition at = SrsWriterFrontier.landed(run, table).map(Landed::resumableAt).orElse(null);
-                if (at == null) {
-                    return null;
-                }
-                if (lowest == null || at.order().compareTo(lowest.order()) < 0) {
-                    lowest = at;
-                }
-            }
-            return lowest != null && isSnapshotOf(lowest) ? lowest : null;
+        private ChainPosition ackedCandidate(SourceProgress source,WriterRun run) {
+            return source.kind() == ConsumerProgressKind.DIRECT_SOURCE ? null : io.tapstate.spi.store.WriterFrontier.resumableAt(run).orElse(null);
         }
 
         // Each write of the source node's record, fenced where the report was. A fenced write the store turned
@@ -597,10 +581,8 @@ final class StoreBackedSinkAckFactory implements SinkAckFactory {
      * position - an order a token from beneath it would be read back as reaching.
      */
     private static ChainPosition confirmedAt(Landed landed) {
-        ChainPosition resumable = landed.resumableAt();
-        String token = resumable != null && resumable.order().equals(landed.durableThrough())
-                ? resumable.token() : null;
-        return new ChainPosition(landed.durableThrough(), token);
+        return io.tapstate.spi.store.WriterFrontier.confirmedAt(
+                new io.tapstate.spi.store.WriterFrontier.Landed(landed.durableThrough(),landed.resumableAt()));
     }
 
     /**

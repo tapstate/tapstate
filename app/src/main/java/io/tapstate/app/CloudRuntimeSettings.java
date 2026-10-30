@@ -22,8 +22,6 @@ import java.util.Objects;
 final class CloudRuntimeSettings {
 
     private static final int MAX_DATABASE_NAME_BYTES = 63;
-    private static final String OPERATOR_SUFFIX = "_operator";
-    private static final String VIEWS_SUFFIX = "_views";
 
     enum Mode {
         ON_PREM,
@@ -35,18 +33,13 @@ final class CloudRuntimeSettings {
     private final String token;
     private final String atlasUri;
     private final String clusterId;
-    private final String operatorStateDatabase;
-    private final String viewsDatabase;
 
-    private CloudRuntimeSettings(Mode mode, URI baseUrl, String token, String atlasUri, String clusterId,
-            String operatorStateDatabase, String viewsDatabase) {
+    private CloudRuntimeSettings(Mode mode, URI baseUrl, String token, String atlasUri, String clusterId) {
         this.mode = Objects.requireNonNull(mode, "mode");
         this.baseUrl = baseUrl;
         this.token = token;
         this.atlasUri = atlasUri;
         this.clusterId = clusterId;
-        this.operatorStateDatabase = operatorStateDatabase;
-        this.viewsDatabase = viewsDatabase;
     }
 
     static CloudRuntimeSettings resolve(CloudProperties properties) {
@@ -62,7 +55,7 @@ final class CloudRuntimeSettings {
                 || properties.getAtlasUri() != null
                 || clusterId != null;
         if (!any) {
-            return new CloudRuntimeSettings(Mode.ON_PREM, null, null, null, null, null, null);
+            return new CloudRuntimeSettings(Mode.ON_PREM, null, null, null, null);
         }
         if (!hasText(properties.getBaseUrl())
                 || !hasText(properties.getToken())
@@ -75,10 +68,8 @@ final class CloudRuntimeSettings {
         if (!(atlasUri.startsWith("mongodb://") || atlasUri.startsWith("mongodb+srv://"))) {
             throw new TapstateException(BootError.CLOUD_ATLAS_URI_INVALID, Map.of(), null);
         }
-        String metadataDatabase = metadataDatabase(atlasUri);
-        return new CloudRuntimeSettings(Mode.CLOUD, baseUrl, properties.getToken(), atlasUri, clusterId.trim(),
-                derivedDatabase(metadataDatabase, OPERATOR_SUFFIX),
-                derivedDatabase(metadataDatabase, VIEWS_SUFFIX));
+        validateConfigurationDatabase(atlasUri);
+        return new CloudRuntimeSettings(Mode.CLOUD, baseUrl, properties.getToken(), atlasUri, clusterId.trim());
     }
 
     private static URI parseBaseUrl(String raw) {
@@ -137,15 +128,7 @@ final class CloudRuntimeSettings {
         return cloud() ? atlasUri : onPremUri;
     }
 
-    String operatorStateDatabase(String onPremDatabase) {
-        return cloud() ? operatorStateDatabase : onPremDatabase;
-    }
-
-    String viewsDatabase(String onPremDatabase) {
-        return cloud() ? viewsDatabase : onPremDatabase;
-    }
-
-    private static String metadataDatabase(String atlasUri) {
+    private static void validateConfigurationDatabase(String atlasUri) {
         try {
             String path = new URI(atlasUri).getRawPath();
             if (path == null || path.length() <= 1 || path.indexOf('/', 1) >= 0) {
@@ -155,20 +138,13 @@ final class CloudRuntimeSettings {
             // literal plus before decoding percent escapes so a path cannot silently name another DB.
             String database = URLDecoder.decode(path.substring(1).replace("+", "%2B"), StandardCharsets.UTF_8);
             if (database.isBlank()) throw new IllegalArgumentException("missing database");
-            if (!MongoDatabaseNames.isValid(database)) throw new IllegalArgumentException("invalid database");
-            return database;
+            if (!MongoDatabaseNames.isValid(database)
+                    || database.getBytes(StandardCharsets.UTF_8).length > MAX_DATABASE_NAME_BYTES)
+                throw new IllegalArgumentException("invalid database");
         } catch (URISyntaxException | IllegalArgumentException invalid) {
             // Driver diagnostics quote connection strings and can therefore carry credentials.
             throw new TapstateException(BootError.CLOUD_ATLAS_URI_INVALID, Map.of(), null);
         }
-    }
-
-    private static String derivedDatabase(String metadataDatabase, String suffix) {
-        String derived = metadataDatabase + suffix;
-        if (derived.getBytes(StandardCharsets.UTF_8).length > MAX_DATABASE_NAME_BYTES) {
-            throw new TapstateException(BootError.CLOUD_ATLAS_URI_INVALID, Map.of(), null);
-        }
-        return derived;
     }
 
     @Override

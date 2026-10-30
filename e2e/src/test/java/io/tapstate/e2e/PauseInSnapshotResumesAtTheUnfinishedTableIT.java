@@ -1,10 +1,8 @@
 package io.tapstate.e2e;
 
-import com.mongodb.ConnectionString;
-import com.mongodb.client.MongoClient;
-import com.mongodb.client.MongoClients;
-import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.core.lifecycle.LifecycleVerb;
+import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.testsupport.DockerGate;
 import org.bson.Document;
 import org.junit.jupiter.api.AfterEach;
@@ -44,34 +42,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  * the wrong table pass unnoticed, and the tables are read in a fixed order, so an off-by-one in the
  * attribution has somewhere to hide unless the numbers themselves disagree.
  *
- * <h2>Why the unconfirmed table is arranged by selection rather than by timing</h2>
- *
- * <p>The state this case needs is a boundary inside one pipeline's durable cursor: some tables confirmed,
- * one not.
- * Reaching it by interrupting a running full load does not work, and both reasons are properties of the
- * shipped path rather than of this harness.
- *
- * <p>A run cut short while <em>reading</em> has confirmed nothing at all. The bounded round drains into a
- * member-local buffer and the source vertex drains that once the job runs, so a round that stopped part way
- * wrote no row, confirmed no table, and is owed every one of them on the way back. That is a real state,
- * but it is not one with a boundary in it.
- *
- * <p>A run stalled while <em>writing</em> confirms nothing either, and this was measured rather than
- * assumed: holding one table's writes while the other two completed left the record naming no table at all
- * after two minutes, not the two that had gone through. A table's confirmation is published when the sink
- * has no batch in flight, so one held table withholds every table's confirmation, not its own.
- *
- * <p>What does produce the boundary is widening the selection of a pipeline that is stopped with its
- * state kept -- which is what adding a table to a pipeline is. It reads two tables and confirms them, is
- * stopped without clearing anything, and comes back reading three: its own cursor names two of them, so
- * the third is owed and the other two are not.
- *
- * <p>It used to be arranged with two pipelines instead, one reading two tables and one reading three, on
- * the strength of their sharing a chain. That is no longer a boundary: completion is recorded against the
- * pipeline that confirmed it, because it answers "are this pipeline's rows in this pipeline's target" and
- * two pipelines on a chain write to targets of their own. The second pipeline there now owes all three
- * tables, correctly -- so the old arrangement stopped producing the state this case is about, and the
- * arrangement had to become one that happens inside a single pipeline.
+ * <p>A source-side hold pauses before the third table is read. The first two tables must be confirmed
+ * through their real writers before the pipeline is stopped with state kept. Its definition and target
+ * roster stay fixed across replacement; releasing the third read then proves partial snapshot recovery
+ * without treating a definition change as a continuation of the same target preparation.
  *
  * <p>Gated on Docker for the state store. Source and target are the harness's own file connector, so this
  * needs no directory of real connector jars and runs in the ordinary pull-request lane.
@@ -109,6 +83,9 @@ class PauseInSnapshotResumesAtTheUnfinishedTableIT {
     @TempDir
     private Path targetDirectory;
 
+    @TempDir
+    private Path holds;
+
     private String previousConnectorsDir;
 
     @BeforeAll
@@ -134,70 +111,83 @@ class PauseInSnapshotResumesAtTheUnfinishedTableIT {
     @Test
     void theRunThatComesBackReadsOnlyTheTableNoSinkHadConfirmed() throws Exception {
         ROWS.forEach(this::seed);
+        Files.writeString(holds.resolve("read-" + OWED), "");
 
-        String storeUri = SharedMongo.replicaSetUrl("pause_in_snapshot_state");
         byte[] jar = Files.readAllBytes(E2eConnectorJar.buildInto(connectorJars));
 
-        Map<String, Long> confirmingRunReads;
-        try (ServerHandle server = InProcessServer.start(storeUri)) {
-            ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
-            control.registerConnector(E2eConnectorJar.CONNECTOR_ID, jar);
-            control.apply(resources(FIRST + ", " + SECOND));
-            control.discoverSchema(SOURCE, E2eConnectorJar.CONNECTOR_ID, sourceSettings());
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                NativeSrsDocuments documents = new NativeSrsDocuments(storage)) {
+            Map<String, Long> confirmingRunReads;
+            long originalGeneration;
+            try (ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
+                ControlPlane control = new ControlPlane(server.baseUrl());
+                storage.loginAndAwaitBusiness(control);
+                control.registerConnector(E2eConnectorJar.CONNECTOR_ID, jar);
+                control.apply(resources(FIRST + ", " + SECOND + ", " + OWED));
+                control.discoverSchema(SOURCE, E2eConnectorJar.CONNECTOR_ID, sourceSettings());
 
-            control.lifecycle(PIPELINE, LifecycleVerb.START);
+                control.lifecycle(PIPELINE, LifecycleVerb.START);
 
-            // A durable synchronisation point rather than a sleep: the record itself is what says the two
-            // tables are confirmed, and it is the only thing this test carries across the restart.
-            awaitCompleted(storeUri, Set.of(FIRST, SECOND));
-            assertThat(completedTables(storeUri))
-                    .as("the third table is in no selection that has run, so nothing has confirmed it")
-                    .doesNotContain(OWED);
+                Await.until("the third snapshot read to be held before delivering rows", TIMEOUT,
+                        this::thirdReadHeld, () -> "the source has not reached its third read");
+                // Completion comes from the actual target writers while the third source read is held.
+                awaitCompleted(documents, Set.of(FIRST, SECOND));
+                assertThat(completedTables(documents))
+                        .as("the third table is selected but its held read has delivered no rows")
+                        .doesNotContain(OWED);
 
             // The durable proof keeps its original bound. Metrics then get a separate, fresh publication
             // allowance, so completion near that bound cannot reduce this phase to a single sample.
             confirmingRunReads = control.awaitSnapshotRowsRead(PIPELINE, Set.of(FIRST, SECOND));
 
-            // Stopped without clearing: the pipeline has to be at rest before its selection can be widened,
-            // and what it confirmed has to survive that. A clearing stop would give its record back and the
-            // run that comes back would owe all three tables -- which is the correct answer to a different
-            // question, and would leave this case asserting nothing.
-            control.stop(PIPELINE, false);
+                originalGeneration = documents.pipelineMembership(PIPELINE, SOURCE).getLong("stateGeneration");
+                control.stop(PIPELINE, false);
+                Await.until("the partial snapshot to stop with its confirmed tables retained", TIMEOUT,
+                        () -> control.state(PIPELINE).filter(PipelineState.STOPPED::equals).isPresent(),
+                        () -> "state=" + control.state(PIPELINE) + ", failure=" + control.failureCode(PIPELINE));
+                assertThat(completedTables(documents)).containsExactlyInAnyOrder(FIRST, SECOND);
+            }
+
+            assertThat(confirmingRunReads)
+                    .as("the first run read the two unheld tables in full")
+                    .containsEntry(FIRST, 2L)
+                    .containsEntry(SECOND, 3L);
+            assertThat(confirmingRunReads.getOrDefault(OWED, 0L)).isZero();
+            Files.delete(holds.resolve("read-" + OWED));
+
+            try (ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
+                ControlPlane control = new ControlPlane(server.baseUrl());
+                // The admin is already in the store this reopens, so this logs in rather than bootstrapping --
+                // bootstrapping again would be a different server, not the same one coming back.
+                storage.loginAndAwaitBusiness(control);
+
+                // The persisted definition is unchanged; only the held source read is now released.
+                control.lifecycle(PIPELINE, LifecycleVerb.START);
+                Map<String, Long> owedRunReads = awaitSettledReads(control);
+
+                assertThat(owedRunReads)
+                        .as("the two tables the sink confirmed are not read again; the one it never confirmed "
+                                + "is read in full, which is the accepted cost of recording that a table was "
+                                + "written without recording how far its read got")
+                        .containsEntry(FIRST, 0L)
+                        .containsEntry(SECOND, 0L)
+                        .containsEntry(OWED, 5L);
+
+                // The other half: not what discriminates -- re-reading everything would land the same rows --
+                // but a run that skipped a table nothing had confirmed would be short here.
+                awaitTargetRows();
+                assertThat(documents.pipelineMembership(PIPELINE, SOURCE).getLong("stateGeneration"))
+                        .isEqualTo(originalGeneration);
+                assertThat(completedTables(documents)).containsExactlyInAnyOrder(FIRST, SECOND, OWED);
+            }
         }
+    }
 
-        assertThat(confirmingRunReads)
-                .as("the first run read the two tables it selected, in full")
-                .containsEntry(FIRST, 2L)
-                .containsEntry(SECOND, 3L);
-
-        try (ServerHandle server = InProcessServer.start(storeUri)) {
-            ControlPlane control = new ControlPlane(server.baseUrl());
-            // The admin is already in the store this reopens, so this logs in rather than bootstrapping --
-            // bootstrapping again would be a different server, not the same one coming back.
-            control.login("e2e", "e2e-password");
-
-            // The table is added the way an author adds one: same source, same pipeline, one more table
-            // in each. The chain is keyed by the physical coordinate and excludes the table subset, so this
-            // is the same chain and the same consumer record -- which is what makes the two confirmations
-            // still apply to it.
-            control.apply(resources(FIRST + ", " + SECOND + ", " + OWED));
-            control.discoverSchema(SOURCE, E2eConnectorJar.CONNECTOR_ID, sourceSettings());
-
-            control.lifecycle(PIPELINE, LifecycleVerb.START);
-            Map<String, Long> owedRunReads = awaitSettledReads(control);
-
-            assertThat(owedRunReads)
-                    .as("the two tables the sink confirmed are not read again; the one it never confirmed "
-                            + "is read in full, which is the accepted cost of recording that a table was "
-                            + "written without recording how far its read got")
-                    .containsEntry(FIRST, 0L)
-                    .containsEntry(SECOND, 0L)
-                    .containsEntry(OWED, 5L);
-
-            // The other half: not what discriminates -- re-reading everything would land the same rows --
-            // but a run that skipped a table nothing had confirmed would be short here.
-            awaitTargetRows();
+    private boolean thirdReadHeld() {
+        try (var files = Files.list(holds)) {
+            return files.anyMatch(file -> file.getFileName().toString().startsWith("held-read-" + OWED + "-"));
+        } catch (IOException failure) {
+            throw new UncheckedIOException(failure);
         }
     }
 
@@ -213,11 +203,11 @@ class PauseInSnapshotResumesAtTheUnfinishedTableIT {
     }
 
     /** Waits until the chain record names every table a sink is expected to have confirmed. */
-    private static void awaitCompleted(String storeUri, Set<String> expected) {
+    private static void awaitCompleted(NativeSrsDocuments documents, Set<String> expected) {
         long deadline = System.nanoTime() + TIMEOUT.toNanos();
         List<String> last = List.of();
         while (System.nanoTime() - deadline < 0) {
-            last = completedTables(storeUri);
+            last = completedTables(documents);
             if (last.containsAll(expected)) {
                 return;
             }
@@ -240,12 +230,13 @@ class PauseInSnapshotResumesAtTheUnfinishedTableIT {
             if (!now.equals(last)) {
                 last = now;
                 unchangedSince = System.nanoTime();
-            } else if (!now.isEmpty() && System.nanoTime() - unchangedSince > SETTLE.toNanos()) {
+            } else if (now.getOrDefault(OWED, 0L) > 0 && System.nanoTime() - unchangedSince > SETTLE.toNanos()) {
                 return now;
             }
             sleep();
         }
-        assertThat(last).as("the run that came back published no per-table read counts").isNotEmpty();
+        assertThat(last).as("the replacement run did not publish its selected tables; state=%s failure=%s logs=%s",
+                control.state(PIPELINE), control.failureCode(PIPELINE), control.logs(PIPELINE)).containsKey(OWED);
         return last;
     }
 
@@ -280,32 +271,22 @@ class PauseInSnapshotResumesAtTheUnfinishedTableIT {
         return counts;
     }
 
-    /**
-     * Every table any chain in this store has marked snapshot-complete, read straight from the collection
-     * rather than through the store port -- the port is part of what is under test, and asking it whether
-     * it wrote would take its own word for it.
-     */
-    private static List<String> completedTables(String storeUri) {
-        try (MongoClient client = MongoClients.create(storeUri)) {
-            String database = new ConnectionString(storeUri).getDatabase();
-            List<String> tables = new ArrayList<>();
-            for (Document consumer : client.getDatabase(database)
-                    .getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS).find()) {
-                // Completion is recorded in the cursor of the pipeline that confirmed it. One pipeline
-                // runs here, so gathering every cursor's marks is the same set.
-                if (consumer.get(COMPLETED) instanceof List<?> entries) {
-                    entries.forEach(entry -> tables.add(String.valueOf(entry)));
-                }
-            }
-            return tables;
-        }
+    /** Reads only the current native membership's exact generation and revision, without aggregating cursors. */
+    private static List<String> completedTables(NativeSrsDocuments documents) {
+        Document member = documents.pipelineMembership(PIPELINE, SOURCE);
+        if (member == null) return List.of();
+        String chain = member.get("_id", Document.class).getString("chain");
+        Document cursor = documents.consumerOffset(chain, SrsConsumerId.of(PIPELINE, SOURCE).value());
+        if (cursor == null || !member.get("stateGeneration").equals(cursor.get("stateGeneration"))
+                || !member.get("revision").equals(cursor.get("membershipRevision"))) return List.of();
+        return cursor.get("progress", Document.class).getList(COMPLETED, String.class, List.of());
     }
 
     private Map<String, Object> sourceSettings() {
-        return Map.of("uri", sourceDirectory.toString());
+        return Map.of("uri", sourceDirectory.toString(), "hold", holds.toString());
     }
 
-    /** The whole workspace over one table list -- applied once narrow, then once wider. */
+    /** The same fixed workspace is reused across the interrupted snapshot and replacement. */
     private Map<String, String> resources(String tables) {
         Map<String, String> resources = new LinkedHashMap<>();
         resources.put("src_files.tap.yml", sourceYaml(SOURCE, tables));
@@ -314,22 +295,18 @@ class PauseInSnapshotResumesAtTheUnfinishedTableIT {
         return resources;
     }
 
-    /**
-     * One source over the seeded directory. Widening its table list leaves its settings alone, which is
-     * what keeps the chain the same one: the chain is keyed by the physical coordinate and the table
-     * subset is deliberately not part of it.
-     */
+    /** The source hold remains part of the same connection identity across replacement. */
     private String sourceYaml(String id, String tables) {
         return """
                 version: tapstate/v1
                 kind: source
                 id: %s
                 connector: %s
-                config: { uri: "%s" }
+                config: { uri: "%s", hold: "%s" }
                 mode: cdc
                 tables: [ %s ]
                 """
-                .formatted(id, E2eConnectorJar.CONNECTOR_ID, sourceDirectory, tables);
+                .formatted(id, E2eConnectorJar.CONNECTOR_ID, sourceDirectory, holds, tables);
     }
 
     private String targetYaml() {

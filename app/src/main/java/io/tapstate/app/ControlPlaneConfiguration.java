@@ -52,6 +52,7 @@ import io.tapstate.control.core.StartCheckEvaluator;
 import io.tapstate.control.core.StartChecks;
 import io.tapstate.control.core.StartPlanner;
 import io.tapstate.control.core.PipelineDraftService;
+import io.tapstate.control.core.PipelineDeletionService;
 import io.tapstate.control.core.PipelineCatalogService;
 import io.tapstate.control.core.PipelineLayoutService;
 import io.tapstate.control.core.PipelineLogQueryService;
@@ -182,8 +183,10 @@ class ControlPlaneConfiguration {
     @Bean
     @org.springframework.boot.autoconfigure.condition.ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
     io.tapstate.control.core.AiProviderService aiProviderService(
-            io.tapstate.spi.store.AiProviderSettingsStore store, AuditGate auditGate) {
-        return new io.tapstate.control.core.AiProviderService(store, auditGate);
+            ObjectProvider<io.tapstate.spi.store.AiProviderSettingsStore> stores, AuditGate auditGate) {
+        var store = stores.getIfAvailable();
+        // An optional provider feature cannot block a runtime whose active backend has no settings adapter.
+        return store == null ? null : new io.tapstate.control.core.AiProviderService(store, auditGate);
     }
 
     @Bean
@@ -474,14 +477,14 @@ class ControlPlaneConfiguration {
     @Bean
     ArtifactMutationService artifactMutationService(
             ArtifactStore artifactStore, StorePort storePort, AuditGate auditGate,
-            ObjectProvider<DataBrowserFollows> follows) {
+            ObjectProvider<DataBrowserFollows> follows, ObjectProvider<ArtifactMutationService.PipelineDeletion> pipelines) {
         // The removal takes the same artifact store bean apply writes through, so both paths see one
         // view of a resource. The dependent bookkeeping a removed pipeline owns is reclaimed straight
         // off the store port: those facets have no service in front of them.
         return new ArtifactMutationService(
                 artifactStore, storePort.desired(), storePort.state(), storePort.observations(),
                 storePort.layouts(), storePort.meta(), storePort.derivedSchemas(), storePort.rateHistory(),
-                auditGate, follows.getIfAvailable(() -> DataBrowserFollows.NONE));
+                auditGate, follows.getIfAvailable(() -> DataBrowserFollows.NONE), pipelines.getIfAvailable());
     }
 
     @Bean
@@ -568,10 +571,12 @@ class ControlPlaneConfiguration {
     @Bean
     SeedSweepRunner seedSweepRunner(
             SeedConnectorSweep sweep, ConnectorPluginProperties properties, CloudRuntimeSettings cloud,
-            ConnectorRegistry registry, ConnectorCatalogStore catalog, ConnectorSpecStore specs, CapabilityDeriver deriver) {
+            ConnectorRegistry registry, ConnectorCatalogStore catalog, ConnectorSpecStore specs, CapabilityDeriver deriver,
+            org.springframework.core.env.Environment environment) {
         var readiness = cloud.cloud()
                 ? CloudConnectorSeedReadiness.checkedRelease(
-                        properties.getSeedDir(), properties.getPluginsDir(), registry, catalog, specs, deriver)
+                        properties.getSeedDir(), properties.getPluginsDir(), registry, catalog, specs, deriver,
+                        "true".equals(environment.getProperty(WebDistribution.DEVELOPMENT_CONFIRMATION_PROPERTY)))
                 : null;
         return new SeedSweepRunner(sweep, properties.getSeedDir(), readiness);
     }
@@ -615,8 +620,10 @@ class ControlPlaneConfiguration {
     @Bean
     ConnectionTestService connectionTestService(
             ConnectionProbe probe, ConnectionTestResultStore resultStore, AuditGate auditGate,
-            ConnectorConfigValidator configValidator, SourceConnectionResolver sourceConnections) {
-        return new ConnectionTestService(probe, resultStore, auditGate, configValidator, sourceConnections);
+            ConnectorConfigValidator configValidator, SourceConnectionResolver sourceConnections,
+            org.springframework.beans.factory.ObjectProvider<ConnectionTestService.Observer> observers) {
+        return new ConnectionTestService(probe, resultStore, auditGate, configValidator, sourceConnections,
+                observers.getIfAvailable(() -> ignored -> ConnectionTestService.Attempt.NONE));
     }
 
     @Bean
@@ -722,6 +729,14 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
+    PipelineDeletionService pipelineDeletionService(
+            ArtifactQueryService artifacts,
+            ArtifactMutationService mutations,
+            PipelineDraftService drafts) {
+        return new PipelineDeletionService(artifacts, mutations, drafts);
+    }
+
+    @Bean
     PipelinePreviewService pipelinePreviewService(
             ApplyService applyService, PipelinePreviewProbe probe, Clock clock) {
         return new PipelinePreviewService(applyService, probe, clock);
@@ -734,15 +749,16 @@ class ControlPlaneConfiguration {
             PipelineObservationQueryService observations,
             StorePort storePort) {
         return new PipelineCatalogService(
-                artifacts, pipelineDrafts, storePort.desired(), observations);
+                artifacts, pipelineDrafts, storePort.desired(), observations,storePort::pipelineRecoveryRequired);
     }
 
     @Bean
     PipelineObservationQueryService pipelineObservationQueryService(
-            ArtifactQueryService artifactQueryService, StorePort storePort, ObjectProvider<HazelcastInstance> member) {
+            ArtifactQueryService artifactQueryService, StorePort storePort, ObjectProvider<HazelcastInstance> member,
+            ObjectProvider<io.tapstate.control.core.PipelineStatusDiagnostics> diagnostics) {
         HazelcastInstance engine = member.getIfAvailable();
         return new PipelineObservationQueryService(artifactQueryService, storePort.observations(),
-                executionPlans(engine), dataMembers(engine));
+                executionPlans(engine), dataMembers(engine), diagnostics.getIfAvailable(() -> io.tapstate.control.core.PipelineStatusDiagnostics.NONE));
     }
 
     @Bean
@@ -811,9 +827,9 @@ class ControlPlaneConfiguration {
 
     @Bean
     PipelinePositionService pipelinePositionService(PipelineChains pipelineChains, StorePort storePort,
-            LivePipelines livePipelines, AuditGate auditGate) {
+            LivePipelines livePipelines, AuditGate auditGate, ObjectProvider<PipelinePositionService.WriteBack> nativeWrites) {
         return new PipelinePositionService(
-                pipelineChains, storePort.meta(), storePort.artifacts(), livePipelines, auditGate);
+                pipelineChains, storePort.meta(), storePort.artifacts(), livePipelines, auditGate, nativeWrites.getIfAvailable());
     }
 
     // ---- the node-local log tail: the sink, the appender that feeds it, and the read face over it ----

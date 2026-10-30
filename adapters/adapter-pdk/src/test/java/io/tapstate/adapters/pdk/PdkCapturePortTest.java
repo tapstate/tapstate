@@ -791,6 +791,20 @@ class PdkCapturePortTest {
                 .isNotNull();
     }
 
+    @Test void aStillRunningOriginalCdcSubscriptionRefusesCloseAndCanBeRetried(@TempDir Path dir) throws Exception {
+        Path jar=Synthetic.emittingSource(dir);var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
+        var port=new PdkCapturePort(provisioner(jar,"synthetic.EmittingSource",null));
+        var sub=port.cdc(config("t1"),CaptureStart.present(),(events,position) -> {
+            entered.countDown();
+            while(release.getCount()!=0)try {release.await();}catch(InterruptedException stopping) { }
+        });
+        try {
+            assertThat(entered.await(5,TimeUnit.SECONDS)).isTrue();
+            assertThatThrownBy(sub::close).isInstanceOfSatisfying(TapstateException.class,error -> assertThat(error.code()).isEqualTo(ConnectorError.CAPTURE_FAILED));
+        } finally {release.countDown();sub.close();}
+        assertThatCode(sub::close).doesNotThrowAnyException();
+    }
+
     @Test
     void cdcSubscriptionCloseIsIdempotent(@TempDir Path dir) throws Exception {
         // The Subscription contract promises idempotent close; a second close must be a no-op, not a
@@ -801,6 +815,126 @@ class PdkCapturePortTest {
         });
         sub.close();
         assertThatCode(sub::close).doesNotThrowAnyException();
+    }
+
+    @Test void aRefusedPreflightRetainsItsGatedPluginStopAndCannotOpenAReplacement(@TempDir Path dir) throws Exception {
+        String channel="preflight-stop-"+java.util.UUID.randomUUID();
+        var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var ended=new CountDownLatch(1);
+        System.getProperties().put(channel+".entered",entered);System.getProperties().put(channel+".release",release);System.getProperties().put(channel+".ended",ended);
+        var provisions=new java.util.concurrent.atomic.AtomicInteger();
+        Path jar=Synthetic.gatedStopSource(dir,channel);
+        var ref=new ConnectorRef(List.of(jar),"synthetic.GatedStopSource","2.0.8",null);
+        var original=new TapstateException(io.tapstate.spi.store.IoError.SRS_MODEL_UNAVAILABLE,
+                Map.of("chain","original","table","t1","version","0"),null);
+        var port=new PdkCapturePort(id -> {provisions.incrementAndGet();return ref;}).withStreamPreparation(actual -> {throw original;});
+        try {
+            assertThatThrownBy(() -> port.cdc(config("t1"),CaptureStart.present(),(events,position) -> {}))
+                    .isSameAs(original).satisfies(failure -> assertThat(failure.getSuppressed()).singleElement()
+                            .isInstanceOfSatisfying(TapstateException.class,cleanup -> assertThat(cleanup.code()).isEqualTo(ConnectorError.CAPTURE_FAILED)));
+            assertThat(entered.await(5,TimeUnit.SECONDS)).isTrue();assertThat(ended.getCount()).isOne();
+            assertThatThrownBy(() -> port.cdc(config("t1"),CaptureStart.present(),(events,position) -> {}))
+                    .isInstanceOfSatisfying(TapstateException.class,failure -> assertThat(failure.code()).isEqualTo(ConnectorError.CAPTURE_FAILED));
+            assertThat(provisions).hasValue(1);
+            var clone=port.withStreamPreparation(actual -> {});
+            assertThatThrownBy(() -> clone.cdc(config("t1"),CaptureStart.present(),(events,position) -> {}))
+                    .isInstanceOfSatisfying(TapstateException.class,failure -> assertThat(failure.code()).isEqualTo(ConnectorError.CAPTURE_FAILED));
+            assertThat(provisions).hasValue(1);
+            release.countDown();((AutoCloseable)(Object)port).close();
+            assertThat(ended.await(5,TimeUnit.SECONDS)).isTrue();
+            assertThatThrownBy(() -> port.cdc(config("t1"),CaptureStart.present(),(events,position) -> {})).isSameAs(original);
+            assertThat(provisions).hasValue(2);
+        } finally {
+            release.countDown();assertThat(ended.await(5,TimeUnit.SECONDS)).isTrue();
+            if ((Object)port instanceof AutoCloseable close) close.close();
+            for(String key:List.of(".entered",".release",".ended"))System.getProperties().remove(channel+key);
+        }
+    }
+
+    @Test void aPendingPreflightAlsoFencesSnapshotOpeningsThroughAPreparedClone(@TempDir Path dir) throws Exception {
+        String channel="preflight-snapshot-"+java.util.UUID.randomUUID();
+        var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var ended=new CountDownLatch(1);
+        System.getProperties().put(channel+".entered",entered);System.getProperties().put(channel+".release",release);System.getProperties().put(channel+".ended",ended);
+        var provisions=new java.util.concurrent.atomic.AtomicInteger();
+        var ref=new ConnectorRef(List.of(Synthetic.gatedStopSource(dir,channel)),"synthetic.GatedStopSource","2.0.8",null);
+        var port=new PdkCapturePort(id -> {provisions.incrementAndGet();return ref;}).withStreamPreparation(actual -> {
+            throw new TapstateException(io.tapstate.spi.store.IoError.SRS_MODEL_UNAVAILABLE,Map.of("chain","original","table","t1","version","0"),null);
+        });
+        var unexpected=new AtomicReference<SnapshotSession>();
+        try {
+            assertThatThrownBy(() -> port.cdc(config("t1"),CaptureStart.present(),(events,position) -> {}))
+                    .isInstanceOfSatisfying(TapstateException.class,failure -> {
+                        assertThat(failure.code()).isEqualTo(io.tapstate.spi.store.IoError.SRS_MODEL_UNAVAILABLE);
+                        assertThat(failure.getSuppressed()).singleElement().isInstanceOfSatisfying(TapstateException.class,
+                                cleanup -> assertThat(cleanup.code()).isEqualTo(ConnectorError.CAPTURE_FAILED));
+                    });
+            var clone=port.withSnapshotPreparation((request,seam,actual) -> {});
+            assertThatThrownBy(() -> unexpected.set(clone.snapshotSession(config("t1"),new io.tapstate.spi.capture.SnapshotPreparation(1,null))))
+                    .isInstanceOfSatisfying(TapstateException.class,failure -> assertThat(failure.code()).isEqualTo(ConnectorError.CAPTURE_FAILED));
+            assertThat(provisions).hasValue(1);
+        } finally {
+            release.countDown();if(unexpected.get()!=null)unexpected.get().close();((AutoCloseable)(Object)port).close();
+            assertThat(ended.await(5,TimeUnit.SECONDS)).isTrue();
+            for(String key:List.of(".entered",".release",".ended"))System.getProperties().remove(channel+key);
+        }
+    }
+
+    @Test void aTransientPluginStopFailureRetriesTheOriginalInstanceWithoutOpeningAnother(@TempDir Path dir) throws Exception {
+        String channel="preflight-stop-retry-"+java.util.UUID.randomUUID();
+        var stops=new java.util.concurrent.atomic.AtomicInteger();var provisions=new java.util.concurrent.atomic.AtomicInteger();
+        System.getProperties().put(channel,stops);
+        var ref=new ConnectorRef(List.of(Synthetic.retryingStopSource(dir,channel)),"synthetic.RetryingStopSource","2.0.8",null);
+        var port=new PdkCapturePort(id -> {provisions.incrementAndGet();return ref;}).withStreamPreparation(actual -> {
+            throw new TapstateException(io.tapstate.spi.store.IoError.SRS_MODEL_UNAVAILABLE,Map.of("chain","original","table","t1","version","0"),null);
+        });
+        try {
+            assertThatThrownBy(() -> port.cdc(config("t1"),CaptureStart.present(),(events,position) -> {}))
+                    .isInstanceOfSatisfying(TapstateException.class,failure -> {
+                        assertThat(failure.code()).isEqualTo(io.tapstate.spi.store.IoError.SRS_MODEL_UNAVAILABLE);
+                        assertThat(failure.getSuppressed()).singleElement().isInstanceOfSatisfying(TapstateException.class,
+                                cleanup -> assertThat(cleanup.code()).isEqualTo(ConnectorError.CAPTURE_FAILED));
+                    });
+            assertThat(stops).hasValue(1);assertThat(provisions).hasValue(1);
+            assertThatCode(() -> ((AutoCloseable)(Object)port).close()).doesNotThrowAnyException();
+            assertThat(stops).hasValue(2);assertThat(provisions).hasValue(1);
+            ((AutoCloseable)(Object)port).close();assertThat(stops).hasValue(2);
+        } finally {
+            try {((AutoCloseable)(Object)port).close();}catch(TapstateException expectedOnDefectiveVersion) { }
+            System.getProperties().remove(channel);
+        }
+    }
+
+    @Test void refusedOpeningCleanupWaitsForAnAdmittedConnectorOwnedDeliveryAfterTheWorkerEnds(@TempDir Path dir) throws Exception {
+        var ref=new ConnectorRef(List.of(Synthetic.emittingSource(dir)),"synthetic.EmittingSource","2.0.8",null);
+        var provisions=new java.util.concurrent.atomic.AtomicInteger();
+        var port=new PdkCapturePort(id -> {provisions.incrementAndGet();return ref;});
+        var connector=PdkConnector.open("demo",ref,Map.of(),null,null,null);
+        var workerFailure=new AtomicReference<Throwable>();
+        var worker=new Thread(() -> {try {connector.underLoader(() -> {connector.connector().init(connector.context());return null;});}
+            catch(Throwable failure){workerFailure.set(failure);}},"fixture-ended-preflight-worker");
+        worker.start();worker.join(5000);assertThat(worker.isAlive()).isFalse();assertThat(workerFailure.get()).isNull();
+        var delivery=new PdkCapturePort.CdcDelivery();var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var exited=new CountDownLatch(1);
+        var unexpected=new AtomicReference<Throwable>();
+        var callback=new Thread(() -> {try {delivery.accept(() -> {
+            entered.countDown();boolean interrupted=false;
+            try {for(;;)try {release.await();break;}catch(InterruptedException ignored){interrupted=true;}}
+            finally {exited.countDown();if(interrupted)Thread.currentThread().interrupt();}
+        });}catch(CancellationException expected){/* Cancellation is the completed boundary's normal result. */}
+            catch(Throwable failure){unexpected.set(failure);}},"fixture-admitted-delivery");
+        callback.start();
+        try {
+            assertThat(entered.await(5,TimeUnit.SECONDS)).isTrue();
+            // Arrange the exact race state after a timed-out caller cancels a just-admitted callback.
+            delivery.cancel();
+            assertThatThrownBy(() -> port.abortPreflight(connector,worker,delivery))
+                    .isInstanceOfSatisfying(TapstateException.class,failure -> assertThat(failure.code()).isEqualTo(ConnectorError.CAPTURE_FAILED));
+            assertThat(exited.getCount()).isOne();
+            assertThatThrownBy(() -> port.snapshotSession(config("t1")))
+                    .isInstanceOfSatisfying(TapstateException.class,failure -> assertThat(failure.code()).isEqualTo(ConnectorError.CAPTURE_FAILED));
+            assertThat(provisions).hasValue(0);
+        } finally {
+            release.countDown();callback.join(5000);port.close();assertThat(callback.isAlive()).isFalse();
+            assertThat(exited.getCount()).isZero();assertThat(unexpected.get()).isNull();
+        }
     }
 
     @Test

@@ -93,8 +93,10 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     private SrsRingbuffer ring;
     private SrsLogStore log;
     private ChainPosition confirmed;
+    private Long recoveryAfter;
     private LongConsumer cursor;
     private SrsRingReader reader;
+    private SrsEventModelVerifier modelVerifier = SrsEventModelVerifier.NONE;
     // When this run of refusals began, so the bound below measures the stretch the cluster has been
     // saying no rather than one attempt. Armed on the first refusal; an answer clears it, because a
     // later refusal is a new stretch and not a continuation of one the cluster already came back from.
@@ -142,6 +144,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
 
     // Times each read of the ring that produced something, which is this stage's unit of work.
     private StageTimer timer = StageTimer.none(Stage.SOURCE);
+    private SourceArrivals arrivals = SourceArrivals.of(null);
 
     @Override
     public void holdChangesUntil(List<AwaitedLoad> awaited, LoadLandings landings) {
@@ -152,6 +155,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     @Override
     protected void init(Context context) {
         this.timer = StageTimer.of(stage(), context);
+        this.arrivals = SourceArrivals.of(context);
         // Take what the capture side has already buffered for this ring before opening the ring reader, so
         // the source emits every snapshot row (op r, no source position) ahead of the first cdc change -- the
         // ordering that keeps a stale snapshot from landing at the sink after a newer change of the same key.
@@ -187,12 +191,20 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             // the ring's first refusable operation on the initialisation path, which has nowhere to wait: the
             // refusal a forming cluster answers with would end the run before it had read anything, and
             // nothing submits another.
+            Object durable = context.hazelcastInstance().getUserContext().get(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY);
+            log = durable instanceof SrsLogStore resolved ? resolved : null;
+            if (log == null && ringTail.publisherFactory().requiresDurableLog())
+                throw new TapstateException(CaptureError.SRS_NOT_RECOVERABLE,Map.of("chain",ringName),null);
+            modelVerifier = Objects.requireNonNull(ringTail.publisherFactory().modelVerifier(context.hazelcastInstance(),ringName),"model verifier");
             Ringbuffer<SrsItem> rb = context.hazelcastInstance().getRingbuffer(ringName);
             ring = new SrsRingbuffer(rb);
             cursor = ringTail.publisherFactory().resolve(context.hazelcastInstance());
-            Object durable = context.hazelcastInstance().getUserContext()
-                    .get(CaptureRunUnit.SRS_LOG_USER_CONTEXT_KEY);
-            log = durable instanceof SrsLogStore resolved ? resolved : null;
+            var recovery = ringTail.publisherFactory().recoverySequence(context.hazelcastInstance());
+            recoveryAfter = ringTail.resumeAfter();
+            if (recovery.isPresent()) recoveryAfter = recovery.getAsLong();
+            if (recovery.isPresent() && ringTail.resumeAfter() != null && recovery.getAsLong() < ringTail.resumeAfter())
+                throw new TapstateException(CaptureError.RECOVERY_LOG_GAP,Map.of("ring",ringName,"sequence",recovery.getAsLong(),
+                        "reason","the original saved recovery floor moved backwards"),null);
             confirmed = ringTail.publisherFactory().confirmedPosition(context.hazelcastInstance()).orElse(null);
         }
     }
@@ -244,8 +256,11 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         if (ringTail != null && !awaitingSnapshot && !holding && openReader()) {
             try {
                 reader.fill((item, seq) -> {
+                    modelVerifier.verify(item,seq);
                     SourceOrder order = orderOf(item, seq);
-                    pending.add(SrsProjection.toEnvelope(item, src, order));
+                    Envelope row = SrsProjection.toEnvelope(item, src, order);
+                    arrivals.received(src, row);
+                    pending.add(row);
                     read = order;
                 }, readBatch);
                 refused = false;
@@ -291,7 +306,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         }
         try {
             if (log == null) {
-                Long resumeAfter = ringTail.resumeAfter();
+                Long resumeAfter = recoveryAfter;
                 if (confirmed != null && confirmed.order() != null && confirmed.order().seq() >= 0L) {
                     // A resumed job reuses its graph, but its sink may have confirmed more since assembly.
                     long confirmedSeq = confirmed.order().seq();
@@ -301,9 +316,9 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
                         ? SrsRingReader.resumingAfter(ring, resumeAfter, cursor)
                         : SrsRingReader.from(ring, ringTail.start(), cursor);
             } else {
-                reader = ringTail.resumeAfter() != null
+                reader = recoveryAfter != null
                         ? SrsRingReader.resumingAfter(
-                                ring, ringTail.resumeAfter(), confirmed, cursor, ringName, log)
+                                ring, recoveryAfter, confirmed, cursor, ringName, log)
                         : SrsRingReader.from(ring, ringTail.start(), cursor, null, ringName, log);
             }
             refused = false;
@@ -366,6 +381,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             awaitingSnapshot = !buffered.snapshotState(pipelineId, ringName).handedOver();
         }
         for (Envelope row : rows) {
+            arrivals.received(src, row);
             if (holding && (!held.isEmpty() || !isLoadRow(row))) {
                 held.add(row);
             } else {

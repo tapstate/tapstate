@@ -11,7 +11,6 @@ import io.tapstate.control.core.StartCheckReport;
 import io.tapstate.control.core.StartIntent;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.DesiredState;
-import java.net.URI;
 import java.util.Locale;
 import java.util.Map;
 import org.springframework.http.HttpHeaders;
@@ -24,6 +23,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.util.UriComponentsBuilder;
 
 /**
  * The Pipeline write verbs projected onto HTTP: a conditional structured replacement at
@@ -66,7 +66,8 @@ class PipelineController {
     @PostMapping("/pipelines")
     ResponseEntity<PipelineView> create(@RequestBody PipelineInput input) {
         PipelineView created = pipelines.create(AuthenticatedCaller.subject(), input);
-        return ResponseEntity.created(URI.create("/api/pipelines/" + created.id()))
+        return ResponseEntity.created(UriComponentsBuilder.fromPath("/api/pipelines/{id}")
+                        .buildAndExpand(created.id()).encode().toUri())
                 .eTag(created.contentHash())
                 .body(created);
     }

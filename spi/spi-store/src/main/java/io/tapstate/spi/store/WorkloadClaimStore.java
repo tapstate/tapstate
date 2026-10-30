@@ -10,9 +10,29 @@ import java.util.Set;
 /** Persistence port for Mongo-time owner leases and their monotonic fencing generations. */
 public interface WorkloadClaimStore {
 
-    /** Acquires an absent, expired, or already-self-owned claim atomically. */
+    /**
+     * Acquires an absent, expired, or already-self-owned claim atomically. Only a still-live same-owner
+     * acquisition keeps its tenure; an expired or released tenure always takes a new claim generation.
+     */
     WorkloadClaimAttempt acquire(
             WorkloadClaimKey key, WorkloadOwner owner, long topologyRevision, Duration ttl);
+
+    /**
+     * Admits a Pipeline claim only under the captured current physical state identity. Implementations
+     * without this check refuse; falling back to a bare Pipeline id could revive a retired generation.
+     */
+    default WorkloadClaimAttempt acquirePipeline(PipelineIntentScope scope, WorkloadOwner owner,
+            long topologyRevision, Duration ttl) {
+        throw new io.tapstate.core.common.TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+    }
+
+    /**
+     * Reads only the claim admitted under this original Pipeline scope. A generic metadata read does
+     * not establish that a run still belongs to its physical state; unsupported stores refuse.
+     */
+    default Optional<WorkloadClaimReading> readPipeline(PipelineIntentScope scope) {
+        throw new io.tapstate.core.common.TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+    }
 
     /** Renews only the exact owner and generation while its current lease is still live. */
     Optional<WorkloadClaim> renew(WorkloadClaim expected, Duration ttl);

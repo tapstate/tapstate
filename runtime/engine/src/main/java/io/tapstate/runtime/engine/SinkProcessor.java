@@ -178,7 +178,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
     // Resolved at init from the running job, so a failed write can be recorded against this pipeline's id
     // before it leaves this processor — see reapSettled and JobFailureRegistry.
     private String pipelineId;
-    private JobFailureRegistry failureRegistry;
+    private JobFailureRegistry.Recorder failureRegistry;
     // When this processor began counting, epoch milliseconds. Taken here rather than from the job because
     // the counters are this processor's: an execution that restarts inside a job builds a new processor
     // with its totals back at zero, and a start that did not move with them would describe a stream that
@@ -400,7 +400,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             ack = sinkAck.forWriter(writerId(writerOf, totalOne ? 0 : context.globalProcessorIndex()));
         }
         HazelcastInstance instance = context.hazelcastInstance();
-        this.failureRegistry = instance != null ? JobFailureRegistry.of(instance) : null;
+        this.failureRegistry = instance != null ? JobFailureRegistry.of(instance).forJob(context.jobId(), context.jobConfig()) : null;
         // A gauge that writes into a job's statistics can only do so from that job's own threads, and a
         // sink is also driven by hand - which is how its behaviour is pinned at all. Outside a job there
         // is nothing to write into and asking for a handle fails outright, taking the sink down with it,
@@ -710,7 +710,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
                 // exact cause (see JobFailureRegistry), so the last point this processor still holds the
                 // real, unwrapped cause is the only reliable place to keep it.
                 if (failureRegistry != null) {
-                    failureRegistry.record(pipelineId, failure);
+                    failureRegistry.record(failure);
                 }
                 throw failure;
             }

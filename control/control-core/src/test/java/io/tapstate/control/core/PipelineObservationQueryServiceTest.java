@@ -125,6 +125,38 @@ class PipelineObservationQueryServiceTest {
         });
     }
 
+    @Test
+    void aProvedReadDiagnosisNeverRewritesTheStoredStateTimeOrMeasurements() {
+        var original = runningWithFacts();
+        var store = storeWith(original);
+        var diagnosis = new ObservationFailure("engine.out-of-memory", Map.of("pipeline", "orders_sync"));
+        var calls = new java.util.concurrent.atomic.AtomicInteger();
+        var query = new PipelineObservationQueryService(artifactsWith("orders_sync"), store,
+                ExecutionPlans.NONE, List::of, (pipeline, observed) -> { calls.incrementAndGet(); return Optional.of(diagnosis); });
+        var status = query.lifecycleStatus("orders_sync");
+        assertThat(status.state()).isEqualTo(PipelineState.FAILED);
+        assertThat(status.observedState()).isEqualTo(PipelineState.RUNNING);
+        assertThat(status.failure()).isEqualTo(diagnosis);
+        assertThat(status.observedAt()).isEqualTo(TAKEN);
+        assertThat(query.metrics("orders_sync").metrics()).isEqualTo(original.metrics());
+        assertThat(store.read("orders_sync")).contains(original);
+        assertThat(calls).hasValue(1);
+        var item = new PipelineCatalogItem("orders_sync", "orders_sync", null, null, null, null, null, true,
+                new PipelineCatalogItem.Status(PipelineCatalogItem.DisplayState.FAILED, PipelineCatalogItem.UiState.FAILED,
+                        PipelineState.RUNNING, PipelineState.RUNNING, diagnosis, TAKEN));
+        assertThat(query.findStatusWithPlan(item).orElseThrow()).isEqualTo(status);
+        assertThat(calls).hasValue(1);
+    }
+
+    @Test
+    void terminalAndUnobservedPipelinesCannotBeDiagnosedAsAnotherRun() {
+        var stopped = new Observation("orders_sync", PipelineState.STOPPED, Map.of(), Map.of());
+        var query = new PipelineObservationQueryService(artifactsWith("orders_sync"), storeWith(stopped),
+                ExecutionPlans.NONE, List::of, (pipeline, observed) -> { throw new AssertionError("no active observed run"); });
+        assertThat(query.status("orders_sync").state()).isEqualTo(PipelineState.STOPPED);
+        assertThat(query.findStatus("missing")).isEmpty();
+    }
+
     private static Observation running() {
         return new Observation("orders_sync", PipelineState.RUNNING,
                 Map.of("recordCount", 5L), Map.of("orders", new TableSnapshot(10L, 20L, 50)));

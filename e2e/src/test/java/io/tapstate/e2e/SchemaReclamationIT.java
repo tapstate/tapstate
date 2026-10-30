@@ -2,6 +2,7 @@ package io.tapstate.e2e;
 
 import com.mongodb.client.MongoClients;
 import io.tapstate.testsupport.DockerGate;
+import io.tapstate.adapters.mongostore.SystemCollections;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -39,13 +40,12 @@ class SchemaReclamationIT {
     void rediscoveryReclaimsAbandonedTablesAndPreservesActiveAndCurrentTables() throws Exception {
         Path connectorJar = E2eConnectorJar.buildInto(connectorJars);
         Files.writeString(sourceDirectory.resolve("orders.csv"), "id,amount\n1,12\n");
-        String database = "e2e_schema_reclamation_" + UUID.randomUUID().toString().replace("-", "");
-        String storeUri = SharedMongo.replicaSetUrl(database);
         String previous = System.setProperty("tapstate.e2e.connectors-dir", connectorJars.toString());
-        try (var client = MongoClients.create(storeUri);
-             ServerHandle server = InProcessServer.start(storeUri)) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+             ServerHandle server = Tiers.IN_PROCESS.launch(storage);
+             var client = MongoClients.create(storage.cacheUri())) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID, Files.readAllBytes(connectorJar));
             control.apply(Map.of("source.tap.yml", """
                     version: tapstate/v1
@@ -59,9 +59,10 @@ class SchemaReclamationIT {
             control.discoverSchema(SOURCE_ID, E2eConnectorJar.CONNECTOR_ID,
                     Map.of("uri", sourceDirectory.toString()));
 
-            var schemas = client.getDatabase(database).getCollection("source_schemas");
+            var schemas = SystemCollections.CACHE_SOURCE_SCHEMAS.on(client.getDatabase(storage.cacheDatabase()));
             Document table = schemas.find(new Document("name", "orders")).first();
             assertThat(table).isNotNull();
+            assertThat(table.get("cacheScope", Document.class)).containsEntry("clusterId", storage.clusterId());
             String abandoned = UUID.randomUUID().toString();
             String active = UUID.randomUUID().toString();
             // Persist the state left after table insertion but before envelope publication. Copy a
