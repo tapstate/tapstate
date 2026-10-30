@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      EXPECTED_PRODUCT_REVISION: fe6011933c7f4c0e4de726e35a7f8fb7ca2bafdf
+      EXPECTED_PRODUCT_REVISION: b3aba4c98040a9ec5a3f79ec06a2a282d22c8d48
       MAVEN_OPTS: -Xmx1536m -XX:ActiveProcessorCount=2
       JAVA_TOOL_OPTIONS: -Xmx1536m -XX:ActiveProcessorCount=2
     steps:
@@ -25,6 +25,7 @@ jobs:
           fetch-depth: 2
       - name: Verify identical product and test sources
         run: |
+          git fetch --no-tags --depth=1 origin "$EXPECTED_PRODUCT_REVISION"
           git diff --exit-code "$EXPECTED_PRODUCT_REVISION" HEAD -- . \
             ':(exclude).github/scripts/_connector-inputs.py' \
             ':(exclude).github/workflows/issue-900-fixed-release-validation.yml'
