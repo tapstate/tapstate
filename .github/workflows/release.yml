@@ -884,7 +884,7 @@ jobs:
             echo "The gate will ask for a run that already succeeded on ${{ needs.version.outputs.sha }}."
             exit 0
           fi
-          gh workflow run nightly-real-connectors.yml --ref "${GITHUB_REF_NAME}"
+          gh workflow run nightly-real-connectors.yml --ref "${GITHUB_REF_NAME}" -f connector-inputs=release
           echo "Dispatched the real-connector lane on ${GITHUB_REF_NAME} (${tip})."
 
   join-perf:
@@ -976,13 +976,13 @@ jobs:
       #    same way as everything else. Failing closed in both directions is the point -- a lane that
       #    never started and a lane still running are both refusals, and neither can be read off a
       #    count of failures.
-      - name: 6. the real-connector lane is green on this commit
+      - name: 6. the shipped-connector lane is green on this commit
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           deadline=$(( SECONDS + 75 * 60 ))
           while true; do
-            .github/scripts/checks-on-commit.sh --sha "${{ needs.version.outputs.sha }}" --required real-connectors && break
+            .github/scripts/checks-on-commit.sh --sha "${{ needs.version.outputs.sha }}" --required real-connectors-release && break
             # 3 is the only answer worth waiting on: nothing has concluded yet. Anything else has
             # concluded something, and polling a lane that already failed would burn the whole
             # deadline printing that it is waiting.

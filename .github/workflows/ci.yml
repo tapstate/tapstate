@@ -602,6 +602,7 @@ jobs:
       - name: Cloud connector input and test-preparation cases
         run: |
           python3 deploy/cloud/stage-connectors-test.py
+          python3 -B .github/scripts/connector-inputs-test.py
           PYTHONDONTWRITEBYTECODE=1 python3 deploy/cloud/prepare-test-inputs-test.py
       - name: Cloud image runtime helper cases
         run: |

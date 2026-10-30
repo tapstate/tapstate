@@ -37,6 +37,26 @@ and not a bar applied to you.)
 4. **Open a pull request** against `main`. Describe what changed and why. CI runs
    the build and a few repository checks on every PR — make sure it's green.
 
+
+## Real connector inputs
+
+The Real connectors workflow runs the same ten witness shards with two input policies:
+
+- **Shipping acceptance:** dispatch with `connector-inputs=release`. It downloads the seven
+  connector witness assets from `connectors-preview`, verifies their size, SHA-256, manifest and
+  specification against `deploy/cloud/connectors.lock.json`, and reports `real-connectors-release`.
+  Every shard and the aggregate must agree on the actual input identities. A missing or changed
+  asset fails; the workflow does not substitute an upstream build. The Cloud image staging path
+  retains its separate eight-connector and companion-license contract.
+- **Upstream compatibility:** schedules and default manual dispatches build current upstream
+  source and SNAPSHOT inputs and report `real-connectors`. This detects new compatibility work;
+  its result does not substitute for shipping acceptance on a different connector set.
+
+Both policies retain the existing witness selection, tiers, report admission and explicit external
+fixture deferrals. Release publication dispatches and requires the shipping-specific verdict on
+its selected commit. The release tag can move, so the lock and recorded artifact digests identify
+what was actually tested.
+
 ## External contributions
 
 You need access to nothing private to contribute here. There are two ways in, and they differ in

@@ -366,7 +366,7 @@ has "the write-back only opens for the newest line" write-back "if: needs.versio
 # started on this commit produces no check-run at all, and every way of counting failures reports that
 # as nothing wrong.
 has "the connector lane is judged by the same reader as every other check" \
-    gates 'checks-on-commit\.sh --sha .* --required real-connectors'
+    gates 'checks-on-commit\.sh --sha .* --required real-connectors-release'
 
 # --- and so is the performance lane -------------------------------------------------------------
 # The same shape for the same reason. This one is the easier of the two to lose: the ordinary build
