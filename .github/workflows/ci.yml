@@ -77,9 +77,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.shard-plan.outputs.matrix) }}
-    runs-on: ubuntu-latest
+    # Avoid MongoDB 8's Ubuntu 7.0 kernel startup incompatibility (SERVER-131779).
+    # Keep all independent build producers on the same compatible runner image.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+      # Receipt hashing uses hashlib.file_digest, available since Python 3.11.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
       - uses: actions/download-artifact@v4
         if: startsWith(matrix.shard, 'e2e-')
         with:
@@ -247,11 +253,15 @@ jobs:
       sonar-outcome: ${{ steps.analyze.outcome }}
     needs: [shard-plan, test-shards]
     if: ${{ always() }}
-    runs-on: ubuntu-latest
+    # Match test-shards so toolchain and ABI evidence remain comparable.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
