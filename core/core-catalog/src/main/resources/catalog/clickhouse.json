@@ -267,7 +267,7 @@
   ],
   "provenance": {
     "specPath": "connectors/clickhouse-connector/src/main/resources/spec_clickhouse.json",
-    "specContentHash": "1e3511e7bb50690a",
+    "specContentHash": "afd52088de4e936f",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

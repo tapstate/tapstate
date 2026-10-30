@@ -78,7 +78,7 @@
   ],
   "provenance": {
     "specPath": "connectors/tablestore-connector/src/main/resources/spec_tablestore.json",
-    "specContentHash": "b93243400a67964c",
+    "specContentHash": "8084c8f72e3f9044",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {}

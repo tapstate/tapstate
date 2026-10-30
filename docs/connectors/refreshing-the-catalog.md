@@ -75,6 +75,11 @@ specification content, but it does not always win: where this repository declare
 connector, ours outranks it, and the difference is reported rather than silently resolved. See
 [Declaring modes](declaring-modes.md).
 
+A spec-only refresh updates only connectors already in the bundled catalog. New upstream ids remain
+in the drift report until a full refresh supplies their capability face; they are not added to the
+catalog with empty modes. Existing catalog entries without bitmap records remain eligible for
+specification updates.
+
 ## Running a refresh yourself
 
 One script, both depths. It needs a connectors checkout - there is no way to regenerate without one,
