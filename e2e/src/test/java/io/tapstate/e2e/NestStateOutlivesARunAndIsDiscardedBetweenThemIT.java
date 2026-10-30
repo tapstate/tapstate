@@ -29,6 +29,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -309,10 +310,18 @@ class NestStateOutlivesARunAndIsDiscardedBetweenThemIT {
     }
 
     private static void awaitCustomer(MongoEndpoints mongo, PreparedNativeStore storage, String expected, String what) {
+        awaitCustomer(() -> mongo.documents(EndpointAddress.uri(storage.masterUri()), VIEW), expected, what);
+    }
+
+    static void awaitCustomer(Supplier<List<Document>> documents, String expected, String what) {
         Await.until(what, () -> {
-            var rows = mongo.documents(EndpointAddress.uri(storage.masterUri()), VIEW);
-            return rows.size() == 1 && expected.equals(rows.getFirst().getString("customer"));
-        }, () -> mongo.documents(EndpointAddress.uri(storage.masterUri()), VIEW).toString());
+            var rows = documents.get();
+            if (rows.size() != 1 || !expected.equals(rows.getFirst().getString("customer"))) return false;
+            var items = rows.getFirst().getList("items", Document.class);
+            return items != null && items.size() == 2
+                    && items.stream().map(item -> item.getString("sku")).sorted().toList()
+                            .equals(List.of("sku-1", "sku-2"));
+        }, () -> documents.get().toString());
     }
 
     private static boolean hasWaitingChild(MongoEndpoints mongo, PreparedNativeStore storage) {
