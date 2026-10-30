@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      EXPECTED_PRODUCT_REVISION: b3aba4c98040a9ec5a3f79ec06a2a282d22c8d48
+      EXPECTED_PRODUCT_REVISION: 8c3180dcc8c237f16cf7c5acb9eafb232d604182
       MAVEN_OPTS: -Xmx1536m -XX:ActiveProcessorCount=2
       JAVA_TOOL_OPTIONS: -Xmx1536m -XX:ActiveProcessorCount=2
     steps:
