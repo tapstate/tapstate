@@ -77,7 +77,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.shard-plan.outputs.matrix) }}
-    runs-on: ubuntu-latest
+    # Avoid MongoDB 8's Ubuntu 7.0 kernel startup incompatibility (SERVER-131779).
+    # Keep all independent build producers on the same compatible runner image.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -247,7 +249,8 @@ jobs:
       sonar-outcome: ${{ steps.analyze.outcome }}
     needs: [shard-plan, test-shards]
     if: ${{ always() }}
-    runs-on: ubuntu-latest
+    # Match test-shards so toolchain and ABI evidence remain comparable.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
         with:

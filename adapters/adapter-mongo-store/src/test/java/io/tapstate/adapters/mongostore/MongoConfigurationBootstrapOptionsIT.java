@@ -29,7 +29,33 @@ import static org.assertj.core.api.Assertions.catchThrowable;
 @RequiresDocker
 class MongoConfigurationBootstrapOptionsIT {
     @Container
-    private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:8.0"));
+    private static final MongoDBContainer MONGO = new StartupMongo();
+
+    private static final class StartupMongo extends MongoDBContainer {
+        private static final int OUTPUT_LIMIT = 16 * 1024;
+        private String startupOutput = "";
+
+        StartupMongo() {
+            super(DockerImageName.parse("mongo:8.0"));
+        }
+
+        @Override public String getLogs() {
+            String logs = super.getLogs();
+            // Testcontainers reads logs synchronously before removing a failed container.
+            startupOutput = logs.substring(Math.max(0, logs.length() - OUTPUT_LIMIT));
+            return logs;
+        }
+
+        @Override public void start() {
+            try {
+                super.start();
+            } catch (RuntimeException failure) {
+                // Preserve the actual server startup reason even without an SLF4J provider.
+                failure.addSuppressed(new IllegalStateException("Mongo startup output (bounded):\n" + startupOutput));
+                throw failure;
+            }
+        }
+    }
 
     @ParameterizedTest
     @ValueSource(strings = {"", "w=majority", "retryWrites=true&w=majority", "w=1"})
