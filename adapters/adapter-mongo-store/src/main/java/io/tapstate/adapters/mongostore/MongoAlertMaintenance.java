@@ -74,10 +74,13 @@ final class MongoAlertMaintenance implements AlertMaintenance {
         try { if(System.nanoTime()>=schemaVerifiedUntil){b.use(64,64*1024);transactions.verify(b.remaining());schemaVerifiedUntil=b.until;} }
         catch(Yield end){return new Batch(cursor,b.used,0,b.encoded,Map.of("budget",1L),null);}
         while(b.available()) {
-            Cursor original=cursor;Document candidate;
-            try { b.use(16,32*1024);candidate=transactions.run(false,b.remaining(),s->next(s,collection,original,b)); }
+            Cursor pageAfter=cursor;List<Document> candidates;
+            try { b.use(16,32*1024);candidates=transactions.run(false,b.remaining(),s->next(s,collection,pageAfter,b)); }
             catch(Yield end){break;}
-            if(candidate==null){exhausted=true;break;}
+            if(candidates.isEmpty()){exhausted=true;break;}
+            boolean yielded=false,retry=false;
+            for(Document candidate:candidates){
+            Cursor original=cursor;
             Instant candidateAt=candidate.get("cleanupAt") instanceof Date date?date.toInstant():null;
             b.currentCandidate=candidateAt;
             String encodedCursor=candidate.containsKey("cursor")?candidate.getString("cursor"):new Document("id",candidate.get("_id")).toJson();
@@ -99,11 +102,11 @@ final class MongoAlertMaintenance implements AlertMaintenance {
             }catch(Yield end){skipped.merge("budget",1L,Long::sum);
                 // Budget exhaustion has not classified or committed this candidate. Retrying its
                 // original key with a fresh batch must precede advancing to later candidates.
-                b.eligible(b.currentCandidate);pendingCandidate[index]=candidate.get("_id");cursor=original;break;}
+                b.eligible(b.currentCandidate);pendingCandidate[index]=candidate.get("_id");cursor=original;yielded=true;break;}
             catch(MongoReadBudget.MaintenanceConflict conflict){
                 conflict();skipped.merge("conflict",1L,Long::sum);
                 if(++conflicts>3)throw new io.tapstate.core.common.TapstateException(IoError.STORE_UNAVAILABLE,Map.of("detail","maintenance-contention"),null);
-                if(resumingCandidate||b.proofSteps>proofBefore)pendingCandidate[index]=candidate.get("_id");cursor=original;
+                if(resumingCandidate||b.proofSteps>proofBefore)pendingCandidate[index]=candidate.get("_id");cursor=original;retry=true;break;
             }
             catch(IllegalArgumentException | ClassCastException | NullPointerException invalid) {
                 // A malformed or unsupported record is retained, and its scanned key still advances.
@@ -111,11 +114,14 @@ final class MongoAlertMaintenance implements AlertMaintenance {
             }catch(io.tapstate.core.common.TapstateException invalid){
                 if(invalid.code()!=IoError.DOCUMENT_UNREADABLE)throw invalid;skipped.merge("unreadable",1L,Long::sum);b.protect(b.currentCandidate);pendingCandidate[index]=null;cursor=scanned;
             }
+            }
+            if(yielded)break;
+            if(retry)continue;
         }
         if(b.isolated)skipped.merge("unreadable",1L,Long::sum);
         return new Batch(exhausted?null:cursor,b.used,changed,b.encoded,skipped,b.oldestEligible,b.oldestProtected);
     }
-    private Document next(ClientSession s,SystemCollections c,Cursor after,Budget b) {
+    private List<Document> next(ClientSession s,SystemCollections c,Cursor after,Budget b) {
         Document header=candidateHeader(c);
         if(!b.isolationChecked){b.use(4096);b.isolated=handles.apply(c).aggregate(s,List.of(new Document("$match",and(scope(c),new Document("$nor",List.of(header)))),
                 new Document("$limit",1),new Document("$project",new Document("_id",0).append("present",new Document("$literal",true))))).first()!=null;b.isolationChecked=true;}
@@ -136,21 +142,33 @@ final class MongoAlertMaintenance implements AlertMaintenance {
                 filter=and(filter,definitions?new Document("_id",new Document("$gt",id)):
                         lex(List.of("cleanupAt","_id"),List.of(Date.from(after.candidateAt()),id)));}
         }
-        b.use(4096);
+        // Fetch only four bounded projected keys under one discovery authority check.
+        // The header caps the BSON key at 16 KiB; 24 KiB also covers projected node fields.
+        // Reserve every key before IO, including unused keys when the page is short.
+        int pageSize=4;b.use(pageSize,pageSize*24L*1024);
+        Document projection=new Document("_id",1);
+        if(c==SystemCollections.ALERT_NODE_LIFECYCLES)projection.append("phase",1).append("nodeId",1).append("bootId",1);
+        else projection.append("cleanupAt",1);
         var query=handles.apply(c).find(s,filter).hintString(c==SystemCollections.ALERT_NODE_LIFECYCLES?"alert_query_node_lifecycle":"alert_cleanup")
-                .sort(sort).projection(new Document("_id",1).append("cleanupAt",1).append("phase",1).append("nodeId",1).append("bootId",1)).batchSize(1).limit(1);
-        Document result=query.first();
-        if(result!=null&&c==SystemCollections.ALERT_NODE_LIFECYCLES) {
+                .sort(sort).projection(projection).batchSize(pageSize).limit(pageSize);
+        List<Document> results=query.into(new ArrayList<>());
+        if(c==SystemCollections.ALERT_NODE_LIFECYCLES)for(Document result:results){
             // Copy the key, never an arbitrary original node object, into the process-local cursor.
             result.put("cursor",new Document("id",result.get("_id")).append("phase",result.get("phase")).append("nodeId",result.get("nodeId")).append("bootId",result.get("bootId")).toJson());
         }
-        return result;
+        return results;
     }
     private static Document candidateHeader(SystemCollections collection) {
         var tests=new ArrayList<Object>();
         var versions=collection==SystemCollections.ALERT_INSTANCES?List.of(2,3,4):collection==SystemCollections.ALERT_DELIVERY_INTENTS?List.of(1,2,3):collection==SystemCollections.ALERT_RULES||collection==SystemCollections.ALERT_SUBSCRIPTIONS||collection==SystemCollections.ALERT_RECEIVERS?List.of(1,2):
                 collection==SystemCollections.ALERT_EPISODES||collection==SystemCollections.ALERT_TRANSITIONS?List.of(2):List.of(1);
         tests.add(new Document("$lte",List.of(new Document("$bsonSize",new Document("key","$_id")),16*1024)));
+        if(collection!=SystemCollections.ALERT_NODE_LIFECYCLES){
+            var type=new Document("$type","$cleanupAt");
+            // Protected live records legitimately have no cleanup timestamp. Eligibility
+            // still requires a date below; arrays never enter either projected key shape.
+            tests.add(new Document("$in",List.of(type,List.of("missing","null","date"))));
+        }
         if(collection==SystemCollections.ALERT_NODE_LIFECYCLES){
             tests.add(textKey("$_id",64));tests.add(new Document("$cond",List.of(new Document("$eq",List.of(new Document("$type","$_id"),"string")),new Document("$regexMatch",new Document("input","$_id").append("regex","^[a-f0-9]{64}$")),false)));
             tests.add(textKey("$nodeId",256));tests.add(textKey("$bootId",256));tests.add(new Document("$in",List.of("$phase",List.of("EXPECTED","RETIRING"))));

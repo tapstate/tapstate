@@ -447,6 +447,50 @@ class MongoAlertCoordinatorIT {
             assertThat(old).isNotNull();
         });
     }
+    @Test void projectedPagesBoundActualCommandsAndBytesEvenWhenANonNodeRowHasAnOversizedNodeField(){
+        withStore(f->{
+            var poisoned=MongoAlertNotificationCodec.quota(new AlertTestQuota.Bucket(SCOPE,T.minusSeconds(9000),Map.of("original-actor",1)),1);
+            poisoned.append("nodeId","x".repeat(4*1024*1024-16*1024));SystemCollections.ALERT_TEST_QUOTAS.on(f.db).insertOne(poisoned);
+            var arrayPoison=MongoAlertNotificationCodec.quota(new AlertTestQuota.Bucket(SCOPE,T.minusSeconds(9060),Map.of("original-actor",1)),1);
+            arrayPoison.put("cleanupAt",List.of(Date.from(T.minusSeconds(5400)),"x".repeat(4*1024*1024-16*1024)));SystemCollections.ALERT_TEST_QUOTAS.on(f.db).insertOne(arrayPoison);
+            for(int i=0;i<8;i++)SystemCollections.ALERT_TEST_QUOTAS.on(f.db).insertOne(MongoAlertNotificationCodec.quota(
+                    new AlertTestQuota.Bucket(SCOPE,T.minusSeconds(7200+i*60L),Map.of("original-actor",1)),1));
+            AlertMaintenance.Cursor cursor=null;long changed=0,isolated=0;
+            for(int i=0;i<4;i++){
+                var commands=new ArrayList<String>();var observed=new java.util.concurrent.atomic.AtomicLong();
+                MongoCommandObservation.CURRENT.set(commands::add);MongoCommandObservation.BYTES.set(observed::addAndGet);AlertMaintenance.Batch batch;
+                try{batch=clean(f,10,cursor);}finally{MongoCommandObservation.CURRENT.remove();MongoCommandObservation.BYTES.remove();}
+                assertThat(commands.size()).isLessThanOrEqualTo(batch.scanned());assertThat(batch.scanned()).isLessThanOrEqualTo(200);
+                assertThat(observed.get()).isLessThanOrEqualTo(batch.bytes());assertThat(batch.bytes()).isLessThanOrEqualTo(4L*1024*1024);
+                changed+=batch.changed();isolated+=batch.skipped().getOrDefault("unreadable",0L);cursor=batch.next();if(cursor==null)break;
+            }
+            assertThat(changed).isEqualTo(8);assertThat(isolated).isPositive();assertThat(SystemCollections.ALERT_TEST_QUOTAS.on(f.db).countDocuments()).isEqualTo(2);
+            assertThat(SystemCollections.ALERT_TEST_QUOTAS.on(f.db).find(new Document("_id",poisoned.get("_id"))).first()).isEqualTo(poisoned);
+            assertThat(SystemCollections.ALERT_TEST_QUOTAS.on(f.db).find(new Document("_id",arrayPoison.get("_id"))).first()).isEqualTo(arrayPoison);
+        });
+    }
+    @Test void nodeDiscoveryDoesNotFetchAnUnboundedForeignCleanupTimestampField(){
+        withStore(f->{var poisoned=new Document("_id","e".repeat(64)).append("formatVersion",1).append("authorityId",SCOPE.authorityId()).append("clusterId",SCOPE.clusterId())
+                    .append("phase","EXPECTED").append("nodeId","poisoned-node").append("bootId","original-boot").append("cleanupAt","x".repeat(4*1024*1024-16*1024));
+            SystemCollections.ALERT_NODE_LIFECYCLES.on(f.db).insertOne(poisoned);
+            var commands=new ArrayList<String>();var observed=new java.util.concurrent.atomic.AtomicLong();MongoCommandObservation.CURRENT.set(commands::add);MongoCommandObservation.BYTES.set(observed::addAndGet);AlertMaintenance.Batch batch;
+            try{batch=clean(f,11,null);}finally{MongoCommandObservation.CURRENT.remove();MongoCommandObservation.BYTES.remove();}
+            assertThat(batch.changed()).isZero();assertThat(batch.skipped().getOrDefault("unreadable",0L)).isPositive();
+            assertThat(commands.size()).isLessThanOrEqualTo(batch.scanned());assertThat(observed.get()).isLessThanOrEqualTo(batch.bytes());
+            assertThat(batch.scanned()).isLessThanOrEqualTo(200);assertThat(batch.bytes()).isLessThanOrEqualTo(4L*1024*1024);
+            assertThat(SystemCollections.ALERT_NODE_LIFECYCLES.on(f.db).find(new Document("_id",poisoned.get("_id"))).first()).isEqualTo(poisoned);
+        });
+    }
+    @Test void validActiveHeadsAndSchedulesWithNullCleanupTimestampsAreNotIsolated(){
+        withStore(f->{var facts=businessFacts(f);assertThat(accept(f,facts)).isEqualTo(Outcome.STAGED);
+            var head=SystemCollections.ALERT_INSTANCES.on(f.db).find().first();var schedule=SystemCollections.ALERT_NOTIFICATION_SCHEDULES.on(f.db).find().first();
+            assertThat(head.get("cleanupAt")).isNull();assertThat(schedule.get("cleanupAt")).isNull();
+            for(int collection:List.of(1,4)){
+                var batch=clean(f,collection,null);assertThat(batch.changed()).isZero();assertThat(batch.skipped()).doesNotContainKey("unreadable");
+            }
+            assertThat(SystemCollections.ALERT_INSTANCES.on(f.db).find().first()).isEqualTo(head);assertThat(SystemCollections.ALERT_NOTIFICATION_SCHEDULES.on(f.db).find().first()).isEqualTo(schedule);
+        });
+    }
     @Test void maintenanceConservativeBudgetBoundsObservedMongoCommandsIncludingAuthorityAndCommit() {
         withStore(f->{var candidate=test(f,"1",email("one@example.test"));f.store.admitTest(candidate,f.access);f.time.set(T.plus(Duration.ofDays(5)));
             var commands=new ArrayList<String>();MongoCommandObservation.CURRENT.set(commands::add);

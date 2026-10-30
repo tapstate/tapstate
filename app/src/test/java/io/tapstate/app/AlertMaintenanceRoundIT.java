@@ -14,6 +14,26 @@ import static org.assertj.core.api.Assertions.*;
 @RequiresDocker
 class AlertMaintenanceRoundIT {
     @Container static final org.testcontainers.containers.MongoDBContainer MONGO=AlertEvaluationHostIT.MONGO;
+    @Test void twentyFiveSmallCandidatesFitOneOriginalRoundAlongsideTheOtherResources(){
+        AlertEvaluationHostIT.withFixture(f->{var scope=f.storeHost().scope();var start=f.clock().instant();
+            try(var client=MongoClients.create(f.settings().uri())){
+                var db=client.getDatabase(new com.mongodb.ConnectionString(f.settings().uri()).getDatabase());
+                // Twenty-five cheap mutations are the five-minute floor of the admitted engineering load.
+                // Quota rows isolate transaction-discovery overhead without simulating transport or an SLO pass.
+                for(int i=0;i<25;i++){var minute=start.minusSeconds(7200+i*60L).truncatedTo(java.time.temporal.ChronoUnit.MINUTES);
+                    var id=new Document("authorityId",scope.authorityId()).append("clusterId",scope.clusterId()).append("minute",minute.toString());
+                    db.getCollection("alert_test_quotas").insertOne(new Document("_id",id).append("formatVersion",1).append("recordRevision",1L).append("cleanupAt",Date.from(minute.plusSeconds(3660)))
+                            .append("body",new Document("actors",List.of(new Document("actor","original-actor").append("accepted",1)))));
+                }
+                try(var worker=new AlertMaintenanceRuntime(f.store().maintenance().orElseThrow(),f.clock(),()->{})){
+                    worker.tick();assertThat(worker.health()).containsEntry("changed",25L).containsEntry("failures",0L);
+                    assertThat(db.getCollection("alert_test_quotas").countDocuments()).isZero();
+                    assertThat(((Number)worker.health().get("scanned")).longValue()).isLessThanOrEqualTo(1000);
+                    assertThat(((Number)worker.health().get("ioBytes")).longValue()).isLessThanOrEqualTo(16L*1024*1024);
+                }
+            }
+        });
+    }
     @Test void thirtyEligibleControlRowsAreReclaimedWithinThreeUnexpandedRounds() {
         AlertEvaluationHostIT.withFixture(f->{var scope=f.storeHost().scope();var start=f.clock().instant();
             try(var client=MongoClients.create(f.settings().uri())){
@@ -43,8 +63,8 @@ class AlertMaintenanceRoundIT {
                 var maintenance=f.store().maintenance().orElseThrow();
                 maintenance.maintain(new AlertMaintenance.Cursor(1,null,null),200,4L*1024*1024,Duration.ofSeconds(10));
                 var version=db.getCollection("configuration_version").find().first();
-                var yielded=maintenance.maintain(new AlertMaintenance.Cursor(10,null,null),35,4L*1024*1024,Duration.ofSeconds(5));
-                assertThat(yielded.changed()).isZero();assertThat(yielded.scanned()).isLessThanOrEqualTo(35);assertThat(yielded.next()).isNotNull();
+                var yielded=maintenance.maintain(new AlertMaintenance.Cursor(10,null,null),39,4L*1024*1024,Duration.ofSeconds(5));
+                assertThat(yielded.changed()).isZero();assertThat(yielded.scanned()).isLessThanOrEqualTo(39);assertThat(yielded.next()).isNotNull();
                 assertThat(yielded.oldestCandidate()).isEqualTo(minute.plusSeconds(3660));
                 assertThat(db.getCollection("configuration_version").find().first()).isEqualTo(version);
                 assertThat(db.getCollection("alert_test_quotas").countDocuments(new Document("_id",id))).isOne();
