@@ -491,6 +491,47 @@ class MongoAlertCoordinatorIT {
             assertThat(SystemCollections.ALERT_INSTANCES.on(f.db).find().first()).isEqualTo(head);assertThat(SystemCollections.ALERT_NOTIFICATION_SCHEDULES.on(f.db).find().first()).isEqualTo(schedule);
         });
     }
+    @Test void boundAndRecoveredAuthorityCommandsFitEveryWarmMaintenancePage(){
+        for(boolean recovered:List.of(false,true))withStore(f->{
+            String suffix=java.util.UUID.randomUUID().toString().replace("-","");String cacheName="alert_budget_cache_"+suffix;
+            var connection=new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,MONGO.getReplicaSetUrl(cacheName),cacheName,null);
+            var masterUri=MONGO.getReplicaSetUrl("alert_budget_master_"+suffix);
+            var master=new SourceResource("views",null,"mongodb",Map.of("isUri",true,"uri",masterUri),null,null,null,null);
+            try(var probe=com.mongodb.client.MongoClients.create(masterUri)){probe.getDatabase("admin").runCommand(new Document("ping",1));}
+            try{
+                var committed=f.domain.bindings().commitWithFirstCache(f.host.setup(),StorageBinding.Mode.OP,connection,master);
+                try(var cache=MongoCacheDomain.connect(connection,Duration.ofSeconds(5),"alert-budget-authority")){
+                    cache.prepareFirstAuth(committed.firstCreation().orElseThrow());cache.prepareInitialBusiness(committed.preparation(),()->{});
+                    assertThat(cache.loadAuthScope(committed.preparation().authScope())).isEqualTo(committed.preparation().authScope());
+                }
+                f.domain.bindings().complete(f.host.setup());
+                f.domain.firstAdmin().create(f.domain.firstAdmin().load().orElseThrow().scope(),new User("budget-admin","isolated-test-hash","admin"));
+                if(recovered){
+                    try(var client=com.mongodb.client.MongoClients.create(connection.uri())){client.getDatabase(cacheName).drop();}
+                    try(var cache=MongoCacheDomain.connect(connection,Duration.ofSeconds(5),"alert-budget-recovery")){
+                        var prepared=f.domain.prepareAuthenticationRecovery(cache,()->{});f.domain.requireAuthenticationPublished(prepared);
+                        assertThat(prepared.authScope().authGeneration()).isEqualTo(2);assertThat(prepared.authScope().cacheIncarnation()).isNotEqualTo(committed.preparation().authScope().cacheIncarnation());
+                    }
+                }
+                var setup=SystemCollections.STORAGE_SETUP.on(f.db).find(new Document("_id","cluster")).first();
+                var scope=new StorageSetupScope(SCOPE.clusterId(),setup.getString("installationId"),setup.getString("operationId"),setup.getLong("generation"));
+                var host=new Host(SCOPE,scope,AlertChannelPolicy.Deployment.ON_PREM,()->{}).withChannels(Set.of(EMAIL));
+                var store=f.domain.alerts(host,BuiltinAlarmTypes.catalog(),f.clock);var port=store.maintenance().orElseThrow();
+                port.maintain(new AlertMaintenance.Cursor(4,null,null),200,4L*1024*1024,Duration.ofSeconds(10));
+                for(int i=0;i<12;i++)SystemCollections.ALERT_TEST_QUOTAS.on(f.db).insertOne(MongoAlertNotificationCodec.quota(
+                        new AlertTestQuota.Bucket(SCOPE,T.minusSeconds(7200+i*60L),Map.of("original-actor",1)),1));
+                AlertMaintenance.Cursor cursor=new AlertMaintenance.Cursor(10,null,null);long changed=0;
+                for(int i=0;i<4;i++){
+                    var commands=new ArrayList<String>();var bytes=new java.util.concurrent.atomic.AtomicLong();MongoCommandObservation.CURRENT.set(commands::add);MongoCommandObservation.BYTES.set(bytes::addAndGet);AlertMaintenance.Batch batch;
+                    try{batch=port.maintain(cursor,200,4L*1024*1024,Duration.ofSeconds(10));}finally{MongoCommandObservation.CURRENT.remove();MongoCommandObservation.BYTES.remove();}
+                    assertThat(commands.size()).as("recovered=%s; charged=%s; commands=%s",recovered,batch.scanned(),commands).isLessThanOrEqualTo(batch.scanned());
+                    assertThat(bytes.get()).isLessThanOrEqualTo(batch.bytes());assertThat(batch.scanned()).isLessThanOrEqualTo(200);assertThat(batch.bytes()).isLessThanOrEqualTo(4L*1024*1024);
+                    changed+=batch.changed();cursor=batch.next();if(cursor==null)break;
+                }
+                assertThat(changed).isEqualTo(12);
+            }finally{try(var client=com.mongodb.client.MongoClients.create(connection.uri())){client.getDatabase(cacheName).drop();}}
+        });
+    }
     @Test void maintenanceConservativeBudgetBoundsObservedMongoCommandsIncludingAuthorityAndCommit() {
         withStore(f->{var candidate=test(f,"1",email("one@example.test"));f.store.admitTest(candidate,f.access);f.time.set(T.plus(Duration.ofDays(5)));
             var commands=new ArrayList<String>();MongoCommandObservation.CURRENT.set(commands::add);

@@ -54,6 +54,7 @@ final class MongoAlertMaintenance implements AlertMaintenance {
     private long schemaVerifiedUntil;
     private final Object[] pendingCandidate=new Object[12];
     private static final class Yield extends RuntimeException { }
+    private static final int DISCOVERY_KEYS=8;
     private static final class Budget {
         final int rows; final long bytes, until; int used; long encoded;int proofSteps;boolean isolationChecked,isolated;
         Instant currentCandidate,oldestEligible,oldestProtected;
@@ -75,7 +76,7 @@ final class MongoAlertMaintenance implements AlertMaintenance {
         catch(Yield end){return new Batch(cursor,b.used,0,b.encoded,Map.of("budget",1L),null);}
         while(b.available()) {
             Cursor pageAfter=cursor;List<Document> candidates;
-            try { b.use(16,32*1024);candidates=transactions.run(false,b.remaining(),s->next(s,collection,pageAfter,b)); }
+            try { b.use(18,32*1024);candidates=transactions.run(false,b.remaining(),s->next(s,collection,pageAfter,b)); }
             catch(Yield end){break;}
             if(candidates.isEmpty()){exhausted=true;break;}
             boolean yielded=false,retry=false;
@@ -90,7 +91,7 @@ final class MongoAlertMaintenance implements AlertMaintenance {
             try {
                 // Reserve before entering authority validation. Every attempted transaction is billed once,
                 // including commit/abort allowance; maintenance does not run hidden callback retries.
-                b.use(16,32*1024);
+                b.use(22,32*1024);
                 String result=transactions.run(true,b.remaining(),s->{
                     Document row=read(s,collection,new Document("_id",candidate.get("_id")),b);
                     if(row==null)return "conflict";
@@ -117,6 +118,7 @@ final class MongoAlertMaintenance implements AlertMaintenance {
             }
             if(yielded)break;
             if(retry)continue;
+            if(candidates.size()<DISCOVERY_KEYS){exhausted=true;break;}
         }
         if(b.isolated)skipped.merge("unreadable",1L,Long::sum);
         return new Batch(exhausted?null:cursor,b.used,changed,b.encoded,skipped,b.oldestEligible,b.oldestProtected);
@@ -138,14 +140,17 @@ final class MongoAlertMaintenance implements AlertMaintenance {
             sort=new Document("cleanupAt",1).append("_id",1);
             boolean definitions=MongoAlertConfigurationStore.COLLECTIONS.contains(c);
             filter.append("cleanupAt",definitions?null:new Document("$type","date").append("$lte",Date.from(clock.instant())));
+            if(Set.of(SystemCollections.ALERT_RULES,SystemCollections.ALERT_RECEIVERS,SystemCollections.ALERT_SUBSCRIPTIONS).contains(c))
+                filter.append("retiredAt",new Document("$ne",null));
             if(after!=null&&after.id()!=null){Object id=Document.parse(after.id()).get("id");
                 filter=and(filter,definitions?new Document("_id",new Document("$gt",id)):
                         lex(List.of("cleanupAt","_id"),List.of(Date.from(after.candidateAt()),id)));}
         }
-        // Fetch only four bounded projected keys under one discovery authority check.
+        // Fetch only eight bounded projected keys under one discovery authority check.
         // The header caps the BSON key at 16 KiB; 24 KiB also covers projected node fields.
-        // Reserve every key before IO, including unused keys when the page is short.
-        int pageSize=4;b.use(pageSize,pageSize*24L*1024);
+        // One find obtains the bounded page. Reserve every projected byte before IO;
+        // every processed or skipped key is additionally billed by its guarded row transaction.
+        int pageSize=DISCOVERY_KEYS;b.use(1,pageSize*24L*1024);
         Document projection=new Document("_id",1);
         if(c==SystemCollections.ALERT_NODE_LIFECYCLES)projection.append("phase",1).append("nodeId",1).append("bootId",1);
         else projection.append("cleanupAt",1);

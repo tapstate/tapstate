@@ -103,8 +103,6 @@ final class MongoAlertCoordinator implements AlertStore {
     private <T>T maintenanceTx(boolean write,Duration remaining,Function<ClientSession,T> action) {
         host.locallyActive().run();return StoreIo.call(()->domain.alertMaintenanceTransaction(new MongoReadBudget(remaining),session->{
             currentHost(session);
-            Document schema=SystemCollections.SCHEMA_MIGRATIONS.on(db).find(session,new Document("_id","config")).first();
-            if(schema==null || !Integer.valueOf(MongoAlertStorageSchema.VERSION).equals(schema.get("alerting",Document.class).get("installedVersion")))throw unreadable("schema-capability");
             if(write){if(!keys.fenceWrite(new SourceConfigWriteScope(session),keys.currentForWrite().activeKeyId()))throw stale("configuration-key");
                 ConfigurationVersion.advanceAlert(session,SystemCollections.CONFIGURATION_VERSION.on(db));}
             T result=action.apply(session);host.locallyActive().run();return result;
