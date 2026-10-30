@@ -6,7 +6,10 @@ import io.tapstate.core.validation.ValidationFailureLatch;
 import io.tapstate.core.validation.ValidationKey;
 import io.tapstate.core.validation.ValidationPhysicalIdentity;
 import io.tapstate.core.validation.ValidationValues;
+import io.tapstate.core.validation.ValidationCheckEvent;
 import io.tapstate.spi.store.ValidationRowCursor;
+import java.time.Clock;
+import java.time.Instant;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -38,6 +41,9 @@ public final class ValidationOrderedGroups implements AutoCloseable {
     private final ValidationRowCursor input;
     private final Function<ValidationValues.Row, Key> project;
     private final long maxSampleBytes;
+    private final Clock clock;
+    private Instant startedAt;
+    private Instant observedThrough;
     private final AtomicBoolean closed = new AtomicBoolean();
     private volatile Sample lookahead;
     private volatile Group outstanding;
@@ -48,6 +54,10 @@ public final class ValidationOrderedGroups implements AutoCloseable {
 
     public ValidationOrderedGroups(String readId, ValidationRowCursor input,
             Function<ValidationValues.Row, Key> project, long maxSampleBytes) {
+        this(readId,input,project,maxSampleBytes,Clock.systemUTC());
+    }
+    public ValidationOrderedGroups(String readId, ValidationRowCursor input,
+            Function<ValidationValues.Row, Key> project, long maxSampleBytes,Clock clock) {
         this.readId = Objects.requireNonNull(readId, "readId");
         this.input = Objects.requireNonNull(input, "input");
         this.project = Objects.requireNonNull(project, "project");
@@ -55,6 +65,14 @@ public final class ValidationOrderedGroups implements AutoCloseable {
             throw new IllegalArgumentException("invalid ordered-group admission");
         }
         this.maxSampleBytes = maxSampleBytes;
+        this.clock=Objects.requireNonNull(clock,"clock");
+    }
+
+    /** The consumed ordered prefix, not a new equality query or the still-running stream's final EOF. */
+    ValidationCheckEvent.ReadBoundary prefixRead(){
+        checkActive();
+        if(startedAt==null||observedThrough==null)throw new IllegalStateException("ordered input has not been observed");
+        return new ValidationCheckEvent.ReadBoundary(readId,"independent-ordered-prefix-v1",startedAt,observedThrough);
     }
 
     public Optional<Group> next() {
@@ -107,9 +125,11 @@ public final class ValidationOrderedGroups implements AutoCloseable {
     private Sample readOne() {
         checkActive();
         if (eof) return null;
+        if(startedAt==null)startedAt=clock.instant();
         Optional<ValidationRowCursor.Row> delivered = Objects.requireNonNull(input.next(), "row result");
         if (delivered.isEmpty()) {
             eof = true;
+            observedThrough=clock.instant();
             return null;
         }
         var row = delivered.orElseThrow();
@@ -122,6 +142,7 @@ public final class ValidationOrderedGroups implements AutoCloseable {
             ValidationKey prior = previous;
             if (prior != null && prior.compareTo(key.comparison()) > 0) throw protocol();
             previous = key.comparison();
+            observedThrough=clock.instant();
             return new Sample(key, values);
         } catch (RuntimeException | Error reported) {
             failure.record(reported);

@@ -49,7 +49,8 @@ public final class ValidationOrderedMerge implements AutoCloseable {
                 if (sourceEof && targetEof) return Optional.empty();
                 int order = sourceEof ? 1 : targetEof ? -1
                         : sourcePending.key().comparison().compareTo(targetPending.key().comparison());
-                Pair pair = new Pair(order <= 0 ? sourcePending : null, order >= 0 ? targetPending : null);
+                Pair pair = new Pair(order <= 0 ? sourcePending : null, order >= 0 ? targetPending : null,
+                        source.prefixRead(),target.prefixRead());
                 if (order <= 0) sourcePending = null;
                 if (order >= 0) targetPending = null;
                 outstanding = pair;
@@ -135,14 +136,20 @@ public final class ValidationOrderedMerge implements AutoCloseable {
         private final AtomicBoolean released = new AtomicBoolean();
         private final ValidationOrderedGroups.Group source;
         private final ValidationOrderedGroups.Group target;
+        private final ValidationCheckEvent.ReadBoundary sourceRead;
+        private final ValidationCheckEvent.ReadBoundary targetRead;
 
-        private Pair(ValidationOrderedGroups.Group source, ValidationOrderedGroups.Group target) {
+        private Pair(ValidationOrderedGroups.Group source, ValidationOrderedGroups.Group target,
+                ValidationCheckEvent.ReadBoundary sourceRead,ValidationCheckEvent.ReadBoundary targetRead) {
             this.source = source;
             this.target = target;
+            this.sourceRead=sourceRead;this.targetRead=targetRead;
         }
 
         public Optional<ValidationOrderedGroups.Group> source() { checkOpen(); return Optional.ofNullable(source); }
         public Optional<ValidationOrderedGroups.Group> target() { checkOpen(); return Optional.ofNullable(target); }
+        public ValidationCheckEvent.ReadBoundary sourceRead(){checkOpen();return sourceRead;}
+        public ValidationCheckEvent.ReadBoundary targetRead(){checkOpen();return targetRead;}
         public ValidationCheckEvent.PairState state() {
             checkOpen();
             return source == null ? ValidationCheckEvent.PairState.TARGET_ONLY

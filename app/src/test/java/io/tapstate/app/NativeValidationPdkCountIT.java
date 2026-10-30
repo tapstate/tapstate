@@ -184,7 +184,11 @@ class NativeValidationPdkCountIT {
                     if(count){
                         assertThat(commands).filteredOn(command->command.containsKey("aggregate")).hasSize(2);
                         assertThat(commands).noneSatisfy(command->assertThat(command.containsKey("find")||command.containsKey("count")||command.toJson().contains("$sample")).isTrue());
-                    }else assertThat(commands).anySatisfy(command->assertThat(command).containsKey("find"));
+                    }else {
+                        assertThat(commands).anySatisfy(command->assertThat(command).containsKey("find"));
+                        assertThat(commands).filteredOn(command->command.get("find") instanceof String table&&Set.of("checked_orders","checked_items").contains(table))
+                                .as("one ordered business scan per target table, regardless of root count").hasSize(2);
+                    }
                 }finally{target.drop();}
             }
         }

@@ -225,6 +225,69 @@ public final class ValidationRootReader {
                 row -> new Target(row, targetIdentity.apply(row)), content, true);
     }
 
+    /**
+     * Direct tables have no participation rules to reevaluate. A completed ordered group supplies
+     * exact multiplicity and one real sample; only unique pairs can supply content. The boundaries
+     * describe consumed ordered prefixes sufficient for this key, not fresh keyed rereads. The
+     * caller keeps the pair and its working-memory admission until checking and publication end.
+     */
+    public static ValidationRootCheck readOrderedDirect(ValidationObservation observation,ValidationMethod method,
+            ValidationOrderedMerge.Pair pair,Limits resultLimits,Runnable requireAuthorized,ContentCheck content){
+        Objects.requireNonNull(pair,"pair");Objects.requireNonNull(requireAuthorized,"requireAuthorized");
+        Objects.requireNonNull(content,"content");
+        if(method!=ValidationMethod.UNIQUE_KEY&&method!=ValidationMethod.FULL_COLUMN)throw invalid("rootRead.orderedMethod");
+        requireAuthorized.run();
+        var source=pair.source().orElse(null);var target=pair.target().orElse(null);
+        if(source==null&&target==null)throw invalid("rootRead.emptyPair");
+        for(var group:List.of(pair.source(),pair.target()))group.ifPresent(value->{
+            if(!value.key().comparison().equals(observation.root().rootKey()))throw invalid("rootRead.orderedKey");
+        });
+        var sourceRead=pair.sourceRead();var targetRead=pair.targetRead();
+        boolean shouldExist=source!=null,exists=target!=null;
+        boolean sourceDuplicate=source!=null&&source.occurrences()>1;
+        try(var root=ValidationRootCheck.pending(observation,method,resultLimits)){
+            root.read(Side.SOURCE,sourceRead).bindOutcome(shouldExist?Participation.SHOULD_EXIST:Participation.SHOULD_NOT_EXIST,
+                    exists?TargetPresence.PRESENT:TargetPresence.ABSENT).read(Side.TARGET,targetRead);
+            var whole=new Location(observation.root(),List.of());
+            var sourceSample=orderedSample(source,sourceRead);var targetSample=orderedSample(target,targetRead);
+            if(sourceDuplicate){
+                var cause=new Finding(Kind.SOURCE_DUPLICATE,whole,Optional.of(new Multiplicity(source.occurrences(),true)));
+                root.finding(cause,sourceSample,Optional.empty()).notCompared(Check.IDENTITY,whole,cause);
+                blockContent(root,whole,cause);
+            }
+            if(target!=null&&target.occurrences()>1){
+                var cause=new Finding(Kind.TARGET_DUPLICATE,whole,Optional.of(new Multiplicity(target.occurrences(),true)));
+                root.finding(cause,sourceSample,targetSample);
+                if(shouldExist){
+                    root.notApplicable(Check.STRUCTURE,whole,cause);
+                    if(method==ValidationMethod.FULL_COLUMN)root.notApplicable(Check.VALUES,whole,cause);
+                }
+            }
+            if(shouldExist!=exists)root.finding(new Finding(shouldExist?Kind.TARGET_MISSING:Kind.TARGET_EXTRA,whole),sourceSample,targetSample);
+            root.checked(Check.IDENTITY).checked(Check.PARTICIPATION);
+            if(shouldExist&&exists){
+                if(!sourceDuplicate&&target.occurrences()==1){
+                    requireAuthorized.run();
+                    content.check(new Pair(orderedRow(source),sourceRead,orderedRow(target),targetRead,SourceEvidence.empty()),root);
+                }
+                root.checked(Check.STRUCTURE);
+                if(method==ValidationMethod.FULL_COLUMN)root.checked(Check.VALUES);
+            }else if(!sourceDuplicate){
+                root.notApplicable(Check.STRUCTURE);
+                if(method==ValidationMethod.FULL_COLUMN)root.notApplicable(Check.VALUES);
+            }
+            requireAuthorized.run();return root.finish();
+        }
+    }
+
+    private static ValidationRelationRows.Sample orderedRow(ValidationOrderedGroups.Group group){
+        var values=group.sampleValues();
+        return new ValidationRelationRows.Sample(values,values,Optional.of(group.key().physical()));
+    }
+    private static Optional<SampledSide> orderedSample(ValidationOrderedGroups.Group group,ValidationCheckEvent.ReadBoundary read){
+        return group==null?Optional.empty():Optional.of(new SampledSide(group.key().physical(),group.sampleValues(),read.readId()));
+    }
+
     /** Opens each cursor only when needed and authorized; the relation reader closes it on every exit. */
     public static ValidationRootCheck read(ValidationObservation observation, ValidationMethod method,
             Query sourceQuery, Query targetQuery, ValidationRelationRows.Limits readLimits, Limits resultLimits,

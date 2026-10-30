@@ -9,7 +9,7 @@ import java.util.function.Function;
 
 /**
  * One complete ordered scan of the fixed mappings, on admitted blocking I/O. The scan selects root
- * identities only: each checker independently rereads its complete necessary source/target scope.
+ * identities for rule-based rereads, or lends complete ordered pairs to a direct-table checker.
  * Each completed observation is handed to the original publisher before advancing. Neither EOF nor
  * successful publication is strong timing confirmation, and no production operator value is used.
  * The assembly owns native reads, their actual drain and all retained memory until physical exit.
@@ -18,9 +18,17 @@ public final class ValidationFullScan {
     @FunctionalInterface public interface Checker {
         ValidationRootCheck read(ValidationObservation observation,Runnable requireCurrent);
     }
-    public record Mapping(String id,Function<Runnable,ValidationOrderedMerge> open,Checker checker) {
+    @FunctionalInterface public interface PairedChecker {
+        ValidationRootCheck read(ValidationObservation observation,ValidationOrderedMerge.Pair pair,Runnable requireCurrent);
+    }
+    public record Mapping(String id,Function<Runnable,ValidationOrderedMerge> open,Checker checker,PairedChecker pairedChecker) {
+        public Mapping(String id,Function<Runnable,ValidationOrderedMerge> open,Checker checker){this(id,open,checker,null);}
+        public static Mapping paired(String id,Function<Runnable,ValidationOrderedMerge> open,PairedChecker checker){
+            return new Mapping(id,open,null,Objects.requireNonNull(checker));
+        }
         public Mapping {
-            ValidationError.fieldName(id,"fullScan.mapping");Objects.requireNonNull(open);Objects.requireNonNull(checker);
+            ValidationError.fieldName(id,"fullScan.mapping");Objects.requireNonNull(open);
+            if((checker==null)==(pairedChecker==null))throw new IllegalArgumentException("exactly one validation checker is required");
         }
     }
     private final ValidationRunIdentity identity;
@@ -69,11 +77,14 @@ public final class ValidationFullScan {
                         target.ifPresent(group->physical(group.key().physical(),declared.target()));
                         var key=source.isPresent()?source.orElseThrow().key().comparison():target.orElseThrow().key().comparison();
                         root=new ValidationRoot(declared.mappingId(),declared.outputId(),key,List.of());
+                        if(mapping.pairedChecker()!=null){
+                            check();var observation=new ValidationObservation(identity,root,1);
+                            publish(observation,mapping.pairedChecker().read(observation,pair,this::check));
+                            continue;
+                        }
                     }
                     check();var observation=new ValidationObservation(identity,root,1);
-                    var result=Objects.requireNonNull(mapping.checker().read(observation,this::check),"complete root result");
-                    if(!observation.equals(result.observation())||result.method()!=spec.method())throw invalid("rootResult");
-                    check();publish.accept(result);check();
+                    publish(observation,mapping.checker().read(observation,this::check));
                 }
                 check();
             }catch(RuntimeException|Error failed){record(failed);throw failed;}
@@ -85,6 +96,11 @@ public final class ValidationFullScan {
             completedMappings=index+1;readingMapping=null;
         }
         check();complete=true;
+    }
+    private void publish(ValidationObservation observation,ValidationRootCheck result){
+        Objects.requireNonNull(result,"complete root result");
+        if(!observation.equals(result.observation())||result.method()!=spec.method())throw invalid("rootResult");
+        check();publish.accept(result);check();
     }
     private static void physical(ValidationPhysicalIdentity actual,ValidationTaskSpec.Table expected) {
         if(!actual.sourceId().equals(expected.sourceId())||!Objects.equals(actual.database(),expected.database())

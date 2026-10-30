@@ -57,23 +57,24 @@ class ValidationFullScanTest {
         for(var check:Check.values())b.checked(check);return b.finish();
     }
     static ValidationOrderedMerge merge(Rows left,Rows right){return new ValidationOrderedMerge(groups(left,"source"),groups(right,"target"));}
-    static ValidationOrderedGroups groups(Rows rows,String side){return new ValidationOrderedGroups(side,rows,row->{
+    static ValidationOrderedGroups groups(ValidationRowCursor rows,String side){return new ValidationOrderedGroups(side,rows,row->{
         var key=new ValidationKey(List.of(ValidationKey.Part.number(((Number)row.fields().get("id")).longValue())));
         return new ValidationOrderedGroups.Key(key,new ValidationPhysicalIdentity(side,"db",null,"orders",List.of(List.of("id")),key));
     },ROW.bytes());}
     static final class Rows implements ValidationRowCursor {
-        final int count;int index;boolean closed;Rows(int count){this.count=count;}
-        public Optional<Row> next(){if(index==count)return Optional.empty();int ordinal=index++;return Optional.of(new Row(){
-            public long ordinal(){return ordinal;}public ValidationValues.Row values(){return ValidationValues.ownRow(Map.of("id",ordinal),ROW);}public void close(){}
+        final int count;int index,nextCalls,rowsClosed;boolean closed;Rows(int count){this.count=count;}
+        public Optional<Row> next(){nextCalls++;if(index==count)return Optional.empty();int ordinal=index++;return Optional.of(new Row(){
+            public long ordinal(){return ordinal;}public ValidationValues.Row values(){return ValidationValues.ownRow(Map.of("id",ordinal),ROW);}public void close(){rowsClosed++;}
         });}
         public void close(){closed=true;}
     }
     static final class Fixture {
         final ValidationRunSpec spec;final ValidationRunIdentity identity;
-        Fixture(){var keys=List.of(new ValidationKeyBinding.Component(List.of("id"),ValidationKey.Kind.EXACT_NUMBER,Set.of("exact-number")));
+        Fixture(){this(ValidationMethod.FULL_COLUMN);}
+        Fixture(ValidationMethod method){var keys=List.of(new ValidationKeyBinding.Component(List.of("id"),ValidationKey.Kind.EXACT_NUMBER,Set.of("exact-number")));
             var task=new ValidationTaskSpec("flow",Map.of("flow","a".repeat(64),"source","b".repeat(64),"target","c".repeat(64)),1,"rules",List.of(new ValidationTaskSpec.Mapping("mapping",ValidationTaskSpec.OutputKind.SYNC,"out",
                     new ValidationTaskSpec.Table("input","source","db",null,"orders","model","codec"),new ValidationTaskSpec.Table("out","target","db",null,"orders","model","codec"),new ValidationTaskSpec.Keys("confirmed",keys,keys))));
-            spec=new ValidationRunSpec(task,ValidationMode.FULL,ValidationMethod.FULL_COLUMN);identity=new ValidationRunIdentity(new ValidationOwner("cluster","flow","node","boot",1,1,1),"task","run",ValidationMode.FULL,spec.fingerprint(),1,"rules");}
+            spec=new ValidationRunSpec(task,ValidationMode.FULL,method);identity=new ValidationRunIdentity(new ValidationOwner("cluster","flow","node","boot",1,1,1),"task","run",ValidationMode.FULL,spec.fingerprint(),1,"rules");}
     }
     private static TapstateException unknown(){return new TapstateException(ValidationError.INVALID_CONTRACT,Map.of("field","test.unknown"),null);}
 }

@@ -16,7 +16,7 @@ import java.util.*;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.*;
 
-/** Serial direct-table scans and complete independent logical-key rereads on the original owner. */
+/** Serial direct-table ordered pairs, checked and published under the original owner. */
 final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
     private static final ValidationValues.Limits ROW=new ValidationValues.Limits(64*1024,8192,32);
     private static final long READ_BYTES=16L*1024*1024+PdkValidationReads.decodingWorkBytes(ROW)+2*ROW.bytes();
@@ -51,8 +51,8 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
                             ||from.domain()!=ValidationKey.Kind.TEXT||to.domain()!=ValidationKey.Kind.TEXT))
                     throw unsupported("keys","native-object-id-domain-mismatch");
             }
-            mappings.add(new ValidationFullScan.Mapping(declared.mapping().mappingId(),guard->open(selected,guard),
-                    (observation,guard)->check(selected,observation,guard)));
+            mappings.add(ValidationFullScan.Mapping.paired(declared.mapping().mappingId(),guard->open(selected,guard),
+                    (observation,pair,guard)->check(selected,observation,pair,guard)));
         }
         this.mappings=List.copyOf(mappings);
     }
@@ -107,13 +107,13 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
     private ValidationOrderedGroups groups(int index,boolean source,Runnable guard){
         var mapping=declarations.get(index).mapping();var side=source?mapping.source():mapping.target();
         var keys=keyBinding(mapping,source);
-        return new ValidationOrderedGroups(side.sourceId(),reader(index,source,null,guard),row->{
+        return new ValidationOrderedGroups(UUID.randomUUID().toString(),reader(index,source,guard),row->{
             require();guard.run();var key=bound(keys,row);
             return new ValidationOrderedGroups.Key(key,physical(side,keys,key));
-        },ROW.bytes());
+        },ROW.bytes(),clock);
     }
 
-    private ValidationReadHandle reader(int index,boolean source,ValidationKey root,Runnable guard){
+    private ValidationReadHandle reader(int index,boolean source,Runnable guard){
         require();guard.run();awaitClosed(guard);
         var mapping=declarations.get(index).mapping();var side=source?mapping.source():mapping.target();
         var keys=components(mapping,source);var read=admit();ValidationReadHandle raw=null;
@@ -121,8 +121,7 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
             var resource=resource(side);var connection=connection(side,resource);var artifact=artifact(resource);
             var query=original.resources().queryExecutor();var decode=original.resources().decodeExecutor();
             Runnable active=()->{require();guard.run();};
-            raw=root==null?PdkValidationReads.scan(connection,artifact,CanonicalHash.of(resource),side.table(),binding(side),keys,full(),active,query,decode,2,ROW)
-                    :PdkValidationReads.lookup(connection,artifact,CanonicalHash.of(resource),side.table(),binding(side),keys,root,full(),active,query,decode,2,ROW);
+            raw=PdkValidationReads.scan(connection,artifact,CanonicalHash.of(resource),side.table(),binding(side),keys,full(),active,query,decode,2,ROW);
             var handle=raw;read.attach(handle::close,handle.workersExited(),handle.rowsReleased());read.opened();require();guard.run();
             return new ValidationReadHandle(){
                 @Override public Optional<Row> next(){require();guard.run();return handle.next();}
@@ -136,26 +135,19 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
         }finally{read.opened();}
     }
 
-    private ValidationRootCheck check(int index,ValidationObservation observation,Runnable guard){
+    private ValidationRootCheck check(int index,ValidationObservation observation,ValidationOrderedMerge.Pair ordered,Runnable guard){
         consumers.incrementAndGet();
         try{
             require();guard.run();var table=current;if(table==null||table.index()!=index)throw invalid("tableSequence");
             var mapping=declarations.get(index).mapping();
-            var source=keyBinding(mapping,true);var target=keyBinding(mapping,false);
             var generated=ValidationFieldCheck.generatedId(observation.run(),mapping.mappingId(),mapping.outputId(),
                     artifacts.get(mapping.target().sourceId()).className().equals("io.tapdata.mongodb.MongodbConnector"),
                     table.source().model().fields().stream().anyMatch(field->field.name().equals("_id")),
                     java.util.stream.Stream.concat(mapping.keys().source().stream(),mapping.keys().target().stream())
                             .anyMatch(component->component.path().getFirst().equals("_id")),
                     value->value instanceof ValidationValues.Typed typed&&typed.logicalType().equals("object-id")&&typed.value() instanceof String);
-            return ValidationRootReader.readDirect(observation,original.spec().method(),
-                    new ValidationRootReader.Query(UUID.randomUUID().toString(),"independent-complete-key-reread-v1",
-                            ()->reader(index,true,observation.root().rootKey(),guard)),
-                    new ValidationRootReader.Query(UUID.randomUUID().toString(),"independent-complete-key-reread-v1",
-                            ()->reader(index,false,observation.root().rootKey(),guard)),
-                    new ValidationRelationRows.Limits(65536,ROW),new ValidationRootCheck.Limits(256*1024,256,256,8,2),clock,
-                    ()->{require();guard.run();},row->physical(mapping.source(),source,matching(source,row,observation)),
-                    row->physical(mapping.target(),target,matching(target,row,observation)),(pair,result)->{
+            return ValidationRootReader.readOrderedDirect(observation,original.spec().method(),ordered,
+                    new ValidationRootCheck.Limits(256*1024,256,256,8,2),()->{require();guard.run();},(pair,result)->{
                         if(full())ValidationFieldCheck.check(observation,List.of(),pair.source().working(),pair.target().working(),
                                 pair.sourceSample(),pair.targetSample(),generated,String::equals,
                                 new ValidationValueComparison.TraversalLimits(ROW,100000),result);
@@ -247,9 +239,6 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
     private static ValidationKey bound(ValidationKeyBinding binding,ValidationValues.Row row){
         var result=binding.read(row);if(result instanceof ValidationKeyBinding.Bound bound)return bound.key();
         throw new TapstateException(ValidationError.INCOMPATIBLE_KEY,Map.of("component",((ValidationKeyBinding.Invalid)result).problems().getFirst().component()),null);
-    }
-    private static ValidationKey matching(ValidationKeyBinding binding,ValidationValues.Row row,ValidationObservation observation){
-        var key=bound(binding,row);if(!key.equals(observation.root().rootKey()))throw invalid("rootKeyScope");return key;
     }
     private static ValidationPhysicalIdentity physical(ValidationTaskSpec.Table table,ValidationKeyBinding binding,ValidationKey key){
         return new ValidationPhysicalIdentity(table.sourceId(),table.database(),table.schema(),table.table(),

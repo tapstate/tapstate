@@ -114,7 +114,7 @@ class NativeValidationFullJobIT {
             var start=prepare(f);var reservation=f.owners.take(start);
             var original=new ValidationControlStore.Run(start.run(),reservation.countingGeneration(),start,reservation.spec());
             var rows=java.util.stream.LongStream.rangeClosed(1,1001).mapToObj(id->Plan.row(id,"missing")).toList();
-            var plan=new Plan(start.run(),f.comparison.mappings().getFirst(),rows,List.of());
+            var plan=new Plan(start.run(),f.comparison.mappings().getFirst(),rows,List.of(),true);
             runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,runs,ignored->plan));
             var stored=f.raw.getDatabase(f.cacheName).getCollection("validation_runs");
             var exactRun=new org.bson.Document("_id.kind","run").append("_id.clusterId",start.run().owner().clusterId())
@@ -163,7 +163,7 @@ class NativeValidationFullJobIT {
             var probe=java.util.concurrent.Executors.newSingleThreadExecutor();
             try{
                 runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,runs,
-                        ignored->new Plan(start.run(),f.comparison.mappings().getFirst())));
+                        ignored->new Plan(start.run(),f.comparison.mappings().getFirst(),true)));
                 assertThat(entered.await(12,TimeUnit.SECONDS)).isTrue();
                 var quota=probe.submit(()->{
                     while(true){
@@ -321,14 +321,27 @@ class NativeValidationFullJobIT {
     static final class Plan implements NativeValidationFullJob.Plan {
         final ValidationRunIdentity run;final ValidationTaskSpec.Mapping mapping;final AtomicInteger checked=new AtomicInteger(),borrowed=new AtomicInteger();
         final List<Map<String,Object>> source,target;
-        volatile boolean closed;
+        volatile boolean closed;final boolean ordered;
         Plan(ValidationRunIdentity run,ValidationTaskSpec.Mapping mapping){this(run,mapping,
                 List.of(row(1,"a"),row(2,"b"),row(3,"c"),row(3,"duplicate"),row(5,"e")),
                 List.of(row(1,"a"),row(2,"wrong"),row(4,"extra"),row(5,"e")));}
-        Plan(ValidationRunIdentity run,ValidationTaskSpec.Mapping mapping,List<Map<String,Object>> source,List<Map<String,Object>> target){
-            this.run=run;this.mapping=mapping;this.source=List.copyOf(source);this.target=List.copyOf(target);
+        Plan(ValidationRunIdentity run,ValidationTaskSpec.Mapping mapping,boolean ordered){this(run,mapping,
+                List.of(row(1,"a"),row(2,"b"),row(3,"c"),row(3,"duplicate"),row(5,"e")),
+                List.of(row(1,"a"),row(2,"wrong"),row(4,"extra"),row(5,"e")),ordered);}
+        Plan(ValidationRunIdentity run,ValidationTaskSpec.Mapping mapping,List<Map<String,Object>> source,List<Map<String,Object>> target){this(run,mapping,source,target,false);}
+        Plan(ValidationRunIdentity run,ValidationTaskSpec.Mapping mapping,List<Map<String,Object>> source,List<Map<String,Object>> target,boolean ordered){
+            this.run=run;this.mapping=mapping;this.source=List.copyOf(source);this.target=List.copyOf(target);this.ordered=ordered;
         }
-        public List<ValidationFullScan.Mapping> mappings(){return List.of(new ValidationFullScan.Mapping(mapping.mappingId(),guard->
+        public List<ValidationFullScan.Mapping> mappings(){
+            if(ordered)return List.of(ValidationFullScan.Mapping.paired(mapping.mappingId(),guard->
+                    new ValidationOrderedMerge(groups(source,mapping.source(),guard),groups(target,mapping.target(),guard)),
+                    (observation,pair,guard)->{
+                        checked.incrementAndGet();return ValidationRootReader.readOrderedDirect(observation,ValidationMethod.FULL_COLUMN,pair,
+                                new ValidationRootCheck.Limits(65536,32,32,8,2),guard,(values,root)->
+                                ValidationFieldCheck.check(observation,List.of(),values.source().working(),values.target().working(),values.sourceSample(),values.targetSample(),Optional.empty(),String::equals,
+                                        new ValidationValueComparison.TraversalLimits(ROW,10000),root));
+                    }));
+            return List.of(new ValidationFullScan.Mapping(mapping.mappingId(),guard->
                 new ValidationOrderedMerge(groups(source,mapping.source(),guard),groups(target,mapping.target(),guard)),this::check));}
         ValidationOrderedGroups groups(List<Map<String,Object>> rows,ValidationTaskSpec.Table side,Runnable guard){
             return new ValidationOrderedGroups(side.sourceId(),cursor(rows,guard),row->new ValidationOrderedGroups.Key(key(row),physical(side,key(row))),ROW.bytes());
