@@ -1,5 +1,6 @@
 package io.tapstate.adapters.mongostore;
 
+import com.mongodb.WriteConcern;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.gridfs.GridFSBucket;
@@ -375,7 +376,9 @@ public enum SystemCollections {
     /** Controlled preparation creates an empty declared collection in its original schema transaction. */
     void prepareCollectionOn(MongoDatabase database, com.mongodb.client.ClientSession session) {
         if (kind != Kind.COLLECTION) throw new IllegalStateException("only plain collections have this preparation path");
-        database.createCollection(session, collectionName);
+        // Schema commands cannot carry their own write concern inside a transaction. Its commit
+        // options retain the required durability; the original database handle keeps its URI policy.
+        database.withWriteConcern(WriteConcern.ACKNOWLEDGED).createCollection(session, collectionName);
     }
 
     /**
@@ -397,7 +400,9 @@ public enum SystemCollections {
     /** Explicit schema preparation owns both GridFS physical collections before any upload. */
     void prepareGridFsCollectionsOn(MongoDatabase database, com.mongodb.client.ClientSession session) {
         if (kind != Kind.GRIDFS_BUCKET) throw new IllegalStateException("only GridFS buckets have two physical collections");
-        for (String name : physicalNames()) database.createCollection(session, name);
+        // Both physical collections use the original transaction's commit write concern.
+        var schema = database.withWriteConcern(WriteConcern.ACKNOWLEDGED);
+        for (String name : physicalNames()) schema.createCollection(session, name);
     }
 
     /** The chunk handle stays in this registry for indexes and exact unpublished-upload cleanup. */
