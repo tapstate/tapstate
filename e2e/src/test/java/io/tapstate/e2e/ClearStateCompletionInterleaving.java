@@ -1,5 +1,6 @@
 package io.tapstate.e2e;
 
+import com.mongodb.MongoException;
 import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
@@ -98,10 +99,16 @@ final class ClearStateCompletionInterleaving implements AutoCloseable {
             Thread.currentThread().interrupt();
             throw new AssertionError(interrupted);
         } finally {
-            var mapping = SystemCollections.OPERATOR_GENERATIONS.on(client.getDatabase(storage.configurationDatabase()))
-                    .find(new Document("_id", pipeline)).first();
-            System.out.println("clear-state probe: released operation mapping=" + mapping);
-            client.close();
+            try {
+                var mapping = SystemCollections.OPERATOR_GENERATIONS.on(client.getDatabase(storage.configurationDatabase()))
+                        .find(new Document("_id", pipeline)).first();
+                System.out.println("clear-state probe: released operation mapping=" + mapping);
+            } catch (MongoException diagnostic) {
+                System.out.println("clear-state probe: released operation mapping unavailable: "
+                        + diagnostic.getClass().getSimpleName());
+            } finally {
+                client.close();
+            }
         }
     }
 }
