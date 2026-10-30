@@ -5,6 +5,8 @@ import io.tapdata.entity.schema.type.TapBinary;
 import io.tapdata.entity.schema.type.TapBoolean;
 import io.tapdata.entity.schema.type.TapDate;
 import io.tapdata.entity.schema.type.TapDateTime;
+import io.tapdata.entity.schema.type.TapDouble;
+import io.tapdata.entity.schema.type.TapFloat;
 import io.tapdata.entity.schema.type.TapJson;
 import io.tapdata.entity.schema.type.TapMap;
 import io.tapdata.entity.schema.type.TapNumber;
@@ -141,7 +143,9 @@ final class PdkTypeMapping {
         if (number == null || (type != TapstateType.DECIMAL && type != TapstateType.INT64 && type != TapstateType.DOUBLE)) {
             return targetType(type);
         }
-        return new TapNumber().bit(number.bit()).fixed(number.fixed()).unsigned(number.unsigned())
+        TapNumber restored = type == TapstateType.DOUBLE
+                ? (Integer.valueOf(32).equals(number.bit()) ? new TapFloat() : new TapDouble()) : new TapNumber();
+        return restored.bit(number.bit()).fixed(number.fixed()).unsigned(number.unsigned())
                 .zerofill(number.zerofill()).minValue(number.minValue()).maxValue(number.maxValue())
                 .precision(number.precision()).scale(number.scale());
     }
@@ -155,7 +159,7 @@ final class PdkTypeMapping {
             case DECIMAL -> throw new IllegalArgumentException(
                     "decimal target requires declared numeric attributes; rediscover the source schema. "
                             + "Computed decimal columns have no declared numeric metadata");
-            case DOUBLE -> new TapNumber().fixed(false).bit(64)
+            case DOUBLE -> new TapDouble().fixed(false).bit(64)
                     .minValue(BigDecimal.valueOf(-Double.MAX_VALUE)).maxValue(BigDecimal.valueOf(Double.MAX_VALUE));
             case BOOLEAN -> new TapBoolean();
             case DATE -> new TapDate();

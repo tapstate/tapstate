@@ -67,7 +67,7 @@ class PdkCapturePortTest {
                     TapstateException ce = (TapstateException) e;
                     assertThat(ce.code()).isEqualTo(ConnectorError.API_LEVEL_INCOMPATIBLE);
                     assertThat(ce.args()).containsEntry("connector", "demo")
-                            .containsEntry("required", 99).containsEntry("provided", 1);
+                            .containsEntry("required", 99).containsEntry("provided", 2);
                 });
     }
 

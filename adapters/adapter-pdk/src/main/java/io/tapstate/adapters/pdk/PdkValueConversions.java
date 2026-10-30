@@ -27,6 +27,7 @@ final class PdkValueConversions {
             Map.entry("TapBooleanValue", TapBooleanValue::new), Map.entry("TapDateValue", TapDateValue::new),
             Map.entry("TapDateTimeValue", TapDateTimeValue::new), Map.entry("TapMapValue", TapMapValue::new),
             Map.entry("TapNumberValue", TapNumberValue::new), Map.entry("TapStringValue", TapStringValue::new),
+            Map.entry("TapFloatValue", TapFloatValue::new), Map.entry("TapDoubleValue", TapDoubleValue::new),
             Map.entry("TapTimeValue", TapTimeValue::new), Map.entry("TapYearValue", TapYearValue::new),
             Map.entry("TapMoneyValue", TapMoneyValue::new), Map.entry("TapJsonValue", TapJsonValue::new),
             Map.entry("TapXmlValue", TapXmlValue::new), Map.entry("TapRawValue", TapRawValue::new),

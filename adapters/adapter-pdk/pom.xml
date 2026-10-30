@@ -107,6 +107,12 @@
       <artifactId>tapdata-pdk-runner</artifactId>
       <scope>test</scope>
     </dependency>
+    <!-- Match the assembly host when initializing real connector classes in isolation tests. -->
+    <dependency>
+      <groupId>io.tapdata</groupId>
+      <artifactId>tapdata-common</artifactId>
+      <scope>test</scope>
+    </dependency>
     <dependency>
       <groupId>org.assertj</groupId>
       <artifactId>assertj-core</artifactId>
