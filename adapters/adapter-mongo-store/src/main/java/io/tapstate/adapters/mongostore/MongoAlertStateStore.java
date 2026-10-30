@@ -188,7 +188,12 @@ final class MongoAlertStateStore {
     private static void validateEnvelope(io.tapstate.core.alerting.AlertStateRecord.Head before,
             io.tapstate.core.alerting.AlertStateRecord.Head candidate, io.tapstate.core.alerting.AlertSignal signal, java.time.Instant now) {
         var next = candidate.snapshot();
-        if (next.lastObservedAt() != null && next.lastObservedAt().isAfter(now) || candidate.retiredAt() != null && candidate.retiredAt().isAfter(now)) {
+        boolean retainedClock = before!=null && signal==null && next.quality()==io.tapstate.core.alerting.AlertSnapshot.Quality.CLOCK_INVALID
+                && io.tapstate.core.alerting.AlertLifecycle.tick(before.snapshot(),now).snapshot().equals(next)
+                && Objects.equals(candidate.episode(),before.episode()) && Objects.equals(candidate.binding(),before.binding())
+                && Objects.equals(candidate.operationalEvidence(),before.operationalEvidence())
+                && Objects.equals(candidate.retiredAt(),before.retiredAt()) && candidate.summariesHandedOff()==before.summariesHandedOff();
+        if (!retainedClock && next.lastObservedAt() != null && next.lastObservedAt().isAfter(now) || candidate.retiredAt() != null && candidate.retiredAt().isAfter(now)) {
             throw new IllegalArgumentException("state evidence is in the future");
         }
         var oldOwner = before == null ? io.tapstate.core.alerting.AlertOwnership.unclaimed() : before.owner(); var owner = candidate.owner();
@@ -227,7 +232,7 @@ final class MongoAlertStateStore {
         } else if (next.episodeSequence() > 1 || next.episode() == null && next.episodeSequence() != 0 || candidate.summariesHandedOff()) { throw new IllegalArgumentException("new head lacks original state history"); }
         var ep = candidate.episode(); var oldEp = before == null ? null : before.episode();
         if (ep == null) { return; }
-        if (ep.value().firedAt().isAfter(now) || ep.value().endedAt() != null && ep.value().endedAt().isAfter(now)) { throw new IllegalArgumentException("episode is in the future"); }
+        if (!retainedClock && (ep.value().firedAt().isAfter(now) || ep.value().endedAt() != null && ep.value().endedAt().isAfter(now))) { throw new IllegalArgumentException("episode is in the future"); }
         boolean same = oldEp != null && oldEp.value().number() == ep.value().number();
         if (same && (!oldEp.originalBinding().equals(ep.originalBinding()) || !oldEp.policy().equals(ep.policy())
                 || !oldEp.value().firedAt().equals(ep.value().firedAt()) || oldEp.value().endedAt() != null && !oldEp.value().equals(ep.value())

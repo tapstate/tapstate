@@ -195,8 +195,14 @@ final class AlertEvaluationHost {
                 if(outcome==AlertStore.Outcome.CONFLICT)continue;
                 points.remove(binding.key());return Result.ACCEPTED;
             }
-            var severity=AlertLifecycle.severity(before.snapshot(),binding.definition().effectiveSeverity(catalog),now);
-            var update = severity.snapshot().equals(before.snapshot())?AlertLifecycle.tick(before.snapshot(),now):severity;
+            var timed=AlertLifecycle.tick(before.snapshot(),now);
+            var episode=timed.snapshot().episode();
+            var severity=now.isBefore(binding.definition().header().updatedAt()) || episode!=null&&now.isBefore(episode.firedAt())
+                    || timed.snapshot().lastObservedAt()!=null&&timed.snapshot().lastObservedAt().isAfter(now)
+                    ?new AlertUpdate(timed.snapshot(),List.of(),false)
+                    :AlertLifecycle.severity(timed.snapshot(),binding.definition().effectiveSeverity(catalog),now);
+            var changes=new ArrayList<>(timed.transitions());changes.addAll(severity.transitions());
+            var update=new AlertUpdate(severity.snapshot(),changes,false);
             if (update.snapshot().equals(before.snapshot())) return Result.IGNORED;
             var outcome = commit(retained, before, head(binding, before, update, ownership, null, null),
                     update, null, binding);

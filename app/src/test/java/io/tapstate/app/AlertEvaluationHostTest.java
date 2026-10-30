@@ -198,6 +198,29 @@ class AlertEvaluationHostTest {
         assertThat(changes.getFirst().value().episode()).isZero();assertThat(changes.getFirst().diagnosticReference()).isNull();
         assertThat(changes.getLast().diagnosticReference().episode()).isOne();
     }
+    @Test void metadataCannotBlockClockInvalidTickOrBackdateItsSeverityChange(){
+        var original=definition("pipeline.failed");var initial=binding(original,"producer-a");condition(initial,1,0,AlertSignal.Condition.BAD);
+        var changed=new AlertConfiguration.Rule(original.header().next(T.plusSeconds(1),"admin"),original.name(),original.typeId(),1,original.resources(),original.parameters(),AlarmSeverity.CRITICAL,true,null).enrolled(original);
+        now.set(T.minusSeconds(1));host.tick(binding(changed,"producer-a"));var invalid=rows.get(initial.key()).value().snapshot();
+        assertThat(invalid.quality()).isEqualTo(AlertSnapshot.Quality.CLOCK_INVALID);assertThat(invalid.episode().severity()).isEqualTo(original.effectiveSeverity(BuiltinAlarmTypes.catalog()));
+        assertThat(invalid.lastSequence()).isOne();assertThat(invalid.lastObservedAt()).isEqualTo(T);
+        now.set(T.plusSeconds(2));host.tick(binding(changed,"producer-a"));var later=rows.get(initial.key()).value().snapshot();
+        assertThat(later.quality()).isEqualTo(AlertSnapshot.Quality.CLOCK_INVALID);assertThat(later.episode().severity()).isEqualTo(AlarmSeverity.CRITICAL);
+        assertThat(later.lastObservedAt()).isEqualTo(T);assertThat(later.episode().number()).isOne();
+    }
+    @Test void repeatedSeverityEditsCannotSuppressIndependentFreshnessOrRenewTheAcceptedFrontier(){
+        var original=definition("pipeline.failed");var initial=binding(original,"producer-a");condition(initial,1,0,AlertSignal.Condition.BAD);
+        var current=original;
+        for(int second:new int[]{20,21,22}){
+            now.set(T.plusSeconds(second));var severity=second%2==0?AlarmSeverity.CRITICAL:AlarmSeverity.MINOR;
+            var changed=new AlertConfiguration.Rule(current.header().next(now.get(),"admin"),current.name(),current.typeId(),1,current.resources(),current.parameters(),severity,true,null).enrolled(current);
+            host.tick(binding(changed,"producer-a"));var head=rows.get(initial.key()).value();
+            assertThat(head.snapshot().quality()).isEqualTo(AlertSnapshot.Quality.STALE);
+            assertThat(head.snapshot().status()).isEqualTo(AlertSnapshot.Status.FIRING);assertThat(head.snapshot().episode().number()).isOne();
+            assertThat(head.snapshot().lastSequence()).isOne();assertThat(head.snapshot().lastObservedAt()).isEqualTo(T);
+            assertThat(head.snapshot().episode().severity()).isEqualTo(severity);current=changed;
+        }
+    }
     @Test void severityMetadataChangesAreAppliedWithoutAnotherPublicationOrNewEpisode() {
         var original=definition("pipeline.failed");var b=binding(original,"producer-a");
         condition(b,1,0,AlertSignal.Condition.BAD);now.set(T.plusSeconds(1));

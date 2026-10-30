@@ -50,6 +50,31 @@ class AlertRuleBindingIT {
             }
         });
     }
+    @org.junit.jupiter.params.ParameterizedTest @org.junit.jupiter.params.provider.ValueSource(ints={-1,5})
+    void rollbackPublishesClockInvalidWithoutAcceptingFutureEvidenceOrRewritingTheEpisode(int rollback){
+        withFixture(f->{bad(f);var binding=f.binding(()->new AlertStore.EvaluationProof(f.intent(),ACTIVE));
+            f.now().set(T.plusSeconds(10));f.evaluator().accept(binding,2,new AlertInput.Conditions(f.clock().instant(),AlertSignal.Condition.BAD,null));
+            var original=f.store().state(binding.key(),f.reads()).orElseThrow();var rule=saved(f);
+            f.now().set(T.plusSeconds(rollback<0?11:rollback));f.store().saveDefinition(rule,edit(rule,rule.name(),rule.parameters(),AlarmSeverity.CRITICAL,true,f.clock().instant()),access());
+            var current=saved(f);f.now().set(T.plusSeconds(rollback));
+            assertThat(f.evaluator().tick(binding(f,current))).isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
+            var invalid=f.store().state(binding.key(),f.reads()).orElseThrow();var snapshot=invalid.value().snapshot();
+            assertThat(snapshot.quality()).isEqualTo(AlertSnapshot.Quality.CLOCK_INVALID);assertThat(snapshot.lastObservedAt()).isEqualTo(T.plusSeconds(10));assertThat(snapshot.lastSequence()).isEqualTo(2);
+            assertThat(invalid.value().episode()).isEqualTo(original.value().episode());
+            var advanced=new AlertSnapshot(snapshot.rule(),snapshot.enabled(),snapshot.status(),snapshot.quality(),3,T.plusSeconds(11),snapshot.pendingSince(),snapshot.recoverySince(),snapshot.episodeSequence(),snapshot.episode());
+            var old=invalid.value();var forged=new AlertStateRecord.Head(advanced,old.deployment(),old.owner(),old.retiredAt(),old.summariesHandedOff(),old.episode(),old.binding(),old.operationalEvidence());
+            var change=new AlertStore.StateChange(invalid.revision(),old,forged,List.of(),null,new AlertStore.EvaluationProof(f.intent(),ACTIVE),current.header().revision());
+            assertThatThrownBy(()->f.store().commit(new AlertStore.Commit(AlertStore.CommitKind.STATE_AND_PLAN,change,List.of(),List.of()))).isInstanceOf(IllegalArgumentException.class);
+            assertThat(f.store().state(binding.key(),f.reads()).orElseThrow()).isEqualTo(invalid);
+            f.now().set(T.plusSeconds(12));f.evaluator().tick(binding(f,current));var later=f.store().state(binding.key(),f.reads()).orElseThrow().value();
+            assertThat(later.snapshot().quality()).isEqualTo(AlertSnapshot.Quality.CLOCK_INVALID);assertThat(later.episode().value().severity()).isEqualTo(AlarmSeverity.CRITICAL);
+            assertThat(later.snapshot().lastObservedAt()).isEqualTo(T.plusSeconds(10));
+            f.now().set(T.plusSeconds(13));f.evaluator().accept(binding(f,current),3,new AlertInput.Conditions(f.clock().instant(),AlertSignal.Condition.GOOD,null));
+            var recovered=f.store().state(binding.key(),f.reads()).orElseThrow().value();
+            assertThat(recovered.snapshot().quality()).isEqualTo(AlertSnapshot.Quality.VALID);assertThat(recovered.snapshot().status()).isEqualTo(AlertSnapshot.Status.RESOLVED);
+            assertThat(recovered.episode().value().number()).isOne();
+        });
+    }
     @Test void aPreparedOldEvaluationCannotCommitAfterTheMetadataCasWins() throws Exception {
         withFixture(f->{bad(f);var before=f.store().state(f.binding(()->new AlertStore.EvaluationProof(f.intent(),ACTIVE)).key(),f.reads()).orElseThrow();
             var prepared=new java.util.concurrent.CountDownLatch(1);var release=new java.util.concurrent.CountDownLatch(1);
