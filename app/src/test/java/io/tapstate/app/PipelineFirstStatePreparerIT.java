@@ -685,8 +685,9 @@ class PipelineFirstStatePreparerIT {
                 var assembled = io.tapstate.runtime.engine.nest.NestDag.attach(dag,topology,"step","customer","out",
                         alias -> List.of(inputs.get(alias)),binding,vertex -> ordinal.merge(vertex,1,Integer::sum)-1,null,
                         new io.tapstate.runtime.engine.NodeWidth("step",2,1,null));
-                var sink = dag.newVertex("collected",com.hazelcast.jet.core.processor.SinkProcessors.writeListP("recovered-documents"));
-                dag.edge(com.hazelcast.jet.core.Edge.between(assembled,sink));
+                var sink = dag.newVertex("collected",RecoveredNestDocuments.sink("recovered-documents"));
+                dag.edge(com.hazelcast.jet.core.Edge.between(assembled,sink)
+                        .partitioned((io.tapstate.core.event.Envelope event) -> RecoveredNestDocuments.key(event)));
                 member.getJet().newJob(dag).getFuture().toCompletableFuture().get(20,java.util.concurrent.TimeUnit.SECONDS);
                 for (int key = 1; key <= 2; key++) {
                     var restored = member.<Object,io.tapstate.runtime.engine.nest.RootAssembly>getMap(rootName).get(List.of("C"+key));
@@ -697,7 +698,7 @@ class PipelineFirstStatePreparerIT {
                     assertThat(children).hasSize(1);
                     assertThat(((Map<?,?>)children.getFirst()).get("value")).isEqualTo(1);
                 }
-                assertThat(member.getList("recovered-documents")).hasSize(2);
+                RecoveredNestDocuments.assertRecovered(member,"recovered-documents");
             } finally { member.shutdown(); }
         });
     }
