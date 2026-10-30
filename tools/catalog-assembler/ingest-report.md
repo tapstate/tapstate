@@ -4,7 +4,7 @@ Spec SHA: `b0367d2`
 Capability SHA: `cc13816`
 
 > The capability face comes from an earlier upstream revision than the spec face: modes, sink and write semantics were derived at `cc13816`, while the structure below was read at `b0367d2`. A full refresh brings them back together.
-Ingested connectors: 95
+Ingested connectors: 82
 
 ## Unclassified — no resolvable mode (need tapstate.modes)
 - ai-chat
@@ -31,19 +31,7 @@ Ingested connectors: 95
 - yashandb: driver published only to the upstream project's private repository
 
 ## Not derived — no built jar or did not classload (excluded from refresh)
-- aliyun-rds-sqlserver
-- dameng
-- gbase8a
-- gbase8s
-- hana
-- informix
-- iris
-- kingbaser3
-- kingbaser6
-- oceanbase_oracle
-- sybase
-- tencent-db-mysql
-- tencent-db-sqlserver
+(none)
 
 ## Unverified modes — derived for a non-database connector nobody declared
 - coding
@@ -109,12 +97,10 @@ Ingested connectors: 95
 ## Unresolved label refs — fell back to raw key
 - aliyun-adb-mysql:addtionalString
 - aliyun-rds-mysql:addtionalString
-- aliyun-rds-sqlserver:timezone
 - aws-rds-mysql:addtionalString
 - mysql-pxc:addtionalString
 - polar-db-mysql:addtionalString
 - tencent-db-mariadb:addtionalString
-- tencent-db-sqlserver:timezone
 
 ## Exemptions — modules and specs set aside
 - [EXCLUDED] coding-demo-connector: known non-connector module
