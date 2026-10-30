@@ -229,14 +229,27 @@ class RealPostgresIndependentRecoveryIT {
                 String chain = consumer(store, SLOW_PIPELINE, SLOW_SOURCE).channelId();
                 assertThat(consumer(store, FAST_PIPELINE, FAST_SOURCE).channelId())
                         .isEqualTo(chain);
-                assertThat(SystemCollections.SRS_CHAINS.on(store).find(new Document("_id", chain)).first())
-                        .containsEntry("sourceReadDurable", true);
+                Document sharedChain = SystemCollections.SRS_CHAINS.on(store).find(new Document("_id", chain)).first();
+                assertThat(sharedChain).isNotNull();
+                Document checkpoint = sharedChain.get("checkpoint", Document.class);
+                assertThat(checkpoint).isNotEmpty();
+                assertThat(checkpoint.getString("token")).isNotBlank();
+                assertThat(sharedChain.getLong("checkpointRevision")).isPositive();
                 originalSlots = slotNames(postgres);
                 assertThat(originalSlots).hasSize(1);
                 control.stop(SLOW_PIPELINE, false);
                 awaitState(control, SLOW_PIPELINE, PipelineState.STOPPED);
                 stoppedConfirmation = token(consumer(store, SLOW_PIPELINE, SLOW_SOURCE));
+                String boot = sharedChain.get("captureFence", Document.class).getString("ownerBootId");
                 first.kill();
+                Await.until("the crashed boot's leases to expire before replacement", TIMEOUT,
+                        () -> SystemCollections.CACHE_WORKLOAD_CLAIMS.on(store).aggregate(List.of(
+                                new Document("$match", new Document("ownerBootId", boot)),
+                                new Document("$project", new Document("leased",
+                                        new Document("$gt", List.of("$leaseUntil", "$$NOW"))))))
+                                .into(new ArrayList<>()).stream()
+                                .noneMatch(claim -> Boolean.TRUE.equals(claim.getBoolean("leased"))),
+                        () -> "old boot=" + boot);
             }
             Await.until("the crashed capture to release its connection while retaining its slot", TIMEOUT,
                     () -> activeSlots(postgres) == 0, () -> "slots=" + slotNames(postgres));
