@@ -90,7 +90,7 @@
   ],
   "provenance": {
     "specPath": "connectors/databend-connector/src/main/resources/spec_databend.json",
-    "specContentHash": "68c98e4f9d819d0e",
+    "specContentHash": "a5a93f8e18839d63",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {}

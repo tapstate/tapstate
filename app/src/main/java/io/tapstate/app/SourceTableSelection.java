@@ -50,16 +50,50 @@ final class SourceTableSelection {
 
         LinkedHashSet<String> selected = new LinkedHashSet<>();
         for (TableRef selector : selectors) {
-            switch (selector) {
-                case TableRef.Literal literal -> addLiteral(source, discovered, selected, literal.name());
-                case TableRef.Spec spec -> addSpec(source, discovered, selected, spec);
-                case TableRef.Regex regex -> addRegex(source, discovered, selected, regex.pattern());
-            }
+            select(source, discovered, selected, selector);
         }
         if (selected.isEmpty()) {
             throw emptySelection(source);
         }
         return List.copyOf(selected);
+    }
+
+    /** Known selection members and unresolved selectors for read-only output naming. */
+    record Names(List<String> tables, List<TapstateException> unresolved) {
+        Names {
+            tables = List.copyOf(tables);
+            unresolved = List.copyOf(unresolved);
+        }
+    }
+
+    static Names forOutputNames(SourceResource source, SourceModel discovered) {
+        if (source.tables() == null || source.tables().isEmpty()) {
+            try {
+                return new Names(resolve(source, discovered), List.of());
+            } catch (TapstateException unavailable) {
+                return new Names(List.of(), List.of(unavailable));
+            }
+        }
+        LinkedHashSet<String> selected = new LinkedHashSet<>();
+        List<TapstateException> unresolved = new ArrayList<>();
+        for (TableRef selector : source.tables()) {
+            try {
+                select(source, discovered, selected, selector);
+            } catch (TapstateException unavailable) {
+                unresolved.add(unavailable);
+            }
+        }
+        if (selected.isEmpty() && unresolved.isEmpty()) unresolved.add(emptySelection(source));
+        return new Names(List.copyOf(selected), unresolved);
+    }
+
+    private static void select(SourceResource source, SourceModel discovered,
+            LinkedHashSet<String> selected, TableRef selector) {
+        switch (selector) {
+            case TableRef.Literal literal -> addLiteral(source, discovered, selected, literal.name());
+            case TableRef.Spec spec -> addSpec(source, discovered, selected, spec);
+            case TableRef.Regex regex -> addRegex(source, discovered, selected, regex.pattern());
+        }
     }
 
     private static void addLiteral(

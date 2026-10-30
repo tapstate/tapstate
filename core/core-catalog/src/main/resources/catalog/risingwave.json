@@ -174,7 +174,7 @@
   ],
   "provenance": {
     "specPath": "connectors/risingwave-connector/src/main/resources/spec_risingwave.json",
-    "specContentHash": "f45046942a7bc83d",
+    "specContentHash": "5b648342adac57c5",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {}

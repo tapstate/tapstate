@@ -337,7 +337,7 @@
   ],
   "provenance": {
     "specPath": "connectors/db2i-connector/src/main/resources/spec_db2.json",
-    "specContentHash": "6098a087e5c2d6cc",
+    "specContentHash": "af3e00058809854b",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

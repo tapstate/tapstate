@@ -823,7 +823,22 @@ class PipelineDirectPreparationIT {
                         .singleElement().satisfies(row -> assertThat(row.position().order()).isEqualTo(SourceOrder.snapshotRow(1)));
                 var firstFactory=copied(new ScopedSrsSinkAckFactory(Map.of(),Map.of("orders",new ScopedDirectSinkAckFactory.Source(one,"orders"),"quiet",new ScopedDirectSinkAckFactory.Source(one,"quiet")),"first-snapshot"));
                 firstFactory.beginRun(member,Map.of("orders",List.of("writer"),"quiet",List.of("writer")),original);var firstAck=firstFactory.resolve(member).forWriter("writer");
+                var displayPlan = new io.tapstate.core.lifecycle.ExecutionPlan("flow", original.claimGeneration(),
+                        original.executionGeneration(), original.topologyRevision(), List.of(OWNER.nodeId()), List.of(), CLOCK.instant());
+                var reading = first.initialLoad("flow", displayPlan, CLOCK.instant());
+                assertThat(reading).isNotNull();
+                assertThat(reading.tables()).containsOnlyKeys("orders", "quiet");
+                assertThat(reading.tables().get("orders").stage()).isEqualTo(io.tapstate.core.lifecycle.InitialLoad.Stage.LANDING);
+                assertThat(reading.tables().get("orders").rowsRead()).isEqualTo(1L);
+                assertThat(reading.tables().get("quiet").rowsRead()).isEqualTo(0L);
+                var wrongPlan = new io.tapstate.core.lifecycle.ExecutionPlan("flow", original.claimGeneration(),
+                        original.executionGeneration() + 1, original.topologyRevision(), List.of(OWNER.nodeId()), List.of(), CLOCK.instant());
+                assertThat(first.initialLoad("flow", wrongPlan, CLOCK.instant())).isNull();
                 firstAck.bounded("orders",SourceOrder.snapshotRow(1),original);assertThat(first.loadDelivered("flow")).isFalse();
+                var mixed = first.initialLoad("flow", displayPlan, CLOCK.instant());
+                assertThat(mixed.tables().get("orders").stage()).isEqualTo(io.tapstate.core.lifecycle.InitialLoad.Stage.LANDED);
+                assertThat(mixed.tables().get("quiet").stage()).isEqualTo(io.tapstate.core.lifecycle.InitialLoad.Stage.LANDING);
+                assertThat(mixed.phase(io.tapstate.core.lifecycle.PipelineState.RUNNING)).isEqualTo(io.tapstate.core.lifecycle.InitialLoad.Phase.MIXED);
                 ports.getFirst().direct.listener.get().onBatch(List.of(Envelope.insert(1,"orders",Map.of("id",2),null)),Optional.of(new SourcePosition("settled")));
                 var changes=buffer.drain(first.captureBindings().bufferKey("input"),SrsRingbuffer.ringName(one.context().channelId(),"orders"));
                 firstAck.advance("orders",changes.getFirst().position(),original);awaitTold(ports.getFirst().direct,"settled");first.stopCapture("flow",false);
@@ -905,6 +920,12 @@ class PipelineDirectPreparationIT {
                 var models=SourceModelSnapshot.capture("flow",List.of(f.source()),f.cache.schemas(f.business(),ACTIVE));
                 var run=coordinator.forRun(f.scope,original,new ExecutionFence(f.scope,original));run.startCapture("flow",artifacts,models);
                 var fixed=run.captureBindings().direct().get("input");assertThat(fixed.epoch()).isOne();assertThat(run.captureBindings().freshFullLoad()).isFalse();
+                var cdcPlan = new io.tapstate.core.lifecycle.ExecutionPlan("flow", original.claimGeneration(),
+                        original.executionGeneration(), original.topologyRevision(), List.of(OWNER.nodeId()), List.of(), CLOCK.instant());
+                var cdcLoad = run.initialLoad("flow", cdcPlan, CLOCK.instant());
+                assertThat(cdcLoad.readMode()).isEqualTo("cdc_only");
+                assertThat(cdcLoad.tables()).isEmpty();
+                assertThat(cdcLoad.phase(io.tapstate.core.lifecycle.PipelineState.RUNNING)).isEqualTo(io.tapstate.core.lifecycle.InitialLoad.Phase.STREAMING);
                 assertThat(ports.getFirst().start.get()).isEqualTo(switch(firstStart) {
                     case "latest" -> CaptureStart.present();case "earliest" -> CaptureStart.earliest();default -> CaptureStart.at(Instant.parse(firstStart));
                 });
@@ -945,7 +966,7 @@ class PipelineDirectPreparationIT {
                     """.formatted(StorageBinding.defaultSourceId(StorageBinding.Mode.OP)));
             f.configuration.artifacts().save(definition);
             f.cache.schemas(f.business(),ACTIVE).save(new DiscoveredSourceModel("input","mongodb",0,new SourceModel(List.of(
-                    new SourceTable("orders",List.of(new SourceField("id","INT")),List.of("id"),List.of()),
+                    new SourceTable("orders",List.of(new SourceField("id","INT")),List.of("id"),List.of(), 20L),
                     new SourceTable("quiet",List.of(new SourceField("id","INT")),List.of("id"),List.of())))));
             var inputs=f.inputs(); f.preparer(f.configuration,f.cache).prepare(f.scope,inputs);
             var claims=f.cache.workloadClaims(f.business()); var initial=claims.readPipeline(f.scope).orElseThrow().claim();
@@ -975,6 +996,14 @@ class PipelineDirectPreparationIT {
                 assertThat(firstBindings.snapshots().get("input").epoch()).isOne();
                 assertThat(first.snapshotProgress("flow").byTable().get("orders").rowsDone()).isOne();
                 assertThat(first.snapshotProgress("flow").byTable().get("quiet").rowsDone()).isZero();
+                var boundedPlan = new io.tapstate.core.lifecycle.ExecutionPlan("flow", original.claimGeneration(),
+                        original.executionGeneration(), original.topologyRevision(), List.of(OWNER.nodeId()), List.of(), CLOCK.instant());
+                var boundedLoad = first.initialLoad("flow", boundedPlan, CLOCK.instant());
+                assertThat(boundedLoad.readMode()).isEqualTo("snapshot_only");
+                assertThat(boundedLoad.tables().get("orders").rowsTotalEstimate()).isEqualTo(20L);
+                assertThat(boundedLoad.tables().values()).allSatisfy(table ->
+                        assertThat(table.stage()).isEqualTo(io.tapstate.core.lifecycle.InitialLoad.Stage.LANDING));
+                assertThat(boundedLoad.phase(io.tapstate.core.lifecycle.PipelineState.RUNNING)).isEqualTo(io.tapstate.core.lifecycle.InitialLoad.Phase.SNAPSHOTTING);
                 String ring=SourceCaptureResolution.forPipeline(f.pipeline(),f.source(),models.model(f.source())).orElseThrow().ringName("orders");
                 assertThat(buffer.drain(firstBindings.bufferKey("input"),ring)).singleElement().satisfies(row -> assertThat(row.position().order()).isEqualTo(SourceOrder.snapshotRow(1)));
                 var targetInputs=buildBoundedDag(f,provisioner,firstBindings);

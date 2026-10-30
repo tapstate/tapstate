@@ -428,15 +428,18 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         final String id; final SourceCaptureResolution selected;final boolean shared;boolean positionEditsRestricted; final Map<String,Long> rows=new ConcurrentHashMap<>();
         final Set<String> completed=ConcurrentHashMap.newKeySet();
         final Map<String,SourceTable> expectedModels;
+        final Map<String,Long> estimates = new LinkedHashMap<>();
         Owner owner;CapturePreparation prepared;WorkloadClaimFence foreign;SrsStores srs;SrsConsumerRun consumer;SrsFreshFullPreparation freshFull; CaptureRun run; DirectChannelStore channels; DirectChannelProgress direct; CaptureStart start; long snapshotEpoch; Set<String> readTables=Set.of();
         Source(String id,SourceCaptureResolution selected,boolean shared,SourceModel frozen) {
             this.id=id;this.selected=selected;this.shared=shared;
             if(frozen==null)expectedModels=null;
             else {
                 var fixed=new LinkedHashMap<String,SourceTable>();
-                for(var table:frozen.tables())if(selected.tables().contains(table.name()))
+                for(var table:frozen.tables())if(selected.tables().contains(table.name())) {
                     if(fixed.put(table.name(),new SourceTable(table.name(),table.fields(),table.primaryKey(),table.indexes()))!=null)
                         throw modelUnproven(this);
+                    if (table.approximateRowCount() != null) estimates.put(table.name(), table.approximateRowCount());
+                }
                 expectedModels=Map.copyOf(fixed);
             }
         }
@@ -491,10 +494,11 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                 var confirmed = session.bounded ? List.<String>of() : streamingCursor(session, source).snapshotCompletedTables();
                 for (String table : source.selected.tables()) {
                     Long rows = source.rows.get(table);
+                    if (rows == null && source.completed.contains(table) && source.readTables.contains(table)) rows = 0L;
                     var stage = boundedLanded || confirmed.contains(table) ? InitialLoad.Stage.LANDED
                             : source.completed.contains(table) ? InitialLoad.Stage.LANDING
                             : rows != null ? InitialLoad.Stage.READING : InitialLoad.Stage.PENDING;
-                    tables.put(session.label(source.id, table), new InitialLoad.Table(stage, rows, null));
+                    tables.put(session.label(source.id, table), new InitialLoad.Table(stage, rows, source.estimates.get(table)));
                 }
             }
         }
