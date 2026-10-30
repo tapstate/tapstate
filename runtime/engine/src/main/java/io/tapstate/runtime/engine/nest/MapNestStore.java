@@ -318,10 +318,10 @@ final class MapNestStore<S> implements NestStore<S> {
 
     private static final class GrownBatch<S> implements EntryProcessor<Object, S, Void>, Serializable {
         private static final long serialVersionUID = 1L;
-        private final LinkedHashMap<Object, Set<Object>> additions;
+        private final LinkedHashMap<Object, Set<Object>> additions = new LinkedHashMap<>();
 
         GrownBatch(Map<Object, Set<Object>> additions) {
-            this.additions = new LinkedHashMap<>(additions);
+            this.additions.putAll(additions);
         }
 
         @Override public Void process(Map.Entry<Object, S> entry) {
