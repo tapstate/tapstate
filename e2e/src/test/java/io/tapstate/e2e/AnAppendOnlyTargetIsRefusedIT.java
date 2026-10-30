@@ -9,7 +9,6 @@ import org.junit.jupiter.params.provider.EnumSource;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.LinkedHashMap;
-import java.util.Locale;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -32,10 +31,9 @@ class AnAppendOnlyTargetIsRefusedIT {
     void appendIsRefusedBeforeAnythingIsFiledButTheSameUpsertDeclarationIsAccepted(
             Tiers tier, @TempDir Path directory) throws Exception {
         byte[] connector = Files.readAllBytes(E2eConnectorJar.buildInto(directory));
-        String store = SharedMongo.replicaSetUrl("append_unwind_" + tier.name().toLowerCase(Locale.ROOT));
-        try (ServerHandle server = tier.launch(store)) {
+        try (var storage = PreparedNativeStore.create("e2e", "e2e-password"); ServerHandle server = tier.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID, connector);
             Map<String, String> resources = new LinkedHashMap<>();
             for (String file : new String[] {"src_file.tap.yml", "tgt_file.tap.yml", "pipeline.tap.yml"}) {

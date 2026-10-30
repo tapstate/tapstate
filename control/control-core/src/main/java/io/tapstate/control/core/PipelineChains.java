@@ -17,6 +17,12 @@ public interface PipelineChains {
     /** The chains {@code pipelineId} reads, in the order its sources are declared. */
     List<Chain> of(String pipelineId);
 
+    /** Captures a read's original scope/version; recheck after all dependent progress IO has finished. */
+    default Runnable readingGuard(String pipelineId) {return () -> {};}
+
+    /** Whether this pipeline's current scope can read progress on the described chain. */
+    default boolean canReadPositions(String pipelineId, Chain chain) {return true;}
+
     /**
      * Every chain that can hold {@code pipelineId}'s durable progress: the chains it reads, and any older
      * chain a source recorded its progress on before it read the one it reads now. Whether a start is a

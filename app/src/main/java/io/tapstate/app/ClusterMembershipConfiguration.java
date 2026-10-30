@@ -24,8 +24,17 @@ import org.springframework.context.annotation.Configuration;
 class ClusterMembershipConfiguration {
 
     @Bean
+    @org.springframework.context.annotation.Conditional(BusinessScope.class)
     ClusterMembershipGate clusterMembershipGate(ClusterProperties properties) {
         return new ClusterMembershipGate(properties);
+    }
+
+    /** The minimum CONFIG context owns no business gate; an admitted child owns exactly one. */
+    static final class BusinessScope implements org.springframework.context.annotation.Condition {
+        @Override public boolean matches(org.springframework.context.annotation.ConditionContext context,
+                org.springframework.core.type.AnnotatedTypeMetadata metadata) {
+            return !context.getRegistry().containsBeanDefinition("storageRootConfiguration");
+        }
     }
 
     /**
@@ -33,6 +42,7 @@ class ClusterMembershipConfiguration {
      * rather than beside either of them because both need the same one, and neither needs the other to exist.
      */
     @Bean
+    @org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean(BootId.class)
     BootId bootId() {
         return BootId.fresh();
     }

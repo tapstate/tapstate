@@ -136,11 +136,37 @@ public final class CdcRecoveryFixture {
                         Files.writeString(signals.resolve("waiting-" + Thread.currentThread().threadId()), "");
                     }
                 }
-                write.writeRecord(context, events, table, result);
+                write.writeRecord(context, events, table, value -> {
+                    Object replyHold=context.getConnectionConfig().getObject("hold_result");
+                    Object replyId=context.getConnectionConfig().getObject("hold_result_id");
+                    Path signals=replyHold == null ? null : Path.of(String.valueOf(replyHold));
+                    boolean held=signals != null && !Files.exists(signals.resolve("release")) && events.stream().anyMatch(event ->
+                            event instanceof TapInsertRecordEvent inserted && String.valueOf(inserted.getAfter().get("id")).equals(String.valueOf(replyId)));
+                    if (held) holdActualResult(signals);
+                    try { result.accept(value); }
+                    finally { if (held) signal(signals.resolve("returned")); }
+                });
             });
             functions.supportTimestampToStreamOffset((context, startTime) -> positionAt(context, startTime))
                     .supportStreamRead((context, tables, offset, size, consumer) ->
                             tail(context, tables, offset, size, consumer));
+        }
+
+        /** Keeps a completed physical write inside its original call even when member shutdown interrupts it. */
+        private static void holdActualResult(Path signals) {
+            signal(signals.resolve("held")); boolean interrupted=false;
+            long deadline=System.nanoTime()+Duration.ofSeconds(60).toNanos();
+            try {
+                while (!Files.exists(signals.resolve("release"))) {
+                    if (System.nanoTime()>=deadline) throw new AssertionError("the test did not release its target result");
+                    if (Thread.interrupted()) interrupted=true;
+                    java.util.concurrent.locks.LockSupport.parkNanos(java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(10));
+                }
+            } finally { if (interrupted) Thread.currentThread().interrupt(); }
+        }
+        private static void signal(Path path) {
+            try { Files.createDirectories(path.getParent()); Files.writeString(path,""); }
+            catch (IOException failure) { throw new UncheckedIOException(failure); }
         }
 
         @Override

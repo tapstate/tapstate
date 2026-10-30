@@ -37,7 +37,7 @@ final class ClusterLifecycleProbe {
         Scope scope = ACTIVE.get();
         if (scope == null) return null;
         try {
-            List<String> parameters = new ArrayList<>(List.of(storeUri, operatorDatabase, listenAddress));
+            List<String> parameters = new ArrayList<>(List.of(storeUri, operatorDatabase == null ? "<native-config>" : operatorDatabase, listenAddress));
             parameters.addAll(jvmOptions);
             parameters.addAll(extraArguments);
             String cluster = setting(extraArguments, "--tapstate.cluster.id=");

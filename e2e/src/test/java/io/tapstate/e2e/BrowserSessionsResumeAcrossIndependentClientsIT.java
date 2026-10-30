@@ -19,9 +19,12 @@ class BrowserSessionsResumeAcrossIndependentClientsIT {
 
     @Test
     void independentClientsResumeUntilTheSharedSessionIsRevoked() throws Exception {
-        try (ServerHandle server = RealProcessServer.start(SharedMongo.replicaSetUrl("e2e_browser_auth"),
-                java.util.List.of("--tapstate.browser-auth.allow-insecure-loopback=true"))) {
-            new ControlPlane(server.baseUrl()).bootstrapAndLogin("browser-admin", "browser-password");
+        try (PreparedNativeStore storage = PreparedNativeStore.create("browser-admin", "browser-password");
+                ServerHandle server = RealProcessServer.startPrepared(storage.configurationUri(), "127.0.0.1",
+                        port -> java.util.List.of("--tapstate.cluster.id=" + storage.clusterId(),
+                                "--tapstate.browser-auth.allow-insecure-loopback=true", "--tapstate.hz.member-port=0",
+                                "--tapstate.hz.jet.cooperative-thread-count=2"))) {
+            storage.loginAndAwaitBusiness(new ControlPlane(server.baseUrl()));
             String origin = server.baseUrl().toString().replaceAll("/$", "");
             HttpClient first = HttpClient.newHttpClient();
             HttpClient second = HttpClient.newHttpClient();

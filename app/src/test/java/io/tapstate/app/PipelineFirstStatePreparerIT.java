@@ -1,0 +1,881 @@
+package io.tapstate.app;
+
+import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoDatabase;
+import io.tapstate.adapters.mongostore.MongoCacheDomain;
+import io.tapstate.adapters.mongostore.MongoConfigurationBootstrap;
+import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
+import io.tapstate.adapters.mongostore.MongoConnectionSettings;
+import io.tapstate.adapters.mongostore.SystemCollections;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.dsl.DslParser;
+import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.model.SourceResource;
+import io.tapstate.core.model.canonical.CanonicalHash;
+import io.tapstate.spi.store.CacheAuthScope;
+import io.tapstate.spi.store.CacheBusinessScope;
+import io.tapstate.spi.store.FirstPipelineCreationResult;
+import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.PipelineIntentScope;
+import io.tapstate.spi.store.PipelinePreparation;
+import io.tapstate.spi.store.StorageBinding;
+import io.tapstate.spi.store.StorageSetupScope;
+import io.tapstate.spi.store.WorkloadClaimFence;
+import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimType;
+import io.tapstate.spi.store.WorkloadOwner;
+import io.tapstate.testsupport.RequiresDocker;
+import org.bson.Document;
+import org.junit.jupiter.api.Test;
+import org.testcontainers.containers.MongoDBContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.utility.DockerImageName;
+
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+/** Concrete app orchestration over isolated CONFIG/CACHE replica sets. */
+@RequiresDocker
+class PipelineFirstStatePreparerIT {
+    @Container private static final MongoDBContainer CONFIG = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
+    @Container private static final MongoDBContainer CACHE = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
+    private static final Runnable ACTIVE = () -> {};
+    private static final Duration TTL = Duration.ofSeconds(30);
+    private static final Clock CLOCK = Clock.fixed(Instant.parse("2026-10-18T08:00:00Z"), ZoneOffset.UTC);
+    private static final WorkloadOwner OWNER = new WorkloadOwner("node-a", "boot-a");
+
+    @Test void unpreparedAuthoringModelsAreRetiredWithoutInventingExecutionHistory() {
+        withFixture(f -> {
+            var models = f.cache.unpreparedPipelineDerivedSchemas(f.scope, f.node, () -> {
+                if (f.configuration.pipelineStates().read("flow").orElseThrow().phase() != io.tapstate.spi.store.PipelineStateMapping.Phase.ACTIVE
+                        || f.configuration.preparations().read("flow").orElseThrow().phase() != PipelinePreparation.Phase.UNASSIGNED) throw fenced();
+            });
+            models.record("flow", "source.orders", Map.of("id", "INT64 NULL"), "source", "discovery", "test");
+            var old = f.configuration.intents().load("flow").orElseThrow();
+            f.configuration.intents().compareAndSet(f.scope, old.intentRevision(), new DesiredState("flow", PipelineState.STOPPED, old.desired().revision()));
+            var pipeline = f.configuration.artifacts().get("flow").orElseThrow();
+            var request = new io.tapstate.spi.store.PipelineRetirementRequest(UUID.randomUUID().toString(), f.scope, CanonicalHash.of(pipeline), Optional.empty());
+            var original = f.configuration.retirements().begin(request);
+            var receipt = f.cache.pipelineRetirements(f.business(), ACTIVE).retire(original, f.node, Optional.empty());
+            f.configuration.retirements().complete(receipt);
+            assertThat(f.configuration.artifacts().get("flow")).isEmpty();
+            assertThat(f.cacheDatabase.getCollection("derived_schemas").countDocuments()).isZero();
+            assertThat(f.claim()).isNull(); assertThat(f.state()).isNull();
+            f.configuration.artifacts().create(pipeline);
+            var next = new PipelineIntentScope(f.scope.clusterId(), f.scope.bindingVersion(), f.scope.cacheIncarnation(), "flow", 2);
+            var proof = f.configuration.authoringModels(next);
+            var reused = f.cache.unpreparedPipelineDerivedSchemas(proof, f.node, ACTIVE);
+            reused.record("flow", "source.orders", Map.of("id", "INT64 NULL"), "source", "discovery", "test");
+            assertThat(reused.latest("flow", "source.orders")).isPresent();
+            assertThat(f.claim()).isNull(); assertThat(f.state()).isNull();
+            assertCode(() -> f.cache.unpreparedPipelineDerivedSchemas(next, f.node, ACTIVE)
+                    .record("flow", "other", Map.of("id", "INT64 NULL"), "source", "discovery", "test"), IoError.CACHE_BUSINESS_FENCED);
+            f.preparer(f.configuration, f.cache).prepare(next);
+            assertThat(f.cache.pipelineDerivedSchemas(next).latest("flow", "source.orders")).isPresent();
+            assertThatThrownBy(() -> reused.record("flow", "late", Map.of(), "source", "discovery", "test")).isInstanceOf(TapstateException.class);
+        });
+    }
+
+    @Test void anotherNodesRetirementCannotPassTheLastAuthoringGuardAndLeaveALateModel() {
+        withFixture(f -> {
+            var old = f.configuration.intents().load("flow").orElseThrow();
+            f.configuration.intents().compareAndSet(f.scope, old.intentRevision(), new DesiredState("flow", PipelineState.STOPPED, old.desired().revision()));
+            var owner = new WorkloadOwner("node-b", "boot-b");
+            var other = WorkloadClaimFence.from(f.cache.workloadClaims(f.business()).acquire(
+                    new WorkloadClaimKey(f.scope.clusterId(), WorkloadClaimType.NODE_SESSION, owner.nodeId()), owner, 1, TTL).claim());
+            var staged = new java.util.concurrent.CountDownLatch(1); var release = new java.util.concurrent.CountDownLatch(1);
+            var begun = new java.util.concurrent.CountDownLatch(1); var checks = new java.util.concurrent.atomic.AtomicInteger();
+            var models = f.cache.unpreparedPipelineDerivedSchemas(f.scope, f.node, () -> {
+                if (f.configuration.pipelineStates().read("flow").orElseThrow().phase() != io.tapstate.spi.store.PipelineStateMapping.Phase.ACTIVE
+                        || f.configuration.preparations().read("flow").orElseThrow().phase() != PipelinePreparation.Phase.UNASSIGNED) throw fenced();
+                if (checks.incrementAndGet() == 3) {
+                    staged.countDown();
+                    try { if (!release.await(15, java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError("authoring cut timed out"); }
+                    catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new AssertionError(interrupted); }
+                }
+            });
+            var request = new io.tapstate.spi.store.PipelineRetirementRequest(UUID.randomUUID().toString(), f.scope,
+                    CanonicalHash.of(f.configuration.artifacts().get("flow").orElseThrow()), Optional.empty());
+            try (var workers = java.util.concurrent.Executors.newFixedThreadPool(2)) {
+                var writing = workers.submit(() -> models.record("flow", "source.orders", Map.of("id", "INT64 NULL"), "source", "discovery", "test"));
+                try {
+                    assertThat(staged.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                    var retiring = workers.submit(() -> {
+                        var original = f.configuration.retirements().begin(request); begun.countDown();
+                        return f.cache.pipelineRetirements(f.business(), ACTIVE).retire(original, other, Optional.empty());
+                    });
+                    assertThat(begun.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                    assertThatThrownBy(() -> retiring.get(2, java.util.concurrent.TimeUnit.SECONDS)).isInstanceOf(java.util.concurrent.TimeoutException.class);
+                    release.countDown();
+                    assertThatThrownBy(() -> writing.get(5, java.util.concurrent.TimeUnit.SECONDS)).isInstanceOf(java.util.concurrent.ExecutionException.class);
+                    var receipt = retiring.get(10, java.util.concurrent.TimeUnit.SECONDS);
+                    f.configuration.retirements().complete(receipt);
+                    assertThat(f.cacheDatabase.getCollection("derived_schemas").countDocuments()).isZero();
+                    assertThat(f.claim()).isNull(); assertThat(f.state()).isNull();
+                } finally { release.countDown(); }
+            }
+        });
+    }
+
+    @Test void theAppPreparerConsumesConcretePrivateGrantAndReceiptAcrossTwoInstances() {
+        withFixture(f -> {
+            long revision = f.version();
+            var complete = f.preparer(f.configuration, f.cache).prepare(f.scope);
+            assertThat(complete.phase()).isEqualTo(PipelinePreparation.Phase.COMPLETE);
+            assertThat(f.configuration.intents().loadForActuation("flow")).isPresent();
+            assertThat(f.cache.pipelineStates(f.scope).read("flow").orElseThrow().stateJson()).isEqualTo("NEW");
+            assertThat(f.state()).containsEntry("epoch", 0L).containsEntry("runtimeWriteFence", 1L);
+            assertThat(f.claim()).containsEntry("claimGeneration", 1L).containsEntry("executionGeneration", 0L);
+            assertThat(f.version()).isEqualTo(revision);
+            assertThat(f.configDatabase.listCollectionNames().into(new ArrayList<>())).doesNotContain("pipeline_state", "workload_claims");
+            assertThat(f.cacheDatabase.listCollectionNames().into(new ArrayList<>())).doesNotContain("operator_generations", "pipeline_intents");
+            // COMPLETE is historical preparation status, never proof that lost CACHE state is healthy.
+            f.cacheDatabase.getCollection("pipeline_state").deleteMany(new Document());
+            f.cacheDatabase.getCollection("workload_claims").deleteOne(f.pipelineFilter());
+            var missing = f.snapshot();
+            assertThat(f.preparer(f.configuration, f.cache).prepare(f.scope)).isEqualTo(complete);
+            assertCode(() -> f.cache.workloadClaims(f.business()).acquirePipeline(f.scope, OWNER, 1, TTL), IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.snapshot()).isEqualTo(missing);
+        });
+    }
+
+    @Test void reopeningClientsCannotReissueAnAuthorityWhoseCacheHistoryIsAbsent() {
+        withFixture(f -> {
+            var issued = f.configuration.preparations().issueFirstCreate(f.scope, f.node);
+            assertThat(issued).isInstanceOf(FirstPipelineCreationResult.Issued.class);
+            var before = f.snapshot(); var mapping = f.configDatabase.getCollection("operator_generations").find().first();
+            try (var reopened = MongoConfigurationDomain.open(f.settings, "cluster-a");
+                 var cache = MongoCacheDomain.connect(f.cacheConnection, Duration.ofSeconds(5), "reopened-test")) {
+                assertCode(() -> f.preparer(reopened, cache).prepare(f.scope), IoError.PIPELINE_STATE_REBUILD_REQUIRED);
+                assertThat(reopened.preparations().issueFirstCreate(f.scope, f.node)).isInstanceOf(FirstPipelineCreationResult.AlreadyIssued.class);
+            }
+            assertThat(f.snapshot()).isEqualTo(before);
+            assertThat(f.configDatabase.getCollection("operator_generations").find().first()).isEqualTo(mapping);
+        });
+    }
+
+    @Test void reopeningAfterSeedCompletesFromTheConcreteReceiptWithoutAnyCacheMutation() {
+        withFixture(f -> {
+            var grant = ((FirstPipelineCreationResult.Issued) f.configuration.preparations().issueFirstCreate(f.scope, f.node)).creation();
+            var preparer = f.cache.pipelinePreparations(f.business(), ACTIVE);
+            preparer.seed(preparer.reserveFirst(grant, TTL), f.configuration.preparations(), CLOCK.instant());
+            var before = f.snapshot();
+            try (var reopened = MongoConfigurationDomain.open(f.settings, "cluster-a");
+                 var cache = MongoCacheDomain.connect(f.cacheConnection, Duration.ofSeconds(5), "reopened-test")) {
+                assertThat(f.preparer(reopened, cache).prepare(f.scope).phase()).isEqualTo(PipelinePreparation.Phase.COMPLETE);
+                assertThat(reopened.intents().loadForActuation("flow")).isPresent();
+            }
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
+    @Test void aScopedRunCannotWriteWithTheTopologyOfALaterSameOwnerAcquisition() {
+        withFixture(f -> {
+            f.preparer(f.configuration,f.cache).prepare(f.scope);
+            var claims = f.cache.workloadClaims(f.business());
+            var owned = claims.acquirePipeline(f.scope,OWNER,1,TTL).claim();
+            var run = claims.advanceExecution(owned,1,java.util.Set.of(OWNER.nodeId())).orElseThrow();
+            var original = new ExecutionFence(f.scope,WorkloadClaimFence.from(run));
+            var later = claims.acquirePipeline(f.scope,OWNER,2,TTL).claim();
+            assertThat(later.claimGeneration()).isEqualTo(run.claimGeneration());
+            assertThat(later.executionGeneration()).isEqualTo(run.executionGeneration());
+            assertThat(later.topologyRevision()).isEqualTo(2);
+            var before = f.state();
+            try (var guard = ExecutionAuthorization.scoped(f.business(),claims,Duration.ofSeconds(10),System::nanoTime,() -> true)) {
+                assertThatThrownBy(() -> {
+                    var borrowed = guard.require(original);
+                    f.cache.pipelineStates(f.scope,borrowed,ACTIVE).compareAndSwap("flow",0,"RUNNING",CLOCK.instant());
+                }).isInstanceOfSatisfying(TapstateException.class,failure ->
+                        assertThat(failure.code()).isEqualTo(io.tapstate.runtime.engine.EngineError.EXECUTION_NOT_AUTHORIZED));
+                assertThat(f.state()).isEqualTo(before);
+                assertCode(() -> f.cache.pipelineStates(f.scope,WorkloadClaimFence.from(run),ACTIVE)
+                        .compareAndSwap("flow",0,"RUNNING",CLOCK.instant()),IoError.WORKLOAD_CLAIM_FENCED);
+                guard.recordSinkWriteFailure(original);
+                assertThat(claims.readPipeline(f.scope).orElseThrow().claim().failureClaimGeneration()).isZero();
+                var actual = guard.require(new ExecutionFence(f.scope,WorkloadClaimFence.from(later)));
+                f.cache.pipelineStates(f.scope,actual,ACTIVE).compareAndSwap("flow",0,"RUNNING",CLOCK.instant());
+                assertThat(f.state().getLong("epoch")).isEqualTo(1);
+            }
+        });
+    }
+
+    @Test void actualMapStoreFactoriesKeepTheirOriginalClaimsOverTheControlledCacheAssembly() {
+        withFixture(f -> {
+            f.preparer(f.configuration,f.cache).prepare(f.scope);
+            var claims = f.cache.workloadClaims(f.business()); var owned = claims.acquirePipeline(f.scope,OWNER,1,TTL).claim();
+            var first = claims.advanceExecution(owned,1,java.util.Set.of(OWNER.nodeId())).orElseThrow();
+            var topology = literalRootTopology();
+            var placement = io.tapstate.runtime.engine.OperatorMapCoordinates.nest(f.scope,f.cacheDatabase.getName(),"step",List.of(),
+                    io.tapstate.runtime.engine.OperatorMapCoordinates.NestMap.STATE,null);
+            var embeddedPlacement = io.tapstate.runtime.engine.OperatorMapCoordinates.nest(f.scope,f.cacheDatabase.getName(),"step",List.of("$root"),
+                    io.tapstate.runtime.engine.OperatorMapCoordinates.NestMap.STATE,null);
+            assertThat(placement.mapName()).isNotEqualTo(embeddedPlacement.mapName());
+            f.cache.nestShapes(f.scope,f.cacheDatabase.getName(),WorkloadClaimFence.from(first),ACTIVE).recordIfAbsent("step",topology.stateIdentityPaths());
+            var member = org.mockito.Mockito.mock(com.hazelcast.core.HazelcastInstance.class);
+            org.mockito.Mockito.when(member.getUserContext()).thenReturn(new java.util.concurrent.ConcurrentHashMap<>());
+            org.mockito.Mockito.when(member.getDistributedObjects()).thenReturn(List.of());
+            try (var authorization = ExecutionAuthorization.scoped(f.business(),claims,Duration.ofSeconds(10),System::nanoTime,() -> true);
+                 var registry = io.tapstate.runtime.engine.OperatorMapBindings.bindTo(member,new ScopedOperatorStateProvider(f.cache,authorization))) {
+                var originalFence = new ExecutionFence(f.scope,WorkloadClaimFence.from(first));
+                var original = new io.tapstate.runtime.engine.OperatorMapBinding(placement,originalFence,originalFence.operatorExecutionKey());
+                var embeddedOriginal = new io.tapstate.runtime.engine.OperatorMapBinding(embeddedPlacement,originalFence,originalFence.operatorExecutionKey());
+                registry.install(List.of(original,embeddedOriginal)); var old = mapStore(member,original); var embeddedOld = mapStore(member,embeddedOriginal);
+                Object key = List.of("key"); old.store(key,"before"); embeddedOld.store(key,"embedded-before");
+                var nextClaim = claims.advanceExecution(first,1,java.util.Set.of(OWNER.nodeId())).orElseThrow();
+                var nextFence = new ExecutionFence(f.scope,WorkloadClaimFence.from(nextClaim));
+                var next = new io.tapstate.runtime.engine.OperatorMapBinding(placement,nextFence,nextFence.operatorExecutionKey());
+                var embeddedNext = new io.tapstate.runtime.engine.OperatorMapBinding(embeddedPlacement,nextFence,nextFence.operatorExecutionKey());
+                registry.install(List.of(next,embeddedNext)); var current = mapStore(member,next); var embeddedCurrent = mapStore(member,embeddedNext);
+                assertThat(current.load(key)).isEqualTo("before"); assertThat(embeddedCurrent.load(key)).isEqualTo("embedded-before");
+                current.store(key,"after"); embeddedCurrent.store(key,"embedded-after"); var before = f.state();
+                assertCode(() -> old.store(key,"late"),IoError.WORKLOAD_CLAIM_FENCED);
+                assertCode(() -> old.storeAll(Map.of(key,"late")),IoError.WORKLOAD_CLAIM_FENCED);
+                assertCode(() -> old.delete(key),IoError.WORKLOAD_CLAIM_FENCED);
+                assertCode(() -> old.deleteAll(List.of(key)),IoError.WORKLOAD_CLAIM_FENCED);
+                assertCode(() -> embeddedOld.deleteAll(List.of(key)),IoError.WORKLOAD_CLAIM_FENCED);
+                assertCode(() -> f.cache.operatorState(placement,WorkloadClaimFence.from(first),ACTIVE)
+                        .save(placement.mapName(),"late",new byte[]{1}),IoError.WORKLOAD_CLAIM_FENCED);
+                assertThat(f.state()).isEqualTo(before); assertThat(current.load(key)).isEqualTo("after");
+                assertThat(registry.release(original)).isFalse(); assertThat(current.load(key)).isEqualTo("after");
+                assertThat(registry.release(embeddedOriginal)).isFalse(); assertThat(embeddedCurrent.load(key)).isEqualTo("embedded-after");
+                var encoded = new java.io.ByteArrayOutputStream();
+                try (var output = new java.io.ObjectOutputStream(encoded)) { output.writeObject(key); }
+                var rows = f.cacheDatabase.getCollection("nest_state");
+                rows.updateMany(new Document(),new Document("$set",new Document("state",new org.bson.types.Binary(new byte[]{1}))
+                        .append("pendingRelease",true).append("releaseKey",new org.bson.types.Binary(encoded.toByteArray()))));
+                var damaged = rows.find().into(new ArrayList<>());
+                assertCode(() -> current.load(key),IoError.DOCUMENT_UNREADABLE);
+                assertCode(() -> current.loadAll(List.of(key)),IoError.DOCUMENT_UNREADABLE);
+                assertThat(rows.find().into(new ArrayList<>())).isEqualTo(damaged);
+            }
+        });
+    }
+
+    @Test void aDeletedParentAndItsOriginalChildReloadThroughTheScopedMongoMapStore() {
+        withFixture(f -> {
+            f.preparer(f.configuration, f.cache).prepare(f.scope);
+            var claims = f.cache.workloadClaims(f.business());
+            var owned = claims.acquirePipeline(f.scope, OWNER, 1, TTL).claim();
+            var run = claims.advanceExecution(owned, 1, java.util.Set.of(OWNER.nodeId())).orElseThrow();
+            var topology = literalRootTopology();
+            f.cache.nestShapes(f.scope, f.cacheDatabase.getName(), WorkloadClaimFence.from(run), ACTIVE)
+                    .recordIfAbsent("step", topology.stateIdentityPaths());
+            var placement = io.tapstate.runtime.engine.OperatorMapCoordinates.nest(f.scope, f.cacheDatabase.getName(), "step",
+                    List.of("$root"), io.tapstate.runtime.engine.OperatorMapCoordinates.NestMap.STATE, null);
+            var fence = new ExecutionFence(f.scope, WorkloadClaimFence.from(run));
+            var binding = new io.tapstate.runtime.engine.OperatorMapBinding(placement, fence, fence.operatorExecutionKey());
+            var config = new com.hazelcast.config.Config();
+            config.setProperty("hazelcast.phone.home.enabled", "false");
+            config.setProperty("hazelcast.shutdownhook.enabled", "false");
+            config.setProperty("hazelcast.operation.thread.count", "2");
+            config.setProperty("hazelcast.operation.generic.thread.count", "2");
+            var join = config.getNetworkConfig().getJoin();
+            join.getMulticastConfig().setEnabled(false); join.getTcpIpConfig().setEnabled(false);
+            join.getAutoDetectionConfig().setEnabled(false);
+            config.getNetworkConfig().getInterfaces().setEnabled(true).addInterface("127.0.0.1");
+            config.getNetworkConfig().setPort(0).setPortAutoIncrement(false);
+            var mapConfig = io.tapstate.runtime.engine.nest.NestSettings.defaults().backedStateMaps(binding.mapName());
+            mapConfig.getMapStoreConfig().getProperties().setProperty(io.tapstate.runtime.engine.OperatorMapBindings.SCOPED_PROPERTY, "true");
+            config.addMapConfig(mapConfig);
+            var member = com.hazelcast.core.Hazelcast.newHazelcastInstance(config);
+            try (var authorization = ExecutionAuthorization.scoped(f.business(), claims, Duration.ofSeconds(10), System::nanoTime, () -> true);
+                 var registry = io.tapstate.runtime.engine.OperatorMapBindings.bindTo(member, new ScopedOperatorStateProvider(f.cache, authorization))) {
+                registry.install(List.of(binding));
+                var map = member.<Object, io.tapstate.runtime.engine.nest.ResolverState>getMap(binding.mapName());
+                var state = new io.tapstate.runtime.engine.nest.ResolverState();
+                state.deleteMapping(new io.tapstate.core.event.SourceOrder(1, 1));
+                var child = new io.tapstate.runtime.engine.nest.NestElement(
+                        new io.tapstate.runtime.engine.nest.ElementRef(List.of("$root", "child"), List.of("P1"), List.of("K1"), null),
+                        Map.of("claim_id", "K1", "value", 1, "payload", new byte[]{1, 2}), new io.tapstate.core.event.SourceOrder(1, 3),
+                        Map.of("claims", new io.tapstate.core.event.ChainPosition(new io.tapstate.core.event.SourceOrder(1, 3), "original-opaque-token")));
+                state.resolve(child, 1); map.set(List.of("P1"), state);
+                assertThat(f.cacheDatabase.getCollection("nest_state").countDocuments()).isEqualTo(1);
+                assertThat(f.configDatabase.listCollectionNames().into(new ArrayList<>())).doesNotContain("nest_state");
+                assertThat(map.evict(List.of("P1"))).isTrue();
+                assertThat(map.getLocalMapStats().getOwnedEntryCount()).isZero();
+                var cold = map.get(List.of("P1"));
+                assertThat(cold.deleted()).isTrue(); assertThat(cold.pending()).isEqualTo(1);
+                map.destroy();
+                var reopened = member.<Object, io.tapstate.runtime.engine.nest.ResolverState>getMap(binding.mapName());
+                var restored = reopened.get(List.of("P1"));
+                restored.resolve(child, 2);
+                assertThat(restored.pending()).isEqualTo(1);
+                var released = restored.declare(List.of("C1"), new io.tapstate.core.event.SourceOrder(1, 2));
+                assertThat(released).singleElement().satisfies(value -> {
+                    assertThat(value.fields()).containsEntry("value", 1);
+                    assertThat((byte[]) value.fields().get("payload")).containsExactly((byte) 1, (byte) 2);
+                    assertThat(value.positions().get("claims").token()).isEqualTo("original-opaque-token");
+                    assertThat(value.order()).isEqualTo(new io.tapstate.core.event.SourceOrder(1, 3));
+                });
+            } finally { member.shutdown(); }
+        });
+    }
+
+    @Test void queuedCallbacksForEveryOperatorResourceCannotReachTheSuccessor() {
+        withFixture(f -> {
+            f.preparer(f.configuration, f.cache).prepare(f.scope);
+            var claims = f.cache.workloadClaims(f.business());
+            var held = claims.advanceExecution(claims.readPipeline(f.scope).orElseThrow().claim(), 1,
+                    java.util.Set.of(OWNER.nodeId())).orElseThrow();
+            var original = new ExecutionFence(f.scope, WorkloadClaimFence.from(held));
+            var placements = new ArrayList<io.tapstate.spi.store.OperatorPlacement>();
+            placements.add(io.tapstate.runtime.engine.OperatorMapCoordinates.nest(f.scope, f.cacheDatabase.getName(),
+                    "step", List.of(), io.tapstate.runtime.engine.OperatorMapCoordinates.NestMap.STATE, null));
+            for (var resource : List.of(io.tapstate.spi.store.OperatorPlacement.Resource.JOIN_FACTS,
+                    io.tapstate.spi.store.OperatorPlacement.Resource.JOIN_DIMENSIONS,
+                    io.tapstate.spi.store.OperatorPlacement.Resource.JOIN_INDEXES,
+                    io.tapstate.spi.store.OperatorPlacement.Resource.JOIN_WRITERS))
+                placements.add(io.tapstate.runtime.engine.OperatorMapCoordinates.join(f.scope, f.cacheDatabase.getName(), "joined", resource, "dimension"));
+            var originals = placements.stream().map(at -> new io.tapstate.runtime.engine.OperatorMapBinding(at, original, original.operatorExecutionKey())).toList();
+            var manifest = new io.tapstate.runtime.engine.OperatorRunManifest("flow", original, originals);
+            f.cache.nestShapes(f.scope, f.cacheDatabase.getName(), WorkloadClaimFence.from(held), ACTIVE)
+                    .recordIfAbsent("step", literalRootTopology().stateIdentityPaths());
+            var config = isolatedNestMember();
+            config.getMemberAttributeConfig().setAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE, OWNER.nodeId())
+                    .setAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE, OWNER.bootId());
+            originals.forEach(binding -> config.addMapConfig(scopedMapConfiguration(binding)));
+            var entered = new java.util.concurrent.CountDownLatch(originals.size() * 4);
+            var release = new java.util.concurrent.CountDownLatch(1);
+            var callbackThread = ThreadLocal.withInitial(() -> false);
+            var member = com.hazelcast.core.Hazelcast.newHazelcastInstance(config);
+            try (var authorization = ExecutionAuthorization.scoped(f.business(), claims, Duration.ofSeconds(10), System::nanoTime, () -> true)) {
+                var actualProvider = new ScopedOperatorStateProvider(f.cache, authorization);
+                io.tapstate.runtime.engine.OperatorMapBindings.Provider delayed = (binding, active) -> actualProvider.open(binding, () -> {
+                    active.run();
+                    if (binding.placement().scope().equals(f.scope) && callbackThread.get()) {
+                        entered.countDown();
+                        try { if (!release.await(20, java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError("old callback was not released"); }
+                        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new AssertionError(interrupted); }
+                    }
+                });
+                try (var registry = io.tapstate.runtime.engine.OperatorMapBindings.bindTo(member, delayed);
+                     var workers = java.util.concurrent.Executors.newFixedThreadPool(originals.size() * 4)) {
+                    registry.install(originals);
+                    for (var binding : originals) {
+                        var map = member.<Object, Object>getMap(binding.mapName());
+                        map.set("key", "generation-one"); map.evict("key");
+                        assertThat(map.get("key")).isEqualTo("generation-one");
+                    }
+                    var pending = new ArrayList<java.util.concurrent.Future<?>>();
+                    try {
+                        for (var binding : originals) {
+                            var callbacks = mapStore(member, binding);
+                            for (org.assertj.core.api.ThrowableAssert.ThrowingCallable action : List.<org.assertj.core.api.ThrowableAssert.ThrowingCallable>of(
+                                    () -> callbacks.store("key", "late"), () -> callbacks.storeAll(Map.of("key", "late")),
+                                    () -> callbacks.delete("key"), () -> callbacks.deleteAll(List.of("key"))))
+                                pending.add(workers.submit(() -> {
+                                    callbackThread.set(true);
+                                    try { assertThatThrownBy(action).isInstanceOfSatisfying(TapstateException.class, failure ->
+                                            assertThat(failure.code()).isIn(IoError.WORKLOAD_CLAIM_FENCED, io.tapstate.runtime.engine.EngineError.EXECUTION_NOT_AUTHORIZED)); }
+                                    finally { callbackThread.remove(); }
+                                }));
+                        }
+                        assertThat(entered.await(10, java.util.concurrent.TimeUnit.SECONDS)).as("all twenty actual MapStore callbacks have passed their original binding guard").isTrue();
+                        var hot = new HazelcastOperatorReadiness(member, Duration.ofSeconds(10)); hot.releaseHot(manifest);
+                        assertThat(registry.originals(f.scope)).isEmpty();
+                        var current = f.configuration.intents().load("flow").orElseThrow();
+                        f.configuration.intents().compareAndSet(f.scope, current.intentRevision(), new DesiredState("flow", PipelineState.STOPPED, current.desired().revision(), true));
+                        var pass = new PipelineConvergencePass(f.configuration.intents().load("flow").orElseThrow(), WorkloadClaimFence.from(held), f.cache, ACTIVE);
+                        var actual = f.cache.pipelineRebuilds(f.business(), ACTIVE);
+                        var receipt = new java.util.concurrent.atomic.AtomicReference<io.tapstate.spi.store.PipelineRebuildReceipt>();
+                        io.tapstate.spi.store.PipelineCacheRebuilds recording = (preparation, node, ttl, time) -> {
+                            var result = actual.prepare(preparation, node, ttl, time); receipt.set(result); return result;
+                        };
+                        var changes = f.configuration.rebuilds();
+                        var rebuilds = new PipelineRebuildCoordinator(new PipelineRebuildCoordinator.Stores(f.configuration.artifacts(), f.cache.schemas(f.business(), ACTIVE),
+                                f.cache, f.cache.srs(f.business(), ACTIVE).consumers(), changes, recording),
+                                new PipelinePrivateNoteRetirement(f.configuration.requiredNotes(), changes,
+                                        (notes, capture, purpose, cluster, guard) -> { throw new AssertionError("no external source exists"); }),
+                                () -> f.node, ACTIVE, (request, captured) -> {
+                                    assertThat(captured).contains(manifest); assertThat(registry.originals(f.scope)).isEmpty();
+                                }, TTL, CLOCK);
+                        assertThat(rebuilds.rebuild(pass, Optional.of(manifest)).stateGeneration()).isEqualTo(2);
+                        var scope = receipt.get().preparation().request().targetScope();
+                        var nextClaim = claims.advanceExecution(claims.readPipeline(scope).orElseThrow().claim(), 1, java.util.Set.of(OWNER.nodeId())).orElseThrow();
+                        var next = new ExecutionFence(scope, WorkloadClaimFence.from(nextClaim));
+                        f.cache.nestShapes(scope, f.cacheDatabase.getName(), WorkloadClaimFence.from(nextClaim), ACTIVE)
+                                .recordIfAbsent("step", literalRootTopology().stateIdentityPaths());
+                        var successors = placements.stream().map(at -> new io.tapstate.spi.store.OperatorPlacement(scope, at.database(), at.resource(), at.stepId(), at.pathId(), at.namespace()))
+                                .map(at -> new io.tapstate.runtime.engine.OperatorMapBinding(at, next, next.operatorExecutionKey())).toList();
+                        successors.forEach(binding -> member.getConfig().addMapConfig(scopedMapConfiguration(binding))); registry.install(successors);
+                        for (var binding : successors) {
+                            assertThat(originals).noneMatch(old -> old.mapName().equals(binding.mapName()));
+                            var map = member.<Object, Object>getMap(binding.mapName()); assertThat(map.get("key")).isNull(); map.set("key", "generation-two");
+                        }
+                        var successorState = f.state(); var successorClaim = f.claim();
+                        release.countDown();
+                        for (var callback : pending) callback.get(10, java.util.concurrent.TimeUnit.SECONDS);
+                        assertThat(actual.reclaim(receipt.get(), f.node)).isPositive(); hot.releaseRetiredHot(manifest);
+                        assertThat(registry.originals(scope)).containsExactlyInAnyOrderElementsOf(successors);
+                        for (var binding : successors) {
+                            var map = member.<Object, Object>getMap(binding.mapName()); assertThat(map.localKeySet()).contains("key");
+                            assertThat(map.get("key")).isEqualTo("generation-two"); map.evict("key"); assertThat(map.get("key")).isEqualTo("generation-two");
+                        }
+                        for (String table : List.of("nest_state", "join_facts", "join_dimensions", "join_indexes", "join_writers"))
+                            assertThat(f.cacheDatabase.getCollection(table).countDocuments()).as(table).isOne();
+                        assertThat(f.state()).isEqualTo(successorState); assertThat(f.claim()).isEqualTo(successorClaim);
+                        assertThat(f.configuration.pipelineStates().read("flow").orElseThrow().stateGeneration()).isEqualTo(2);
+                    } finally { release.countDown(); }
+                }
+            } finally { release.countDown(); member.shutdown(); }
+        });
+    }
+
+    private static com.hazelcast.config.MapConfig scopedMapConfiguration(io.tapstate.runtime.engine.OperatorMapBinding binding) {
+        var config = binding.placement().resource() == io.tapstate.spi.store.OperatorPlacement.Resource.NEST_STATE
+                ? io.tapstate.runtime.engine.nest.NestSettings.defaults().backedStateMaps(binding.mapName())
+                : io.tapstate.runtime.engine.join.JoinMaps.backedStateMaps(binding.mapName(), 100);
+        config.getMapStoreConfig().getProperties().setProperty(io.tapstate.runtime.engine.OperatorMapBindings.SCOPED_PROPERTY, "true");
+        return config;
+    }
+
+    @Test void aRetiredGenerationCannotReachItsSuccessorsHotOrColdState() {
+        withFixture(f -> {
+            f.preparer(f.configuration, f.cache).prepare(f.scope);
+            var claims = f.cache.workloadClaims(f.business());
+            var held = claims.advanceExecution(claims.readPipeline(f.scope).orElseThrow().claim(), 1,
+                    java.util.Set.of(OWNER.nodeId())).orElseThrow();
+            var original = new ExecutionFence(f.scope, WorkloadClaimFence.from(held));
+            var placement = io.tapstate.runtime.engine.OperatorMapCoordinates.nest(f.scope, f.cacheDatabase.getName(),
+                    "step", List.of(), io.tapstate.runtime.engine.OperatorMapCoordinates.NestMap.STATE, null);
+            var oldBinding = new io.tapstate.runtime.engine.OperatorMapBinding(placement, original, original.operatorExecutionKey());
+            var manifest = new io.tapstate.runtime.engine.OperatorRunManifest("flow", original, List.of(oldBinding));
+            f.cache.nestShapes(f.scope, f.cacheDatabase.getName(), WorkloadClaimFence.from(held), ACTIVE)
+                    .recordIfAbsent("step", literalRootTopology().stateIdentityPaths());
+            var config = isolatedNestMember();
+            config.getMemberAttributeConfig().setAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE, OWNER.nodeId())
+                    .setAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE, OWNER.bootId());
+            var oldMapConfig = io.tapstate.runtime.engine.nest.NestSettings.defaults().backedStateMaps(oldBinding.mapName());
+            oldMapConfig.getMapStoreConfig().getProperties().setProperty(io.tapstate.runtime.engine.OperatorMapBindings.SCOPED_PROPERTY, "true");
+            config.addMapConfig(oldMapConfig);
+            var member = com.hazelcast.core.Hazelcast.newHazelcastInstance(config);
+            try (var authorization = ExecutionAuthorization.scoped(f.business(), claims, Duration.ofSeconds(10), System::nanoTime, () -> true);
+                 var registry = io.tapstate.runtime.engine.OperatorMapBindings.bindTo(member, new ScopedOperatorStateProvider(f.cache, authorization))) {
+                registry.install(List.of(oldBinding));
+                var oldCallbacks = mapStore(member, oldBinding);
+                var oldMap = member.<Object, Object>getMap(oldBinding.mapName());
+                Object key = List.of("key"); oldMap.set(key, "generation-one"); oldMap.evict(key);
+                assertThat(oldMap.get(key)).isEqualTo("generation-one");
+                var hot = new HazelcastOperatorReadiness(member, Duration.ofSeconds(10));
+                hot.releaseHot(manifest);
+                assertThat(registry.originals(f.scope)).isEmpty();
+                var current = f.configuration.intents().load("flow").orElseThrow();
+                f.configuration.intents().compareAndSet(f.scope, current.intentRevision(),
+                        new DesiredState("flow", PipelineState.STOPPED, current.desired().revision(), true));
+                var pass = new PipelineConvergencePass(f.configuration.intents().load("flow").orElseThrow(),
+                        WorkloadClaimFence.from(held), f.cache, ACTIVE);
+                var actual = f.cache.pipelineRebuilds(f.business(), ACTIVE);
+                var receipt = new java.util.concurrent.atomic.AtomicReference<io.tapstate.spi.store.PipelineRebuildReceipt>();
+                io.tapstate.spi.store.PipelineCacheRebuilds recording = (preparation, node, ttl, time) -> {
+                    var result = actual.prepare(preparation, node, ttl, time); receipt.set(result); return result;
+                };
+                var changes = f.configuration.rebuilds();
+                var rebuilds = new PipelineRebuildCoordinator(new PipelineRebuildCoordinator.Stores(f.configuration.artifacts(),
+                        f.cache.schemas(f.business(), ACTIVE), f.cache, f.cache.srs(f.business(), ACTIVE).consumers(), changes, recording),
+                        new PipelinePrivateNoteRetirement(f.configuration.requiredNotes(), changes,
+                                (notes, capture, purpose, cluster, guard) -> { throw new AssertionError("no external source exists"); }),
+                        () -> f.node, ACTIVE, (request, captured) -> {
+                            assertThat(captured).contains(manifest); assertThat(registry.originals(f.scope)).isEmpty();
+                        }, TTL, CLOCK);
+                var rebuilt = rebuilds.rebuild(pass, Optional.of(manifest));
+                assertThat(rebuilt.stateGeneration()).isEqualTo(2);
+                var scope = receipt.get().preparation().request().targetScope();
+                var nextClaim = claims.advanceExecution(claims.readPipeline(scope).orElseThrow().claim(), 1,
+                        java.util.Set.of(OWNER.nodeId())).orElseThrow();
+                var next = new ExecutionFence(scope, WorkloadClaimFence.from(nextClaim));
+                var nextPlacement = io.tapstate.runtime.engine.OperatorMapCoordinates.nest(scope, f.cacheDatabase.getName(),
+                        "step", List.of(), io.tapstate.runtime.engine.OperatorMapCoordinates.NestMap.STATE, null);
+                var nextBinding = new io.tapstate.runtime.engine.OperatorMapBinding(nextPlacement, next, next.operatorExecutionKey());
+                assertThat(nextBinding.mapName()).isNotEqualTo(oldBinding.mapName());
+                assertThat(nextPlacement.mapName()).isNotEqualTo(placement.mapName());
+                f.cache.nestShapes(scope, f.cacheDatabase.getName(), WorkloadClaimFence.from(nextClaim), ACTIVE)
+                        .recordIfAbsent("step", literalRootTopology().stateIdentityPaths());
+                var nextMapConfig = io.tapstate.runtime.engine.nest.NestSettings.defaults().backedStateMaps(nextBinding.mapName());
+                nextMapConfig.getMapStoreConfig().getProperties().setProperty(io.tapstate.runtime.engine.OperatorMapBindings.SCOPED_PROPERTY, "true");
+                member.getConfig().addMapConfig(nextMapConfig); registry.install(List.of(nextBinding));
+                var nextMap = member.<Object, Object>getMap(nextBinding.mapName());
+                assertThat(nextMap.get(key)).isNull(); nextMap.set(key, "generation-two");
+                assertCode(() -> oldCallbacks.store(key, "late"), IoError.WORKLOAD_CLAIM_FENCED);
+                assertCode(() -> oldCallbacks.storeAll(Map.of(key, "late")), IoError.WORKLOAD_CLAIM_FENCED);
+                assertCode(() -> oldCallbacks.delete(key), IoError.WORKLOAD_CLAIM_FENCED);
+                assertCode(() -> oldCallbacks.deleteAll(List.of(key)), IoError.WORKLOAD_CLAIM_FENCED);
+                var successorState = f.state(); var successorClaim = f.claim();
+                var identity = f.cacheDatabase.getCollection("cache_identity").find().first();
+                var nodeFilter = new Document("_id.resourceType", "NODE_SESSION");
+                var nodeBefore = f.cacheDatabase.getCollection("workload_claims").find(nodeFilter).first();
+                assertThat(actual.reclaim(receipt.get(), f.node)).isPositive().isLessThanOrEqualTo(256);
+                assertThat(actual.reclaim(receipt.get(), f.node)).isZero();
+                hot.releaseRetiredHot(manifest);
+                assertThat(member.getDistributedObjects()).extracting(com.hazelcast.core.DistributedObject::getName)
+                        .contains(nextBinding.mapName()).doesNotContain(oldBinding.mapName());
+                assertThat(registry.originals(scope)).containsExactly(nextBinding);
+                assertThat(nextMap.localKeySet()).contains(key);
+                assertThat(f.state()).isEqualTo(successorState); assertThat(f.claim()).isEqualTo(successorClaim);
+                assertThat(f.cacheDatabase.getCollection("cache_identity").find().first()).isEqualTo(identity);
+                assertThat(f.cacheDatabase.getCollection("workload_claims").find(nodeFilter).first()).isEqualTo(
+                        new Document(nodeBefore).append("fencedPreparationWrites", nodeBefore.getLong("fencedPreparationWrites") + 2));
+                assertThat(nextMap.get(key)).isEqualTo("generation-two"); nextMap.evict(key);
+                assertThat(nextMap.get(key)).isEqualTo("generation-two");
+                assertThat(f.cacheDatabase.getCollection("nest_state").countDocuments()).isOne();
+                assertThat(f.cacheDatabase.getCollection("nest_shapes").countDocuments()).isOne();
+                assertThat(f.cache.retiredPipelinePayloads(f.business(), ACTIVE).find(f.scope)).isPresent();
+            } finally { member.shutdown(); }
+        });
+    }
+
+    @Test void deletionKeepsOriginalIdentityAndBlocksReuseUntilReleaseIsConfirmed() {
+        withFixture(f -> {
+            f.preparer(f.configuration,f.cache).prepare(f.scope);var claims=f.cache.workloadClaims(f.business());
+            var run=claims.advanceExecution(claims.readPipeline(f.scope).orElseThrow().claim(),1,java.util.Set.of(OWNER.nodeId())).orElseThrow();
+            var store=f.configuration.requiredNotes();
+            var token=store.initialize(io.tapstate.spi.store.RequiredNoteOwner.forNode(1,new io.tapstate.core.model.PipelineNode("flow","original-source"),io.tapstate.core.model.PipelineNode.Purpose.CAPTURE,1));
+            var origin=io.tapstate.adapters.pdk.ConnectorNoteOrigin.capture("original-connector","c".repeat(64),Map.of("uri","original-database"));
+            store.prepareOrigin(token,origin);store.compareAndSet(token,"slot",0,new byte[]{7},false);
+            var global=store.initialize(new io.tapstate.spi.store.RequiredNoteOwner(1,"pdk.global-state",io.tapstate.spi.store.RequiredNoteOwner.Kind.GLOBAL,"cluster-a",0));
+            store.compareAndSet(global,"keep",0,new byte[]{8},false);
+            var pipeline=f.configuration.artifacts().get("flow").orElseThrow();
+            var request=new io.tapstate.spi.store.PipelineRetirementRequest("app-delete",f.scope,CanonicalHash.of(pipeline),Optional.of(new io.tapstate.spi.store.PipelineRetirementRequest.CacheOriginal(WorkloadClaimFence.from(run),0)));
+            var failed=new java.util.concurrent.atomic.AtomicBoolean(true);var releases=new java.util.concurrent.atomic.AtomicInteger();
+            var notes=new PipelinePrivateNoteRetirement(store,f.configuration.rebuilds(),(retirement,config,purpose,cluster,guard) -> {
+                releases.incrementAndGet();guard.run();assertThat(retirement.origin()).contains(origin);
+                assertThat(config.connectorId()).isEqualTo("original-connector");assertThat(purpose).isEqualTo(io.tapstate.core.model.PipelineNode.Purpose.CAPTURE);
+                assertThat(retirement.notes().read(token,"slot").bytes()).containsExactly(7);
+                return failed.get()?Optional.of(new TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE,Map.of(),null)):Optional.empty();
+            });
+            var coordinator=new PipelineDeletionCoordinator(f.configuration.retirements(),f.cache.pipelineRetirements(f.business(),ACTIVE),f.cache.srs(f.business(),ACTIVE).consumers(),notes,
+                    () -> f.node,ACTIVE,(original,manifest) -> new PipelineDeletionCoordinator.Isolated(original.cache(),ACTIVE,ACTIVE));
+            assertThatThrownBy(() -> coordinator.delete(request,Optional.empty())).isInstanceOf(TapstateException.class);
+            assertThat(f.configuration.pipelineStates().read("flow").orElseThrow().phase()).isEqualTo(io.tapstate.spi.store.PipelineStateMapping.Phase.RETIRING);
+            var beforeLateRelease=f.claim();
+            assertThat(claims.release(run)).isFalse();
+            assertThat(f.claim()).isEqualTo(beforeLateRelease);
+            var malformedScope=new Document(beforeLateRelease).append("pipelineScope","broken");
+            f.cacheDatabase.getCollection("workload_claims").replaceOne(f.pipelineFilter(),malformedScope);
+            assertThatThrownBy(() -> claims.release(run)).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+            assertThat(f.claim()).isEqualTo(malformedScope);
+            f.cacheDatabase.getCollection("workload_claims").replaceOne(f.pipelineFilter(),beforeLateRelease);
+            assertThat(f.configuration.artifacts().get("flow")).contains(pipeline);assertThat(releases).hasValue(1);assertThat(store.retirement(token,request.operationId()).origin()).contains(origin);
+            assertThat(f.configuration.artifacts().create(pipeline)).isEqualTo(io.tapstate.spi.store.ArtifactMutation.ALREADY_EXISTS);
+            var retiredClaim=f.claim();failed.set(false);var result=coordinator.resume(f.scope,request.operationId(),Optional.empty()).orElseThrow();
+            assertThat(releases).hasValue(2);assertThat(f.configuration.artifacts().get("flow")).isEmpty();
+            assertThat(coordinator.delete(request,Optional.empty())).isEqualTo(result);assertThat(releases).hasValue(2);
+            assertThat(f.claim().get("claimGeneration")).isEqualTo(retiredClaim.get("claimGeneration"));
+            assertThat(store.read(global,"keep").bytes()).containsExactly(8);
+            f.configuration.artifacts().create(pipeline);var next=new PipelineIntentScope(f.scope.clusterId(),1,f.scope.cacheIncarnation(),"flow",2);
+            f.preparer(f.configuration,f.cache).prepare(next);
+            assertThat(f.claim().getLong("claimGeneration")).isGreaterThan(retiredClaim.getLong("claimGeneration"));
+            assertThat(coordinator.delete(request,Optional.empty())).isEqualTo(result);assertThat(f.configuration.artifacts().get("flow")).contains(pipeline);
+        });
+    }
+
+    @Test void actualStopPortResumesTheSameRebuildAfterTheCacheCommitResponseIsLost() {
+        withFixture(f -> {
+            f.preparer(f.configuration,f.cache).prepare(f.scope);var claims=f.cache.workloadClaims(f.business());
+            var original=claims.advanceExecution(claims.readPipeline(f.scope).orElseThrow().claim(),1,java.util.Set.of(OWNER.nodeId())).orElseThrow();
+            var originalNotes=f.configuration.requiredNotes();
+            var originalNoteOwner=io.tapstate.spi.store.RequiredNoteOwner.forNode(1,new io.tapstate.core.model.PipelineNode("flow","original-source"),io.tapstate.core.model.PipelineNode.Purpose.CAPTURE,1);
+            var originalNoteToken=originalNotes.initialize(originalNoteOwner);
+            var originalOrigin=io.tapstate.adapters.pdk.ConnectorNoteOrigin.capture("mongodb","c".repeat(64),Map.of("uri","original-database"));
+            originalNotes.prepareOrigin(originalNoteToken,originalOrigin);originalNotes.compareAndSet(originalNoteToken,"slot",0,new byte[]{1,2},false);
+            var fence=WorkloadClaimFence.from(original);var current=f.configuration.intents().load("flow").orElseThrow();
+            f.configuration.intents().compareAndSet(f.scope,current.intentRevision(),new DesiredState("flow",PipelineState.STOPPED,current.desired().revision(),true));
+            var intent=f.configuration.intents().load("flow").orElseThrow();var pass=new PipelineConvergencePass(intent,fence,f.cache,ACTIVE);
+            var manifest=new io.tapstate.runtime.engine.OperatorRunManifest("flow",new ExecutionFence(f.scope,fence),List.of());
+            var engine=org.mockito.Mockito.mock(io.tapstate.runtime.engine.Engine.class);var run=org.mockito.Mockito.mock(io.tapstate.runtime.engine.Engine.Run.class);
+            var captures=org.mockito.Mockito.mock(PipelineCaptureCoordinator.class);var fixedCapture=org.mockito.Mockito.mock(PipelineCaptureCoordinator.class);
+            var ownership=org.mockito.Mockito.mock(PipelineActuationOwnership.class);
+            var cancelled=new java.util.concurrent.atomic.AtomicBoolean();var captureStopped=new java.util.concurrent.atomic.AtomicBoolean();var hotRetired=new java.util.concurrent.atomic.AtomicBoolean();
+            org.mockito.Mockito.when(engine.captureRun("flow")).thenReturn(Optional.of(run));org.mockito.Mockito.when(run.operatorManifest()).thenReturn(manifest);
+            org.mockito.Mockito.doAnswer(call -> {cancelled.set(true);return null;}).when(run).cancel();
+            org.mockito.Mockito.when(run.awaitTerminal(org.mockito.ArgumentMatchers.any())).thenAnswer(call -> cancelled.get());
+            org.mockito.Mockito.when(captures.forRun(org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.any())).thenReturn(fixedCapture);
+            org.mockito.Mockito.doAnswer(call -> {captureStopped.set(true);return null;}).when(fixedCapture).stopCapture("flow",false);
+            org.mockito.Mockito.when(ownership.proveClaim(f.scope,fence)).thenReturn(true);
+            PipelineRebuildCoordinator.RetiredExecution retired=(request,held) -> {
+                assertThat(held).contains(manifest);assertThat(cancelled).isTrue();assertThat(captureStopped).isTrue();assertThat(hotRetired).isTrue();
+            };
+            var actual=f.cache.pipelineRebuilds(f.business(),ACTIVE);var lost=new IllegalStateException("simulated lost cache response");
+            var fault=new io.tapstate.spi.store.PipelineCacheRebuilds() {
+                public io.tapstate.spi.store.PipelineRebuildReceipt prepare(io.tapstate.spi.store.PipelineRebuildPreparation prepared,WorkloadClaimFence node,Duration ttl,Instant time) {
+                    actual.prepare(prepared,node,ttl,time);throw lost;
+                }
+            };
+            var noteRetirement=new PipelinePrivateNoteRetirement(f.configuration.requiredNotes(),f.configuration.rebuilds(),
+                    (notes,config,purpose,cluster,guard) -> {throw new AssertionError("no connector was opened");});
+            var consumerStore=f.cache.srs(f.business(),ACTIVE).consumers();
+            var faulty=new PipelineRebuildCoordinator(new PipelineRebuildCoordinator.Stores(f.configuration.artifacts(),f.cache.schemas(f.business(),ACTIVE),f.cache,consumerStore,f.configuration.rebuilds(),fault),
+                    noteRetirement,() -> f.node,ACTIVE,retired,TTL,CLOCK);
+            var ports=new ScopedEngineLifecycleActuator.Ports((m,c,n,g) -> {},m -> {assertThat(m).isEqualTo(manifest);hotRetired.set(true);},faulty::rebuild,(r,c) -> ExecutionPlanRecorder.NONE);
+            var actor=new ScopedEngineLifecycleActuator(pass,engine,org.mockito.Mockito.mock(DagSource.class),captures,ownership,f.cacheDatabase.getName(),ConnectorReadiness.NONE,CLOCK,ports,new ScopedEngineLifecycleActuator.Submissions());
+            assertThatThrownBy(() -> actor.stop("flow",true)).isSameAs(lost);
+            var pending=f.configuration.pipelineStates().read("flow").orElseThrow();assertThat(pending.phase()).isEqualTo(io.tapstate.spi.store.PipelineStateMapping.Phase.REBUILDING);assertThat(pending.stateGeneration()).isOne();
+            var committed=f.cacheDatabase.getCollection("workload_claims").find(new Document("_id.resourceId","flow")).first();
+            var resumed=new PipelineRebuildCoordinator(new PipelineRebuildCoordinator.Stores(f.configuration.artifacts(),f.cache.schemas(f.business(),ACTIVE),f.cache,consumerStore,f.configuration.rebuilds(),actual),
+                    noteRetirement,() -> f.node,ACTIVE,retired,TTL,CLOCK);
+            var result=resumed.resume(f.scope,Optional.of(manifest)).orElseThrow();assertThat(result.stateGeneration()).isEqualTo(2);
+            assertThat(f.configuration.pipelineStates().read("flow").orElseThrow().operationId()).isEqualTo(pending.operationId());
+            var after=f.cacheDatabase.getCollection("workload_claims").find(new Document("_id.resourceId","flow")).first();
+            for(String field:List.of("claimGeneration","executionGeneration","topologyRevision","pipelinePreparation"))assertThat(after.get(field)).isEqualTo(committed.get(field));
+            var nextNoteOwner=io.tapstate.spi.store.RequiredNoteOwner.forNode(1,new io.tapstate.core.model.PipelineNode("flow","original-source"),io.tapstate.core.model.PipelineNode.Purpose.CAPTURE,2);
+            var nextToken=originalNotes.open(nextNoteOwner);assertThat(nextToken.generation()).isEqualTo(originalNoteToken.generation());
+            assertThat(originalNotes.origin(nextToken)).isEqualTo(originalOrigin);assertThat(originalNotes.read(nextToken,"slot").bytes()).containsExactly(1,2);
+            assertThat(resumed.resume(f.scope,Optional.of(manifest))).isEmpty();
+            assertThatThrownBy(() -> actor.stop("flow",true)).isInstanceOf(TapstateException.class);
+        });
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
+    void theActualGraphFindsColdHandoffsWithoutAnyNewSourceRows(boolean killedWorkerJvm) {
+        withFixture(f -> {
+            f.preparer(f.configuration, f.cache).prepare(f.scope);
+            var claims = f.cache.workloadClaims(f.business());
+            var owned = claims.acquirePipeline(f.scope, OWNER, 1, TTL).claim();
+            var run = claims.advanceExecution(owned, 1, java.util.Set.of(OWNER.nodeId())).orElseThrow();
+            var fence = new ExecutionFence(f.scope, WorkloadClaimFence.from(run));
+            var topology = literalRootTopology();
+            f.cache.nestShapes(f.scope, f.cacheDatabase.getName(), WorkloadClaimFence.from(run), ACTIVE)
+                    .recordIfAbsent("step", topology.stateIdentityPaths());
+            var bindings = new ArrayList<io.tapstate.runtime.engine.OperatorMapBinding>();
+            for (var vertex : topology.vertices()) for (var kind : List.of(
+                    io.tapstate.runtime.engine.OperatorMapCoordinates.NestMap.STATE,
+                    io.tapstate.runtime.engine.OperatorMapCoordinates.NestMap.PARKING)) {
+                var at = io.tapstate.runtime.engine.OperatorMapCoordinates.nest(f.scope, f.cacheDatabase.getName(), "step", vertex.pathId(), kind, null);
+                bindings.add(new io.tapstate.runtime.engine.OperatorMapBinding(at, fence, fence.operatorExecutionKey()));
+            }
+            var manifest = new io.tapstate.runtime.engine.OperatorRunManifest("flow", fence, bindings);
+            var config = isolatedNestMember();
+            for (var binding : bindings) {
+                var mapConfig = io.tapstate.runtime.engine.nest.NestSettings.defaults().backedStateMaps(binding.mapName());
+                mapConfig.getMapStoreConfig().getProperties().setProperty(io.tapstate.runtime.engine.OperatorMapBindings.SCOPED_PROPERTY,"true");
+                config.addMapConfig(mapConfig);
+            }
+            var member = com.hazelcast.core.Hazelcast.newHazelcastInstance(config);
+            try (var authorization = ExecutionAuthorization.scoped(f.business(), claims, Duration.ofSeconds(10), System::nanoTime, () -> true);
+                 var registry = io.tapstate.runtime.engine.OperatorMapBindings.bindTo(member,new ScopedOperatorStateProvider(f.cache,authorization))) {
+                registry.install(bindings);
+                var names = manifest.forStep("flow","step");
+                var rootName = names.nest(List.of(),io.tapstate.runtime.engine.OperatorMapCoordinates.NestMap.STATE,null).mapName();
+                var resolverName = names.nest(List.of("$root"),io.tapstate.runtime.engine.OperatorMapCoordinates.NestMap.STATE,null).mapName();
+                var roots = member.<Object,io.tapstate.runtime.engine.nest.RootAssembly>getMap(rootName);
+                var states = member.<Object,io.tapstate.runtime.engine.nest.ResolverState>getMap(resolverName);
+                if(killedWorkerJvm) seedInKilledWorker(f,manifest);
+                else seedHandoffs(member,manifest);
+                assertThat(f.cacheDatabase.getCollection("nest_state").countDocuments(new Document("pendingRelease",true))).isEqualTo(2);
+                roots.destroy(); states.destroy();
+                var stores = io.tapstate.runtime.engine.nest.NestBinding.onMap(manifest).forStep("flow","step");
+                var binding = new io.tapstate.runtime.engine.nest.NestBinding(alias -> null,stores,(from,child) -> {},
+                        ignored -> chain -> Optional.of(new io.tapstate.core.event.SourceOrder(1,50)));
+                var dag = new com.hazelcast.jet.core.DAG();
+                var inputs = new java.util.HashMap<String,com.hazelcast.jet.core.Vertex>();
+                for (String alias : List.of("customer","policy","claim")) inputs.put(alias,dag.newVertex(alias+"-empty",
+                        com.hazelcast.jet.core.ProcessorMetaSupplier.of(com.hazelcast.jet.core.ProcessorSupplier.of(EmptyNestInput::new))).localParallelism(1));
+                var ordinal = new java.util.HashMap<com.hazelcast.jet.core.Vertex,Integer>();
+                var assembled = io.tapstate.runtime.engine.nest.NestDag.attach(dag,topology,"step","customer","out",
+                        alias -> List.of(inputs.get(alias)),binding,vertex -> ordinal.merge(vertex,1,Integer::sum)-1,null,
+                        new io.tapstate.runtime.engine.NodeWidth("step",2,1,null));
+                var sink = dag.newVertex("collected",com.hazelcast.jet.core.processor.SinkProcessors.writeListP("recovered-documents"));
+                dag.edge(com.hazelcast.jet.core.Edge.between(assembled,sink));
+                member.getJet().newJob(dag).getFuture().toCompletableFuture().get(20,java.util.concurrent.TimeUnit.SECONDS);
+                for (int key = 1; key <= 2; key++) {
+                    var restored = member.<Object,io.tapstate.runtime.engine.nest.RootAssembly>getMap(rootName).get(List.of("C"+key));
+                    var document = restored.render(topology.slots()).orElseThrow();
+                    var parents = (List<?>) document.get("$root");
+                    assertThat(parents).hasSize(1);
+                    var children = (List<?>) ((Map<?,?>)parents.getFirst()).get("child");
+                    assertThat(children).hasSize(1);
+                    assertThat(((Map<?,?>)children.getFirst()).get("value")).isEqualTo(1);
+                }
+                assertThat(member.getList("recovered-documents")).hasSize(2);
+            } finally { member.shutdown(); }
+        });
+    }
+
+    private static void seedHandoffs(com.hazelcast.core.HazelcastInstance member,io.tapstate.runtime.engine.OperatorRunManifest manifest) throws Exception {
+        var topology=literalRootTopology();var names=manifest.forStep("flow","step");
+        var roots=member.<Object,io.tapstate.runtime.engine.nest.RootAssembly>getMap(names.nest(List.of(),io.tapstate.runtime.engine.OperatorMapCoordinates.NestMap.STATE,null).mapName());
+        var states=member.<Object,io.tapstate.runtime.engine.nest.ResolverState>getMap(names.nest(List.of("$root"),io.tapstate.runtime.engine.OperatorMapCoordinates.NestMap.STATE,null).mapName());
+                var spec = topology.vertexAt(List.of("$root"));
+                var axes = io.tapstate.runtime.engine.ChainAxes.assign(List.of("policy","claim"));
+                for (int key = 1; key <= 2; key++) {
+                    String parentId = "P"+key, customer = "C"+key;
+                    var parent = Map.<String,Object>of("policy_id",parentId,"customer_id",customer,"policy_no","PN"+key);
+                    var assembly = new io.tapstate.runtime.engine.nest.RootAssembly();
+                    assembly.applyRoot(Map.of("customer_id",customer),new io.tapstate.core.event.SourceOrder(1,io.tapstate.core.event.SourceOrder.SNAPSHOT_SEQ));
+                    assembly.applyElement(new io.tapstate.runtime.engine.nest.ElementRef(List.of("$root"),null,List.of("PN"+key),List.of(parentId)),
+                            parent,new io.tapstate.core.event.SourceOrder(1,2),Map.of());
+                    roots.set(List.of(customer),assembly);
+                    io.tapstate.runtime.engine.nest.NestStore<io.tapstate.runtime.engine.nest.ResolverState> state = new io.tapstate.runtime.engine.nest.NestStore<>() {
+                        @Override public io.tapstate.runtime.engine.nest.ResolverState load(Object at) { return states.get(at); }
+                        @Override public void save(Object at,io.tapstate.runtime.engine.nest.ResolverState value) { states.set(at,value); }
+                        @Override public void remove(Object at) { states.delete(at); }
+                        @Override public long count() { return states.size(); }
+                    };
+                    var receiver = new io.tapstate.runtime.engine.nest.ResolverProcessor(spec,state,(from,child) -> {},axes,
+                            Map.of(0,List.of("policy"),1,List.of("claim")));
+                    var remaining = new java.util.concurrent.atomic.AtomicInteger(1);
+                    var out = org.mockito.Mockito.mock(com.hazelcast.jet.core.Outbox.class, invocation -> {
+                        if (invocation.getMethod().getName().equals("bucketCount")) return 1;
+                        if (invocation.getMethod().getName().equals("offer")) {
+                            Object value = invocation.getArguments()[invocation.getArguments().length-1];
+                            return value instanceof com.hazelcast.jet.core.Watermark || remaining.getAndDecrement() > 0;
+                        }
+                        return org.mockito.Mockito.RETURNS_DEFAULTS.answer(invocation);
+                    });
+                    receiver.init(out,org.mockito.Mockito.mock(com.hazelcast.jet.core.Processor.Context.class));
+                    feedNest(receiver,0,io.tapstate.core.event.Envelope.delete(1,"policy",parent,null).withOrder(new io.tapstate.core.event.SourceOrder(1,1)));
+                    receiver.tryProcessWatermark(0,new com.hazelcast.jet.core.Watermark(
+                            io.tapstate.runtime.engine.FrontierOrders.pack("policy",new io.tapstate.core.event.SourceOrder(1,50)),axes.axisOf("policy")));
+                    feedNest(receiver,1,io.tapstate.core.event.Envelope.insert(3,"claim",Map.of("claim_id","K"+key,"policy_id",parentId,"value",1),null)
+                            .withOrder(new io.tapstate.core.event.SourceOrder(1,3)).withSrcPos("original-child-"+key));
+                    remaining.set(1);
+                    feedNest(receiver,0,io.tapstate.core.event.Envelope.insert(2,"policy",parent,null).withOrder(new io.tapstate.core.event.SourceOrder(1,2)));
+                    assertThat(states.get(List.of(parentId)).pending()).isEqualTo(1);
+                }
+    }
+    /** Only the owned worker JVM is killed; the original controller claim and CACHE remain intact. */
+    private static void seedInKilledWorker(Fixture f,io.tapstate.runtime.engine.OperatorRunManifest manifest) throws Exception {
+        var directory=java.nio.file.Files.createTempDirectory("tapstate-held-worker-");
+        var descriptor=directory.resolve("manifest.bin");var ready=directory.resolve("ready");var log=directory.resolve("worker.log");
+        try(var out=new java.io.ObjectOutputStream(java.nio.file.Files.newOutputStream(descriptor))){out.writeObject(manifest);}
+        Process child=null;
+        try {
+            String classpath=System.getProperty("surefire.test.class.path",System.getProperty("java.class.path"));
+            child=new ProcessBuilder(System.getProperty("java.home")+"/bin/java","-Xmx384m","-cp",classpath,HeldWorker.class.getName(),
+                    f.cacheConnection.uri(),f.cacheDatabase.getName(),descriptor.toString(),ready.toString()).redirectErrorStream(true).redirectOutput(log.toFile()).start();
+            long deadline=System.nanoTime()+Duration.ofSeconds(30).toNanos();
+            while(!java.nio.file.Files.exists(ready) && child.isAlive() && System.nanoTime()<deadline)Thread.sleep(20);
+            assertThat(java.nio.file.Files.exists(ready)).withFailMessage("worker did not durably hold its output: %s",java.nio.file.Files.readString(log)).isTrue();
+            assertThat(child.isAlive()).isTrue();child.destroyForcibly();assertThat(child.waitFor(10,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            assertThat(child.exitValue()).isNotZero();
+        } finally {
+            if(child!=null && child.isAlive()){child.destroyForcibly();child.waitFor(10,java.util.concurrent.TimeUnit.SECONDS);}
+            java.nio.file.Files.deleteIfExists(ready);java.nio.file.Files.deleteIfExists(descriptor);java.nio.file.Files.deleteIfExists(log);java.nio.file.Files.deleteIfExists(directory);
+        }
+    }
+    public static final class HeldWorker {
+        public static void main(String[] arguments) throws Exception {
+            io.tapstate.runtime.engine.OperatorRunManifest manifest;
+            try(var input=new java.io.ObjectInputStream(java.nio.file.Files.newInputStream(java.nio.file.Path.of(arguments[2])))){
+                manifest=(io.tapstate.runtime.engine.OperatorRunManifest)input.readObject();
+            }
+            var original=(ExecutionFence)manifest.executionIdentity();var scope=original.scope();
+            var business=new CacheBusinessScope(scope.clusterId(),scope.bindingVersion(),scope.cacheIncarnation());
+            var connection=new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,arguments[0],arguments[1],null);
+            try(var cache=MongoCacheDomain.connect(connection,Duration.ofSeconds(5),"held-worker")) {
+                var claims=cache.workloadClaims(business);var config=isolatedNestMember();
+                for(var binding:manifest.bindings()){
+                    var map=io.tapstate.runtime.engine.nest.NestSettings.defaults().backedStateMaps(binding.mapName());
+                    map.getMapStoreConfig().getProperties().setProperty(io.tapstate.runtime.engine.OperatorMapBindings.SCOPED_PROPERTY,"true");config.addMapConfig(map);
+                }
+                var member=com.hazelcast.core.Hazelcast.newHazelcastInstance(config);
+                try(var authorization=ExecutionAuthorization.scoped(business,claims,Duration.ofSeconds(10),System::nanoTime,() -> true);
+                    var registry=io.tapstate.runtime.engine.OperatorMapBindings.bindTo(member,new ScopedOperatorStateProvider(cache,authorization))) {
+                    registry.install(manifest.bindings());seedHandoffs(member,manifest);
+                    java.nio.file.Files.writeString(java.nio.file.Path.of(arguments[3]),"durable-held");
+                    new java.util.concurrent.CountDownLatch(1).await();
+                } finally {member.shutdown();}
+            }
+        }
+    }
+
+    private static com.hazelcast.config.Config isolatedNestMember() {
+        var config = new com.hazelcast.config.Config();
+        config.getJetConfig().setEnabled(true).setCooperativeThreadCount(2);
+        config.getSerializationConfig().addSerializerConfig(new com.hazelcast.config.SerializerConfig()
+                .setTypeClass(io.tapstate.core.event.Envelope.class).setImplementation(new io.tapstate.runtime.engine.EnvelopeSerializer()));
+        config.setProperty("hazelcast.phone.home.enabled","false"); config.setProperty("hazelcast.shutdownhook.enabled","false");
+        config.setProperty("hazelcast.operation.thread.count","2"); config.setProperty("hazelcast.operation.generic.thread.count","2");
+        var join = config.getNetworkConfig().getJoin(); join.getMulticastConfig().setEnabled(false);
+        join.getTcpIpConfig().setEnabled(false); join.getAutoDetectionConfig().setEnabled(false);
+        config.getNetworkConfig().getInterfaces().setEnabled(true).addInterface("127.0.0.1");
+        config.getNetworkConfig().setPort(0).setPortAutoIncrement(false);
+        return config;
+    }
+    private static void feedNest(io.tapstate.runtime.engine.nest.ResolverProcessor receiver,int ordinal,Object value) {
+        var queue = new java.util.ArrayDeque<>(); queue.add(value);
+        var inbox = org.mockito.Mockito.mock(com.hazelcast.jet.core.Inbox.class);
+        org.mockito.Mockito.when(inbox.peek()).thenAnswer(ignored -> queue.peek());
+        org.mockito.Mockito.doAnswer(ignored -> { queue.remove(); return null; }).when(inbox).remove();
+        receiver.process(ordinal,inbox);
+    }
+    private static final class EmptyNestInput extends com.hazelcast.jet.core.AbstractProcessor {}
+
+    private static io.tapstate.runtime.engine.nest.NestTopology literalRootTopology() {
+        var child = new io.tapstate.core.model.Embed("claim",Map.of("policy_id","policy_id"),io.tapstate.core.model.EmbedAs.ARRAY,"child",List.of("claim_id"),null,null,null);
+        var parent = new io.tapstate.core.model.Embed("policy",Map.of("customer_id","customer_id"),io.tapstate.core.model.EmbedAs.ARRAY,"$root",List.of("policy_no"),null,null,List.of(child));
+        var tree = new io.tapstate.core.model.TransformBody.Nest(null,null,new io.tapstate.core.model.NestRoot("customer",List.of("customer_id"),null,null,List.of(parent)));
+        var tables = Map.of("customer",new io.tapstate.runtime.engine.nest.NestTable("customers",List.of("customer_id")),
+                "policy",new io.tapstate.runtime.engine.nest.NestTable("policies",List.of("policy_id")),"claim",new io.tapstate.runtime.engine.nest.NestTable("claims",List.of("claim_id")));
+        return io.tapstate.runtime.engine.nest.NestTopology.compile("flow","step",tree,tables::get);
+    }
+
+    @SuppressWarnings("unchecked") private static com.hazelcast.map.MapStore<Object,Object> mapStore(com.hazelcast.core.HazelcastInstance member,
+            io.tapstate.runtime.engine.OperatorMapBinding binding) {
+        var properties = new java.util.Properties(); properties.setProperty(io.tapstate.runtime.engine.OperatorMapBindings.SCOPED_PROPERTY,"true");
+        var loader = binding.placement().resource() == io.tapstate.spi.store.OperatorPlacement.Resource.NEST_STATE
+                ? new io.tapstate.runtime.engine.nest.NestStateMapStoreFactory().newMapStore(binding.mapName(),properties)
+                : new io.tapstate.runtime.engine.join.JoinStateMapStoreFactory().newMapStore(binding.mapName(),properties);
+        ((com.hazelcast.map.MapLoaderLifecycleSupport)loader).init(member,properties,binding.mapName());
+        return (com.hazelcast.map.MapStore<Object,Object>)loader;
+    }
+
+    private static TapstateException fenced() { return new TapstateException(IoError.PIPELINE_INTENT_FENCED, Map.of(), null); }
+    private static void assertCode(org.assertj.core.api.ThrowableAssert.ThrowingCallable action, IoError code) {
+        assertThatThrownBy(action).isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(code));
+    }
+    private static void withFixture(Scenario scenario) {
+        String suffix = UUID.randomUUID().toString().replace("-", "");
+        String configName = "app_first_cfg_" + suffix; String cacheName = "app_first_cache_" + suffix;
+        try (var configClient = MongoClients.create(CONFIG.getReplicaSetUrl()); var cacheClient = MongoClients.create(CACHE.getReplicaSetUrl())) {
+            var configDb = configClient.getDatabase(configName); var cacheDb = cacheClient.getDatabase(cacheName);
+            var settings = new MongoConnectionSettings(CONFIG.getReplicaSetUrl(configName), null, Duration.ofSeconds(5));
+            var cacheConnection = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB, CACHE.getReplicaSetUrl(cacheName), cacheName, null);
+            try (var configuration = MongoConfigurationBootstrap.prepare(settings, "cluster-a", "installation-a", "setup-a", 1);
+                 var cache = MongoCacheDomain.connect(cacheConnection, Duration.ofSeconds(5), "app-preparation-test")) {
+                var master = new SourceResource(StorageBinding.defaultSourceId(StorageBinding.Mode.OP), null, "mongodb", Map.of("uri", "mongodb://master.invalid/master"), null, null, null, null);
+                var committed = configuration.bindings().commitWithFirstCache(new StorageSetupScope("cluster-a", "installation-a", "setup-a", 1), StorageBinding.Mode.OP, cacheConnection, master);
+                var business = committed.preparation().businessScope();
+                cache.prepareFirstAuth(committed.firstCreation().orElseThrow());
+                cache.prepareInitialBusiness(committed.preparation(),ACTIVE);
+                var pipeline = new DslParser().parse("version: tapstate/v1\nkind: pipeline\nid: flow\nsource: []\n");
+                configuration.artifacts().create(pipeline);
+                var scope = new PipelineIntentScope(business.clusterId(), business.bindingVersion(), business.cacheIncarnation(), "flow", 1);
+                configuration.intents().compareAndSet(scope, 0, new DesiredState("flow", PipelineState.RUNNING, CanonicalHash.of(pipeline)));
+                var node = cache.workloadClaims(business).acquire(new WorkloadClaimKey("cluster-a", WorkloadClaimType.NODE_SESSION, "node-a"), OWNER, 1, TTL).claim();
+                scenario.run(new Fixture(configuration, cache, configDb, cacheDb, settings, cacheConnection, scope, WorkloadClaimFence.from(node)));
+            } finally { configDb.drop(); cacheDb.drop(); }
+        } catch (RuntimeException | Error failure) { throw failure; }
+        catch (Exception failure) { throw new AssertionError(failure); }
+    }
+    private record Fixture(MongoConfigurationDomain configuration, MongoCacheDomain cache, MongoDatabase configDatabase,
+            MongoDatabase cacheDatabase, MongoConnectionSettings settings, StorageBinding.Connection cacheConnection,
+            PipelineIntentScope scope, WorkloadClaimFence node) {
+        CacheBusinessScope business() { return new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation()); }
+        PipelineFirstStatePreparer preparer(MongoConfigurationDomain configuration, MongoCacheDomain cache) {
+            return new PipelineFirstStatePreparer(business(), configuration.preparations(), cache.pipelinePreparations(business(), ACTIVE),
+                    () -> Optional.of(node), ACTIVE, CLOCK, TTL);
+        }
+        long version() { return configDatabase.getCollection("configuration_version").find().first().getLong("revision"); }
+        Document pipelineFilter() { return new Document("_id", new Document("clusterId", scope.clusterId()).append("resourceType", "PIPELINE_ACTUATION").append("resourceId", scope.pipelineId())); }
+        Document claim() { return cacheDatabase.getCollection("workload_claims").find(pipelineFilter()).first(); }
+        Document state() { return cacheDatabase.getCollection("pipeline_state").find().first(); }
+        Map<String, List<Document>> snapshot() {
+            var out = new java.util.TreeMap<String, List<Document>>();
+            for (String table : List.of("workload_claims", "pipeline_state", "cache_identity")) out.put(table, cacheDatabase.getCollection(table).find().sort(new Document("_id", 1)).into(new ArrayList<>()));
+            return out;
+        }
+    }
+    @FunctionalInterface private interface Scenario { void run(Fixture fixture) throws Exception; }
+}

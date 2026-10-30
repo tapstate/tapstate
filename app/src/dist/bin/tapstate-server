@@ -15,8 +15,36 @@ else
   JAVA=java
 fi
 
-exec "$JAVA" \
+AUTOMATIC_INSTALLATION=false
+for ARG in "$@"; do
+  case "$ARG" in
+    --tapstate.installation.directory=*) AUTOMATIC_INSTALLATION=true ;;
+  esac
+done
+if [[ "$AUTOMATIC_INSTALLATION" == false || " $* " == *" installation "* ]]; then
+  exec "$JAVA" --add-opens java.base/java.lang=ALL-UNNAMED -jar "${JARS[0]}" \
+    --spring.config.additional-location="optional:file:$ROOT/conf/" "$@"
+fi
+# Only the successful initial handoff can request one fresh process. Failures never loop.
+RESTARTED=false
+CHILD=
+stop_child() {
+  if [[ -n "$CHILD" ]]; then kill -TERM "$CHILD" 2>/dev/null || true; wait "$CHILD" 2>/dev/null || true; fi
+  exit 0
+}
+trap stop_child TERM INT
+while true; do
+  "$JAVA" \
   --add-opens java.base/java.lang=ALL-UNNAMED \
   -jar "${JARS[0]}" \
   --spring.config.additional-location="optional:file:$ROOT/conf/" \
-  "$@"
+  --tapstate.installation.automatic-restart=true "$@" &
+  CHILD=$!
+  if wait "$CHILD"; then
+    STATUS=0
+  else
+    STATUS=$?
+  fi
+  if [[ "$STATUS" != 75 || "$RESTARTED" == true ]]; then exit "$STATUS"; fi
+  RESTARTED=true
+done

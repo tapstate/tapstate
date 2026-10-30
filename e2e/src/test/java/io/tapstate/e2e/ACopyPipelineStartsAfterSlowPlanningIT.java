@@ -1,18 +1,15 @@
 package io.tapstate.e2e;
 
-import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.app.Bootstrap;
-import io.tapstate.control.core.PipelineWriteTargets;
 import io.tapstate.control.core.StartCheckEvaluator;
 import io.tapstate.testsupport.RequiresDocker;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.web.server.context.WebServerApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.context.annotation.Primary;
 
 import java.net.URI;
 import java.nio.file.Files;
@@ -32,7 +29,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * A copy start keeps a usable check budget after slow target planning. The declarative vocabulary
  * cannot advance time inside planning or inspect a start's findings, so this in-process case decorates
- * the real target planner and drives the assembled product through HTTP, with a real Mongo store.
+ * the clock at the real evaluator's planning boundary and drives the assembled product through HTTP,
+ * with a real Mongo store.
  */
 @RequiresDocker
 class ACopyPipelineStartsAfterSlowPlanningIT {
@@ -41,25 +39,24 @@ class ACopyPipelineStartsAfterSlowPlanningIT {
 
     @Test
     void aCopyStartChecksItsTargetAfterPlanningExceedsTheCheckBudget(@TempDir Path directory) throws Exception {
-        String database = "slow_planned_copy_" + Long.toUnsignedString(System.nanoTime(), 16);
-        String storeUri = SharedMongo.replicaSetUrl(database);
         EndpointAddress source = EndpointAddress.uri(Files.createDirectories(directory.resolve("source")).toString());
         EndpointAddress target = EndpointAddress.uri(Files.createDirectories(directory.resolve("target")).toString());
         FileEndpoints files = new FileEndpoints();
         files.seed(source, TABLE, SeedRows.generated(2));
         files.seed(target, TABLE, List.of(Map.of("id", 99L, "seq", 99L)));
         Path staging = ServerHandle.privateStagingDirectory();
-        try {
+        try (PreparedNativeStore storage = PreparedNativeStore.create()) {
             try (var context = new SpringApplicationBuilder(Bootstrap.class, SlowPlanning.class).run(
                     "--server.address=127.0.0.1", "--server.port=0",
-                    "--tapstate.store.mongo.enabled=true", "--tapstate.store.mongo.uri=" + storeUri,
-                    "--tapstate.store.mongo.operator-state-database=" + database + "_operator",
+                    "--tapstate.store.mongo.enabled=true", "--tapstate.store.mongo.uri=" + storage.configurationUri(),
+                    "--tapstate.cluster.id=" + storage.clusterId(),
+                    "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2",
                     "--tapstate.connectors.plugins-dir=" + staging);
-                    StoreDocuments documents = StoreDocuments.at(storeUri)) {
+                    StoreDocuments documents = StoreDocuments.at(storage.configurationUri())) {
                 URI base = URI.create("http://127.0.0.1:"
                         + ((WebServerApplicationContext) context).getWebServer().getPort());
                 ControlPlane control = new ControlPlane(base);
-                control.bootstrapAndLogin("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
                 String connector = E2eConnectorJar.BROWSABLE_CONNECTOR_ID;
                 control.registerConnector(connector, Files.readAllBytes(E2eConnectorJar.buildInto(directory, connector)));
                 control.discoverSchema("copy_source", connector, source.settings());
@@ -94,7 +91,7 @@ class ACopyPipelineStartsAfterSlowPlanningIT {
                             .containsEntry("code", "start-check.target-set-to-clear");
                     assertThat(((Map<?, ?>) finding.get("params")).get("rows")).isEqualTo(1L);
                 });
-                assertThat(documents.holds(MongoStorePort.PIPELINE_DESIRED, PIPELINE)).isTrue();
+                assertThat(documents.holds(SystemCollections.PIPELINE_INTENTS.collectionName(), PIPELINE)).isTrue();
                 assertThat(documents.auditOf("pipeline.start", PIPELINE)).hasSize(1);
                 Await.until("the accepted copy to replace the target's old row",
                         () -> files.count(target, TABLE) == 2
@@ -121,21 +118,10 @@ class ACopyPipelineStartsAfterSlowPlanningIT {
     @Configuration(proxyBeanMethods = false)
     static class SlowPlanning {
         @Bean
-        @Primary
-        PlanningClock planningClock() {
-            return new PlanningClock();
-        }
-
-        @Bean
-        @Primary
-        PipelineWriteTargets slowTargets(@Qualifier("pipelineWriteTargets") PipelineWriteTargets real,
-                PlanningClock clock) {
-            return pipeline -> {
-                var targets = real.of(pipeline);
-                if (PIPELINE.equals(pipeline.id()) && clock.slowNextPlan.compareAndSet(true, false)) {
-                    clock.offset.updateAndGet(offset -> offset.plus(StartCheckEvaluator.BUDGET).plusMillis(200));
-                }
-                return targets;
+        static org.springframework.beans.factory.config.BeanFactoryPostProcessor controlledClock() {
+            return factory -> {
+                ((org.springframework.beans.factory.support.BeanDefinitionRegistry) factory).removeBeanDefinition("clock");
+                factory.registerSingleton("clock", new PlanningClock());
             };
         }
     }
@@ -143,9 +129,21 @@ class ACopyPipelineStartsAfterSlowPlanningIT {
     static final class PlanningClock extends Clock {
         private final AtomicReference<Duration> offset = new AtomicReference<>(Duration.ZERO);
         private final AtomicBoolean slowNextPlan = new AtomicBoolean();
+        private final java.util.concurrent.atomic.AtomicInteger planningReads = new java.util.concurrent.atomic.AtomicInteger();
 
         @Override public ZoneId getZone() { return ZoneOffset.UTC; }
         @Override public Clock withZone(ZoneId zone) { return Clock.offset(Clock.system(zone), offset.get()); }
-        @Override public Instant instant() { return Instant.now().plus(offset.get()); }
+        @Override public Instant instant() {
+            // Authentication also reads this clock; only the evaluator's two planning-boundary reads
+            // consume the armed delay. The real target planner and check workers remain unchanged.
+            if (slowNextPlan.get() && StackWalker.getInstance().walk(frames -> frames.anyMatch(frame ->
+                    frame.getClassName().equals(StartCheckEvaluator.class.getName())
+                            && frame.getMethodName().equals("evaluate")))
+                    && planningReads.incrementAndGet() == 2) {
+                offset.updateAndGet(value -> value.plus(StartCheckEvaluator.BUDGET).plusMillis(200));
+                slowNextPlan.set(false);
+            }
+            return Instant.now().plus(offset.get());
+        }
     }
 }

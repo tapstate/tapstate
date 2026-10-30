@@ -54,6 +54,10 @@ public final class IndexEnsure {
                     + " Starting over it either way would mean running without a constraint the store's"
                     + " own declaration asks for, or with one it does not");
         }
+        Document partial = index.partialFilterJson() == null ? null : Document.parse(index.partialFilterJson());
+        if (!java.util.Objects.equals(partial, existing.get("partialFilterExpression"))) {
+            throw new IllegalStateException("index partial filter differs from its declared constraint");
+        }
         Long declared = index.expireAfterSeconds();
         Number found = existing.get("expireAfterSeconds", Number.class);
         if (declared == null || (found != null && found.longValue() == declared)) {
@@ -73,6 +77,16 @@ public final class IndexEnsure {
     }
 
     private static void create(MongoCollection<Document> collection, SystemCollections.IndexSpec index) {
+        create(null, collection, index);
+    }
+
+    /** Empty collections may receive their declared indexes in the same local-read schema transaction. */
+    static void createInTransaction(com.mongodb.client.ClientSession session, MongoCollection<Document> collection,
+            SystemCollections.IndexSpec index) {
+        create(java.util.Objects.requireNonNull(session, "session"), collection, index);
+    }
+
+    private static void create(com.mongodb.client.ClientSession session, MongoCollection<Document> collection, SystemCollections.IndexSpec index) {
         Document keys = new Document();
         for (String key : index.keys()) {
             keys.append(key, 1);
@@ -81,7 +95,11 @@ public final class IndexEnsure {
         if (index.expireAfterSeconds() != null) {
             options.expireAfter(index.expireAfterSeconds(), TimeUnit.SECONDS);
         }
-        collection.createIndex(keys, options);
+        if (index.partialFilterJson() != null) {
+            options.partialFilterExpression(Document.parse(index.partialFilterJson()));
+        }
+        if (session == null) collection.createIndex(keys, options);
+        else collection.createIndex(session, keys, options);
     }
 
     /** The existing index of that name, as the server describes it, or {@code null}. */

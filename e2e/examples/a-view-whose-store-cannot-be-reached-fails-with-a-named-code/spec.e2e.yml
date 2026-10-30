@@ -26,7 +26,8 @@
 name: a-view-whose-store-cannot-be-reached-fails-with-a-named-code
 setup:
   connectors: [e2e_file, mongodb]
-  apply: [src_file.tap.yml, views.tap.yml, tgt_file.tap.yml, pipeline.tap.yml]
+  managed_target: views.tap.yml
+  apply: [src_file.tap.yml, tgt_file.tap.yml, pipeline.tap.yml]
   discover: [src_file]
 pipeline: pipeline.tap.yml
 seed:

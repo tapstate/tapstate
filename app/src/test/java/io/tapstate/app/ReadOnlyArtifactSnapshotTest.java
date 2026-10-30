@@ -38,6 +38,19 @@ class ReadOnlyArtifactSnapshotTest {
                 .hasMessageContaining("duplicate id");
     }
 
+    @Test
+    void overlayDetachesNestedCandidateValuesAndEveryReadResult() {
+        var value = new java.util.ArrayList<>(List.of("original"));
+        SourceResource replacement = new SourceResource("source", null, "mysql", java.util.Map.of("nested", value), SourceMode.CDC, null, null, null);
+        var snapshot = ReadOnlyArtifactSnapshot.overlay(store(List.of(source("source", "csv"))), List.of(replacement));
+        value.add("input-change");
+        SourceResource first = (SourceResource) snapshot.get("source").orElseThrow();
+        @SuppressWarnings("unchecked") var exposed = (List<Object>) first.config().get("nested");
+        try { exposed.add("result-change"); } catch (UnsupportedOperationException immutable) { /* Immutable or detached values are both safe. */ }
+        assertThat(((SourceResource) snapshot.get("source").orElseThrow()).config()).containsEntry("nested", List.of("original"));
+        assertThat(((SourceResource) snapshot.list().getFirst()).config()).containsEntry("nested", List.of("original"));
+    }
+
     private static SourceResource source(String id, String connector) {
         return new SourceResource(id, null, connector, java.util.Map.of(), SourceMode.CDC, null, null, null);
     }

@@ -56,6 +56,45 @@ class PipelineConvergerTest {
     private final PipelineConverger converger =
             new PipelineConverger(desired, state, actuator, Clock.fixed(T0, ZoneOffset.UTC));
 
+    @Test void sinkVerifiedBoundedCompletionStopsTheRunAndNeverRestartsIt() {
+        desired.save(new DesiredState("p1",RUNNING,REV));converger.converge("p1");actuator.reset();
+        converger.converge("p1");assertThat(state.read("p1").orElseThrow().stateJson()).isEqualTo(StateJson.of(RUNNING));
+        actuator.completeLoad();converger.converge("p1");
+        assertThat(state.read("p1").orElseThrow().stateJson()).isEqualTo(StateJson.of(COMPLETED));
+        assertThat(actuator.calls()).containsExactly("stop:p1:keep");actuator.reset();
+        converger.converge("p1");assertThat(actuator.calls()).isEmpty();
+        assertThat(desired.read("p1").orElseThrow().targetState()).isEqualTo(RUNNING);
+    }
+
+    @Test void initialBoundedCompletionKeepsItsDurableResultWhenCleanupNeedsRetry() {
+        desired.save(new DesiredState("p1",RUNNING,REV));converger.converge("p1");actuator.completeLoad();
+        var refused=new TapstateException(new StubCode("test.cleanup-refused"),Map.of(),null);
+        actuator.refuseStopWith(refused);
+        assertThatThrownBy(() -> converger.converge("p1")).isSameAs(refused);
+        assertThat(state.read("p1").orElseThrow().stateJson()).isEqualTo(StateJson.of(COMPLETED));
+    }
+
+    @Test void completedCheckpointFinishesInterruptedCleanupWithoutRestarting() {
+        desired.save(new DesiredState("p1",RUNNING,REV));converger.converge("p1");actuator.reset();
+        var running=state.read("p1").orElseThrow();
+        actuator.finishBoundedRun();
+        state.applySwap("p1",running.epoch(),StateJson.of(COMPLETED),T0);
+        converger.converge("p1");converger.converge("p1");
+        assertThat(actuator.calls()).containsExactly("stop:p1:keep");
+        assertThat(state.read("p1").orElseThrow().stateJson()).isEqualTo(StateJson.of(COMPLETED));
+    }
+
+    @Test void boundedCompletionConcedesToAConcurrentStop() {
+        desired.save(new DesiredState("p1",RUNNING,REV));converger.converge("p1");actuator.reset();actuator.completeLoad();
+        state.onBeforeSwap(() -> {
+            var current=state.read("p1").orElseThrow();
+            state.applySwap("p1",current.epoch(),StateJson.of(STOPPED),T0);
+        });
+        assertThat(converger.converge("p1").status()).isEqualTo(SUPERSEDED);
+        assertThat(state.read("p1").orElseThrow().stateJson()).isEqualTo(StateJson.of(STOPPED));
+        assertThat(actuator.calls()).isEmpty();
+    }
+
     @Test
     @DisplayName("with no desired intent there is nothing to converge and no checkpoint is written")
     void noDesiredIsANoOp() {

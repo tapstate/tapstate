@@ -55,8 +55,8 @@ class AHundredTablesShareTheSinksWritersIT {
         List<String> tables = IntStream.range(0, TABLES).mapToObj(i -> String.format("t%03d", i)).toList();
 
         try (FileEndpoints files = new FileEndpoints()) {
-            String store = SharedMongo.replicaSetUrl("e2e_hundred_tables_cluster");
-            try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-hundred-tables")) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                 TwoMemberCluster cluster = TwoMemberCluster.startPrepared(storage)) {
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.first();
                 control.registerConnector(E2eConnectorJar.CONNECTOR_ID, connector);
@@ -81,8 +81,7 @@ class AHundredTablesShareTheSinksWritersIT {
                 Await.until("every table's rows to be written", Duration.ofMinutes(3),
                         () -> idsWrittenByTable(written).size() == TABLES && idsWrittenByTable(written).values()
                                 .stream().allMatch(ids -> ids.size() == ROWS_EACH),
-                        () -> "tables with every row written: " + idsWrittenByTable(written).values().stream()
-                                .filter(ids -> ids.size() == ROWS_EACH).count() + " of " + TABLES);
+                        () -> incompleteWrites(written, files, targetAddress, tables, control));
 
                 List<WriteWitness.Written> rows = written.rows();
                 Map<String, Set<String>> tablesByBatch = rows.stream().collect(Collectors.groupingBy(
@@ -113,5 +112,20 @@ class AHundredTablesShareTheSinksWritersIT {
     private static Map<String, Set<String>> idsWrittenByTable(WriteWitness written) {
         return written.rows().stream().collect(Collectors.groupingBy(WriteWitness.Written::rowTable,
                 Collectors.mapping(WriteWitness.Written::id, Collectors.toSet())));
+    }
+
+    private static String incompleteWrites(WriteWitness written, FileEndpoints files, EndpointAddress target,
+            List<String> tables, ControlPlane control) {
+        Map<String, Set<String>> observed = idsWrittenByTable(written);
+        Map<String, Object> incomplete = new java.util.TreeMap<>();
+        for (String table : tables) {
+            Set<String> ids = observed.getOrDefault(table, Set.of());
+            if (ids.size() != ROWS_EACH) {
+                incomplete.put(table, Map.of("witnessIds", ids, "targetRows", files.count(target, table),
+                        "writtenTables", written.rowsOf(table).stream().map(WriteWitness.Written::rowTable).distinct().toList()));
+            }
+        }
+        return "incomplete=" + incomplete + ", pipeline=" + control.state(PIPELINE)
+                + ", failure=" + control.failure(PIPELINE);
     }
 }

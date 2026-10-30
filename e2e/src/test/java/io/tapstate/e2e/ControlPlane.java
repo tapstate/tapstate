@@ -160,6 +160,13 @@ final class ControlPlane {
         cloudCookie = false;
     }
 
+    /** Reads admission through the same native snapshot used by the application. */
+    Map<?, ?> storageStatus() {
+        var response = send(authed("/api/storage/status", "{}"));
+        expect(response, 200, "read native storage admission");
+        return (Map<?, ?>) JsonReader.parse(response.body());
+    }
+
     /** Redeems one code once; the real SDK and server create the local session. */
     String exchangeCloudCode(String code) {
         HttpResponse<String> response = send(get("/auth/exchange?code=" + urlSegment(code)));
@@ -346,6 +353,21 @@ final class ControlPlane {
     /** The ids the server holds - read back from the server, which is the truth, not from the files sent. */
     List<String> artifactIds() {
         HttpResponse<String> response = send(authedGet("/api/artifacts"));
+        return artifactIds(response);
+    }
+
+    /** A fault witness can wait through the driver's transaction retry window, preserving coded refusals. */
+    Optional<List<String>> artifactIdsIfConfigurationAvailable(Duration timeout) {
+        HttpResponse<String> response = send(authedGet("/api/artifacts", timeout));
+        if (response.statusCode() == 503
+                && Set.of(io.tapstate.spi.store.IoError.STORE_UNAVAILABLE.code(),
+                        io.tapstate.control.core.ControlError.STORAGE_UNAVAILABLE.code()).contains(codeOf(response.body()))) {
+            return Optional.empty();
+        }
+        return Optional.of(artifactIds(response));
+    }
+
+    private static List<String> artifactIds(HttpResponse<String> response) {
         expect(response, 200, "list artifacts");
         if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> map)
                 || !(map.get("artifacts") instanceof List<?> artifacts)) {
@@ -807,6 +829,50 @@ final class ControlPlane {
             throw new AssertionError("the pipeline draft read was not an object: " + read.body());
         }
         return asObject(map);
+    }
+
+    /** Reads a durable authoring draft, distinguishing an absent draft from a failed read. */
+    Optional<Map<String, Object>> pipelineDraft(String id) {
+        HttpResponse<String> response = send(authedGet("/api/pipelines/" + urlSegment(id) + "/draft"));
+        if (response.statusCode() == 404) return Optional.empty();
+        expect(response, 200, "read pipeline draft " + id);
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> map)) {
+            throw new AssertionError("the pipeline draft read was not an object: " + response.body());
+        }
+        return Optional.of(asObject(map));
+    }
+
+    /** The merged catalog that backs the Web list. */
+    List<String> pipelineCatalogIds() {
+        HttpResponse<String> response = send(authedGet("/api/pipelines?limit=200&offset=0"));
+        expect(response, 200, "read the Pipeline catalog");
+        if (!(JsonReader.parse(response.body()) instanceof Map<?, ?> map)
+                || !(map.get("items") instanceof List<?> items)) {
+            throw new AssertionError("the pipeline catalog was not a list: " + response.body());
+        }
+        return items.stream().map(item -> {
+            if (!(item instanceof Map<?, ?> entry) || !(entry.get("id") instanceof String id)) {
+                throw new AssertionError("the pipeline catalog contained an invalid entry: " + item);
+            }
+            return id;
+        }).toList();
+    }
+
+    /** Removes the applied Pipeline and the exact authoring revision the caller read. */
+    void deletePipeline(String id, String artifactHash, long draftRevision) {
+        expect(send(pipelineDelete(id, artifactHash, draftRevision)), 204, "delete the whole Pipeline " + id);
+    }
+
+    Refusal deletePipelineExpectingRefusal(String id, String artifactHash, long draftRevision) {
+        HttpResponse<String> response = send(pipelineDelete(id, artifactHash, draftRevision));
+        return interpretRefusal(response.statusCode(), response.body(), "deleting the whole Pipeline " + id);
+    }
+
+    private HttpRequest pipelineDelete(String id, String artifactHash, long draftRevision) {
+        return authenticate(HttpRequest.newBuilder(baseUrl.resolve("/api/pipelines/" + urlSegment(id)))
+                .timeout(TIMEOUT).DELETE())
+                .header("If-Match", "\"" + artifactHash + "\"")
+                .header("If-Draft-Match", "\"" + draftRevision + "\"").build();
     }
 
     /** Reads the aggregate lifecycle projection for a known pipeline draft. */
@@ -1291,6 +1357,12 @@ final class ControlPlane {
         }
         expect(send(authed("/api/pipelines/" + pipelineId + ":" + verb.id(), "")),
                 200, verb.id() + " " + pipelineId);
+    }
+
+    /** A refused admission must be a coded client response, never an accepted intent or server failure. */
+    Refusal startExpectingRefusal(String pipelineId) {
+        var response = send(authed("/api/pipelines/" + urlSegment(pipelineId) + ":start", ""));
+        return interpretRefusal(response.statusCode(), response.body(), "starting " + pipelineId);
     }
 
     /**
@@ -2285,7 +2357,7 @@ final class ControlPlane {
      */
     private HttpRequest authedDelete(String id, String expectedContentHash) {
         HttpRequest.Builder builder = authenticate(HttpRequest.newBuilder(baseUrl.resolve("/api/artifacts/" + urlSegment(id)))
-                .timeout(TIMEOUT)
+                .timeout(io.tapstate.control.client.HttpControlClient.DEFAULT_HEAVY_TIMEOUT)
                 .DELETE());
         if (expectedContentHash != null) {
             builder.header("If-Match", "\"" + expectedContentHash + "\"");
@@ -2294,8 +2366,12 @@ final class ControlPlane {
     }
 
     private HttpRequest authedGet(String path) {
+        return authedGet(path, TIMEOUT);
+    }
+
+    private HttpRequest authedGet(String path, Duration timeout) {
         return authenticate(HttpRequest.newBuilder(baseUrl.resolve(path))
-                .timeout(TIMEOUT)
+                .timeout(timeout)
                 .GET()).build();
     }
 
@@ -2335,14 +2411,19 @@ final class ControlPlane {
 
     /** The typed Source wire, including its caller-visible ETag precondition. */
     HttpResponse<String> sourceRequest(String method, String path, Map<String, ?> body, String etag, int status) {
+        HttpResponse<String> response = sourceResponse(method,path,body,etag);
+        expect(response, status, method + " " + path);
+        return response;
+    }
+
+    /** Leaves an explicitly tested alternative outcome to the calling witness's own assertions. */
+    HttpResponse<String> sourceResponse(String method,String path,Map<String,?> body,String etag) {
         HttpRequest.Builder request = authenticate(HttpRequest.newBuilder(baseUrl.resolve(path)).timeout(TIMEOUT))
                 .header("Content-Type", "application/json");
         if (etag != null) request.header("If-Match", etag);
         request.method(method, body == null ? HttpRequest.BodyPublishers.noBody()
                 : HttpRequest.BodyPublishers.ofString(JsonWriter.write(body), StandardCharsets.UTF_8));
-        HttpResponse<String> response = send(request.build());
-        expect(response, status, method + " " + path);
-        return response;
+        return send(request.build());
     }
 
     /**

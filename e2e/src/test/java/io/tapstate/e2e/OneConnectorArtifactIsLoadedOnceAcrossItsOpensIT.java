@@ -8,7 +8,6 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.UUID;
 import java.util.stream.Collectors;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -48,12 +47,11 @@ class OneConnectorArtifactIsLoadedOnceAcrossItsOpensIT {
         Path customers = Files.createDirectory(directory.resolve("customers"));
         Files.writeString(orders.resolve("orders.csv"), "id,amount\n7,70.00\n");
         Files.writeString(customers.resolve("customers.csv"), "id,name\n8,ada\n");
-        String database = "e2e_one_loader_" + UUID.randomUUID().toString().replace("-", "");
 
         Set<String> before = initializations();
-        try (ServerHandle server = InProcessServer.start(SharedMongo.replicaSetUrl(database))) {
+        try (var storage = PreparedNativeStore.create(); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID, Files.readAllBytes(jar));
 
             control.testConnection("src_orders", E2eConnectorJar.CONNECTOR_ID, Map.of("uri", orders.toString()));

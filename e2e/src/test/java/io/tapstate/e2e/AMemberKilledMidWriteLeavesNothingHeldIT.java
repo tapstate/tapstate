@@ -5,7 +5,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 import io.tapstate.adapters.mongostore.MongoConnection;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
-import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.testsupport.DockerGate;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -66,9 +65,9 @@ class AMemberKilledMidWriteLeavesNothingHeldIT {
             EndpointAddress targetAddress = EndpointAddress.uri(target.toString());
             files.seed(sourceAddress, TABLE, SeedRows.generated(SEEDED_ROWS));
 
-            String store = SharedMongo.replicaSetUrl("e2e_killed_mid_write");
-            try (StoreDocuments documents = StoreDocuments.at(store);
-                    TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-killed-mid-write")) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                    NativeSrsDocuments documents = new NativeSrsDocuments(storage);
+                    TwoMemberCluster cluster = TwoMemberCluster.startPrepared(storage)) {
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.first();
                 control.registerConnector(E2eConnectorJar.CONNECTOR_ID, connector);
@@ -90,21 +89,28 @@ class AMemberKilledMidWriteLeavesNothingHeldIT {
                         .map(ClusterMemberFacts::bootId)
                         .findFirst()
                         .orElseThrow(() -> new AssertionError("the cluster lists no boot of " + killed));
-                String chain = documents.miningChainIds().stream()
-                        .filter(candidate -> documents.consumersOf(candidate)
-                                .contains(SrsConsumerId.of(PIPELINE, SOURCE_ID).value()))
-                        .findFirst()
-                        .orElseThrow(() -> new AssertionError("no chain carries " + PIPELINE));
+                var membership = documents.pipelineMembership(PIPELINE, SOURCE_ID);
+                assertThat(membership).isNotNull();
+                String chain = membership.get("_id", org.bson.Document.class).getString("chain");
+                var original = documents.chain(chain);
+                var captureFence = original.get("captureFence", org.bson.Document.class);
+                assertThat(captureFence.getString("resourceId")).isEqualTo(original.getString("captureId"));
+                assertThat(captureFence.getString("ownerNodeId"))
+                        .as("the killed non-driver leaves the actual source owner alive")
+                        .isEqualTo(driver);
                 ControlPlane survivor = cluster.memberOtherThan(killed);
 
-                try (StoreDocuments.HeldOpen held =
-                        documents.holdChainOpenAs(chain, MongoConnection.processTag(killedBoot))) {
+                long holdStarted = System.nanoTime();
+                try (var held = new NativeHeldTransaction(storage, captureFence, MongoConnection.processTag(killedBoot))) {
+                    assertThat(held.stillHeld()).as("the exact tagged session holds an actual server-side transaction").isTrue();
                     cluster.processCarrying(killed).kill();
 
                     long rowsAtTheKill = files.count(targetAddress, TABLE);
                     files.cdc(sourceAddress, TABLE, CdcOp.INSERT, 1);
+                    Duration remaining = WITHIN_THE_HOLD.minusNanos(System.nanoTime() - holdStarted);
+                    assertThat(remaining).as("the whole proof must precede natural transaction expiry").isPositive();
                     Await.until("a change made after the kill to reach the target while the store would still be "
-                                    + "holding the record the killed member left open", WITHIN_THE_HOLD,
+                                    + "holding the record the killed member left open", remaining,
                             () -> files.count(targetAddress, TABLE) > rowsAtTheKill,
                             () -> "rows at target = " + files.count(targetAddress, TABLE) + ", was " + rowsAtTheKill
                                     + " when " + killed + " was killed; the pipeline is " + survivor.state(PIPELINE)

@@ -44,6 +44,17 @@ class PdkSchemaDiscovererTest {
         return new ConnectionConfig("conn-1", "demo", Map.of());
     }
 
+    @Test void structureOnlyDiscoveryDoesNotRunTheRegisteredCount(@TempDir Path dir) throws Exception {
+        var ref=new ConnectorRef(List.of(Synthetic.countTracingDiscoverableSource(dir)),"synthetic.TracingCount","2.0.8",null);
+        var discovery=new PdkSchemaDiscoverer(id -> ref);var trace=dir.resolve("count-trace");
+        var input=new ConnectionConfig("source","demo",Map.of("countTrace",trace.toString()));
+        var model=discovery.discoverStructure(input);
+        assertThat(model.tables()).hasSize(1);assertThat(model.tables().getFirst().approximateRowCount()).isNull();
+        assertThat(java.nio.file.Files.exists(trace)).isFalse();
+        assertThat(discovery.discover(input).tables().getFirst().approximateRowCount()).isEqualTo(7L);
+        assertThat(java.nio.file.Files.readString(trace)).isEqualTo("counted");
+    }
+
     @Test
     void boundedStringSurvivesDiscoveryAndTargetReconstruction() throws Exception {
         var declared = new io.tapdata.entity.schema.type.TapString().bytes(36L).fixed(false)

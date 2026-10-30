@@ -17,7 +17,16 @@ public record PipelineInput(
         Map<String, Object> experimental,
         PipelineDag dag,
         String contentHash,
-        PipelineStatus status) {
+        PipelineStatus status,
+        PipelineOutputNames.Result outputTargets) {
+
+    /** Read projections may be echoed by a client, but never become authored configuration. */
+    public PipelineInput(String id, Metadata metadata, List<Object> sources,
+            List<Map<String, Object>> transforms, Map<String, Object> view, Map<String, Object> serve,
+            Map<String, Object> settings, Map<String, Object> experimental, PipelineDag dag,
+            String contentHash, PipelineStatus status) {
+        this(id, metadata, sources, transforms, view, serve, settings, experimental, dag, contentHash, status, null);
+    }
 
     public PipelineInput(
             String id,

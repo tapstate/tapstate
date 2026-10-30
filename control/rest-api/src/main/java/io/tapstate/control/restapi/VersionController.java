@@ -37,8 +37,8 @@ class VersionController {
     private final SystemDataVersion systemDataVersion;
 
     /**
-     * Takes the store's schema version if this run has a store. A run without one -- a substrate check,
-     * say -- has no such bean, and reports the field as absent rather than inventing a number for it.
+     * Takes the opened configuration store's schema version. A provider may still report absence
+     * while minimum startup waits for setup; neither that nor a missing provider invents a version.
      */
     VersionController(@Nullable SystemDataVersion systemDataVersion) {
         this.systemDataVersion = systemDataVersion;

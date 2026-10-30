@@ -237,7 +237,7 @@ class RegistryConnectorProvisionerTest {
     }
 
     @Test
-    void refusesMismatchedStoreBytesBeforeCreatingTheCache(@TempDir Path dir) throws IOException {
+    void refusesMismatchedStoreBytesBeforePublishingTheCache(@TempDir Path dir) throws IOException {
         byte[] artifact = Files.readAllBytes(Synthetic.annotatedConnector(dir));
         InMemoryConnectorRegistry registry = new InMemoryConnectorRegistry();
         String hash = registry.register("orders", "1.3.5", RegistrationSource.SEED, artifact)
@@ -249,7 +249,7 @@ class RegistryConnectorProvisionerTest {
 
         assertSafeLoadFailure(() -> provisioner.resolve("orders"));
 
-        assertThat(cacheDir).doesNotExist();
+        assertThat(cacheDir).isEmptyDirectory();
         assertThat(registry.artifactCalls).isEqualTo(1);
     }
 
@@ -401,6 +401,33 @@ class RegistryConnectorProvisionerTest {
         assertThatThrownBy(() -> provisioner.resolve("orders"))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(e -> assertThat(((TapstateException) e).code()).isEqualTo(ConnectorError.LOAD_FAILED));
+    }
+
+    @Test
+    void retainedContextSelectsItsExactRegisteredHashEvenWhenNormalResolutionIsAmbiguous(@TempDir Path dir) throws IOException {
+        var registry = new InMemoryConnectorRegistry();
+        String retained = registry.register("orders", "1.3.5", RegistrationSource.SEED,
+                Files.readAllBytes(Synthetic.annotatedConnector(dir))).registration().contentHash();
+        registry.register("orders", "2.0.8", RegistrationSource.REGISTER,
+                Files.readAllBytes(Synthetic.annotatedEmittingConnector(dir)));
+        var provisioner = new RegistryConnectorProvisioner(registry, new ConnectorIntrospector(), dir.resolve("plugins"));
+        assertThatThrownBy(() -> provisioner.resolve("orders")).isInstanceOf(TapstateException.class);
+        var exact = provisioner.resolve("orders", retained);
+        assertThat(exact.contentHash()).isEqualTo(retained);
+        assertThat(exact.className()).isEqualTo("synthetic.OrdersConnector");
+    }
+
+    @Test
+    void retainedResolutionRefusesMissingRegistrationBytesAndChangedArtifacts(@TempDir Path dir) {
+        var registry = new InMemoryConnectorRegistry();
+        String hash = "a".repeat(64);
+        var provisioner = new RegistryConnectorProvisioner(registry, new ConnectorIntrospector(), dir.resolve("plugins"));
+        assertThatThrownBy(() -> provisioner.resolve("orders", hash)).isInstanceOfSatisfying(TapstateException.class,
+                error -> assertThat(error.code()).isEqualTo(ConnectorError.NOT_REGISTERED));
+        registry.addDanglingRegistration("orders", hash, "2.0.8");
+        assertSafeLoadFailure(() -> provisioner.resolve("orders", hash));
+        registry.replaceArtifact(hash, new byte[]{1, 2});
+        assertSafeLoadFailure(() -> provisioner.resolve("orders", hash));
     }
 
     @Test

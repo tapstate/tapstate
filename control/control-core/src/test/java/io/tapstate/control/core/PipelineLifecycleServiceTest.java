@@ -129,6 +129,23 @@ class PipelineLifecycleServiceTest {
     }
 
     @Test
+    void anAlreadyStoppedPipelineCanExplicitlyClearItsRetainedStateBeforeStartingAgain() {
+        artifacts.save(PIPELINE_V1);
+        service.start("alice", "pl1");
+        service.stop("alice", "pl1", false);
+        checkpoint = Optional.of(new CheckpointDoc("pl1", "STOPPED", 8L, FIXED));
+
+        DesiredState clearing = service.stop("alice", "pl1", true);
+        assertThat(clearing.targetState()).isEqualTo(PipelineState.STOPPED);
+        assertThat(clearing.purgeState()).isTrue();
+        TapstateException refused = catchThrowableOfType(TapstateException.class,
+                () -> service.stop("alice", "pl1", false));
+        assertThat(refused.code().code()).isEqualTo("lifecycle.illegal-transition");
+        assertThat(desired.read("pl1")).contains(clearing);
+        assertThat(service.start("alice", "pl1").purgeState()).isTrue();
+    }
+
+    @Test
     void anOlderCheckpointCannotConsumeANewerAcceptedStart() {
         artifacts.save(PIPELINE_V1);
         checkpoint = Optional.of(new CheckpointDoc("pl1", "COMPLETED", 7L, FIXED));

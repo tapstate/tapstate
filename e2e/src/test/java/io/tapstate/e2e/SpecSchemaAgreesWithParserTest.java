@@ -37,6 +37,37 @@ class SpecSchemaAgreesWithParserTest {
             .getSchema(SpecGenerator.schema());
 
     @Test
+    void aStartRefusalNamesOneCanonicalCode() {
+        String specification = """
+                name: refused
+                pipeline: p.tap.yml
+                steps:
+                  - start_refused: actuation.source-schema-not-discovered
+                """;
+        assertThat(EnvelopeParser.parse(specification).steps()).containsExactly(new Step.StartRefused("actuation.source-schema-not-discovered"));
+        assertThat(validate(specification)).isEmpty();
+        String invalid = specification.replace("actuation.source-schema-not-discovered", "not-a-code");
+        assertThat(catchThrowable(() -> EnvelopeParser.parse(invalid))).isInstanceOf(EnvelopeException.class);
+        assertThat(validate(invalid)).isNotEmpty();
+    }
+
+    @Test
+    void aManagedTargetIsOneInstallationFileRatherThanAnApplyList() {
+        String specification = """
+                name: managed
+                setup:
+                  managed_target: views.tap.yml
+                pipeline: p.tap.yml
+                steps: [start]
+                """;
+        assertThat(catchThrowable(() -> EnvelopeParser.parse(specification))).isNull();
+        assertThat(validate(specification)).isEmpty();
+        String array = specification.replace("managed_target: views.tap.yml", "managed_target: [views.tap.yml]");
+        assertThat(catchThrowable(() -> EnvelopeParser.parse(array))).isInstanceOf(EnvelopeException.class);
+        assertThat(validate(array)).isNotEmpty();
+    }
+
+    @Test
     void theSchemaAcceptsEverySpecificationTheParserAccepts() {
         for (String specification : accepted()) {
             assertThat(catchThrowable(() -> EnvelopeParser.parse(specification)))

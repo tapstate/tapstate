@@ -30,4 +30,9 @@ public interface JoinStoresBinding extends Serializable {
             return new ImapJoinStores(member, pipelineId, stepId);
         };
     }
+    static JoinStoresBinding onTheCluster(io.tapstate.runtime.engine.OperatorRunManifest original) {
+        Objects.requireNonNull(original,"original");
+        return (member,pipelineId,stepId) -> new ImapJoinStores(member,pipelineId,stepId,original);
+    }
+
 }

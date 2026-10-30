@@ -1,6 +1,7 @@
 package io.tapstate.e2e;
 
-import io.tapstate.adapters.mongostore.MongoStorePort;
+import com.mongodb.client.MongoClients;
+import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.testsupport.DockerGate;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
@@ -48,17 +49,16 @@ class AFailTargetIsRefusedAtStartIT {
 
     @Test
     void aSyncTargetSetToFailThatHoldsRowsRefusesTheStartAndKeepsThem(@TempDir Path directory) throws Exception {
-        String storeUri = SharedMongo.replicaSetUrl("fail_at_start_sync_store");
         EndpointAddress source = EndpointAddress.uri(Files.createDirectories(directory.resolve("src")).toString());
         EndpointAddress target = EndpointAddress.uri(Files.createDirectories(directory.resolve("tgt")).toString());
         FileEndpoints files = new FileEndpoints();
         files.seed(source, TABLE, SeedRows.generated(3));
         files.seed(target, TABLE, unrelatedRows());
 
-        try (ServerHandle server = InProcessServer.start(storeUri);
-                StoreDocuments documents = StoreDocuments.at(storeUri)) {
+        try (files; PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             String connector = E2eConnectorJar.BROWSABLE_CONNECTOR_ID;
             control.registerConnector(connector, Files.readAllBytes(E2eConnectorJar.buildInto(directory, connector)));
             control.discoverSchema("src_file", connector, source.settings());
@@ -84,7 +84,7 @@ class AFailTargetIsRefusedAtStartIT {
             assertRefusedOver(answer, "target-not-empty/tgt_file/" + TABLE);
             // The intent is written by the start itself, before it answers. Not there now means never: a
             // start that wrote it and then refused would leave a converger to run what was refused.
-            assertThat(documents.holds(MongoStorePort.PIPELINE_DESIRED, PIPELINE))
+            assertThat(holdsIntent(storage))
                     .as("the intent of a start that was refused")
                     .isFalse();
             assertThat(files.count(target, TABLE)).as("rows at the target after the refusal").isEqualTo(5);
@@ -98,18 +98,17 @@ class AFailTargetIsRefusedAtStartIT {
     @Test
     void aViewSetToFailThatHoldsRowsRefusesTheStartAndKeepsThem(@TempDir Path directory) throws Exception {
         RealConnectorGate.require("mongodb");
-        String storeUri = SharedMongo.replicaSetUrl("fail_at_start_view_store");
-        EndpointAddress views = EndpointAddress.uri(SharedMongo.replicaSetUrl("fail_at_start_view_views"));
 
-        try (ServerHandle server = InProcessServer.start(storeUri);
-                StoreDocuments documents = StoreDocuments.at(storeUri);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage);
                 MongoEndpoints mongo = new MongoEndpoints()) {
-            ControlPlane control = viewOverUnrelatedDocuments(server, mongo, directory, views, "fail");
+            EndpointAddress views = EndpointAddress.uri(storage.masterUri());
+            ControlPlane control = viewOverUnrelatedDocuments(storage, server, mongo, directory, views, "fail");
 
             ControlPlane.StartAnswer answer = control.start(PIPELINE, List.of(), null);
 
             assertRefusedOver(answer, "target-not-empty/views/" + VIEW);
-            assertThat(documents.holds(MongoStorePort.PIPELINE_DESIRED, PIPELINE))
+            assertThat(holdsIntent(storage))
                     .as("the intent of a start that was refused")
                     .isFalse();
             assertThat(mongo.documents(views, VIEW))
@@ -126,12 +125,12 @@ class AFailTargetIsRefusedAtStartIT {
     @Test
     void aViewSetToClearThatHoldsRowsStartsAndHoldsOnlyTheSourcesRows(@TempDir Path directory) throws Exception {
         RealConnectorGate.require("mongodb");
-        String storeUri = SharedMongo.replicaSetUrl("fail_at_start_view_clear_store");
-        EndpointAddress views = EndpointAddress.uri(SharedMongo.replicaSetUrl("fail_at_start_view_clear_views"));
 
-        try (ServerHandle server = InProcessServer.start(storeUri);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage);
                 MongoEndpoints mongo = new MongoEndpoints()) {
-            ControlPlane control = viewOverUnrelatedDocuments(server, mongo, directory, views, "clear");
+            EndpointAddress views = EndpointAddress.uri(storage.masterUri());
+            ControlPlane control = viewOverUnrelatedDocuments(storage, server, mongo, directory, views, "clear");
 
             ControlPlane.StartAnswer answer = control.start(PIPELINE, List.of(), null);
 
@@ -149,7 +148,7 @@ class AFailTargetIsRefusedAtStartIT {
      * three rows whose {@code on_full_load} is {@code policy}.
      */
     private static ControlPlane viewOverUnrelatedDocuments(
-            ServerHandle server, MongoEndpoints mongo, Path directory, EndpointAddress views, String policy)
+            PreparedNativeStore storage, ServerHandle server, MongoEndpoints mongo, Path directory, EndpointAddress views, String policy)
             throws Exception {
         EndpointAddress source = EndpointAddress.uri(Files.createDirectories(directory.resolve("src")).toString());
         new FileEndpoints().seed(source, TABLE, SeedRows.generated(3));
@@ -157,19 +156,12 @@ class AFailTargetIsRefusedAtStartIT {
             mongo.insert(views, VIEW, new Document("_id", id).append("id", id).append("seq", id));
         }
         ControlPlane control = new ControlPlane(server.baseUrl());
-        control.bootstrapAndLogin("e2e", "e2e-password");
+        storage.loginAndAwaitBusiness(control);
         control.registerConnector(E2eConnectorJar.CONNECTOR_ID, Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
         control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
         control.discoverSchema("src_file", E2eConnectorJar.CONNECTOR_ID, source.settings());
         Map<String, String> resources = new LinkedHashMap<>();
         resources.put("src_file.tap.yml", fileYaml("src_file", E2eConnectorJar.CONNECTOR_ID, source, true));
-        resources.put("views.tap.yml", """
-                version: tapstate/v1
-                kind: source
-                id: views
-                connector: mongodb
-                config: { uri: "%s" }
-                """.formatted(views.text("uri")));
         resources.put(PIPELINE + ".tap.yml", """
                 version: tapstate/v1
                 kind: pipeline
@@ -185,6 +177,13 @@ class AFailTargetIsRefusedAtStartIT {
                 """.formatted(PIPELINE, VIEW, TABLE, policy, VIEW));
         control.apply(resources);
         return control;
+    }
+
+    private static boolean holdsIntent(PreparedNativeStore storage) {
+        try (var client = MongoClients.create(storage.configurationUri())) {
+            return SystemCollections.PIPELINE_INTENTS.on(client.getDatabase(storage.configurationDatabase()))
+                    .find(new Document("_id", PIPELINE)).first() != null;
+        }
     }
 
     /** The {@code id} of every document in the view, as text. */

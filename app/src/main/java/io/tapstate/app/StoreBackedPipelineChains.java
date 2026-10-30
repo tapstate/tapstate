@@ -24,31 +24,42 @@ final class StoreBackedPipelineChains implements PipelineChains {
     StoreBackedPipelineChains(StorePort storePort) {
         this.storePort = Objects.requireNonNull(storePort, "storePort");
     }
+    @Override public Runnable readingGuard(String pipelineId) {
+        return storePort instanceof ThreeLayerStorePort nativeStore?nativeStore.readingGuard(pipelineId):() -> {};
+    }
 
     @Override
     public List<Chain> of(String pipelineId) {
-        return resolutions(pipelineId).stream()
+        return resolutions(pipelineId,false).stream()
                 .map(resolution -> new Chain(resolution.chainId().value(), resolution.sourceId(),
                         resolution.tables()))
                 .toList();
     }
 
     @Override
+    public boolean canReadPositions(String pipelineId, Chain chain) {
+        return !(storePort instanceof ThreeLayerStorePort) || resolutions(pipelineId,true).stream()
+                .anyMatch(resolution -> resolution.sourceId().equals(chain.sourceId())
+                        && resolution.chainId().value().equals(chain.chainId()));
+    }
+
+    @Override
     public List<String> progressChainsOf(String pipelineId) {
-        return resolutions(pipelineId).stream()
-                .flatMap(resolution -> resolution.progressChainIds(pipelineId).stream())
+        return resolutions(pipelineId,true).stream()
+                .flatMap(resolution -> storePort instanceof ThreeLayerStorePort
+                        ?java.util.stream.Stream.of(resolution.chainId().value()):resolution.progressChainIds(pipelineId).stream())
                 .distinct()
                 .toList();
     }
 
     /** Each source the pipeline reads, resolved the way its capture resolves it, in declaration order. */
-    private List<SourceCaptureResolution> resolutions(String pipelineId) {
+    private List<SourceCaptureResolution> resolutions(String pipelineId,boolean requireAttachment) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         PipelineResource pipeline = StoredArtifacts.requirePipeline(storePort.artifacts(), pipelineId);
         List<SourceCaptureResolution> resolutions = new ArrayList<>();
         for (String sourceId : pipeline.sourceIds()) {
             SourceResource source = StoredArtifacts.requireSource(storePort.artifacts(), sourceId);
-            SourceCaptureResolution.forPipeline(pipeline, source, SourceDiscovery.model(storePort, source))
+            SourceCaptureResolution.forStoredPipeline(storePort,pipeline, source, SourceDiscovery.model(storePort, source),requireAttachment)
                     .ifPresent(resolutions::add);
         }
         return List.copyOf(resolutions);

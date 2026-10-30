@@ -111,7 +111,7 @@ public final class PipelineLifecycleService {
     }
 
     /**
-     * Stops the pipeline (from RUNNING / PAUSED). {@code purgeState} says whether stopping also clears
+     * Stops the pipeline, or explicitly clears an already stopped pipeline. {@code purgeState} says whether stopping also clears
      * what this pipeline has accumulated — its resume position and its operators' state — and it is a
      * parameter rather than a policy because the two answers are not variations of one act: keeping
      * leaves a pipeline that carries on where it left off, clearing leaves one whose next run reads its
@@ -174,7 +174,10 @@ public final class PipelineLifecycleService {
         Optional<DesiredState> prior = desired.read(pipelineId);
         Optional<CheckpointDoc> checkpoint = actualCheckpoint.apply(pipelineId);
         PipelineState current = currentState(prior, checkpoint);
-        PipelineState target = LifecycleMachine.transition(current, verb);
+        // Clearing retained state is meaningful after a keeping stop. A repeated keeping stop remains
+        // illegal, including while a clearing operation is pending, so it cannot withdraw that decision.
+        PipelineState target = verb == LifecycleVerb.STOP && purgeState && current == PipelineState.STOPPED
+                ? PipelineState.STOPPED : LifecycleMachine.transition(current, verb);
 
         // What the latest artifact would be assembled from, alongside what it hashes to. Both are taken off
         // the same canonical structure, so a field that moves one moves the other and the two cannot drift

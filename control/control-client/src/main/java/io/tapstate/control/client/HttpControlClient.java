@@ -81,7 +81,7 @@ public final class HttpControlClient implements AutoCloseable {
      */
     public ControlResponse delete(URI baseUrl, String token, String path, String expectedContentHash) {
         String ifMatch = expectedContentHash == null ? null : "\"" + expectedContentHash + "\"";
-        return exchange(baseUrl, token, path, "DELETE", null, ifMatch, RequestBudget.LIGHT);
+        return exchange(baseUrl, token, path, "DELETE", null, ifMatch, RequestBudget.HEAVY);
     }
 
     private ControlResponse exchange(

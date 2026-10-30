@@ -9,6 +9,7 @@ import io.tapstate.adapters.transform.MapSpec;
 import io.tapstate.adapters.transform.StatelessTransforms;
 import io.tapstate.adapters.transform.UnwindSpec;
 import io.tapstate.control.core.PipelineWriteTargets;
+import io.tapstate.control.core.PipelineOutputNames;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.dsl.UnwindWriteKeys;
@@ -24,6 +25,7 @@ import io.tapstate.core.model.ServeBlock;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.SyncElement;
+import io.tapstate.core.model.TableRef;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.model.BatchSpec;
@@ -118,6 +120,7 @@ final class StoreBackedDagSource implements DagSource {
 
     private final StorePort storePort;
     private final ArtifactStore artifactStore;
+    private final Function<SourceResource,SourceModel> modelInputs;
     private final SinkWriterBinder sinkWriterBinder;
     private final TargetModelResolver targetModelResolver;
     private final NestSettings nestSettings;
@@ -125,6 +128,7 @@ final class StoreBackedDagSource implements DagSource {
     private final JoinSchemaDrift joinSchemaDrift;
     private final SourceSchemaCopy sourceSchemaCopy;
     private final StepSchemaRecord stepSchemaRecord;
+    private final io.tapstate.spi.store.DerivedSchemaStore modelRecords;
     private final SourcePlacement sourcePlacement;
     private final boolean requireMarkedStore;
     // The members a run built now takes part on, by stable id, read at the moment it is built: the widths of its
@@ -133,6 +137,12 @@ final class StoreBackedDagSource implements DagSource {
     // The one member a source built without a cluster plans over: no cluster names it, so it is named here.
     private static final String LOCAL_MEMBER = "local";
     private final ParallelismBudget parallelismBudget;
+    interface CapturedStartGuard {
+        Map<String,String> inspect(PipelineConvergencePass pass,ReadOnlyArtifactSnapshot artifacts,SourceModelSnapshot models);
+        CapturedStartGuard NONE=(pass,artifacts,models) -> Map.of();
+    }
+    private final CapturedStartGuard capturedStartGuard;
+    private final java.util.function.BiFunction<ExecutionFence,Map<String,Long>,SinkAckFactory> boundedLoads;
 
     StoreBackedDagSource(StorePort storePort) {
         this(storePort, assembledSinkWriterBinder());
@@ -207,21 +217,70 @@ final class StoreBackedDagSource implements DagSource {
 
     @Override
     public StartPreparation prepareStart(String pipelineId, String defaultDatabase) {
-        ReadOnlyArtifactSnapshot snapshot = ReadOnlyArtifactSnapshot.capture(storePort.artifacts());
+        return prepareCapturedStart(ReadOnlyArtifactSnapshot.capture(artifacts()), pipelineId, defaultDatabase, modelRecords);
+    }
+
+    @Override
+    public StartPreparation prepareStart(PipelineConvergencePass pass, String defaultDatabase) {
+        Objects.requireNonNull(pass, "pass");
+        String pipelineId = pass.scope().pipelineId();
+        pass.requirePipeline(pipelineId);
+        ReadOnlyArtifactSnapshot snapshot = ReadOnlyArtifactSnapshot.capture(artifacts());
+        PipelineResource original = StoredArtifacts.requirePipeline(snapshot, pipelineId);
+        if (!io.tapstate.core.model.canonical.CanonicalHash.of(original).equals(pass.intent().desired().revision()))
+            throw new TapstateException(io.tapstate.spi.store.IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
+        StartPreparation prepared = prepareCapturedStart(snapshot, pipelineId, defaultDatabase, pass.derivedSchemas(),pass);
+        pass.requirePipeline(pipelineId);
+        return prepared;
+    }
+
+    private StartPreparation prepareCapturedStart(ReadOnlyArtifactSnapshot snapshot, String pipelineId, String defaultDatabase,
+            io.tapstate.spi.store.DerivedSchemaStore records) {
+        return prepareCapturedStart(snapshot,pipelineId,defaultDatabase,records,null);
+    }
+    private StartPreparation prepareCapturedStart(ReadOnlyArtifactSnapshot snapshot,String pipelineId,String defaultDatabase,
+            io.tapstate.spi.store.DerivedSchemaStore records,PipelineConvergencePass pass) {
+        PipelineResource pipeline = PipelineInlining.inline(StoredArtifacts.requirePipeline(snapshot,pipelineId),snapshot);
+        var sources = pipeline.sourceIds().stream().distinct().map(id -> StoredArtifacts.requireSource(snapshot,id)).toList();
+        SourceModelSnapshot models = SourceModelSnapshot.capture(pipelineId,sources,storePort.schemas());
+        Map<String,String> confirmedHashes=pass==null?Map.of():capturedStartGuard.inspect(pass,snapshot,models);
         StoreBackedDagSource captured = new StoreBackedDagSource(
                 storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement, snapshot,
-                requireMarkedStore, members, parallelismBudget);
+                requireMarkedStore, members, parallelismBudget, records, models::model, boundedLoads);
         captured.validateStart(pipelineId);
-        NestCapacity capacity = captured.capacityOf(pipelineId);
-        Set<OperatorStateLocation> locations = captured.stateLocations(pipelineId, defaultDatabase);
-        PipelineResource pipeline = PipelineInlining.inline(
-                StoredArtifacts.requirePipeline(captured.artifacts(), pipelineId), captured.artifacts());
+        PreparedOperators operators = pass == null ? null : captured.prepareOperators(pipeline,defaultDatabase,pass);
+        NestCapacity capacity = operators == null ? captured.capacityOf(pipelineId) : NestCapacity.none();
+        Set<OperatorStateLocation> locations = operators == null ? captured.stateLocations(pipelineId,defaultDatabase) : Set.of();
         // Freshness belongs to the start before capture registers its ring cursor and snapshot seam.
         // Carry that answer into the deferred build rather than re-reading capture's own mutations.
-        boolean freshFullLoad = captured.freshFullLoad(pipeline);
+        boolean freshFullLoad = pass == null && captured.freshFullLoad(pipeline);
         return new StartPreparation(
                 capacity, locations, Optional.of(snapshot),
-                () -> captured.plannedTopology(pipelineId, freshFullLoad), captured.sinkConnectors(pipelineId));
+                () -> captured.plannedTopology(pipelineId,pipeline,freshFullLoad,operators), captured.sinkConnectors(pipelineId),
+                Optional.of(models),Optional.ofNullable(operators).map(PreparedOperators::coordinates),confirmedHashes);
+    }
+
+    private record PreparedOperators(OperatorCoordinatePlan coordinates,Map<String,NestTable> tables,
+            Map<String,CompiledJoin> joins,PipelineConvergencePass pass,String defaultDatabase) {
+        private PreparedOperators { tables = Map.copyOf(tables); joins = Map.copyOf(joins); }
+        OriginalOperators bind(ExecutionFence fence) {
+            var original = pass.claim(); pass.requirePipeline(pass.scope().pipelineId());
+            if (fence == null || original.executionGeneration() < 1 || !original.equals(pass.claim())
+                    || !new ExecutionFence(pass.scope(),original).equals(fence))
+                throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);
+            return new OriginalOperators(coordinates.bind(fence),original);
+        }
+    }
+    private record OriginalOperators(io.tapstate.runtime.engine.OperatorRunManifest manifest,io.tapstate.spi.store.WorkloadClaimFence claim) {}
+    private PreparedOperators prepareOperators(PipelineResource pipeline,String defaultDatabase,PipelineConvergencePass pass) {
+        var sourceTables = sourceTablesByName(sourceVertices(pipeline));
+        var tables = nestTablesByAlias(pipeline,sourceTables); var joins = compiledJoins(pipeline,sourceTables);
+        var dimensions = new LinkedHashMap<String,Set<String>>();
+        joins.forEach((step,compiled) -> dimensions.put(step,compiled.plan().from().sources().stream()
+                .filter(source -> !source.name().equals(compiled.plan().factSource().name()))
+                .map(io.tapstate.core.sql.JoinTree.Source::name).collect(java.util.stream.Collectors.toUnmodifiableSet())));
+        return new PreparedOperators(OperatorCoordinatePlan.compile(pass.scope(),pipeline,defaultDatabase,tables::get,dimensions,nestSettings),
+                tables,joins,pass,defaultDatabase);
     }
 
     /**
@@ -235,7 +294,7 @@ final class StoreBackedDagSource implements DagSource {
                 StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
         Map<String, String> connectors = new TreeMap<>();
         if (pipeline.view() instanceof ViewBlock.Inline view) {
-            artifacts().get(ViewTargetResolver.resolve(view).sourceId())
+            artifacts().get(ViewTargetResolver.resolve(view, viewStoreId()).sourceId())
                     .filter(SourceResource.class::isInstance)
                     .map(SourceResource.class::cast)
                     .ifPresent(store -> connectors.put(PipelineDagBuilder.viewVertex(view), store.connector()));
@@ -314,15 +373,67 @@ final class StoreBackedDagSource implements DagSource {
             StorePort storePort, SinkWriterBinder sinkWriterBinder, NestSettings nestSettings,
             StoreReachability storeReachability, SourcePlacement sourcePlacement, ArtifactStore artifactStore,
             boolean requireMarkedStore, Supplier<List<String>> members, ParallelismBudget parallelismBudget) {
+        this(storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement, artifactStore,
+                requireMarkedStore, members, parallelismBudget, unscopedModelRecords(storePort));
+    }
+
+    /** Constructing a source for a later scoped pass must not open an unscoped model store. */
+    private static io.tapstate.spi.store.DerivedSchemaStore unscopedModelRecords(StorePort store) {
+        Objects.requireNonNull(store,"store");
+        return new io.tapstate.spi.store.DerivedSchemaStore() {
+            @Override public Optional<io.tapstate.spi.store.DerivedSchema> latest(String pipeline,String step) { return store.derivedSchemas().latest(pipeline,step); }
+            @Override public Map<String,io.tapstate.spi.store.DerivedSchema> latestMany(String pipeline,Set<String> steps) { return store.derivedSchemas().latestMany(pipeline,steps); }
+            @Override public void record(String pipeline,String step,Map<String,String> columns,String statement,String from,String by) {
+                store.derivedSchemas().record(pipeline,step,columns,statement,from,by);
+            }
+            @Override public void pin(String pipeline,String step,long version) { store.derivedSchemas().pin(pipeline,step,version); }
+            @Override public Optional<io.tapstate.spi.store.DerivedSchema> pinned(String pipeline,String step) { return store.derivedSchemas().pinned(pipeline,step); }
+            @Override public void delete(String pipeline) { store.derivedSchemas().delete(pipeline); }
+        };
+    }
+
+    private StoreBackedDagSource(
+            StorePort storePort, SinkWriterBinder sinkWriterBinder, NestSettings nestSettings,
+            StoreReachability storeReachability, SourcePlacement sourcePlacement, ArtifactStore artifactStore,
+            boolean requireMarkedStore, Supplier<List<String>> members, ParallelismBudget parallelismBudget,
+            io.tapstate.spi.store.DerivedSchemaStore modelRecords) {
+        this(storePort,sinkWriterBinder,nestSettings,storeReachability,sourcePlacement,artifactStore,
+                requireMarkedStore,members,parallelismBudget,modelRecords,source -> SourceDiscovery.model(storePort,source));
+    }
+
+    private StoreBackedDagSource(StorePort storePort,SinkWriterBinder sinkWriterBinder,NestSettings nestSettings,
+            StoreReachability storeReachability,SourcePlacement sourcePlacement,ArtifactStore artifactStore,
+            boolean requireMarkedStore,Supplier<List<String>> members,ParallelismBudget parallelismBudget,
+            io.tapstate.spi.store.DerivedSchemaStore modelRecords,Function<SourceResource,SourceModel> modelInputs) {
+        this(storePort,sinkWriterBinder,nestSettings,storeReachability,sourcePlacement,artifactStore,
+                requireMarkedStore,members,parallelismBudget,modelRecords,modelInputs,(fence,epochs) -> SinkAckFactory.NONE);
+    }
+    private StoreBackedDagSource(StorePort storePort,SinkWriterBinder sinkWriterBinder,NestSettings nestSettings,
+            StoreReachability storeReachability,SourcePlacement sourcePlacement,ArtifactStore artifactStore,
+            boolean requireMarkedStore,Supplier<List<String>> members,ParallelismBudget parallelismBudget,
+            io.tapstate.spi.store.DerivedSchemaStore modelRecords,Function<SourceResource,SourceModel> modelInputs,
+            java.util.function.BiFunction<ExecutionFence,Map<String,Long>,SinkAckFactory> boundedLoads) {
+        this(storePort,sinkWriterBinder,nestSettings,storeReachability,sourcePlacement,artifactStore,requireMarkedStore,
+                members,parallelismBudget,modelRecords,modelInputs,boundedLoads,CapturedStartGuard.NONE);
+    }
+    private StoreBackedDagSource(StorePort storePort,SinkWriterBinder sinkWriterBinder,NestSettings nestSettings,
+            StoreReachability storeReachability,SourcePlacement sourcePlacement,ArtifactStore artifactStore,
+            boolean requireMarkedStore,Supplier<List<String>> members,ParallelismBudget parallelismBudget,
+            io.tapstate.spi.store.DerivedSchemaStore modelRecords,Function<SourceResource,SourceModel> modelInputs,
+            java.util.function.BiFunction<ExecutionFence,Map<String,Long>,SinkAckFactory> boundedLoads,CapturedStartGuard capturedStartGuard) {
+        this.capturedStartGuard=Objects.requireNonNull(capturedStartGuard);
+        this.boundedLoads=Objects.requireNonNull(boundedLoads);
+        this.modelInputs = Objects.requireNonNull(modelInputs,"modelInputs");
         this.storePort = Objects.requireNonNull(storePort, "storePort");
         this.artifactStore = Objects.requireNonNull(artifactStore, "artifactStore");
         this.sinkWriterBinder = Objects.requireNonNull(sinkWriterBinder, "sinkWriterBinder");
-        this.targetModelResolver = new TargetModelResolver(this.storePort, this.artifactStore);
+        this.targetModelResolver = new TargetModelResolver(this.storePort, this.artifactStore, this.modelInputs);
         this.nestSettings = Objects.requireNonNull(nestSettings, "nestSettings");
         this.storeReachability = Objects.requireNonNull(storeReachability, "storeReachability");
-        this.joinSchemaDrift = new JoinSchemaDrift(this.storePort.derivedSchemas());
-        this.sourceSchemaCopy = new SourceSchemaCopy(this.storePort.derivedSchemas());
-        this.stepSchemaRecord = new StepSchemaRecord(this.storePort.derivedSchemas());
+        this.modelRecords = Objects.requireNonNull(modelRecords, "modelRecords");
+        this.joinSchemaDrift = new JoinSchemaDrift(this.modelRecords);
+        this.sourceSchemaCopy = new SourceSchemaCopy(this.modelRecords);
+        this.stepSchemaRecord = new StepSchemaRecord(this.modelRecords);
         this.sourcePlacement = Objects.requireNonNull(sourcePlacement, "sourcePlacement");
         this.requireMarkedStore = requireMarkedStore;
         this.members = Objects.requireNonNull(members, "members");
@@ -336,6 +447,34 @@ final class StoreBackedDagSource implements DagSource {
                 ParallelismBudget.DEFAULTS);
     }
 
+    static StoreBackedDagSource scopedRoot(StorePort store, NestSettings nests, StoreReachability reachability,
+            SourcePlacement placement, boolean marked, Supplier<List<String>> members, ParallelismBudget budget,
+            io.tapstate.spi.store.RequiredNoteStore notes, io.tapstate.adapters.pdk.ConnectorProvisioner connectors, ArtifactStore artifacts) {
+        return scopedRoot(store,nests,reachability,placement,marked,members,budget,notes,connectors,artifacts,ignored -> false);
+    }
+    static StoreBackedDagSource scopedRoot(StorePort store,NestSettings nests,StoreReachability reachability,
+            SourcePlacement placement,boolean marked,Supplier<List<String>> members,ParallelismBudget budget,
+            io.tapstate.spi.store.RequiredNoteStore notes,io.tapstate.adapters.pdk.ConnectorProvisioner connectors,ArtifactStore artifacts,
+            java.util.function.Predicate<io.tapstate.spi.store.PipelineIntentScope> recoveryPinned) {
+        return scopedRoot(store,nests,reachability,placement,marked,members,budget,notes,connectors,artifacts,recoveryPinned,
+                (fence,epochs) -> SinkAckFactory.NONE);
+    }
+    static StoreBackedDagSource scopedRoot(StorePort store,NestSettings nests,StoreReachability reachability,
+            SourcePlacement placement,boolean marked,Supplier<List<String>> members,ParallelismBudget budget,
+            io.tapstate.spi.store.RequiredNoteStore notes,io.tapstate.adapters.pdk.ConnectorProvisioner connectors,ArtifactStore artifacts,
+            java.util.function.Predicate<io.tapstate.spi.store.PipelineIntentScope> recoveryPinned,
+            java.util.function.BiFunction<ExecutionFence,Map<String,Long>,SinkAckFactory> boundedLoads) {
+        return scopedRoot(store,nests,reachability,placement,marked,members,budget,notes,connectors,artifacts,recoveryPinned,boundedLoads,CapturedStartGuard.NONE);
+    }
+    static StoreBackedDagSource scopedRoot(StorePort store,NestSettings nests,StoreReachability reachability,
+            SourcePlacement placement,boolean marked,Supplier<List<String>> members,ParallelismBudget budget,
+            io.tapstate.spi.store.RequiredNoteStore notes,io.tapstate.adapters.pdk.ConnectorProvisioner connectors,ArtifactStore artifacts,
+            java.util.function.Predicate<io.tapstate.spi.store.PipelineIntentScope> recoveryPinned,
+            java.util.function.BiFunction<ExecutionFence,Map<String,Long>,SinkAckFactory> boundedLoads,CapturedStartGuard capturedStartGuard) {
+        return new StoreBackedDagSource(store,new PdkSinkWriterBinder(notes,connectors,recoveryPinned),nests,reachability,
+                placement,artifacts,marked,members,budget,unscopedModelRecords(store),source -> SourceDiscovery.model(store,source),boundedLoads,capturedStartGuard);
+    }
+
     /** Resolves the candidate's selected source tables without opening a connector or changing a store. */
     List<PreviewSourceTable> previewSourceTables(PipelineResource pipeline) {
         List<PreviewSourceTable> selected = new ArrayList<>();
@@ -343,7 +482,7 @@ final class StoreBackedDagSource implements DagSource {
         for (Map.Entry<String, SourceVertex> entry : vertices.entrySet()) {
             SourceVertex vertex = entry.getValue();
             SourceResource source = StoredArtifacts.requireSource(artifacts(), vertex.sourceId());
-            SourceModel discovered = SourceDiscovery.model(storePort, source);
+            SourceModel discovered = modelInputs.apply(source);
             SourceTable table = discovered == null ? null : discovered.tables().stream()
                     .filter(candidate -> candidate.name().equals(vertex.table())).findFirst().orElse(null);
             if (table == null) {
@@ -457,7 +596,7 @@ final class StoreBackedDagSource implements DagSource {
                 this::discoveredColumns));
         SyncElement selected = serve.sync().getFirst();
         Map<String, TargetTable> renamed = TargetModelResolver.renameAll(
-                targets, streams, selected.rename(), sourceIdByTable(vertices));
+                targets, streams, selected.rename(), sourceIdByTable(pipeline, vertices));
         Map<String, List<String>> keys = new LinkedHashMap<>();
         for (String stream : streams) {
             TargetTable target = renamed.get(stream);
@@ -555,11 +694,15 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     private Function<ExecutionFence, PlannedDag> plannedTopology(
-            String pipelineId, PipelineResource pipeline, boolean freshFullLoad) {
+            String pipelineId,PipelineResource pipeline,boolean freshFullLoad) {
+        return plannedTopology(pipelineId,pipeline,freshFullLoad,null);
+    }
+    private Function<ExecutionFence,PlannedDag> plannedTopology(
+            String pipelineId,PipelineResource pipeline,boolean freshFullLoad,PreparedOperators operators) {
         // Expanded before anything reads the blocks, so every later step - target resolution included -
         // sees one shape rather than having to know a reference from a body.
         Map<String, SourceVertex> sourceVertices = sourceVertices(pipeline);
-        refuseProgressNoSinkCanAnswerFor(pipelineId, pipeline, sourceVertices);
+        if (operators == null) refuseProgressNoSinkCanAnswerFor(pipelineId, pipeline, sourceVertices);
         // The pipeline takes its own copy of what discovery found for each table it reads, before anything
         // downstream is worked out from it. Reading the discovery directly instead would let a
         // re-discovery change the shape of this run's input while the run is already using it.
@@ -574,7 +717,7 @@ final class StoreBackedDagSource implements DagSource {
         // Compiled once, here, and handed to both the targets below and the join binding. Compiling it
         // twice would mean two answers to the same question with nothing comparing them.
         Map<String, CompiledJoin> compiledJoins =
-                compiledJoins(pipeline, sourceTablesByName(sourceVertices));
+                operators == null ? compiledJoins(pipeline,sourceTablesByName(sourceVertices)) : operators.joins();
         // Held to the columns it was last recorded producing, before anything is built out of them. A
         // join's output columns follow from the SELECT and from what the sources say their columns are,
         // so the same pipeline can start one day producing a differently shaped row than the day before
@@ -626,21 +769,30 @@ final class StoreBackedDagSource implements DagSource {
                         streamOfSourceVertex(sourceVertices),
                         keyColumnsOf(bySourceTable),
                         keyColumnsOf(assembled),
-                        PipelineDagBuilder.nestBlockingVertices(pipeline,
-                                nestTablesByAlias(pipeline, sourceTablesByName(sourceVertices))::get),
+                        operators == null ? PipelineDagBuilder.nestBlockingVertices(pipeline,
+                                nestTablesByAlias(pipeline,sourceTablesByName(sourceVertices))::get) : operators.coordinates().blockingVertices(),
                         sourceExecutions(sourceVertices)),
-                sinksOf(pipeline, targets, serveLanding, viewLanding, sourceIdByTable(sourceVertices)));
-        return fence -> {
+                sinksOf(pipeline, targets, serveLanding, viewLanding, sourceIdByTable(pipeline, sourceVertices)));
+        return new PlannedTopology(planned, fence -> {
+            var original = operators == null ? null : operators.bind(fence);
+            var capturedSources = original == null ? null : operators.pass().captureBindings(original.claim());
+            var runSources = capturedSources == null ? sourceVertices : physicalSources(sourceVertices,capturedSources);
+            var scopedSources = capturedSources == null ? null : scopedSources(runSources,capturedSources);
+            var scopedDirect = capturedSources == null ? null : scopedDirectSources(runSources,capturedSources);
+            var targetPreparations=new ArrayList<io.tapstate.spi.store.SinkPreparationStore.Input>();
             NodeVertices drawn = new NodeVertices();
             DAG dag = PipelineDagBuilder.build(
                     builtPipeline,
-                    bindings(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, targets, viewTargets,
-                            serveLanding, viewLanding, stepIds, frontier, compiledJoins, freshFullLoad, fence),
-                    FencedSinkAckFactory.heldTo(sinkAckFactory(pipeline, pipelineId, fence), fence), frontier,
+                    bindings(pipeline, runSources, sourceKeyByTable, sourceKeysById, targets, viewTargets,
+                            serveLanding,viewLanding,stepIds,frontier,compiledJoins,
+                            capturedSources == null ? freshFullLoad : capturedSources.freshFullLoad(),fence,operators,capturedSources,scopedSources,scopedDirect,targetPreparations),
+                    FencedSinkAckFactory.heldTo(scopedSources == null ? sinkAckFactory(pipeline,pipelineId,fence) :
+                            scopedSources.isEmpty() && scopedDirect.isEmpty() ? boundedLoads.apply(fence,snapshotEpochs(runSources,capturedSources)) : new ScopedSrsSinkAckFactory(scopedSources,scopedDirect,runIdOf(fence)),fence),frontier,
                     shape, drawn);
-            return new PlannedDag(dag, shape, planned, nodeBatches(pipeline, sourceVertices), drawn.byNode(),
+            if(original!=null)operators.pass().prepareSinkTargets(original.claim(),targetPreparations);
+            return new PlannedDag(dag, shape, planned, nodeBatches(pipeline, runSources), drawn.byNode(),
                     drawn.feedingByNode());
-        };
+        });
     }
 
     /**
@@ -816,20 +968,14 @@ final class StoreBackedDagSource implements DagSource {
      */
     private static Set<String> connectorStateNamespaces(PipelineResource pipeline) {
         Set<String> namespaces = new LinkedHashSet<>();
-        pipeline.sources().forEach(source -> namespaces.add(
-                ConnectorStateNamespace.of(new PipelineNode(pipeline.id(), source.id()))));
-        if (pipeline.view() instanceof ViewBlock.Inline view) {
-            PipelineNode node = new PipelineNode(pipeline.id(), view.id());
-            namespaces.add(ConnectorStateNamespace.of(node));
-            namespaces.add(SinkPreparationNamespace.of(node));
-        }
-        if (pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync() != null) {
-            serve.sync().forEach(sync -> {
-                PipelineNode node = new PipelineNode(pipeline.id(), syncNodeId(sync));
-                namespaces.add(ConnectorStateNamespace.of(node));
-                namespaces.add(SinkPreparationNamespace.of(node));
-            });
-        }
+        io.tapstate.core.model.PipelineConnectorNodes.of(pipeline, id -> {
+            throw new IllegalStateException("connector inventory requires an expanded pipeline");
+        }).forEach(identity -> {
+            namespaces.add(ConnectorStateNamespace.of(identity.node(), identity.purpose()));
+            if (identity.purpose() != PipelineNode.Purpose.CAPTURE) {
+                namespaces.add(SinkPreparationNamespace.of(identity.node(), identity.purpose()));
+            }
+        });
         return namespaces;
     }
 
@@ -853,7 +999,7 @@ final class StoreBackedDagSource implements DagSource {
         List<String> copied = new ArrayList<>();
         for (SourceVertex vertex : sourceVertices.values()) {
             SourceResource source = StoredArtifacts.requireSource(artifacts(), vertex.sourceId());
-            SourceModel discovered = SourceDiscovery.model(storePort, source);
+            SourceModel discovered = modelInputs.apply(source);
             if (sourceSchemaCopy.copy(pipelineId, vertex.sourceId(), vertex.table(),
                     discovered == null ? null : discoveredTable(discovered, vertex.table()))) {
                 copied.add(SourceSchemaCopy.nodeId(vertex.sourceId(), vertex.table()));
@@ -877,8 +1023,10 @@ final class StoreBackedDagSource implements DagSource {
                 StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
         List<String> copied = new ArrayList<>();
         for (String sourceId : pipeline.sourceIds()) {
+            if (artifacts().managedDefaultSourceId().filter(sourceId::equals).isPresent())
+                throw new TapstateException(ActuationError.VIEW_STORE_IS_A_CAPTURE_SOURCE, Map.of("store", sourceId), null);
             SourceResource source = StoredArtifacts.requireSource(artifacts(), sourceId);
-            SourceModel discovered = SourceDiscovery.model(storePort, source);
+            SourceModel discovered = modelInputs.apply(source);
             // Applying an undiscovered source records nothing, including when discovery is needed
             // to expand an omitted or regex table selector. A start still requires capture resolution.
             if (discovered == null) {
@@ -899,8 +1047,8 @@ final class StoreBackedDagSource implements DagSource {
      */
     private void pinWhatThisRunHolds(String pipelineId, List<String> stepIds) {
         for (String stepId : stepIds) {
-            storePort.derivedSchemas().latest(pipelineId, stepId).ifPresent(recorded ->
-                    storePort.derivedSchemas().pin(pipelineId, stepId, recorded.version()));
+            modelRecords.latest(pipelineId, stepId).ifPresent(recorded ->
+                    modelRecords.pin(pipelineId, stepId, recorded.version()));
         }
     }
 
@@ -930,11 +1078,31 @@ final class StoreBackedDagSource implements DagSource {
      * The source id behind each physical table and stream identity the pipeline reads, used to resolve
      * source-qualified target names.
      */
-    private static Map<String, String> sourceIdByTable(Map<String, SourceVertex> sourceVertices) {
+    private static Map<String, String> sourceIdByTable(PipelineResource pipeline, Map<String, SourceVertex> sourceVertices) {
+        return sourceIdByTable(pipeline, sourceVertices, null);
+    }
+
+    private static Map<String, String> sourceIdByTable(PipelineResource pipeline,
+            Map<String, SourceVertex> sourceVertices, Set<String> resolvedAssemblies) {
         Map<String, String> byTable = new LinkedHashMap<>();
         for (SourceVertex vertex : sourceVertices.values()) {
             byTable.putIfAbsent(vertex.table(), vertex.sourceId());
             byTable.put(vertex.stream(), vertex.sourceId());
+        }
+        Map<String, List<String>> sources = sourceKeysById(sourceVertices);
+        Map<String, String> keys = new LinkedHashMap<>();
+        sourceVertices.forEach((key, vertex) -> keys.putIfAbsent(vertex.table(), key));
+        Set<String> steps = stepIds(pipeline);
+        for (Step step : pipeline.transforms() == null ? List.<Step>of() : pipeline.transforms()) {
+            if (resolvedAssemblies != null && !resolvedAssemblies.contains(step.id())) continue;
+            FromRef root = assemblyRoot(step);
+            if (root != null) {
+                Set<String> streams = streamsReaching(pipeline, root, keys, sources, sourceVertices, steps);
+                if (streams.size() == 1) {
+                    String owner = byTable.get(streams.iterator().next());
+                    if (owner != null) byTable.put(step.id(), owner);
+                }
+            }
         }
         return byTable;
     }
@@ -949,6 +1117,27 @@ final class StoreBackedDagSource implements DagSource {
         return byName;
     }
 
+    /** A verified binding wins over all author-controlled labels and display identifiers. */
+    private String viewStoreId() {
+        var managed = artifacts().managedDefaultSourceId();
+        if (managed.isPresent()) return managed.orElseThrow();
+        List<SourceResource> markedStores = artifacts().list().stream()
+                .filter(SourceResource.class::isInstance)
+                .map(SourceResource.class::cast)
+                .filter(source -> source.metadata() != null
+                        && "true".equals(source.metadata().labels().get("store")))
+                .toList();
+        if (markedStores.size() > 1) {
+            throw new IllegalStateException("Multiple marked state stores");
+        }
+        if (requireMarkedStore && markedStores.isEmpty()) {
+            throw new TapstateException(ActuationError.VIEW_STORE_NOT_CONFIGURED,
+                    Map.of("store", "atlas-store"), null);
+        }
+        return markedStores.isEmpty()
+                ? ViewTargetResolver.STATE_STORE_SOURCE_ID : markedStores.getFirst().id();
+    }
+
     /**
      * The source id to reach for each table the pipeline's sources read. A reference into a source names the
      * table, while the vertex reading it is keyed by the source id, so this is what carries one to the other.
@@ -960,22 +1149,19 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     private Map<String, SourceVertex> sourceVertices(PipelineResource pipeline, boolean skipUndiscovered) {
+        return sourceVertices(pipeline, skipUndiscovered, null);
+    }
+
+    /** A non-null failure map is used only by name queries; write and start callers remain fail-fast. */
+    private Map<String, SourceVertex> sourceVertices(PipelineResource pipeline, boolean skipUndiscovered,
+            Map<String, List<TapstateException>> failures) {
         Map<String, SourceVertex> vertices = new LinkedHashMap<>();
         for (String sourceId : pipeline.sourceIds()) {
-            SourceResource source = StoredArtifacts.requireSource(artifacts(), sourceId);
-            SourceModel discovered = SourceDiscovery.model(storePort, source);
-            if (skipUndiscovered && discovered == null) {
-                continue;
-            }
-            Optional<SourceCaptureResolution> selected =
-                    SourceCaptureResolution.forPipeline(pipeline, source, discovered);
-            if (selected.isEmpty()) {
-                continue;
-            }
-            SourceCaptureResolution resolution = selected.orElseThrow();
-            for (String table : resolution.tables()) {
-                String key = resolution.tables().size() == 1 ? sourceId : sourceId + "." + table;
-                vertices.put(key, new SourceVertex(pipeline.id(), sourceId, table, resolution, table));
+            try {
+                addSourceVertices(pipeline, sourceId, skipUndiscovered, vertices, failures);
+            } catch (TapstateException unavailable) {
+                if (failures == null) throw unavailable;
+                failures.computeIfAbsent(sourceId, ignored -> new ArrayList<>()).add(unavailable);
             }
         }
         Map<String, Long> counts = vertices.values().stream().collect(java.util.stream.Collectors.groupingBy(
@@ -985,6 +1171,30 @@ final class StoreBackedDagSource implements DagSource {
                         vertex.sourceId() + "." + vertex.table())
                 : vertex);
         return vertices;
+    }
+
+    private void addSourceVertices(PipelineResource pipeline, String sourceId, boolean skipUndiscovered,
+            Map<String, SourceVertex> vertices, Map<String, List<TapstateException>> failures) {
+        if (artifacts().managedDefaultSourceId().filter(sourceId::equals).isPresent())
+            throw new TapstateException(ActuationError.VIEW_STORE_IS_A_CAPTURE_SOURCE, Map.of("store", sourceId), null);
+        SourceResource source = StoredArtifacts.requireSource(artifacts(), sourceId);
+        SourceModel discovered = modelInputs.apply(source);
+        if (skipUndiscovered && discovered == null) return;
+        Optional<SourceCaptureResolution> selected;
+        if (failures == null) {
+            selected = SourceCaptureResolution.forPipeline(pipeline, source, discovered);
+        } else {
+            SourceTableSelection.Names names = SourceTableSelection.forOutputNames(source, discovered);
+            if (!names.unresolved().isEmpty()) failures.put(sourceId, new ArrayList<>(names.unresolved()));
+            selected = SourceCaptureResolution.forSelectedTables(pipeline, source,
+                    PipelineTableSelection.forOutputNames(pipeline, source, names.tables()));
+        }
+        if (selected.isEmpty()) return;
+        SourceCaptureResolution resolution = selected.orElseThrow();
+        for (String table : resolution.tables()) {
+            String key = resolution.tables().size() == 1 ? sourceId : sourceId + "." + table;
+            vertices.put(key, new SourceVertex(pipeline.id(), sourceId, table, resolution, table));
+        }
     }
 
     private Map<String, String> sourceKeyByTable(Map<String, SourceVertex> sourceVertices) {
@@ -1294,16 +1504,22 @@ final class StoreBackedDagSource implements DagSource {
         Map<String, List<String>> keysBySource = sourceKeysById(vertices);
         Set<String> steps = stepIds(pipeline);
         boolean incomplete = keysBySource.size() < pipeline.sourceIds().size();
+        Map<String,io.tapstate.spi.store.DerivedSchema> sourceModels = vertices.isEmpty() ? Map.of() : modelRecords.latestMany(pipelineId,vertices.values().stream()
+                .map(vertex -> SourceSchemaCopy.nodeId(vertex.sourceId(),vertex.table())).collect(java.util.stream.Collectors.toSet()));
+        Function<SourceVertex,NodeColumns> copied = vertex -> {
+            var recorded = sourceModels.get(SourceSchemaCopy.nodeId(vertex.sourceId(),vertex.table()));
+            return recorded == null ? null : NodeColumns.known(recorded.schema());
+        };
         Map<String, CompiledJoin> compiled = new LinkedHashMap<>();
         for (Step step : pipeline.transforms() == null ? List.<Step>of() : pipeline.transforms()) {
             if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Join join
                     && inputsOf(refsOf(inline.from()), vertices, keysByTable, keysBySource, steps,
-                            Map.of(), vertex -> copiedColumns(pipelineId, vertex), incomplete) != null) {
+                            Map.of(), copied, incomplete) != null) {
                 compiled.put(step.id(), compileJoin(inline, join, sourceTablesByName(vertices), steps));
             }
         }
         recordStepSchemas(pipelineId, deriveSteps(pipeline, vertices, keysByTable, keysBySource,
-                steps, compiled, vertex -> copiedColumns(pipelineId, vertex), incomplete));
+                steps, compiled, copied, incomplete));
     }
 
     /**
@@ -1349,7 +1565,7 @@ final class StoreBackedDagSource implements DagSource {
      */
     private NodeColumns discoveredColumns(SourceVertex vertex) {
         SourceResource source = StoredArtifacts.requireSource(artifacts(), vertex.sourceId());
-        SourceModel discovered = SourceDiscovery.model(storePort, source);
+        SourceModel discovered = modelInputs.apply(source);
         SourceTable table = discovered == null ? null : discoveredTable(discovered, vertex.table());
         return table == null ? null : NodeColumns.known(SourceSchemaCopy.columnsOf(table));
     }
@@ -1430,7 +1646,7 @@ final class StoreBackedDagSource implements DagSource {
 
     /** This pipeline's own copy of one source table's model, as a node's columns. */
     private NodeColumns copiedColumns(String pipelineId, SourceVertex vertex) {
-        return storePort.derivedSchemas()
+        return modelRecords
                 .latest(pipelineId, SourceSchemaCopy.nodeId(vertex.sourceId(), vertex.table()))
                 .map(recorded -> NodeColumns.known(recorded.schema()))
                 .orElse(null);
@@ -1686,7 +1902,7 @@ final class StoreBackedDagSource implements DagSource {
         return new TargetField(output, null, primaryKey);
     }
 
-    private Map<String, List<String>> sourceKeysById(Map<String, SourceVertex> sourceVertices) {
+    private static Map<String, List<String>> sourceKeysById(Map<String, SourceVertex> sourceVertices) {
         Map<String, List<String>> keys = new LinkedHashMap<>();
         for (Map.Entry<String, SourceVertex> entry : sourceVertices.entrySet()) {
             keys.computeIfAbsent(entry.getValue().sourceId(), ignored -> new java.util.ArrayList<>())
@@ -1759,41 +1975,58 @@ final class StoreBackedDagSource implements DagSource {
             FrontierBinding frontier,
             Map<String, CompiledJoin> compiledJoins,
             boolean freshFullLoad,
-            ExecutionFence fence) {
+            ExecutionFence fence,PreparedOperators operators,PipelineCaptureBindings captureBindings,
+            Map<String,ScopedSrsSinkAckFactory.Source> scopedSources,
+            Map<String,ScopedDirectSinkAckFactory.Source> scopedDirect,
+            List<io.tapstate.spi.store.SinkPreparationStore.Input> targetPreparations) {
+        var originalOperators = operators == null ? null : operators.bind(fence);
+        var manifest = originalOperators == null ? null : originalOperators.manifest();
+        Runnable targetGuard=originalOperators==null?() -> {}:operators.pass().guardOriginal(originalOperators.claim());
         ChainAxes axes = frontier.axes();
         boolean snapshotOnly = readModeOf(pipeline) == ReadMode.SNAPSHOT_ONLY;
-        long snapshotEpoch = snapshotOnly
-                ? SnapshotRunOrder.current(storePort.keyedState(), pipeline.id())
-                : 0L;
+        long snapshotEpoch = snapshotOnly && captureBindings == null
+                ? SnapshotRunOrder.current(storePort.keyedState(), pipeline.id()) : 0L;
         Map<String, Long> sourceEpochs = new LinkedHashMap<>();
-        sourceVertices.values().forEach(vertex -> sourceEpochs.put(vertex.stream(), snapshotOnly ? snapshotEpoch
-                : sourceContextEpoch(vertex.resolution().chainId().value(), vertex.consumerId(), vertex.table())));
+        sourceVertices.values().forEach(vertex -> {
+            String chain = vertex.resolution().chainId().value();
+            long epoch;
+            if (captureBindings == null) {
+                epoch = snapshotOnly ? snapshotEpoch : sourceContextEpoch(chain, vertex.consumerId(), vertex.table());
+            } else if (snapshotOnly) {
+                epoch = captureBindings.requireSnapshot(vertex.sourceId(), chain, vertex.table()).epoch();
+            } else if (captureBindings.direct().containsKey(vertex.sourceId())) {
+                epoch = captureBindings.requireDirect(vertex.sourceId(), chain, vertex.table()).loadEpoch();
+            } else {
+                epoch = captureBindings.require(vertex.sourceId(), chain, vertex.table()).snapshotEpoch();
+            }
+            sourceEpochs.put(vertex.stream(), epoch);
+        });
         Map<String, Long> snapshotEpochs = new LinkedHashMap<>();
         if (readModeOf(pipeline) != ReadMode.CDC_ONLY) {
-            sourceEpochs.forEach((chain, epoch) -> {
-                if (epoch > 0) {
-                    snapshotEpochs.put(chain, epoch);
-                }
-            });
+            sourceEpochs.forEach((chain, epoch) -> { if (epoch > 0) snapshotEpochs.put(chain, epoch); });
         }
         Map<String, Step.Inline> stepsById = inlineStepsById(pipeline);
-        Map<String, String> sourceIdByTable = sourceIdByTable(sourceVertices);
+        Map<String, String> sourceIdByTable = sourceIdByTable(pipeline, sourceVertices);
         StartFrom freshStart = freshRingStart(pipeline);
         Map<String, StoreBackedSinkAckFactory.SourceProgress> progress = progressByTable(pipeline);
         return new DagBindings(
                 key -> sourceVertex(sourceVertices.get(key), axes, snapshotOnly, snapshotEpoch, freshStart,
-                        progress.get(sourceVertices.get(key).stream()).kind() == ConsumerProgressKind.DIRECT_SOURCE,
-                        sourceEpochs.get(sourceVertices.get(key).stream())),
+                        progress.get(sourceVertices.get(key).stream()).kind() == ConsumerProgressKind.DIRECT_SOURCE,captureBindings, sourceEpochs.get(sourceVertices.get(key).stream())),
                 step -> transformBinding(step, stepsById, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds),
                 element -> FencedSinkWriterFactory.heldTo(
-                        sinkWriter(pipeline, element, targets, serveStreams, sourceIdByTable, freshFullLoad), fence),
+                        sinkWriter(pipeline, element, targets, serveStreams, sourceIdByTable, freshFullLoad,fence,targetPreparations,targetGuard), fence),
                 ref -> upstreams(ref, sourceKeyByTable, sourceKeysById, sourceVertices, stepIds),
                 sourceKeysById::get,
                 view -> FencedSinkWriterFactory.heldTo(
-                        viewSink(pipeline, view, viewTargets, viewStreams, sourceStreamsById(sourceVertices),
-                                freshFullLoad), fence),
-                nestBinding(pipeline, sourceTablesByName(sourceVertices)).withSnapshotEpochs(snapshotEpochs),
-                joinBinding(compiledJoins));
+                        viewSink(pipeline, view, viewTargets, viewStreams, sourceStreamsById(sourceVertices),freshFullLoad,fence,targetPreparations,targetGuard), fence),
+                (operators == null ? nestBinding(pipeline,sourceTablesByName(sourceVertices)) :
+                        new NestBinding(operators.tables()::get,NestBinding.onMap(manifest),
+                                new LoggingNestDeadLetter(new io.tapstate.runtime.engine.nest.RequiredNestDeadLetter(manifest)),
+                                new ScopedSrsReplayFloorFactory(scopedSources,scopedDirect),
+                                new ScopedNestStateLedger(operators.pass(),operators.defaultDatabase(),operators.coordinates().nestDatabases(),originalOperators.claim()),
+                                nestSettings,NestClock.SYSTEM)
+                                .withCompiledSteps(pipeline.id(),operators.coordinates().compiledNests())).withSnapshotEpochs(snapshotEpochs),
+                joinBinding(compiledJoins,manifest == null ? JoinStoresBinding.onTheCluster() : JoinStoresBinding.onTheCluster(manifest)));
     }
 
     SupplierEx<? extends TransformPort> transformBinding(PipelineResource pipeline, Step step) {
@@ -1824,8 +2057,7 @@ final class StoreBackedDagSource implements DagSource {
             for (String key : upstreams(ref, keysByTable, keysBySource, vertices, stepIds)) {
                 SourceVertex vertex = vertices.get(key);
                 if (vertex != null) {
-                    List<String> primaryKey = storePort.schemas().get(vertex.sourceId())
-                            .map(DiscoveredSourceModel::model)
+                    List<String> primaryKey = Optional.ofNullable(modelInputs.apply(StoredArtifacts.requireSource(artifacts(),vertex.sourceId())))
                             .map(model -> discoveredTable(model, vertex.table()))
                             .map(SourceTable::primaryKey).orElse(List.of());
                     byStream.put(vertex.stream(), primaryKey);
@@ -2032,7 +2264,8 @@ final class StoreBackedDagSource implements DagSource {
      */
     private SupplierEx<? extends SinkWriter> viewSink(
             PipelineResource pipeline, ViewBlock view, Map<String, TargetTable> targets,
-            Set<String> viewStreams, Map<String, List<String>> tablesBySourceId, boolean freshFullLoad) {
+            Set<String> viewStreams, Map<String, List<String>> tablesBySourceId,boolean freshFullLoad,ExecutionFence fence,
+            List<io.tapstate.spi.store.SinkPreparationStore.Input> targetPreparations,Runnable targetGuard) {
         if (!(view instanceof ViewBlock.Inline inline)) {
             throw new IllegalArgumentException(
                     "view block is a use-reference; resolve it to an inline view first");
@@ -2051,9 +2284,7 @@ final class StoreBackedDagSource implements DagSource {
                 .map(SourceResource.class::cast)
                 .orElseThrow(() -> new TapstateException(ActuationError.VIEW_STORE_NOT_CONFIGURED,
                         Map.of("store", target.sourceId()), null));
-        // Resolved by id alone, so a source the author happened to give that id would satisfy the lookup
-        // - and be written into. Capture settings are what tells an authored source from the store; a
-        // plain connection under the id is indistinguishable today, which is a narrower, recorded gap.
+        // Managed deployments resolve the validated binding above; capture-shaped targets remain invalid.
         if (store.mode() != null || store.tables() != null) {
             throw new TapstateException(ActuationError.VIEW_STORE_IS_A_CAPTURE_SOURCE,
                     Map.of("store", target.sourceId()), null);
@@ -2074,34 +2305,16 @@ final class StoreBackedDagSource implements DagSource {
             bySourceTable.put(sourceTable,
                     viewTargetTable(target, targets == null ? null : targets.get(sourceTable)));
         }
-        SupplierEx<? extends SinkWriter> writer = sinkWriterBinder.bind(
+        SupplierEx<? extends SinkWriter> writer = sinkWriterBinder.bindView(
                 store.connector(), store.config(), writeMode(inline.writeMode()), DdlPolicy.FAIL, bySourceTable,
                 new PipelineNode(pipeline.id(), inline.id()), onFullLoad(inline.onFullLoad()), freshFullLoad);
+        writer=sinkWriterBinder.scoped(writer,fence,targetPreparations,targetGuard);
         String viewId = inline.id();
         String viewKey = inline.primaryKey();
         // A unique current value says nothing about what the capture stream puts in an earlier image.
         // Guard only an accepted alternate identity: the discovered primary identity is the capture
         // contract already used throughout the pipeline, while an alternate has no such guarantee.
         return alternateKey ? ViewSinkWriters.requiringAlternateKeyInBeforeImage(writer, viewId, viewKey) : writer;
-    }
-
-    /** The managed view store selected by both a start check and the sink it predicts. */
-    private String viewStoreId() {
-        List<SourceResource> markedStores = artifacts().list().stream()
-                .filter(SourceResource.class::isInstance)
-                .map(SourceResource.class::cast)
-                .filter(source -> source.metadata() != null
-                        && "true".equals(source.metadata().labels().get("store")))
-                .toList();
-        if (markedStores.size() > 1) {
-            throw new IllegalStateException("Multiple marked state stores");
-        }
-        if (requireMarkedStore && markedStores.isEmpty()) {
-            throw new TapstateException(ActuationError.VIEW_STORE_NOT_CONFIGURED,
-                    Map.of("store", "atlas-store"), null);
-        }
-        return markedStores.isEmpty()
-                ? ViewTargetResolver.STATE_STORE_SOURCE_ID : markedStores.getFirst().id();
     }
 
     /**
@@ -2657,12 +2870,15 @@ final class StoreBackedDagSource implements DagSource {
      *
      * <p>A pipeline with no join step compiles nothing and asks nothing of the schema store.
      */
-    private JoinBinding joinBinding(Map<String, CompiledJoin> byStep) {
+    private JoinBinding joinBinding(Map<String,CompiledJoin> byStep) {
+        return joinBinding(byStep,JoinStoresBinding.onTheCluster());
+    }
+    private JoinBinding joinBinding(Map<String,CompiledJoin> byStep,JoinStoresBinding stores) {
         return new JoinBinding(
                 step -> compiledJoin(byStep, step).plan(),
                 step -> compiledJoin(byStep, step).factKeyColumns(),
                 step -> compiledJoin(byStep, step).dimensionRowKeyColumns(),
-                JoinStoresBinding.onTheCluster(),
+                stores,
                 new LoggingDimensionRowDisplacedAlert());
     }
 
@@ -2844,8 +3060,7 @@ final class StoreBackedDagSource implements DagSource {
         if (sourceTable == null) {
             return List.of();
         }
-        return storePort.schemas().get(sourceTable.sourceId())
-                .map(DiscoveredSourceModel::model)
+        return Optional.ofNullable(modelInputs.apply(StoredArtifacts.requireSource(artifacts(),sourceTable.sourceId())))
                 .flatMap(model -> model.tables().stream()
                         .filter(t -> t.name().equals(sourceTable.table())).findFirst())
                 .map(t -> t.fields().stream()
@@ -2960,8 +3175,7 @@ final class StoreBackedDagSource implements DagSource {
         }
         String resolvedTable = table;
         String physicalTable = sourceTable.table();
-        return storePort.schemas().get(sourceTable.sourceId())
-                .map(DiscoveredSourceModel::model)
+        return Optional.ofNullable(modelInputs.apply(StoredArtifacts.requireSource(artifacts(),sourceTable.sourceId())))
                 .flatMap(model -> model.tables().stream().filter(t -> t.name().equals(physicalTable)).findFirst())
                 .map(discovered -> new NestTable(
                         resolvedTable,
@@ -2995,7 +3209,7 @@ final class StoreBackedDagSource implements DagSource {
      */
     private ProcessorMetaSupplier sourceVertex(
             SourceVertex vertex, ChainAxes axes, boolean snapshotOnly, long snapshotEpoch, StartFrom freshStart,
-            boolean direct, long sourceEpoch) {
+            boolean direct,PipelineCaptureBindings captureBindings, long sourceEpoch) {
         if (vertex == null) {
             throw new IllegalStateException("source vertex binding is missing");
         }
@@ -3004,6 +3218,24 @@ final class StoreBackedDagSource implements DagSource {
         // here rather than reached for from the source.
         String chain = vertex.stream();
         byte axis = axes.axisOf(chain);
+        if (captureBindings != null) {
+            if (snapshotOnly) {
+                var source=captureBindings.requireSnapshot(vertex.sourceId(),vertex.resolution().chainId().value(),vertex.table());
+                return SrsSourceProcessor.snapshotOnlyMetaSupplier(captureBindings.bufferKey(vertex.sourceId()),vertex.resolution().ringName(vertex.table()),vertex.stream(),source.epoch(),
+                        order -> new Watermark(FrontierOrders.pack(chain,order),axis),sourcePlacement);
+            }
+            if (!captureBindings.snapshots().isEmpty()) throw new TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null);
+            if (direct) {
+                var source = captureBindings.requireDirect(vertex.sourceId(),vertex.resolution().chainId().value(),vertex.table());
+                return SrsSourceProcessor.directMetaSupplier(captureBindings.bufferKey(vertex.sourceId()),vertex.resolution().ringName(vertex.table()),vertex.stream(),source.loadEpoch(),
+                        order -> new Watermark(FrontierOrders.pack(chain,order),axis),sourcePlacement);
+            }
+            var source = captureBindings.require(vertex.sourceId(),vertex.resolution().chainId().value(),vertex.table());
+            return SrsSourceProcessor.metaSupplier(captureBindings.bufferKey(vertex.sourceId()),vertex.resolution().ringName(vertex.table()),vertex.stream(),freshStart,
+                    source.recoveryAfter().get(vertex.table()),source.snapshotEpoch(),new ScopedSrsReadCursorPublisherFactory(source.run(),vertex.table()),
+                    order -> new Watermark(FrontierOrders.pack(chain,order),axis),sourcePlacement,
+                    readBatchOf(StoredArtifacts.requireSource(artifacts(),vertex.sourceId())));
+        }
         if (snapshotOnly) {
             return SrsSourceProcessor.snapshotOnlyMetaSupplier(
                     vertex.pipelineId(), vertex.resolution().ringName(vertex.table()), vertex.stream(), snapshotEpoch,
@@ -3030,6 +3262,56 @@ final class StoreBackedDagSource implements DagSource {
                         vertex.resolution().chainId().value(), vertex.consumerId(), vertex.table()),
                 order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement,
                 readBatchOf(StoredArtifacts.requireSource(artifacts(), vertex.sourceId())));
+    }
+
+    private static Map<String,Long> snapshotEpochs(Map<String,SourceVertex> vertices,PipelineCaptureBindings bindings) {
+        var epochs=new TreeMap<String,Long>();
+        for(var vertex:vertices.values()) {
+            var source=bindings.requireSnapshot(vertex.sourceId(),vertex.resolution().chainId().value(),vertex.table());
+            if(epochs.put(vertex.stream(),source.epoch())!=null)throw new TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null);
+        }
+        return Map.copyOf(epochs);
+    }
+
+    private static Map<String,SourceVertex> physicalSources(Map<String,SourceVertex> vertices,PipelineCaptureBindings bindings) {
+        var result=new LinkedHashMap<String,SourceVertex>();
+        vertices.forEach((key,vertex) -> {
+            var source=bindings.logged().get(vertex.sourceId());
+            if(source==null)result.put(key,vertex);
+            else {
+                var resolution=vertex.resolution().onPhysicalChain(source.canonicalChainId(),source.run().miningChainId());
+                bindings.require(vertex.sourceId(),resolution.chainId().value(),vertex.table());
+                result.put(key,new SourceVertex(vertex.pipelineId(),vertex.sourceId(),vertex.table(),resolution,vertex.stream()));
+            }
+        });
+        return java.util.Collections.unmodifiableMap(result);
+    }
+
+    private static Map<String,ScopedSrsSinkAckFactory.Source> scopedSources(Map<String,SourceVertex> vertices,PipelineCaptureBindings bindings) {
+        var sources = new LinkedHashMap<String,ScopedSrsSinkAckFactory.Source>(); var selected = new HashSet<String>();
+        for (var vertex : vertices.values()) {
+            if (bindings.direct().containsKey(vertex.sourceId()) || bindings.snapshots().containsKey(vertex.sourceId())) continue;
+            var source = bindings.require(vertex.sourceId(),vertex.resolution().chainId().value(),vertex.table()); selected.add(vertex.sourceId());
+            sources.put(vertex.stream(),new ScopedSrsSinkAckFactory.Source(source.run(),vertex.table()));
+        }
+        if (!selected.equals(bindings.logged().keySet())) throw new TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null);
+        return Map.copyOf(sources);
+    }
+
+    private static Map<String,ScopedDirectSinkAckFactory.Source> scopedDirectSources(Map<String,SourceVertex> vertices,PipelineCaptureBindings bindings) {
+        var sources = new LinkedHashMap<String,ScopedDirectSinkAckFactory.Source>(); var selected = new HashSet<String>();
+        for (var vertex : vertices.values()) {
+            if (!bindings.direct().containsKey(vertex.sourceId())) continue;
+            var run = bindings.requireDirect(vertex.sourceId(),vertex.resolution().chainId().value(),vertex.table()); selected.add(vertex.sourceId());
+            sources.put(vertex.stream(),new ScopedDirectSinkAckFactory.Source(run,vertex.table()));
+        }
+        if (!selected.equals(bindings.direct().keySet())) throw new TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null);
+        var bounded=new HashSet<String>();
+        for (var vertex:vertices.values()) if (bindings.snapshots().containsKey(vertex.sourceId())) {
+            bindings.requireSnapshot(vertex.sourceId(),vertex.resolution().chainId().value(),vertex.table()); bounded.add(vertex.sourceId());
+        }
+        if (!bounded.equals(bindings.snapshots().keySet())) throw new TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null);
+        return Map.copyOf(sources);
     }
 
     /**
@@ -3154,13 +3436,15 @@ final class StoreBackedDagSource implements DagSource {
      */
     private SupplierEx<? extends SinkWriter> sinkWriter(
             PipelineResource pipeline, SyncElement element, Map<String, TargetTable> targets,
-            Set<String> serveStreams, Map<String, String> sourceIdByTable, boolean freshFullLoad) {
+            Set<String> serveStreams, Map<String, String> sourceIdByTable, boolean freshFullLoad,ExecutionFence fence,
+            List<io.tapstate.spi.store.SinkPreparationStore.Input> targetPreparations,Runnable targetGuard) {
         SourceResource sink = StoredArtifacts.requireSource(artifacts(), element.source());
-        return sinkWriterBinder.bind(
+        var writer=sinkWriterBinder.bind(
                 sink.connector(), sink.config(), writeMode(element.writeMode()), ddl(element.ddl()),
                 TargetModelResolver.renameAll(targets, serveStreams, element.rename(), sourceIdByTable),
                 new PipelineNode(pipeline.id(), syncNodeId(element)),
                 onFullLoad(element.onFullLoad()), freshFullLoad);
+        return sinkWriterBinder.scoped(writer,fence,targetPreparations,targetGuard);
     }
 
     /** A declared full-load policy as the sink takes it, keeping the rows already there when none is declared. */
@@ -3228,6 +3512,286 @@ final class StoreBackedDagSource implements DagSource {
         return writeTargets(definition, (coordinate, stream, model) -> { });
     }
 
+    /** Names declared outputs using the same source selection, stream walk and rename as the sinks. */
+    List<PipelineOutputNames.Output> outputNames(PipelineResource definition) {
+        return outputNameResult(definition).outputs();
+    }
+
+    PipelineOutputNames.Result outputNameResult(PipelineResource definition) {
+        PipelineResource pipeline;
+        try {
+            pipeline = PipelineInlining.inline(definition, artifacts());
+        } catch (TapstateException unavailable) {
+            return new PipelineOutputNames.Result(List.of(), List.of(outputProblem(definition, unavailable)));
+        }
+        List<PipelineOutputNames.Output> outputs = new ArrayList<>();
+        List<PipelineOutputNames.Unresolved> unresolved = new ArrayList<>();
+        try {
+            if (pipeline.view() instanceof ViewBlock.Inline view) {
+                ViewTargetResolver.ViewTarget target = ViewTargetResolver.resolve(view, viewStoreId());
+                outputs.add(new PipelineOutputNames.Output(view.id(), "view", target.sourceId(),
+                        target.collection(), view.id()));
+            }
+        } catch (TapstateException unavailable) {
+            unresolved.add(outputProblem(pipeline, unavailable));
+        }
+        try {
+            outputs.addAll(syncOutputNames(pipeline, unresolved));
+        } catch (TapstateException unavailable) {
+            unresolved.add(outputProblem(pipeline, unavailable));
+        }
+        return new PipelineOutputNames.Result(outputs, unresolved);
+    }
+
+    private List<PipelineOutputNames.Output> syncOutputNames(PipelineResource pipeline,
+            List<PipelineOutputNames.Unresolved> unresolved) {
+        if (!(pipeline.serve() instanceof ServeBlock.Inline serve) || serve.sync() == null || serve.sync().isEmpty()) {
+            return List.of();
+        }
+        PartialOutputStreams partial = new PartialOutputStreams(pipeline, unresolved);
+        Map<String, SourceVertex> vertices = partial.vertices;
+        Set<String> streams = new LinkedHashSet<>();
+        for (FromRef ref : refsOf(serve.from())) partial.collect(ref, streams, new HashSet<>());
+        Map<String, TargetTable> names = outputModelsWithoutColumns(pipeline, vertices, streams);
+        Map<String, String> owners = sourceIdByTable(pipeline, vertices, partial.assemblies);
+        String kind = pipeline.transforms() == null || pipeline.transforms().isEmpty() ? "replica" : "view";
+        List<PipelineOutputNames.Output> outputs = new ArrayList<>();
+        for (SyncElement sync : serve.sync()) {
+            Set<String> seen = new HashSet<>();
+            for (var entry : TargetModelResolver.renameAll(names, streams, sync.rename(), owners).entrySet()) {
+                if (seen.add(entry.getValue().name())) {
+                    String identity = outputIdentity(sync, entry.getKey(), names, owners, vertices);
+                    outputs.add(new PipelineOutputNames.Output(syncNodeId(sync), kind, sync.source(),
+                            entry.getValue().name(), syncNodeId(sync) + ":" + identity));
+                }
+            }
+        }
+        return outputs;
+    }
+
+    /** Isolates unavailable input branches without treating the remaining source universe as complete. */
+    private final class PartialOutputStreams {
+        private final PipelineResource pipeline;
+        private final List<PipelineOutputNames.Unresolved> unresolved;
+        private final Map<String, List<TapstateException>> failures = new LinkedHashMap<>();
+        private final Map<String, Optional<SourceResource>> failedDefinitions = new LinkedHashMap<>();
+        private final Map<String, SourceVertex> vertices;
+        private final Map<String, String> keys;
+        private final Map<String, List<String>> sources;
+        private final Set<String> steps;
+        private final Set<String> assemblies = new HashSet<>();
+        private final Map<String, List<String>> resolvedSteps = new LinkedHashMap<>();
+
+        private PartialOutputStreams(PipelineResource pipeline, List<PipelineOutputNames.Unresolved> unresolved) {
+            this.pipeline = pipeline;
+            this.unresolved = unresolved;
+            vertices = sourceVertices(pipeline, false, failures);
+            keys = sourceKeyByTable(vertices);
+            sources = sourceKeysById(vertices);
+            pipeline.sourceIds().forEach(id -> sources.putIfAbsent(id, List.of()));
+            steps = stepIds(pipeline);
+        }
+
+        private void collect(FromRef ref, Set<String> streams, Set<String> visiting) {
+            try {
+                collectAvailable(ref, streams, visiting);
+            } catch (TapstateException unavailable) {
+                // An empty match against an incomplete universe is not evidence that the selector is empty.
+                if (unavailable.code() != ActuationError.FROM_REGEX_EMPTY || failures.isEmpty()) record(unavailable);
+            }
+        }
+
+        private void collectAvailable(FromRef ref, Set<String> streams, Set<String> visiting) {
+            ViewBlock.Inline view = inlineViewNamed(pipeline, ref);
+            if (view != null) {
+                collect(view.from(), streams, visiting);
+                return;
+            }
+            requireAvailableReference(ref);
+            for (String key : upstreams(ref, keys, sources, vertices, steps)) {
+                SourceVertex source = vertices.get(key);
+                if (source != null) {
+                    streams.add(source.stream());
+                } else {
+                    collectStep(key, streams, visiting);
+                }
+            }
+        }
+
+        private void collectStep(String key, Set<String> streams, Set<String> visiting) {
+            List<String> cached = resolvedSteps.get(key);
+            if (cached != null) {
+                streams.addAll(cached);
+                return;
+            }
+            Step step = stepOf(pipeline, key);
+            if (step == null || !visiting.add(key)) return;
+            Set<String> produced = new LinkedHashSet<>();
+            try {
+                collectStepOutputs(step, produced, visiting);
+                resolvedSteps.put(key, List.copyOf(produced));
+                streams.addAll(produced);
+            } finally {
+                visiting.remove(key);
+            }
+        }
+
+        private void collectStepOutputs(Step step, Set<String> streams, Set<String> visiting) {
+            FromRef root = assemblyRoot(step);
+            if (root != null) {
+                Set<String> roots = new LinkedHashSet<>();
+                collect(root, roots, visiting);
+                if (roots.size() != 1) return;
+                requireStableAssemblyName(step, roots);
+                assemblies.add(step.id());
+                streams.add(step.id());
+            } else {
+                for (FromRef upstream : refsOf(step.from())) collect(upstream, streams, visiting);
+            }
+        }
+
+        private void requireStableAssemblyName(Step step, Set<String> roots) {
+            if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Join) {
+                // Discovery may qualify a join's fact name when another source selects that table.
+                for (SourceVertex vertex : vertices.values()) {
+                    if (roots.contains(vertex.stream())) requireUnambiguousUnavailableSources(vertex.table());
+                }
+            }
+        }
+
+        private void requireAvailableReference(FromRef ref) {
+            if (ref instanceof FromRef.Regex) {
+                failures.values().forEach(errors -> errors.forEach(this::record));
+                return;
+            }
+            String token = ((FromRef.Literal) ref).ref();
+            for (var entry : failures.entrySet()) {
+                if (token.equals(entry.getKey())) {
+                    entry.getValue().forEach(this::record);
+                    return;
+                }
+                String prefix = entry.getKey() + ".";
+                if (token.startsWith(prefix)) {
+                    if (hasKnownTable(entry.getKey(), token.substring(prefix.length()))) return;
+                    entry.getValue().forEach(this::record);
+                    throw entry.getValue().getFirst();
+                }
+            }
+            if (steps.contains(token) || pipeline.sourceIds().contains(token)) return;
+            int dot = token.indexOf('.');
+            if (dot > 0 && pipeline.sourceIds().contains(token.substring(0, dot))) return;
+            requireUnambiguousUnavailableSources(token);
+        }
+
+        private void requireUnambiguousUnavailableSources(String table) {
+            for (var entry : failures.entrySet()) {
+                if (!hasKnownTable(entry.getKey(), table) && maySelect(entry.getKey(), table)) {
+                    entry.getValue().forEach(this::record);
+                    throw entry.getValue().getFirst();
+                }
+            }
+        }
+
+        private boolean hasKnownTable(String sourceId, String table) {
+            return vertices.values().stream().anyMatch(vertex ->
+                    vertex.sourceId().equals(sourceId) && vertex.table().equals(table));
+        }
+
+        private boolean maySelect(String sourceId, String table) {
+            if (!PipelineTableSelection.references(pipeline, sourceId, table)) return false;
+            SourceResource source = failedDefinitions.computeIfAbsent(sourceId, id -> artifacts().get(id)
+                    .filter(SourceResource.class::isInstance).map(SourceResource.class::cast)).orElse(null);
+            if (source == null || source.tables() == null) return true;
+            for (TableRef selector : source.tables()) {
+                if (selectorMayMatch(selector, table)) return true;
+            }
+            return false;
+        }
+
+        private boolean selectorMayMatch(TableRef selector, String table) {
+            return switch (selector) {
+                case TableRef.Literal literal -> literal.name().equals(table);
+                case TableRef.Spec spec -> spec.name().equals(table);
+                case TableRef.Regex regex -> regexMayMatch(regex.pattern(), table);
+            };
+        }
+
+        private boolean regexMayMatch(String pattern, String table) {
+            try {
+                return Pattern.compile(pattern).matcher(table).matches();
+            } catch (PatternSyntaxException invalid) {
+                return true;
+            }
+        }
+
+        private void record(TapstateException error) {
+            var problem = outputProblem(pipeline, error);
+            if (!unresolved.contains(problem)) unresolved.add(problem);
+        }
+    }
+
+    private Map<String, TargetTable> outputModelsWithoutColumns(PipelineResource pipeline,
+            Map<String, SourceVertex> vertices, Set<String> streams) {
+        Map<String, TargetTable> names = new LinkedHashMap<>();
+        vertices.values().forEach(vertex -> names.put(vertex.stream(), new TargetTable(vertex.table(), List.of())));
+        Map<String, SourceVertex> tables = sourceTablesByName(vertices);
+        Map<String, NestTable> roots = nestTablesByAlias(pipeline, tables);
+        for (String stream : streams) {
+            Step step = stepOf(pipeline, stream);
+            String table = null;
+            if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Nest nest) {
+                NestTable root = roots.get(nest.root().from());
+                if (root != null) table = root.name();
+            } else if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Join) {
+                // A join's compiled fact name retains qualification when physical source names repeat.
+                // Preserve that existing write address instead of silently relocating its collection.
+                table = nestTable(assemblyRoot(step), tables).name();
+                names.put(stream, new TargetTable(table, List.of()));
+                continue;
+            }
+            if (table != null) {
+                names.put(stream, names.getOrDefault(table, new TargetTable(table, List.of())));
+            }
+        }
+        return names;
+    }
+
+    /** The source reference that determines an assembly's physical output name and source ownership. */
+    private static FromRef assemblyRoot(Step step) {
+        if (!(step instanceof Step.Inline inline) || !(step.from() instanceof FromClause.Aliases aliases)) {
+            return null;
+        }
+        if (inline.body() instanceof TransformBody.Nest nest) {
+            return aliases.aliases().get(nest.root().from());
+        }
+        if (inline.body() instanceof TransformBody.Join join) {
+            try {
+                String fact = io.tapstate.core.sql.SqlFrontEnd.factSource(join.sql()).name();
+                return aliases.aliases().getOrDefault(fact, FromRef.literal(fact));
+            } catch (io.tapstate.core.sql.SqlFrontEndException invalid) {
+                throw new TapstateException(ActuationError.JOIN_SQL_INVALID,
+                        Map.of("step", step.id(), "detail", diagnosis(invalid)), invalid);
+            }
+        }
+        return null;
+    }
+
+    private static String outputIdentity(SyncElement sync, String stream, Map<String, TargetTable> names,
+            Map<String, String> owners, Map<String, SourceVertex> vertices) {
+        String original = names.get(stream).name();
+        String identity = vertices.values().stream().anyMatch(v -> v.stream().equals(stream)) ? stream : original;
+        String qualified = owners.get(stream) == null ? null : owners.get(stream) + "." + original;
+        if (sync.rename() != null && sync.rename().map() != null && qualified != null
+                && !sync.rename().map().containsKey(original) && sync.rename().map().containsKey(qualified)) {
+            return qualified;
+        }
+        return identity;
+    }
+
+    private static PipelineOutputNames.Unresolved outputProblem(PipelineResource pipeline, TapstateException error) {
+        return new PipelineOutputNames.Unresolved(pipeline.id(), error.code().code(), error.args());
+    }
+
     @FunctionalInterface
     interface TargetModelConsumer {
         void accept(PipelineWriteTargets.WriteTarget coordinate, String stream, TargetTable model);
@@ -3254,7 +3818,7 @@ final class StoreBackedDagSource implements DagSource {
     private void collectSyncWriteTargets(PipelineResource definition, PipelineResource pipeline,
             ServeBlock.Inline serve, TargetModelConsumer models, List<PipelineWriteTargets.WriteTarget> written) {
         Map<String, SourceVertex> vertices = sourceVertices(pipeline);
-        Map<String, String> sourceIdByTable = sourceIdByTable(vertices);
+        Map<String, String> sourceIdByTable = sourceIdByTable(pipeline, vertices);
         Map<String, TargetTable> bySourceTable = sourceTargets(vertices);
         Map<String, TargetTable> assembled = assembledTargets(
                 pipeline, bySourceTable, vertices, compiledJoins(pipeline, sourceTablesByName(vertices)));
@@ -3290,7 +3854,7 @@ final class StoreBackedDagSource implements DagSource {
      * the fallback.
      */
     private static String syncNodeId(SyncElement element) {
-        return element.id() != null && !element.id().isBlank() ? element.id() : element.source();
+        return io.tapstate.core.model.PipelineConnectorNodes.syncNodeId(element);
     }
 
     /**
@@ -3411,6 +3975,12 @@ final class StoreBackedDagSource implements DagSource {
      */
     @FunctionalInterface
     interface SinkWriterBinder {
+        default SupplierEx<? extends SinkWriter> scoped(SupplierEx<? extends SinkWriter> factory,ExecutionFence original,
+                List<io.tapstate.spi.store.SinkPreparationStore.Input> roster,Runnable requireActive) {
+            if(original!=null && original.scope()!=null && factory instanceof PdkSinkWriterFactory)
+                throw new TapstateException(io.tapstate.spi.store.IoError.NOTE_SCOPE_UNAVAILABLE,Map.of(),null);
+            return factory;
+        }
 
         SupplierEx<? extends SinkWriter> bind(
                 String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
@@ -3422,6 +3992,18 @@ final class StoreBackedDagSource implements DagSource {
             return bind(connectorId, settings, writeMode, ddl,
                     targets.size() == 1 ? targets.values().iterator().next() : null, node);
         }
+        default SupplierEx<? extends SinkWriter> bindView(
+                String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
+                Map<String, TargetTable> targets, PipelineNode node) {
+            return bind(connectorId, settings, writeMode, ddl, targets, node);
+        }
+
+        default SupplierEx<? extends SinkWriter> bindView(
+                String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
+                Map<String, TargetTable> targets, PipelineNode node, OnFullLoad onFullLoad, boolean fullLoad) {
+            return bind(connectorId, settings, writeMode, ddl, targets, node, onFullLoad, fullLoad);
+        }
+
         default SupplierEx<? extends SinkWriter> bind(
                 String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
                 Map<String, TargetTable> targets, PipelineNode node, OnFullLoad onFullLoad, boolean fullLoad) {
@@ -3430,6 +4012,36 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     static final class PdkSinkWriterBinder implements SinkWriterBinder {
+        private final io.tapstate.spi.store.RequiredNoteStore notes;
+        private final io.tapstate.adapters.pdk.ConnectorProvisioner provisioner;
+        private final java.util.function.Predicate<io.tapstate.spi.store.PipelineIntentScope> recoveryPinned;
+        PdkSinkWriterBinder(){this.notes=null;this.provisioner=null;this.recoveryPinned=ignored -> false;}
+        PdkSinkWriterBinder(io.tapstate.spi.store.RequiredNoteStore notes,io.tapstate.adapters.pdk.ConnectorProvisioner provisioner){this(notes,provisioner,ignored -> false);}
+        PdkSinkWriterBinder(io.tapstate.spi.store.RequiredNoteStore notes,io.tapstate.adapters.pdk.ConnectorProvisioner provisioner,java.util.function.Predicate<io.tapstate.spi.store.PipelineIntentScope> recoveryPinned){this.notes=Objects.requireNonNull(notes,"notes");this.provisioner=Objects.requireNonNull(provisioner,"provisioner");this.recoveryPinned=Objects.requireNonNull(recoveryPinned);}
+        @Override public SupplierEx<? extends SinkWriter> scoped(SupplierEx<? extends SinkWriter> factory,ExecutionFence original,
+                List<io.tapstate.spi.store.SinkPreparationStore.Input> roster,Runnable requireActive) {
+            if(original==null || original.scope()==null)return factory;
+            if(!(factory instanceof PdkSinkWriterFactory sink))throw new IllegalStateException("the configured binder requires a concrete target factory");
+            if(notes==null || provisioner==null)throw new TapstateException(io.tapstate.spi.store.IoError.NOTE_SCOPE_UNAVAILABLE,Map.of(),null);
+            var run=ConfiguredSinkRun.prepare(original,sink.config(),sink.purpose(),notes,provisioner,requireActive,recoveryPinned.test(original.scope()));
+            var bound=sink.forRun(run,run.assessTargets(sink.config(),sink.targets(),notes,provisioner,requireActive));
+            requireActive.run();roster.addAll(bound.preparationInputs(original.scope()));return bound;
+        }
+
+        @Override
+        public SupplierEx<? extends SinkWriter> bindView(
+                String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
+                Map<String, TargetTable> targets, PipelineNode node) {
+            return bindView(connectorId, settings, writeMode, ddl, targets, node, OnFullLoad.APPEND, true);
+        }
+
+        @Override
+        public SupplierEx<? extends SinkWriter> bindView(
+                String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
+                Map<String, TargetTable> targets, PipelineNode node, OnFullLoad onFullLoad, boolean fullLoad) {
+            return new PdkSinkWriterFactory(connectorId, settings, writeMode, ddl, targets, node,
+                    onFullLoad, fullLoad, PipelineNode.Purpose.VIEW);
+        }
 
         @Override
         public SupplierEx<? extends SinkWriter> bind(

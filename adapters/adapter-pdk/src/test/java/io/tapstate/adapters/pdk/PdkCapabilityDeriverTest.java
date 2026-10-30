@@ -19,6 +19,13 @@ import org.junit.jupiter.api.io.TempDir;
  * the PDK runtime.
  */
 class PdkCapabilityDeriverTest {
+    @Test void exactArtifactDerivationRefusesAnotherHashWithoutOpeningAConnection(@TempDir Path dir) {
+        var ref=new ConnectorRef(List.of(Synthetic.initHostileSource(dir)),"synthetic.InitHostile","2.0.8",null,null,"a".repeat(64),false);
+        var derived=new PdkCapabilityDeriver(id -> ref);
+        assertThat(derived.derive("demo","a".repeat(64)).capabilityIds()).containsExactly("batch_read_function");
+        assertThatThrownBy(() -> derived.derive("demo","b".repeat(64))).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(ConnectorError.LOAD_FAILED));
+    }
 
     /** A deriver over a provisioner that hands back one fixed connector ref, whatever id is asked for. */
     private static CapabilityDeriver deriver(Path jar, String className) {

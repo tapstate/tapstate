@@ -21,7 +21,8 @@ setup:
     src_store: { kind: mongo }
     store: { kind: mongo }
   connectors: [mongodb]
-  apply: [src_store.tap.yml, views.tap.yml, pipeline.tap.yml]
+  managed_target: views.tap.yml
+  apply: [src_store.tap.yml, pipeline.tap.yml]
   discover: [src_store]
 pipeline: pipeline.tap.yml
 seed:

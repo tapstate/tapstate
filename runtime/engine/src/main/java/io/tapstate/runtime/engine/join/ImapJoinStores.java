@@ -4,6 +4,9 @@ import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.core.ReadOnly;
 import com.hazelcast.map.EntryProcessor;
 import io.tapstate.runtime.engine.ProtectedMap;
+import io.tapstate.runtime.engine.OperatorRunManifest;
+import io.tapstate.runtime.engine.OperatorStepMaps;
+import io.tapstate.spi.store.OperatorPlacement;
 
 import java.io.Serializable;
 import java.util.ArrayList;
@@ -58,12 +61,18 @@ public final class ImapJoinStores implements JoinStores {
     private final String pipelineId;
     private final String stepId;
     private final int pageSize;
+    private final OperatorStepMaps names;
 
     public ImapJoinStores(HazelcastInstance member, String pipelineId, String stepId) {
         this(member, pipelineId, stepId, ReverseIndex.DEFAULT_PAGE_SIZE);
     }
 
-    public ImapJoinStores(HazelcastInstance member, String pipelineId, String stepId, int pageSize) {
+    public ImapJoinStores(HazelcastInstance member, String pipelineId, String stepId, int pageSize) { this(member,pipelineId,stepId,pageSize,null); }
+    public ImapJoinStores(HazelcastInstance member,String pipelineId,String stepId,OperatorRunManifest original) {
+        this(member,pipelineId,stepId,ReverseIndex.DEFAULT_PAGE_SIZE,Objects.requireNonNull(original,"original"));
+    }
+    private ImapJoinStores(HazelcastInstance member,String pipelineId,String stepId,int pageSize,OperatorRunManifest original) {
+        this.names = original == null ? null : original.forStep(pipelineId,stepId);
         this.member = Objects.requireNonNull(member, "member");
         this.pipelineId = Objects.requireNonNull(pipelineId, "pipelineId");
         this.stepId = Objects.requireNonNull(stepId, "stepId");
@@ -268,19 +277,23 @@ public final class ImapJoinStores implements JoinStores {
     // a member joining takes parts of this state over before its protection verdict has caught up.
 
     private ProtectedMap<String, Map<String, Object>> facts() {
-        return ProtectedMap.of(member.getMap(JoinMaps.factMirror(pipelineId, stepId)));
+        return ProtectedMap.of(member.getMap(name(OperatorPlacement.Resource.JOIN_FACTS,null,JoinMaps.factMirror(pipelineId,stepId))));
     }
 
     private ProtectedMap<String, Map<String, Object>> dimension(String source) {
-        return ProtectedMap.of(member.getMap(JoinMaps.dimensionMirror(pipelineId, stepId, source)));
+        return ProtectedMap.of(member.getMap(name(OperatorPlacement.Resource.JOIN_DIMENSIONS,source,JoinMaps.dimensionMirror(pipelineId,stepId,source))));
     }
 
     private ProtectedMap<ReverseBucket.At, ReverseBucket> index(String source) {
-        return ProtectedMap.of(member.getMap(JoinMaps.reverseIndex(pipelineId, stepId, source)));
+        return ProtectedMap.of(member.getMap(name(OperatorPlacement.Resource.JOIN_INDEXES,source,JoinMaps.reverseIndex(pipelineId,stepId,source))));
     }
 
     private ProtectedMap<String, Long> writers() {
-        return ProtectedMap.of(member.getMap(JoinMaps.writers(pipelineId, stepId)));
+        return ProtectedMap.of(member.getMap(name(OperatorPlacement.Resource.JOIN_WRITERS,null,JoinMaps.writers(pipelineId,stepId))));
+    }
+
+    private String name(OperatorPlacement.Resource kind,String alias,String legacy) {
+        return names == null ? legacy : names.join(kind,alias).mapName();
     }
 
     /** Appends one fact key to a page, or says the page is full. Runs where the entry lives. */

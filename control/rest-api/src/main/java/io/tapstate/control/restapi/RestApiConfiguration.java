@@ -16,8 +16,8 @@ import java.time.Duration;
 
 /**
  * The HTTP presentation configuration: the single Spring context's Web MVC face over the control
- * core. It is imported into the one service context (there is no second application context and no
- * second port); the control verbs are projected onto HTTP here.
+ * core. The control verbs are projected here in the one service context. The assembly may supply a
+ * dedicated installation connector with its own channel and capability checks.
  *
  * <p>Every {@code @RestController} handler is mounted under the single {@code /api} prefix, so the
  * verb surface lives at one route root. A plain {@code @Controller} (not annotated

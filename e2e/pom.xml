@@ -35,6 +35,19 @@
   </dependencyManagement>
 
   <dependencies>
+    <!-- Native fixture preparation uses the same split-store ports as the assembly root. -->
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>adapter-mongo-store</artifactId>
+      <version>${revision}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>spi-store</artifactId>
+      <version>${revision}</version>
+      <scope>test</scope>
+    </dependency>
     <!-- Shared test scaffolding: the Docker gate these suites are held to. A test-jar in test
          scope - nothing from it reaches the shipped artifact. -->
     <dependency>

@@ -79,7 +79,7 @@ class RuntimeConvergenceConfiguration {
         return observationPublisher(storePort, engine, captureCoordinator, ExecutionPlans.NONE);
     }
 
-    private ObservationPublisher observationPublisher(StorePort storePort, Engine engine,
+    ObservationPublisher observationPublisher(StorePort storePort, Engine engine,
             PipelineCaptureCoordinator captureCoordinator, ExecutionPlans executionPlans) {
         // The publisher's four run-statistic sources: recordCount and the per-chain frontier readings ride
         // from the engine's live Jet job, the per-table sink-acked positions from the store, and the
@@ -158,9 +158,13 @@ class RuntimeConvergenceConfiguration {
     ConvergenceDriver convergenceDriver(
             PipelineConverger pipelineConverger, StorePort storePort, ObservationPublisher observationPublisher,
             RateSampler rateSampler, MetricsExport metricsExport,
-            ClusterMembershipGate membershipGate, PipelineActuationOwnership pipelineActuationOwnership) {
+            ClusterMembershipGate membershipGate, PipelineActuationOwnership pipelineActuationOwnership,
+            ClusterProperties cluster, NodeSessionLease nodeSession) {
         return new ConvergenceDriver(
                 pipelineConverger, storePort.desired(), observationPublisher, rateSampler, metricsExport,
-                membershipGate::businessEligible, pipelineActuationOwnership);
+                // A stopped single member must still report its held engine failure while the original
+                // node proof is live. New claims and execution generations retain the business gate.
+                cluster.getProfile() == ClusterProperties.Profile.SINGLE
+                        ? nodeSession::active : membershipGate::businessEligible, pipelineActuationOwnership);
     }
 }

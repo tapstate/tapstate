@@ -603,7 +603,8 @@ public final class CaptureRunUnit {
             if (subscribed && through >= 0 && through != Long.MAX_VALUE) {
                 long already = log.bounds(ring).trimmedThrough();
                 if (through > already) {
-                    log.trim(ring, through);
+                    if (spec.captureFence() == null) log.trim(ring, through);
+                    else log.trim(ring, through, spec.captureFence());
                 }
             }
         }
@@ -730,7 +731,10 @@ public final class CaptureRunUnit {
                 // one ring is comparable with a sequence of another exactly when both were opened by the
                 // same provisioning.
                 CdcChain chain = new CdcChain(gate, meta, cid, epoch, spec.schemaVer(), spec.captureFence());
-                LongConsumer trim = cuttable ? seq -> log.trim(ringName, seq) : seq -> { };
+                LongConsumer trim = cuttable ? seq -> {
+                    if (spec.captureFence() == null) log.trim(ringName, seq);
+                    else log.trim(ringName, seq, spec.captureFence());
+                } : seq -> { };
                 routes.put(table, new CdcPhase.TableRoute(chain, consumers, trim));
             }
             CaptureStart minerStart = tailStart(meta, cid, spec.consumerId(), ownSeam, CaptureStart.present());

@@ -1,9 +1,8 @@
 package io.tapstate.e2e;
 
-import com.mongodb.client.MongoClient;
-import com.mongodb.client.MongoClients;
-import io.tapstate.adapters.mongostore.MongoStorePort;
 import io.tapstate.testsupport.DockerGate;
+import io.tapstate.spi.store.SrsConsumerId;
+import io.tapstate.core.lifecycle.PipelineState;
 import org.bson.Document;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
@@ -85,12 +84,14 @@ class SnapshotCompletionIsRecordedIT {
     void aDrainedSnapshotMarksItsOwnTableCompleteInTheChainRecord() {
         Path workspace = Examples.ROOT.resolve(EXAMPLE);
         Envelope envelope = EnvelopeParser.parse(Examples.read(workspace.resolve("spec.e2e.yml")));
-        String storeUri = SharedMongo.replicaSetUrl("e2e_snapshot_completion");
+        String pipeline = new FilePipelineLoader(workspace).resolvePipelineId(envelope.pipeline());
 
-        try (ServerHandle server = InProcessServer.start(storeUri);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage);
+                NativeSrsDocuments documents = new NativeSrsDocuments(storage);
                 Endpoints files = new FileEndpoints()) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             HttpTierBinding binding = new HttpTierBinding(
                     control, workspace, Map.of(E2eConnectorJar.CONNECTOR_ID, files), env());
 
@@ -100,11 +101,29 @@ class SnapshotCompletionIsRecordedIT {
             // rows land at the target strictly before the mark does. See awaitMarkedTables.
             new E2eExecutor(binding, new FilePipelineLoader(workspace), TIMEOUT, POLL).execute(envelope);
 
-            assertThat(awaitMarkedTables(storeUri))
+            assertThat(awaitMarkedTables(documents, pipeline))
                     .as("the table the drained snapshot marks complete, read out of the chain record by a "
                             + "reader that is not the product; the product resolved this name from the "
                             + "applied source, and the example is what declares it is %s", TABLE)
                     .contains(TABLE);
+            assertThat(documents.miningChainIds()).hasSize(1);
+            String chain = documents.miningChainIds().iterator().next();
+            String consumer = SrsConsumerId.of(pipeline, "src_file").value();
+            // This connector replays the three seeded rows once into zero-based CDC slots 0..2.
+            // Drain that known overlap so old queued rows cannot witness the later row's capture.
+            Await.until("all three initial tail rows to be captured and consumed", TIMEOUT,
+                    () -> documents.largestSequence(chain, TABLE) == 2
+                            && documents.consumerReadSeq(chain, consumer, TABLE) == 2,
+                    () -> "largest=" + documents.largestSequence(chain, TABLE)
+                            + " cursor=" + documents.consumerReadSeq(chain, consumer, TABLE));
+            assertThat(control.state(pipeline)).contains(PipelineState.RUNNING);
+            files.cdc(EndpointAddress.uri(sourceDirectory.toString()), TABLE, CdcOp.INSERT, 1);
+            Await.until("the completed snapshot's live tail to consume a later filtered change", TIMEOUT,
+                    () -> documents.largestSequence(chain, TABLE) == 3
+                            && documents.consumerReadSeq(chain, consumer, TABLE) == 3,
+                    () -> String.valueOf(documents.consumerOffset(chain, consumer)));
+            assertThat(control.state(pipeline)).contains(PipelineState.RUNNING);
+            assertThat(files.count(EndpointAddress.uri(targetDirectory.toString()), TABLE)).isEqualTo(3);
         }
     }
 
@@ -121,12 +140,12 @@ class SnapshotCompletionIsRecordedIT {
      * has not happened yet. Measured: the same commit passed one CI run and failed the other on this
      * assertion, reading an empty list.
      */
-    private static List<String> awaitMarkedTables(String storeUri) {
+    private static List<String> awaitMarkedTables(NativeSrsDocuments documents, String pipeline) {
         List<String> marked = new ArrayList<>();
         Await.until("a snapshot-completion mark in the chain record",
                 () -> {
                     marked.clear();
-                    marked.addAll(completedTables(storeUri));
+                    marked.addAll(completedTables(documents, pipeline));
                     return !marked.isEmpty();
                 },
                 marked::toString);
@@ -138,21 +157,14 @@ class SnapshotCompletionIsRecordedIT {
      * rather than through the store port -- the port is the thing under test, and asking it whether it
      * wrote would take its own word for it.
      */
-    private static List<String> completedTables(String storeUri) {
-        try (MongoClient client = MongoClients.create(storeUri)) {
-            String database = new com.mongodb.ConnectionString(storeUri).getDatabase();
-            List<String> tables = new ArrayList<>();
-            for (Document consumer : client.getDatabase(database)
-                    .getCollection(MongoStorePort.SRS_CONSUMER_OFFSETS).find()) {
-                // Completion is recorded in the cursor of the pipeline that confirmed it. This gathers
-                // every cursor's marks, which is what "was it recorded at all" asks; which pipeline
-                // marked it is asserted where two of them exist.
-                if (consumer.get(COMPLETED) instanceof List<?> entries) {
-                    entries.forEach(entry -> tables.add(String.valueOf(entry)));
-                }
-            }
-            return tables;
+    private static List<String> completedTables(NativeSrsDocuments documents, String pipeline) {
+        List<String> tables = new ArrayList<>();
+        for (String chain : documents.miningChainIds()) {
+            Document consumer = documents.consumerOffset(chain, SrsConsumerId.of(pipeline, "src_file").value());
+            if (consumer != null && consumer.get("progress", Document.class).get(COMPLETED) instanceof List<?> entries)
+                entries.forEach(entry -> tables.add(String.valueOf(entry)));
         }
+        return tables;
     }
 
     /**
