@@ -2270,6 +2270,52 @@ class ManagedMongoStoreIsolationIT {
         }
     }
 
+    @Test void nativeOutputNamesUseConfiguredTargetsWithoutCreatingRuntimeState() {
+        try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
+            var databases = prepareNativeDatabases(admin, "names_" + UUID.randomUUID().toString().substring(0, 8));
+            try (var application = nativeRoot(uri(databases.configUser(), databases.config()))) {
+                var root = application.getBean(StorageRoot.class);
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(15)).until(root.runtime()::businessStarted);
+                var business = (NativeBusinessContext) root.runtime().business().orElseThrow();
+                var child = (ConfigurableApplicationContext) org.springframework.test.util.ReflectionTestUtils.getField(business, "context");
+                var parser = new io.tapstate.core.dsl.DslParser();
+                var source = new SourceResource("input", null, "mongodb", Map.of("uri", uri(databases.masterUser(), databases.master())),
+                        SourceMode.CDC, List.of(TableRef.literal("orders"), new TableRef.Regex("customer.*")), null, null);
+                var pipeline = (PipelineResource) parser.parse("""
+                        version: tapstate/v1
+                        kind: pipeline
+                        id: named_outputs
+                        source: input
+                        transforms:
+                          - id: expanded
+                            type: unwind
+                            from: input.orders
+                            path: items
+                            element_key: sku
+                        serve:
+                          from: [expanded, input]
+                          sync: [{id: sink, source: views, rename: {prefix: out_}}]
+                        """);
+                root.runtime().requireConfiguration().artifacts().saveAll(List.of(source, pipeline));
+                var output = child.getBean(io.tapstate.control.core.PipelineOutputNames.class).resolve(pipeline);
+                assertThat(output.outputs()).singleElement().satisfies(value -> {
+                    assertThat(value.connection()).isEqualTo("views");
+                    assertThat(value.table()).isEqualTo("out_orders");
+                });
+                assertThat(output.unresolved()).singleElement().satisfies(problem ->
+                        assertThat(problem.code()).isEqualTo("actuation.source-schema-not-discovered"));
+                var catalog = child.getBean(io.tapstate.control.core.ViewCatalogService.class).catalog();
+                assertThat(catalog.items()).singleElement().satisfies(item -> {
+                    assertThat(item.location().database()).isEqualTo(databases.master());
+                    assertThat(item.location().collection()).isEqualTo("out_orders");
+                });
+                assertThat(admin.getDatabase(databases.cache()).getCollection("pipeline_observation").countDocuments()).isZero();
+                assertThat(admin.getDatabase(databases.cache()).getCollection("pipeline_state").countDocuments()).isZero();
+                assertThat(admin.getDatabase(databases.config()).listCollectionNames()).doesNotContain("pipeline_observation");
+            }
+        }
+    }
+
     @Test void anUnstartedPipelineRetiresThroughTheNativeApplicationWithoutInventingRuntimeHistory() {
         try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
             var databases = prepareNativeDatabases(admin, "delete_" + UUID.randomUUID().toString().substring(0, 8));
