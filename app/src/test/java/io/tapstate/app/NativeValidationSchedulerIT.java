@@ -50,7 +50,7 @@ class NativeValidationSchedulerIT {
                         await(()->fact(facts,a,task,1).isPresent()&&fact(facts,b,task,1).isPresent());
                         time.now.set(Instant.parse("2026-10-29T00:01:01Z"));
                         try{await(()->f.configuration.validationReports(()->{}).history("flow",task.taskId(),ValidationMode.FULL,new ValidationReports.Paging(0,10)).items().stream().anyMatch(row->row.terminal()==ValidationRunState.COMPLETED));}
-                        catch(org.awaitility.core.ConditionTimeoutException failed){throw new AssertionError("scheduled original: a="+fact(facts,a,task,1)+"; b="+fact(facts,b,task,1)+"; mode="+f.tasks.read("flow",task.taskId()).orElseThrow().full()+"; resources="+f.resources.snapshot()+"; reports="+f.configuration.validationReports(()->{}).history("flow",task.taskId(),ValidationMode.FULL,new ValidationReports.Paging(0,10)),failed);}
+                        catch(org.awaitility.core.ConditionTimeoutException failed){throw new AssertionError("scheduled original: a="+fact(facts,a,task,1)+"; b="+fact(facts,b,task,1)+"; originalA="+observed(facts,a,task,1)+"; originalB="+observed(facts,b,task,1)+"; mode="+f.tasks.read("flow",task.taskId()).orElseThrow().full()+"; resources="+f.resources.snapshot()+"; reports="+f.configuration.validationReports(()->{}).history("flow",task.taskId(),ValidationMode.FULL,new ValidationReports.Paging(0,10)),failed);}
                         assertThat(f.tasks.read("flow",task.taskId()).orElseThrow().full().nextStartSequence()).isEqualTo(2);
                         assertThat(f.configuration.validationReports(()->{}).history("flow",task.taskId(),ValidationMode.FULL,new ValidationReports.Paging(0,10)).total()).isEqualTo(1);
                         assertThat(f.member.getJet().getJobs()).hasSize(1);
@@ -111,6 +111,13 @@ class NativeValidationSchedulerIT {
             var settings=new ValidationTaskStore.Settings(new ValidationTaskStore.Full(ValidationMethod.COUNT,1,schedule,true,10),new ValidationTaskStore.Incremental(0,10));
             assertThat(f.tasks.create(new ValidationTaskStore.Create(task,comparison,settings,UUID.randomUUID()))).isEqualTo(ValidationTaskStore.Write.APPLIED);return task;
         }
+    }
+    private static String observed(MemoryValidationSchedules facts,NativeValidationStartCoordinator coordinator,ValidationReportAdmission.Task task,long revision){
+        var fact=fact(facts,coordinator,task,revision).orElse(null);
+        if(fact==null||fact.command()==null||fact.sequence()<1)return "no-original";
+        var operation=new ValidationOperation(coordinator.context(),task.pipelineId(),task.taskId(),task.generation(),revision,fact.sequence(),fact.command());
+        try(var response=coordinator.read(operation)){return response.value().toString();}
+        catch(RuntimeException refused){return refused.toString();}
     }
     private static Optional<ValidationScheduleObservations.Fact> fact(MemoryValidationSchedules facts,NativeValidationStartCoordinator coordinator,ValidationReportAdmission.Task task,long revision){
         var origin=coordinator.context();return facts.view(new ValidationScheduleObservations.Origin(origin.node(),origin.boot(),origin.member(),origin.incarnation())).read(task,revision);

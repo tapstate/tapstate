@@ -107,7 +107,8 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
         if(verb==Verb.START&&!checked.eligible())return checked.refusal();
         var target=member.getCluster().getMembers().stream().filter(value->matches(original.context(),value)).findFirst().orElse(null);
         if(target==null)return status(original,verb==Verb.START?Outcome.REJECTED:Outcome.UNKNOWN,null);
-        if(target.localMember())return accept(original,verb,checked.fence(),latest);
+        if(target.localMember())return verb==Verb.START&&latest!=null
+                ? scheduled(original,checked.fence(),latest,scope):accept(original,verb,checked.fence(),latest);
         try{
             var result=member.getExecutorService(ValidationOwnerRouter.EXECUTOR)
                     .submitToMember(new EntryCall(original,verb,checked.fence(),latest),target).get(2,TimeUnit.SECONDS);
@@ -118,6 +119,9 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
         catch(ExecutionException failed){return failed(original,failed.getCause());}
     }
     private Status accept(ValidationOperation original,Verb verb,Fence fence,java.time.Instant latest){
+        return accept(original,verb,fence,latest,true);
+    }
+    private Status accept(ValidationOperation original,Verb verb,Fence fence,java.time.Instant latest,boolean dispatch){
         require();if(!context.equals(original.context()))return status(original,Outcome.REJECTED,null);
         Entry entry;
         synchronized(entries){
@@ -131,7 +135,37 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
             }
             if(verb==Verb.START&&!Objects.equals(entry.latest,latest))return status(original,Outcome.REJECTED,null);
             if(verb==Verb.STOP)entry.stop=true;
-            if(entry.observed.drain()!=Drain.DRAINED&&(verb!=Verb.READ||entry.owner!=null))dispatch(entry,verb);return entry.observed;
+            if(dispatch&&entry.observed.drain()!=Drain.DRAINED&&(verb!=Verb.READ||entry.owner!=null))dispatch(entry,verb);return entry.observed;
+        }
+    }
+    /** The timer caller has no later HTTP poll: return its paid attempt's actual admission outcome.
+     * Its existing response frame also pays for the worker, so owner admission can retain inputs. */
+    private Status scheduled(ValidationOperation original,Fence fence,java.time.Instant latest,ResponseScope scope){
+        var initial=accept(original,Verb.START,fence,latest,false);
+        if(initial.outcome()!=Outcome.PENDING)return initial;
+        final ValidationMemberResources.Control body;
+        try{body=scope.control();}
+        catch(TapstateException refused){return scheduledRefusal(original,
+                refused.code()==ValidationError.VALUE_LIMIT_EXCEEDED?Outcome.CAPACITY:Outcome.UNKNOWN,refused.code().code());}
+        try{return paid(body,()->{
+            final Entry entry;
+            synchronized(entries){
+                entry=entries.get(Key.of(original));
+                if(entry==null||closed)return status(original,Outcome.REJECTED,null);
+                if(entry.inFlight||entry.reservationAttempted&&entry.owner==null)return entry.observed;
+                entry.inFlight=true;entry.body=body;
+            }
+            advance(entry,Verb.START);
+            synchronized(entries){return entry.observed;}
+        });}catch(TapstateException refused){return scheduledRefusal(original,Outcome.UNKNOWN,refused.code().code());}
+    }
+    private Status scheduledRefusal(ValidationOperation original,Outcome outcome,String reason){
+        synchronized(entries){
+            var entry=entries.get(Key.of(original));
+            if(entry==null)return status(original,outcome,reason);
+            if(entry.observed.outcome()==Outcome.PENDING&&(outcome==Outcome.UNKNOWN||!entry.inFlight&&!entry.reservationAttempted))
+                entry.observed=status(original,outcome,reason);
+            return entry.observed;
         }
     }
     /** Only routing memos are removed. Native actors and their independent resource receipts are untouched. */
@@ -163,7 +197,14 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
     private void advance(Entry entry,Verb verb){
         try{
             require();entry.body.require();if(expired(entry)){publish(entry,status(entry.original,Outcome.REJECTED,ValidationError.EXECUTION_CANCELLED.code()));return;}var checked=lookup(entry.original);
-            if(checked.known()!=null){publish(entry,original(entry.original,entry.stop?Verb.STOP:verb,checked.known()));return;}
+            if(checked.known()!=null){
+                final Verb action;
+                synchronized(entries){
+                    if(closed)return;
+                    entry.owner=checked.known().start().run().owner();action=entry.stop?Verb.STOP:verb;
+                }
+                require();entry.body.require();publish(entry,original(entry.original,action,checked.known()));return;
+            }
             synchronized(entries){
                 if(entry.stop&&!entry.reservationAttempted){entry.observed=status(entry.original,Outcome.REJECTED,ValidationError.EXECUTION_CANCELLED.code());return;}
             }
@@ -217,8 +258,9 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
         return new Lookup(null,valid,status(operation,Outcome.REJECTED,null),fence(saved));
     }
     private static Fence fence(ValidationTaskStore.Snapshot saved){return saved==null?null:new Fence(saved.task().generation(),saved.full().nextStartSequence(),saved.closed());}
-    private <T>T paid(ResponseScope scope,java.util.concurrent.Callable<T> command){
-        var control=scope.control();var value=new CompletableFuture<T>();var answer=new CompletableFuture<T>();
+    private <T>T paid(ResponseScope scope,java.util.concurrent.Callable<T> command){return paid(scope.control(),command);}
+    private <T>T paid(ValidationMemberResources.Control control,java.util.concurrent.Callable<T> command){
+        var value=new CompletableFuture<T>();var answer=new CompletableFuture<T>();
         control.released().whenComplete((ignored,failed)->{if(failed!=null)answer.completeExceptionally(failed);
             else value.whenComplete((result,problem)->{if(problem==null)answer.complete(result);else answer.completeExceptionally(problem);});});
         try{

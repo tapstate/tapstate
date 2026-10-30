@@ -59,8 +59,12 @@ class NativeValidationReportHistoryIT {
             await(()->f.resources.snapshot().metadataFrames()==2);assertThat(runs.read(second.identity()).waiting()).isTrue();
             var third=new ValidationReportAdmission.Task("cluster","flow","third",UUID.randomUUID());
             f.tasks.create(new ValidationTaskStore.Create(third,f.comparison,ValidationTaskStore.Settings.defaults(ValidationMethod.COUNT,1000),UUID.randomUUID()));
-            assertThat(f.owners.reserve(new ValidationOwnerRouter.Request("flow",third.taskId(),third.generation(),1,1,"FULL",UUID.randomUUID(),UUID.randomUUID().toString())).outcome())
-                    .isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
+            var request=new ValidationOwnerRouter.Request("flow",third.taskId(),third.generation(),1,1,"FULL",UUID.randomUUID(),UUID.randomUUID().toString());
+            var reserved=new java.util.concurrent.atomic.AtomicReference<ValidationOwnerRouter.Result>();
+            // The live sibling may own this Pipeline's nonblocking control turn. Acquire the turn,
+            // then reserve exactly once; a reservation refusal must not be retried as success.
+            await(()->reserved.get()!=null||f.owners.control("flow",()->reserved.set(f.owners.reserve(request))));
+            assertThat(reserved.get().outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
             runs.stop(second.identity());await(()->f.resources.snapshot().processors()==1);
         }finally{blocked.set(false);}
     }
