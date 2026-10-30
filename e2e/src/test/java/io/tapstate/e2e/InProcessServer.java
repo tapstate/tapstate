@@ -194,6 +194,22 @@ final class InProcessServer implements ServerHandle {
         return cancelled;
     }
 
+    /** The real scheduled pass, for a case that controls its storage interleaving. */
+    Runnable publishingObservations() {
+        var passes = new java.util.ArrayList<Runnable>();
+        for (var owner : refreshedContexts) {
+            if (!owner.isActive() || !belongsToThisServer(owner)) continue;
+            for (ScheduledTaskHolder holder : owner.getBeansOfType(ScheduledTaskHolder.class).values()) {
+                for (ScheduledTask task : holder.getScheduledTasks()) {
+                    if (PUBLISHING_PASS.equals(String.valueOf(task.getTask().getRunnable())))
+                        passes.add(task.getTask().getRunnable());
+                }
+            }
+        }
+        if (passes.size() != 1) throw new AssertionError("expected one native convergence pass: " + passes.size());
+        return passes.getFirst();
+    }
+
     private boolean belongsToThisServer(ConfigurableApplicationContext candidate) {
         for (org.springframework.context.ApplicationContext owner = candidate; owner != null; owner = owner.getParent())
             if (owner == context) return true;
