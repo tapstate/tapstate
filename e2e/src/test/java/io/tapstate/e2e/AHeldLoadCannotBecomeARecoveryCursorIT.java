@@ -86,9 +86,9 @@ class AHeldLoadCannotBecomeARecoveryCursorIT {
             long producedThrough = log.get("largestSequence", Number.class).longValue();
             Await.until("the new child's ring sequence to be confirmed", CONVERGE,
                     () -> {
-                        Document done = documents.consumerOffset(chain, consumer).get("perTableRingDone", Document.class);
-                        return done != null && done.get("items") instanceof Number cursor
-                                && cursor.longValue() >= producedThrough;
+                        List<Document> done = documents.consumerOffset(chain, consumer).getList("ringDoneThrough", Document.class);
+                        return done.stream().anyMatch(confirmed -> "items".equals(confirmed.getString("table"))
+                                && confirmed.get("sequence", Number.class).longValue() >= producedThrough);
                     },
                     () -> "consumer=" + documents.consumerOffset(chain, consumer)
                             + ", log=" + documents.logBounds(SrsRingbuffer.ringName(chain, "items"))
