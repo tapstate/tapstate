@@ -1,7 +1,6 @@
 package io.tapstate.app;
 
 import com.hazelcast.core.HazelcastInstance;
-import io.tapstate.core.common.TapstateException;
 import io.tapstate.runtime.engine.validation.ValidationProcessorRegistry;
 import java.util.Objects;
 import static io.tapstate.app.ValidationOwnerRouter.*;
@@ -38,7 +37,7 @@ final class NativeValidationCommands implements Commands {
         }
         if(command.action()==Action.STOP)runs.stop(start.run());
         var status=runs.read(start.run());
-        String code=status.failure() instanceof TapstateException coded?coded.code().code():null;
+        String code=NativeValidationReportFailure.code(status.failure());
         return new CommandReply(Outcome.ACCEPTED,command,status.state().name(),status.admitted(),status.waiting(),status.controlUnknown(),status.retired(),status.drained(),code,runs.tables(start.run()));
     }
     private static CommandReply pending(Command command,NativeValidationOwnerReservations.Pending value){

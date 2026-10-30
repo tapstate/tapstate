@@ -225,7 +225,7 @@ final class NativeValidationRuns implements AutoCloseable {
                 if(known!=null){if(!known.retired()||known.state()!=terminal)throw invalid("runs.terminalUnknown");terminalKnown=known;terminalKnownAt=clock.instant();}
             }
             var failure=lifecycle.executionFailure();
-            reservation.rememberTerminal(terminal,lifecycle.status().admitted(),failure instanceof TapstateException coded?coded.code().code():null,lifecycle.reportBorn());
+            reservation.rememberTerminal(terminal,lifecycle.status().admitted(),NativeValidationReportFailure.code(failure),lifecycle.reportBorn());
             var value=shared;if(value!=null){value.quota.retired(original,terminal);value.members.remove(original.identity());releaseShared(value);}
             reservation.releaseAfterKnownTerminal();retirementReleased=true;
         }
