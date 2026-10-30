@@ -80,9 +80,10 @@ class ViewsListOnlyShapeOutputsIT {
                         .insertOne(new Document("_id", "customer-1"));
                 client.getDatabase("target_db").getCollection("out_orders")
                         .insertOne(new Document("_id", "order-1"));
-                try (ServerHandle server = Tiers.IN_PROCESS.launch(mongo.getReplicaSetUrl("control_db"), "operator_db")) {
+                try (var storage = PreparedNativeStore.createOn(mongo);
+                        ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
                     ControlPlane control = new ControlPlane(server.baseUrl());
-                    control.bootstrapAndLogin("e2e", "e2e-password");
+                    storage.loginAndAwaitBusiness(control);
                     control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
                     Map<String, String> resources = new LinkedHashMap<>();
                     resources.put("sources.tap.yml", """
@@ -167,9 +168,10 @@ class ViewsListOnlyShapeOutputsIT {
                         .append("customer_id", "customer-1").append("TAGS", List.of("red", "blue")));
                 source.getCollection("customers").insertOne(new Document("_id", "customer-1").append("name", "Customer"));
                 var target = client.getDatabase("target_db");
-                try (ServerHandle server = Tiers.IN_PROCESS.launch(mongo.getReplicaSetUrl("control_db"), "operator_db")) {
+                try (var storage = PreparedNativeStore.createOn(mongo);
+                        ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
                     ControlPlane control = new ControlPlane(server.baseUrl());
-                    control.bootstrapAndLogin("e2e", "e2e-password");
+                    storage.loginAndAwaitBusiness(control);
                     control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
                     Map<String, String> resources = new LinkedHashMap<>();
                     resources.put("source.tap.yml", """
@@ -205,6 +207,24 @@ class ViewsListOnlyShapeOutputsIT {
                     Await.until("shape output reaches target", Duration.ofSeconds(120),
                             () -> target.getCollection(collection).countDocuments() == count, () -> control.logs("p"));
                     assertThat(target.listCollectionNames()).containsExactly(collection);
+                    var observations = client.getDatabase(storage.cacheDatabase()).getCollection("pipeline_observation");
+                    Await.until("current-run counts reach the native cache projection", Duration.ofSeconds(30), () -> {
+                        Document observed = observations.find(new Document("_id", "p")).first();
+                        if (observed == null || !(observed.get("initialLoad") instanceof Document load)
+                                || !(load.get("tables") instanceof Document tables)
+                                || !(tables.get("orders") instanceof Document orders)) return false;
+                        return Long.valueOf(1).equals(orders.get("rowsRead"));
+                    }, () -> control.logs("p"));
+                    var storedObservation = observations.find(new Document("_id", "p")).first();
+                    assertThat(storedObservation.get("scope", Document.class).getString("pipelineId")).isEqualTo("p");
+                    Map<?, ?> snapshot = (Map<?, ?>) JsonReader.parse(control.sourceRequest(
+                            "GET", "/api/pipelines/p/snapshot", null, null, 200).body());
+                    Map<?, ?> load = (Map<?, ?>) snapshot.get("initialLoad");
+                    assertThat(load).isNotNull();
+                    assertThat(load.get("runKey")).isEqualTo(storedObservation.get("initialLoad", Document.class).getString("runKey"));
+                    assertThat(load.get("readMode")).isEqualTo("snapshot_and_cdc");
+                    assertThat(((Number) ((Map<?, ?>) ((Map<?, ?>) load.get("tables")).get("orders")).get("rowsRead")).longValue()).isEqualTo(1);
+                    assertThat(client.getDatabase(storage.configurationDatabase()).listCollectionNames()).doesNotContain("pipeline_observation");
                     var response = control.sourceRequest("GET", "/api/views", null, null, 200);
                     Map<?, ?> body = (Map<?, ?>) JsonReader.parse(response.body());
                     assertThat((List<?>) body.get("unresolved")).isEmpty();
