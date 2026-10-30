@@ -298,7 +298,7 @@
   ],
   "provenance": {
     "specPath": "connectors/tidb-connector/src/main/resources/spec_tidb.json",
-    "specContentHash": "f9541706131b0e93",
+    "specContentHash": "907353834b37dc93",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

@@ -48,6 +48,7 @@ import io.tapstate.control.core.DraftSyncingDefinitionWriter;
 import io.tapstate.control.core.PipelineLifecycleService;
 import io.tapstate.control.core.PipelineStartService;
 import io.tapstate.control.core.PipelineWriteTargets;
+import io.tapstate.control.core.PipelineOutputNames;
 import io.tapstate.control.core.StartCheckEvaluator;
 import io.tapstate.control.core.StartChecks;
 import io.tapstate.control.core.StartPlanner;
@@ -798,6 +799,11 @@ class ControlPlaneConfiguration {
      * the reason the chains above are: the side that binds a sink is the one that knows its table names.
      */
     @Bean
+    PipelineOutputNames pipelineOutputNames(StorePort storePort, CloudRuntimeSettings cloud) {
+        return new StoreBackedPipelineOutputNames(storePort, cloud.cloud());
+    }
+
+    @Bean
     PipelineWriteTargets pipelineWriteTargets(StorePort storePort, CloudRuntimeSettings cloud) {
         return new StoreBackedPipelineWriteTargets(storePort, cloud.cloud());
     }
@@ -918,15 +924,15 @@ class ControlPlaneConfiguration {
     PipelineViewService pipelineViewService(
             ArtifactQueryService artifactQueryService,
             PipelineRepresentation representation,
-            PipelineObservationQueryService observations) {
-        return new PipelineViewService(artifactQueryService, representation, observations);
+            PipelineObservationQueryService observations, PipelineOutputNames outputNames) {
+        return new PipelineViewService(artifactQueryService, representation, observations, outputNames);
     }
 
     @Bean
     ViewCatalogService viewCatalogService(ArtifactQueryService artifacts,
             PipelineObservationQueryService observations, DataBrowserService browser,
-            SourceSchemaQueryService schemas) {
-        return new ViewCatalogService(artifacts, observations, browser, schemas);
+            PipelineOutputNames outputNames) {
+        return new ViewCatalogService(artifacts, observations, browser, outputNames);
     }
 
     @Bean

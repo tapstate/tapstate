@@ -469,7 +469,7 @@
   ],
   "provenance": {
     "specPath": "connectors/csv-connector/src/main/resources/spec_csv.json",
-    "specContentHash": "2d54f4dff9d9a686",
+    "specContentHash": "06dc774868ab791b",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

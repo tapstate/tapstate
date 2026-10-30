@@ -481,7 +481,7 @@
   ],
   "provenance": {
     "specPath": "connectors/kafka-avro-connector/src/main/resources/spec_kafka_avro.json",
-    "specContentHash": "54141fb7215fa3f4",
+    "specContentHash": "e06df31ad74a0ead",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

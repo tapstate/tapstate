@@ -50,8 +50,16 @@ class ViewCatalogServiceTest {
                 (config,table)->{throw new AssertionError("no target probe");},
                 (config,query)->{throw new AssertionError("no target probe");},
                 (config,request,listener)->{throw new AssertionError("no target probe");});
-        var schemas=new SourceSchemaQueryService(store,schemaStore);
-        return new Fixture(new ViewCatalogService(artifacts,new PipelineObservationQueryService(artifacts,observations),browser,schemas,Clock.fixed(now,ZoneOffset.UTC)),reads);
+        PipelineOutputNames outputs = new PipelineOutputNames() {
+            public List<Output> of(io.tapstate.core.model.PipelineResource definition) {
+                return List.of(new Output("order_state", "view", "views", "order_state", "order_state"));
+            }
+            public Description describe(io.tapstate.core.model.PipelineResource definition, Map<String, Resource> resources) {
+                return new Description(resolve(definition), Map.of("order_state", Set.of(
+                        new io.tapstate.core.dsl.PipelineInputs.Input("src", "orders"))));
+            }
+        };
+        return new Fixture(new ViewCatalogService(artifacts,new PipelineObservationQueryService(artifacts,observations),browser,outputs,Clock.fixed(now,ZoneOffset.UTC)),reads);
     }
     static MetricPoint point(String table,long seconds,Instant observed) {
         return MetricPoint.reading(Map.of(MetricAttributes.TABLE_ID,table,MetricAttributes.PIPELINE_ID,"pipeline"),observed,seconds);

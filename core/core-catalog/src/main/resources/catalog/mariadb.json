@@ -268,7 +268,7 @@
   ],
   "provenance": {
     "specPath": "connectors/mariadb-connector/src/main/resources/spec_mariadb.json",
-    "specContentHash": "9cba04b3068d282b",
+    "specContentHash": "5d1f3a7574fb38d1",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

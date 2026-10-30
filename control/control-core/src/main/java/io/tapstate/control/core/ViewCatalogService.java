@@ -11,14 +11,7 @@ import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.TableSnapshot;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
-import io.tapstate.core.model.ServeBlock;
-import io.tapstate.core.model.ServeResource;
 import io.tapstate.core.model.SourceResource;
-import io.tapstate.core.model.SyncElement;
-import io.tapstate.core.model.TableRef;
-import io.tapstate.core.model.TableRename;
-import io.tapstate.core.model.ViewBlock;
-import io.tapstate.core.model.ViewResource;
 
 import java.time.Clock;
 import java.time.Duration;
@@ -39,29 +32,40 @@ public final class ViewCatalogService {
     private final ArtifactQueryService artifacts;
     private final PipelineObservationQueryService observations;
     private final DataBrowserService browser;
-    private final SourceSchemaQueryService schemas;
+    private final PipelineOutputNames outputs;
     private final Clock clock;
 
     public ViewCatalogService(ArtifactQueryService artifacts, PipelineObservationQueryService observations,
-            DataBrowserService browser, SourceSchemaQueryService schemas) {
-        this(artifacts, observations, browser, schemas, Clock.systemUTC());
+            DataBrowserService browser, PipelineOutputNames outputs) {
+        this(artifacts, observations, browser, outputs, Clock.systemUTC());
     }
 
     public ViewCatalogService(ArtifactQueryService artifacts, PipelineObservationQueryService observations,
-            DataBrowserService browser, SourceSchemaQueryService schemas, Clock clock) {
+            DataBrowserService browser, PipelineOutputNames outputs, Clock clock) {
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
         this.observations = Objects.requireNonNull(observations, "observations");
         this.browser = Objects.requireNonNull(browser, "browser");
-        this.schemas = Objects.requireNonNull(schemas, "schemas");
+        this.outputs = Objects.requireNonNull(outputs, "outputs");
         this.clock = Objects.requireNonNull(clock, "clock");
     }
 
     public List<ViewCatalogItem> list() {
+        return catalog().items();
+    }
+
+    public record Catalog(List<ViewCatalogItem> items, List<PipelineOutputNames.Unresolved> unresolved) {
+        public Catalog {
+            items = List.copyOf(items);
+            unresolved = List.copyOf(unresolved);
+        }
+    }
+
+    public Catalog catalog() {
         Map<String, Resource> resources = new LinkedHashMap<>();
         for (StoredResource stored : artifacts.listResources()) {
             resources.put(stored.resource().id(), stored.resource());
         }
-        String storeId = storeId(resources);
+        List<PipelineOutputNames.Unresolved> unresolved = new ArrayList<>();
         List<ViewCatalogItem> result = new ArrayList<>();
         for (Resource resource : resources.values()) {
             if (!(resource instanceof PipelineResource pipeline)) continue;
@@ -69,42 +73,21 @@ public final class ViewCatalogService {
             PipelineStatus status = publication == null ? null : publication.status();
             PipelineMetrics metrics = publication == null ? null : publication.metrics();
             PipelineSnapshot snapshot = publication == null ? null : publication.snapshot();
-            ViewBlock.Inline view = inlineView(pipeline.view(), resources);
-            if (view != null) {
-                String collection = view.storage() != null && view.storage().warm() != null
-                        ? view.storage().warm().collection() : view.id();
-                result.add(item("view", pipeline.id(), pipeline.id() + ":" + view.id(), storeId, collection,
-                        status, metrics, snapshot, resources,PipelineInputs.reaching(pipeline,resources,FromClause.list(view.from()))));
-            }
-            List<SyncElement> sync = syncElements(pipeline.serve(), resources);
-            FromClause served=switch(pipeline.serve()) {
-                case ServeBlock.Inline inline -> inline.from();
-                case ServeBlock.Use use -> use.from();
-                case null -> null;
-            };
-            var servedInputs=served==null?Set.<PipelineInputs.Input>of():PipelineInputs.reaching(pipeline,resources,served);
-            for (SyncElement element : sync) {
-                Map<String, String> explicitNames = element.rename() == null ? null : element.rename().map();
-                List<String> outputTables = explicitNames != null && !explicitNames.isEmpty()
-                        ? List.copyOf(explicitNames.keySet()) : sourceTables(pipeline, resources);
-                String kind = pipeline.transforms() != null && !pipeline.transforms().isEmpty()
-                        ? "view" : "replica";
-                for (String table : outputTables) {
-                    String collection = TableRename.apply(table, element.rename());
-                    result.add(item(kind, pipeline.id(), pipeline.id() + ":" + element.id() + ":" + table,
-                            element.source(), collection, status, metrics, snapshot, resources,
-                            servedInputs.stream().filter(input->input.table()==null || input.table().equals(table)
-                                    || (input.source()+"."+input.table()).equals(table)).collect(java.util.stream.Collectors.toUnmodifiableSet())));
-                }
+            PipelineOutputNames.Description description = outputs.describe(pipeline, resources);
+            unresolved.addAll(description.names().unresolved());
+            for (PipelineOutputNames.Output output : description.names().outputs()) {
+                result.add(item(output.kind(), pipeline.id(), pipeline.id() + ":" + output.identity(),
+                        output.connection(), output.table(), status, metrics, snapshot, resources,
+                        description.inputs().getOrDefault(output.identity(), Set.of()), description.qualifiedTables()));
             }
         }
         result.sort(Comparator.comparing(ViewCatalogItem::pipelineId).thenComparing(ViewCatalogItem::id));
-        return List.copyOf(result);
+        return new Catalog(result, unresolved);
     }
 
     private ViewCatalogItem item(String kind, String pipelineId, String id, String sourceId,
             String collection, PipelineStatus pipelineStatus, PipelineMetrics metrics,
-            PipelineSnapshot snapshot, Map<String, Resource> resources,Set<PipelineInputs.Input> inputs) {
+            PipelineSnapshot snapshot, Map<String, Resource> resources,Set<PipelineInputs.Input> inputs,Set<String> qualifiedTables) {
         Resource resource = resources.get(sourceId);
         String database = resource instanceof SourceResource source ? database(source) : null;
         Long documents = null;
@@ -120,15 +103,15 @@ public final class ViewCatalogService {
         }
         return new ViewCatalogItem(id, kind,
                 new ViewCatalogItem.Location(sourceId, database, collection), pipelineId,
-                freshness(pipelineStatus, metrics, snapshot,inputs), documents, sizeBytes, null);
+                freshness(pipelineStatus, metrics, snapshot,inputs,qualifiedTables), documents, sizeBytes, null);
     }
 
     private ViewCatalogItem.Freshness freshness(PipelineStatus status, PipelineMetrics metrics,
-            PipelineSnapshot snapshot,Set<PipelineInputs.Input> inputs) {
+            PipelineSnapshot snapshot,Set<PipelineInputs.Input> inputs,Set<String> qualifiedTables) {
         Instant now=clock.instant();
         if(status==null || status.state()==PipelineState.NEW)
             return freshness("not-loaded",null,null,null,now,null,"not-loaded");
-        var measurement=eventAge(metrics,inputs,now);
+        var measurement=eventAge(metrics,inputs,qualifiedTables,now);
         Instant observed=status.observedAt();
         if(measurement!=null && measurement.clockInvalid())
             return freshness("stale",null,null,measurement.observedAt(),now,null,"clock-or-time-unavailable");
@@ -141,7 +124,7 @@ public final class ViewCatalogService {
         if(status.state()!=PipelineState.RUNNING)
             return freshness("stale",eventAge,age,observed,now,null,"pipeline-inactive");
         if(age>FRESH_LIMIT_SECONDS)return freshness("stale",eventAge,age,observed,now,null,"observation-stale");
-        var tables=inputTables(inputs);
+        var tables=inputTables(inputs,qualifiedTables);
         Integer progress=snapshot==null?null:snapshot.snapshot().entrySet().stream()
                 .filter(entry->tables.contains(entry.getKey())).map(entry->entry.getValue().donePct())
                 .filter(Objects::nonNull).min(Integer::compareTo).orElse(null);
@@ -155,15 +138,15 @@ public final class ViewCatalogService {
                 progress,eventAge,observed,now,age,"s","max-input-table-event-age",reason);
     }
     private record EventAge(Long seconds,Instant observedAt,boolean clockInvalid) { }
-    private static Set<String> inputTables(Set<PipelineInputs.Input> inputs) {
+    private static Set<String> inputTables(Set<PipelineInputs.Input> inputs,Set<String> qualifiedTables) {
         var tables=new java.util.HashSet<String>();
-        for(var input:inputs)if(input.table()!=null){tables.add(input.table());tables.add(input.source()+"."+input.table());}
+        for(var input:inputs)if(input.table()!=null){if(!qualifiedTables.contains(input.table()))tables.add(input.table());tables.add(input.source()+"."+input.table());}
         return Set.copyOf(tables);
     }
-    private static EventAge eventAge(PipelineMetrics metrics,Set<PipelineInputs.Input> inputs,Instant now) {
+    private static EventAge eventAge(PipelineMetrics metrics,Set<PipelineInputs.Input> inputs,Set<String> qualifiedTables,Instant now) {
         if(metrics==null || inputs.isEmpty() || inputs.stream().anyMatch(input->input.table()==null))return null;
         var points=new LinkedHashMap<String,MetricPoint>();
-        var tables=inputTables(inputs);
+        var tables=inputTables(inputs,qualifiedTables);
         for(var fact:metrics.facts())if(LAG_METRIC.equals(fact.name()) && fact.type()==io.tapstate.core.lifecycle.MetricType.GAUGE && fact.unit().equals("s"))
             for(var point:fact.points()) {
                 String table=point.attributes().get(MetricAttributes.TABLE_ID);
@@ -175,7 +158,7 @@ public final class ViewCatalogService {
         for(var input:inputs) {
             var point=points.get(input.source()+"."+input.table());
             if(point==null) {
-                if(inputs.stream().filter(other->input.table().equals(other.table())).count()>1)return null;
+                if(qualifiedTables.contains(input.table()) || inputs.stream().filter(other->input.table().equals(other.table())).count()>1)return null;
                 point=points.get(input.table());
             }
             if(point==null)return null;
@@ -186,14 +169,6 @@ public final class ViewCatalogService {
             if(measured==null || point.observedAt().isBefore(measured))measured=point.observedAt();
         }
         return new EventAge(maximum,measured,false);
-    }
-
-    private static String storeId(Map<String, Resource> resources) {
-        return resources.values().stream().filter(SourceResource.class::isInstance)
-                .map(SourceResource.class::cast)
-                .filter(source -> source.metadata() != null
-                        && "true".equals(source.metadata().labels().get("store")))
-                .map(SourceResource::id).findFirst().orElse("views");
     }
 
     private static String database(SourceResource source) {
@@ -209,35 +184,4 @@ public final class ViewCatalogService {
         return name.isBlank() ? null : name;
     }
 
-    private static ViewBlock.Inline inlineView(ViewBlock block, Map<String, Resource> resources) {
-        if (block instanceof ViewBlock.Inline inline) return inline;
-        if (block instanceof ViewBlock.Use use && resources.get(use.use()) instanceof ViewResource view) {
-            return new ViewBlock.Inline(use.id(), use.from(), view.primaryKey(), view.storage());
-        }
-        return null;
-    }
-
-    private static List<SyncElement> syncElements(ServeBlock block, Map<String, Resource> resources) {
-        if (block instanceof ServeBlock.Inline inline) return inline.sync() == null ? List.of() : inline.sync();
-        if (block instanceof ServeBlock.Use use && resources.get(use.use()) instanceof ServeResource serve) {
-            return serve.sync() == null ? List.of() : serve.sync();
-        }
-        return List.of();
-    }
-
-    private List<String> sourceTables(PipelineResource pipeline, Map<String, Resource> resources) {
-        List<String> names = new ArrayList<>();
-        for (String sourceId : pipeline.sourceIds()) {
-            if (!(resources.get(sourceId) instanceof SourceResource source)) continue;
-            if (source.tables() == null) {
-                schemas.find(sourceId).ifPresent(report -> report.tables().forEach(table -> names.add(table.name())));
-            } else {
-                for (TableRef table : source.tables()) {
-                    if (table instanceof TableRef.Literal literal) names.add(literal.name());
-                    if (table instanceof TableRef.Spec spec) names.add(spec.name());
-                }
-            }
-        }
-        return names;
-    }
 }

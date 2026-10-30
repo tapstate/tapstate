@@ -42,7 +42,7 @@
   ],
   "provenance": {
     "specPath": "connectors/bigquery-connector/src/main/resources/spec-v2.json",
-    "specContentHash": "2702e1194211127b",
+    "specContentHash": "b98a654d1caa8041",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {}

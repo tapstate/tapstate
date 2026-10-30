@@ -68,7 +68,7 @@
   ],
   "provenance": {
     "specPath": "connectors/hbase-connector/src/main/resources/spec.json",
-    "specContentHash": "6e5ab17af6a74a69",
+    "specContentHash": "e4f4d6f7e9cdb76c",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

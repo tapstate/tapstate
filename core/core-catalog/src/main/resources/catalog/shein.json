@@ -41,7 +41,7 @@
   ],
   "provenance": {
     "specPath": "connectors-javascript/shein-connector/src/main/resources/spec.json",
-    "specContentHash": "cc04f4e6f3f420a6",
+    "specContentHash": "7e48d55bddf6fc9b",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {
