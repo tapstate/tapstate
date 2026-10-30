@@ -268,7 +268,7 @@
   ],
   "provenance": {
     "specPath": "connectors/aws-rds-mysql-connector/src/main/resources/aws-rds-mysql-spec.json",
-    "specContentHash": "7fa1e642c31bffa0",
+    "specContentHash": "2e8973ce2006f7db",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

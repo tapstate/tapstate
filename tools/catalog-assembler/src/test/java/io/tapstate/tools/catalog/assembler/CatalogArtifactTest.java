@@ -163,8 +163,11 @@ class CatalogArtifactTest {
 
         String bitmapTsv = Files.readString(Path.of(bitmapPath));
         Map<String, Set<String>> bitmap = BitmapReader.read(bitmapTsv);
-        GeneratedCatalog catalog = CatalogGenerator.generate(
-                connectorRoots(checkout.get()), resolveSpecSha(), resolveCapabilitySha(), bitmap);
+        List<Path> roots = connectorRoots(checkout.get());
+        GeneratedCatalog catalog = Boolean.getBoolean("tapstate.catalog.spec-only")
+                ? CatalogGenerator.generateSpecOnly(roots, resolveSpecSha(), resolveCapabilitySha(), bitmap,
+                        Set.copyOf(TapstateCatalog.load().ids()))
+                : CatalogGenerator.generate(roots, resolveSpecSha(), resolveCapabilitySha(), bitmap);
 
         if (UPDATE) {
             writeArtifacts(catalog, bitmapTsv);

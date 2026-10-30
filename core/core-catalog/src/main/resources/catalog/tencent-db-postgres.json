@@ -329,7 +329,7 @@
   ],
   "provenance": {
     "specPath": "connectors/tencent-db-postgres-connector/src/main/resources/tencent-db-postgres-spec.json",
-    "specContentHash": "74a30adc84131925",
+    "specContentHash": "7658c4eb0d604bcf",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {
