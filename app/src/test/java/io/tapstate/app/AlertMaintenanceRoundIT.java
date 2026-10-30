@@ -14,7 +14,9 @@ import static org.assertj.core.api.Assertions.*;
 @RequiresDocker
 class AlertMaintenanceRoundIT {
     @Container static final org.testcontainers.containers.MongoDBContainer MONGO=AlertEvaluationHostIT.MONGO;
-    @Test void oneRoundKeepsUpWithTwentyAcceptedPayloadsAndFiveQuotasBesideLiveConfiguration(){
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(ints={0,4})
+    void oneRoundKeepsUpWithTwentyAcceptedPayloadsAndFiveQuotasBesideLiveConfiguration(int conflicts){
         AlertEvaluationHostIT.withFixture(f->{
             AlertNotificationPlannerIT.route(f,Duration.ZERO);var planner=AlertNotificationPlannerIT.planner(f,"mixed-cleanup-planner");
             var settings=new AlertRetentionSettings();settings.setRetention(Map.of("accepted-payload","PT15M"));var policy=settings.resolve(f.storeHost().deployment());
@@ -44,6 +46,9 @@ class AlertMaintenanceRoundIT {
                     db.getCollection("alert_test_quotas").insertOne(new Document("_id",id).append("formatVersion",1).append("recordRevision",1L).append("cleanupAt",Date.from(minute.plusSeconds(3660)))
                             .append("body",new Document("actors",List.of(new Document("actor","original-actor").append("accepted",1)))));
                 }
+                var admin=client.getDatabase("admin");
+                if(conflicts>0)admin.runCommand(new Document("configureFailPoint","failCommand").append("mode",new Document("times",conflicts))
+                        .append("data",new Document("failCommands",List.of("update")).append("errorCode",112).append("errorLabels",List.of("TransientTransactionError"))));
                 try(var worker=new AlertMaintenanceRuntime(f.store().maintenance().orElseThrow(),f.clock(),()->{})){
                     worker.tick();
                     assertThat(ids.stream().filter(id->f.store().intent(id,null).orElseThrow().value().state().payload()!=null).map(io.tapstate.core.alerting.AlertIntent.Identity::deliveryId).toList())
@@ -51,7 +56,7 @@ class AlertMaintenanceRoundIT {
                     assertThat(db.getCollection("alert_test_quotas").countDocuments()).isZero();
                     assertThat(((Number)worker.health().get("scanned")).longValue()).isLessThanOrEqualTo(1000);
                     assertThat(((Number)worker.health().get("ioBytes")).longValue()).isLessThanOrEqualTo(16L*1024*1024);
-                }
+                }finally{if(conflicts>0)admin.runCommand(new Document("configureFailPoint","failCommand").append("mode","off"));}
             }
         });
     }

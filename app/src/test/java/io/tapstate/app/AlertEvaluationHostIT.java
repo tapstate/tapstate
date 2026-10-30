@@ -22,7 +22,7 @@ import static org.mockito.Mockito.*;
 
 @RequiresDocker
 class AlertEvaluationHostIT {
-    @Container static final MongoDBContainer MONGO=new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
+    @Container static final MongoDBContainer MONGO=new MongoDBContainer(DockerImageName.parse("mongo:7.0")).withCommand("--replSet","docker-rs","--setParameter","enableTestCommands=1");
     static final Instant T=AlertEvaluationHostTest.T;
     static final Runnable ACTIVE=()->{};
     static final Duration TTL=Duration.ofSeconds(60);

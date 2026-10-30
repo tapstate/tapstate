@@ -58,6 +58,7 @@ final class MongoAlertMaintenance implements AlertMaintenance {
     private static final class Budget {
         final int rows; final long bytes, until; int used; long encoded;int proofSteps;boolean isolationChecked,isolated;
         Instant currentCandidate,oldestEligible,oldestProtected;
+        List<PendingMutation> staged;
         void eligible(Instant at){if(at!=null&&(oldestEligible==null||at.isBefore(oldestEligible)))oldestEligible=at;}
         void protect(Instant at){if(at!=null&&(oldestProtected==null||at.isBefore(oldestProtected)))oldestProtected=at;}
         Budget(int rows,long bytes,Duration time) { this.rows=rows;this.bytes=bytes;this.until=System.nanoTime()+time.toNanos(); }
@@ -79,6 +80,31 @@ final class MongoAlertMaintenance implements AlertMaintenance {
             try { b.use(18,32*1024);candidates=transactions.run(false,b.remaining(),s->next(s,collection,pageAfter,b)); }
             catch(Yield end){break;}
             if(candidates.isEmpty()){exhausted=true;break;}
+            if(collection==SystemCollections.ALERT_DELIVERY_INTENTS || collection==SystemCollections.ALERT_TEST_QUOTAS) {
+                Cursor original=cursor;
+                try {
+                    // Share only this transaction's live authority/fences. Every original row still
+                    // passes its own decode, retention/reference checks and fragment-owner CAS.
+                    b.use(22,32*1024);
+                    var group=transactions.run(true,b.remaining(),session->hotGroup(session,index,collection,candidates,b));
+                    for(var row:group.rows()) {
+                        cursor=row.cursor();
+                        if(row.outcome().equals("changed"))changed++;
+                        else {skipped.merge(row.outcome(),1L,Long::sum);
+                            if(row.outcome().equals("conflict"))b.eligible(row.at());else b.protect(row.at());}
+                    }
+                    pendingCandidate[index]=group.pending();
+                    if(group.stop()!=null){skipped.merge(group.stop(),1L,Long::sum);b.eligible(group.at());break;}
+                    if(group.rows().size()==candidates.size() && candidates.size()<DISCOVERY_KEYS){exhausted=true;break;}
+                }catch(Yield end){skipped.merge("budget",1L,Long::sum);b.eligible(candidateTime(candidates.getFirst()));
+                    pendingCandidate[index]=candidates.getFirst().get("_id");cursor=original;break;}
+                catch(MongoReadBudget.MaintenanceConflict conflict){
+                    conflict();skipped.merge("conflict",1L,Long::sum);b.eligible(candidateTime(candidates.getFirst()));
+                    pendingCandidate[index]=candidates.getFirst().get("_id");cursor=original;
+                    if(++conflicts>3){skipped.merge("contention-yield",1L,Long::sum);break;}
+                }
+                continue;
+            }
             boolean yielded=false,retry=false;
             for(Document candidate:candidates){
             Cursor original=cursor;
@@ -126,6 +152,55 @@ final class MongoAlertMaintenance implements AlertMaintenance {
         }
         if(b.isolated)skipped.merge("unreadable",1L,Long::sum);
         return new Batch(exhausted?null:cursor,b.used,changed,b.encoded,skipped,b.oldestEligible,b.oldestProtected);
+    }
+    private record PendingMutation(SystemCollections collection,Document original,Document replacement) { }
+    private record CleanedRow(Cursor cursor,String outcome,Instant at) { }
+    private record HotGroup(List<CleanedRow> rows,String stop,Object pending,Instant at) { }
+    private static Instant candidateTime(Document candidate) {return candidate.get("cleanupAt") instanceof Date at?at.toInstant():null;}
+    private static Cursor candidateCursor(int index,Document candidate) {
+        String encoded=new Document("id",candidate.get("_id")).toJson();
+        if(encoded.length()>8192)throw new io.tapstate.core.common.TapstateException(IoError.DOCUMENT_UNREADABLE,Map.of("id","alert-maintenance","field","candidate-cursor"),null);
+        return new Cursor(index,candidateTime(candidate),encoded);
+    }
+    private HotGroup hotGroup(ClientSession session,int index,SystemCollections collection,List<Document> candidates,Budget budget) {
+        var rows=new ArrayList<CleanedRow>();budget.staged=new ArrayList<>();
+        String stop=null;Object pending=null;Instant at=null;
+        try {
+            for(var candidate:candidates.subList(0,Math.min(4,candidates.size()))) {
+                Cursor scanned=candidateCursor(index,candidate);budget.currentCandidate=candidateTime(candidate);
+                int before=budget.staged.size();String outcome;
+                try {
+                    Document original=read(session,collection,new Document("_id",candidate.get("_id")),budget);
+                    outcome=original==null?"conflict":clean(session,collection,original,budget);
+                    // Several expired intents may hand summaries to the same schedule. Commit the
+                    // first original before rereading that schedule in the next guarded transaction.
+                    boolean overlap=false;
+                    for(int next=before;next<budget.staged.size();next++)for(int prior=0;prior<next;prior++) {
+                        var a=budget.staged.get(prior);var b=budget.staged.get(next);
+                        if(a.collection()==b.collection() && Objects.equals(a.original().get("_id"),b.original().get("_id")))overlap=true;
+                    }
+                    if(overlap){budget.staged.subList(before,budget.staged.size()).clear();stop="batch-boundary";pending=candidate.get("_id");at=budget.currentCandidate;break;}
+                }catch(Yield end){
+                    budget.staged.subList(before,budget.staged.size()).clear();
+                    if(rows.isEmpty())throw end;
+                    stop="budget";pending=candidate.get("_id");at=budget.currentCandidate;break;
+                }catch(IllegalArgumentException | ClassCastException | NullPointerException invalid){
+                    budget.staged.subList(before,budget.staged.size()).clear();outcome="unreadable";
+                }catch(io.tapstate.core.common.TapstateException invalid){
+                    if(invalid.code()!=IoError.DOCUMENT_UNREADABLE)throw invalid;
+                    budget.staged.subList(before,budget.staged.size()).clear();outcome="unreadable";
+                }
+                rows.add(new CleanedRow(scanned,outcome,budget.currentCandidate));
+            }
+            // No row mutation occurs until its complete read/validation and byte/operation
+            // reservation succeeded. A later budget boundary can commit only earlier whole rows.
+            for(var write:budget.staged) {
+                budget.remaining();writeAttempt(write.collection().collectionName(),1);
+                if(!mutation.apply(session,write.collection(),write.original(),write.replacement()))
+                    throw new MongoReadBudget.MaintenanceConflict();
+            }
+            return new HotGroup(List.copyOf(rows),stop,pending,at);
+        }finally{budget.staged=null;}
     }
     private List<Document> next(ClientSession s,SystemCollections c,Cursor after,Budget b) {
         Document header=candidateHeader(c);
@@ -424,9 +499,14 @@ final class MongoAlertMaintenance implements AlertMaintenance {
         for(String field:List.of("incarnation","writeFence"))if(original.containsKey(field))filter.append(field,original.get(field));
         return filter;
     }
-    private String replace(ClientSession s,SystemCollections c,Document before,Document after,Budget b) { b.use(8192L+MongoAlertConfigurationCodec.size(versionFilter(before))+MongoAlertConfigurationCodec.size(after));writeAttempt(c.collectionName(),1);boolean changed=mutation.apply(s,c,before,after);
-        return changed?"changed":"conflict"; }
-    private String remove(ClientSession s,SystemCollections c,Document row,Budget b) { b.use(8192L+MongoAlertConfigurationCodec.size(row));writeAttempt(c.collectionName(),1);return mutation.apply(s,c,row,null)?"changed":"conflict"; }
+    private String replace(ClientSession s,SystemCollections c,Document before,Document after,Budget b) { b.use(8192L+MongoAlertConfigurationCodec.size(versionFilter(before))+MongoAlertConfigurationCodec.size(after));
+        if(b.staged!=null){b.staged.add(new PendingMutation(c,before,after));return "changed";}
+        writeAttempt(c.collectionName(),1);return mutation.apply(s,c,before,after)?"changed":"conflict";
+    }
+    private String remove(ClientSession s,SystemCollections c,Document row,Budget b) { b.use(8192L+MongoAlertConfigurationCodec.size(row));
+        if(b.staged!=null){b.staged.add(new PendingMutation(c,row,null));return "changed";}
+        writeAttempt(c.collectionName(),1);return mutation.apply(s,c,row,null)?"changed":"conflict";
+    }
     private Document scope(SystemCollections c) {
         String prefix=c==SystemCollections.ALERT_NODE_LIFECYCLES?"":c==SystemCollections.ALERT_EPISODES||c==SystemCollections.ALERT_TRANSITIONS?"_id.alarm.":"_id.";
         return new Document(prefix+"authorityId",scope.authorityId()).append(prefix+"clusterId",scope.clusterId());

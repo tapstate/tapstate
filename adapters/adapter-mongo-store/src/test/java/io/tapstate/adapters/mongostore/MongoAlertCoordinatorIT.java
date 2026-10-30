@@ -532,6 +532,84 @@ class MongoAlertCoordinatorIT {
             }finally{try(var client=com.mongodb.client.MongoClients.create(connection.uri())){client.getDatabase(cacheName).drop();}}
         });
     }
+    @Test void groupedCleanupRollsBackEarlierRowsWhenALaterOriginalCasConflicts(){
+        withStore(f->{var rows=SystemCollections.ALERT_TEST_QUOTAS.on(f.db);
+            for(int i=0;i<4;i++)rows.insertOne(MongoAlertNotificationCodec.quota(new AlertTestQuota.Bucket(SCOPE,T.minusSeconds(7200+i*60L),Map.of("actor",1)),1));
+            var ordered=rows.find().sort(new Document("cleanupAt",1)).into(new ArrayList<>());var second=ordered.get(1);
+            var port=f.store.maintenance().orElseThrow();port.maintain(new AlertMaintenance.Cursor(4,null,null),200,4L*1024*1024,Duration.ofSeconds(10));
+            var version=SystemCollections.CONFIGURATION_VERSION.on(f.db).find().first();var keys=SystemCollections.CLUSTER_KEYS.on(f.db).find().first();
+            var deletes=new java.util.concurrent.atomic.AtomicInteger();MongoCommandObservation.COLLECTIONS.set((command,collection)->{
+                if(command.equals("delete")&&collection.equals("alert_test_quotas")&&deletes.incrementAndGet()%2==0)
+                    rows.updateOne(new Document("_id",second.get("_id")),new Document("$inc",new Document("recordRevision",1L)));
+            });
+            AlertMaintenance.Batch batch;
+            try{batch=port.maintain(new AlertMaintenance.Cursor(10,null,null),200,4L*1024*1024,Duration.ofSeconds(5));}
+            finally{MongoCommandObservation.COLLECTIONS.remove();}
+            assertThat(deletes.get()).isGreaterThanOrEqualTo(2);assertThat(batch.changed()).isZero();assertThat(batch.next()).isNotNull();
+            assertThat(batch.skipped().getOrDefault("conflict",0L)).isPositive();assertThat(rows.countDocuments()).isEqualTo(4);
+            assertThat(rows.find(new Document("_id",ordered.getFirst().get("_id"))).first()).isEqualTo(ordered.getFirst());
+            assertThat(SystemCollections.CONFIGURATION_VERSION.on(f.db).find().first()).isEqualTo(version);
+            assertThat(SystemCollections.CLUSTER_KEYS.on(f.db).find().first()).isEqualTo(keys);
+            long changed=0;var cursor=batch.next();for(int i=0;i<4&&cursor!=null;i++){var next=port.maintain(cursor,200,4L*1024*1024,Duration.ofSeconds(5));changed+=next.changed();cursor=next.next();}
+            assertThat(changed).isEqualTo(4);assertThat(rows.countDocuments()).isZero();
+        });
+    }
+    @Test void partialGroupByteBoundaryCommitsOnlyCompletedRowsAndResumesTheOriginalCandidate(){
+        withStore(f->{var rows=SystemCollections.ALERT_TEST_QUOTAS.on(f.db);
+            for(int i=0;i<4;i++)rows.insertOne(MongoAlertNotificationCodec.quota(new AlertTestQuota.Bucket(SCOPE,T.minusSeconds(7200+i*60L),Map.of("actor",1)),1));
+            var port=f.store.maintenance().orElseThrow();port.maintain(new AlertMaintenance.Cursor(4,null,null),200,4L*1024*1024,Duration.ofSeconds(10));
+            var commands=new ArrayList<String>();var observed=new java.util.concurrent.atomic.AtomicLong();
+            MongoCommandObservation.CURRENT.set(commands::add);MongoCommandObservation.BYTES.set(observed::addAndGet);AlertMaintenance.Batch first;
+            try{first=port.maintain(new AlertMaintenance.Cursor(10,null,null),200,300_000,Duration.ofSeconds(5));}
+            finally{MongoCommandObservation.CURRENT.remove();MongoCommandObservation.BYTES.remove();}
+            assertThat(first.changed()).isBetween(1,3);assertThat(first.next()).isNotNull();assertThat(first.skipped()).containsKey("budget");
+            assertThat(rows.countDocuments()).isEqualTo(4-first.changed());assertThat(first.scanned()).isLessThanOrEqualTo(200);
+            assertThat(commands.size()).isLessThanOrEqualTo(first.scanned());assertThat(observed.get()).isLessThanOrEqualTo(first.bytes());assertThat(first.bytes()).isLessThanOrEqualTo(300_000);
+            var next=port.maintain(first.next(),200,4L*1024*1024,Duration.ofSeconds(5));
+            assertThat(first.changed()+next.changed()).isEqualTo(4);assertThat(rows.countDocuments()).isZero();
+        });
+    }
+    @Test void anUnknownGroupCommitPublishesNoProgressAndReopensOnlyTheOriginalKeys(){
+        withStore(f->{var rows=SystemCollections.ALERT_TEST_QUOTAS.on(f.db);
+            for(int i=0;i<4;i++)rows.insertOne(MongoAlertNotificationCodec.quota(new AlertTestQuota.Bucket(SCOPE,T.minusSeconds(7200+i*60L),Map.of("actor",1)),1));
+            var port=f.store.maintenance().orElseThrow();
+            port.maintain(new AlertMaintenance.Cursor(4,null,null),200,4L*1024*1024,Duration.ofSeconds(10));
+            try(var client=MongoClients.create(f.settings.uri())){
+            var armed=new java.util.concurrent.atomic.AtomicBoolean();var admin=client.getDatabase("admin");
+            MongoCommandObservation.COLLECTIONS.set((command,collection)->{
+                if(command.equals("delete")&&collection.equals("alert_test_quotas")&&armed.compareAndSet(false,true))
+                    admin.runCommand(new Document("configureFailPoint","failCommand").append("mode","alwaysOn")
+                            .append("data",new Document("failCommands",List.of("commitTransaction")).append("writeConcernError",new Document("code",64).append("errmsg","group commit reply lost")).append("errorLabels",List.of("UnknownTransactionCommitResult"))));
+            });
+            try{assertThatThrownBy(()->port.maintain(new AlertMaintenance.Cursor(10,null,null),200,4L*1024*1024,Duration.ofSeconds(5))).isInstanceOf(TapstateException.class);}
+            finally{MongoCommandObservation.COLLECTIONS.remove();admin.runCommand(new Document("configureFailPoint","failCommand").append("mode","off"));}
+            assertThat(armed).isTrue();assertThat(rows.countDocuments()).isZero();
+            var committed=SystemCollections.CONFIGURATION_VERSION.on(f.db).find().first();
+            var resumed=port.maintain(new AlertMaintenance.Cursor(10,null,null),200,4L*1024*1024,Duration.ofSeconds(5));
+            assertThat(resumed.changed()).isZero();assertThat(rows.countDocuments()).isZero();
+            assertThat(SystemCollections.CONFIGURATION_VERSION.on(f.db).find().first()).isEqualTo(committed);
+            }
+        });
+    }
+    @Test void twoExpiredIntentsHandingOffToOneScheduleCannotOverwriteEachOthersOriginalProof(){
+        withStore(f->{var facts=businessFacts(f);accept(f,facts);var first=facts.intent().frozen();var oldKey=((AlertIntent.Business)first.identity()).key();
+            var secondKey=new DeliveryKey(DeliveryKey.NotificationRound.forEpisode(facts.head().snapshot().rule().key(),1,"route-a",UUID_A,DeliveryKey.Kind.REMINDER,2),"email",UUID_A,oldKey.targetId());
+            var second=new AlertIntent.Frozen(new AlertIntent.Business(secondKey),first.channel(),first.route(),first.target(),first.content(),first.members(),first.retry(),first.retention(),first.createdAt(),first.deadline());
+            f.time.set(T.plus(Duration.ofDays(8)));var intents=SystemCollections.ALERT_DELIVERY_INTENTS.on(f.db);
+            for(var frozen:List.of(first,second)){
+                var accepted=AlertDeliveryFixtures.accepted(AlertDeliveryFixtures.pending(AlertDeliveryFixtures.initial(frozen,PAYLOAD,null),"worker-a","attempt-"+frozen.identity().deliveryId()),T.plusSeconds(1));
+                var pruned=AlertMaintenancePolicy.prune(accepted,f.time.get());
+                intents.replaceOne(new Document("_id",MongoAlertDeliveryCodec.key(frozen.identity())),MongoAlertDeliveryCodec.write(pruned,2),new com.mongodb.client.model.ReplaceOptions().upsert(true));
+            }
+            var old=facts.schedule();var shared=new AlertSchedule.Record(old.key(),old.route(),old.retention(),old.createdAt(),old.owner(),old.grouping(),old.clock(),old.batchSequence(),old.pending(),old.batch(),old.disposition(),old.summaries(),List.of(oldKey,secondKey),old.retiredAt(),old.summariesHandedOff(),old.members());
+            SystemCollections.ALERT_NOTIFICATION_SCHEDULES.on(f.db).replaceOne(new Document("_id",MongoAlertScheduleCodec.key(old.key())),MongoAlertScheduleCodec.write(shared,2));
+            for(int i=0;i<8&&intents.countDocuments()>0;i++)clean(f,0,null);
+            assertThat(intents.countDocuments()).isZero();
+            var retained=MongoAlertScheduleCodec.read(old.key(),SystemCollections.ALERT_NOTIFICATION_SCHEDULES.on(f.db).find().first()).value();
+            assertThat(retained.protectedIntents()).isEmpty();assertThat(retained.summaries()).singleElement().satisfies(summary->assertThat(summary.outcome()).isEqualTo(DeliveryEvidence.Outcome.ACCEPTED));
+            assertThat(f.store.active(null,5,readAll()).total()).isOne();
+        });
+    }
     @Test void finiteWriteContentionYieldsWithinTheOriginalRoundInsteadOfLosingFiveMinutes(){
         withStore(f->{var quota=MongoAlertNotificationCodec.quota(new AlertTestQuota.Bucket(SCOPE,T.minusSeconds(7200),Map.of("original-actor",1)),1);
             SystemCollections.ALERT_TEST_QUOTAS.on(f.db).insertOne(quota);var port=f.store.maintenance().orElseThrow();
