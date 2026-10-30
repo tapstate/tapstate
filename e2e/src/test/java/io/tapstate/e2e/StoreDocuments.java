@@ -117,9 +117,11 @@ final class StoreDocuments implements AutoCloseable {
         if (chain(miningChainId) == null) {
             return Set.of();
         }
+        Document filter = new Document(nativeSrs ? "_id.chain" : "miningChainId", miningChainId);
+        if (nativeSrs) filter.append("detached", false);
         return StreamSupport.stream(database.getCollection(nativeSrs ? SystemCollections.SRS_CONSUMERS.collectionName()
                                 : MongoStorePort.SRS_CONSUMER_OFFSETS)
-                        .find(new Document(nativeSrs ? "_id.chain" : "miningChainId", miningChainId))
+                        .find(filter)
                         .projection(new Document(nativeSrs ? "_id.consumer" : "pipelineId", 1))
                         .spliterator(), false)
                 .map(document -> nativeSrs ? document.get("_id", Document.class).getString("consumer")
