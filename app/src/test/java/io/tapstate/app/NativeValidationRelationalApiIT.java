@@ -142,12 +142,21 @@ class NativeValidationRelationalApiIT {
     }
     private static Map<String,Object> run(RestClient http,String write,String read,Map<String,Object> operation){
         var start=post(http,write,"start",operation);assertThat(start.get("outcome")).isIn("PENDING","ACCEPTED");
-        var completed=new java.util.concurrent.atomic.AtomicReference<Map<String,Object>>();
-        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(25)).pollInterval(Duration.ofMillis(100))
+        var completed=new java.util.concurrent.atomic.AtomicReference<Map<String,Object>>();var retried=new java.util.concurrent.atomic.AtomicBoolean();
+        try{org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(25)).pollInterval(Duration.ofMillis(100))
                 .ignoreExceptionsMatching(failure->failure instanceof org.springframework.web.client.HttpClientErrorException.NotFound||failure instanceof org.springframework.web.client.HttpClientErrorException.TooManyRequests).untilAsserted(()->{
+                    var current=post(http,read,"progress",operation);assertThat(current.get("original")).isEqualTo(operation);
+                    // Passive receipt recovery does not activate. The caller explicitly retries only this original once.
+                    if("ACCEPTED".equals(current.get("outcome"))&&Boolean.FALSE.equals(current.get("admitted"))
+                            &&Boolean.FALSE.equals(current.get("controlUnknown"))&&"STARTING".equals(current.get("state"))&&retried.compareAndSet(false,true)){
+                        var retry=post(http,write,"start",operation);assertThat(retry.get("original")).isEqualTo(operation);assertThat(retry.get("run")).isEqualTo(start.get("run"));
+                    }
                     var report=get(http,read,"/api/pipelines/flow/validation-tasks/"+operation.get("task")+"/reports/"+start.get("run")+"?generation="+operation.get("taskGeneration")+"&sequence="+operation.get("sequence"));
                     assertThat(report).containsEntry("terminal","COMPLETED").containsEntry("closed",true);completed.set(report);
-                });
+                });}catch(org.awaitility.core.ConditionTimeoutException failed){
+            throw new AssertionError("original="+operation+"; initial="+start+"; progress="+post(http,read,"progress",operation)
+                    +"; task="+get(http,read,"/api/pipelines/flow/validation-tasks/"+operation.get("task")),failed);
+        }
         assertThat(post(http,read,"progress",operation)).containsEntry("state","COMPLETED");return completed.get();
     }
     private static Map<String,Object> post(RestClient http,String token,String action,Map<String,?> body){return http.post().uri("/api/validation:"+action).header("Authorization","Bearer "+token).contentType(MediaType.APPLICATION_JSON).body(body).retrieve().body(Map.class);}
