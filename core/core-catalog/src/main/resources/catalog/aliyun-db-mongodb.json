@@ -241,7 +241,7 @@
   ],
   "provenance": {
     "specPath": "connectors/aliyun-mongodb-connector/src/main/resources/aliyun-mongodb-spec.json",
-    "specContentHash": "8abe0a08e6fd0e51",
+    "specContentHash": "6c60490b6a6f4602",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {

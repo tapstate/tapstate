@@ -3,6 +3,7 @@ package io.tapstate.tools.catalog.assembler;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -82,6 +83,50 @@ class CatalogGeneratorTest {
         assertThat(generate().report())
                 .contains("## Unclassified — no resolvable mode (need tapstate.modes)")
                 .contains("- github");
+    }
+
+    @Test
+    void specOnlyRefreshUpdatesExistingRowsWithoutAdmittingNewConnectors() throws IOException {
+        write("connectors-javascript/new-connector/src/main/resources/spec.json", """
+                {"properties":{"id":"new-upstream","name":"New","tags":["Database"]},
+                 "configOptions":{"connection":{"properties":{}}},
+                 "messages":{"default":"en_US","en_US":{}}}
+                """);
+        Set<String> existingIds = Set.of("mysql", "github");
+        Map<String, Set<String>> bitmap = Map.of("mysql", Set.of("batch_read_function"));
+
+        GeneratedCatalog refreshed = CatalogGenerator.generateSpecOnly(
+                List.of(repo), "new-spec", "old-capabilities", bitmap, existingIds);
+
+        assertThat(refreshed.entries()).containsOnlyKeys("mysql", "github");
+        ConnectorCatalogEntry mysql = CatalogEntryReader.read(refreshed.entries().get("mysql"));
+        assertThat(mysql.config()).extracting(field -> field.name()).contains("host");
+        assertThat(mysql.modes()).containsExactly(SourceMode.SNAPSHOT);
+        // Existing entries without capability bits are still part of the shipped catalog.
+        assertThat(CatalogEntryReader.read(refreshed.entries().get("github")).modes()).isEmpty();
+        assertThat(refreshed.index()).contains("\"specSha\": \"new-spec\"",
+                "\"capabilitySha\": \"old-capabilities\"").doesNotContain("new-upstream");
+        assertThat(refreshed.report()).contains("Ingested connectors: 2").doesNotContain("new-upstream");
+        // A full refresh remains the path that can admit a newly discovered connector.
+        assertThat(CatalogGenerator.generate(repo, "new-spec", "new-capabilities", bitmap).entries())
+                .containsOnlyKeys("mysql", "github", "new-upstream");
+    }
+
+    @Test
+    void specOnlyAdmissionUsesTheCatalogRatherThanTheBitmapAcrossCheckouts() throws IOException {
+        Path enterprise = repo.resolve("enterprise");
+        write("enterprise/connectors-javascript/new-connector/src/main/resources/spec.json", """
+                {"properties":{"id":"new-enterprise","name":"New","tags":["Database"]},
+                 "configOptions":{"connection":{"properties":{}}},
+                 "messages":{"default":"en_US","en_US":{}}}
+                """);
+
+        GeneratedCatalog refreshed = CatalogGenerator.generateSpecOnly(List.of(repo, enterprise),
+                "new-spec", "old-capabilities", Map.of("new-enterprise", Set.of("batch_read_function")),
+                Set.of("mysql", "github"));
+
+        assertThat(refreshed.entries()).containsOnlyKeys("mysql", "github");
+        assertThat(refreshed.report()).doesNotContain("new-enterprise");
     }
 
     @Test
