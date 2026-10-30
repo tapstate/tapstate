@@ -240,7 +240,8 @@ final class AlertEvaluationHost {
         return Result.CONFLICT;
     }
     static void requireResult(Result outcome){
-        if(outcome==Result.CONFLICT||outcome==Result.BUSY)throw new TapstateException(AlertError.COMMAND_CONFLICT,Map.of(),null);
+        // Housekeeping belongs to the live owner; deferral does not accept a new observation.
+        if(outcome==Result.CONFLICT)throw new TapstateException(AlertError.COMMAND_CONFLICT,Map.of(),null);
     }
 
     private AlertRule rule(Binding b, AlertStateRecord.Head before) {

@@ -80,7 +80,7 @@ final class ClusterNodeAlertSource implements MembershipListener, AutoCloseable 
                 var row=entry.getValue();if(row.phase()!=Phase.EXPECTED)continue;
                 boolean present=row.registration().memberId().equals(
                         Optional.ofNullable(captured.live().get(entry.getKey())).map(UUID::toString).orElse(null));
-                runtime.resourceInput(entry.getKey(),"cluster.node-unavailable",0,row.registration().producerIncarnation(),
+                runtime.sharedResourceInput(entry.getKey(),"cluster.node-unavailable",0,row.registration().producerIncarnation(),
                         evidence.orElseThrow().requireCurrent(),new AlertInput.Conditions(captured.observedAt(),
                                 present?AlertSignal.Condition.GOOD:AlertSignal.Condition.BAD,null));
             }

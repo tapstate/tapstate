@@ -19,6 +19,63 @@ import static org.mockito.Mockito.*;
 @RequiresDocker
 class AlertNodeDetectorIT {
     @Container static final org.testcontainers.containers.MongoDBContainer MONGO=AlertEvaluationHostIT.MONGO;
+    @Test void healthyPeerObserversDoNotDegradeAndTheSurvivorTakesOverOnlyAfterTheOriginalLease() {
+        AlertEvaluationHostIT.withFixture(f->{
+            var start=Instant.now();f.now().set(start);String cluster="peer-node-alert-"+UUID.randomUUID();
+            var first=Hazelcast.newHazelcastInstance(config(cluster,"node-a","boot-a",null));
+            HazelcastInstance second=null;
+            try {
+                second=Hazelcast.newHazelcastInstance(config(cluster,"node-b","boot-b",first.getCluster().getLocalMember().getAddress().getHost()+":"+first.getCluster().getLocalMember().getAddress().getPort()));
+                var peer=second;await().atMost(Duration.ofSeconds(15)).until(()->first.getCluster().getMembers().size()==2);
+                var claims=f.cache().workloadClaims(f.business());
+                var nodeA=claims.read(new WorkloadClaimKey(f.storeHost().scope().clusterId(),WorkloadClaimType.NODE_SESSION,"node-a")).orElseThrow().claim();
+                var nodeB=claims.acquire(new WorkloadClaimKey(f.storeHost().scope().clusterId(),WorkloadClaimType.NODE_SESSION,"node-b"),new WorkloadOwner("node-b","boot-b"),1,Duration.ofSeconds(60)).claim();
+                var setup=f.storeHost().setup();var cache=f.configuration().bindings().cachePreparation().orElseThrow().authScope();
+                var lifecycle=f.configuration().alertNodeLifecycles(f.storeHost().scope(),setup,()->{});
+                var own=new Registration(new Key(f.storeHost().scope(),"node-a","boot-a"),setup,cache,WorkloadClaimFence.from(nodeA),first.getCluster().getLocalMember().getUuid().toString(),1);
+                var remote=new Registration(new Key(f.storeHost().scope(),"node-b","boot-b"),setup,cache,WorkloadClaimFence.from(nodeB),peer.getCluster().getLocalMember().getUuid().toString(),1);
+                lifecycle.register(remote,start,()->{});
+                var header=AlertConfiguration.Header.create(AlertConfiguration.Identity.create(AlertConfiguration.Kind.RULE,f.storeHost().scope(),"peer-node-rule"),AlertChannelPolicy.Deployment.ON_PREM,start,"operator");
+                var rule=new AlertConfiguration.Rule(header,"Node availability","cluster.node-unavailable",1,new AlertConfiguration.Resources(Set.of("cluster-node"),true,Set.of()),Map.of(),null,true,null).validated(BuiltinAlarmTypes.catalog());
+                f.store().saveDefinition(null,rule,AlertNotificationPlannerIT.access());
+                try(var a=observer(f,first,own,lifecycle,"observer-a");var b=observer(f,peer,remote,lifecycle,"observer-b")) {
+                    a.runtime().tick();drained(a.runtime());
+                    var key=new AlarmKey(f.storeHost().scope(),own.key().resource(),rule.typeId(),header.identity().incarnation());
+                    var before=a.store().state(key,f.reads()).orElseThrow();
+                    assertThat(before.value().owner().ownerId()).isEqualTo("observer-a");
+                    b.runtime().tick();drained(b.runtime());
+                    assertThat(b.runtime().health().degraded()).as("a healthy peer must not turn another valid owner into a collection failure").isFalse();
+                    assertThat(b.store().state(key,f.reads()).orElseThrow()).isEqualTo(before);
+                    f.now().set(start.plusSeconds(1));a.runtime().tick();drained(a.runtime());b.runtime().tick();drained(b.runtime());
+                    assertThat(a.runtime().health().degraded()).isFalse();assertThat(b.runtime().health().degraded()).isFalse();
+                    a.source().close();a.runtime().close();first.getLifecycleService().terminate();
+                    await().atMost(Duration.ofSeconds(15)).until(()->peer.getCluster().getMembers().size()==1);
+                    f.now().set(start.plusSeconds(2));b.runtime().tick();drained(b.runtime());
+                    assertThat(b.store().state(key,f.reads()).orElseThrow().value().owner().ownerId()).isEqualTo("observer-a");
+                    f.now().set(start.plusSeconds(32));b.runtime().tick();drained(b.runtime());
+                    var after=b.store().state(key,f.reads()).orElseThrow().value();
+                    assertThat(after.owner().ownerId()).isEqualTo("observer-b");assertThat(after.owner().generation()).isGreaterThan(before.value().owner().generation());
+                    assertThat(after.snapshot().status()).isEqualTo(AlertSnapshot.Status.FIRING);assertThat(after.snapshot().episode().number()).isEqualTo(1);
+                }
+            }finally{if(second!=null&&second.getLifecycleService().isRunning())second.shutdown();if(first.getLifecycleService().isRunning())first.shutdown();}
+        });
+    }
+    private record Observer(PipelineAlertRuntime runtime,ClusterNodeAlertSource source,AlertStore store) implements AutoCloseable {
+        public void close(){if(!runtime.health().closed()){source.close();runtime.close();}}
+    }
+    private static Observer observer(AlertEvaluationHostIT.Fixture f,HazelcastInstance member,Registration own,AlertNodeLifecycleStore lifecycle,String owner) {
+        var gate=mock(ClusterMembershipGate.class);
+        when(gate.committed()).thenReturn(new ClusterMembership(f.storeHost().scope().clusterId(),1,Set.of("node-a","node-b")));
+        when(gate.visibleNodeIds()).thenAnswer(call->member.getCluster().getMembers().stream().map(ClusterMembershipGate::stableIdOf).collect(java.util.stream.Collectors.toSet()));
+        var reference=new AtomicReference<PipelineAlertRuntime>();var cache=f.configuration().bindings().cachePreparation().orElseThrow().authScope();
+        var signals=new BuiltinResourceSignals(reference::get,()->f.configuration().bindings().load().orElseThrow(),cache,()->{},f.clock());
+        var host=new AlertStore.Host(f.storeHost().scope(),f.storeHost().setup(),AlertChannelPolicy.Deployment.ON_PREM,()->{},null,null,signals::resourceEvidence,Set.of());
+        var store=f.configuration().alerts(host,BuiltinAlarmTypes.catalog(),f.clock());
+        var evaluator=new AlertEvaluationHost(store,BuiltinAlarmTypes.catalog(),AlertChannelPolicy.Deployment.ON_PREM,f.clock(),owner,()->{});
+        var runtime=new PipelineAlertRuntime(()->new PipelineAlertRuntime.Services(store,evaluator,BuiltinAlarmTypes.catalog(),null,null,Set.of("cluster-member-health","pipeline-lifecycle")),f.configuration().intents(),(scope,fence)->Optional.empty(),()->{},f.clock());
+        var source=new ClusterNodeAlertSource(member,gate,runtime,signals,()->{},f.clock(),()->lifecycle,()->own,registration->()->{});
+        reference.set(runtime);runtime.observerTick(source::tick);return new Observer(runtime,source,store);
+    }
     @Test void anUnexpectedDetectorRemovalFiresWhileAnOrderlyRemovalEndsMonitoringWithoutRecovery() {
         for(boolean orderly:List.of(false,true))AlertEvaluationHostIT.withFixture(f->{
             f.now().set(Instant.now());String cluster="node-alert-"+UUID.randomUUID();

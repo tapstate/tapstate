@@ -292,6 +292,15 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             Runnable originalGuard,Runnable localProof,AlertInput input) {resourceInput(resource,typeId,sourceRevision,producer,originalGuard,localProof,input,()->{});}
     void resourceInput(AlarmKey.Resource resource,String typeId,long sourceRevision,String producer,
             Runnable originalGuard,Runnable localProof,AlertInput input,Runnable settled) {
+        resourceInput(resource,typeId,sourceRevision,producer,originalGuard,localProof,input,settled,false);
+    }
+    /** Every admitted member repeats this same authoritative snapshot; only the current owner writes it. */
+    void sharedResourceInput(AlarmKey.Resource resource,String typeId,long sourceRevision,String producer,
+            Runnable originalGuard,AlertInput input) {
+        resourceInput(resource,typeId,sourceRevision,producer,originalGuard,active,input,()->{},true);
+    }
+    private void resourceInput(AlarmKey.Resource resource,String typeId,long sourceRevision,String producer,
+            Runnable originalGuard,Runnable localProof,AlertInput input,Runnable settled,boolean shared) {
         if(closed.get()){settled.run();return;}
         ResourceSlot slot;
         synchronized(objectAdmission){
@@ -331,7 +340,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
                             &&head.snapshot().lastObservedAt()!=null
                             &&op.observedAt().isBefore(head.snapshot().lastObservedAt().plusSeconds(5)))continue;
                 }
-                accept(binding,next,input);
+                accept(binding,next,input,shared);
             }
         }finally{settled.run();}},settled);
     }
@@ -387,7 +396,11 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         active.run();
     }
     private void accept(AlertEvaluationHost.Binding binding, long sequence, AlertInput input) {
+        accept(binding,sequence,input,false);
+    }
+    private void accept(AlertEvaluationHost.Binding binding,long sequence,AlertInput input,boolean shared) {
         var outcome = services.evaluator().accept(binding, sequence, input);
+        if(shared && outcome==AlertEvaluationHost.Result.BUSY)return;
         if (outcome == AlertEvaluationHost.Result.CONFLICT || outcome == AlertEvaluationHost.Result.BUSY) throw refused("state-contention");
     }
     private void submit(Slot slot, int bytes, Runnable action) { submit(slot, bytes, action, () -> { }); }

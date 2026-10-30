@@ -195,6 +195,32 @@ class PipelineAlertRuntimeTest {
     private void drained(PipelineAlertRuntime runtime) {
         await().atMost(Duration.ofSeconds(3)).until(()->runtime.health().queuedInputs()==0);
     }
+    @Test void aNecessaryOperationFailureStillReportsBusyRatherThanClaimingAcceptance() {
+        var rule=useResourceRule();var resource=new AlarmKey.Resource("source","erp","uuid");
+        var binding=new AlertEvaluationHost.Binding(rule,resource,"producer",1,()->{});
+        fixture.host.accept(binding,0,new AlertInput.Operational(T,"a".repeat(64),OperationalEvidence.Capability.STREAM_READ,true));
+        var before=rows.get(binding.key());
+        var peer=new AlertEvaluationHost(fixture.store,BuiltinAlarmTypes.catalog(),AlertChannelPolicy.Deployment.ON_PREM,fixture.clock,"other-owner",()->{});
+        try(var runtime=new PipelineAlertRuntime(()->new PipelineAlertRuntime.Services(fixture.store,peer,BuiltinAlarmTypes.catalog(),null,null,Set.of("source-operational-health")),intentStore,(scope,claim)->Optional.empty(),()->{},fixture.clock)) {
+            runtime.tick();drained(runtime);assertThat(runtime.health().degraded()).isFalse();
+            fixture.now.set(T.plusSeconds(1));resource(runtime,"erp",T.plusSeconds(1),false,()->{});drained(runtime);
+            assertThat(runtime.health().degraded()).isTrue();assertThat(runtime.health().parameters()).containsEntry("reason","state-contention");
+            assertThat(rows.get(binding.key())).isEqualTo(before);
+        }
+    }
+    @Test void aSharedSnapshotStillReportsExhaustedRealCompareAndSetConflicts() {
+        var original=AlertEvaluationHostTest.definition("pipeline.failed");
+        var rule=new AlertConfiguration.Rule(original.header(),"Node health","cluster.node-unavailable",1,
+                new AlertConfiguration.Resources(Set.of("cluster-node"),true,Set.of()),Map.of(),null,true,null).validated(BuiltinAlarmTypes.catalog());
+        when(fixture.store.evaluationRules(any(),anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule),null));
+        doReturn(AlertStore.Outcome.CONFLICT).when(fixture.store).commit(any());
+        try(var runtime=new PipelineAlertRuntime(()->new PipelineAlertRuntime.Services(fixture.store,fixture.host,BuiltinAlarmTypes.catalog(),null,null,Set.of("cluster-member-health")),intentStore,(scope,claim)->Optional.empty(),()->{},fixture.clock)) {
+            runtime.tick();drained(runtime);
+            runtime.sharedResourceInput(new AlarmKey.Resource("cluster-node","node-a","boot-a"),rule.typeId(),0,"node-producer",()->{},new AlertInput.Conditions(T,AlertSignal.Condition.BAD,null));
+            drained(runtime);assertThat(runtime.health().degraded()).isTrue();assertThat(runtime.health().parameters()).containsEntry("reason","state-contention");
+            assertThat(rows).isEmpty();verify(fixture.store,times(3)).commit(any());
+        }
+    }
     @Test void resourceFailureAndRecoveryStayOrderedWhileAnotherResourceCanProceed() throws Exception {
         useResourceRule();var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
         try(var runtime=runtime()) {
