@@ -11,6 +11,9 @@ import org.bson.conversions.Bson;
 
 /** Indexed candidate discovery with process-local progress; mutations return to the original fragment owners. */
 final class MongoAlertMaintenance implements AlertMaintenance {
+    // Legal rows are at most 1 MiB. Leave room for authority, discovery and mutation
+    // accounting in a fresh 4 MiB batch before fetching an opaque body.
+    private static final long MAX_FETCH_BYTES=2L*1024*1024;
     static final List<SystemCollections> RESOURCES = List.of(SystemCollections.ALERT_DELIVERY_INTENTS,
             SystemCollections.ALERT_NOTIFICATION_SCHEDULES, SystemCollections.ALERT_EPISODES,
             SystemCollections.ALERT_TRANSITIONS, SystemCollections.ALERT_INSTANCES, SystemCollections.ALERT_RULES,
@@ -49,7 +52,7 @@ final class MongoAlertMaintenance implements AlertMaintenance {
     // Structural verification is reusable only until this original bounded round deadline.
     // Every transaction still revalidates the live host, feature version, key and CONFIG fence.
     private long schemaVerifiedUntil;
-    private final Object[] pendingProofCandidate=new Object[12];
+    private final Object[] pendingCandidate=new Object[12];
     private static final class Yield extends RuntimeException { }
     private static final class Budget {
         final int rows; final long bytes, until; int used; long encoded;int proofSteps;boolean isolationChecked,isolated;
@@ -80,7 +83,7 @@ final class MongoAlertMaintenance implements AlertMaintenance {
             String encodedCursor=candidate.containsKey("cursor")?candidate.getString("cursor"):new Document("id",candidate.get("_id")).toJson();
             if(encodedCursor.length()>8192)throw new io.tapstate.core.common.TapstateException(IoError.DOCUMENT_UNREADABLE,Map.of("id","alert-maintenance","field","candidate-cursor"),null);
             Cursor scanned=new Cursor(index,candidateAt,encodedCursor);
-            int proofBefore=b.proofSteps;boolean resumingProof=Objects.equals(pendingProofCandidate[index],candidate.get("_id"));
+            int proofBefore=b.proofSteps;boolean resumingCandidate=Objects.equals(pendingCandidate[index],candidate.get("_id"));
             try {
                 // Reserve before entering authority validation. Every attempted transaction is billed once,
                 // including commit/abort allowance; maintenance does not run hidden callback retries.
@@ -92,21 +95,21 @@ final class MongoAlertMaintenance implements AlertMaintenance {
                 });
                 if(result.equals("changed"))changed++;else {skipped.merge(result,1L,Long::sum);
                     if(result.equals("conflict"))b.eligible(b.currentCandidate);else b.protect(b.currentCandidate);}
-                pendingProofCandidate[index]=null;cursor=scanned;
+                pendingCandidate[index]=null;cursor=scanned;
             }catch(Yield end){skipped.merge("budget",1L,Long::sum);
-                // A bounded proof which made progress is the one continuation for this collection.
-                // Finish it before admitting another large candidate, so finite caches cannot thrash.
-                if(resumingProof||b.proofSteps>proofBefore){pendingProofCandidate[index]=candidate.get("_id");cursor=original;}else cursor=scanned;break;}
+                // Budget exhaustion has not classified or committed this candidate. Retrying its
+                // original key with a fresh batch must precede advancing to later candidates.
+                b.eligible(b.currentCandidate);pendingCandidate[index]=candidate.get("_id");cursor=original;break;}
             catch(MongoReadBudget.MaintenanceConflict conflict){
                 conflict();skipped.merge("conflict",1L,Long::sum);
                 if(++conflicts>3)throw new io.tapstate.core.common.TapstateException(IoError.STORE_UNAVAILABLE,Map.of("detail","maintenance-contention"),null);
-                if(resumingProof||b.proofSteps>proofBefore)pendingProofCandidate[index]=candidate.get("_id");cursor=original;
+                if(resumingCandidate||b.proofSteps>proofBefore)pendingCandidate[index]=candidate.get("_id");cursor=original;
             }
             catch(IllegalArgumentException | ClassCastException | NullPointerException invalid) {
                 // A malformed or unsupported record is retained, and its scanned key still advances.
-                skipped.merge("unreadable",1L,Long::sum);b.protect(b.currentCandidate);pendingProofCandidate[index]=null;cursor=scanned;
+                skipped.merge("unreadable",1L,Long::sum);b.protect(b.currentCandidate);pendingCandidate[index]=null;cursor=scanned;
             }catch(io.tapstate.core.common.TapstateException invalid){
-                if(invalid.code()!=IoError.DOCUMENT_UNREADABLE)throw invalid;skipped.merge("unreadable",1L,Long::sum);b.protect(b.currentCandidate);pendingProofCandidate[index]=null;cursor=scanned;
+                if(invalid.code()!=IoError.DOCUMENT_UNREADABLE)throw invalid;skipped.merge("unreadable",1L,Long::sum);b.protect(b.currentCandidate);pendingCandidate[index]=null;cursor=scanned;
             }
         }
         if(b.isolated)skipped.merge("unreadable",1L,Long::sum);
@@ -385,7 +388,7 @@ final class MongoAlertMaintenance implements AlertMaintenance {
         // Inspect size on the server before fetching an untrusted or future-format body.
         var size=handles.apply(c).aggregate(s,List.of(new Document("$match",and(scope(c),filter)),new Document("$limit",1),new Document("$project",new Document("size",new Document("$bsonSize","$$ROOT"))))).first();
         if(size==null)return null;long bytes=((Number)size.get("size")).longValue();
-        if(bytes>4L*1024*1024)throw new IllegalArgumentException("oversized unknown maintenance record");b.use(bytes+4096+MongoAlertConfigurationCodec.size(filter));
+        if(bytes>MAX_FETCH_BYTES)throw new IllegalArgumentException("oversized unknown maintenance record");b.use(bytes+4096+MongoAlertConfigurationCodec.size(filter));
         return handles.apply(c).find(s,and(scope(c),filter)).batchSize(1).limit(1).first();
     }
     static Document versionFilter(Document original) {

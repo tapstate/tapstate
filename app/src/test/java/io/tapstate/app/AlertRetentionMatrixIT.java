@@ -56,9 +56,10 @@ class AlertRetentionMatrixIT {
             assertThat(pruned.state().attemptsConsumed()).isOne();
             assertThat(store.active(null,10,f.reads()).total()).isOne();
             f.now().set(retained.resultUntil());clean(store);
-            var closed=store.intent(identity,null).orElseThrow().value();
+            var closedRow=store.intent(identity,null).orElseThrow();var closed=closedRow.value();
             assertThat(closed.state().detailsPrunedAt()).isNotNull();assertThat(closed.state().attempts()).isEmpty();
             assertThat(closed.state().summary()).isEqualTo(expected);assertThat(closed.state().lastAttemptEnd()).isNotNull();
+            assertThat(AlertHttpModel.delivery(closedRow,false).get("attempts")).isEqualTo(1);
             assertThat(AlertDeliveryProgress.result(closed,permit,DeliveryEvidence.Outcome.ACCEPTED,
                     new AlertIntent.Protocol(AlertIntent.Phase.FINAL_RESPONSE,AlertIntent.Action.STOP,200,"fixture-late",null),
                     new AlertIntent.Receipt(cloud?"sdk-event-center":"channel-protocol","012345678901234567890123",null),f.clock().instant(),0)).isEqualTo(closed);

@@ -29,6 +29,7 @@ final class AlertManagement implements AlertControlDispatcher {
     }
     private Map<String,Object> invoke(String op,Map<String,Object> input,PipelineAlertRuntime.Services resolved,AlertStore.Access access,CredentialAuthentication caller){
         var store=resolved.store();var reads=new AlertStore.ReadAccess(true,Set.of(),access.locallyActive());
+        var capabilityTypes=new DeliveryTypes(store,resolved.catalog(),reads);
         var author=new AlertAuthoring(store,scope,deployment,resolved.catalog(),clock,resolved.channels());var commands=new AlertDeliveryCommands(store,scope,deployment,clock,resolved.evaluator().retentionPolicy());
         int limit=integer(input,"limit",25);if(limit<1||limit>100)throw invalid("limit");
         switch(op){
@@ -67,11 +68,11 @@ final class AlertManagement implements AlertControlDispatcher {
                 m.put("basis",map("typeId",key.typeId(),"quality",current?h.value().snapshot().quality().name():"HISTORICAL", "observedAt",instant(observed),"triggerForSeconds",rule.triggerFor().toSeconds(),"recoverForSeconds",rule.resolveFor().toSeconds()));return m;
             }
             case "alert.deliveries": {
-                fields(input,"cursor","limit","channel","result","id","key","episode");var id=optional(input,"id");if(id!=null)return projectDelivery(store.delivery(id,reads).orElseThrow(()->stale("delivery-not-found")),true,resolved);
+                fields(input,"cursor","limit","channel","result","id","key","episode");var id=optional(input,"id");if(id!=null)return projectDelivery(store.delivery(id,reads).orElseThrow(()->stale("delivery-not-found")),true,resolved,capabilityTypes);
                 var channel=optional(input,"channel");if(channel!=null&&!"cloud-sdk".equals(channel))resolved.channels().require(channel);
                 if(deployment==AlertChannelPolicy.Deployment.CLOUD_MANAGED&&channel!=null&&!channel.equals("cloud-sdk"))throw stale("managed-channel");
                 var outcome=optional(input,"result");if(outcome!=null&&!Set.of("NOT_ATTEMPTED","NOT_ACCEPTED","UNKNOWN","ACCEPTED","WAITING_RETRY","QUEUED","IN_FLIGHT","PAUSED","CANCELLED","EXHAUSTED","EXPIRED").contains(outcome))throw invalid("result");var alarm=input.get("key")==null?null:key(text(input,"key"),scope);long episode=number(input,"episode",0);String filter=JsonWriter.write(java.util.Arrays.asList(channel,outcome,input.get("key"),episode));String token=optional(input,"cursor");String after=token==null?null:text(cursor(token,"deliveries:"+filter),"after");
-                var p=store.deliveries(after,limit,channel,null,reads);var rows=p.rows().stream().filter(r->alarm==null||r.value().frozen().members().stream().anyMatch(m->m.evaluation().key().equals(alarm)&&(episode==0||m.episode()==episode))).map(r->projectDelivery(r,false,resolved)).filter(r->outcome==null||outcome.equals(r.get("outcome"))||outcome.equals(r.get("displayState"))).toList();
+                var p=store.deliveries(after,limit,channel,null,reads);var rows=p.rows().stream().filter(r->alarm==null||r.value().frozen().members().stream().anyMatch(m->m.evaluation().key().equals(alarm)&&(episode==0||m.episode()==episode))).map(r->projectDelivery(r,false,resolved,capabilityTypes)).filter(r->outcome==null||outcome.equals(r.get("outcome"))||outcome.equals(r.get("displayState"))).toList();
                 return map("rows",rows,"isolated",p.isolatedRecords(),"nextCursor",p.nextId()==null?null:cursorToken("deliveries:"+filter,map("after",p.nextId())));
             }
             case "alert.health": {
@@ -95,9 +96,9 @@ final class AlertManagement implements AlertControlDispatcher {
                 if(input.get("existingId")!=null){existing=(AlertReceiver)store.definition(AlertConfiguration.Kind.RECEIVER,text(input,"existingId"),access).orElseThrow(()->stale("receiver-not-found"));if(existing.header().revision()!=number(input,"etag",0))throw stale("receiver-etag");}
                 var transport=AlertAuthoring.transport(form,existing,resolved.channels());var retain=new LinkedHashSet<AlertStore.PrivateField>();if(bool(form,"retainMaterial",false)&&existing!=null){if(transport.authentication()!=AlertReceiver.Authentication.NONE)retain.add(AlertStore.PrivateField.AUTHENTICATION);if(transport.trust()==AlertReceiver.Trust.PRIVATE_CA)retain.add(AlertStore.PrivateField.PRIVATE_CA);if(!(transport instanceof AlertReceiver.Email)&&privateInput(form,"endpoint")==null)retain.add(AlertStore.PrivateField.ENDPOINT);}
                 AlertConfiguration.Subscription route=null;if(input.get("routeId")!=null)route=(AlertConfiguration.Subscription)store.definition(AlertConfiguration.Kind.SUBSCRIPTION,text(input,"routeId"),access).orElseThrow(()->stale("route-not-found"));
-                try(var material=AlertAuthoring.material(form)){return projectDelivery(commands.test(AlertTestCommand.ClientId.parse(text(input,"commandId")),text(input,"candidateId"),transport,transport instanceof AlertReceiver.Email?emailTarget(text(input,"target")):AlertReceiver.httpsTargetId(transport),existing,material,retain,route,access),false,resolved);}
+                try(var material=AlertAuthoring.material(form)){return projectDelivery(commands.test(AlertTestCommand.ClientId.parse(text(input,"commandId")),text(input,"candidateId"),transport,transport instanceof AlertReceiver.Email?emailTarget(text(input,"target")):AlertReceiver.httpsTargetId(transport),existing,material,retain,route,access),false,resolved,capabilityTypes);}
             }
-            case "alert.test-result": {fields(input,"commandId");requireOp();return projectDelivery(commands.result(new AlertTestCommand.Key(scope,access.actor().principalKey(),AlertTestCommand.ClientId.parse(text(input,"commandId"))),access),false,resolved);}
+            case "alert.test-result": {fields(input,"commandId");requireOp();return projectDelivery(commands.result(new AlertTestCommand.Key(scope,access.actor().principalKey(),AlertTestCommand.ClientId.parse(text(input,"commandId"))),access),false,resolved,capabilityTypes);}
             case "alert.retry": {fields(input,"id","etag");requireOp();var current=store.delivery(text(input,"id"),reads).orElseThrow(()->stale("delivery-not-found"));AlertAuthoring.check(commands.retry(current.value().frozen().identity(),number(input,"etag",0),access));return map("queued",true);}
             default:throw new IllegalStateException("unregistered alert operation");
         }
@@ -110,13 +111,39 @@ final class AlertManagement implements AlertControlDispatcher {
         var result=new NotificationRenderer().render(new NotificationRenderer.Facts(kind,"preview",kind==NotificationRenderer.Kind.CHANNEL_TEST?0:1,now,kind==NotificationRenderer.Kind.CHANNEL_TEST?List.of():List.of(item),kind==NotificationRenderer.Kind.CHANNEL_TEST?0:1,null,List.of(),kind==NotificationRenderer.Kind.CHANNEL_TEST?"preview":null,kind==NotificationRenderer.Kind.CHANNEL_TEST?channel:null),messages(object(input.get("messages"))));
         if(!result.successful())throw invalid("preview-budget");var s=result.snapshot();return map("example",true,"subject",s.subject(),"text",s.text(),"html",s.html(),"webhook",new String(s.webhook(),java.nio.charset.StandardCharsets.UTF_8));
     }
-    private Map<String,Object> projectDelivery(AlertStore.Stored<AlertIntent.Record> stored,boolean detail,PipelineAlertRuntime.Services services){
+    private Map<String,Object> projectDelivery(AlertStore.Stored<AlertIntent.Record> stored,boolean detail,PipelineAlertRuntime.Services services,
+            DeliveryTypes types){
         var row=delivery(stored,detail);if(!stored.value().state().permitsStopped()&&stored.value().state().summary()!=DeliveryEvidence.Outcome.ACCEPTED
                 &&(services.delivery()==null||!services.delivery().supportsForManagement(stored.value().frozen())))row.put("displayState","PAUSED");
+        var capability=stored.value().state().summary()==DeliveryEvidence.Outcome.ACCEPTED?null:types.unavailable(stored.value().frozen());
+        if(capability!=null){row.put("capability",capability);if(!stored.value().state().permitsStopped())row.put("displayState","PAUSED");}
         boolean retry=false;if(deployment==AlertChannelPolicy.Deployment.ON_PREM&&stored.value().frozen().identity() instanceof AlertIntent.Business
-                &&services.delivery()!=null&&services.delivery().supportsForManagement(stored.value().frozen())){
+                &&capability==null&&services.delivery()!=null&&services.delivery().supportsForManagement(stored.value().frozen())){
             try{AlertDeliveryProgress.manual(stored.value(),clock.instant());retry=true;}catch(io.tapstate.core.common.TapstateException refused){}}
         row.put("canRetry",retry);return row;
+    }
+    private record RuleVersion(AlertConfiguration.Identity identity,long revision,String type) { }
+    private static final class DeliveryTypes {
+        private final AlertStore store;private final AlertStore.ReadAccess reads;
+        private final Map<String,AlarmTypeCatalog.Type> descriptors=new HashMap<>();
+        private final Map<RuleVersion,Integer> versions=new HashMap<>();
+        DeliveryTypes(AlertStore store,AlarmTypeCatalog catalog,AlertStore.ReadAccess reads){
+            this.store=store;this.reads=reads;catalog.types().forEach(type->descriptors.put(type.id(),type));
+        }
+        Map<String,Object> unavailable(AlertIntent.Frozen frozen){
+            for(var member:frozen.members()){
+                String type=member.evaluation().key().typeId();var descriptor=descriptors.get(type);
+                if(descriptor==null)return map("reason",AlarmTypeCatalog.Availability.UNKNOWN_TYPE.name(),"typeId",type,"typeVersion",null,"availableVersion",null);
+                var key=new RuleVersion(member.ruleIdentity(),member.evaluation().revision(),type);Integer required=versions.get(key);
+                if(required==null){
+                    var original=store.originalRule(member.evaluation(),reads).filter(rule->rule.header().identity().equals(member.ruleIdentity())
+                            &&rule.evaluationRevision()==member.evaluation().revision()&&rule.typeId().equals(type));
+                    if(original.isPresent()){required=original.orElseThrow().typeVersion();versions.put(key,required);}
+                }
+                if(required!=null&&descriptor.version()!=required)return map("reason",AlarmTypeCatalog.Availability.UNSUPPORTED_TYPE_VERSION.name(),"typeId",type,"typeVersion",required,"availableVersion",descriptor.version());
+            }
+            return null;
+        }
     }
     private static Map<String,Object> channelPolicies(AlertChannelCatalog catalog){var policies=new LinkedHashMap<String,Object>();for(var descriptor:catalog.descriptors())policies.put(descriptor.capability().typeId(),policy(descriptor.transportFamily()==AlertChannelCatalog.TransportFamily.EMAIL?ChannelRetryPolicy.emailDefaults():ChannelRetryPolicy.webhookDefaults()));return policies;}
     private static Map<String,Object> channelDescriptor(AlertChannelCatalog.Descriptor d){return map("id",d.capability().typeId(),"version",d.capability().version(),"label",d.label(),"transportFamily",d.transportFamily().name(),"transportVersion",d.transportVersion(),"fields",d.fields().stream().map(f->map("key",f.key(),"label",f.label(),"maximumBytes",f.maximumBytes(),"required",f.required(),"defaultValue",f.defaultValue())).toList());}

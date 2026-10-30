@@ -27,7 +27,14 @@ class AlertRatedCleanupIT {
         int minutes=Integer.getInteger("tapstate.test.alert-rated-minutes",60);
         assertThat(minutes).isBetween(1,60);
         try(var smtp=new AlertDeliveryNetworkIT.SmtpPeer(true)){
-            AlertEvaluationHostIT.withFixture(f->{
+            AlertEvaluationHostIT.withFixture(original->{
+                long clockOrigin=System.nanoTime();
+                Clock continuous=new Clock(){public ZoneId getZone(){return ZoneOffset.UTC;}public Clock withZone(ZoneId zone){return this;}
+                    public Instant instant(){return T.plusNanos(System.nanoTime()-clockOrigin);}};
+                var host=original.storeHost().withChannels(Set.of(new AlertChannelPolicy.Capability("email",1,AlertChannelPolicy.Family.OP_EXTERNAL),new AlertChannelPolicy.Capability("webhook",1,AlertChannelPolicy.Family.OP_EXTERNAL)));
+                var live=original.configuration().alerts(host,BuiltinAlarmTypes.catalog(),continuous);
+                var f=new AlertEvaluationHostIT.Fixture(original.configuration(),original.cache(),original.settings(),original.business(),original.intent(),original.claim(),live,host,original.rule(),
+                        new AlertEvaluationHost(live,BuiltinAlarmTypes.catalog(),host.deployment(),continuous,"live-protected-evaluator",ACTIVE),continuous,original.now());
                 // This active, unrouted rule is independent of the repeated critical workload.
                 bad(f);var protectedKey=f.binding(()->new AlertStore.EvaluationProof(f.intent(),ACTIVE)).key();
                 var route=route(f,Duration.ZERO);
@@ -42,7 +49,7 @@ class AlertRatedCleanupIT {
                 var settings=new AlertRetentionSettings();settings.setRetention(Map.of("accepted-payload","PT15M"));var policy=settings.resolve(f.storeHost().deployment());
                 var evaluator=new AlertEvaluationHost(f.store(),BuiltinAlarmTypes.catalog(),f.storeHost().deployment(),f.clock(),"rated-evaluator",ACTIVE,policy);
                 var binding=new AlertEvaluationHost.Binding(rule,new AlarmKey.Resource("pipeline","orders","1"),"rated-producer",0,ACTIVE,()->new AlertStore.EvaluationProof(f.intent(),ACTIVE));
-                var planner=planner(f,"rated-planner");evaluator.withPlanner(planner);var store=sendingStore(f);
+                var planner=planner(f,"rated-planner");evaluator.withPlanner(planner);var store=f.store();
                 var candidate=AlertDeliveryRuntimeIT.seedLegacyTestPayload(f,new AlertTestCommand.ClientId(T,"d".repeat(32)),AlertDeliveryRuntimeIT.testEmail(),"a@example.test");
                 var unknownChannel=new AlertDeliveryRuntimeIT.Channels(store);unknownChannel.answer=request->new io.tapstate.spi.alerting.NotificationChannel.Result(DeliveryEvidence.Outcome.UNKNOWN,io.tapstate.spi.alerting.NotificationChannel.Action.STOP,null,io.tapstate.spi.alerting.NotificationChannel.Phase.DEADLINE,0,"controlled-unknown");
                 try(var unknown=AlertDeliveryRuntimeIT.runtime(f,store,unknownChannel,"protected-unknown")){unknown.tick();AlertDeliveryRuntimeIT.settled(unknown);}
@@ -55,20 +62,21 @@ class AlertRatedCleanupIT {
                     var payloadDeadlines=new LinkedHashMap<AlertIntent.Identity,Instant>();
                     var quotaDeadlines=new LinkedHashMap<Document,Instant>();
                     var probe=new ReclamationProbe(f,store,db,payloadDeadlines,quotaDeadlines);
-                    long started=System.nanoTime();int sequence=0;
+                    maintenance.start();org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(10)).untilAsserted(()->assertThat(maintenance.health()).containsEntry("capacitySampleStale",false));
+                    long started=System.nanoTime();Instant workloadEpoch=f.clock().instant();int sequence=0;var admissions=new AtomicInteger();
                     for(int minute=0;minute<minutes;minute++){
-                        waitUntil(f,maintenance,probe,started,(long)minute*60);
-                        assertThat(Duration.between(T.plusSeconds(minute*60L),f.clock().instant())).isLessThan(Duration.ofSeconds(10));
+                        waitUntil(probe,started,(long)minute*60);
+                        assertThat(Duration.between(workloadEpoch.plusSeconds(minute*60L),f.clock().instant())).isLessThan(Duration.ofSeconds(10));
                         var quotaMinute=f.clock().instant().truncatedTo(java.time.temporal.ChronoUnit.MINUTES).minusSeconds(3660);
                         var id=new Document("authorityId",f.storeHost().scope().authorityId()).append("clusterId",f.storeHost().scope().clusterId()).append("minute",quotaMinute.toString());
                         var eligible=quotaMinute.plusSeconds(3660);quotaDeadlines.put(id,eligible);
                         db.getCollection("alert_test_quotas").insertOne(new Document("_id",id).append("formatVersion",1).append("recordRevision",1L).append("cleanupAt",Date.from(eligible))
                                 .append("body",new Document("actors",List.of(new Document("actor","rated-actor").append("accepted",1)))));
-                        assertThat(evaluator.accept(binding,++sequence,new AlertInput.Conditions(f.clock().instant(),AlertSignal.Condition.BAD,null))).isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
-                        pump(f,maintenance,probe,planner,sender,smtp,started,minute*4+2);
-                        waitUntil(f,maintenance,probe,started,(long)minute*60+3);
-                        assertThat(evaluator.accept(binding,++sequence,new AlertInput.Conditions(f.clock().instant(),AlertSignal.Condition.GOOD,null))).isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
-                        pump(f,maintenance,probe,planner,sender,smtp,started,minute*4+4);
+                        accept(store,evaluator,binding,++sequence,new AlertInput.Conditions(f.clock().instant(),AlertSignal.Condition.BAD,null),admissions);
+                        pump(probe,planner,sender,smtp,minute*4+2);
+                        waitUntil(probe,started,(long)minute*60+3);
+                        accept(store,evaluator,binding,++sequence,new AlertInput.Conditions(f.clock().instant(),AlertSignal.Condition.GOOD,null),admissions);
+                        pump(probe,planner,sender,smtp,minute*4+4);
                         if(minute==0)db.getCollection("alert_delivery_intents").insertOne(future);
                         var deliveries=store.deliveries(null,100,null,null,f.reads());String after=null;
                         do{
@@ -91,34 +99,45 @@ class AlertRatedCleanupIT {
                         assertThat(maintenance.health()).containsEntry("failures",0L);
                         System.out.println("RATED_CLEANUP minute="+(minute+1)+" smtp="+smtp.bodies.size()+" changed="+maintenance.health().get("changed"));
                     }
-                    waitUntil(f,maintenance,probe,started,(long)minutes*60);
+                    waitUntil(probe,started,(long)minutes*60);
                     assertThat(smtp.bodies).hasSize(minutes*4);
                     assertThat(payloadDeadlines).hasSize(minutes*4);
+                    var distribution=new TreeMap<String,Integer>();for(var identity:payloadDeadlines.keySet()){
+                        var key=((AlertIntent.Business)identity).key();distribution.merge(key.notification().kind().name()+":"+key.targetId(),1,Integer::sum);}
+                    assertThat(distribution).containsExactlyInAnyOrderEntriesOf(Map.of("FAULT:a@example.test",minutes,"FAULT:b@example.test",minutes,"RECOVERY:a@example.test",minutes,"RECOVERY:b@example.test",minutes));
                     var matured=payloadDeadlines.entrySet().stream().filter(entry->!f.clock().instant().isBefore(entry.getValue().plusSeconds(900))).map(Map.Entry::getKey).toList();
                     assertThat(probe.pruned).containsAll(matured);
                     if(minutes==60){assertThat(matured).hasSizeGreaterThanOrEqualTo(120);assertThat(probe.deleted).hasSizeGreaterThanOrEqualTo(45);
                         assertThat(maintenance.health()).containsEntry("isolatedRecords",true);
                         assertThat(((Number)((Map<?,?>)maintenance.health().get("skipped")).get("unreadable")).longValue()).isPositive();}
-                    var currentQuota=new Document("authorityId",f.storeHost().scope().authorityId()).append("clusterId",f.storeHost().scope().clusterId()).append("minute",T.truncatedTo(java.time.temporal.ChronoUnit.MINUTES).toString());
-                    assertThat(f.clock().instant()).isBefore(T.truncatedTo(java.time.temporal.ChronoUnit.MINUTES).plusSeconds(3660));
+                    var currentQuota=new Document("authorityId",f.storeHost().scope().authorityId()).append("clusterId",f.storeHost().scope().clusterId()).append("minute",((AlertIntent.Test)candidate.value().frozen().identity()).command().acceptedAt().truncatedTo(java.time.temporal.ChronoUnit.MINUTES).toString());
+                    assertThat(f.clock().instant()).isBefore(((AlertIntent.Test)candidate.value().frozen().identity()).command().acceptedAt().truncatedTo(java.time.temporal.ChronoUnit.MINUTES).plusSeconds(3660));
                     assertThat(db.getCollection("alert_test_quotas").find(new Document("_id",currentQuota)).first()).isNotNull();
                     long elapsed=TimeUnit.NANOSECONDS.toMillis(System.nanoTime()-started);
                     assertThat(elapsed).isGreaterThanOrEqualTo(minutes*60_000L);
-                    var evidence=new LinkedHashMap<String,Object>();evidence.put("minutes",minutes);evidence.put("wallMilliseconds",elapsed);evidence.put("acceptanceDuration",minutes==60);evidence.put("clockScale",1);evidence.put("quotaFixture","historical quota rows introduced at eligibility; natural aging is separately covered");evidence.put("smtpAccepted",smtp.bodies.size());evidence.put("businessIntents",payloadDeadlines.size());evidence.put("reclaimedPayloads",probe.pruned.size());evidence.put("reclaimedQuotas",probe.deleted.size());evidence.put("maximumObservedReclamationMillis",probe.maximumMillis);evidence.put("health",maintenance.health());
+                    var evidence=new LinkedHashMap<String,Object>();evidence.put("minutes",minutes);evidence.put("wallMilliseconds",elapsed);evidence.put("acceptanceDuration",minutes==60);evidence.put("clockScale",1);evidence.put("clockMode","continuous-monotonic");evidence.put("maintenanceDriver","production-scheduled");evidence.put("admissionCalls",admissions.get());evidence.put("quotaFixture","historical quota rows introduced at eligibility; natural aging is separately covered");evidence.put("smtpAccepted",smtp.bodies.size());evidence.put("businessIntents",payloadDeadlines.size());evidence.put("reclaimedPayloads",probe.pruned.size());evidence.put("reclaimedQuotas",probe.deleted.size());evidence.put("maximumObservedReclamationMillis",probe.maximumMillis);evidence.put("health",maintenance.health());
                     String output=System.getProperty("tapstate.test.alert-rated-receipt");if(output!=null)try{Files.writeString(Path.of(output),io.tapstate.core.common.JsonWriter.write(evidence));}catch(java.io.IOException failure){throw new AssertionError(failure);}
                 }
             });
         }
     }
-    private static void waitUntil(AlertEvaluationHostIT.Fixture f,AlertMaintenanceRuntime maintenance,ReclamationProbe probe,long started,long seconds){
-        while(true){long elapsed=System.nanoTime()-started;f.now().set(T.plusNanos(elapsed));maintenance.tick();probe.observe();
-            long remaining=TimeUnit.SECONDS.toNanos(seconds)-elapsed;if(remaining<=0)return;
+    private static void accept(AlertStore store,AlertEvaluationHost evaluator,AlertEvaluationHost.Binding binding,int sequence,AlertInput input,AtomicInteger calls){
+        org.awaitility.Awaitility.await().pollInterval(Duration.ofMillis(100)).atMost(Duration.ofSeconds(10)).untilAsserted(()->{
+            calls.incrementAndGet();var result=evaluator.accept(binding,sequence,input);
+            assertThat(result).isIn(AlertEvaluationHost.Result.ACCEPTED,AlertEvaluationHost.Result.IGNORED);
+            if(result==AlertEvaluationHost.Result.IGNORED){var retained=store.state(binding.key(),new AlertStore.ReadAccess(true,Set.of(),ACTIVE)).orElseThrow().value().snapshot();
+                assertThat(retained.lastSequence()).isEqualTo(sequence);assertThat(retained.lastObservedAt()).isEqualTo(input.observedAt());}
+        });
+    }
+    private static void waitUntil(ReclamationProbe probe,long started,long seconds){
+        while(true){probe.observe();
+            long remaining=TimeUnit.SECONDS.toNanos(seconds)-(System.nanoTime()-started);if(remaining<=0)return;
             try{TimeUnit.NANOSECONDS.sleep(Math.min(remaining,TimeUnit.SECONDS.toNanos(1)));}catch(InterruptedException failure){Thread.currentThread().interrupt();throw new AssertionError(failure);}}
     }
-    private static void pump(AlertEvaluationHostIT.Fixture f,AlertMaintenanceRuntime maintenance,ReclamationProbe probe,AlertNotificationPlanner planner,
-            AlertDeliveryRuntime sender,AlertDeliveryNetworkIT.SmtpPeer smtp,long started,int expected){
+    private static void pump(ReclamationProbe probe,AlertNotificationPlanner planner,
+            AlertDeliveryRuntime sender,AlertDeliveryNetworkIT.SmtpPeer smtp,int expected){
         long deadline=System.nanoTime()+Duration.ofSeconds(10).toNanos();
-        do{f.now().set(T.plusNanos(System.nanoTime()-started));maintenance.tick();probe.observe();planner.tick();sender.tick();AlertDeliveryRuntimeIT.settled(sender);
+        do{probe.observe();planner.tick();sender.tick();AlertDeliveryRuntimeIT.settled(sender);
             if(sender.failure()!=null)assertThat(sender.failure().code()).isEqualTo(AlertError.CHANNEL_UNAVAILABLE.code());
             if(smtp.bodies.size()==expected)return;
             try{Thread.sleep(100);}catch(InterruptedException failure){Thread.currentThread().interrupt();throw new AssertionError(failure);}
@@ -130,13 +149,13 @@ class AlertRatedCleanupIT {
         final Map<AlertIntent.Identity,Instant> payloads;final Map<Document,Instant> quotas;
         final Set<AlertIntent.Identity> pruned=new HashSet<>();final Set<Document> deleted=new HashSet<>();long maximumMillis;
         ReclamationProbe(AlertEvaluationHostIT.Fixture fixture,AlertStore store,com.mongodb.client.MongoDatabase database,Map<AlertIntent.Identity,Instant> payloads,Map<Document,Instant> quotas){this.fixture=fixture;this.store=store;this.database=database;this.payloads=payloads;this.quotas=quotas;}
-        void observe(){var now=fixture.clock().instant();
-            for(var entry:payloads.entrySet())if(!pruned.contains(entry.getKey())&&!now.isBefore(entry.getValue())){
+        void observe(){
+            for(var entry:payloads.entrySet())if(!pruned.contains(entry.getKey())&&!fixture.clock().instant().isBefore(entry.getValue())){
                 var record=store.intent(entry.getKey(),null).orElseThrow().value();boolean absent=record.state().payload()==null;
-                check(entry.getValue(),now,absent);if(absent)pruned.add(entry.getKey());}
-            for(var entry:quotas.entrySet())if(!deleted.contains(entry.getKey())&&!now.isBefore(entry.getValue())){
+                check(entry.getValue(),fixture.clock().instant(),absent);if(absent)pruned.add(entry.getKey());}
+            for(var entry:quotas.entrySet())if(!deleted.contains(entry.getKey())&&!fixture.clock().instant().isBefore(entry.getValue())){
                 boolean absent=database.getCollection("alert_test_quotas").countDocuments(new Document("_id",entry.getKey()))==0;
-                check(entry.getValue(),now,absent);if(absent)deleted.add(entry.getKey());}
+                check(entry.getValue(),fixture.clock().instant(),absent);if(absent)deleted.add(entry.getKey());}
         }
         void check(Instant eligible,Instant now,boolean absent){long age=Duration.between(eligible,now).toMillis();
             if(absent){assertThat(age).isLessThanOrEqualTo(900_000);maximumMillis=Math.max(maximumMillis,age);}

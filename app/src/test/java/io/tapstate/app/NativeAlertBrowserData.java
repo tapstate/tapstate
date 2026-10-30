@@ -55,4 +55,35 @@ final class NativeAlertBrowserData {
 
     void recover(){evaluate(bindings.getFirst(),AlertSignal.Condition.GOOD,null);}
     void refreshDiagnostic(){evaluate(bindings.get(1),AlertSignal.Condition.BAD,"java.lang.IllegalStateException: newer synthetic evidence\n\tat example.Pipeline.retry(Pipeline.java:24)");}
+    String capabilityProbe(ConfigurableApplicationContext application){
+        var configuration=application.getBean(StorageRoot.class).runtime().requireConfiguration();
+        var services=NativeAppStorage.business(application).getBean(PipelineAlertRuntime.class).managementServices();
+        var host=services.store().planning().host();var now=Clock.systemUTC();
+        var token=new TokenRecord("capability-seed","ADMIN","isolated-browser-seed",false,now.instant());configuration.tokens().save(token);
+        var retainedToken=configuration.tokens().find(token.tokenId()).orElseThrow();
+        var access=new AlertStore.Access(new AlertTestAuthority(AlertTestAuthority.Mechanism.MACHINE_TOKEN,host.setup().installationId(),retainedToken.tokenId(),"ADMIN",retainedToken.authenticationBinding(),null),()->{},()->{},()->"");
+        var types=new ArrayList<>(BuiltinAlarmTypes.catalog().types());String type="test.browser-capability";
+        types.add(new AlarmTypeCatalog.Type(type,2,AlarmTypeCatalog.Kind.STATEFUL,Set.of("pipeline"),"pipeline-lifecycle","condition",List.of(),AlarmSeverity.MAJOR,false,"test.condition","test.recovery","test.guidance"));
+        var catalog=new AlarmTypeCatalog(types);var store=configuration.alerts(host,catalog,now);var original=bindings.getFirst();
+        var header=AlertConfiguration.Header.create(AlertConfiguration.Identity.create(AlertConfiguration.Kind.RULE,host.scope(),"browser-capability"),host.deployment(),now.instant(),token.tokenId());
+        var rule=new AlertConfiguration.Rule(header,"Unavailable type fixture",type,2,new AlertConfiguration.Resources(Set.of("pipeline"),false,Set.of(original.resource())),Map.of(),null,true,null).validated(catalog).enrolled(null);
+        if(store.saveDefinition(null,rule,access)!=AlertStore.Outcome.STAGED)throw new AssertionError("capability fixture rule");
+        var planner=new AlertNotificationPlanner(store,now,"capability-browser-planner",null,()->{});
+        var evaluator=new AlertEvaluationHost(store,catalog,host.deployment(),now,"capability-browser-evaluator",()->{}).withPlanner(planner);
+        var binding=new AlertEvaluationHost.Binding(rule,original.resource(),"capability-browser-producer",original.sourceBindingRevision(),original.requireCurrent(),original.proof());
+        org.awaitility.Awaitility.await().pollInterval(Duration.ofSeconds(1)).atMost(Duration.ofSeconds(60)).untilAsserted(()->{
+            var result=evaluator.accept(binding,1,new AlertInput.Conditions(now.instant(),AlertSignal.Condition.BAD,null));
+            if(result!=AlertEvaluationHost.Result.ACCEPTED&&result!=AlertEvaluationHost.Result.IGNORED)throw new AssertionError("capability fixture state: "+result);
+            var retained=store.state(binding.key(),new AlertStore.ReadAccess(true,Set.of(),()->{})).orElseThrow();
+            if(retained.value().snapshot().status()!=AlertSnapshot.Status.FIRING||retained.value().snapshot().lastSequence()!=1)throw new AssertionError("capability fixture state not retained");
+        });
+        var delivery=new java.util.concurrent.atomic.AtomicReference<String>();
+        org.awaitility.Awaitility.await().pollInterval(Duration.ofSeconds(1)).atMost(Duration.ofSeconds(60)).untilAsserted(()->{
+            try{planner.tick();}catch(io.tapstate.core.common.TapstateException conflict){if(conflict.code()!=AlertError.COMMAND_CONFLICT)throw conflict;}
+            var found=store.deliveries(null,100,null,null,new AlertStore.ReadAccess(true,Set.of(),()->{})).rows().stream()
+                    .filter(row->row.value().frozen().members().stream().anyMatch(member->member.evaluation().key().typeId().equals(type)))
+                    .map(row->row.value().frozen().identity().deliveryId()).findFirst();
+            if(found.isEmpty())throw new AssertionError("capability fixture is not planned");delivery.set(found.orElseThrow());
+        });return delivery.get();
+    }
 }
