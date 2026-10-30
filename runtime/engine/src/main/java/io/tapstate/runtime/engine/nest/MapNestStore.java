@@ -5,6 +5,8 @@ import com.hazelcast.map.IMap;
 import io.tapstate.runtime.engine.ProtectedMap;
 import java.io.Serializable;
 import java.util.Collection;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Objects;
@@ -184,6 +186,19 @@ final class MapNestStore<S> implements NestStore<S> {
         publishReading();
     }
 
+    @Override
+    public void addAll(Map<Object, Set<Object>> additions) {
+        if (additions.isEmpty()) return;
+        Map<Object, Set<Object>> snapshot = new LinkedHashMap<>();
+        additions.forEach((key, elements) -> snapshot.put(key,
+                Collections.unmodifiableSet(new LinkedHashSet<>(elements))));
+        snapshot.keySet().forEach(ignored -> countAccess());
+        // ADD-only union is idempotent across a partial protected retry. The lookup owns these keys
+        // and cannot handle a later removal while this synchronous operation is still in progress.
+        map.executeOnKeys(snapshot.keySet(), new GrownBatch<>(snapshot));
+        publishReading();
+    }
+
     /**
      * Shrinks the set at its own key, the mirror of {@link #add} and one reach like it. The default reads
      * the set back to find out whether it holds the element - which is the read-then-write pair this whole
@@ -283,18 +298,38 @@ final class MapNestStore<S> implements NestStore<S> {
         }
 
         @Override
-        @SuppressWarnings("unchecked")
         public Void process(Map.Entry<Object, S> entry) {
-            Set<Object> held = (Set<Object>) entry.getValue();
-            Set<Object> grown = held == null ? new LinkedHashSet<>() : new LinkedHashSet<>(held);
-            if (grown.add(element)) {
-                entry.setValue((S) grown);
-            }
+            grow(entry, Collections.singleton(element));
             return null;
         }
 
         @Override
         public EntryProcessor<Object, S, Void> getBackupProcessor() {
+            return null;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <S> void grow(Map.Entry<Object, S> entry, Collection<?> additions) {
+        Set<Object> held = (Set<Object>) entry.getValue();
+        Set<Object> grown = held == null ? new LinkedHashSet<>() : new LinkedHashSet<>(held);
+        if (grown.addAll(additions)) entry.setValue((S) grown);
+    }
+
+    private static final class GrownBatch<S> implements EntryProcessor<Object, S, Void>, Serializable {
+        private static final long serialVersionUID = 1L;
+        private final Map<Object, Set<Object>> additions;
+
+        GrownBatch(Map<Object, Set<Object>> additions) {
+            this.additions = additions;
+        }
+
+        @Override public Void process(Map.Entry<Object, S> entry) {
+            grow(entry, additions.get(entry.getKey()));
+            return null;
+        }
+
+        @Override public EntryProcessor<Object, S, Void> getBackupProcessor() {
             return null;
         }
     }

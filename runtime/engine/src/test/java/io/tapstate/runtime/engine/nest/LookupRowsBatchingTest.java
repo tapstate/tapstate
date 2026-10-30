@@ -29,6 +29,122 @@ class LookupRowsBatchingTest {
             tables()).lookups().getFirst();
 
     @Test
+    void snapshotRegistrationsUseAcknowledgedBoundedUnionsBeforeOrderedTouches() throws Exception {
+        CountingStore<Map<String, Object>> rows = new CountingStore<>();
+        CountingStore<Set<Object>> refs = new CountingStore<>();
+        TestOutbox outbox = new TestOutbox(128);
+        for (int i = 0; i < 32; i++) rows.save(List.of(i), row("customer_id", i));
+        LookupProcessor processor = processor(rows, refs, outbox);
+        TestInbox inbox = snapshotOrders(32);
+        processor.process(LookupProcessor.REGISTRATIONS, inbox);
+        assertThat(inbox).isEmpty();
+        assertThat(refs.growthBatches).containsExactly(16, 16);
+        assertThat(refs.count()).isEqualTo(32);
+        assertThat(outbox.queue(0)).filteredOn(NestTouch.class::isInstance)
+                .extracting(item -> ((NestTouch) item).key())
+                .containsExactlyElementsOf(java.util.stream.IntStream.range(0, 32).mapToObj(i -> List.of((Object) (long) i)).toList());
+    }
+
+    @Test
+    void partialRegistrationUnionFailureKeepsEveryInputAndEmitsNoTouchBeforeFreshReplay() throws Exception {
+        CountingStore<Map<String, Object>> rows = new CountingStore<>();
+        CountingStore<Set<Object>> refs = new CountingStore<>();
+        TestOutbox outbox = new TestOutbox(128);
+        for (int i = 0; i < 16; i++) rows.save(List.of(i), row("customer_id", i));
+        LookupProcessor processor = processor(rows, refs, outbox);
+        refs.failGrowthAfterFirst = true;
+        TestInbox inbox = snapshotOrders(16);
+        assertThatThrownBy(() -> processor.process(LookupProcessor.REGISTRATIONS, inbox))
+                .isInstanceOf(IllegalStateException.class).hasMessage("injected partial union failure");
+        assertThat(inbox.size()).isEqualTo(16);
+        assertThat(outbox.queue(0)).isEmpty();
+        assertThat(refs.count()).isEqualTo(1);
+        refs.failGrowthAfterFirst = false;
+        processor(rows, refs, outbox).process(LookupProcessor.REGISTRATIONS, inbox);
+        assertThat(inbox).isEmpty();
+        assertThat(refs.count()).isEqualTo(16);
+        assertThat(refs.states.values()).allSatisfy(value -> assertThat((Set<?>) value).hasSize(1));
+        assertThat(outbox.queue(0)).hasSize(16);
+    }
+
+    @Test
+    void registrationBackpressureKeepsOneAcknowledgedWaveAndPreservesEveryTouchPosition() throws Exception {
+        CountingStore<Map<String, Object>> rows = new CountingStore<>();
+        CountingStore<Set<Object>> refs = new CountingStore<>();
+        TestOutbox outbox = new TestOutbox(1);
+        for (int i = 0; i < 32; i++) rows.save(List.of(i), row("customer_id", i));
+        LookupProcessor processor = processor(rows, refs, outbox);
+        TestInbox inbox = snapshotOrders(32);
+        processor.process(LookupProcessor.REGISTRATIONS, inbox);
+        assertThat(inbox.size()).isEqualTo(16);
+        List<NestTouch> touches = new ArrayList<>();
+        for (int turn = 0; turn < 64; turn++) {
+            outbox.queue(0).stream().map(NestTouch.class::cast).forEach(touches::add);
+            outbox.queue(0).clear();
+            if (inbox.isEmpty()) processor.tryProcess();
+            else processor.process(LookupProcessor.REGISTRATIONS, inbox);
+        }
+        outbox.queue(0).stream().map(NestTouch.class::cast).forEach(touches::add);
+        assertThat(inbox).isEmpty();
+        assertThat(refs.growthBatches).containsExactly(16, 16);
+        assertThat(touches).hasSize(32);
+        for (int i = 0; i < 32; i++) {
+            NestTouch touch = touches.get(i);
+            assertThat(touch.key()).isEqualTo(List.of((long) i));
+            assertThat(touch.onlyIfWaiting()).isTrue();
+            assertThat(touch.positions()).containsEntry("order",
+                    new io.tapstate.core.event.ChainPosition(at(i + 1), "registration-" + i));
+        }
+    }
+
+    @Test
+    void aDeletionFollowingReadRegistrationsRemovesItsMembershipOutsideTheUnion() throws Exception {
+        CountingStore<Map<String, Object>> rows = new CountingStore<>();
+        CountingStore<Set<Object>> refs = new CountingStore<>();
+        LookupProcessor processor = processor(rows, refs, new TestOutbox(128));
+        TestInbox inbox = snapshotOrders(16);
+        inbox.add(Envelope.delete(17, "order", row("order_id", 0L, "cust_ref", 0), null).withOrder(at(17)));
+        processor.process(LookupProcessor.REGISTRATIONS, inbox);
+        assertThat(inbox).isEmpty();
+        assertThat(refs.growthBatches).containsExactly(16);
+        assertThat(refs.count()).isEqualTo(15);
+        assertThat(refs.load(NestLookup.bucketKey(List.of(0), NestLookup.bucketOf(List.of(0L))))).isNull();
+    }
+
+    @Test
+    void collidingRegistrationsPreserveOldMembersAndADeletionOnlyRemovesItsOwnMember() throws Exception {
+        Map<Integer, List<Long>> buckets = new LinkedHashMap<>();
+        List<Long> collision = List.of();
+        for (long id = 0; id < 3 * NestLookup.BUCKETS; id++) {
+            List<Long> candidates = buckets.computeIfAbsent(NestLookup.bucketOf(List.of(id)), ignored -> new ArrayList<>());
+            candidates.add(id);
+            if (candidates.size() == 3) { collision = candidates; break; }
+        }
+        assertThat(collision).hasSize(3);
+        long old = collision.get(0), added = collision.get(1), removed = collision.get(2);
+        CountingStore<Map<String, Object>> rows = new CountingStore<>();
+        CountingStore<Set<Object>> refs = new CountingStore<>();
+        Object bucket = NestLookup.bucketKey(List.of(7), NestLookup.bucketOf(List.of(old)));
+        refs.add(bucket, List.of(old));
+        TestInbox inbox = new TestInbox();
+        inbox.add(Envelope.read(1, "order", row("order_id", added, "cust_ref", 7), null).withOrder(at(1)));
+        inbox.add(Envelope.read(2, "order", row("order_id", removed, "cust_ref", 7), null).withOrder(at(2)));
+        inbox.add(Envelope.delete(3, "order", row("order_id", removed, "cust_ref", 7), null).withOrder(at(3)));
+        processor(rows, refs, new TestOutbox(128)).process(LookupProcessor.REGISTRATIONS, inbox);
+        assertThat(inbox).isEmpty();
+        assertThat(refs.growthBatches).containsExactly(1);
+        assertThat(refs.load(bucket)).containsExactlyInAnyOrder(List.of(old), List.of(added));
+    }
+
+    private static TestInbox snapshotOrders(int count) {
+        TestInbox inbox = new TestInbox();
+        for (int i = 0; i < count; i++) inbox.add(Envelope.read(i, "order",
+                row("order_id", (long) i, "cust_ref", i), null).withOrder(at(i + 1))
+                .withPositions(Map.of("order", new io.tapstate.core.event.ChainPosition(at(i + 1), "registration-" + i))));
+        return inbox;
+    }
+
+    @Test
     void customersArrivingBeforeOrdersReadEmptyReferencesAndWriteRowsInBoundedBatches() throws Exception {
         CountingStore<Map<String, Object>> rows = new CountingStore<>();
         CountingStore<Set<Object>> refs = new CountingStore<>();
@@ -194,6 +310,8 @@ class LookupRowsBatchingTest {
         private final List<String> writtenNames = new ArrayList<>();
         private boolean failBatch;
         private boolean failAfterFirstWrite;
+        private boolean failGrowthAfterFirst;
+        private final List<Integer> growthBatches = new ArrayList<>();
 
         @Override public S load(Object key) { return states.get(key); }
         @Override public Map<Object, S> loadAll(Collection<Object> keys) {
@@ -215,6 +333,15 @@ class LookupRowsBatchingTest {
             NestStore.super.saveAll(batch, firstFilings);
         }
         @Override public void remove(Object key) { states.remove(key); }
+        @Override public void addAll(Map<Object, Set<Object>> additions) {
+            growthBatches.add(additions.size());
+            if (failGrowthAfterFirst) {
+                var first = additions.entrySet().iterator().next();
+                NestStore.super.add(first.getKey(), first.getValue().iterator().next());
+                throw new IllegalStateException("injected partial union failure");
+            }
+            NestStore.super.addAll(additions);
+        }
         @Override public long count() { return states.size(); }
     }
 }

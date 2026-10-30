@@ -150,7 +150,7 @@ class NestStateMapGatesTest {
     }
 
     @Test
-    @DisplayName("no nest vertex reaches past the one key its event is partitioned to")
+    @DisplayName("no nest code enumerates or mutates the whole state keyspace")
     void noNestCodeSpansTheWholeStateMap() {
         WHOLE_MAP_MECHANISMS.forEach((mechanism, detects) -> assertThat(accesses(productionClasses, detects, NEST))
                 .as("%s: the entry an event needs is already on this partition, and spanning the map "
@@ -194,6 +194,11 @@ class NestStateMapGatesTest {
                         && access.getTargetOwner().getName().equals(NEST + "NestStore"))
                 .map(access -> access.getOriginOwner().getName()).toList())
                 .isNotEmpty().containsOnly(NEST + "LookupProcessor", NEST + "AssemblerProcessor$RootWrites");
+        assertThat(productionClasses.stream().flatMap(type -> type.getAccessesFromSelf().stream())
+                .filter(access -> access.getName().equals("addAll")
+                        && access.getTargetOwner().getName().equals(NEST + "NestStore"))
+                .map(access -> access.getOriginOwner().getName()).toList())
+                .isNotEmpty().containsOnly(NEST + "LookupProcessor");
     }
 
     @Test
@@ -294,10 +299,11 @@ class NestStateMapGatesTest {
         return Map.copyOf(mechanisms);
     }
 
-    /** Independent replacements have bounded named batches; owned subtree handovers keep carried writes. */
+    /** Named replacement/union batches stay in the adapter; owned handovers keep carried writes. */
     private static Map<String, Predicate<JavaAccess<?>>> boundedWriteMechanisms() {
         Map<String, Predicate<JavaAccess<?>>> mechanisms = new LinkedHashMap<>();
         named(mechanisms, "replacing a handed-in set of independent keys", "setAll");
+        named(mechanisms, "unioning a handed-in set of owned keys", "executeOnKeys");
         return Map.copyOf(mechanisms);
     }
 
@@ -332,7 +338,7 @@ class NestStateMapGatesTest {
         named(mechanisms, "writing or removing across keys", "putAll", "removeAll",
                 "clear", "evictAll");
         named(mechanisms, "reading across keys", "loadAll");
-        named(mechanisms, "running over more than one entry", "executeOnEntries", "executeOnKeys",
+        named(mechanisms, "running over more than one entry", "executeOnEntries",
                 "aggregate", "project", "forEach");
         return Map.copyOf(mechanisms);
     }

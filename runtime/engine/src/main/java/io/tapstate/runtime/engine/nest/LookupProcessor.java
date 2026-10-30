@@ -150,6 +150,10 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
             default -> new LinkedHashSet<>();
         };
         for (Object item; (item = inbox.peek()) != null; ) {
+            if (ordinal == REGISTRATIONS && registerSnapshotBatch(inbox, filed)) {
+                if (!flush()) return;
+                continue;
+            }
             if (item instanceof SettledPositions settled) {
                 // Registration copies are spoken for on their assembly path. Only this lookup's own
                 // rows settle here, behind the wakes already queued for earlier rows.
@@ -167,6 +171,46 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
         sayWhatOwesNothing();
         flush();
     }
+
+    /** ADD-only snapshot copies share I/O; deletes and departures retain their original ordering. */
+    private boolean registerSnapshotBatch(Inbox inbox, Set<Object> filed) {
+        List<Registration> registrations = new ArrayList<>();
+        Set<List<Object>> referrers = new LinkedHashSet<>();
+        long bytes = 0;
+        for (Object item : inbox) {
+            if (!(item instanceof Envelope event) || event.op() != io.tapstate.core.event.Op.READ
+                    || registrations.size() == ROW_BATCH_LIMIT) break;
+            Map<String, Object> row = NestKeys.rowOf(event);
+            List<Object> referrer = NestKeys.valuesOf(row, lookup.referrerIdentity(), lookup.mapName());
+            if (referrers.contains(referrer)) break;
+            long weight = PayloadBytes.of(event);
+            if (!registrations.isEmpty() && weight > ROW_BATCH_BYTES - bytes) break;
+            List<Object> referenced = NestKeys.valuesOf(row, lookup.referenceFields(), lookup.mapName());
+            registrations.add(new Registration(event, referenced, referrer,
+                    NestLookup.bucketKey(referenced, NestLookup.bucketOf(referrer))));
+            referrers.add(referrer);
+            bytes += weight;
+        }
+        if (registrations.size() < 2) return false;
+        Map<Object, Set<Object>> additions = new LinkedHashMap<>();
+        for (Registration registration : registrations) additions
+                .computeIfAbsent(registration.bucket(), ignored -> new LinkedHashSet<>()).add(registration.referrer());
+        // This processor owns every affected identity and handles no newer mutation during this call.
+        // A partial union can be replayed, but no input or touch may leave before the whole call returns.
+        references.addAll(additions);
+        acknowledgeRegistrations(inbox, filed, registrations);
+        return true;
+    }
+
+    private void acknowledgeRegistrations(Inbox inbox, Set<Object> filed, List<Registration> registrations) {
+        for (Registration registration : registrations) {
+            if (inbox.peek() != registration.event()) throw new IllegalStateException("registration inputs changed before acknowledgement");
+            if (filed.contains(registration.referenced())) tellItWhatItMissed(registration.referrer(), registration.event());
+            inbox.remove();
+        }
+    }
+
+    private record Registration(Envelope event, List<Object> referenced, List<Object> referrer, Object bucket) { }
 
     private void processRows(Inbox inbox) {
         while (!inbox.isEmpty()) {

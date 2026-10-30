@@ -94,6 +94,16 @@ public interface NestStore<S> extends Serializable {
     }
 
     /**
+     * Unions bounded additions under explicit keys, waiting for every mutation before returning.
+     * A failed call may have applied a prefix. Only ADD-only inputs owned by one ordered writer may
+     * use this seam: replay is idempotent, and no later remove may interleave with a protected retry.
+     * Remote stores override this without fetching the existing sets into the caller.
+     */
+    default void addAll(Map<Object, Set<Object>> additions) {
+        additions.forEach((key, elements) -> elements.forEach(element -> add(key, element)));
+    }
+
+    /**
      * Takes {@code element} out of the set held under {@code key}, dropping the entry once nothing is left
      * in it. The other half of {@link #add}, and travelling the same way and for the same reasons: the one
      * element goes, not the set.
