@@ -99,7 +99,10 @@ class AlertRatedCleanupIT {
                         assertThat(store.intent(candidate.value().frozen().identity(),null).orElseThrow().value().state().summary()).isEqualTo(DeliveryEvidence.Outcome.UNKNOWN);
                         assertThat(db.getCollection("alert_delivery_intents").find(new Document("_id",future.get("_id"))).first()).isEqualTo(future);
                         assertThat(((Number)maintenance.health().get("consecutiveFailures")).intValue()).isLessThan(3);
-                        System.out.println("RATED_CLEANUP minute="+(minute+1)+" smtp="+smtp.bodies.size()+" changed="+maintenance.health().get("changed"));
+                        var health=maintenance.health();
+                        System.out.println("RATED_CLEANUP minute="+(minute+1)+" smtp="+smtp.bodies.size()+" changed="+health.get("changed")
+                                +" scanned="+health.get("scanned")+" ioBytes="+health.get("ioBytes")+" skipped="+health.get("skipped")
+                                +" conflicts="+health.get("ownerConflicts")+" failures="+health.get("failures"));
                     }
                     waitUntil(probe,started,(long)minutes*60);
                     assertThat(smtp.bodies).hasSize(minutes*4);

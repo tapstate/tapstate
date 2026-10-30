@@ -5,6 +5,8 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import re
+import xml.etree.ElementTree as ET
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -12,8 +14,18 @@ SPEC = importlib.util.spec_from_file_location("runtime_web_provenance", ROOT / "
 assert SPEC is not None and SPEC.loader is not None
 PROVENANCE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(PROVENANCE)
-SDK = "BOOT-INF/lib/cloud-control-plane-sdk-0.2-5ad2cb0d-SNAPSHOT.jar"
-SDK_SHA = "e165e80d9422cf0e5a1d25c1f0ad300a8a87ac58c1b37012e7cd3bad3e4fd76c"
+def sdk_entry(version: str) -> str:
+    # Maven keeps the base snapshot name in the Boot JAR even for an exact timestamp request.
+    if not re.fullmatch(r'[0-9]+\.[0-9]+(?:\.[0-9]+)?-[0-9a-f]{8}-(?:SNAPSHOT|[0-9]{8}\.[0-9]{6}-[1-9][0-9]*)', version):
+        raise ValueError("invalid locked Cloud SDK coordinate")
+    base = re.sub(r'-[0-9]{8}\.[0-9]{6}-[1-9][0-9]*$', '-SNAPSHOT', version)
+    return f"BOOT-INF/lib/cloud-control-plane-sdk-{base}.jar"
+
+
+SDK_VERSION = ET.parse(ROOT / "pom.xml").findtext(
+    "{http://maven.apache.org/POM/4.0.0}properties/{http://maven.apache.org/POM/4.0.0}cloud.sdk.version")
+SDK = sdk_entry(SDK_VERSION or "")
+SDK_SHA = "e74bbb9d24dec2a91a8ba6fc23201b0e9cb67c1537e35da5581ecec3b723f255"
 
 
 def metadata(jar_path: Path, image_path: Path, profile: str, lock: Path) -> dict:

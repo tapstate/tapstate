@@ -33,7 +33,16 @@ class MetadataTest(unittest.TestCase):
         namespace = {"m": "http://maven.apache.org/POM/4.0.0"}
         version = pom.findtext("m:properties/m:cloud.sdk.version", namespaces=namespace)
         self.assertIsNotNone(version)
-        self.assertEqual(SUBJECT.SDK, f"BOOT-INF/lib/cloud-control-plane-sdk-{version}.jar")
+        publisher_prefix = "-".join(version.split("-")[:2])
+        self.assertEqual(SUBJECT.SDK, f"BOOT-INF/lib/cloud-control-plane-sdk-{publisher_prefix}-SNAPSHOT.jar")
+
+    def test_timestamp_and_base_versions_name_the_same_packaged_snapshot(self):
+        expected = "BOOT-INF/lib/cloud-control-plane-sdk-0.1.1-1813f345-SNAPSHOT.jar"
+        for version in ("0.1.1-1813f345-SNAPSHOT", "0.1.1-1813f345-20261026.093742-1"):
+            self.assertEqual(SUBJECT.sdk_entry(version), expected)
+        for invalid in ("LATEST", "0.1.1-1813f34-SNAPSHOT", "0.1.1-1813f345-20261026.09374-1"):
+            with self.assertRaises(ValueError):
+                SUBJECT.sdk_entry(invalid)
 
     def inputs(self, profile):
         content = f"<script src=\"/assets/{profile}.js\"></script>".encode()

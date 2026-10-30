@@ -324,6 +324,9 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
             var opened=PdkCaptureBatch.start(connector,
                     reading->read(connector,()->batchRead(connector,config,batch,reading,sampleSeam)),
                     "tapstate-snapshot-"+connector.connectorId());
+            if(driveObservers.get(connector)==SourceOperationObserver.NONE){
+                closeObserver(connector);return opened;
+            }
             return new CaptureBatch() {
                 public Optional<SourcePosition> seam(){return opened.seam();}
                 public boolean hasNext(){return opened.hasNext();}
@@ -614,9 +617,12 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
         pendingPreflights.remove(retained);
     }
 
-    /** Retries only original failed-open cleanup; active subscriptions still own their own shutdown. */
+    /** Releases observation and retries failed-open cleanup; subscriptions own their physical shutdown. */
     @Override public void close() {
         operationObserver.close();driveObservers.values().forEach(SourceOperationObserver::close);driveObservers.clear();
+        retryFailedOpenCleanup();
+    }
+    private void retryFailedOpenCleanup(){
         for (var retained : List.copyOf(pendingPreflights)) {
             awaitPreflightClose(retained); pendingPreflights.remove(retained);
         }
@@ -983,7 +989,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
     }
 
     private PdkConnector open(CaptureConfig config, PipelineNode node, SharedNotes notes) {
-        close();
+        retryFailedOpenCleanup();
         return PdkConnector.open(config.connectorId(), provisioner.resolve(config.connectorId()), config.settings(),
                 node, stateStore, notes, node == null && notes == null ? null : noteScopes);
     }

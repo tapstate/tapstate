@@ -56,6 +56,41 @@ class PdkCapturePortTest {
     }
 
     @Test
+    void aStandaloneSnapshotKeepsItsPhysicalObserverUntilCloseWithoutClosingTheStream(@TempDir Path dir)throws Exception{
+        var closed=new java.util.concurrent.ConcurrentHashMap<String,java.util.concurrent.atomic.AtomicInteger>();
+        var snapshotRead=new CountDownLatch(1);var streamRead=new CountDownLatch(1);var factoryClosed=new AtomicBoolean();
+        var factory=new io.tapstate.spi.capture.SourceOperationObserver(){
+            public void completed(Capability capability,Throwable failure){throw new AssertionError("a physical observer is required");}
+            public io.tapstate.spi.capture.SourceOperationObserver fork(String phase){
+                var count=new java.util.concurrent.atomic.AtomicInteger();closed.put(phase,count);
+                return new io.tapstate.spi.capture.SourceOperationObserver(){
+                    public void completed(Capability capability,Throwable failure){
+                        assertThat(count.get()).isZero();
+                        if(phase.equals("snapshot")&&capability==Capability.SNAPSHOT_READ)snapshotRead.countDown();
+                        if(phase.equals("stream")&&capability==Capability.STREAM_READ)streamRead.countDown();
+                    }
+                    public void close(){count.incrementAndGet();}
+                };
+            }
+            public void close(){factoryClosed.set(true);}
+        };
+        var jar=Synthetic.positionedSource(dir);
+        try(var port=new PdkCapturePort(provisioner(jar,"synthetic.PositionedSource",null)).withOperationObserver(factory)){
+            var snapshot=port.snapshot(config("t1"));
+            try{
+                while(snapshot.hasNext())snapshot.next();assertThat(snapshotRead.await(5,TimeUnit.SECONDS)).isTrue();
+                try(var stream=port.cdc(config("t1"),CaptureStart.present(),(events,position)->{})){
+                    assertThat(streamRead.await(5,TimeUnit.SECONDS)).isTrue();assertThat(closed.get("snapshot").get()).isZero();
+                    snapshot.close();snapshot.close();assertThat(closed.get("snapshot").get()).isEqualTo(1);assertThat(closed.get("stream").get()).isZero();
+                    assertThat(factoryClosed).isFalse();
+                }
+                assertThat(closed.get("stream").get()).isEqualTo(1);
+            }finally{snapshot.close();}
+        }
+        assertThat(factoryClosed).isTrue();assertThat(closed.get("snapshot").get()).isEqualTo(1);
+    }
+
+    @Test
     void aDownstreamSocketFailureIsNotReportedAsASourceReadFailure(@TempDir Path dir) throws Exception {
         Path jar=Synthetic.positionedSource(dir);
         var observed=new CopyOnWriteArrayList<Throwable>();
