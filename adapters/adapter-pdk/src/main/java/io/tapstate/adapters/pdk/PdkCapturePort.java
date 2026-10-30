@@ -26,8 +26,6 @@ import io.tapdata.entity.event.TapBaseEvent;
 import io.tapdata.entity.event.TapEvent;
 import io.tapdata.entity.event.control.ControlEvent;
 import io.tapdata.entity.schema.TapTable;
-import io.tapdata.entity.utils.InstanceFactory;
-import io.tapdata.entity.utils.JsonParser;
 import io.tapdata.entity.utils.cache.Entry;
 import io.tapdata.entity.utils.cache.Iterator;
 import io.tapdata.entity.utils.cache.KVReadOnlyMap;
@@ -646,6 +644,8 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
     }
 
     /** The caller waits within its old budget; this original owner retains every still-running callback. */
+    // Cleanup retains the original worker and restores interruption only after it and its deliveries finish.
+    @SuppressWarnings("java:S2142")
     private static void finishCdc(PdkConnector connector, Thread worker, CdcDelivery delivery, CompletableFuture<Void> ended) {
         Throwable failure = null;
         try {
@@ -683,6 +683,8 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
             return true;
         }
 
+        // An interrupted cleanup still owns active callbacks; restore the flag after the drain barrier.
+        @SuppressWarnings("java:S2142")
         void awaitDrained() {
             boolean interrupted = false;
             synchronized (this) {
@@ -1051,6 +1053,8 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
             throw new IllegalStateException(
                     "stream " + stream + " was requested but the connector did not discover it");
         }
+        LOG.info("Snapshot read started for table {}", stream);
+        java.util.concurrent.atomic.LongAdder eventsRead = new java.util.concurrent.atomic.LongAdder();
         operation(connector,stream,SourceOperationObserver.Capability.SNAPSHOT_READ, () -> { batch.batchRead(connector.context(), table, null, BATCH_SIZE, (events, offset) -> {
             if (events.isEmpty()) {
                 return;
@@ -1058,7 +1062,10 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
             // A copy: the list is the connector's, and is decoded only once somebody takes it.
             List<TapEvent> handed = new ArrayList<>(events);
             reading.rowsRead(() -> decodeSnapshotRows(connector, handed, snapshot.declared()));
+            eventsRead.add(handed.size());
         }); return null; });
+        LOG.info("Snapshot read finished for table {} ({} events read; awaiting target confirmation)",
+                stream, eventsRead.sum());
     }
 
     private record PreparedSnapshot(Map<String, TapTable> discovered,
@@ -1268,9 +1275,9 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
 
     private static Object readerOffset(PdkConnector connector, Object startOffset, boolean resumed) {
         Object reader = MysqlResumeOffset.forReader(connector.connectorId(), startOffset,
-                connector.context().getStateMap(), () -> InstanceFactory.instance(JsonParser.class));
+                connector.context().getStateMap(), PdkJsonProvider::parser);
         return resumed ? PostgresResumeOffset.forReader(connector.connectorId(), reader,
-                () -> InstanceFactory.instance(JsonParser.class)) : reader;
+                PdkJsonProvider::parser) : reader;
     }
 
     /**
@@ -1525,7 +1532,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
         // A snapshot renders its seam after the read's loader scope has ended. The
         // connector's native JSON service must still resolve under that same loader.
         Object represented = read(connector, () -> SqlServerOffset.forStorage(
-                connector.connectorId(), offset, () -> InstanceFactory.instance(JsonParser.class)));
+                connector.connectorId(), offset, PdkJsonProvider::parser));
         return Optional.of(new SourcePosition(
                 ConnectorOffsetCodec.toToken(connector.connectorId(), represented)));
     }

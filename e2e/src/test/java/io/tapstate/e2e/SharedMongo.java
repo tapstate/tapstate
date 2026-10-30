@@ -64,6 +64,11 @@ final class SharedMongo {
         if (container == null) {
             DockerGate.require();
             MongoDBContainer starting = new MongoDBContainer(IMAGE);
+            String owner = System.getProperty("tapstate.e2e.resource-owner");
+            if (owner != null && !owner.isBlank()) {
+                starting.withLabel(System.getProperty("tapstate.e2e.resource-owner-label",
+                        "io.tapstate.e2e.resource-owner"), owner);
+            }
             if (Boolean.getBoolean("tapstate.e2e.mongo-tmpfs")) {
                 starting.withTmpFs(java.util.Map.of("/data/db", "rw,size=1g", "/data/configdb", "rw,size=16m"));
                 var command = new java.util.ArrayList<>(java.util.Arrays.asList(starting.getCommandParts()));

@@ -23,8 +23,8 @@ final class SourceModelSnapshot {
         return new SourceModelSnapshot(pipeline,models);
     }
     SourceModel model(SourceResource source) {
-        Optional<DiscoveredSourceModel> captured = models.get(source.id());
-        if (captured == null) throw fenced(); return SourceDiscovery.matched(captured,source);
+        if (!models.containsKey(source.id())) throw fenced();
+        return SourceDiscovery.matched(models.get(source.id()),source);
     }
     PipelinePreparationInputs preparationInputs(PipelineIntentScope scope,PipelineResource original,PipelineResource selected,Map<String,SourceResource> sources) {
         requirePipeline(scope.pipelineId());

@@ -68,12 +68,16 @@ final class MongoRetiredPipelinePayloads implements RetiredPipelinePayloads {
                                 new Document("_id.scope",scope).append("_id.stepId",shape.getString("stepId")),256-(int)deleted);
                         if(deleted>=256)break;
                     }
+                    // A clear preserves samples under their existing TTL. Logical deletion authorizes
+                    // history cleanup only for each separately verified, frozen original scope.
+                    if (deleted < 256 && historyRetired(session, old, inventory))
+                        deleted += reclaimRows(session, SystemCollections.CACHE_PIPELINE_RATE_HISTORY.on(database),
+                                new Document("scope", scope), 256 - (int) deleted);
                     var payloads=List.of(
                             java.util.Map.entry(SystemCollections.DIRECT_BATCHES,new Document("_id.channel.scope",scope)),
                             java.util.Map.entry(SystemCollections.DIRECT_CHANNEL_OFFSETS,new Document("_id.scope",scope)),
                             java.util.Map.entry(SystemCollections.CACHE_SINK_PREPARATIONS,MongoSinkPreparationStore.scopeFilter(old)),
                             java.util.Map.entry(SystemCollections.CACHE_DERIVED_SCHEMAS,new Document("scope",scope)),
-                            java.util.Map.entry(SystemCollections.CACHE_PIPELINE_RATE_HISTORY,new Document("scope",scope)),
                             java.util.Map.entry(SystemCollections.CACHE_SNAPSHOT_COUNTS,new Document("_id.scope",scope)),
                             java.util.Map.entry(SystemCollections.CACHE_SNAPSHOT_ORDERS,new Document("_id",scope)));
                     if(deleted<256)for(var payload:payloads) {
@@ -83,6 +87,19 @@ final class MongoRetiredPipelinePayloads implements RetiredPipelinePayloads {
             active.run();return deleted;
         });
     }
+    private boolean historyRetired(ClientSession session, PipelineIntentScope original, Document inventory) {
+        if ("DELETE".equals(inventory.get("retirement", Document.class).get("purpose"))) return true;
+        var filter = new Document("_id.clusterId", original.clusterId()).append("_id.bindingVersion", original.bindingVersion())
+                .append("_id.cacheIncarnation", original.cacheIncarnation()).append("_id.pipelineId", original.pipelineId())
+                .append("_id.stateGeneration", new Document("$gt", original.stateGeneration())).append("retirement.purpose", "DELETE");
+        var deletion = SystemCollections.CACHE_OPERATOR_CLEANUP.on(database).find(session, filter)
+                .sort(new Document("_id.stateGeneration", 1)).first();
+        if (deletion == null) return false;
+        MongoOperatorInventory.frozen(session, database,
+                MongoPipelinePreparationFacts.scope(deletion.get("_id", Document.class)), deletion);
+        return true;
+    }
+
     @Override public List<PipelineIntentScope> listAfter(PipelineIntentScope after, int limit) {
         if (limit <= 0 || limit > 128) throw new IllegalArgumentException("invalid retired inventory page");
         if (after != null) requireScope(after);

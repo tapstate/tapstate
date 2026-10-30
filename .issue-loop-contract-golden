@@ -68,3 +68,82 @@ Other exact-head failures:
   Authenticated exact-head Sonar evidence helper: status=unavailable, reason=analysis-missing,
     analysis_date=null, gate=null, issues=[]. A new head must run CI and refresh Sonar evidence before readiness.
   e2e-admission passed; both e2e test shards passed. No waiver is justified or requested.
+
+Issue 830: new RenameSpec provider values exceed the existing CI identity contract.
+Source: GitHub Actions run 40310175170, attempt 1, test-shards (rest), job 121529154853.
+PR: https://github.com/tapstate/tapstate/pull/878
+Head: 61a24b5b6622f7dd119746dccfd971db19a4987e.
+Actions checkout: 296c3f5f3aaa24f7b6a4da55780417e36b6e731d (the PR merge checkout).
+
+Observed failure:
+  The selected Maven reactor finished BUILD SUCCESS at 2026-10-26T11:00:12Z.
+  The next step, Record the observed test identity hashes, reported:
+    {"cases": 7672, "complete": false, "source_not_applicable": 10, "unresolved": 5}
+    ci-evidence: unresolved case cannot be exported as an expected identity
+  The job exited 1 at 2026-10-26T11:00:14Z during export, not during an assertion.
+
+Exact source and XML evidence:
+  control/control-core/src/test/java/io/tapstate/control/core/PipelineViewServiceTest.java:268-275
+    collectionRenames() supplies these five unchanged pairs to
+    viewCatalogUsesTheRenamedCollectionForInlineAndReusableServe:
+      1. null -> ACC_COMPOSITE
+      2. new RenameSpec(null, RenameCase.LOWER, "Raw_", "_v1") -> Raw_acc_composite_v1
+      3. new RenameSpec(Map.of("ACC_COMPOSITE", "chosen"), RenameCase.UPPER,
+             "ignored_", "_ignored") -> chosen
+      4. new RenameSpec(Map.of(), null, null, "_archive") -> ACC_COMPOSITE_archive
+      5. new RenameSpec(null, RenameCase.PASCAL, null, null) -> AccComposite
+  The CI XML records all five invocations as executed, with no failure/error/skip.
+  The independent source inventory cannot parse new RenameSpec(...):
+    source parameter expression requires an independent contract:
+      new RenameSpec(null, RenameCase.LOWER, "Raw_", "_v1")
+  In ci-inputs-rest/expected-case-hashes.json, this method has mapping=null,
+  no provider contract, and no expected case identities. The inventory is
+  complete=false with unresolved_count=1 before selection.
+  Replaying the original CI XML through reports produces five entries with
+  reason="source parameter identities are unresolved", one for each [1]-[5].
+  Export then refuses with the identical unresolved-case message.
+
+There is a second, independently observed representation limit:
+  core/core-model/src/main/java/io/tapstate/core/model/RenameSpec.java:22-23
+    The existing constructor copies every non-null map into a LinkedHashMap and
+    wraps the copy with Collections.unmodifiableMap, including an empty map.
+  CI start/finish markers for invocations [3] and [4] contain stable=false and
+  argument_descriptors[0].reason="unsupported-collection-implementation".
+  Their RenameSpec descriptor digests are respectively:
+    36ed57a570086a2b39a2c6155864f0c8670c14bc3d63c0ab590ef483f09b33f2
+    195967c5fec1b540dc6881b25be36fed32e5512386a92d96569268ed9d55b04c
+  Invocations [1], [2] and [5] have stable=true markers. This alone cannot
+  supply their missing independent source identities.
+
+Existing contract boundaries:
+  .github/scripts/_ci-evidence.py:653-711 only interprets bounded supported
+  expressions; arbitrary record constructors require an independent contract.
+  .github/scripts/ci-provider-contracts.json does not register this provider;
+  its contract explicitly keeps unknown providers and unsupported arguments
+  incomplete. A source-hash entry written by the repair itself is not review.
+  test-support/src/test/java/io/tapstate/testsupport/CiCaseEvidence.java:303-306
+  restricts collection observation to exact known implementations, excluding
+  wrappers that can delegate to unknown code.
+  CiCaseEvidenceTest#arbitraryCollectionsAreNotAskedToRunTheirOwnCodeDuringObservation
+  explicitly requires Collections.unmodifiableMap(customMap) to remain unstable
+  and requires zero custom collection calls. Whitelisting every wrapper would
+  violate that existing assertion and observation constraint.
+
+Verification and boundary:
+  Original CI artifact 12643999577 (ci-failure-rest) supplies the raw XML;
+  artifact 12644628583 (ci-inputs-rest) supplies the expected identity metadata.
+  A local replay of the unchanged original XML reproduces all five unresolved
+  entries and the exact export refusal. No fixture or identity was invented.
+  With the configured JDK 21 environment sourced inside the shell,
+    mvn -o -q -pl control/control-core -am -Dtest=PipelineViewServiceTest \
+      -Dsurefire.failIfNoSpecifiedTests=false -Dtapstate.ci.case-evidence=true test
+  passed 15 tests, zero failures/errors/skips. This is functional verification;
+  that local command did not produce observer markers and is not CI acceptance.
+  The saved reproduction and wider verification commands remain unchanged.
+
+  No product, test, workflow, observer or provider-contract change is made here.
+  The no-contract-repair instruction requires a human decision before extending
+  the parameter identity contract. A permitted repair must cover both independent
+  source identities and runtime representation without invoking arbitrary
+  collection delegates, changing RenameSpec semantics, dropping any case or
+  relaxing assertion/evidence checks. This is not an e2e waiver situation.

@@ -53,6 +53,8 @@ final class HazelcastOperatorReadiness {
         if(member.getUserContext().putIfAbsent(SHARED_PREVIEW_CONTEXT,new LocalSharedPreview(preview,captures))!=null)throw fenced();
     }
 
+    // toNanos deliberately rejects overflow before any distributed operation starts.
+    @SuppressWarnings("java:S2201")
     HazelcastOperatorReadiness(HazelcastInstance member,Duration timeout) {
         this.member = Objects.requireNonNull(member,"member"); this.timeout = Objects.requireNonNull(timeout,"timeout");
         if (timeout.isNegative() || timeout.isZero()) throw new IllegalArgumentException("operator preparation needs a positive timeout");

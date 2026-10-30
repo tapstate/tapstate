@@ -534,7 +534,7 @@ class MongoConfigurationArtifactStoreIT {
             assertThatThrownBy(() -> MongoConfigurationDomain.open(settings(uri), "wrong-cluster"))
                     .isInstanceOf(TapstateException.class);
             SystemCollections.SCHEMA_MIGRATIONS.on(database).updateOne(new Document("_id", "config"),
-                    new Document("$set", new Document("installedVersion", 2)));
+                    new Document("$set", new Document("installedVersion", MongoConfigurationDomain.SCHEMA_VERSION + 1)));
             assertThatThrownBy(() -> MongoConfigurationDomain.open(settings(uri), "cluster-a"))
                     .isInstanceOfSatisfying(TapstateException.class,
                             error -> assertThat(error.code()).isEqualTo(MigrationError.DATA_NEWER_THAN_BINARY));
@@ -606,7 +606,7 @@ class MongoConfigurationArtifactStoreIT {
                             "schema_migrations", "configuration_version", "sources", "pdk_note_origins", "pdk_note_carries", "pipeline_drafts", "configuration_imports", "nest_dead_letters", "capture_preparations",
                             "alert_rules", "alert_receivers", "alert_subscriptions", "alert_silences", "alert_instances",
                             "alert_episodes", "alert_transitions", "alert_notification_schedules", "alert_delivery_intents",
-                            "alert_target_limits", "alert_test_quotas");
+                            "alert_target_limits", "alert_test_quotas", "alert_node_lifecycles", "ai_provider_settings");
             assertThat(SystemCollections.CAPTURE_PREPARATIONS.on(database).countDocuments()).isZero();
             assertThat(SystemCollections.PDK_NOTE_ORIGINS.on(database).countDocuments()).isZero();
             assertThat(SystemCollections.PDK_NOTE_CARRIES.on(database).countDocuments()).isZero();

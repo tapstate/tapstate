@@ -26,6 +26,8 @@ public final class DirectCaptureWriter implements CaptureStartedListener, AutoCl
     private final Deque<Pending> pending=new ArrayDeque<>();
     private final Map<String,Long> targets=new HashMap<>();
     private volatile String expectedResume;
+    // Publishes CaptureHealth before callbacks; that object uses atomic fields and concurrent maps.
+    @SuppressWarnings("java:S3077")
     private volatile CaptureHealth health;
     private String anchor;
     private long nextSequence,recordedThrough;

@@ -144,7 +144,8 @@ public final class MongoCloudSessionStore implements CloudSessionStore {
                     .append("clusterName", context.clusterName())
                     .append("region", context.region())
                     .append("ec2PublicIp", context.ec2PublicIp())
-                    .append("egressAddressStatus", context.egressAddressStatus()));
+                    .append("egressAddressStatus", context.egressAddressStatus())
+                    .append("userEmail", context.userEmail()));
         }
         return document;
     }
@@ -183,7 +184,8 @@ public final class MongoCloudSessionStore implements CloudSessionStore {
         try {
             return new CloudSessionContext(text(document, "organizationId"), text(document, "clusterId"),
                     text(document, "organizationName"), text(document, "clusterName"), text(document, "region"),
-                    optionalText(document, "ec2PublicIp"), optionalText(document, "egressAddressStatus"));
+                    optionalText(document, "ec2PublicIp"), optionalText(document, "egressAddressStatus"),
+                    optionalText(document, "userEmail"));
         } catch (IllegalArgumentException invalid) {
             throw unreadable("clusterContext");
         }

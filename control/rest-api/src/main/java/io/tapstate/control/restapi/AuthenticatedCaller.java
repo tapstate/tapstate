@@ -1,5 +1,6 @@
 package io.tapstate.control.restapi;
 
+import io.tapstate.control.core.CredentialType;
 import io.tapstate.control.core.TapstatePrincipal;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
@@ -12,6 +13,10 @@ final class AuthenticatedCaller {
 
     static String subject() {
         return principal().subject();
+    }
+
+    static boolean isCloudSession() {
+        return principal().credentialType() == CredentialType.CLOUD_SESSION;
     }
 
     static TapstatePrincipal principal() {

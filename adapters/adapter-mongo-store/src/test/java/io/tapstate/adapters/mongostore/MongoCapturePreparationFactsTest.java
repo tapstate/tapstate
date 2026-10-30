@@ -8,11 +8,10 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.IoError;
 import java.util.List;
 import java.util.Set;
-import java.util.stream.Stream;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -79,21 +78,31 @@ class MongoCapturePreparationFactsTest {
                 "formatVersion", "operationId", "planHash", "previousPhysicalChain", "previousPreparationId", "physicalChain", "phase"));
     }
 
-    static Stream<Document> malformedAnnexes() {
+    enum AnnexFault {
+        MISSING_ORIGINAL, EXTRA_FIELD, NESTED_ORIGINAL, LONG_VERSION,
+        WRONG_PHYSICAL_CHAIN, DIRECT_ORIGINAL, WRONG_BIRTH, EXTRA_ORIGINAL_FIELD
+    }
+
+    static Document malformedAnnex(AnnexFault fault) {
         var original = MongoCapturePreparationFacts.row(BIRTH);
         var valid = new Document("formatVersion", 2).append("original", original).append("physicalChain", PHYSICAL).append("preparationId", OPERATION);
         var missing = new Document(valid); missing.remove("original");
-        var extra = new Document(valid).append("extra", true);
-        var nested = new Document(valid).append("original", valid);
         var mode = new Document(original).append("mode", "DIRECT");
         var wrongBirth = new Document(original).append("preparationId", OPERATION);
-        return Stream.of(missing, extra, nested, new Document(valid).append("formatVersion", 2L),
-                new Document(valid).append("physicalChain", "a-different-physical-domain"),
-                new Document(valid).append("original", mode), new Document(valid).append("original", wrongBirth),
-                new Document(valid).append("original", new Document(original).append("extra", true)));
+        return switch (fault) {
+            case MISSING_ORIGINAL -> missing;
+            case EXTRA_FIELD -> new Document(valid).append("extra", true);
+            case NESTED_ORIGINAL -> new Document(valid).append("original", valid);
+            case LONG_VERSION -> new Document(valid).append("formatVersion", 2L);
+            case WRONG_PHYSICAL_CHAIN -> new Document(valid).append("physicalChain", "a-different-physical-domain");
+            case DIRECT_ORIGINAL -> new Document(valid).append("original", mode);
+            case WRONG_BIRTH -> new Document(valid).append("original", wrongBirth);
+            case EXTRA_ORIGINAL_FIELD -> new Document(valid).append("original", new Document(original).append("extra", true));
+        };
     }
-    @ParameterizedTest @MethodSource("malformedAnnexes")
-    void malformedReplacementFactsNeverFallBackToTheOriginalBirth(Document row) {
+    @ParameterizedTest @EnumSource(AnnexFault.class)
+    void malformedReplacementFactsNeverFallBackToTheOriginalBirth(AnnexFault fault) {
+        Document row = malformedAnnex(fault);
         assertThatThrownBy(() -> MongoCapturePreparationFacts.decode(row)).isInstanceOfSatisfying(TapstateException.class,
                 error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
     }

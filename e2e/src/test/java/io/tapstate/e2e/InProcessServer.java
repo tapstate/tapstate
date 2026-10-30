@@ -52,10 +52,18 @@ final class InProcessServer implements ServerHandle {
     }
 
     static InProcessServer startPrepared(PreparedNativeStore storage, List<String> additionalArguments) {
-        var arguments = new java.util.ArrayList<>(List.of("--tapstate.cluster.id=" + storage.clusterId(),
-                "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2"));
+        return startPrepared(storage, additionalArguments, null);
+    }
+    static InProcessServer startPrepared(PreparedNativeStore storage, List<String> additionalArguments,
+            io.tapstate.control.core.AiProviderClient provider) {
+        var arguments = new java.util.ArrayList<String>();
+        for (String value : List.of("--tapstate.cluster.id=" + storage.clusterId(),
+                "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2")) {
+            String key = value.substring(0, value.indexOf('=') + 1);
+            if (additionalArguments.stream().noneMatch(argument -> argument.startsWith(key))) arguments.add(value);
+        }
         arguments.addAll(additionalArguments);
-        return start(storage.configurationUri(), null, arguments);
+        return start(storage.configurationUri(), null, arguments, provider);
     }
 
     /** Boots the assembly with an explicit operator-state database. */
@@ -65,11 +73,16 @@ final class InProcessServer implements ServerHandle {
 
     /** Additional settings let a focused witness select the actual Cloud assembly. */
     static InProcessServer start(String storeUri, String operatorStateDatabase, List<String> additionalArguments) {
+        return start(storeUri, operatorStateDatabase, additionalArguments, null);
+    }
+
+    static InProcessServer start(String storeUri, String operatorStateDatabase, List<String> additionalArguments,
+            io.tapstate.control.core.AiProviderClient provider) {
         Path stagingDirectory = ServerHandle.privateStagingDirectory();
         ConfigurableApplicationContext context;
         var refreshed = new java.util.concurrent.CopyOnWriteArrayList<ConfigurableApplicationContext>();
         try {
-            context = boot(storeUri, operatorStateDatabase, stagingDirectory, additionalArguments, refreshed);
+            context = boot(storeUri, operatorStateDatabase, stagingDirectory, additionalArguments, refreshed, provider);
         } catch (RuntimeException e) {
             // Nothing is handed back to close, so nothing else will ever clear this up. Attached rather
             // than thrown: why the assembly did not boot is the thing a reader needs.
@@ -88,7 +101,8 @@ final class InProcessServer implements ServerHandle {
 
     private static ConfigurableApplicationContext boot(String storeUri, String operatorStateDatabase,
             Path stagingDirectory, List<String> additionalArguments,
-            java.util.concurrent.CopyOnWriteArrayList<ConfigurableApplicationContext> refreshedContexts) {
+            java.util.concurrent.CopyOnWriteArrayList<ConfigurableApplicationContext> refreshedContexts,
+            io.tapstate.control.core.AiProviderClient provider) {
         java.util.ArrayList<String> arguments = new java.util.ArrayList<>(List.of(
                 "--server.address=127.0.0.1", "--server.port=0"));
         arguments.addAll(additionalArguments);
@@ -102,7 +116,19 @@ final class InProcessServer implements ServerHandle {
                         ServerHandle.PLUGINS_DIRECTORY_SETTING + "=" + stagingDirectory,
                         ServerHandle.ALSO_ACCEPT_IDS_SETTING + "=" + E2eConnectorJar.CONNECTOR_ID));
         if (operatorStateDatabase != null) defaults.add(ServerHandle.OPERATOR_STATE_DATABASE_SETTING + "=" + operatorStateDatabase);
-        return new SpringApplicationBuilder(Bootstrap.class)
+        var builder = new SpringApplicationBuilder(Bootstrap.class);
+        if (provider != null) {
+            builder.initializers(context -> context.addBeanFactoryPostProcessor(factory -> {
+                var registry = (org.springframework.beans.factory.support.BeanDefinitionRegistry) factory;
+                if (registry.containsBeanDefinition("aiProviderClient")) registry.removeBeanDefinition("aiProviderClient");
+                var definition = new org.springframework.beans.factory.support.RootBeanDefinition(
+                        io.tapstate.control.core.AiProviderClient.class, () -> provider);
+                definition.setPrimary(true);
+                if (provider instanceof AutoCloseable) definition.setDestroyMethodName("close");
+                registry.registerBeanDefinition("aiProviderClient", definition);
+            }));
+        }
+        return builder
                 .listeners((ApplicationListener<ContextRefreshedEvent>) event -> {
                     if (event.getApplicationContext() instanceof ConfigurableApplicationContext refreshed)
                         refreshedContexts.addIfAbsent(refreshed);

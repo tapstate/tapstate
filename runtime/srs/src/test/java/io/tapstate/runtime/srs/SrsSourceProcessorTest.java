@@ -17,13 +17,16 @@ import com.hazelcast.jet.config.EdgeConfig;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.JobStatus;
+import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.jet.core.Vertex;
 import com.hazelcast.jet.core.Watermark;
 import com.hazelcast.jet.core.processor.Processors;
 import com.hazelcast.jet.core.processor.SinkProcessors;
+import com.hazelcast.jet.core.test.TestOutbox;
 import com.hazelcast.jet.core.test.TestProcessorMetaSupplierContext;
+import com.hazelcast.jet.core.test.TestProcessorSupplierContext;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
@@ -35,6 +38,7 @@ import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.engine.SinkAckFactory;
 import io.tapstate.spi.capture.SourcePosition;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -569,6 +573,63 @@ class SrsSourceProcessorTest {
         runRecordingBounds("srs.chain.boundbp", "orders", "out-boundbp", 6, 1, "b:7:6");
 
         assertThat(SEEN).containsSubsequence("i:5", "b:7:6");
+    }
+
+    @Test
+    void retriesARefusedBoundExactlyOnceWhenTheOutboxHasRoom() throws Exception {
+        String ringName = "srs.chain.refused-bound";
+        SnapshotBuffer buffer = new SnapshotBuffer();
+        buffer.append(PIPELINE, ringName, snapshotRow(100).withOrder(SourceOrder.snapshotRow(1L)));
+        hz.getUserContext().put(SnapshotBuffer.USER_CONTEXT_KEY, buffer);
+        ProcessorMetaSupplier meta = SrsSourceProcessor.snapshotOnlyMetaSupplier(
+                PIPELINE, ringName, "orders", 1L, RECORDED_STAMP, SourcePlacement.anyMember());
+        Address address = hz.getCluster().getLocalMember().getAddress();
+        meta.init(new TestProcessorMetaSupplierContext()
+                .setHazelcastInstance(hz).setTotalParallelism(1).setLocalParallelism(1));
+        ProcessorSupplier supplier = meta.get(List.of(address)).apply(address);
+        supplier.init(new TestProcessorSupplierContext().setHazelcastInstance(hz));
+        Processor processor = supplier.get(1).iterator().next();
+        TestOutbox outbox = new TestOutbox(1);
+        var node = ((com.hazelcast.instance.impl.HazelcastInstanceProxy) hz).getOriginal().node.nodeEngine;
+        var context = new com.hazelcast.jet.impl.execution.init.Contexts.ProcCtx(node, 1, 1,
+                new com.hazelcast.jet.config.JobConfig(), hz.getLoggingService().getLogger("source"), "source",
+                0, 0, false, Map.of(), 1, 0, 1, new java.util.concurrent.ConcurrentHashMap<>(),
+                (com.hazelcast.internal.serialization.InternalSerializationService) node.getSerializationService(),
+                null, getClass().getClassLoader());
+        var thread = com.hazelcast.jet.impl.execution.init.Contexts.container();
+        var previous = thread.getContext();
+        thread.setContext(context);
+        try {
+            processor.init(outbox, context);
+
+            // The row takes the only slot, refusing its bound without relying on worker scheduling.
+            assertThat(processor.complete()).isFalse();
+            assertThat(outbox.queue(0)).hasSize(1);
+            assertThat(describe((Envelope) outbox.queue(0).peek())).isEqualTo("orders|null|100|1:" + SourceOrder.SNAPSHOT_SEQ);
+            outbox.reset();
+            assertThat(processor.complete()).isFalse();
+            assertThat(outbox.queue(0)).hasSize(1);
+
+            List<Object> emitted = new ArrayList<>();
+            outbox.drainQueueAndReset(0, emitted, false);
+            assertThat(emitted).hasSize(1);
+            assertThat(processor.complete()).isFalse();
+            assertThat(outbox.queue(0)).containsExactly(new Watermark(0L, (byte) 7));
+
+            outbox.drainQueueAndReset(0, emitted, false);
+            assertThat(emitted).hasSize(2);
+            assertThat(processor.complete()).isFalse();
+            assertThat(outbox.queue(0)).isEmpty();
+        } finally {
+            try {
+                processor.close();
+                supplier.close(null);
+                meta.close(null);
+            } finally {
+                hz.getUserContext().remove(SnapshotBuffer.USER_CONTEXT_KEY);
+                thread.setContext(previous);
+            }
+        }
     }
 
     @Test

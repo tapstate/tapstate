@@ -70,6 +70,12 @@ final class SharedMySql {
         if (container == null) {
             DockerGate.require();
             MySQLContainer<?> starting = new MySQLContainer<>(IMAGE);
+            String owner = System.getProperty("tapstate.e2e.resource-owner");
+            if (owner != null && !owner.isBlank()) {
+                starting.withLabel(System.getProperty("tapstate.e2e.resource-owner-label",
+                        "io.tapstate.e2e.resource-owner"), owner);
+                starting.withTmpFs(Map.of("/var/lib/mysql", "rw,size=1g"));
+            }
             starting.start();
             grantReplication(starting);
             container = starting;

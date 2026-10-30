@@ -380,7 +380,28 @@ public final class NestDag {
                 : NestSendPolicy.everyChange();
         return new NestVertexSupplier(spec, slots, stores, deadLetter, outputStream,
                 axes, chainsByOrdinal, binding.replayFloor(), binding.settings(), binding.clock(), sending,
-                topology.lookups(), binding.settleMissingReferencesOnComplete());
+                topology.lookups(), binding.settleMissingReferencesOnComplete(),
+                lookupSnapshots(topology, binding, frontier));
+    }
+
+    private static Map<String, LookupSnapshot> lookupSnapshots(
+            NestTopology topology, NestBinding binding, NestFrontier frontier) {
+        Map<String, LookupSnapshot> snapshots = new LinkedHashMap<>();
+        if (frontier == null || binding.snapshotEpochs().isEmpty()) {
+            return snapshots;
+        }
+        for (NestLookup lookup : topology.lookups()) {
+            List<String> chains = frontier.chainsOfAlias(lookup.alias());
+            if (chains.isEmpty() || !binding.snapshotEpochs().keySet().containsAll(chains)) {
+                continue;
+            }
+            Map<String, Long> epochs = new LinkedHashMap<>();
+            chains.forEach(chain -> epochs.put(chain, binding.snapshotEpochs().get(chain)));
+            int ordinal = lookup.referrerPathId().isEmpty() ? lookup.touchOrdinal()
+                    : topology.assembler().inboundFor(List.of(lookup.referrerPathId().getFirst())).ordinal();
+            snapshots.put(lookup.mapName(), new LookupSnapshot(ordinal, epochs));
+        }
+        return snapshots;
     }
 
     /**
@@ -512,6 +533,7 @@ public final class NestDag {
         private final NestSendPolicy sending;
         private final List<NestLookup> lookups;
         private final boolean settleMissingReferencesOnComplete;
+        private final Map<String, LookupSnapshot> lookupSnapshots;
         private transient ReplayFloor floor;
         private transient NestBinding.NestStores bound;
         private transient NestDeadLetter boundDeadLetter;
@@ -520,11 +542,12 @@ public final class NestDag {
                 NestDeadLetter deadLetter, String outputStream, ChainAxes axes,
                 Map<Integer, List<String>> chainsByOrdinal, ReplayFloorFactory replayFloor,
                 NestSettings settings, NestClock clock, NestSendPolicy sending, List<NestLookup> lookups,
-                boolean settleMissingReferencesOnComplete) {
+                boolean settleMissingReferencesOnComplete, Map<String, LookupSnapshot> lookupSnapshots) {
             this.lookups = lookups;
             this.clock = clock;
             this.sending = sending;
             this.settleMissingReferencesOnComplete = settleMissingReferencesOnComplete;
+            this.lookupSnapshots = Map.copyOf(lookupSnapshots);
             this.spec = spec;
             this.slots = slots;
             this.stores = stores;
@@ -555,7 +578,7 @@ public final class NestDag {
                         ? new AssemblerProcessor(spec, slots, bound.forAssembler(spec), outputStream,
                                 axes, chainsByOrdinal, floor, settings, clock, sending,
                                 bound.forParking(spec), boundDeadLetter, referenced(),
-                                settleMissingReferencesOnComplete)
+                                settleMissingReferencesOnComplete, lookupSnapshots)
                         : new ResolverProcessor(spec, bound.forResolver(spec), boundDeadLetter, axes,
                                 chainsByOrdinal, floor, clock, settings, bound.forParking(spec)));
             }

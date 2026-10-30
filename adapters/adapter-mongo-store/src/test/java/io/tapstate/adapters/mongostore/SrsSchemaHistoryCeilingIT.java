@@ -8,9 +8,7 @@ import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.containers.MongoDBContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.utility.DockerImageName;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -50,7 +48,6 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 @RequiresDocker
 class SrsSchemaHistoryCeilingIT {
 
-    private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
 
     /** The width of the table whose schema each history entry carries. */
     private static final int COLUMNS = 20;
@@ -60,14 +57,15 @@ class SrsSchemaHistoryCeilingIT {
 
     private static final String CHAIN = "orders@mysql-1";
 
-    @Container
-    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
+    @RegisterExtension
+    private static final SharedMongoCase REPLICA_SET =
+            SharedMongoCase.forSuite(SrsSchemaHistoryCeilingIT.class);
 
     @Test
     void aChainAtTheDocumentCeilingCanStillRecordItsNextSchema() {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
             MongoCollection<Document> collection =
-                    client.getDatabase("tapstate").getCollection("srs_meta");
+                    client.getDatabase(REPLICA_SET.database("tapstate")).getCollection("srs_meta");
             MongoSrsMetaStore store = new MongoSrsMetaStore(client, collection);
 
             store.create(CHAIN, null);

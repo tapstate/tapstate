@@ -93,6 +93,8 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
             Function<SrsSnapshotPreparation,CapturePort> ports,CaptureHandoff handoff,Runnable requireActive) {
         return beginSnapshot(run, config, firstSnapshotEpoch, ports, handoff, requireActive, null, java.time.Instant.EPOCH, ignored -> {});
     }
+    // The returned run/background owns the load; failed startup closes it or retains the original cleanup owner.
+    @SuppressWarnings("java:S2095")
     public synchronized CaptureRun beginSnapshot(SrsConsumerRun run,CaptureConfig config,long firstSnapshotEpoch,
             Function<SrsSnapshotPreparation,CapturePort> ports,CaptureHandoff handoff,Runnable requireActive,
             SrsFreshFullPreparation freshFull, java.time.Instant preparedAt, java.util.function.Consumer<SrsFreshFullReceipt> beforeRows) {
@@ -122,6 +124,8 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
     }
 
     /** A private change stream records batches before handoff and acknowledges only its original settled prefix. */
+    // The returned subscription owns the writer; pendingCloses retains failed or incomplete cleanup.
+    @SuppressWarnings("java:S2095")
     public synchronized CaptureRun startDirect(CaptureConfig config,DirectChannelProgress opened,DirectChannelStore channels,
             CaptureStart start,CapturePort port,CaptureHandoff handoff,int capacity,Runnable requireActive) {
         Objects.requireNonNull(opened,"opened");Objects.requireNonNull(channels,"channels");Objects.requireNonNull(handoff,"handoff");
@@ -145,6 +149,8 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
     }
 
     /** Opens the original private seam before returning; its CDC tail follows the bounded load on the same worker. */
+    // The background and returned run own the load; failure paths close or retain that same load.
+    @SuppressWarnings("java:S2095")
     public synchronized CaptureRun beginDirectSnapshot(CaptureConfig config,DirectChannelProgress opened,DirectChannelStore channels,
             Function<DirectSnapshotPreparation,CapturePort> ports,CaptureHandoff handoff,int capacity,Runnable requireActive) {
         Runnable fixed=guard(requireActive);fixed.run();var preparation=new DirectSnapshotPreparation(opened,channels,fixed);
@@ -185,6 +191,8 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
     }
 
     /** A bounded-only source opens no change chain or CDC seam and uses the already allocated row order. */
+    // The returned run/background owns the load, including its deferred cleanup on failure.
+    @SuppressWarnings("java:S2095")
     public synchronized CaptureRun beginSnapshotOnly(CaptureConfig config,long snapshotEpoch,CapturePort port,
             CaptureHandoff handoff,Runnable requireActive) {
         Objects.requireNonNull(config,"config"); Objects.requireNonNull(port,"port"); Objects.requireNonNull(handoff,"handoff");
@@ -207,7 +215,11 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
 
     public final class Tail implements AutoCloseable {
         private final SrsCaptureWriter writer;
+        // Handle publication is separate from the subscription lifecycle guarded by this unit.
+        @SuppressWarnings("java:S3077")
         private volatile Subscription subscription;
+        // The unit synchronizes startup and retirement; this publishes only its cleanup handle.
+        @SuppressWarnings("java:S3077")
         private volatile Runnable opening;
         private final CaptureHealth health;
         private final Runnable owner;

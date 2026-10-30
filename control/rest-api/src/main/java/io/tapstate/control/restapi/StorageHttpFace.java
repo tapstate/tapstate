@@ -16,7 +16,7 @@ import java.util.Map;
 @Configuration(proxyBeanMethods = false)
 @ConditionalOnWebApplication(type = ConditionalOnWebApplication.Type.SERVLET)
 @Import({RestApiConfiguration.class, RestApiSecurityConfiguration.class, HealthController.class,
-        VersionController.class, IssuerDiscoveryController.class, AuthController.class, CloudAuthController.class,
+        VersionController.class, IssuerDiscoveryController.class, AuthController.class, BrowserAuthController.class, CloudAuthController.class,
         CurrentUserController.class, ClusterContextController.class, StorageControlController.class, StorageEntryController.class, InstallationController.class, ApiExceptionHandler.class})
 public class StorageHttpFace {
     @Bean

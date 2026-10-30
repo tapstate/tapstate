@@ -34,6 +34,8 @@ public final class SourceCaptureIdentity {
         for (String stream : sorted) input.append('|').append(stream.length()).append(':').append(stream);
         return "capture-"+CanonicalHash.ofText(input.toString());
     }
+    // toEpochMilli validates representability while the canonical identity deliberately retains nanoseconds.
+    @SuppressWarnings("java:S2201")
     public static String startAxis(String start) {
         if (start == null || start.equals("latest")) return "latest";
         if (start.equals("earliest")) return "earliest";

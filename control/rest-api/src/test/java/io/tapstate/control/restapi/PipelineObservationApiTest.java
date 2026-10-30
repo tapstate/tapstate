@@ -27,6 +27,7 @@ import io.tapstate.control.core.TokenSigner;
 import io.tapstate.control.core.VerifiedToken;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.CasOutcome;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.DesiredState;
@@ -45,6 +46,7 @@ import io.tapstate.spi.store.AuditRecord;
 import io.tapstate.spi.store.AuditStore;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.DesiredStore;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.ObservationStore;
 import io.tapstate.spi.store.RateHistoryStore;
 import io.tapstate.spi.store.SchemaVersion;
@@ -619,6 +621,40 @@ class PipelineObservationApiTest {
     }
 
     @Test
+    void statusKeepsObservedFactsAndReturnsACodedIntentReadFailure() {
+        context.getBean(FakeStoppedPipelines.class).unreadableIntent("pl1");
+
+        Map<String, Object> body = client().get().uri("/api/pipelines/pl1/status")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(new ParameterizedTypeReference<>() {});
+
+        assertThat(body).containsEntry("state", "RUNNING")
+                .containsEntry("observedState", "RUNNING")
+                .containsEntry("displayState", "RUNNING")
+                .containsEntry("hasArtifact", true);
+        Object intentReadFailure = body.get("intentReadFailure");
+        assertThat(intentReadFailure).isInstanceOf(Map.class);
+        assertThat(((Map<?, ?>) intentReadFailure).get("code"))
+                .isEqualTo("io.document-unreadable");
+    }
+
+    @Test
+    void unreadableIntentWithoutObservationReturnsASeparateCodedFailure() {
+        context.getBean(FakeObservationStore.class).clear();
+        context.getBean(FakeStoppedPipelines.class).unreadableIntent("pl1");
+
+        Map<String, Object> body = client().get().uri("/api/pipelines/pl1/status")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(new ParameterizedTypeReference<>() {});
+
+        assertThat(body).containsEntry("state", "NEW").containsEntry("hasArtifact", true)
+                .doesNotContainKey("displayState");
+        Object intentReadFailure = body.get("intentReadFailure");
+        assertThat(intentReadFailure).isInstanceOf(Map.class);
+        assertThat(((Map<?, ?>) intentReadFailure).get("code")).isEqualTo("io.document-unreadable");
+    }
+
+    @Test
     void aReadOfADraftBeforeItsFirstRuntimeObservationReturnsDraftState() {
         var draft = new io.tapstate.spi.store.PipelineDraft("draft-only", 1, 1,
                 io.tapstate.spi.store.PipelineDraft.Mode.DAG, "Draft", null,
@@ -1067,9 +1103,14 @@ class PipelineObservationApiTest {
 
         private final Map<String, PipelineState> actual = new LinkedHashMap<>();
         private final Map<String, DesiredState> intents = new LinkedHashMap<>();
+        private final Set<String> unreadableIntents = new java.util.HashSet<>();
 
         void intent(String pipelineId, PipelineState target) {
             intents.put(pipelineId, new DesiredState(pipelineId, target, "fixture-revision"));
+        }
+
+        void unreadableIntent(String pipelineId) {
+            unreadableIntents.add(pipelineId);
         }
 
         void running(String pipelineId) {
@@ -1079,6 +1120,7 @@ class PipelineObservationApiTest {
         void reset() {
             actual.clear();
             intents.clear();
+            unreadableIntents.clear();
         }
 
         DesiredStore desired() {
@@ -1090,6 +1132,10 @@ class PipelineObservationApiTest {
 
                 @Override
                 public Optional<DesiredState> read(String pipelineId) {
+                    if (unreadableIntents.contains(pipelineId)) {
+                        throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
+                                Map.of("id", pipelineId, "field", "targetState"), null);
+                    }
                     return Optional.ofNullable(intents.get(pipelineId));
                 }
 

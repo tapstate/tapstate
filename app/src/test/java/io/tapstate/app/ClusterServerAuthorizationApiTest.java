@@ -123,12 +123,14 @@ class ClusterServerAuthorizationApiTest {
 
                 var readMe = request(client, origin, "GET", "/api/auth/me", read, null, Map.of());
                 assertThat(readMe.statusCode()).isEqualTo(200);
-                assertThat(body(readMe)).isEqualTo(Map.of("mode", "cloud", "principal", "user-read",
-                        "scopes", List.of("read")));
+                assertThat(body(readMe)).containsEntry("mode", "cloud").containsEntry("principal", "user-read")
+                        .containsEntry("scopes", List.of("read")).containsEntry("username", null)
+                        .containsEntry("email", "user@example.test");
                 var writeMe = request(client, origin, "GET", "/api/auth/me", write, null, Map.of());
                 assertThat(writeMe.statusCode()).isEqualTo(200);
-                assertThat(body(writeMe)).isEqualTo(Map.of("mode", "cloud", "principal", "user-write",
-                        "scopes", List.of("read", "write")));
+                assertThat(body(writeMe)).containsEntry("mode", "cloud").containsEntry("principal", "user-write")
+                        .containsEntry("scopes", List.of("read", "write")).containsEntry("username", null)
+                        .containsEntry("email", "user@example.test");
 
                 var deniedWrite = request(client, origin, "POST", "/api/connections:test", read,
                         CONNECTION, Map.of());

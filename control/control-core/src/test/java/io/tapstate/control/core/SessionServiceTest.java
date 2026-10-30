@@ -50,6 +50,19 @@ class SessionServiceTest {
     }
 
     @Test
+    void urlSafeSeparatorsSurviveSessionCreationAndExchange() {
+        MemorySessionStore store = new MemorySessionStore();
+        SessionService service = service(store, NOW, "s_01", "session_-secret");
+        CreatedSession created = service.create("admin", Scope.ADMIN, ISSUER);
+
+        assertThat(created.token()).isEqualTo("tss_s_01.session_-secret");
+        assertThat(service.exchange(created.token(), ISSUER)).isPresent();
+        int exchanges = store.exchangeCalls;
+        assertThat(service.exchange("tss_s*01.session_-secret", ISSUER)).isEmpty();
+        assertThat(store.exchangeCalls).isEqualTo(exchanges);
+    }
+
+    @Test
     void issuerSecretAndExpiryMismatchFailClosed() {
         MemorySessionStore store = new MemorySessionStore();
         service(store, NOW).create("admin", Scope.ADMIN, ISSUER);
@@ -104,6 +117,19 @@ class SessionServiceTest {
     }
 
     @Test
+    void browserLogoutDoesNotTreatAnotherIssuersExpiredSessionAsInactive() {
+        MemorySessionStore store = new MemorySessionStore();
+        SessionService service = service(store, NOW);
+        service.create("admin", Scope.ADMIN, ISSUER);
+        SessionRecord existing = store.records.get("s01");
+        store.records.put("s01", new SessionRecord(existing.sessionId(), existing.secretHash(), existing.principal(),
+                existing.scope(), "urn:other", true, existing.createdAt(), existing.lastUsedAt(),
+                NOW.minusSeconds(1), existing.absoluteExpiresAt()));
+        assertThat(service.logoutForBrowser("tss_s01.session-secret", ISSUER))
+                .isEqualTo(SessionService.LogoutResult.INVALID);
+    }
+
+    @Test
     void malformedTokensNeverReachStorage() {
         MemorySessionStore store = new MemorySessionStore();
         SessionService service = service(store, NOW);
@@ -128,15 +154,20 @@ class SessionServiceTest {
     }
 
     private static SessionService service(MemorySessionStore store, Instant now) {
+        return service(store, now, "s01", "session-secret");
+    }
+
+    private static SessionService service(
+            MemorySessionStore store, Instant now, String sessionId, String sessionSecret) {
         TokenSecrets secrets = new TokenSecrets() {
             @Override
             public GeneratedSecret generate() {
-                return new GeneratedSecret("s01", "session-secret", "digest-fixture");
+                return new GeneratedSecret(sessionId, sessionSecret, "digest-fixture");
             }
 
             @Override
             public String hash(String presentedSecret) {
-                return "session-secret".equals(presentedSecret) ? "digest-fixture" : "digest-wrong";
+                return sessionSecret.equals(presentedSecret) ? "digest-fixture" : "digest-wrong";
             }
 
             @Override
@@ -205,6 +236,16 @@ class SessionServiceTest {
             records.put(sessionId, new SessionRecord(record.sessionId(), record.secretHash(), record.principal(),
                     record.scope(), record.issuer(), true, record.createdAt(), record.lastUsedAt(),
                     record.idleExpiresAt(), record.absoluteExpiresAt()));
+            return true;
+        }
+
+        @Override
+        public boolean revokeBrowserSession(String sessionId, String secretHash, String issuer) {
+            SessionRecord current = records.get(sessionId);
+            if (current == null || !current.secretHash().equals(secretHash) || !current.issuer().equals(issuer)) return false;
+            records.put(sessionId, new SessionRecord(current.sessionId(), current.secretHash(), current.principal(),
+                    current.scope(), current.issuer(), true, current.createdAt(), current.lastUsedAt(),
+                    current.idleExpiresAt(), current.absoluteExpiresAt()));
             return true;
         }
     }

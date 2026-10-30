@@ -96,8 +96,9 @@ Sampled integer metadata therefore cannot silently authorize later CDC type drif
 Other representations, including string-to-number coercion, decimal rounding and
 unknown widths, are refused until lossless equality can be established. Tapstate does not add missing columns to an existing relational
 table, remove business constraints, or rename unrelated unique fields to make a
-write succeed. Partial, expression, prefix, sparse or non-simple-collation unique
-indexes do not establish the required guarantee and block automatic separation.
+write succeed. For relational targets, partial, expression, prefix or
+non-simple-collation unique indexes do not establish the required guarantee and
+block automatic separation.
 MySQL character-collated unique keys are conservatively refused, including binary
 collations with unproven padding semantics. PostgreSQL nondeterministic collations
 are refused. A compatible
@@ -105,16 +106,20 @@ composite primary key does not exempt conflicting secondary business indexes.
 Existing targets whose connectors cannot expose exact constraint metadata are
 refused until that metadata can be verified.
 
-For MongoDB, exact index-option inspection uses the connector's read-only
-`$indexStats` command, which requires the `indexStats` privilege on the target
-collection. The connector's general `listIndexes` result does not expose all the
-options required for this check. If exact metadata or permission is unavailable,
-START is blocked with `connector.target-identity-check-failed`; it is never reported
-as "no change needed". Tapstate does not grant privileges. A required logical
-index may be prepared for a new or empty collection, or when the existing full-load
-policy explicitly clears the collection. Preparation is followed by another exact
-index check before writes begin. A populated collection without the matching index
-requires an explicit migration or a new destination.
+For MongoDB, index inspection uses the connector's existing index-query capability,
+which reads `listIndexes`. Matching unique or primary indexes are accepted using
+the portable PDK index declaration. MongoDB-specific options such as sparse,
+partial filters and collation are not represented by that declaration and are not
+validated by this check. The destination owner must ensure those options are
+suitable for the rows and key comparisons used by the pipeline. This check does
+not require `$indexStats` or the `indexStats` privilege.
+
+If index querying is unavailable, fails or returns malformed metadata, START is
+blocked with `connector.target-identity-check-failed`. A required logical index
+may be prepared for a new or empty collection, or when the existing full-load
+policy explicitly clears the collection. Preparation is followed by another
+index query before writes begin. A populated collection without the matching
+index requires an explicit migration or a new destination.
 
 MongoDB automatic matching accepts canonical scalar keys: strings, booleans,
 signed 64-bit integers, ObjectIds, binary values with preserved subtype, and dates

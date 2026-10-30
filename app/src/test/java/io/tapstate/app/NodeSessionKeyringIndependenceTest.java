@@ -55,11 +55,16 @@ class NodeSessionKeyringIndependenceTest {
         var lease = new RootBeanDefinition(NodeSessionLease.class); lease.setFactoryBeanName("configuration");
         lease.setFactoryMethodName("nodeSessionLease"); lease.setAutowireMode(AbstractBeanDefinition.AUTOWIRE_CONSTRUCTOR);
         lease.setDestroyMethodName("close"); beans.registerBeanDefinition("lease", lease);
+        long acquiredAt = System.nanoTime();
+        context.put(HazelcastConfiguration.NODE_SESSION_ASKED_AT_CONTEXT_KEY, acquiredAt);
+        var originalLease = new NodeSessionLease(store, claim, acquiredAt, properties.getNodeSessionTtl(),
+                properties.getNodeSessionRenewInterval(), member::shutdown);
+        context.put(HazelcastConfiguration.NODE_SESSION_LEASE_CONTEXT_KEY, originalLease);
         try {
-            assertThatCode(() -> assertThat(beans.getBean("lease", NodeSessionLease.class)).isNotNull()).doesNotThrowAnyException();
+            assertThatCode(() -> assertThat(beans.getBean("lease", NodeSessionLease.class)).isSameAs(originalLease)).doesNotThrowAnyException();
             assertThat(renewals.await(2, TimeUnit.SECONDS)).isTrue();
             assertThat(attempted).hasValue(0); verify(member, never()).shutdown();
-        } finally { beans.destroySingletons(); }
+        } finally { beans.destroySingletons(); originalLease.close(); }
         verify(store).release(claim); assertThat(attempted).hasValue(0);
     }
 }

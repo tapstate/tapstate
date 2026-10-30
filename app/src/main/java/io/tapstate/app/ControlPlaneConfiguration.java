@@ -52,6 +52,7 @@ import io.tapstate.control.core.StartCheckEvaluator;
 import io.tapstate.control.core.StartChecks;
 import io.tapstate.control.core.StartPlanner;
 import io.tapstate.control.core.PipelineDraftService;
+import io.tapstate.control.core.PipelineDeletionService;
 import io.tapstate.control.core.PipelineCatalogService;
 import io.tapstate.control.core.PipelineLayoutService;
 import io.tapstate.control.core.PipelineLogQueryService;
@@ -178,6 +179,15 @@ class ControlPlaneConfiguration {
     private static final int MAX_LOG_LINES_PER_PIPELINE = 200;
 
     // ---- authentication ports over the store (the counterpart to StoreConfiguration's StorePort) ----
+
+    @Bean
+    @org.springframework.boot.autoconfigure.condition.ConditionalOnProperty(prefix = "tapstate.store.mongo", name = "enabled", matchIfMissing = true)
+    io.tapstate.control.core.AiProviderService aiProviderService(
+            ObjectProvider<io.tapstate.spi.store.AiProviderSettingsStore> stores, AuditGate auditGate) {
+        var store = stores.getIfAvailable();
+        // An optional provider feature cannot block a runtime whose active backend has no settings adapter.
+        return store == null ? null : new io.tapstate.control.core.AiProviderService(store, auditGate);
+    }
 
     @Bean
     MongoAuthStores authStores(MongoConnection storeConnection) {
@@ -719,6 +729,14 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
+    PipelineDeletionService pipelineDeletionService(
+            ArtifactQueryService artifacts,
+            ArtifactMutationService mutations,
+            PipelineDraftService drafts) {
+        return new PipelineDeletionService(artifacts, mutations, drafts);
+    }
+
+    @Bean
     PipelinePreviewService pipelinePreviewService(
             ApplyService applyService, PipelinePreviewProbe probe, Clock clock) {
         return new PipelinePreviewService(applyService, probe, clock);
@@ -828,7 +846,8 @@ class ControlPlaneConfiguration {
 
     @Bean
     SecretRedactor secretRedactor() {
-        return new SecretRedactor();
+        return RedactingLogConverter.redactor(
+                (ch.qos.logback.classic.LoggerContext) org.slf4j.LoggerFactory.getILoggerFactory());
     }
 
     @Bean

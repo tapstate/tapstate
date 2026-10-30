@@ -2,6 +2,7 @@ package io.tapstate.spi.store;
 
 import java.util.List;
 import java.util.Objects;
+import java.util.Arrays;
 
 /** A narrowly indexed recovery facet for unfinished Nest handoffs, never an operator keyspace listing. */
 public interface NestReleaseStore extends KeyedStateStore {
@@ -14,6 +15,11 @@ public interface NestReleaseStore extends KeyedStateStore {
             routingKey = Objects.requireNonNull(routingKey, "routingKey").clone();
         }
         @Override public byte[] routingKey() { return routingKey.clone(); }
+        @Override public boolean equals(Object value) {
+            return value instanceof PendingKey other && stateKey.equals(other.stateKey) && Arrays.equals(routingKey, other.routingKey);
+        }
+        @Override public int hashCode() { return 31 * stateKey.hashCode() + Arrays.hashCode(routingKey); }
+        @Override public String toString() { return "PendingKey[stateKey=redacted, routingKey=" + routingKey.length + " bytes]"; }
     }
 
     /** Writes state and its pending marker atomically; a null routing key removes that marker. */

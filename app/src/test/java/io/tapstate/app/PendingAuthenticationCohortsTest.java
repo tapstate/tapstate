@@ -39,6 +39,18 @@ class PendingAuthenticationCohortsTest {
         }
     }
 
+    @Test void explicitOwnerRevocationPreservesItsAuthenticationFailure() throws Exception {
+        try (var cohorts = new PendingAuthenticationCohorts<String>(Duration.ofSeconds(30), 4, 2)) {
+            var denied = new TapstateException(io.tapstate.control.core.ControlError.UNAUTHENTICATED, java.util.Map.of(), null);
+            var first = task(() -> cohorts.validate(new Object(), "cookie", deadline(),
+                    () -> { throw new AssertionError("revoked before validation"); }, ACTIVE));
+            waiting(first.thread());
+            cohorts.invalidate(denied);
+            assertThatThrownBy(() -> first.future().get(2, TimeUnit.SECONDS))
+                    .isInstanceOf(ExecutionException.class).hasCause(denied);
+        }
+    }
+
     @Test void leaderBudgetIncludesGatheringAndValidationTime() throws Exception {
         try (var cohorts = new PendingAuthenticationCohorts<String>(Duration.ofSeconds(30), 4, 2)) {
             var epoch = new Object();

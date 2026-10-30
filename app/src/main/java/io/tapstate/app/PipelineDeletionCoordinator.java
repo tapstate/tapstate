@@ -46,7 +46,7 @@ final class PipelineDeletionCoordinator {
         var members=originalConsumers.forPipeline(original.request().scope());guard.run();
         for(var member:members) {
             guard.run();if(member.detached())continue;
-            originalConsumers.detachForRetirement(original,member,currentNode,isolated.cache()).orElseThrow(PipelineDeletionCoordinator::fenced);
+            if (originalConsumers.detachForRetirement(original,member,currentNode,isolated.cache()).isEmpty()) throw fenced();
             guard.run();
         }
         guard.run();var receipt=cache.retire(original,currentNode,isolated.cache());guard.run();

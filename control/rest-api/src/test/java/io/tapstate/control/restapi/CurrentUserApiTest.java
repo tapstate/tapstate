@@ -58,9 +58,13 @@ class CurrentUserApiTest {
                         });
                 List<String> scopes = java.util.Arrays.stream(Scope.values()).filter(grade::permits)
                         .map(scope -> scope.name().toLowerCase(Locale.ROOT)).toList();
-                assertThat(body).isEqualTo(Map.of("mode", expectedMode, "principal", principal, "scopes", scopes));
+                assertThat(body.get("mode")).isEqualTo(expectedMode);
+                assertThat(body.get("principal")).isEqualTo(principal);
+                assertThat(body.get("scopes")).isEqualTo(scopes);
+                assertThat(body.get("username")).isEqualTo(mode == AuthenticationMode.ON_PREM ? "alice" : null);
+                assertThat(body.get("email")).isNull();
                 assertThat(body.toString()).doesNotContain(credential, "forged-current-user", "password",
-                        "jwt", "jti", "tokenId", "email", "displayName");
+                        "jwt", "jti", "tokenId", "displayName");
             }
 
             assertRefused(client.get().uri("/api/auth/me"));
@@ -83,6 +87,11 @@ class CurrentUserApiTest {
                 assertRefused(client.get().uri("/api/auth/me").header(HttpHeaders.ORIGIN, origin)
                         .header(HttpHeaders.COOKIE, CloudSessionCookies.NAME + "=" + MACHINE));
             } else {
+                Map<?, ?> emailUser = client.get().uri("/api/auth/me")
+                        .header(HttpHeaders.AUTHORIZATION, "Bearer human-email")
+                        .retrieve().body(Map.class);
+                assertThat(emailUser.get("username")).isEqualTo("alice@example.test");
+                assertThat(emailUser.get("email")).isEqualTo("alice@example.test");
                 assertRefused(client.get().uri("/api/auth/me")
                         .header(HttpHeaders.COOKIE, CloudSessionCookies.NAME + "=" + userCredential(AuthenticationMode.CLOUD, Scope.READ)));
             }
@@ -139,6 +148,9 @@ class CurrentUserApiTest {
         @Bean
         CredentialAuthenticator credentials(AuthenticationMode mode) {
             return new CredentialAuthenticator(presented -> {
+                if (mode == AuthenticationMode.ON_PREM && "human-email".equals(presented)) {
+                    return Optional.of(new VerifiedToken("alice@example.test", Scope.READ));
+                }
                 if (mode == AuthenticationMode.ON_PREM && MACHINE.equals(presented)) {
                     return Optional.of(new VerifiedToken("current-machine", Scope.ADMIN));
                 }

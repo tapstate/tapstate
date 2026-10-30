@@ -431,6 +431,7 @@ class ManagedMongoStoreIsolationIT {
             try (var process = installationProcess(files, seeds, "admin-response")) {
                 var issued = InstallationCommand.authorize(files, new MongoProperties(), java.time.Clock.systemUTC());
                 var database = admin.getDatabase(config);
+                var administratorAudit = new Document("operationId", io.tapstate.control.core.ControlOperations.USER_CREATE.id());
                 if (!database.listCollectionNames().into(new ArrayList<>()).contains("audit")) database.createCollection("audit");
                 database.runCommand(new Document("collMod", "audit").append("validator", new Document("$expr", new Document("$eq", List.of(1, 0)))).append("validationLevel", "strict"));
                 var management = process.management(files, issued.token());
@@ -439,7 +440,7 @@ class ManagedMongoStoreIsolationIT {
                                 failure -> assertThat(failure.getResponseBodyAsString()).contains("control.audit-blocked"));
                 assertThat(database.getCollection("users").countDocuments()).isZero();
                 assertThat(database.getCollection("op_bootstrap").find().first().getString("phase")).isEqualTo("PENDING");
-                assertThat(database.getCollection("audit").countDocuments()).isZero();
+                assertThat(database.getCollection("audit").countDocuments(administratorAudit)).isZero();
                 database.runCommand(new Document("collMod", "audit").append("validator", new Document()));
                 var address = java.net.URI.create(files.stage().managementUrl());
                 byte[] body = io.tapstate.core.common.JsonWriter.write(Map.of("username", "admin", "password", "original-admin-password")).getBytes(StandardCharsets.UTF_8);
@@ -455,7 +456,7 @@ class ManagedMongoStoreIsolationIT {
                 var saved = database.getCollection("users").find().first();
                 assertThat(new BCryptPasswordHasher().matches("original-admin-password", saved.getString("passwordHash"))).isTrue();
                 assertThat(database.getCollection("op_bootstrap").find().first().getString("phase")).isEqualTo("COMPLETE");
-                assertThat(database.getCollection("audit").countDocuments()).isOne();
+                assertThat(database.getCollection("audit").countDocuments(administratorAudit)).isOne();
                 assertThatThrownBy(() -> management.post().uri("/installation/first-admin").body(Map.of("username", "admin", "password", "replacement-password"))
                         .retrieve().toBodilessEntity()).isInstanceOf(org.springframework.web.client.RestClientResponseException.class);
                 assertThat(database.getCollection("users").find().first()).isEqualTo(saved);
@@ -1487,10 +1488,14 @@ class ManagedMongoStoreIsolationIT {
                         var loginEntered = new java.util.concurrent.CountDownLatch(1);
                         var login = callers.submit(() -> { loginEntered.countDown(); return root.managedAuthentication(); });
                         assertThat(loginEntered.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
-                        assertThatThrownBy(() -> login.get(1, java.util.concurrent.TimeUnit.SECONDS)).isInstanceOf(java.util.concurrent.TimeoutException.class);
+                        var whileCommitting = login.get(5, java.util.concurrent.TimeUnit.SECONDS);
+                        assertThat(whileCommitting.service()).isSameAs(oldContext.service());
+                        whileCommitting.requireActive().run();
+                        assertThat(admin.getDatabase(cacheDb).listCollectionNames().into(new ArrayList<>())).isEmpty();
                         deliverGrant.countDown();
                         assertThat(commit.get(60, java.util.concurrent.TimeUnit.SECONDS)).containsEntry("setupPhase", "COMPLETE");
-                        login.get(10, java.util.concurrent.TimeUnit.SECONDS).requireActive().run();
+                        assertThatThrownBy(() -> whileCommitting.requireActive().run()).isInstanceOf(TapstateException.class);
+                        root.managedAuthentication().requireActive().run();
                         assertThat(root.runtime().current().orElseThrow().preparation().authScope().authGeneration()).isEqualTo(1);
                     } finally { deliverGrant.countDown(); }
                 }
@@ -1514,6 +1519,9 @@ class ManagedMongoStoreIsolationIT {
                 assertThat(admin.getDatabase(configDb).getCollection("storage_binding").countDocuments()).isOne();
                 assertThat(admin.getDatabase(configDb).getCollection("users").countDocuments()).isZero();
                 assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims").countDocuments()).isOne();
+                Document originalNodeClaim = admin.getDatabase(cacheDb).getCollection("workload_claims")
+                        .find().projection(new Document("ownerNodeId", 1).append("ownerBootId", 1)
+                                .append("claimGeneration", 1).append("executionGeneration", 1)).first();
                 try (MongoClient limited = MongoClients.create(uri(configUser, configDb))) {
                     assertDenied(limited, cacheDb); assertDenied(limited, masterDb);
                     assertDenied(limited, configDb + "_operator"); assertDenied(limited, configDb + "_views");
@@ -1562,10 +1570,19 @@ class ManagedMongoStoreIsolationIT {
                 var member = child.getBean(com.hazelcast.core.HazelcastInstance.class);
                 root.close(); assertThat(member.getLifecycleService().isRunning()).isFalse();
                 assertThat(rootClient(application).get().uri("/healthz").retrieve().toBodilessEntity().getStatusCode().value()).isEqualTo(200);
-                var claims = admin.getDatabase(cacheDb).getCollection("workload_claims").aggregate(List.of(
-                        new Document("$project", new Document("leased", new Document("$gt", List.of("$leaseUntil", "$$NOW")))))).into(new ArrayList<>());
-                assertThat(claims).hasSize(1);
-                assertThat(claims.getFirst().get("leased")).isEqualTo(false);
+                // Losing CACHE permission stops the member without releasing a claim it can no
+                // longer prove. Its original lease expires; shutdown must not reacquire it to release it.
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+                    var claims = admin.getDatabase(cacheDb).getCollection("workload_claims").aggregate(List.of(
+                            new Document("$project", new Document("ownerNodeId", 1).append("ownerBootId", 1)
+                                    .append("claimGeneration", 1).append("executionGeneration", 1)
+                                    .append("leased", new Document("$gt", List.of("$leaseUntil", "$$NOW"))))))
+                            .into(new ArrayList<>());
+                    assertThat(claims).hasSize(1);
+                    Document claim = new Document(claims.getFirst());
+                    assertThat(claim.remove("leased")).isEqualTo(false);
+                    assertThat(claim).isEqualTo(originalNodeClaim);
+                });
             }
             // A new process context reconstructs clients from the same persisted bundle, never a probe file.
             if (failAfterCompletion) admin.getDatabase("admin").runCommand(new Document("updateUser", configUser).append("roles", List.of()));
@@ -1735,48 +1752,59 @@ class ManagedMongoStoreIsolationIT {
                 }
                 var pipeline = new PipelineResource("position_flow", null, List.of(SourceRef.spec("shared_source", true), SourceRef.spec("direct_source", false)), null, null, null, null, null);
                 configuration.artifacts().create(pipeline);
+                assertThat(configuration.intents().pipelineIds()).doesNotContain(pipeline.id());
                 var scope = new PipelineIntentScope(business.clusterId(), business.bindingVersion(), business.cacheIncarnation(), pipeline.id(), 1);
                 var inputs = SourceModelSnapshot.capture(pipeline.id(), List.copyOf(sources.values()), cache.schemas(business, () -> {}))
                         .preparationInputs(scope, pipeline, pipeline, sources);
                 child.getBean(PipelineFirstStatePreparer.class).prepare(scope, inputs);
                 var ownership = child.getBean(PipelineActuationOwnership.class);
                 org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(15)).until(() -> ownership.permit(scope).granted());
-                var permit = ownership.permit(scope); assertThat(permit.granted()).isTrue();
-                var execution = ownership.beginExecution(scope, WorkloadClaimFence.from(permit.claim()));
-                assertThat(execution.allowed()).isTrue(); var pipelineFence = execution.claimFence();
+                // Manual fixture writes have no desired intent; pin their exact claim through ordinary control.
+                PipelineActuationOwnership.Execution execution;
+                PipelineActuationOwnership.Control seedControl;
+                synchronized (ownership) {
+                    var permit = ownership.permit(scope); assertThat(permit.granted()).isTrue();
+                    execution = ownership.beginExecution(scope, WorkloadClaimFence.from(permit.claim()));
+                    assertThat(execution.allowed()).isTrue();
+                    seedControl = ownership.control(scope);
+                }
+                var pipelineFence = execution.claimFence();
                 var node = child.getBean(NodeSessionLease.class).currentFence().orElseThrow();
                 var captures = child.getBean(CaptureOwnership.class);
                 var srs = cache.srs(business, () -> {});
                 String sharedId = null; DirectChannelContext directContext = null; DirectBatch pending = null;
-                for (String source : sources.keySet()) {
-                    var issued = (CaptureCreationResult.Issued)configuration.capturePreparations().issueFirstCreate(new CapturePreparationRequest(scope, pipelineFence, node, source, inputs));
-                    var prepared = cache.capturePreparations(business, () -> {}).createFirst(issued.creation()).preparation();
-                    var capture = captures.acquire(new io.tapstate.runtime.srs.CaptureId(prepared.captureId()));
-                    assertThat(capture.acquired()).isTrue();
-                    try {
-                        if (prepared.mode() == CapturePreparation.Mode.SHARED_SRS) {
-                            sharedId = prepared.chainId();
-                            srs.chains().requestTables(sharedId, java.util.Set.of("orders"), capture.fence());
-                            srs.chains().openEpoch(sharedId, 0, capture.fence()).orElseThrow();
-                            srs.chains().publishServingTables(sharedId, 1, java.util.Set.of("orders"), capture.fence());
-                            var key = new SrsModelKey(sharedId, "orders", business.cacheIncarnation(), 1, 0);
-                            srs.models().publishInitial(key, io.tapstate.runtime.srs.SrsRingbuffer.ringName(sharedId, "orders"), table, capture.fence());
-                            srs.chains().checkpoint(sharedId, 0, new SrsCaptureCheckpoint(new ChainPosition(SourceOrder.snapshotRow(1), "old-shared"),
-                                    Map.of("orders", new SrsTableCheckpoint(key, -1))), capture.fence()).orElseThrow();
-                            var consumer = new SrsConsumerContext(new SrsConsumerKey(sharedId, pipeline.id(), source), 1);
-                            srs.consumers().attach(consumer, 0, java.util.Set.of("orders"), pipelineFence).orElseThrow();
-                            srs.consumers().beginWriterRun(consumer, 1, "old-writer", Map.of("orders", List.of("writer")), pipelineFence);
-                        } else {
-                            directContext = inputs.directChannels().getFirst().context();
-                            var direct = cache.directChannels(business, () -> {}); var before = direct.load(directContext);
-                            long epoch = direct.beginCapture(directContext, before.revision(), 0, capture.fence(), pipelineFence).orElseThrow();
-                            direct.confirmAnchor(directContext, epoch, "old-direct", capture.fence(), pipelineFence);
-                            assertThat(direct.pinSnapshot(directContext, direct.load(directContext).revision(), epoch, "old-direct", pipelineFence)).isTrue();
-                            direct.beginWriterRun(directContext, epoch, "old-writer", Map.of("orders", List.of("writer")), pipelineFence);
-                            pending = new DirectBatch(directContext, epoch, 1, new ChainPosition(new SourceOrder(epoch, 0), "pending"), Map.of("orders", 0L));
-                            direct.recordBatch(pending, 0, capture.fence(), pipelineFence);
-                        }
-                    } finally { captures.release(capture.claim()); }
+                try (seedControl) {
+                    assertThat(seedControl.claim()).isEqualTo(pipelineFence);
+                    for (String source : sources.keySet()) {
+                        var issued = (CaptureCreationResult.Issued)configuration.capturePreparations().issueFirstCreate(new CapturePreparationRequest(scope, pipelineFence, node, source, inputs));
+                        var prepared = cache.capturePreparations(business, () -> {}).createFirst(issued.creation()).preparation();
+                        var capture = captures.acquire(new io.tapstate.runtime.srs.CaptureId(prepared.captureId()));
+                        assertThat(capture.acquired()).isTrue();
+                        try {
+                            if (prepared.mode() == CapturePreparation.Mode.SHARED_SRS) {
+                                sharedId = prepared.chainId();
+                                srs.chains().requestTables(sharedId, java.util.Set.of("orders"), capture.fence());
+                                srs.chains().openEpoch(sharedId, 0, capture.fence()).orElseThrow();
+                                srs.chains().publishServingTables(sharedId, 1, java.util.Set.of("orders"), capture.fence());
+                                var key = new SrsModelKey(sharedId, "orders", business.cacheIncarnation(), 1, 0);
+                                srs.models().publishInitial(key, io.tapstate.runtime.srs.SrsRingbuffer.ringName(sharedId, "orders"), table, capture.fence());
+                                srs.chains().checkpoint(sharedId, 0, new SrsCaptureCheckpoint(new ChainPosition(SourceOrder.snapshotRow(1), "old-shared"),
+                                        Map.of("orders", new SrsTableCheckpoint(key, -1))), capture.fence()).orElseThrow();
+                                var consumer = new SrsConsumerContext(new SrsConsumerKey(sharedId, pipeline.id(), source), 1);
+                                srs.consumers().attach(consumer, 0, java.util.Set.of("orders"), pipelineFence).orElseThrow();
+                                srs.consumers().beginWriterRun(consumer, 1, "old-writer", Map.of("orders", List.of("writer")), pipelineFence);
+                            } else {
+                                directContext = inputs.directChannels().getFirst().context();
+                                var direct = cache.directChannels(business, () -> {}); var before = direct.load(directContext);
+                                long epoch = direct.beginCapture(directContext, before.revision(), 0, capture.fence(), pipelineFence).orElseThrow();
+                                direct.confirmAnchor(directContext, epoch, "old-direct", capture.fence(), pipelineFence);
+                                assertThat(direct.pinSnapshot(directContext, direct.load(directContext).revision(), epoch, "old-direct", pipelineFence)).isTrue();
+                                direct.beginWriterRun(directContext, epoch, "old-writer", Map.of("orders", List.of("writer")), pipelineFence);
+                                pending = new DirectBatch(directContext, epoch, 1, new ChainPosition(new SourceOrder(epoch, 0), "pending"), Map.of("orders", 0L));
+                                direct.recordBatch(pending, 0, capture.fence(), pipelineFence);
+                            }
+                        } finally { captures.release(capture.claim()); }
+                    }
                 }
                 var login = ordinaryLogin(application, false); var client = rootClient(application);
                 var reading = client.get().uri("/api/pipelines/position_flow/position").header("Authorization", "Bearer " + login.token())
@@ -1801,33 +1829,44 @@ class ManagedMongoStoreIsolationIT {
                 var oldConsumer = new SrsConsumerContext(new SrsConsumerKey(sharedId, pipeline.id(), "shared_source"), 1);
                 assertThatThrownBy(() -> srs.consumers().beginWriterRun(oldConsumer, 1, "old-writer", Map.of("orders", List.of("writer")), pipelineFence))
                         .isInstanceOf(TapstateException.class);
-                var nextPermit = ownership.permit(scope);
-                var nextExecution = ownership.beginExecution(scope, WorkloadClaimFence.from(nextPermit.claim()));
-                var nextCapture = captures.acquire(new io.tapstate.runtime.srs.CaptureId(directContext.captureId()));
-                assertThat(nextCapture.acquired()).isTrue();
-                try {
-                    long epoch = direct.beginCapture(directContext, changed.revision(), 1, nextCapture.fence(), nextExecution.claimFence()).orElseThrow();
-                    var opened = cache.directChannels(business, () -> {}).load(directContext);
-                    assertThat(opened.resumeToken()).isEqualTo("second-direct");
-                    assertThat(opened.cursor().sinkAcked().token()).isEqualTo("old-direct");
-                    assertThat(opened.retained().pendingCount()).isOne();
-                    assertThat(direct.beginWriterRun(directContext, epoch, "next-writer", Map.of("orders", List.of("writer")), nextExecution.claimFence())).isTrue();
-                    assertThat(direct.advanceWriter(directContext, epoch, "next-writer", "orders", "writer",
-                            new WriterProgress(SourceOrder.snapshotRow(1),new ChainPosition(SourceOrder.snapshotRow(1),"old-direct")),nextExecution.claimFence())).isTrue();
-                    var loaded = direct.load(directContext);
-                    assertThat(loaded.cursor().snapshotCompletedTables()).containsExactly("orders");
-                    assertThat(loaded.cursor().sinkAcked().token()).isEqualTo("old-direct");
-                    assertThat(loaded.resumeOverride().token()).isEqualTo("second-direct");
-                    var fixedDirect = directContext;
-                    assertThatThrownBy(() -> direct.advanceWriter(fixedDirect,epoch,"next-writer","orders","writer",
-                            new WriterProgress(new SourceOrder(epoch,0),new ChainPosition(new SourceOrder(epoch,0),"unstarted-cdc")),nextExecution.claimFence()))
-                            .isInstanceOfSatisfying(TapstateException.class,failure -> assertThat(failure.code()).isEqualTo(IoError.DIRECT_CHANNEL_UNAVAILABLE));
-                    assertThat(direct.load(directContext)).isEqualTo(loaded);
-                    assertThat(direct.confirmAnchor(directContext, epoch, "second-direct", nextCapture.fence(), nextExecution.claimFence())).isTrue();
-                    assertThat(direct.load(directContext).resumeOverride()).isNull();
-                    assertThat(direct.load(directContext).cursor().sinkAcked().order()).isEqualTo(SourceOrder.snapshotRow(epoch));
-                    assertThat(admin.getDatabase(cacheDb).getCollection("direct_batches").countDocuments()).isZero();
-                } finally { captures.release(nextCapture.claim()); }
+                PipelineActuationOwnership.Execution nextExecution;
+                PipelineActuationOwnership.Control nextSeedControl;
+                synchronized (ownership) {
+                    var nextPermit = ownership.permit(scope); assertThat(nextPermit.granted()).isTrue();
+                    nextExecution = ownership.beginExecution(scope, WorkloadClaimFence.from(nextPermit.claim()));
+                    assertThat(nextExecution.allowed()).isTrue();
+                    nextSeedControl = ownership.control(scope);
+                }
+                try (nextSeedControl) {
+                    assertThat(nextSeedControl.claim()).isEqualTo(nextExecution.claimFence());
+                    var nextCapture = captures.acquire(new io.tapstate.runtime.srs.CaptureId(directContext.captureId()));
+                    assertThat(nextCapture.acquired()).isTrue();
+                    try {
+                        long epoch = direct.beginCapture(directContext, changed.revision(), 1, nextCapture.fence(), nextExecution.claimFence()).orElseThrow();
+                        ownership.retain(configuration.intents().pipelineIds());
+                        nextSeedControl.requireActive();
+                        var opened = cache.directChannels(business, () -> {}).load(directContext);
+                        assertThat(opened.resumeToken()).isEqualTo("second-direct");
+                        assertThat(opened.cursor().sinkAcked().token()).isEqualTo("old-direct");
+                        assertThat(opened.retained().pendingCount()).isOne();
+                        assertThat(direct.beginWriterRun(directContext, epoch, "next-writer", Map.of("orders", List.of("writer")), nextExecution.claimFence())).isTrue();
+                        assertThat(direct.advanceWriter(directContext, epoch, "next-writer", "orders", "writer",
+                                new WriterProgress(SourceOrder.snapshotRow(1),new ChainPosition(SourceOrder.snapshotRow(1),"old-direct")),nextExecution.claimFence())).isTrue();
+                        var loaded = direct.load(directContext);
+                        assertThat(loaded.cursor().snapshotCompletedTables()).containsExactly("orders");
+                        assertThat(loaded.cursor().sinkAcked().token()).isEqualTo("old-direct");
+                        assertThat(loaded.resumeOverride().token()).isEqualTo("second-direct");
+                        var fixedDirect = directContext;
+                        assertThatThrownBy(() -> direct.advanceWriter(fixedDirect,epoch,"next-writer","orders","writer",
+                                new WriterProgress(new SourceOrder(epoch,0),new ChainPosition(new SourceOrder(epoch,0),"unstarted-cdc")),nextExecution.claimFence()))
+                                .isInstanceOfSatisfying(TapstateException.class,failure -> assertThat(failure.code()).isEqualTo(IoError.DIRECT_CHANNEL_UNAVAILABLE));
+                        assertThat(direct.load(directContext)).isEqualTo(loaded);
+                        assertThat(direct.confirmAnchor(directContext, epoch, "second-direct", nextCapture.fence(), nextExecution.claimFence())).isTrue();
+                        assertThat(direct.load(directContext).resumeOverride()).isNull();
+                        assertThat(direct.load(directContext).cursor().sinkAcked().order()).isEqualTo(SourceOrder.snapshotRow(epoch));
+                        assertThat(admin.getDatabase(cacheDb).getCollection("direct_batches").countDocuments()).isZero();
+                    } finally { captures.release(nextCapture.claim()); }
+                }
                 // A required second-source fact disappears after preflight/audit. The first source must stay unchanged.
                 var sharedCollection = admin.getDatabase(cacheDb).getCollection("srs_chains");
                 var cursorCollection = admin.getDatabase(cacheDb).getCollection("srs_consumer_offsets");

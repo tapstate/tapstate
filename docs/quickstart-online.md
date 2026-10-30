@@ -377,6 +377,29 @@ If 8080 is taken on your machine, move it in one place and use your port above:
 Two places cannot read a shell variable and so spell the address out: what you type at the
 REPL prompt, and the MCP JSON configuration. Substitute your port there by hand.
 
+### On-prem browser authentication
+
+For browser access, serve the workbench and API from the same HTTPS origin and set
+`TAPSTATE_BROWSER_AUTH_PUBLIC_ORIGINS` to the allowed public origins, separated by commas.
+For example, use `https://workbench.example.com` or `https://workbench.example.com:8443`.
+The allow-list is required for HTTPS browser authentication; unrelated Host aliases are refused.
+
+When a reverse proxy terminates HTTPS, set `TAPSTATE_BROWSER_AUTH_TRUSTED_PROXIES` to the
+comma-separated exact IP addresses of its immediate connections to Tapstate. The proxy must
+replace `X-Forwarded-Proto`, `X-Forwarded-Host`, and `X-Forwarded-Port` with its own values,
+and direct access to the upstream listener must be restricted. Leave this setting empty when
+there is no trusted proxy.
+
+Plain HTTP browser authentication is disabled by default. For isolated local development only,
+`TAPSTATE_BROWSER_AUTH_ALLOW_INSECURE_LOOPBACK=true` permits loopback HTTP. This mode puts a
+long-lived session credential in an HTTP-only cookie on the loopback hostname. Cookies are not
+scoped by port: another local service on that hostname can receive and replay the credential.
+Enable it only when every local service and browser profile using that hostname is trusted, and
+sign out when finished. Use HTTPS and a dedicated hostname for normal deployments.
+
+The browser keeps the short-lived access token in memory. Signing out revokes the session used
+for future exchanges; an access token already issued can remain valid until its expiry.
+
 ## 3. Get the CLI
 
 Install it right here in the demo directory — the same installer as a permanent

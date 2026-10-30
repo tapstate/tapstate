@@ -99,6 +99,19 @@ public final class RootAssembly implements Serializable {
     private SourceOrder rootOrder;
     private boolean rootPresent;
 
+    /** Null in older serialized state means that reference completeness must be re-determined. */
+    private Set<MissingObjectReference> missingObjectReferences = new LinkedHashSet<>();
+
+    private record MissingObjectReference(List<String> path, String namespace, List<Object> key)
+            implements Serializable {
+        private static final long serialVersionUID = 1L;
+
+        private MissingObjectReference {
+            path = List.copyOf(path);
+            key = List.copyOf(key);
+        }
+    }
+
     /**
      * Top-level fields each flat embed has contributed in any emitted version of this document. A sink
      * applies rows by setting present fields, so a later delete or narrower row must name the old fields
@@ -164,6 +177,7 @@ public final class RootAssembly implements Serializable {
         rootFields = copyOf(fields);
         rootOrder = order;
         rootPresent = true;
+        missingObjectReferences = null;
         fromRoot.add(positions);
         return true;
     }
@@ -210,6 +224,7 @@ public final class RootAssembly implements Serializable {
         rootFields = null;
         rootOrder = order;
         rootPresent = false;
+        missingObjectReferences = new LinkedHashSet<>();
         fromRoot.add(positions);
         return true;
     }
@@ -687,10 +702,15 @@ public final class RootAssembly implements Serializable {
      * answers to a key of nulls, and asking would spend a lookup to be told so.
      */
     public Map<String, Set<List<Object>>> referencesNeeded(List<EmbedSlot> slots) {
+        return referencesNeeded(slots, false, Set.of());
+    }
+
+    private Map<String, Set<List<Object>>> referencesNeeded(List<EmbedSlot> slots, boolean allowMissingObjects,
+            Set<String> completedObjectLookups) {
         Objects.requireNonNull(slots, "slots");
         Map<String, Set<List<Object>>> needed = new LinkedHashMap<>();
         if (rootPresent) {
-            collectReferences(rootFields, children, slots, needed);
+            collectReferences(rootFields, children, slots, needed, allowMissingObjects, completedObjectLookups);
         }
         return needed;
     }
@@ -709,15 +729,28 @@ public final class RootAssembly implements Serializable {
      * the field. Reading absence alone would hold such a document for ever, waiting on an arrival that has
      * already happened.
      *
-     * <p>Nothing here ends the wait on a clock. What ends it is the row arriving - which reaches this
+     * <p>Nothing here ends the wait on a clock. A live wait ends with the row arriving - which reaches this
      * document because the row pointing at it was recorded against it when it came through, whether or not
-     * the row it named existed yet.
+     * the row it named existed yet. Normal input completion can also settle a missing object reference.
      */
     public boolean waitsForARowItPointsAt(List<EmbedSlot> slots,
             Map<String, Map<Object, Map<String, Object>>> resolved) {
+        return waitsForARowItPointsAt(slots, resolved, false);
+    }
+
+    /** Finished inputs cannot supply a missing object, but do not settle other reference shapes. */
+    boolean waitsForARowItPointsAt(List<EmbedSlot> slots,
+            Map<String, Map<Object, Map<String, Object>>> resolved, boolean allowMissingObjects) {
+        return waitsForARowItPointsAt(slots, resolved, allowMissingObjects, Set.of());
+    }
+
+    boolean waitsForARowItPointsAt(List<EmbedSlot> slots,
+            Map<String, Map<Object, Map<String, Object>>> resolved, boolean allowMissingObjects,
+            Set<String> completedObjectLookups) {
         Objects.requireNonNull(slots, "slots");
         Objects.requireNonNull(resolved, "resolved");
-        for (Map.Entry<String, Set<List<Object>>> named : referencesNeeded(slots).entrySet()) {
+        for (Map.Entry<String, Set<List<Object>>> named :
+                referencesNeeded(slots, allowMissingObjects, completedObjectLookups).entrySet()) {
             Map<Object, Map<String, Object>> rows = resolved.getOrDefault(named.getKey(), Map.of());
             for (List<Object> key : named.getValue()) {
                 if (!rows.containsKey(key)) {
@@ -730,9 +763,13 @@ public final class RootAssembly implements Serializable {
 
     private static void collectReferences(Map<String, Object> fields,
             Map<String, Map<List<Object>, ElementNode>> held, List<EmbedSlot> slots,
-            Map<String, Set<List<Object>>> needed) {
+            Map<String, Set<List<Object>>> needed, boolean allowMissingObjects, Set<String> completedObjectLookups) {
         for (EmbedSlot slot : slots) {
             if (slot.isReference()) {
+                if (slot.as() == EmbedAs.OBJECT
+                        && (allowMissingObjects || completedObjectLookups.contains(slot.lookupMap()))) {
+                    continue;
+                }
                 List<Object> key = NestKeys.valuesOf(fields, slot.referenceFields(), slot.lookupMap());
                 if (!key.contains(null)) {
                     needed.computeIfAbsent(slot.lookupMap(), namespace -> new LinkedHashSet<>()).add(key);
@@ -745,7 +782,81 @@ public final class RootAssembly implements Serializable {
             }
             for (ElementNode element : elements.values()) {
                 if (!element.deleted()) {
-                    collectReferences(element.fields(), element.children(), slot.children(), needed);
+                    collectReferences(element.fields(), element.children(), slot.children(), needed,
+                            allowMissingObjects, completedObjectLookups);
+                }
+            }
+        }
+    }
+
+    /** A first filing can be news after a missing object was emitted, including after a restart. */
+    boolean mayNeedReferenceUpdate() {
+        return rootPresent && (missingObjectReferences == null || !fromRoot.lowest.isEmpty()
+                || !heldElements.isEmpty() || !missingObjectReferences.isEmpty());
+    }
+
+    boolean needsReferenceUpdate(List<EmbedSlot> slots,
+            Map<String, Map<Object, Map<String, Object>>> resolved) {
+        if (!rootPresent) {
+            return false;
+        }
+        if (missingObjectReferences == null || !fromRoot.lowest.isEmpty() || !heldElements.isEmpty()) {
+            return true;
+        }
+        Set<MissingObjectReference> missing = new LinkedHashSet<>();
+        collectObjectReferences(rootFields, children, slots, List.of(), missing, resolved);
+        return !missingObjectReferences.equals(missing);
+    }
+
+    /** Retargeting and subtree edits must not retain responsibility for identities no longer named. */
+    void reconcileMissingObjects(List<EmbedSlot> slots) {
+        if (missingObjectReferences != null && !missingObjectReferences.isEmpty()) {
+            Set<MissingObjectReference> named = new LinkedHashSet<>();
+            if (rootPresent) {
+                collectObjectReferences(rootFields, children, slots, List.of(), named, null);
+            }
+            missingObjectReferences.retainAll(named);
+        }
+    }
+
+    /** Written with the same root state as its emission; no copy of a referenced row is retained. */
+    void rememberMissingObjects(List<EmbedSlot> slots,
+            Map<String, Map<Object, Map<String, Object>>> resolved) {
+        Set<MissingObjectReference> missing = new LinkedHashSet<>();
+        if (rootPresent) {
+            collectObjectReferences(rootFields, children, slots, List.of(), missing, resolved);
+        }
+        missingObjectReferences = missing;
+    }
+
+    boolean waitsForObjectSnapshot(List<EmbedSlot> slots,
+            Map<String, Map<Object, Map<String, Object>>> resolved, Set<String> incompleteLookups) {
+        Set<MissingObjectReference> missing = new LinkedHashSet<>();
+        if (rootPresent) {
+            collectObjectReferences(rootFields, children, slots, List.of(), missing, resolved);
+        }
+        return missing.stream().anyMatch(ref -> incompleteLookups.contains(ref.namespace()));
+    }
+
+    private static void collectObjectReferences(Map<String, Object> fields,
+            Map<String, Map<List<Object>, ElementNode>> held, List<EmbedSlot> slots, List<String> parentPath,
+            Set<MissingObjectReference> into, Map<String, Map<Object, Map<String, Object>>> resolved) {
+        for (EmbedSlot slot : slots) {
+            List<String> path = new ArrayList<>(parentPath);
+            path.add(slot.stateField());
+            if (slot.isReference()) {
+                if (slot.as() == EmbedAs.OBJECT) {
+                    List<Object> key = NestKeys.valuesOf(fields, slot.referenceFields(), slot.lookupMap());
+                    if (!key.contains(null) && (resolved == null
+                            || !resolved.getOrDefault(slot.lookupMap(), Map.of()).containsKey(key))) {
+                        into.add(new MissingObjectReference(path, slot.lookupMap(), key));
+                    }
+                }
+                continue;
+            }
+            for (ElementNode element : held.getOrDefault(slot.stateField(), Map.of()).values()) {
+                if (!element.deleted()) {
+                    collectObjectReferences(element.fields(), element.children(), slot.children(), path, into, resolved);
                 }
             }
         }

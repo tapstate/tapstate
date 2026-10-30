@@ -26,10 +26,13 @@ class LoggingNestColdLayerAlertTest {
 
     private final ListAppender<ILoggingEvent> written = new ListAppender<>();
     private Logger logger;
+    private Level previousLevel;
 
     @BeforeEach
     void captureWhatIsWritten() {
         logger = (Logger) LoggerFactory.getLogger(LoggingNestColdLayerAlert.class);
+        previousLevel = logger.getLevel();
+        logger.setLevel(Level.INFO);
         written.start();
         logger.addAppender(written);
     }
@@ -38,6 +41,7 @@ class LoggingNestColdLayerAlertTest {
     void stopCapturing() {
         logger.detachAppender(written);
         written.stop();
+        logger.setLevel(previousLevel);
     }
 
     @Test

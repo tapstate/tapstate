@@ -95,6 +95,13 @@ class ARediscoveredColumnReachesThePipelineAtItsNextStartIT {
                     "pipeline.tap.yml", pipeline()));
             discover(control);
 
+            // Applied is not running: the display projection must distinguish the
+            // unstarted artifact without inventing a runtime observation.
+            assertThat(control.pipelineStatus(PIPELINE_ID))
+                    .containsEntry("displayState", "NOT_STARTED")
+                    .containsEntry("hasArtifact", true)
+                    .doesNotContainKey("observedState");
+
             // The control: the column is nowhere yet, so its arrival below is the run's doing.
             runOnce(control);
             assertThat(targetHeader()).containsExactly("id", "amount");

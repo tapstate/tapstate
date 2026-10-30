@@ -12,10 +12,8 @@ import io.tapstate.spi.store.IoError;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.provider.EnumSource;
-import org.testcontainers.containers.MongoDBContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.utility.DockerImageName;
 
 import java.io.PrintWriter;
 import java.io.StringWriter;
@@ -35,8 +33,9 @@ class SourceConfigKeyringRestoreIT {
     private static final String SECRET = "restore-config-secret-sentinel";
     private static final DslParser PARSER = new DslParser();
 
-    @Container
-    private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
+    @RegisterExtension
+    private static final SharedMongoCase MONGO =
+            SharedMongoCase.forSuite(SourceConfigKeyringRestoreIT.class);
 
     @ParameterizedTest
     @EnumSource(SnapshotPhase.class)
@@ -44,7 +43,7 @@ class SourceConfigKeyringRestoreIT {
         Snapshot captured = capture(phase);
         String target = freshName("paired_restore");
         try (MongoClient raw = MongoClients.create(MONGO.getReplicaSetUrl())) {
-            MongoDatabase database = raw.getDatabase(target);
+            MongoDatabase database = raw.getDatabase(MONGO.database(target));
             restore(database, captured);
             assertThat(SystemCollections.ARTIFACTS.on(database).find().into(new ArrayList<>()))
                     .containsExactlyInAnyOrderElementsOf(captured.artifacts);
@@ -97,13 +96,13 @@ class SourceConfigKeyringRestoreIT {
         Snapshot captured = capture(SnapshotPhase.MIXED_AFTER_ROTATION);
         String target = freshName("incomplete_restore");
         try (MongoClient raw = MongoClients.create(MONGO.getReplicaSetUrl())) {
-            MongoDatabase database = raw.getDatabase(target);
+            MongoDatabase database = raw.getDatabase(MONGO.database(target));
             restore(database, captured);
             switch (damage) {
                 case MISSING_KEYRING -> SystemCollections.SYSTEM_META.on(database)
                         .deleteOne(new Document("_id", KEYRING_ID));
                 case WRONG_KEYRING -> {
-                    MongoDatabase other = raw.getDatabase(freshName("unrelated_keyring"));
+                    MongoDatabase other = raw.getDatabase(MONGO.database(freshName("unrelated_keyring")));
                     new SourceConfigKeyringStore(other).loadOrCreateCipher();
                     SystemCollections.SYSTEM_META.on(database).replaceOne(new Document("_id", KEYRING_ID), keyring(other));
                 }

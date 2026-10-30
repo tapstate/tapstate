@@ -1261,6 +1261,40 @@ class MongoCachePipelineRebuildsIT {
             assertThat(f.configuration.rebuilds().complete(receipt).scope()).isEqualTo(pending.request().targetScope());
         });
     }
+    @Test void clearingStateKeepsOriginalRateSamplesUntilLogicalDeletionAndNeverDeletesFutureScopes() {
+        withFixture(f -> {
+            var fence = f.advance("flow");
+            f.domain.pipelineRateHistory(f.scope, fence, ACTIVE).append(new io.tapstate.core.lifecycle.RateSample(
+                    "flow", java.time.Instant.now(), Map.of("records.out", 1L), Map.of(), null));
+            var rows = SystemCollections.CACHE_PIPELINE_RATE_HISTORY.on(f.cache);
+            var saved = rows.find().first();
+            var pending = f.pending(0);
+            var receipt = f.rebuilds().prepare(pending, f.node, TTL, AT);
+            while (f.rebuilds().reclaim(receipt) > 0) { }
+            assertThat(rows.find().first()).isEqualTo(saved);
+            f.configuration.rebuilds().complete(receipt);
+            var scope = pending.request().targetScope();
+            var definition = f.configuration.artifacts().get("flow").orElseThrow();
+            var deletion = f.configuration.retirements().begin(new PipelineRetirementRequest("delete-retained-history", scope,
+                    CanonicalHash.of(definition), java.util.Optional.of(new PipelineRetirementRequest.CacheOriginal(
+                            receipt.claim(), receipt.checkpointEpoch()))));
+            f.configuration.retirements().complete(f.domain.pipelineRetirements(f.business, ACTIVE).retire(deletion, f.node));
+            var future = new PipelineIntentScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation(), "flow", scope.stateGeneration() + 1);
+            var neighbor = new PipelineIntentScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation(), "independent", 1);
+            var futureRow = new Document(saved).append("_id", new org.bson.types.ObjectId())
+                    .append("scope", MongoPipelinePreparationFacts.scope(future));
+            var neighborRow = new Document(saved).append("_id", new org.bson.types.ObjectId()).append("pipelineId", "independent")
+                    .append("scope", MongoPipelinePreparationFacts.scope(neighbor));
+            rows.insertMany(List.of(futureRow, neighborRow));
+            var cleanup = f.domain.retiredPipelinePayloads(f.business, ACTIVE);
+            var originals = cleanup.list("flow", 0, 128);
+            assertThat(originals).extracting(RetiredPipelinePayloads.Original::scope).containsExactly(f.scope, scope);
+            for (var original : originals) while (cleanup.reclaim(original, f.node) > 0) { }
+            assertThat(rows.find().into(new ArrayList<>())).containsExactlyInAnyOrder(futureRow, neighborRow);
+            for (var original : originals) assertThat(cleanup.reclaim(original, f.node)).isZero();
+        });
+    }
+
     @Test void retiredPayloadReclamationIsBoundedAndKeepsOtherScopesAndBirthHistory() {
         withFixture(f -> {
             var fence=f.advance("flow");

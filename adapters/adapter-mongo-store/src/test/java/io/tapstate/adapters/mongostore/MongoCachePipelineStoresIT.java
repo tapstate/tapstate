@@ -56,6 +56,26 @@ class MongoCachePipelineStoresIT {
     private static final Runnable ACTIVE = () -> {};
     private static final Instant AT = Instant.parse("2026-10-18T00:00:00Z");
 
+    @Test void initialLoadDisplayRoundTripsAndNewRunReplacesOnlyItsOwnCurrentFacts() {
+        withFixture(f -> {
+            var observations = f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE);
+            var collection = SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database());
+            var load = new io.tapstate.core.lifecycle.InitialLoad("execution:orders:2:at", AT, "snapshot_and_cdc", Map.of(
+                    "orders", new io.tapstate.core.lifecycle.InitialLoad.Table(io.tapstate.core.lifecycle.InitialLoad.Stage.READING, 3L, null)));
+            var first = new Observation("orders", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(), null, AT, List.of(), load);
+            observations.save(first);
+            assertThat(observations.read("orders")).contains(first);
+            var next = new Observation("orders", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(), null, AT.plusSeconds(1), List.of(),
+                    new io.tapstate.core.lifecycle.InitialLoad("execution:orders:3:next", AT.plusSeconds(1), "snapshot_and_cdc", Map.of(
+                            "orders", new io.tapstate.core.lifecycle.InitialLoad.Table(io.tapstate.core.lifecycle.InitialLoad.Stage.PENDING, null, null))));
+            observations.save(next);
+            assertThat(collection.countDocuments()).isEqualTo(1);
+            assertThat(observations.read("orders")).contains(next);
+            collection.updateOne(new Document("_id", "orders"), new Document("$unset", new Document("initialLoad", "")));
+            assertThat(observations.read("orders").orElseThrow().initialLoad()).isNull();
+        });
+    }
+
     @Test void checkpointsAndProjectionsUseTheOriginalScopeAndLiveClaimInOneCacheDomain() {
         withFixture(f -> {
             var states = f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE);

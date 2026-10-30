@@ -29,6 +29,11 @@ class RecoveryContinuationOrderingTest {
         when(setup.load()).thenReturn(new StorageSetupStateStore.Status(new StorageSetupScope("cluster","installation","setup",1),StorageSetupStateStore.Phase.COMPLETE,1));
         when(commands.current(auth)).thenReturn(Optional.of(plan));
         var runtime=mock(StorageRuntime.class);var bound=mock(StorageRuntime.Bound.class);var business=mock(NativeBusinessContext.class);var shared=mock(NativeSharedSrsRecovery.class);
+        var originalBinding = new StorageBinding(setup.load().scope(), StorageBinding.Mode.OP, 1, "views",
+                new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB, "mongodb://fixture/cache", "cache", null));
+        when(bound.binding()).thenReturn(originalBinding);
+        when(business.applicationDataVerification()).thenReturn(new DefaultSourceVerification.Verification(
+                DefaultSourceVerification.Status.UNKNOWN, null, null));
         var current=new AtomicReference<StorageRuntime.Business>();
         when(runtime.configuration()).thenReturn(Optional.of(configuration));when(runtime.requireConfiguration()).thenReturn(configuration);
         when(runtime.loadBound()).thenReturn(Optional.of(bound));when(runtime.current()).thenReturn(Optional.of(bound));
@@ -39,6 +44,7 @@ class RecoveryContinuationOrderingTest {
         Function<StorageRuntime.Bound,StorageRuntime.Business> assembly=ignored -> business;
         doAnswer(call -> {if(startupFails)throw StorageRuntime.unavailable();current.set(business);return null;}).when(runtime).startBusiness(bound,assembly);
         var executor=new ManualExecutor();var root=mock(StorageRoot.class,CALLS_REAL_METHODS);
+        ReflectionTestUtils.setField(root,"initializationProgress",new StorageInitializationProgress(java.time.Clock.systemUTC()));
         ReflectionTestUtils.setField(root,"runtime",runtime);ReflectionTestUtils.setField(root,"installationActive",(Runnable)() -> {});
         ReflectionTestUtils.setField(root,"authentication",mock(StorageAuthentication.class));ReflectionTestUtils.setField(root,"cloud",CloudRuntimeSettings.resolve(new CloudProperties()));
         ReflectionTestUtils.setField(root,"recoveryWorker",executor);

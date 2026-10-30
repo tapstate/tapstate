@@ -4,6 +4,16 @@
 server:
   port: ${SERVER_PORT:8080}
 
+# Browser HTTPS origins are an explicit allow-list; include scheme, host and optional port.
+# Trusted proxies are exact peer IP addresses; they must replace forwarded headers.
+# Insecure loopback is an explicit development-only opt-in. Cookies are shared across ports,
+# so any local service on the same hostname can read the long-lived session credential.
+tapstate:
+  browser-auth:
+    trusted-proxies: ${TAPSTATE_BROWSER_AUTH_TRUSTED_PROXIES:}
+    public-origins: ${TAPSTATE_BROWSER_AUTH_PUBLIC_ORIGINS:}
+    allow-insecure-loopback: ${TAPSTATE_BROWSER_AUTH_ALLOW_INSECURE_LOOPBACK:false}
+
 # Metrics export is opt-in. With neither key set, nothing is started and every read face is unchanged.
 # The names exported are the same the metrics face reads, and they are still unstable (see the docs).
 #   tapstate.metrics.export.prometheus.port: 9464       # serve a Prometheus scrape endpoint on this port

@@ -9,6 +9,7 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.annotation.Order;
+import org.springframework.core.io.support.PathMatchingResourcePatternResolver;
 import org.springframework.security.authentication.AuthenticationManager;
 import org.springframework.security.authentication.ProviderManager;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
@@ -107,8 +108,19 @@ class RestApiSecurityConfiguration {
     }
 
     @Bean
+    PublicStaticResource publicStaticResource(PathMatchingResourcePatternResolver publicImageResolver) {
+        return PublicStaticResource.create(publicImageResolver);
+    }
+
+    @Bean
+    PathMatchingResourcePatternResolver publicImageResolver() {
+        return new PathMatchingResourcePatternResolver(PublicStaticResource.class.getClassLoader());
+    }
+
+    @Bean
     @Order(2)
-    SecurityFilterChain rootSecurityFilterChain(HttpSecurity http, ApiSecurityErrorWriter errors) throws Exception {
+    SecurityFilterChain rootSecurityFilterChain(HttpSecurity http, ApiSecurityErrorWriter errors,
+            PublicStaticResource images) {
         CodedAuthenticationEntryPoint entryPoint = new CodedAuthenticationEntryPoint(errors);
         http
                 .securityMatcher(new NegatedRequestMatcher(PathPatternRequestMatcher.pathPattern("/api/**")))
@@ -121,12 +133,19 @@ class RestApiSecurityConfiguration {
                 .exceptionHandling(exceptions -> exceptions.authenticationEntryPoint(entryPoint))
                 .authorizeHttpRequests(authorize -> authorize
                         .requestMatchers("/healthz", "/version", AuthWire.DISCOVERY_PATH, AuthWire.LOGIN_PATH,
-                                AuthWire.SESSION_PATH, AuthWire.LOGOUT_PATH, CloudAuthController.EXCHANGE_PATH,
+                                AuthWire.SESSION_PATH, AuthWire.LOGOUT_PATH, AuthWire.BROWSER_LOGIN_PATH,
+                                AuthWire.BROWSER_SESSION_PATH, AuthWire.BROWSER_LOGOUT_PATH, CloudAuthController.EXCHANGE_PATH,
                                 CloudAuthController.INVALIDATE_PATH, "/auth/bootstrap", "/connector-icons/*",
-                                "/auth/storage-entry", "/index.html", "/assets/**", "/error").permitAll()
+                                "/auth/storage-entry", "/index.html", "/assets/**", "/favicon.ico", "/tapstate-mark.svg",
+                                "/tapstate-mark-light.svg", "/error").permitAll()
+                        .requestMatchers(images::matches).permitAll()
                         .requestMatchers(SpaNavigationRequest::matches).permitAll()
                         .anyRequest().denyAll());
-        return http.build();
+        try {
+            return http.build();
+        } catch (Exception failure) {
+            throw new IllegalStateException("Unable to build the root security filter chain", failure);
+        }
     }
 
     private static AuthenticationFilter bearerFilter(

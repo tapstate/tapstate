@@ -7,9 +7,7 @@ import io.tapstate.spi.store.SessionRecord;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.containers.MongoDBContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.utility.DockerImageName;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.time.Instant;
 import java.util.List;
@@ -22,12 +20,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 @RequiresDocker
 class MongoSessionStoreIT {
 
-    private static final MongoDBContainer MONGO =
-            new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
     private static final Instant CREATED = Instant.parse("2026-08-17T10:00:00Z");
 
-    @Container
-    static final MongoDBContainer CONTAINER = MONGO;
+    @RegisterExtension
+    static final SharedMongoCase CONTAINER =
+            SharedMongoCase.forSuite(MongoSessionStoreIT.class);
 
     @Test
     void sessionSurvivesStoreRestartWithoutPersistingTheRawSecret() throws Exception {
@@ -88,6 +85,24 @@ class MongoSessionStoreIT {
         });
     }
 
+    @Test
+    void browserLogoutAtomicallyRevokesMatchingExpiredCredentials() throws Exception {
+        withCollection(collection -> {
+            MongoSessionStore store = new MongoSessionStore(collection);
+            SessionRecord existing = record();
+            store.save(new SessionRecord(existing.sessionId(), existing.secretHash(), existing.principal(),
+                    existing.scope(), existing.issuer(), false, existing.createdAt(), existing.lastUsedAt(),
+                    CREATED.minusSeconds(1), existing.absoluteExpiresAt()));
+            assertThat(store.revokeBrowserSession("s01", "wrong", existing.issuer())).isFalse();
+            assertThat(store.revokeBrowserSession("s01", existing.secretHash(), "urn:other")).isFalse();
+            assertThat(store.revokeBrowserSession("s01", existing.secretHash(), existing.issuer())).isTrue();
+            assertThat(store.find("s01")).get().extracting(SessionRecord::revoked).isEqualTo(true);
+            assertThat(store.revokeBrowserSession("s01", existing.secretHash(), existing.issuer())).isTrue();
+            assertThat(store.exchange("s01", existing.secretHash(), existing.issuer(), CREATED,
+                    CREATED.plusSeconds(60))).isEmpty();
+        });
+    }
+
     private static SessionRecord record() {
         return new SessionRecord("s01", "sha256-fixture", "admin", "ADMIN",
                 "urn:tapstate:cluster:01J5FIXTURE", false, CREATED, CREATED,
@@ -96,7 +111,7 @@ class MongoSessionStoreIT {
 
     private static void withCollection(CollectionTest body) throws Exception {
         try (MongoClient client = MongoClients.create(CONTAINER.getReplicaSetUrl())) {
-            MongoCollection<Document> collection = client.getDatabase("tapstate").getCollection("sessions");
+            MongoCollection<Document> collection = client.getDatabase(CONTAINER.database("tapstate")).getCollection("sessions");
             collection.drop();
             body.run(collection);
         }

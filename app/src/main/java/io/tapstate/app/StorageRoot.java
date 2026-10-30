@@ -16,8 +16,14 @@ final class StorageRoot implements AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(StorageRoot.class);
     enum Phase { CONFIGURATION_REQUIRED, CONFIGURATION_UNAVAILABLE, SETUP_REQUIRED, CACHE_UNAVAILABLE, AUTH_READY, BUSINESS_READY }
     private final CloudRuntimeSettings cloud;
+    // Publishes an owner identity; the runtime synchronizes its own mutable lifecycle.
+    @SuppressWarnings("java:S3077")
     private volatile StorageRuntime runtime;
+    // Publishes an authentication owner whose operations retain their own guards.
+    @SuppressWarnings("java:S3077")
     private volatile StorageAuthentication authentication;
+    // Publishes a replacement immutable endpoint snapshot.
+    @SuppressWarnings("java:S3077")
     private volatile Optional<StorageBinding.Connection> endpoint;
     private final java.util.function.Supplier<MongoConfigurationDomain> configurationLoader;
     private final Function<MongoConfigurationDomain, StorageRuntime> runtimes;
@@ -38,6 +44,8 @@ final class StorageRoot implements AutoCloseable {
     private volatile boolean recoveryQueued;
     private volatile boolean recoveryFailed;
     private record RecoveryFailure(StorageRecoveryCommands.Plan operation, TapstateException cause) {}
+    // Publishes the completed recovery failure identity without mutating its contents.
+    @SuppressWarnings("java:S3077")
     private volatile RecoveryFailure recoveryFailure;
     private final Runnable installationActive;
     private final StorageInitializationProgress initializationProgress;

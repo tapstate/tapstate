@@ -180,6 +180,49 @@ class PipelineObservationQueryServiceTest {
     }
 
     @Test
+    void completedBoundedLoadSurvivesPlanCleanupButNotAReplacementExecution() {
+        var now = java.time.Instant.parse("2026-10-28T09:00:00Z");
+        var plan = new io.tapstate.core.lifecycle.ExecutionPlan("p", 1L, 2L, 3L, List.of(), List.of(), now);
+        var current = new HashMap<String, io.tapstate.core.lifecycle.ExecutionPlan>();
+        current.put("p", plan);
+        var load = new io.tapstate.core.lifecycle.InitialLoad(
+                io.tapstate.core.lifecycle.InitialLoad.executionKey(plan), now, "snapshot_only", Map.of(
+                        "orders", new io.tapstate.core.lifecycle.InitialLoad.Table(
+                                io.tapstate.core.lifecycle.InitialLoad.Stage.LANDED, 3L, null)));
+        var store = storeWith(new Observation("p", PipelineState.COMPLETED, Map.of(), Map.of(), Map.of(),
+                null, now, List.of(), load));
+        var service = new PipelineObservationQueryService(artifactsWith("p"), store,
+                ids -> Map.copyOf(current), List::of, java.time.Clock.fixed(now, java.time.ZoneOffset.UTC));
+        assertThat(service.snapshot("p").initialLoad()).isEqualTo(load);
+        current.clear();
+        assertThat(service.snapshot("p").phase()).isEqualTo(io.tapstate.core.lifecycle.InitialLoad.Phase.COMPLETED);
+        current.put("p", new io.tapstate.core.lifecycle.ExecutionPlan("p", 1L, 3L, 3L, List.of(), List.of(), now));
+        assertThat(service.snapshot("p").initialLoad()).isNull();
+    }
+
+    @Test
+    void initialLoadIsAvailableOnlyForAFreshMatchingExecution() {
+        var now = java.time.Instant.parse("2026-10-28T09:00:00Z");
+        var plan = new io.tapstate.core.lifecycle.ExecutionPlan("p", 1L, 2L, 3L, List.of(), List.of(), now);
+        var load = new io.tapstate.core.lifecycle.InitialLoad(
+                io.tapstate.core.lifecycle.InitialLoad.executionKey(plan), now, "snapshot_and_cdc", Map.of(
+                        "orders", new io.tapstate.core.lifecycle.InitialLoad.Table(
+                                io.tapstate.core.lifecycle.InitialLoad.Stage.READING, 3L, null)));
+        var store = storeWith(new Observation("p", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(),
+                null, now, List.of(), load));
+        var service = new PipelineObservationQueryService(artifactsWith("p"), store,
+                ids -> Map.of("p", plan), List::of, java.time.Clock.fixed(now, java.time.ZoneOffset.UTC));
+        assertThat(service.snapshot("p").initialLoad()).isEqualTo(load);
+        assertThat(service.snapshot("p").phase()).isEqualTo(io.tapstate.core.lifecycle.InitialLoad.Phase.SNAPSHOTTING);
+        var replacement = new io.tapstate.core.lifecycle.ExecutionPlan("p", 1L, 4L, 3L, List.of(), List.of(), now);
+        assertThat(new PipelineObservationQueryService(artifactsWith("p"), store, ids -> Map.of("p", replacement),
+                List::of, java.time.Clock.fixed(now, java.time.ZoneOffset.UTC)).snapshot("p").initialLoad()).isNull();
+        assertThat(new PipelineObservationQueryService(artifactsWith("p"), store, ids -> Map.of("p", plan),
+                List::of, java.time.Clock.fixed(now.plusSeconds(30), java.time.ZoneOffset.UTC))
+                .snapshot("p").initialLoad()).isNull();
+    }
+
+    @Test
     void statusProjectsThePublishedState() {
         var service = new PipelineObservationQueryService(artifactsWith("orders_sync"), storeWith(running()));
 

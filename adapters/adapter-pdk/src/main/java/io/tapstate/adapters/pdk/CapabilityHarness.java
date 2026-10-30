@@ -43,6 +43,7 @@ public final class CapabilityHarness {
     public static Set<String> deriveCapabilities(ConnectorClassLoader loader, String connectorClassName) {
         ClassLoader restore = Thread.currentThread().getContextClassLoader();
         try {
+            PdkJsonProvider.prepareRuntime();
             Class<? extends TapConnector> connectorClass = loader.loadConnectorClass(connectorClassName);
             // Instantiation runs the connector's base-class initialization; run it under the
             // connector's own loader so any context-loader-based PDK lookup resolves against the

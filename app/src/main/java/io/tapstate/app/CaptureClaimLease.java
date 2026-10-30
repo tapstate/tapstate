@@ -25,6 +25,8 @@ final class CaptureClaimLease implements AutoCloseable {
     private final CaptureOwnership ownership;
     private final AtomicReference<WorkloadClaim> current;
     private final ScheduledExecutorService renewer;
+    // Publishes only worker identity for self-close detection; Thread owns its synchronization.
+    @SuppressWarnings("java:S3077")
     private volatile Thread renewalThread;
     private final AtomicBoolean closed = new AtomicBoolean();
     private final Object closeRelease = new Object();

@@ -5,14 +5,17 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.Proxy;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Supplier;
 
 /**
  * A stretch of network in front of one member that a case can cut per peer.
@@ -52,8 +55,11 @@ final class CuttableLink implements AutoCloseable {
     private final String targetHost;
     private final int targetPort;
     private final Map<String, int[]> diallerPorts;
+    private final Supplier<Socket> targetSockets;
     private final List<String> refused = new CopyOnWriteArrayList<>();
     private final List<Held> live = new CopyOnWriteArrayList<>();
+    // Guarded by live: accepted sockets are owned before target creation can call case-owned code.
+    private final Map<Socket, String> pending = new LinkedHashMap<>();
     private final Map<String, AtomicInteger> carriedFrom = new LinkedHashMap<>();
     private final AtomicInteger carried = new AtomicInteger();
     private final AtomicInteger turnedAway = new AtomicInteger();
@@ -65,11 +71,13 @@ final class CuttableLink implements AutoCloseable {
     /** One connection through here, remembered by who dialled it so a cut can pick it out. */
     private record Held(Socket inbound, Socket outbound, String dialler) { }
 
-    private CuttableLink(int port, String targetHost, int targetPort, Map<String, int[]> diallerPorts) {
+    private CuttableLink(int port, String targetHost, int targetPort, Map<String, int[]> diallerPorts,
+            Supplier<Socket> targetSockets) {
         this.port = port;
         this.targetHost = targetHost;
         this.targetPort = targetPort;
         this.diallerPorts = Map.copyOf(diallerPorts);
+        this.targetSockets = Objects.requireNonNull(targetSockets);
         diallerPorts.keySet().forEach(node -> carriedFrom.put(node, new AtomicInteger()));
     }
 
@@ -82,7 +90,13 @@ final class CuttableLink implements AutoCloseable {
      * here -- everything arrives from loopback.
      */
     static CuttableLink open(int port, String targetHost, int targetPort, Map<String, int[]> diallerPorts) {
-        CuttableLink link = new CuttableLink(port, targetHost, targetPort, diallerPorts);
+        return open(port, targetHost, targetPort, diallerPorts, () -> new Socket(Proxy.NO_PROXY));
+    }
+
+    /** Opens a relay with case-owned unconnected target sockets for connection lifecycle controls. */
+    static CuttableLink open(int port, String targetHost, int targetPort, Map<String, int[]> diallerPorts,
+            Supplier<Socket> targetSockets) {
+        CuttableLink link = new CuttableLink(port, targetHost, targetPort, diallerPorts, targetSockets);
         link.listen();
         return link;
     }
@@ -126,12 +140,22 @@ final class CuttableLink implements AutoCloseable {
      * would read as a cluster that never noticed anything.
      */
     void refuse(String dialler) {
-        refused.add(dialler);
-        for (Held held : List.copyOf(live)) {
-            if (held.dialler().equals(dialler)) {
-                closeQuietly(held.inbound());
-                closeQuietly(held.outbound());
-                live.remove(held);
+        synchronized (live) {
+            refused.add(dialler);
+            var awaiting = pending.entrySet().iterator();
+            while (awaiting.hasNext()) {
+                Map.Entry<Socket, String> accepted = awaiting.next();
+                if (accepted.getValue().equals(dialler)) {
+                    closeQuietly(accepted.getKey());
+                    awaiting.remove();
+                }
+            }
+            for (Held held : List.copyOf(live)) {
+                if (held.dialler().equals(dialler)) {
+                    closeQuietly(held.inbound());
+                    closeQuietly(held.outbound());
+                    live.remove(held);
+                }
             }
         }
     }
@@ -153,23 +177,37 @@ final class CuttableLink implements AutoCloseable {
                 // Closing a listener that is already gone is not a failure.
             }
         }
-        // A blocked accept can retain the socket after close returns. Wait for it to release the port.
-        Thread accepting = acceptThread;
-        if (accepting != null) {
-            try {
-                if (!accepting.join(Duration.ofSeconds(10))) {
-                    throw new AssertionError("the cuttable link listener did not stop on " + address());
+        // Closing a tracked connecting socket releases the accept thread before it is joined.
+        closeOwnedRelays();
+        try {
+            // A blocked accept can retain the socket after close returns. Keep the original join budget.
+            Thread accepting = acceptThread;
+            if (accepting != null) {
+                try {
+                    if (!accepting.join(Duration.ofSeconds(10))) {
+                        throw new AssertionError("the cuttable link listener did not stop on " + address());
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("interrupted while closing the cuttable link on " + address(), e);
                 }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new AssertionError("interrupted while closing the cuttable link on " + address(), e);
             }
+        } finally {
+            // A failed join must still close owned relays, including a concurrent accepted connection.
+            closeOwnedRelays();
         }
-        for (Held held : live) {
-            closeQuietly(held.inbound());
-            closeQuietly(held.outbound());
+    }
+
+    private void closeOwnedRelays() {
+        synchronized (live) {
+            for (Socket inbound : pending.keySet()) closeQuietly(inbound);
+            pending.clear();
+            for (Held held : live) {
+                closeQuietly(held.inbound());
+                closeQuietly(held.outbound());
+            }
+            live.clear();
         }
-        live.clear();
     }
 
     private void listen() {
@@ -188,6 +226,11 @@ final class CuttableLink implements AutoCloseable {
         }
     }
 
+    /** Reaches the fixture-owned member endpoint directly, independent of JVM proxy selection. */
+    private void connectTarget(Socket socket) throws IOException {
+        socket.connect(new InetSocketAddress(targetHost, targetPort));
+    }
+
     private void accept(ServerSocket server) {
         while (!server.isClosed() && !closed) {
             Socket inbound;
@@ -198,20 +241,54 @@ final class CuttableLink implements AutoCloseable {
                 return;
             }
             String dialler = whoDialled(inbound.getPort());
-            if (refused.contains(dialler)) {
-                turnedAway.incrementAndGet();
-                closeQuietly(inbound);
-                continue;
+            synchronized (live) {
+                if (closed || refused.contains(dialler)) {
+                    if (!closed) turnedAway.incrementAndGet();
+                    closeQuietly(inbound);
+                    if (closed) return;
+                    continue;
+                }
+                pending.put(inbound, dialler);
             }
             carried.incrementAndGet();
             carriedFrom.computeIfAbsent(dialler, unknown -> new AtomicInteger()).incrementAndGet();
+            Socket outbound;
             try {
-                Socket outbound = new Socket(targetHost, targetPort);
-                live.add(new Held(inbound, outbound, dialler));
-                pump(inbound, outbound);
-                pump(outbound, inbound);
-            } catch (IOException unreachable) {
+                outbound = Objects.requireNonNull(targetSockets.get());
+            } catch (RuntimeException | Error failure) {
+                synchronized (live) { pending.remove(inbound); }
                 closeQuietly(inbound);
+                throw failure;
+            }
+            Held held = new Held(inbound, outbound, dialler);
+            synchronized (live) {
+                boolean stillOwned = pending.remove(inbound) != null;
+                if (closed || refused.contains(dialler) || !stillOwned) {
+                    closeQuietly(inbound);
+                    closeQuietly(outbound);
+                    if (closed) return;
+                    continue;
+                }
+                // Ownership begins before connect: both close and peer refusal can cancel this stage.
+                live.add(held);
+            }
+            try {
+                connectTarget(outbound);
+                synchronized (live) {
+                    if (closed || refused.contains(dialler) || !live.contains(held)) {
+                        closeQuietly(inbound);
+                        closeQuietly(outbound);
+                        live.remove(held);
+                        if (closed) return;
+                        continue;
+                    }
+                    pump(inbound, outbound);
+                    pump(outbound, inbound);
+                }
+            } catch (IOException unreachable) {
+                live.remove(held);
+                closeQuietly(inbound);
+                closeQuietly(outbound);
             }
         }
     }

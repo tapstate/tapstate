@@ -3,8 +3,6 @@ package io.tapstate.archtests;
 import com.tngtech.archunit.core.domain.JavaClasses;
 import com.tngtech.archunit.core.domain.JavaMethod;
 import com.tngtech.archunit.core.domain.JavaMethodCall;
-import com.tngtech.archunit.core.importer.ClassFileImporter;
-import com.tngtech.archunit.core.importer.ImportOption;
 import io.tapstate.control.core.OperationRegistry;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
@@ -33,9 +31,7 @@ class MaturityCeilingGatesTest {
 
     @BeforeAll
     static void importProductionClasses() {
-        production = new ClassFileImporter()
-                .withImportOption(ImportOption.Predefined.DO_NOT_INCLUDE_TESTS)
-                .importPackages("io.tapstate");
+        production = ProductionClassImports.packages("io.tapstate");
     }
 
     /** Every production call to {@code OperationRegistry.exposedOn} taking {@code parameterCount} arguments. */

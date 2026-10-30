@@ -162,6 +162,10 @@ public final class SourceConfigCipher {
         finally { Arrays.fill(encoded, (byte) 0); if (derived != null) { Arrays.fill(derived, (byte) 0); } }
     }
 
+    ProviderSecretCipher providerSecrets() {
+        return new ProviderSecretCipher(activeKeyId, keys);
+    }
+
     String activeKeyId() {
         return activeKeyId;
     }

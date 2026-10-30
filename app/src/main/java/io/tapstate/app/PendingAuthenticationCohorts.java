@@ -88,8 +88,11 @@ final class PendingAuthenticationCohorts<T> implements AutoCloseable {
         }
     }
 
-    synchronized void invalidate() {
-        for (var group : active) group.result.completeExceptionally(StorageRuntime.unavailable());
+    synchronized void invalidate() { invalidate(StorageRuntime.unavailable()); }
+
+    synchronized void invalidate(RuntimeException reason) {
+        java.util.Objects.requireNonNull(reason, "reason");
+        for (var group : active) group.result.completeExceptionally(reason);
         open.clear(); notifyAll();
     }
 

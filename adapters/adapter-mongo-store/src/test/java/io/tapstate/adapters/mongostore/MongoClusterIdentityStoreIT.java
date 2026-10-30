@@ -5,9 +5,7 @@ import com.mongodb.client.MongoClients;
 import io.tapstate.spi.store.ClusterIdentity;
 import io.tapstate.testsupport.RequiresDocker;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.containers.MongoDBContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.utility.DockerImageName;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -15,14 +13,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 @RequiresDocker
 class MongoClusterIdentityStoreIT {
 
-    @Container
-    private static final MongoDBContainer REPLICA_SET =
-            new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
+    @RegisterExtension
+    private static final SharedMongoCase REPLICA_SET =
+            SharedMongoCase.forSuite(MongoClusterIdentityStoreIT.class);
 
     @Test
     void identitySurvivesReconstructionAndFirstWriterWins() {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            var collection = client.getDatabase("tapstate").getCollection(MongoAuthStores.CLUSTER_IDENTITY);
+            var collection = client.getDatabase(REPLICA_SET.database("tapstate")).getCollection(MongoAuthStores.CLUSTER_IDENTITY);
             collection.drop();
 
             MongoClusterIdentityStore firstProcess = new MongoClusterIdentityStore(collection);

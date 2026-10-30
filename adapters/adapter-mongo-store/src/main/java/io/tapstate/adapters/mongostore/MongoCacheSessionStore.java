@@ -25,6 +25,7 @@ import java.util.function.Function;
 /** OP session semantics on the cache handle's fixed authentication generation. */
 final class MongoCacheSessionStore implements SessionStore {
     private static final FindOneAndUpdateOptions AFTER = new FindOneAndUpdateOptions().returnDocument(ReturnDocument.AFTER);
+    private static final FindOneAndUpdateOptions BEFORE = new FindOneAndUpdateOptions().returnDocument(ReturnDocument.BEFORE);
     private static final Set<String> FIELDS = Set.of("_id", "formatVersion", "secretHash", "principal", "scope", "issuer", "revoked",
             "createdAt", "lastUsedAt", "idleExpiresAt", "absoluteExpiresAt");
     private final MongoCacheIdentity facts;
@@ -73,7 +74,21 @@ final class MongoCacheSessionStore implements SessionStore {
         return transaction(session -> {
             facts.fence(session);
             Document row = sessions.findOneAndUpdate(session, live(id, hash, issuer, now),
-                    new Document("$set", new Document("revoked", true)), AFTER);
+                    new Document("$set", new Document("revoked", true)), BEFORE);
+            if (row == null) return false;
+            decode(id, row);
+            return true;
+        });
+    }
+
+    /** Revocation only: no lifetime extension or authorization is obtained from an expired browser credential. */
+    @Override public boolean revokeBrowserSession(String id, String hash, String issuer) {
+        Objects.requireNonNull(id, "id"); Objects.requireNonNull(hash, "hash"); Objects.requireNonNull(issuer, "issuer");
+        return transaction(session -> {
+            facts.fence(session);
+            Document filter = new Document("_id", key(id)).append("secretHash", hash).append("issuer", issuer);
+            Document row = sessions.findOneAndUpdate(session, filter,
+                    new Document("$set", new Document("revoked", true)), BEFORE);
             if (row == null) return false;
             decode(id, row);
             return true;

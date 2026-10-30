@@ -50,7 +50,8 @@ class PipelineObservationController {
 
     @Verb("pipeline.snapshot")
     @GetMapping("/pipelines/{id}/snapshot")
-    PipelineSnapshot snapshot(@PathVariable("id") String id) {
-        return observations.snapshot(id);
+    PipelineSnapshotResponse snapshot(@PathVariable("id") String id) {
+        PipelineSnapshot snapshot = observations.snapshot(id);
+        return PipelineSnapshotResponse.of(snapshot);
     }
 }

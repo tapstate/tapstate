@@ -41,6 +41,17 @@ class MongoRequiredNoteStoreIT {
             .withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");
 
     @Test
+    void repeatedClearsRetainTheOriginalConnectionBeyondTheBoxedLongCache() {
+        withNotes(f -> {
+            var scope = f.initialize(chain("long-lived"));
+            for (int count = 0; count < 128; count++) scope = f.notes.clear(scope, false);
+            assertThat(scope.generation()).isEqualTo(129);
+            assertThat(f.notes.compareAndSet(scope, "key", 0, bytes("current-generation"), false)).isTrue();
+            assertThat(f.notes.read(scope, "key").bytes()).containsExactly(bytes("current-generation"));
+        });
+    }
+
+    @Test
     void keyDeletionRetainsTheRevisionAndNoOldPayloadOrEventArchive() {
         withNotes(f -> {
             RequiredNoteScope scope = f.initialize(global());

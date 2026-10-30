@@ -106,6 +106,7 @@ final class ConnectorInstancePool<T> implements AutoCloseable {
     private final Limits limits;
     private final Clock clock;
     private final ExecutorService calls;
+    private final Runnable beforeClaim;
 
     private final ReentrantLock lock = new ReentrantLock();
     private final Condition capacityReturned = lock.newCondition();
@@ -116,6 +117,12 @@ final class ConnectorInstancePool<T> implements AutoCloseable {
     private boolean closed;
 
     ConnectorInstancePool(Function<ConnectionConfig, T> open, Consumer<T> dispose, Limits limits, Clock clock) {
+        this(open, dispose, limits, clock, null);
+    }
+
+    ConnectorInstancePool(Function<ConnectionConfig, T> open, Consumer<T> dispose, Limits limits, Clock clock,
+                          Runnable beforeClaim) {
+        this.beforeClaim = beforeClaim;
         this.open = open;
         this.dispose = dispose;
         this.limits = limits;
@@ -370,6 +377,9 @@ final class ConnectorInstancePool<T> implements AutoCloseable {
             }
             boolean handedOut = false;
             try {
+                if (beforeClaim != null) {
+                    beforeClaim.run();
+                }
                 Claim<T> claim = claim(key, slot);
                 if (claim == null) {
                     // The slot was let go between looking it up and this turn becoming ours. Nothing was

@@ -1,0 +1,22 @@
+{
+  "repository": "https://github.com/tapstate/tapstate-skills",
+  "revision": "5bf120b7ed15f0608ce139e2bfd9f5b9acfef40b",
+  "files": {
+    "pipeline-semantics.txt": {
+      "source": "skills/dsl-authoring/references/pipeline-semantics.md",
+      "sha256": "d7edca13aeaa4e3ca3c7a41528c92b810b2e408b4511bc6d51bdaa2b0c2fb5a5"
+    },
+    "runtime-support.txt": {
+      "source": "skills/dsl-authoring/references/runtime-support.md",
+      "sha256": "f2337dd6b8fe616aaed6056ae28d49206e826348851a49339b1a62004ae55228"
+    },
+    "tapstate-v1.schema.json": {
+      "source": "skills/dsl-authoring/references/tapstate-v1.schema.json",
+      "sha256": "9a33ccb0db2900f78d5aa2b8674cf8d9a327a66da84b45a4393e9c85421036b9"
+    },
+    "LICENSE.txt": {
+      "source": "LICENSE",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    }
+  }
+}

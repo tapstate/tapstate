@@ -49,7 +49,7 @@ class SrsCaptureWriterTest {
             var last = f.saved.getLast();
             assertThat(last.position()).isEqualTo(new ChainPosition(new SourceOrder(2, 2), "batch-2"));
             assertThat(last.tables().get("orders").sequence()).isEqualTo(1); assertThat(last.tables().get("quiet").sequence()).isZero();
-            assertThat(f.log.rows.values()).allSatisfy(rows -> assertThat(rows.values()).allSatisfy(row -> {
+            assertThat(f.log.rows.values()).hasSize(2).allSatisfy(rows -> assertThat(rows.values()).isNotEmpty().allSatisfy(row -> {
                 assertThat(row.schemaVer()).isZero(); assertThat(row.epoch()).isEqualTo(2); assertThat(row.captureFence()).isEqualTo(FENCE);
             }));
             assertThat(f.published).hasSize(2).allSatisfy((key, model) -> assertThat(model.table().approximateRowCount()).isNull());

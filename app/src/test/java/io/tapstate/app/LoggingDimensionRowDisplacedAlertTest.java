@@ -28,10 +28,13 @@ class LoggingDimensionRowDisplacedAlertTest {
 
     private final ListAppender<ILoggingEvent> written = new ListAppender<>();
     private Logger logger;
+    private Level previousLevel;
 
     @BeforeEach
     void captureWhatIsWritten() {
         logger = (Logger) LoggerFactory.getLogger(LoggingDimensionRowDisplacedAlert.class);
+        previousLevel = logger.getLevel();
+        logger.setLevel(Level.WARN);
         written.start();
         logger.addAppender(written);
     }
@@ -41,6 +44,7 @@ class LoggingDimensionRowDisplacedAlertTest {
         MDC.remove(PipelineLogAppender.PIPELINE_ID_MDC_KEY);
         logger.detachAppender(written);
         written.stop();
+        logger.setLevel(previousLevel);
     }
 
     @Test

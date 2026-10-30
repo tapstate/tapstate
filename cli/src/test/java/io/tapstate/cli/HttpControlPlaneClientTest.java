@@ -404,6 +404,13 @@ class HttpControlPlaneClientTest {
     }
 
     @Test
+    void sessionTokenAlphabetAcceptsUrlSafeSeparatorsAndRejectsOtherPunctuation() {
+        assertThat(LoginOutcome.isValidSessionToken("tss_A-z_0.a_Z-9")).isTrue();
+        assertThat(LoginOutcome.isValidSessionToken("tss_A*z_0.a_Z-9")).isFalse();
+        assertThat(LoginOutcome.isValidSessionToken("tss_A-z_0.a_Z*9")).isFalse();
+    }
+
+    @Test
     void persistentLoginRequestsAndDecodesTheIncrementalSessionFields() throws Exception {
         AtomicReference<String> body = new AtomicReference<>();
         String response = "{\"token\":\"jwt-access\",\"accessExpiresAt\":\"2026-08-17T10:15:00Z\","

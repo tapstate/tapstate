@@ -76,9 +76,9 @@ class MongoAlertStorageSchemaIT {
 
     @Test void firstInstallationPublishesTheWholeFeatureWithoutChangingTheGlobalConfigVersion() {
         withConfiguration(false, fixture -> {
-            assertThat(fixture.domain().schemaVersion()).isEqualTo(1);
+            assertThat(fixture.domain().schemaVersion()).isEqualTo(MongoConfigurationDomain.SCHEMA_VERSION);
             assertThat(fixture.domain().alertSchemaVersion()).isEqualTo(MongoAlertStorageSchema.VERSION);
-            assertThat(schema(fixture).getInteger("installedVersion")).isEqualTo(1);
+            assertThat(schema(fixture).getInteger("installedVersion")).isEqualTo(MongoConfigurationDomain.SCHEMA_VERSION);
             assertThat(schema(fixture).get(MongoAlertStorageSchema.FIELD, Document.class).getString("operationId"))
                     .isEqualTo("setup-a");
             assertAllTables(fixture);
@@ -142,6 +142,7 @@ class MongoAlertStorageSchemaIT {
 
     @Test void unmarkedPartialStructuresAreNotAdoptedAndDoNotResetTheGlobalSchema() {
         withConfiguration(true, fixture -> {
+            Document before = schema(fixture);
             try (var session = fixture.client().startSession()) {
                 session.startTransaction();
                 SystemCollections.ALERT_RULES.prepareCollectionOn(fixture.database(), session);
@@ -150,7 +151,7 @@ class MongoAlertStorageSchemaIT {
             assertUnreadable(fixture.domain()::alertSchemaVersion);
             assertUnreadable(() -> fixture.domain().prepareAlertStorage("cannot-adopt-partial"));
             assertThat(schema(fixture)).doesNotContainKey(MongoAlertStorageSchema.FIELD);
-            assertThat(schema(fixture).getInteger("installedVersion")).isEqualTo(1);
+            assertThat(schema(fixture)).isEqualTo(before);
             assertThat(names(fixture)).contains("alert_rules").doesNotContain("alert_instances");
         });
     }
@@ -233,7 +234,7 @@ class MongoAlertStorageSchemaIT {
             assertThat(versions(f).find().first()).doesNotContainKey(ConfigurationVersion.ALERT_FENCE);
             assertThat(f.domain().prepareAlertStorage("authority-upgrade-a")).isEqualTo(MongoAlertStorageSchema.VERSION);
             Document after = schema(f);
-            assertThat(after.getInteger("installedVersion")).isEqualTo(1);
+            assertThat(after.getInteger("installedVersion")).isEqualTo(before.getInteger("installedVersion"));
             assertThat(after.get(MongoSourceIdentitySchema.FIELD, Document.class)).isEqualTo(source);
             Document marker = after.get(MongoAlertStorageSchema.FIELD, Document.class);
             assertThat(marker.getString("operationId")).isEqualTo("setup-a");

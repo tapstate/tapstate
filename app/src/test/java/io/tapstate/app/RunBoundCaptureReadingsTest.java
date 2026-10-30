@@ -6,6 +6,8 @@ import static org.mockito.Mockito.*;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.CaptureReading;
+import io.tapstate.core.lifecycle.ExecutionPlan;
+import io.tapstate.core.lifecycle.InitialLoad;
 import io.tapstate.core.lifecycle.SnapshotReading;
 import io.tapstate.core.lifecycle.TableSnapshot;
 import io.tapstate.spi.store.*;
@@ -52,6 +54,24 @@ class RunBoundCaptureReadingsTest {
         verify(captures, never()).runSnapshotProgress(anyString());
         verify(captures, never()).capturedRows(anyString());
         verify(run, never()).capturedRows(anyString());
+    }
+
+    @Test void initialLoadUsesTheOriginalRunAndRefusesReplacementDuringTheRead() {
+        var captures = mock(PipelineCaptureCoordinator.class);
+        var run = mock(PipelineCaptureCoordinator.class);
+        when(captures.forRun(SCOPE, CLAIM, ORIGINAL)).thenReturn(run);
+        var selected = new AtomicReference<>(Optional.of(ORIGINAL));
+        var plan = new ExecutionPlan("flow", 2L, 3L, 1L, java.util.List.of("node"), java.util.List.of(), BEGAN);
+        var load = new InitialLoad(InitialLoad.executionKey(plan), BEGAN, "snapshot_only", Map.of());
+        when(run.initialLoad("flow", plan, BEGAN)).thenReturn(load);
+        var readings = new RunBoundCaptureReadings(captures, ignored -> selected.get(), ignored -> CaptureReading.NONE);
+        assertThat(readings.initialLoad("flow", plan, BEGAN)).isSameAs(load);
+        when(run.initialLoad("flow", plan, BEGAN)).thenAnswer(call -> { selected.set(Optional.empty()); return load; });
+        assertThatThrownBy(() -> readings.initialLoad("flow", plan, BEGAN)).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(IoError.PIPELINE_INTENT_FENCED));
+        assertThat(readings.initialLoad("flow", plan, BEGAN)).isNull();
+        verify(run, times(2)).initialLoad("flow", plan, BEGAN);
+        verify(captures, never()).initialLoad(anyString(), any(), any());
     }
 
     @Test void jobReplacementDuringArrivalCollectionRefusesItsCounters() {

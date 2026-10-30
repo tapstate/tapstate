@@ -14,13 +14,15 @@ public record OperatorRunManifest(String pipelineId, Serializable executionIdent
         if (pipelineId == null || pipelineId.isBlank()) throw new IllegalArgumentException("missing pipeline identity");
         Objects.requireNonNull(executionIdentity, "executionIdentity"); bindings = List.copyOf(bindings);
         var cold = new HashSet<String>(); var hot = new HashSet<String>();
-        var scope = bindings.isEmpty() ? null : bindings.getFirst().placement().scope();
-        String executionKey = bindings.isEmpty() ? null : bindings.getFirst().executionKey();
-        for (var binding : bindings) {
-            if (!pipelineId.equals(binding.placement().scope().pipelineId()) || !executionIdentity.equals(binding.executionIdentity())
-                    || !scope.equals(binding.placement().scope()) || !executionKey.equals(binding.executionKey())
-                    || !cold.add(binding.placement().mapName()) || !hot.add(binding.mapName())) {
-                throw new IllegalArgumentException("operator manifest requires one original run and unique physical positions");
+        if (!bindings.isEmpty()) {
+            var scope = bindings.getFirst().placement().scope();
+            String executionKey = bindings.getFirst().executionKey();
+            for (var binding : bindings) {
+                if (!pipelineId.equals(binding.placement().scope().pipelineId()) || !executionIdentity.equals(binding.executionIdentity())
+                        || !scope.equals(binding.placement().scope()) || !executionKey.equals(binding.executionKey())
+                        || !cold.add(binding.placement().mapName()) || !hot.add(binding.mapName())) {
+                    throw new IllegalArgumentException("operator manifest requires one original run and unique physical positions");
+                }
             }
         }
     }

@@ -180,11 +180,7 @@ public final class SrsRingReader {
                 throw reader.gap(ackedSeq, "the confirmed position does not prove this table's recovery cursor");
             }
             if (ackedSeq > bounds.trimmedThrough()) {
-                SrsLogBatch batch = reader.readDurable(ackedSeq, 1);
-                SrsLogRecord record = batch.records().get(ackedSeq);
-                if (record.epoch() != order.epoch() || !Objects.equals(record.srcToken(), confirmed.token())) {
-                    throw reader.gap(ackedSeq, "the confirmed position differs from the retained record's generation or token");
-                }
+                reader.verifyConfirmation(ackedSeq, confirmed);
             }
         }
         return reader;
@@ -192,6 +188,19 @@ public final class SrsRingReader {
 
     private static long nextSequence(long sequence) {
         return Math.addExact(sequence, 1L);
+    }
+
+    private void verifyConfirmation(long sequence, ChainPosition confirmed) {
+        SrsLogBatch batch = log.readBatch(ringName, sequence, 1);
+        // Compaction may retire this confirmed record during the lookup; the unread suffix must remain.
+        requireRetained(cursor, batch.bounds());
+        if (sequence <= batch.bounds().trimmedThrough()) return;
+        SrsLogRecord record = batch.records().get(sequence);
+        if (record == null) throw gap(sequence, "the retained log has no record at the required sequence");
+        if (record.epoch() < 1L) throw gap(sequence, "the retained record has no verified original capture generation");
+        if (record.epoch() != confirmed.order().epoch() || !Objects.equals(record.srcToken(), confirmed.token())) {
+            throw gap(sequence, "the confirmed position differs from the retained record's generation or token");
+        }
     }
 
     private long firstDurableSeqAtOrAfter(StartFrom.At at, String retention, SrsLogBounds bounds) {

@@ -121,6 +121,49 @@ class MongoCacheSessionStoresIT {
     }
 
     @Test
+    void browserLogoutOnlyRevokesTheMatchingOriginalSessionEvenAfterExpiry() {
+        withCache(StorageBinding.Mode.OP, (root, database, binding, scope) -> {
+            var sessions = root.sessions(scope);
+            sessions.save(op("browser"));
+            var before = row(database, SystemCollections.OP_SESSIONS, "browser");
+            assertThat(sessions.revokeBrowserSession("browser", "wrong", "op-issuer")).isFalse();
+            assertThat(sessions.revokeBrowserSession("browser", HASH, "other-issuer")).isFalse();
+            assertThat(row(database, SystemCollections.OP_SESSIONS, "browser")).isEqualTo(before);
+            assertThat(sessions.revokeBrowserSession("browser", HASH, "op-issuer")).isTrue();
+            assertThat(sessions.revokeBrowserSession("browser", HASH, "op-issuer")).isTrue();
+            assertThat(sessions.find("browser").orElseThrow().revoked()).isTrue();
+            assertThat(sessions.exchange("browser", HASH, "op-issuer", CREATED, CREATED.plusSeconds(20))).isEmpty();
+        });
+    }
+
+    @Test
+    void browserRevocationRefusesCorruptOriginalFactsWithoutCommittingItsFence() {
+        withCache(StorageBinding.Mode.OP, (root, database, binding, scope) -> {
+            var sessions = root.sessions(scope);
+            for (boolean missing : List.of(false, true)) {
+                sessions.save(op("corrupt-browser"));
+                var collection = SystemCollections.OP_SESSIONS.on(database);
+                var key = row(database, SystemCollections.OP_SESSIONS, "corrupt-browser").get("_id");
+                collection.updateOne(new Document("_id", key), missing
+                        ? new Document("$unset", new Document("revoked", ""))
+                        : new Document("$set", new Document("revoked", "not-a-boolean")));
+                var before = collection.find(new Document("_id", key)).first();
+                var identity = SystemCollections.CACHE_IDENTITY.on(database).find().first();
+                assertThatThrownBy(() -> sessions.revokeBrowserSession("corrupt-browser", HASH, "op-issuer"))
+                        .isInstanceOfSatisfying(TapstateException.class, failure ->
+                                assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+                assertThat(collection.find(new Document("_id", key)).first()).isEqualTo(before);
+                assertThat(SystemCollections.CACHE_IDENTITY.on(database).find().first()).isEqualTo(identity);
+                assertThatThrownBy(() -> sessions.revoke("corrupt-browser", HASH, "op-issuer", CREATED))
+                        .isInstanceOfSatisfying(TapstateException.class, failure ->
+                                assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+                assertThat(collection.find(new Document("_id", key)).first()).isEqualTo(before);
+                assertThat(SystemCollections.CACHE_IDENTITY.on(database).find().first()).isEqualTo(identity);
+            }
+        });
+    }
+
+    @Test
     void cloudReopensWithoutLocalUsersAndDuplicateJtiNeverReplacesLoginFacts() {
         withCache(StorageBinding.Mode.CLOUD, (root, database, binding, scope) -> {
             var sessions = root.cloudSessions(scope);

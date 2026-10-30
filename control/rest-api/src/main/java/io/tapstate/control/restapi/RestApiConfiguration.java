@@ -1,6 +1,8 @@
 package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.PipelinePreviewService;
+import io.tapstate.control.core.AiProviderClient;
+import io.tapstate.control.core.OpenAiCompatibleClient;
 import io.tapstate.messages.MessageCatalog;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -33,7 +35,9 @@ public class RestApiConfiguration {
     private static final Duration ASYNC_RESPONSE_BUFFER = Duration.ofSeconds(15);
 
     static long asyncRequestTimeoutMillis() {
-        return PipelinePreviewService.DEADLINE.plus(ASYNC_RESPONSE_BUFFER).toMillis();
+        long previewBudget = PipelinePreviewService.DEADLINE.plus(ASYNC_RESPONSE_BUFFER).toMillis();
+        long assistantBudget = OpenAiCompatibleClient.maximumProposalDuration().plus(ASYNC_RESPONSE_BUFFER).toMillis();
+        return Math.max(Math.max(previewBudget, assistantBudget), 105000L);
     }
 
     @Bean
@@ -59,5 +63,10 @@ public class RestApiConfiguration {
     @Bean
     MessageCatalog messageCatalog() {
         return MessageCatalog.bundled();
+    }
+
+    @Bean
+    AiProviderClient aiProviderClient() {
+        return new OpenAiCompatibleClient();
     }
 }

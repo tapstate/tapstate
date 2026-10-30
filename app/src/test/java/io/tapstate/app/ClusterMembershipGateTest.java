@@ -4,6 +4,10 @@ import io.tapstate.spi.store.ClusterMembership;
 import org.junit.jupiter.api.Test;
 
 import java.util.Set;
+import java.util.List;
+import java.lang.reflect.Proxy;
+import java.util.concurrent.atomic.AtomicBoolean;
+import com.hazelcast.cluster.Member;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -92,5 +96,31 @@ class ClusterMembershipGateTest {
         properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
         properties.setBootstrapMinMembers(3);
         return new ClusterMembershipGate(properties);
+    }
+
+    @Test
+    void anUnprovedLocalNodeSessionRefusesWorkAndMembershipWritesBeforeTheMemberStops() {
+        ClusterMembershipGate gate = productionGate();
+        AtomicBoolean current = new AtomicBoolean(true);
+        gate.observeNodeSession(current::get);
+        gate.install(new ClusterMembership("cluster-a", 1, Set.of("a", "b", "c")));
+        List<Member> members = List.of(member("a"), member("b"));
+        assertThat(gate.apply(members)).isTrue();
+        assertThat(gate.businessEligible()).isTrue();
+        assertThat(gate.canCommit(Set.of("a", "b"))).isTrue();
+
+        current.set(false);
+
+        assertThat(gate.apply(members)).isFalse();
+        assertThat(gate.businessEligible()).isFalse();
+        assertThat(gate.canCommit(Set.of("a", "b"))).isFalse();
+    }
+
+    private static Member member(String nodeId) {
+        return (Member) Proxy.newProxyInstance(Member.class.getClassLoader(), new Class<?>[]{Member.class},
+                (proxy, method, args) -> {
+                    if (method.getName().equals("getAttribute")) return nodeId;
+                    throw new AssertionError("unexpected member metadata call: " + method.getName());
+                });
     }
 }

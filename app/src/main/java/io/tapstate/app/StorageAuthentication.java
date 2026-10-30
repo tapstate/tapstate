@@ -64,7 +64,7 @@ final class StorageAuthentication implements AutoCloseable {
 
     synchronized void invalidateFormal() {
         current.set(null);
-        pending.invalidate();
+        pending.invalidate(unauthenticated());
         if (bootstrap != null) bootstrap.sessions.close();
     }
 
@@ -107,16 +107,9 @@ final class StorageAuthentication implements AutoCloseable {
             // The fenced session transaction checks CACHE identity and structure before reading.
             // Check CONFIG first, then publish only after the full final CACHE/index validation.
             original.requirePublished(budget);
-            try {
-                var authenticated = original.managed(budget).authenticateWithContext(presented);
-                verified = authenticated.map(AuthenticatedCloudSession::identity);
-                organization = authenticated.map(value -> value.clusterContext().organizationId());
-            } catch (TapstateException failure) {
-                if (failure.code() == IoError.CACHE_AUTH_FENCED || failure.code() == IoError.STORE_UNAVAILABLE)
-                    throw StorageRuntime.unavailable();
-                original.requireActive(budget);
-                throw failure;
-            }
+            var authenticated = authenticateCloud(original, presented, budget);
+            verified = authenticated.map(AuthenticatedCloudSession::identity);
+            organization = authenticated.map(value -> value.clusterContext().organizationId());
             original.requireLocallyActive();
             evidence = verified.map(ignored -> new CredentialEvidence(CredentialType.CLOUD_SESSION,
                     Optional.empty(), original::requireLocallyActive));
@@ -129,8 +122,18 @@ final class StorageAuthentication implements AutoCloseable {
                         && original.signer.verify(presented).filter(value.identity()::equals).isEmpty()) throw unauthenticated();
             }, value.humanToken()));
         }
-        // A vanished session must not hide a concurrent scope or structure failure as a bad cookie.
-        if (cloud.cloud() || verified.isPresent()) original.requireActive(budget);
+        // The last CACHE transaction validates both scope and this exact session's revocation. A
+        // scope-only check after the first session read would miss a denial committed in between.
+        if (cloud.cloud() && verified.isPresent()) {
+            original.requireActive(budget);
+            var checked = authenticateCloud(original, presented, budget);
+            original.requireLocallyActive();
+            if (!checked.map(AuthenticatedCloudSession::identity).equals(verified)
+                    || !checked.map(value -> value.clusterContext().organizationId()).equals(organization)) return Optional.empty();
+        } else if (cloud.cloud() || verified.isPresent()) {
+            // A vanished session must not hide a concurrent scope or structure failure as a bad cookie.
+            original.requireActive(budget);
+        }
         if (verified.isEmpty()) return Optional.empty();
         if (cloud.cloud() && organization.isEmpty()) return Optional.empty();
         VerifiedToken identity = verified.orElseThrow();
@@ -170,6 +173,17 @@ final class StorageAuthentication implements AutoCloseable {
         Epoch epoch=selected();if(cloud.cloud())throw unauthenticated();
         return new io.tapstate.spi.store.AlertStore.Access(original,epoch::requireActive,epoch::requireLocallyActive,
                 ()->((HmacTokenSigner)epoch.signer).verifierBinding());
+    }
+
+    private Optional<AuthenticatedCloudSession> authenticateCloud(Epoch original, String presented, MongoReadBudget budget) {
+        try {
+            return original.managed(budget).authenticateWithContext(presented);
+        } catch (TapstateException failure) {
+            if (failure.code() == IoError.CACHE_AUTH_FENCED || failure.code() == IoError.STORE_UNAVAILABLE)
+                throw StorageRuntime.unavailable();
+            original.requireActive(budget);
+            throw failure;
+        }
     }
 
     private final class Bootstrap {

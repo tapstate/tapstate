@@ -25,8 +25,11 @@ class OnPremManagementChannelTest {
         java.nio.file.Files.writeString(web.resolve("index.html"), "<!doctype html><title>Storage setup</title><div id=\"root\"></div>");
         java.nio.file.Files.writeString(web.resolve("assets/setup.js"), "document.title = 'Storage setup';");
         var issued = InstallationCommand.authorize(files, new MongoProperties(), Clock.systemUTC());
+        var rootLogger = (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME);
+        var originalLevel = rootLogger.getLevel();
         try (var application = new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated()).run(
                 "--server.address=127.0.0.1", "--server.port=0", "--logging.level.root=ERROR",
+                "--tapstate.installation.require-credential=true",
                 "--spring.web.resources.static-locations=" + web.toUri(),
                 "--tapstate.installation.directory=" + files.directory(), "--tapstate.control.auth.jwt-secret=installation-test-signing-key",
                 "--tapstate.connectors.seed-dir=" + temporary.resolve("no-seeds"))) {
@@ -85,7 +88,11 @@ class OnPremManagementChannelTest {
                 assertThat(files.configurationUri()).isEmpty();
                 assertThat(application.getBeanFactory().containsSingleton("installedConnectorTests")).isFalse();
             }
+        } finally {
+            ((ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME)).setLevel(originalLevel);
         }
+        assertThat(((ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME)).getLevel())
+                .isEqualTo(originalLevel);
     }
 
     private static void assertPublicReverseProxyCannotGrantManagement(HttpClient http, String upstream,

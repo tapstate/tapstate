@@ -33,7 +33,7 @@ import java.util.Objects;
  */
 public final class MongoConfigurationDomain implements AutoCloseable {
     static final String LAYOUT = "three-layer-v1";
-    static final int SCHEMA_VERSION = 1;
+    static final int SCHEMA_VERSION = 2;
     private final MongoConnection connection;
     private final MongoConfigurationArtifactStore artifacts;
     private final MongoConfigurationCatalogStore catalog;
@@ -213,6 +213,12 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                 configurationKey.refresh(budget), this::requireOpen).step(operationId, budget);
     }
     public String databaseName() { requireOpen(); return connection.database().getName(); }
+
+    public io.tapstate.spi.store.AiProviderSettingsStore aiProviderSettings() {
+        requireOpen();
+        return new MongoConfigurationAiProviderSettingsStore(connection.client(), connection.database(), clusterId,
+                configurationKey, this::requireOpen);
+    }
 
     public ArtifactStore artifacts() {
         return artifacts;

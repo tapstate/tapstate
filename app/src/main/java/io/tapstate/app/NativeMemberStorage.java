@@ -17,6 +17,8 @@ final class NativeMemberStorage implements MemberStorage, AutoCloseable {
     private final WorkloadClaimStore claims;
     private final SrsStores sources;
     private final AtomicReference<NodeSessionLease> lease = new AtomicReference<>();
+    // Publishes the joined member; Hazelcast provides concurrency safety for its operations.
+    @SuppressWarnings("java:S3077")
     private volatile HazelcastInstance member;
     private volatile boolean closed;
     private volatile long initialDeadline;

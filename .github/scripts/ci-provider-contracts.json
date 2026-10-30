@@ -1,0 +1,139 @@
+{
+  "classes": {
+    "io.tapstate.adapters.pdk.PdkTypeMappingTest": {
+      "module": "adapters/adapter-pdk",
+      "providers": {
+        "declaredColumnShapes": {
+          "kind": "source",
+          "projection": "strict"
+        },
+        "driverNativeColumnShapes": {
+          "kind": "source",
+          "projection": "strict"
+        }
+      },
+      "source": "adapters/adapter-pdk/src/test/java/io/tapstate/adapters/pdk/PdkTypeMappingTest.java",
+      "source_sha256": "c77042856e3be8ba50a67f44a8067aa3d3a4c08287b706b679ca9908b8c0da5a"
+    },
+    "io.tapstate.app.ServerTimeZoneTest": {
+      "module": "app",
+      "providers": {
+        "scenarios": {
+          "kind": "source",
+          "projection": "strict"
+        }
+      },
+      "source": "app/src/test/java/io/tapstate/app/ServerTimeZoneTest.java",
+      "source_sha256": "0bb41345aec4adf5ae141456a7f46aa60dda4ff977222eecb5276dc5a140b4a6"
+    },
+    "io.tapstate.cli.PublishedConnectorArtifactsTest": {
+      "module": "cli",
+      "providers": {
+        "publishedIds": {
+          "kind": "source",
+          "projection": "strict"
+        }
+      },
+      "source": "cli/src/test/java/io/tapstate/cli/PublishedConnectorArtifactsTest.java",
+      "source_sha256": "b9844afa4a4efcbc98d1fc0c43135a911336454fc1805925d490225e4bfdcfa5"
+    },
+    "io.tapstate.control.restapi.WrittenFilterTest": {
+      "module": "control/rest-api",
+      "providers": {
+        "theVocabularyDownBothRoads": {
+          "kind": "source",
+          "projection": "strict"
+        }
+      },
+      "source": "control/rest-api/src/test/java/io/tapstate/control/restapi/WrittenFilterTest.java",
+      "source_sha256": "6544bde83446c02eaffd18acbcf070a918605a56c7431afad99379108724bf63"
+    },
+    "io.tapstate.core.dsl.CanonicalRoundTripTest": {
+      "module": "core/core-dsl",
+      "providers": {
+        "canonicalResources": {
+          "kind": "source",
+          "projection": "strict"
+        }
+      },
+      "source": "core/core-dsl/src/test/java/io/tapstate/core/dsl/CanonicalRoundTripTest.java",
+      "source_sha256": "1d9a26d11cd4edf6e1f3c585bab53d673ab54a28bf92708931dbe985be1fea8d"
+    },
+    "io.tapstate.core.dsl.CorpusSemanticGateTest": {
+      "module": "core/core-dsl",
+      "providers": {
+        "invalidCases": {
+          "kind": "source",
+          "projection": "strict"
+        },
+        "validScenarios": {
+          "kind": "source",
+          "projection": "strict"
+        }
+      },
+      "source": "core/core-dsl/src/test/java/io/tapstate/core/dsl/CorpusSemanticGateTest.java",
+      "source_sha256": "edd9be0f9da78e73f1c31c98f4250c932ac39d04833c6c8147a294bf98e919f2"
+    },
+    "io.tapstate.core.dsl.DslPipelineParserTest": {
+      "module": "core/core-dsl",
+      "providers": {
+        "allValidDocs": {
+          "kind": "source",
+          "projection": "strict"
+        }
+      },
+      "source": "core/core-dsl/src/test/java/io/tapstate/core/dsl/DslPipelineParserTest.java",
+      "source_sha256": "4b181361d6fba4e4521c6bbd3db9781fe337fcdfc6910211fe8fd43b9e9cc99e"
+    },
+    "io.tapstate.core.dsl.DslReferenceClosureTest": {
+      "module": "core/core-dsl",
+      "providers": {
+        "closureViolations": {
+          "kind": "source",
+          "projection": "strict"
+        },
+        "validScenarios": {
+          "kind": "source",
+          "projection": "strict"
+        }
+      },
+      "source": "core/core-dsl/src/test/java/io/tapstate/core/dsl/DslReferenceClosureTest.java",
+      "source_sha256": "57be751135717912ff1a2c104879a85f458d0c22c3f5a0d0cd4e97509b7b510c"
+    },
+    "io.tapstate.core.dsl.TargetConnectorRulesTest": {
+      "module": "core/core-dsl",
+      "providers": {
+        "sinkConnectors": {
+          "kind": "source",
+          "projection": "strict"
+        }
+      },
+      "source": "core/core-dsl/src/test/java/io/tapstate/core/dsl/TargetConnectorRulesTest.java",
+      "source_sha256": "f7f4f9a38a3da5ef8acc929e93fa4936ca948677c8ecf30591526bf7fd5c5ff6"
+    },
+    "io.tapstate.core.event.HowManyBytesARowIsTest": {
+      "module": "core/core-event",
+      "providers": {
+        "eachRuleChargesWhatTheDefinitionSays": {
+          "kind": "dynamic",
+          "projection": "strict"
+        }
+      },
+      "source": "core/core-event/src/test/java/io/tapstate/core/event/HowManyBytesARowIsTest.java",
+      "source_sha256": "e9a4af86cbdc39b323050cbeff96c9c15aa83a5025d1e98566d64968614642ae"
+    },
+    "io.tapstate.e2e.JoinConformanceIT": {
+      "module": "e2e",
+      "providers": {
+        "carriers": {
+          "kind": "source",
+          "projection": "named-carrier"
+        }
+      },
+      "source": "e2e/src/test/java/io/tapstate/e2e/JoinConformanceIT.java",
+      "source_sha256": "2cf8697d4c05b5668280e993dfb3908a4a3019fadd840690b1cbb9cb61df5b64"
+    }
+  },
+  "contract": "Only these source-hash-bound local providers are enumerated before test selection. Streams, filesystem corpus and catalog resources are read without executing test assertions, functions or processes. Changed source, unknown providers and unsupported arguments remain incomplete.",
+  "schema": 1
+}

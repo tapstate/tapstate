@@ -15,11 +15,11 @@ DIRECTORY = "/var/lib/tapstate/installation"
 JAR = "/opt/tapstate/tapstate.jar"
 
 
-def command(*args, body=None, timeout=180):
+def command(*args, body=None, timeout=180, label="command"):
     result = subprocess.run(args, input=body, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
     if result.returncode:
         # Request arguments and output may carry the fixture capability. Never echo either.
-        raise RuntimeError(f"native installation smoke command failed (exit {result.returncode})")
+        raise RuntimeError(f"native installation smoke {label} failed (exit {result.returncode})")
     return result.stdout
 
 
@@ -70,19 +70,41 @@ def document(server, filename):
     return json.loads(command("docker", "exec", server, "cat", f"{DIRECTORY}/{filename}.json"))
 
 
-def request(server, path, body=None, stage=None, capability=None):
+def request(server, path, body=None, stage=None, capability=None, label=None):
     origin = stage["managementUrl"] if stage else "http://127.0.0.1:8080"
     if not origin.startswith("http://127.0.0.1:"):
         raise RuntimeError("the smoke must use the retained independent loopback management listener")
-    args = ["docker", "exec", "-i", server, "curl", "--noproxy", "*", "--fail", "--silent", "--show-error",
-            "--max-time", "60", origin + path]
+    args = ["docker", "exec", "-i", server, "curl", "--noproxy", "*", "--silent", "--show-error",
+            "--max-time", "60", "--write-out", "\n%{http_code}", origin + path]
     if stage:
         args += ["-H", "Origin: " + origin, "-H", "X-Tapstate-Setup-Capability: " + capability["token"]]
     encoded = None
     if body is not None:
         args += ["-H", "Content-Type: application/json", "--data-binary", "@-"]
         encoded = json.dumps(body).encode()
-    return json.loads(command(*args, body=encoded, timeout=70))
+    phase = label or path
+    try:
+        response = command(*args, body=encoded, timeout=70, label=phase)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"native installation smoke {phase} timed out") from None
+    except OSError:
+        raise RuntimeError(f"native installation smoke {phase} transport unavailable") from None
+    content, separator, status = response.rpartition(b"\n")
+    if not separator or not re.fullmatch(rb"[1-5][0-9]{2}", status):
+        raise RuntimeError(f"native installation smoke {phase} returned no HTTP status")
+    if not status.startswith(b"2"):
+        # Only catalog codes may leave a failed response; never echo its message or parameters.
+        code = "unavailable"
+        try:
+            value = json.loads(content)
+            catalog = Path(__file__).resolve().parents[2] / "arch-tests/src/test/resources/error-codes.golden"
+            known = {line.strip() for line in catalog.read_text().splitlines() if not line.startswith("#")}
+            if isinstance(value, dict) and isinstance(value.get("code"), str) and value["code"] in known:
+                code = value["code"]
+        except (ValueError, OSError):
+            pass
+        raise RuntimeError(f"native installation smoke {phase} failed (HTTP {status.decode()}, code {code})")
+    return json.loads(content)
 
 
 def await_entry(server, expected):
@@ -110,7 +132,8 @@ def install(args):
     original = {"operationId": capability["operationId"], "generation": capability["generation"], "candidate": candidate}
     stamps = {}
     for layer in ("CONFIG", "CACHE", "MASTER"):
-        tested = request(args.server, "/api/storage/test", {**original, "layer": layer}, stage, capability)
+        tested = request(args.server, "/api/storage/test", {**original, "layer": layer}, stage, capability,
+                label="test-" + layer)
         stamps[layer] = tested["testStamp"]
     committed = request(args.server, "/api/storage/setup/commit", {**original, "testStamps": stamps}, stage, capability)
     if committed["setupPhase"] != "COMPLETE":

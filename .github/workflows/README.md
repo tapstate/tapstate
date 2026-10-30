@@ -69,8 +69,8 @@ the repository's Actions secrets before using that notification:
 - Variable `CLOUD_RELEASE_CODE`: `ALPHA`, `BETA`, `RC`, or `STABLE`.
 - Repository secret `CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_PROD`: the operator
   token configured on the production Cloud control plane. The release workflow
-  reads only this production key; `CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_DEV`
-  is reserved for other CI workflows.
+  production publication job reads only this production key;
+  `CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_DEV` is used by the dev validation job.
 
 The request carries the version and source revision; `git.extra` records the
 image tag, immutable image reference, digest, release URL, and workflow URL.
@@ -89,8 +89,20 @@ The approved image and its source revision still come from the selected release.
 
 ## Cloud cluster dev images
 
-`cloud-cluster-dev.yml` is manual-only and accepts branch refs, not tags. Dispatch
-it on `main` to build Tapstate and Web `main`, or on an allowlisted development
+`release.yml` calls `cloud-cluster-dev.yml` after all release gates pass, using
+the selected release version and frozen Tapstate and Web commits. Both Cloud
+environments must allow the workflow's dispatch ref; the current default is
+`main`, and `commit` can still select an older product commit. The dev job uses
+the `cloud-ghcr-dev` configuration, verifies and pushes the image, and registers
+it in the dev catalog before the existing `release` environment waits for human
+approval. Validate the digest shown in the dev job summary, review the draft,
+then choose **Approve and deploy** to continue production publication or
+**Reject** to end the release. Rejection retires the draft and release branches;
+the dev image and catalog entry remain available for diagnosis. The `release`
+environment must retain its required reviewers.
+
+The dev workflow also retains manual dispatch and accepts branch refs, not tags.
+Dispatch it on `main` to build Tapstate and Web `main`, or on an allowlisted development
 branch to build both repositories at the selected ref (the branch must exist in
 both repositories). Select `minor`, `patch`, or `major`; the version calculator
 uses the tagged `main` history so an unmerged feature branch does not need a
@@ -150,7 +162,8 @@ locked inputs, and uploads the checked OCI digest. It deploys no environment.
 Use the digest reference in the run summary for dev validation; a numeric dev
 tag can point to different bytes after a rebuild. Release rebuilds independently
 with its own environment configuration and approval. This lane adds no automatic
-PR/main test suite; its runner cost is incurred only on explicit dispatch.
+PR/main test suite; its runner cost is incurred on manual dev dispatch and once
+per release attempt after the release gates pass.
 
 Choose a location for new work before adding a workflow:
 

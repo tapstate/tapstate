@@ -104,6 +104,9 @@ class EveryMemberCanSayWhereAPipelinesWorkIsRunningTest {
             assertThat(fromSecond.vertices())
                     .as("the same placement from either member, which is what makes it the cluster's "
                             + "answer rather than the answer of whoever was asked")
+                    // Per-member metrics can arrive in either order; every processor's fields must still agree.
+                    .usingRecursiveComparison()
+                    .ignoringCollectionOrderInFields("processors")
                     .isEqualTo(fromFirst.vertices());
             assertThat(fromFirst.executionId())
                     .as("and the execution these processors belong to, which is how a restarted run is "

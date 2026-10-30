@@ -218,6 +218,8 @@ final class PdkCaptureBatch implements CaptureBatch {
     }
 
     /** Only the original cleanup owner waits without a caller budget, retaining its own reader reference. */
+    // The cleanup owner waits for termination, then restores every deferred interrupt.
+    @SuppressWarnings("java:S2142")
     void awaitReader() {
         boolean interrupted=false;
         while(reader.isAlive())try {reader.join();}catch(InterruptedException stopping){interrupted=true;}

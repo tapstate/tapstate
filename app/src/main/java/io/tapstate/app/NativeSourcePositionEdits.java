@@ -149,17 +149,21 @@ final class NativeSourcePositionEdits implements PipelinePositionService.WriteBa
             fixed.run();
         } catch (RuntimeException | Error failed) { primary = failed; throw failed; }
         finally {
-            Throwable cleanup = null;
-            for (var permit : captures.values()) try { captureOwnership.release(permit.claim()); }
-            catch (RuntimeException | Error failed) { cleanup = combine(cleanup, failed); }
-            var reverse = new ArrayList<>(controls.values()); Collections.reverse(reverse);
-            for (var control : reverse) try { control.close(); }
-            catch (RuntimeException | Error failed) { cleanup = combine(cleanup, failed); }
-            if (cleanup != null) {
-                if (primary != null) combine(primary, cleanup);
-                else if (cleanup instanceof RuntimeException failed) throw failed;
-                else throw (Error)cleanup;
-            }
+            releaseOwned(captures, controls, primary);
+        }
+    }
+    private void releaseOwned(Map<String,CaptureOwnership.Permit> captures,
+            Map<Reader,PipelineActuationOwnership.Control> controls, Throwable primary) {
+        Throwable cleanup = null;
+        for (var permit : captures.values()) try { captureOwnership.release(permit.claim()); }
+        catch (RuntimeException | Error failed) { cleanup = combine(cleanup, failed); }
+        var reverse = new ArrayList<>(controls.values()); Collections.reverse(reverse);
+        for (var control : reverse) try { control.close(); }
+        catch (RuntimeException | Error failed) { cleanup = combine(cleanup, failed); }
+        if (cleanup != null) {
+            if (primary != null) combine(primary, cleanup);
+            else if (cleanup instanceof RuntimeException failed) throw failed;
+            else throw (Error)cleanup;
         }
     }
     private static Throwable combine(Throwable primary, Throwable next) {

@@ -1945,13 +1945,32 @@ final class StoreBackedDagSource implements DagSource {
         boolean snapshotOnly = readModeOf(pipeline) == ReadMode.SNAPSHOT_ONLY;
         long snapshotEpoch = snapshotOnly && captureBindings == null
                 ? SnapshotRunOrder.current(storePort.keyedState(), pipeline.id()) : 0L;
+        Map<String, Long> sourceEpochs = new LinkedHashMap<>();
+        sourceVertices.values().forEach(vertex -> {
+            String chain = vertex.resolution().chainId().value();
+            long epoch;
+            if (captureBindings == null) {
+                epoch = snapshotOnly ? snapshotEpoch : sourceContextEpoch(chain, vertex.consumerId(), vertex.table());
+            } else if (snapshotOnly) {
+                epoch = captureBindings.requireSnapshot(vertex.sourceId(), chain, vertex.table()).epoch();
+            } else if (captureBindings.direct().containsKey(vertex.sourceId())) {
+                epoch = captureBindings.requireDirect(vertex.sourceId(), chain, vertex.table()).loadEpoch();
+            } else {
+                epoch = captureBindings.require(vertex.sourceId(), chain, vertex.table()).snapshotEpoch();
+            }
+            sourceEpochs.put(vertex.stream(), epoch);
+        });
+        Map<String, Long> snapshotEpochs = new LinkedHashMap<>();
+        if (readModeOf(pipeline) != ReadMode.CDC_ONLY) {
+            sourceEpochs.forEach((chain, epoch) -> { if (epoch > 0) snapshotEpochs.put(chain, epoch); });
+        }
         Map<String, Step.Inline> stepsById = inlineStepsById(pipeline);
         Map<String, String> sourceIdByTable = sourceIdByTable(sourceVertices);
         StartFrom freshStart = freshRingStart(pipeline);
         Map<String, StoreBackedSinkAckFactory.SourceProgress> progress = progressByTable(pipeline);
         return new DagBindings(
                 key -> sourceVertex(sourceVertices.get(key), axes, snapshotOnly, snapshotEpoch, freshStart,
-                        progress.get(sourceVertices.get(key).stream()).kind() == ConsumerProgressKind.DIRECT_SOURCE,captureBindings),
+                        progress.get(sourceVertices.get(key).stream()).kind() == ConsumerProgressKind.DIRECT_SOURCE,captureBindings, sourceEpochs.get(sourceVertices.get(key).stream())),
                 step -> transformBinding(step, stepsById, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds),
                 element -> FencedSinkWriterFactory.heldTo(
                         sinkWriter(pipeline, element, targets, serveStreams, sourceIdByTable, freshFullLoad,fence,targetPreparations,targetGuard), fence),
@@ -1959,13 +1978,13 @@ final class StoreBackedDagSource implements DagSource {
                 sourceKeysById::get,
                 view -> FencedSinkWriterFactory.heldTo(
                         viewSink(pipeline, view, viewTargets, viewStreams, sourceStreamsById(sourceVertices),freshFullLoad,fence,targetPreparations,targetGuard), fence),
-                operators == null ? nestBinding(pipeline,sourceTablesByName(sourceVertices)) :
+                (operators == null ? nestBinding(pipeline,sourceTablesByName(sourceVertices)) :
                         new NestBinding(operators.tables()::get,NestBinding.onMap(manifest),
                                 new LoggingNestDeadLetter(new io.tapstate.runtime.engine.nest.RequiredNestDeadLetter(manifest)),
                                 new ScopedSrsReplayFloorFactory(scopedSources,scopedDirect),
                                 new ScopedNestStateLedger(operators.pass(),operators.defaultDatabase(),operators.coordinates().nestDatabases(),originalOperators.claim()),
                                 nestSettings,NestClock.SYSTEM)
-                                .withCompiledSteps(pipeline.id(),operators.coordinates().compiledNests()),
+                                .withCompiledSteps(pipeline.id(),operators.coordinates().compiledNests())).withSnapshotEpochs(snapshotEpochs),
                 joinBinding(compiledJoins,manifest == null ? JoinStoresBinding.onTheCluster() : JoinStoresBinding.onTheCluster(manifest)));
     }
 
@@ -3149,7 +3168,7 @@ final class StoreBackedDagSource implements DagSource {
      */
     private ProcessorMetaSupplier sourceVertex(
             SourceVertex vertex, ChainAxes axes, boolean snapshotOnly, long snapshotEpoch, StartFrom freshStart,
-            boolean direct,PipelineCaptureBindings captureBindings) {
+            boolean direct,PipelineCaptureBindings captureBindings, long sourceEpoch) {
         if (vertex == null) {
             throw new IllegalStateException("source vertex binding is missing");
         }
@@ -3184,7 +3203,7 @@ final class StoreBackedDagSource implements DagSource {
         if (direct) {
             return SrsSourceProcessor.directMetaSupplier(vertex.pipelineId(),
                     vertex.resolution().ringName(vertex.table()), vertex.stream(),
-                    sourceContextEpoch(vertex.resolution().chainId().value(), vertex.consumerId(), vertex.table()),
+                    sourceEpoch,
                     order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement);
         }
         // Where in the ring this run starts. Not the head as such: a ring outlives the runs that read it, so
@@ -3197,8 +3216,7 @@ final class StoreBackedDagSource implements DagSource {
                 .get(vertex.table());
         return SrsSourceProcessor.metaSupplier(
                 vertex.pipelineId(), vertex.resolution().ringName(vertex.table()), vertex.stream(), freshStart,
-                doneThrough, sourceContextEpoch(
-                        vertex.resolution().chainId().value(), vertex.consumerId(), vertex.table()),
+                doneThrough, sourceEpoch,
                 CaptureRunUnit.readCursorPublisher(
                         vertex.resolution().chainId().value(), vertex.consumerId(), vertex.table()),
                 order -> new Watermark(FrontierOrders.pack(chain, order), axis), sourcePlacement,

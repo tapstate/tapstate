@@ -292,7 +292,8 @@ public enum SystemCollections {
     ALERT_TEST_QUOTAS("alert_test_quotas", Database.CONFIG, MongoAlertNotificationStore.class, Strategy.MIGRATED, 2,
             new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup")),
     ALERT_NODE_LIFECYCLES("alert_node_lifecycles", Database.CONFIG, MongoAlertNodeLifecycleStore.class, Strategy.MIGRATED, 1,
-            new IndexSpec(List.of("authorityId","clusterId","phase","nodeId","bootId"), false, "alert_query_node_lifecycle"));
+            new IndexSpec(List.of("authorityId","clusterId","phase","nodeId","bootId"), false, "alert_query_node_lifecycle")),
+    CONFIG_AI_PROVIDER_SETTINGS("ai_provider_settings", Database.CONFIG, MongoConfigurationAiProviderSettingsStore.class, Strategy.MIGRATED, 2);
 
     /** What happens to a collection's documents as the product's shape moves on. */
     public enum Strategy {
@@ -442,7 +443,7 @@ public enum SystemCollections {
         return collectionName;
     }
 
-    /** Stable engineering identity shared with the closed storage contract inventory. */
+    /** The stable identity binding this declaration to its storage contract inventory. */
     public String resourceId() {
         return switch (this) {
             case ALERT_RULES, ALERT_RECEIVERS, ALERT_SUBSCRIPTIONS, ALERT_SILENCES, ALERT_INSTANCES,
@@ -452,12 +453,14 @@ public enum SystemCollections {
         };
     }
 
-    public Kind kind() { return kind; }
-
     public Class<?> owner() { return owner; }
 
     public Database database() {
         return database;
+    }
+
+    public Kind kind() {
+        return kind;
     }
 
     public Strategy strategy() {

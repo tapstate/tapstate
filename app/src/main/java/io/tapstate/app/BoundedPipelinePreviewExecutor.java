@@ -49,6 +49,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadFactory;
@@ -78,10 +79,16 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
     private final PreviewSelectionPlanner planner;
     private final PdkBoundedSnapshotQueryPort snapshotQueries;
     private final PdkTargetPreviewRenderer targetPreviewRenderer;
-    private final ThreadPoolExecutor workers;
+    private final ExecutorService workers;
 
     BoundedPipelinePreviewExecutor(StorePort storePort, ConnectorProvisioner connectors,
             HazelcastInstance member, NestSettings nestSettings, Clock clock) {
+        this(storePort, connectors, member, nestSettings, clock, newWorkers());
+    }
+
+    /** Owns the supplied workers and shuts them down when this executor closes. */
+    BoundedPipelinePreviewExecutor(StorePort storePort, ConnectorProvisioner connectors,
+            HazelcastInstance member, NestSettings nestSettings, Clock clock, ExecutorService workers) {
         this.storePort = Objects.requireNonNull(storePort, "storePort");
         this.connectors = Objects.requireNonNull(connectors, "connectors");
         this.member = Objects.requireNonNull(member, "member");
@@ -91,16 +98,21 @@ final class BoundedPipelinePreviewExecutor implements PipelinePreviewProbe, Auto
         this.planner = new PreviewSelectionPlanner(snapshotQueries,
                 new PreviewSampleCache(member), clock);
         this.targetPreviewRenderer = new PdkTargetPreviewRenderer(connectors);
+        this.workers = Objects.requireNonNull(workers, "workers");
+    }
+
+    private static ThreadPoolExecutor newWorkers() {
         ThreadFactory threads = task -> {
             Thread thread = new Thread(task, "tapstate-preview-" + UUID.randomUUID());
             thread.setDaemon(true);
             return thread;
         };
-        this.workers = new ThreadPoolExecutor(
+        ThreadPoolExecutor workers = new ThreadPoolExecutor(
                 2, MAX_WORKERS, 30, TimeUnit.SECONDS,
                 new ArrayBlockingQueue<>(MAX_QUEUED_RUNS), threads,
                 new ThreadPoolExecutor.AbortPolicy());
-        this.workers.allowCoreThreadTimeOut(true);
+        workers.allowCoreThreadTimeOut(true);
+        return workers;
     }
 
     @Override

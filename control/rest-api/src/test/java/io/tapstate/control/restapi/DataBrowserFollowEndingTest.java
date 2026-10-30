@@ -122,6 +122,26 @@ class DataBrowserFollowEndingTest {
                 .hasSize(1);
     }
 
+    @Test
+    @DisplayName("duplicate connection-close callbacks release the follow only once")
+    void ignoresACloseCallbackAfterTheFollowWasAlreadyReleased() throws Exception {
+        AtomicReference<DataBrowserChangeListener> opened = new AtomicReference<>();
+        AtomicInteger closes = new AtomicInteger();
+        MutableClock clock = new MutableClock(Instant.parse("2026-08-19T10:00:00Z"));
+        DataBrowserTailHandler handler =
+                new DataBrowserTailHandler(service(opened, closes), clock, IDLE_LIMIT);
+        FakeSession session = new FakeSession("closed-twice");
+        handler.afterConnectionEstablished(session);
+
+        handler.afterConnectionClosed(session, CloseStatus.NORMAL);
+        assertThat(closes.get()).isEqualTo(1);
+        handler.afterConnectionClosed(session, CloseStatus.NORMAL);
+
+        assertThat(closes.get())
+                .as("the late callback no longer owns a follow or a connector instance")
+                .isEqualTo(1);
+    }
+
     // ---- fakes ----
 
     /** A service whose follow records the listener it was given and counts what closing it releases. */

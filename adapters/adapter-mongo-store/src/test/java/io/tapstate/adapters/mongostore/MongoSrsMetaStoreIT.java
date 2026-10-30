@@ -24,9 +24,7 @@ import io.tapstate.testsupport.RequiresDocker;
 import org.bson.BsonDocument;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.containers.MongoDBContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.utility.DockerImageName;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.time.Clock;
 import java.time.Instant;
@@ -62,7 +60,6 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 @RequiresDocker
 class MongoSrsMetaStoreIT {
 
-    private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
     private static final String CHAIN = "orders@mysql-1";
     private static final Instant WRITTEN_AT = Instant.parse("2026-09-03T10:12:44Z");
 
@@ -99,8 +96,9 @@ class MongoSrsMetaStoreIT {
     /** The commands that change something at the endpoint, as a command listener names them. */
     private static final Set<String> WRITE_COMMANDS = Set.of("insert", "update", "delete", "findAndModify");
 
-    @Container
-    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
+    @RegisterExtension
+    private static final SharedMongoCase REPLICA_SET =
+            SharedMongoCase.forSuite(MongoSrsMetaStoreIT.class);
 
     @Test
     void createSeedsAnEmptyRecordAndReadReturnsIt() {
@@ -1022,9 +1020,9 @@ class MongoSrsMetaStoreIT {
         ExecutorService executor = Executors.newSingleThreadExecutor();
         try (MongoClient staleClient = MongoClients.create(staleSettings);
                 MongoClient currentClient = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            MongoCollection<Document> roots = currentClient.getDatabase("tapstate").getCollection("srs_meta");
+            MongoCollection<Document> roots = currentClient.getDatabase(REPLICA_SET.database("tapstate")).getCollection("srs_meta");
             MongoCollection<Document> consumers =
-                    currentClient.getDatabase("tapstate").getCollection("srs_consumer_offsets");
+                    currentClient.getDatabase(REPLICA_SET.database("tapstate")).getCollection("srs_consumer_offsets");
             roots.drop();
             consumers.drop();
             ConsumerOffset departing = new ConsumerOffset("departing", Map.of("orders", 10L), null);
@@ -1033,8 +1031,8 @@ class MongoSrsMetaStoreIT {
                     new SrsMeta(CHAIN, null, List.of(departing, staying), List.of(), null)));
 
             MongoSrsMetaStore staleStore = new MongoSrsMetaStore(staleClient,
-                    staleClient.getDatabase("tapstate").getCollection("srs_meta"),
-                    staleClient.getDatabase("tapstate").getCollection("srs_consumer_offsets"));
+                    staleClient.getDatabase(REPLICA_SET.database("tapstate")).getCollection("srs_meta"),
+                    staleClient.getDatabase(REPLICA_SET.database("tapstate")).getCollection("srs_consumer_offsets"));
             MongoSrsMetaStore currentStore = new MongoSrsMetaStore(currentClient, roots, consumers);
             Future<?> staleWrite = executor.submit(
                     () -> staleStore.advanceConsumerReadSeq(CHAIN, "staying", "orders", 21L));
@@ -1108,14 +1106,14 @@ class MongoSrsMetaStoreIT {
         ExecutorService executor = Executors.newSingleThreadExecutor();
         try (MongoClient writingClient = MongoClients.create(writingSettings);
                 MongoClient currentClient = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            MongoCollection<Document> roots = currentClient.getDatabase("tapstate").getCollection("srs_meta");
+            MongoCollection<Document> roots = currentClient.getDatabase(REPLICA_SET.database("tapstate")).getCollection("srs_meta");
             MongoCollection<Document> consumers =
-                    currentClient.getDatabase("tapstate").getCollection("srs_consumer_offsets");
+                    currentClient.getDatabase(REPLICA_SET.database("tapstate")).getCollection("srs_consumer_offsets");
             roots.drop();
             consumers.drop();
             MongoSrsMetaStore writingStore = new MongoSrsMetaStore(writingClient,
-                    writingClient.getDatabase("tapstate").getCollection("srs_meta"),
-                    writingClient.getDatabase("tapstate").getCollection("srs_consumer_offsets"));
+                    writingClient.getDatabase(REPLICA_SET.database("tapstate")).getCollection("srs_meta"),
+                    writingClient.getDatabase(REPLICA_SET.database("tapstate")).getCollection("srs_consumer_offsets"));
             MongoSrsMetaStore currentStore = new MongoSrsMetaStore(currentClient, roots, consumers);
             currentStore.create(CHAIN, null);
 
@@ -1211,14 +1209,14 @@ class MongoSrsMetaStoreIT {
         ExecutorService executor = Executors.newFixedThreadPool(2);
         try (MongoClient droppingClient = MongoClients.create(droppingSettings);
                 MongoClient currentClient = MongoClients.create(currentSettings)) {
-            MongoCollection<Document> roots = currentClient.getDatabase("tapstate").getCollection("srs_meta");
+            MongoCollection<Document> roots = currentClient.getDatabase(REPLICA_SET.database("tapstate")).getCollection("srs_meta");
             MongoCollection<Document> consumers =
-                    currentClient.getDatabase("tapstate").getCollection("srs_consumer_offsets");
+                    currentClient.getDatabase(REPLICA_SET.database("tapstate")).getCollection("srs_consumer_offsets");
             roots.drop();
             consumers.drop();
             MongoSrsMetaStore droppingStore = new MongoSrsMetaStore(droppingClient,
-                    droppingClient.getDatabase("tapstate").getCollection("srs_meta"),
-                    droppingClient.getDatabase("tapstate").getCollection("srs_consumer_offsets"));
+                    droppingClient.getDatabase(REPLICA_SET.database("tapstate")).getCollection("srs_meta"),
+                    droppingClient.getDatabase(REPLICA_SET.database("tapstate")).getCollection("srs_consumer_offsets"));
             MongoSrsMetaStore currentStore = new MongoSrsMetaStore(currentClient, roots, consumers);
             currentStore.create(CHAIN, "old");
             currentStore.upsertConsumerOffset(
@@ -1310,14 +1308,14 @@ class MongoSrsMetaStoreIT {
         ExecutorService executor = Executors.newFixedThreadPool(2);
         try (MongoClient stoppingClient = MongoClients.create(stoppingSettings);
                 MongoClient survivingClient = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            MongoCollection<Document> roots = survivingClient.getDatabase("tapstate").getCollection("srs_meta");
+            MongoCollection<Document> roots = survivingClient.getDatabase(REPLICA_SET.database("tapstate")).getCollection("srs_meta");
             MongoCollection<Document> consumers =
-                    survivingClient.getDatabase("tapstate").getCollection("srs_consumer_offsets");
+                    survivingClient.getDatabase(REPLICA_SET.database("tapstate")).getCollection("srs_consumer_offsets");
             roots.drop();
             consumers.drop();
             MongoSrsMetaStore stopping = new MongoSrsMetaStore(stoppingClient,
-                    stoppingClient.getDatabase("tapstate").getCollection("srs_meta"),
-                    stoppingClient.getDatabase("tapstate").getCollection("srs_consumer_offsets"));
+                    stoppingClient.getDatabase(REPLICA_SET.database("tapstate")).getCollection("srs_meta"),
+                    stoppingClient.getDatabase(REPLICA_SET.database("tapstate")).getCollection("srs_consumer_offsets"));
             MongoSrsMetaStore surviving = new MongoSrsMetaStore(survivingClient, roots, consumers);
             surviving.create(CHAIN, null);
             // Two pipelines on the chain, each with a record already: one whose writers are on both members, and
@@ -1537,7 +1535,7 @@ class MongoSrsMetaStoreIT {
 
             try (MongoClient reopenedClient = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
                 MongoSrsMetaStore reopened = new MongoSrsMetaStore(reopenedClient,
-                        reopenedClient.getDatabase(collection.getNamespace().getDatabaseName())
+                        reopenedClient.getDatabase(REPLICA_SET.database(collection.getNamespace().getDatabaseName()))
                                 .getCollection(collection.getNamespace().getCollectionName()));
                 SrsMeta persisted = reopened.read(CHAIN).orElseThrow();
                 ConsumerOffset held = persisted.consumerOffset(first).orElseThrow();
@@ -1639,6 +1637,40 @@ class MongoSrsMetaStoreIT {
     }
 
     @Test
+    void aDirectPrefixUsesTheLowestPositionWhenTheLowestTableIsFirst() {
+        assertDirectPrefixForTableOrder(List.of("support_case", "emailmessage"));
+    }
+
+    @Test
+    void aDirectPrefixUsesTheLowestPositionWhenTheLowestTableIsLast() {
+        assertDirectPrefixForTableOrder(List.of("emailmessage", "support_case"));
+    }
+
+    private void assertDirectPrefixForTableOrder(List<String> tables) {
+        withStore(store -> {
+            String consumer = SrsConsumerId.of("ordered_prefix", "source").value();
+            Map<String, List<String>> expected = new LinkedHashMap<>();
+            for (String table : tables) {
+                expected.put(table, List.of("view"));
+            }
+            store.create(CHAIN, null);
+            store.beginWriterRun(CHAIN, consumer, "ordered-run", expected, ConsumerProgressKind.DIRECT_SOURCE);
+            ChainPosition low = new ChainPosition(new SourceOrder(1, 1), "after-low");
+            ChainPosition high = new ChainPosition(new SourceOrder(1, 3), "after-high");
+            confirmDirect(store, CHAIN, consumer, "support_case", low);
+            confirmDirect(store, CHAIN, consumer, "emailmessage", high);
+
+            ChainPosition settled = store.read(CHAIN).orElseThrow()
+                    .consumerOffset(consumer).orElseThrow().sinkAcked();
+            assertThat(settled)
+                    .as("table iteration order must not move the durable prefix past the lowest table")
+                    .isEqualTo(low);
+            store.advanceSourceReadOffset(CHAIN, settled);
+            assertThat(store.read(CHAIN).orElseThrow().sourceReadOffset()).isEqualTo("after-low");
+        });
+    }
+
+    @Test
     void directBatchRecoveryRetainsUnconfirmedHighAcrossStoreReopenAndAdvancesPastAQuietTable() {
         withCollection((store, collection) -> {
             String consumer = SrsConsumerId.of("support_case_state", "case_source").value();
@@ -1663,7 +1695,7 @@ class MongoSrsMetaStoreIT {
                     .isEqualTo(low);
             try (MongoClient reopenedClient = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
                 MongoSrsMetaStore reopened = new MongoSrsMetaStore(reopenedClient,
-                        reopenedClient.getDatabase(collection.getNamespace().getDatabaseName())
+                        reopenedClient.getDatabase(REPLICA_SET.database(collection.getNamespace().getDatabaseName()))
                                 .getCollection(collection.getNamespace().getCollectionName()));
                 // A repeated same-generation startup must keep both pending batch manifests.
                 reopened.beginDirectCapture(CHAIN, consumer, epoch, "before-batch");
@@ -2175,7 +2207,7 @@ class MongoSrsMetaStoreIT {
                 .addCommandListener(recordFinds)
                 .build();
         try (MongoClient client = MongoClients.create(settings)) {
-            MongoCollection<Document> collection = client.getDatabase("tapstate").getCollection("srs_meta");
+            MongoCollection<Document> collection = client.getDatabase(REPLICA_SET.database("tapstate")).getCollection("srs_meta");
             collection.drop();
             MongoSrsMetaStore store = new MongoSrsMetaStore(client, collection, Clock.systemUTC());
             store.create(CHAIN, null);
@@ -2217,7 +2249,7 @@ class MongoSrsMetaStoreIT {
 
     private static void withCollection(Clock clock, CollectionTest test) {
         try (MongoClient client = MongoClients.create(REPLICA_SET.getReplicaSetUrl())) {
-            MongoCollection<Document> collection = client.getDatabase("tapstate").getCollection("srs_meta");
+            MongoCollection<Document> collection = client.getDatabase(REPLICA_SET.database("tapstate")).getCollection("srs_meta");
             collection.drop();
             test.run(new MongoSrsMetaStore(client, collection, clock), collection);
         } catch (Exception e) {

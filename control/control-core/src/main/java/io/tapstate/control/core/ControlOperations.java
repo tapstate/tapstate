@@ -30,6 +30,13 @@ public final class ControlOperations {
     private static final Map<Frontend, Maturity> CLI_AND_REST =
             Map.of(Frontend.CLI, Maturity.CURRENT, Frontend.REST, Maturity.CURRENT);
 
+    public static final Operation AI_PROVIDER_GET = new Operation("ai-provider.get", Scope.READ, false, null, "Read the current caller provider metadata without a credential.", CLI_AND_REST);
+    public static final Operation AI_PROVIDER_REPLACE = new Operation("ai-provider.replace", Scope.WRITE, true, null, "Replace the current caller encrypted provider credential.", CLI_AND_REST);
+    public static final Operation AI_PROVIDER_DELETE = new Operation("ai-provider.delete", Scope.WRITE, true, null, "Delete the current caller provider credential.", CLI_AND_REST);
+    public static final Operation AI_PROVIDER_CHECK = new Operation("ai-provider.check", Scope.WRITE, false, null, "Test an ephemeral provider credential without persisting it.", CLI_AND_REST);
+    public static final Operation PIPELINE_DRAFT_ASSISTANT = new Operation("pipeline-draft.assistant", Scope.WRITE, false, null, "Stream a validated Pipeline Builder proposal without saving it.", CLI_AND_REST);
+    public static final Operation PIPELINE_DRAFT_ASSISTANT_VALIDATE = new Operation("pipeline-draft.assistant-validate", Scope.READ, false, null, "Validate a Pipeline Builder proposal against the current draft revision.", CLI_AND_REST);
+
     // system domain
     public static final Operation SYSTEM_VERSION = new Operation(
             "system.version", Scope.READ, false, ControlApiSchema.ref("system.version"),
@@ -197,7 +204,7 @@ public final class ControlOperations {
     public static final Operation CLUSTER_MEMBERS = new Operation("cluster.members", Scope.READ, false, null, CLI_ONLY);
     public static final Operation CLUSTER_CONTEXT = new Operation(
             "cluster.context", Scope.READ, false, null,
-            "Read the organization and Cluster display context bound to the authenticated Cloud session.",
+            "Read the organization and Cluster display context and verified user email bound to the authenticated Cloud session.",
             Map.of(Frontend.REST, Maturity.CURRENT));
 
     // pipeline domain: static projection reads, conditional definition replacement, and the four lifecycle
@@ -212,6 +219,10 @@ public final class ControlOperations {
             "pipeline.catalog", Scope.READ, false, null,
             "List a bounded page of Pipelines from the unified artifact-and-draft catalog, including lifecycle status.",
             CLI_AND_REST);
+    public static final Operation PIPELINE_DELETE = new Operation(
+            "pipeline.delete", Scope.WRITE, true, null,
+            "Remove one applied Pipeline and the authoring draft revision the caller read, preserving the existing lifecycle, reference, and version guards.",
+            Map.of(Frontend.REST, Maturity.CURRENT));
     public static final Operation VIEW_LIST = new Operation(
             "view.list", Scope.READ, false, null,
             "List materialized views and replicas with their location, maintaining pipeline, and freshness.",
@@ -390,6 +401,12 @@ public final class ControlOperations {
 
     private static final List<Operation> ALL = List.of(
             ALERT_RULE_PREVIEW, ALERT_ROUTE_PREVIEW, ALERT_RESOURCES, ALERT_CATALOG, ALERT_CENTER, ALERT_DETAIL, ALERT_DELIVERIES, ALERT_HEALTH, ALERT_CONFIGURATION_LIST, ALERT_CONFIGURATION_SAVE, ALERT_CONFIGURATION_RETIRE, ALERT_PREVIEW, ALERT_TEST, ALERT_TEST_RESULT, ALERT_RETRY,
+            AI_PROVIDER_GET,
+            AI_PROVIDER_REPLACE,
+            AI_PROVIDER_DELETE,
+            AI_PROVIDER_CHECK,
+            PIPELINE_DRAFT_ASSISTANT,
+            PIPELINE_DRAFT_ASSISTANT_VALIDATE,
             SYSTEM_VERSION,
             ARTIFACT_APPLY,
             ARTIFACT_VALIDATE,
@@ -425,6 +442,7 @@ public final class ControlOperations {
             CLUSTER_CONTEXT,
             PIPELINE_LIST,
             PIPELINE_CATALOG,
+            PIPELINE_DELETE,
             VIEW_LIST,
             PIPELINE_GET,
             PIPELINE_LAYOUT_GET,

@@ -99,7 +99,7 @@ class SingleNodeLifecycleE2ETest {
                 NestSettings.defaults(), null, null, null, beans.getBeanProvider(ClusterIdentityStore.class),
                 beans.getBeanProvider(WorkloadClaimStore.class), gate, BootId.fresh(), beans.getBeanProvider(StorePort.class),
                 beans.getBeanProvider(ClusterMembershipStore.class));
-        nodeLease = wiring.nodeSessionLease(member, properties, beans.getBeanProvider(WorkloadClaimStore.class), gate);
+        nodeLease = wiring.nodeSessionLease(member);
         var dataPlane = new DataPlaneActuationConfiguration();
         authorization = dataPlane.executionAuthorization(member, properties, claims, nodeLease, gate);
         ownership = dataPlane.pipelineActuationOwnership(member, properties, gate, new ClusterWorkloadClaims(claims, gate));

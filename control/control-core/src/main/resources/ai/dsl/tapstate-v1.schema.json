@@ -1,0 +1,1392 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tapstate.io/schema/tapstate/v1.json",
+  "$ref": "#/$defs/Resource",
+  "$defs": {
+    "DdlPolicy": {
+      "type": "string",
+      "description": "How the sink reacts to incoming schema-change (DDL) events; defaults to fail to avoid silent drift.",
+      "oneOf": [
+        {
+          "const": "apply",
+          "description": "Apply the schema change to the target so its structure tracks the source."
+        },
+        {
+          "const": "ignore",
+          "description": "Skip the schema change and keep replicating data against the existing target structure."
+        },
+        {
+          "const": "fail",
+          "description": "Stop the pipeline on a schema change rather than risk silent drift."
+        }
+      ]
+    },
+    "Embed": {
+      "type": "object",
+      "description": "One child of a nest tree, joined onto its parent and either placed at a path or merged into it.",
+      "properties": {
+        "from": {
+          "description": "Alias of the nest step's from map that supplies this child's rows.",
+          "type": "string"
+        },
+        "on": {
+          "description": "Maps this child's join fields to the parent fields they match.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "as": {
+          "description": "How matched child rows contribute under the parent: an array, an object, or flat fields.",
+          "$ref": "#/$defs/EmbedAs"
+        },
+        "path": {
+          "description": "Target field path for array and object embeds. Flat embeds must omit it.",
+          "type": "string"
+        },
+        "key": {
+          "description": "Fields that identify one row of this embed's stream. Absent means the stream's own declared key is used, and a stream that declares none is refused.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "arrayKey": {
+          "description": "Fields that tell one element apart from the others in the same array, which may be unique only within that array. Absent means the row identity above is used.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "ignoreUpdates": {
+          "description": "When true, updates to the child rows are not propagated into the parent.",
+          "type": "boolean"
+        },
+        "trackKeyChanges": {
+          "description": "When true, changes to this child's structural keys are tracked so embedded data is moved accordingly: the key identifying an element within its array, the key saying which parent it hangs under, and the key its own children point at. Requires the source to supply a before image.",
+          "type": "boolean"
+        },
+        "embed": {
+          "description": "Further children embedded beneath this one, forming a nested tree.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Embed"
+          }
+        }
+      },
+      "required": [
+        "from",
+        "on",
+        "as"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "as": {
+                "const": "flat"
+              }
+            },
+            "required": [
+              "as"
+            ]
+          },
+          "then": {
+            "allOf": [
+              {
+                "not": {
+                  "required": [
+                    "path"
+                  ]
+                }
+              },
+              {
+                "not": {
+                  "required": [
+                    "arrayKey"
+                  ]
+                }
+              }
+            ]
+          },
+          "else": {
+            "required": [
+              "path"
+            ]
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "EmbedAs": {
+      "type": "string",
+      "description": "How a nested child contributes to its parent: as an array, an object, or fields merged in place.",
+      "oneOf": [
+        {
+          "const": "array",
+          "description": "One-to-many relationship: matching child rows are embedded as an array."
+        },
+        {
+          "const": "object",
+          "description": "One-to-one relationship: a single matching child row is embedded as an object."
+        },
+        {
+          "const": "flat",
+          "description": "One-to-one or many-to-one relationship: the matched row's fields are merged into the parent."
+        }
+      ]
+    },
+    "ErrorPolicy": {
+      "type": "string",
+      "description": "How the pipeline handles a record that fails processing.",
+      "oneOf": [
+        {
+          "const": "dead_letter",
+          "description": "Route the failed record to a dead-letter sink for later inspection and continue."
+        },
+        {
+          "const": "skip",
+          "description": "Drop the failed record and continue processing."
+        },
+        {
+          "const": "fail",
+          "description": "Stop the pipeline and report the failure."
+        }
+      ]
+    },
+    "FieldRule": {
+      "description": "One field projection rule: rename a source field, drop a field, set a literal value, or compute a value from a CEL expression."
+    },
+    "FromClause": {
+      "description": "The upstream wiring of a transform step: either a list of references for streaming steps, or a map of named upstreams for nest and join.",
+      "oneOf": [
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FromRef"
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/FromRef"
+          }
+        }
+      ]
+    },
+    "FromRef": {
+      "description": "An upstream reference: either a literal token (step id, table name, or source_id.table) or a /…/ regex matching multiple upstreams.",
+      "type": "string"
+    },
+    "JoinEngine": {
+      "type": "string",
+      "description": "The engine that runs the join.",
+      "oneOf": [
+        {
+          "const": "builtin",
+          "description": "The built-in join carrier, the only engine this release runs joins on."
+        }
+      ]
+    },
+    "Metadata": {
+      "type": "object",
+      "description": "Optional annotation block: labels plus a free-text description. Never carries identity.",
+      "properties": {
+        "labels": {
+          "description": "Arbitrary key/value labels attached to the resource for grouping and selection.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "description": {
+          "description": "Free-text description of the resource; never identity.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "NestOrder": {
+      "type": "string",
+      "description": "Order in which a nest transform processes main and sub-table change events.",
+      "oneOf": [
+        {
+          "const": "main_first",
+          "description": "Process the main-table event before its related sub-table events."
+        },
+        {
+          "const": "sub_first",
+          "description": "Process the sub-table events before the related main-table event."
+        }
+      ]
+    },
+    "NestRoot": {
+      "type": "object",
+      "description": "Root of a nest tree: the parent stream, its upsert key, write mode, and the embedded child streams.",
+      "properties": {
+        "from": {
+          "description": "Alias of the parent stream that anchors this nest tree.",
+          "type": "string"
+        },
+        "key": {
+          "description": "Upsert key fields that identify a parent document for updates.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "mode": {
+          "description": "Write mode for the parent stream, such as append-only or upsert.",
+          "type": "string"
+        },
+        "trackKeyChanges": {
+          "description": "When true, changes to the root key are tracked so the whole document is moved to its new identity. The root declares its own because nothing above it does. Requires the source to supply a before image.",
+          "type": "boolean"
+        },
+        "embed": {
+          "description": "Child streams embedded under each parent document.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Embed"
+          }
+        }
+      },
+      "required": [
+        "from"
+      ],
+      "additionalProperties": false
+    },
+    "NestStateStorage": {
+      "type": "object",
+      "description": "Durable operator-state placement for one nest.",
+      "properties": {
+        "database": {
+          "description": "MongoDB database holding this nest's state, shape record, and dead letters.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "database"
+      ],
+      "additionalProperties": false
+    },
+    "OnFullLoad": {
+      "type": "string",
+      "description": "Treatment of existing target rows before a new full load; recovery and CDC-only runs never clear rows.",
+      "oneOf": [
+        {
+          "const": "clear",
+          "description": "Clear existing target rows before a new full load."
+        },
+        {
+          "const": "append",
+          "description": "Keep existing target rows and write the full load using the configured write mode."
+        },
+        {
+          "const": "fail",
+          "description": "Refuse a new full load when the target table is not empty."
+        }
+      ]
+    },
+    "PipelineResource": {
+      "type": "object",
+      "description": "Composing runnable unit that references pre-created sources by id and wires transforms, view and serve into a task.",
+      "properties": {
+        "version": {
+          "description": "The grammar version; always \"tapstate/v1\".",
+          "const": "tapstate/v1"
+        },
+        "kind": {
+          "description": "Resource kind discriminator.",
+          "const": "pipeline"
+        },
+        "id": {
+          "description": "Unique resource id across the workspace; must not contain a dot.",
+          "type": "string"
+        },
+        "metadata": {
+          "description": "Optional labels and free-text description.",
+          "$ref": "#/$defs/Metadata"
+        },
+        "source": {
+          "description": "Pre-created sources this pipeline reads from. Each is a bare source id or an object carrying this pipeline's own srs switch; blank drafts may omit the list.",
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SourceRef"
+            },
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/SourceRef"
+              }
+            }
+          ]
+        },
+        "transforms": {
+          "description": "Ordered transform steps applied to the source data.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Step"
+          }
+        },
+        "view": {
+          "description": "View configuration that shapes the pipeline output into a queryable result.",
+          "$ref": "#/$defs/ViewBlock"
+        },
+        "serve": {
+          "description": "Serve configuration that exposes the pipeline output downstream.",
+          "$ref": "#/$defs/ServeBlock"
+        },
+        "settings": {
+          "description": "Task-level settings for this pipeline.",
+          "$ref": "#/$defs/Settings"
+        },
+        "experimental": {
+          "description": "Experimental fields, exempt from the v1 compatibility freeze.",
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "version",
+        "kind",
+        "id",
+        "source"
+      ],
+      "additionalProperties": false
+    },
+    "PushElement": {
+      "type": "object",
+      "description": "A serve.push egress element that streams change events to a target connector topic, with no table model.",
+      "properties": {
+        "id": {
+          "description": "Optional id for this push element; defaults to a generated id when omitted.",
+          "type": "string"
+        },
+        "source": {
+          "description": "Id of the source resource this egress reads change events from.",
+          "type": "string"
+        },
+        "topic": {
+          "description": "Target topic or channel the change events are pushed to.",
+          "type": "string"
+        },
+        "format": {
+          "description": "Serialization format used to encode each pushed change event.",
+          "$ref": "#/$defs/PushFormat"
+        }
+      },
+      "required": [
+        "source"
+      ],
+      "additionalProperties": false
+    },
+    "PushFormat": {
+      "description": "Shape of the egress payload pushed to the target; absent means the default tapstate envelope.",
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/FieldRule"
+          }
+        }
+      ]
+    },
+    "QueryElement": {
+      "type": "object",
+      "description": "One query exposed by a serve resource. Today only parallel egress from the view store is served.",
+      "properties": {
+        "type": {
+          "description": "The kind of query this element exposes.",
+          "$ref": "#/$defs/QueryType"
+        },
+        "backend": {
+          "description": "Reserved: the sync id whose sink would serve this query as an API. Nothing reads it yet — it is accepted, stored and written back unchanged, and naming a sync that does not exist is not refused. Omit it for parallel egress from the view store.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": false
+    },
+    "QueryType": {
+      "type": "string",
+      "description": "The kind of pull-based query surface a served resource exposes to consumers.",
+      "oneOf": [
+        {
+          "const": "rest",
+          "description": "A RESTful HTTP endpoint queried over standard request/response semantics."
+        },
+        {
+          "const": "graphql",
+          "description": "A GraphQL endpoint where consumers shape responses with their own queries."
+        },
+        {
+          "const": "mcp",
+          "description": "A Model Context Protocol endpoint exposing the resource to AI tools and agents."
+        }
+      ]
+    },
+    "ReadMode": {
+      "type": "string",
+      "description": "Pipeline read mode: what a pipeline consumes from a cdc source, along snapshot x change-tail.",
+      "oneOf": [
+        {
+          "const": "snapshot_and_cdc",
+          "description": "Full initial snapshot, then continuously apply the incremental change tail (the default)."
+        },
+        {
+          "const": "cdc_only",
+          "description": "Skip the initial snapshot and read only the incremental change tail."
+        },
+        {
+          "const": "snapshot_only",
+          "description": "Read the current rows once as a bounded pass and stop; no incremental tail."
+        }
+      ]
+    },
+    "RenameCase": {
+      "type": "string",
+      "description": "Case conversion applied to the source name before any prefix or suffix is added.",
+      "oneOf": [
+        {
+          "const": "upper",
+          "description": "Convert the name to all uppercase letters."
+        },
+        {
+          "const": "lower",
+          "description": "Convert the name to all lowercase letters."
+        },
+        {
+          "const": "camel",
+          "description": "Convert the name to camelCase, lowercasing the first word."
+        },
+        {
+          "const": "pascal",
+          "description": "Convert the name to PascalCase, capitalizing the first letter of each word."
+        }
+      ]
+    },
+    "RenameSpec": {
+      "type": "object",
+      "description": "Sink-side table rename rules: an explicit per-table name map plus bulk case and prefix/suffix transforms.",
+      "properties": {
+        "map": {
+          "description": "Explicit per-table rename map from source name to target name; takes highest priority.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "case": {
+          "description": "Case transform applied to table names before prefix/suffix rules.",
+          "$ref": "#/$defs/RenameCase"
+        },
+        "prefix": {
+          "description": "Prefix prepended to each target table name.",
+          "type": "string"
+        },
+        "suffix": {
+          "description": "Suffix appended to each target table name.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Resource": {
+      "description": "A top-level tapstate/v1 resource; one document holds exactly one of source, pipeline, transform, view or serve.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/SourceResource"
+        },
+        {
+          "$ref": "#/$defs/PipelineResource"
+        },
+        {
+          "$ref": "#/$defs/TransformResource"
+        },
+        {
+          "$ref": "#/$defs/ViewResource"
+        },
+        {
+          "$ref": "#/$defs/ServeResource"
+        }
+      ]
+    },
+    "ServeBlock": {
+      "description": "The publish surface of a pipeline: either an inline serve definition or a reference to a reusable serve body.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/ServeBlock.Inline"
+        },
+        {
+          "$ref": "#/$defs/ServeBlock.Use"
+        }
+      ]
+    },
+    "ServeBlock.Inline": {
+      "type": "object",
+      "description": "An inline serve definition that declares the sync, query and push surfaces directly on the pipeline.",
+      "properties": {
+        "id": {
+          "description": "Optional id for this serve block.",
+          "type": "string"
+        },
+        "from": {
+          "description": "The data source this serve block exposes.",
+          "$ref": "#/$defs/FromClause"
+        },
+        "sync": {
+          "description": "Tables continuously synchronized to the serving layer.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SyncElement"
+          }
+        },
+        "query": {
+          "description": "Read endpoints exposed for querying the served data.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/QueryElement"
+          }
+        },
+        "push": {
+          "description": "Push endpoints that stream changes to downstream consumers.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PushElement"
+          }
+        }
+      },
+      "required": [
+        "from"
+      ],
+      "additionalProperties": false
+    },
+    "ServeBlock.Use": {
+      "type": "object",
+      "description": "A serve block that references a reusable serve definition body by name.",
+      "properties": {
+        "id": {
+          "description": "Optional id for this serve block; defaults to the referenced definition name.",
+          "type": "string"
+        },
+        "use": {
+          "description": "Name of the reusable serve definition to use.",
+          "type": "string"
+        },
+        "from": {
+          "description": "The data source this serve block exposes.",
+          "$ref": "#/$defs/FromClause"
+        }
+      },
+      "required": [
+        "use",
+        "from"
+      ],
+      "additionalProperties": false
+    },
+    "ServeResource": {
+      "type": "object",
+      "description": "Reusable publish-surface definition holding sync, query and push declarations without source wiring.",
+      "properties": {
+        "version": {
+          "description": "The grammar version; always \"tapstate/v1\".",
+          "const": "tapstate/v1"
+        },
+        "kind": {
+          "description": "Resource kind discriminator.",
+          "const": "serve"
+        },
+        "id": {
+          "description": "Unique resource id across the workspace; must not contain a dot.",
+          "type": "string"
+        },
+        "metadata": {
+          "description": "Optional labels and free-text description.",
+          "$ref": "#/$defs/Metadata"
+        },
+        "sync": {
+          "description": "Sync publish declarations exposed by this serve surface.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SyncElement"
+          }
+        },
+        "query": {
+          "description": "Query publish declarations exposed by this serve surface.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/QueryElement"
+          }
+        },
+        "push": {
+          "description": "Push publish declarations exposed by this serve surface.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PushElement"
+          }
+        },
+        "experimental": {
+          "description": "Experimental fields, exempt from the v1 compatibility freeze.",
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "version",
+        "kind",
+        "id"
+      ],
+      "additionalProperties": false
+    },
+    "Settings": {
+      "type": "object",
+      "description": "Task-level settings shared across a task: cross-cutting knobs plus the read axis.",
+      "properties": {
+        "error_policy": {
+          "description": "How the task reacts to record-level errors during processing.",
+          "$ref": "#/$defs/ErrorPolicy",
+          "default": "fail"
+        },
+        "batch_size": {
+          "description": "Number of records processed per batch.",
+          "type": "integer",
+          "default": 1000
+        },
+        "parallelism": {
+          "description": "Number of parallel workers used to process the task.",
+          "type": "integer",
+          "default": 1
+        },
+        "schedule": {
+          "description": "Cron-style schedule for running the task; only valid for a bounded read.",
+          "type": "string"
+        },
+        "read_mode": {
+          "description": "What the pipeline reads from a cdc source: full snapshot then changes, changes only, or a one-shot snapshot.",
+          "$ref": "#/$defs/ReadMode",
+          "default": "snapshot_and_cdc"
+        },
+        "start_from": {
+          "description": "Where to start consuming an incremental tail: earliest, latest, or an ISO-8601 timestamp.",
+          "type": "string",
+          "default": "latest"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SourceMode": {
+      "type": "string",
+      "description": "Source read mode: how the connector reads, along boundedness × change-awareness.",
+      "oneOf": [
+        {
+          "const": "cdc",
+          "description": "Change data capture — an unbounded stream of inserts, updates and deletes."
+        },
+        {
+          "const": "snapshot",
+          "description": "One-shot bounded read of current rows; no change capture."
+        },
+        {
+          "const": "stream",
+          "description": "Unbounded push stream from a message system."
+        },
+        {
+          "const": "file",
+          "description": "Bounded read from files."
+        },
+        {
+          "const": "api",
+          "description": "Pull from an API or SaaS endpoint."
+        }
+      ]
+    },
+    "SourceRef": {
+      "description": "A source this pipeline reads from: a bare source id, or an object carrying its srs switch.",
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "$ref": "#/$defs/SourceRef.Spec"
+        }
+      ]
+    },
+    "SourceRef.Spec": {
+      "type": "object",
+      "description": "A source reference carrying this pipeline's own srs switch for that source.",
+      "properties": {
+        "id": {
+          "description": "Id of the source this pipeline reads from.",
+          "type": "string"
+        },
+        "srs": {
+          "description": "Whether this pipeline reads that source through the shared replay store. Materialized from the source on first apply, and only follows this file after.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "srs"
+      ],
+      "additionalProperties": false
+    },
+    "SourceResource": {
+      "type": "object",
+      "description": "kind: source — an independent collection/mining resource owning connection config and, for CDC, the Shared Record Store.",
+      "properties": {
+        "version": {
+          "description": "The grammar version; always \"tapstate/v1\".",
+          "const": "tapstate/v1"
+        },
+        "kind": {
+          "description": "Resource kind discriminator.",
+          "const": "source"
+        },
+        "id": {
+          "description": "Unique resource id across the workspace; must not contain a dot.",
+          "type": "string"
+        },
+        "metadata": {
+          "description": "Optional labels and free-text description.",
+          "$ref": "#/$defs/Metadata"
+        },
+        "connector": {
+          "description": "Id of the connector this source reads through (e.g. mysql, kafka).",
+          "type": "string"
+        },
+        "config": {
+          "description": "Connector connection config; keys are connector-specific.",
+          "type": "object",
+          "additionalProperties": true
+        },
+        "mode": {
+          "description": "Read mode; may be omitted when the source is only a connection supplier.",
+          "$ref": "#/$defs/SourceMode"
+        },
+        "tables": {
+          "description": "Tables to read: bare names, /regex/ patterns, or per-table objects.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TableRef"
+          }
+        },
+        "srs": {
+          "description": "Shared Record Store configuration; only valid on cdc sources.",
+          "$ref": "#/$defs/Srs"
+        },
+        "experimental": {
+          "description": "Experimental fields, exempt from the v1 compatibility freeze.",
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "version",
+        "kind",
+        "id",
+        "connector"
+      ],
+      "additionalProperties": false
+    },
+    "Srs": {
+      "type": "object",
+      "description": "Stream Replay Store configuration; only valid on sources running in cdc mode.",
+      "properties": {
+        "key": {
+          "description": "Shared mining-chain assertion key identifying the replay store.",
+          "type": "string"
+        },
+        "retention": {
+          "description": "How long captured change data is retained in the replay store.",
+          "type": "string"
+        },
+        "schema_evolution": {
+          "description": "Schema-evolution policy applied as upstream table structures change.",
+          "$ref": "#/$defs/SrsSchemaEvolution"
+        },
+        "queryable": {
+          "description": "Whether the replay store can be queried directly.",
+          "type": "boolean"
+        },
+        "enabled": {
+          "description": "Whether the replay store is provisioned; false streams cdc straight to the single consumer with no shared buffering.",
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "SrsSchemaEvolution": {
+      "type": "string",
+      "description": "How the source reacts to schema changes detected at the origin during streaming.",
+      "oneOf": [
+        {
+          "const": "track",
+          "description": "Track schema changes and propagate them downstream as they occur."
+        },
+        {
+          "const": "ignore",
+          "description": "Ignore schema changes and keep reading against the originally discovered schema."
+        }
+      ]
+    },
+    "Step": {
+      "description": "One transform in the pipeline: either an inline transform definition or a reference to a named transform.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/Step.Inline"
+        },
+        {
+          "$ref": "#/$defs/Step.Use"
+        }
+      ]
+    },
+    "Step.Inline": {
+      "type": "object",
+      "description": "A transform defined inline in the pipeline, with its body specified directly.",
+      "properties": {
+        "id": {
+          "description": "Unique step id within the pipeline; auto-generated for anonymous inline steps.",
+          "type": "string"
+        },
+        "from": {
+          "description": "The upstream steps or sources this transform reads from.",
+          "$ref": "#/$defs/FromClause"
+        },
+        "experimental": {
+          "description": "Experimental fields, exempt from the v1 compatibility freeze.",
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "id",
+        "from"
+      ],
+      "allOf": [
+        {
+          "$ref": "#/$defs/TransformBody"
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "Step.Use": {
+      "type": "object",
+      "description": "A reference to a named transform definition, used as defined.",
+      "properties": {
+        "id": {
+          "description": "Unique step id within the pipeline; defaults to the referenced transform name.",
+          "type": "string"
+        },
+        "use": {
+          "description": "Name of the transform definition to reuse.",
+          "type": "string"
+        },
+        "from": {
+          "description": "The upstream steps or sources this transform reads from.",
+          "$ref": "#/$defs/FromClause"
+        }
+      },
+      "required": [
+        "use",
+        "from"
+      ],
+      "additionalProperties": false
+    },
+    "Storage": {
+      "type": "object",
+      "description": "Tiered storage configuration for a view: hot in-memory, warm database, and cold data-lake layers.",
+      "properties": {
+        "hot": {
+          "description": "Hot in-memory layer settings.",
+          "$ref": "#/$defs/Storage.Hot"
+        },
+        "warm": {
+          "description": "Warm database layer settings.",
+          "$ref": "#/$defs/Storage.Warm"
+        },
+        "cold": {
+          "description": "Cold data-lake layer settings.",
+          "$ref": "#/$defs/Storage.Cold"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Storage.Cold": {
+      "type": "object",
+      "description": "Cold data-lake storage layer of a view.",
+      "properties": {
+        "partition_by": {
+          "description": "Fields to partition cold data by.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Storage.Hot": {
+      "type": "object",
+      "description": "Hot in-memory storage layer of a view.",
+      "properties": {
+        "ttl": {
+          "description": "Time-to-live for hot entries, as a duration string.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ttl"
+      ],
+      "additionalProperties": false
+    },
+    "Storage.Warm": {
+      "type": "object",
+      "description": "Warm database storage layer of a view.",
+      "properties": {
+        "collection": {
+          "description": "Database collection that backs the warm layer.",
+          "type": "string"
+        },
+        "indexes": {
+          "description": "Indexes to create on the warm collection.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "collection"
+      ],
+      "additionalProperties": false
+    },
+    "SyncElement": {
+      "type": "object",
+      "description": "One serve.sync element — a table-model write of pipeline output to an external store.",
+      "properties": {
+        "id": {
+          "description": "Optional id for this sync element; generated from its position when omitted.",
+          "type": "string"
+        },
+        "source": {
+          "description": "Reference to a kind: source connection supplier that provides the target connector and config.",
+          "type": "string"
+        },
+        "write_mode": {
+          "description": "How rows are written to the target — for example upsert or append.",
+          "$ref": "#/$defs/WriteMode",
+          "default": "upsert"
+        },
+        "rename": {
+          "description": "Rules for renaming the target table and columns relative to the pipeline output.",
+          "$ref": "#/$defs/RenameSpec"
+        },
+        "ddl": {
+          "description": "Policy controlling how schema changes are applied to the target store.",
+          "$ref": "#/$defs/DdlPolicy",
+          "default": "fail"
+        },
+        "on_full_load": {
+          "description": "Treatment of existing target rows before a new full load; resume, recovery and CDC-only never clear rows.",
+          "$ref": "#/$defs/OnFullLoad",
+          "default": "append"
+        }
+      },
+      "required": [
+        "source"
+      ],
+      "additionalProperties": false
+    },
+    "TableRef": {
+      "description": "A table selected from the source: a bare name, a regex pattern, or an object with per-table configuration.",
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "$ref": "#/$defs/TableRef.Spec"
+        }
+      ]
+    },
+    "TableRef.Spec": {
+      "type": "object",
+      "description": "A table selected by literal name with optional per-table configuration.",
+      "properties": {
+        "name": {
+          "description": "Literal name of the table to select from the source.",
+          "type": "string"
+        },
+        "filter": {
+          "description": "CEL row expression that filters which rows of the table are included.",
+          "type": "string"
+        },
+        "pk": {
+          "description": "Primary key column names used to identify rows when the source does not declare one.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "additionalProperties": false
+    },
+    "TransformBody": {
+      "description": "Type-specific payload of a transform, selected by the type discriminator.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/TransformBody.Js"
+        },
+        {
+          "$ref": "#/$defs/TransformBody.MapProjection"
+        },
+        {
+          "$ref": "#/$defs/TransformBody.Filter"
+        },
+        {
+          "$ref": "#/$defs/TransformBody.Unwind"
+        },
+        {
+          "$ref": "#/$defs/TransformBody.Union"
+        },
+        {
+          "$ref": "#/$defs/TransformBody.Nest"
+        },
+        {
+          "$ref": "#/$defs/TransformBody.Join"
+        }
+      ]
+    },
+    "TransformBody.Filter": {
+      "type": "object",
+      "description": "Row predicate transform; rows failing the expression are dropped while non-row events pass through.",
+      "properties": {
+        "type": {
+          "description": "Transform type discriminator.",
+          "const": "filter"
+        },
+        "expr": {
+          "description": "The CEL boolean expression evaluated against each row.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "expr"
+      ]
+    },
+    "TransformBody.Join": {
+      "type": "object",
+      "description": "Materializes a flat wide table by joining streams with SQL.",
+      "properties": {
+        "type": {
+          "description": "Transform type discriminator.",
+          "const": "join"
+        },
+        "engine": {
+          "description": "The engine that runs the join.",
+          "$ref": "#/$defs/JoinEngine"
+        },
+        "sql": {
+          "description": "The SQL query that produces the joined wide table.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "engine",
+        "sql"
+      ]
+    },
+    "TransformBody.Js": {
+      "type": "object",
+      "description": "JavaScript transform running on GraalVM; sees every event.",
+      "properties": {
+        "type": {
+          "description": "Transform type discriminator.",
+          "const": "js"
+        },
+        "script": {
+          "description": "The JavaScript source executed for each event.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "script"
+      ]
+    },
+    "TransformBody.MapProjection": {
+      "type": "object",
+      "description": "Field projection transform; the declared field order is the output order.",
+      "properties": {
+        "type": {
+          "description": "Transform type discriminator.",
+          "const": "map"
+        },
+        "fields": {
+          "description": "Output fields keyed by name, each mapped by a field rule; declared order is the output order.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/FieldRule"
+          }
+        }
+      },
+      "required": [
+        "type",
+        "fields"
+      ]
+    },
+    "TransformBody.Nest": {
+      "type": "object",
+      "description": "Stateful transform that materializes nested documents from related streams.",
+      "properties": {
+        "type": {
+          "description": "Transform type discriminator.",
+          "const": "nest"
+        },
+        "primary_key": {
+          "description": "Primary key used to group child records under their parent document.",
+          "type": "string"
+        },
+        "order": {
+          "description": "Ordering applied to nested child records.",
+          "$ref": "#/$defs/NestOrder"
+        },
+        "entries_in_memory": {
+          "description": "How many entries each of this nest's levels keeps in memory; what is beyond it is kept on the layer behind them and read back as it is asked for. A count of entries, not of bytes. Absent leaves the number the deployment was started with.",
+          "type": "integer"
+        },
+        "max_elements_per_document": {
+          "description": "How many embedded elements one document of this nest may hold before the run is failed. Per document rather than per nest: a document is assembled whole, so no layer behind the memory can absorb one that outgrows it. Absent leaves the number the deployment was started with.",
+          "type": "integer"
+        },
+        "state": {
+          "description": "Durable state placement for this nest; absent inherits the deployment default.",
+          "$ref": "#/$defs/NestStateStorage"
+        },
+        "root": {
+          "description": "The root stream whose documents receive the nested children.",
+          "$ref": "#/$defs/NestRoot"
+        }
+      },
+      "required": [
+        "type",
+        "root"
+      ]
+    },
+    "TransformBody.Union": {
+      "type": "object",
+      "description": "Explicit merge of multiple input streams into one.",
+      "properties": {
+        "type": {
+          "description": "Transform type discriminator.",
+          "const": "union"
+        }
+      },
+      "required": [
+        "type"
+      ]
+    },
+    "TransformBody.Unwind": {
+      "type": "object",
+      "description": "Expands one row into one row per element of an array field.",
+      "properties": {
+        "type": {
+          "description": "Transform type discriminator.",
+          "const": "unwind"
+        },
+        "path": {
+          "description": "The array field to expand; one output row is produced per element of it.",
+          "type": "string"
+        },
+        "include_array_index": {
+          "description": "Name of a column carrying each element's ordinal within the array; absent adds none.",
+          "type": "string"
+        },
+        "preserve_null_and_empty_arrays": {
+          "description": "Whether a row whose array is null, missing or empty still produces one output row, that field left empty. Absent drops such rows.",
+          "type": "boolean",
+          "default": false
+        },
+        "element_key": {
+          "description": "Field inside each element that identifies its row; also copied into a top-level column of the same name, which joins the parent key at the target.",
+          "type": "string"
+        },
+        "element_type": {
+          "description": "Declared type of the expanded column; absent leaves the connector to infer one.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "path"
+      ]
+    },
+    "TransformResource": {
+      "type": "object",
+      "description": "A reusable transform definition holding pure logic that pipeline steps can reference; it cannot declare its own input wiring.",
+      "properties": {
+        "version": {
+          "description": "The grammar version; always \"tapstate/v1\".",
+          "const": "tapstate/v1"
+        },
+        "kind": {
+          "description": "Resource kind discriminator.",
+          "const": "transform"
+        },
+        "id": {
+          "description": "Unique resource id across the workspace; must not contain a dot.",
+          "type": "string"
+        },
+        "metadata": {
+          "description": "Optional labels and free-text description.",
+          "$ref": "#/$defs/Metadata"
+        },
+        "experimental": {
+          "description": "Experimental fields, exempt from the v1 compatibility freeze.",
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "version",
+        "kind",
+        "id"
+      ],
+      "allOf": [
+        {
+          "$ref": "#/$defs/TransformBody"
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "ViewBlock": {
+      "description": "The view block of a pipeline: an inline private MDM sink, or a use-reference to a separately defined view body.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/ViewBlock.Inline"
+        },
+        {
+          "$ref": "#/$defs/ViewBlock.Use"
+        }
+      ]
+    },
+    "ViewBlock.Inline": {
+      "type": "object",
+      "description": "An inline view that defines its private MDM sink directly inside the pipeline.",
+      "properties": {
+        "id": {
+          "description": "Unique resource id across the workspace; must not contain a dot.",
+          "type": "string"
+        },
+        "from": {
+          "description": "The upstream source this view consumes records from.",
+          "$ref": "#/$defs/FromRef"
+        },
+        "primary_key": {
+          "description": "Field or fields that uniquely identify a record in this view.",
+          "type": "string"
+        },
+        "storage": {
+          "description": "Storage backend used to persist this view.",
+          "$ref": "#/$defs/Storage"
+        }
+      },
+      "required": [
+        "id",
+        "from",
+        "primary_key"
+      ],
+      "additionalProperties": false
+    },
+    "ViewBlock.Use": {
+      "type": "object",
+      "description": "A reference to a separately defined view body, reused inside this pipeline.",
+      "properties": {
+        "id": {
+          "description": "Unique resource id across the workspace; must not contain a dot. Defaults to the referenced view name.",
+          "type": "string"
+        },
+        "use": {
+          "description": "Name of the externally defined view to reuse.",
+          "type": "string"
+        },
+        "from": {
+          "description": "The upstream source this view consumes records from.",
+          "$ref": "#/$defs/FromRef"
+        }
+      },
+      "required": [
+        "use",
+        "from"
+      ],
+      "additionalProperties": false
+    },
+    "ViewResource": {
+      "type": "object",
+      "description": "A reusable view: declares where and how to materialize data, without any inbound wiring.",
+      "properties": {
+        "version": {
+          "description": "The grammar version; always \"tapstate/v1\".",
+          "const": "tapstate/v1"
+        },
+        "kind": {
+          "description": "Resource kind discriminator.",
+          "const": "view"
+        },
+        "id": {
+          "description": "Unique resource id across the workspace; must not contain a dot.",
+          "type": "string"
+        },
+        "metadata": {
+          "description": "Optional labels and free-text description.",
+          "$ref": "#/$defs/Metadata"
+        },
+        "primary_key": {
+          "description": "Name of the column used as the view's primary key.",
+          "type": "string"
+        },
+        "storage": {
+          "description": "Where and how the view's data is materialized.",
+          "$ref": "#/$defs/Storage"
+        },
+        "experimental": {
+          "description": "Experimental fields, exempt from the v1 compatibility freeze.",
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "version",
+        "kind",
+        "id",
+        "primary_key"
+      ],
+      "additionalProperties": false
+    },
+    "WriteMode": {
+      "type": "string",
+      "description": "How a sink applies inserts, updates and deletes to the target.",
+      "oneOf": [
+        {
+          "const": "upsert",
+          "description": "Insert new rows and update existing ones by primary key; deletes remove the matching row."
+        },
+        {
+          "const": "append",
+          "description": "Always insert rows without matching on a key; updates and deletes are not applied."
+        }
+      ]
+    }
+  }
+}

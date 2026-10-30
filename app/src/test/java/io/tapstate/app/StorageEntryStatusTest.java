@@ -48,4 +48,26 @@ class StorageEntryStatusTest {
         assertThat(reader.read().entry()).isEqualTo(StorageEntryStatus.Entry.UNAVAILABLE);
         verifyNoInteractions(states);
     }
+    @Test void firstAdministratorEntryWaitsForTheActualBusinessAdmissionGate() {
+        var reader = reader();
+        var administrators = mock(FirstAdminStore.class);
+        var files = mock(InstallationFiles.class);
+        when(installation.files()).thenReturn(files);
+        when(files.stage()).thenReturn(new InstallationFiles.Stage(scope, InstallationFiles.Handoff.RESTARTED,
+                "a".repeat(64), "http://127.0.0.1:8081"));
+        when(root.phase()).thenReturn(StorageRoot.Phase.BUSINESS_READY);
+        when(states.load()).thenReturn(new StorageSetupStateStore.Status(scope, StorageSetupStateStore.Phase.COMPLETE, 1));
+        when(installation.normalStartupAllowed()).thenReturn(true);
+        when(configuration.firstAdmin()).thenReturn(administrators);
+        when(administrators.load()).thenReturn(Optional.of(new FirstAdminStore.Status(scope, 1,
+                FirstAdminStore.Phase.PENDING, null)));
+        when(runtime.businessStarted()).thenReturn(false);
+        assertThat(reader.read().entry()).isEqualTo(StorageEntryStatus.Entry.UNAVAILABLE);
+        when(runtime.businessStarted()).thenReturn(true);
+        assertThat(reader.read().entry()).isEqualTo(StorageEntryStatus.Entry.FIRST_ADMIN_REQUIRED);
+        when(files.stage()).thenReturn(new InstallationFiles.Stage(scope, InstallationFiles.Handoff.RESTART_REQUIRED,
+                "a".repeat(64), "http://127.0.0.1:8081"));
+        assertThat(reader.read().entry()).isEqualTo(StorageEntryStatus.Entry.UNAVAILABLE);
+        verify(runtime, never()).loadBound();
+    }
 }

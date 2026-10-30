@@ -92,25 +92,17 @@ class PublishedExamplesIT {
      * the directory named from outside, gated first - so a developer machine skips a real-connector
      * example the way it skips any real-connector witness, and a named-but-broken directory fails it.
      * The gate must run before the property is overridden: it is asking about the outside directory.
-     * The managed Mongo dependency may instead come from its separately verified CI input; a named
-     * input that is unavailable fails, without turning on unrelated real-connector gates.
      */
     private void stageConnectorJars(List<String> connectorIds) {
-        String supplied = System.getProperty("tapstate.e2e.managed-mongo-jar");
-        Path managedMongo = supplied == null || supplied.isBlank() ? null : Path.of(supplied);
         List<String> real = connectorIds.stream()
                 .filter(connectorId -> !E2eConnectorJar.CONNECTOR_ID.equals(connectorId))
                 .toList();
         if (!real.isEmpty()) {
-            var external = real.stream().filter(id -> !id.equals("mongodb") || managedMongo == null).toList();
-            if (!external.isEmpty()) RealConnectorGate.require(external.toArray(String[]::new));
-            if (managedMongo != null && real.contains("mongodb"))
-                assertThat(managedMongo).as("the explicitly supplied managed-target connector").isRegularFile();
+            RealConnectorGate.require(real.toArray(String[]::new));
             try {
                 for (String connectorId : real) {
                     Files.write(connectorJars.resolve(connectorId + "-connector.jar"),
-                            connectorId.equals("mongodb") && managedMongo != null
-                                    ? Files.readAllBytes(managedMongo) : ConnectorJars.bytesFor(connectorId));
+                            ConnectorJars.bytesFor(connectorId));
                 }
             } catch (IOException e) {
                 throw new UncheckedIOException("cannot stage real connector jars for this run", e);

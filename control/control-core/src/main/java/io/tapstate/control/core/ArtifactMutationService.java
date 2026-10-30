@@ -251,6 +251,15 @@ public final class ArtifactMutationService {
      * partly-executed removal would do next — learning nothing about the residue it now owns.
      */
     public void delete(String principal, String id, String expectedContentHash) {
+        delete(principal, id, expectedContentHash, ControlOperations.ARTIFACT_DELETE);
+    }
+
+    /** Shares Artifact guards and reclaim while attributing the whole-Pipeline operation to its own audit verb. */
+    void deletePipeline(String principal, String id, String expectedContentHash) {
+        delete(principal, id, expectedContentHash, ControlOperations.PIPELINE_DELETE);
+    }
+
+    private void delete(String principal, String id, String expectedContentHash, Operation operation) {
         Objects.requireNonNull(principal, "principal");
         Objects.requireNonNull(id, "id");
         if (expectedContentHash == null) {
@@ -288,7 +297,7 @@ public final class ArtifactMutationService {
         // caller offered is the only one that describes the attempt.
         AuditContext audit = new AuditContext(principal, id, expectedContentHash);
         Runnable originalDeletion = nativeDeletion;
-        auditGate.dispatch(ControlOperations.ARTIFACT_DELETE, audit, () -> {
+        auditGate.dispatch(operation, audit, () -> {
             if (originalDeletion != null) {
                 originalDeletion.run(); return null;
             }

@@ -384,6 +384,11 @@ public final class MongoConnection implements AutoCloseable {
     }
 
     /** The verified keyring view used by the artifact store after migration has completed. */
+    /** Owner-scoped encrypted AI credentials in the verified metadata database. */
+    public io.tapstate.spi.store.AiProviderSettingsStore aiProviderSettings() {
+        return new MongoAiProviderSettingsStore(client, database(), sourceConfigKeyring());
+    }
+
     public SourceConfigKeyringHandle sourceConfigKeyring() {
         if (sourceConfigKeyring == null) {
             throw new IllegalStateException("Source config keyring not verified");

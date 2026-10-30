@@ -2,6 +2,9 @@ package io.tapstate.app;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.CaptureReading;
+import io.tapstate.core.lifecycle.ExecutionPlan;
+import io.tapstate.core.lifecycle.InitialLoad;
+import java.time.Instant;
 import io.tapstate.core.lifecycle.SnapshotReading;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.WorkloadClaimFence;
@@ -31,6 +34,9 @@ final class RunBoundCaptureReadings implements PipelineCaptureCoordinator {
     }
     @Override public SnapshotReading runSnapshotProgress(String pipeline) {
         return read(pipeline, SnapshotReading.NONE, original -> view(original).runSnapshotProgress(pipeline));
+    }
+    @Override public InitialLoad initialLoad(String pipeline, ExecutionPlan plan, Instant at) {
+        return read(pipeline, null, original -> view(original).initialLoad(pipeline, plan, at));
     }
     @Override public CaptureReading capturedRows(String pipeline) {
         return read(pipeline, CaptureReading.NONE, original -> arrivals.apply(pipeline));

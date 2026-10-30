@@ -190,7 +190,7 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
     private Document requireOriginal(ClientSession session, PipelineIntentScope scope, String preparationId) {
         Document row = claimRow(session, scope);
         if (row == null) throw rebuild(scope);
-        raw(session).read(pipelineKey(scope)).orElseThrow();
+        if (raw(session).read(pipelineKey(scope)).isEmpty()) throw new java.util.NoSuchElementException("No value present");
         try {
             if (!(row.get("pipelineScope") instanceof Document stored) || !scope.equals(MongoPipelinePreparationFacts.scope(stored))) throw rebuild(scope);
             phase(row, scope);
@@ -215,8 +215,8 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
         Document row = stateRow(session, scope);
         var prior=retiredBirth(claimRow(session,scope),scope);
         if (row == null || !MongoPipelinePreparationFacts.scope(scope).equals(row.get("scope"))
-                || !Long.valueOf(prior.map(value -> value.epoch()+1).orElse(0L)).equals(row.get("epoch"))
-                || !Long.valueOf(prior.map(value -> value.writeFence()+1).orElse(1L)).equals(row.get("runtimeWriteFence"))
+                || !prior.map(value -> value.epoch()+1).orElse(0L).equals(row.get("epoch"))
+                || !prior.map(value -> value.writeFence()+1).orElse(1L).equals(row.get("runtimeWriteFence"))
                 || !StateJson.of(PipelineState.NEW).equals(row.get("stateJson")) || !(row.get("touchMillis") instanceof Long)) throw rebuild(scope);
         MongoSinkPreparationStore.requireEmpty(session,database,scope);
         var inputs = MongoPipelineSourcePreparations.retained(session,database,scope);

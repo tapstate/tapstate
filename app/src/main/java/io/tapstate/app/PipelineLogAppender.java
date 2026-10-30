@@ -39,7 +39,7 @@ final class PipelineLogAppender extends AppenderBase<ILoggingEvent> {
             return;
         }
         sink.append(pipelineId,
-                new LogLine(event.getTimeStamp(), event.getLevel().toString(), redactor.redact(render(event))));
+                new LogLine(event.getTimeStamp(), event.getLevel().toString(), redactor.redactLog(render(event))));
     }
 
     /** The formatted message, with the exception's stack trace appended when the event carries one. */

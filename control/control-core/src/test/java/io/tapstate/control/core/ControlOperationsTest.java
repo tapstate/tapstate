@@ -16,7 +16,10 @@ class ControlOperationsTest {
                 .containsExactlyInAnyOrder(
                         "alert.rule-preview", "alert.route-preview", "alert.catalog", "alert.resources", "alert.center", "alert.detail", "alert.deliveries", "alert.health", "alert.configuration.list", "alert.configuration.save", "alert.configuration.retire", "alert.preview", "alert.test", "alert.test-result", "alert.retry",
                         "storage.status", "storage.test", "storage.setup.commit", "storage.setup.status", "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status",
-                        "configuration.export", "configuration.import.preflight", "configuration.import.commit", "configuration.import.status", "system.version",
+                        "configuration.export", "configuration.import.preflight", "configuration.import.commit", "configuration.import.status",
+                        "ai-provider.get", "ai-provider.replace", "ai-provider.delete", "ai-provider.check",
+                        "pipeline-draft.assistant", "pipeline-draft.assistant-validate",
+                        "system.version",
                         "artifact.apply",
                         "artifact.validate",
                         "artifact.get",
@@ -48,6 +51,7 @@ class ControlOperationsTest {
                         "cluster.context",
                         "pipeline.list",
                         "pipeline.catalog",
+                        "pipeline.delete",
                         "view.list",
                         "pipeline.get",
                         "pipeline.layout.get",
@@ -133,7 +137,7 @@ class ControlOperationsTest {
         assertThat(registry.resolve("cluster.members").scope()).isEqualTo(Scope.READ);
         // The layout update replaces editor metadata, while the lifecycle verbs write desired state.
         for (String id : List.of(
-                "pipeline.layout.update", "pipeline.create", "pipeline.update", "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume")) {
+                "pipeline.layout.update", "pipeline.create", "pipeline.update", "pipeline.delete", "pipeline.start", "pipeline.stop", "pipeline.pause", "pipeline.resume")) {
             assertThat(registry.resolve(id).scope()).as(id).isEqualTo(Scope.WRITE);
         }
         // The static Pipeline projection, layout read, and observation reads are all
@@ -169,6 +173,7 @@ class ControlOperationsTest {
                         "pipeline.pause",
                         "pipeline.resume",
                         "pipeline.update",
+                        "pipeline.delete",
                         "pipeline.create",
                         "user.create",
                         "user.passwd",
@@ -218,9 +223,9 @@ class ControlOperationsTest {
     void theRegistryOpensEveryUsableOperationOnCliAndKeepsTheRevealReservationClosed() {
         // The cluster context is REST-only. The reveal reservation stays unpublished until its
         // dedicated authorizer exists.
-        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(78);
+        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(84);
         assertThat(registry.all()).filteredOn(op -> !"source.reveal-config".equals(op.id())
-                && !"cluster.context".equals(op.id()) && !op.id().startsWith("alert.")).allSatisfy(op ->
+                && !"cluster.context".equals(op.id()) && !"pipeline.delete".equals(op.id()) && !op.id().startsWith("alert.")).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
         assertThat(registry.all()).filteredOn(op -> op.id().startsWith("alert.")).hasSize(15).allSatisfy(op ->
                 assertThat(op.exposure()).containsOnlyKeys(Frontend.REST));
@@ -271,6 +276,8 @@ class ControlOperationsTest {
                 .extracting(Operation::id)
                 .containsExactlyInAnyOrder(
                         "alert.rule-preview", "alert.route-preview", "alert.catalog", "alert.resources", "alert.center", "alert.detail", "alert.deliveries", "alert.health", "alert.configuration.list", "alert.configuration.save", "alert.configuration.retire", "alert.preview", "alert.test", "alert.test-result", "alert.retry",
+                        "ai-provider.get", "ai-provider.replace", "ai-provider.delete", "ai-provider.check",
+                        "pipeline-draft.assistant", "pipeline-draft.assistant-validate",
                         "sample-source.list", "sample-source.install", "state-store.connect",
                         "storage.status", "storage.test", "storage.setup.commit", "storage.setup.status", "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status",
                         "configuration.export", "configuration.import.preflight", "configuration.import.commit", "configuration.import.status",
@@ -278,7 +285,7 @@ class ControlOperationsTest {
                         "pipeline-draft.list", "pipeline-draft.get", "pipeline-draft.create",
                         "pipeline-draft.replace", "pipeline-draft.delete", "pipeline-draft.preview",
                         "pipeline.preview",
-                        "pipeline-draft.publish", "pipeline-draft.rebase", "pipeline.catalog");
+                        "pipeline-draft.publish", "pipeline-draft.rebase", "pipeline.catalog", "pipeline.delete");
     }
 
     /**

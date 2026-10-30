@@ -144,7 +144,7 @@ final class MongoSrsModelContexts {
                     || !(row.get("firstSequence") instanceof Long first) || first < 0
                     || !(row.get("publishedVersion") instanceof Long version) || version < 0 || version == Long.MAX_VALUE
                     || !(row.get("publishedSequence") instanceof Long sequence) || sequence < first
-                    || (version == 0 && sequence != first) || (version > 0 && sequence <= first)
+                    || (version == 0 && sequence.longValue() != first.longValue()) || (version > 0 && sequence <= first)
                     || !(row.get("publishedHash") instanceof String hash) || hash.isBlank()) throw unreadable();
             SrsModelKey key = identity(row.get("_id", Document.class));
             Document storedFence = row.get("captureFence", Document.class);

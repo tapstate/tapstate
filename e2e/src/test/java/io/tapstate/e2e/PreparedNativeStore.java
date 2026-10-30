@@ -29,6 +29,18 @@ final class PreparedNativeStore implements AutoCloseable {
         this.uriForDatabase = uriForDatabase;
     }
 
+    static PreparedNativeStore createCloud() {
+        var result = new PreparedNativeStore("e2e-" + UUID.randomUUID(), null, null, null, SharedMongo::replicaSetUrl);
+        try {
+            var cache = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB, result.cacheUri(), result.cacheDatabase, null);
+            NativeMongoStorageFixture.prepareCloud(result.configurationUri(), cache, result.masterUri(), result.cluster);
+            return result;
+        } catch (RuntimeException | Error failure) {
+            try { result.close(); } catch (RuntimeException cleanup) { failure.addSuppressed(cleanup); }
+            throw failure;
+        }
+    }
+
     static PreparedNativeStore create() {
         return create("e2e", "e2e-password");
     }

@@ -34,6 +34,8 @@ public final class DefaultSourceVerification implements ConnectionTestService.Ob
     private final ConnectionTestResultStore results;
     private final Clock clock;
     private long sequence;
+    // Immutable observation snapshots are replaced under the verification monitor.
+    @SuppressWarnings("java:S3077")
     private volatile Observation observation;
 
     public DefaultSourceVerification(Supplier<Optional<SourceResource>> currentSource,

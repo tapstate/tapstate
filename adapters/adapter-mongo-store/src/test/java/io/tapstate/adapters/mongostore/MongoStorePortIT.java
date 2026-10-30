@@ -24,9 +24,7 @@ import io.tapstate.spi.store.SourceTable;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.containers.MongoDBContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.utility.DockerImageName;
+import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -49,14 +47,14 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 @RequiresDocker
 class MongoStorePortIT {
 
-    private static final DockerImageName MONGO_IMAGE = DockerImageName.parse("mongo:7.0");
     private static final DslParser PARSER = new DslParser();
     private static final String OPERATOR_STATE_DATABASE = "tapstate_nest";
     private static final String OPERATOR_STATE_DATABASE_A = "operator_state_route_a";
     private static final String OPERATOR_STATE_DATABASE_B = "operator_state_route_b";
 
-    @Container
-    private static final MongoDBContainer REPLICA_SET = new MongoDBContainer(MONGO_IMAGE);
+    @RegisterExtension
+    private static final SharedMongoCase REPLICA_SET =
+            SharedMongoCase.forSuite(MongoStorePortIT.class);
 
     private static final String ORDERS = """
             version: tapstate/v1
@@ -75,7 +73,7 @@ class MongoStorePortIT {
         MongoConnectionSettings settings = new MongoConnectionSettings(uri, null, Duration.ofSeconds(5));
         try (MongoConnection connection = new MongoConnection(settings)) {
             connection.verify();
-            MongoStorePort port = new MongoStorePort(connection, OPERATOR_STATE_DATABASE);
+            MongoStorePort port = new MongoStorePort(connection, REPLICA_SET.database(OPERATOR_STATE_DATABASE));
             dropAggregateStorage(uri);
 
             // one write through each of the eleven sub-stores
@@ -119,7 +117,7 @@ class MongoStorePortIT {
             // and each landed in its own distinct, named storage — no concern shares storage
             String databaseName = new ConnectionString(uri).getDatabase();
             try (MongoClient raw = MongoClients.create(uri)) {
-                MongoDatabase database = raw.getDatabase(databaseName);
+                MongoDatabase database = raw.getDatabase(REPLICA_SET.database(databaseName));
                 assertThat(database.getCollection(MongoStorePort.ARTIFACTS).countDocuments()).isEqualTo(1);
                 assertThat(database.getCollection(MongoStorePort.PIPELINE_STATE).countDocuments()).isEqualTo(1);
                 assertThat(database.getCollection(MongoStorePort.PIPELINE_DESIRED).countDocuments()).isEqualTo(1);
@@ -151,7 +149,7 @@ class MongoStorePortIT {
         MongoConnectionSettings settings = new MongoConnectionSettings(uri, null, Duration.ofSeconds(5));
         try (MongoConnection connection = new MongoConnection(settings)) {
             connection.verify();
-            MongoStorePort port = new MongoStorePort(connection, OPERATOR_STATE_DATABASE);
+            MongoStorePort port = new MongoStorePort(connection, REPLICA_SET.database(OPERATOR_STATE_DATABASE));
 
             port.keyedState().save("nest.orders_sync.assemble.items", "k1",
                     "held-child".getBytes(StandardCharsets.UTF_8));
@@ -159,9 +157,9 @@ class MongoStorePortIT {
             assertThat(port.keyedState().load("nest.orders_sync.assemble.items", "k1")).isPresent();
             String configured = new ConnectionString(uri).getDatabase();
             try (MongoClient raw = MongoClients.create(uri)) {
-                assertThat(raw.getDatabase(OPERATOR_STATE_DATABASE)
+                assertThat(raw.getDatabase(REPLICA_SET.database(OPERATOR_STATE_DATABASE))
                         .getCollection(MongoStorePort.OPERATOR_STATE).countDocuments()).isEqualTo(1);
-                assertThat(raw.getDatabase(configured)
+                assertThat(raw.getDatabase(REPLICA_SET.database(configured))
                         .getCollection(MongoStorePort.OPERATOR_STATE).countDocuments()).isZero();
             }
         }
@@ -178,7 +176,7 @@ class MongoStorePortIT {
         MongoConnectionSettings settings = new MongoConnectionSettings(uri, null, Duration.ofSeconds(5));
         try (MongoConnection connection = new MongoConnection(settings)) {
             connection.verify();
-            MongoStorePort port = new MongoStorePort(connection, OPERATOR_STATE_DATABASE);
+            MongoStorePort port = new MongoStorePort(connection, REPLICA_SET.database(OPERATOR_STATE_DATABASE));
 
             port.nestDeadLetters().record(new NestDeadLetterRecord("nest.orders_sync.assemble.items",
                     "[\"items\"]#[1]~i", "mysql-a", "1:1", 0L, 9_000L, Map.of("id", 1)));
@@ -186,9 +184,9 @@ class MongoStorePortIT {
             assertThat(port.nestDeadLetters().read("nest.orders_sync.assemble.items", 10)).hasSize(1);
             String configured = new ConnectionString(uri).getDatabase();
             try (MongoClient raw = MongoClients.create(uri)) {
-                assertThat(raw.getDatabase(OPERATOR_STATE_DATABASE)
+                assertThat(raw.getDatabase(REPLICA_SET.database(OPERATOR_STATE_DATABASE))
                         .getCollection(MongoStorePort.NEST_DEAD_LETTERS).countDocuments()).isEqualTo(1);
-                assertThat(raw.getDatabase(configured)
+                assertThat(raw.getDatabase(REPLICA_SET.database(configured))
                         .getCollection(MongoStorePort.NEST_DEAD_LETTERS).countDocuments()).isZero();
             }
         }
@@ -200,15 +198,15 @@ class MongoStorePortIT {
         MongoConnectionSettings settings = new MongoConnectionSettings(uri, null, Duration.ofSeconds(5));
         try (MongoConnection connection = new MongoConnection(settings)) {
             connection.verify();
-            MongoStorePort port = new MongoStorePort(connection, OPERATOR_STATE_DATABASE);
+            MongoStorePort port = new MongoStorePort(connection, REPLICA_SET.database(OPERATOR_STATE_DATABASE));
             try (MongoClient raw = MongoClients.create(uri)) {
-                raw.getDatabase(OPERATOR_STATE_DATABASE_A).drop();
-                raw.getDatabase(OPERATOR_STATE_DATABASE_B).drop();
+                raw.getDatabase(REPLICA_SET.database(OPERATOR_STATE_DATABASE_A)).drop();
+                raw.getDatabase(REPLICA_SET.database(OPERATOR_STATE_DATABASE_B)).drop();
             }
 
             String namespace = "nest.orders.order_doc.$root";
-            var first = port.operatorStateStores().inDatabase(OPERATOR_STATE_DATABASE_A);
-            var second = port.operatorStateStores().inDatabase(OPERATOR_STATE_DATABASE_B);
+            var first = port.operatorStateStores().inDatabase(REPLICA_SET.database(OPERATOR_STATE_DATABASE_A));
+            var second = port.operatorStateStores().inDatabase(REPLICA_SET.database(OPERATOR_STATE_DATABASE_B));
             first.state().save(namespace, "same-key", "first".getBytes(StandardCharsets.UTF_8));
             first.deadLetters().record(new NestDeadLetterRecord(
                     namespace, "same-element", "mysql-a", "1:1", 0L, 9_000L, Map.of("id", 1)));
@@ -239,7 +237,7 @@ class MongoStorePortIT {
         MongoConnectionSettings settings = new MongoConnectionSettings(uri, null, Duration.ofSeconds(5));
         try (MongoConnection connection = new MongoConnection(settings)) {
             connection.verify();
-            MongoStorePort port = new MongoStorePort(connection, OPERATOR_STATE_DATABASE);
+            MongoStorePort port = new MongoStorePort(connection, REPLICA_SET.database(OPERATOR_STATE_DATABASE));
 
             assertThatThrownBy(() -> port.operatorStateStores().inDatabase("local"))
                     .isInstanceOf(TapstateException.class)
@@ -254,7 +252,7 @@ class MongoStorePortIT {
         MongoConnectionSettings settings = new MongoConnectionSettings(uri, null, Duration.ofSeconds(5));
         try (MongoConnection connection = new MongoConnection(settings)) {
             connection.verify();
-            MongoStorePort port = new MongoStorePort(connection, OPERATOR_STATE_DATABASE);
+            MongoStorePort port = new MongoStorePort(connection, REPLICA_SET.database(OPERATOR_STATE_DATABASE));
             // The suite shares one replica-set across tests, so the counts below only mean what they say
             // once this test owns these four collections outright.
             dropLifecycleStorage(uri);
@@ -276,7 +274,7 @@ class MongoStorePortIT {
 
             String databaseName = new ConnectionString(uri).getDatabase();
             try (MongoClient raw = MongoClients.create(uri)) {
-                MongoDatabase database = raw.getDatabase(databaseName);
+                MongoDatabase database = raw.getDatabase(REPLICA_SET.database(databaseName));
                 // The three that belong to this pipeline alone go; each has its own storage, so this is
                 // three separate removals rather than one that happens to catch them all.
                 assertThat(database.getCollection(MongoStorePort.PIPELINE_STATE).countDocuments()).isZero();
@@ -296,7 +294,7 @@ class MongoStorePortIT {
     /** Empties the four collections this test counts, so a sibling test's writes cannot answer for it. */
     private static void dropLifecycleStorage(String uri) {
         try (MongoClient raw = MongoClients.create(uri)) {
-            MongoDatabase database = raw.getDatabase(new ConnectionString(uri).getDatabase());
+            MongoDatabase database = raw.getDatabase(REPLICA_SET.database(new ConnectionString(uri).getDatabase()));
             database.getCollection(MongoStorePort.PIPELINE_STATE).drop();
             database.getCollection(MongoStorePort.PIPELINE_DESIRED).drop();
             database.getCollection(MongoStorePort.PIPELINE_OBSERVATION).drop();
@@ -308,7 +306,7 @@ class MongoStorePortIT {
     /** Empties every configuration collection asserted by the aggregate-store witness. */
     private static void dropAggregateStorage(String uri) {
         try (MongoClient raw = MongoClients.create(uri)) {
-            MongoDatabase database = raw.getDatabase(new ConnectionString(uri).getDatabase());
+            MongoDatabase database = raw.getDatabase(REPLICA_SET.database(new ConnectionString(uri).getDatabase()));
             List.of(
                     MongoStorePort.ARTIFACTS,
                     MongoStorePort.PIPELINE_STATE,
