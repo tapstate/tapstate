@@ -209,7 +209,8 @@ public final class MongoConnection implements AutoCloseable {
                     .writeConcern(WriteConcern.MAJORITY.withJournal(true))
                     .timeout(Math.max(1L, settings.serverSelectionTimeout().toMillis()), TimeUnit.MILLISECONDS).build());
             try {
-                collection.createIndex(session, new Document("value", 1),
+                // Preserve URI policy on the probe handle while omitting per-command concern for DDL.
+                collection.withWriteConcern(WriteConcern.ACKNOWLEDGED).createIndex(session, new Document("value", 1),
                         new com.mongodb.client.model.IndexOptions().name("storage_probe_value").unique(true));
                 collection.insertOne(session, new Document("_id", id).append("value", "initial"));
                 Document read = collection.find(session, new Document("_id", id)).first();

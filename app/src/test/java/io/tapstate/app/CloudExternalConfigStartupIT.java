@@ -483,6 +483,53 @@ class CloudExternalConfigStartupIT {
     }
 
     @Test
+    void firstCloudConfigurationWithExplicitWriteConcernReachesStorageSetup() throws Exception {
+        String selected = uniqueDatabase("concern_selected");
+        String ignored = uniqueDatabase("concern_ignored");
+        String uri = MONGO.getReplicaSetUrl(selected);
+        uri += (uri.contains("?") ? "&" : "?") + "retryWrites=true&w=majority";
+        String prefix = "/v1/api/clusters/" + CLUSTER + "/configuration-initialization/";
+        String operation = "8c0d4ceb-61a6-4477-8e11-bdd037329be5";
+        cloud.createContext(prefix, exchange -> {
+            cloudRequests.incrementAndGet();
+            String path = exchange.getRequestURI().getPath();
+            cloudPaths.add(exchange.getRequestMethod() + " " + path);
+            assertThat(exchange.getRequestHeaders().getFirst("Authorization")).isEqualTo("Bearer " + TOKEN);
+            var body = JSON.readTree(exchange.getRequestBody());
+            boolean claim = path.equals(prefix + "claim");
+            if (!claim) {
+                assertThat(path).isEqualTo(prefix + "complete");
+                assertThat(body.path("operationId").asText()).isEqualTo(operation);
+            }
+            byte[] response = JSON.writeValueAsBytes(Map.of("code", "ok", "data", Map.of(
+                    "clusterId", CLUSTER, "operationId", operation, "phase", claim ? "CLAIMED" : "COMPLETE",
+                    "configurationHash", body.path("configurationHash").asText(), "creationGranted", claim)));
+            exchange.getResponseHeaders().set("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, response.length);
+            exchange.getResponseBody().write(response); exchange.close();
+        });
+
+        Running running = start(Carrier.ENVIRONMENT, cloudValues(uri), MONGO.getReplicaSetUrl(ignored));
+        running.awaitReady();
+        var entry = running.get("/auth/storage-entry");
+        assertThat(entry.statusCode()).isEqualTo(200);
+        assertThat(JSON.readTree(entry.body()).path("mode").asText()).isEqualTo("CLOUD");
+        assertThat(JSON.readTree(entry.body()).path("entry").asText()).isEqualTo("SETUP_REQUIRED");
+        awaitStatusReport(0, running);
+        assertThat(cloudPaths).filteredOn(path -> path.contains("/configuration-initialization/"))
+                .containsExactly("POST " + prefix + "claim", "POST " + prefix + "complete");
+        assertThat(running.output()).doesNotContain("Cloud configuration initialization failed");
+        assertSafeOutput(running, uri);
+        try (var raw = MongoClients.create(MONGO.getReplicaSetUrl())) {
+            var database = raw.getDatabase(selected);
+            assertThat(SystemCollections.STORAGE_SETUP.on(database).find(new Document("_id", "cluster")).first())
+                    .containsEntry("phase", "CONFIG_PREPARED").containsEntry("operationId", operation);
+            assertThat(SystemCollections.CLUSTER_KEYS.on(database).countDocuments()).isEqualTo(1);
+            assertThat(raw.getDatabase(ignored).listCollectionNames().into(new ArrayList<>())).isEmpty();
+        }
+    }
+
+    @Test
     void aRefusedConfigurationPreparationKeepsItsSafeDiagnosticWhenCloudEntryResumes() throws Exception {
         String selected = uniqueDatabase("diagnostic_selected");
         String ignored = uniqueDatabase("diagnostic_ignored");
