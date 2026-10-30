@@ -14,11 +14,85 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
 import static io.tapstate.app.ValidationOwnerRouter.*;
 import static org.assertj.core.api.Assertions.*;
 
 /** Real member RPC/identity tests. The local lease port is a fixture, not durable acquisition proof. */
 class ValidationOwnerRouterTest {
+    @Test void anOwnerReadFailureAfterCapacityKeepsTheOriginalReceipt() {
+        try (var f = new Fixture(Duration.ofSeconds(5))) {
+            var request=request();var chosen=f.ranked(request).getFirst();var reads=new AtomicInteger();
+            f.ownerReads.set(pipeline->{
+                if(reads.incrementAndGet()==2)throw new io.tapstate.core.common.TapstateException(
+                        io.tapstate.core.validation.ValidationError.OWNER_NOT_AUTHORIZED,Map.of("pipeline",pipeline),null);
+                return Optional.empty();
+            });
+            f.behaviors.put(chosen,ignored->Result.capacity());
+            f.receipts.put(chosen,original->new LocalReceipt(new Result(Outcome.REJECTED,null,null),true));
+            var captured=new AtomicReference<Attempt>();
+            assertThatCode(()->captured.set(f.left.reserveAttempt(request))).doesNotThrowAnyException();
+            var attempt=captured.get();
+            assertThat(attempt.reply().outcome()).isEqualTo(Outcome.UNKNOWN);
+            assertThat(attempt.reply().reasonCode()).isEqualTo(io.tapstate.core.validation.ValidationError.OWNER_NOT_AUTHORIZED.code());
+            assertThat(attempt.dispatched()).isTrue();
+            assertThat(attempt.receiver().identity().node()).isEqualTo(chosen);
+            assertThat(f.left.receipt(request,attempt.receiver()).disposed()).isTrue();
+            assertThat(f.calls.get(chosen)).hasValue(1);
+            assertThat(f.calls.get(f.ranked(request).getLast())).hasValue(0);
+        }
+    }
+    @Test void aDeadlineAfterCapacityKeepsTheOriginalDispatchedReceipt() {
+        deadlineAfterCapacity(0);
+    }
+    @Test void aDeadlineBeforeTheNextDispatchKeepsThePriorCapacityReceipt() {
+        deadlineAfterCapacity(1);
+    }
+    private void deadlineAfterCapacity(int successfulReadsAfterCapacity) {
+        var capacityReturned=new AtomicBoolean();var readsAfterCapacity=new AtomicInteger();
+        LongSupplier nanos=()->!capacityReturned.get()||readsAfterCapacity.getAndIncrement()<successfulReadsAfterCapacity
+                ?0:Duration.ofSeconds(6).toNanos();
+        try (var f = new Fixture(Duration.ofSeconds(5), 2, nanos)) {
+            var request = request(); var chosen = f.ranked(request).getFirst();
+            f.behaviors.put(chosen, ignored -> { capacityReturned.set(true); return Result.capacity(); });
+            f.receipts.put(chosen, original -> new LocalReceipt(new Result(Outcome.REJECTED, null, null), true));
+            var attempt = f.left.reserveAttempt(request);
+            assertThat(attempt.reply().outcome()).isEqualTo(Outcome.UNKNOWN);
+            assertThat(attempt.dispatched()).isTrue();
+            assertThat(attempt.receiver().identity().node()).isEqualTo(chosen);
+            assertThat(f.left.receipt(request, attempt.receiver()).disposed()).isTrue();
+            assertThat(f.calls.get(chosen)).hasValue(1);
+            assertThat(f.calls.get(f.ranked(request).getLast())).hasValue(0);
+        }
+    }
+    @Test void anExistingOwnerRedirectNeverRanksAReplacementInTheSameAttempt() {
+        try (var f = new Fixture(Duration.ofSeconds(5))) {
+            var request = request(); var owner = f.ranked(request).getLast();
+            f.reading.set(reading(owner, request.pipeline()));
+            f.behaviors.put(owner, ignored -> { f.reading.set(null); return new Result(Outcome.REDIRECT, null, null); });
+            var attempt = f.left.reserveAttempt(request);
+            assertThat(attempt.reply().outcome()).isEqualTo(Outcome.REDIRECT);
+            assertThat(attempt.dispatched()).isTrue();
+            assertThat(attempt.receiver().identity().node()).isEqualTo(owner);
+            assertThat(f.calls.get(owner)).hasValue(1);
+            assertThat(f.calls.get(f.ranked(request).getFirst())).hasValue(0);
+        }
+    }
+    @Test void exhaustedCapacityCandidatesRetainTheLastDispatchedReceipt() {
+        try (var f = new Fixture(Duration.ofSeconds(5))) {
+            var request = request();
+            for (var node : List.of("a", "b")) {
+                f.behaviors.put(node, ignored -> Result.capacity());
+                f.receipts.put(node, original -> new LocalReceipt(new Result(Outcome.REJECTED, null, null), true));
+            }
+            var attempt = f.left.reserveAttempt(request);
+            assertThat(attempt.reply().outcome()).isEqualTo(Outcome.CAPACITY);
+            assertThat(attempt.dispatched()).isTrue();
+            assertThat(attempt.receiver().identity().node()).isEqualTo(f.ranked(request).getLast());
+            assertThat(f.left.receipt(request, attempt.receiver()).disposed()).isTrue();
+            assertThat(f.calls.values()).allSatisfy(count -> assertThat(count).hasValue(1));
+        }
+    }
     @Test void originalCommandsUseOnlyTheExactOwnerAndNeverReserveOrRerank(){
         try(var f=new Fixture(Duration.ofSeconds(5))){
             var request=request();var seen=new CopyOnWriteArrayList<Command>();
@@ -232,9 +306,16 @@ class ValidationOwnerRouterTest {
         final Map<String,Function<Command,CommandReply>> commands=new ConcurrentHashMap<>();
         final Map<String,Function<Request,LocalReceipt>> receipts=new ConcurrentHashMap<>();
         final AtomicReference<WorkloadClaimReading> reading = new AtomicReference<>();
+        final AtomicReference<Function<String,Optional<WorkloadClaimReading>>> ownerReads =
+                new AtomicReference<>(ignored->Optional.ofNullable(reading.get()));
         final ValidationOwnerRouter left, right;
+        final LongSupplier nanoTime;
         Fixture(Duration timeout) { this(timeout,2); }
         Fixture(Duration timeout,int executorWorkers) {
+            this(timeout,executorWorkers,System::nanoTime);
+        }
+        Fixture(Duration timeout,int executorWorkers,LongSupplier nanoTime) {
+            this.nanoTime=nanoTime;
             ga.observeNodeSession(live.get("a")::get);gb.observeNodeSession(live.get("b")::get);
             String cluster = "validation-routing-" + UUID.randomUUID();
             a = Hazelcast.newHazelcastInstance(config(cluster, "a", null,executorWorkers));
@@ -256,12 +337,12 @@ class ValidationOwnerRouterTest {
             }
         }
         ValidationOwnerRouter router(HazelcastInstance member, ClusterMembershipGate gate, String id, Duration timeout) {
-            return new ValidationOwnerRouter(member, gate, () -> nodes.get(id).get(), ignored -> Optional.ofNullable(reading.get()),
+            return new ValidationOwnerRouter(member, gate, () -> nodes.get(id).get(), pipeline -> ownerReads.get().apply(pipeline),
                     new Local(){public Result reserve(Request request){calls.get(id).incrementAndGet();return behaviors.get(id).apply(request);}
                         public LocalReceipt receipt(Request request){var read=receipts.get(id);return read==null?LocalReceipt.unknown():read.apply(request);}}, command->commands.get(id).apply(command),() -> {
                         if (!live.get(id).get()) throw new io.tapstate.core.common.TapstateException(io.tapstate.core.validation.ValidationError.OWNER_NOT_AUTHORIZED,
                                 Map.of("pipeline", "test"), null);
-                    }, timeout);
+                    }, timeout,nanoTime);
         }
         List<String> ranked(Request request) { return ValidationOwnerRanking.rank("cluster", request.pipeline(), List.of("a", "b")); }
         void install(long revision, Set<String> nodes) {

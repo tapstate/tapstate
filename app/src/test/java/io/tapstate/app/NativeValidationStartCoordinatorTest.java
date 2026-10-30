@@ -17,6 +17,30 @@ import static org.mockito.Mockito.*;
 /** Real member routing and paid I/O over bounded CONFIG fixtures; not connector or durable admission acceptance. */
 class NativeValidationStartCoordinatorTest {
     private static final UUID GENERATION=UUID.randomUUID();
+    @Test @Timeout(30) void stoppingAnExhaustedCapacityAttemptReadsItsOriginalDisposedReceipt() {
+        try(var routing=new ValidationOwnerRouterTest.Fixture(Duration.ofSeconds(5),1);var process=new ValidationMemberResources()){
+            var resources=process.bind("cluster","a","boot-a",2,()->{});
+            for(var node:List.of("a","b")){
+                routing.behaviors.put(node,request->ValidationOwnerRouter.Result.capacity());
+                routing.receipts.put(node,request->new ValidationOwnerRouter.LocalReceipt(
+                        new ValidationOwnerRouter.Result(ValidationOwnerRouter.Outcome.REJECTED,null,null),true));
+            }
+            try(var coordinator=new NativeValidationStartCoordinator(routing.a,configuration(),routing.left,resources,process,()->{})){
+                var op=operation(coordinator.context());
+                try(var started=coordinator.start(op)){
+                    assertThat(started.value().outcome()).isIn(ValidationOperation.Outcome.PENDING,ValidationOperation.Outcome.CAPACITY);
+                }
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).until(()->
+                        routing.calls.values().stream().mapToInt(AtomicInteger::get).sum()==2&&resources.snapshot().metadataFrames()==0);
+                try(var stopped=coordinator.stop(op)){
+                    assertThat(stopped.value().original()).isEqualTo(op);
+                    assertThat(stopped.value().state()).isEqualTo("STOPPED");
+                    assertThat(stopped.value().drain()).isEqualTo(ValidationOperation.Drain.DRAINED);
+                }
+                assertThat(routing.calls.values()).allSatisfy(count->assertThat(count).hasValue(1));
+            }
+        }
+    }
     @Test @Timeout(30) void lateReservationCannotActivateAfterTheEntryContextWasReplaced()throws Exception{
         var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var activated=new AtomicInteger();
         try(var routing=new ValidationOwnerRouterTest.Fixture(Duration.ofSeconds(5),1);var process=new ValidationMemberResources()){

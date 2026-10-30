@@ -70,7 +70,10 @@ class NativeValidationOwnerReservationsIT {
             var held = new ArrayList<ValidationMemberResources.Run>();
             for (int index = 0; index < 2; index++) held.add(f.resources.admit(new ValidationRunIdentity(new ValidationOwner("cluster", "other", "node", "boot", 1, 1, 1),
                     "other", "held-" + index, ValidationMode.FULL, "spec", 1, "rules"), new ValidationLocalBudget.Amount(1024, 1, 0, 0), 1, () -> {}));
-            assertThat(f.owners.reserve(f.request("FULL", 1)).outcome()).isEqualTo(ValidationOwnerRouter.Outcome.CAPACITY);
+            var original=f.request("FULL", 1);
+            assertThat(f.owners.reserve(original).outcome()).isEqualTo(ValidationOwnerRouter.Outcome.CAPACITY);
+            assertThat(f.owners.receipt(original).disposed()).isTrue();
+            assertThat(f.resources.snapshot().metadataFrames()).isZero();
             assertThat(f.raw.getDatabase(f.cacheName).getCollection("workload_claims").countDocuments(new Document("_id.resourceType", "VALIDATION"))).isZero();
             held.forEach(value -> { value.close(); value.processorsExited(); });
             assertThat(f.owners.reserve(f.request("FULL", 1)).outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);

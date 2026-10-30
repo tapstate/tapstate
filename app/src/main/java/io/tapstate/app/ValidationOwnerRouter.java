@@ -17,6 +17,7 @@ import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
 /**
@@ -116,6 +117,7 @@ final class ValidationOwnerRouter implements AutoCloseable {
     private final Commands commands;
     private final Runnable active;
     private final long timeoutNanos;
+    private final LongSupplier nanoTime;
     private final UUID incarnation = UUID.randomUUID();
     private volatile boolean closed;
 
@@ -126,10 +128,15 @@ final class ValidationOwnerRouter implements AutoCloseable {
     }
     ValidationOwnerRouter(HazelcastInstance member,ClusterMembershipGate membership,Supplier<WorkloadClaimFence> node,
             Function<String,Optional<WorkloadClaimReading>> readOwner,Local local,Commands commands,Runnable active,Duration timeout){
+        this(member,membership,node,readOwner,local,commands,active,timeout,System::nanoTime);
+    }
+    ValidationOwnerRouter(HazelcastInstance member,ClusterMembershipGate membership,Supplier<WorkloadClaimFence> node,
+            Function<String,Optional<WorkloadClaimReading>> readOwner,Local local,Commands commands,Runnable active,Duration timeout,LongSupplier nanoTime){
         this.member = Objects.requireNonNull(member); this.membership = Objects.requireNonNull(membership);
         this.node = Objects.requireNonNull(node); this.readOwner = Objects.requireNonNull(readOwner);
         this.local = Objects.requireNonNull(local); this.active = Objects.requireNonNull(active);
         this.commands=Objects.requireNonNull(commands);
+        this.nanoTime=Objects.requireNonNull(nanoTime);
         if (timeout == null || timeout.isNegative() || timeout.isZero() || timeout.compareTo(Duration.ofSeconds(30)) > 0) throw invalid("routing.timeout");
         timeoutNanos = timeout.toNanos();
         var executor = member.getConfig().findExecutorConfig(EXECUTOR);
@@ -147,12 +154,12 @@ final class ValidationOwnerRouter implements AutoCloseable {
                 ||pinned!=null&&!pinned.identity().equals(target))
             return commandUnavailable(command,Outcome.REJECTED,null);
         try{
-            var executor=member.getExecutorService(EXECUTOR);long deadline=System.nanoTime()+timeoutNanos;
+            var executor=member.getExecutorService(EXECUTOR);long deadline=nanoTime.getAsLong()+timeoutNanos;
             var destination=before.members.get(target.node());
             var receiver=executor.submitToMember(new Probe(target,before.revision),destination).get(timeoutNanos,TimeUnit.NANOSECONDS);
             if(receiver==null||!target.equals(receiver.identity())||before.revision!=receiver.topologyRevision()
                     ||pinned!=null&&!pinned.incarnation().equals(receiver.incarnation()))return commandUnavailable(command,Outcome.REJECTED,null);
-            long remaining=deadline-System.nanoTime();if(remaining<=0)return commandUnavailable(command,Outcome.UNKNOWN,null);
+            long remaining=deadline-nanoTime.getAsLong();if(remaining<=0)return commandUnavailable(command,Outcome.UNKNOWN,null);
             var answer=executor.submitToMember(new CommandCall(command,target,before.revision,receiver.incarnation()),destination).get(remaining,TimeUnit.NANOSECONDS);
             requireActive();if(!before.same(roster())||answer==null||!command.equals(answer.original()))return commandUnavailable(command,Outcome.UNKNOWN,null);
             return answer;
@@ -179,47 +186,66 @@ final class ValidationOwnerRouter implements AutoCloseable {
 
     Reply reserve(Request request) {return reserveAttempt(request).reply();}
     Attempt reserveAttempt(Request request) {
-        Objects.requireNonNull(request); var before = roster(); long deadline = System.nanoTime() + timeoutNanos;
+        Objects.requireNonNull(request); var before = roster(); long deadline = nanoTime.getAsLong() + timeoutNanos;
         var tried = new HashSet<Identity>();
-        for (int candidateAttempt = 0; candidateAttempt <= before.members.size(); candidateAttempt++) {
-            requireActive(); if (!before.same(roster()) || System.nanoTime() - deadline >= 0) return new Attempt(unknown(request,null,null),null,false);
-            var reading = Objects.requireNonNull(readOwner.apply(request.pipeline()));
-            reading.ifPresent(value -> {
-                var key = value.claim().key();
-                if (!key.equals(ValidationClaims.key(before.cluster, request.pipeline())))
-                    throw invalid("routing.claim");
-            });
-            boolean owned = reading.filter(WorkloadClaimReading::leased).isPresent();
-            Identity selected;
-            if (owned) {
-                var claim = reading.orElseThrow().claim();
-                selected = before.identities.get(claim.owner().nodeId());
-                if (selected == null || !selected.boot.equals(claim.owner().bootId()) || tried.contains(selected)) return new Attempt(unknown(request,selected,null),null,false);
-            } else {
-                selected = ValidationOwnerRanking.rank(before.cluster, request.pipeline(), before.identities.keySet()).stream()
-                        .map(before.identities::get).filter(value -> !tried.contains(value)).findFirst().orElse(null);
-                if (selected == null) return new Attempt(new Reply(Outcome.CAPACITY,request.command(),null,0,0,0,null),null,false);
+        Attempt lastCapacity = null;
+        try {
+            for (int candidateAttempt = 0; candidateAttempt <= before.members.size(); candidateAttempt++) {
+                requireActive(); if (!before.same(roster()) || nanoTime.getAsLong() - deadline >= 0) return uncertain(request,null,null,lastCapacity);
+                var reading = Objects.requireNonNull(readOwner.apply(request.pipeline()));
+                reading.ifPresent(value -> {
+                    var key = value.claim().key();
+                    if (!key.equals(ValidationClaims.key(before.cluster, request.pipeline())))
+                        throw invalid("routing.claim");
+                });
+                boolean owned = reading.filter(WorkloadClaimReading::leased).isPresent();
+                Identity selected;
+                if (owned) {
+                    var claim = reading.orElseThrow().claim();
+                    selected = before.identities.get(claim.owner().nodeId());
+                    if (selected == null || !selected.boot.equals(claim.owner().bootId()) || tried.contains(selected)) return uncertain(request,selected,null,lastCapacity);
+                } else {
+                    selected = ValidationOwnerRanking.rank(before.cluster, request.pipeline(), before.identities.keySet()).stream()
+                            .map(before.identities::get).filter(value -> !tried.contains(value)).findFirst().orElse(null);
+                    if (selected == null) return lastCapacity != null ? lastCapacity
+                            : new Attempt(new Reply(Outcome.CAPACITY,request.command(),null,0,0,0,null),null,false);
+                }
+                tried.add(selected);
+                var attempt = invoke(request, selected, before.revision, before.members.get(selected.node), deadline);var reply=attempt.reply();
+                var retained = attempt.dispatched() ? attempt : lastCapacity;
+                try { requireActive(); if (!before.same(roster())) return uncertain(request,selected,reply.reasonCode(),retained); }
+                catch (TapstateException unavailable) { return uncertain(request,selected,unavailable.code().code(),retained); }
+                if (reply.outcome() == Outcome.CAPACITY && !owned) {
+                    // The original receiver still owns the cleanup receipt after the candidate list is exhausted.
+                    lastCapacity = attempt;
+                    continue;
+                }
+                if (reply.outcome() == Outcome.REDIRECT && !owned) continue;
+                if (!attempt.dispatched() && lastCapacity != null) return uncertain(request,selected,reply.reasonCode(),lastCapacity);
+                return attempt;
             }
-            tried.add(selected);
-            var attempt = invoke(request, selected, before.revision, before.members.get(selected.node), deadline);var reply=attempt.reply();
-            try { requireActive(); if (!before.same(roster())) return new Attempt(unknown(request,selected,reply.reasonCode()),attempt.receiver(),attempt.dispatched()); }
-            catch (TapstateException unavailable) { return new Attempt(unknown(request,selected,unavailable.code().code()),attempt.receiver(),attempt.dispatched()); }
-            if (reply.outcome() == Outcome.CAPACITY && !owned || reply.outcome() == Outcome.REDIRECT) continue;
-            return attempt;
+        } catch (TapstateException unavailable) {
+            if (lastCapacity == null) throw unavailable;
+            return uncertain(request,null,unavailable.code().code(),lastCapacity);
         }
-        return new Attempt(unknown(request,null,null),null,false);
+        return uncertain(request,null,null,lastCapacity);
+    }
+
+    private static Attempt uncertain(Request request,Identity target,String reason,Attempt retained) {
+        var receiver=retained==null?null:retained.receiver();
+        return new Attempt(unknown(request,receiver==null?target:receiver.identity(),reason),receiver,retained!=null&&retained.dispatched());
     }
 
     private Attempt invoke(Request request, Identity target, long revision, Member destination, long deadline) {
         Receiver verified=null;boolean dispatched=false;
         try {
-            long remaining = deadline - System.nanoTime(); if (remaining <= 0) return new Attempt(unknown(request,target,null),verified,dispatched);
+            long remaining = deadline - nanoTime.getAsLong(); if (remaining <= 0) return new Attempt(unknown(request,target,null),verified,dispatched);
             var executor = member.getExecutorService(EXECUTOR);
             var receiver = executor.submitToMember(new Probe(target, revision), destination).get(remaining, TimeUnit.NANOSECONDS);
             if (receiver == null) return new Attempt(rejected(request,target,null),null,false);
             if (!target.equals(receiver.identity()) || revision != receiver.topologyRevision()) return new Attempt(unknown(request,target,null),verified,dispatched);
             verified=receiver;
-            remaining = deadline - System.nanoTime(); if (remaining <= 0) return new Attempt(unknown(request,target,null),verified,dispatched);
+            remaining = deadline - nanoTime.getAsLong(); if (remaining <= 0) return new Attempt(unknown(request,target,null),verified,dispatched);
             dispatched=true;
             var future = executor.submitToMember(new Call(request, target, revision, receiver.incarnation()), destination);
             var reply = future.get(remaining, TimeUnit.NANOSECONDS);
