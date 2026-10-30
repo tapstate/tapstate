@@ -532,6 +532,30 @@ class MongoAlertCoordinatorIT {
             }finally{try(var client=com.mongodb.client.MongoClients.create(connection.uri())){client.getDatabase(cacheName).drop();}}
         });
     }
+    @Test void finiteWriteContentionYieldsWithinTheOriginalRoundInsteadOfLosingFiveMinutes(){
+        withStore(f->{var quota=MongoAlertNotificationCodec.quota(new AlertTestQuota.Bucket(SCOPE,T.minusSeconds(7200),Map.of("original-actor",1)),1);
+            SystemCollections.ALERT_TEST_QUOTAS.on(f.db).insertOne(quota);var port=f.store.maintenance().orElseThrow();
+            port.maintain(new AlertMaintenance.Cursor(4,null,null),200,4L*1024*1024,Duration.ofSeconds(10));
+            var remaining=new java.util.concurrent.atomic.AtomicInteger(4);var attempts=new java.util.concurrent.atomic.AtomicInteger();
+            MongoCommandObservation.COLLECTIONS.set((command,collection)->{
+                if(command.equals("update")&&collection.equals("cluster_keys")&&remaining.getAndUpdate(n->Math.max(0,n-1))>0){
+                    attempts.incrementAndGet();SystemCollections.CLUSTER_KEYS.on(f.db).updateOne(new Document("_id","cluster"),new Document("$inc",new Document("sourceWriteFence",1L)));
+                }
+            });
+            long operations=0,bytes=0,conflicts=0,changed=0;AlertMaintenance.Cursor cursor=new AlertMaintenance.Cursor(10,null,null);
+            long deadline=System.nanoTime()+Duration.ofSeconds(10).toNanos();
+            try{
+                for(int i=0;i<5&&cursor!=null;i++){
+                    long remainingNanos=deadline-System.nanoTime();assertThat(remainingNanos).isPositive();
+                    var batch=port.maintain(cursor,Math.min(200,(int)(1000-operations)),Math.min(4L*1024*1024,16L*1024*1024-bytes),Duration.ofNanos(Math.min(Duration.ofSeconds(5).toNanos(),remainingNanos)));
+                    operations+=batch.scanned();bytes+=batch.bytes();changed+=batch.changed();conflicts+=batch.skipped().getOrDefault("conflict",0L);cursor=batch.next();
+                }
+            }finally{MongoCommandObservation.COLLECTIONS.remove();}
+            assertThat(attempts.get()).isEqualTo(4);assertThat(conflicts).isGreaterThanOrEqualTo(4);assertThat(changed).isEqualTo(1);
+            assertThat(SystemCollections.ALERT_TEST_QUOTAS.on(f.db).countDocuments()).isZero();assertThat(operations).isLessThanOrEqualTo(1000);assertThat(bytes).isLessThanOrEqualTo(16L*1024*1024);
+            assertThat(System.nanoTime()).isLessThanOrEqualTo(deadline);
+        });
+    }
     @Test void maintenanceConservativeBudgetBoundsObservedMongoCommandsIncludingAuthorityAndCommit() {
         withStore(f->{var candidate=test(f,"1",email("one@example.test"));f.store.admitTest(candidate,f.access);f.time.set(T.plus(Duration.ofDays(5)));
             var commands=new ArrayList<String>();MongoCommandObservation.CURRENT.set(commands::add);

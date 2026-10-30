@@ -109,6 +109,12 @@ final class ControlPlane {
         if(!(parsed instanceof Map<?,?> map))throw new AssertionError("alert response is not an object");
         var value=new LinkedHashMap<String,Object>();map.forEach((key,item)->value.put(String.valueOf(key),item));return value;
     }
+    void awaitInitialAlertMaintenance(){
+        Await.until("the initial bounded alert cleanup to finish",Duration.ofSeconds(30),()->{
+            var value=alert("health",Map.of()).get("maintenance");
+            return value instanceof Map<?,?> maintenance&&maintenance.get("lastSuccess")!=null;
+        },()->"initial alert cleanup has not finished");
+    }
     /** Whether the product answers its health probe; the readiness signal a launcher waits on. */
     boolean healthy() {
         try {

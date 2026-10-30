@@ -30,6 +30,37 @@ class AlertMaintenanceRuntimeTest {
             assertThat(runtime.health()).containsEntry("scanned",2400L).containsEntry("ioBytes",48L*1024*1024).containsEntry("changed",12L);
         }
     }
+    @Test void aContentionYieldCanResumeWithinTheSameBoundedRound(){
+        var first=new java.util.concurrent.atomic.AtomicBoolean(true);
+        AlertMaintenance port=new AlertMaintenance(){
+            public Inventory inventory(){return new Inventory(T,List.of(),0,null,0,0);}
+            public Batch maintain(Cursor cursor,int rows,long bytes,Duration duration){
+                if(cursor.collection()!=0)return new Batch(null,1,0,100,Map.of(),null);
+                return first.getAndSet(false)?new Batch(cursor,200,0,100,Map.of("contention-yield",1L,"conflict",4L),T)
+                        :new Batch(null,25,1,100,Map.of(),null);
+            }
+        };
+        try(var runtime=new AlertMaintenanceRuntime(port,Clock.fixed(T,ZoneOffset.UTC),()->{})){
+            runtime.tick();assertThat(runtime.health()).containsEntry("changed",1L).containsEntry("failures",0L).containsEntry("degraded",false);
+            assertThat(((Map<?,?>)runtime.health().get("skipped")).get("contention-yield")).isEqualTo(1L);
+            assertThat(((Number)runtime.health().get("scanned")).longValue()).isLessThanOrEqualTo(1000);
+        }
+    }
+    @Test void threeEntireRoundsOfContentionWithoutProgressRemainAVisibleFailure(){
+        var time=new AtomicReference<>(T);
+        AlertMaintenance port=new AlertMaintenance(){
+            public Inventory inventory(){return new Inventory(time.get(),List.of(),0,null,0,0);}
+            public Batch maintain(Cursor cursor,int rows,long bytes,Duration duration){
+                return cursor.collection()==0?new Batch(cursor,rows,0,100,Map.of("contention-yield",1L,"conflict",4L),T)
+                        :new Batch(null,1,0,100,Map.of(),null);
+            }
+        };
+        try(var runtime=new AlertMaintenanceRuntime(port,clock(time),()->{})){
+            for(int i=0;i<3;i++){time.set(T.plusSeconds(i*300L));runtime.tick();}
+            assertThat(runtime.health()).containsEntry("changed",0L).containsEntry("failures",3L).containsEntry("consecutiveFailures",3).containsEntry("degraded",true);
+            assertThat(runtime.health()).containsEntry("code",io.tapstate.spi.store.IoError.STORE_UNAVAILABLE.code());
+        }
+    }
     @Test void failedAndStaleMeasurementsNeverLookHealthyAndSuccessfulRecoveryClearsTheCurrentFailure() {
         var time=new AtomicReference<>(T);var port=new Port();
         try(var runtime=new AlertMaintenanceRuntime(port,clock(time),()->{})) {

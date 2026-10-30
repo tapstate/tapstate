@@ -3,6 +3,7 @@ package io.tapstate.app;
 import io.tapstate.core.alerting.AlertMaintenancePolicy;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.AlertMaintenance;
+import io.tapstate.spi.store.IoError;
 import java.time.*;
 import java.util.*;
 import java.util.concurrent.*;
@@ -46,6 +47,7 @@ final class AlertMaintenanceRuntime implements AutoCloseable {
         if(now.isBefore(nextCleanup)){metrics();return;}
         nextCleanup=now.plusSeconds(300);lastAttempt=now;
         int rows=0,tailPriority=-1;long encoded=0;long deadline=System.nanoTime()+Duration.ofSeconds(10).toNanos();
+        long changedBefore=changed;boolean contentionYield=false;
         try {
             var exhausted=new boolean[12];int remainingCollections=12;
             while(remainingCollections>0&&rows<1000&&encoded<16L*1024*1024&&System.nanoTime()<deadline) {
@@ -60,9 +62,11 @@ final class AlertMaintenanceRuntime implements AutoCloseable {
                 if(batch.next()==null)isolated[slot]=isolatedInScan[slot];else if(isolatedInScan[slot])isolated[slot]=true;
                 rows+=batch.scanned();encoded+=batch.bytes();scanned+=batch.scanned();changed+=batch.changed();bytes+=batch.bytes();
                 batch.skipped().forEach((key,value)->skipped.merge(key,value,Long::sum));
+                contentionYield|=batch.skipped().containsKey("contention-yield");
                 if(batch.scanned()==0)break;
             }
             if(tailPriority>=0)collection=tailPriority;
+            if(contentionYield&&changed==changedBefore)throw new TapstateException(IoError.STORE_UNAVAILABLE,Map.of("detail","maintenance-contention"),null);
             cleanupFailed=false;consecutiveFailures=0;lastSuccess=clock.instant();if(!inventoryFailed)code=null;
         }catch(TapstateException refused){cleanupFailed=true;consecutiveFailures++;failure(refused);}
         metrics();

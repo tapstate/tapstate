@@ -106,7 +106,11 @@ final class MongoAlertMaintenance implements AlertMaintenance {
                 b.eligible(b.currentCandidate);pendingCandidate[index]=candidate.get("_id");cursor=original;yielded=true;break;}
             catch(MongoReadBudget.MaintenanceConflict conflict){
                 conflict();skipped.merge("conflict",1L,Long::sum);
-                if(++conflicts>3)throw new io.tapstate.core.common.TapstateException(IoError.STORE_UNAVAILABLE,Map.of("detail","maintenance-contention"),null);
+                b.eligible(b.currentCandidate);
+                if(++conflicts>3){
+                    skipped.merge("contention-yield",1L,Long::sum);pendingCandidate[index]=candidate.get("_id");
+                    cursor=original;yielded=true;break;
+                }
                 if(resumingCandidate||b.proofSteps>proofBefore)pendingCandidate[index]=candidate.get("_id");cursor=original;retry=true;break;
             }
             catch(IllegalArgumentException | ClassCastException | NullPointerException invalid) {
