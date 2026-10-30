@@ -17,6 +17,87 @@ import static org.assertj.core.api.Assertions.*;
 @RequiresDocker
 class NativeValidationCommandsIT {
     @Container static final MongoDBContainer MONGO=NativeValidationOwnerReservationsIT.MONGO;
+    @Test void aLostReservationReplyCanBeReadPassivelyBeforeOnlyAnExplicitOriginalRetryActivates()throws Exception{
+        var entered=new java.util.concurrent.CountDownLatch(1);var release=new java.util.concurrent.CountDownLatch(1);
+        var returned=new java.util.concurrent.CountDownLatch(1);var reservations=new AtomicInteger();var plans=new AtomicInteger();var receiptsVisible=new AtomicBoolean();
+        var captured=new AtomicReference<Request>();
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+                var processors=new ValidationProcessorRegistry(f.member,()->{})){
+            // Prepare the fixed native domains outside the deliberately lost receiver reply.
+            f.owners.readOwner("flow");
+            Local receiver=new Local(){
+                public Result reserve(Request request){
+                    reservations.incrementAndGet();captured.set(request);var accepted=f.owners.reserve(request);
+                    assertThat(accepted.outcome()).isEqualTo(Outcome.ACCEPTED);entered.countDown();
+                    try{if(!release.await(12,java.util.concurrent.TimeUnit.SECONDS))throw new AssertionError("original reply barrier timeout");}
+                    catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}
+                    returned.countDown();return accepted;
+                }
+                public LocalReceipt receipt(Request request){return receiptsVisible.get()?f.owners.receipt(request):LocalReceipt.unknown();}
+            };
+            NativeValidationFullJob.Factory factory=original->{plans.incrementAndGet();var closed=new AtomicBoolean();var mapping=original.spec().task().mappings().getFirst();
+                return new NativeValidationFullJob.Plan(){
+                    public List<ValidationCountScan.Mapping> counts(){return List.of(new ValidationCountScan.Mapping(mapping.mappingId(),guard->{guard.run();return scalar(mapping.source(),1);},guard->{guard.run();return scalar(mapping.target(),1);}));}
+                    public boolean drained(){return closed.get();}public void close(){closed.set(true);}
+                };};
+            var commands=new NativeValidationCommands(f.owners,runs,f.member,processors,f.process,factory);
+            try(var router=new ValidationOwnerRouter(f.member,f.gate,()->WorkloadClaimFence.from(f.node),f.owners::readOwner,receiver,commands,()->{},Duration.ofSeconds(5));
+                    var coordinator=new NativeValidationStartCoordinator(f.member,f.configuration,router,f.resources,f.process,()->{})){
+                var op=new io.tapstate.runtime.probe.ValidationOperation(coordinator.context(),"flow","task",f.task.generation(),1,1,UUID.randomUUID());
+                try{
+                    try(var response=coordinator.start(op)){assertThat(response.value().original()).isEqualTo(op);}
+                    if(!entered.await(5,java.util.concurrent.TimeUnit.SECONDS)){
+                        try(var response=coordinator.read(op)){throw new AssertionError("receiver not entered: original="+response.value()+"; reservations="+reservations+"; request="+captured+"; resources="+f.resources.snapshot());}
+                    }
+                    await(()->{try(var response=coordinator.read(op)){return response.value().outcome()==io.tapstate.runtime.probe.ValidationOperation.Outcome.UNKNOWN;}});
+                    release.countDown();assertThat(returned.await(2,java.util.concurrent.TimeUnit.SECONDS)).isTrue();receiptsVisible.set(true);
+                    assertThat(f.owners.receipt(captured.get()).result().outcome()).isEqualTo(Outcome.ACCEPTED);
+                    try(var response=coordinator.read(op)){
+                        assertThat(response.value().outcome()).isEqualTo(io.tapstate.runtime.probe.ValidationOperation.Outcome.ACCEPTED);
+                        assertThat(response.value().admitted()).isFalse();assertThat(response.value().state()).isEqualTo("STARTING");
+                    }
+                    assertThat(reservations).hasValue(1);assertThat(plans).hasValue(0);assertThat(f.member.getJet().getJobs()).isEmpty();
+                    assertThat(f.tasks.read("flow","task").orElseThrow().full().permission()).isNull();
+                    try(var response=coordinator.start(op)){assertThat(response.value().original()).isEqualTo(op);}
+                    await(()->{try(var response=coordinator.read(op)){return "COMPLETED".equals(response.value().state())&&response.value().drain()==io.tapstate.runtime.probe.ValidationOperation.Drain.DRAINED;}});
+                    assertThat(reservations).hasValue(1);assertThat(plans).hasValue(1);assertThat(f.member.getJet().getJobs()).hasSize(1);
+                    assertThat(f.tasks.read("flow","task").orElseThrow().full().nextStartSequence()).isEqualTo(2);
+                }finally{release.countDown();}
+            }
+        }finally{release.countDown();}
+    }
+    @Test void anUnusedRecoveredHandoffRemainsKnownDisposedAfterItsOwnerExpires()throws Exception{
+        var entered=new java.util.concurrent.CountDownLatch(1);var release=new java.util.concurrent.CountDownLatch(1);
+        var reservations=new AtomicInteger();var visible=new AtomicBoolean();var now=new AtomicLong(System.nanoTime());var captured=new AtomicReference<Request>();
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture(64,128,now::get);var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+                var processors=new ValidationProcessorRegistry(f.member,()->{})){
+            f.owners.readOwner("flow");
+            Local receiver=new Local(){
+                public Result reserve(Request request){reservations.incrementAndGet();captured.set(request);var accepted=f.owners.reserve(request);
+                    assertThat(accepted.outcome()).isEqualTo(Outcome.ACCEPTED);entered.countDown();
+                    try{if(!release.await(12,java.util.concurrent.TimeUnit.SECONDS))throw new AssertionError("unused reply barrier timeout");}
+                    catch(InterruptedException interrupted){throw new AssertionError(interrupted);}return accepted;}
+                public LocalReceipt receipt(Request request){return visible.get()?f.owners.receipt(request):LocalReceipt.unknown();}
+            };
+            var commands=new NativeValidationCommands(f.owners,runs,f.member,processors,f.process,original->{throw new AssertionError("receipt reads cannot construct a plan");});
+            try(var router=new ValidationOwnerRouter(f.member,f.gate,()->WorkloadClaimFence.from(f.node),f.owners::readOwner,receiver,commands,()->{},Duration.ofSeconds(5));
+                    var coordinator=new NativeValidationStartCoordinator(f.member,f.configuration,router,f.resources,f.process,()->{})){
+                var op=new io.tapstate.runtime.probe.ValidationOperation(coordinator.context(),"flow","task",f.task.generation(),1,1,UUID.randomUUID());
+                try{
+                    try(var response=coordinator.start(op)){assertThat(response.value().original()).isEqualTo(op);}
+                    await(()->entered.getCount()==0);
+                    await(()->{try(var response=coordinator.read(op)){return response.value().outcome()==io.tapstate.runtime.probe.ValidationOperation.Outcome.UNKNOWN;}});
+                    release.countDown();visible.set(true);
+                    try(var response=coordinator.read(op)){assertThat(response.value().outcome()).isEqualTo(io.tapstate.runtime.probe.ValidationOperation.Outcome.ACCEPTED);assertThat(response.value().admitted()).isFalse();}
+                    now.addAndGet(Duration.ofSeconds(31).toNanos());f.owners.expire();
+                    await(()->{try(var response=coordinator.read(op)){var value=response.value();return "STOPPED".equals(value.state())&&value.drain()==io.tapstate.runtime.probe.ValidationOperation.Drain.DRAINED;}});
+                    try(var response=coordinator.read(op)){assertThat(response.value().admitted()).isFalse();assertThat(response.value().retired()).isFalse();assertThat(response.value().controlUnknown()).isFalse();}
+                    assertThat(f.owners.receipt(captured.get()).disposed()).isTrue();assertThat(reservations).hasValue(1);assertThat(f.member.getJet().getJobs()).isEmpty();
+                    assertThat(f.tasks.read("flow","task").orElseThrow().full().nextStartSequence()).isEqualTo(1);
+                }finally{release.countDown();}
+            }
+        }finally{release.countDown();}
+    }
     @Test void exactActivationIsIdempotentAndAnOldStopNeverControlsTheNextRun()throws Exception{
         var ready=new AtomicBoolean();var prepared=new AtomicInteger();var counts=new AtomicInteger();var allowDrain=new AtomicBoolean();
         var counting=new java.util.concurrent.CountDownLatch(1);var releaseCount=new java.util.concurrent.CountDownLatch(1);

@@ -182,6 +182,128 @@ class NativeValidationStartCoordinatorTest {
             }
         }finally{releaseLookup.countDown();releaseActivation.countDown();}
     }
+    @Test @Timeout(30) void aStaleEntryIncarnationCannotReadReceiptsOrStopTheCurrentMemo(){
+        var reads=new AtomicInteger();var commands=new java.util.concurrent.CopyOnWriteArrayList<ValidationOwnerRouter.Command>();
+        try(var routing=new ValidationOwnerRouterTest.Fixture(Duration.ofSeconds(5),1);var process=new ValidationMemberResources()){
+            var resources=process.bind("cluster","a","boot-a",2,()->{});
+            for(var node:List.of("a","b")){
+                routing.behaviors.put(node,request->new ValidationOwnerRouter.Result(ValidationOwnerRouter.Outcome.UNKNOWN,null,null));
+                routing.receipts.put(node,request->{reads.incrementAndGet();return new ValidationOwnerRouter.LocalReceipt(
+                        new ValidationOwnerRouter.Result(ValidationOwnerRouter.Outcome.ACCEPTED,new ValidationOwner("cluster","flow",node,"boot-"+node,3,4,1),null),false);});
+                routing.commands.put(node,command->{commands.add(command);return new ValidationOwnerRouter.CommandReply(ValidationOwnerRouter.Outcome.ACCEPTED,command,"STARTING",false,false,false,false,false,null);});
+            }
+            try(var coordinator=new NativeValidationStartCoordinator(routing.a,configuration(),routing.left,resources,process,()->{})){
+                var current=operation(coordinator.context());try(var response=coordinator.start(current)){assertThat(response.value().original()).isEqualTo(current);}
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->resources.snapshot().metadataFrames()==0);
+                var context=current.context();var staleContext=new ValidationOperation.Context(context.cluster(),context.node(),context.boot(),context.member(),UUID.randomUUID());
+                var stale=new ValidationOperation(staleContext,current.pipeline(),current.task(),current.taskGeneration(),current.revision(),current.sequence(),current.command());
+                try(var response=coordinator.read(stale)){assertThat(response.value().original()).isEqualTo(stale);assertThat(response.value().outcome()).isIn(ValidationOperation.Outcome.REJECTED,ValidationOperation.Outcome.UNKNOWN);}
+                try(var response=coordinator.stop(stale)){assertThat(response.value().original()).isEqualTo(stale);}
+                assertThat(reads).hasValue(0);assertThat(commands).isEmpty();
+                try(var response=coordinator.read(current)){assertThat(response.value().outcome()).isEqualTo(ValidationOperation.Outcome.ACCEPTED);}
+                assertThat(commands).isNotEmpty().allSatisfy(command->assertThat(command.action()).isEqualTo(ValidationOwnerRouter.Action.STATUS));
+            }
+        }
+    }
+    @Test @Timeout(30) void anotherEntryMemberRecoversOnlyTheOriginalReceiptWithoutStartingFromProgress()throws Exception{
+        var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var visible=new AtomicBoolean();var activations=new AtomicInteger();
+        try(var routing=new ValidationOwnerRouterTest.Fixture(Duration.ofMillis(150),1);var process=new ValidationMemberResources()){
+            var aResources=process.bind("cluster","a","boot-a",2,()->{});var bResources=process.bind("cluster","b","boot-b",2,()->{});var configuration=configuration();
+            for(var node:List.of("a","b")){
+                routing.behaviors.put(node,request->{entered.countDown();try{assertThat(release.await(5,TimeUnit.SECONDS)).isTrue();}
+                    catch(InterruptedException interrupted){throw new AssertionError(interrupted);}
+                    return new ValidationOwnerRouter.Result(ValidationOwnerRouter.Outcome.ACCEPTED,new ValidationOwner("cluster","flow",node,"boot-"+node,3,4,1),null);});
+                routing.receipts.put(node,request->visible.get()?new ValidationOwnerRouter.LocalReceipt(
+                        new ValidationOwnerRouter.Result(ValidationOwnerRouter.Outcome.ACCEPTED,new ValidationOwner("cluster","flow",node,"boot-"+node,3,4,1),null),false):ValidationOwnerRouter.LocalReceipt.unknown());
+                routing.commands.put(node,command->{if(command.action()==ValidationOwnerRouter.Action.ACTIVATE)activations.incrementAndGet();
+                    return new ValidationOwnerRouter.CommandReply(ValidationOwnerRouter.Outcome.ACCEPTED,command,"STARTING",false,false,false,false,false,null);});
+            }
+            try(var a=new NativeValidationStartCoordinator(routing.a,configuration,routing.left,aResources,process,()->{});
+                    var b=new NativeValidationStartCoordinator(routing.b,configuration,routing.right,bResources,process,()->{})){
+                var op=operation(a.context());
+                try{
+                    try(var response=b.start(op)){assertThat(response.value().original()).isEqualTo(op);}
+                    assertThat(entered.await(2,TimeUnit.SECONDS)).isTrue();
+                    org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(2)).until(()->{try(var response=b.read(op)){return response.value().outcome()==ValidationOperation.Outcome.UNKNOWN;}});
+                    release.countDown();visible.set(true);
+                    org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->{try(var response=b.read(op)){return response.value().outcome()==ValidationOperation.Outcome.ACCEPTED;}});
+                    assertThat(activations).hasValue(0);assertThat(routing.calls.values().stream().mapToInt(AtomicInteger::get).sum()).isOne();
+                    try(var response=b.start(op)){assertThat(response.value().original()).isEqualTo(op);}
+                    org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(2)).until(()->activations.get()==1);
+                    assertThat(routing.calls.values().stream().mapToInt(AtomicInteger::get).sum()).isOne();
+                }finally{release.countDown();}
+            }
+        }finally{release.countDown();}
+    }
+    @Test @Timeout(30) void anotherMemberCannotDropTheKnownOriginalEntryReceiverPin(){
+        try(var routing=new ValidationOwnerRouterTest.Fixture(Duration.ofSeconds(5),1);var process=new ValidationMemberResources()){
+            var aResources=process.bind("cluster","a","boot-a",2,()->{});var bResources=process.bind("cluster","b","boot-b",2,()->{});var configuration=configuration();
+            var saved=snapshot("flow","task");var current=new AtomicReference<>(saved);var original=new AtomicReference<ValidationOperation>();var replacedCommands=new AtomicInteger();
+            when(configuration.validationTasks(()->{}).read("flow","task")).thenAnswer(ignored->Optional.of(current.get()));
+            routing.behaviors.put("b",request->ValidationOwnerRouter.Result.capacity());
+            routing.commands.put("a",command->{
+                var op=original.get();var spec=new ValidationRunSpec(saved.comparison(),ValidationMode.FULL,ValidationMethod.COUNT);
+                var identity=new ValidationRunIdentity(command.owner(),"task",NativeValidationStartCoordinator.runId(op),ValidationMode.FULL,spec.fingerprint(),1,"direct-full-v1");
+                var start=new ValidationReportAdmission.Start(saved.task(),1,1,op.command().toString(),identity);
+                current.set(new ValidationTaskStore.Snapshot(saved.task(),1,saved.commandId(),saved.comparison(),saved.settings(),1,saved.schedulingCommandId(),false,
+                        new ValidationTaskStore.Mode(2,new ValidationTaskStore.Permission(start,ValidationTaskStore.Phase.OPEN)),saved.incremental()));
+                return new ValidationOwnerRouter.CommandReply(ValidationOwnerRouter.Outcome.ACCEPTED,command,"STARTING",false,false,false,false,false,null);
+            });
+            try(var a=new NativeValidationStartCoordinator(routing.a,configuration,routing.left,aResources,process,()->{});
+                    var b=new NativeValidationStartCoordinator(routing.b,configuration,routing.right,bResources,process,()->{})){
+                var op=operation(a.context());original.set(op);try(var response=b.start(op)){assertThat(response.value().original()).isEqualTo(op);}
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->current.get()!=saved&&aResources.snapshot().metadataFrames()==0);
+                int reservations=routing.calls.values().stream().mapToInt(AtomicInteger::get).sum();routing.left.close();
+                routing.commands.put("a",command->{replacedCommands.incrementAndGet();return new ValidationOwnerRouter.CommandReply(ValidationOwnerRouter.Outcome.ACCEPTED,command,"STOPPED",false,false,false,true,true,null);});
+                try(var replacement=routing.router(routing.a,routing.ga,"a",Duration.ofSeconds(5))){
+                    try(var response=b.stop(op)){assertThat(response.value().original()).isEqualTo(op);}
+                    try(var response=b.start(op)){assertThat(response.value().original()).isEqualTo(op);}
+                    org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->aResources.snapshot().metadataFrames()==0);
+                    assertThat(replacedCommands).hasValue(0);assertThat(routing.calls.values().stream().mapToInt(AtomicInteger::get).sum()).isEqualTo(reservations);
+                }
+            }
+        }
+    }
+    @Test @Timeout(30) void aLocalOriginalRetrySelectedWithAReceiptReadIsNotLostBehindThatRead()throws Exception{receiptRetryRace(false);}
+    @Test @Timeout(30) void aLocalOriginalRetrySelectedBeforeOwnerRecoveryStillActivatesAfterRecovery()throws Exception{receiptRetryRace(true);}
+    private void receiptRetryRace(boolean readFinishesFirst)throws Exception{
+        var readSelected=new CountDownLatch(1);var startSelected=new CountDownLatch(1);var releaseRead=new CountDownLatch(1);var releaseStart=new CountDownLatch(1);
+        var receiptEntered=new CountDownLatch(1);var releaseReceipt=new CountDownLatch(1);var readGate=new AtomicBoolean();var startGate=new AtomicBoolean();var activations=new AtomicInteger();
+        try(var routing=new ValidationOwnerRouterTest.Fixture(Duration.ofSeconds(5),1);var process=new ValidationMemberResources();var callers=Executors.newFixedThreadPool(2)){
+            var resources=process.bind("cluster","a","boot-a",2,()->{
+                boolean selected=StackWalker.getInstance().walk(frames->frames.anyMatch(frame->frame.getClassName().equals(NativeValidationStartCoordinator.class.getName())&&frame.getMethodName().equals("originalReceipt")));
+                try{
+                    if(selected&&Thread.currentThread().getName().equals("local-receipt-read")&&readGate.compareAndSet(false,true)){
+                        readSelected.countDown();assertThat(releaseRead.await(5,TimeUnit.SECONDS)).isTrue();}
+                    if(selected&&Thread.currentThread().getName().equals("local-receipt-start")&&startGate.compareAndSet(false,true)){
+                        startSelected.countDown();assertThat(releaseStart.await(5,TimeUnit.SECONDS)).isTrue();}
+                }catch(InterruptedException interrupted){throw new AssertionError(interrupted);}
+            });
+            for(var node:List.of("a","b")){
+                routing.behaviors.put(node,request->new ValidationOwnerRouter.Result(ValidationOwnerRouter.Outcome.UNKNOWN,null,null));
+                routing.receipts.put(node,request->{receiptEntered.countDown();try{assertThat(releaseReceipt.await(5,TimeUnit.SECONDS)).isTrue();}
+                    catch(InterruptedException interrupted){throw new AssertionError(interrupted);}
+                    return new ValidationOwnerRouter.LocalReceipt(new ValidationOwnerRouter.Result(ValidationOwnerRouter.Outcome.ACCEPTED,new ValidationOwner("cluster","flow",node,"boot-"+node,3,4,1),null),false);});
+                routing.commands.put(node,command->{if(command.action()==ValidationOwnerRouter.Action.ACTIVATE)activations.incrementAndGet();
+                    return new ValidationOwnerRouter.CommandReply(ValidationOwnerRouter.Outcome.ACCEPTED,command,"STARTING",false,false,false,false,false,null);});
+            }
+            try(var coordinator=new NativeValidationStartCoordinator(routing.a,configuration(),routing.left,resources,process,()->{})){
+                var op=operation(coordinator.context());try(var response=coordinator.start(op)){assertThat(response.value().original()).isEqualTo(op);}
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->resources.snapshot().metadataFrames()==0);
+                var reading=callers.submit(()->{Thread.currentThread().setName("local-receipt-read");try(var response=coordinator.read(op)){return response.value();}});
+                try{
+                    assertThat(readSelected.await(2,TimeUnit.SECONDS)).isTrue();
+                    var starting=callers.submit(()->{Thread.currentThread().setName("local-receipt-start");try(var response=coordinator.start(op)){return response.value();}});
+                    assertThat(startSelected.await(2,TimeUnit.SECONDS)).isTrue();releaseRead.countDown();assertThat(receiptEntered.await(2,TimeUnit.SECONDS)).isTrue();
+                    if(readFinishesFirst){releaseReceipt.countDown();assertThat(reading.get(3,TimeUnit.SECONDS).outcome()).isEqualTo(ValidationOperation.Outcome.ACCEPTED);assertThat(activations).hasValue(0);}
+                    releaseStart.countDown();assertThat(starting.get(2,TimeUnit.SECONDS).original()).isEqualTo(op);
+                    releaseReceipt.countDown();assertThat(reading.get(3,TimeUnit.SECONDS).outcome()).isEqualTo(ValidationOperation.Outcome.ACCEPTED);
+                    org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(2)).until(()->activations.get()==1);
+                    assertThat(routing.calls.values().stream().mapToInt(AtomicInteger::get).sum()).isOne();
+                }finally{releaseRead.countDown();releaseStart.countDown();releaseReceipt.countDown();}
+            }
+        }finally{releaseRead.countDown();releaseStart.countDown();releaseReceipt.countDown();}
+    }
     @Test void wrappedTransportLossIsUnknownRatherThanAProgrammerFailure(){
         var op=operation(new ValidationOperation.Context("cluster","a","boot-a",UUID.randomUUID(),UUID.randomUUID()));
         for(var failure:List.of(new RejectedExecutionException("transport queue"),new com.hazelcast.core.OperationTimeoutException("transport timeout"),

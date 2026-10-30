@@ -195,6 +195,23 @@ class ValidationOwnerRouterTest {
         }
     }
 
+    @Test void anAcceptedReceiptDoesNotAuthorizeAReplacementReceiverIncarnation(){
+        try(var f=new Fixture(Duration.ofSeconds(5))){
+            var request=request();var target=f.ranked(request).getFirst();var sender=target.equals("a")?f.right:f.left;
+            var initial=sender.reserveAttempt(request);assertThat(initial.reply().outcome()).isEqualTo(Outcome.ACCEPTED);assertThat(initial.dispatched()).isTrue();
+            var owner=new ValidationOwner("cluster",request.pipeline(),target,"boot-"+target,initial.reply().claimGeneration(),initial.reply().executionGeneration(),initial.reply().topologyRevision());
+            f.receipts.put(target,original->new LocalReceipt(new Result(Outcome.ACCEPTED,owner,null),false));
+            assertThat(sender.receipt(request,initial.receiver()).reply().outcome()).isEqualTo(Outcome.ACCEPTED);
+            int reservations=f.calls.values().stream().mapToInt(AtomicInteger::get).sum();var commands=new AtomicInteger();
+            f.commands.put(target,command->{commands.incrementAndGet();return new CommandReply(Outcome.ACCEPTED,command,"STARTING",false,false,false,false,false,null);});
+            var receiver=target.equals("a")?f.left:f.right;receiver.close();
+            try(var replacement=f.router(target.equals("a")?f.a:f.b,target.equals("a")?f.ga:f.gb,target,Duration.ofSeconds(5))){
+                assertThat(sender.command(Command.of(Action.ACTIVATE,request,owner),initial.receiver()).outcome()).isEqualTo(Outcome.REJECTED);
+                assertThat(sender.receipt(request,initial.receiver()).reply().outcome()).isEqualTo(Outcome.UNKNOWN);
+                assertThat(commands).hasValue(0);assertThat(f.calls.values().stream().mapToInt(AtomicInteger::get).sum()).isEqualTo(reservations);
+            }
+        }
+    }
     private static Request request() { return new Request("pipeline", "task", UUID.randomUUID(), 1, 1, "FULL", UUID.randomUUID(), UUID.randomUUID().toString()); }
     private static Result accepted(String node, Request request) {
         return new Result(Outcome.ACCEPTED, new ValidationOwner("cluster", request.pipeline(), node, "boot-" + node, 3, 4, 1), null);
@@ -213,6 +230,7 @@ class ValidationOwnerRouterTest {
         final Map<String, AtomicReference<WorkloadClaimFence>> nodes = new HashMap<>();
         final Map<String, Function<Request, Result>> behaviors = new ConcurrentHashMap<>();
         final Map<String,Function<Command,CommandReply>> commands=new ConcurrentHashMap<>();
+        final Map<String,Function<Request,LocalReceipt>> receipts=new ConcurrentHashMap<>();
         final AtomicReference<WorkloadClaimReading> reading = new AtomicReference<>();
         final ValidationOwnerRouter left, right;
         Fixture(Duration timeout) { this(timeout,2); }
@@ -239,7 +257,8 @@ class ValidationOwnerRouterTest {
         }
         ValidationOwnerRouter router(HazelcastInstance member, ClusterMembershipGate gate, String id, Duration timeout) {
             return new ValidationOwnerRouter(member, gate, () -> nodes.get(id).get(), ignored -> Optional.ofNullable(reading.get()),
-                    request -> { calls.get(id).incrementAndGet(); return behaviors.get(id).apply(request); }, command->commands.get(id).apply(command),() -> {
+                    new Local(){public Result reserve(Request request){calls.get(id).incrementAndGet();return behaviors.get(id).apply(request);}
+                        public LocalReceipt receipt(Request request){var read=receipts.get(id);return read==null?LocalReceipt.unknown():read.apply(request);}}, command->commands.get(id).apply(command),() -> {
                         if (!live.get(id).get()) throw new io.tapstate.core.common.TapstateException(io.tapstate.core.validation.ValidationError.OWNER_NOT_AUTHORIZED,
                                 Map.of("pipeline", "test"), null);
                     }, timeout);

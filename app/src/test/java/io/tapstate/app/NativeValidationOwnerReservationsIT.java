@@ -29,6 +29,26 @@ import static org.assertj.core.api.Assertions.*;
 class NativeValidationOwnerReservationsIT {
     @Container static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
 
+    @Test void anActivationWinningItsMonitorCannotBeReportedAsAnUnusedDisposedReceipt()throws Exception{
+        var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var stops=new AtomicInteger();
+        try(var f=new Fixture()){
+            var request=f.request("FULL",1);var accepted=f.owners.reserve(request);assertThat(accepted.outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
+            var reservation=f.owners.take(f.owners.original(request,accepted.owner()));var allocation=reservation.resources();
+            f.localGuard=()->{if(Thread.currentThread().getName().equals("receipt-activate")){
+                entered.countDown();try{assertThat(release.await(5,TimeUnit.SECONDS)).isTrue();}catch(InterruptedException interrupted){throw new AssertionError(interrupted);}}};
+            var activation=new FutureTask<Void>(()->{reservation.activate(stops::incrementAndGet);return null;});
+            var reading=new FutureTask<ValidationOwnerRouter.LocalReceipt>(()->f.owners.receipt(request));
+            var actor=new Thread(activation,"receipt-activate");var reader=new Thread(reading,"receipt-reader");
+            try{
+                actor.start();assertThat(entered.await(2,TimeUnit.SECONDS)).isTrue();reader.start();
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(2)).until(()->reader.getState()==Thread.State.BLOCKED);
+                release.countDown();activation.get(2,TimeUnit.SECONDS);var receipt=reading.get(2,TimeUnit.SECONDS);
+                assertThat(receipt.disposed()).isFalse();assertThat(receipt.result().outcome()).isEqualTo(ValidationOwnerRouter.Outcome.UNKNOWN);
+            }finally{release.countDown();actor.join(5000);reader.join(5000);f.localGuard=()->{};
+                reservation.close();allocation.close();allocation.processorsExited();reservation.releaseAfterKnownTerminal();}
+            assertThat(stops).hasValue(1);
+        }finally{release.countDown();}
+    }
     @Test void nativeFullAndIncrementalReservationsReuseOneAdvancedOwnerWithoutLaunchTickets() {
         try (var f = new Fixture()) {
             var full = f.request("FULL", 1); var first = f.owners.reserve(full);

@@ -69,9 +69,22 @@ final class ValidationOwnerRouter implements AutoCloseable {
     record Receiver(UUID incarnation, Identity identity, long topologyRevision) implements Serializable {
         Receiver { Objects.requireNonNull(incarnation); Objects.requireNonNull(identity); if (topologyRevision < 1) throw invalid("routing.receiver"); }
     }
+    /** Sender-local proof of the sole dispatched reservation; it is never reconstructed from a claim. */
+    record Attempt(Reply reply,Receiver receiver,boolean dispatched) {
+        Attempt{Objects.requireNonNull(reply);if(dispatched&&receiver==null)throw invalid("routing.attempt");}
+    }
+    record LocalReceipt(Result result,boolean disposed) {
+        LocalReceipt{Objects.requireNonNull(result);if(disposed&&result.outcome()!=Outcome.REJECTED)throw invalid("routing.disposedReceipt");}
+        static LocalReceipt unknown(){return new LocalReceipt(new Result(Outcome.UNKNOWN,null,null),false);}
+    }
+    record Receipt(Reply reply,boolean disposed) implements Serializable {
+        Receipt{Objects.requireNonNull(reply);if(disposed&&reply.outcome()!=Outcome.REJECTED)throw invalid("routing.disposedReceipt");}
+    }
     @FunctionalInterface interface Local {
         /** CAPACITY/REDIRECT must prove no claim, ticket, Job or unknown allocation was retained. */
         Result reserve(Request request);
+        /** Passive lookup only. Missing original state never authorizes preparation or a new reservation. */
+        default LocalReceipt receipt(Request request){return LocalReceipt.unknown();}
     }
     enum Action { ACTIVATE,STATUS,STOP,CANCEL_UNUSED }
     /** Immutable original coordinates only. No spec, executable object, model or connection crosses the wire. */
@@ -126,16 +139,19 @@ final class ValidationOwnerRouter implements AutoCloseable {
     }
 
     /** One exact original owner only; missing/unknown status never causes a reservation or replacement start. */
-    CommandReply command(Command command){
+    CommandReply command(Command command){return command(command,null);}
+    CommandReply command(Command command,Receiver pinned){
         Objects.requireNonNull(command);var before=roster();
         var target=before.identities.get(command.node());
-        if(!before.cluster.equals(command.cluster())||target==null||!target.boot().equals(command.boot())||command.topology()>before.revision)
+        if(!before.cluster.equals(command.cluster())||target==null||!target.boot().equals(command.boot())||command.topology()>before.revision
+                ||pinned!=null&&!pinned.identity().equals(target))
             return commandUnavailable(command,Outcome.REJECTED,null);
         try{
             var executor=member.getExecutorService(EXECUTOR);long deadline=System.nanoTime()+timeoutNanos;
             var destination=before.members.get(target.node());
             var receiver=executor.submitToMember(new Probe(target,before.revision),destination).get(timeoutNanos,TimeUnit.NANOSECONDS);
-            if(receiver==null||!target.equals(receiver.identity())||before.revision!=receiver.topologyRevision())return commandUnavailable(command,Outcome.REJECTED,null);
+            if(receiver==null||!target.equals(receiver.identity())||before.revision!=receiver.topologyRevision()
+                    ||pinned!=null&&!pinned.incarnation().equals(receiver.incarnation()))return commandUnavailable(command,Outcome.REJECTED,null);
             long remaining=deadline-System.nanoTime();if(remaining<=0)return commandUnavailable(command,Outcome.UNKNOWN,null);
             var answer=executor.submitToMember(new CommandCall(command,target,before.revision,receiver.incarnation()),destination).get(remaining,TimeUnit.NANOSECONDS);
             requireActive();if(!before.same(roster())||answer==null||!command.equals(answer.original()))return commandUnavailable(command,Outcome.UNKNOWN,null);
@@ -161,11 +177,12 @@ final class ValidationOwnerRouter implements AutoCloseable {
     }
     static CommandReply commandUnavailable(Command command,Outcome outcome,String reason){return new CommandReply(outcome,command,null,false,false,false,false,false,reason);}
 
-    Reply reserve(Request request) {
+    Reply reserve(Request request) {return reserveAttempt(request).reply();}
+    Attempt reserveAttempt(Request request) {
         Objects.requireNonNull(request); var before = roster(); long deadline = System.nanoTime() + timeoutNanos;
         var tried = new HashSet<Identity>();
-        for (int attempt = 0; attempt <= before.members.size(); attempt++) {
-            requireActive(); if (!before.same(roster()) || System.nanoTime() - deadline >= 0) return unknown(request, null, null);
+        for (int candidateAttempt = 0; candidateAttempt <= before.members.size(); candidateAttempt++) {
+            requireActive(); if (!before.same(roster()) || System.nanoTime() - deadline >= 0) return new Attempt(unknown(request,null,null),null,false);
             var reading = Objects.requireNonNull(readOwner.apply(request.pipeline()));
             reading.ifPresent(value -> {
                 var key = value.claim().key();
@@ -177,50 +194,87 @@ final class ValidationOwnerRouter implements AutoCloseable {
             if (owned) {
                 var claim = reading.orElseThrow().claim();
                 selected = before.identities.get(claim.owner().nodeId());
-                if (selected == null || !selected.boot.equals(claim.owner().bootId()) || tried.contains(selected)) return unknown(request, selected, null);
+                if (selected == null || !selected.boot.equals(claim.owner().bootId()) || tried.contains(selected)) return new Attempt(unknown(request,selected,null),null,false);
             } else {
                 selected = ValidationOwnerRanking.rank(before.cluster, request.pipeline(), before.identities.keySet()).stream()
                         .map(before.identities::get).filter(value -> !tried.contains(value)).findFirst().orElse(null);
-                if (selected == null) return new Reply(Outcome.CAPACITY, request.command(), null, 0, 0, 0, null);
+                if (selected == null) return new Attempt(new Reply(Outcome.CAPACITY,request.command(),null,0,0,0,null),null,false);
             }
             tried.add(selected);
-            var reply = invoke(request, selected, before.revision, before.members.get(selected.node), deadline);
-            try { requireActive(); if (!before.same(roster())) return unknown(request, selected, reply.reasonCode()); }
-            catch (TapstateException unavailable) { return unknown(request, selected, unavailable.code().code()); }
+            var attempt = invoke(request, selected, before.revision, before.members.get(selected.node), deadline);var reply=attempt.reply();
+            try { requireActive(); if (!before.same(roster())) return new Attempt(unknown(request,selected,reply.reasonCode()),attempt.receiver(),attempt.dispatched()); }
+            catch (TapstateException unavailable) { return new Attempt(unknown(request,selected,unavailable.code().code()),attempt.receiver(),attempt.dispatched()); }
             if (reply.outcome() == Outcome.CAPACITY && !owned || reply.outcome() == Outcome.REDIRECT) continue;
-            return reply;
+            return attempt;
         }
-        return unknown(request, null, null);
+        return new Attempt(unknown(request,null,null),null,false);
     }
 
-    private Reply invoke(Request request, Identity target, long revision, Member destination, long deadline) {
+    private Attempt invoke(Request request, Identity target, long revision, Member destination, long deadline) {
+        Receiver verified=null;boolean dispatched=false;
         try {
-            long remaining = deadline - System.nanoTime(); if (remaining <= 0) return unknown(request, target, null);
+            long remaining = deadline - System.nanoTime(); if (remaining <= 0) return new Attempt(unknown(request,target,null),verified,dispatched);
             var executor = member.getExecutorService(EXECUTOR);
             var receiver = executor.submitToMember(new Probe(target, revision), destination).get(remaining, TimeUnit.NANOSECONDS);
-            if (receiver == null) return rejected(request, target, null);
-            if (!target.equals(receiver.identity()) || revision != receiver.topologyRevision()) return unknown(request, target, null);
-            remaining = deadline - System.nanoTime(); if (remaining <= 0) return unknown(request, target, null);
+            if (receiver == null) return new Attempt(rejected(request,target,null),null,false);
+            if (!target.equals(receiver.identity()) || revision != receiver.topologyRevision()) return new Attempt(unknown(request,target,null),verified,dispatched);
+            verified=receiver;
+            remaining = deadline - System.nanoTime(); if (remaining <= 0) return new Attempt(unknown(request,target,null),verified,dispatched);
+            dispatched=true;
             var future = executor.submitToMember(new Call(request, target, revision, receiver.incarnation()), destination);
             var reply = future.get(remaining, TimeUnit.NANOSECONDS);
-            if (reply == null || !request.command().equals(reply.command()) || !target.equals(reply.receiver())) return unknown(request, target, null);
-            return reply;
+            if (reply == null || !request.command().equals(reply.command()) || !target.equals(reply.receiver())) return new Attempt(unknown(request,target,null),verified,dispatched);
+            return new Attempt(reply,verified,dispatched);
         } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt(); return unknown(request, target, null);
+            Thread.currentThread().interrupt(); return new Attempt(unknown(request,target,null),verified,dispatched);
         } catch (TimeoutException | CancellationException | RejectedExecutionException | HazelcastInstanceNotActiveException
                 | MemberLeftException | TargetDisconnectedException | TargetNotMemberException | OperationTimeoutException unavailable) {
-            return unknown(request, target, null);
+            return new Attempt(unknown(request,target,null),verified,dispatched);
         } catch (ExecutionException failed) {
             var cause = failed.getCause();
-            if (cause instanceof TapstateException coded) return unknown(request, target, coded.code().code());
+            if (cause instanceof TapstateException coded) return new Attempt(unknown(request,target,coded.code().code()),verified,dispatched);
             if (cause instanceof MemberLeftException || cause instanceof TargetDisconnectedException || cause instanceof TargetNotMemberException
                     || cause instanceof OperationTimeoutException || cause instanceof HazelcastInstanceNotActiveException
-                    || cause instanceof RejectedExecutionException) return unknown(request, target, null);
+                    || cause instanceof RejectedExecutionException) return new Attempt(unknown(request,target,null),verified,dispatched);
             if (cause instanceof Error fatal) throw fatal;
             throw new IllegalStateException("validation control receiver failed", cause);
         }
     }
 
+    /** One original receiver/context only. This path never invokes ranking, preparation or reserve. */
+    Receipt receipt(Request request,Receiver pinned){
+        Objects.requireNonNull(request);Objects.requireNonNull(pinned);var before=roster();var expected=pinned.identity();
+        if(!expected.equals(before.identities.get(expected.node())))return new Receipt(unknown(request,expected,null),false);
+        try{
+            var reply=member.getExecutorService(EXECUTOR).submitToMember(new ReceiptCall(request,pinned,before.revision),before.members.get(expected.node()))
+                    .get(timeoutNanos,TimeUnit.NANOSECONDS);
+            requireActive();
+            if(!before.same(roster())||reply==null||!request.command().equals(reply.reply().command())||!expected.equals(reply.reply().receiver()))
+                return new Receipt(unknown(request,expected,null),false);
+            return reply;
+        }catch(InterruptedException interrupted){Thread.currentThread().interrupt();return new Receipt(unknown(request,expected,null),false);}
+        catch(TimeoutException|CancellationException|RejectedExecutionException|HazelcastInstanceNotActiveException|MemberLeftException
+                |TargetDisconnectedException|TargetNotMemberException|OperationTimeoutException unavailable){return new Receipt(unknown(request,expected,null),false);}
+        catch(ExecutionException failed){
+            var cause=failed.getCause();if(cause instanceof TapstateException coded)return new Receipt(unknown(request,expected,coded.code().code()),false);
+            if(cause instanceof MemberLeftException||cause instanceof TargetDisconnectedException||cause instanceof TargetNotMemberException
+                    ||cause instanceof OperationTimeoutException||cause instanceof HazelcastInstanceNotActiveException||cause instanceof RejectedExecutionException)
+                return new Receipt(unknown(request,expected,null),false);
+            if(cause instanceof Error fatal)throw fatal;throw new IllegalStateException("validation original receipt failed",cause);
+        }
+    }
+    private Receipt receiveReceipt(Request request,Receiver pinned,long revision){
+        var current=roster();var expected=pinned.identity();
+        if(!incarnation.equals(pinned.incarnation())||current.revision!=revision||!expected.matches(member.getCluster().getLocalMember())
+                ||!expected.equals(current.identities.get(expected.node())))return new Receipt(unknown(request,expected,null),false);
+        var result=Objects.requireNonNull(local.receipt(request));requireActive();
+        if(!current.same(roster()))return new Receipt(unknown(request,expected,null),false);
+        var value=result.result();var owner=value.owner();
+        if(owner!=null&&(!owner.clusterId().equals(current.cluster)||!owner.pipelineId().equals(request.pipeline())
+                ||!owner.nodeId().equals(expected.node())||!owner.bootId().equals(expected.boot())||owner.topologyRevision()>current.revision))throw invalid("routing.receiptOwner");
+        return new Receipt(new Reply(value.outcome(),request.command(),expected,owner==null?0:owner.claimGeneration(),
+                owner==null?0:owner.executionGeneration(),owner==null?0:owner.topologyRevision(),value.reasonCode()),result.disposed());
+    }
     private Reply receive(Request request, Identity expected, long revision) {
         boolean entered = false;
         try {
@@ -282,6 +336,17 @@ final class ValidationOwnerRouter implements AutoCloseable {
     private static TapstateException invalid(String field) { return new TapstateException(ValidationError.INVALID_CONTRACT, Map.of("field", field), null); }
     private static TapstateException unauthorized() { return new TapstateException(ValidationError.OWNER_NOT_AUTHORIZED, Map.of("pipeline", "validation-control"), null); }
 
+    private static final class ReceiptCall implements Callable<Receipt>,Serializable,HazelcastInstanceAware {
+        private static final long serialVersionUID=1L;
+        private final Request request;private final Receiver pinned;private final long revision;private transient HazelcastInstance member;
+        ReceiptCall(Request request,Receiver pinned,long revision){this.request=request;this.pinned=pinned;this.revision=revision;}
+        @Override public void setHazelcastInstance(HazelcastInstance member){this.member=member;}
+        @Override public Receipt call(){
+            var receiver=member.getUserContext().get(CONTEXT);
+            return receiver instanceof ValidationOwnerRouter router&&router.incarnation.equals(pinned.incarnation())
+                    ?router.receiveReceipt(request,pinned,revision):new Receipt(unknown(request,pinned.identity(),null),false);
+        }
+    }
     static final class Call implements Callable<Reply>, Serializable, HazelcastInstanceAware {
         private static final long serialVersionUID = 1L;
         private final Request request; private final Identity expected; private final long revision;

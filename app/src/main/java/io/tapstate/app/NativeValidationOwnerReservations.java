@@ -182,6 +182,25 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         }
     }
 
+    /** A coherent original-local receipt; no missing registry or authority is constructed by reading. */
+    @Override public ValidationOwnerRouter.LocalReceipt receipt(Request request){
+        requireActive();final Pipeline local;
+        synchronized(pipelines){local=pipelines.get(request.pipeline());if(local==null)return ValidationOwnerRouter.LocalReceipt.unknown();local.references++;}
+        if(!local.lock.tryLock()){unpin(local);return ValidationOwnerRouter.LocalReceipt.unknown();}
+        try{
+            var original=local.operations.get(new Operation(request.task(),request.taskGeneration(),request.mode(),request.command()));
+            if(original==null||!original.request.equals(request))return ValidationOwnerRouter.LocalReceipt.unknown();
+            synchronized(original){
+                if(original.preparing||original.unknown||original.claimUncertain)return ValidationOwnerRouter.LocalReceipt.unknown();
+                if(!original.activated&&original.cancelled.get()&&original.metadata==null&&(original.bound==null||original.bound.fullyReleased()))
+                    return new ValidationOwnerRouter.LocalReceipt(new Result(Outcome.REJECTED,null,original.reason),true);
+                if(original.accepted&&!original.activated&&!original.cancelled.get()&&original.bound!=null&&original.owner!=null){
+                    original.requireReserved();return new ValidationOwnerRouter.LocalReceipt(new Result(Outcome.ACCEPTED,original.owner.lease.owner(),null),false);
+                }
+                return ValidationOwnerRouter.LocalReceipt.unknown();
+            }
+        }finally{local.lock.unlock();unpin(local);}
+    }
     ValidationReportAdmission.Start original(Request request,ValidationOwner expected){
         requireActive();var local=pipeline(request.pipeline());
         if(!local.lock.tryLock()){unpin(local);throw unauthorized(local.pipeline);}
@@ -215,6 +234,10 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
             // This is an immutable local receipt, not authority to resume or control a retired run.
             if(original.completed&&original.terminal!=null)return Optional.of(new Pending(original.terminal==ValidationRunState.STOPPED,
                     original.bound.fullyReleased(),original.terminal,original.terminalAdmitted,original.reason));
+            synchronized(original){
+                if(!original.preparing&&!original.unknown&&!original.claimUncertain&&!original.activated&&original.cancelled.get()
+                        &&original.metadata==null&&original.bound.fullyReleased())return Optional.of(new Pending(true,true));
+            }
             original.requireOwner();if(stop&&!original.cancelIfUnused()||!stop&&original.isActivated())return Optional.empty();
             return Optional.of(new Pending(original.cancelled.get(),original.cancelled.get()&&original.bound.fullyReleased()));
         }finally{local.lock.unlock();unpin(local);}
