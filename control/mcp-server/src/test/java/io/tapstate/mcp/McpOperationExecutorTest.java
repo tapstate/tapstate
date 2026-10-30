@@ -30,6 +30,26 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class McpOperationExecutorTest {
 
+    @Test void storageToolsPostTheSameSharedBodyAndNeverPutSecretsInUrls() throws Exception {
+        var paths = new ArrayList<String>(); var requests = new ArrayList<Object>();
+        HttpServer server = server(exchange -> {
+            paths.add(exchange.getRequestURI().toString());
+            assertThat(exchange.getRequestMethod()).isEqualTo("POST");
+            requests.add(JsonReader.parse(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8)));
+            answer(exchange, 200, "{\"phase\":\"UNKNOWN\"}");
+        });
+        try (HttpControlClient client = new HttpControlClient()) {
+            var executor = new McpOperationExecutor(baseOf(server), "bearer", Map.of(), client);
+            var body = Map.<String,Object>of("transferKey", "sentinel-transfer-key", "operationId", "original");
+            for (var id : new java.util.TreeSet<>(io.tapstate.control.client.StorageControlClient.OPERATIONS)) {
+                assertThat(executor.execute(ControlOperations.registry().resolve(id), body).error()).as(id).isFalse();
+                assertThat(paths.getLast()).isEqualTo(io.tapstate.control.client.StorageControlClient.path(id)).doesNotContain("sentinel");
+                assertThat(requests.getLast()).isEqualTo(body);
+            }
+            assertThat(paths).hasSize(11);
+        } finally { server.stop(0); }
+    }
+
     @Test
     void connectionOperationsWaitForTheConnectorBeyondTheHeavyBudget() throws Exception {
         HttpServer server = server(exchange -> {
@@ -126,6 +146,10 @@ class McpOperationExecutorTest {
                             Map.of("sourceId", "views", "collection", "order_state")),
                     Map.entry(ControlOperations.DATA_BROWSER_FIND,
                             Map.of("sourceId", "views", "collection", "order_state")));
+
+            calls = new ArrayList<>(calls);
+            for (var id : new java.util.TreeSet<>(io.tapstate.control.client.StorageControlClient.OPERATIONS))
+                calls.add(Map.entry(ControlOperations.registry().resolve(id), Map.of()));
 
             // "Every" is derived, not counted by hand. The routing is a switch over operation ids, and
             // the failure it has is silent in exactly this shape: a verb marked open on this face with

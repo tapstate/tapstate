@@ -67,6 +67,11 @@ public enum ConnectorError implements TapstateErrorCode {
      */
     LOAD_FAILED("connector.load-failed", Set.of(Parameters.CONNECTOR)),
 
+    /** The persisted server trust bundle or its verification options cannot be used safely. */
+    TLS_TRUST_INVALID("connector.tls-trust-invalid", Set.of("connector")),
+    /** Owned temporary trust material could not be removed after its connector use. */
+    TLS_MATERIAL_CLEANUP_FAILED("connector.tls-material-cleanup-failed", Set.of("connector")),
+
     /**
      * The declared entry class is not on the connector's classpath or is not a connector.
      * {@code connector} is the connector id; {@code class} is the class name that was looked up.
@@ -190,6 +195,9 @@ public enum ConnectorError implements TapstateErrorCode {
      * people.
      */
     READ_FAILED("connector.read-failed", Set.of(Parameters.CONNECTOR, Parameters.DETAIL)),
+
+    /** A snapshot cannot establish its required metadata and replay anchor before reading source rows. */
+    SNAPSHOT_PREPARATION_UNAVAILABLE("connector.snapshot-preparation-unavailable", Set.of("connector", "reason")),
 
     /**
      * The connector gave up part way through a read and returned as if it had not. {@code connector} is

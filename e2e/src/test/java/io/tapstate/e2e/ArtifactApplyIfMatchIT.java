@@ -1,10 +1,9 @@
 package io.tapstate.e2e;
 
-import com.mongodb.ConnectionString;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
-import io.tapstate.adapters.mongostore.SourceConfigKeyringStore;
+import io.tapstate.adapters.mongostore.SourceConfigCipher;
 import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.dsl.DslParser;
@@ -20,7 +19,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Locale;
+import java.util.Base64;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -65,10 +64,10 @@ class ArtifactApplyIfMatchIT {
     @EnumSource(Tiers.class)
     void aStaleVersionIsRefusedWithoutWritingAndTheCurrentOneIsAccepted(Tiers tier, @TempDir Path directory)
             throws Exception {
-        String uri = storeUri("apply_if_match", tier);
-        try (MongoClient raw = MongoClients.create(uri); ServerHandle server = tier.launch(uri)) {
-            MongoDatabase database = raw.getDatabase(new ConnectionString(uri).getDatabase());
-            ControlPlane control = connected(server, directory);
+        try (var storage = PreparedNativeStore.create(); MongoClient raw = MongoClients.create(storage.configurationUri());
+                ServerHandle server = tier.launch(storage)) {
+            MongoDatabase database = raw.getDatabase(storage.configurationDatabase());
+            ControlPlane control = connected(server, storage, directory);
 
             control.apply(Map.of("src_file.tap.yml", sourceYaml("first")));
             assertStoredSource(database, control, "first");
@@ -119,10 +118,10 @@ class ArtifactApplyIfMatchIT {
     @EnumSource(Tiers.class)
     void anApplyThatClaimsNoVersionOverwritesWhateverIsStored(Tiers tier, @TempDir Path directory)
             throws Exception {
-        String uri = storeUri("apply_no_if_match", tier);
-        try (MongoClient raw = MongoClients.create(uri); ServerHandle server = tier.launch(uri)) {
-            MongoDatabase database = raw.getDatabase(new ConnectionString(uri).getDatabase());
-            ControlPlane control = connected(server, directory);
+        try (var storage = PreparedNativeStore.create(); MongoClient raw = MongoClients.create(storage.configurationUri());
+                ServerHandle server = tier.launch(storage)) {
+            MongoDatabase database = raw.getDatabase(storage.configurationDatabase());
+            ControlPlane control = connected(server, storage, directory);
 
             control.apply(Map.of("src_file.tap.yml", sourceYaml("first")));
             assertStoredSource(database, control, "first");
@@ -140,27 +139,27 @@ class ArtifactApplyIfMatchIT {
         }
     }
 
-    private static ControlPlane connected(ServerHandle server, Path directory) throws Exception {
+    private static ControlPlane connected(ServerHandle server, PreparedNativeStore storage, Path directory) throws Exception {
         ControlPlane control = new ControlPlane(server.baseUrl());
-        control.bootstrapAndLogin("e2e", "e2e-password");
+        storage.loginAndAwaitBusiness(control);
         control.registerConnector(
                 E2eConnectorJar.CONNECTOR_ID, Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
         return control;
     }
 
-    private static String storeUri(String name, Tiers tier) {
-        return SharedMongo.replicaSetUrl(name + "_" + tier.name().toLowerCase(Locale.ROOT));
-    }
-
     /** Reads only this fixture's metadata; public HTTP must withhold even its non-secret fake config. */
     private static Document assertStoredSource(MongoDatabase database, ControlPlane control, String marker) {
-        Document stored = SystemCollections.ARTIFACTS.on(database).find(new Document("_id", SOURCE_ID)).first();
+        Document stored = SystemCollections.SOURCES.on(database).find(new Document("_id", SOURCE_ID)).first();
         assertThat(stored).isNotNull();
         String envelope = stored.get("body", Document.class).getString("config");
         assertThat(envelope).startsWith("tscfg:1:");
         assertThat(stored.toJson()).doesNotContain("/tmp/first", "/tmp/second", "/tmp/third");
         SourceResource expected = (SourceResource) new DslParser().parse(sourceYaml(marker));
-        var cipher = new SourceConfigKeyringStore(database).loadExistingCipher();
+        Document key = SystemCollections.CLUSTER_KEYS.on(database).find(new Document("_id", "cluster")).first();
+        assertThat(key).isNotNull();
+        byte[] material = Base64.getUrlDecoder().decode(key.getString("material"));
+        var cipher = new SourceConfigCipher(material);
+        java.util.Arrays.fill(material, (byte) 0);
         assertThat(JsonReader.parse(cipher.decrypt(SOURCE_ID, E2eConnectorJar.CONNECTOR_ID, envelope)))
                 .as("the accepted HTTP write stores the complete config the runtime reconstructs")
                 .isEqualTo(expected.config());

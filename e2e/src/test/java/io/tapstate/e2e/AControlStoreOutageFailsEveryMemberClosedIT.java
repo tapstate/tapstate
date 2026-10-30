@@ -126,9 +126,9 @@ class AControlStoreOutageFailsEveryMemberClosedIT {
 
             // Its own store, not the module's shared one: this case takes the store away, and taking
             // away something other cases are using is a different kind of failure entirely.
-            try (NetworkedMongo store = NetworkedMongo.start()) {
-                try (PartitionableCluster cluster = PartitionableCluster.start(
-                        store.uriForThisHost("e2e_store_outage"), "e2e-store-outage", nodes)) {
+            try (NetworkedMongo store = NetworkedMongo.start();
+                 PreparedNativeStore storage = PreparedNativeStore.createOn(store)) {
+                try (PartitionableCluster cluster = PartitionableCluster.startPrepared(storage, nodes)) {
                     cluster.awaitMembers("node-a", 3);
                     ControlPlane control = cluster.member("node-a");
                     start(control, connector, source, target);
@@ -223,6 +223,9 @@ class AControlStoreOutageFailsEveryMemberClosedIT {
                             .describedAs("the run came back under one owner: a member that had acted "
                                     + "while it could not prove its claim would be a second one here")
                             .hasSize(1);
+                } finally {
+                    // Restore the owned server before its databases are cleaned, including on failure.
+                    store.thaw();
                 }
             }
         }

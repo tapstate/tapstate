@@ -14,7 +14,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.LinkedHashMap;
-import java.util.Locale;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -53,11 +52,10 @@ class OracleLogMinerIdentifierPreflightIT {
         Files.createDirectories(target);
         FileEndpoints.replaceTable(source.resolve(TABLE + ".csv"), "id,seq\n1,1\n");
 
-        try (ServerHandle server = tier.launch(
-                SharedMongo.replicaSetUrl(
-                        "oracle_logminer_preflight_" + tier.name().toLowerCase(Locale.ROOT)))) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+             ServerHandle server = tier.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(ORACLE, read(E2eConnectorJar.buildInto(directory, ORACLE)));
             control.registerConnector(
                     E2eConnectorJar.CONNECTOR_ID, read(E2eConnectorJar.buildInto(directory)));

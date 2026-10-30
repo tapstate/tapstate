@@ -129,6 +129,10 @@ public final class Cli implements Runnable {
     static final String DATA_BROWSER_VERB = "data-browser";
 
     public static final Map<String, String> VERB_BY_OPERATION = Map.ofEntries(
+            Map.entry("storage.status", "storage"), Map.entry("storage.test", "storage"), Map.entry("storage.setup.commit", "storage"), Map.entry("storage.setup.status", "storage"),
+            Map.entry("storage.recovery.plan", "storage"), Map.entry("storage.recovery.confirm", "storage"), Map.entry("storage.recovery.status", "storage"),
+            Map.entry("configuration.export", "configuration"),
+            Map.entry("configuration.import.preflight", "configuration"), Map.entry("configuration.import.commit", "configuration"), Map.entry("configuration.import.status", "configuration"),
             Map.entry("data-browser.collections", DATA_BROWSER_VERB),
             Map.entry("data-browser.find", DATA_BROWSER_VERB),
             Map.entry("data-browser.stats", DATA_BROWSER_VERB),
@@ -235,6 +239,8 @@ public final class Cli implements Runnable {
      * that only some of these verbs accept.
      */
     static final Map<String, VerbHelp> VERB_HELP = Map.ofEntries(
+            Map.entry("storage", new VerbHelp("<status|test|setup ACTION|recovery ACTION> [--file request.json]", "Query storage or submit one confirmed operation; request secrets stay in the file.")),
+            Map.entry("configuration", new VerbHelp("export|import <preflight|commit|status> --file request.json", "Export encrypted configuration, or preflight, confirm, and query an import by its original ID.")),
             Map.entry("apply", new VerbHelp("[<path>] [--if-match <hash>]",
                     "Upload the workspace, or one artifact, creating or updating each resource.")),
             Map.entry("get", new VerbHelp("<id>",

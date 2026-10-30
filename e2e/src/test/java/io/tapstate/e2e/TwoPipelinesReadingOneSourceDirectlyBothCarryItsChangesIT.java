@@ -48,8 +48,8 @@ class TwoPipelinesReadingOneSourceDirectlyBothCarryItsChangesIT {
             EndpointAddress firstTarget = EndpointAddress.uri(first.toString());
             EndpointAddress secondTarget = EndpointAddress.uri(second.toString());
             files.seed(src, TABLE, SeedRows.generated(SEEDED_ROWS));
-            String store = SharedMongo.replicaSetUrl("e2e_direct_pair_cluster");
-            try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-direct-pair")) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                 TwoMemberCluster cluster = TwoMemberCluster.startPrepared(storage)) {
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.first();
                 control.registerConnector(E2eConnectorJar.CONNECTOR_ID, connector);

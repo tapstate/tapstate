@@ -46,6 +46,39 @@ class PdkTargetIdentityPlannerTest {
     }
 
     @ParameterizedTest
+    @ValueSource(strings = {"names", "indexes", "indexes-clear"})
+    void losingAuthorityDuringMetadataStopsTheNextExternalCall(String lastAllowed) throws Throwable {
+        var active = new java.util.concurrent.atomic.AtomicBoolean(true);
+        List<String> calls = new ArrayList<>();
+        var lost = new TapstateException(io.tapstate.spi.store.IoError.NOTE_SCOPE_UNAVAILABLE, Map.of(), null);
+        try (var connector = IdentityConnectorFixture.guarded("mongodb", ref, Map.of(), () -> {
+            if (!active.get()) throw lost;
+        })) {
+            connector.functions().supportGetTableNamesFunction((context, size, out) -> {
+                calls.add("names");
+                out.accept(List.of("orders"));
+                if (lastAllowed.equals("names")) active.set(false);
+            });
+            connector.functions().supportQueryIndexes((context, table, out) -> {
+                calls.add("indexes");
+                out.accept(List.of(new TapIndex().name("_id_").unique(true)
+                        .indexField(new TapIndexField().name("_id"))));
+                if (lastAllowed.startsWith("indexes")) active.set(false);
+            });
+            connector.functions().supportCountByPartitionFilterFunction((context, table, filter) -> {
+                calls.add("count"); return 0L;
+            });
+            var assessment = lastAllowed.equals("indexes-clear")
+                    ? new SinkConfig("mongodb", Map.of(), WriteMode.UPSERT, DdlPolicy.FAIL, null, null, OnFullLoad.CLEAR, true)
+                    : config("mongodb", Map.of());
+            assertThatThrownBy(() -> PdkTargetIdentityPlanner.assess(connector, assessment,
+                    Map.of("orders", target("_id")))).isSameAs(lost);
+            assertThat(calls).containsExactlyElementsOf(lastAllowed.equals("names")
+                    ? List.of("names") : List.of("names", "indexes"));
+        }
+    }
+
+    @ParameterizedTest
     @ValueSource(strings = {"initFails", "discoverFails"})
     void connectorMetadataFailuresHaveAStableCodedDiagnosis(String failure) {
         var config = config("postgres", Map.of(failure, true));
@@ -152,6 +185,32 @@ class PdkTargetIdentityPlannerTest {
                     Envelope.insert(3L, "orders", collision, null))).toCompletableFuture().get(5, TimeUnit.SECONDS))
                     .hasRootCauseInstanceOf(TapstateException.class);
             assertThat(received).hasSize(2);
+        }
+    }
+
+    @Test
+    void changedFrozenProjectionRefusesPreparationAndWriterBeforeSideEffects() throws Throwable {
+        var settings=Map.<String,Object>of("rows",IdentityConnectorFixture.mongoIndexes());
+        var config=config("mongodb",settings);
+        var targets=Map.of("orders",target("_id"));
+        var port=new PdkSinkPort(id -> ref);
+        var frozen=port.assessTargets(config,targets);
+        var plan=frozen.get("orders");
+        var changed=new TargetIdentityPlan(plan.status(),plan.reason(),plan.target(),plan.sourceField(),
+                "another_preserved_id",plan.writeKey(),plan.requireSignedInt64Keys(),plan.requireDocumentKeys());
+        var stale=Map.of("orders",changed);
+        assertThatThrownBy(() -> port.withTargetIdentities(stale).prepare(config,targets))
+                .isInstanceOfSatisfying(TapstateException.class,error ->
+                        assertThat(error.code()).isEqualTo(ConnectorError.TARGET_IDENTITY_CHECK_FAILED));
+        try(var connector=PdkConnector.open("mongodb",ref,settings)) {
+            connector.functions().supportCreateIndex((context,table,event) -> {
+                throw new AssertionError("changed frozen identity reached target preparation");
+            });
+            assertThatThrownBy(() -> new PdkSinkWriter(connector,(context,rows,table,out) -> {
+                throw new AssertionError("changed frozen identity reached a write");
+            },config,targets,null,true,null,io.tapstate.core.model.PipelineNode.Purpose.SYNC,null,stale))
+                    .isInstanceOfSatisfying(TapstateException.class,error ->
+                            assertThat(error.code()).isEqualTo(ConnectorError.TARGET_IDENTITY_CHECK_FAILED));
         }
     }
 

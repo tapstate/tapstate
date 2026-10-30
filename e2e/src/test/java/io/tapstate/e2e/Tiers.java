@@ -23,6 +23,15 @@ enum Tiers {
         return launch(storeUri, SharedMongo.OPERATOR_STATE_DATABASE);
     }
 
+    ServerHandle launch(PreparedNativeStore storage) {
+        return switch (this) {
+            case IN_PROCESS -> InProcessServer.startPrepared(storage);
+            case REAL_PROCESS -> RealProcessServer.startPrepared(storage.configurationUri(), "127.0.0.1",
+                    port -> java.util.List.of("--tapstate.cluster.id=" + storage.clusterId(),
+                            "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2"));
+        };
+    }
+
     ServerHandle launch(String storeUri, String operatorStateDatabase) {
         return launcher.apply(storeUri, operatorStateDatabase);
     }

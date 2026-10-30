@@ -89,11 +89,13 @@ public final class PdkTargetIdentityPlanner {
             var names = connector.functions().getGetTableNamesFunction();
             if (names == null) throw new IllegalStateException("target collection metadata is unavailable");
             List<String> tables = new ArrayList<>();
+            connector.requireActive();
             names.tableNames(connector.context(), 1000, tables::addAll);
             // Flexible target columns do not require sampling user documents to infer a schema.
             return tables.contains(table) ? new TapTable(table) : null;
         }
         List<TapTable> discovered = new ArrayList<>();
+        connector.requireActive();
         connector.connector().discoverSchema(connector.context(), List.of(table), 1, discovered::addAll);
         return discovered.stream().filter(candidate -> table.equals(candidate.getId())).findFirst().orElse(null);
     }
@@ -135,6 +137,7 @@ public final class PdkTargetIdentityPlanner {
     private static List<List<String>> genericUniqueKeys(PdkConnector connector, TapTable table) throws Throwable {
         List<TapIndex> indexes = new ArrayList<>();
         if (connector.functions().getQueryIndexesFunction() != null) {
+            connector.requireActive();
             connector.functions().getQueryIndexesFunction().query(connector.context(), table, indexes::addAll);
         } else if (table.getIndexList() != null) {
             indexes.addAll(table.getIndexList());
@@ -161,6 +164,7 @@ public final class PdkTargetIdentityPlanner {
             if (clearing) {
                 mayPrepare = true;
             } else if (connector.functions().getCountByPartitionFilterFunction() != null) {
+                connector.requireActive();
                 long count = connector.functions().getCountByPartitionFilterFunction()
                         .countByPartitionFilter(connector.context(), existing, TapAdvanceFilter.create());
                 mayPrepare = count == 0;
@@ -186,6 +190,14 @@ public final class PdkTargetIdentityPlanner {
         return new TargetIdentityPlan(TargetIdentityPlan.NOT_REQUIRED, "compatible-key", target, null, null,
                 target.fields().stream().filter(io.tapstate.spi.sink.TargetField::primaryKey)
                         .map(io.tapstate.spi.sink.TargetField::name).toList());
+    }
+
+    static void requireSame(SinkConfig config, Map<String, TargetIdentityPlan> expected,
+            Map<String, TargetIdentityPlan> actual) {
+        if (expected != null && !expected.equals(actual)) {
+            throw failed(config.connectorId(), "",
+                    new IllegalStateException("target identity differs from the frozen preparation model"));
+        }
     }
 
     private static TapstateException failed(String connector, String table, Throwable failure) {

@@ -1,6 +1,9 @@
 package io.tapstate.e2e;
 
 import io.tapstate.testsupport.DockerGate;
+import io.tapstate.core.dsl.DslParser;
+import io.tapstate.core.dsl.Interpolator;
+import io.tapstate.core.model.SourceResource;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.io.TempDir;
@@ -145,17 +148,14 @@ class PublishedExamplesIT {
         stageConnectorJars(envelope.setup().connectors());
 
         String run = store(workspace, tier);
-        // Every run in this harness uses the deployment's default operator-state database. Two tiers of
-        // one example share every id in it; without this reset the second serves documents the first
-        // assembled from rows this one never had.
-        SharedMongo.discardNestState();
         // The stores the example asked for come up before anything else: a resource cannot be applied
         // before the endpoint whose address it interpolates exists.
         try (ProvisionedStores stores = ProvisionedStores.provision(envelope.setup().databases(), run);
-                ServerHandle server = tier.launch(SharedMongo.replicaSetUrl(run));
+                PreparedNativeStore storage = prepareInstallation(envelope.setup(), workspace, stores, run);
+                ServerHandle server = tier.launch(storage);
                 Endpoints files = new FileEndpoints()) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             HttpTierBinding binding = new HttpTierBinding(
                     control, workspace, drivers(files, stores), env(stores),
                     stores::driveStream, stores::behindTheGate);
@@ -189,6 +189,20 @@ class PublishedExamplesIT {
         // including the independent read. The release gate reads absence from it, so nothing may be
         // recorded on a path that can be reached without the assertions.
         WitnessLedger.record(specification, tier);
+    }
+
+    private PreparedNativeStore prepareInstallation(Setup setup, Path workspace, ProvisionedStores stores, String run) {
+        if (setup.managedTarget() == null) return PreparedNativeStore.create(run, "e2e", "e2e-password");
+        try {
+            var resource = new DslParser().parse(Interpolator.interpolate(
+                    Files.readString(workspace.resolve(setup.managedTarget())), env(stores)));
+            if (!(resource instanceof SourceResource target) || !"views".equals(target.id())
+                    || !"mongodb".equals(target.connector()) || !(target.config().get("uri") instanceof String uri) || uri.isBlank())
+                throw new EnvelopeException("setup.managed_target must declare the MongoDB views installation target");
+            return PreparedNativeStore.withBorrowedMaster(run, "e2e", "e2e-password", target);
+        } catch (IOException failure) {
+            throw new UncheckedIOException("cannot read the managed installation target", failure);
+        }
     }
 
     /**
@@ -251,20 +265,21 @@ class PublishedExamplesIT {
             HttpTierBinding binding,
             ProvisionedStores stores,
             Endpoints files) {
-        if (envelope.setup().databases().isEmpty()) {
-            // Read once, at one instant. A file target is replaced whole - the new content is staged
-            // beside it and moved into place - so a reader is never shown a table mid-write, and a count
-            // that disagrees here is the product's answer rather than the run's timing. Polling it
-            // instead samples around the write rather than reading the table, and accepts a target that
-            // holds the rows only some of the time.
-            settled.forEach((alias, rows) -> assertThat(
-                            files.count(EndpointAddress.uri(targetDirectory.toString()), alias.table()))
-                    .as("%s settles on %s rows in %s, read there by the address it named; this reads the "
-                            + "target this run handed out, which it cannot name", specification, rows, alias)
-                    .isEqualTo(rows));
-        } else {
-            theSettledCountIsInAStoreTheSeedNeverTouched(specification, envelope, settled, binding, stores);
-        }
+        Map<TableAlias, Long> databaseTargets = new LinkedHashMap<>();
+        settled.forEach((alias, rows) -> {
+            var address = binding.addressOf(alias);
+            if (stores.storeHolding(address).isPresent()) databaseTargets.put(alias, rows);
+            else {
+                assertThat(namesOneOf(address, List.of(targetDirectory.toString())))
+                        .as("%s must name the independently owned file target", alias).isTrue();
+                // Read the owned target once, without polling around an incorrect settled result.
+                assertThat(files.count(EndpointAddress.uri(targetDirectory.toString()), alias.table()))
+                        .as("%s settles on %s rows in the independently held target for %s", specification, rows, alias)
+                        .isEqualTo(rows);
+            }
+        });
+        if (!databaseTargets.isEmpty())
+            theSettledCountIsInAStoreTheSeedNeverTouched(specification, envelope, databaseTargets, binding, stores);
     }
 
     /**
@@ -289,6 +304,7 @@ class PublishedExamplesIT {
                 case Step.Await await -> await.matcher();
                 case Step.Assertion assertion -> assertion.matcher();
                 case Step.Lifecycle ignored -> null;
+                case Step.StartRefused ignored -> null;
                 case Step.StreamLifecycle ignored -> null;
                 case Step.Composed ignored -> null;
                 case Step.Cdc ignored -> null;

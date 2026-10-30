@@ -1,0 +1,369 @@
+package io.tapstate.adapters.pdk;
+
+import io.tapstate.adapters.pdk.fixture.PreparedSnapshotSource;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.capture.CaptureBatch;
+import io.tapstate.spi.capture.CaptureConfig;
+import io.tapstate.spi.capture.SnapshotPreparation;
+import io.tapstate.spi.capture.SnapshotSession;
+import io.tapstate.spi.capture.SourcePosition;
+import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.SourceTable;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import java.nio.file.Path;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+class PdkSnapshotPreparationTest {
+    private final Map<String, Object> state = new HashMap<>();
+    @BeforeEach void install() {
+        for (String key : List.of("inits", "stops", "reads", "earlyReads", "discoveries", "streams", "earlyStreams")) state.put(key, new AtomicInteger());
+        state.put("pinned", new AtomicBoolean()); state.put("streamPrepared",new AtomicBoolean()); state.put("reportSeam", new AtomicBoolean(true));
+        System.getProperties().put(PreparedSnapshotSource.STATE, state);
+    }
+    @AfterEach void clear() { System.getProperties().remove(PreparedSnapshotSource.STATE); }
+    private AtomicInteger counter(String key) { return (AtomicInteger) state.get(key); }
+    private AtomicBoolean flag(String key) { return (AtomicBoolean) state.get(key); }
+    private static CaptureConfig config(String... tables) { return new CaptureConfig("prepared", Map.of(), List.of(tables)); }
+    private static PdkCapturePort port() throws Exception {
+        Path classes = Path.of(PreparedSnapshotSource.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+        return new PdkCapturePort(id -> new ConnectorRef(List.of(classes), PreparedSnapshotSource.class.getName(), "2.0.8", null));
+    }
+    private static void drain(CaptureBatch batch) { try (batch) { assertThat(batch.hasNext()).isFalse(); } }
+
+    @Test void closingAPreparedSessionRetainsItsActualReaderUntilItExits() throws Exception {
+        var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var worker=new AtomicReference<Thread>();
+        state.put("readEntered",entered);state.put("readRelease",release);state.put("readWorker",worker);
+        var port=port().withSnapshotPreparation((request,seam,tables) -> flag("pinned").set(true));
+        var session=SnapshotSession.openPrepared(port,config("t1"),new SnapshotPreparation(1,null)).orElseThrow();
+        try {
+            session.read("t1");assertThat(entered.await(3,TimeUnit.SECONDS)).isTrue();
+            assertThatThrownBy(session::close).isInstanceOfSatisfying(TapstateException.class,error -> assertThat(error.code()).isEqualTo(ConnectorError.CAPTURE_FAILED));
+            assertThat(worker.get().isAlive()).isTrue();release.countDown();session.close();assertThat(worker.get().isAlive()).isFalse();
+        } finally {release.countDown();if(worker.get()!=null)worker.get().join(3000);session.close();}
+    }
+
+    @Test void aPreparedSessionStopThatBlocksCannotBlockItsCallerWithoutABudget() throws Exception {
+        var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var exited=new CountDownLatch(1);
+        state.put("stopEntered",entered);state.put("stopRelease",release);state.put("stopExited",exited);
+        var session=SnapshotSession.openPrepared(port().withSnapshotPreparation((request,seam,tables) -> flag("pinned").set(true)),config("t1"),new SnapshotPreparation(1,null)).orElseThrow();
+        drain(session.read("t1"));
+        try(var executor=Executors.newSingleThreadExecutor()) {
+            var close=executor.submit(session::close);
+            try {
+                assertThat(entered.await(3,TimeUnit.SECONDS)).isTrue();
+                var failure = org.assertj.core.api.Assertions.catchThrowable(() -> close.get(3,TimeUnit.SECONDS));
+                assertThat(failure).isInstanceOf(java.util.concurrent.ExecutionException.class)
+                        .hasCauseInstanceOf(SnapshotSession.PendingClose.class);
+                var pending = (SnapshotSession.PendingClose)failure.getCause();
+                assertThat(pending.code()).isEqualTo(ConnectorError.CAPTURE_FAILED);
+                assertThat(pending.completion().toCompletableFuture()).isNotDone();
+                pending.completion().toCompletableFuture().complete(null);
+                assertThat(pending.completion().toCompletableFuture()).isNotDone();
+                assertThat(exited.getCount()).isOne();
+            } finally {release.countDown();assertThat(exited.await(3,TimeUnit.SECONDS)).isTrue();}
+        }
+        session.close();assertThat(counter("stops")).hasValue(1);
+    }
+
+    @Test void cdcPublishesActualSelectedSessionMetadataBeforeItCanStream() throws Exception {
+        var calls=new AtomicInteger();var delivered=new CountDownLatch(1);var host=Thread.currentThread().getContextClassLoader();
+        var port=port().withStreamPreparation(tables -> {
+            calls.incrementAndGet();assertThat(Thread.currentThread().getContextClassLoader()).isSameAs(host);
+            assertThat(counter("streams")).hasValue(0);assertThat(tables.keySet()).containsExactly("t1");
+            var actual=tables.get("t1");assertThat(actual.fields()).extracting(field -> field.name()).containsExactly("session_id");
+            assertThat(actual.fields().getFirst().dataType()).isEqualTo("int");assertThat(actual.primaryKey()).containsExactly("session_id");
+            assertThat(actual.indexes()).extracting(index -> index.name()).containsExactly("idx_session");assertThat(actual.approximateRowCount()).isNull();
+            assertThatThrownBy(tables::clear).isInstanceOf(UnsupportedOperationException.class);flag("streamPrepared").set(true);
+        });
+        var batch=new AtomicReference<List<io.tapstate.core.event.Envelope>>();var failure=new AtomicReference<Throwable>();
+        var listener=new io.tapstate.spi.capture.CaptureListener() {
+            @Override public void onBatch(List<io.tapstate.core.event.Envelope> events,java.util.Optional<SourcePosition> position){batch.set(events);delivered.countDown();}
+            @Override public void onError(Throwable error){failure.set(error);delivered.countDown();}
+        };
+        try(var subscription=port.cdc(config("t1"),io.tapstate.spi.capture.CaptureStart.present(),listener)) {
+            assertThat(delivered.await(5,TimeUnit.SECONDS)).isTrue();assertThat(failure.get()).isNull();assertThat(batch.get()).hasSize(1);
+            assertThat(batch.get().getFirst().after()).containsEntry("session_id",1L);
+        }
+        assertThat(calls).hasValue(1);assertThat(counter("streams")).hasValue(1);assertThat(counter("earlyStreams")).hasValue(0);
+        assertThat(counter("inits")).hasValue(1);assertThat(counter("discoveries")).hasValue(1);assertThat(counter("stops")).hasValue(1);
+    }
+
+    @Test void cdcHostRefusalIsReturnedUnchangedBeforeAnySourceStreamOrDelivery() throws Exception {
+        var refused=new TapstateException(IoError.SRS_MODEL_UNAVAILABLE,Map.of("chain","chain","table","t1","version","0"),null);var deliveries=new AtomicInteger();
+        var port=port().withStreamPreparation(tables -> {throw refused;});
+        assertThatThrownBy(() -> port.cdc(config("t1"),io.tapstate.spi.capture.CaptureStart.present(),(events,position) -> deliveries.incrementAndGet())).isSameAs(refused);
+        assertThat(counter("streams")).hasValue(0);assertThat(deliveries).hasValue(0);assertThat(counter("stops")).hasValue(1);
+    }
+
+    @Test void missingCdcSelectionUsesACaptureDiagnosticBeforeCallingTheModelOwner() throws Exception {
+        var calls=new AtomicInteger();var port=port().withStreamPreparation(tables -> calls.incrementAndGet());
+        assertThatThrownBy(() -> port.cdc(config("absent"),io.tapstate.spi.capture.CaptureStart.present(),(events,position) -> {}))
+                .isInstanceOfSatisfying(TapstateException.class,error -> assertThat(error.code()).isEqualTo(ConnectorError.CAPTURE_FAILED));
+        assertThat(calls).hasValue(0);assertThat(counter("streams")).hasValue(0);assertThat(counter("stops")).hasValue(1);
+    }
+
+    @Test void cdcHostInvariantIsNotLaunderedIntoAConnectorFailure() throws Exception {
+        var defect=new AssertionError("host model invariant");var port=port().withStreamPreparation(tables -> {throw defect;});
+        assertThatThrownBy(() -> port.cdc(config("t1"),io.tapstate.spi.capture.CaptureStart.present(),(events,position) -> {})).isSameAs(defect);
+        assertThat(counter("streams")).hasValue(0);assertThat(counter("stops")).hasValue(1);
+    }
+
+    @Test void immutableCopiesKeepBothSnapshotAndStreamPreparationInEitherOrder() throws Exception {
+        var snapshots=new AtomicInteger();var streams=new AtomicInteger();
+        PdkCapturePort.SnapshotPreparer snapshot=(request,seam,tables) -> {snapshots.incrementAndGet();flag("pinned").set(true);};
+        PdkCapturePort.StreamPreparer stream=tables -> {streams.incrementAndGet();flag("streamPrepared").set(true);};
+        for(var port:List.of(port().withStreamPreparation(stream).withSnapshotPreparation(snapshot),port().withSnapshotPreparation(snapshot).withStreamPreparation(stream))) {
+            flag("pinned").set(false);flag("streamPrepared").set(false);
+            try(var session=SnapshotSession.openPrepared(port,config("t1"),new SnapshotPreparation(1,null)).orElseThrow()){drain(session.read("t1"));}
+            var delivered=new CountDownLatch(1);
+            try(var subscription=port.cdc(config("t1"),io.tapstate.spi.capture.CaptureStart.present(),(events,position) -> delivered.countDown())){assertThat(delivered.await(5,TimeUnit.SECONDS)).isTrue();}
+        }
+        assertThat(snapshots).hasValue(2);assertThat(streams).hasValue(2);assertThat(counter("earlyReads")).hasValue(0);assertThat(counter("earlyStreams")).hasValue(0);assertThat(counter("stops")).hasValue(4);
+    }
+
+    @Test void aTimedOutHostPreparationCannotStartTheSourceWhenItReturnsLate() throws Exception {
+        Path classes=Path.of(PreparedSnapshotSource.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+        var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var exited=new CountDownLatch(1);var worker=new AtomicReference<Thread>();
+        var port=new PdkCapturePort(id -> new ConnectorRef(List.of(classes),PreparedSnapshotSource.class.getName(),"2.0.8",null),null,java.time.Duration.ofSeconds(1))
+                .withStreamPreparation(tables -> {
+                    worker.set(Thread.currentThread());entered.countDown();
+                    try {
+                        boolean interrupted=false;
+                        while(true) {try{release.await();break;}catch(InterruptedException ignored){interrupted=true;}}
+                        flag("streamPrepared").set(true);if(interrupted)Thread.currentThread().interrupt();
+                    } finally {exited.countDown();}
+                });
+        var deliveries=new AtomicInteger();
+        try(var callers=Executors.newSingleThreadExecutor()) {
+            var opened=callers.submit(() -> port.cdc(config("t1"),io.tapstate.spi.capture.CaptureStart.present(),(events,position) -> deliveries.incrementAndGet()));
+            try {
+                assertThat(entered.await(5,TimeUnit.SECONDS)).isTrue();
+                assertThatThrownBy(() -> opened.get(5,TimeUnit.SECONDS)).hasCauseInstanceOf(TapstateException.class).satisfies(failure ->
+                        assertThat(((TapstateException)failure.getCause()).code()).isEqualTo(ConnectorError.CAPTURE_FAILED));
+                assertThat(exited.getCount()).as("the host callback deliberately ignores cancellation until released").isEqualTo(1);
+                assertThat(counter("streams")).hasValue(0);assertThat(counter("stops")).hasValue(1);
+            } finally {release.countDown();assertThat(exited.await(5,TimeUnit.SECONDS)).isTrue();worker.get().join(5000);assertThat(worker.get().isAlive()).isFalse();}
+        }
+        assertThat(counter("streams")).hasValue(0);assertThat(deliveries).hasValue(0);assertThat(counter("stops")).hasValue(1);
+    }
+
+    @Test void aBlockedConnectorStopCannotHideTheOriginalHostRefusal() throws Exception {
+        var entered = new CountDownLatch(1); var release = new CountDownLatch(1); var exited = new CountDownLatch(1);
+        state.put("stopEntered", entered); state.put("stopRelease", release); state.put("stopExited", exited);
+        var refused = new TapstateException(IoError.SRS_MODEL_UNAVAILABLE,
+                Map.of("chain", "chain", "table", "t1", "version", "0"), null);
+        var port = port().withStreamPreparation(tables -> { throw refused; });
+        try (var callers = Executors.newSingleThreadExecutor()) {
+            var opened = callers.submit(() -> port.cdc(config("t1"), io.tapstate.spi.capture.CaptureStart.present(), (events, position) -> {}));
+            try {
+                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThatThrownBy(() -> opened.get(5, TimeUnit.SECONDS)).hasCause(refused);
+                assertThat(refused.getSuppressed()).singleElement().isInstanceOf(TapstateException.class);
+                assertThat(exited.getCount()).as("cleanup remains pending until its own stop returns").isOne();
+                assertThat(counter("streams")).hasValue(0);
+            } finally { release.countDown(); assertThat(exited.await(5, TimeUnit.SECONDS)).isTrue(); }
+        }
+        port.close();
+        assertThat(counter("stops")).hasValue(1);
+    }
+
+    @Test void aBlockedStopAndLateHostPreparationCannotDefeatThePreflightDeadline() throws Exception {
+        Path classes = Path.of(PreparedSnapshotSource.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+        var stopEntered = new CountDownLatch(1); var stopRelease = new CountDownLatch(1); var stopExited = new CountDownLatch(1);
+        state.put("stopEntered", stopEntered); state.put("stopRelease", stopRelease); state.put("stopExited", stopExited);
+        var hostEntered = new CountDownLatch(1); var hostRelease = new CountDownLatch(1); var hostExited = new CountDownLatch(1);
+        var worker = new AtomicReference<Thread>(); var deliveries = new AtomicInteger();
+        var port = new PdkCapturePort(id -> new ConnectorRef(List.of(classes), PreparedSnapshotSource.class.getName(), "2.0.8", null),
+                null, java.time.Duration.ofSeconds(1)).withStreamPreparation(tables -> {
+            worker.set(Thread.currentThread()); hostEntered.countDown();
+            boolean interrupted = false;
+            try {
+                while (true) {
+                    try { hostRelease.await(); break; }
+                    catch (InterruptedException ignored) { interrupted = true; }
+                }
+                flag("streamPrepared").set(true);
+            } finally { hostExited.countDown(); if (interrupted) Thread.currentThread().interrupt(); }
+        });
+        try (var callers = Executors.newSingleThreadExecutor()) {
+            var opened = callers.submit(() -> port.cdc(config("t1"), io.tapstate.spi.capture.CaptureStart.present(),
+                    (events, position) -> deliveries.incrementAndGet()));
+            try {
+                assertThat(hostEntered.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(stopEntered.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThatThrownBy(() -> opened.get(5, TimeUnit.SECONDS)).hasCauseInstanceOf(TapstateException.class)
+                        .satisfies(failure -> assertThat(((TapstateException) failure.getCause()).code()).isEqualTo(ConnectorError.CAPTURE_FAILED));
+                assertThat(stopExited.getCount()).as("plugin cleanup is still unknown").isOne();
+                assertThat(hostExited.getCount()).as("host preparation is still pending").isOne();
+            } finally {
+                hostRelease.countDown(); stopRelease.countDown();
+                assertThat(hostExited.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(stopExited.await(5, TimeUnit.SECONDS)).isTrue();
+                worker.get().join(5000); assertThat(worker.get().isAlive()).isFalse();
+            }
+        }
+        assertThat(counter("streams")).hasValue(0); assertThat(deliveries).hasValue(0); assertThat(counter("stops")).hasValue(1);
+    }
+
+    @Test void noPreparationOwnerRefusesBeforeProvisioningAnyConnector() {
+        var provisions = new AtomicInteger();
+        var port = new PdkCapturePort(id -> { provisions.incrementAndGet(); throw new AssertionError("must not provision"); });
+        assertThatThrownBy(() -> SnapshotSession.openPrepared(port, config("t1"), new SnapshotPreparation(1, null)))
+                .isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.code()).isEqualTo(ConnectorError.SNAPSHOT_PREPARATION_UNAVAILABLE));
+        assertThat(provisions).hasValue(0);
+    }
+
+    @Test void actualSessionMetadataAndFixedSnapshotContextAreAcceptedOnceBeforeEitherTableReads() throws Exception {
+        var calls = new AtomicInteger(); var sampled = new AtomicReference<SourcePosition>();
+        var original = new SnapshotPreparation(83, new SourcePosition("saved-replay-anchor"));
+        var hostLoader = Thread.currentThread().getContextClassLoader();
+        var port = port().withSnapshotPreparation((request, seam, tables) -> {
+            calls.incrementAndGet(); sampled.set(seam);
+            assertThat(request).isEqualTo(original); assertThat(counter("reads")).hasValue(0);
+            assertThat(Thread.currentThread().getContextClassLoader()).isSameAs(hostLoader);
+            assertThat(tables.keySet()).containsExactlyInAnyOrder("t1", "t2");
+            SourceTable actual = tables.get("t1");
+            assertThat(actual.fields()).extracting(field -> field.name()).containsExactly("session_id");
+            assertThat(actual.fields().getFirst().dataType()).isEqualTo("int");
+            assertThat(actual.primaryKey()).containsExactly("session_id");
+            assertThat(actual.indexes()).extracting(index -> index.name()).containsExactly("idx_session");
+            assertThat(actual.approximateRowCount()).isNull();
+            assertThatThrownBy(tables::clear).isInstanceOf(UnsupportedOperationException.class);
+            flag("pinned").set(true);
+        });
+        try (var session = SnapshotSession.openPrepared(port, config("t1", "t2"), original).orElseThrow()) {
+            try (var first = session.read("t1")) { assertThat(first.seam()).contains(sampled.get()); assertThat(first.hasNext()).isFalse(); }
+            drain(session.read("t2"));
+        }
+        assertThat(calls).hasValue(1); assertThat(counter("reads")).hasValue(2); assertThat(counter("earlyReads")).hasValue(0);
+        assertThat(counter("inits")).hasValue(1); assertThat(counter("discoveries")).hasValue(1); assertThat(counter("stops")).hasValue(1);
+    }
+
+    @Test void pinRefusalPreservesItsCodeAndStopsTheSessionWithoutReadingRows() throws Exception {
+        var refused = new TapstateException(IoError.SRS_MODEL_UNAVAILABLE, Map.of("chain", "chain", "table", "t1", "version", "0"), null);
+        var port = port().withSnapshotPreparation((request, seam, tables) -> { throw refused; });
+        try (var session = SnapshotSession.openPrepared(port, config("t1"), new SnapshotPreparation(1, null)).orElseThrow()) {
+            assertThatThrownBy(() -> session.read("t1")).isSameAs(refused);
+            assertThat(counter("reads")).hasValue(0); assertThat(counter("stops")).hasValue(1);
+            assertThatThrownBy(() -> session.read("t1")).isInstanceOf(CancellationException.class);
+        }
+        assertThat(counter("stops")).hasValue(1);
+    }
+
+    @Test void aHostPreparationBugIsNotWrappedAsAConnectorReadFailure() throws Exception {
+        var defect = new AssertionError("host invariant");
+        var port = port().withSnapshotPreparation((request, seam, tables) -> { throw defect; });
+        try (var session = SnapshotSession.openPrepared(port, config("t1"), new SnapshotPreparation(1, null)).orElseThrow()) {
+            assertThatThrownBy(() -> session.read("t1")).isSameAs(defect);
+        }
+        assertThat(counter("reads")).hasValue(0); assertThat(counter("stops")).hasValue(1);
+    }
+
+    @Test void aMissingSeamCannotCallThePinOwnerOrReadRows() throws Exception {
+        flag("reportSeam").set(false); var calls = new AtomicInteger();
+        var port = port().withSnapshotPreparation((request, seam, tables) -> calls.incrementAndGet());
+        try (var session = SnapshotSession.openPrepared(port, config("t1"), new SnapshotPreparation(1, null)).orElseThrow()) {
+            assertThatThrownBy(() -> session.read("t1")).isInstanceOfSatisfying(TapstateException.class,
+                    error -> assertThat(error.code()).isEqualTo(ConnectorError.SNAPSHOT_PREPARATION_UNAVAILABLE));
+        }
+        assertThat(calls).hasValue(0); assertThat(counter("reads")).hasValue(0); assertThat(counter("stops")).hasValue(1);
+    }
+
+    @Test void thePinOwnerCannotReceiveAPartialSelectedTableSet() throws Exception {
+        var calls = new AtomicInteger(); var port = port().withSnapshotPreparation((request, seam, tables) -> calls.incrementAndGet());
+        try (var session = SnapshotSession.openPrepared(port, config("t1", "absent"), new SnapshotPreparation(1, null)).orElseThrow()) {
+            assertThatThrownBy(() -> session.read("t1")).isInstanceOfSatisfying(TapstateException.class,
+                    error -> assertThat(error.code()).isEqualTo(ConnectorError.SNAPSHOT_PREPARATION_UNAVAILABLE));
+        }
+        assertThat(calls).hasValue(0); assertThat(counter("reads")).hasValue(0); assertThat(counter("stops")).hasValue(1);
+    }
+
+    @Test void sourceReadWaitsForTheSynchronousPinAndCannotStartAnotherTableDuringIt() throws Exception {
+        var entered = new CountDownLatch(1); var accepted = new CountDownLatch(1);
+        var port = port().withSnapshotPreparation((request, seam, tables) -> {
+            entered.countDown();
+            try { assertThat(accepted.await(5, TimeUnit.SECONDS)).isTrue(); }
+            catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new CancellationException(); }
+            flag("pinned").set(true);
+        });
+        try (var executor = Executors.newSingleThreadExecutor(); var session = SnapshotSession.openPrepared(port, config("t1"), new SnapshotPreparation(1, null)).orElseThrow()) {
+            var opened = executor.submit(() -> session.read("t1"));
+            try {
+                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThat(counter("reads")).hasValue(0); assertThat(opened.isDone()).isFalse();
+                assertThatThrownBy(() -> session.read("t1")).isInstanceOf(IllegalStateException.class);
+                accepted.countDown(); drain(opened.get(5, TimeUnit.SECONDS));
+            } finally { accepted.countDown(); }
+        }
+        assertThat(counter("reads")).hasValue(1); assertThat(counter("earlyReads")).hasValue(0);
+    }
+
+    @Test void anUnselectedDiscoveredTableCannotBypassAcceptedMetadata() throws Exception {
+        var calls = new AtomicInteger(); var port = port().withSnapshotPreparation((request, seam, tables) -> {
+            calls.incrementAndGet(); assertThat(tables.keySet()).containsExactly("t1"); flag("pinned").set(true);
+        });
+        try (var session = SnapshotSession.openPrepared(port, config("t1"), new SnapshotPreparation(1, null)).orElseThrow()) {
+            assertThatThrownBy(() -> { try (var unexpected = session.read("t2")) { unexpected.hasNext(); } })
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(ConnectorError.SNAPSHOT_PREPARATION_UNAVAILABLE));
+        }
+        assertThat(calls).hasValue(0); assertThat(counter("reads")).hasValue(0);
+    }
+
+    @Test void closingReleasesTheCallerEvenWhenThePinCallbackIgnoresInterruption() throws Exception {
+        var entered = new CountDownLatch(1); var release = new CountDownLatch(1); var exited = new CountDownLatch(1);
+        var worker = new AtomicReference<Thread>();
+        var port = port().withSnapshotPreparation((request, seam, tables) -> {
+            worker.set(Thread.currentThread()); entered.countDown();
+            try {
+                boolean allowed = false;
+                while (!allowed) {
+                    try { allowed = release.await(10, TimeUnit.SECONDS); assertThat(allowed).isTrue(); }
+                    catch (InterruptedException ignored) { /* The database driver may not stop on interruption. */ }
+                }
+                flag("pinned").set(true);
+            } finally { exited.countDown(); }
+        });
+        try (var executor = Executors.newSingleThreadExecutor(); var session = SnapshotSession.openPrepared(port, config("t1"), new SnapshotPreparation(1, null)).orElseThrow()) {
+            var opened = executor.submit(() -> session.read("t1"));
+            try {
+                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+                assertThatThrownBy(session::close).isInstanceOfSatisfying(TapstateException.class,error -> assertThat(error.code()).isEqualTo(ConnectorError.CAPTURE_FAILED));
+                assertThat(exited.getCount()).as("the callback is deliberately still pending").isOne();
+                assertThatThrownBy(() -> opened.get(1, TimeUnit.SECONDS)).hasCauseInstanceOf(CancellationException.class);
+            } finally {
+                release.countDown(); assertThat(exited.await(5, TimeUnit.SECONDS)).isTrue();
+                worker.get().join(5000); assertThat(worker.get().isAlive()).isFalse();
+            }
+        }
+        assertThat(counter("reads")).hasValue(0); assertThat(counter("stops")).hasValue(1);
+    }
+
+    @Test void closingWhilePinningInterruptsTheRegisteredWorkerBeforeAnyRead() throws Exception {
+        var entered = new CountDownLatch(1); var interrupted = new CountDownLatch(1);
+        var port = port().withSnapshotPreparation((request, seam, tables) -> {
+            entered.countDown();
+            try { new CountDownLatch(1).await(); throw new AssertionError("unexpected wake"); }
+            catch (InterruptedException stopped) { interrupted.countDown(); Thread.currentThread().interrupt(); throw new CancellationException(); }
+        });
+        try (var executor = Executors.newSingleThreadExecutor(); var session = SnapshotSession.openPrepared(port, config("t1"), new SnapshotPreparation(1, null)).orElseThrow()) {
+            var opened = executor.submit(() -> session.read("t1")); assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+            session.close(); assertThat(interrupted.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThatThrownBy(() -> opened.get(5, TimeUnit.SECONDS)).hasCauseInstanceOf(CancellationException.class);
+        }
+        assertThat(counter("reads")).hasValue(0); assertThat(counter("stops")).hasValue(1);
+    }
+}

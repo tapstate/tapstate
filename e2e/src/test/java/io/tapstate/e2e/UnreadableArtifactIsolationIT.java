@@ -3,7 +3,7 @@ package io.tapstate.e2e;
 import com.mongodb.ConnectionString;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
-import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.testsupport.DockerGate;
 import org.bson.Document;
@@ -44,16 +44,16 @@ class UnreadableArtifactIsolationIT {
 
     @Test
     void anUnreadableStoredArtifactDoesNotHideAReadablePipeline() {
-        String storeUri = SharedMongo.replicaSetUrl("unreadable_artifact_isolation");
-        try (ServerHandle server = InProcessServer.start(storeUri);
-                MongoClient store = MongoClients.create(storeUri)) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage);
+                MongoClient store = MongoClients.create(storage.configurationUri())) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.apply(Map.of(
                     "readable.tap.yml", pipeline(READABLE_ID),
                     "unreadable.tap.yml", pipeline(UNREADABLE_ID)));
 
-            makeBodyUnreadable(store, storeUri, UNREADABLE_ID);
+            makeBodyUnreadable(store, storage.configurationUri(), UNREADABLE_ID);
 
             assertThat(pipelineIds(control.pipelines())).containsExactly(READABLE_ID);
         }
@@ -62,18 +62,18 @@ class UnreadableArtifactIsolationIT {
     @Test
     void anUnreadableReferencingPipelineCannotLetItsSourceBeDeleted(@TempDir Path directory)
             throws Exception {
-        String storeUri = SharedMongo.replicaSetUrl("unreadable_artifact_reference");
-        try (ServerHandle server = InProcessServer.start(storeUri);
-                MongoClient store = MongoClients.create(storeUri)) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage);
+                MongoClient store = MongoClients.create(storage.configurationUri())) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(
                     E2eConnectorJar.CONNECTOR_ID,
                     Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
             control.apply(referencingWorkspace());
             ControlPlane.StoredArtifact source = control.artifact(SOURCE_ID).orElseThrow();
 
-            makeFieldUnreadable(store, storeUri, REFERRER_ID, "body.settings");
+            makeFieldUnreadable(store, storage.configurationUri(), REFERRER_ID, "body.settings");
 
             assertThatThrownBy(() -> control.deleteArtifact(SOURCE_ID, source.contentHash()))
                     .isInstanceOf(AssertionError.class)
@@ -86,15 +86,15 @@ class UnreadableArtifactIsolationIT {
     @Test
     void anUnreadableRunningPipelineCannotLetItsSourceBufferingChange(@TempDir Path directory)
             throws Exception {
-        String storeUri = SharedMongo.replicaSetUrl("unreadable_live_pipeline");
-        try (ServerHandle server = InProcessServer.start(storeUri);
-                MongoClient store = MongoClients.create(storeUri)) {
-            RunningPipeline running = RunningPipeline.started(server, directory);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage);
+                MongoClient store = MongoClients.create(storage.configurationUri())) {
+            RunningPipeline running = RunningPipeline.started(server, directory, storage);
             ControlPlane control = running.control();
             ControlPlane.StoredArtifact source = control.artifact(running.sourceId()).orElseThrow();
 
-            makeBodyUnreadable(store, storeUri, running.pipelineId());
-            String replacement = source.canonicalForm() + """
+            makeBodyUnreadable(store, storage.configurationUri(), running.pipelineId());
+            String replacement = Workspaces.cdcSourceYaml(running.sourceId(), directory.resolve(running.sourceId())) + """
                     srs:
                       enabled: false
                     """;
@@ -154,7 +154,7 @@ class UnreadableArtifactIsolationIT {
             throw new AssertionError("the store URI names no database");
         }
         long matched = store.getDatabase(database)
-                .getCollection(MongoStorePort.ARTIFACTS)
+                .getCollection(SystemCollections.PIPELINES.collectionName())
                 .updateOne(
                         new Document("_id", id),
                         new Document("$set", new Document(field, "unreadable")))

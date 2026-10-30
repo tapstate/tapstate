@@ -9,7 +9,6 @@ import org.junit.jupiter.params.provider.EnumSource;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -31,9 +30,9 @@ class BoundedPipelinePreviewIT {
     @EnumSource(Tiers.class)
     void runsTheUnsavedCandidateWithABoundedSourceSampleOnBothTiers(Tiers tier, @TempDir Path directory)
             throws Exception {
-        try (ServerHandle server = tier.launch(storeUri(tier))) {
+        try (var storage = PreparedNativeStore.create(); ServerHandle server = tier.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID,
                     Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
 
@@ -473,7 +472,4 @@ class BoundedPipelinePreviewIT {
                 """;
     }
 
-    private static String storeUri(Tiers tier) {
-        return SharedMongo.replicaSetUrl("bounded_preview_" + tier.name().toLowerCase(Locale.ROOT));
-    }
 }

@@ -42,7 +42,8 @@ setup:
     src: { kind: postgres }
     store: { kind: mongo }
   connectors: [postgres, mongodb]
-  apply: [src_point_orders.tap.yml, src_point_customers.tap.yml, views.tap.yml, pipeline.tap.yml]
+  managed_target: views.tap.yml
+  apply: [src_point_orders.tap.yml, src_point_customers.tap.yml, pipeline.tap.yml]
   discover: [src_point_orders, src_point_customers]
 pipeline: pipeline.tap.yml
 seed:

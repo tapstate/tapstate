@@ -35,7 +35,8 @@ setup:
     src: { kind: postgres }
     store: { kind: mongo }
   connectors: [postgres, mongodb]
-  apply: [src_move_orders.tap.yml, src_move_items.tap.yml, views.tap.yml, pipeline.tap.yml]
+  managed_target: views.tap.yml
+  apply: [src_move_orders.tap.yml, src_move_items.tap.yml, pipeline.tap.yml]
   discover: [src_move_orders, src_move_items]
 pipeline: pipeline.tap.yml
 seed:

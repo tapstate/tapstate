@@ -28,6 +28,39 @@ class HmacTokenSignerTest {
     }
 
     @Test
+    void accessTokensRemainBoundToTheirOriginalAuthenticationGeneration() {
+        var scope = new io.tapstate.spi.store.CacheAuthScope("cluster", 1,
+                io.tapstate.spi.store.StorageBinding.Mode.OP, "8a5bbd9e-e330-4238-a001-98f5f104ef2c", 1);
+        var clock = Clock.fixed(T0, ZoneOffset.UTC);
+        var original = new HmacTokenSigner(SECRET, Duration.ofMinutes(15), clock, scope);
+        String token = original.issue("alice", Scope.ADMIN);
+        assertThat(original.verify(token)).contains(new VerifiedToken("alice", Scope.ADMIN));
+        var next = new io.tapstate.spi.store.CacheAuthScope(scope.clusterId(), scope.bindingVersion(),
+                scope.mode(), scope.cacheIncarnation(), 2);
+        var replacement = new HmacTokenSigner(SECRET, Duration.ofMinutes(15), clock, next);
+        assertThat(replacement.verify(token)).isEmpty();
+        assertThat(original.verify(replacement.issue("alice", Scope.ADMIN))).isEmpty();
+        assertThat(replacement.verify(signerAt(T0, SECRET).issue("alice", Scope.ADMIN))).isEmpty();
+        assertThat(signerAt(T0, SECRET).verify(token)).isEmpty();
+    }
+
+    @Test
+    void sameGenerationFromAnotherCacheOrClusterCannotAuthorizeAnAccessToken() {
+        var clock = Clock.fixed(T0, ZoneOffset.UTC);
+        var mode = io.tapstate.spi.store.StorageBinding.Mode.OP;
+        String incarnation = "8a5bbd9e-e330-4238-a001-98f5f104ef2c";
+        var original = new HmacTokenSigner(SECRET, Duration.ofMinutes(15), clock,
+                new io.tapstate.spi.store.CacheAuthScope("cluster", 1, mode, incarnation, 1));
+        String token = original.issue("alice", Scope.ADMIN);
+        for (var other : java.util.List.of(
+                new io.tapstate.spi.store.CacheAuthScope("other", 1, mode, incarnation, 1),
+                new io.tapstate.spi.store.CacheAuthScope("cluster", 2, mode, incarnation, 1),
+                new io.tapstate.spi.store.CacheAuthScope("cluster", 1, mode, "ca6be84e-d0e4-4449-8b8f-4a29f6f57583", 1))) {
+            assertThat(new HmacTokenSigner(SECRET, Duration.ofMinutes(15), clock, other).verify(token)).isEmpty();
+        }
+    }
+
+    @Test
     void issuedTokenRoundTripsSubjectAndScope() {
         HmacTokenSigner signer = signerAt(T0, SECRET);
 

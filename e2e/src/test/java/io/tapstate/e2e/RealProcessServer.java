@@ -122,6 +122,50 @@ final class RealProcessServer implements ServerHandle {
         return healthy(launching(storeUri, bootJar(), listenAddress, extraArguments));
     }
 
+    /** Starts an already prepared split-store installation with only its configuration URI. */
+    static RealProcessServer startPrepared(String configurationUri, String listenAddress,
+            IntFunction<List<String>> extraArguments) {
+        return startPrepared(configurationUri, listenAddress, null, extraArguments);
+    }
+
+    static RealProcessServer startPrepared(String configurationUri, String listenAddress, Path stagingDirectory,
+            IntFunction<List<String>> extraArguments) {
+        RealProcessServer server = launchingPrepared(configurationUri, listenAddress, stagingDirectory, extraArguments);
+        try {
+            server.awaitReady();
+            return server;
+        } catch (RuntimeException | Error failure) {
+            server.close();
+            throw failure;
+        }
+    }
+
+    /** Lets a fixture launch every seed before waiting for any member to finish joining. */
+    static RealProcessServer launchingPrepared(String configurationUri, String listenAddress,
+            IntFunction<List<String>> extraArguments) {
+        return launchingPrepared(configurationUri, listenAddress, null, extraArguments);
+    }
+
+    /** Keeps an explicitly supplied connector staging directory owned by the caller. */
+    static RealProcessServer launchingPrepared(String configurationUri, String listenAddress, Path stagingDirectory,
+            IntFunction<List<String>> extraArguments) {
+        return launching(configurationUri, null, bootJar(), listenAddress,
+                List.of("-Xmx768m", "-XX:ActiveProcessorCount=2"), stagingDirectory, extraArguments);
+    }
+
+    /** Real Cloud Bootstrap in a separate JVM; only its external SDK boundary is a fixture. */
+    static RealProcessServer startCloudFixture(String configurationUri,String cluster,Path seeds) {
+        var server=launching(configurationUri,null,bootJar(),LOOPBACK,
+                List.of("-Xmx768m","-XX:ActiveProcessorCount=2"),null,port -> List.of(
+                        "--tapstate.cloud.cluster-id="+cluster,"--tapstate.cluster.node-id=restart-node",
+                        "--tapstate.hz.member-port=0","--tapstate.hz.jet.cooperative-thread-count=2",
+                        "--tapstate.connectors.seed-dir="+seeds,"--logging.level.root=ERROR",
+                        "--logging.level.io.tapstate.app.ConvergenceDriver=WARN"),
+                io.tapstate.app.CloudConfiguredOutageProcess.class.getName());
+        try { server.awaitReady(STARTUP_BUDGET,"CLOUD_FIXTURE_APPLICATION_READY");return server; }
+        catch(RuntimeException|Error failure) { try { server.close(); } catch(RuntimeException|Error cleanup) { failure.addSuppressed(cleanup); } throw failure; }
+    }
+
     /**
      * The same, staging the connectors it resolves into {@code stagingDirectory} rather than a directory of this
      * launch's own, which it then leaves where it is when it ends; null for a directory of the launch's own.
@@ -244,6 +288,17 @@ final class RealProcessServer implements ServerHandle {
                 jvmOptions, null, port -> List.of()));
     }
 
+    /** Retains native storage admission while the scenario selects the child JVM's original runtime shape. */
+    static RealProcessServer startPreparedInJvm(String configurationUri, List<String> jvmOptions,
+            IntFunction<List<String>> extraArguments) {
+        return healthy(launchingPreparedInJvm(configurationUri, jvmOptions, extraArguments));
+    }
+
+    static RealProcessServer launchingPreparedInJvm(String configurationUri, List<String> jvmOptions,
+            IntFunction<List<String>> extraArguments) {
+        return launching(configurationUri, null, bootJar(), LOOPBACK, jvmOptions, null, extraArguments);
+    }
+
     /**
      * Returns the launch once its health probe answers, and ends it otherwise.
      *
@@ -283,9 +338,31 @@ final class RealProcessServer implements ServerHandle {
         }
     }
 
+    private static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar,
+            String listenAddress, List<String> jvmOptions, Path stagingDirectory,
+            IntFunction<List<String>> extraArguments, String fixtureMain) {
+        try (PreparedLaunch prepared = prepare(storeUri, operatorStateDatabase, jar, listenAddress,
+                jvmOptions, stagingDirectory, extraArguments, fixtureMain)) {
+            return prepared.launch();
+        }
+    }
+
+    static PreparedLaunch preparePrepared(String configurationUri, String listenAddress, Path stagingDirectory,
+            IntFunction<List<String>> extraArguments) {
+        return prepare(configurationUri, null, bootJar(), listenAddress,
+                List.of("-Xmx768m", "-XX:ActiveProcessorCount=2"), stagingDirectory, extraArguments, null);
+    }
+
     private static PreparedLaunch prepare(String storeUri, String operatorStateDatabase, Path jar,
             String listenAddress, List<String> jvmOptions, Path stagingDirectory,
             IntFunction<List<String>> extraArguments) {
+        return prepare(storeUri, operatorStateDatabase, jar, listenAddress, jvmOptions, stagingDirectory,
+                extraArguments, null);
+    }
+
+    private static PreparedLaunch prepare(String storeUri, String operatorStateDatabase, Path jar,
+            String listenAddress, List<String> jvmOptions, Path stagingDirectory,
+            IntFunction<List<String>> extraArguments, String fixtureMain) {
         long fixturePreparation = ClusterFixtureTiming.beginPreparation();
         int port = freePort();
         ClusterFixtureTiming.bind(fixturePreparation, port);
@@ -303,7 +380,7 @@ final class RealProcessServer implements ServerHandle {
             }
             if (owned) staging = ServerHandle.privateStagingDirectory();
             return new PreparedLaunch(jar, jvmOptions, port, listenAddress, storeUri, operatorStateDatabase,
-                    workingDirectory, baseUrl, output, staging, owned, extraArguments.apply(port));
+                    workingDirectory, baseUrl, output, staging, owned, extraArguments.apply(port), fixtureMain);
         } catch (RuntimeException | Error failure) {
             try { releasePort(port); }
             catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
@@ -330,6 +407,7 @@ final class RealProcessServer implements ServerHandle {
         private final Path stagingDirectory;
         private final boolean ownsStagingDirectory;
         private final List<String> extraArguments;
+        private final String fixtureMain;
         private final ClusterLifecycleProbe.Facts lifecycle;
         private final StoreProcessScope processes;
         private boolean launchAttempted;
@@ -340,7 +418,7 @@ final class RealProcessServer implements ServerHandle {
 
         private PreparedLaunch(Path jar, List<String> jvmOptions, int httpPort, String listenAddress,
                 String storeUri, String operatorStateDatabase, Path workingDirectory, URI baseUrl,
-                Path output, Path stagingDirectory, boolean ownsStagingDirectory, List<String> extraArguments) {
+                Path output, Path stagingDirectory, boolean ownsStagingDirectory, List<String> extraArguments, String fixtureMain) {
             this.jar = jar;
             this.jvmOptions = List.copyOf(jvmOptions);
             this.httpPort = httpPort;
@@ -354,6 +432,7 @@ final class RealProcessServer implements ServerHandle {
             this.stagingDirectory = stagingDirectory;
             this.ownsStagingDirectory = ownsStagingDirectory;
             this.extraArguments = List.copyOf(extraArguments);
+            this.fixtureMain = fixtureMain;
             this.lifecycle = ClusterLifecycleProbe.facts(httpPort, workingDirectory, output, stagingDirectory,
                     storeUri, operatorStateDatabase, listenAddress, this.jvmOptions, this.extraArguments);
             ClusterLifecycleProbe.record(ClusterLifecycleProbe.Phase.PREPARED, lifecycle, -1);
@@ -368,7 +447,7 @@ final class RealProcessServer implements ServerHandle {
             try {
                 if (processes != null) processes.beforeLaunch();
                 unhandedProcess = RealProcessServer.launch(jar, jvmOptions, httpPort, listenAddress,
-                        storeUri, operatorStateDatabase, workingDirectory, output, stagingDirectory, extraArguments);
+                        storeUri, operatorStateDatabase, workingDirectory, output, stagingDirectory, extraArguments, fixtureMain);
                 if (processes != null) processes.launched(unhandedProcess);
                 ClusterFixtureTiming.spawned(httpPort, unhandedProcess);
                 ClusterHealthProbe.bind(unhandedProcess.pid(), baseUrl);
@@ -519,16 +598,23 @@ final class RealProcessServer implements ServerHandle {
 
     /** Waits for all startup runners, not merely the earlier Tomcat health response. */
     void awaitReady() {
+        awaitReady(STARTUP_BUDGET);
+    }
+
+    void awaitReady(Duration budget) {
+        awaitReady(budget,"Tapstate application is ready");
+    }
+    private void awaitReady(Duration budget,String marker) {
         ClusterFixtureTiming.phase(process, ClusterFixtureTiming.Phase.READY_BEGIN);
         observe(ClusterLifecycleProbe.Phase.READY_STARTED);
         ControlPlane control = new ControlPlane(baseUrl);
-        Await.until("the process to complete application startup", STARTUP_BUDGET, () -> {
+        Await.until("the process to complete application startup", budget, () -> {
             if (!process.isAlive()) {
                 throw new AssertionError("the server exited with status " + process.exitValue()
                         + " before application readiness; its output was:\n" + tail());
             }
             try {
-                return Files.readString(output).contains("Tapstate application is ready") && control.healthy();
+                return Files.readString(output).contains(marker) && control.healthy();
             } catch (IOException failure) {
                 throw new UncheckedIOException("could not read application readiness", failure);
             }
@@ -636,13 +722,14 @@ final class RealProcessServer implements ServerHandle {
 
     private static Process launch(Path jar, List<String> jvmOptions, int port, String listenAddress,
             String storeUri, String operatorStateDatabase, Path workingDirectory, Path output,
-            Path stagingDirectory, List<String> extraArguments) {
+            Path stagingDirectory, List<String> extraArguments,String fixtureMain) {
         List<String> command = new ArrayList<>();
         command.add(javaBinary());
         command.addAll(jvmOptions);
+        command.addAll(fixtureMain==null?List.of("-jar",jar.toString()):List.of(
+                "--add-opens=java.base/java.lang=ALL-UNNAMED","-cp",
+                System.getProperty("surefire.test.class.path",System.getProperty("java.class.path")),fixtureMain));
         command.addAll(List.of(
-                "-jar",
-                jar.toString(),
                 // The role the deliverable is documented to take; parsed by the product before Spring starts.
                 "--role=all",
                 // Bound to the loopback, which is where the probe and
@@ -653,13 +740,15 @@ final class RealProcessServer implements ServerHandle {
                 "--server.port=" + port,
                 "--tapstate.store.mongo.enabled=true",
                 "--tapstate.store.mongo.uri=" + storeUri,
-                "--" + ServerHandle.OPERATOR_STATE_DATABASE_SETTING + "=" + operatorStateDatabase,
                 "--tapstate.store.mongo.server-selection-timeout=5s",
                 // A staging directory of this launch's own unless a witness names one, for the same reason
                 // the other tier gets one: the cache is content-addressed and reused, so a shared one serves
                 // a stale connector.
                 "--" + ServerHandle.PLUGINS_DIRECTORY_SETTING + "=" + stagingDirectory,
                 "--" + ServerHandle.ALSO_ACCEPT_IDS_SETTING + "=" + E2eConnectorJar.CONNECTOR_ID));
+        if (operatorStateDatabase != null) {
+            command.add("--" + ServerHandle.OPERATOR_STATE_DATABASE_SETTING + "=" + operatorStateDatabase);
+        }
         // After the standing ones, and additional to them rather than replacing any: a repeated option
         // is joined with the earlier one by comma rather than winning over it, so anything a case needs
         // to set differently is a parameter above instead of an argument here.

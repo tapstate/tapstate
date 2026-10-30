@@ -25,7 +25,14 @@ final class CaptureClaimLease implements AutoCloseable {
     private final CaptureOwnership ownership;
     private final AtomicReference<WorkloadClaim> current;
     private final ScheduledExecutorService renewer;
+    // Publishes only worker identity for self-close detection; Thread owns its synchronization.
+    @SuppressWarnings("java:S3077")
+    private volatile Thread renewalThread;
     private final AtomicBoolean closed = new AtomicBoolean();
+    private final Object closeRelease = new Object();
+    /** An explicit close retries its original release until the call acknowledges completion. */
+    private boolean closeReleasePending;
+    private boolean closeReleaseAcknowledged;
     /** What losing the claim stops; null until the capture it guards is open. Guarded by this. */
     private Runnable lost;
     /** Whether the claim was lost while nothing was bound to answer for it yet. Guarded by this. */
@@ -61,6 +68,7 @@ final class CaptureClaimLease implements AutoCloseable {
         this.renewer = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "tapstate-capture-claim-renewer");
             thread.setDaemon(true);
+            renewalThread = thread;
             return thread;
         });
         renewer.scheduleWithFixedDelay(
@@ -155,14 +163,25 @@ final class CaptureClaimLease implements AutoCloseable {
 
     @Override
     public void close() {
-        if (!closed.compareAndSet(false, true)) {
-            return;
-        }
-        if (renewer != null) {
-            renewer.shutdownNow();
-        }
-        if (ownership != null) {
+        close(false);
+    }
+
+    /** Called by the owner only after its physical readers have actually exited. */
+    void closeAfterPhysicalExit() {
+        close(true);
+    }
+
+    private void close(boolean physicalExit) {
+        synchronized(closeRelease) {
+            if(closed.compareAndSet(false,true) || physicalExit && !closeReleaseAcknowledged)
+                closeReleasePending=ownership!=null;
+            if(!closeReleasePending)return;
+            if(renewer!=null) {
+                if(Thread.currentThread()==renewalThread)renewer.shutdown();
+                else renewer.shutdownNow();
+            }
             ownership.release(current.get());
+            closeReleasePending=false;closeReleaseAcknowledged=true;
         }
     }
 }

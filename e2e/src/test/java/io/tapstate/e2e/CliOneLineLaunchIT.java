@@ -36,17 +36,18 @@ class CliOneLineLaunchIT {
 
     @Test
     void aOneLineLaunchSignsInAndRunsTheCommandAgainstTheServer() {
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(SharedMongo.replicaSetUrl("e2e_cli_store"))) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin(USER, PASSWORD);
+            storage.loginAndAwaitBusiness(control);
 
             CliOnce.Run run = CliOnce.runWithPassword(PASSWORD, "-c", server.baseUrl().toString(), "-u", USER, "ls");
 
             // `ls` is a credentialed read: reaching an answer at all proves the connection was made and
             // the credential exchanged, both from the arguments, with no session ever opened
             assertThat(run.exitCode()).isZero();
-            // A server that has never been applied to is not empty any more: it registers the state store
-            // its views materialize into as it starts, so the first listing on a fresh deployment shows
+            // A completed native installation already contains its default target Source, so the first
+            // listing before the user applies any other resources shows
             // that one resource. Asserting it here rather than loosening the check keeps this test's real
             // subject -- that a one-line launch reaches a credentialed read at all -- pinned to a
             // specific answer instead of to whatever happens to come back.
@@ -59,9 +60,10 @@ class CliOneLineLaunchIT {
 
     @Test
     void aCommandThatFailedFailsTheProcess() {
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(SharedMongo.replicaSetUrl("e2e_cli_fail"))) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin(USER, PASSWORD);
+            storage.loginAndAwaitBusiness(control);
 
             CliOnce.Run run = CliOnce.runWithPassword(PASSWORD, "-c", server.baseUrl().toString(), "-u", USER,
                     "get", "no-such-artifact");
@@ -73,9 +75,10 @@ class CliOneLineLaunchIT {
 
     @Test
     void aLaunchThatCannotSignInStopsWithoutRunningTheCommand() {
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(SharedMongo.replicaSetUrl("e2e_cli_auth"))) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin(USER, PASSWORD);
+            storage.loginAndAwaitBusiness(control);
 
             CliOnce.Run run = CliOnce.runWithPassword("wrong", "-c", server.baseUrl().toString(), "-u", USER, "ls");
 

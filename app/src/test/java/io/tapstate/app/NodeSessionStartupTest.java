@@ -4,7 +4,6 @@ import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.core.LifecycleEvent;
 import com.hazelcast.core.LifecycleService;
 import io.tapstate.core.common.TapstateException;
-import io.tapstate.adapters.mongostore.SourceConfigKeyringSession;
 import io.tapstate.spi.store.ClusterIdentity;
 import io.tapstate.spi.store.ClusterIdentityStore;
 import io.tapstate.spi.store.StorePort;
@@ -39,7 +38,7 @@ import static org.awaitility.Awaitility.await;
 class NodeSessionStartupTest {
 
     @Test
-    void aLeaseConstructionFailureReleasesTheReservedSessionAndKeyring() {
+    void aLeaseConstructionFailureReleasesTheReservedSession() {
         assertThat(failLeaseConstruction(Duration.ofSeconds(5), Duration.ofNanos(500_000), null))
                 .isInstanceOf(IllegalArgumentException.class);
     }
@@ -51,7 +50,7 @@ class NodeSessionStartupTest {
     }
 
     @Test
-    void cleanupStillReleasesTheKeyringAndPreservesTheConstructionFailure() {
+    void cleanupPreservesTheConstructionFailure() {
         IllegalStateException releaseFailure = new IllegalStateException("owned release failure");
         assertThat(failLeaseConstruction(Duration.ofSeconds(5), Duration.ofNanos(500_000), releaseFailure))
                 .isInstanceOf(IllegalArgumentException.class).hasSuppressedException(releaseFailure);
@@ -65,19 +64,16 @@ class NodeSessionStartupTest {
         control.setAdvertiseUrl("https://node-a.internal:8080");
         RecordingClaims claims = new RecordingClaims();
         claims.releaseFailure = releaseFailure;
-        RecordingKeyring keyring = new RecordingKeyring(claims);
         Throwable failure = org.assertj.core.api.Assertions.catchThrowable(() ->
                 new HazelcastConfiguration().hazelcastMember(clusteredProperties(), cluster, control,
                         null, null, null, null, NestSettings.defaults(), null, null, null,
                         provider(ClusterIdentityStore.class, new MemoryIdentity()),
-                        provider(WorkloadClaimStore.class, claims), provider(SourceConfigKeyringSession.class, keyring),
-                        new ClusterMembershipGate(cluster), new BootId("boot-startup"), provider(StorePort.class, null),
+                        provider(WorkloadClaimStore.class, claims),
+                        new ClusterMembershipGate(cluster), new BootId("boot-startup"), provider(StorePort.class, null), provider(io.tapstate.spi.store.ClusterMembershipStore.class, null),
                         config -> { throw new AssertionError("member factory must not run after lease setup fails"); }));
         assertThat(failure).isNotNull();
         assertThat(claims.acquisitions).hasValue(1);
-        assertThat(keyring.acknowledgements).hasValue(1);
         assertThat(claims.releases).hasValue(1);
-        assertThat(keyring.releases).hasValue(1);
         return failure;
     }
 
@@ -97,17 +93,15 @@ class NodeSessionStartupTest {
         ControlEndpointProperties control = new ControlEndpointProperties();
         control.setAdvertiseUrl("https://node-a.internal:8080");
         RecordingClaims claims = new RecordingClaims();
-        RecordingKeyring keyring = new RecordingKeyring(claims);
         IllegalStateException factoryFinished = new IllegalStateException("owned factory control finished");
 
         assertThatThrownBy(() -> new HazelcastConfiguration().hazelcastMember(
                 properties, cluster, control, null, null, null, null, NestSettings.defaults(),
                 null, null, null, provider(ClusterIdentityStore.class, new MemoryIdentity()),
-                provider(WorkloadClaimStore.class, claims), provider(SourceConfigKeyringSession.class, keyring),
-                new ClusterMembershipGate(cluster), new BootId("boot-startup"), provider(StorePort.class, null),
+                provider(WorkloadClaimStore.class, claims),
+                new ClusterMembershipGate(cluster), new BootId("boot-startup"), provider(StorePort.class, null), provider(io.tapstate.spi.store.ClusterMembershipStore.class, null),
                 config -> {
                     assertThat(claims.acquisitions).hasValue(1);
-                    assertThat(keyring.acknowledgements).hasValueGreaterThanOrEqualTo(1);
                     claims.factoryRunning.set(true);
                     try {
                         assertThat(claims.renewedDuringFactory.await(2, TimeUnit.SECONDS))
@@ -122,15 +116,12 @@ class NodeSessionStartupTest {
                 .isSameAs(factoryFinished);
         assertThat(claims.acquisitions).hasValue(1);
         assertThat(claims.releases).hasValue(1);
-        assertThat(keyring.acknowledgements).hasValueGreaterThanOrEqualTo(2);
-        assertThat(keyring.releases).hasValue(1);
     }
 
     @Test
     void aLostStartupTerminatesTheMemberCapturedBeforeTheFactoryReturns() throws Exception {
         RecordingClaims claims = new RecordingClaims();
-        RecordingKeyring keyring = new RecordingKeyring(claims);
-        NodeSessionStartup startup = startup(claims, keyring);
+        NodeSessionStartup startup = startup(claims);
         OwnedMember member = new OwnedMember(startup, true);
         try {
             startup.setHazelcastInstance(member.instance);
@@ -147,7 +138,6 @@ class NodeSessionStartupTest {
                             failure -> assertThat(failure.code()).isEqualTo(BootError.NODE_SESSION_LOST));
             assertThat(claims.acquisitions).hasValue(1);
             assertThat(claims.releases).hasValue(0);
-            assertThat(keyring.releases).hasValue(0);
         } finally {
             member.allowStop.countDown();
             startup.abort();
@@ -158,8 +148,7 @@ class NodeSessionStartupTest {
     @Test
     void anInstanceReturnedAfterItsSessionWasLostIsStoppedAndNeverHandedOff() {
         RecordingClaims claims = new RecordingClaims();
-        RecordingKeyring keyring = new RecordingKeyring(claims);
-        NodeSessionStartup startup = startup(claims, keyring);
+        NodeSessionStartup startup = startup(claims);
         OwnedMember member = new OwnedMember(startup, false);
         try {
             claims.refuseRenewals.set(true);
@@ -179,8 +168,7 @@ class NodeSessionStartupTest {
     @Test
     void lossAfterHandoffKeepsTheExistingGracefulMemberStop() throws Exception {
         RecordingClaims claims = new RecordingClaims();
-        RecordingKeyring keyring = new RecordingKeyring(claims);
-        NodeSessionStartup startup = startup(claims, keyring);
+        NodeSessionStartup startup = startup(claims);
         OwnedMember member = new OwnedMember(startup, false);
         try {
             startup.setHazelcastInstance(member.instance);
@@ -199,8 +187,7 @@ class NodeSessionStartupTest {
     void theLibraryLifecycleCallbackDoesNotWaitForAStoreRelease() throws Exception {
         RecordingClaims claims = new RecordingClaims();
         claims.holdRelease.set(true);
-        RecordingKeyring keyring = new RecordingKeyring(claims);
-        NodeSessionStartup startup = startup(claims, keyring);
+        NodeSessionStartup startup = startup(claims);
         CountDownLatch returned = new CountDownLatch(1);
         Thread callback = Thread.ofPlatform().daemon().name("owned-node-session-lifecycle-control").unstarted(() -> {
             try {
@@ -221,18 +208,16 @@ class NodeSessionStartupTest {
             callback.join(2000);
             startup.abort();
         }
-        await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertThat(keyring.releases).hasValue(1));
         assertThat(claims.releases).hasValue(1);
     }
 
-    private static NodeSessionStartup startup(RecordingClaims claims, RecordingKeyring keyring) {
+    private static NodeSessionStartup startup(RecordingClaims claims) {
         Duration ttl = Duration.ofSeconds(5);
         long askedAt = System.nanoTime();
         WorkloadClaim claim = claims.acquire(
                 new WorkloadClaimKey("startup-cluster", WorkloadClaimType.NODE_SESSION, "node-a"),
                 new WorkloadOwner("node-a", "boot-startup"), 0, ttl).claim();
-        keyring.acknowledge(claim, ttl);
-        return new NodeSessionStartup(claims, claim, askedAt, ttl, Duration.ofMillis(10), keyring);
+        return new NodeSessionStartup(claims, claim, askedAt, ttl, Duration.ofMillis(10));
     }
 
     @Test
@@ -242,7 +227,6 @@ class NodeSessionStartupTest {
         ControlEndpointProperties control = new ControlEndpointProperties();
         control.setAdvertiseUrl("https://node-a.internal:8080");
         RecordingClaims claims = new RecordingClaims();
-        RecordingKeyring keyring = new RecordingKeyring(claims);
         IllegalStateException wiringFailure = new IllegalStateException("owned post-factory wiring failed");
         AtomicReference<NodeSessionStartup> createdStartup = new AtomicReference<>();
         AtomicReference<OwnedMember> createdMember = new AtomicReference<>();
@@ -256,8 +240,8 @@ class NodeSessionStartupTest {
             assertThatThrownBy(() -> new HazelcastConfiguration().hazelcastMember(
                     properties, cluster, control, null, null, null, null, NestSettings.defaults(),
                     null, null, null, provider(ClusterIdentityStore.class, new MemoryIdentity()),
-                    provider(WorkloadClaimStore.class, claims), provider(SourceConfigKeyringSession.class, keyring),
-                    new ClusterMembershipGate(cluster), new BootId("boot-startup"), failingStore,
+                    provider(WorkloadClaimStore.class, claims),
+                    new ClusterMembershipGate(cluster), new BootId("boot-startup"), failingStore, provider(io.tapstate.spi.store.ClusterMembershipStore.class, null),
                     config -> {
                         NodeSessionStartup startup = config.getListenerConfigs().stream()
                                 .map(listener -> listener.getImplementation())
@@ -274,7 +258,6 @@ class NodeSessionStartupTest {
                     .isFalse();
             assertThat(createdStartup.get().isCurrent()).isFalse();
             assertThat(claims.releases).hasValue(1);
-            assertThat(keyring.releases).hasValue(1);
         } finally {
             if (createdStartup.get() != null) createdStartup.get().abort();
         }
@@ -284,8 +267,7 @@ class NodeSessionStartupTest {
     void abortStopsItsMemberBeforeWaitingForCoordinationStoreRelease() throws Exception {
         RecordingClaims claims = new RecordingClaims();
         claims.holdRelease.set(true);
-        RecordingKeyring keyring = new RecordingKeyring(claims);
-        NodeSessionStartup startup = startup(claims, keyring);
+        NodeSessionStartup startup = startup(claims);
         OwnedMember member = new OwnedMember(startup, false);
         startup.setHazelcastInstance(member.instance);
         Thread abort = Thread.ofPlatform().daemon().name("owned-node-session-abort-control")
@@ -345,27 +327,6 @@ class NodeSessionStartupTest {
         }
     }
 
-    private static final class RecordingKeyring implements SourceConfigKeyringSession {
-        private final RecordingClaims claims;
-        private final AtomicInteger acknowledgements = new AtomicInteger();
-        private final AtomicInteger releases = new AtomicInteger();
-
-        private RecordingKeyring(RecordingClaims claims) {
-            this.claims = claims;
-        }
-
-        @Override
-        public void acknowledge(WorkloadClaim claim, Duration ttl) {
-            acknowledgements.incrementAndGet();
-            if (claims.factoryRunning.get()) claims.renewedDuringFactory.countDown();
-        }
-
-        @Override
-        public void release(WorkloadClaim claim) {
-            releases.incrementAndGet();
-        }
-    }
-
     private static final class RecordingClaims implements WorkloadClaimStore {
         private final InMemoryWorkloadClaimStore delegate = new InMemoryWorkloadClaimStore();
         private final AtomicInteger acquisitions = new AtomicInteger();
@@ -387,6 +348,7 @@ class NodeSessionStartupTest {
 
         @Override
         public Optional<WorkloadClaim> renew(WorkloadClaim expected, Duration ttl) {
+            if (factoryRunning.get()) renewedDuringFactory.countDown();
             return refuseRenewals.get() ? Optional.empty() : delegate.renew(expected, ttl);
         }
 

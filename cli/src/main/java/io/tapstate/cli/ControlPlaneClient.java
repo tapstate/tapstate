@@ -14,6 +14,11 @@ import java.util.function.BooleanSupplier;
  * is swapped in only at the process entry point.
  */
 interface ControlPlaneClient extends AutoCloseable {
+    /** Sends one storage command without retrying an ambiguous write result. */
+    default io.tapstate.control.client.ControlResponse storageOperation(URI baseUrl, String credential, String operation, Map<String,Object> input) {
+        return new io.tapstate.control.client.ControlResponse.Unreachable();
+    }
+
 
     /** Reads anonymous stable cluster identity from the well-known endpoint. */
     default DiscoveryOutcome discover(URI baseUrl) {

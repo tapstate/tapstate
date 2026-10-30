@@ -150,15 +150,12 @@ class DataPlaneActuationConfiguration {
             ClusterProperties clusterProperties,
             ClusterMembershipGate membershipGate,
             ClusterWorkloadClaims workloadClaims) {
-        if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
-            return CaptureOwnership.single();
-        }
         Object stored = hazelcastMember.getUserContext().get(HazelcastConfiguration.NODE_SESSION_CONTEXT_KEY);
         if (!(stored instanceof WorkloadClaim nodeSession)) {
             throw new IllegalStateException("cluster member started without its node-session identity");
         }
         return new CaptureOwnership(
-                clusterProperties.getId(), nodeSession.owner(), membershipGate,
+                nodeSession.key().clusterId(), nodeSession.owner(), membershipGate,
                 workloadClaims, clusterProperties.getWorkloadClaimTtl());
     }
 
@@ -168,20 +165,21 @@ class DataPlaneActuationConfiguration {
      * it -- can ask without a store round trip per batch. A bean rather than something the member factory
      * makes, because it keeps a refresh thread and the container is what knows when to stop it.
      *
-     * <p>A single-node run has one member and one run of anything, so it binds nothing and every resolve
-     * answers with a guard that allows everything -- which leaves that path exactly as it was.
+     * <p>Every admitted member uses its original node-session proof, including a single-node deployment.
      */
     @Bean(destroyMethod = "close")
     ExecutionAuthorization executionAuthorization(
             HazelcastInstance hazelcastMember,
             ClusterProperties clusterProperties,
-            WorkloadClaimStore workloadClaimStore) {
-        if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
-            return ExecutionAuthorization.unfenced();
-        }
+            WorkloadClaimStore workloadClaimStore, NodeSessionLease nodeSessionLease, ClusterMembershipGate membershipGate) {
+        Object stored = hazelcastMember.getUserContext().get(HazelcastConfiguration.NODE_SESSION_CONTEXT_KEY);
+        if (!(stored instanceof WorkloadClaim nodeSession)) throw new IllegalStateException("member started without its original node session");
+        boolean single = clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE;
         ExecutionAuthorization authorization = new ExecutionAuthorization(
-                clusterProperties.getId(), workloadClaimStore,
-                clusterProperties.getWorkloadClaimRenewInterval());
+                nodeSession.key().clusterId(), workloadClaimStore,
+                clusterProperties.getWorkloadClaimRenewInterval(), System::nanoTime,
+                () -> nodeSessionLease.active() && hazelcastMember.getLifecycleService().isRunning()
+                        && (!single || membershipGate.businessEligible()));
         hazelcastMember.getUserContext().put(ExecutionAuthorization.USER_CONTEXT_KEY, authorization);
         return authorization;
     }
@@ -216,7 +214,7 @@ class DataPlaneActuationConfiguration {
      * Who drives a pipeline's lifecycle. Wired beside the capture owner because the two are the same
      * mechanism over two different resources, and both need the same three things: this member's durable
      * identity, the membership gate that decides whether it may hold business claims at all, and the claim
-     * facade that enforces it. A single-node run has one member, so nothing is fenced there.
+     * facade that enforces it. Single-node deployments use the same original claim contract.
      */
     @Bean
     PipelineActuationOwnership pipelineActuationOwnership(
@@ -224,28 +222,22 @@ class DataPlaneActuationConfiguration {
             ClusterProperties clusterProperties,
             ClusterMembershipGate membershipGate,
             ClusterWorkloadClaims workloadClaims) {
-        if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
-            return PipelineActuationOwnership.single();
-        }
         Object stored = hazelcastMember.getUserContext().get(HazelcastConfiguration.NODE_SESSION_CONTEXT_KEY);
         if (!(stored instanceof WorkloadClaim nodeSession)) {
             throw new IllegalStateException("cluster member started without its node-session identity");
         }
         return new PipelineActuationOwnership(
-                clusterProperties.getId(), nodeSession.owner(), membershipGate, workloadClaims,
+                nodeSession.key().clusterId(), nodeSession.owner(), membershipGate, workloadClaims,
                 clusterProperties.getWorkloadClaimTtl(), clusterProperties.getWorkloadClaimRenewInterval());
     }
 
     /**
      * Keeps the actuation claims renewed apart from the convergence pass, which a single start can hold for
-     * longer than a lease. Nothing to renew on a single node.
+     * longer than a lease, including on a single node.
      */
     @Bean(destroyMethod = "close")
     ActuationClaimRenewer actuationClaimRenewer(
             PipelineActuationOwnership pipelineActuationOwnership, ClusterProperties clusterProperties) {
-        if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
-            return ActuationClaimRenewer.inactive();
-        }
         return new ActuationClaimRenewer(
                 pipelineActuationOwnership, clusterProperties.getWorkloadClaimRenewInterval());
     }
@@ -269,10 +261,6 @@ class DataPlaneActuationConfiguration {
                 return captureRunUnit.release(spec);
             }
         };
-        if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) {
-            return new StoreBackedPipelineCaptureCoordinator(
-                    storePort, attacher, srsCoordinator, snapshotBuffer);
-        }
         return new StoreBackedPipelineCaptureCoordinator(
                 storePort, attacher, srsCoordinator, snapshotBuffer,
                 captureOwnership, clusterProperties.getWorkloadClaimRenewInterval());

@@ -16,6 +16,7 @@ import io.tapstate.spi.store.ConnectorRegistration;
 import io.tapstate.spi.store.ConnectorRegistry;
 import io.tapstate.spi.store.ConnectorSpecStore;
 import io.tapstate.spi.store.ContentHash;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.RegistrationOutcome;
 import io.tapstate.spi.store.RegistrationSource;
 
@@ -28,6 +29,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.UUID;
 
 /**
  * Registers a connector artifact on disk into the distribution store by what the artifact itself
@@ -39,8 +41,7 @@ import java.util.Objects;
  * <p>An artifact whose spec cannot yield an id — not valid JSON, or no {@code properties.id} — is
  * refused with a coded connector-domain exception: registration would have no identity to file the
  * artifact under. A different artifact under an already-registered id is likewise refused — a single
- * active artifact is kept per id. A raw I/O failure reading the artifact is not a connector defect and
- * surfaces as an unchecked I/O exception.
+ * active artifact is kept per id. An unreadable artifact is refused with a coded diagnostic without exposing its path or cause.
  *
  * <p>After the bytes are registered, the connector's normalized catalog row is derived (its declared
  * capabilities merged with its spec) and stored, so the online catalog view can list the connector and
@@ -126,8 +127,8 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
         Object specTree = parseSpecTree(introspected, artifact);
         String connectorId = declaredId(specTree, introspected, artifact);
         rejectUnofficialConnector(connectorId);
-        byte[] bytes = bytesOf(artifact);
-        rejectConflictingArtifact(connectorId, ContentHash.of(bytes));
+        String hash = hashOf(artifact);
+        rejectConflictingArtifact(connectorId, hash);
         // Kept before the artifact is registered, so that a store failure writing it fails a register that
         // has taken nothing: the id is still free and the caller's retry is a clean first attempt. The
         // source is read straight off the artifact and does not depend on the connector loading, so there
@@ -135,7 +136,21 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
         // leaves the source stored and unreferenced, which costs one small content-addressed document
         // that the next registration of the same spec reuses.
         String specHash = storeSpecSource(introspected);
-        RegistrationOutcome outcome = registry.register(connectorId, introspected.pdkApiVersion(), source, bytes);
+        RegistrationOutcome outcome;
+        try (var bytes = Files.newInputStream(artifact)) {
+            outcome = registry.register(connectorId, introspected.pdkApiVersion(), source, hash, Files.size(artifact), bytes);
+        } catch (IOException failure) {
+            TapstateException diagnostic = artifactUnreadable(artifact);
+            for (Throwable suppressed : failure.getSuppressed()) {
+                if (suppressed instanceof TapstateException cleanup && cleanup.code() == IoError.CONNECTOR_ARTIFACT_CLEANUP_UNCONFIRMED
+                        && cleanup.args().get("hash") instanceof String cleanupHash && cleanupHash.matches("[0-9a-f]{64}")
+                        && cleanup.args().get("upload") instanceof String upload && canonicalUploadId(upload)) {
+                    diagnostic.addSuppressed(new TapstateException(IoError.CONNECTOR_ARTIFACT_CLEANUP_UNCONFIRMED,
+                            Map.of("hash", cleanupHash, "upload", upload), null));
+                }
+            }
+            throw diagnostic;
+        }
         persistCatalogRow(connectorId, introspected, specTree, specHash, outcome);
         return outcome;
     }
@@ -317,11 +332,21 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
                 cause);
     }
 
-    private static byte[] bytesOf(Path artifact) {
-        try {
-            return Files.readAllBytes(artifact);
-        } catch (IOException e) {
-            throw new UncheckedIOException("reading connector artifact " + artifact, e);
+    private static String hashOf(Path artifact) {
+        try (var bytes = Files.newInputStream(artifact)) {
+            return ContentHash.of(bytes);
+        } catch (IOException failure) {
+            throw artifactUnreadable(artifact);
         }
+    }
+
+    private static TapstateException artifactUnreadable(Path artifact) {
+        return new TapstateException(ConnectorError.ARTIFACT_UNREADABLE,
+                Map.of("artifact", artifact.getFileName().toString()), null);
+    }
+
+    private static boolean canonicalUploadId(String upload) {
+        try { return UUID.fromString(upload).toString().equals(upload); }
+        catch (IllegalArgumentException invalid) { return false; }
     }
 }

@@ -6,6 +6,7 @@ import com.hazelcast.function.SupplierEx;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.adapters.pdk.PdkSinkPort;
 import io.tapstate.adapters.pdk.SharedSinkConnectors;
+import io.tapstate.adapters.pdk.TargetIdentityPlan;
 import io.tapstate.core.model.PipelineNode;
 import io.tapstate.runtime.engine.PreparesTargets;
 import io.tapstate.spi.sink.DdlPolicy;
@@ -75,6 +76,9 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter>, PreparesTarg
     private final boolean fullLoad;
     private final Map<String, TargetTable> targets;
     private final PipelineNode node;
+    private final PipelineNode.Purpose purpose;
+    private final ConfiguredSinkRun configured;
+    private final Map<String,TargetIdentityPlan> identities;
 
     PdkSinkWriterFactory(
             String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl, TargetTable target,
@@ -92,6 +96,25 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter>, PreparesTarg
     PdkSinkWriterFactory(
             String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
             Map<String, TargetTable> targets, PipelineNode node, OnFullLoad onFullLoad, boolean fullLoad) {
+        this(connectorId, settings, writeMode, ddl, targets, node, onFullLoad, fullLoad, PipelineNode.Purpose.SYNC);
+    }
+
+    PdkSinkWriterFactory(
+            String connectorId, Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
+            Map<String, TargetTable> targets, PipelineNode node, OnFullLoad onFullLoad, boolean fullLoad,
+            PipelineNode.Purpose purpose) {
+        this(connectorId,settings,writeMode,ddl,targets,node,onFullLoad,fullLoad,purpose,null,null);
+    }
+
+    private PdkSinkWriterFactory(String connectorId,Map<String,Object> settings,WriteMode writeMode,DdlPolicy ddl,
+            Map<String,TargetTable> targets,PipelineNode node,OnFullLoad onFullLoad,boolean fullLoad,
+            PipelineNode.Purpose purpose,ConfiguredSinkRun configured,Map<String,TargetIdentityPlan> identities) {
+        this.configured=configured;
+        this.identities=identities==null?null:Map.copyOf(identities);
+        if (purpose != PipelineNode.Purpose.VIEW && purpose != PipelineNode.Purpose.SYNC) {
+            throw new IllegalArgumentException("sink purpose must be view or sync");
+        }
+        this.purpose = purpose;
         this.onFullLoad = onFullLoad;
         this.fullLoad = fullLoad;
         this.connectorId = connectorId;
@@ -100,6 +123,24 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter>, PreparesTarg
         this.ddl = ddl;
         this.targets = targets == null ? Map.of() : Map.copyOf(targets);
         this.node = node;
+    }
+
+    PdkSinkWriterFactory forRun(ConfiguredSinkRun run) {
+        if(targets.values().stream().anyMatch(target -> target.unwindIdentity()!=null))
+            throw new IllegalStateException("configured unwind targets require a frozen identity assessment");
+        var unchanged=new io.tapstate.adapters.pdk.PdkTargetIdentityPlanner(id -> {
+            throw new IllegalStateException("ordinary targets require no identity connector");
+        }).assess(config(),targets);
+        return forRun(run,unchanged);
+    }
+    PdkSinkWriterFactory forRun(ConfiguredSinkRun run,Map<String,TargetIdentityPlan> identities) {
+        if(!node.equals(run.node()) || purpose!=run.purpose())throw new IllegalArgumentException("configured sink run belongs to another node");
+        if(!targets.keySet().equals(identities.keySet()))throw new IllegalArgumentException("frozen identities must cover every input stream");
+        return new PdkSinkWriterFactory(connectorId,settings,writeMode,ddl,targets,node,onFullLoad,fullLoad,purpose,run,identities);
+    }
+    java.util.List<io.tapstate.spi.store.SinkPreparationStore.Input> preparationInputs(io.tapstate.spi.store.PipelineIntentScope scope) {
+        var physical=identities==null?targets.values():identities.values().stream().map(TargetIdentityPlan::target).toList();
+        return physical.stream().map(target -> io.tapstate.adapters.pdk.PdkSinkPreparations.input(scope,node,purpose,onFullLoad,fullLoad,target)).distinct().toList();
     }
 
     /** The write-side models this factory will hand the sink, keyed by the stream each answers for. */
@@ -112,6 +153,8 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter>, PreparesTarg
         return node;
     }
 
+    PipelineNode.Purpose purpose() { return purpose; }
+
     OnFullLoad onFullLoad() { return onFullLoad; }
 
     boolean fullLoad() { return fullLoad; }
@@ -119,7 +162,9 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter>, PreparesTarg
     @Override
     public SinkWriter getEx() {
         HazelcastInstance member = localMember();
-        return new PdkSinkPort(provisioner(member), stateStore(member), sharing(member))
+        if(configured!=null)return ScopedSinkStateProvider.of(member).open(member,configured,config(),provisioner(member),sharing(member))
+                .withTargetIdentities(identities).openPrepared(config(),targets);
+        return new PdkSinkPort(provisioner(member), stateStore(member), sharing(member), purpose)
                 .openPrepared(config(), targets);
     }
 
@@ -131,10 +176,12 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter>, PreparesTarg
 
     @Override
     public void prepareTargets(HazelcastInstance coordinator) {
-        new PdkSinkPort(provisioner(coordinator), stateStore(coordinator)).prepare(config(), targets);
+        if(configured!=null){ScopedSinkStateProvider.of(coordinator).open(coordinator,configured,config(),provisioner(coordinator),null)
+                .withTargetIdentities(identities).prepare(config(),targets);return;}
+        new PdkSinkPort(provisioner(coordinator), stateStore(coordinator), null, purpose).prepare(config(), targets);
     }
 
-    private SinkConfig config() {
+    SinkConfig config() {
         return new SinkConfig(connectorId, settings, writeMode, ddl, null, node, onFullLoad, fullLoad);
     }
 

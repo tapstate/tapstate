@@ -62,9 +62,15 @@ actuation.connector-unavailable-on-member:
 actuation.connector-differs-across-members:
   message: "Pipeline {pipeline} was not started: the members load different artifacts for connector {connector} ({artifacts})."
   solution: "Check that every member reads the same store; a registration replaced while the pipeline was starting is picked up by starting it again."
+actuation.operator-state-unavailable-on-member:
+  message: "Pipeline {pipeline} was not submitted: member {member} could not prepare its original operator state ({reason})."
+  solution: "Resolve the reported member, configuration or execution-authority failure before retrying. Keep the original cache state; do not delete claims or change storage to bypass the refusal."
 actuation.schema-sync-while-running:
   message: "Pipeline `{pipeline}` is {state} and has been asked to be {desired}, so the recorded model of what it produces cannot be re-copied from its sources right now."
   solution: "Stop the pipeline and wait until it is at rest, then retry the schema refresh. Pausing is not enough: a paused run retains its assembled model, and resuming an unchanged pipeline may reuse it."
+actuation.shared-recovery-member-unavailable:
+  message: "Shared capture {capture} recovery could not verify member {member} ({reason})."
+  solution: "Keep the original recovery scope and storage. Resolve the member or authority failure, then repeat preflight if the membership or original control facts changed. All affected old executions and source or target connections must be isolated before confirmation."
 actuation.view-key-missing:
   message: "View `{view}` declares no primary key."
   solution: "Give the view a primaryKey naming the column that identifies one record, so updates converge on it instead of appending a copy."
@@ -376,6 +382,9 @@ cli.auth-logout-unreachable:
 cli.auth-logout-cache-changed:
   message: "The session for context `{context}` changed while logout was in progress; the newer local session was kept."
   solution: "Run `tapstate auth status` to inspect the current session, then retry logout if needed."
+cli.storage-usage:
+  message: "Invalid storage command: {reason}."
+  solution: "Read storage or configuration help and provide request secrets only in a local JSON file."
 cli.auth-usage:
   message: "Invalid auth command: {reason}."
   solution: "Use `tapstate auth login [username]`, `tapstate auth status`, or `tapstate auth logout [--local-only]`."
@@ -547,9 +556,24 @@ store.source-config-keyring-not-ready:
 store.source-config-keyring-rotation-blocked:
   message: "The prepared Source config key cannot become active because a live node has not loaded it."
   solution: "Wait for every current node session to renew, or remove the failed node and wait for its lease to expire, then retry rotation."
+store.initialization-refused:
+  message: "Configuration initialization cannot proceed for this installation operation."
+  solution: "Verify the original installation identity, operation and generation. Inspect the existing configuration; do not reset its identity or encryption key."
+store.default-source-protected:
+  message: "The system default target Source cannot be changed through ordinary authoring."
+  solution: "Inspect the Cluster storage binding in Settings. Do not remove or replace its default target Source."
+store.pipeline-retirement-required:
+  message: "Pipeline {pipeline} must complete its recorded state retirement before removal or identity reuse."
+  solution: "Continue the original deletion operation and verify its private resource release and notes cleanup. Keep retained identities while the result is unknown."
 store.tls-ca-unreadable:
   message: "The store TLS CA certificate file at {path} could not be read."
   solution: "Check the path points at a readable PEM certificate for the store's TLS chain."
+store.storage-connection-unsupported:
+  message: "The storage connection uses unsupported database, authentication or TLS settings."
+  solution: "Use an explicit valid database, verified server TLS and a separate CA bundle. Atlas requires a username and password with authSource=admin. Omit the mechanism to negotiate SCRAM, or specify supported SCRAM-SHA-256 or SCRAM-SHA-1 credentials. Client keys and disabled certificate verification are not supported."
+store.tls-trust-invalid:
+  message: "The storage TLS trust bundle is invalid."
+  solution: "Provide a PEM certificate bundle of at most 64 KiB without private keys. Check the server chain and hostname; do not disable verification."
 migration.data-newer-than-binary:
   message: "The store holds system data at version {installed}, which is newer than this build supports (up to {supported})."
   solution: "Start a build at or above the one that wrote it. Downgrading across a system-data version is not supported; to go back, restore the backup taken before the upgrade."
@@ -559,6 +583,15 @@ migration.lock-timeout:
 migration.changeset-failed:
   message: "System data changeset {changeset} failed: {cause}"
   solution: "Fix what the cause names, then start again -- the migration resumes at this changeset rather than repeating the ones before it."
+io.note-write-conflict:
+  message: "Connector notes changed during this operation."
+  solution: "Stop this connector drive and verify the current notes before reopening. Do not overwrite the newer value by refreshing the expected revision."
+io.note-referenced:
+  message: "A shared capture still depends on these private connector notes."
+  solution: "Keep the retained identity until the original shared capture and its external resources have retired. Do not clear the notes or bypass the recorded dependency."
+io.note-scope-unavailable:
+  message: "The captured connector-note scope is missing, changed, or no longer current."
+  solution: "Stop this connector drive and verify the original configuration binding and note scope before reopening. Do not substitute an empty map or retry against a newer generation."
 io.connector-upload-unsettled:
   message: "Connector artifact '{hash}' upload '{attempt}' could not be reconciled."
   solution: "Restore store connectivity and inspect this upload's file and chunks. Retained chunks may still belong to a committed artifact; do not delete them based only on a missing-file read."
@@ -571,6 +604,9 @@ io.store-unauthorized:
 io.workload-claim-fenced:
   message: "The store rejected a write from an expired or superseded workload owner."
   solution: "Let the current cluster owner continue the workload; do not retry from the fenced generation."
+io.document-invalid:
+  message: "The document '{id}' cannot be stored without changing the value in '{field}'."
+  solution: "Use values supported by the storage format and submit the document again."
 io.document-unreadable:
   message: "A stored document with id '{id}' could not be read back; the fault is in '{field}'."
   solution: "The stored document is corrupt or was written by a newer version; inspect or restore it."
@@ -1106,6 +1142,116 @@ cli.auth-issuer-mismatch:
 actuation.unwind-parent-key-unresolved:
   message: "Cannot bind the parent key for step `{step}` and stream `{stream}`: {reason}."
   solution: "Discover a source primary key and keep its column names consistent across merged branches feeding unwind."
+
+io.note-origin-mismatch:
+  message: "The connector context does not match the retained notes. Retire the original resources before using a new connection or artifact."
+  solution: "Continue the original retirement operation with the saved connection and exact registered artifact."
+
+io.cache-auth-fenced:
+  message: "The captured cache authentication generation is unavailable or no longer current."
+  solution: "Load the current trusted storage binding and authentication readiness before retrying."
+
+io.pipeline-intent-fenced:
+  message: "The lifecycle intent no longer owns its captured storage binding or Pipeline state generation."
+  solution: "Load the current trusted storage and Pipeline state before starting a new lifecycle operation. Do not retarget the old operation."
+
+io.cache-business-fenced:
+  message: "The captured cache business incarnation is unavailable or no longer current."
+  solution: "Verify the original storage binding and business recovery state before starting a new operation. Do not retarget an old callback."
+io.srs-consumer-unavailable:
+  message: "Consumer membership or progress for chain {chain} cannot be verified."
+  solution: "Keep the original consumer state and inspect the missing or mismatched membership, cursor and state generation before resuming."
+io.srs-checkpoint-unproven:
+  message: "The source checkpoint for chain {chain} cannot prove its durable table and model closure."
+  solution: "Keep the original state and inspect the missing checkpoint, log or model facts before resuming."
+io.srs-model-unavailable:
+  message: "Actual model {version} for table {table} on chain {chain} is unavailable in its captured context."
+  solution: "Stop continuation and restore the exact retained model or complete the authorized full rebuild. Do not use the latest discovery model as a substitute."
+io.srs-model-capacity:
+  message: "Required retained models for chain {chain} exceed the {bytes}-byte history budget."
+  solution: "Keep required history intact. Allow confirmed consumers to advance or complete an authorized rebuild before retrying; do not delete referenced models."
+io.srs-model-conflict:
+  message: "Model {version} for table {table} on chain {chain} already names different content."
+  solution: "Keep the original version unchanged and verify the capture context before publishing a new model version."
+
+io.srs-event-model-unavailable:
+  message: "Ring {ring} cannot prove actual model {version} at capture epoch {epoch}."
+  solution: "Stop continuation and restore the exact model and log history, or complete the authorized full rebuild. Do not substitute the latest discovery model."
+
+io.required-dead-letter-fenced:
+  message: "The diagnostic command no longer owns its original storage binding, state generation or retirement operation."
+  solution: "Verify the original Pipeline state and operation. Do not retarget an old callback or clear an active namespace."
+
+io.required-dead-letter-conflict:
+  message: "The same source event names different retained row, deletion or token facts."
+  solution: "Keep the existing diagnostic and verify the original event before retrying through its current authorized execution."
+
+connector.snapshot-preparation-unavailable:
+  message: "Snapshot preparation for connector `{connector}` could not complete: {reason}."
+  solution: "Keep the saved recovery state and use a capture runtime that can durably accept the session metadata and stream position before reading rows."
+
+io.pipeline-state-rebuild-required:
+  message: "Pipeline {pipeline} cannot prove its original checkpoint preparation and claim history."
+  solution: "Inspect the original operation or explicitly confirm a full rebuild. Do not recreate missing claims, epochs or preparation authority."
+
+io.connector-artifact-cleanup-unconfirmed:
+  message: "Cleanup of artifact {hash} upload {upload} could not be confirmed."
+  solution: "Query the original registration result. Keep an unpublished upload quarantined and clean only that upload after its writes are known to have ended."
+
+store.invalid-history-retention:
+  message: "Cache history retention must be a positive whole number of seconds."
+  solution: "Configure an exact positive duration in tapstate.metrics.history.retention before initializing or opening the cache. Fractional seconds are not truncated."
+
+store.history-retention-mismatch:
+  message: "Configured history retention is {configuredSeconds} seconds, but the cache TTL is {storedSeconds} seconds."
+  solution: "Stop all Cluster instances, adjust the TTL through database tools, then restart every instance with the same retention. Startup never changes this index."
+
+io.direct-channel-unavailable:
+  message: "Private direct channel {channel} cannot prove its retained recovery state."
+  solution: "Restore the original cache facts or explicitly confirm a full rebuild before continuing."
+
+io.pipeline-capture-identity-unproven:
+  message: "Pipeline {pipeline} cannot prove that its capture identity matches the prepared state. If its source or table selection changed, stop with Clear all state and start a full load before applying it."
+  solution: "Keep the retained recovery facts. If source references, coordinates, SRS mode or selection changed, explicitly confirm a full rebuild."
+
+io.pipeline-table-selection-rebuild-required:
+  message: "Pipeline {pipeline} cannot apply added tables ({tables}) while retaining state. Stop with Clear all state, then start a full load to apply them."
+  solution: "Pause/resume and ordinary stop/start retain the original table selection."
+
+io.configuration-import-refused:
+  message: "Configuration import was refused ({reason})."
+  solution: "Check the original import status. Preserve unknown outcomes and request a new preflight only after the original operation is known not to have committed."
+
+io.configuration-import-limit:
+  message: "Configuration import exceeded its {limit} budget."
+  solution: "Use a smaller package or resolve the retained original operations. Do not delete unknown or committed receipts to bypass the limit."
+
+io.capture-state-rebuild-required:
+  message: "Capture {capture} has missing or unproven canonical claim history."
+  solution: "Keep the original state and explicitly confirm Cluster cache recovery, including affected pipelines and sessions. Do not recreate the claim or reset its generations."
+
+capture.still-ending:
+  message: "Capture `{captureId}` has not finished stopping."
+  solution: "Retry the original stop after the source call exits; retain its original resource identity."
+
+control.storage-test-required:
+  message: "Test every storage layer again using the current settings before saving."
+control.storage-test-failed:
+  message: "The {layer} storage test failed ({causeCode}). Check the connection and permissions."
+control.storage-scope-conflict:
+  message: "The storage operation or installation phase has changed. Read its current status."
+control.storage-unavailable:
+  message: "The storage operation is temporarily unavailable. Query the original operation before retrying."
+
+control.storage-databases-overlap:
+  message: "Choose a different logical database name for each storage layer. Equal names cannot prove storage isolation."
+
+connector.tls-trust-invalid:
+  message: "Connector '{connector}' has invalid server TLS trust material or conflicting TLS settings."
+  solution: "Provide a valid CA certificate bundle with server verification enabled and no client private key."
+connector.tls-material-cleanup-failed:
+  message: "Connector '{connector}' could not remove its temporary TLS material."
+  solution: "Inspect the owning process file permissions before retrying cleanup."
 control.ai-not-configured:
   message: "Configure an AI provider in the Pipeline Builder before requesting a proposal."
 control.ai-provider-failed:
@@ -1154,3 +1300,17 @@ start-check.target-identity-compatible:
 start-check.target-identity-refused:
   message: "Target '{target}' on '{connection}' cannot safely preserve '{field}' as '{preserved}': {reason}."
   solution: "Resolve the field collision or target identity constraints before starting. Source values and existing business constraints are not overwritten."
+
+io.srs-full-preparation-capacity:
+  message: "The pending full baseline for chain {chain} exceeds its {bytes}-byte control budget."
+  solution: "Reduce the selected model references or source token size before retrying the same explicit full. Keep all required existing history intact."
+io.srs-full-preparation-unproven:
+  message: "The original clear-state full baseline for chain {chain} cannot be verified."
+  solution: "Keep the original preparation, snapshot pin, model and progress facts. Retry only the same verified full operation; do not create a replacement from missing history."
+io.srs-position-model-unproven:
+  message: "The requested source position for chain {chain} cannot prove compatibility with its model history."
+  solution: "Arbitrary position editing is unavailable after model handoff or replacement-cache history. Stop, clear the task state and explicitly rerun a full load instead."
+
+store.ai-provider-schema-unsupported:
+  message: "AI provider settings require configuration schema {required}."
+  solution: "Keep using the existing non-AI configuration, or explicitly initialize a supported configuration database. No automatic upgrade is performed."

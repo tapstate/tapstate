@@ -96,9 +96,15 @@ final class SpecGenerator {
     private static Map<String, Object> setupDef() {
         Map<String, Object> properties = new LinkedHashMap<>();
         for (String key : Vocabulary.SETUP_KEYS) {
-            // Every setup key but one is a list of names; databases is a mapping, because each store
-            // carries a kind and is referenced by the name its author gave it.
-            properties.put(key, "databases".equals(key) ? databasesDef() : stringArray(setupDescription(key)));
+            properties.put(key, switch (key) {
+                case "databases" -> databasesDef();
+                case "managed_target" -> {
+                    var target = new LinkedHashMap<String, Object>();
+                    target.put("type", "string"); target.put("minLength", 1);
+                    target.put("description", setupDescription(key)); yield target;
+                }
+                default -> stringArray(setupDescription(key));
+            });
         }
         Map<String, Object> setup = new LinkedHashMap<>();
         setup.put("type", "object");
@@ -197,6 +203,11 @@ final class SpecGenerator {
                         case CDC -> keyed(keyword.word(), cdcBody());
                         case AWAIT -> keyed(keyword.word(), Map.of("$ref", "#/$defs/matcher"));
                         case ASSERT -> keyed(keyword.word(), Map.of("$ref", "#/$defs/matcher"));
+                        case START_REFUSED -> {
+                            var code = failureCodeBody();
+                            code.put("description", "Exact canonical code returned by an HTTP 409 start admission refusal.");
+                            yield keyed(keyword.word(), code);
+                        }
                     });
         }
         // The same two words again, this time carrying a source: one lifecycle word means the whole
@@ -547,6 +558,7 @@ final class SpecGenerator {
             case CDC -> "Produces changes against a seeded table while the pipeline runs.";
             case AWAIT -> "Polls a matcher until it holds or the bound expires.";
             case ASSERT -> "Checks a matcher once, now.";
+            case START_REFUSED -> "Requires an HTTP 409 start admission refusal carrying the named code.";
         };
     }
 
@@ -575,6 +587,8 @@ final class SpecGenerator {
             case "databases" -> "Stores the harness provisions first, keyed by the name whose address the "
                     + "resources interpolate.";
             case "connectors" -> "Connector ids whose runtime jars are registered; idempotent by content hash.";
+            case "managed_target" -> "Source file used to prepare the installation's managed default target; "
+                    + "read for endpoint assertions and never included in setup.apply.";
             case "apply" -> "Product resource files, applied as one batch: the product resolves references "
                     + "within the submitted set. The pipeline is applied in the same batch whether or not "
                     + "it is listed here.";

@@ -1,8 +1,6 @@
 package io.tapstate.adapters.pdk;
 
 import io.tapdata.entity.schema.type.TapType;
-import io.tapdata.entity.utils.InstanceFactory;
-import io.tapdata.entity.utils.JsonParser;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.math.BigDecimal;
@@ -70,6 +68,6 @@ final class PdkTypeDescription {
     }
 
     static String describe(TapType type) {
-        return Objects.requireNonNull(InstanceFactory.instance(JsonParser.class), "PDK JSON provider").toJson(type);
+        return PdkJsonProvider.parser().toJson(type);
     }
 }

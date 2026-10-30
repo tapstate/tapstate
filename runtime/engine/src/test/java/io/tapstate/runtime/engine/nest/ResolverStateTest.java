@@ -7,7 +7,6 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
-import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 
@@ -79,7 +78,7 @@ class ResolverStateTest {
         ResolverState state = new ResolverState();
         state.declare("C1", at(5));
 
-        assertThat(state.deleteMapping(at(5), ARRIVED)).isEmpty();
+        state.deleteMapping(at(5));
         assertThat(state.deleted()).isFalse();
         assertThat(state.parentKey()).isEqualTo("C1");
     }
@@ -88,7 +87,7 @@ class ResolverStateTest {
     void deletingTheRowLeavesAVersionedTombstoneNotAHole() {
         ResolverState state = new ResolverState();
         state.declare("C1", at(5));
-        state.deleteMapping(at(10), ARRIVED);
+        state.deleteMapping(at(10));
 
         assertThat(state.deleted()).isTrue();
         assertThat(state.parentKey()).isNull();
@@ -104,34 +103,45 @@ class ResolverStateTest {
     }
 
     @Test
-    void deletingTheRowDrainsWhatWasWaitingImmediately() {
-        ResolverState state = new ResolverState();
-        NestElement orphaned = child("items", 2, "t2", "sku", "a");
-        state.resolve(orphaned, ARRIVED);
-
-        // The parent is known deleted, so the bucket empties now rather than waiting for a timeout: those
-        // children can never resolve, and holding them would pin the frontier for nothing.
-        List<ReleasedChild> released = state.deleteMapping(at(10), ARRIVED + 90_000);
-        assertThat(released).extracting(ReleasedChild::child).containsExactly(orphaned);
-        assertThat(released).extracting(ReleasedChild::heldFor)
-                .describedAs("measured from when this change started waiting, not from when the row was "
-                        + "deleted - it is the whole of what tells a long-dangling reference from a parent "
-                        + "deleted while its children were still arriving")
-                .containsExactly(Duration.ofMinutes(1).plusSeconds(30));
-        assertThat(state.waiting()).isEmpty();
+    void deletingTheRowRetainsExistingWaitingUntilAHigherParentDeclaration() {
+        ResolverState state=new ResolverState();NestElement waiting=child("items",2,"t2","sku","a");
+        state.resolve(waiting,ARRIVED);state.deleteMapping(at(10));
+        assertThat(state.waiting()).containsExactly(waiting);assertThat(state.deleted()).isTrue();
+        assertThat(state.declare("old",at(9))).isEmpty();assertThat(state.waiting()).containsExactly(waiting);
+        assertThat(state.declare("C1",at(11))).containsExactly(waiting);assertThat(state.waiting()).isEmpty();
     }
 
     @Test
-    void aChildArrivingAfterTheRowIsDeletedIsNotHeld() {
-        ResolverState state = new ResolverState();
-        state.declare("C1", at(1));
-        state.deleteMapping(at(10), ARRIVED);
-
-        assertThat(state.resolve(child("items", 11, "t11", "sku", "a"), ARRIVED))
-                .isEqualTo(Resolution.PARENT_ABSENT);
-        assertThat(state.waiting()).isEmpty();
+    void aChildArrivingAfterDeletionWaitsForAParentThatCanStillReappear() {
+        ResolverState state=new ResolverState();state.declare("C1",at(1));state.deleteMapping(at(10));
+        NestElement waiting=child("items",11,"t11","sku","a");
+        assertThat(state.resolve(waiting,ARRIVED)).isEqualTo(Resolution.HELD);
+        assertThat(state.waiting()).containsExactly(waiting);assertThat(state.declare("C2",at(12))).containsExactly(waiting);
     }
 
+    @Test
+    void repeatedParentDeletionsPreserveWaitingAcrossRestoreAndOldDeclarations() throws Exception {
+        var state=new ResolverState();
+        NestElement waiting=child("items",11,"opaque-child-11","sku","a");
+        state.declare("C1",at(1));state.deleteMapping(at(10));
+        state.resolve(waiting,ARRIVED);state.deleteMapping(at(12));
+        var bytes=new ByteArrayOutputStream();try(var out=new ObjectOutputStream(bytes)){out.writeObject(state);}
+        ResolverState restored;try(var in=new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()))){restored=(ResolverState)in.readObject();}
+        assertThat(restored.deleted()).isTrue();assertThat(restored.waiting()).containsExactly(waiting);
+        assertThat(restored.lowestHeldByChain()).containsEntry("items",new ChainPosition(at(11),"opaque-child-11"));
+        assertThat(restored.declare("too-old",at(11))).isEmpty();assertThat(restored.waiting()).containsExactly(waiting);
+        assertThat(restored.declare("C2",at(13))).containsExactly(waiting);assertThat(restored.waiting()).isEmpty();
+    }
+    @Test
+    void exactChildReplayAfterRestoreDoesNotSpendMorePendingCapacity() throws Exception {
+        var state=new ResolverState();
+        NestElement waiting=child("items",2,"opaque-2","sku","a","payload",new io.tapstate.core.event.Bytes((byte)4,new byte[]{1,2,3}));
+        state.resolve(waiting,ARRIVED);
+        var bytes=new ByteArrayOutputStream();try(var out=new ObjectOutputStream(bytes)){out.writeObject(state);}
+        ResolverState restored;try(var in=new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()))){restored=(ResolverState)in.readObject();}
+        assertThat(restored.resolve(waiting,ARRIVED+90_000)).isEqualTo(Resolution.HELD);
+        assertThat(restored.pending()).isEqualTo(1);assertThat(restored.declare("C1",at(3))).containsExactly(waiting);
+    }
     @Test
     void theWaitingBucketReportsThePositionsTheFrontierMustNotPass() {
         ResolverState state = new ResolverState();
@@ -159,7 +169,7 @@ class ResolverStateTest {
     void everyMutationCarriesAnOrder() {
         ResolverState state = new ResolverState();
         assertThatNullPointerException().isThrownBy(() -> state.declare("C1", null));
-        assertThatNullPointerException().isThrownBy(() -> state.deleteMapping(null, ARRIVED));
+        assertThatNullPointerException().isThrownBy(() -> state.deleteMapping(null));
     }
 
     @Test

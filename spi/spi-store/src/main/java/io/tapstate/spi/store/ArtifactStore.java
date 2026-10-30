@@ -159,6 +159,9 @@ public interface ArtifactStore {
     /** Returns the stored resource for the id, or empty if none is stored. */
     Optional<Resource> get(String id);
 
+    /** Verified deployment-owned target identity; absent only for a store without a storage binding. */
+    default Optional<String> managedDefaultSourceId() { return Optional.empty(); }
+
     /** Lists every stored resource. */
     List<Resource> list();
 

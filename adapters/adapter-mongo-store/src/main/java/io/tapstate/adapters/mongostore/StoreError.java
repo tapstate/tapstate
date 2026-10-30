@@ -36,6 +36,9 @@ public enum StoreError implements TapstateErrorCode {
      */
     INVALID_URI("store.invalid-uri", Set.of()),
 
+    /** This initialized CONFIG schema does not support provider settings. */
+    AI_PROVIDER_SCHEMA_UNSUPPORTED("store.ai-provider-schema-unsupported", Set.of("required")),
+
     /** The metadata-backed Source config keyring is absent, malformed, or internally inconsistent. */
     SOURCE_CONFIG_KEYRING_INVALID("store.source-config-keyring-invalid", Set.of()),
 
@@ -45,12 +48,33 @@ public enum StoreError implements TapstateErrorCode {
     /** A prepared key cannot become active until every live node session has acknowledged its epoch. */
     SOURCE_CONFIG_KEYRING_ROTATION_BLOCKED("store.source-config-keyring-rotation-blocked", Set.of()),
 
+    /** Existing configuration facts do not belong to this exact new-installation operation. */
+    INITIALIZATION_REFUSED("store.initialization-refused", Set.of()),
+
+    /** A normal authoring write cannot replace or remove the storage binding's system-owned Source. */
+    DEFAULT_SOURCE_PROTECTED("store.default-source-protected", Set.of()),
+
+    /** A Pipeline's retained state identity cannot be removed or reused before its explicit retirement. */
+    PIPELINE_RETIREMENT_REQUIRED("store.pipeline-retirement-required", Set.of("pipeline")),
+
     /**
      * The configured TLS CA certificate file could not be read or parsed. {@code path} is the CA
      * file path (a filesystem path, not a credential, so it is safe to echo back). Reached only when
      * TLS is enabled (opt-in via the URI) and a CA file is configured.
      */
-    TLS_CA_UNREADABLE("store.tls-ca-unreadable", Set.of("path"));
+    TLS_CA_UNREADABLE("store.tls-ca-unreadable", Set.of("path")),
+
+    /** A normalized storage endpoint violates its database, server TLS or authentication boundary. */
+    STORAGE_CONNECTION_UNSUPPORTED("store.storage-connection-unsupported", Set.of()),
+
+    /** A cache history retention cannot be represented as an exact positive MongoDB TTL in seconds. */
+    INVALID_HISTORY_RETENTION("store.invalid-history-retention", Set.of()),
+
+    /** Existing cache history indexes require explicit offline maintenance before using a new retention. */
+    HISTORY_RETENTION_MISMATCH("store.history-retention-mismatch", Set.of("configuredSeconds", "storedSeconds")),
+
+    /** Stored trust material is invalid; no URI, certificate or private-key contents are exposed. */
+    TLS_TRUST_INVALID("store.tls-trust-invalid", Set.of());
 
     private final String code;
     private final Set<String> placeholders;

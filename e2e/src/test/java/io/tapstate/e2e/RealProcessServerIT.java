@@ -37,11 +37,11 @@ class RealProcessServerIT {
 
     @Test
     void launchesTheShippedJarAndServesTheSameSurfaceTheInProcessTierDoes() {
-        try (ServerHandle server = RealProcessServer.start(SharedMongo.replicaSetUrl("e2e_realproc"))) {
+        try (var storage = PreparedNativeStore.create(); ServerHandle server = Tiers.REAL_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
             assertThat(control.healthy()).isTrue();
 
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.apply(Map.of("e2e_probe.tap.yml", SOURCE));
 
             assertThat(control.artifactIds()).contains("e2e_probe");
@@ -49,34 +49,35 @@ class RealProcessServerIT {
     }
 
     @Test
-    void publishesTheConfiguredSingleMemberIdentityThroughTheShippedJar() {
+    void publishesTheRetainedSingleMemberIdentityEvenWithAnExplicitNodeSetting() {
         String nodeId = "configured-single-member";
-        try (ServerHandle server = RealProcessServer.start(
-                SharedMongo.replicaSetUrl("e2e_realproc_identity"),
+        try (var storage = PreparedNativeStore.create("e2e-local-single", "e2e-single", "e2e-single-password");
+                ServerHandle server = RealProcessServer.startPrepared(storage.configurationUri(), "127.0.0.1",
                 port -> List.of(
                         "--tapstate.cluster.id=e2e-local-single",
                         "--tapstate.cluster.node-id=" + nodeId,
                         "--tapstate.control.advertise-url=http://127.0.0.1:" + port))) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e-single", "e2e-single-password");
+            storage.loginAndAwaitBusiness(control);
 
             assertThat(control.clusterMembers()).singleElement().satisfies(member -> {
-                assertThat(member.nodeId()).isEqualTo(nodeId);
+                assertThat(member.nodeId()).isEqualTo(storage.clusterId());
                 assertThat(member.memberUuid()).isNotBlank();
                 assertThat(member.bootId()).isNotBlank();
-                assertThat(member.controlUrl()).isEqualTo(server.baseUrl().toString());
+                assertThat(member.controlUrl()).isNull();
             });
         }
     }
 
     @Test
     void stopsTheServerItLaunchedSoTheNextRunIsNotServedByThisOne() {
-        ServerHandle server = RealProcessServer.start(SharedMongo.replicaSetUrl("e2e_realproc_stop"));
-        ControlPlane control = new ControlPlane(server.baseUrl());
-        assertThat(control.healthy()).isTrue();
-
-        server.close();
-
-        assertThat(control.healthy()).isFalse();
+        try (var storage = PreparedNativeStore.create()) {
+            ControlPlane control;
+            try (ServerHandle server = Tiers.REAL_PROCESS.launch(storage)) {
+                control = new ControlPlane(server.baseUrl());
+                assertThat(control.healthy()).isTrue();
+            }
+            assertThat(control.healthy()).isFalse();
+        }
     }
 }

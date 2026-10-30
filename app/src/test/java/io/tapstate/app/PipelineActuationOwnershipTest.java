@@ -7,6 +7,7 @@ import io.tapstate.runtime.scheduler.ObservationPublisher;
 import io.tapstate.runtime.scheduler.PipelineConverger;
 import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.WorkloadClaim;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
@@ -288,6 +289,61 @@ class PipelineActuationOwnershipTest {
                 .as("more than a lease went by with no pass, and the claim is still live").isTrue();
         assertThat(ownership(NODE_B).permit("orders").granted())
                 .as("so no other member could take it").isFalse();
+    }
+
+    @Test void aCoordinatedOwnerNeverProvesAMissingExecutionFence() {
+        var owner = ownership(NODE_A);
+        assertThat(owner.permit("orders").granted()).isTrue();
+        assertThat(owner.proveExecution(null)).isFalse();
+    }
+
+    @Test void anOldPassCannotAdvanceAReacquiredTenureUnderTheSamePipelineId() {
+        var owner = ownership(NODE_A);
+        var original = WorkloadClaimFence.from(owner.permit("orders").claim());
+        claims.elapse(TTL.plusSeconds(1)); nanos.addAndGet(RENEW.toNanos());
+        assertThat(owner.permit("orders").granted()).isFalse();
+        nanos.addAndGet(RENEW.toNanos());
+        var current = owner.permit("orders");
+        assertThat(current.granted()).isTrue();
+        assertThat(current.claim().claimGeneration()).isGreaterThan(original.claimGeneration());
+        assertThat(owner.beginExecution("orders", original).allowed()).isFalse();
+        assertThat(claims.read(ORDERS).orElseThrow().claim().executionGeneration()).isZero();
+        var advanced = owner.beginExecution("orders", WorkloadClaimFence.from(current.claim()));
+        assertThat(advanced.allowed()).isTrue();
+        assertThat(advanced.claimFence()).isEqualTo(WorkloadClaimFence.from(claims.read(ORDERS).orElseThrow().claim()));
+        assertThat(advanced.claimFence().owner()).isEqualTo(NODE_A);
+        assertThat(advanced.claimFence().topologyRevision()).isEqualTo(current.claim().topologyRevision());
+    }
+
+    @Test void leaseOnlyRenewalKeepsTheOriginalPassIdentityButAdvancementSpendsIt() {
+        var owner = ownership(NODE_A);
+        var original = owner.permit("orders").claim();
+        var expected = WorkloadClaimFence.from(original);
+        claims.elapse(Duration.ofSeconds(5)); nanos.addAndGet(RENEW.toNanos());
+        owner.renewDue();
+        assertThat(claims.read(ORDERS).orElseThrow().claim().leaseUntil()).isAfter(original.leaseUntil());
+        var advanced = owner.beginExecution("orders", expected);
+        assertThat(advanced.allowed()).isTrue();
+        assertThat(advanced.claimFence().executionGeneration()).isEqualTo(expected.executionGeneration() + 1);
+        assertThat(owner.beginExecution("orders", expected).allowed()).isFalse();
+        var next = owner.beginExecution("orders", advanced.claimFence());
+        assertThat(next.allowed()).isTrue();
+        assertThat(next.claimFence().executionGeneration()).isEqualTo(advanced.claimFence().executionGeneration() + 1);
+    }
+
+    @Test void anOldPassCannotAttributeItsRefusalToALaterRun() {
+        var owner = ownership(NODE_A);
+        var original = WorkloadClaimFence.from(owner.permit("orders").claim());
+        var advanced = owner.beginExecution("orders", original);
+        owner.startRefusedBeforeItsRun("orders", original);
+        assertThat(owner.departure("orders", SETTLING)).isEqualTo(PipelineActuationOwnership.Departure.NOBODY_LEFT);
+        owner.startRefusedBeforeItsRun("orders", advanced.claimFence());
+        assertThat(owner.departure("orders", SETTLING)).isEqualTo(PipelineActuationOwnership.Departure.START_REFUSED);
+    }
+
+    @Test void anExplicitOriginalClaimCannotUseAnUncoordinatedFixtureOwner() {
+        var original = WorkloadClaimFence.from(ownership(NODE_A).permit("orders").claim());
+        assertThat(PipelineActuationOwnership.single().beginExecution("orders", original).allowed()).isFalse();
     }
 
     private PipelineActuationOwnership ownership(WorkloadOwner owner) {

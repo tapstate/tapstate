@@ -65,8 +65,8 @@ class ATablesChangesWaitForItsOwnLoadAndNoOtherIT {
         WriteWitness written = new WriteWitness(directory.resolve("written"));
 
         try (FileEndpoints files = new FileEndpoints()) {
-            String store = SharedMongo.replicaSetUrl("e2e_own_load_cluster");
-            try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-own-load")) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                    TwoMemberCluster cluster = TwoMemberCluster.startPrepared(storage)) {
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.first();
                 control.registerConnector(E2eConnectorJar.CONNECTOR_ID, connector);

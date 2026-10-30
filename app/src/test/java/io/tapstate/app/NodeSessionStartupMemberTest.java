@@ -6,7 +6,6 @@ import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.core.HazelcastInstanceAware;
 import com.hazelcast.core.ManagedContext;
-import io.tapstate.adapters.mongostore.SourceConfigKeyringSession;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
@@ -42,17 +41,8 @@ class NodeSessionStartupMemberTest {
         WorkloadClaim claim = claims.acquire(
                 new WorkloadClaimKey("owned-startup", WorkloadClaimType.NODE_SESSION, "node-a"),
                 new WorkloadOwner("node-a", "owned-boot"), 0, ttl).claim();
-        AtomicInteger acknowledgements = new AtomicInteger();
-        SourceConfigKeyringSession keyring = new SourceConfigKeyringSession() {
-            @Override public void acknowledge(WorkloadClaim renewed, Duration lease) {
-                assertThat(renewed.owner()).isEqualTo(claim.owner());
-                assertThat(renewed.claimGeneration()).isEqualTo(claim.claimGeneration());
-                acknowledgements.incrementAndGet();
-            }
-            @Override public void release(WorkloadClaim ending) { }
-        };
         NodeSessionStartup startup = new NodeSessionStartup(
-                claims, claim, askedAt, ttl, Duration.ofMillis(10), keyring);
+                claims, claim, askedAt, ttl, Duration.ofMillis(10));
         ConstructorBarrier barrier = new ConstructorBarrier();
         String name = "owned-node-session-startup-" + UUID.randomUUID();
         HazelcastProperties properties = new HazelcastProperties();
@@ -77,8 +67,8 @@ class NodeSessionStartupMemberTest {
         try {
             assertThat(barrier.entered.await(10, TimeUnit.SECONDS)).isTrue();
             assertThat(factory.isDone()).isFalse();
-            int before = acknowledgements.get();
-            await().atMost(Duration.ofSeconds(2)).until(() -> acknowledgements.get() > before);
+            int before = claims.renewals.get();
+            await().atMost(Duration.ofSeconds(2)).until(() -> claims.renewals.get() > before);
             assertThat(startup.isCurrent()).isTrue();
             assertThat(barrier.member.get().getLifecycleService().isRunning()).isTrue();
 
@@ -129,6 +119,7 @@ class NodeSessionStartupMemberTest {
         private final AtomicBoolean refuse = new AtomicBoolean();
         private final AtomicInteger acquisitions = new AtomicInteger();
         private final AtomicInteger releases = new AtomicInteger();
+        private final AtomicInteger renewals = new AtomicInteger();
 
         @Override public WorkloadClaimAttempt acquire(WorkloadClaimKey key, WorkloadOwner owner,
                 long revision, Duration ttl) {
@@ -136,6 +127,7 @@ class NodeSessionStartupMemberTest {
             return delegate.acquire(key, owner, revision, ttl);
         }
         @Override public Optional<WorkloadClaim> renew(WorkloadClaim expected, Duration ttl) {
+            renewals.incrementAndGet();
             return refuse.get() ? Optional.empty() : delegate.renew(expected, ttl);
         }
         @Override public boolean release(WorkloadClaim expected) {

@@ -66,6 +66,11 @@
             }
           }
         },
+        "managed_target": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Source file used to prepare the installation's managed default target; read for endpoint assertions and never included in setup.apply."
+        },
         "connectors": {
           "type": "array",
           "description": "Connector ids whose runtime jars are registered; idempotent by content hash.",
@@ -333,6 +338,20 @@
           "properties": {
             "await": {
               "$ref": "#/$defs/matcher"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "start_refused"
+          ],
+          "properties": {
+            "start_refused": {
+              "type": "string",
+              "description": "Exact canonical code returned by an HTTP 409 start admission refusal.",
+              "pattern": "^[a-z0-9]+\\.[a-z0-9-]+$"
             }
           }
         },

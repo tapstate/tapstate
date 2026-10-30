@@ -45,6 +45,7 @@ import java.util.Properties;
 final class JoinStateMapStore implements MapStore<Object, Object>, MapLoaderLifecycleSupport {
 
     private final String namespace;
+    private final boolean scoped;
 
     /**
      * The layer this files under, and where a trip made here is counted. Neither can be handed in: the
@@ -56,6 +57,11 @@ final class JoinStateMapStore implements MapStore<Object, Object>, MapLoaderLife
     private JoinStateStats stats;
 
     JoinStateMapStore(String namespace) {
+        this(namespace, false);
+    }
+
+    JoinStateMapStore(String namespace, boolean scoped) {
+        this.scoped = scoped;
         this.namespace = Objects.requireNonNull(namespace, "namespace");
     }
 
@@ -66,6 +72,7 @@ final class JoinStateMapStore implements MapStore<Object, Object>, MapLoaderLife
      * question cost the expensive one. The wiring itself is witnessed where a member exists anyway.
      */
     JoinStateMapStore(String namespace, KeyedStateStore store, JoinStateStats stats) {
+        this.scoped = false;
         this.namespace = Objects.requireNonNull(namespace, "namespace");
         this.store = Objects.requireNonNull(store, "store");
         this.stats = Objects.requireNonNull(stats, "stats");
@@ -73,7 +80,10 @@ final class JoinStateMapStore implements MapStore<Object, Object>, MapLoaderLife
 
     @Override
     public void init(HazelcastInstance member, Properties properties, String mapName) {
-        this.store = JoinStateMapStoreFactory.boundTo(member);
+        boolean required = scoped || io.tapstate.runtime.engine.OperatorMapBindings.required(properties);
+        var bindings = io.tapstate.runtime.engine.OperatorMapBindings.resolve(member, required);
+        this.store = bindings == null ? JoinStateMapStoreFactory.boundTo(member)
+                : required ? bindings.initializingJoin(namespace) : bindings.join(namespace);
         this.stats = JoinStateStats.of(member);
     }
 

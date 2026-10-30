@@ -4,6 +4,9 @@ import io.tapstate.control.core.ConnectorCatalogView;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.ConnectorRegistry;
 import io.tapstate.spi.store.RegistrationSource;
+import io.tapstate.spi.store.StorageBinding;
+import io.tapstate.adapters.mongostore.MongoCacheDomain;
+import java.time.Duration;
 import io.tapstate.testsupport.RequiresDocker;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -40,50 +43,51 @@ class CloudConnectorSeedReadinessIT {
     @Test
     void allLockedRealArtifactsRegisterBeforeReadyAndRemainIdempotentAcrossRestart() {
         Path seeds = CloudConnectorTestInputs.seedDirectory();
-        String uri = database("complete");
+        var storage = database("complete",true);
         var ready = new AtomicInteger();
         List<String> hashes;
-        try (var context = builder(ready).run(arguments(uri, true, seeds))) {
+        try (var context = builder(ready).run(arguments(storage, true, seeds))) {
             assertThat(ready.get()).isEqualTo(1);
-            var registry = context.getBean(ConnectorRegistry.class);
+            var business=NativeAppStorage.business(context);
+            var registry = business.getBean(ConnectorRegistry.class);
             assertThat(registry.list()).extracting(registration -> registration.connectorId())
                     .containsExactlyInAnyOrderElementsOf(IDS);
-            assertThat(context.getBean(ConnectorCatalogView.class).summaries())
+            assertThat(business.getBean(ConnectorCatalogView.class).summaries())
                     .extracting(summary -> summary.id()).containsExactlyInAnyOrderElementsOf(IDS);
             hashes = registry.list().stream().map(registration -> registration.contentHash()).sorted().toList();
         }
-        try (var restarted = builder(ready).run(arguments(uri, true, seeds))) {
+        try (var restarted = builder(ready).run(arguments(storage, true, seeds))) {
             assertThat(ready.get()).isEqualTo(2);
-            assertThat(restarted.getBean(ConnectorRegistry.class).list().stream()
+            assertThat(NativeAppStorage.business(restarted).getBean(ConnectorRegistry.class).list().stream()
                     .map(registration -> registration.contentHash()).sorted()).containsExactlyElementsOf(hashes);
         }
     }
 
     @Test
-    void aMissingCloudJarRefusesReadyEvenThoughEveryOtherJarIsValid() throws Exception {
+    void aMissingCloudJarRefusesBusinessEvenThoughEveryOtherJarIsValid() throws Exception {
         Path seeds = copyRelease();
         Files.delete(seeds.resolve("mongodb-atlas-connector.jar"));
-        refusesReady(database("missing"), seeds);
+        refusesBusiness(database("missing",true), seeds);
     }
 
     @Test
-    void aCorruptCloudJarRefusesReadyWithoutWeakeningTheOtherLockedInputs() throws Exception {
+    void aCorruptCloudJarRefusesBusinessWithoutWeakeningTheOtherLockedInputs() throws Exception {
         Path seeds = copyRelease();
         Path atlas = seeds.resolve("mongodb-atlas-connector.jar");
         // Replace only the owned copy with the damaged file. Never modify the shared input.
         Files.delete(atlas);
         Files.write(atlas, new byte[] {0x13, 0x37});
-        refusesReady(database("corrupt"), seeds);
+        refusesBusiness(database("corrupt",true), seeds);
     }
 
     @Test
     void aValidButByteChangedPluginCacheCannotBecomeReadyOnRestart() throws Exception {
-        String uri = database("changed_cache");
+        var storage = database("changed_cache",true);
         var ready = new AtomicInteger();
         Path seeds = CloudConnectorTestInputs.seedDirectory();
         String atlasHash;
-        try (var context = builder(ready).run(arguments(uri, true, seeds))) {
-            atlasHash = context.getBean(ConnectorRegistry.class).findAll("mongodb-atlas").getFirst().contentHash();
+        try (var context = builder(ready).run(arguments(storage, true, seeds))) {
+            atlasHash = NativeAppStorage.business(context).getBean(ConnectorRegistry.class).findAll("mongodb-atlas").getFirst().contentHash();
         }
         Path cache = work.resolve("plugins").resolve(atlasHash + ".jar");
         Files.write(cache, new byte[] {0x42}, StandardOpenOption.APPEND);
@@ -91,54 +95,55 @@ class CloudConnectorSeedReadinessIT {
             assertThat(stillValid.getJarEntry("atlas-spec.json")).isNotNull();
         }
         ready.set(0);
-        refusesReady(uri, seeds, ready);
+        refusesBusiness(storage, seeds, ready);
     }
 
     @Test
-    void aRegistrationConflictIsFatalForCloudButDoesNotEmitApplicationReady() {
-        String uri = database("conflict");
+    void aRegistrationConflictRefusesCloudBusinessWithoutChangingItsInstallationMode() {
+        var storage = database("conflict",true);
         var ready = new AtomicInteger();
-        try (var onPrem = builder(ready).run(arguments(uri, false, work.resolve("optional-seeds")))) {
-            onPrem.getBean(ConnectorRegistry.class).register(
+        var connection=new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,storage.cacheUri(),storage.cacheDatabase(),null);
+        try(var cache=MongoCacheDomain.connect(connection,Duration.ofSeconds(5),"seed-conflict-fixture")) {
+            cache.verifyBusinessReady(storage.preparation().businessScope());
+            cache.connectors(storage.preparation().businessScope(),() -> {}).register(
                     "mysql", "2.0.5-SNAPSHOT", RegistrationSource.SEED, new byte[] {1, 2, 3});
         }
-        ready.set(0);
-        refusesReady(uri, CloudConnectorTestInputs.seedDirectory(), ready);
+        refusesBusiness(storage, CloudConnectorTestInputs.seedDirectory(), ready);
     }
 
     @Test
     void onPremStillStartsWithMissingOrDefectiveOptionalSeeds() throws Exception {
         var ready = new AtomicInteger();
-        try (var missing = builder(ready).run(arguments(database("onprem_missing"), false, work.resolve("absent")))) {
-            assertThat(missing.getBean(ConnectorRegistry.class).list()).isEmpty();
+        try (var missing = builder(ready).run(arguments(database("onprem_missing",false), false, work.resolve("absent")))) {
+            assertThat(NativeAppStorage.business(missing).getBean(ConnectorRegistry.class).list()).isEmpty();
             assertThat(ready.get()).isEqualTo(1);
         }
         Path defective = Files.createDirectories(work.resolve("defective"));
         Files.write(defective.resolve("garbage.jar"), new byte[] {0x13, 0x37});
-        try (var damaged = builder(ready).run(arguments(database("onprem_defective"), false, defective))) {
-            assertThat(damaged.getBean(ConnectorRegistry.class).list()).isEmpty();
+        try (var damaged = builder(ready).run(arguments(database("onprem_defective",false), false, defective))) {
+            assertThat(NativeAppStorage.business(damaged).getBean(ConnectorRegistry.class).list()).isEmpty();
             assertThat(ready.get()).isEqualTo(2);
         }
     }
 
-    private void refusesReady(String uri, Path seeds) {
-        refusesReady(uri, seeds, new AtomicInteger());
+    private void refusesBusiness(NativeAppStorage storage, Path seeds) {
+        refusesBusiness(storage, seeds, new AtomicInteger());
     }
 
-    private void refusesReady(String uri, Path seeds, AtomicInteger ready) {
-        assertThatThrownBy(() -> {
-            try (var unexpected = builder(ready).run(arguments(uri, true, seeds))) {
-                throw new AssertionError("Cloud started without its required connector release");
-            }
-        }).satisfies(failure -> {
-            Throwable cause = failure;
-            while (!(cause instanceof TapstateException) && cause.getCause() != null) {
-                cause = cause.getCause();
-            }
-            assertThat(cause).isInstanceOfSatisfying(TapstateException.class,
-                    coded -> assertThat(coded.code()).isEqualTo(BootError.CLOUD_CONNECTORS_INVALID));
-        });
-        assertThat(ready.get()).as("failed seed startup never emits ApplicationReadyEvent").isZero();
+    private void refusesBusiness(NativeAppStorage storage, Path seeds, AtomicInteger ready) {
+        try(var context=builder(ready).run(arguments(storage,true,seeds))) {
+            var root=context.getBean(StorageRoot.class);
+            assertThat(ready.get()).as("the diagnostic/auth root remains available").isEqualTo(1);
+            assertThat(root.phase()).isEqualTo(StorageRoot.Phase.AUTH_READY);
+            assertThat(root.runtime().business()).isEmpty();
+            // Retry the actual child assembly to retain the exact release-validation diagnosis.
+            assertThatThrownBy(() -> root.runtime().startBusiness(root.runtime().current().orElseThrow(),
+                    bound -> new NativeBusinessContext(root,bound,context)))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            coded -> assertThat(coded.code()).isEqualTo(BootError.CLOUD_CONNECTORS_INVALID));
+            assertThat(root.runtime().business()).isEmpty();
+            assertThat(com.hazelcast.core.Hazelcast.getAllHazelcastInstances()).isEmpty();
+        }
     }
 
     private static SpringApplicationBuilder builder(AtomicInteger ready) {
@@ -149,24 +154,25 @@ class CloudConnectorSeedReadinessIT {
                 });
     }
 
-    private String[] arguments(String uri, boolean cloud, Path seeds) {
+    private String[] arguments(NativeAppStorage storage, boolean cloud, Path seeds) {
+        String uri=storage.configurationUri();
         List<String> args = new ArrayList<>(List.of(
                 "--server.address=127.0.0.1", "--server.port=0", "--tapstate.hz.member-port=0",
                 "--tapstate.hz.jet.cooperative-thread-count=2", "--SDK_STATUS_SENDER_ENABLED=false",
                 "--tapstate.store.mongo.uri=" + uri,
-                "--tapstate.store.mongo.operator-state-database=seed_ops_" + Long.toUnsignedString(System.nanoTime(), 16),
                 "--tapstate.connectors.seed-dir=" + seeds,
                 "--tapstate.connectors.plugins-dir=" + work.resolve("plugins")));
         if (cloud) {
             args.addAll(List.of("--tapstate.cloud.base-url=https://cloud.example.invalid",
                     "--tapstate.cloud.token=cloud-seed-fixture-token", "--tapstate.cloud.atlas-uri=" + uri,
-                    "--tapstate.cloud.cluster-id=cloud-seed-cluster"));
+                    "--tapstate.cloud.cluster-id="+storage.clusterId()));
         }
         return args.toArray(String[]::new);
     }
 
-    private static String database(String prefix) {
-        return MONGO.getReplicaSetUrl("seed_" + prefix + "_" + Long.toUnsignedString(System.nanoTime(), 16));
+    private static NativeAppStorage database(String prefix,boolean cloud) {
+        return NativeAppStorage.create(MONGO,"seed_"+prefix,cloud?StorageBinding.Mode.CLOUD:StorageBinding.Mode.OP,
+                "cloud-seed-"+java.util.UUID.randomUUID());
     }
 
     private Path copyRelease() throws IOException {

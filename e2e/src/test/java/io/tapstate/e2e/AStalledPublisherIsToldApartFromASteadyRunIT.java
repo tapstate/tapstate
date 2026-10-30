@@ -79,9 +79,10 @@ class AStalledPublisherIsToldApartFromASteadyRunIT {
             @TempDir Path source, @TempDir Path target, @TempDir Path jars) {
         FileEndpoints.replaceTable(source.resolve(TABLE + ".csv"), "id,amount\n1,12\n");
 
-        try (InProcessServer server = InProcessServer.start(SharedMongo.replicaSetUrl("publisher_stall"))) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create(USER, PASSWORD);
+             InProcessServer server = InProcessServer.startPrepared(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin(USER, PASSWORD);
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID, read(E2eConnectorJar.buildInto(jars)));
             control.apply(Map.of(
                     "src_file.tap.yml", sourceYaml(source),

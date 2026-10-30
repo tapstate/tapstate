@@ -153,6 +153,8 @@ public final class SourceRepresentation {
     private static Map<String, SecretConfigPaths.Path> secretFields(ConnectorCatalogEntry connector) {
         Map<String, SecretConfigPaths.Path> result = new LinkedHashMap<>();
         SecretConfigPaths.forConnector(connector).forEach(path -> result.put(path.name(), path));
+        if (isMongoConnector(connector.id())) result.put(StorageSetupService.CA_BUNDLE_FIELD,
+                SecretConfigPaths.Path.field(StorageSetupService.CA_BUNDLE_FIELD, false));
         return result;
     }
 

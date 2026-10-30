@@ -4,7 +4,6 @@ import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.core.HazelcastInstanceAware;
 import com.hazelcast.core.LifecycleEvent;
 import com.hazelcast.core.LifecycleListener;
-import io.tapstate.adapters.mongostore.SourceConfigKeyringSession;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimStore;
@@ -22,9 +21,8 @@ final class NodeSessionStartup implements HazelcastInstanceAware, LifecycleListe
     private boolean stopped;
 
     NodeSessionStartup(WorkloadClaimStore store, WorkloadClaim claim, long askedAt,
-            Duration ttl, Duration interval, SourceConfigKeyringSession keyring) {
-        lease = new NodeSessionLease(store, claim, askedAt, ttl, interval,
-                Objects.requireNonNull(keyring, "keyring"), this::lose);
+            Duration ttl, Duration interval) {
+        lease = new NodeSessionLease(store, claim, askedAt, ttl, interval, this::lose);
     }
 
     NodeSessionLease lease() {

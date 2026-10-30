@@ -1,5 +1,7 @@
 package io.tapstate.e2e;
 
+import com.mongodb.client.MongoClients;
+import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.testsupport.DockerGate;
@@ -54,10 +56,9 @@ class AStartAfterStopYAsksBeforeKeepingDeletedRowsIT {
     @Test
     void aSyncTargetKeepsTheRowsItWasToldToKeepAndTheStartRecordsTheAnswer(@TempDir Path directory)
             throws Exception {
-        String storeUri = SharedMongo.replicaSetUrl("asks_after_stop_sync_keep_store");
-        try (ServerHandle server = InProcessServer.start(storeUri);
-                StoreDocuments documents = StoreDocuments.at(storeUri)) {
-            SyncScene scene = SyncScene.loadedAndStopped(server, directory);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
+            SyncScene scene = SyncScene.loadedAndStopped(storage, server, directory);
 
             Map<String, Object> question = askedOnceTheSourceDeletedRows(
                     scene.control(), scene.source(), scene.files(), "target-not-empty/tgt_file/" + TABLE);
@@ -69,20 +70,20 @@ class AStartAfterStopYAsksBeforeKeepingDeletedRowsIT {
             assertThat(scene.files().count(scene.target(), TABLE)).as("rows at the target").isEqualTo(SEEDED);
             assertThat(scene.files().fetch(scene.target(), TABLE, Map.of("id", 4L))).isPresent();
             assertThat(scene.files().fetch(scene.target(), TABLE, Map.of("id", 5L))).isPresent();
-            assertAnswerAudited(documents, question, "keep");
+            assertAnswerAudited(storage, question, "keep");
         }
     }
 
     @Test
     void aSyncTargetClearedByTheAnswerHoldsExactlyWhatTheSourceHolds(@TempDir Path directory) throws Exception {
-        String storeUri = SharedMongo.replicaSetUrl("asks_after_stop_sync_clear_store");
-        try (ServerHandle server = InProcessServer.start(storeUri)) {
-            SyncScene scene = SyncScene.loadedAndStopped(server, directory);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
+            SyncScene scene = SyncScene.loadedAndStopped(storage, server, directory);
 
             Map<String, Object> question = askedOnceTheSourceDeletedRows(
                     scene.control(), scene.source(), scene.files(), "target-not-empty/tgt_file/" + TABLE);
-            assertThat(scene.control().start(PIPELINE, List.of(answer(question, "clear")), hashOf(question))
-                    .status()).isEqualTo(200);
+            var started = scene.control().start(PIPELINE, List.of(answer(question, "clear")), hashOf(question));
+            assertThat(started.status()).as("the confirmed clear start: %s", started.body()).isEqualTo(200);
 
             // The answer is recorded on the element that writes the target, so the next new full load clears it
             // without asking again.
@@ -102,12 +103,11 @@ class AStartAfterStopYAsksBeforeKeepingDeletedRowsIT {
     @Test
     void aViewKeepsTheRowsItWasToldToKeepAndTheStartRecordsTheAnswer(@TempDir Path directory) throws Exception {
         RealConnectorGate.require("mongodb");
-        String storeUri = SharedMongo.replicaSetUrl("asks_after_stop_view_store");
-        try (ServerHandle server = InProcessServer.start(storeUri);
-                StoreDocuments documents = StoreDocuments.at(storeUri);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage);
                 MongoEndpoints mongo = new MongoEndpoints()) {
-            ViewScene scene = ViewScene.loadedAndStopped(server, mongo, directory,
-                    SharedMongo.replicaSetUrl("asks_after_stop_view_views"));
+            ViewScene scene = ViewScene.loadedAndStopped(storage, server, mongo, directory,
+                    storage.masterUri());
 
             Map<String, Object> question = askedOnceTheSourceDeletedRows(
                     scene.control(), scene.source(), scene.files(), "target-not-empty/views/" + VIEW);
@@ -118,23 +118,23 @@ class AStartAfterStopYAsksBeforeKeepingDeletedRowsIT {
             assertThat(mongo.count(scene.views(), VIEW)).as("documents in the view").isEqualTo(SEEDED);
             assertThat(viewRow(mongo, scene.views(), 4L)).isPresent();
             assertThat(viewRow(mongo, scene.views(), 5L)).isPresent();
-            assertAnswerAudited(documents, question, "keep");
+            assertAnswerAudited(storage, question, "keep");
         }
     }
 
     @Test
     void aViewClearedByTheAnswerHoldsExactlyWhatTheSourceHolds(@TempDir Path directory) throws Exception {
         RealConnectorGate.require("mongodb");
-        String storeUri = SharedMongo.replicaSetUrl("asks_after_stop_view_clear_store");
-        try (ServerHandle server = InProcessServer.start(storeUri);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage);
                 MongoEndpoints mongo = new MongoEndpoints()) {
-            ViewScene scene = ViewScene.loadedAndStopped(server, mongo, directory,
-                    SharedMongo.replicaSetUrl("asks_after_stop_view_clear_views"));
+            ViewScene scene = ViewScene.loadedAndStopped(storage, server, mongo, directory,
+                    storage.masterUri());
 
             Map<String, Object> question = askedOnceTheSourceDeletedRows(
                     scene.control(), scene.source(), scene.files(), "target-not-empty/views/" + VIEW);
-            assertThat(scene.control().start(PIPELINE, List.of(answer(question, "clear")), hashOf(question))
-                    .status()).isEqualTo(200);
+            var started = scene.control().start(PIPELINE, List.of(answer(question, "clear")), hashOf(question));
+            assertThat(started.status()).as("the confirmed clear start: %s", started.body()).isEqualTo(200);
 
             assertThat(scene.control().artifact(PIPELINE).orElseThrow().canonicalForm())
                     .as("the pipeline's definition after the answer")
@@ -154,14 +154,14 @@ class AStartAfterStopYAsksBeforeKeepingDeletedRowsIT {
     /** One sync case's endpoints and session, with the pipeline loaded once and then stopped with its state cleared. */
     private record SyncScene(ControlPlane control, FileEndpoints files, EndpointAddress source, EndpointAddress target) {
 
-        static SyncScene loadedAndStopped(ServerHandle server, Path directory) throws Exception {
+        static SyncScene loadedAndStopped(PreparedNativeStore storage, ServerHandle server, Path directory) throws Exception {
             EndpointAddress source = EndpointAddress.uri(Files.createDirectories(directory.resolve("src")).toString());
             EndpointAddress target = EndpointAddress.uri(Files.createDirectories(directory.resolve("tgt")).toString());
             FileEndpoints files = new FileEndpoints();
             files.seed(source, TABLE, SeedRows.generated(SEEDED));
 
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             String connector = E2eConnectorJar.BROWSABLE_CONNECTOR_ID;
             control.registerConnector(connector, Files.readAllBytes(E2eConnectorJar.buildInto(directory, connector)));
             control.discoverSchema("src_file", connector, source.settings());
@@ -188,7 +188,7 @@ class AStartAfterStopYAsksBeforeKeepingDeletedRowsIT {
     /** One view case's endpoints and session, with the pipeline loaded once and then stopped with its state cleared. */
     private record ViewScene(ControlPlane control, FileEndpoints files, EndpointAddress source, EndpointAddress views) {
 
-        static ViewScene loadedAndStopped(ServerHandle server, MongoEndpoints mongo, Path directory, String viewUri)
+        static ViewScene loadedAndStopped(PreparedNativeStore storage, ServerHandle server, MongoEndpoints mongo, Path directory, String viewUri)
                 throws Exception {
             EndpointAddress views = EndpointAddress.uri(viewUri);
             EndpointAddress source = EndpointAddress.uri(Files.createDirectories(directory.resolve("src")).toString());
@@ -196,19 +196,12 @@ class AStartAfterStopYAsksBeforeKeepingDeletedRowsIT {
             files.seed(source, TABLE, SeedRows.generated(SEEDED));
 
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID, Files.readAllBytes(E2eConnectorJar.buildInto(directory)));
             control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
             control.discoverSchema("src_file", E2eConnectorJar.CONNECTOR_ID, source.settings());
             Map<String, String> resources = new LinkedHashMap<>();
             resources.put("src_file.tap.yml", fileYaml("src_file", E2eConnectorJar.CONNECTOR_ID, source, true));
-            resources.put("views.tap.yml", """
-                    version: tapstate/v1
-                    kind: source
-                    id: views
-                    connector: mongodb
-                    config: { uri: "%s" }
-                    """.formatted(viewUri));
             resources.put(PIPELINE + ".tap.yml", """
                     version: tapstate/v1
                     kind: pipeline
@@ -277,8 +270,13 @@ class AStartAfterStopYAsksBeforeKeepingDeletedRowsIT {
                 () -> String.valueOf(rowById.apply(1L)));
     }
 
-    private static void assertAnswerAudited(StoreDocuments documents, Map<String, Object> question, String action) {
-        List<Document> starts = documents.auditOf("pipeline.start", PIPELINE);
+    private static void assertAnswerAudited(PreparedNativeStore storage, Map<String, Object> question, String action) {
+        List<Document> starts;
+        try (var client = MongoClients.create(storage.configurationUri())) {
+            starts = SystemCollections.CONFIG_AUDIT.on(client.getDatabase(storage.configurationDatabase()))
+                    .find(new Document("operationId", "pipeline.start").append("resourceId", PIPELINE))
+                    .sort(new Document("ts", 1)).into(new java.util.ArrayList<>());
+        }
         assertThat(starts).as("the audit records of the pipeline's starts").isNotEmpty();
         Document detail = starts.getLast().get("detail", Document.class);
         assertThat(detail).as("what the last start recorded").isNotNull();

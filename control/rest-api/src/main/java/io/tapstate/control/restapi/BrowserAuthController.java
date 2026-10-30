@@ -6,6 +6,8 @@ import io.tapstate.control.core.CallerOrigin;
 import io.tapstate.control.core.ClusterIdentityService;
 import io.tapstate.control.core.ControlError;
 import io.tapstate.control.core.LoginService;
+import io.tapstate.control.core.LocalAuthenticationContext;
+import org.springframework.beans.factory.annotation.Autowired;
 import io.tapstate.control.core.SessionService;
 import io.tapstate.core.common.TapstateException;
 import jakarta.servlet.http.Cookie;
@@ -37,9 +39,7 @@ final class BrowserAuthController {
     private static final String HTTP_SCHEME = "http";
     private static final String HTTPS_SCHEME = "https";
     private static final String NO_STORE = "no-store";
-    private final LoginService login;
-    private final SessionService sessions;
-    private final ClusterIdentityService identity;
+    private final java.util.function.Supplier<LocalAuthenticationContext> local;
     private final AuthenticationMode mode;
     private Set<String> trustedProxyAddresses = Set.of();
     private Set<URI> publicOrigins = Set.of();
@@ -47,9 +47,19 @@ final class BrowserAuthController {
 
     BrowserAuthController(LoginService login, SessionService sessions, ClusterIdentityService identity,
             ObjectProvider<AuthenticationMode> modes) {
-        this.login = login;
-        this.sessions = sessions;
-        this.identity = identity;
+        this.local = () -> new LocalAuthenticationContext(login, sessions, identity, () -> {});
+        this.mode = modes.getIfAvailable(() -> AuthenticationMode.ON_PREM);
+    }
+
+    @Autowired
+    BrowserAuthController(ObjectProvider<LocalAuthenticationContext.Provider> contexts,
+            ObjectProvider<LoginService> logins, ObjectProvider<SessionService> sessions,
+            ObjectProvider<ClusterIdentityService> identities, ObjectProvider<AuthenticationMode> modes) {
+        this.local = () -> {
+            var selected = contexts.getIfAvailable();
+            return selected != null ? selected.current() : new LocalAuthenticationContext(
+                    logins.getObject(), sessions.getObject(), identities.getObject(), () -> {});
+        };
         this.mode = modes.getIfAvailable(() -> AuthenticationMode.ON_PREM);
     }
 
@@ -76,9 +86,12 @@ final class BrowserAuthController {
         BrowserRequest browser = guard(request);
         MalformedRequest.requireText(credentials.username(), "a `username` is required");
         MalformedRequest.requireText(credentials.password(), "a `password` is required");
-        AccessTokenGrant grant = login.loginGrant(credentials.username(), credentials.password());
-        String issuer = identity.identityView().issuer();
-        var session = sessions.create(grant.principal(), grant.scope(), issuer);
+        var original = local.get();
+        original.requireActive().run();
+        AccessTokenGrant grant = original.login().loginGrant(credentials.username(), credentials.password());
+        String issuer = original.identity().identityView().issuer();
+        var session = original.sessions().create(grant.principal(), grant.scope(), issuer);
+        original.requireActive().run();
         return ResponseEntity.ok().header(HttpHeaders.CACHE_CONTROL, NO_STORE)
                 .header(HttpHeaders.SET_COOKIE, loginCookies(browser.secure(), session.token()))
                 .body(grant(grant, issuer, session.token()));
@@ -88,8 +101,11 @@ final class BrowserAuthController {
     ResponseEntity<BrowserGrant> session(HttpServletRequest request) {
         BrowserRequest browser = guard(request);
         String token = readCookie(request, browser.secure());
-        String issuer = identity.identityView().issuer();
-        AccessTokenGrant grant = sessions.exchange(token, issuer).orElseThrow(BrowserAuthController::refused);
+        var original = local.get();
+        original.requireActive().run();
+        String issuer = original.identity().identityView().issuer();
+        AccessTokenGrant grant = original.sessions().exchange(token, issuer).orElseThrow(BrowserAuthController::refused);
+        original.requireActive().run();
         return ResponseEntity.ok().header(HttpHeaders.CACHE_CONTROL, NO_STORE)
                 .body(grant(grant, issuer, token));
     }
@@ -98,7 +114,10 @@ final class BrowserAuthController {
     ResponseEntity<Void> logout(HttpServletRequest request) {
         BrowserRequest browser = guard(request);
         String token = readCookie(request, browser.secure());
-        SessionService.LogoutResult result = sessions.logoutForBrowser(token, identity.identityView().issuer());
+        var original = local.get();
+        original.requireActive().run();
+        SessionService.LogoutResult result = original.sessions().logoutForBrowser(token, original.identity().identityView().issuer());
+        original.requireActive().run();
         if (result == SessionService.LogoutResult.INVALID) throw refused();
         return ResponseEntity.noContent().header(HttpHeaders.CACHE_CONTROL, NO_STORE)
                 .header(HttpHeaders.SET_COOKIE, cookie(browser.secure(), "", true)).build();
