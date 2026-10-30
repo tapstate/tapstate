@@ -35,7 +35,7 @@ class AlertCloudBuiltinWorkerIT {
     @Test void fiveBuiltinTypesPersistOriginalFaultReminderAndRecoveryReceiptsForTwoClusters()throws Exception{
         var root=Path.of(System.getProperty("tapstate.test.alert-cloud-worker-root"));var json=new ObjectMapper();
         var launch=json.readTree(root.resolve("launch.json").toFile());
-        assertThat(launch.path("source").asText()).isEqualTo("650082bdf4180d6e5da679c5040522d4855ff6a1");
+        assertThat(launch.path("source").asText()).isEqualTo("5c2ad398f3ecbd40a70beadedfcc9cd9632b8322");
         String database=launch.path("database").asText();assertThat(database).startsWith("w4_alert_t10_control_");
         var origin=URI.create("https://localhost:"+launch.path("cloudPort").asInt());var ssl=AlertChannels.trust(Files.readAllBytes(root.resolve("tls-cert.pem")));
         var org=new ObjectId();var rows=new ArrayList<Map<String,Object>>();

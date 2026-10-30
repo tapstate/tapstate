@@ -20,7 +20,7 @@ import static org.awaitility.Awaitility.await;
 @EnabledIfSystemProperty(named="tapstate.test.alert-cloud-matrix-root",matches=".+")
 class AlertCloudEventMatrixIT {
     static final ObjectMapper JSON=new ObjectMapper();
-    static final String SOURCE="650082bdf4180d6e5da679c5040522d4855ff6a1";
+    static final String SOURCE="5c2ad398f3ecbd40a70beadedfcc9cd9632b8322";
     @Test void fiveTypesAndThreeNotificationKindsKeepClusterIdentityAndPolicyResultsSeparate()throws Exception {
         var root=Path.of(System.getProperty("tapstate.test.alert-cloud-matrix-root"));
         var launch=JSON.readTree(root.resolve("launch.json").toFile());
