@@ -91,7 +91,8 @@ class ViewControllerTest {
                     (config, request, listener) -> { throw new AssertionError("Listing views must not follow rows"); });
             return new ViewCatalogService(artifacts,
                     new PipelineObservationQueryService(artifacts, new PipelineApiTest.TestApp().observationStore()),
-                    browser, new SourceSchemaQueryService(store, schemas));
+                    browser, pipeline -> List.of(new io.tapstate.control.core.PipelineOutputNames.Output(
+                            "sink", "replica", "atlas-store", "mysql_acc_composite_copy", "sink:ACC_COMPOSITE")));
         }
     }
 }

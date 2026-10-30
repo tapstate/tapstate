@@ -17,7 +17,19 @@ public record PipelineView(
         Map<String, Object> experimental,
         PipelineDag dag,
         String contentHash,
-        PipelineStatus status) {
+        PipelineStatus status, PipelineOutputNames.Result outputTargets) {
+
+    public PipelineView(String id, Metadata metadata, List<PipelineSourceSummary> sources,
+            List<Map<String, Object>> transforms, Map<String, Object> view, Map<String, Object> serve,
+            Map<String, Object> settings, Map<String, Object> experimental, PipelineDag dag,
+            String contentHash, PipelineStatus status) {
+        this(id, metadata, sources, transforms, view, serve, settings, experimental, dag, contentHash, status, null);
+    }
+
+    public PipelineView withOutputTargets(PipelineOutputNames.Result outputs) {
+        return new PipelineView(id, metadata, sources, transforms, view, serve, settings,
+                experimental, dag, contentHash, status, outputs);
+    }
 
     public PipelineView {
         Objects.requireNonNull(id, "id");
