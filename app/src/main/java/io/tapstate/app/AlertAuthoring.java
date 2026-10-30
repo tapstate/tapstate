@@ -53,6 +53,7 @@ final class AlertAuthoring {
             after=before==null?new AlertConfiguration.Subscription(header,text(form,"name"),match,bool(form,"enabled",true),channels,groups,grouping,edges)
                     :((AlertConfiguration.Subscription)before).edit(text(form,"name"),match,bool(form,"enabled",true),channels,groups,grouping,edges,clock.instant(),access.subject());
         }
+        if(after instanceof AlertConfiguration.Rule rule)after=rule.enrolled((AlertConfiguration.Rule)before);
         check(store.saveDefinition(before,after,access));return after;
     }
     void external(AlertConfiguration.Kind kind){if(deployment!=AlertChannelPolicy.Deployment.ON_PREM&&(kind==AlertConfiguration.Kind.RECEIVER||kind==AlertConfiguration.Kind.SUBSCRIPTION))throw stale("managed-external-configuration");}

@@ -120,6 +120,7 @@ final class MongoAlertCoordinator implements AlertStore {
         Document schema=SystemCollections.SCHEMA_MIGRATIONS.on(db).find(session,new Document("_id","config")).first();
         Document version=SystemCollections.CONFIGURATION_VERSION.on(db).find(session,new Document("_id",ConfigurationVersion.ID)).first();
         MongoAlertStorageSchema.verifyAuthorityState(schema,version,scope.clusterId(),keys.currentForWrite().activeKeyId());
+        if(!Integer.valueOf(MongoAlertStorageSchema.VERSION).equals(schema.get("alerting",Document.class).get("installedVersion")))throw unreadable("schema-capability");
     }
     private void currentActor(ClientSession session,AlertTestAuthority actor,Access access) {
         if(access.actor()==null){
@@ -154,7 +155,7 @@ final class MongoAlertCoordinator implements AlertStore {
             if(!AlertOperationDomain.belongs(identity.incarnation(),binding.key()))return Optional.<Rule>empty();
             return definitions.load(s,Kind.RULE,identity.id()).map(MongoAlertConfigurationCodec.Stored::definition)
                     .filter(Rule.class::isInstance).map(Rule.class::cast)
-                    .filter(rule->rule.header().identity().equals(identity)&&rule.header().revision()==binding.revision());
+                    .filter(rule->rule.header().identity().equals(identity)&&rule.evaluationRevision()==binding.revision());
         });access.requireActive().run();return result;
     }
     @Override public Optional<Definition> definition(Kind kind,String id,Access access) {
@@ -297,7 +298,11 @@ final class MongoAlertCoordinator implements AlertStore {
                 }
                 else {
                     if(v.after().binding()==null)throw stale("state-rule-binding");
-                    validateMember(s,v.after().binding(),true);
+                    var member=v.after().binding();
+                    var rule=definitions.load(s,Kind.RULE,member.ruleIdentity().id()).orElseThrow(()->stale("rule"));
+                    long expected=v.expectedRuleRevision()==null?member.evaluation().revision():v.expectedRuleRevision();
+                    if(rule.definition().header().revision()!=expected)throw stale("rule-authoring-revision");
+                    validateMember(s,member,true);
                 }
                 if(v.before()==null){admission("alert_instances",1);if(v.after().binding()!=null)requireDomainCapacity(s,v.after());}
                 changed|=outcome(states.stageEnvelope(s,v.revision(),v.before(),v.after(),v.transitions(),v.diagnosticSignal(),clock))==Outcome.STAGED;
@@ -474,7 +479,7 @@ final class MongoAlertCoordinator implements AlertStore {
     private void validateMember(ClientSession s,AlertIntent.Member member,boolean fence) {
         var current=definitions.load(s,Kind.RULE,member.ruleIdentity().id()).orElseThrow(()->stale("rule"));
         if(!(current.definition() instanceof Rule r)||!r.header().identity().equals(member.ruleIdentity())||!r.header().active()||!r.enabled()
-                ||!AlertOperationDomain.belongs(member.ruleIdentity().incarnation(),member.evaluation().key())||r.header().revision()!=member.evaluation().revision()||!r.matches(member.evaluation().key())||!definitions.fence(s,r))throw stale("rule-binding");
+                ||!AlertOperationDomain.belongs(member.ruleIdentity().incarnation(),member.evaluation().key())||r.evaluationRevision()!=member.evaluation().revision()||!r.matches(member.evaluation().key())||!definitions.fence(s,r))throw stale("rule-binding");
         resource(s,member.evaluation().key().resource(),member.sourceBindingRevision(),fence);
         if(member.evaluation().key().resource().kind().equals("cluster-node")){var proof=host.resourceEvidence().apply(member.evaluation().key().resource()).orElseThrow(()->stale("member-proof"));
             if(!(proof instanceof NodeEvidence n)||!n.producerIncarnation().equals(member.evaluation().producerIncarnation()))throw stale("member-producer");nodeResource(s,member.evaluation().key().resource(),n);}

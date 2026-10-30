@@ -84,6 +84,19 @@ public final class AlertLifecycle {
                 signal.observedAt(), pending, recovery, number, episode), transitions, false);
     }
 
+    /** A metadata edit changes only a current active episode, without manufacturing an observation. */
+    public static AlertUpdate severity(AlertSnapshot old,AlarmSeverity severity,Instant now){
+        Objects.requireNonNull(severity);Objects.requireNonNull(now);
+        var episode=old.episode();
+        if(!old.enabled()||old.status()!=Status.FIRING||episode==null||episode.endedAt()!=null||episode.severity()==severity)
+            return new AlertUpdate(old,List.of(),false);
+        if(now.isBefore(episode.firedAt()))throw stale("severity");
+        var changed=new Episode(episode.number(),episode.firedAt(),severity,null,null,null);
+        return new AlertUpdate(new AlertSnapshot(old.rule(),old.enabled(),old.status(),old.quality(),old.lastSequence(),old.lastObservedAt(),
+                old.pendingSince(),old.recoverySince(),old.episodeSequence(),changed),
+                List.of(new AlertUpdate.Transition(Kind.SEVERITY_CHANGED,now,episode.number(),severity)),false);
+    }
+
     /** An independent tick detects missing callbacks; it never advances a trigger/recovery window. */
     public static AlertUpdate tick(AlertSnapshot old, Instant now) {
         Objects.requireNonNull(now, "now");

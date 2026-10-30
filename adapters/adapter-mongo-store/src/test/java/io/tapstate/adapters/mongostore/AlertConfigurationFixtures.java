@@ -17,7 +17,8 @@ final class AlertConfigurationFixtures {
         return Header.create(new Identity(kind, SCOPE, id, INCARNATION), AlertChannelPolicy.Deployment.ON_PREM, AT, "actor-a");
     }
     static Resources resources() { return new Resources(Set.of("source"), true, Set.of()); }
-    static Rule rule() {
+    static Rule rule() { return legacyRule().enrolled(null); }
+    static Rule legacyRule() {
         return new Rule(header(Kind.RULE, "rule-a"), "Source health", "source.connection-failed", 1,
                 resources(), Map.of(), null, true, null).validated(BuiltinAlarmTypes.catalog());
     }
@@ -38,10 +39,10 @@ final class AlertConfigurationFixtures {
     }
     static Rule edit(Rule rule, String name) {
         return new Rule(rule.header().next(AT.plusSeconds(1), "actor-b"), name, rule.typeId(), rule.typeVersion(),
-                rule.resources(), rule.parameters(), rule.severityOverride(), rule.enabled(), rule.metric());
+                rule.resources(), rule.parameters(), rule.severityOverride(), rule.enabled(), rule.metric()).enrolled(rule);
     }
     static Rule retire(Rule rule) {
         return new Rule(rule.header().retire(AT.plusSeconds(2), "actor-b"), rule.name(), rule.typeId(), rule.typeVersion(),
-                rule.resources(), rule.parameters(), rule.severityOverride(), rule.enabled(), rule.metric());
+                rule.resources(), rule.parameters(), rule.severityOverride(), rule.enabled(), rule.metric()).enrolled(rule);
     }
 }

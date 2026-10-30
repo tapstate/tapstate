@@ -8,6 +8,20 @@ import static io.tapstate.core.alerting.AlertSignal.Condition.*;
 import static io.tapstate.core.alerting.AlertSnapshot.*;
 
 class AlertLifecycleTest {
+    @Test void metadataSeverityPreservesRecoveryContinuityAndNeverRewritesEndedHistory(){
+        var firing=sample(AlertSnapshot.initial(rule(1,0,10)),1,0,BAD);
+        var recovering=sample(firing,2,1,GOOD);
+        var update=AlertLifecycle.severity(recovering,AlarmSeverity.CRITICAL,T.plusSeconds(2));var after=update.snapshot();
+        assertThat(after.rule()).isEqualTo(recovering.rule());assertThat(after.status()).isEqualTo(Status.FIRING);
+        assertThat(after.lastSequence()).isEqualTo(recovering.lastSequence());assertThat(after.lastObservedAt()).isEqualTo(recovering.lastObservedAt());
+        assertThat(after.pendingSince()).isEqualTo(recovering.pendingSince());assertThat(after.recoverySince()).isEqualTo(recovering.recoverySince());
+        assertThat(after.episode().firedAt()).isEqualTo(recovering.episode().firedAt());
+        assertThat(update.transitions()).extracting(AlertUpdate.Transition::kind).containsExactly(AlertUpdate.Kind.SEVERITY_CHANGED);
+        var ended=AlertLifecycle.terminate(after,EndReason.DISABLED,T.plusSeconds(3)).snapshot();
+        assertThat(AlertLifecycle.severity(ended,AlarmSeverity.MINOR,T.plusSeconds(4)).snapshot()).isEqualTo(ended);
+        var pending=sample(AlertSnapshot.initial(rule(1,10,10)),1,0,BAD);
+        assertThat(AlertLifecycle.severity(pending,AlarmSeverity.CRITICAL,T.plusSeconds(2)).snapshot()).isEqualTo(pending);
+    }
     @Test void missingProducerSequencesBreakBothTriggerAndRecoveryContinuity() {
         var pending = sample(AlertSnapshot.initial(rule(1, 10, 10)), 1, 0, BAD);
         pending = sample(pending, 3, 10, BAD);

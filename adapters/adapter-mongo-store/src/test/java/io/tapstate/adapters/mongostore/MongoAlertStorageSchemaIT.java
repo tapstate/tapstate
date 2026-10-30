@@ -7,6 +7,8 @@ import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.IndexOptions;
 import io.tapstate.core.alerting.AlarmKey;
 import io.tapstate.core.alerting.AlertRule;
+import io.tapstate.core.alerting.AlertConfiguration;
+import io.tapstate.core.alerting.BuiltinAlarmTypes;
 import io.tapstate.core.alerting.AlertSnapshot;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.IoError;
@@ -42,7 +44,7 @@ class MongoAlertStorageSchemaIT {
             assertThat(f.domain().alertSchemaVersion()).isEqualTo(4);
             try(var reopen=MongoConfigurationDomain.open(f.settings(),"cluster-a")){assertThat(reopen.alertSchemaVersion()).isEqualTo(4);}
             assertThat(names(f)).doesNotContain("alert_node_lifecycles");
-            assertThat(f.domain().prepareAlertStorage("separate-maintenance-invocation")).isEqualTo(6);
+            assertThat(f.domain().prepareAlertStorage("separate-maintenance-invocation")).isEqualTo(MongoAlertStorageSchema.VERSION);
             var after=schema(f).get("alerting",Document.class);
             assertThat(after.getString("operationId")).isEqualTo(marker.getString("operationId"));
             assertThat(after.get("queryPreparation",Document.class)).isEqualTo(new Document(query).append("indexContractVersion",2).append("nextIndex",6));
@@ -67,7 +69,7 @@ class MongoAlertStorageSchemaIT {
             assertThat(progress.installedVersion()).isEqualTo(4);assertThat(progress.indexContractVersion()).isEqualTo(2);
             assertThat(progress.phase()).isEqualTo(io.tapstate.spi.store.AlertQueryPreparation.Phase.PREPARING);
             assertThat(progress.nextIndex()).isEqualTo(5);assertThat(progress.operationId()).isEqualTo(query.getString("operationId"));
-            assertThat(f.domain().prepareAlertStorage("retry-node-maintenance")).isEqualTo(6);
+            assertThat(f.domain().prepareAlertStorage("retry-node-maintenance")).isEqualTo(MongoAlertStorageSchema.VERSION);
             assertThat(f.domain().alertQueryPreparation().orElseThrow().operationId()).isEqualTo(progress.operationId());
         });
     }
@@ -406,6 +408,37 @@ class MongoAlertStorageSchemaIT {
                 try (var reopened = MongoConfigurationDomain.open(f.settings(), "cluster-a")) { assertThat(reopened.alertSchemaVersion()).isEqualTo(MongoAlertStorageSchema.VERSION); }
             } catch (Exception failure) { throw new AssertionError(failure); }
             finally { upgraded.countDown(); }
+        });
+    }
+
+    @Test void firstLegacySemanticCasReconcilesAnUnknownCommitUsingItsOriginalBinding(){
+        withConfiguration(false,f->{
+            var legacy=AlertConfigurationFixtures.legacyRule();
+            var rows=SystemCollections.ALERT_RULES.on(f.database());rows.insertOne(MongoAlertConfigurationCodec.write(legacy,0));
+            var values=new java.util.HashMap<>(legacy.parameters());values.put("trigger-for",java.math.BigDecimal.ONE);
+            var changed=new AlertConfiguration.Rule(legacy.header().next(AlertConfigurationFixtures.AT.plusSeconds(1),"actor"),legacy.name(),legacy.typeId(),1,legacy.resources(),values,null,true,null);
+            var store=new MongoAlertConfigurationStore(f.database(),AlertConfigurationFixtures.SCOPE,BuiltinAlarmTypes.catalog(),()->{});
+            failCommit(f,new Document("writeConcernError",new Document("code",64).append("errmsg","original rule CAS receipt lost")).append("errorLabels",List.of("UnknownTransactionCommitResult")));
+            try{transaction(f,session->store.stage(session,legacy,changed));}finally{clearFailPoint(f);}
+            MongoAlertConfigurationStore.Stage replay=transaction(f,session->store.stage(session,legacy,changed));assertThat(replay).isEqualTo(MongoAlertConfigurationStore.Stage.UNCHANGED);
+            MongoAlertConfigurationCodec.Stored saved=transaction(f,session->store.load(session,AlertConfiguration.Kind.RULE,legacy.header().identity().id()).orElseThrow());
+            assertThat(((AlertConfiguration.Rule)saved.definition()).bindingRevision()).isEqualTo(2);
+            assertThat(saved.writeFence()).isEqualTo(1);assertThat(rows.countDocuments()).isOne();
+        });
+    }
+
+    @Test void capabilitySixRequiresExplicitRulePreparationWithoutRewritingOriginalRowsOrCounters(){
+        withConfiguration(false,f->{
+            SystemCollections.SCHEMA_MIGRATIONS.on(f.database()).updateOne(new Document("_id","config"),new Document("$set",new Document("alerting.installedVersion",6)));
+            var before=schema(f);var counter=versions(f).find().first();
+            var rules=SystemCollections.ALERT_RULES.on(f.database());var original=new Document("_id","opaque-rule").append("body","never-rewrite");rules.insertOne(original);
+            assertThat(f.domain().alertSchemaVersion()).isEqualTo(6);assertThat(schema(f)).isEqualTo(before);
+            failCommit(f,new Document("writeConcernError",new Document("code",64).append("errmsg","original rule preparation receipt lost")).append("errorLabels",List.of("UnknownTransactionCommitResult")));
+            try{assertThat(f.domain().prepareAlertStorage("explicit-rule-preparation")).isEqualTo(7);}finally{clearFailPoint(f);}
+            var expected=new Document(before);expected.get("alerting",Document.class).put("installedVersion",7);
+            assertThat(schema(f)).isEqualTo(expected);assertThat(versions(f).find().first()).isEqualTo(counter);assertThat(rules.find().first()).isEqualTo(original);
+            assertThat(f.domain().prepareAlertStorage("idempotent-rule-preparation")).isEqualTo(7);
+            assertThat(MongoAlertConfigurationCodec.size(schema(f).get("alerting",Document.class))).isLessThanOrEqualTo(2048);
         });
     }
 

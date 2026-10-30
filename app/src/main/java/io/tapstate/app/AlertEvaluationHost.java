@@ -195,7 +195,8 @@ final class AlertEvaluationHost {
                 if(outcome==AlertStore.Outcome.CONFLICT)continue;
                 points.remove(binding.key());return Result.ACCEPTED;
             }
-            var update = AlertLifecycle.tick(before.snapshot(), now);
+            var severity=AlertLifecycle.severity(before.snapshot(),binding.definition().effectiveSeverity(catalog),now);
+            var update = severity.snapshot().equals(before.snapshot())?AlertLifecycle.tick(before.snapshot(),now):severity;
             if (update.snapshot().equals(before.snapshot())) return Result.IGNORED;
             var outcome = commit(retained, before, head(binding, before, update, ownership, null, null),
                     update, null, binding);
@@ -240,10 +241,10 @@ final class AlertEvaluationHost {
         var r = b.definition();
         long generation = before == null ? 1 : before.snapshot().rule().generation();
         if (before != null && (!before.snapshot().rule().producerIncarnation().equals(b.producer())
-                || before.snapshot().rule().revision() != r.header().revision() || !before.snapshot().enabled()
+                || before.snapshot().rule().revision() != r.evaluationRevision() || !before.snapshot().enabled()
                 || !before.binding().ruleIdentity().equals(r.header().identity())
                 || before.binding().sourceBindingRevision()!=b.sourceBindingRevision())) generation = Math.incrementExact(generation);
-        return new AlertRule(b.key(), r.header().revision(), generation, b.producer(),
+        return new AlertRule(b.key(), r.evaluationRevision(), generation, b.producer(),
                 seconds(r, "trigger-for", 0), seconds(r, "resolve-for", 0), Duration.ofSeconds(15), Duration.ofSeconds(5));
     }
     static Duration seconds(AlertConfiguration.Rule r, String name, int fallback) {
@@ -283,7 +284,7 @@ final class AlertEvaluationHost {
         var proof=binding.proof().get();if(proof!=null)proof.requireCurrent().run();
         var result = persist(new AlertStore.Commit(AlertStore.CommitKind.STATE_AND_PLAN,
                 new AlertStore.StateChange(retained.map(AlertStore.Stored::revision).orElse(0L), before, after,
-                        transitions(update, after.episode(), policy), signal,proof), List.of(), List.of()));
+                        transitions(update, after.episode(), policy), signal,proof,binding.definition().header().revision()), List.of(), List.of()));
         if(proof!=null)proof.requireCurrent().run();binding.requireCurrent().run(); return result;
     }
     private static List<AlertStateRecord.Transition> transitions(AlertUpdate update,

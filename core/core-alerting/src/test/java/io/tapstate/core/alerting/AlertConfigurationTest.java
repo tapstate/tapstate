@@ -16,6 +16,31 @@ class AlertConfigurationTest {
     private static final AlarmKey.Scope SCOPE = new AlarmKey.Scope("organization", "cluster");
     private static final Instant AT = Instant.parse("2026-10-27T00:00:00.123456789Z");
     private static final AlarmKey.Resource SOURCE = new AlarmKey.Resource("source", "orders", "source-lifetime-1");
+    @Test void ruleSemanticRevisionSeparatesMetadataNumericEqualityAndCriteriaAba(){
+        var original=rule(header(Kind.RULE,"semantic"),Map.of(),null).validated(BuiltinAlarmTypes.catalog());
+        var legacyHeader=new Header(original.header().identity(),10,original.header().deployment(),AT,"creator",AT,"creator",null);
+        var legacy=new Rule(legacyHeader,original.name(),original.typeId(),1,original.resources(),original.parameters(),null,true,null);
+        var equal=new java.util.HashMap<String,BigDecimal>();legacy.parameters().forEach((k,v)->equal.put(k,v.setScale(2)));
+        var metadata=new Rule(legacy.header().next(AT.plusSeconds(1),"actor"),"New name",legacy.typeId(),1,legacy.resources(),equal,AlarmSeverity.CRITICAL,true,null).enrolled(legacy);
+        assertThat(metadata.bindingRevision()).isEqualTo(10);assertThat(metadata.header().revision()).isEqualTo(11);
+        var parameters=new java.util.HashMap<>(equal);parameters.put("trigger-for",BigDecimal.ONE);
+        var changed=new Rule(metadata.header().next(AT.plusSeconds(2),"actor"),metadata.name(),metadata.typeId(),1,metadata.resources(),parameters,metadata.severityOverride(),true,null).enrolled(metadata);
+        var back=new Rule(changed.header().next(AT.plusSeconds(3),"actor"),changed.name(),changed.typeId(),1,changed.resources(),equal,null,true,null).enrolled(changed);
+        assertThat(changed.evaluationRevision()).isEqualTo(11);assertThat(back.evaluationRevision()).isEqualTo(12);
+        var disabled=new Rule(back.header().next(AT.plusSeconds(4),"actor"),back.name(),back.typeId(),1,back.resources(),back.parameters(),null,false,null).enrolled(back);
+        var enabled=new Rule(disabled.header().next(AT.plusSeconds(5),"actor"),back.name(),back.typeId(),1,back.resources(),back.parameters(),null,true,null).enrolled(disabled);
+        assertThat(enabled.evaluationRevision()).isEqualTo(14);
+    }
+    @Test void metricScaleIsMetadataButMetricDirectionAndSelectorsAreEvaluationChanges(){
+        var h=header(Kind.RULE,"metric-binding");var a=new MetricAlertEvaluator.Rule("lag",MetricType.GAUGE,"s",Map.of(),MetricAlertEvaluator.Direction.ABOVE,BigDecimal.TEN,BigDecimal.ONE);
+        var b=new MetricAlertEvaluator.Rule("lag",MetricType.GAUGE,"s",Map.of(),MetricAlertEvaluator.Direction.ABOVE,new BigDecimal("10.00"),new BigDecimal("1.0"));
+        var first=new Rule(h,"A","test.threshold",1,sources(),Map.of(),null,true,a);
+        assertThat(first.sameEvaluation(new Rule(h,"B",first.typeId(),1,sources(),Map.of(),AlarmSeverity.CRITICAL,true,b))).isTrue();
+        var c=new MetricAlertEvaluator.Rule("lag",MetricType.GAUGE,"s",Map.of(),MetricAlertEvaluator.Direction.BELOW,BigDecimal.ONE,BigDecimal.TEN);
+        assertThat(first.sameEvaluation(new Rule(h,"A",first.typeId(),1,sources(),Map.of(),null,true,c))).isFalse();
+        assertThat(first.sameEvaluation(new Rule(h,"A",first.typeId(),1,new Resources(Set.of("source"),true,Set.of()),Map.of(),null,true,a))).isFalse();
+    }
+
     @Test void anEventWithoutRecoveryCannotBeAuthoredAsAStatefulRule(){
         var descriptor=new AlarmTypeCatalog.Type("test.one-shot",1,AlarmTypeCatalog.Kind.EVENT,Set.of("source"),"test.events","event",List.of(),
                 AlarmSeverity.WARNING,false,"test.event.condition",null,"test.event.guidance");

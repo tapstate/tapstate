@@ -253,7 +253,7 @@ final class AlertNotificationPlanner {
         return root.protectedIntents().stream().filter(k->k.notification().kind()==DeliveryKey.Kind.FAULT||k.notification().kind()==DeliveryKey.Kind.REMINDER).map(view.intents()::get)
                 .filter(Objects::nonNull).anyMatch(v->v.value().state().summary()==DeliveryEvidence.Outcome.ACCEPTED&&v.value().frozen().members().stream().anyMatch(m->m.episodeMember().equals(member.episodeMember())));
     }
-    private static boolean bindingCurrent(AlertStore.Planning view,AlertIntent.Member member){return view.definitions().stream().filter(d->d instanceof AlertConfiguration.Rule).map(d->(AlertConfiguration.Rule)d).anyMatch(r->r.header().identity().equals(member.ruleIdentity())&&r.header().revision()==member.evaluation().revision()&&r.matches(member.evaluation().key()));}
+    private static boolean bindingCurrent(AlertStore.Planning view,AlertIntent.Member member){return view.definitions().stream().filter(d->d instanceof AlertConfiguration.Rule).map(d->(AlertConfiguration.Rule)d).anyMatch(r->r.header().identity().equals(member.ruleIdentity())&&r.evaluationRevision()==member.evaluation().revision()&&r.matches(member.evaluation().key()));}
     private boolean matches(Destination d,AlertStateRecord.Head head){return d.subscription()==null||d.subscription().matches(head.snapshot().rule().key(),head.episode().value().severity());}
     private boolean muted(AlertStore.Planning view,Destination d,AlertStateRecord.Head head,Instant now){
         for(var def:view.definitions())if(def instanceof AlertConfiguration.Silence silence&&silence.matches(head.snapshot().rule().key(),now))return true;

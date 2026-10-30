@@ -19,8 +19,23 @@ import static io.tapstate.adapters.mongostore.AlertConfigurationFixtures.*;
 import static org.assertj.core.api.Assertions.*;
 
 class MongoAlertConfigurationCodecTest {
+    @Test void ruleVersionTwoHasExactlyOneBoundedLongAndNeverInfersLostBinding() throws Exception {
+        var old=legacyRule();var current=old.enrolled(null);var encoded=bson(MongoAlertConfigurationCodec.write(current,0));
+        try(var input=getClass().getResourceAsStream("/alert-rule-v2.golden.json")){assertThat(input).isNotNull();assertThat(encoded).isEqualTo(Document.parse(new String(input.readAllBytes(),StandardCharsets.UTF_8)));}
+        assertThat(encoded.getInteger("formatVersion")).isEqualTo(2);
+        assertThat(encoded.get("body",Document.class).get("bindingRevision")).isInstanceOf(Long.class);
+        assertThat(MongoAlertConfigurationCodec.size(encoded)-MongoAlertConfigurationCodec.size(MongoAlertConfigurationCodec.write(old,0))).isEqualTo(25);
+        assertThat(MongoAlertConfigurationCodec.read(Kind.RULE,SCOPE,"rule-a",encoded).definition()).isEqualTo(current);
+        for(Object bad:java.util.Arrays.asList(null,1,0L,-1L,2L,"1")){
+            var row=bson(encoded);if(bad==null)row.get("body",Document.class).remove("bindingRevision");else row.get("body",Document.class).put("bindingRevision",bad);
+            assertUnreadable(()->MongoAlertConfigurationCodec.read(Kind.RULE,SCOPE,"rule-a",row));
+        }
+        var mixed=bson(encoded);mixed.put("formatVersion",1);assertUnreadable(()->MongoAlertConfigurationCodec.read(Kind.RULE,SCOPE,"rule-a",mixed));
+        assertThat(((Rule)MongoAlertConfigurationCodec.read(Kind.RULE,SCOPE,"rule-a",MongoAlertConfigurationCodec.write(old,0)).definition()).evaluationRevision()).isEqualTo(1);
+    }
+
     @Test void explicitShapesMatchTheAuthoredGoldenAndRetainBsonTypesAndNanoseconds() throws Exception {
-        Document actual = new Document("rule", MongoAlertConfigurationCodec.write(rule(), 0))
+        Document actual = new Document("rule", MongoAlertConfigurationCodec.write(legacyRule(), 0))
                 .append("subscription", MongoAlertConfigurationCodec.write(legacyRoute(), 0))
                 .append("silence", MongoAlertConfigurationCodec.write(silence(), 0));
         try (var input = getClass().getResourceAsStream("/alert-configuration-v1.golden.json")) {
@@ -59,7 +74,7 @@ class MongoAlertConfigurationCodecTest {
     }
 
     @Test void malformedOrFutureEnvelopeCannotMasqueradeAsAnEmptyDefinition() {
-        List<Consumer<Document>> corruptions = List.of(row -> row.put("formatVersion", 2),
+        List<Consumer<Document>> corruptions = List.of(row -> row.put("formatVersion", 3),
                 row -> row.put("formatVersion", 1L), row -> row.remove("formatVersion"),
                 row -> row.put("recordRevision", 1), row -> row.put("writeFence", -1L),
                 row -> row.put("deployment", "UNRESOLVED"), row -> row.put("createdAt", "not-time"),

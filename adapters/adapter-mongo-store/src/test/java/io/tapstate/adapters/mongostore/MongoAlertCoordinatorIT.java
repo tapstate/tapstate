@@ -249,8 +249,10 @@ class MongoAlertCoordinatorIT {
             f.domain.artifacts().save(new SourceResource("orders",null,"mongodb",Map.of("database","changed"),null,null,null,null));f.domain.artifacts().save(source("orders"));
             var binding=f.domain.artifacts().sourceBinding("orders").orElseThrow().identity();assertThat(binding.bindingRevision()).isEqualTo(3);
             f.time.set(T.plusSeconds(1));var original=(Rule)f.store.definition(Kind.RULE,"rule-a",f.access).orElseThrow();
-            var changed=new Rule(original.header().next(f.time.get(),f.access.actor().subject()),original.name(),original.typeId(),original.typeVersion(),original.resources(),original.parameters(),original.severityOverride(),true,original.metric());
-            f.store.saveDefinition(original,changed,f.access);var rule=new AlertRule(key,2,2,"producer-b",Duration.ZERO,Duration.ZERO,Duration.ofSeconds(30),Duration.ofSeconds(30));
+            var parameters=new java.util.HashMap<>(original.parameters());parameters.put("trigger-for",java.math.BigDecimal.ONE);
+            var changed=new Rule(original.header().next(f.time.get(),f.access.actor().subject()),original.name(),original.typeId(),original.typeVersion(),original.resources(),parameters,original.severityOverride(),true,original.metric());
+            f.store.saveDefinition(original,changed,f.access);var current=(Rule)f.store.definition(Kind.RULE,"rule-a",f.access).orElseThrow();assertThat(current.evaluationRevision()).isEqualTo(2);
+            var rule=new AlertRule(key,current.evaluationRevision(),2,"producer-b",Duration.ofSeconds(1),Duration.ZERO,Duration.ofSeconds(30),Duration.ofSeconds(30));
             var update=AlertLifecycle.replace(facts.head.snapshot(),rule,f.time.get());var e=new AlertStateRecord.Episode(facts.head.episode().originalBinding(),update.snapshot().episode(),POLICY,facts.head.episode().diagnostics(),false);
             var after=new AlertStateRecord.Head(update.snapshot(),POLICY.deployment(),facts.head.owner(),null,false,e,new AlertIntent.Member(rule,1,changed.header().identity(),3));
             assertThat(f.store.commit(new Commit(CommitKind.STATE_AND_PLAN,new StateChange(1,facts.head,after,List.of(),null),List.of(),List.of()))).isEqualTo(Outcome.STAGED);

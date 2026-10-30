@@ -90,9 +90,10 @@ final class MongoAlertConfigurationStore {
             }
         }
         var actual = load(session, identity.kind(), identity.id());
-        if (actual.isPresent() && actual.orElseThrow().definition().equals(candidate)) { return Stage.UNCHANGED; }
-        if (expected == null ? actual.isPresent() : actual.isEmpty()
-                || !actual.orElseThrow().definition().equals(expected)) { return Stage.CONFLICT; }
+        if(actual.isPresent()&&sameCommand(candidate,actual.orElseThrow().definition()))return Stage.UNCHANGED;
+        if(expected==null?actual.isPresent():actual.isEmpty()||!sameCommand(expected,actual.orElseThrow().definition()))return Stage.CONFLICT;
+        if(expected!=null)expected=actual.orElseThrow().definition();
+        if(candidate instanceof AlertConfiguration.Rule rule)candidate=rule.enrolled((AlertConfiguration.Rule)expected);
         long fence = actual.isEmpty() ? 0 : increment(actual.orElseThrow().writeFence());
         Document row = MongoAlertConfigurationCodec.write(candidate, fence);
         MongoAlertConfigurationCodec.read(identity.kind(), scope, identity.id(), row);
@@ -128,7 +129,7 @@ final class MongoAlertConfigurationStore {
         var identity = expected.header().identity(); requireScope(identity.scope());
         if (!expected.header().active()) { return false; }
         var actual = load(session, identity.kind(), identity.id());
-        if (actual.isEmpty() || !actual.orElseThrow().definition().equals(expected)) { return false; }
+        if (actual.isEmpty() || !sameCommand(expected,actual.orElseThrow().definition())) { return false; }
         long original = actual.orElseThrow().writeFence(); long next = increment(original);
         Document filter = new Document("_id", MongoAlertConfigurationCodec.key(scope, identity.id()))
                 .append("incarnation", identity.incarnation()).append("recordRevision", expected.header().revision())
@@ -244,12 +245,18 @@ final class MongoAlertConfigurationStore {
             throw new TapstateException(StoreError.SOURCE_CONFIG_KEYRING_NOT_READY, Map.of(), null);
         }
     }
+    private static boolean sameCommand(Definition expected,Definition actual){
+        if(expected instanceof AlertConfiguration.Rule rule && rule.bindingRevision()==0 && actual instanceof AlertConfiguration.Rule saved){
+            return expected.equals(new AlertConfiguration.Rule(saved.header(),saved.name(),saved.typeId(),saved.typeVersion(),saved.resources(),saved.parameters(),saved.severityOverride(),saved.enabled(),saved.metric(),0));
+        }
+        return expected.equals(actual);
+    }
     private Definition normalized(Definition value) {
         return value instanceof AlertConfiguration.Rule rule ? rule.validated(catalog) : value;
     }
     private static Document retirementBody(Definition value) {
         var body = new Document((Document) MongoAlertConfigurationCodec.write(value, 0).get("body"));
-        if (value instanceof AlertConfiguration.Subscription) { body.remove("bindingRevision"); }
+        if (value instanceof AlertConfiguration.Subscription || value instanceof AlertConfiguration.Rule) { body.remove("bindingRevision"); }
         return body;
     }
     private void requireScope(AlarmKey.Scope supplied) {

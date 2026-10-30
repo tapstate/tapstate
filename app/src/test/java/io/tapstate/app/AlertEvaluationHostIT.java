@@ -146,7 +146,7 @@ class AlertEvaluationHostIT {
                 var store=configuration.alerts(storeHost,BuiltinAlarmTypes.catalog(),clock);
                 if(cloud)access=AlertStore.Access.cloud("operator",fixtureScope.authorityId(),"ADMIN",ACTIVE,ACTIVE);
                 var header=AlertConfiguration.Header.create(AlertConfiguration.Identity.create(AlertConfiguration.Kind.RULE,fixtureScope,"rule"),deployment,T,"operator");
-                var rule=new AlertConfiguration.Rule(header,"Failure","pipeline.failed",1,new AlertConfiguration.Resources(Set.of("pipeline"),true,Set.of()),Map.of(),null,true,null).validated(BuiltinAlarmTypes.catalog());
+                var rule=new AlertConfiguration.Rule(header,"Failure","pipeline.failed",1,new AlertConfiguration.Resources(Set.of("pipeline"),true,Set.of()),Map.of(),null,true,null).validated(BuiltinAlarmTypes.catalog()).enrolled(null);
                 assertThat(store.saveDefinition(null,rule,access)).isEqualTo(AlertStore.Outcome.STAGED);
                 test.accept(new Fixture(configuration,cache,settings,business,intent,claim,store,storeHost,rule,
                         new AlertEvaluationHost(store,BuiltinAlarmTypes.catalog(),deployment,clock,"host-a",ACTIVE),clock,now));

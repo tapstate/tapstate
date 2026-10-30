@@ -145,7 +145,7 @@ final class MongoAlertMaintenance implements AlertMaintenance {
     }
     private static Document candidateHeader(SystemCollections collection) {
         var tests=new ArrayList<Object>();
-        var versions=collection==SystemCollections.ALERT_INSTANCES?List.of(2,3,4):collection==SystemCollections.ALERT_DELIVERY_INTENTS?List.of(1,2,3):collection==SystemCollections.ALERT_SUBSCRIPTIONS||collection==SystemCollections.ALERT_RECEIVERS?List.of(1,2):
+        var versions=collection==SystemCollections.ALERT_INSTANCES?List.of(2,3,4):collection==SystemCollections.ALERT_DELIVERY_INTENTS?List.of(1,2,3):collection==SystemCollections.ALERT_RULES||collection==SystemCollections.ALERT_SUBSCRIPTIONS||collection==SystemCollections.ALERT_RECEIVERS?List.of(1,2):
                 collection==SystemCollections.ALERT_EPISODES||collection==SystemCollections.ALERT_TRANSITIONS?List.of(2):List.of(1);
         tests.add(new Document("$lte",List.of(new Document("$bsonSize",new Document("key","$_id")),16*1024)));
         if(collection==SystemCollections.ALERT_NODE_LIFECYCLES){
@@ -373,7 +373,7 @@ final class MongoAlertMaintenance implements AlertMaintenance {
     private boolean unknown(ClientSession s,SystemCollections c,Budget b) {
         if(c==SystemCollections.ALERT_DELIVERY_INTENTS)return exists(s,c,new Document("$nor",List.of(MongoAlertEnvelopeSupport.intentFilter())),b);
         if(c==SystemCollections.ALERT_RECEIVERS)return exists(s,c,new Document("$nor",List.of(MongoAlertEnvelopeSupport.receiverFilter())),b);
-        var versions=c==SystemCollections.ALERT_INSTANCES?List.of(2,3,4):c==SystemCollections.ALERT_DELIVERY_INTENTS?List.of(1,2,3):c==SystemCollections.ALERT_SUBSCRIPTIONS||c==SystemCollections.ALERT_RECEIVERS?List.of(1,2):
+        var versions=c==SystemCollections.ALERT_INSTANCES?List.of(2,3,4):c==SystemCollections.ALERT_DELIVERY_INTENTS?List.of(1,2,3):c==SystemCollections.ALERT_RULES||c==SystemCollections.ALERT_SUBSCRIPTIONS||c==SystemCollections.ALERT_RECEIVERS?List.of(1,2):
                 c==SystemCollections.ALERT_EPISODES||c==SystemCollections.ALERT_TRANSITIONS?List.of(2):List.of(1);
         return exists(s,c,new Document("formatVersion",new Document("$nin",versions)),b);
     }

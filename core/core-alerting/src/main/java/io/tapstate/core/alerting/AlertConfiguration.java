@@ -12,6 +12,7 @@ import java.util.UUID;
 public final class AlertConfiguration {
     public static final int FORMAT_VERSION = 1;
     public static final int SUBSCRIPTION_FORMAT_VERSION = 2;
+    public static final int RULE_FORMAT_VERSION = 2;
     private AlertConfiguration() { }
 
     public enum Kind { RULE, RECEIVER, SUBSCRIPTION, SILENCE }
@@ -107,8 +108,12 @@ public final class AlertConfiguration {
 
     public record Rule(Header header, String name, String typeId, int typeVersion, Resources resources,
             Map<String, BigDecimal> parameters, AlarmSeverity severityOverride, boolean enabled,
-            MetricAlertEvaluator.Rule metric) implements Definition {
+            MetricAlertEvaluator.Rule metric, long bindingRevision) implements Definition {
+        public Rule(Header header,String name,String typeId,int typeVersion,Resources resources,Map<String,BigDecimal> parameters,AlarmSeverity severityOverride,boolean enabled,MetricAlertEvaluator.Rule metric){
+            this(header,name,typeId,typeVersion,resources,parameters,severityOverride,enabled,metric,0);
+        }
         public Rule {
+            AlertValidation.require(bindingRevision>=0 && bindingRevision<=header.revision(),"ruleBinding","invalid-revision");
             requireKind(header, Kind.RULE);
             name = AlertValidation.text(name, "ruleName", 128);
             typeId = AlertConfiguration.typeId(typeId, "ruleType");
@@ -135,7 +140,26 @@ public final class AlertConfiguration {
             AlertValidation.require(type.resourceKinds().containsAll(resources.kinds()), "resourceKinds", "unsupported-by-type");
             AlertValidation.require((metric != null) == type.evaluatorId().equals("threshold"), "metric", "evaluator-contract-mismatch");
             return new Rule(header, name, typeId, typeVersion, resources,
-                    type.validatedParameters(parameters), severityOverride, enabled, metric);
+                    type.validatedParameters(parameters), severityOverride, enabled, metric, bindingRevision);
+        }
+        /** Legacy records keep their original authoring revision until an explicit management CAS enrolls them. */
+        public long evaluationRevision(){return bindingRevision==0?header.revision():bindingRevision;}
+        public Rule enrolled(Rule before){
+            long revision=before==null?1:Math.addExact(before.evaluationRevision(),before.sameEvaluation(this)?0:1);
+            return new Rule(header,name,typeId,typeVersion,resources,parameters,severityOverride,enabled,metric,revision);
+        }
+        public boolean sameEvaluation(Rule other){
+            return typeId.equals(other.typeId)&&typeVersion==other.typeVersion&&resources.equals(other.resources)
+                    &&enabled==other.enabled&&header.active()==other.header.active()&&equalDecimals(parameters,other.parameters)
+                    &&sameMetric(metric,other.metric);
+        }
+        private static boolean equalDecimals(Map<String,BigDecimal> a,Map<String,BigDecimal> b){
+            return a.keySet().equals(b.keySet())&&a.entrySet().stream().allMatch(e->e.getValue().compareTo(b.get(e.getKey()))==0);
+        }
+        private static boolean sameMetric(MetricAlertEvaluator.Rule a,MetricAlertEvaluator.Rule b){
+            return a==null?b==null:b!=null&&a.name().equals(b.name())&&a.type()==b.type()&&a.unit().equals(b.unit())
+                    &&a.attributes().equals(b.attributes())&&a.direction()==b.direction()
+                    &&a.trigger().compareTo(b.trigger())==0&&a.recover().compareTo(b.recover())==0;
         }
         public AlarmSeverity effectiveSeverity(AlarmTypeCatalog catalog) {
             AlarmTypeCatalog.Type type = requireType(catalog);

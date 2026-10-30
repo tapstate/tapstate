@@ -16,7 +16,7 @@ class MongoAlertStorageSchemaTest {
     }
 
     @Test void queryAndNodeDomainGoldensRetainTheirOwnExactCapability() throws Exception {
-        for(int version:new int[]{3,4,5,6})try(var input=getClass().getResourceAsStream("/alert-schema-v"+version+".golden.json")) {
+        for(int version:new int[]{3,4,5,6,7})try(var input=getClass().getResourceAsStream("/alert-schema-v"+version+".golden.json")) {
             var marker=Document.parse(new String(input.readAllBytes(),StandardCharsets.UTF_8));
             var schema=new Document("installedVersion",1).append("alerting",marker);
             assertThat(MongoAlertStorageSchema.verifyAuthorityState(schema,ConfigurationVersion.initial(),"cluster-a",marker.getString("keyId")))

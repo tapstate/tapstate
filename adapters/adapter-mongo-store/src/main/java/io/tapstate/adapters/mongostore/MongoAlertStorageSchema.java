@@ -23,7 +23,8 @@ import org.bson.Document;
 
 /** One fixed feature-version fact in the existing CONFIG schema aggregate, independent of other features. */
 final class MongoAlertStorageSchema {
-    static final int VERSION = 6;
+    static final int VERSION = 7;
+    static final int DOMAIN_VERSION = 6;
     static final int NODE_VERSION = 5;
     static final int OPERATIONAL_VERSION = 4;
     private static final int BASE_QUERY_COUNT = 5;
@@ -92,8 +93,17 @@ final class MongoAlertStorageSchema {
             Document original=marker(session,budget);
             if(original==null)throw unreadable("missing-node-preparation");
             int version=original.getInteger("installedVersion");
-            if(version==VERSION)return null;
+            if(version>=DOMAIN_VERSION)return null;
             if(version!=NODE_VERSION)throw unreadable("operation-domain-preparation");
+            replaceMarker(session,original,new Document(original).append("installedVersion",DOMAIN_VERSION));
+            return null;
+        });
+        budget.transaction(client,session->{
+            Document original=marker(session,budget);
+            if(original==null)throw unreadable("missing-rule-binding-preparation");
+            int version=original.getInteger("installedVersion");
+            if(version==VERSION)return null;
+            if(version!=DOMAIN_VERSION)throw unreadable("rule-binding-preparation");
             replaceMarker(session,original,new Document(original).append("installedVersion",VERSION));
             return null;
         });
@@ -324,7 +334,7 @@ final class MongoAlertStorageSchema {
                     || (installed==QUERY_VERSION || installed==OPERATIONAL_VERSION) && "READY".equals(query.get("phase")) && next==BASE_QUERY_COUNT)
                     || contract==2 && next>=BASE_QUERY_COUNT && next<=QUERY_INDEXES.size()
                     && (installed==OPERATIONAL_VERSION && "PREPARING".equals(query.get("phase"))
-                    || (installed==NODE_VERSION || installed==VERSION) && "READY".equals(query.get("phase")) && next==QUERY_INDEXES.size());
+                    || (installed==NODE_VERSION || installed==DOMAIN_VERSION || installed==VERSION) && "READY".equals(query.get("phase")) && next==QUERY_INDEXES.size());
             if(!supported)throw unreadable("query-preparation");requireStoredOperation(id);
         }else if(installed>=QUERY_VERSION)throw unreadable("query-preparation");
         ConfigurationVersion.validateAlertState(counter, installed >= AUTHORITY_VERSION);

@@ -198,15 +198,19 @@ class AlertEvaluationHostTest {
         assertThat(changes.getFirst().value().episode()).isZero();assertThat(changes.getFirst().diagnosticReference()).isNull();
         assertThat(changes.getLast().diagnosticReference().episode()).isOne();
     }
-    @Test void ruleRevisionChangesAreAppliedWithoutWaitingForAnotherPublication() {
+    @Test void severityMetadataChangesAreAppliedWithoutAnotherPublicationOrNewEpisode() {
         var original=definition("pipeline.failed");var b=binding(original,"producer-a");
         condition(b,1,0,AlertSignal.Condition.BAD);now.set(T.plusSeconds(1));
         var changed=new AlertConfiguration.Rule(original.header().next(now.get(),"admin"),original.name(),original.typeId(),1,
-                original.resources(),original.parameters(),AlarmSeverity.CRITICAL,true,null);
-        host.tick(binding(changed,"producer-a"));
-        var head=rows.get(b.key()).value();assertThat(head.snapshot().rule().generation()).isEqualTo(2);
-        assertThat(head.snapshot().quality()).isEqualTo(AlertSnapshot.Quality.UNKNOWN);
-        assertThat(head.episode().value().endReason()).isEqualTo(AlertSnapshot.EndReason.SUPERSEDED);
+                original.resources(),original.parameters(),AlarmSeverity.CRITICAL,true,null).enrolled(original);
+        var before=rows.get(b.key()).value();host.tick(binding(changed,"producer-a"));
+        var head=rows.get(b.key()).value();assertThat(head.snapshot().rule()).isEqualTo(before.snapshot().rule());
+        assertThat(head.snapshot().quality()).isEqualTo(before.snapshot().quality());
+        assertThat(head.episode().value().endReason()).isNull();assertThat(head.episode().value().severity()).isEqualTo(AlarmSeverity.CRITICAL);
+        assertThat(head.snapshot().lastSequence()).isEqualTo(before.snapshot().lastSequence());
+        assertThat(head.snapshot().lastObservedAt()).isEqualTo(before.snapshot().lastObservedAt());
+        assertThat(commits.getLast().state().expectedRuleRevision()).isEqualTo(changed.header().revision());
+        assertThat(commits.getLast().state().transitions()).extracting(v->v.value().kind()).containsExactly(AlertUpdate.Kind.SEVERITY_CHANGED);
     }
     @Test void anAlreadyDisabledHeadCanStillAcquireItsFinalResourceRetirementTime() {
         var b=binding(definition("pipeline.failed"),"producer-a");condition(b,1,0,AlertSignal.Condition.BAD);

@@ -50,7 +50,7 @@ class NativeNodeLifecycleIT {
                 else assertThat(retained).containsEntry("phase","RETIRING").containsEntry("reason","ORDERLY_SHUTDOWN");
                 try(var domain=io.tapstate.adapters.mongostore.MongoConfigurationDomain.open(
                         new io.tapstate.adapters.mongostore.MongoConnectionSettings(storage.configurationUri(),null,Duration.ofSeconds(5)),storage.clusterId())) {
-                    assertThat(domain.alertSchemaVersion()).isEqualTo(6);
+                    assertThat(domain.alertSchemaVersion()).isEqualTo(7);
                     assertThat(rows.find().first()).isEqualTo(retained);
                 }
                 observer.getDatabase(storage.configurationDatabase()).drop();observer.getDatabase(storage.cacheDatabase()).drop();observer.getDatabase(storage.masterDatabase()).drop();

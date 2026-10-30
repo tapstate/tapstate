@@ -46,9 +46,10 @@ public interface AlertStore {
         public static EvaluationProof operation(Runnable pureOriginal){return new EvaluationProof(null,pureOriginal);}
         public EvaluationProof { Objects.requireNonNull(requireCurrent);if(pipeline!=null && pipeline.deleted())throw new IllegalArgumentException("deleted producer intent"); }
     }
-    record StateChange(long revision,AlertStateRecord.Head before,AlertStateRecord.Head after,List<AlertStateRecord.Transition> transitions,AlertSignal diagnosticSignal,EvaluationProof proof) {
-        public StateChange(long revision,AlertStateRecord.Head before,AlertStateRecord.Head after,List<AlertStateRecord.Transition> transitions,AlertSignal diagnosticSignal){this(revision,before,after,transitions,diagnosticSignal,null);}
-        public StateChange { Objects.requireNonNull(after);transitions=List.copyOf(transitions);if(revision<0||(revision==0)!=(before==null))throw new IllegalArgumentException("invalid state baseline"); }
+    record StateChange(long revision,AlertStateRecord.Head before,AlertStateRecord.Head after,List<AlertStateRecord.Transition> transitions,AlertSignal diagnosticSignal,EvaluationProof proof,Long expectedRuleRevision) {
+        public StateChange(long revision,AlertStateRecord.Head before,AlertStateRecord.Head after,List<AlertStateRecord.Transition> transitions,AlertSignal signal,EvaluationProof proof){this(revision,before,after,transitions,signal,proof,null);}
+        public StateChange(long revision,AlertStateRecord.Head before,AlertStateRecord.Head after,List<AlertStateRecord.Transition> transitions,AlertSignal diagnosticSignal){this(revision,before,after,transitions,diagnosticSignal,null,null);}
+        public StateChange { Objects.requireNonNull(after);transitions=List.copyOf(transitions);if(expectedRuleRevision!=null&&expectedRuleRevision<1)throw new IllegalArgumentException("invalid expected rule revision");if(revision<0||(revision==0)!=(before==null))throw new IllegalArgumentException("invalid state baseline"); }
     }
     record IntentChange(Stored<AlertIntent.Record> before,AlertIntent.Record after) { public IntentChange { Objects.requireNonNull(after); } }
     record ScheduleChange(Stored<AlertSchedule.Record> before,AlertSchedule.Record after) { public ScheduleChange { Objects.requireNonNull(after); } }

@@ -317,7 +317,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
                 long next=before.map(v->Math.incrementExact(v.value().snapshot().lastSequence())).orElse(0L);
                 if(input instanceof AlertInput.Operational op && before.isPresent()){
                     var head=before.orElseThrow().value();var evidence=head.operationalEvidence();
-                    if(head.snapshot().rule().revision()==rule.header().revision()&&head.snapshot().rule().producerIncarnation().equals(producer)
+                    if(head.snapshot().rule().revision()==rule.evaluationRevision()&&head.snapshot().rule().producerIncarnation().equals(producer)
                             &&head.binding().sourceBindingRevision()==sourceRevision&&head.snapshot().enabled()
                             &&evidence!=null&&evidence.bindingDigest().equals(op.bindingDigest())
                             &&evidence.equals(evidence.observe(op.capability(),op.succeeded()))

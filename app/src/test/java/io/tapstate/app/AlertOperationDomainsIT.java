@@ -21,7 +21,7 @@ class AlertOperationDomainsIT {
         var header=AlertConfiguration.Header.create(AlertConfiguration.Identity.create(AlertConfiguration.Kind.RULE,f.storeHost().scope(),"source-rule"),
                 AlertChannelPolicy.Deployment.ON_PREM,AlertEvaluationHostIT.T,"operator");
         var rule=new AlertConfiguration.Rule(header,"Source access","source.connection-failed",1,
-                new AlertConfiguration.Resources(Set.of("source"),true,Set.of()),parameters,null,true,null).validated(BuiltinAlarmTypes.catalog());
+                new AlertConfiguration.Resources(Set.of("source"),true,Set.of()),parameters,null,true,null).validated(BuiltinAlarmTypes.catalog()).enrolled(null);
         assertThat(f.store().saveDefinition(null,rule,AlertNotificationPlannerIT.access())).isEqualTo(AlertStore.Outcome.STAGED);
         return new SourceCase(rule,id,new AlarmKey.Resource("source","erp",id.incarnation()));
     }

@@ -62,6 +62,7 @@ final class MongoAlertConfigurationCodec {
             body.append("bindingRevision", route.bindingRevision());
             row.put("formatVersion", AlertConfiguration.SUBSCRIPTION_FORMAT_VERSION);
         }
+        if(definition instanceof Rule rule && rule.bindingRevision()>0){body.append("bindingRevision",rule.bindingRevision());row.put("formatVersion",AlertConfiguration.RULE_FORMAT_VERSION);}
         if (definition instanceof AlertReceiver) { row.append("privateSlot", null); }
         if (definition instanceof AlertReceiver receiver && receiver.transport() instanceof AlertReceiver.HttpsJson) { row.put("formatVersion",2); }
         if (size(row) > (definition instanceof AlertReceiver ? MAX_RECEIVER_BYTES : MAX_BYTES)) {
@@ -79,7 +80,8 @@ final class MongoAlertConfigurationCodec {
             int version = row.getInteger("formatVersion");
             require(version == AlertConfiguration.FORMAT_VERSION
                     || expectedKind == Kind.SUBSCRIPTION && version == AlertConfiguration.SUBSCRIPTION_FORMAT_VERSION
-                    || expectedKind == Kind.RECEIVER && version == 2);
+                    || expectedKind == Kind.RECEIVER && version == 2
+                    || expectedKind == Kind.RULE && version == AlertConfiguration.RULE_FORMAT_VERSION);
             Document key = doc(row, "_id"); fields(key, Set.of("authorityId", "clusterId", "id"));
             require(key(expectedScope, expectedId).equals(key));
             require(text(row, "kind").equals(expectedKind.name()));
@@ -90,7 +92,7 @@ final class MongoAlertConfigurationCodec {
                     text(row, "updatedBy"), time(row, "retiredAt", true));
             Document body = doc(row, "body");
             Definition definition = switch (expectedKind) {
-                case RULE -> readRule(header, body);
+                case RULE -> readRule(header, body, version);
                 case SUBSCRIPTION -> readSubscription(header, body, version);
                 case SILENCE -> {
                     fields(body, Set.of("reason", "window"));
@@ -109,8 +111,10 @@ final class MongoAlertConfigurationCodec {
         }
     }
 
-    private static Rule readRule(Header header, Document body) {
-        fields(body, Set.of("name", "typeId", "typeVersion", "resources", "parameters", "severityOverride", "enabled", "metric"));
+    private static Rule readRule(Header header, Document body, int version) {
+        var expected=new HashSet<>(Set.of("name", "typeId", "typeVersion", "resources", "parameters", "severityOverride", "enabled", "metric"));
+        if(version==AlertConfiguration.RULE_FORMAT_VERSION)expected.add("bindingRevision");
+        fields(body, expected);
         require(body.get("typeVersion") instanceof Integer);
         Map<String, BigDecimal> parameters = new LinkedHashMap<>();
         Document supplied = doc(body, "parameters"); require(supplied.size() <= 16);
@@ -118,7 +122,8 @@ final class MongoAlertConfigurationCodec {
         return new Rule(header, text(body, "name"), text(body, "typeId"), body.getInteger("typeVersion"),
                 readResources(doc(body, "resources")), parameters, body.get("severityOverride") == null ? null
                         : enumeration(AlarmSeverity.values(), text(body, "severityOverride")),
-                bool(body, "enabled"), body.get("metric") == null ? null : readMetric(doc(body, "metric")));
+                bool(body, "enabled"), body.get("metric") == null ? null : readMetric(doc(body, "metric")),
+                version==AlertConfiguration.RULE_FORMAT_VERSION?number(body,"bindingRevision",1):0);
     }
 
     private static Subscription readSubscription(Header header, Document body, int version) {
