@@ -43,7 +43,7 @@ class ScopedPipelineCaptureCoordinatorTest {
         }
     }
     @Test void aLostReadersFailedCloseKeepsTheOriginalReleaseForTheExplicitRetry() throws Exception {
-        try(var f=new Fixture(List.of("input"),1,ReadMode.SNAPSHOT_ONLY,Duration.ofMillis(100))) {
+        try(var f=new Fixture(List.of("input"),1,ReadMode.SNAPSHOT_ONLY,Duration.ofMillis(100));var paused=f.pauseSecondRead()) {
             var originalCloseFailure=new IllegalStateException("original reader close pending");
             f.rowCount.set(32);f.closeFailure.set(originalCloseFailure);
             var failRenewal=new AtomicBoolean();var firstCloseReturned=new CountDownLatch(1);
@@ -58,7 +58,7 @@ class ScopedPipelineCaptureCoordinatorTest {
                 return Optional.of(call.getArgument(0));
             }).when(f.ownership).renew(any());
             var run=f.coordinator.forRun(SCOPE,PIPELINE,ORIGINAL);run.startCapture("flow",f.snapshot(),f.models());
-            failRenewal.set(true);assertThat(firstCloseReturned.await(3,TimeUnit.SECONDS)).isTrue();
+            paused.awaitEntered();failRenewal.set(true);assertThat(firstCloseReturned.await(3,TimeUnit.SECONDS)).isTrue();
             assertThat(observedCloseFailure.get()).isSameAs(originalCloseFailure);
             verify(f.ownership,never()).release(f.capture);
             f.closeFailure.set(null);f.coordinator.retireScope(SCOPE,PIPELINE);
@@ -249,27 +249,55 @@ class ScopedPipelineCaptureCoordinatorTest {
     }
     @ParameterizedTest @ValueSource(booleans={false,true})
     void aSourceCloseFailureRetainsTheOriginalSessionAndLeaseForRetry(boolean error) throws Exception {
-        try(var f=new Fixture(List.of("input"),1)) {
+        try(var f=new Fixture(List.of("input"),1);var paused=f.pauseSecondRead()) {
             Throwable failure=error?new AssertionError("close invariant"):new IllegalStateException("close invariant");
             f.closeFailure.set(failure);f.rowCount.set(3);
             var run=f.coordinator.forRun(SCOPE,PIPELINE,ORIGINAL);run.startCapture("flow",f.snapshot(),f.models());var bindings=run.captureBindings();
             String key=bindings.bufferKey("input"),ring=SrsRingbuffer.ringName("mck-key","orders");
-            long deadline=System.nanoTime()+Duration.ofSeconds(3).toNanos();
-            while(f.readRows.get()<2 && System.nanoTime()<deadline)Thread.sleep(5);
             try {
+                paused.awaitEntered();
                 assertThat(f.readRows).hasValue(2);
                 assertThatThrownBy(() -> run.stopCapture("flow",false)).isSameAs(failure);
+                assertThat(paused.closer.get()).isSameAs(Thread.currentThread());
                 verify(f.ownership,never()).release(f.capture);assertThat(run.isCapturing("flow")).isTrue();
                 run.stopCapture("flow",false);verify(f.ownership).release(f.capture);assertThat(run.isCapturing("flow")).isFalse();
                 assertThat(f.buffer.snapshotState(key,ring).declared()).isFalse();
             } finally { f.buffer.release(key); }
         }
     }
-    @Test void wholeCoordinatorCloseRetainsUnclosedOriginalSessionsForRetry() throws Exception {
+    @ParameterizedTest @ValueSource(booleans={false,true})
+    void aReaderCloseFailureAlreadyCleanedUpDoesNotNeedToBeThrownAgainByStop(boolean error) throws Exception {
         try(var f=new Fixture(List.of("input"),1)) {
+            Throwable failure=error?new AssertionError("reader close invariant"):new IllegalStateException("reader close invariant");
+            f.closeFailure.set(failure);f.rowCount.set(3);
+            var physical=new AtomicReference<CaptureRun>();
+            doAnswer(call -> {
+                var started=(CaptureRun)call.callRealMethod();physical.set(started);return started;
+            }).when(f.runtime).beginSnapshotOnly(any(),anyLong(),any(),any(),any());
+            var run=f.coordinator.forRun(SCOPE,PIPELINE,ORIGINAL);run.startCapture("flow",f.snapshot(),f.models());
+            var bindings=run.captureBindings();String key=bindings.bufferKey("input"),ring=SrsRingbuffer.ringName("mck-key","orders");
+            long deadline=System.nanoTime()+Duration.ofSeconds(3).toNanos();
+            while(f.readRows.get()<2 && System.nanoTime()<deadline)Thread.sleep(5);
+            assertThat(f.readRows).hasValue(2);
+            // Release the handoff before stopping, so the reader performs the first close and final cleanup.
+            f.buffer.release(key);
+            assertThat(physical.get().awaitLoaded(Duration.ofSeconds(3))).isTrue();
+            assertThat(physical.get().failure()).contains(failure);
+            verify(f.ownership,never()).release(f.capture);assertThat(run.isCapturing("flow")).isTrue();
+            doAnswer(call -> {
+                assertThat(physical.get().awaitLoaded(Duration.ZERO)).isTrue();
+                assertThat(f.closedPorts).hasValue(1);return null;
+            }).when(f.ownership).release(f.capture);
+            assertThatCode(() -> run.stopCapture("flow",false)).doesNotThrowAnyException();
+            verify(f.ownership).release(f.capture);assertThat(run.isCapturing("flow")).isFalse();
+            assertThat(f.buffer.snapshotState(key,ring).declared()).isFalse();
+        }
+    }
+    @Test void wholeCoordinatorCloseRetainsUnclosedOriginalSessionsForRetry() throws Exception {
+        try(var f=new Fixture(List.of("input"),1);var paused=f.pauseSecondRead()) {
             f.rowCount.set(3);var failure=new IllegalStateException("original reader close pending");f.closeFailure.set(failure);
             var run=f.coordinator.forRun(SCOPE,PIPELINE,ORIGINAL);run.startCapture("flow",f.snapshot(),f.models());
-            long deadline=System.nanoTime()+Duration.ofSeconds(3).toNanos();while(f.readRows.get()<2 && System.nanoTime()<deadline)Thread.sleep(5);
+            paused.awaitEntered();
             assertThatThrownBy(f.coordinator::close).isSameAs(failure);verify(f.ownership,never()).release(f.capture);
             f.coordinator.close();verify(f.ownership).release(f.capture);
         }
@@ -497,19 +525,35 @@ class ScopedPipelineCaptureCoordinatorTest {
         }
     }
 
+    /** Holds the reader inside next() until the explicit closer has consumed the one-shot failure. */
+    private static final class PausedRead implements AutoCloseable {
+        final CountDownLatch entered=new CountDownLatch(1),resume=new CountDownLatch(1);
+        final AtomicReference<Thread> closer=new AtomicReference<>();
+        void beforeRow(int row) {
+            if(row!=2)return;
+            entered.countDown();
+            try {if(!resume.await(3,TimeUnit.SECONDS))throw new AssertionError("reader pause was not released");}
+            catch(InterruptedException interrupted) {Thread.currentThread().interrupt();throw new AssertionError(interrupted);}
+        }
+        void awaitEntered() throws InterruptedException {assertThat(entered.await(3,TimeUnit.SECONDS)).isTrue();}
+        void closed() {closer.compareAndSet(null,Thread.currentThread());close();}
+        @Override public void close() {resume.countDown();}
+    }
     private static final class Port implements CapturePort,SnapshotOnlyCapture {
         final String source; final Runnable guard; final AtomicInteger closed,read; final int count; final AtomicReference<Throwable> closeFailure;
-        Port(String source,Runnable guard,AtomicInteger closed,AtomicInteger read,int count,AtomicReference<Throwable> closeFailure) {
-            this.source=source;this.guard=guard;this.closed=closed;this.read=read;this.count=count;this.closeFailure=closeFailure;
+        final PausedRead pausedRead;
+        Port(String source,Runnable guard,AtomicInteger closed,AtomicInteger read,int count,AtomicReference<Throwable> closeFailure,PausedRead pausedRead) {
+            this.source=source;this.guard=guard;this.closed=closed;this.read=read;this.count=count;this.closeFailure=closeFailure;this.pausedRead=pausedRead;
         }
         public CaptureBatch snapshotOnly(CaptureConfig config) {
             guard.run(); var rows=java.util.stream.IntStream.range(0,count).mapToObj(i -> Envelope.read(1,"orders",Map.of("source",source,"id",i),null)).iterator(); var ended=new AtomicBoolean();
             return new CaptureBatch() {
                 public boolean hasNext() { guard.run(); return rows.hasNext(); }
-                public Envelope next() { guard.run();read.incrementAndGet();return rows.next(); }
+                public Envelope next() { guard.run();int row=read.incrementAndGet();if(pausedRead!=null)pausedRead.beforeRow(row);return rows.next(); }
                 public Optional<SourcePosition> seam() { throw new AssertionError("bounded reads have no seam"); }
                 public void close() { if(ended.compareAndSet(false,true)) {
-                    closed.incrementAndGet();var failure=closeFailure.get();if(failure instanceof RuntimeException runtime)throw runtime;if(failure instanceof Error error)throw error;
+                    try {closed.incrementAndGet();var failure=closeFailure.get();if(failure instanceof RuntimeException runtime)throw runtime;if(failure instanceof Error error)throw error;}
+                    finally {if(pausedRead!=null)pausedRead.closed();}
                 } }
             };
         }
@@ -538,6 +582,8 @@ class ScopedPipelineCaptureCoordinatorTest {
         final List<SourceResource> definitions=new ArrayList<>();
         final AtomicInteger opened=new AtomicInteger(),closedPorts=new AtomicInteger(),readRows=new AtomicInteger(),rowCount=new AtomicInteger(1);
         final AtomicReference<Throwable> closeFailure=new AtomicReference<>();
+        PausedRead pausedRead;
+        PausedRead pauseSecondRead() {pausedRead=new PausedRead();return pausedRead;}
         final WorkloadClaim capture;
         final SrsConsumerContext streamingContext = new SrsConsumerContext(new SrsConsumerKey("mck-key", "flow", "input"), 7);
         final AtomicReference<SrsConsumerProgress> streamingProgress = new AtomicReference<>();
@@ -582,7 +628,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             coordinator=new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(BUSINESS,pipelines,sources,configuration,cache,notes,ignored -> false,
                             boundedLoads,completedFull),
                     new ScopedPipelineCaptureCoordinator.Execution(() -> Optional.of(node),authorization,ownership,renewal,() -> {},Clock.systemUTC()),
-                    runtime,buffer,connectors,(original,config,guard,preparation,stream) -> { guard.run(); opened.incrementAndGet(); return new Port(config.node().nodeId(),guard,closedPorts,readRows,rowCount.get(),closeFailure); });
+                    runtime,buffer,connectors,(original,config,guard,preparation,stream) -> { guard.run(); opened.incrementAndGet(); return new Port(config.node().nodeId(),guard,closedPorts,readRows,rowCount.get(),closeFailure,pausedRead); });
             if (!bounded) streaming();
         }
         private SrsConsumerProgress progress(boolean complete, long membership, long epoch) {
