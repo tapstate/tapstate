@@ -107,8 +107,12 @@ class AlertDeliveryNetworkIT {
             receiver(f,email,null);var planner=planner(f,"planner");f.evaluator().withPlanner(planner);bad(f);planner.tick();var identity=intents(f).getFirst().value().frozen().identity();var store=sendingStore(f);
             long baseline=channelThreads();
             var worker=new AlertDeliveryRuntime(store,f.clock(),"sender",ACTIVE,channels(f,new AtomicInteger()),a->access());
-            try{worker.tick();await().atMost(Duration.ofSeconds(5)).until(()->smtp.bodies.size()==1);worker.close();
-                await().atMost(Duration.ofSeconds(2)).until(()->smtp.active.get()==0 && worker.occupied()==0 && channelThreads()<=baseline);
+            try{worker.tick();await().atMost(Duration.ofSeconds(5)).until(()->smtp.bodies.size()==1 && smtp.awaitingFinal.getCount()==0);worker.close();
+                await().atMost(Duration.ofSeconds(2)).untilAsserted(()->{
+                    assertThat(smtp.active.get()).as("owned SMTP sockets after host close").isZero();
+                    assertThat(worker.occupied()).as("owned delivery slots after host close").isZero();
+                    assertThat(channelThreads()).as("channel threads after host close").isLessThanOrEqualTo(baseline);
+                });
                 var original=store.intent(identity,null).orElseThrow().value();assertThat(original.state().attemptsConsumed()).isOne();
                 f.now().set(T.plusSeconds(1));try(var replacement=new AlertDeliveryRuntime(store,f.clock(),"replacement",ACTIVE,channels(f,new AtomicInteger()),a->access())){replacement.tick();AlertDeliveryRuntimeIT.settled(replacement);assertThat(smtp.bodies).hasSize(1);}
             }finally{worker.close();}
@@ -173,7 +177,7 @@ class AlertDeliveryNetworkIT {
     }
     static long channelThreads(){return Thread.getAllStackTraces().keySet().stream().filter(Thread::isAlive).filter(t->t.getName().startsWith("alert-delivery")||t.getName().startsWith("alert-dns")||t.getName().startsWith("tapstate-alert-smtp")).count();}
     static final class SmtpPeer implements AutoCloseable {
-        final java.net.ServerSocket server;final ExecutorService executor=Executors.newFixedThreadPool(2);final List<String> bodies=new CopyOnWriteArrayList<>(),recipients=new CopyOnWriteArrayList<>();final AtomicInteger active=new AtomicInteger();final boolean implicit,stallFinal;
+        final java.net.ServerSocket server;final ExecutorService executor=Executors.newFixedThreadPool(2);final List<String> bodies=new CopyOnWriteArrayList<>(),recipients=new CopyOnWriteArrayList<>();final AtomicInteger active=new AtomicInteger();final CountDownLatch awaitingFinal=new CountDownLatch(1);final boolean implicit,stallFinal;
         volatile boolean dropFinal;volatile String rejectedRecipient;
         SmtpPeer(boolean implicit)throws Exception{this(implicit,false);}
         SmtpPeer(boolean implicit,boolean stallFinal)throws Exception{this.implicit=implicit;this.stallFinal=stallFinal;server=implicit?serverTls.getServerSocketFactory().createServerSocket(0,2,InetAddress.getLoopbackAddress()):new java.net.ServerSocket(0,2,InetAddress.getLoopbackAddress());executor.submit(()->{while(!server.isClosed())try{var socket=server.accept();executor.submit(()->serve(socket));}catch(java.io.IOException closed){break;}});}
@@ -184,7 +188,7 @@ class AlertDeliveryNetworkIT {
                 else if(line.equals("STARTTLS")){write(out,"220 begin\r\n");var tls=(SSLSocket)serverTls.getSocketFactory().createSocket(socket,"localhost",port(),true);tls.setUseClientMode(false);tls.startHandshake();socket=tls;input=socket.getInputStream();out=socket.getOutputStream();}
                 else if(line.startsWith("MAIL FROM"))write(out,"250 ok\r\n");
                 else if(line.startsWith("RCPT TO")){recipients.add(line);write(out,line.equals("RCPT TO:<"+rejectedRecipient+">")?"550 rejected\r\n":"250 ok\r\n");}
-                else if(line.equals("DATA")){write(out,"354 continue\r\n");var body=new StringBuilder();while(true){var part=line(input);if(part==null||part.equals("."))break;body.append(part.startsWith("..")?part.substring(1):part).append("\r\n");}bodies.add(body.toString());if(dropFinal)break;if(stallFinal){while(input.read()>=0){}break;}write(out,"250 accepted\r\n");}
+                else if(line.equals("DATA")){write(out,"354 continue\r\n");var body=new StringBuilder();while(true){var part=line(input);if(part==null||part.equals("."))break;body.append(part.startsWith("..")?part.substring(1):part).append("\r\n");}bodies.add(body.toString());if(dropFinal)break;if(stallFinal){awaitingFinal.countDown();while(input.read()>=0){}break;}write(out,"250 accepted\r\n");}
                 else if(line.equals("QUIT")){write(out,"221 bye\r\n");break;}
                 else throw new AssertionError("unexpected SMTP command");
             }

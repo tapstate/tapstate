@@ -72,6 +72,57 @@ class AlertDeliveryRuntimeIT {
     static void seed(AlertEvaluationHostIT.Fixture f){route(f,Duration.ZERO);var planner=planner(f,"planner");f.evaluator().withPlanner(planner);bad(f);planner.tick();}
     static List<AlertIntent.Identity> ids(AlertEvaluationHostIT.Fixture f){return intents(f).stream().map(v->v.value().frozen().identity()).toList();}
     static void settled(AlertDeliveryRuntime runtime){await().atMost(Duration.ofSeconds(10)).until(()->runtime.occupied()==0);}
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
+    void closeReleasesLocalSlotsWhenAnInterruptedResultCannotBePersisted(boolean finishesAfterClose) {
+        AlertEvaluationHostIT.withFixture(f->{seed(f);var store=sendingStore(f);var entered=new CountDownLatch(2);var release=new CountDownLatch(1);
+            var unavailable=(AlertStore)java.lang.reflect.Proxy.newProxyInstance(AlertStore.class.getClassLoader(),new Class<?>[]{AlertStore.class},(proxy,method,args)->{
+                if(method.getName().equals("commit") && ((AlertStore.Commit)args[0]).kind()==AlertStore.CommitKind.RESULT) {
+                    if(!finishesAfterClose) {
+                        entered.countDown();
+                        try { release.await(); } catch(InterruptedException cancelled) { Thread.currentThread().interrupt(); }
+                    }
+                    throw new TapstateException(io.tapstate.spi.store.IoError.STORE_UNAVAILABLE,Map.of("detail","isolated-result-outage"),null);
+                }
+                try{return method.invoke(store,args);}catch(java.lang.reflect.InvocationTargetException failure){throw failure.getCause();}
+            });
+            var channels=new Channels(unavailable);
+            if(finishesAfterClose) channels.answer=request->{
+                entered.countDown();boolean interrupted=false;
+                while(true)try{release.await();break;}catch(InterruptedException cancelled){interrupted=true;}
+                if(interrupted)Thread.currentThread().interrupt();
+                return accepted();
+            };
+            var identities=ids(f);var worker=runtime(f,unavailable,channels,"closing-results");
+            try {
+                worker.tick();await().atMost(Duration.ofSeconds(5)).until(()->entered.getCount()==0);
+                worker.close();if(finishesAfterClose)release.countDown();
+                await().atMost(Duration.ofSeconds(2)).untilAsserted(()->assertThat(worker.occupied()).isZero());
+                assertThat(channels.calls).hasValue(2);
+                for(var identity:identities)assertThat(store.intent(identity,null).orElseThrow().value().state().attempts())
+                        .singleElement().satisfies(attempt->assertThat(attempt.endedAt()).isNull());
+                f.now().set(T.plusSeconds(1));
+                try(var replacement=runtime(f,store,channels,"replacement-results")){replacement.tick();settled(replacement);}
+                assertThat(channels.calls).hasValue(2);
+            } finally { release.countDown();worker.close(); }
+        });
+    }
+    @Test void anActiveWorkerRetainsAndRetriesAPendingResultWithoutResending() {
+        AlertEvaluationHostIT.withFixture(f->{seed(f);var store=sendingStore(f);var unavailable=new AtomicBoolean(true);
+            var interrupted=(AlertStore)java.lang.reflect.Proxy.newProxyInstance(AlertStore.class.getClassLoader(),new Class<?>[]{AlertStore.class},(proxy,method,args)->{
+                if(method.getName().equals("commit") && ((AlertStore.Commit)args[0]).kind()==AlertStore.CommitKind.RESULT && unavailable.get())
+                    throw new TapstateException(io.tapstate.spi.store.IoError.STORE_UNAVAILABLE,Map.of("detail","isolated-result-outage"),null);
+                try{return method.invoke(store,args);}catch(java.lang.reflect.InvocationTargetException failure){throw failure.getCause();}
+            });
+            var channels=new Channels(interrupted);
+            try(var worker=runtime(f,interrupted,channels,"retry-results")) {
+                worker.tick();await().atMost(Duration.ofSeconds(5)).until(()->channels.calls.get()==2 && worker.failure()!=null && worker.occupied()==2);
+                unavailable.set(false);worker.tick();settled(worker);
+                assertThat(channels.calls).hasValue(2);
+                for(var identity:ids(f))assertThat(store.intent(identity,null).orElseThrow().value().state().summary()).isEqualTo(DeliveryEvidence.Outcome.ACCEPTED);
+            }
+        });
+    }
     @Test void aCommittedPermitPrecedesEveryCallAndReopenNeverResendsAccepted(){
         AlertEvaluationHostIT.withFixture(f->{seed(f);var store=sendingStore(f);var channels=new Channels(store);var ids=ids(f);
             try(var a=runtime(f,store,channels,"worker-a")){a.tick();settled(a);assertThat(channels.calls).hasValue(2);}

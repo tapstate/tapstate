@@ -145,8 +145,9 @@ class NativeBusinessCandidateLifecycleIT {
                     configuration.firstAdmin().create(configuration.firstAdmin().load().orElseThrow().scope(),new User("admin",new BCryptPasswordHasher().hash("candidate-password"),"admin"));
                 }
                 var original=fingerprints(observer.getDatabase(configName));
+                var configDatabase=observer.getDatabase(configName);
+                int auditedBefore=beginKeyWriteAudit(configDatabase);
                 var admin=observer.getDatabase("admin");
-                long originalKeyWrites=armKeyWrites(admin,configName);
                 try (var application=new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated())
                         .initializers(context -> {
                             var definition=new RootBeanDefinition(StorageBusinessFactory.class,() -> (StorageBusinessFactory)bound ->
@@ -177,20 +178,32 @@ class NativeBusinessCandidateLifecycleIT {
                         var member=child.getBean(HazelcastInstance.class); var node=child.getBean(NodeSessionLease.class);
                         var exact=node.currentFence().orElseThrow();
                         var claims=retained.cache().workloadClaims(retained.preparation().businessScope());
-                        var before=claims.read(exact.key()).orElseThrow(); assertThat(before.leased()).isTrue();
-                        assertThat(WorkloadClaimFence.from(before.claim())).isEqualTo(exact);
-                        factory.failed.forEach(candidate -> candidate.nativeOwner.close());
-                        factory.failed.forEach(Candidate::assertStopped);
-                        await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
-                            var live=claims.read(exact.key()).orElseThrow();
-                            assertThat(live.leased()).isTrue(); assertThat(WorkloadClaimFence.from(live.claim())).isEqualTo(exact);
-                            assertThat(live.claim().leaseUntil()).isAfter(before.claim().leaseUntil());
-                        });
-                        assertThat(child.isActive()).isTrue(); assertThat(member.getLifecycleService().isRunning()).isTrue();
-                        assertThat(node.currentFence()).contains(exact); assertThat(root.runtime().current()).contains(retained);
-                        retained.cache().verifyBusinessReady(retained.preparation().businessScope());
-                        root.loadExisting(bound -> { throw new AssertionError("a published successor cannot assemble again"); });
-                        assertThat(factory.calls.get()).isEqualTo(4);
+                        await().atMost(Duration.ofSeconds(15)).until(() ->
+                                SystemCollections.ALERT_NODE_LIFECYCLES.on(configDatabase).countDocuments(new Document("nodeId",exact.owner().nodeId())
+                                        .append("bootId",exact.owner().bootId()).append("phase","EXPECTED"))==1);
+                        await().atMost(Duration.ofSeconds(15)).until(() -> successor.alertHealth()
+                                .map(health -> health.maintenance().get("lastSuccess")!=null).orElse(false));
+                        var admittedKey=SystemCollections.CLUSTER_KEYS.on(configDatabase).find().first();
+                        long originalKeyWrites=armKeyWrites(admin,configName);
+                        try {
+                            var before=claims.read(exact.key()).orElseThrow(); assertThat(before.leased()).isTrue();
+                            assertThat(WorkloadClaimFence.from(before.claim())).isEqualTo(exact);
+                            factory.failed.forEach(candidate -> candidate.nativeOwner.close());
+                            factory.failed.forEach(Candidate::assertStopped);
+                            await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+                                var live=claims.read(exact.key()).orElseThrow();
+                                assertThat(live.leased()).isTrue(); assertThat(WorkloadClaimFence.from(live.claim())).isEqualTo(exact);
+                                assertThat(live.claim().leaseUntil()).isAfter(before.claim().leaseUntil());
+                            });
+                            assertThat(child.isActive()).isTrue(); assertThat(member.getLifecycleService().isRunning()).isTrue();
+                            assertThat(node.currentFence()).contains(exact); assertThat(root.runtime().current()).contains(retained);
+                            retained.cache().verifyBusinessReady(retained.preparation().businessScope());
+                            root.loadExisting(bound -> { throw new AssertionError("a published successor cannot assemble again"); });
+                            assertThat(factory.calls.get()).isEqualTo(4);
+                            assertThat(SystemCollections.CLUSTER_KEYS.on(configDatabase).find().first()).isEqualTo(admittedKey);
+                        } finally {
+                            assertThat(keyWritesOff(admin)).as("ordinary CACHE renewal and stale-owner cleanup never write CONFIG keys").isEqualTo(originalKeyWrites);
+                        }
                     }
                     int port=((WebServerApplicationContext)application).getWebServer().getPort();
                     var http=org.springframework.web.client.RestClient.create("http://127.0.0.1:"+port);
@@ -203,11 +216,8 @@ class NativeBusinessCandidateLifecycleIT {
                     assertThat(factory.calls.get()).isEqualTo(unknownCleanup ? 1 : 4);
                     assertThat(fingerprints(observer.getDatabase(configName))).isEqualTo(original);
                 } finally {
-                    try { factory.failed.forEach(candidate -> candidate.nativeOwner.close()); }
-                    finally {
-                        long observed=keyWritesOff(admin);
-                        assertThat(observed).as("pre-join, failed startup, ordinary renewal and all cleanup leave the existing key untouched").isEqualTo(originalKeyWrites);
-                    }
+                    factory.failed.forEach(candidate -> candidate.nativeOwner.close());
+                    finishKeyWriteAudit(configDatabase,auditedBefore);
                 }
                 long positive=armKeyWrites(admin,configName);
                 try {
@@ -218,6 +228,39 @@ class NativeBusinessCandidateLifecycleIT {
                 } finally { assertThat(keyWritesOff(admin)).isEqualTo(positive+1); }
                 assertThat(fingerprints(observer.getDatabase(configName))).isEqualTo(original);
             } finally { observer.getDatabase(configName).drop(); observer.getDatabase(cacheName).drop(); observer.getDatabase(masterName).drop(); }
+        }
+    }
+
+    private static List<Document> keyWriteAudit(MongoDatabase database) {
+        return database.getCollection("system.profile").find(new Document("ns",database.getName()+".cluster_keys")
+                .append("op",new Document("$in",List.of("update","insert","remove","command"))))
+                .sort(new Document("$natural",1)).into(new ArrayList<>());
+    }
+    private static int beginKeyWriteAudit(MongoDatabase database) {
+        database.createCollection("system.profile",new com.mongodb.client.model.CreateCollectionOptions().capped(true).sizeInBytes(8L*1024*1024));
+        database.runCommand(new Document("profile",2).append("filter",new Document("ns",database.getName()+".cluster_keys")));
+        var key=SystemCollections.CLUSTER_KEYS.on(database).find().first();
+        assertThat(SystemCollections.CLUSTER_KEYS.on(database).updateOne(new Document("_id",key.get("_id")),
+                new Document("$set",new Document("keyId",key.get("keyId")))).getModifiedCount()).isZero();
+        var observed=keyWriteAudit(database);
+        assertThat(observed).singleElement().satisfies(row -> assertThat(row.get("command",Document.class).get("u",Document.class))
+                .isEqualTo(new Document("$set",new Document("keyId",key.get("keyId")))));
+        return observed.size();
+    }
+    private static void finishKeyWriteAudit(MongoDatabase database,int before) {
+        database.runCommand(new Document("profile",0));
+        var rows=keyWriteAudit(database);
+        assertThat(rows.size()).as("the bounded profiler retained its original positive control").isGreaterThanOrEqualTo(before);
+        var current=SystemCollections.CLUSTER_KEYS.on(database).find().first();
+        assertThat(rows.getFirst().get("command",Document.class).get("u",Document.class))
+                .as("the no-op positive control was not evicted from the profiler")
+                .isEqualTo(new Document("$set",new Document("keyId",current.get("keyId"))));
+        for(var row:rows.subList(before,rows.size())) {
+            assertThat(row.getString("op")).isEqualTo("update");
+            var command=row.get("command",Document.class);
+            assertThat(command.get("q",Document.class)).isEqualTo(new Document("_id",current.get("_id")).append("keyId",current.get("keyId")));
+            assertThat(command.get("u",Document.class)).isEqualTo(new Document("$inc",new Document("sourceWriteFence",1L)));
+            assertThat(command.getBoolean("multi",false)).isFalse();assertThat(command.getBoolean("upsert",false)).isFalse();
         }
     }
 
@@ -235,6 +278,9 @@ class NativeBusinessCandidateLifecycleIT {
         for (var collection:List.of(SystemCollections.CLUSTER_KEYS,SystemCollections.SOURCES,SystemCollections.STORAGE_BINDING,
                 SystemCollections.STORAGE_SETUP,SystemCollections.OP_BOOTSTRAP)) {
             var rows=collection.on(database).find().sort(new Document("_id",1)).into(new ArrayList<>());
+            // Monitoring enrollment and retirement may increment only this already-authorized fence.
+            // Every key identity/material field and every other original row remain byte-for-byte stable.
+            if(collection==SystemCollections.CLUSTER_KEYS) rows.forEach(row -> row.remove("sourceWriteFence"));
             result.put(collection.collectionName(),CanonicalHash.ofText(rows.stream().map(Document::toJson).toList().toString()));
         }
         return result;

@@ -120,7 +120,12 @@ final class AlertDeliveryRuntime implements AutoCloseable {
             pending.put(key,receipt);persist(receipt);
         }catch(InterruptedException cancelled){Thread.currentThread().interrupt();}
         catch(TapstateException unavailable){failure=new Failure(unavailable.code().code(),Map.of("phase","dispatch"));}
-        finally{inflight.remove(key);release(identity);}
+        finally{
+            // A stopped worker cannot retry memory-only receipts. The durable original permit remains
+            // authoritative for replacement workers, including orphan reconciliation after its deadline.
+            if(closed.get())pending.remove(key);
+            inflight.remove(key);release(identity);
+        }
     }
     private void persist(Pending pendingResult){
         var id=pendingResult.identity();
@@ -152,5 +157,5 @@ final class AlertDeliveryRuntime implements AutoCloseable {
     private synchronized void release(AlertIntent.Identity id){running.remove(id.deliveryId());byChannel.computeIfPresent(id.channelType(),(k,v)->v==1?null:v-1);}
     Failure failure(){return failure;}
     int occupied(){return running.size()+pending.size();}
-    @Override public synchronized void close(){if(closed.compareAndSet(false,true)){timer.shutdownNow();calls.values().forEach(NotificationChannel::close);pool.shutdownNow();channels.close();}}
+    @Override public synchronized void close(){if(closed.compareAndSet(false,true)){timer.shutdownNow();calls.values().forEach(NotificationChannel::close);pending.clear();pool.shutdownNow();channels.close();}}
 }

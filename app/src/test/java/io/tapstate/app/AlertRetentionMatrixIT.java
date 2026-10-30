@@ -17,7 +17,13 @@ import static io.tapstate.app.AlertNotificationPlannerIT.*;
 @RequiresDocker
 class AlertRetentionMatrixIT {
     @org.testcontainers.junit.jupiter.Container static final org.testcontainers.containers.MongoDBContainer MONGO=AlertEvaluationHostIT.MONGO;
-    static Stream<Arguments> outcomes(){return Stream.of(false,true).flatMap(cloud->Stream.of("accepted","rejected","unknown","retry").map(outcome->Arguments.of(cloud,outcome)));}
+    static Stream<Arguments> outcomes() {
+        return Stream.of(
+                Arguments.of(false, "accepted"), Arguments.of(false, "rejected"),
+                Arguments.of(false, "unknown"), Arguments.of(false, "retry"),
+                Arguments.of(true, "accepted"), Arguments.of(true, "rejected"),
+                Arguments.of(true, "unknown"), Arguments.of(true, "retry"));
+    }
     @ParameterizedTest @MethodSource("outcomes")
     void payloadAndResultWindowsRemainFrozenAndNeverDeleteTheActiveEpisode(boolean cloud,String outcome){
         AlertEvaluationHostIT.withFixture(false,cloud,f->{
