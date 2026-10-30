@@ -70,10 +70,19 @@ final class ClusterFixtureTiming {
                 if (id == 0) { scope.valid = false; return; }
                 if (scope.parameters.containsKey(id)) return;
                 MessageDigest digest = MessageDigest.getInstance("SHA-256");
-                List<String> values = new ArrayList<>(List.of(store, operator, listen));
+                List<String> values = new ArrayList<>();
+                values.add(java.util.Objects.requireNonNull(store));
+                values.add(operator);
+                values.add(java.util.Objects.requireNonNull(listen));
                 values.addAll(options);
                 values.addAll(arguments);
                 for (String value : values) {
+                    // Native configuration has no operator database. Tag absence separately from every
+                    // literal value while retaining the existing framing for non-null arguments.
+                    if (value == null) {
+                        digest.update(new byte[] {-1, -1, -1, -1});
+                        continue;
+                    }
                     byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
                     digest.update(new byte[] {(byte)(bytes.length >>> 24), (byte)(bytes.length >>> 16),
                             (byte)(bytes.length >>> 8), (byte)bytes.length});
