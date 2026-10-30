@@ -8,6 +8,7 @@ import com.hazelcast.jet.core.Watermark;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.PayloadBytes;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.Staged;
@@ -18,6 +19,7 @@ import io.tapstate.runtime.engine.SettledPositions;
 
 import java.time.Duration;
 import java.util.ArrayDeque;
+import java.util.Collection;
 import java.util.Deque;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -71,6 +73,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
      */
     private final Map<String, NestStore<Map<String, Object>>> referenced;
     private final NestStore<RootAssembly> store;
+    private boolean snapshotRootsHaveHistory;
     private final String outputStream;
     private final Deque<Object> outgoing = new ArrayDeque<>();
     private final LevelBounds bounds;
@@ -117,6 +120,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
     // and the first touch consumes a remembered absence. Eviction and restart read durable state again.
     private final LinkedHashMap<Object, ReferenceState> recentReferenceStates = new LinkedHashMap<>(64, 0.75f, true);
     private static final int MAX_RECENT_REFERENCE_STATES = 4_096;
+    private static final int MAX_SNAPSHOT_LOOKAHEAD = 4_096;
 
     /**
      * Keys keeping the record of a deletion, which is where the sweep that drops them has to look. Kept for
@@ -630,8 +634,13 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         }
         NestInbound edge = vertex.inbound().get(ordinal);
         Map<Object, Touched> touched = new LinkedHashMap<>();
+        boolean snapshotWaves = canUseSnapshotWaves(edge);
         try {
             for (Object item; (item = inbox.peek()) != null; ) {
+                if (snapshotWaves && !snapshotRootsHaveHistory && touched.isEmpty() && processFreshSnapshotWave(inbox)) {
+                    if (!flush()) return;
+                    continue;
+                }
                 handle(edge, item, touched);
                 inbox.remove();
                 // Under append every change is a record of its own, so a drain may not be merged into one
@@ -665,6 +674,133 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         // else is coming for.
         collectWhatIsOwed();
         sendWhatWindowsHaveRunOutOn();
+    }
+
+    private boolean referenceOnlyRootShape() {
+        return vertex.pathId().isEmpty() && !slots.isEmpty()
+                && slots.stream().allMatch(slot -> slot.isReference()
+                        && slot.as() == io.tapstate.core.model.EmbedAs.OBJECT && slot.children().isEmpty());
+    }
+
+    private boolean canUseSnapshotWaves(NestInbound edge) {
+        if (snapshotRootsHaveHistory || !referenceOnlyRootShape() || edge.isCascade() || !edge.pathId().isEmpty()
+                || edge.carriesTouches() || edge.carriesDepartures() || edge.tracksKeyChanges()) return false;
+        return true;
+    }
+
+    private boolean snapshotKeysAreDistinct(Inbox inbox, Set<Object> candidates) {
+        Set<Object> seen = new LinkedHashSet<>();
+        int examined = 0;
+        for (Object item : inbox) {
+            // A wider inbox uses the ordinary bounded folding drain instead of quadratic lookahead.
+            if (++examined > MAX_SNAPSHOT_LOOKAHEAD) return false;
+            if (!(item instanceof Envelope event) || event.op() != io.tapstate.core.event.Op.READ) return false;
+            try {
+                Object key = NestKeys.valuesOf(NestKeys.rowOf(event), vertex.partitionKey(), vertex.mapName());
+                if (candidates.contains(key) && !seen.add(key)) return false;
+            } catch (TapstateException invalidRow) {
+                // The ordinary path reports a malformed row at its original point in the drain.
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private Map<Object, Envelope> nextSnapshotRoots(Inbox inbox) {
+        Map<Object, Envelope> rows = new LinkedHashMap<>();
+        long bytes = 0;
+        for (Object item : inbox) {
+            if (!(item instanceof Envelope event) || event.op() != io.tapstate.core.event.Op.READ
+                    || rows.size() == RootWrites.KEYS) break;
+            Object key = NestKeys.valuesOf(NestKeys.rowOf(event), vertex.partitionKey(), vertex.mapName());
+            if (rows.containsKey(key)) break;
+            long weight = PayloadBytes.of(event);
+            if (!rows.isEmpty() && weight > RootWrites.BYTES - bytes) break;
+            rows.put(key, event);
+            bytes += weight;
+        }
+        return rows;
+    }
+
+    /** Distinct first snapshot roots may share I/O without merging any version of one key. */
+    private boolean processFreshSnapshotWave(Inbox inbox) {
+        Map<Object, Envelope> rows = nextSnapshotRoots(inbox);
+        if (rows.size() < 2) return false;
+        if (sending.foldingAllowed() && !snapshotKeysAreDistinct(inbox, rows.keySet())) return false;
+        Set<Object> unknown = new LinkedHashSet<>(rows.keySet());
+        unknown.removeIf(key -> recentReferenceStates.get(key) == ReferenceState.ABSENT);
+        if (!unknown.isEmpty() && !store.loadAll(unknown).isEmpty()) {
+            snapshotRootsHaveHistory = true;
+            return false;
+        }
+        if (sending.foldingAllowed()) {
+            // A folding drain already resolves its references together. Keep that property while
+            // reducing the existing drain's key bound from 256 to 16; append still probes incrementally
+            // below so a wide reference cannot multiply the values retained behind backpressure.
+            Map<Object, Touched> wave = new LinkedHashMap<>();
+            rows.forEach((key, event) -> {
+                RootAssembly assembly = new RootAssembly();
+                assembly.applyRoot(NestKeys.rowOf(event), NestKeys.orderOf(event), event.positions());
+                Touched document = new Touched(assembly, true);
+                document.ts = event.ts();
+                document.inputBytes = PayloadBytes.of(event);
+                wave.put(key, document);
+                recentReferenceStates.remove(key);
+            });
+            settle(wave);
+            removeAcknowledgedSnapshotRows(inbox, rows.values());
+            return true;
+        }
+        Map<Object, Touched> wave = new LinkedHashMap<>();
+        List<Envelope> admitted = new java.util.ArrayList<>();
+        Map<String, Map<Object, Map<String, Object>>> snapshots = new LinkedHashMap<>();
+        Map<String, Set<Object>> inspected = new LinkedHashMap<>();
+        long retainedBytes = 0;
+        for (var entry : rows.entrySet()) {
+            Envelope event = entry.getValue();
+            RootAssembly assembly = new RootAssembly();
+            assembly.applyRoot(NestKeys.rowOf(event), NestKeys.orderOf(event), event.positions());
+            readSnapshotReferences(assembly, snapshots, inspected);
+            long renderedBytes = assembly.render(slots, snapshots).map(rendered -> PayloadBytes.of(
+                    Envelope.insert(event.ts(), outputStream, rendered, null).withPositions(assembly.covered())
+                            .withRemoved(assembly.embedsNotRendered(slots, rendered)))).orElse(0L);
+            long weight = Math.max(PayloadBytes.of(event), renderedBytes);
+            if (!wave.isEmpty() && weight > RootWrites.BYTES - retainedBytes) break;
+            Touched document = new Touched(assembly, true);
+            document.ts = event.ts();
+            document.inputBytes = PayloadBytes.of(event);
+            wave.put(entry.getKey(), document);
+            recentReferenceStates.remove(entry.getKey());
+            admitted.add(event);
+            retainedBytes += weight;
+            if (retainedBytes >= RootWrites.BYTES) break;
+        }
+        // Reuse exactly the reference snapshots weighed above; a concurrent edit is handled by its
+        // existing wake, rather than replacing a small admitted row with a wide one during settlement.
+        settle(wave, false, false, snapshots);
+        removeAcknowledgedSnapshotRows(inbox, admitted);
+        return true;
+    }
+
+    private static void removeAcknowledgedSnapshotRows(Inbox inbox, Collection<Envelope> admitted) {
+        for (Envelope event : admitted) {
+            if (inbox.peek() != event) throw new IllegalStateException("snapshot roots changed before acknowledgement");
+            inbox.remove();
+        }
+    }
+
+    private void readSnapshotReferences(RootAssembly assembly,
+            Map<String, Map<Object, Map<String, Object>>> snapshots, Map<String, Set<Object>> inspected) {
+        assembly.referencesNeeded(slots).forEach((namespace, keys) -> {
+            Set<Object> seen = inspected.computeIfAbsent(namespace, ignored -> new LinkedHashSet<>());
+            Set<Object> unread = new LinkedHashSet<>(keys);
+            unread.removeAll(seen);
+            if (!unread.isEmpty()) {
+                snapshots.computeIfAbsent(namespace, ignored -> new LinkedHashMap<>())
+                        .putAll(storeOf(namespace).loadAll(unread));
+                seen.addAll(unread);
+            }
+        });
     }
 
     /**
@@ -919,6 +1055,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
             return;
         }
         Touched document = touched(key, touched);
+        document.inputBytes = Math.max(document.inputBytes, PayloadBytes.of(event));
         document.ts = event.ts();
         if (NestKeys.isDeletion(event)) {
             document.assembly.deleteRoot(order, event.positions());
@@ -1232,13 +1369,25 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
     }
 
     private void settle(Map<Object, Touched> touched, boolean allowMissingReferences, boolean allowMissingObjects) {
-        Map<String, Map<Object, Map<String, Object>>> resolved = resolveReferences(touched);
+        settle(touched, allowMissingReferences, allowMissingObjects, null);
+    }
+
+    private void settle(Map<Object, Touched> touched, boolean allowMissingReferences, boolean allowMissingObjects,
+            Map<String, Map<Object, Map<String, Object>>> snapshots) {
+        Map<String, Map<Object, Map<String, Object>>> resolved = snapshots == null ? resolveReferences(touched) : snapshots;
+        RootWrites writes = new RootWrites();
         touched.forEach((key, document) -> {
+            document.emissionBytes = -1;
             recentReferenceStates.remove(key);
             document.assembly.reconcileMissingObjects(slots);
             document.assembly.render(slots, resolved).ifPresentOrElse(
                     rendered -> {
                         deleted.remove(key);
+                        Envelope emission = Envelope.insert(document.ts, outputStream, rendered, null)
+                                .withPositions(document.assembly.covered())
+                                .withRemoved(document.assembly.embedsNotRendered(slots, rendered));
+                        // Waiting roots still replace independent state, without releasing their positions.
+                        writes.weigh(document, emission);
                         if (isOwedAHandOver(key)) {
                             return;
                         }
@@ -1251,13 +1400,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
                         stopWaitingForReference(key);
                         Map<String, ChainPosition> unsent = document.assembly.lowestUnsentByChain();
                         if (mayGoOutNow(key, unsent)) {
-                            outgoing.add(Envelope.insert(document.ts, outputStream, rendered, null)
-                                    .withPositions(document.assembly.covered())
-                                    // Said out loud, because a field that stopped being rendered and a
-                                    // field this tree never had are the same document downstream - and a
-                                    // target applies one by setting what is in it, so what is gone from it
-                                    // stays there at its last value unless the emission names it.
-                                    .withRemoved(document.assembly.embedsNotRendered(slots, rendered)));
+                            outgoing.add(emission);
                             document.assembly.rememberMissingObjects(slots, resolved);
                             documentSent(key, document.assembly);
                         } else {
@@ -1277,19 +1420,72 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
                             stopWaitingForReference(key);
                         }
                     });
-            store.save(key, document.assembly, document.heldNothing);
-            refuseToLetOneDocumentGrowPastItsWidth(key, document.assembly);
-            long pending = document.assembly.pending();
-            // Reported before it is weighed, so that the count that stopped the run is the one on record
-            // rather than the last one that was allowed.
-            store.holding(pending);
-            NestLimits.refuse(vertex, key, pending, pendingLimit);
-            if (refuseToKeepMoreDeletionsThanAllowed(key, document.assembly) > 0) {
-                keeping.add(key);
+            if (writes.canGroup(document)) {
+                writes.add(key, document);
             } else {
-                keeping.remove(key);
+                writes.flush();
+                store.save(key, document.assembly, document.heldNothing);
+                weighStoredRoot(key, document);
             }
         });
+        writes.flush();
+    }
+
+    private void weighStoredRoot(Object key, Touched document) {
+        refuseToLetOneDocumentGrowPastItsWidth(key, document.assembly);
+        long pending = document.assembly.pending();
+        // Report the violating reading before refusing it, as on the individual write path.
+        store.holding(pending);
+        NestLimits.refuse(vertex, key, pending, pendingLimit);
+        if (refuseToKeepMoreDeletionsThanAllowed(key, document.assembly) > 0) keeping.add(key);
+        else keeping.remove(key);
+    }
+
+    /** Independent reference-only roots with no owned subtree share bounded replacement waves. */
+    private final class RootWrites {
+        private static final int KEYS = 16;
+        private static final long BYTES = 8L * 1024 * 1024;
+        private final Map<Object, Touched> pending = new LinkedHashMap<>();
+        private final boolean referenceOnly = referenceOnlyRootShape();
+        private long bytes;
+
+        void weigh(Touched document, Envelope emission) {
+            if (referenceOnly) document.emissionBytes = Math.max(document.assembly.rootPayloadBytes(),
+                    Math.max(document.inputBytes, PayloadBytes.of(emission)));
+        }
+
+        boolean canGroup(Touched document) {
+            return referenceOnly && !document.rootDeleted
+                    && document.emissionBytes >= 0 && document.emissionBytes <= BYTES
+                    && document.assembly.pending() == 0 && document.assembly.tombstones() == 0
+                    && document.assembly.elements() <= elementLimit;
+        }
+
+        void add(Object key, Touched document) {
+            if (!pending.isEmpty() && (pending.size() == KEYS || document.emissionBytes > BYTES - bytes)) flush();
+            pending.put(key, document);
+            bytes += document.emissionBytes;
+        }
+
+        void flush() {
+            if (pending.isEmpty()) return;
+            if (pending.size() == 1) {
+                var only = pending.entrySet().iterator().next();
+                store.save(only.getKey(), only.getValue().assembly, only.getValue().heldNothing);
+            } else {
+                Map<Object, RootAssembly> states = new LinkedHashMap<>();
+                Set<Object> firstFilings = new LinkedHashSet<>();
+                pending.forEach((key, document) -> {
+                    states.put(key, document.assembly);
+                    if (document.heldNothing) firstFilings.add(key);
+                });
+                // Outputs remain queued until the whole acknowledged replacement wave succeeds.
+                store.saveAll(states, firstFilings);
+            }
+            pending.forEach(AssemblerProcessor.this::weighStoredRoot);
+            pending.clear();
+            bytes = 0;
+        }
     }
 
     /**
@@ -1461,6 +1657,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         }
         long now = clock.millis();
         boolean letGo = false;
+        RootWrites writes = new RootWrites();
         Iterator<Map.Entry<Object, Window>> open = windows.entrySet().iterator();
         while (open.hasNext()) {
             Map.Entry<Object, Window> entry = open.next();
@@ -1512,18 +1709,27 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
                 continue;
             }
             stopWaitingForReference(entry.getKey());
-            outgoing.add(Envelope.insert(window.ts, outputStream, rendered.get(), null)
+            Envelope emission = Envelope.insert(window.ts, outputStream, rendered.get(), null)
                     .withPositions(assembly.covered())
                     // As on the drain's own path. A document released by the window is the same document
                     // and needs the same saying-so - and this is the path a deployment with a window open
                     // sends most of them on, so leaving it out would fix nothing where it matters.
-                    .withRemoved(assembly.embedsNotRendered(slots, rendered.get())));
+                    .withRemoved(assembly.embedsNotRendered(slots, rendered.get()));
+            outgoing.add(emission);
             assembly.rememberMissingObjects(slots, references);
             documentSent(entry.getKey(), assembly);
-            store.save(entry.getKey(), assembly);
+            Touched document = new Touched(assembly, false);
+            writes.weigh(document, emission);
+            if (writes.canGroup(document)) {
+                writes.add(entry.getKey(), document);
+            } else {
+                writes.flush();
+                store.save(entry.getKey(), assembly);
+            }
             window.reopen(now);
             letGo = true;
         }
+        writes.flush();
         if (!flush()) {
             return false;
         }
@@ -1727,6 +1933,8 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         private final boolean heldNothing;
 
         private boolean rootDeleted;
+        private long emissionBytes = -1;
+        private long inputBytes = -1;
         private long ts;
 
         private Touched(RootAssembly assembly, boolean heldNothing) {

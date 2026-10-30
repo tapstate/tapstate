@@ -181,11 +181,11 @@ class NestStateMapGatesTest {
     }
 
     @Test
-    @DisplayName("bounded lookup-row replacement batches stay behind the state-map adapter")
+    @DisplayName("bounded independent replacement batches stay behind the state-map adapter")
     void namedReplacementBatchesAreConfinedToTheStateStore() {
         BOUNDED_WRITE_MECHANISMS.forEach((mechanism, detects) -> {
             assertThat(accesses(productionClasses, detects, NEST))
-                    .as("%s may replace only a bounded caller-supplied set of independent lookup rows", mechanism)
+                    .as("%s may replace only a bounded caller-supplied set of independent state keys", mechanism)
                     .isNotEmpty()
                     .allMatch(access -> access.startsWith(THE_STORE_BEHIND_EVERY_NAMESPACE + " ->"));
         });
@@ -193,7 +193,7 @@ class NestStateMapGatesTest {
                 .filter(access -> access.getName().equals("saveAll")
                         && access.getTargetOwner().getName().equals(NEST + "NestStore"))
                 .map(access -> access.getOriginOwner().getName()).toList())
-                .isNotEmpty().containsOnly(NEST + "LookupProcessor");
+                .isNotEmpty().containsOnly(NEST + "LookupProcessor", NEST + "AssemblerProcessor$RootWrites");
     }
 
     @Test
@@ -294,7 +294,7 @@ class NestStateMapGatesTest {
         return Map.copyOf(mechanisms);
     }
 
-    /** Flat lookup rows have bounded named batches; assembled documents keep their carried writes. */
+    /** Independent replacements have bounded named batches; owned subtree handovers keep carried writes. */
     private static Map<String, Predicate<JavaAccess<?>>> boundedWriteMechanisms() {
         Map<String, Predicate<JavaAccess<?>>> mechanisms = new LinkedHashMap<>();
         named(mechanisms, "replacing a handed-in set of independent keys", "setAll");

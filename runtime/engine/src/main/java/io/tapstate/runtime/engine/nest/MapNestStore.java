@@ -158,7 +158,7 @@ final class MapNestStore<S> implements NestStore<S> {
         publishReading();
     }
 
-    /** Lookup rows have distinct keys and are small independent values, never assembled documents. */
+    /** Callers bound independent replacement waves; owned subtree handovers keep their carried writes. */
     @Override
     public void saveAll(Map<Object, S> states, Set<Object> firstFilings) {
         if (states.isEmpty()) return;
