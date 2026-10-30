@@ -17,7 +17,6 @@ import java.sql.Statement;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -80,9 +79,6 @@ class RealMysqlToMongoViewIndexIT {
             SharedMySql.grantReplication(mysql);
             seedMysqlOrders(mysql, SEEDED_ROWS);
 
-            String suffix = tier.name().toLowerCase(Locale.ROOT);
-            String targetUri = SharedMongo.replicaSetUrl("real_view_target_" + suffix);
-
             try (PreparedNativeStore storage = PreparedNativeStore.create(); ServerHandle server = tier.launch(storage);
                     MongoEndpoints mongo = new MongoEndpoints()) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
@@ -94,16 +90,13 @@ class RealMysqlToMongoViewIndexIT {
                 Map<String, Object> mysqlConfig = mysqlConfig(mysql);
                 Map<String, String> resources = new LinkedHashMap<>();
                 resources.put("src_mysql.tap.yml", sourceYaml(mysqlConfig));
-                // The store a view lands in is the deployment's rather than the pipeline's, so it is
-                // registered under the id the product resolves for every view - the pipeline never names it.
-                resources.put("views.tap.yml", stateStoreYaml(targetUri));
                 resources.put("pipeline.tap.yml", pipelineYaml());
                 control.apply(resources);
 
                 control.discoverSchema("src_mysql", "mysql", mysqlConfig);
                 control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
 
-                EndpointAddress target = EndpointAddress.uri(targetUri);
+                EndpointAddress target = EndpointAddress.uri(storage.masterUri());
                 awaitCount(mongo, target, VIEW_ID, SEEDED_ROWS);
 
                 List<Document> indexes = mongo.indexes(target, VIEW_ID);
@@ -193,17 +186,6 @@ class RealMysqlToMongoViewIndexIT {
                         config.get("database"),
                         config.get("username"),
                         config.get("password"));
-    }
-
-    private static String stateStoreYaml(String targetUri) {
-        return """
-                version: tapstate/v1
-                kind: source
-                id: views
-                connector: mongodb
-                config: { uri: "%s" }
-                """
-                .formatted(targetUri);
     }
 
     private static String pipelineYaml() {
