@@ -61,6 +61,7 @@ public final class MongoConnection implements AutoCloseable {
     /** The database used when the connection URI names none. */
     private static final String DEFAULT_DATABASE = "tapstate";
     private static final String PROBE_VALUE_FIELD = "value";
+    private static final String PROBE_INITIAL_VALUE = "initial";
 
     /** The longest application name the driver sends, in UTF-8 bytes. */
     private static final int MAX_APPLICATION_NAME_BYTES = 128;
@@ -163,9 +164,7 @@ public final class MongoConnection implements AutoCloseable {
     public void verifyDeploymentDatabases(List<String> databases) {
         Objects.requireNonNull(databases, "databases");
         for (String database : databases) {
-            if (!MongoDatabaseNames.isValid(database)) {
-                throw new IllegalArgumentException("a deployment database name is invalid");
-            }
+            requireValidDeploymentDatabase(database);
             UUID probeId = UUID.randomUUID();
             String id = probeId.toString();
             var collection = SystemCollections.accessProbeOn(client().getDatabase(database), probeId);
@@ -174,9 +173,9 @@ public final class MongoConnection implements AutoCloseable {
                         .writeConcern(WriteConcern.MAJORITY.withJournal(true))
                         .timeout(Math.max(1L, settings.serverSelectionTimeout().toMillis()), TimeUnit.MILLISECONDS).build());
                 try {
-                    collection.insertOne(session, new Document("_id", id).append(PROBE_VALUE_FIELD, "initial"));
+                    collection.insertOne(session, new Document("_id", id).append(PROBE_VALUE_FIELD, PROBE_INITIAL_VALUE));
                     Document read = collection.find(session, new Document("_id", id)).first();
-                    if (read == null || !"initial".equals(read.getString(PROBE_VALUE_FIELD))
+                    if (read == null || !PROBE_INITIAL_VALUE.equals(read.getString(PROBE_VALUE_FIELD))
                             || collection.updateOne(session, new Document("_id", id),
                                     new Document("$set", new Document(PROBE_VALUE_FIELD, "updated"))).getModifiedCount() != 1
                             || collection.deleteOne(session, new Document("_id", id)).getDeletedCount() != 1) {
@@ -193,6 +192,12 @@ public final class MongoConnection implements AutoCloseable {
                 // Driver messages can contain credentials. Only the already validated database name travels out.
                 throw new TapstateException(StoreError.DATABASE_ACCESS_FAILED, Map.of("database", database), null);
             }
+        }
+    }
+
+    private static void requireValidDeploymentDatabase(String database) {
+        if (!MongoDatabaseNames.isValid(database)) {
+            throw new IllegalArgumentException("a deployment database name is invalid");
         }
     }
 
@@ -213,9 +218,9 @@ public final class MongoConnection implements AutoCloseable {
                 // Preserve URI policy on the probe handle while omitting per-command concern for DDL.
                 collection.withWriteConcern(WriteConcern.ACKNOWLEDGED).createIndex(session, new Document(PROBE_VALUE_FIELD, 1),
                         new com.mongodb.client.model.IndexOptions().name("storage_probe_value").unique(true));
-                collection.insertOne(session, new Document("_id", id).append(PROBE_VALUE_FIELD, "initial"));
+                collection.insertOne(session, new Document("_id", id).append(PROBE_VALUE_FIELD, PROBE_INITIAL_VALUE));
                 Document read = collection.find(session, new Document("_id", id)).first();
-                if (read == null || !"initial".equals(read.get(PROBE_VALUE_FIELD))
+                if (read == null || !PROBE_INITIAL_VALUE.equals(read.get(PROBE_VALUE_FIELD))
                         || collection.updateOne(session, new Document("_id", id),
                         new Document("$set", new Document(PROBE_VALUE_FIELD, "updated"))).getModifiedCount() != 1
                         || collection.deleteOne(session, new Document("_id", id)).getDeletedCount() != 1) {
