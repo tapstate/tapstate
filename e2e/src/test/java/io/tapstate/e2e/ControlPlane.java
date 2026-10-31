@@ -247,7 +247,7 @@ final class ControlPlane {
                 .map(entry -> Map.of("source", entry.getKey(), "content", entry.getValue()))
                 .toList();
         String body = JsonWriter.write(Map.of("drafts", drafts));
-        HttpResponse<String> response = send(authed("/api/artifacts:apply", body));
+        HttpResponse<String> response = send(applyRequest(body));
         expect(response, 200, "apply " + contentBySource.keySet());
         return warningsOf(response.body());
     }
@@ -330,7 +330,7 @@ final class ControlPlane {
                 .map(entry -> Map.of("source", entry.getKey(), "content", entry.getValue()))
                 .toList();
         String body = JsonWriter.write(Map.of("drafts", drafts));
-        HttpResponse<String> response = send(authed("/api/artifacts:apply", body));
+        HttpResponse<String> response = send(applyRequest(body));
         return interpretRefusal(response.statusCode(), response.body(), "applying " + contentBySource.keySet());
     }
 
@@ -343,7 +343,7 @@ final class ControlPlane {
 
     /** Applies one document written against the version {@code expectedContentHash} names. */
     void applyExpecting(String source, String content, String expectedContentHash) {
-        expect(send(authed("/api/artifacts:apply", applyBody(List.of(
+        expect(send(applyRequest(applyBody(List.of(
                         new Draft(source, content, expectedContentHash))))),
                 200, "apply " + source + " against version " + expectedContentHash);
     }
@@ -354,8 +354,7 @@ final class ControlPlane {
      * is kept apart from its success: one return value cannot mean both.
      */
     Refusal applyExpectingRefusal(String source, String content, String expectedContentHash) {
-        HttpResponse<String> response = send(authed("/api/artifacts:apply",
-                applyBody(List.of(new Draft(source, content, expectedContentHash)))));
+        HttpResponse<String> response = send(applyRequest(applyBody(List.of(new Draft(source, content, expectedContentHash)))));
         return interpretRefusal(response.statusCode(), response.body(), "applying " + source);
     }
 
@@ -2417,6 +2416,11 @@ final class ControlPlane {
 
     private HttpRequest authed(String path, String body) {
         return authed(path, body, TIMEOUT);
+    }
+
+    /** Artifact configuration writes use the existing shared heavy-operation budget. */
+    private HttpRequest applyRequest(String body) {
+        return authed("/api/artifacts:apply", body, io.tapstate.control.client.HttpControlClient.DEFAULT_HEAVY_TIMEOUT);
     }
 
     /** The same request with a bound of the caller's own, for a body large enough to need one. */
