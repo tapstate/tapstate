@@ -348,6 +348,22 @@ class CloudConnectorSeedReadinessTest {
     }
 
     @Test
+    void aQuotaRefusalRetainsOnlyItsSafeClassificationAcrossTheCloudSeedGate() throws Exception {
+        var changed = new ArrayList<>(outcomes);
+        var quota = new TapstateException(IoError.STORE_QUOTA_EXCEEDED, Map.of("untrusted", SENTINEL),
+                new IllegalArgumentException(SENTINEL));
+        changed.set(5, new SeedOutcome.Failed(seeds.resolve("mongodb-atlas-connector.jar"), quota));
+        assertThatThrownBy(() -> gate().verifyRegistrations(changed)).isInstanceOfSatisfying(TapstateException.class, failure -> {
+            assertThat(failure.code()).isEqualTo(IoError.STORE_QUOTA_EXCEEDED);
+            assertThat(failure.args()).isEmpty(); assertThat(failure.getCause()).isNull();
+            assertThat(failure.toString()).doesNotContain(SENTINEL);
+        });
+        loadFailure = quota;
+        assertThatThrownBy(() -> gate().verifyRegistrations(outcomes)).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(IoError.STORE_QUOTA_EXCEEDED));
+    }
+
+    @Test
     void aContainedSweepFailureCannotBecomeReadyOrLeakItsCause() throws Exception {
         var gate = gate();
         var changed = new ArrayList<>(outcomes);
