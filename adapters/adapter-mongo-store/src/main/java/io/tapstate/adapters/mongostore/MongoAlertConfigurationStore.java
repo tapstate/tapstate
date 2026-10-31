@@ -59,10 +59,16 @@ final class MongoAlertConfigurationStore {
     static List<AlertConfiguration.Rule> initialRules(AlarmKey.Scope scope,
             io.tapstate.core.alerting.AlertChannelPolicy.Deployment deployment, java.time.Instant at) {
         var catalog = io.tapstate.core.alerting.BuiltinAlarmTypes.catalog();
+        var names = Map.of(
+                "pipeline.failed", "Pipeline execution failed",
+                "pipeline.observation-stale", "Pipeline observation stale",
+                "source.connection-failed", "Source connection failed",
+                "cluster.node-unavailable", "Cluster node unavailable",
+                "cluster.storage-unavailable", "Required storage unavailable");
         return catalog.types().stream().map(type -> {
             var identity = AlertConfiguration.Identity.create(Kind.RULE, scope, "builtin-" + type.id());
             var header = AlertConfiguration.Header.create(identity, deployment, at, "system:cluster-initialization");
-            return new AlertConfiguration.Rule(header, type.id(), type.id(), type.version(),
+            return new AlertConfiguration.Rule(header, Objects.requireNonNull(names.get(type.id()), "initial rule name"), type.id(), type.version(),
                     new AlertConfiguration.Resources(type.resourceKinds(), true, java.util.Set.of()),
                     Map.of(), null, type.enabledByDefault(), null).validated(catalog);
         }).toList();

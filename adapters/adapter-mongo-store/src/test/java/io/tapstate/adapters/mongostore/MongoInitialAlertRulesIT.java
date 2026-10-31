@@ -27,6 +27,12 @@ class MongoInitialAlertRulesIT {
         var settings = new MongoConnectionSettings(MONGO.getReplicaSetUrl(database), null, Duration.ofSeconds(5));
         var scope = new AlarmKey.Scope(deployment == AlertChannelPolicy.Deployment.ON_PREM ? "installation" : "organization", "cluster");
         var catalog = BuiltinAlarmTypes.catalog();
+        var expectedNames = java.util.Map.of(
+                "pipeline.failed", "Pipeline execution failed",
+                "pipeline.observation-stale", "Pipeline observation stale",
+                "source.connection-failed", "Source connection failed",
+                "cluster.node-unavailable", "Cluster node unavailable",
+                "cluster.storage-unavailable", "Required storage unavailable");
         try (var observer = MongoClients.create(settings.uri())) {
             var raw = observer.getDatabase(database);
             try (var configuration = MongoConfigurationBootstrap.prepareWithAlerts(settings, "cluster", "installation", "setup", 1, scope, deployment)) {
@@ -37,6 +43,8 @@ class MongoInitialAlertRulesIT {
                     String id = row.get("_id", Document.class).getString("id");
                     var rule = (Rule) MongoAlertConfigurationCodec.read(Kind.RULE, scope, id, row).definition();
                     var type = catalog.types().stream().filter(value -> value.id().equals(rule.typeId())).findFirst().orElseThrow();
+                    assertThat(rule.name()).isEqualTo(expectedNames.get(rule.typeId()));
+                    assertThat(rule.header().identity().id()).isEqualTo("builtin-" + rule.typeId());
                     assertThat(rule.header().deployment()).isEqualTo(deployment);
                     assertThat(rule.bindingRevision()).isEqualTo(1L);
                     assertThat(rule.parameters()).isEqualTo(type.validatedParameters(java.util.Map.of()));
