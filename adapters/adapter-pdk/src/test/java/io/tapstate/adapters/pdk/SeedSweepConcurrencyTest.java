@@ -107,8 +107,10 @@ class SeedSweepConcurrencyTest {
 
     private Path seeds(int count) throws IOException {
         Path seeds = Files.createDirectories(work.resolve("seeds"));
-        Path jar = Synthetic.seedableMysqlConnector(work.resolve("fixture"));
-        for (int i = 0; i < count; i++) Files.copy(jar, seeds.resolve(i + ".jar"));
+        Path mysql = Synthetic.seedableMysqlConnector(work.resolve("mysql-fixture"));
+        Path mongo = Synthetic.seedableMongodbConnector(work.resolve("mongo-fixture"));
+        // Independent transfers use distinct logical IDs; current versions of one ID serialize.
+        for (int i = 0; i < count; i++) Files.copy(i % 2 == 0 ? mysql : mongo, seeds.resolve(i + ".jar"));
         return seeds;
     }
 

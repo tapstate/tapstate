@@ -75,6 +75,9 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
      */
     private static final ConnectorOverlay OVERLAY = ConnectorOverlay.load();
 
+    // The active-ID policy belongs to this registrar, while the store retains hash-addressed history.
+    // Fixed stripes bound memory and leave the release's independent IDs free to publish concurrently.
+    private final Object[] registrationLocks = new Object[256];
     private final ConnectorRegistry registry;
     private final ConnectorIntrospector introspector;
     private final CapabilityDeriver capabilityDeriver;
@@ -98,6 +101,7 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
     public ConnectorArtifactRegistrar(ConnectorRegistry registry, ConnectorIntrospector introspector,
                                       CapabilityDeriver capabilityDeriver, ConnectorCatalogStore catalogStore,
                                       ConnectorSpecStore specStore, List<String> alsoAccept) {
+        java.util.Arrays.setAll(registrationLocks, ignored -> new Object());
         this.registry = Objects.requireNonNull(registry, "registry");
         this.introspector = Objects.requireNonNull(introspector, "introspector");
         this.capabilityDeriver = Objects.requireNonNull(capabilityDeriver, "capabilityDeriver");
@@ -134,30 +138,35 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
         String hash = hashOf(artifact);
         phase(connectorId, "source-hash", hashStarted);
         long preparationStarted = System.nanoTime();
-        rejectConflictingArtifact(connectorId, hash);
-        // Kept before the artifact is registered, so that a store failure writing it fails a register that
-        // has taken nothing: the id is still free and the caller's retry is a clean first attempt. The
-        // source is read straight off the artifact and does not depend on the connector loading, so there
-        // is nothing about the registration it needs to wait for. An artifact refused after this point
-        // leaves the source stored and unreferenced, which costs one small content-addressed document
-        // that the next registration of the same spec reuses.
-        String specHash = storeSpecSource(introspected);
-        phase(connectorId, "metadata-preparation", preparationStarted);
-        long uploadStarted = System.nanoTime();
+        String specHash;
+        long uploadStarted;
         RegistrationOutcome outcome;
-        try (var bytes = Files.newInputStream(artifact)) {
-            outcome = registry.register(connectorId, introspected.pdkApiVersion(), source, hash, Files.size(artifact), bytes);
-        } catch (IOException failure) {
-            TapstateException diagnostic = artifactUnreadable(artifact);
-            for (Throwable suppressed : failure.getSuppressed()) {
-                if (suppressed instanceof TapstateException cleanup && cleanup.code() == IoError.CONNECTOR_ARTIFACT_CLEANUP_UNCONFIRMED
-                        && cleanup.args().get("hash") instanceof String cleanupHash && cleanupHash.matches("[0-9a-f]{64}")
-                        && cleanup.args().get("upload") instanceof String upload && canonicalUploadId(upload)) {
-                    diagnostic.addSuppressed(new TapstateException(IoError.CONNECTOR_ARTIFACT_CLEANUP_UNCONFIRMED,
-                            Map.of("hash", cleanupHash, "upload", upload), null));
+        synchronized (registrationLocks[Math.floorMod(connectorId.hashCode(), registrationLocks.length)]) {
+            if (Thread.currentThread().isInterrupted()) throw artifactUnreadable(artifact);
+            rejectConflictingArtifact(connectorId, hash);
+            // Kept before the artifact is registered, so that a store failure writing it fails a register that
+            // has taken nothing: the id is still free and the caller's retry is a clean first attempt. The
+            // source is read straight off the artifact and does not depend on the connector loading, so there
+            // is nothing about the registration it needs to wait for. An artifact refused after this point
+            // leaves the source stored and unreferenced, which costs one small content-addressed document
+            // that the next registration of the same spec reuses.
+            specHash = storeSpecSource(introspected);
+            phase(connectorId, "metadata-preparation", preparationStarted);
+            uploadStarted = System.nanoTime();
+            try (var bytes = Files.newInputStream(artifact)) {
+                outcome = registry.register(connectorId, introspected.pdkApiVersion(), source, hash, Files.size(artifact), bytes);
+            } catch (IOException failure) {
+                TapstateException diagnostic = artifactUnreadable(artifact);
+                for (Throwable suppressed : failure.getSuppressed()) {
+                    if (suppressed instanceof TapstateException cleanup && cleanup.code() == IoError.CONNECTOR_ARTIFACT_CLEANUP_UNCONFIRMED
+                            && cleanup.args().get("hash") instanceof String cleanupHash && cleanupHash.matches("[0-9a-f]{64}")
+                            && cleanup.args().get("upload") instanceof String upload && canonicalUploadId(upload)) {
+                        diagnostic.addSuppressed(new TapstateException(IoError.CONNECTOR_ARTIFACT_CLEANUP_UNCONFIRMED,
+                                Map.of("hash", cleanupHash, "upload", upload), null));
+                    }
                 }
+                throw diagnostic;
             }
-            throw diagnostic;
         }
         phase(connectorId, "upload-and-publication", uploadStarted);
         long catalogStarted = System.nanoTime();
