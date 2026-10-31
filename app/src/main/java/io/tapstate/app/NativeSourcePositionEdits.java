@@ -109,8 +109,8 @@ final class NativeSourcePositionEdits implements PipelinePositionService.WriteBa
         Throwable primary = null;
         try {
             fixed.run();
-            for (var original:readers) controls.put(original,original.preparation().phase()==PipelinePreparation.Phase.UNASSIGNED
-                    ? ownership.unpreparedControl(original.scope()):ownership.control(original.scope()));
+            for (var original:readers) controls.put(original,ownership.controlAfterPass(original.scope(),
+                    original.preparation().phase()==PipelinePreparation.Phase.UNASSIGNED,Duration.ofSeconds(30)));
             fixed.run(); controls.values().forEach(PipelineActuationOwnership.Control::requireActive);
             for (var original:readers) {
                 var claim=controls.get(original).claim(); var run=original.run();
