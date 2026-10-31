@@ -45,6 +45,14 @@ public final class MetricAttributes {
     public static final String CHAIN_ID = "tapstate.chain.id";
     /** The namespace a nest step keeps one level of its state under. */
     public static final String NEST_NAMESPACE = "tapstate.nest.namespace";
+    /**
+     * The three names a nest namespace has in the pipeline's definition: the step that keeps it, the level
+     * of the document it serves and which of the step's maps it is. They ride only on the namespace's info
+     * reading, never on its counts, and each namespace has exactly one of each, so they add no series.
+     */
+    public static final String NEST_STEP = "tapstate.nest.step";
+    public static final String NEST_PATH = "tapstate.nest.path";
+    public static final String NEST_MAP = "tapstate.nest.map";
     /** The namespace a join step mirrors one dimension in. */
     public static final String JOIN_NAMESPACE = "tapstate.join.namespace";
     public static final String DIRECTION = "direction";

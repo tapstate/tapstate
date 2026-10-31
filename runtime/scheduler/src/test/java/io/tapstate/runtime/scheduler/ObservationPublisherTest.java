@@ -3,6 +3,9 @@ package io.tapstate.runtime.scheduler;
 import io.tapstate.core.lifecycle.CasOutcome;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.FrontierStallPressure;
+import io.tapstate.core.lifecycle.MetricFact;
+import io.tapstate.core.lifecycle.MetricType;
+import io.tapstate.core.lifecycle.NestOrigin;
 import io.tapstate.core.lifecycle.NestColdLayerPressure;
 import io.tapstate.core.lifecycle.NestStateWindow;
 import io.tapstate.core.lifecycle.Observation;
@@ -218,6 +221,59 @@ class ObservationPublisherTest {
                         entry("nestStateBackfills.nest.orders.doc.$root", 30L),
                         entry("nestStateBackfillMillis.nest.orders.doc.$root", 210L),
                         entry("nestStatePendingHighWater.nest.orders.doc.$root", 0L));
+    }
+
+    /**
+     * A namespace is named by a digest of its coordinates, which keeps it apart from every other and tells a
+     * reader nothing. Where the reporter knows which step, level and map it is, that is published once per
+     * namespace as an info reading beside the counts, so a reader can name it without the names riding on
+     * every count's series. The flat face is unchanged: it has no spelling for a mapping, and the counts
+     * keep the keys every reader was built against.
+     */
+    @Test
+    void publishCarriesWhereEachNestNamespaceComesFromBesideItsCounts() {
+        state.seed("orders", PipelineState.RUNNING);
+        ObservationPublisher wired = new ObservationPublisher(state, observations,
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(),
+                id -> Map.of("nest.ab12.run.cd34", new NestStateReading(4_000L, 900L, 30L, 210L, 0L,
+                        OptionalLong.empty(), new NestOrigin("order_doc", "[\"lines\"]", "state"))));
+
+        wired.publish("orders");
+
+        Observation published = observations.read("orders").orElseThrow();
+        assertThat(published.facts())
+                .filteredOn(fact -> fact.name().equals("tapstate.pipeline.nest.namespace.info"))
+                .singleElement().satisfies(fact -> {
+                    assertThat(fact.type()).isEqualTo(MetricType.GAUGE);
+                    assertThat(fact.points()).singleElement().satisfies(point -> {
+                        assertThat(point.value()).isEqualTo(1L);
+                        assertThat(point.attributes()).containsOnly(
+                                entry("tapstate.pipeline.id", "orders"),
+                                entry("tapstate.nest.namespace", "nest.ab12.run.cd34"),
+                                entry("tapstate.nest.step", "order_doc"),
+                                entry("tapstate.nest.path", "[\"lines\"]"),
+                                entry("tapstate.nest.map", "state"));
+                    });
+                });
+        assertThat(published.metrics()).containsOnlyKeys(
+                "nestStateEntries.nest.ab12.run.cd34",
+                "nestStateAccesses.nest.ab12.run.cd34",
+                "nestStateBackfills.nest.ab12.run.cd34",
+                "nestStateBackfillMillis.nest.ab12.run.cd34",
+                "nestStatePendingHighWater.nest.ab12.run.cd34");
+    }
+
+    @Test
+    void aNamespaceWhoseOriginTheReporterCannotSayHasNoInfoReading() {
+        state.seed("orders", PipelineState.RUNNING);
+        ObservationPublisher wired = new ObservationPublisher(state, observations,
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(),
+                id -> Map.of("nest.ab12.run.cd34", new NestStateReading(4_000L, 900L, 30L, 210L)));
+
+        wired.publish("orders");
+
+        assertThat(observations.read("orders").orElseThrow().facts()).extracting(MetricFact::name)
+                .doesNotContain("tapstate.pipeline.nest.namespace.info");
     }
 
     /**

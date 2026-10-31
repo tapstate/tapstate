@@ -17,6 +17,7 @@ import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.HistogramValue;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.StageReading;
+import io.tapstate.core.lifecycle.NestOrigin;
 import io.tapstate.core.lifecycle.NestStateReading;
 import io.tapstate.runtime.engine.join.JoinRecomputeMetricNames;
 import io.tapstate.runtime.engine.nest.NestDeadLetterMetricNames;
@@ -25,6 +26,7 @@ import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.engine.nest.NestStatePlacement;
 import io.tapstate.runtime.engine.nest.NestStateMetricNames;
 import io.tapstate.spi.store.KeyedStateStore;
+import io.tapstate.spi.store.OperatorPlacement;
 import io.tapstate.spi.store.OperatorStateStores;
 import java.time.Duration;
 import java.time.Instant;
@@ -932,10 +934,28 @@ public final class Engine {
                         .merge(reading.kind(), measurement.value(), Math::max);
             }
         }
+        OperatorMapBindings bindings = member.getUserContext() == null ? null
+                : OperatorMapBindings.resolve(member, false);
         Map<String, NestStateReading> readings = new HashMap<>();
         byNamespace.forEach((namespace, kinds) -> readings.put(namespace,
-                NestStateMetricNames.readingFrom(kinds, stored(namespace))));
+                NestStateMetricNames.readingFrom(kinds, stored(namespace))
+                        .withOrigin(originOf(bindings, namespace))));
         return readings;
+    }
+
+    /**
+     * Where a namespace sits in the pipeline's definition, read off the placement its hot map was installed
+     * for on this member; null where this member holds no such map, which leaves the reading unnamed rather
+     * than wrongly named.
+     */
+    private static NestOrigin originOf(OperatorMapBindings bindings, String namespace) {
+        if (bindings == null) {
+            return null;
+        }
+        return bindings.placementOf(namespace)
+                .filter(placement -> placement.resource() == OperatorPlacement.Resource.NEST_STATE)
+                .map(placement -> new NestOrigin(placement.stepId(), placement.pathId(), placement.namespace()))
+                .orElse(null);
     }
 
     /**

@@ -18,6 +18,7 @@ import io.tapstate.core.lifecycle.NestColdLayerPressure;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.InitialLoad;
 import io.tapstate.core.lifecycle.ObservationFailure;
+import io.tapstate.core.lifecycle.NestOrigin;
 import io.tapstate.core.lifecycle.NestStateReading;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.SnapshotReading;
@@ -156,6 +157,13 @@ public final class ObservationPublisher {
     private static final String NEST_BACKFILL_TIME_METRIC = "tapstate.pipeline.nest.backfill.time";
     private static final String NEST_PENDING_HIGH_WATER_METRIC = "tapstate.pipeline.nest.pending.high_water";
     private static final String NEST_STORED_METRIC = "tapstate.pipeline.nest.stored";
+    /**
+     * Where each namespace comes from in the pipeline's definition, as one reading of 1 per namespace whose
+     * attributes are the step, level and map. A mapping rather than more attributes on the counts: names a
+     * person reads stay off the series that are measured, and a reader joins the two on the namespace.
+     * Published only for a namespace whose origin the reporter knows; it has no spelling on the flat face.
+     */
+    private static final String NEST_NAMESPACE_INFO_METRIC = "tapstate.pipeline.nest.namespace.info";
     private static final String NEST_DEAD_LETTERED_METRIC = "tapstate.pipeline.nest.dead_lettered";
     private static final String JOIN_RECOMPUTE_ROWS_METRIC = "tapstate.pipeline.join.recompute.rows";
     private static final String JOIN_RECOMPUTE_ROWS_TOTAL_METRIC = "tapstate.pipeline.join.recompute.rows.total";
@@ -1009,6 +1017,7 @@ public final class ObservationPublisher {
                 pendingHighWater).ifPresent(facts::add);
         readingsAt(pipelineId, NEST_STORED_METRIC, "{entry}", at, NEST_NAMESPACE_ATTRIBUTE, stored)
                 .ifPresent(facts::add);
+        nestOrigins(pipelineId, at, nestReadings).ifPresent(facts::add);
         // One point per namespace that discarded something, and none for a namespace that discarded
         // nothing. The absence is load-bearing here rather than merely tidy: rows that never reach a
         // document leave no other trace, so a reader has only this to go on, and a zero published on every
@@ -1029,6 +1038,24 @@ public final class ObservationPublisher {
         load(pipelineId, at, loaded).forEach(facts::add);
         runLoad(pipelineId, at, readThisRun).ifPresent(facts::add);
         return facts;
+    }
+
+    private static Optional<MetricFact> nestOrigins(String pipelineId, Instant at,
+            Map<String, NestStateReading> nestReadings) {
+        List<MetricPoint> points = new ArrayList<>();
+        nestReadings.forEach((namespace, reading) -> {
+            NestOrigin origin = reading.origin();
+            if (origin != null) {
+                points.add(MetricPoint.reading(Map.of(
+                        PIPELINE_ID_ATTRIBUTE, pipelineId,
+                        NEST_NAMESPACE_ATTRIBUTE, namespace,
+                        MetricAttributes.NEST_STEP, origin.step(),
+                        MetricAttributes.NEST_PATH, origin.path(),
+                        MetricAttributes.NEST_MAP, origin.map()), at, 1L));
+            }
+        });
+        return points.isEmpty() ? Optional.empty()
+                : Optional.of(new MetricFact(NEST_NAMESPACE_INFO_METRIC, MetricType.GAUGE, "1", points));
     }
 
     private static Optional<MetricFact> runLoad(String pipelineId, Instant at, SnapshotReading read) {

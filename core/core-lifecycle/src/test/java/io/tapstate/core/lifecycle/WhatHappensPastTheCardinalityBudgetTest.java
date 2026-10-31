@@ -96,6 +96,7 @@ class WhatHappensPastTheCardinalityBudgetTest {
                         "tapstate.pipeline.nest.pending.high_water",
                         "tapstate.pipeline.nest.stored",
                         "tapstate.pipeline.nest.dead_lettered",
+                        "tapstate.pipeline.nest.namespace.info",
                         "tapstate.pipeline.join.recompute.rows",
                         "tapstate.pipeline.join.recompute.rows.total",
                         "tapstate.pipeline.records.driven",
@@ -115,7 +116,7 @@ class WhatHappensPastTheCardinalityBudgetTest {
         for (CardinalityBudget budget : List.of(CardinalityBudget.NEST_ENTRIES, CardinalityBudget.NEST_ACCESSES,
                 CardinalityBudget.NEST_BACKFILLS, CardinalityBudget.NEST_BACKFILL_TIME,
                 CardinalityBudget.NEST_PENDING_HIGH_WATER, CardinalityBudget.NEST_STORED,
-                CardinalityBudget.NEST_DEAD_LETTERED)) {
+                CardinalityBudget.NEST_DEAD_LETTERED, CardinalityBudget.NEST_NAMESPACE_INFO)) {
             assertThat(budget.openDimension()).as(budget.name()).contains(MetricAttributes.NEST_NAMESPACE);
             assertThat(budget.distinctValues()).as(budget.name()).isEqualTo(1_000);
         }
@@ -448,6 +449,7 @@ class WhatHappensPastTheCardinalityBudgetTest {
                         "tapstate.pipeline.frontier.gap",
                         "tapstate.pipeline.frontier.stall",
                         "tapstate.pipeline.nest.pending.high_water",
+                        "tapstate.pipeline.nest.namespace.info",
                         "tapstate.pipeline.reconcile.failures.streak");
     }
 }

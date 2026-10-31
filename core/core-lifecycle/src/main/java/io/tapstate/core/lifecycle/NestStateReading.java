@@ -40,9 +40,17 @@ import java.util.OptionalLong;
  * @param pendingHighWater the deepest one key of this namespace has been seen holding for something that
  *     has not arrived, since the run began
  * @param stored how many keys the layer behind the memory holds, where there is one to ask
+ * @param origin where in the pipeline's definition the namespace comes from, or null where the reporter
+ *     could not say
  */
 public record NestStateReading(long entries, long accesses, long backfills, long backfillMillis,
-        long pendingHighWater, OptionalLong stored) {
+        long pendingHighWater, OptionalLong stored, NestOrigin origin) {
+
+    /** A reading whose namespace's place in the definition is not known to the reporter. */
+    public NestStateReading(long entries, long accesses, long backfills, long backfillMillis,
+            long pendingHighWater, OptionalLong stored) {
+        this(entries, accesses, backfills, backfillMillis, pendingHighWater, stored, null);
+    }
 
     /** A reading from a run with no cold layer to ask, whose state is however much is in memory. */
     public NestStateReading(long entries, long accesses, long backfills, long backfillMillis) {
@@ -53,5 +61,11 @@ public record NestStateReading(long entries, long accesses, long backfills, long
     public NestStateReading(long entries, long accesses, long backfills, long backfillMillis,
             OptionalLong stored) {
         this(entries, accesses, backfills, backfillMillis, 0L, stored);
+    }
+
+    /** The same reading, placed in the pipeline's definition. */
+    public NestStateReading withOrigin(NestOrigin origin) {
+        return new NestStateReading(entries, accesses, backfills, backfillMillis, pendingHighWater, stored,
+                origin);
     }
 }

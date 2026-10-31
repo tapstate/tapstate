@@ -84,6 +84,9 @@ public enum CardinalityBudget {
     NEST_STORED("tapstate.pipeline.nest.stored", MetricAttributes.NEST_NAMESPACE, 1_000, Fold.ADDED),
     NEST_DEAD_LETTERED("tapstate.pipeline.nest.dead_lettered", MetricAttributes.NEST_NAMESPACE, 1_000,
             Fold.ADDED),
+    /** One reading per namespace naming where it comes from; a fold of them is a namespace, not a count. */
+    NEST_NAMESPACE_INFO("tapstate.pipeline.nest.namespace.info", MetricAttributes.NEST_NAMESPACE, 1_000,
+            Fold.HIGHEST),
     JOIN_RECOMPUTE_ROWS("tapstate.pipeline.join.recompute.rows", MetricAttributes.JOIN_NAMESPACE, 1_000,
             Fold.ADDED),
     JOIN_RECOMPUTE_ROWS_TOTAL("tapstate.pipeline.join.recompute.rows.total", MetricAttributes.JOIN_NAMESPACE,

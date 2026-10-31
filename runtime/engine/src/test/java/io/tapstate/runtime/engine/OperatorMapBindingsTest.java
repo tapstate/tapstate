@@ -39,6 +39,17 @@ class OperatorMapBindingsTest {
         assertThat(first.placement()).isEqualTo(second.placement());
     }
 
+    @Test void aLiveHotMapNamesThePlacementItWasInstalledForAndARetiredOneNamesNone() {
+        var original = binding(placement(OperatorPlacement.Resource.NEST_STATE,"lookup:c"),1);
+        var registry = OperatorMapBindings.bindTo(member(),(binding,active) -> new RecordingStore());
+        assertThat(registry.placementOf(original.mapName())).isEmpty();
+        registry.install(List.of(original));
+        assertThat(registry.placementOf(original.mapName())).contains(original.placement());
+        assertThat(registry.placementOf(original.placement().mapName())).as("a cold name is not a hot map").isEmpty();
+        assertThat(registry.release(original)).isTrue();
+        assertThat(registry.placementOf(original.mapName())).isEmpty();
+    }
+
     @Test void batchedWritesReachTheOriginalBackendThroughBothHandles() {
         var original = binding(placement(OperatorPlacement.Resource.NEST_STATE, "root"), 1);
         var cold = new RecordingStore();
