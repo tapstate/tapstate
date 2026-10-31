@@ -196,6 +196,82 @@ class PipelineAlertRuntimeTest {
             assertThat(last.operationalEvidence().failedCapabilities()).isZero();
         } finally {release.countDown();}
     }
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({"healthy,false","resolved,false","exact-gap,false","exact-age,false",
+            "new-failure,true","recovery,true","other-capability,true","expired-evidence,true","gap-exceeded,true",
+            "age-exceeded,true","binding-changed,true","missing-rule,true","raced-failure,true","source-resource,true","cas-conflict,true"})
+    void peerOwnedCacheHeartbeatsDeferOnlyUnchangedFreshHealthyEvidence(String scenario,boolean degraded) {
+        var original=AlertEvaluationHostTest.definition("pipeline.failed");
+        boolean source=scenario.equals("source-resource");
+        var rule=new AlertConfiguration.Rule(original.header(),"Operational health",source?"source.connection-failed":"cluster.storage-unavailable",1,
+                new AlertConfiguration.Resources(Set.of(source?"source":"cluster-storage"),true,Set.of()),Map.of(),null,true,null).validated(BuiltinAlarmTypes.catalog());
+        when(fixture.store.evaluationRules(any(),anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule),null));
+        when(fixture.store.definition(eq(AlertConfiguration.Kind.RULE),eq(rule.header().identity().id()),isNull())).thenReturn(Optional.of(rule));
+        var resource=new AlarmKey.Resource(source?"source":"cluster-storage",source?"erp":"cache","cache:1");var digest="a".repeat(64);
+        var binding=new AlertEvaluationHost.Binding(rule,resource,digest,source?1:0,()->{});
+        var initialCapability=scenario.equals("other-capability")?OperationalEvidence.Capability.CACHE_WRITE:OperationalEvidence.Capability.CACHE_READ;
+        boolean initialSuccess=!Set.of("resolved","recovery","other-capability").contains(scenario);
+        assertThat(fixture.host.accept(binding,0,new AlertInput.Operational(T,digest,initialCapability,initialSuccess)))
+                .isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
+        if(scenario.equals("resolved")) {
+            fixture.now.set(T.plusSeconds(1));
+            assertThat(fixture.host.accept(binding,1,new AlertInput.Operational(fixture.clock.instant(),digest,initialCapability,true)))
+                    .isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
+        }
+        fixture.now.set(T.plusSeconds(scenario.equals("resolved")?4:3));
+        var peer=new AlertEvaluationHost(fixture.store,BuiltinAlarmTypes.catalog(),AlertChannelPolicy.Deployment.ON_PREM,fixture.clock,"other-owner",()->{});
+        try(var runtime=new PipelineAlertRuntime(()->new PipelineAlertRuntime.Services(fixture.store,peer,BuiltinAlarmTypes.catalog(),null,null,
+                Set.of("cluster-storage-health","source-operational-health")),intentStore,(scope,claim)->Optional.empty(),()->{},fixture.clock)) {
+            runtime.tick();drained(runtime);assertThat(runtime.health().degraded()).isFalse();
+            if(scenario.equals("expired-evidence")) {
+                fixture.now.set(T.plus(rows.get(binding.key()).value().snapshot().rule().maxAge()).plusSeconds(1));
+                fixture.host.tick(binding);
+            }
+            if(scenario.equals("cas-conflict")) {
+                fixture.now.set(T.plusSeconds(31));doReturn(AlertStore.Outcome.CONFLICT).when(fixture.store).commit(any());
+            }
+            if(scenario.equals("gap-exceeded")||scenario.equals("exact-gap"))fixture.now.set(T.plusSeconds(scenario.equals("exact-gap")?5:6));
+            if(scenario.equals("age-exceeded")||scenario.equals("exact-age"))fixture.now.set(T.plusSeconds(scenario.equals("exact-age")?15:16));
+            var before=new AtomicReference<>(rows.get(binding.key()));
+            if(scenario.equals("missing-rule"))when(fixture.store.definition(eq(AlertConfiguration.Kind.RULE),eq(rule.header().identity().id()),isNull())).thenReturn(Optional.empty());
+            if(scenario.equals("raced-failure"))when(fixture.store.definition(eq(AlertConfiguration.Kind.RULE),eq(rule.header().identity().id()),isNull())).thenAnswer(call->{
+                assertThat(fixture.host.accept(binding,1,new AlertInput.Operational(fixture.clock.instant(),digest,OperationalEvidence.Capability.CACHE_READ,false)))
+                        .isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
+                before.set(rows.get(binding.key()));return Optional.of(rule);
+            });
+            var incoming=scenario.equals("binding-changed")?"b".repeat(64):digest;
+            var observed=scenario.equals("age-exceeded")||scenario.equals("exact-age")?T.plusSeconds(3):fixture.clock.instant();
+            runtime.resourceInput(resource,rule.typeId(),binding.sourceBindingRevision(),incoming,()->{},new AlertInput.Operational(observed,incoming,
+                    OperationalEvidence.Capability.CACHE_READ,!scenario.equals("new-failure")));
+            drained(runtime);assertThat(runtime.health().degraded()).isEqualTo(degraded);
+            assertThat(rows.get(binding.key())).as("deferred or refused peer input cannot freshen retained evidence or change ownership").isEqualTo(before.get());
+        }
+    }
+    @Test void healthyCacheCoalescingLeavesRoomForTheRealSamplingCadence() {
+        var original=AlertEvaluationHostTest.definition("pipeline.failed");
+        var rule=new AlertConfiguration.Rule(original.header(),"Cache health","cluster.storage-unavailable",1,
+                new AlertConfiguration.Resources(Set.of("cluster-storage"),true,Set.of()),Map.of(),null,true,null).validated(BuiltinAlarmTypes.catalog());
+        when(fixture.store.evaluationRules(any(),anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule),null));
+        var resource=new AlarmKey.Resource("cluster-storage","cache","cache:1");var digest="a".repeat(64);
+        var binding=new AlertEvaluationHost.Binding(rule,resource,digest,0,()->{});
+        fixture.host.accept(binding,0,new AlertInput.Operational(T,digest,OperationalEvidence.Capability.CACHE_READ,true));
+        var accepted=new ArrayList<Instant>();accepted.add(T);
+        try(var runtime=new PipelineAlertRuntime(()->new PipelineAlertRuntime.Services(fixture.store,fixture.host,BuiltinAlarmTypes.catalog(),null,null,
+                Set.of("cluster-storage-health")),intentStore,(scope,claim)->Optional.empty(),()->{},fixture.clock)) {
+            runtime.tick();drained(runtime);
+            for(int index=1;index<=8;index++) {
+                fixture.now.set(T.plusMillis(index*1100L));
+                runtime.resourceInput(resource,rule.typeId(),0,digest,()->{},new AlertInput.Operational(fixture.clock.instant(),digest,
+                        OperationalEvidence.Capability.CACHE_READ,true));drained(runtime);
+                var observed=rows.get(binding.key()).value().snapshot().lastObservedAt();
+                if(!observed.equals(accepted.getLast()))accepted.add(observed);
+            }
+            var maxGap=rows.get(binding.key()).value().snapshot().rule().maxGap();
+            assertThat(accepted).hasSizeGreaterThan(1);
+            for(int index=1;index<accepted.size();index++)assertThat(Duration.between(accepted.get(index-1),accepted.get(index)))
+                    .as("coalescing and the one-second sampler cannot themselves manufacture a gap").isLessThanOrEqualTo(maxGap);
+        }
+    }
     @Test void oneBlockedObjectDoesNotOccupyBothWorkersAndStarveAnotherObject() throws Exception {
         var entered = new CountDownLatch(1); var release = new CountDownLatch(1);
         doAnswer(c -> {

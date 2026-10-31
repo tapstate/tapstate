@@ -341,11 +341,16 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
                             &&head.snapshot().recoverySince()==null
                             &&head.snapshot().quality()==AlertSnapshot.Quality.VALID
                             &&head.snapshot().lastObservedAt()!=null
-                            &&op.observedAt().isBefore(head.snapshot().lastObservedAt().plusSeconds(5)))continue;
+                            &&op.observedAt().isBefore(head.snapshot().lastObservedAt().plus(healthyCoalescingWindow(head.snapshot()))))continue;
                 }
                 accept(binding,next,input,shared);
             }
         }finally{settled.run();}},settled);
+    }
+    private static Duration healthyCoalescingWindow(AlertSnapshot snapshot) {
+        // Leave room for the producer's sampling cadence inside the original continuity bound.
+        var halfGap=snapshot.rule().maxGap().dividedBy(2);var ceiling=Duration.ofSeconds(5);
+        return halfGap.compareTo(ceiling)<0?halfGap:ceiling;
     }
     private void submitResource(ResourceSlot slot,int bytes,Runnable action){submitResource(slot,bytes,action,()->{});}
     private void submitResource(ResourceSlot slot,int bytes,Runnable action,Runnable refused){
@@ -411,8 +416,35 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     }
     private void accept(AlertEvaluationHost.Binding binding,long sequence,AlertInput input,boolean shared) {
         var outcome = services.evaluator().accept(binding, sequence, input);
-        if(shared && outcome==AlertEvaluationHost.Result.BUSY)return;
+        if(outcome==AlertEvaluationHost.Result.BUSY && (shared || deferHealthyCacheHeartbeat(binding,input)))return;
         if (outcome == AlertEvaluationHost.Result.CONFLICT || outcome == AlertEvaluationHost.Result.BUSY) throw refused("state-contention");
+    }
+    /** Deferral is not acceptance: no timestamp, sequence, capability or ownership is changed. */
+    private boolean deferHealthyCacheHeartbeat(AlertEvaluationHost.Binding binding,AlertInput input) {
+        if(!(input instanceof AlertInput.Operational op)||!op.succeeded()||op.domainToken()!=null||binding.domainToken()!=null
+                ||!Set.of(OperationalEvidence.Capability.CACHE_READ,OperationalEvidence.Capability.CACHE_WRITE).contains(op.capability())
+                ||!binding.resource().kind().equals("cluster-storage")||!binding.resource().id().equals("cache")
+                ||!binding.definition().typeId().equals("cluster.storage-unavailable")||binding.sourceBindingRevision()!=0)return false;
+        binding.requireCurrent().run();
+        var current=services.store().definition(AlertConfiguration.Kind.RULE,binding.definition().header().identity().id(),null);
+        if(current.isEmpty()||!current.orElseThrow().equals(binding.definition()))return false;
+        var retained=services.store().state(binding.key(),new AlertStore.ReadAccess(true,Set.of(),active));
+        binding.requireCurrent().run();if(retained.isEmpty())return false;
+        var head=retained.orElseThrow().value();var snapshot=head.snapshot();var evidence=head.operationalEvidence();var now=clock.instant();
+        if(head.retiredAt()!=null||!snapshot.enabled()||!binding.definition().header().active()||!binding.definition().enabled()
+                ||!Set.of(AlertSnapshot.Status.CLEAR,AlertSnapshot.Status.RESOLVED).contains(snapshot.status())
+                ||snapshot.quality()!=AlertSnapshot.Quality.VALID||snapshot.pendingSince()!=null||snapshot.recoverySince()!=null
+                ||!head.owner().activeAt(now)||head.binding()==null
+                ||!head.binding().ruleIdentity().equals(binding.definition().header().identity())
+                ||head.binding().sourceBindingRevision()!=binding.sourceBindingRevision()
+                ||snapshot.rule().revision()!=binding.definition().evaluationRevision()
+                ||!snapshot.rule().producerIncarnation().equals(binding.producer())
+                ||evidence==null||evidence.version()!=1||evidence.failedCapabilities()!=0
+                ||!evidence.bindingDigest().equals(op.bindingDigest()))return false;
+        var observed=snapshot.lastObservedAt();var rule=snapshot.rule();
+        return observed!=null&&!observed.isAfter(now)&&!op.observedAt().isAfter(now)
+                &&!observed.plus(rule.maxAge()).isBefore(now)&&!op.observedAt().plus(rule.maxAge()).isBefore(now)
+                &&!observed.plus(rule.maxGap()).isBefore(op.observedAt());
     }
     private void submit(Slot slot, int bytes, Runnable action) { submit(slot, bytes, action, () -> { }); }
     private void submit(Slot slot, int bytes, Runnable action, Runnable refused) {
