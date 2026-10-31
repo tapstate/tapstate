@@ -1,6 +1,7 @@
 package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.ControlError;
+import io.tapstate.control.core.StorageQuota;
 import io.tapstate.control.core.StartRefusal;
 import io.tapstate.control.core.CloudAuthenticationObserver;
 import io.tapstate.core.common.TapstateErrorCode;
@@ -47,7 +48,7 @@ class ApiExceptionHandler {
 
     @ExceptionHandler(TapstateException.class)
     ResponseEntity<ApiError> handle(TapstateException e) {
-        if (e.code() == io.tapstate.spi.store.IoError.STORE_QUOTA_EXCEEDED || e.code() == ControlError.STORAGE_QUOTA_EXCEEDED)
+        if (StorageQuota.isQuotaCode(e.code()))
             e = new TapstateException(ControlError.STORAGE_QUOTA_EXCEEDED, Map.of(), null);
         markCloudError(e.code());
         MessageCatalog.Rendered rendered = catalog.render(e.code(), e.args());
