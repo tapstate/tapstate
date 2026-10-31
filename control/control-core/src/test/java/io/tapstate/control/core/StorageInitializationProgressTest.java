@@ -104,6 +104,52 @@ class StorageInitializationProgressTest {
         assertThat(view().connectionChecks()).isEmpty();
     }
 
+    @Test void aSaveSettingsQuotaFailureSurvivesSameScopeRetryButNotANewScopeOrActualSuccess() {
+        var quota = new TapstateException(io.tapstate.spi.store.IoError.STORE_QUOTA_EXCEEDED, Map.of(), null);
+        var unavailable = new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), null);
+        progress.begin(SCOPE, 0, false); progress.failed(SCOPE, quota);
+        progress.begin(SCOPE, 0, false); progress.failed(SCOPE, unavailable);
+        assertThat(view().milestones().get(0).errorCode()).isEqualTo("io.store-quota-exceeded");
+        progress.begin(SCOPE, 0, false);
+        progress.completed(SCOPE, StorageInitializationProgress.Stage.SAVE_SETTINGS);
+        assertThat(progress.quotaExceeded()).isFalse();
+        progress.started(SCOPE, StorageInitializationProgress.Stage.PREPARE_STORAGE); progress.failed(SCOPE, unavailable);
+        assertThat(view().milestones().get(1).errorCode()).isEqualTo("control.storage-unavailable");
+        var nextGeneration = new StorageSetupScope("cluster", "installation", "setup", 2);
+        progress.begin(SCOPE, 0, false); progress.failed(SCOPE, quota);
+        progress.begin(nextGeneration, 0, false); progress.failed(nextGeneration, unavailable);
+        assertThat(progress.snapshot(nextGeneration).orElseThrow().milestones().get(0).errorCode()).isEqualTo("control.storage-unavailable");
+        var nextOperation = new StorageSetupScope("cluster", "installation", "different", 2);
+        progress.begin(nextGeneration, 0, false); progress.failed(nextGeneration, quota);
+        progress.begin(nextOperation, 0, false); progress.failed(nextOperation, unavailable);
+        assertThat(progress.snapshot(nextOperation).orElseThrow().milestones().get(0).errorCode()).isEqualTo("control.storage-unavailable");
+        progress.begin(nextOperation, 0, false); progress.failed(nextOperation, quota);
+        progress.begin(nextOperation, 0, false);
+        progress.failed(nextOperation, new TapstateException(ControlError.STORAGE_TEST_REQUIRED, Map.of(), null));
+        assertThat(progress.quotaExceeded()).isFalse();
+        assertThat(progress.snapshot(nextOperation).orElseThrow().milestones().get(0).errorCode()).isEqualTo("control.storage-test-required");
+    }
+
+    @Test void aKnownQuotaFailureSurvivesGenericRetryFailuresOnlyWithinItsOriginalStageAndScope() {
+        progress.begin(SCOPE, 1, true);
+        progress.failed(SCOPE, new TapstateException(io.tapstate.spi.store.IoError.STORE_QUOTA_EXCEEDED,
+                Map.of("secret", "private-value"), new IllegalArgumentException("private-cause")));
+        progress.begin(SCOPE, 1, true);
+        progress.failed(SCOPE, new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), null));
+        assertThat(view().milestones().get(1).errorCode()).isEqualTo("io.store-quota-exceeded");
+        assertThat(view().toString()).doesNotContain("private-value", "private-cause");
+        progress.begin(SCOPE, 1, true);
+        progress.completed(SCOPE, StorageInitializationProgress.Stage.PREPARE_STORAGE);
+        assertThat(progress.quotaExceeded()).isFalse();
+        progress.started(SCOPE, StorageInitializationProgress.Stage.START_RUNTIME);
+        progress.failed(SCOPE, new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), null));
+        assertThat(view().milestones().get(2).errorCode()).isEqualTo("control.storage-unavailable");
+        var other = new StorageSetupScope("cluster", "installation", "other", 2);
+        progress.begin(other, 1, true);
+        progress.failed(other, new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), null));
+        assertThat(progress.snapshot(other).orElseThrow().milestones().get(1).errorCode()).isEqualTo("control.storage-unavailable");
+    }
+
     @Test void readinessIsPublishedOnlyAfterAllActualStagesFinish() {
         progress.begin(SCOPE, 0, false);
         assertThatThrownBy(() -> progress.started(SCOPE, StorageInitializationProgress.Stage.PUBLISH_READY))

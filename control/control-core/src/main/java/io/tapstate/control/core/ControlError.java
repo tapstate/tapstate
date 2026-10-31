@@ -105,7 +105,8 @@ public enum ControlError implements TapstateErrorCode {
     STORAGE_TEST_REQUIRED("control.storage-test-required", Set.of()),
     STORAGE_TEST_FAILED("control.storage-test-failed", Set.of("layer", "causeCode")),
     STORAGE_SCOPE_CONFLICT("control.storage-scope-conflict", Set.of()),
-    STORAGE_UNAVAILABLE("control.storage-unavailable", Set.of());
+    STORAGE_UNAVAILABLE("control.storage-unavailable", Set.of()),
+    STORAGE_QUOTA_EXCEEDED("control.storage-quota-exceeded", Set.of());
 
     private final String code;
     private final Set<String> placeholders;
