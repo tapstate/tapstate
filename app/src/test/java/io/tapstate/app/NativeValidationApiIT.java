@@ -105,9 +105,11 @@ class NativeValidationApiIT {
                         .<Integer>exchange((request,httpResponse)->httpResponse.getStatusCode().value())).isEqualTo(403);
                 var started=http.post().uri("/api/validation:start").header("Authorization","Bearer "+write).contentType(MediaType.APPLICATION_JSON).body(operation).retrieve().body(Map.class);
                 assertThat(started.get("outcome")).isIn("PENDING","ACCEPTED");
+                var originalRecovery=new java.util.concurrent.atomic.AtomicBoolean();
                 org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(20)).pollInterval(Duration.ofMillis(100)).untilAsserted(()->{
                     var progress=http.post().uri("/api/validation:progress").header("Authorization","Bearer "+token).contentType(MediaType.APPLICATION_JSON).body(operation).retrieve().body(Map.class);
-                    assertThat(progress).containsEntry("state","COMPLETED");
+                    retryOriginalIfUnactivated(http,write,operation,started,progress,originalRecovery);
+                    assertThat(progress).as("Original START receipt: %s",started).containsEntry("state","COMPLETED");
                 });
                 var retried=http.post().uri("/api/validation:start").header("Authorization","Bearer "+write).contentType(MediaType.APPLICATION_JSON).body(operation).retrieve().body(Map.class);
                 assertThat(retried).containsEntry("state","COMPLETED");
@@ -209,12 +211,28 @@ class NativeValidationApiIT {
     private static Map runAndReport(RestClient http,String write,String read,Map<String,?> original,String task){
         var start=http.post().uri("/api/validation:start").header("Authorization","Bearer "+write).contentType(MediaType.APPLICATION_JSON).body(original).retrieve().body(Map.class);
         assertThat(start.get("outcome")).isIn("PENDING","ACCEPTED");
+        var originalRecovery=new java.util.concurrent.atomic.AtomicBoolean();
         org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(20)).pollInterval(Duration.ofMillis(100)).untilAsserted(()->{
             var progress=http.post().uri("/api/validation:progress").header("Authorization","Bearer "+read).contentType(MediaType.APPLICATION_JSON).body(original).retrieve().body(Map.class);
-            assertThat(progress).containsEntry("state","COMPLETED");
+            retryOriginalIfUnactivated(http,write,original,start,progress,originalRecovery);
+            assertThat(progress).as("Original START receipt: %s",start).containsEntry("state","COMPLETED");
         });
         var path="/api/pipelines/validation_flow/validation-tasks/"+task+"/reports/"+start.get("run")+"?generation="+original.get("taskGeneration")+"&sequence="+original.get("sequence");
         return completedReport(http,read,path);
+    }
+
+    private static void retryOriginalIfUnactivated(RestClient http,String write,Map<String,?> original,
+            Map start,Map progress,java.util.concurrent.atomic.AtomicBoolean recovered){
+        // Status reads do not activate. The caller may explicitly recover only this exact original.
+        if("ACCEPTED".equals(progress.get("outcome"))&&"STARTING".equals(progress.get("state"))
+                &&Boolean.FALSE.equals(progress.get("admitted"))&&Boolean.FALSE.equals(progress.get("controlUnknown"))
+                &&Boolean.FALSE.equals(progress.get("retired"))&&progress.get("tables") instanceof List<?> tables&&tables.isEmpty()
+                &&recovered.compareAndSet(false,true)){
+            var retry=http.post().uri("/api/validation:start").header("Authorization","Bearer "+write)
+                    .contentType(MediaType.APPLICATION_JSON).body(original).retrieve().body(Map.class);
+            assertThat(retry.get("original")).isEqualTo(original);
+            assertThat(retry.get("run")).isEqualTo(start.get("run"));
+        }
     }
 
     private static Map completedReport(RestClient http,String token,String path){
