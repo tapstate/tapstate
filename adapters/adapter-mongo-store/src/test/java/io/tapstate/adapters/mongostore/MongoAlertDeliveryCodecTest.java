@@ -21,6 +21,17 @@ import static io.tapstate.adapters.mongostore.AlertDeliveryFixtures.*;
 import static org.assertj.core.api.Assertions.*;
 
 class MongoAlertDeliveryCodecTest {
+    @Test void oversizedUntrustedChannelMetadataIsIsolatedBeforePatternEvaluation() {
+        var row = MongoAlertDeliveryCodec.write(business(), 1);
+        row.put("channelType", "a.".repeat(20_000) + "a");
+        assertThatCode(() -> {
+            var header = MongoAlertDeliveryCodec.header(row);
+            assertThat(header.channelType()).isNull();
+            assertThat(header.scope()).isEqualTo(SCOPE);
+            assertThat(header.deadline()).isEqualTo(business().frozen().deadline());
+        }).doesNotThrowAnyException();
+    }
+
     @Test void genericHttpsTransportMatchesItsClosedGoldenAndRejectsUnknownFamilyAndVersion()throws Exception{
         var original=new AlertReceiver.HttpsJson("test.sink",1,java.net.URI.create("https://notify.example.test"),"a".repeat(64),AlertReceiver.Authentication.NONE,null,AlertReceiver.Trust.SYSTEM,java.util.Map.of("topic","orders"));
         var encoded=MongoAlertReceiverCodec.transport(original);

@@ -14,7 +14,8 @@ public final class AlertTestQuota {
         public Bucket {
             Objects.requireNonNull(scope, "scope");
             AlertValidation.require(minute != null && minute.equals(AlertTestQuota.minute(minute)), "quotaMinute", "not-fixed-minute");
-            AlertValidation.require(actors != null && actors.size() <= SCOPE_LIMIT, "quotaActors", "outside-scope-budget");
+            if (actors == null) { throw AlertValidation.invalid("quotaActors", "outside-scope-budget"); }
+            AlertValidation.require(actors.size() <= SCOPE_LIMIT, "quotaActors", "outside-scope-budget");
             actors.forEach((actor, count) -> {
                 AlertValidation.text(actor, "actorPrincipal", 256);
                 AlertValidation.require(count != null && count >= 1 && count <= ACTOR_LIMIT, "actorAccepted", "outside-actor-budget");
@@ -44,7 +45,7 @@ public final class AlertTestQuota {
             }
             return changed == 1;
         }
-        public Instant cleanupAfter() { return DeliveryRetention.add(minute, java.time.Duration.ofSeconds(60 + 3600)); }
+        public Instant cleanupAfter() { return DeliveryRetention.add(minute, java.time.Duration.ofSeconds(60L + 3600)); }
     }
     public enum Refusal { NONE, ACTOR_LIMIT, SCOPE_LIMIT, RECEIVER_BUSY, TARGET_BUSY }
     public record Window(AlarmKey.Scope scope, String actorPrincipal, Instant minute, int actorAccepted, int scopeAccepted) {

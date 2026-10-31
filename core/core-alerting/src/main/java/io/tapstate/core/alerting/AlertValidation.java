@@ -8,9 +8,11 @@ final class AlertValidation {
     private AlertValidation() { }
     static void require(boolean condition, String field, String reason) {
         if (!condition) {
-            throw new TapstateException(AlertError.INVALID_CONFIGURATION,
-                    Map.of("field", field, "reason", reason), null);
+            throw invalid(field, reason);
         }
+    }
+    static TapstateException invalid(String field, String reason) {
+        return new TapstateException(AlertError.INVALID_CONFIGURATION, Map.of("field", field, "reason", reason), null);
     }
     static String text(String value, String field, int limit) {
         require(value != null && !value.isBlank(), field, "required");

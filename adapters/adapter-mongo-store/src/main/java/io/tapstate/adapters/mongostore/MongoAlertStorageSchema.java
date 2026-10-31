@@ -179,6 +179,7 @@ final class MongoAlertStorageSchema {
         });
         for(int attempt=0;attempt<3;attempt++) {
             Document current=verifiedMarker(budget);
+            if(current==null)throw unreadable("missing-query-preparation");
             if(current.getInteger("installedVersion")>=NODE_VERSION)return;
             Document progress=current.get(QUERY,Document.class);int cursor=progress.getInteger("nextIndex");
             if(cursor==BASE_QUERY_COUNT) {
@@ -187,6 +188,7 @@ final class MongoAlertStorageSchema {
             else throw unreadable("node-query-cursor");
             budget.transaction(client,session->{
                 Document original=marker(session,budget);
+                if(original==null)throw unreadable("missing-query-preparation");
                 if(original.getInteger("installedVersion")>=NODE_VERSION)return null;
                 Document query=original.get(QUERY,Document.class);
                 if(!query.getString("operationId").equals(progress.getString("operationId")))throw unreadable("node-query-operation");

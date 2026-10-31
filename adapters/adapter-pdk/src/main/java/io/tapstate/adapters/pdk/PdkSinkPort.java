@@ -170,7 +170,7 @@ public final class PdkSinkPort implements SinkPort {
             Runnable letGo) {
         WriteRecordFunction write = requireWriteFunction(connector.functions().getWriteRecordFunction());
         try {
-            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, true, letGo, purpose,preparations,plannedIdentities,operationObserver).withOperationObserver(operationObserver);
+            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, true, letGo, purpose,preparations,plannedIdentities,operationObserver);
             writer.prepareTargets();
             return writer;
         } catch (TapstateException e) {
@@ -286,7 +286,7 @@ public final class PdkSinkPort implements SinkPort {
                 initialize(connector);
                 return null;
             });
-            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, preparedAhead, null, purpose,preparations,plannedIdentities,operationObserver).withOperationObserver(operationObserver);
+            PdkSinkWriter writer = new PdkSinkWriter(connector, write, config, targets, stateStore, preparedAhead, null, purpose,preparations,plannedIdentities,operationObserver);
             writer.prepareTargets();
             return writer;
         } catch (TapstateException e) {

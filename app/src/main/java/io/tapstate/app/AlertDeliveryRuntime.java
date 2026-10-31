@@ -29,7 +29,7 @@ final class AlertDeliveryRuntime implements AutoCloseable {
     private final Map<String,Pending> pending=new ConcurrentHashMap<>();
     private final Map<String,Integer> byChannel=new HashMap<>();
     private final AtomicBoolean closed=new AtomicBoolean();
-    private volatile Failure failure; private AlertStore.DueCursor cursor;
+    private final java.util.concurrent.atomic.AtomicReference<Failure> failure=new java.util.concurrent.atomic.AtomicReference<>(); private AlertStore.DueCursor cursor;
     AlertDeliveryRuntime(AlertStore store,Clock clock,String worker,Runnable active,Channels channels,
             Function<AlertTestAuthority,AlertStore.Access> continuation) {
         this.store=store;this.clock=clock;this.worker=worker;this.active=active;this.channels=channels;this.continuation=continuation;timer.setRemoveOnCancelPolicy(true);
@@ -57,8 +57,8 @@ final class AlertDeliveryRuntime implements AutoCloseable {
                 try { pool.execute(()->dispatch(id)); }
                 catch(RejectedExecutionException full){release(id);paused=true;}
             }
-            failure=paused?new Failure(AlertError.CHANNEL_UNAVAILABLE.code(),Map.of("phase","dispatch")):null;
-        }catch(TapstateException unavailable){failure=new Failure(unavailable.code().code(),Map.of("phase","dispatch"));}
+            failure.set(paused?new Failure(AlertError.CHANNEL_UNAVAILABLE.code(),Map.of("phase","dispatch")):null);
+        }catch(TapstateException unavailable){failure.set(new Failure(unavailable.code().code(),Map.of("phase","dispatch")));}
     }
     private void renew(){
         for(String id:running){
@@ -119,7 +119,7 @@ final class AlertDeliveryRuntime implements AutoCloseable {
             var receipt=new Pending(identity,permit,result,placeholder.jitter());
             pending.put(key,receipt);persist(receipt);
         }catch(InterruptedException cancelled){Thread.currentThread().interrupt();}
-        catch(TapstateException unavailable){failure=new Failure(unavailable.code().code(),Map.of("phase","dispatch"));}
+        catch(TapstateException unavailable){failure.set(new Failure(unavailable.code().code(),Map.of("phase","dispatch")));}
         finally{
             // A stopped worker cannot retry memory-only receipts. The durable original permit remains
             // authoritative for replacement workers, including orphan reconciliation after its deadline.
@@ -155,7 +155,7 @@ final class AlertDeliveryRuntime implements AutoCloseable {
     }
     private static int stableJitter(DeliveryAttempt.Permit permit){return Math.floorMod(permit.attemptId().hashCode(),2001);}
     private synchronized void release(AlertIntent.Identity id){running.remove(id.deliveryId());byChannel.computeIfPresent(id.channelType(),(k,v)->v==1?null:v-1);}
-    Failure failure(){return failure;}
+    Failure failure(){return failure.get();}
     int occupied(){return running.size()+pending.size();}
     @Override public synchronized void close(){if(closed.compareAndSet(false,true)){timer.shutdownNow();calls.values().forEach(NotificationChannel::close);pending.clear();pool.shutdownNow();channels.close();}}
 }

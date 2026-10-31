@@ -9,7 +9,7 @@ public record AlarmKey(Scope scope, Resource resource, String typeId, String qua
         Objects.requireNonNull(scope, "scope");
         Objects.requireNonNull(resource, "resource");
         typeId = AlertValidation.text(typeId, "typeId", 128);
-        AlertValidation.require(typeId.matches("[a-z][a-z0-9]*([.-][a-z0-9]+)*"), "typeId", "invalid-id");
+        AlertValidation.require(typeId.matches("[a-z][a-z0-9]*+([.-][a-z0-9]++)*+"), "typeId", "invalid-id");
         qualifier = AlertValidation.text(qualifier, "qualifier", 256);
     }
     /** Both values must come from the authenticated deployment binding. */

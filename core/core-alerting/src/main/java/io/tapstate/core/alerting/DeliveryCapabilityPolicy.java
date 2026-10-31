@@ -67,7 +67,7 @@ public final class DeliveryCapabilityPolicy {
         }
         if (!expectedScope.equals(header.scope())) { return decision(Disposition.ISOLATED, Reason.SCOPE_MISMATCH); }
         if (header.channelType() == null || header.channelType().length() > 64
-                || !header.channelType().matches("[a-z][a-z0-9]*([.-][a-z0-9]+)*")
+                || !header.channelType().matches("[a-z][a-z0-9]*+([.-][a-z0-9]++)*+")
                 || header.channelVersion() == null || header.channelVersion() <= 0) {
             return decision(Disposition.ISOLATED, Reason.INVALID_CHANNEL);
         }

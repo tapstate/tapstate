@@ -9,6 +9,7 @@ import io.tapstate.spi.store.*;
 import java.time.*;
 import java.util.*;
 import java.util.function.Function;
+import java.util.concurrent.atomic.AtomicReference;
 import org.bson.Document;
 
 /** Composes the three alert fragments in the original CONFIG transaction and rechecks current authority. */
@@ -19,7 +20,7 @@ final class MongoAlertCoordinator implements AlertStore {
     private final MongoAlertConfigurationStore definitions;private final MongoAlertStateStore states;private final MongoAlertNotificationStore notifications;
     private final MongoAlertNodeLifecycleStore nodes;
     private final MongoAlertMaintenance maintenance;
-    private volatile AlertMaintenancePolicy.Capacity capacity=AlertMaintenancePolicy.Capacity.initial();
+    private final AtomicReference<AlertMaintenancePolicy.Capacity> capacity=new AtomicReference<>(AlertMaintenancePolicy.Capacity.initial());
     private volatile Instant capacityMeasuredAt;
     private volatile boolean capacityProtection;
     private final Map<String,Integer> admissionRates=new HashMap<>();
@@ -51,15 +52,15 @@ final class MongoAlertCoordinator implements AlertStore {
     private synchronized void observedCapacity(AlertMaintenance.Inventory inventory) {
         if(capacityMeasuredAt==null || !inventory.measuredAt().isBefore(capacityMeasuredAt.plusSeconds(60))) {
             carriedAdmissionBytes=admissionTotal-lastSampleAdmissionTotal;lastSampleAdmissionTotal=admissionTotal;
-            measuredCapacityBytes=inventory.logicalBytes();capacity=capacity.sample(inventory.logicalBytes());capacityMeasuredAt=inventory.measuredAt();
+            measuredCapacityBytes=inventory.logicalBytes();capacity.set(capacity.get().sample(inventory.logicalBytes()));capacityMeasuredAt=inventory.measuredAt();
         }
     }
     private void requireCapacity(boolean lowPriority,boolean newFact) {
         if((lowPriority||newFact) && capacityProtection && (capacityMeasuredAt==null || capacityMeasuredAt.isAfter(clock.instant()) || java.time.Duration.between(capacityMeasuredAt,clock.instant()).compareTo(Duration.ofSeconds(120))>0))
             throw new TapstateException(AlertError.INVALID_CONFIGURATION,Map.of("field","alertCapacity","reason","capacity-unavailable"),null);
         long estimate=measuredCapacityBytes+pendingAdmissionBytes();
-        if(lowPriority&&(!capacity.admitsTestOrReminder() || capacityProtection && estimate>=AlertMaintenancePolicy.CAPACITY_BYTES*9/10)
-                || newFact&&(!capacity.admitsNewFact() || capacityProtection && estimate>=AlertMaintenancePolicy.CAPACITY_BYTES))
+        if(lowPriority&&(!capacity.get().admitsTestOrReminder() || capacityProtection && estimate>=AlertMaintenancePolicy.CAPACITY_BYTES*9/10)
+                || newFact&&(!capacity.get().admitsNewFact() || capacityProtection && estimate>=AlertMaintenancePolicy.CAPACITY_BYTES))
             throw new TapstateException(AlertError.INVALID_CONFIGURATION,Map.of("field","alertCapacity","reason","storage-pressure"),null);
     }
     @Override public Optional<AlertMaintenance> maintenance(){return Optional.of(maintenance);}

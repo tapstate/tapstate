@@ -11,8 +11,34 @@ import javax.net.ssl.SSLContext;
 /** Static host registrations. Extension adapters consume the same frozen HTTPS/JSON envelope and permission boundary. */
 final class AlertChannelRegistry {
     interface Factory { NotificationChannel open(Context context); }
-    record Context(AlertChannelPolicy.Deployment deployment,AlertChannelPolicy.Capability capability,TargetBinding binding,
-            AlertReceiver.HttpsJson transport,URI endpoint,SSLContext tls,String bearer,byte[] signingKey,Clock clock,InetAddress[] addresses) { }
+    /** Borrowed construction inputs; a channel copies any material it retains after its factory returns. */
+    static final class Context {
+        private final AlertChannelPolicy.Deployment deployment;
+        private final AlertChannelPolicy.Capability capability;
+        private final TargetBinding binding;
+        private final AlertReceiver.HttpsJson transport;
+        private final URI endpoint;
+        private final SSLContext tls;
+        private final String bearer;
+        private final byte[] signingKey;
+        private final Clock clock;
+        private final InetAddress[] addresses;
+        Context(AlertChannelPolicy.Deployment deployment,AlertChannelPolicy.Capability capability,TargetBinding binding,
+                AlertReceiver.HttpsJson transport,URI endpoint,SSLContext tls,String bearer,byte[] signingKey,Clock clock,InetAddress[] addresses) {
+            this.deployment=deployment;this.capability=capability;this.binding=binding;this.transport=transport;
+            this.endpoint=endpoint;this.tls=tls;this.bearer=bearer;this.signingKey=signingKey;this.clock=clock;this.addresses=addresses;
+        }
+        public AlertChannelPolicy.Deployment deployment(){return deployment;}
+        public AlertChannelPolicy.Capability capability(){return capability;}
+        public TargetBinding binding(){return binding;}
+        public AlertReceiver.HttpsJson transport(){return transport;}
+        public URI endpoint(){return endpoint;}
+        public SSLContext tls(){return tls;}
+        public String bearer(){return bearer;}
+        public byte[] signingKey(){return signingKey;}
+        public Clock clock(){return clock;}
+        public InetAddress[] addresses(){return addresses;}
+    }
     record Registration(AlertChannelCatalog.Descriptor descriptor,Factory factory) {
         Registration { Objects.requireNonNull(descriptor);Objects.requireNonNull(factory);
             if(descriptor.transportFamily()!=AlertChannelCatalog.TransportFamily.HTTPS_JSON||descriptor.capability().version()!=1

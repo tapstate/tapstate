@@ -186,6 +186,16 @@ class SmtpChannelTest {
             }
         }
     }
+    @Test void aMultilineReplyCannotChangeItsCodeBeforeCredentialsAreSent() throws Exception {
+        try (Fixture fixture = new Fixture(true, Behavior.MISMATCHED_REPLY);
+                SmtpChannel channel = channel(fixture, SmtpChannel.Encryption.IMPLICIT_TLS, SmtpChannel.Authentication.PLAIN, tls.client, "localhost")) {
+            Result result = channel.send(request(Instant.now().plusSeconds(5), false));
+            assertThat(result.outcome()).isEqualTo(Outcome.NOT_ACCEPTED);
+            assertThat(result.action()).isEqualTo(Action.STOP);
+            assertThat(fixture.commands).noneMatch(command -> command.startsWith("AUTH ") || command.startsWith("MAIL "));
+            assertThat(fixture.data.get()).isNull(); idle(channel);
+        }
+    }
     @Test void blockedDataWritesAndMissingFinalRepliesStopAtTheOriginalDeadline() throws Exception {
         for (Behavior behavior : List.of(Behavior.BLOCK_DATA, Behavior.STALL_FINAL)) {
             try (Fixture fixture = new Fixture(true, behavior);
@@ -206,7 +216,7 @@ class SmtpChannelTest {
         while ((channel.activeCalls() != 0 || channel.pendingTimers() != 0) && System.nanoTime() < until) { java.util.concurrent.locks.LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(1)); }
         assertThat(channel.activeCalls()).isZero(); assertThat(channel.pendingTimers()).isZero();
     }
-    enum Behavior { NORMAL, NO_STARTTLS, DISCONNECT_AFTER_DATA, FINAL_BARE_LF, FINAL_CODE_ONLY, TLS_CORRUPTION, OVERSIZE_REPLY, TOTAL_REPLY_BUDGET, BLOCK_DATA, STALL_FINAL }
+    enum Behavior { NORMAL, NO_STARTTLS, DISCONNECT_AFTER_DATA, FINAL_BARE_LF, FINAL_CODE_ONLY, TLS_CORRUPTION, OVERSIZE_REPLY, MISMATCHED_REPLY, TOTAL_REPLY_BUDGET, BLOCK_DATA, STALL_FINAL }
     static final class Fixture implements AutoCloseable {
         final ServerSocket server;
         final Thread thread;
@@ -236,6 +246,7 @@ class SmtpChannelTest {
                         String command = WebhookChannelTest.line(in); commands.add(command);
                         if (command.startsWith("EHLO ")) {
                             if (behavior == Behavior.OVERSIZE_REPLY) { write(out, "250-" + "x".repeat(17000) + "\r\n250 done\r\n"); }
+                            else if (behavior == Behavior.MISMATCHED_REPLY) { write(out, "250-fixture\r\n550 mismatched\r\n"); }
                             else {
                                 write(out, "250-fixture\r\n");
                                 if (!encrypted && behavior != Behavior.NO_STARTTLS) { write(out, "250-STARTTLS\r\n"); }

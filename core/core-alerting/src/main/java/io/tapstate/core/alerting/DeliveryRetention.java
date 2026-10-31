@@ -32,7 +32,10 @@ public final class DeliveryRetention {
     public static DeliveryRetention restore(AlertRetentionPolicy policy, Kind kind, Instant createdAt, Instant deadline,
             Instant payloadUntil, Instant resultUntil, Instant acceptedAt, Instant stoppedAt) {
         DeliveryRetention initial = begin(policy, kind, createdAt, deadline);
-        AlertValidation.require(payloadUntil != null && resultUntil != null && !payloadUntil.isBefore(createdAt)
+        if (payloadUntil == null || resultUntil == null) {
+            throw AlertValidation.invalid("retentionBounds", "outside-frozen-upper-bounds");
+        }
+        AlertValidation.require(!payloadUntil.isBefore(createdAt)
                 && resultUntil.isAfter(createdAt) && !payloadUntil.isAfter(resultUntil)
                 && !payloadUntil.isAfter(initial.payloadUntil) && !resultUntil.isAfter(initial.resultUntil),
                 "retentionBounds", "outside-frozen-upper-bounds");
@@ -70,7 +73,8 @@ public final class DeliveryRetention {
     /** acceptedRecordedAt is the first durable receipt time. Expired detail windows cannot be reopened. */
     public Optional<DeliveryRetention> accept(Instant acceptedRecordedAt, Instant evidenceProtectedUntil, Instant now) {
         Objects.requireNonNull(now, "now"); validateEvidenceFloor(evidenceProtectedUntil);
-        AlertValidation.require(acceptedRecordedAt != null && !acceptedRecordedAt.isBefore(createdAt)
+        if (acceptedRecordedAt == null) { throw AlertValidation.invalid("acceptedAt", "outside-record-lifetime"); }
+        AlertValidation.require(!acceptedRecordedAt.isBefore(createdAt)
                 && !acceptedRecordedAt.isAfter(now), "acceptedAt", "outside-record-lifetime");
         if (!hasResultWindow(now)) { return Optional.empty(); }
         if (acceptedAt != null) { return Optional.of(this); }
@@ -85,7 +89,8 @@ public final class DeliveryRetention {
     /** Fixed only once after no new permit is possible and original attempts have settled. Exhaustion alone is insufficient. */
     public DeliveryRetention stop(Instant fixedStoppedAt, Instant evidenceProtectedUntil) {
         validateEvidenceFloor(evidenceProtectedUntil);
-        AlertValidation.require(fixedStoppedAt != null && !fixedStoppedAt.isBefore(createdAt)
+        if (fixedStoppedAt == null) { throw AlertValidation.invalid("stoppedAt", "outside-original-lifetime"); }
+        AlertValidation.require(!fixedStoppedAt.isBefore(createdAt)
                 && !fixedStoppedAt.isAfter(originalDeadline), "stoppedAt", "outside-original-lifetime");
         if (stoppedAt != null) { return this; }
         Instant payload = payloadUntil, result = resultUntil;

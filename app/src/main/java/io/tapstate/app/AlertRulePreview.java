@@ -22,8 +22,11 @@ final class AlertRulePreview {
         var key=new AlarmKey(scope,new AlarmKey.Resource(definition.resources().kinds().stream().sorted().findFirst().orElseThrow(),"synthetic-example","synthetic-example"),definition.typeId(),header.identity().incarnation());
         long trigger=definition.parameters().getOrDefault("trigger-for",BigDecimal.ZERO).longValueExact();long recover=definition.parameters().getOrDefault("resolve-for",BigDecimal.ZERO).longValueExact();
         var rule=new AlertRule(key,1,1,"synthetic-example",Duration.ofSeconds(trigger),Duration.ofSeconds(recover),Duration.ofSeconds(15),Duration.ofSeconds(5));
-        var effective=definition.effectiveSeverity(catalog);var state=AlertSnapshot.initial(rule);AlertSnapshot.Status first=null;
-        for(long second=0;second<=trigger;second++){var at=now.plusSeconds(second);state=AlertLifecycle.evaluate(state,new AlertSignal(key,1,1,"synthetic-example",second,at,AlertSignal.Condition.BAD,effective),at).snapshot();if(first==null)first=state.status();}
+        var effective=definition.effectiveSeverity(catalog);
+        var state=AlertLifecycle.evaluate(AlertSnapshot.initial(rule),
+                new AlertSignal(key,1,1,"synthetic-example",0,now,AlertSignal.Condition.BAD,effective),now).snapshot();
+        var first=state.status();
+        for(long second=1;second<=trigger;second++){var at=now.plusSeconds(second);state=AlertLifecycle.evaluate(state,new AlertSignal(key,1,1,"synthetic-example",second,at,AlertSignal.Condition.BAD,effective),at).snapshot();}
         long elapsed=trigger;
         if(sample.equals("GOOD")){for(long second=0;second<=recover;second++){var at=now.plusSeconds(trigger+1+second);state=AlertLifecycle.evaluate(state,new AlertSignal(key,1,1,"synthetic-example",state.lastSequence()+1,at,AlertSignal.Condition.GOOD,effective),at).snapshot();}elapsed=trigger+1+recover;}
         else if(sample.equals("MISSING")){elapsed=trigger+1;var at=now.plusSeconds(elapsed);state=AlertLifecycle.evaluate(state,new AlertSignal(key,1,1,"synthetic-example",state.lastSequence()+1,at,AlertSignal.Condition.UNKNOWN,effective),at).snapshot();}

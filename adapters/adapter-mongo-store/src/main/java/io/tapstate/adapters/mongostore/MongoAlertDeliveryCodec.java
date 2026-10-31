@@ -94,8 +94,8 @@ final class MongoAlertDeliveryCodec {
             try { scope = readScope(id); } catch (IllegalArgumentException | TapstateException invalid) { /* Keep the missing identity visible. */ }
             if (id.get("deliveryId") instanceof String value && value.matches("[A-Za-z0-9._-]{1,256}")) { deliveryId = value; }
         }
-        String channel = row.get("channelType") instanceof String value && value.matches("[a-z][a-z0-9]*([.-][a-z0-9]+)*")
-                && value.length() <= 64 ? value : null;
+        String channel = row.get("channelType") instanceof String value && value.length() <= 64
+                && value.matches("[a-z][a-z0-9]*+([.-][a-z0-9]++)*+") ? value : null;
         Instant deadline = null;
         try { deadline = instant(row, "deadline", false); } catch (IllegalArgumentException | java.time.DateTimeException invalid) { /* No invented cutoff. */ }
         return new DeliveryCapabilityPolicy.Header(version, scope, deliveryId, channel, channelVersion, deadline);

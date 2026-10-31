@@ -129,7 +129,8 @@ public final class AlertIntent {
     public static final class Payload {
         private final byte[] bytes;
         public Payload(byte[] bytes) {
-            AlertValidation.require(bytes != null && bytes.length > 0 && bytes.length <= 256 * 1024, "payload", "outside-payload-budget");
+            if (bytes == null) { throw AlertValidation.invalid("payload", "outside-payload-budget"); }
+            AlertValidation.require(bytes.length > 0 && bytes.length <= 256 * 1024, "payload", "outside-payload-budget");
             this.bytes = bytes.clone();
         }
         public byte[] bytes() { return bytes.clone(); }

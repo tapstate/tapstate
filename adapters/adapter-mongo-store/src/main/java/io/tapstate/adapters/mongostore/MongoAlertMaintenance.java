@@ -78,11 +78,11 @@ final class MongoAlertMaintenance implements AlertMaintenance {
             throw new IllegalArgumentException("outside maintenance batch budget");
         int index=after==null?0:after.collection();var collection=RESOURCES.get(index);var b=new Budget(maxRows,maxBytes,maxTime);
         Cursor cursor=after==null?new Cursor(index,null,null):after;int changed=0,conflicts=0;var skipped=new LinkedHashMap<String,Long>();Instant oldest=null;boolean exhausted=false;
-        try { if(System.nanoTime()>=schemaVerifiedUntil){b.use(64,64*1024);transactions.verify(b.remaining());schemaVerifiedUntil=b.until;} }
+        try { if(System.nanoTime()>=schemaVerifiedUntil){b.use(64,64L*1024);transactions.verify(b.remaining());schemaVerifiedUntil=b.until;} }
         catch(Yield end){return new Batch(cursor,b.used,0,b.encoded,Map.of("budget",1L),null);}
         while(b.available()) {
             Cursor pageAfter=cursor;List<Document> candidates;
-            try { b.use(18,32*1024);candidates=transactions.run(false,b.remaining(),s->next(s,collection,pageAfter,b)); }
+            try { b.use(18,32L*1024);candidates=transactions.run(false,b.remaining(),s->next(s,collection,pageAfter,b)); }
             catch(Yield end){break;}
             if(candidates.isEmpty()){exhausted=true;break;}
             if(collection==SystemCollections.ALERT_DELIVERY_INTENTS || collection==SystemCollections.ALERT_TEST_QUOTAS) {
@@ -90,7 +90,7 @@ final class MongoAlertMaintenance implements AlertMaintenance {
                 try {
                     // Share only this transaction's live authority/fences. Every original row still
                     // passes its own decode, retention/reference checks and fragment-owner CAS.
-                    b.use(22,32*1024);
+                    b.use(22,32L*1024);
                     var group=transactions.run(true,b.remaining(),session->hotGroup(session,index,collection,candidates,b));
                     for(var row:group.rows()) {
                         b.classified(row.key());
@@ -126,7 +126,7 @@ final class MongoAlertMaintenance implements AlertMaintenance {
                 String protection=null;
                 if(collection==SystemCollections.ALERT_NODE_LIFECYCLES) {
                     // A protected read needs no write fence. Deletion still repeats every check below.
-                    b.use(18,32*1024);
+                    b.use(18,32L*1024);
                     protection=transactions.run(false,b.remaining(),s->{
                         var row=read(s,collection,new Document("_id",candidate.get("_id")),b);
                         return row==null?"conflict":nodeProtection(s,MongoAlertNodeLifecycleStore.decode(row),b);
@@ -134,7 +134,7 @@ final class MongoAlertMaintenance implements AlertMaintenance {
                 }
                 String result=protection;
                 if(result==null) {
-                    b.use(22,32*1024);
+                    b.use(22,32L*1024);
                     result=transactions.run(true,b.remaining(),s->{
                         Document row=read(s,collection,new Document("_id",candidate.get("_id")),b);
                         if(row==null)return "conflict";
@@ -230,10 +230,9 @@ final class MongoAlertMaintenance implements AlertMaintenance {
             // The reviewed node namespace is capped at 512 rows and has no cleanup timestamp.
             filter.append("formatVersion",1).append("phase",new Document("$in",List.of("EXPECTED","RETIRING"))).append("nodeId",new Document("$type","string")).append("bootId",new Document("$type","string"));
             sort=new Document("phase",1).append("nodeId",1).append("bootId",1);
-            if(after!=null&&after.id()!=null){var prior=Document.parse(after.id()).get("id");Document row=null;
+            if(after!=null&&after.id()!=null){
                 // Use a stable compound cursor even if the previously scanned row was deleted.
-                var encoded=Document.parse(after.id());if(encoded.containsKey("phase"))filter=and(filter,lex(sort.keySet().stream().toList(),List.of(encoded.get("phase"),encoded.get("nodeId"),encoded.get("bootId"))));
-                else if(row!=null)filter=and(filter,lex(sort.keySet().stream().toList(),List.of(row.get("phase"),row.get("nodeId"),row.get("bootId"))));}
+                var encoded=Document.parse(after.id());if(encoded.containsKey("phase"))filter=and(filter,lex(sort.keySet().stream().toList(),List.of(encoded.get("phase"),encoded.get("nodeId"),encoded.get("bootId"))));}
         } else {
             sort=new Document("cleanupAt",1).append("_id",1);
             boolean definitions=MongoAlertConfigurationStore.COLLECTIONS.contains(c);
@@ -425,12 +424,12 @@ final class MongoAlertMaintenance implements AlertMaintenance {
         if(c==SystemCollections.ALERT_NODE_LIFECYCLES) {
             var value=MongoAlertNodeLifecycleStore.decode(row);String protection=nodeProtection(s,value,b);
             if(protection!=null)return protection;
-            b.use(16,32*1024);String removed=remove(s,c,row,b);if(nodeExpected.test(s,value))throw new IllegalStateException("node monitoring changed during cleanup");return removed;
+            b.use(16,32L*1024);String removed=remove(s,c,row,b);if(nodeExpected.test(s,value))throw new IllegalStateException("node monitoring changed during cleanup");return removed;
         }
         return "unsupported";
     }
     private String nodeProtection(ClientSession session,AlertNodeLifecycleStore.Row value,Budget budget) {
-        budget.use(16,32*1024);if(nodeExpected.test(session,value))return "expected-node";
+        budget.use(16,32L*1024);if(nodeExpected.test(session,value))return "expected-node";
         return resourceReferences(session,value.registration().key().resource(),budget)?"node-reference":null;
     }
     private final Map<String,TargetScan> targetScans=new LinkedHashMap<>() {
@@ -444,7 +443,7 @@ final class MongoAlertMaintenance implements AlertMaintenance {
         var scan=targetScans.computeIfAbsent(key,ignored->new TargetScan());
         if(scan.complete)return false;
         while(true) {
-            budget.require(1,68*1024);
+            budget.require(1,68L*1024);
             var filter=scope(SystemCollections.ALERT_DELIVERY_INTENTS).append("channelType",domain.channelType());
             if(scan.after!=null)filter.append("_id",new Document("$gt",scan.after));
             var result=handles.apply(SystemCollections.ALERT_DELIVERY_INTENTS).aggregate(session,List.of(
@@ -467,7 +466,7 @@ final class MongoAlertMaintenance implements AlertMaintenance {
     private boolean episodeReferenced(ClientSession s,AlarmKey key,long number,Instant now,Budget b,Map<String,Instant> proofs) {
         String identity=AlertIntent.hash(new Document("alarm",MongoAlertStateCodec.key(key)).append("number",number).toJson().getBytes(java.nio.charset.StandardCharsets.UTF_8));
         var until=proofs.get(identity);if(until!=null&&!now.isBefore(until))return false;
-        b.require(1,52*1024);
+        b.require(1,52L*1024);
         var filter=and(scope(SystemCollections.ALERT_EPISODES),new Document("_id",new Document("alarm",MongoAlertStateCodec.key(key)).append("number",number)))
                 .append("$expr",new Document("$lte",List.of(new Document("$bsonSize","$$ROOT"),48*1024)));
         Document ep=handles.apply(SystemCollections.ALERT_EPISODES).find(s,filter).batchSize(1).limit(1).first();
@@ -500,7 +499,7 @@ final class MongoAlertMaintenance implements AlertMaintenance {
     private boolean unknown(ClientSession s,SystemCollections c,Budget b) {
         if(c==SystemCollections.ALERT_DELIVERY_INTENTS)return exists(s,c,new Document("$nor",List.of(MongoAlertEnvelopeSupport.intentFilter())),b);
         if(c==SystemCollections.ALERT_RECEIVERS)return exists(s,c,new Document("$nor",List.of(MongoAlertEnvelopeSupport.receiverFilter())),b);
-        var versions=c==SystemCollections.ALERT_INSTANCES?List.of(2,3,4):c==SystemCollections.ALERT_DELIVERY_INTENTS?List.of(1,2,3):c==SystemCollections.ALERT_RULES||c==SystemCollections.ALERT_SUBSCRIPTIONS||c==SystemCollections.ALERT_RECEIVERS?List.of(1,2):
+        var versions=c==SystemCollections.ALERT_INSTANCES?List.of(2,3,4):c==SystemCollections.ALERT_RULES||c==SystemCollections.ALERT_SUBSCRIPTIONS?List.of(1,2):
                 c==SystemCollections.ALERT_EPISODES||c==SystemCollections.ALERT_TRANSITIONS?List.of(2):List.of(1);
         return exists(s,c,new Document("formatVersion",new Document("$nin",versions)),b);
     }

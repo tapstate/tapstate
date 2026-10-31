@@ -62,7 +62,7 @@ public final class AlertTestCommand {
             String targetId, String bindingId, Route route, String payloadSha256) {
         public Parameters {
             channelType = AlertValidation.text(channelType, "channelType", 64);
-            AlertValidation.require(channelType.matches("[a-z][a-z0-9]*([.-][a-z0-9]+)*"), "channelType", "invalid-id");
+            AlertValidation.require(channelType.matches("[a-z][a-z0-9]*+([.-][a-z0-9]++)*+"), "channelType", "invalid-id");
             AlertValidation.require(candidate != null, "candidate", "required");
             targetId = AlertValidation.text(targetId, "targetId", 256);
             bindingId = AlertValidation.text(bindingId, "bindingId", 256);
@@ -72,7 +72,8 @@ public final class AlertTestCommand {
     public record Accepted(Key key, Parameters parameters, Instant acceptedAt, Instant deadline) {
         public Accepted {
             Objects.requireNonNull(key, "key"); Objects.requireNonNull(parameters, "parameters");
-            AlertValidation.require(acceptedAt != null && !acceptedAt.isBefore(key.clientId().createdAt().minus(FUTURE_SKEW))
+            if (acceptedAt == null) { throw AlertValidation.invalid("acceptedAt", "outside-command-admission-window"); }
+            AlertValidation.require(!acceptedAt.isBefore(key.clientId().createdAt().minus(FUTURE_SKEW))
                     && acceptedAt.isBefore(key.clientId().admissionUntil()), "acceptedAt", "outside-command-admission-window");
             AlertValidation.require(deadline != null && deadline.equals(acceptedAt.plus(ADMISSION_AGE)), "deadline", "must-match-original-test-age");
         }

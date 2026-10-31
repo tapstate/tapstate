@@ -10,12 +10,14 @@ public record AlertSilenceWindow(AlarmKey.Scope scope, boolean allResources, Set
         Set<String> typeIds, Instant startsAt, Duration duration, Duration period, Instant endsAt) {
     public AlertSilenceWindow {
         Objects.requireNonNull(scope, "scope"); Objects.requireNonNull(startsAt, "startsAt");
-        AlertValidation.require(resources != null && resources.size() <= 100 && resources.stream().allMatch(Objects::nonNull), "silenceResources", "invalid-resources");
+        if (resources == null) { throw AlertValidation.invalid("silenceResources", "invalid-resources"); }
+        AlertValidation.require(resources.size() <= 100 && resources.stream().allMatch(Objects::nonNull), "silenceResources", "invalid-resources");
         AlertValidation.require(allResources ? resources.isEmpty() : !resources.isEmpty(), "silenceResources", "explicit-scope-or-resources-required");
-        AlertValidation.require(typeIds != null && typeIds.size() <= 16 && typeIds.stream().allMatch(Objects::nonNull), "silenceTypes", "invalid-types");
+        if (typeIds == null) { throw AlertValidation.invalid("silenceTypes", "invalid-types"); }
+        AlertValidation.require(typeIds.size() <= 16 && typeIds.stream().allMatch(Objects::nonNull), "silenceTypes", "invalid-types");
         typeIds.forEach(id -> {
             AlertValidation.text(id, "silenceType", 128);
-            AlertValidation.require(id.matches("[a-z][a-z0-9]*([.-][a-z0-9]+)*"), "silenceType", "invalid-id");
+            AlertValidation.require(id.matches("[a-z][a-z0-9]*+([.-][a-z0-9]++)*+"), "silenceType", "invalid-id");
         });
         resources = Set.copyOf(resources); typeIds = Set.copyOf(typeIds);
         duration = AlertValidation.duration(duration, "silenceDuration", false, Duration.ofDays(7));

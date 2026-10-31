@@ -11,7 +11,7 @@ public record AlertTargetLimit(Domain domain, Instant notBefore) {
         public Domain {
             Objects.requireNonNull(scope, "scope");
             channelType = AlertValidation.text(channelType, "channelType", 64);
-            AlertValidation.require(channelType.matches("[a-z][a-z0-9]*([.-][a-z0-9]+)*"), "channelType", "invalid-id");
+            AlertValidation.require(channelType.matches("[a-z][a-z0-9]*+([.-][a-z0-9]++)*+"), "channelType", "invalid-id");
             semanticTargetId = AlertValidation.text(semanticTargetId, "semanticTargetId", 256);
             authenticationIdentity = AlertValidation.text(authenticationIdentity, "authenticationIdentity", 256);
         }

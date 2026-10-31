@@ -108,7 +108,10 @@ public final class SmtpChannel implements NotificationChannel {
             if (nanos <= 0) { call.abort(); future.cancel(true); return knownOr(call, result(Outcome.UNKNOWN, Action.RETRY, Phase.DEADLINE, 0)); }
             return future.get(nanos, TimeUnit.NANOSECONDS);
         } catch (TimeoutException ex) {
-            call.abort(); future.cancel(true); call.finished.await(1, TimeUnit.SECONDS);
+            call.abort(); future.cancel(true);
+            if (!call.finished.await(1, TimeUnit.SECONDS)) {
+                org.slf4j.LoggerFactory.getLogger(SmtpChannel.class).debug("SMTP cleanup remains pending after the bounded wait");
+            }
             return knownOr(call, result(call.submitted ? Outcome.UNKNOWN : Outcome.NOT_ACCEPTED, Action.RETRY, Phase.DEADLINE, 0));
         } catch (ExecutionException ex) {
             if (ex.getCause() instanceof RuntimeException bug) { throw bug; }
@@ -199,7 +202,8 @@ public final class SmtpChannel implements NotificationChannel {
     private final class Call {
         final Request request;
         final AtomicReference<Result> evidence = new AtomicReference<>();
-        volatile ScheduledFuture<?> watchdog;
+        // Only the protocol worker assigns and cancels its own timer.
+        ScheduledFuture<?> watchdog;
         final AtomicReference<Socket> rawSocket = new AtomicReference<>();
         final AtomicReference<Socket> socket = new AtomicReference<>();
         final AtomicBoolean aborted = new AtomicBoolean();
@@ -231,7 +235,7 @@ public final class SmtpChannel implements NotificationChannel {
                     .orElseGet(() -> result(Outcome.NOT_ACCEPTED, Action.STOP, phase, reply.code)));
         }
         Reply read() throws IOException {
-            int currentBytes = 0; Integer code = null; List<String> lines = new ArrayList<>();
+            int currentBytes = 0, code = -1; List<String> lines = new ArrayList<>();
             while (true) {
                 StringBuilder line = new StringBuilder(); boolean carriage = false;
                 while (true) {
@@ -247,7 +251,7 @@ public final class SmtpChannel implements NotificationChannel {
                 String value = line.toString();
                 if (value.length() < 3 || !value.substring(0, 3).matches("[2-5][0-9]{2}") || value.length() > 3 && value.charAt(3) != ' ' && value.charAt(3) != '-') { throw new ReplyBudgetException(); }
                 int parsed = Integer.parseInt(value.substring(0, 3));
-                if (code != null && parsed != code) { throw new ReplyBudgetException(); }
+                if (code != -1 && parsed != code) { throw new ReplyBudgetException(); }
                 code = parsed; lines.add(value.length() > 3 ? value.substring(4) : "");
                 if (value.length() == 3 || value.charAt(3) == ' ') { return new Reply(code, lines); }
             }

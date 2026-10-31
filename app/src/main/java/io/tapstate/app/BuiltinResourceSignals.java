@@ -27,7 +27,7 @@ final class BuiltinResourceSignals {
     private static final class Connection {
         final String id=UUID.randomUUID().toString();boolean closed;int pending;
     }
-    private static final class Reports { boolean closed;int pending; }
+    private static final class Reports { final Object monitor=new Object();boolean closed;int pending; }
     private final Map<String,Connection> connections=new java.util.concurrent.ConcurrentHashMap<>();
     SourceOperationObserver source(SourceBindingSnapshot original,Runnable operation){return source(original,"legacy-source",operation,active);}
     SourceOperationObserver source(SourceBindingSnapshot original,String logical,Runnable operation,Runnable localProof) {
@@ -35,7 +35,7 @@ final class BuiltinResourceSignals {
     }
     private SourceOperationObserver source(SourceBindingSnapshot original,String logical,Runnable operation,
             Runnable localProof,Reports reports,boolean root) {
-        synchronized(reports){if(reports.closed)return SourceOperationObserver.NONE;}
+        synchronized(reports.monitor){if(reports.closed)return SourceOperationObserver.NONE;}
         var id=original.identity();
         boolean master=storage.get().defaultSourceId().equals(id.sourceId());
         var sourceResource=new AlarmKey.Resource("source",id.sourceId(),id.incarnation());
@@ -54,7 +54,7 @@ final class BuiltinResourceSignals {
             active.run();localProof.run();
             if(connections.get(base)!=connection)throw ThreeLayerStorePort.refused();
         };
-        Runnable settled=()->{synchronized(reports){synchronized(connection){
+        Runnable settled=()->{synchronized(reports.monitor){synchronized(connection){
             if(--connection.pending<0 || --reports.pending<0)throw new IllegalStateException("negative pending operation count");
             if(connection.closed && connection.pending==0)connections.remove(base,connection);
         }}};
@@ -63,7 +63,7 @@ final class BuiltinResourceSignals {
             @Override public void completed(String access,Capability capability,Throwable failure) {
                 if(failure!=null)org.slf4j.LoggerFactory.getLogger(BuiltinResourceSignals.class).debug("Operational failure classification [master={},capability={},classified={}]",master,capability,connectionFailure(failure));
                 if(failure!=null && !connectionFailure(failure))return;
-                synchronized(reports){synchronized(connection){
+                synchronized(reports.monitor){synchronized(connection){
                     if(reports.closed || connection.closed || connections.get(base)!=connection)return;
                     int count=master?2:1;connection.pending+=count;reports.pending+=count;
                 }}
@@ -81,18 +81,19 @@ final class BuiltinResourceSignals {
                 }
             }
             @Override public SourceOperationObserver fork(String phase){closeConnection();return BuiltinResourceSignals.this.source(original,logical+":"+phase,operation,localProof,reports,false);}
-            @Override public boolean hasPendingReports(){synchronized(reports){return reports.pending>0;}}
-            @Override public void close(){synchronized(reports){if(root)reports.closed=true;closeConnection();}}
-            private void closeConnection(){synchronized(reports){synchronized(connection){connection.closed=true;if(connection.pending==0)connections.remove(base,connection);}}}
+            @Override public boolean hasPendingReports(){synchronized(reports.monitor){return reports.pending>0;}}
+            @Override public void close(){synchronized(reports.monitor){if(root)reports.closed=true;closeConnection();}}
+            private void closeConnection(){synchronized(reports.monitor){synchronized(connection){connection.closed=true;if(connection.pending==0)connections.remove(base,connection);}}}
         };
     }
     private static Runnable once(Runnable action){
         var done=new java.util.concurrent.atomic.AtomicBoolean();return ()->{if(done.compareAndSet(false,true))action.run();};
     }
-    private volatile Function<AlarmKey.Resource,Optional<AlertStore.NodeEvidence>> nodeProofs=resource->Optional.empty();
-    void nodeProofs(Function<AlarmKey.Resource,Optional<AlertStore.NodeEvidence>> proofs){nodeProofs=Objects.requireNonNull(proofs);}
+    private final java.util.concurrent.atomic.AtomicReference<Function<AlarmKey.Resource,Optional<AlertStore.NodeEvidence>>> nodeProofs=
+            new java.util.concurrent.atomic.AtomicReference<>(resource->Optional.empty());
+    void nodeProofs(Function<AlarmKey.Resource,Optional<AlertStore.NodeEvidence>> proofs){nodeProofs.set(Objects.requireNonNull(proofs));}
     Optional<AlertStore.ResourceEvidence> resourceEvidence(AlarmKey.Resource resource){
-        if(resource.kind().equals("cluster-node"))return nodeProofs.apply(resource).map(value->value);
+        if(resource.kind().equals("cluster-node"))return nodeProofs.get().apply(resource).map(value->value);
         if(resource.kind().equals("cluster-storage")&&resource.id().equals("cache")){
             var proof=new AlertStore.StorageEvidence(new AlarmKey.Resource("cluster-storage","cache",cache.cacheIncarnation()+":"+cache.bindingVersion()),AlertStore.StorageRole.CACHE,cache,null);
             return proof.resource().equals(resource)?Optional.of(proof):Optional.empty();
@@ -127,15 +128,24 @@ final class BuiltinResourceSignals {
             }
             if(cause instanceof java.net.ConnectException||cause instanceof java.net.NoRouteToHostException
                     ||cause instanceof java.net.UnknownHostException||cause instanceof java.net.SocketTimeoutException)return true;
-            for(Class<?> type=cause.getClass();type!=null;type=type.getSuperclass()){
-                if(Set.of("com.mongodb.MongoSocketException","com.mongodb.MongoTimeoutException").contains(type.getName()))return true;
-                if(type.getName().equals("com.mongodb.MongoException")){
-                    try {Object code=type.getMethod("getCode").invoke(cause);if(code instanceof Number n&&Set.of(13,18,8000).contains(n.intValue()))return true;}
-                    catch(ReflectiveOperationException unavailable){return false;}
-                }
+            if(driverException(cause,"com.mongodb.MongoSocketException").isPresent()
+                    ||driverException(cause,"com.mongodb.MongoTimeoutException").isPresent())return true;
+            var mongo=driverException(cause,"com.mongodb.MongoException");
+            if(mongo.isPresent()){
+                try {Object code=mongo.orElseThrow().getMethod("getCode").invoke(cause);if(code instanceof Number n&&Set.of(13,18,8000).contains(n.intValue()))return true;}
+                catch(ReflectiveOperationException unavailable){return false;}
             }
         }
         return false;
+    }
+    private static Optional<Class<?>> driverException(Throwable failure,String typeName) {
+        try {
+            // The connector's loader owns its exception hierarchy; application-loader identity is insufficient.
+            var type=Class.forName(typeName,false,failure.getClass().getClassLoader());
+            return type.isInstance(failure)?Optional.of(type):Optional.empty();
+        } catch(ClassNotFoundException | LinkageError | SecurityException unavailable) {
+            return Optional.empty();
+        }
     }
     static String digest(String...parts){
         try {var hash=java.security.MessageDigest.getInstance("SHA-256");for(String part:parts){byte[] bytes=part.getBytes(StandardCharsets.UTF_8);hash.update(ByteBuffer.allocate(4).putInt(bytes.length).array());hash.update(bytes);}return HexFormat.of().formatHex(hash.digest());}

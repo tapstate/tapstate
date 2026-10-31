@@ -237,7 +237,7 @@ final class MongoAlertConfigurationStore {
         if (!keys.fenceWrite(new SourceConfigWriteScope(session), prepared.keyId())) { throw unreadable("configuration-key"); }
         if (actual != null && actual.definition().equals(candidate) && Objects.equals(original.get("privateSlot"), slot)) { return Stage.UNCHANGED; }
         if (expected == null ? actual != null : actual == null || !actual.definition().equals(expected)) { return Stage.CONFLICT; }
-        if (!candidate.header().active() && !Objects.equals(original.get("privateSlot"), slot)) { throw unreadable("retirement-material-changed"); }
+        if (!candidate.header().active() && (original == null || !Objects.equals(original.get("privateSlot"), slot))) { throw unreadable("retirement-material-changed"); }
         long nextFence = actual == null ? 0 : increment(actual.writeFence());
         Document row = MongoAlertConfigurationCodec.write(candidate, nextFence).append("privateSlot", slot);
         MongoAlertConfigurationCodec.read(Kind.RECEIVER, scope, identity.id(), row);

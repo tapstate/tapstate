@@ -9,7 +9,8 @@ public final class AlertConditionGroup {
     public enum Operator { ALL, ANY }
     public static AlertSignal.Condition evaluate(Operator operator, List<AlertSignal.Condition> conditions) {
         Objects.requireNonNull(operator, "operator");
-        AlertValidation.require(conditions != null && !conditions.isEmpty() && conditions.size() <= 8,
+        if (conditions == null) { throw AlertValidation.invalid("conditions", "outside-1-8"); }
+        AlertValidation.require(!conditions.isEmpty() && conditions.size() <= 8,
                 "conditions", "outside-1-8");
         AlertValidation.require(conditions.stream().allMatch(Objects::nonNull), "conditions", "missing-condition");
         if (operator == Operator.ALL && conditions.contains(AlertSignal.Condition.GOOD)) { return AlertSignal.Condition.GOOD; }

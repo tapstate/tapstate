@@ -10,7 +10,7 @@ public final class AlertChannelPolicy {
     public record Capability(String typeId, int version, Family family) {
         public Capability {
             typeId = AlertValidation.text(typeId, "channelType", 64);
-            AlertValidation.require(typeId.matches("[a-z][a-z0-9]*([.-][a-z0-9]+)*"), "channelType", "invalid-id");
+            AlertValidation.require(typeId.matches("[a-z][a-z0-9]*+([.-][a-z0-9]++)*+"), "channelType", "invalid-id");
             AlertValidation.require(version > 0, "channelVersion", "must-be-positive");
             Objects.requireNonNull(family, "family");
         }

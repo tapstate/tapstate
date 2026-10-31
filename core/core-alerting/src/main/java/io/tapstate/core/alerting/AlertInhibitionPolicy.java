@@ -17,7 +17,7 @@ public final class AlertInhibitionPolicy {
         }
         private static String type(String value) {
             AlertValidation.text(value, "inhibitionType", 128);
-            AlertValidation.require(value.matches("[a-z][a-z0-9]*([.-][a-z0-9]+)*"), "inhibitionType", "invalid-id");
+            AlertValidation.require(value.matches("[a-z][a-z0-9]*+([.-][a-z0-9]++)*+"), "inhibitionType", "invalid-id");
             return value;
         }
     }
@@ -25,7 +25,8 @@ public final class AlertInhibitionPolicy {
     private final Set<Edge> edges;
     public AlertInhibitionPolicy(AlarmKey.Scope scope, List<Edge> definitions) {
         this.scope = Objects.requireNonNull(scope, "scope");
-        AlertValidation.require(definitions != null && definitions.size() <= 64 && definitions.stream().allMatch(Objects::nonNull), "inhibition", "too-many-or-missing-edges");
+        if (definitions == null) { throw AlertValidation.invalid("inhibition", "too-many-or-missing-edges"); }
+        AlertValidation.require(definitions.size() <= 64 && definitions.stream().allMatch(Objects::nonNull), "inhibition", "too-many-or-missing-edges");
         edges = Set.copyOf(definitions);
         AlertValidation.require(edges.size() == definitions.size(), "inhibition", "duplicate-edge");
         Map<String, List<String>> graph = new HashMap<>();

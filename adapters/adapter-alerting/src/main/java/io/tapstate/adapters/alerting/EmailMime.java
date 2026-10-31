@@ -18,6 +18,14 @@ public final class EmailMime {
         public Result { bytes = bytes == null ? null : bytes.clone(); }
         @Override public byte[] bytes() { return bytes == null ? null : bytes.clone(); }
         public boolean successful() { return bytes != null; }
+        @Override public boolean equals(Object value) {
+            return this == value || value instanceof Result other && failure == other.failure
+                    && java.util.Arrays.equals(bytes, other.bytes);
+        }
+        @Override public int hashCode() { return 31 * java.util.Objects.hashCode(failure) + java.util.Arrays.hashCode(bytes); }
+        @Override public String toString() {
+            return "EmailMimeResult[payloadBytes=" + (bytes == null ? 0 : bytes.length) + ", failure=" + failure + "]";
+        }
     }
     public static Result freeze(String deliveryId, Instant createdAt, String from, String to, NotificationRenderer.Snapshot rendered) {
         if (deliveryId == null || !deliveryId.matches("[A-Za-z0-9._-]{1,256}") || createdAt == null
@@ -41,7 +49,7 @@ public final class EmailMime {
         if (value == null || value.length() > 254 || value.indexOf('@') < 1 || value.indexOf('@') != value.lastIndexOf('@')) { return false; }
         String local = value.substring(0, value.indexOf('@'));
         String domain = value.substring(value.indexOf('@') + 1);
-        if (local.length() > 64 || !local.matches("[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(\\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*") || domain.length() > 253) { return false; }
+        if (local.length() > 64 || !local.matches("[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]++(\\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]++)*+") || domain.length() > 253) { return false; }
         String[] labels = domain.split("\\.", -1);
         if (labels.length < 2) { return false; }
         for (String label : labels) {

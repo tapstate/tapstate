@@ -204,15 +204,19 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
 
     /** The returned port keeps both preparation owners and the same connector and note configuration. */
     public PdkCapturePort withSnapshotPreparation(SnapshotPreparer prepare) {
-        return new PdkCapturePort(provisioner, stateStore, preflightTimeout, Duration.ofNanos(acknowledgeIntervalNanos),
-                nanoClock, releaseTimeout, noteScopes, Objects.requireNonNull(prepare, "prepare"), streamPreparer, pendingPreflights).withOperationObserver(operationObserver);
+        var configured = new PdkCapturePort(provisioner, stateStore, preflightTimeout, Duration.ofNanos(acknowledgeIntervalNanos),
+                nanoClock, releaseTimeout, noteScopes, Objects.requireNonNull(prepare, "prepare"), streamPreparer, pendingPreflights);
+        configured.withOperationObserver(operationObserver);
+        return configured;
     }
 
 
     /** The host callback runs outside the connector loader and completes before CDC preflight succeeds. */
     public PdkCapturePort withStreamPreparation(StreamPreparer prepare) {
-        return new PdkCapturePort(provisioner, stateStore, preflightTimeout, Duration.ofNanos(acknowledgeIntervalNanos),
-                nanoClock, releaseTimeout, noteScopes, snapshotPreparer, Objects.requireNonNull(prepare, "prepare"), pendingPreflights).withOperationObserver(operationObserver);
+        var configured = new PdkCapturePort(provisioner, stateStore, preflightTimeout, Duration.ofNanos(acknowledgeIntervalNanos),
+                nanoClock, releaseTimeout, noteScopes, snapshotPreparer, Objects.requireNonNull(prepare, "prepare"), pendingPreflights);
+        configured.withOperationObserver(operationObserver);
+        return configured;
     }
 
     /** Configured capture notes use the configuration domain, independently of generic operator state. */

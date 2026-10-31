@@ -117,7 +117,7 @@ public final class AlarmTypeCatalog {
     }
     private static String id(String value, String field) {
         AlertValidation.text(value, field, 128);
-        AlertValidation.require(value.matches("[a-z][a-z0-9]*([.-][a-z0-9]+)*"), field, "invalid-id");
+        AlertValidation.require(value.matches("[a-z][a-z0-9]*+([.-][a-z0-9]++)*+"), field, "invalid-id");
         return value;
     }
 }

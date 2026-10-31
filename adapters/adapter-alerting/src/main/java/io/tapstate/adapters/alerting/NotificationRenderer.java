@@ -37,6 +37,18 @@ public final class NotificationRenderer {
     public record Snapshot(int templateVersion, String locale, String subject, String text, String html, byte[] webhook) {
         public Snapshot { webhook = webhook.clone(); }
         @Override public byte[] webhook() { return webhook.clone(); }
+        @Override public boolean equals(Object value) {
+            return this == value || value instanceof Snapshot other && templateVersion == other.templateVersion
+                    && Objects.equals(locale, other.locale) && Objects.equals(subject, other.subject)
+                    && Objects.equals(text, other.text) && Objects.equals(html, other.html)
+                    && java.util.Arrays.equals(webhook, other.webhook);
+        }
+        @Override public int hashCode() {
+            return 31 * Objects.hash(templateVersion, locale, subject, text, html) + java.util.Arrays.hashCode(webhook);
+        }
+        @Override public String toString() {
+            return "NotificationSnapshot[templateVersion=" + templateVersion + ", webhookBytes=" + webhook.length + "]";
+        }
     }
     public record Result(Snapshot snapshot, Failure failure) {
         public boolean successful() { return snapshot != null; }

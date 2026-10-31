@@ -58,6 +58,19 @@ public interface NotificationChannel extends AutoCloseable {
             return new Request(destination, Purpose.CHANNEL_TEST, deliveryId, attemptId, deadline, contentType, payload);
         }
         @Override public byte[] payload() { return payload.clone(); }
+        @Override public boolean equals(Object value) {
+            return this == value || value instanceof Request other && destination.equals(other.destination)
+                    && purpose == other.purpose && deliveryId.equals(other.deliveryId) && attemptId.equals(other.attemptId)
+                    && deadline.equals(other.deadline) && contentType.equals(other.contentType)
+                    && java.util.Arrays.equals(payload, other.payload);
+        }
+        @Override public int hashCode() {
+            return 31 * Objects.hash(destination, purpose, deliveryId, attemptId, deadline, contentType)
+                    + java.util.Arrays.hashCode(payload);
+        }
+        @Override public String toString() {
+            return "NotificationRequest[purpose=" + purpose + ", payloadBytes=" + payload.length + "]";
+        }
     }
     private static void valid(boolean valid, String field) {
         if (!valid) { throw new TapstateException(AlertError.INVALID_CONFIGURATION, Map.of("field", field, "reason", "invalid-frozen-request"), null); }

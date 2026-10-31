@@ -119,7 +119,8 @@ public final class AlertConfiguration {
             typeId = AlertConfiguration.typeId(typeId, "ruleType");
             AlertValidation.require(typeVersion > 0, "typeVersion", "must-be-positive");
             Objects.requireNonNull(resources, "resources");
-            AlertValidation.require(parameters != null && parameters.size() <= 16, "parameters", "too-many-or-missing");
+            if (parameters == null) { throw AlertValidation.invalid("parameters", "too-many-or-missing"); }
+            AlertValidation.require(parameters.size() <= 16, "parameters", "too-many-or-missing");
             parameters.forEach((key, value) -> {
                 AlertConfiguration.typeId(key, "parameterName");
                 AlertValidation.require(value != null && value.precision() <= 64 && Math.abs((long) value.scale()) <= 64,
@@ -171,8 +172,9 @@ public final class AlertConfiguration {
         }
         private AlarmTypeCatalog.Type requireType(AlarmTypeCatalog catalog) {
             Objects.requireNonNull(catalog, "catalog");
-            AlarmTypeCatalog.Type type = catalog.types().stream().filter(value -> value.id().equals(typeId)).findFirst().orElse(null);
-            AlertValidation.require(type != null && type.version() == typeVersion, "ruleType", "unsupported-type-or-version");
+            AlarmTypeCatalog.Type type = catalog.types().stream().filter(value -> value.id().equals(typeId)).findFirst()
+                    .orElseThrow(() -> AlertValidation.invalid("ruleType", "unsupported-type-or-version"));
+            AlertValidation.require(type.version() == typeVersion, "ruleType", "unsupported-type-or-version");
             AlertValidation.require(type.kind()==AlarmTypeCatalog.Kind.STATEFUL,"ruleType","event-cannot-be-stateful-rule");
             return type;
         }
@@ -275,7 +277,7 @@ public final class AlertConfiguration {
     }
     private static String typeId(String value, String field) {
         AlertValidation.text(value, field, 128);
-        AlertValidation.require(value.matches("[a-z][a-z0-9]*([.-][a-z0-9]+)*"), field, "invalid-id");
+        AlertValidation.require(value.matches("[a-z][a-z0-9]*+([.-][a-z0-9]++)*+"), field, "invalid-id");
         return value;
     }
     private static <T> Set<T> checkedSet(Set<T> values, String field, int maximum, boolean emptyAllowed) {

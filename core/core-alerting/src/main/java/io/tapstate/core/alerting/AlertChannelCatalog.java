@@ -22,7 +22,8 @@ public final class AlertChannelCatalog {
             AlertValidation.require(fields.size()<=16&&fields.stream().map(Field::key).distinct().count()==fields.size(),"parameterFields","invalid-or-too-many");
         }
         public Map<String,String> parameters(Map<String,String> input) {
-            AlertValidation.require(input!=null&&fields.stream().map(Field::key).collect(java.util.stream.Collectors.toSet()).containsAll(input.keySet()),"parameters","unregistered-field");
+            if (input == null) { throw AlertValidation.invalid("parameters", "unregistered-field"); }
+            AlertValidation.require(fields.stream().map(Field::key).collect(java.util.stream.Collectors.toSet()).containsAll(input.keySet()),"parameters","unregistered-field");
             var values=new TreeMap<String,String>();
             for(var field:fields){String value=input.containsKey(field.key())?input.get(field.key()):field.defaultValue();
                 AlertValidation.require(value!=null||!field.required(),"parameters."+field.key(),"required");

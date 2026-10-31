@@ -12,6 +12,23 @@ import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class BuiltinResourceSignalsTest {
+    @Test void driverFailuresKeepTheirMeaningAcrossAnIsolatedConnectorLoader() throws Exception {
+        var urls=new java.net.URL[]{
+                com.mongodb.MongoException.class.getProtectionDomain().getCodeSource().getLocation(),
+                org.bson.BsonDocument.class.getProtectionDomain().getCodeSource().getLocation()};
+        try(var loader=new java.net.URLClassLoader(urls,ClassLoader.getPlatformClassLoader())) {
+            var foreign=Class.forName("com.mongodb.MongoException",true,loader);
+            for(int code:new int[]{13,18,8000,999}) {
+                var failure=(Throwable)foreign.getConstructor(int.class,String.class).newInstance(code,"controlled");
+                assertThat(failure).isNotInstanceOf(com.mongodb.MongoException.class);
+                assertThat(BuiltinResourceSignals.connectionFailure(failure)).isEqualTo(code!=999);
+            }
+            var timeout=(Throwable)Class.forName("com.mongodb.MongoTimeoutException",true,loader)
+                    .getConstructor(String.class).newInstance("controlled");
+            assertThat(BuiltinResourceSignals.connectionFailure(timeout)).isTrue();
+        }
+    }
+
     @Test void aClosedObserverFamilyTracksEveryCapturedPhaseReportUntilSettlement() {
         var runtime=mock(PipelineAlertRuntime.class);var binding=mock(StorageBinding.class);when(binding.defaultSourceId()).thenReturn("other");
         var signals=new BuiltinResourceSignals(()->runtime,()->binding,new CacheAuthScope("cluster",1,StorageBinding.Mode.OP,"cache",1),()->{},Clock.systemUTC());

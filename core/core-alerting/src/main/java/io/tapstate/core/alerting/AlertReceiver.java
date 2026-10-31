@@ -30,7 +30,8 @@ public record AlertReceiver(AlertConfiguration.Header header, String name, boole
             AlertValidation.require(!java.util.Set.of("email","webhook","cloud-sdk").contains(channelType),"channelType","reserved-id");
             AlertValidation.require(transportVersion==1,"transportVersion","unsupported");
             new Webhook(origin,endpointDigest,authentication,principal,trust);
-            AlertValidation.require(parameters!=null&&parameters.size()<=16,"parameters","too-many");
+            if (parameters == null) { throw AlertValidation.invalid("parameters", "too-many"); }
+            AlertValidation.require(parameters.size()<=16,"parameters","too-many");
             var normalized=new TreeMap<String,String>();
             parameters.forEach((key,value)->{
                 AlertValidation.require(key!=null&&key.matches("[a-z][a-z0-9-]{0,63}")&&value!=null
@@ -70,7 +71,8 @@ public record AlertReceiver(AlertConfiguration.Header header, String name, boole
             if (authentication == Authentication.NONE) { AlertValidation.require(username == null, "smtpUsername", "unexpected"); }
             else { username = AlertValidation.text(username, "smtpUsername", 256); }
             from = mailbox(from);
-            AlertValidation.require(recipients != null && !recipients.isEmpty() && recipients.size() <= 32, "recipients", "outside-1-32");
+            if (recipients == null) { throw AlertValidation.invalid("recipients", "outside-1-32"); }
+            AlertValidation.require(!recipients.isEmpty() && recipients.size() <= 32, "recipients", "outside-1-32");
             recipients = recipients.stream().map(AlertReceiver::mailbox).sorted().toList();
             AlertValidation.require(recipients.stream().distinct().count() == recipients.size(), "recipients", "duplicate-mailbox");
         }
@@ -152,7 +154,8 @@ public record AlertReceiver(AlertConfiguration.Header header, String name, boole
         catch (java.net.URISyntaxException invalid) { throw new IllegalStateException("validated origin could not be represented", invalid); }
     }
     public static String canonicalEndpoint(URI endpoint) {
-        AlertValidation.require(endpoint != null && "https".equalsIgnoreCase(endpoint.getScheme()) && endpoint.getHost() != null
+        if (endpoint == null) { throw AlertValidation.invalid("webhookEndpoint", "invalid-https-endpoint"); }
+        AlertValidation.require("https".equalsIgnoreCase(endpoint.getScheme()) && endpoint.getHost() != null
                 && endpoint.getUserInfo() == null && endpoint.getFragment() == null && endpoint.getPort() >= -1 && endpoint.getPort() != 0
                 && endpoint.getPort() <= 65535 && endpoint.toASCIIString().getBytes(StandardCharsets.UTF_8).length <= 2048,
                 "webhookEndpoint", "invalid-https-endpoint");
@@ -164,9 +167,10 @@ public record AlertReceiver(AlertConfiguration.Header header, String name, boole
         } catch (java.net.URISyntaxException invalid) { throw new IllegalStateException("validated endpoint could not be represented", invalid); }
     }
     private static String mailbox(String value) {
-        AlertValidation.require(value != null && value.length() <= 254 && value.indexOf('@') > 0 && value.indexOf('@') == value.lastIndexOf('@'), "mailbox", "invalid-address");
+        if (value == null) { throw AlertValidation.invalid("mailbox", "invalid-address"); }
+        AlertValidation.require(value.length() <= 254 && value.indexOf('@') > 0 && value.indexOf('@') == value.lastIndexOf('@'), "mailbox", "invalid-address");
         String local = value.substring(0, value.indexOf('@')); String domain = value.substring(value.indexOf('@') + 1).toLowerCase(Locale.ROOT);
-        AlertValidation.require(local.length() <= 64 && local.matches("[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(\\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*"), "mailbox", "invalid-local-part");
+        AlertValidation.require(local.length() <= 64 && local.matches("[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]++(\\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]++)*+"), "mailbox", "invalid-local-part");
         String[] labels = domain.split("\\.", -1);
         AlertValidation.require(labels.length >= 2 && java.util.Arrays.stream(labels).allMatch(label -> label.matches("[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")), "mailbox", "invalid-domain");
         return local + "@" + domain;

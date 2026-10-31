@@ -82,15 +82,15 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         boolean scheduled;
     }
     private final ConcurrentMap<AlarmKey.Resource,ResourceSlot> resourceSlots = new ConcurrentHashMap<>();
-    private volatile java.util.function.Consumer<AlarmKey.Resource> resourceRetired=r->{};
-    void resourceRetired(java.util.function.Consumer<AlarmKey.Resource> listener){resourceRetired=listener;}
-    private volatile Services services;
+    private final AtomicReference<java.util.function.Consumer<AlarmKey.Resource>> resourceRetired=new AtomicReference<>(r->{});
+    void resourceRetired(java.util.function.Consumer<AlarmKey.Resource> listener){resourceRetired.set(listener);}
+    private final AtomicReference<Services> services=new AtomicReference<>();
     private volatile Instant lastEvaluatedAt;
     private final ConcurrentMap<Work,Instant> inputTimes=new ConcurrentHashMap<>();
-    private volatile List<AlertConfiguration.Rule> rules = List.of();
+    private final AtomicReference<List<AlertConfiguration.Rule>> rules = new AtomicReference<>(List.of());
     private record Failure(String code,Map<String,Object> parameters){}
     private final AtomicReference<Failure> failure = new AtomicReference<>(new Failure(null,Map.of()));
-    private volatile AlarmKey reconciliationCursor;
+    private final AtomicReference<AlarmKey> reconciliationCursor=new AtomicReference<>();
     private boolean legacyBindingsInScan,legacyBindingsUnavailable,legacyScanComplete;
     private final String runtimeId = UUID.randomUUID().toString();
 
@@ -127,7 +127,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
                 null, observation.observedAt(), observation.facts());
         var trace = AlarmDiagnosticCapture.capture(cause, List.of(), failure -> failure instanceof TapstateException coded
                 ? Optional.of(coded.code().code()) : Optional.empty()).orElse(null);
-        var capturedRules = rules;
+        var capturedRules = rules.get();
         submit(slot, bytes + 16 * 1024, () -> {
             requireCurrent(slot);
             long interruption = slot.interruptions.get();
@@ -160,8 +160,8 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         if(closed.get()||!started.compareAndSet(false,true))throw new IllegalStateException("evaluation host already started or closed");
         freshness.setRemoveOnCancelPolicy(true);freshness.scheduleWithFixedDelay(this::tick,0,1,TimeUnit.SECONDS);
     }
-    private volatile Runnable observerTick=()->{};
-    void observerTick(Runnable observer){observerTick=Objects.requireNonNull(observer);}
+    private final AtomicReference<Runnable> observerTick=new AtomicReference<>(()->{});
+    void observerTick(Runnable observer){observerTick.set(Objects.requireNonNull(observer));}
     void tick() {
         if (closed.get()) return;
         if (refreshing.compareAndSet(false, true)) {
@@ -175,17 +175,17 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
                 if(resourceSlots.get(entry.getKey())!=slot)return;
                 for(var entryBinding:slot.bindings.entrySet()) {
                     var previous=entryBinding.getValue();
-                    var current=rules.stream().filter(rule->rule.header().identity().equals(previous.definition().header().identity())
+                    var current=rules.get().stream().filter(rule->rule.header().identity().equals(previous.definition().header().identity())
                             &&rule.matches(entryBinding.getKey())).findFirst();
                     if(current.isEmpty())continue;
                     var binding=new AlertEvaluationHost.Binding(current.orElseThrow(),previous.resource(),previous.producer(),
                             previous.sourceBindingRevision(),active,()->null,previous.domainToken());
                     entryBinding.setValue(binding);
-                    AlertEvaluationHost.requireResult(services.evaluator().tick(binding));
+                    AlertEvaluationHost.requireResult(services.get().evaluator().tick(binding));
                 }
             }finally{slot.tickQueued.set(false);}},()->slot.tickQueued.set(false));
         }
-        var capturedRules = rules;
+        var capturedRules = rules.get();
         for (Slot slot : slots.values()) {
             if (!slot.tickQueued.compareAndSet(false, true)) continue;
             long sequence = slot.freshnessSequence.getAndIncrement();
@@ -196,7 +196,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
                     for (var rule : matching(slot, capturedRules)) {
                         var binding = binding(slot, rule);
                         if (!rule.enabled() || !rule.header().active()) {
-                            AlertEvaluationHost.requireResult(services.evaluator().end(binding.key(), AlertSnapshot.EndReason.DISABLED, binding.requireCurrent()));
+                            AlertEvaluationHost.requireResult(services.get().evaluator().end(binding.key(), AlertSnapshot.EndReason.DISABLED, binding.requireCurrent()));
                         } else if (rule.typeId().equals("pipeline.observation-stale")) {
                             Instant now = clock.instant();
                             boolean expected = slot.producer.intent().desired().targetState() == PipelineState.RUNNING
@@ -206,7 +206,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
                                     AlertEvaluationHost.seconds(rule, "startup-grace", 120), AlertEvaluationHost.seconds(rule, "max-age", 120)));
                         } else {
                             if (slot.discontinuous()) accept(binding, slot.sequence.get(), new AlertInput.Discontinuity(clock.instant()));
-                            AlertEvaluationHost.requireResult(services.evaluator().tick(binding));
+                            AlertEvaluationHost.requireResult(services.get().evaluator().tick(binding));
                         }
                     }
                     requireCurrent(slot);
@@ -218,7 +218,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     private void refresh() {
         Failure previousFailure=failure.get();
         active.run();
-        Services resolved = services == null ? Objects.requireNonNull(open.get()) : services;
+        Services resolved = services.get() == null ? Objects.requireNonNull(open.get()) : services.get();
         var all = new ArrayList<AlertConfiguration.Rule>();
         var unavailableRules=new HashSet<String>();
         String cursor = null;
@@ -234,16 +234,16 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         } while (cursor != null);
         active.run(); synchronized(this){
             if(closed.get()){if(resolved.planner()!=null)resolved.planner().close();if(resolved.delivery()!=null)resolved.delivery().close();if(resolved.maintenance()!=null)resolved.maintenance().close();return;}
-            if(services==null&&resolved.planner()!=null)resolved.planner().start(); if(services==null&&resolved.delivery()!=null)resolved.delivery().start(); if(services==null&&resolved.maintenance()!=null){resolved.maintenance().evaluation(this::health);resolved.maintenance().start();} services = resolved; rules = List.copyOf(all);
+            if(services.get()==null&&resolved.planner()!=null)resolved.planner().start(); if(services.get()==null&&resolved.delivery()!=null)resolved.delivery().start(); if(services.get()==null&&resolved.maintenance()!=null){resolved.maintenance().evaluation(this::health);resolved.maintenance().start();} services.set(resolved); rules.set(List.copyOf(all));
         }
-        observerTick.run();
-        if(reconciliationCursor==null)legacyBindingsInScan=false;
-        var retained = resolved.store().evaluationStates(reconciliationCursor, 50);
+        observerTick.get().run();
+        if(reconciliationCursor.get()==null)legacyBindingsInScan=false;
+        var retained = resolved.store().evaluationStates(reconciliationCursor.get(), 50);
         for(var row:retained.rows())if((row.value().binding()==null||!unavailableRules.contains(row.value().binding().ruleIdentity().id()))&&retained.removedResources().contains(row.value().snapshot().rule().key().resource())){
             if(row.value().retiredAt()==null)AlertEvaluationHost.requireResult(resolved.evaluator().end(row.value().snapshot().rule().key(),AlertSnapshot.EndReason.RESOURCE_REMOVED,active));
             var resource=row.value().snapshot().rule().key().resource();ResourceSlot obsolete;
             synchronized(objectAdmission){obsolete=resourceSlots.remove(resource);if(obsolete!=null){retainedResourceBindings.addAndGet(-obsolete.bindings.size());obsolete.bindings.clear();}}
-            if(obsolete!=null)cancelResource(obsolete);resourceRetired.accept(resource);
+            if(obsolete!=null)cancelResource(obsolete);resourceRetired.get().accept(resource);
         }
         boolean legacyBindingUnavailable=false;
         for(var key:retained.obsoleteBindings()) {
@@ -279,7 +279,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         legacyBindingsInScan|=legacyBindingUnavailable;
         if(legacyBindingUnavailable)legacyBindingsUnavailable=true;
         if(retained.next()==null){legacyBindingsUnavailable=legacyBindingsInScan;legacyScanComplete=true;}
-        reconciliationCursor = retained.next();
+        reconciliationCursor.set(retained.next());
         boolean missing=all.stream().anyMatch(r->r.header().active()&&r.enabled()&&r.metric()==null
                 &&!resolved.providers().contains(resolved.catalog().types().stream().filter(t->t.id().equals(r.typeId())).findFirst().orElseThrow().providerId()));
         if(!unavailableRules.isEmpty())failure.compareAndSet(previousFailure,new Failure(AlertError.INVALID_CONFIGURATION.code(),Map.of("field","evaluationHost","reason","rule-capability-unavailable")));
@@ -310,10 +310,10 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             if(!resourceSlots.containsKey(resource)&&resourceSlots.size()+slots.size()>=MAX_OBJECTS){reject(null,"object-budget");settled.run();return;}
             slot=resourceSlots.computeIfAbsent(resource,ignored->new ResourceSlot());
         }
-        var captured=rules;
+        var captured=rules.get();
         submitResource(slot,512,()->{try{
             if(resourceSlots.get(resource)!=slot)throw refused("retired-resource");
-            active.run();originalGuard.run();var resolved=services;
+            active.run();originalGuard.run();var resolved=services.get();
             if(resolved==null)throw refused("storage-not-ready");
             var matching=captured.stream().filter(r->r.typeId().equals(typeId)&&r.resources().matches(resource)).toList();
             if(matching.size()>MAX_MATCHES)throw refused("matching-rule-budget");
@@ -378,7 +378,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         var matches = snapshot.stream().filter(r -> r.resources().matches(resource)
                 && (r.typeId().equals("pipeline.failed") || r.typeId().equals("pipeline.observation-stale") || r.metric() != null)).toList();
         if (matches.size() > MAX_MATCHES) throw refused("matching-rule-budget");
-        if (services == null) throw refused("storage-not-ready");
+        if (services.get() == null) throw refused("storage-not-ready");
         return matches;
     }
     private AlertEvaluationHost.Binding binding(Slot slot, AlertConfiguration.Rule rule) {
@@ -415,7 +415,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         accept(binding,sequence,input,false);
     }
     private void accept(AlertEvaluationHost.Binding binding,long sequence,AlertInput input,boolean shared) {
-        var outcome = services.evaluator().accept(binding, sequence, input);
+        var outcome = services.get().evaluator().accept(binding, sequence, input);
         String deferral = outcome==AlertEvaluationHost.Result.BUSY ? (shared ? null : cacheHeartbeatDeferralRefusal(binding,input)) : "not-busy";
         if(outcome==AlertEvaluationHost.Result.BUSY && deferral==null)return;
         if (outcome == AlertEvaluationHost.Result.CONFLICT || outcome == AlertEvaluationHost.Result.BUSY) {
@@ -436,9 +436,9 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
                 ||!binding.resource().kind().equals("cluster-storage")||!binding.resource().id().equals("cache")
                 ||!binding.definition().typeId().equals("cluster.storage-unavailable")||binding.sourceBindingRevision()!=0)return "ineligible-input";
         binding.requireCurrent().run();
-        var current=services.store().definition(AlertConfiguration.Kind.RULE,binding.definition().header().identity().id(),null);
+        var current=services.get().store().definition(AlertConfiguration.Kind.RULE,binding.definition().header().identity().id(),null);
         if(current.isEmpty()||!current.orElseThrow().equals(binding.definition()))return "rule-changed";
-        var retained=services.store().state(binding.key(),new AlertStore.ReadAccess(true,Set.of(),active));
+        var retained=services.get().store().state(binding.key(),new AlertStore.ReadAccess(true,Set.of(),active));
         binding.requireCurrent().run();if(retained.isEmpty())return "head-missing";
         var head=retained.orElseThrow().value();var snapshot=head.snapshot();var evidence=head.operationalEvidence();var now=clock.instant();
         if(head.retiredAt()!=null||!snapshot.enabled()||!binding.definition().header().active()||!binding.definition().enabled())return "inactive";
@@ -529,11 +529,11 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     }
     synchronized Services managementServices() {
         active.run();
-        if (closed.get() || services == null) throw new TapstateException(io.tapstate.control.core.ControlError.STORAGE_UNAVAILABLE, Map.of(), null);
-        return services;
+        if (closed.get() || services.get() == null) throw new TapstateException(io.tapstate.control.core.ControlError.STORAGE_UNAVAILABLE, Map.of(), null);
+        return services.get();
     }
     Health health() {
-        Failure current=failure.get();var resolved=services;
+        Failure current=failure.get();var resolved=services.get();
         var planning=resolved==null||resolved.planner()==null?null:resolved.planner().failure();
         var delivery=resolved==null||resolved.delivery()==null?null:resolved.delivery().failure();
         if(current==null&&delivery!=null)current=new Failure(delivery.code(),delivery.parameters());
@@ -573,13 +573,13 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     @Override public void close() {
         if(closed.compareAndSet(false,true)){
             freshness.shutdownNow();
-            synchronized(this){if(services!=null&&services.planner()!=null)services.planner().close();if(services!=null&&services.delivery()!=null)services.delivery().close();if(services!=null&&services.maintenance()!=null)services.maintenance().close();}
+            synchronized(this){if(services.get()!=null&&services.get().planner()!=null)services.get().planner().close();if(services.get()!=null&&services.get().delivery()!=null)services.get().delivery().close();if(services.get()!=null&&services.get().maintenance()!=null)services.get().maintenance().close();}
             for(Runnable task:workers.shutdownNow()){
                 if(task instanceof Work work)work.cancel();
                 else if(task instanceof Dispatcher dispatcher)cancelPending(dispatcher.slot);
                 else if(task instanceof ResourceDispatcher dispatcher)cancelResource(dispatcher.slot);
             }
-            slots.values().forEach(this::cancelPending);slots.clear();resourceSlots.values().forEach(this::cancelResource);resourceSlots.clear();retainedResourceBindings.set(0);rules=List.of();
+            slots.values().forEach(this::cancelPending);slots.clear();resourceSlots.values().forEach(this::cancelResource);resourceSlots.clear();retainedResourceBindings.set(0);rules.set(List.of());
         }
     }
 }
