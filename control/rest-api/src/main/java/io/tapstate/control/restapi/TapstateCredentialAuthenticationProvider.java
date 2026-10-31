@@ -6,6 +6,7 @@ import io.tapstate.control.core.TapstatePrincipal;
 import io.tapstate.control.core.TokenService;
 import io.tapstate.control.core.VerifiedToken;
 import io.tapstate.control.core.ControlError;
+import io.tapstate.control.core.StorageQuota;
 import io.tapstate.core.common.TapstateException;
 import org.springframework.security.authentication.AuthenticationProvider;
 import org.springframework.security.authentication.BadCredentialsException;
@@ -28,6 +29,8 @@ final class TapstateCredentialAuthenticationProvider implements AuthenticationPr
         catch (TapstateException failure) {
             if (failure.code() == ControlError.UNAUTHENTICATED || failure.code() == ControlError.AUTH_FAILED)
                 throw new BadCredentialsException("invalid bearer credential");
+            if (StorageQuota.isQuotaCode(failure.code()))
+                throw new CodedAuthenticationFailure(ControlError.STORAGE_QUOTA_EXCEEDED);
             throw new CodedAuthenticationFailure(failure.code() == ControlError.CLOUD_AUTH_UNAVAILABLE
                     ? ControlError.CLOUD_AUTH_UNAVAILABLE : ControlError.STORAGE_UNAVAILABLE);
         }

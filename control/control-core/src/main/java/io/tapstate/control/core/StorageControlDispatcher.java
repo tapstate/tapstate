@@ -290,6 +290,7 @@ public final class StorageControlDispatcher {
         String optionalUuid(String key) { return values.containsKey(key) ? uuid(key) : null; }
     }
     private static TapstateException safe(TapstateException failure) {
+        if (StorageQuota.confirmed(failure)) return new TapstateException(ControlError.STORAGE_QUOTA_EXCEEDED, Map.of(), null);
         if (failure.code() == ControlError.MALFORMED_REQUEST) return malformed();
         if (failure.code() == io.tapstate.spi.store.IoError.CONFIGURATION_IMPORT_REFUSED)
             return new TapstateException(failure.code(), Map.of("reason", "original-import-conditions-not-satisfied"), null);

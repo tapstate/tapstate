@@ -205,6 +205,7 @@ control.schema-derivation-incomplete
 control.source-config-reveal-unavailable
 control.state-database-unavailable
 control.storage-databases-overlap
+control.storage-quota-exceeded
 control.storage-scope-conflict
 control.storage-test-failed
 control.storage-test-required
@@ -299,6 +300,7 @@ io.srs-model-conflict
 io.srs-model-unavailable
 io.srs-position-model-unproven
 io.srs-progress-unproven
+io.store-quota-exceeded
 io.store-unauthorized
 io.store-unavailable
 io.workload-claim-fenced
