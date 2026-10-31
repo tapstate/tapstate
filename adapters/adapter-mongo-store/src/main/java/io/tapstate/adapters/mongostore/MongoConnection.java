@@ -234,6 +234,8 @@ public final class MongoConnection implements AutoCloseable {
                 if (session.hasActiveTransaction()) session.abortTransaction();
             }
         } catch (MongoException refused) {
+            var classified = StoreIo.coded(refused);
+            if (classified.code() == IoError.STORE_QUOTA_EXCEEDED) throw classified;
             throw new TapstateException(StoreError.DATABASE_ACCESS_FAILED, Map.of("database", databaseName), null);
         }
     }
