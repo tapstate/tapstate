@@ -50,6 +50,7 @@ import java.util.UUID;
  * registered connector without a row.
  */
 public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
+    private static final org.slf4j.Logger LOG = org.slf4j.LoggerFactory.getLogger(ConnectorArtifactRegistrar.class);
 
     /**
      * The officially supported ids, readable from outside this package.
@@ -123,11 +124,16 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
     public RegistrationOutcome register(Path artifact, RegistrationSource source) {
         Objects.requireNonNull(artifact, "artifact");
         Objects.requireNonNull(source, "source");
+        long scanStarted = System.nanoTime();
         IntrospectedConnector introspected = introspector.introspect(List.of(artifact));
         Object specTree = parseSpecTree(introspected, artifact);
         String connectorId = declaredId(specTree, introspected, artifact);
         rejectUnofficialConnector(connectorId);
+        phase(connectorId, "introspection", scanStarted);
+        long hashStarted = System.nanoTime();
         String hash = hashOf(artifact);
+        phase(connectorId, "source-hash", hashStarted);
+        long preparationStarted = System.nanoTime();
         rejectConflictingArtifact(connectorId, hash);
         // Kept before the artifact is registered, so that a store failure writing it fails a register that
         // has taken nothing: the id is still free and the caller's retry is a clean first attempt. The
@@ -136,6 +142,8 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
         // leaves the source stored and unreferenced, which costs one small content-addressed document
         // that the next registration of the same spec reuses.
         String specHash = storeSpecSource(introspected);
+        phase(connectorId, "metadata-preparation", preparationStarted);
+        long uploadStarted = System.nanoTime();
         RegistrationOutcome outcome;
         try (var bytes = Files.newInputStream(artifact)) {
             outcome = registry.register(connectorId, introspected.pdkApiVersion(), source, hash, Files.size(artifact), bytes);
@@ -151,7 +159,10 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
             }
             throw diagnostic;
         }
+        phase(connectorId, "upload-and-publication", uploadStarted);
+        long catalogStarted = System.nanoTime();
         persistCatalogRow(connectorId, introspected, specTree, specHash, outcome);
+        phase(connectorId, "capabilities-and-catalog", catalogStarted);
         return outcome;
     }
 
@@ -343,6 +354,11 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
     private static TapstateException artifactUnreadable(Path artifact) {
         return new TapstateException(ConnectorError.ARTIFACT_UNREADABLE,
                 Map.of("artifact", artifact.getFileName().toString()), null);
+    }
+
+    private static void phase(String connectorId, String phase, long started) {
+        LOG.debug("Connector registration phase completed [connector={}, phase={}, elapsed_ms={}].",
+                connectorId, phase, (System.nanoTime() - started) / 1_000_000);
     }
 
     private static boolean canonicalUploadId(String upload) {

@@ -28,6 +28,46 @@ import org.junit.jupiter.api.io.TempDir;
 class SeedConnectorSweepTest {
 
     @Test
+    void registersIndependentArtifactsConcurrentlyAndReportsInFileOrder(@TempDir Path seeds, @TempDir Path work) throws Exception {
+        Files.copy(Synthetic.seedableMysqlConnector(work.resolve("mysql")), seeds.resolve("b.jar"));
+        Files.copy(Synthetic.seedableMongodbConnector(work.resolve("mongo")), seeds.resolve("a.jar"));
+        var started = new java.util.concurrent.CountDownLatch(2);
+        io.tapstate.spi.store.ConnectorRegistry registry = new io.tapstate.spi.store.ConnectorRegistry() {
+            @Override public io.tapstate.spi.store.RegistrationOutcome register(String id, String version,
+                    RegistrationSource source, byte[] bytes) { throw new AssertionError("Registration must stream"); }
+            @Override public io.tapstate.spi.store.RegistrationOutcome register(String id, String version,
+                    RegistrationSource source, String hash, long length, java.io.InputStream bytes) throws java.io.IOException {
+                started.countDown();
+                try {
+                    assertThat(started.await(3, java.util.concurrent.TimeUnit.SECONDS))
+                            .as("independent registrations overlap instead of waiting for the first transfer").isTrue();
+                } catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new java.io.InterruptedIOException(); }
+                assertThat(io.tapstate.spi.store.ContentHash.of(bytes)).isEqualTo(hash);
+                return new io.tapstate.spi.store.RegistrationOutcome(new ConnectorRegistration(id, hash, version, source), true);
+            }
+            @Override public List<ConnectorRegistration> list() { return List.of(); }
+            @Override public java.util.Optional<byte[]> artifact(String hash) { throw new AssertionError("Download must stream"); }
+            @Override public boolean hasArtifact(String hash) { return false; }
+        };
+        var catalog = new io.tapstate.spi.store.ConnectorCatalogStore() {
+            @Override public void upsert(io.tapstate.core.catalog.ConnectorCatalogEntry row) { }
+            @Override public java.util.Optional<io.tapstate.core.catalog.ConnectorCatalogEntry> get(String id) { return java.util.Optional.empty(); }
+            @Override public List<io.tapstate.core.catalog.ConnectorCatalogEntry> list() { return List.of(); }
+        };
+        var specs = new io.tapstate.spi.store.ConnectorSpecStore() {
+            @Override public void put(String hash, byte[] bytes) { }
+            @Override public java.util.Optional<byte[]> get(String hash) { return java.util.Optional.empty(); }
+        };
+        var registrar = new ConnectorArtifactRegistrar(registry, new ConnectorIntrospector(),
+                id -> new ConnectorCapabilities(Set.of()), catalog, specs);
+
+        var outcomes = new SeedConnectorSweep(registrar, 2).sweep(seeds);
+
+        assertThat(outcomes).extracting(outcome -> outcome.artifact().getFileName().toString())
+                .containsExactly("a.jar", "b.jar");
+    }
+
+    @Test
     void anExplicitSelectionNeverRegistersOrInspectsOtherSeedFiles(@TempDir Path work, @TempDir Path seedDir) throws Exception {
         Files.copy(Synthetic.seedableMongodbConnector(work), seedDir.resolve("mongodb.jar"));
         Files.writeString(seedDir.resolve("db2.jar"), "unselected unreadable artifact");
