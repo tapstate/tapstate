@@ -108,6 +108,22 @@ class StreamingConnectorArtifactTest {
             }
             assertThat(provisioner.resolve("mysql").classpath()).containsExactly(loaded);
             assertThat(registry.downloads).isEqualTo(1);
+            Files.createLink(dir.resolve("mysql-connector.jar"), jar);
+            try (var workers = java.util.concurrent.Executors.newFixedThreadPool(2)) {
+                var first = workers.submit(() -> new RegistryConnectorProvisioner(registry, new ConnectorIntrospector(),
+                        dir.resolve("seed-cache-a"), dir).resolve("mysql").classpath().getFirst());
+                var second = workers.submit(() -> new RegistryConnectorProvisioner(registry, new ConnectorIntrospector(),
+                        dir.resolve("seed-cache-b"), dir).resolve("mysql").classpath().getFirst());
+                for (var future : List.of(first, second)) {
+                    Path cached = future.get(30, TimeUnit.SECONDS);
+                    assertThat(Files.size(cached)).isEqualTo(Files.size(jar));
+                    try (var bytes = Files.newInputStream(cached)) {
+                        assertThat(ContentHash.of(bytes)).isEqualTo(result.registration().contentHash());
+                    }
+                    try (var files = Files.list(cached.getParent())) { assertThat(files.toList()).containsExactly(cached); }
+                }
+            }
+            assertThat(registry.downloads).as("parallel seed staging does not download either large JAR").isEqualTo(1);
         }
     }
 
