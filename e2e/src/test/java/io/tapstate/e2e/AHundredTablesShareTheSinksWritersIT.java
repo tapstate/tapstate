@@ -78,10 +78,25 @@ class AHundredTablesShareTheSinksWritersIT {
                 // puts one table's rows into the other's, so the tables would never both come out whole, and the
                 // wait would end on a timeout rather than on the batch that did it. Counted as distinct ids of
                 // each table, by the table each row carries: a row can be written more than once.
-                Await.until("every table's rows to be written", Duration.ofMinutes(3),
+                try {
+                    Await.until("every table's rows to be written", Duration.ofMinutes(3),
                         () -> idsWrittenByTable(written).size() == TABLES && idsWrittenByTable(written).values()
                                 .stream().allMatch(ids -> ids.size() == ROWS_EACH),
                         () -> incompleteWrites(written, files, targetAddress, tables, control));
+                } catch (AssertionError failure) {
+                    // These are only the fixture's generated row identities and public measurements.
+                    // Capture them before AutoCloseable teardown stops writers and closes the store.
+                    try {
+                        Path scene = Files.createDirectories(Path.of("target", "failure-scenes", "hundred-tables"));
+                        Files.writeString(scene.resolve("writes.txt"), written.rows().toString());
+                        Files.writeString(scene.resolve("measurements.txt"),
+                                "metrics=" + control.metricsNamed(PIPELINE, "") + "\nfacts=" + control.metricFacts(PIPELINE));
+                    } catch (IOException | RuntimeException | AssertionError unavailable) {
+                        failure.addSuppressed(unavailable);
+                    }
+                    cluster.captureFailureThreads();
+                    throw failure;
+                }
 
                 List<WriteWitness.Written> rows = written.rows();
                 Map<String, Set<String>> tablesByBatch = rows.stream().collect(Collectors.groupingBy(
