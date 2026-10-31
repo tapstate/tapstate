@@ -145,7 +145,9 @@ class PdkValidationSessionTest {
                         loader(); count(c, "stops");
                         if (!mode(c).equals("held-init")) signal(c, "release");
                         if (Thread.currentThread().isInterrupted()) count(c, "interruptedStops");
-                        if (mode(c).equals("query-failure") || mode(c).equals("stop-failure"))
+                        if ((mode(c).equals("query-failure") || mode(c).equals("stop-failure") || mode(c).equals("stop-retry"))
+                                && ((AtomicInteger)c.getConnectionConfig().get("stops")).get() == 1
+                                || mode(c).equals("stop-retry-twice") && ((AtomicInteger)c.getConnectionConfig().get("stops")).get() <= 2)
                             throw new IllegalStateException("cleanup failed");
                     }
                     public void discoverSchema(TapConnectionContext c, List<String> names, int limit,
@@ -213,6 +215,7 @@ class PdkValidationSessionTest {
             metadata.close();
             metadata.workersExited().toCompletableFuture().get(3, TimeUnit.SECONDS);
             metadata.rowsReleased().toCompletableFuture().get(3, TimeUnit.SECONDS);
+            metadata.cleanupCompleted().toCompletableFuture().get(3, TimeUnit.SECONDS);
         }
         assertThat(probe.inits).hasValue(1); assertThat(probe.discoveries).hasValue(1);
         assertThat(probe.queries).hasValue(0); assertThat(probe.stops.get()).isGreaterThanOrEqualTo(1);
@@ -646,6 +649,75 @@ class PdkValidationSessionTest {
                 assertThat(failure.getSuppressed()).hasSize(1);
                 assertThat(failure.getSuppressed()[0].getCause()).hasMessage("cleanup failed");
             });
+        }
+    }
+
+    @Test void failedCleanupRetainsTheSameNativeHandleUntilRetrySucceeds() throws Exception {
+        var probe = new Probe("retry", "stop-retry");
+        try (var io = Executors.newSingleThreadExecutor()) {
+            var cursor = (ValidationReadHandle) scan(probe, io);
+            assertThatThrownBy(() -> {
+                while (true) {
+                    var next = cursor.next();
+                    if (next.isEmpty()) break;
+                    next.orElseThrow().close();
+                }
+            }).isInstanceOf(TapstateException.class);
+            io.submit(() -> {}).get(3, TimeUnit.SECONDS);
+            assertThat(cursor.workersExited().toCompletableFuture()).isCompletedExceptionally();
+            assertThat(probe.inits).hasValue(1);
+            assertThat(probe.stops).hasValue(1);
+            assertThat(PdkValidationReads.cleanupCompleted(cursor).toCompletableFuture()).isNotDone();
+            cursor.close();
+            assertThat(PdkValidationReads.cleanupCompleted(cursor).toCompletableFuture()).isCompleted();
+            assertThat(probe.stops).hasValue(2);
+            assertThat(probe.inits).hasValue(1);
+            cursor.close();
+            assertThat(probe.stops).hasValue(2);
+        }
+    }
+
+    @Test void portableMetadataRetainsItsNativeCleanupReceiptAcrossFailure() throws Exception {
+        var probe = new Probe("metadata-retry", "stop-retry-twice");
+        var connection = new io.tapstate.spi.store.ConnectionConfig("input", "fixture", probe.settings());
+        try (var io = Executors.newSingleThreadExecutor()) {
+            var metadata = PdkValidationReads.inspect(connection, hashedArtifact(), "c".repeat(64), "records", List.of("id"),
+                    () -> {}, io, decodeIo, LIMITS);
+            assertThatThrownBy(metadata::result).isInstanceOf(TapstateException.class);
+            io.submit(() -> {}).get(3, TimeUnit.SECONDS);
+            assertThat(metadata.workersExited().toCompletableFuture()).isCompletedExceptionally();
+            assertThat(metadata.cleanupCompleted().toCompletableFuture()).isNotDone();
+            metadata.close();
+            metadata.rowsReleased().toCompletableFuture().get(3, TimeUnit.SECONDS);
+            metadata.cleanupCompleted().toCompletableFuture().get(3, TimeUnit.SECONDS);
+            assertThat(probe.stops).hasValue(3);
+            assertThat(probe.inits).hasValue(1);
+            assertThat(probe.queries).hasValue(0);
+        }
+    }
+
+    @Test void repeatedCleanupFailureCannotBecomeANativeReleaseReceipt() throws Exception {
+        var probe = new Probe("retry-twice", "stop-retry-twice");
+        try (var io = Executors.newSingleThreadExecutor()) {
+            var cursor = (ValidationReadHandle) scan(probe, io);
+            assertThatThrownBy(() -> {
+                while (true) {
+                    var next = cursor.next();
+                    if (next.isEmpty()) break;
+                    next.orElseThrow().close();
+                }
+            }).isInstanceOf(TapstateException.class);
+            io.submit(() -> {}).get(3, TimeUnit.SECONDS);
+            assertThatThrownBy(cursor::close).isInstanceOf(TapstateException.class);
+            assertThat(cursor.workersExited().toCompletableFuture()).isCompletedExceptionally();
+            assertThat(cursor.rowsReleased().toCompletableFuture()).isCompleted();
+            assertThat(PdkValidationReads.cleanupCompleted(cursor).toCompletableFuture()).isNotDone();
+            assertThat(probe.inits).hasValue(1);
+            assertThat(probe.stops).hasValue(2);
+            cursor.close();
+            assertThat(PdkValidationReads.cleanupCompleted(cursor).toCompletableFuture()).isCompleted();
+            assertThat(probe.stops).hasValue(3);
+            assertThat(probe.inits).hasValue(1);
         }
     }
 

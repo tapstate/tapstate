@@ -114,7 +114,8 @@ final class NativeValidationMetadata {
                 var projection=method==ValidationMethod.FULL_COLUMN?List.<String>of():fields;
                 var reader=PdkValidationReads.inspect(connection,artifact,CanonicalHash.of(resource),side.table(),projection,
                         ()->{require();probe.require();},probe.queryExecutor(),probe.decodeExecutor(),ROW);
-                try{probe.retain(reader,reader.workersExited(),reader.rowsReleased());}
+                try{probe.retain(reader,reader.workersExited(),CompletableFuture.allOf(
+                        reader.rowsReleased().toCompletableFuture(),reader.cleanupCompleted().toCompletableFuture()));}
                 catch(RuntimeException|Error refused){closeUnsubmitted(reader,refused);throw refused;}
                 var model=await(probe.consumerExecutor().submit(reader::result));require();
                 if(source)ValidationDirectMappings.requireSourceTable(declared,model.model());

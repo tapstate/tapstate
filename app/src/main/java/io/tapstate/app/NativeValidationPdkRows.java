@@ -90,7 +90,7 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
             handle=PdkValidationReads.inspect(connection,artifact(resource),CanonicalHash.of(resource),side.table(),
                     full()?List.of():fields,()->{require();guard.run();},original.resources().queryExecutor(),
                     original.resources().decodeExecutor(),ROW);
-            read.attach(handle::close,handle.workersExited(),handle.rowsReleased());read.opened();
+            read.attach(handle::close,handle.workersExited(),handle.rowsReleased(),handle.cleanupCompleted());read.opened();
             require();guard.run();var observed=handle.result();
             if(!observed.binding().equals(binding(side)))throw invalid("savedModelChanged");
             if(source)ValidationDirectMappings.requireSourceTable(declared,observed.model());
@@ -122,7 +122,7 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
             var query=original.resources().queryExecutor();var decode=original.resources().decodeExecutor();
             Runnable active=()->{require();guard.run();};
             raw=PdkValidationReads.scan(connection,artifact,CanonicalHash.of(resource),side.table(),binding(side),keys,full(),active,query,decode,2,ROW);
-            var handle=raw;read.attach(handle::close,handle.workersExited(),handle.rowsReleased());read.opened();require();guard.run();
+            var handle=raw;read.attach(handle::close,handle.workersExited(),handle.rowsReleased(),PdkValidationReads.cleanupCompleted(handle));read.opened();require();guard.run();
             return new ValidationReadHandle(){
                 @Override public Optional<Row> next(){require();guard.run();return handle.next();}
                 @Override public void close(){read.close();}
@@ -169,14 +169,15 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
         private volatile Runnable closer;
         private volatile boolean requested;
         Read(ValidationLocalBudget.Reservation lease){this.lease=lease;}
-        void attach(Runnable closer,CompletionStage<Void> workers,CompletionStage<Void> rows){
+        void attach(Runnable closer,CompletionStage<Void> workers,CompletionStage<Void> rows,CompletionStage<Void> cleanup){
             this.closer=closer;
             workers.whenComplete((ignored,error)->{stage(error);signal(1);});
             rows.whenComplete((ignored,error)->{stage(error);signal(2);});
+            cleanup.whenComplete((ignored,error)->{stage(error);if(error==null)signal(16);});
             if(requested||closed)close();
         }
         void opened(){signal(8);}
-        void unopened(){signal(1|2|4);}
+        void unopened(){signal(1|2|4|16);}
         void stage(Throwable error){
             if(error==null)return;
             while(error instanceof java.util.concurrent.CompletionException&&error.getCause()!=null)error=error.getCause();
@@ -192,7 +193,7 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
             finally{closing.set(false);finish();}
         }
         void finish(){
-            if(settled.get()!=15||closing.get()||!released.compareAndSet(false,true))return;
+            if(settled.get()!=31||closing.get()||!released.compareAndSet(false,true))return;
             try{lease.close();synchronized(reads){reads.remove(this);}}
             catch(RuntimeException|Error failed){released.set(false);record(failed);throw failed;}
             releaseWorking();

@@ -148,7 +148,8 @@ final class PdkValidationSession {
     private volatile PdkConnector connector;
     private final Object activityLock = new Object();
     private final CompletableFuture<Void> workersExited = new CompletableFuture<>();
-    private boolean queryExited;
+    private volatile boolean queryExited;
+    private final CompletableFuture<Void> cleanupCompleted = new CompletableFuture<>();
     private int decoding;
     private PdkValidationCursor.Decoder decoder;
     private final PdkValidationQueryCancellation queryCancellation = new PdkValidationQueryCancellation();
@@ -203,11 +204,21 @@ final class PdkValidationSession {
         var cursor = new PdkValidationCursor(scan.table(), this::read, row -> decoder.decode(project(row)),
                 this::checkActive, this::cancel, io, maxInFlightRows, rowLimits, queryCancellation);
         cursor.workersExited().whenComplete((ignored, error) -> activityExited(true, error));
-        return new ValidationReadHandle() {
+        return new PdkValidationReads.ManagedRead() {
             @Override public java.util.Optional<Row> next() { return cursor.next(); }
-            @Override public void close() { cursor.close(); }
+            @Override public void close() {
+                var cleanup = new ValidationFailureLatch();
+                try { cursor.close(); } catch (RuntimeException | Error failed) { cleanup.record(failed); }
+                // A cursor's close is idempotent; native cleanup remains retryable on this same handle.
+                try { if (queryExited) finish(); }
+                catch (RuntimeException | Error failed) { cleanup.record(failed); }
+                completeCleanup();
+                if (cleanup.get() instanceof Error fatal) throw fatal;
+                if (cleanup.get() instanceof RuntimeException failed) throw failed;
+            }
             @Override public CompletionStage<Void> workersExited() { return workersExited.minimalCompletionStage(); }
             @Override public CompletionStage<Void> rowsReleased() { return cursor.rowsReleased(); }
+            @Override public CompletionStage<Void> cleanupCompleted() { return cleanupCompleted.minimalCompletionStage(); }
         };
     }
 
@@ -228,6 +239,7 @@ final class PdkValidationSession {
             Throwable primary = failure.get();
             if (primary == null) workersExited.complete(null);
             else workersExited.completeExceptionally(primary);
+            completeCleanup();
         }
     }
 
@@ -487,13 +499,22 @@ final class PdkValidationSession {
     }
 
     private void cancel() {
-        if (!cancelled.compareAndSet(false, true)) return;
-        PdkValidationActivityTask pending = delivery.get();
-        if (pending != null) pending.cancel(true);
+        if (cancelled.compareAndSet(false, true)) {
+            PdkValidationActivityTask pending = delivery.get();
+            if (pending != null) pending.cancel(true);
+        }
         synchronized (stopLock) {
             PdkConnector opened = connector;
-            if (opened != null) stop(opened);
+            // Active initialization may allocate after this stop. The exiting invocation stops again.
+            // Once it exited, close performs the retry and retires the original host handle together.
+            if (opened != null && !queryExited) stop(opened);
         }
+    }
+
+    private void completeCleanup() {
+        boolean exited;
+        synchronized (activityLock) { exited = queryExited && decoding == 0; }
+        if (exited && connector == null) cleanupCompleted.complete(null);
     }
 
     private void finish() {
@@ -504,14 +525,11 @@ final class PdkValidationSession {
             synchronized (stopLock) {
                 PdkConnector opened = connector;
                 if (opened == null) return;
-                try {
-                    // Cancellation can race initialization; stop again after that invocation exits so late
-                    // resources cannot survive an earlier stop. This never touches a successor's handle.
-                    stop(opened);
-                } finally {
-                    connector = null;
-                    opened.close();
-                }
+                // Keep the original connector and its loader available after a failed stop. Host close
+                // alone cannot prove native resources ended, and a new connector cannot clean them up.
+                stop(opened);
+                opened.close();
+                connector = null;
             }
         } finally { if (interrupted) Thread.currentThread().interrupt(); }
     }
@@ -520,10 +538,7 @@ final class PdkValidationSession {
         // A caller may itself be cancelled. Its existing flag must not abort mandatory close work.
         boolean interrupted = Thread.interrupted();
         try {
-            opened.underLoader(() -> invoke(() -> {
-                opened.connector().stop(opened.context());
-                return null;
-            }));
+            invoke(() -> { opened.stopForCleanup(); return null; });
         } catch (RuntimeException | Error failure) { throw failure; }
         catch (Throwable failure) {
             throw new TapstateException(ValidationError.READ_FAILED, Map.of("table", scan.table()), failure);

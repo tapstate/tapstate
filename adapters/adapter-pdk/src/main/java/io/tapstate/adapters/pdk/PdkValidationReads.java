@@ -19,9 +19,19 @@ import java.util.function.Function;
 /**
  * Portable access to independent utility-query sessions. The caller pins the actual saved
  * configuration hash and artifact, admits native ordering and allocation, and retains its budget
- * until close plus both lifetime stages complete. No production context or mutable PDK model escapes.
+ * until close, both worker/row lifetime stages and native cleanup complete. No production context or mutable PDK model escapes.
  */
 public final class PdkValidationReads {
+    interface ManagedRead extends ValidationReadHandle {
+        CompletionStage<Void> cleanupCompleted();
+    }
+
+    /** Successful release of this adapter's native handle, separately from worker and row exit. */
+    public static CompletionStage<Void> cleanupCompleted(ValidationReadHandle reader) {
+        if (!(reader instanceof ManagedRead managed)) throw new IllegalArgumentException("not an independent PDK read");
+        return managed.cleanupCompleted();
+    }
+
     public record Binding(String modelVersion, String codecBinding) {
         public Binding {
             Objects.requireNonNull(modelVersion); Objects.requireNonNull(codecBinding);
@@ -48,6 +58,7 @@ public final class PdkValidationReads {
         @Override public void close(){reader.close();}
         public CompletionStage<Void> workersExited(){return reader.workersExited();}
         public CompletionStage<Void> rowsReleased(){return reader.rowsReleased();}
+        public CompletionStage<Void> cleanupCompleted(){return PdkValidationReads.cleanupCompleted(reader);}
     }
 
     private PdkValidationReads(){}
@@ -101,7 +112,7 @@ public final class PdkValidationReads {
             if(confirmed.get(index).domain()!=logicalKey.parts().get(index).kind())throw invalid("lookupKeyDomain");
         var reader=scan(connection,artifact,configurationHash,table,expected,confirmed,fullColumns,
                 requireCurrent,query,decode,capacity,rowLimits);
-        return new ValidationReadHandle(){
+        return new ManagedRead(){
             private final ValidationFailureLatch failure=new ValidationFailureLatch();
             private final AtomicReference<Row> failedRelease=new AtomicReference<>();
             private long delivered;
@@ -147,6 +158,7 @@ public final class PdkValidationReads {
             }
             @Override public CompletionStage<Void> workersExited(){return reader.workersExited();}
             @Override public CompletionStage<Void> rowsReleased(){return reader.rowsReleased();}
+            @Override public CompletionStage<Void> cleanupCompleted(){return PdkValidationReads.cleanupCompleted(reader);}
             private void record(Throwable reported){failure.record(reported);ValidationFailureLatch.addContext(failure.get(),reported);}
             private void throwFailure(){if(failure.get() instanceof Error fatal)throw fatal;if(failure.get() instanceof RuntimeException failed)throw failed;}
         };
@@ -220,7 +232,7 @@ public final class PdkValidationReads {
         Objects.requireNonNull(decode);
         var gate=new DeferredSubmission(query);
         var reader=construct.apply(gate);
-        return new ValidationReadHandle(){
+        return new ManagedRead(){
             private final ValidationFailureLatch failure=new ValidationFailureLatch();
             @Override public Optional<Row> next(){
                 throwFailure();
@@ -238,6 +250,7 @@ public final class PdkValidationReads {
             }
             @Override public CompletionStage<Void> workersExited(){return reader.workersExited();}
             @Override public CompletionStage<Void> rowsReleased(){return reader.rowsReleased();}
+            @Override public CompletionStage<Void> cleanupCompleted(){return PdkValidationReads.cleanupCompleted(reader);}
             private void record(Throwable reported){failure.record(reported);ValidationFailureLatch.addContext(failure.get(),reported);}
             private void throwFailure(){if(failure.get() instanceof Error fatal)throw fatal;if(failure.get() instanceof RuntimeException failed)throw failed;}
         };

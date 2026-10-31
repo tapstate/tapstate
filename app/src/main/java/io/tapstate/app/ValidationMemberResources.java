@@ -227,7 +227,7 @@ final class ValidationMemberResources implements AutoCloseable {
             boolean release;ScheduledFuture<?> cancel=null;
             synchronized(this){
                 release=retiring&&!returned&&workers==0&&handles.isEmpty();if(release)returned=true;
-                if(retry!=null&&handles.stream().noneMatch(handle->handle.closing&&!handle.closeSucceeded)){
+                if(retry!=null&&handles.stream().noneMatch(handle->handle.closing&&handle.needsCleanup())){
                     cancel=retry;retry=null;
                 }
             }
@@ -241,14 +241,14 @@ final class ValidationMemberResources implements AutoCloseable {
             synchronized(this){
                 if(!retiring){retiring=true;for(var handle:handles)handle.closing=true;}
                 // Dispatch only on the process timer; rejected or failed original closes stay retryable.
-                if(retry==null&&handles.stream().anyMatch(handle->!handle.closeSucceeded))retry=controlTicks(this::retryCleanup);
+                if(retry==null&&handles.stream().anyMatch(Handle::needsCleanup))retry=controlTicks(this::retryCleanup);
             }
             query.shutdown();decode.shutdown();consumer.shutdown();retryCleanup();releaseIfDone();
         }
         private void retryCleanup(){
             List<Handle> originals;
             synchronized(this){
-                originals=handles.stream().filter(handle->handle.closing&&!handle.submitted&&!handle.closeSucceeded).toList();
+                originals=handles.stream().filter(handle->handle.closing&&!handle.submitted&&handle.needsCleanup()).toList();
                 for(var handle:originals){handle.submitted=true;handle.closeExited=false;}
             }
             for(var handle:originals)cleanup(()->{
@@ -265,6 +265,9 @@ final class ValidationMemberResources implements AutoCloseable {
         private final class Handle {
             final AutoCloseable original;int receipts;boolean closing,submitted,closeExited,closeSucceeded;
             Handle(AutoCloseable original){this.original=original;}
+            // A close may return during initialization, before its later native cleanup can fail.
+            // Keep retrying the same handle until both retained lifetime receipts arrive.
+            boolean needsCleanup(){return !closeSucceeded||receipts<2;}
         }
         private final class ProbeExecutor extends AbstractExecutorService {
             private final ExecutorService delegate;private boolean closed;private int outstanding;

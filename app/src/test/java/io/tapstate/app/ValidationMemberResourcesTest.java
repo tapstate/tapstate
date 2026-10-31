@@ -128,6 +128,33 @@ class ValidationMemberResourcesTest {
             }finally{release.countDown();probe.close();}
         }finally{release.countDown();}
     }
+    @Test void aSuccessfulEarlyCloseStillRetriesWhileNativeCleanupRemainsUnconfirmed()throws Exception{
+        var retryEntered=new CountDownLatch(1);var release=new CountDownLatch(1);
+        try(var process=new ValidationMemberResources()){
+            var member=process.bind("cluster","node","boot",4,()->{});var probe=member.admitProbe();
+            var workers=new CompletableFuture<Void>();var nativeCleanup=new CompletableFuture<Void>();
+            var attempts=new java.util.concurrent.atomic.AtomicInteger();
+            probe.retain(()->{
+                if(attempts.incrementAndGet()==1)return;
+                retryEntered.countDown();if(!release.await(5,TimeUnit.SECONDS))throw new AssertionError("native retry fixture timeout");
+                nativeCleanup.complete(null);
+            },workers,nativeCleanup);
+            try{
+                probe.close();
+                workers.completeExceptionally(new TapstateException(ValidationError.READ_FAILED,Map.of("table","metadata"),null));
+                assertThat(retryEntered.await(3,TimeUnit.SECONDS)).isTrue();
+                assertThat(probe.released().toCompletableFuture()).isNotDone();
+                assertThat(member.snapshot().metadataFrames()).isOne();
+                assertThat(member.snapshot().processReserved().isEmpty()).isFalse();
+                release.countDown();
+                assertThatThrownBy(()->probe.released().toCompletableFuture().get(2,TimeUnit.SECONDS))
+                        .isInstanceOf(ExecutionException.class).hasCauseInstanceOf(TapstateException.class);
+                assertThat(attempts).hasValue(2);
+                assertThat(member.snapshot().metadataFrames()).isZero();
+                assertThat(member.snapshot().processReserved().isEmpty()).isTrue();
+            }finally{release.countDown();nativeCleanup.complete(null);probe.close();}
+        }finally{release.countDown();}
+    }
     @Test void processShutdownKeepsOriginalProbeCleanupAliveUntilPhysicalDrain()throws Exception{
         var entered=new CountDownLatch(4);var release=new CountDownLatch(1);
         try(var process=new ValidationMemberResources()){
