@@ -8,6 +8,8 @@ public interface SourceOperationObserver {
     /** A stable operation/table within the original physical access domain. */
     default void completed(String operation,Capability capability,Throwable failure){completed(capability,failure);}
     default SourceOperationObserver fork(String phase){return this;}
+    /** Already-captured asynchronous reports, shared across the original observer's phases. */
+    default boolean hasPendingReports(){return false;}
     default void close() { }
     SourceOperationObserver NONE = (capability, failure) -> { };
 }

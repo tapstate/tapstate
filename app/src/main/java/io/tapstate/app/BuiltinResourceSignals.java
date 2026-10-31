@@ -27,9 +27,15 @@ final class BuiltinResourceSignals {
     private static final class Connection {
         final String id=UUID.randomUUID().toString();boolean closed;int pending;
     }
+    private static final class Reports { boolean closed;int pending; }
     private final Map<String,Connection> connections=new java.util.concurrent.ConcurrentHashMap<>();
     SourceOperationObserver source(SourceBindingSnapshot original,Runnable operation){return source(original,"legacy-source",operation,active);}
     SourceOperationObserver source(SourceBindingSnapshot original,String logical,Runnable operation,Runnable localProof) {
+        return source(original,logical,operation,localProof,new Reports(),true);
+    }
+    private SourceOperationObserver source(SourceBindingSnapshot original,String logical,Runnable operation,
+            Runnable localProof,Reports reports,boolean root) {
+        synchronized(reports){if(reports.closed)return SourceOperationObserver.NONE;}
         var id=original.identity();
         boolean master=storage.get().defaultSourceId().equals(id.sourceId());
         var sourceResource=new AlarmKey.Resource("source",id.sourceId(),id.incarnation());
@@ -48,26 +54,40 @@ final class BuiltinResourceSignals {
             active.run();localProof.run();
             if(connections.get(base)!=connection)throw ThreeLayerStorePort.refused();
         };
-        Runnable settled=()->{synchronized(connection){if(--connection.pending<0)throw new IllegalStateException("negative pending operation count");
-            if(connection.closed && connection.pending==0)connections.remove(base,connection);}};
+        Runnable settled=()->{synchronized(reports){synchronized(connection){
+            if(--connection.pending<0 || --reports.pending<0)throw new IllegalStateException("negative pending operation count");
+            if(connection.closed && connection.pending==0)connections.remove(base,connection);
+        }}};
         return new SourceOperationObserver() {
             @Override public void completed(Capability capability,Throwable failure){completed("connection",capability,failure);}
             @Override public void completed(String access,Capability capability,Throwable failure) {
                 if(failure!=null)org.slf4j.LoggerFactory.getLogger(BuiltinResourceSignals.class).debug("Operational failure classification [master={},capability={},classified={}]",master,capability,connectionFailure(failure));
                 if(failure!=null && !connectionFailure(failure))return;
-                synchronized(connection){
-                    if(connection.closed || connections.get(base)!=connection)return;
-                    connection.pending+=master?2:1;
-                }
+                synchronized(reports){synchronized(connection){
+                    if(reports.closed || connection.closed || connections.get(base)!=connection)return;
+                    int count=master?2:1;connection.pending+=count;reports.pending+=count;
+                }}
                 String domain=digest(base,access);
                 String binding=digest(id.sourceId(),id.incarnation(),Long.toString(id.bindingRevision()),domain);
                 var input=new AlertInput.Operational(clock.instant(),binding,OperationalEvidence.Capability.valueOf(capability.name()),failure==null,domain);
-                runtime.get().resourceInput(sourceResource,"source.connection-failed",id.bindingRevision(),binding,operation,local,input,settled);
-                if(master)runtime.get().resourceInput(storageResource,"cluster.storage-unavailable",0,binding,operation,local,input,settled);
+                Runnable sourceSettled=once(settled),storageSettled=master?once(settled):()->{};
+                boolean submitted=false;
+                try {
+                    runtime.get().resourceInput(sourceResource,"source.connection-failed",id.bindingRevision(),binding,operation,local,input,sourceSettled);
+                    submitted=true;
+                    if(master)runtime.get().resourceInput(storageResource,"cluster.storage-unavailable",0,binding,operation,local,input,storageSettled);
+                }catch(RuntimeException|Error unavailable){
+                    if(!submitted)sourceSettled.run();storageSettled.run();throw unavailable;
+                }
             }
-            @Override public SourceOperationObserver fork(String phase){close();return BuiltinResourceSignals.this.source(original,logical+":"+phase,operation,localProof);}
-            @Override public void close(){synchronized(connection){connection.closed=true;if(connection.pending==0)connections.remove(base,connection);}}
+            @Override public SourceOperationObserver fork(String phase){closeConnection();return BuiltinResourceSignals.this.source(original,logical+":"+phase,operation,localProof,reports,false);}
+            @Override public boolean hasPendingReports(){synchronized(reports){return reports.pending>0;}}
+            @Override public void close(){synchronized(reports){if(root)reports.closed=true;closeConnection();}}
+            private void closeConnection(){synchronized(reports){synchronized(connection){connection.closed=true;if(connection.pending==0)connections.remove(base,connection);}}}
         };
+    }
+    private static Runnable once(Runnable action){
+        var done=new java.util.concurrent.atomic.AtomicBoolean();return ()->{if(done.compareAndSet(false,true))action.run();};
     }
     private volatile Function<AlarmKey.Resource,Optional<AlertStore.NodeEvidence>> nodeProofs=resource->Optional.empty();
     void nodeProofs(Function<AlarmKey.Resource,Optional<AlertStore.NodeEvidence>> proofs){nodeProofs=Objects.requireNonNull(proofs);}

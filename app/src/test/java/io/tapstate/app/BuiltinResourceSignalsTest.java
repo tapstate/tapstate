@@ -12,6 +12,45 @@ import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class BuiltinResourceSignalsTest {
+    @Test void aClosedObserverFamilyTracksEveryCapturedPhaseReportUntilSettlement() {
+        var runtime=mock(PipelineAlertRuntime.class);var binding=mock(StorageBinding.class);when(binding.defaultSourceId()).thenReturn("other");
+        var signals=new BuiltinResourceSignals(()->runtime,()->binding,new CacheAuthScope("cluster",1,StorageBinding.Mode.OP,"cache",1),()->{},Clock.systemUTC());
+        var id=new SourceBindingIdentity("erp","e6e8d616-985e-49cc-a0f4-9802897abf95",1);
+        var source=new SourceBindingSnapshot(new SourceResource("erp",null,"test",Map.of(),null,null,null,null),"a".repeat(64),id);
+        var root=signals.source(source,"capture",()->{},()->{});var phase=root.fork("stream");
+        phase.completed("orders",SourceOperationObserver.Capability.STREAM_READ,new java.net.ConnectException("failure"));
+        phase.completed("customers",SourceOperationObserver.Capability.STREAM_READ,new java.net.ConnectException("failure"));
+        var settled=org.mockito.ArgumentCaptor.forClass(Runnable.class);
+        verify(runtime,times(2)).resourceInput(any(),anyString(),anyLong(),anyString(),any(),any(),any(),settled.capture());
+        assertThat(root.hasPendingReports()).isTrue();root.close();phase.close();
+        clearInvocations(runtime);phase.completed("orders",SourceOperationObserver.Capability.STREAM_READ,null);
+        root.fork("late").completed(SourceOperationObserver.Capability.STREAM_READ,null);verifyNoInteractions(runtime);
+        settled.getAllValues().getFirst().run();settled.getAllValues().getFirst().run();assertThat(root.hasPendingReports()).isTrue();
+        settled.getAllValues().getLast().run();assertThat(root.hasPendingReports()).isFalse();
+    }
+    @Test void immediateRefusalAndSubmissionFailureCannotStrandMasterReportCounts() {
+        var runtime=mock(PipelineAlertRuntime.class);var binding=mock(StorageBinding.class);when(binding.defaultSourceId()).thenReturn("views");
+        var signals=new BuiltinResourceSignals(()->runtime,()->binding,new CacheAuthScope("cluster",1,StorageBinding.Mode.OP,"cache",1),()->{},Clock.systemUTC());
+        var id=new SourceBindingIdentity("views","e6e8d616-985e-49cc-a0f4-9802897abf95",1);
+        var source=new SourceBindingSnapshot(new SourceResource("views",null,"test",Map.of(),null,null,null,null),"a".repeat(64),id);
+        doAnswer(call->{((Runnable)call.getArgument(7)).run();return null;}).when(runtime).resourceInput(any(),anyString(),anyLong(),anyString(),any(),any(),any(),any());
+        var observer=signals.source(source,"target",()->{},()->{});
+        observer.completed(SourceOperationObserver.Capability.TARGET_WRITE,new java.net.ConnectException("failure"));
+        verify(runtime,times(2)).resourceInput(any(),anyString(),anyLong(),anyString(),any(),any(),any(),any());
+        assertThat(observer.hasPendingReports()).isFalse();
+        var failure=new IllegalStateException("submission failed");
+        doThrow(failure).when(runtime).resourceInput(any(),anyString(),anyLong(),anyString(),any(),any(),any(),any());
+        assertThatThrownBy(()->observer.completed(SourceOperationObserver.Capability.TARGET_WRITE,new java.net.ConnectException("failure"))).isSameAs(failure);
+        assertThat(observer.hasPendingReports()).isFalse();
+        var queued=new java.util.concurrent.atomic.AtomicReference<Runnable>();var calls=new java.util.concurrent.atomic.AtomicInteger();
+        doAnswer(call->{
+            if(calls.incrementAndGet()==1){queued.set(call.getArgument(7));return null;}
+            throw failure;
+        }).when(runtime).resourceInput(any(),anyString(),anyLong(),anyString(),any(),any(),any(),any());
+        assertThatThrownBy(()->observer.completed(SourceOperationObserver.Capability.TARGET_WRITE,new java.net.ConnectException("failure"))).isSameAs(failure);
+        observer.close();assertThat(observer.hasPendingReports()).isTrue();
+        queued.get().run();queued.get().run();assertThat(observer.hasPendingReports()).isFalse();
+    }
     @Test void cacheSuccessSamplingKeepsBoundariesClockRollbackAndEveryFailureEdge(){
         var runtime=mock(PipelineAlertRuntime.class);var now=new java.util.concurrent.atomic.AtomicReference<>(Instant.EPOCH);
         var clock=new Clock(){public ZoneId getZone(){return ZoneOffset.UTC;}public Clock withZone(ZoneId zone){return this;}public Instant instant(){return now.get();}};

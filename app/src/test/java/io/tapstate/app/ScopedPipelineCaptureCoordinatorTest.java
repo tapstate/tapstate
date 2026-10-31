@@ -344,9 +344,134 @@ class ScopedPipelineCaptureCoordinatorTest {
     }
 
     private record OwnedShared(PipelineCaptureCoordinator run, WorkloadClaim claim,
-            NativeSrsCaptureRunUnit.Tail tail, String chain) { }
+            NativeSrsCaptureRunUnit.Tail tail, String chain,CapturePreparation preparation) { }
+
+    private record PendingReport(OwnedShared held,Runnable original,Runnable local,Runnable settled,Throwable failure) { }
+    private static PendingReport pendingTailFailure(Fixture f) {
+        return pendingTailFailure(f,null);
+    }
+    private static PendingReport pendingTailFailure(Fixture f,CountDownLatch allowClose) {
+    var port=mock(PdkCapturePort.class,RETURNS_SELF);f.portOverride.set(port);
+    var runtime=mock(PipelineAlertRuntime.class);var storage=mock(StorageBinding.class);
+    when(storage.defaultSourceId()).thenReturn("other");
+    var signals=new BuiltinResourceSignals(()->runtime,()->storage,
+            new CacheAuthScope("cluster",1,StorageBinding.Mode.OP,"cache",1),()->{},Clock.systemUTC());
+    var source=new SourceBindingSnapshot(f.source,io.tapstate.core.model.canonical.CanonicalHash.of(f.source),
+            new SourceBindingIdentity("input","e6e8d616-985e-49cc-a0f4-9802897abf95",1));
+    var observers=new ConcurrentHashMap<String,SourceOperationObserver>();
+    f.coordinator.withSourceOperations(id->Optional.of(source),(identity,domain,guard,local)->{
+        var observer=signals.source(identity,domain,guard,local);observers.put(domain,observer);return observer;
+    });
+    var held=ownedShared(f,true);
+    var observer=observers.entrySet().stream().filter(e->e.getKey().endsWith(":stream")).findFirst().orElseThrow().getValue();
+    var drive=observer.fork("stream");
+    drive.completed("orders",SourceOperationObserver.Capability.STREAM_READ,new java.net.ConnectException("connection failed"));
+    var original=org.mockito.ArgumentCaptor.forClass(Runnable.class);
+    var local=org.mockito.ArgumentCaptor.forClass(Runnable.class);
+    var settled=org.mockito.ArgumentCaptor.forClass(Runnable.class);
+    verify(runtime).resourceInput(any(),eq("source.connection-failed"),eq(1L),anyString(),original.capture(),local.capture(),
+            argThat(v->v instanceof io.tapstate.core.alerting.AlertInput.Operational op&&!op.succeeded()),settled.capture());
+    var ioClosed=new CountDownLatch(1);
+    doAnswer(call->{observer.close();drive.close();ioClosed.countDown();if(allowClose!=null)allowClose.await();return null;}).when(held.tail()).close();
+    var failure=new TapstateException(ConnectorError.CAPTURE_FAILED,Map.of("connector","fixture","detail","connection failed"),null);
+    var health=held.tail().health();health.recording(mock(CaptureListener.class)).onError(failure);
+    assertThat(health.failure()).contains(failure);
+    try {assertThat(ioClosed.await(3,TimeUnit.SECONDS)).isTrue();}
+    catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}
+    if(allowClose==null)verify(held.tail()).close();
+        return new PendingReport(held,original.getValue(),local.getValue(),settled.getValue(),failure);
+    }
+    @Test void tailFailureClosesIoButKeepsCapturedReportProofUntilSettlement() {
+        try(var f=new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var report=pendingTailFailure(f);
+            assertThat(report.held().run().captureFailure("flow")).contains(report.failure());
+            assertThatThrownBy(()->f.tailGuard.get().run()).isInstanceOf(TapstateException.class);
+            assertThatCode(report.original()::run).doesNotThrowAnyException();
+            assertThatCode(report.local()::run).doesNotThrowAnyException();
+            verify(f.ownership,never()).release(report.held().claim());
+            report.held().run().stopCapture("flow",false);
+            assertThatCode(report.local()::run).doesNotThrowAnyException();
+            report.settled().run();
+            verify(f.ownership,timeout(3000)).release(report.held().claim());
+            assertThatThrownBy(report.original()::run).isInstanceOf(TapstateException.class);
+        }
+    }
+    @Test void aReportDrainDeadlineCannotBeExtendedByAnotherMaintenancePass() {
+        try(var f=new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var report=pendingTailFailure(f);assertThatCode(report.local()::run).doesNotThrowAnyException();
+            f.reportNanos.addAndGet(Duration.ofSeconds(16).toNanos());
+            assertThatThrownBy(report.original()::run).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(report.local()::run).isInstanceOf(TapstateException.class);
+            verify(f.ownership,timeout(3000)).release(report.held().claim());report.settled().run();
+        }
+    }
+    @Test void independentLeaseLossStillInvalidatesCapturedReportsImmediately() {
+        try(var f=new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var report=pendingTailFailure(f);var lost=new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);
+            when(f.authorization.requireCapture(any(),any())).thenThrow(lost);
+            doThrow(lost).when(f.authorization).requireCaptureLocal(any(),any());
+            assertThatThrownBy(report.original()::run).isSameAs(lost);assertThatThrownBy(report.local()::run).isSameAs(lost);
+            verify(f.ownership,timeout(3000)).release(report.held().claim());report.settled().run();
+        }
+    }
+    @Test void hostCloseDoesNotKeepReportAuthorityAliveForItsDrainWindow() {
+        try(var f=new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var report=pendingTailFailure(f);f.coordinator.close();
+            assertThatThrownBy(report.original()::run).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(report.local()::run).isInstanceOf(TapstateException.class);
+            verify(f.ownership).release(report.held().claim());report.settled().run();
+        }
+    }
+    @Test void aDrainingCaptureCannotReserveAnotherAttachment() {
+        try(var f=new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var report=pendingTailFailure(f);report.held().run().stopCapture("flow",false);
+            clearInvocations(f.ownership);
+            assertThatThrownBy(()->report.held().run().startCapture("flow",f.snapshot(),f.models()))
+                    .isInstanceOf(RingNotOpenYet.class);
+            verify(f.ownership,never()).acquire(any());
+            assertThatCode(report.local()::run).doesNotThrowAnyException();report.settled().run();
+            verify(f.ownership,timeout(3000)).release(report.held().claim());
+        }
+    }
+    @Test void pendingReportsKeepTheOriginalClaimNeededAcrossSessionCleanupAndRenewal() {
+        try(var f=new Fixture(List.of("input"),8,ReadMode.SNAPSHOT_AND_CDC,Duration.ofMillis(100))) {
+            var renewals=new AtomicInteger();
+            doAnswer(call->{renewals.incrementAndGet();return Optional.of(call.getArgument(0));}).when(f.ownership).renew(any());
+            var report=pendingTailFailure(f);report.held().run().stopCapture("flow",false);int before=renewals.get();
+            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->renewals.get()>=before+2);
+            assertThatCode(report.original()::run).doesNotThrowAnyException();
+            assertThatCode(report.local()::run).doesNotThrowAnyException();verify(f.ownership,never()).release(report.held().claim());
+            report.settled().run();verify(f.ownership,timeout(3000).atLeastOnce()).release(report.held().claim());
+        }
+    }
+    @Test void explicitRetirementDoesNotWaitForAnUnsettledReport() {
+        try(var f=new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var report=pendingTailFailure(f);report.held().run().stopCapture("flow",false);
+            f.coordinator.retireShared(report.held().preparation(),WorkloadClaimFence.from(report.held().claim()));
+            assertThatThrownBy(report.original()::run).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(report.local()::run).isInstanceOf(TapstateException.class);
+            verify(f.ownership).release(report.held().claim());report.settled().run();
+        }
+    }
+    @Test void anExpiredReportDrainCannotReleaseBeforeBlockedPhysicalCleanupExits() {
+        var allowClose=new CountDownLatch(1);
+        try(var f=new Fixture(List.of("input"),8,ReadMode.SNAPSHOT_AND_CDC,Duration.ofMillis(100))) {
+            try {
+                var renewals=new AtomicInteger();var released=new AtomicBoolean();
+                doAnswer(call->{renewals.incrementAndGet();return Optional.of(call.getArgument(0));}).when(f.ownership).renew(any());
+                doAnswer(call->{released.set(true);return null;}).when(f.ownership).release(any());
+                var report=pendingTailFailure(f,allowClose);int before=renewals.get();
+                report.settled().run();f.reportNanos.addAndGet(Duration.ofSeconds(16).toNanos());
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->released.get()||renewals.get()>=before+2);
+                assertThat(released).as("the original claim remains held while physical cleanup is unproved").isFalse();
+            }finally{allowClose.countDown();}
+        }
+    }
 
     private static OwnedShared ownedShared(Fixture f) {
+        return ownedShared(f,false);
+    }
+    private static OwnedShared ownedShared(Fixture f,boolean openPort) {
         String canonical="mck-key",physical="srs-recovery-"+"b".repeat(64),operation=UUID.randomUUID().toString();
         String captureId=SourceCaptureIdentity.sharedCapture(canonical);
         var prepared=new CapturePreparation(BUSINESS,CapturePreparation.Mode.SHARED_SRS,physical,captureId,
@@ -382,9 +507,12 @@ class ScopedPipelineCaptureCoordinatorTest {
         doReturn(-1L).when(f.runtime).initialReadAfter(any(),anyString(),anyString(),any(),anyString(),any());
         doNothing().when(f.runtime).retain(any(),anyString(),any(),any());
         var tail=mock(NativeSrsCaptureRunUnit.Tail.class);when(tail.health()).thenReturn(new CaptureHealth());
-        doReturn(tail).when(f.runtime).startTail(any(),any(),any(),any(),any(),any(),any(),anyBoolean());
+        doAnswer(call->{
+            if(openPort){f.tailGuard.set(call.getArgument(6));java.util.function.Function<SrsCaptureWriter,CapturePort> factory=call.getArgument(5);factory.apply(mock(SrsCaptureWriter.class));}
+            return tail;
+        }).when(f.runtime).startTail(any(),any(),any(),any(),any(),any(),any(),anyBoolean());
         var run=f.coordinator.forRun(SCOPE,PIPELINE,ORIGINAL);run.startCapture("flow",f.snapshot(),f.models());
-        return new OwnedShared(run, capture, tail, physical);
+        return new OwnedShared(run, capture, tail, physical,prepared);
     }
 
     @Test void aTrustedReplacementUsesPhysicalRingsWhileKeepingCanonicalCaptureNotesAndHistory() {
@@ -582,6 +710,9 @@ class ScopedPipelineCaptureCoordinatorTest {
         final List<SourceResource> definitions=new ArrayList<>();
         final AtomicInteger opened=new AtomicInteger(),closedPorts=new AtomicInteger(),readRows=new AtomicInteger(),rowCount=new AtomicInteger(1);
         final AtomicReference<Throwable> closeFailure=new AtomicReference<>();
+        final AtomicReference<CapturePort> portOverride=new AtomicReference<>();
+        final AtomicReference<Runnable> tailGuard=new AtomicReference<>();
+        final AtomicLong reportNanos=new AtomicLong();
         PausedRead pausedRead;
         PausedRead pauseSecondRead() {pausedRead=new PausedRead();return pausedRead;}
         final WorkloadClaim capture;
@@ -628,7 +759,11 @@ class ScopedPipelineCaptureCoordinatorTest {
             coordinator=new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(BUSINESS,pipelines,sources,configuration,cache,notes,ignored -> false,
                             boundedLoads,completedFull),
                     new ScopedPipelineCaptureCoordinator.Execution(() -> Optional.of(node),authorization,ownership,renewal,() -> {},Clock.systemUTC()),
-                    runtime,buffer,connectors,(original,config,guard,preparation,stream) -> { guard.run(); opened.incrementAndGet(); return new Port(config.node().nodeId(),guard,closedPorts,readRows,rowCount.get(),closeFailure,pausedRead); });
+                    runtime,buffer,connectors,(original,config,guard,preparation,stream) -> {
+                        guard.run();opened.incrementAndGet();
+                        if(portOverride.get()!=null)return portOverride.get();
+                        return new Port(config.node().nodeId(),guard,closedPorts,readRows,rowCount.get(),closeFailure,pausedRead);
+                    },reportNanos::get);
             if (!bounded) streaming();
         }
         private SrsConsumerProgress progress(boolean complete, long membership, long epoch) {
