@@ -72,6 +72,37 @@ class ValidationRootCheckTest {
         assertThat(result.observedAgreement()).isFalse();
     }
 
+    @Test void productionSizedRowsTruncateOptionalBytesWithoutLosingEitherFinding(){
+        var limits=new Limits(256L*1024,256,256,8,2);
+        var rowLimits=new ValidationValues.Limits(64*1024,8192,32);
+        var source=ValidationValues.ownRow(Map.of("id",7,"payload","a".repeat(31000),"note","source"),rowLimits);
+        var target=ValidationValues.ownRow(Map.of("id",7,"payload","b".repeat(31000),"note","target"),rowLimits);
+        assertThat(source.accountedBytes()).isLessThanOrEqualTo(rowLimits.bytes()).isGreaterThan(60*1024);
+        var builder=builder(observation(ValidationMode.FULL,1),ValidationMethod.FULL_COLUMN,SHOULD_EXIST,TargetPresence.PRESENT,limits);
+        complete(builder);
+        var payload=new Finding(Kind.TARGET_VALUE,location(root(),"payload"));
+        var note=new Finding(Kind.TARGET_VALUE,location(root(),"note"));
+        builder.finding(payload,Optional.of(sampled(source,"s")),Optional.of(sampled(target,"t")));
+        builder.finding(note,Optional.of(sampled(source,"s")),Optional.of(sampled(target,"t")));
+        var result=builder.finish();
+        assertThat(result.findings()).containsEntry(payload,1L).containsEntry(note,1L);
+        assertThat(result.counts()).containsEntry(Kind.TARGET_VALUE,2L);
+        assertThat(result.samples()).hasSize(1);assertThat(result.samplesTruncated()).isTrue();
+        assertThat(result.accountedBytes()).isLessThanOrEqualTo(limits.bytes());assertThat(result.observedAgreement()).isFalse();
+    }
+    @Test void laterMandatoryReadFactsCanEvictOptionalSamplesWithinTheSameBound(){
+        var limits=new Limits(24L*1024,32,32,32,2);
+        var builder=builder(observation(ValidationMode.FULL,1),ValidationMethod.FULL_COLUMN,SHOULD_EXIST,TargetPresence.PRESENT,limits);
+        complete(builder);
+        var problem=new Finding(Kind.TARGET_VALUE,location(root(),"payload"));
+        var row=ValidationValues.ownRow(Map.of("payload","x".repeat(2400)),new ValidationValues.Limits(8192,20,4));
+        builder.finding(problem,Optional.of(sampled(row,"s")),Optional.empty());
+        for(int index=0;index<16;index++)builder.read(Side.SOURCE,boundary("extra-source-"+index));
+        var result=builder.finish();assertThat(result.findings()).containsEntry(problem,1L);
+        assertThat(result.reads()).hasSize(18);assertThat(result.samples()).isEmpty();assertThat(result.samplesTruncated()).isTrue();
+        assertThat(result.accountedBytes()).isLessThanOrEqualTo(limits.bytes());assertThat(result.observedAgreement()).isFalse();
+    }
+
     @Test void unknownParticipationIsExplicitlyBlockedAndNeverRequiresInventedTargetFacts() {
         var builder = basic(UNKNOWN, TargetPresence.NOT_READ);
         Finding cause = new Finding(Kind.SOURCE_FIELD_MISSING, location(root(), "customer_id"));

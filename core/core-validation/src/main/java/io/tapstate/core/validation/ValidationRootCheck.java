@@ -323,9 +323,10 @@ public final class ValidationRootCheck {
                 counts.put(finding.kind(), increment(counts.getOrDefault(finding.kind(), 0L)));
                 if (source.isEmpty() && target.isEmpty()) return;
                 if (samples.size() == limits.samples()) { samplesTruncated = true; return; }
-                charge(128L + source.map(SampledSide::accountedBytes).orElse(0L)
-                        + target.map(SampledSide::accountedBytes).orElse(0L));
-                samples.add(new Sample(finding, source, target));
+                var sample=new Sample(finding,source,target);
+                long amount=sampleBytes(sample);
+                if(amount>limits.bytes()-bytes){samplesTruncated=true;return;}
+                bytes+=amount;samples.add(sample);
             });
         }
 
@@ -454,8 +455,16 @@ public final class ValidationRootCheck {
                     || !expected.rootKey().equals(actual.rootKey())) throw ValidationError.invalid("rootCheck.foreignRoot");
         }
         private void charge(long amount) {
+            // Mandatory findings, scopes and read facts take precedence over optional diagnostics.
+            while(amount>limits.bytes()-bytes&&!samples.isEmpty()){
+                bytes-=sampleBytes(samples.removeLast());samplesTruncated=true;
+            }
             if (amount > limits.bytes() - bytes) throw limit("bytes");
             bytes += amount;
+        }
+        private static long sampleBytes(Sample sample){
+            return 128L+sample.source().map(SampledSide::accountedBytes).orElse(0L)
+                    +sample.target().map(SampledSide::accountedBytes).orElse(0L);
         }
         private static long increment(long count) {
             if (count == Long.MAX_VALUE) throw limit("findingCount");
