@@ -36,6 +36,58 @@ class MongoCacheOperatorStateStoreIT {
     private static final WorkloadOwner OWNER = new WorkloadOwner("node-a", "boot-a");
     private static final Runnable ACTIVE = () -> {};
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({"200,1,1", "257,1,2", "2,3145728,2"})
+    void ordinaryBatchWritesUseBoundedCommandsAndClearOnlyReplacedMarkers(int count, int stateBytes, int commands) {
+        withFixture(f -> {
+            var at = f.at(OperatorPlacement.Resource.NEST_STATE);
+            var original = (NestReleaseStore) f.writer(at);
+            original.saveWithRelease(at.mapName(), "key-0", new byte[]{9}, new byte[]{8});
+            original.saveWithRelease(at.mapName(), "untouched", new byte[]{7}, new byte[]{6});
+            var sizes = new ArrayList<Integer>();
+            var listener = new CommandListener() { @Override public void commandStarted(CommandStartedEvent event) {
+                if (event.getDatabaseName().equals(f.database.getName()) && event.getCommandName().equals("update")
+                        && event.getCommand().getString("update").getValue().equals("nest_state")) {
+                    assertThat(event.getCommand()).containsKey("txnNumber");
+                    sizes.add(event.getCommand().getArray("updates").size());
+                }
+            }};
+            var values = new LinkedHashMap<String, byte[]>();
+            for (int index = 0; index < count; index++) values.put("key-" + index, new byte[stateBytes]);
+            try (var client = observed(listener)) {
+                var writer = new MongoCacheOperatorStateStore(new MongoCachePipelineAccess(client, client.getDatabase(f.database.getName()),
+                        SCOPE, WorkloadClaimFence.from(f.claim), ACTIVE), at);
+                writer.saveAll(at.mapName(), values);
+            }
+            assertThat(sizes).hasSize(commands).allSatisfy(size -> assertThat(size).isBetween(1, 256));
+            assertThat(sizes.stream().mapToInt(Integer::intValue).sum()).isEqualTo(count);
+            assertThat(original.loadAll(at.mapName(), values.keySet())).hasSize(count)
+                    .allSatisfy((key, value) -> assertThat(value).containsExactly(values.get(key)));
+            assertThat(original.pendingReleases(at.mapName(), null)).extracting(NestReleaseStore.PendingKey::stateKey)
+                    .containsExactly("untouched");
+        });
+    }
+
+    @Test void aBatchCannotCommitAfterItsOriginalGuardIsLost() {
+        withFixture(f -> {
+            var at = f.at(OperatorPlacement.Resource.NEST_STATE);
+            var before = f.snapshot(); var lost = new AtomicBoolean();
+            var listener = new CommandListener() { @Override public void commandStarted(CommandStartedEvent event) {
+                if (event.getDatabaseName().equals(f.database.getName()) && event.getCommandName().equals("update")
+                        && event.getCommand().getString("update").getValue().equals("nest_state")) lost.set(true);
+            }};
+            try (var client = observed(listener)) {
+                var writer = new MongoCacheOperatorStateStore(new MongoCachePipelineAccess(client, client.getDatabase(f.database.getName()),
+                        SCOPE, WorkloadClaimFence.from(f.claim), () -> {
+                            if (lost.get()) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+                        }), at);
+                code(() -> writer.saveAll(at.mapName(), Map.of("first", new byte[]{1}, "second", new byte[]{2})),
+                        IoError.WORKLOAD_CLAIM_FENCED);
+            }
+            assertThat(lost).isTrue(); assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
     @Test void pendingReleasePagesUseTheirPartialIndexWithoutLoadingOrdinaryState() {
         withFixture(f -> {
             var at = f.at(OperatorPlacement.Resource.NEST_STATE);

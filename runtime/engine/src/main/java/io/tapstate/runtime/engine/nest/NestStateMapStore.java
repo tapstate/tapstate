@@ -46,6 +46,7 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
      * and the difference is silent - counters that are simply never written.
      */
     private KeyedStateStore store;
+    private NestStateIo stateIo;
 
     private NestStateStats stats;
 
@@ -73,6 +74,7 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
             String resolved = database == null ? stores.defaultDatabase() : database;
             this.store = stores.inDatabase(resolved).state();
         }
+        this.stateIo = new NestStateIo(store, namespace);
         this.stats = NestStateStats.of(member);
     }
 
@@ -88,8 +90,9 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
     @Override
     public Object load(Object key) {
         long began = System.nanoTime();
-        Object state = store.load(namespace, NestStateKeys.nameOf(key))
-                .map(this::fromBytes).orElse(null);
+        String name = NestStateKeys.nameOf(key);
+        byte[] bytes = stateIo.load(name);
+        Object state = bytes == null ? null : fromBytes(bytes);
         if (stats != null) {
             stats.backfill(namespace, System.nanoTime() - began);
         }
@@ -119,7 +122,7 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
             byName.put(NestStateKeys.nameOf(key), key);
         }
         long began = System.nanoTime();
-        Map<String, byte[]> found = store.loadAll(namespace, byName.keySet());
+        Map<String, byte[]> found = stateIo.loadAll(byName.keySet());
         if (stats != null) {
             stats.backfill(namespace, System.nanoTime() - began);
         }
@@ -136,16 +139,23 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
 
     @Override
     public void store(Object key, Object value) {
-        byte[] state = toBytes(value);
-        if (store instanceof io.tapstate.spi.store.NestReleaseStore releases) {
-            byte[] originalKey = value instanceof ResolverState resolver && !resolver.releases().isEmpty() ? toBytes(key) : null;
-            releases.saveWithRelease(namespace, NestStateKeys.nameOf(key), state, originalKey);
-        } else store.save(namespace, NestStateKeys.nameOf(key), state);
+        if (store instanceof io.tapstate.spi.store.NestReleaseStore releases
+                && value instanceof ResolverState resolver) {
+            byte[] originalKey = resolver.releases().isEmpty() ? null : toBytes(key);
+            releases.saveWithRelease(namespace, NestStateKeys.nameOf(key), toBytes(value), originalKey);
+        } else stateIo.saveAll(Map.of(NestStateKeys.nameOf(key), toBytes(value)));
     }
 
     @Override
     public void storeAll(Map<Object, Object> map) {
-        map.forEach(this::store);
+        if (store instanceof io.tapstate.spi.store.NestReleaseStore
+                && map.values().stream().anyMatch(ResolverState.class::isInstance)) {
+            map.forEach(this::store);
+            return;
+        }
+        Map<String, byte[]> states = new LinkedHashMap<>();
+        map.forEach((key, value) -> states.put(NestStateKeys.nameOf(key), toBytes(value)));
+        stateIo.saveAll(states);
     }
 
     @Override

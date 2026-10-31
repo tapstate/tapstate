@@ -94,6 +94,14 @@ public final class ProtectedMap<K, V> {
         });
     }
 
+    /** Only for idempotent replacement batches whose callers retain their inputs on partial failure. */
+    public void setAll(Map<K, V> values) {
+        waitingOut(() -> {
+            map.setAll(values);
+            return null;
+        });
+    }
+
     public V put(K key, V value) {
         return waitingOut(() -> map.put(key, value));
     }
@@ -110,8 +118,9 @@ public final class ProtectedMap<K, V> {
     }
 
     /**
-     * Waited out as a whole, so only for a {@code processor} that changes nothing: the keys span partitions, and
-     * the ones the cluster did not refuse have already run it by the time the refusal of another arrives.
+     * Waited out as a whole: some partitions may already have run when another refuses. A processor must
+     * either change nothing or apply an idempotent mutation under one ordered writer for every affected
+     * key. The latter writer must not allow a newer mutation to interleave with a retried prefix.
      */
     public <R> Map<K, R> executeOnKeys(Set<K> keys, EntryProcessor<K, V, R> processor) {
         return waitingOut(() -> map.executeOnKeys(keys, processor));

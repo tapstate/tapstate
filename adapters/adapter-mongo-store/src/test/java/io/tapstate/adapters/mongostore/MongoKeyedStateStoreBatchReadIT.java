@@ -54,6 +54,37 @@ class MongoKeyedStateStoreBatchReadIT {
             SharedMongoCase.forSuite(MongoKeyedStateStoreBatchReadIT.class);
 
     @Test
+    void aBatchOfStateWritesUsesOneAcknowledgedCommandAndRetainsEveryKey() {
+        withCommands("update", (store, commands) -> {
+            Map<String, byte[]> states = new LinkedHashMap<>();
+            for (int i = 0; i < 200; i++) states.put("C" + i, bytes("state-" + i));
+
+            store.saveAll(NAMESPACE, states);
+
+            assertThat(commands).as("a bulk write must not loop over replaceOne").hasSize(1);
+            assertThat(store.loadAll(NAMESPACE, states.keySet())).containsExactlyInAnyOrderEntriesOf(states);
+            assertThat(store.loadAll(SIBLING, states.keySet())).isEmpty();
+        });
+    }
+
+    @Test
+    void anEmptyWriteBatchSendsNothingAndReplacingABatchRemainsIdempotent() {
+        withCommands("update", (store, commands) -> {
+            store.saveAll(NAMESPACE, Map.of());
+            assertThat(commands).isEmpty();
+            store.saveAll(NAMESPACE, Map.of("C1", bytes("old"), "C2", bytes("unchanged")));
+            Map<String, byte[]> replacement = Map.of("C1", bytes("new"), "C3", bytes("added"));
+            store.saveAll(NAMESPACE, replacement);
+            store.saveAll(NAMESPACE, replacement);
+            assertThat(store.count(NAMESPACE)).isEqualTo(3);
+            assertThat(store.loadAll(NAMESPACE, List.of("C1", "C2", "C3")))
+                    .containsEntry("C1", bytes("new"))
+                    .containsEntry("C2", bytes("unchanged"))
+                    .containsEntry("C3", bytes("added"));
+        });
+    }
+
+    @Test
     void aBatchAnswersExactlyWhatTheKeyAtATimeReadsWould() {
         withStore((store, finds) -> {
             store.save(NAMESPACE, "C1", bytes("state of C1"));
@@ -232,13 +263,17 @@ class MongoKeyedStateStoreBatchReadIT {
      * exists to report, arrived at with nothing wrong with the store at all.
      */
     private static void withStore(BiConsumer<MongoKeyedStateStore, List<BsonDocument>> test) {
+        withCommands("find", test);
+    }
+
+    private static void withCommands(String command, BiConsumer<MongoKeyedStateStore, List<BsonDocument>> test) {
         List<BsonDocument> finds = new ArrayList<>();
         MongoClientSettings settings = MongoClientSettings.builder()
                 .applyConnectionString(new ConnectionString(REPLICA_SET.getReplicaSetUrl()))
                 .addCommandListener(new CommandListener() {
                     @Override
                     public void commandStarted(CommandStartedEvent event) {
-                        if ("find".equals(event.getCommandName())) {
+                        if (command.equals(event.getCommandName())) {
                             finds.add(event.getCommand().clone());
                         }
                     }
