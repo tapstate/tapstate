@@ -50,6 +50,44 @@ class AlertEvaluationHostIT {
             }
         });
     }
+    @Test void expiryDuringPlanningRollsBackAndRecomputesOwnershipWithoutLosingTheOriginalEpisode() {
+        withFixture(false,true,new AlarmKey.Scope("a".repeat(24),"b".repeat(24)),f->{
+            var store=mock(AlertStore.class,org.mockito.AdditionalAnswers.delegatesTo(f.store));
+            var advance=new AtomicBoolean();var conflicts=new AtomicInteger();
+            var baseline=new AtomicReference<AlertStore.Planning>();
+            doAnswer(call->{var view=f.store.planning();if(advance.compareAndSet(true,false))f.now.set(T.plusSeconds(31));return view;})
+                    .when(store).planning();
+            doAnswer(call->{
+                var result=f.store.commit(call.getArgument(0));
+                if(result==AlertStore.Outcome.CONFLICT){
+                    conflicts.incrementAndGet();var afterAbort=f.store.planning();
+                    assertThat(afterAbort.states()).isEqualTo(baseline.get().states());
+                    assertThat(afterAbort.schedules()).isEqualTo(baseline.get().schedules());
+                    assertThat(afterAbort.intents()).isEqualTo(baseline.get().intents());
+                }
+                return result;
+            }).when(store).commit(any());
+            f.evaluator.withPlanner(new AlertNotificationPlanner(store,f.clock,"planner",java.net.URI.create("https://cloud.invalid"),ACTIVE));
+            var binding=f.binding(()->new AlertStore.EvaluationProof(f.intent,ACTIVE));
+            assertThat(f.evaluator.accept(binding,1,new AlertInput.Conditions(T,AlertSignal.Condition.BAD,null)))
+                    .isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
+            baseline.set(f.store.planning());assertThat(baseline.get().schedules()).hasSize(1);
+            var before=f.store.state(binding.key(),f.reads()).orElseThrow().value();
+            f.now.set(T.plusSeconds(29));advance.set(true);
+            assertThatCode(()->assertThat(f.evaluator.accept(binding,2,
+                    new AlertInput.Conditions(T.plusSeconds(29),AlertSignal.Condition.GOOD,null)))
+                    .isEqualTo(AlertEvaluationHost.Result.ACCEPTED)).doesNotThrowAnyException();
+            var after=f.store.state(binding.key(),f.reads()).orElseThrow().value();
+            assertThat(conflicts).hasValue(1);
+            assertThat(after.owner().generation()).isEqualTo(before.owner().generation()+1);
+            assertThat(after.owner().activeAt(f.clock.instant())).isTrue();
+            assertThat(after.snapshot().lastSequence()).isEqualTo(2);
+            assertThat(after.snapshot().lastObservedAt()).isEqualTo(T.plusSeconds(29));
+            assertThat(after.episode().value().number()).isEqualTo(before.episode().value().number());
+            assertThat(after.episode().value().firedAt()).isEqualTo(before.episode().value().firedAt());
+            assertThat(after.episode().value().endReason()).isEqualTo(AlertSnapshot.EndReason.RECOVERED);
+        });
+    }
     @Test void nameAndSeverityEditsKeepTheOriginalActiveEpisodeAndItsAcceptedFrontier(){
         withFixture(f->{var originalBinding=f.binding(()->new AlertStore.EvaluationProof(f.intent,ACTIVE));
             f.evaluator.accept(originalBinding,1,new AlertInput.Conditions(T,AlertSignal.Condition.BAD,null));

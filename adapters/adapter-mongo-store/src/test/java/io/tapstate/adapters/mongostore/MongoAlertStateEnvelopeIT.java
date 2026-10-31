@@ -64,6 +64,39 @@ class MongoAlertStateEnvelopeIT {
             assertThat((Object)tx(f,s -> f.store.stageEnvelope(s,2,claim,renew,List.of(),null,clock(T.plusSeconds(7))))).isEqualTo(MongoAlertStateStore.Stage.CONFLICT);
         });
     }
+    @Test void optimisticLeaseExpiryConflictsButMalformedOwnersStillThrowAfterExpiry() {
+        withStore(f->{
+            var old=fired();tx(f,s->f.store.stageEnvelope(s,0,null,old,List.of(),bad(1,T),clock(T)));
+            var owned=head(old.snapshot(),old.episode(),new AlertOwnership(1,"worker-a",T.plusSeconds(5)));
+            tx(f,s->f.store.stageEnvelope(s,1,old,owned,List.of(),null,clock(T)));
+            var baseline=tx(f,s->f.store.loadEnvelope(s,KEY).orElseThrow());
+            var renewal=head(owned.snapshot(),owned.episode(),new AlertOwnership(1,"worker-a",T.plusSeconds(15)));
+            assertThat((Object)tx(f,s->f.store.compareAndSetEnvelope(s,2,owned,renewal,List.of(),null,clock(T.plusSeconds(6)))))
+                    .isEqualTo(MongoAlertStateStore.Stage.CONFLICT);
+            for(var owner:List.of(new AlertOwnership(1,"worker-b",T.plusSeconds(3)),
+                    new AlertOwnership(1,"worker-a",T.plusSeconds(3)),new AlertOwnership(3,"worker-b",T.plusSeconds(3)))){
+                var malformed=head(owned.snapshot(),owned.episode(),owner);
+                assertThatThrownBy(()->tx(f,s->f.store.compareAndSetEnvelope(s,2,owned,malformed,List.of(),null,clock(T.plusSeconds(16)))))
+                        .isInstanceOf(IllegalArgumentException.class);
+            }
+            assertThat((Object)tx(f,s->f.store.loadEnvelope(s,KEY).orElseThrow())).isEqualTo(baseline);
+        });
+    }
+    @Test void anExpiredCandidateCannotAppendStateOrTransitionsThroughOptimisticCas() {
+        withStore(f->{
+            var old=fired();var expired=head(old.snapshot(),old.episode(),new AlertOwnership(1,"worker-a",T.plusSeconds(1)));
+            var raised=AlertLifecycle.evaluate(AlertSnapshot.initial(RULE),bad(1,T),T);
+            var changes=raised.transitions().stream().map(value->new AlertStateRecord.Transition(value,null,
+                    value.episode()==0?DiagnosticStatus.NOT_APPLICABLE:expired.episode().diagnostics().status(),
+                    value.episode()==0?null:expired.episode().diagnostics().latest(),POLICY)).toList();
+            assertThat(changes).isNotEmpty();
+            assertThat((Object)tx(f,s->f.store.compareAndSetEnvelope(s,0,null,expired,changes,bad(1,T),clock(T.plusSeconds(2)))))
+                    .isEqualTo(MongoAlertStateStore.Stage.CONFLICT);
+            assertThat((Object)tx(f,s->f.store.loadEnvelope(s,KEY))).isEqualTo(java.util.Optional.empty());
+            assertThatThrownBy(()->tx(f,s->f.store.stageEnvelope(s,0,null,expired,changes,bad(1,T),clock(T.plusSeconds(2)))))
+                    .isInstanceOf(IllegalArgumentException.class);
+        });
+    }
     @Test void frozenPolicyAndPrunedOccurrenceSurviveSettingsChangesAndNoCaptureResurrection() {
         withStore(f -> {
             var old = fired(); tx(f,s -> f.store.stageEnvelope(s,0,null,old,List.of(),bad(1,T),clock(T)));

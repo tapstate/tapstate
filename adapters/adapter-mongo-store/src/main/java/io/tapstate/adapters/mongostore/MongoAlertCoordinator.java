@@ -332,7 +332,7 @@ final class MongoAlertCoordinator implements AlertStore {
                     validateMember(s,member,true);
                 }
                 if(v.before()==null){admission("alert_instances",1);if(v.after().binding()!=null)requireDomainCapacity(s,v.after());}
-                changed|=outcome(states.stageEnvelope(s,v.revision(),v.before(),v.after(),v.transitions(),v.diagnosticSignal(),clock))==Outcome.STAGED;
+                changed|=outcome(states.compareAndSetEnvelope(s,v.revision(),v.before(),v.after(),v.transitions(),v.diagnosticSignal(),clock))==Outcome.STAGED;
                 if(v.proof()!=null)v.proof().requireCurrent().run();
             }
             for(var change:c.intents()){

@@ -144,6 +144,20 @@ final class MongoAlertStateStore {
         return row == null ? Optional.empty() : Optional.of(MongoAlertStateEnvelope.readEpisode(key, number, row));
     }
 
+    /** A lease window can close after planning; that loses the optimistic attempt, never the invariant. */
+    Stage compareAndSetEnvelope(ClientSession session, long revision, io.tapstate.core.alerting.AlertStateRecord.Head before,
+            io.tapstate.core.alerting.AlertStateRecord.Head candidate,
+            List<io.tapstate.core.alerting.AlertStateRecord.Transition> changes,
+            io.tapstate.core.alerting.AlertSignal diagnosticSignal, java.time.Clock clock) {
+        try { return stageEnvelope(session,revision,before,candidate,changes,diagnosticSignal,clock); }
+        catch (OwnershipWindowClosed expired) { return Stage.CONFLICT; }
+    }
+
+    private static final class OwnershipWindowClosed extends IllegalArgumentException {
+        private static final long serialVersionUID = 1L;
+        OwnershipWindowClosed(String message) { super(message); }
+    }
+
     Stage stageEnvelope(ClientSession session, long revision, io.tapstate.core.alerting.AlertStateRecord.Head before,
             io.tapstate.core.alerting.AlertStateRecord.Head candidate,
             List<io.tapstate.core.alerting.AlertStateRecord.Transition> changes,
@@ -155,15 +169,13 @@ final class MongoAlertStateStore {
         if (actual.isPresent() && actual.get().value().equals(candidate) && actual.get().revision() == revision + 1) { return Stage.UNCHANGED; }
         if (before == null ? actual.isPresent() : actual.isEmpty() || actual.get().revision() != revision || !actual.get().value().equals(before)) { return Stage.CONFLICT; }
         if (before != null && before.equals(candidate) && changes.isEmpty()) { return Stage.UNCHANGED; }
-        if (!changes.isEmpty() && candidate.owner().generation() > 0 && !candidate.owner().activeAt(clock.instant())) { throw new IllegalArgumentException("expired owner cannot append transitions"); }
         if (changes.size() > 8) { throw new IllegalArgumentException("too many state transitions"); }
-        java.time.Instant now = clock.instant();
-        validateEnvelope(before, candidate, diagnosticSignal, now);
         Document head = MongoAlertStateEnvelope.head(candidate, revision + 1);
         Document episode = candidate.episode() == null ? null : MongoAlertStateEnvelope.episode(candidate.episode());
         if (episode != null && (before == null || before.episode() == null || before.episode().value().number() != candidate.episode().value().number())
                 && episodes.find(session,new Document("_id",episode.get("_id"))).first() != null) { throw new IllegalArgumentException("original episode identity already exists"); }
         MongoAlertStateEnvelope.read(key, head, episode);
+        java.time.Instant now = clock.instant();
         var encodedChanges = new java.util.ArrayList<Document>();
         for (int i = 0; i < changes.size(); i++) {
             var change = changes.get(i);
@@ -178,6 +190,11 @@ final class MongoAlertStateStore {
             Document row = MongoAlertStateEnvelope.transition(key, revision + 1, i, change);
             MongoAlertStateEnvelope.readTransition(key, revision + 1, i, row); encodedChanges.add(row);
         }
+        validateEnvelopeStructure(before, candidate, diagnosticSignal, now);
+        validateOwnershipWindow(before, candidate, now);
+        if (!changes.isEmpty() && candidate.owner().generation() > 0 && !candidate.owner().activeAt(now)) {
+            throw new OwnershipWindowClosed("expired owner cannot append transitions");
+        }
         if (before == null) { heads.insertOne(session, head); }
         else if (heads.replaceOne(session, new Document("_id", head.get("_id")).append("recordRevision", revision), head).getMatchedCount() != 1) { return Stage.CONFLICT; }
         if (episode != null) { episodes.replaceOne(session, new Document("_id", episode.get("_id")), episode, new ReplaceOptions().upsert(true)); }
@@ -185,7 +202,7 @@ final class MongoAlertStateStore {
         requireActive.run(); return Stage.STAGED;
     }
 
-    private static void validateEnvelope(io.tapstate.core.alerting.AlertStateRecord.Head before,
+    private static void validateEnvelopeStructure(io.tapstate.core.alerting.AlertStateRecord.Head before,
             io.tapstate.core.alerting.AlertStateRecord.Head candidate, io.tapstate.core.alerting.AlertSignal signal, java.time.Instant now) {
         var next = candidate.snapshot();
         boolean retainedClock = before!=null && signal==null && next.quality()==io.tapstate.core.alerting.AlertSnapshot.Quality.CLOCK_INVALID
@@ -198,13 +215,10 @@ final class MongoAlertStateStore {
         }
         var oldOwner = before == null ? io.tapstate.core.alerting.AlertOwnership.unclaimed() : before.owner(); var owner = candidate.owner();
         if (owner.generation() < oldOwner.generation() || owner.generation() > oldOwner.generation()
-                && (oldOwner.generation() == Long.MAX_VALUE || owner.generation() != oldOwner.generation() + 1 || oldOwner.activeAt(now) || !owner.activeAt(now))
+                && (oldOwner.generation() == Long.MAX_VALUE || owner.generation() != oldOwner.generation() + 1)
                 || owner.generation() == oldOwner.generation() && (!Objects.equals(owner.ownerId(), oldOwner.ownerId())
-                || !Objects.equals(owner.leaseUntil(), oldOwner.leaseUntil()) && (!oldOwner.activeAt(now) || !owner.activeAt(now) || owner.leaseUntil().isBefore(oldOwner.leaseUntil())))) {
+                || !Objects.equals(owner.leaseUntil(), oldOwner.leaseUntil()) && owner.leaseUntil().isBefore(oldOwner.leaseUntil()))) {
             throw new IllegalArgumentException("state owner is stale or moves backwards");
-        }
-        if (before != null && !before.equals(candidate) && owner.generation() > 0 && !owner.activeAt(now)) {
-            throw new IllegalArgumentException("expired state owner cannot mutate");
         }
         if (before != null) {
             var old = before.snapshot();
@@ -249,6 +263,20 @@ final class MongoAlertStateStore {
                 throw new IllegalArgumentException("capture lacks the just-accepted original occurrence");
             }
         } else if (oldD != null || d.first() != null) { throw new IllegalArgumentException("diagnostic status cannot erase evidence"); }
+    }
+
+    private static void validateOwnershipWindow(io.tapstate.core.alerting.AlertStateRecord.Head before,
+            io.tapstate.core.alerting.AlertStateRecord.Head candidate, java.time.Instant now) {
+        var oldOwner = before == null ? io.tapstate.core.alerting.AlertOwnership.unclaimed() : before.owner();
+        var owner = candidate.owner();
+        if (owner.generation() > oldOwner.generation() && (oldOwner.activeAt(now) || !owner.activeAt(now))
+                || owner.generation() == oldOwner.generation() && !Objects.equals(owner.leaseUntil(),oldOwner.leaseUntil())
+                && (!oldOwner.activeAt(now) || !owner.activeAt(now))) {
+            throw new OwnershipWindowClosed("state owner is stale or moves backwards");
+        }
+        if (before != null && !before.equals(candidate) && owner.generation() > 0 && !owner.activeAt(now)) {
+            throw new OwnershipWindowClosed("expired state owner cannot mutate");
+        }
     }
 
     private void requireContext(ClientSession session, AlarmKey key) {
