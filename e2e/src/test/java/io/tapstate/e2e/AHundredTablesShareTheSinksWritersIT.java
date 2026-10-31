@@ -118,11 +118,22 @@ class AHundredTablesShareTheSinksWritersIT {
             List<String> tables, ControlPlane control) {
         Map<String, Set<String>> observed = idsWrittenByTable(written);
         Map<String, Object> incomplete = new java.util.TreeMap<>();
+        Object initialLoad;
+        try {
+            initialLoad = control.initialLoad(PIPELINE).<Object>map(load -> load.get("tables")).orElse("not-published");
+        } catch (RuntimeException | AssertionError unavailable) {
+            initialLoad = unavailable.getClass().getSimpleName();
+        }
+        Map<?, ?> loadTables = initialLoad instanceof Map<?, ?> values ? values : Map.of();
         for (String table : tables) {
             Set<String> ids = observed.getOrDefault(table, Set.of());
             if (ids.size() != ROWS_EACH) {
                 incomplete.put(table, Map.of("witnessIds", ids, "targetRows", files.count(target, table),
-                        "writtenTables", written.rowsOf(table).stream().map(WriteWitness.Written::rowTable).distinct().toList()));
+                        "writtenTables", written.rowsOf(table).stream().map(WriteWitness.Written::rowTable).distinct().toList(),
+                        "initialLoad", loadTables.containsKey(table) ? loadTables.get(table)
+                                : initialLoad instanceof Map<?, ?> ? "table-not-published" : initialLoad,
+                        "writerBatches", written.rowsOf(table).stream().map(row -> Map.of("id", row.id(),
+                                "writer", row.writerId(), "batch", row.batchId(), "table", row.rowTable())).toList()));
             }
         }
         return "incomplete=" + incomplete + ", pipeline=" + control.state(PIPELINE)
