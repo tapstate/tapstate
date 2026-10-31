@@ -417,7 +417,16 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     private void accept(AlertEvaluationHost.Binding binding,long sequence,AlertInput input,boolean shared) {
         var outcome = services.evaluator().accept(binding, sequence, input);
         if(outcome==AlertEvaluationHost.Result.BUSY && (shared || deferHealthyCacheHeartbeat(binding,input)))return;
-        if (outcome == AlertEvaluationHost.Result.CONFLICT || outcome == AlertEvaluationHost.Result.BUSY) throw refused("state-contention");
+        if (outcome == AlertEvaluationHost.Result.CONFLICT || outcome == AlertEvaluationHost.Result.BUSY) {
+            var refusal=refused("state-contention");
+            long second=clock.instant().getEpochSecond(),previous=lastLogged.get();
+            if((previous==Long.MIN_VALUE||second-previous>=60)&&lastLogged.compareAndSet(previous,second))
+                LOG.warn("Alert collection is degraded [{}] [resourceKind={},type={},outcome={},capability={},succeeded={}]",
+                        refusal.code().code(),binding.resource().kind(),binding.definition().typeId(),outcome,
+                        input instanceof AlertInput.Operational op?op.capability():null,
+                        input instanceof AlertInput.Operational op?op.succeeded():null);
+            throw refusal;
+        }
     }
     /** Deferral is not acceptance: no timestamp, sequence, capability or ownership is changed. */
     private boolean deferHealthyCacheHeartbeat(AlertEvaluationHost.Binding binding,AlertInput input) {
