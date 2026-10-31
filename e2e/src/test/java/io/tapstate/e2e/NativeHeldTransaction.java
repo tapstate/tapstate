@@ -44,26 +44,22 @@ final class NativeHeldTransaction implements AutoCloseable {
             for (String field : List.of("ownerNodeId", "ownerBootId", "claimGeneration", "executionGeneration", "topologyRevision"))
                 original.append(field, captureFence.get(field));
             original.append("$expr", new Document("$gt", List.of("$leaseUntil", "$$NOW")));
-            long acquisitionDeadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
-            while (true) {
+            var lastConflict = new java.util.concurrent.atomic.AtomicReference<MongoException>();
+            Await.until("the original live capture fence to admit an uncommitted hold", Duration.ofSeconds(5), () -> {
                 session.startTransaction();
                 try {
                     long matched = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(client.getDatabase(storage.cacheDatabase()))
                             .updateOne(session, original, new Document("$inc", new Document("fencedAppends", 1L))).getMatchedCount();
                     if (matched != 1) throw new AssertionError("the original live capture fence is unavailable to hold");
-                    break;
+                    return true;
                 } catch (MongoException contention) {
                     // Live claim renewal can win acquisition; no member has been killed yet.
-                    if (!contention.hasErrorLabel("TransientTransactionError")
-                            || System.nanoTime() - acquisitionDeadline >= 0) throw contention;
+                    if (!contention.hasErrorLabel("TransientTransactionError")) throw contention;
                     abort(session);
-                    try { Thread.sleep(25); }
-                    catch (InterruptedException interrupted) {
-                        Thread.currentThread().interrupt();
-                        throw new AssertionError("interrupted while acquiring the original transaction hold", interrupted);
-                    }
+                    lastConflict.set(contention);
+                    return false;
                 }
-            }
+            }, () -> "last transient Mongo code = " + (lastConflict.get() == null ? "none" : lastConflict.get().getCode()));
         } catch (RuntimeException | Error failure) {
             try { close(acquired, client); } catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
             throw failure;
