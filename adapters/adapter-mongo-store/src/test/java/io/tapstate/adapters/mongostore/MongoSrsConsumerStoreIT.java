@@ -242,6 +242,71 @@ class MongoSrsConsumerStoreIT {
             }
         });
     }
+    @ParameterizedTest @ValueSource(ints={1,12})
+    void writerProgressReusesCheckpointModelProofsOnlyInsideItsOriginalTransaction(int width) {
+        withBusiness(f -> {
+            var tables=java.util.stream.IntStream.range(0,width).mapToObj(i->"table-"+i).collect(java.util.stream.Collectors.toSet());
+            var refs=publishSnapshotModels(f,tables);
+            f.chains().requestTables(CHAIN,tables,f.captureFence());f.chains().publishServingTables(CHAIN,1,tables,f.captureFence());
+            var log=new MongoSrsLogStore(f.client(),SystemCollections.SRS_EVENTS.on(f.database()),SystemCollections.SRS_LOG_BOUNDS.on(f.database()),
+                    SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()),models(f));
+            var checkpoints=new java.util.HashMap<String,io.tapstate.spi.store.SrsTableCheckpoint>();
+            for(var table:tables) {
+                log.storeAll(ring(table),0,List.of(new io.tapstate.spi.store.SrsLogRecord("captured",io.tapstate.core.event.Op.INSERT,1,
+                        null,Map.of("id",1),0,f.captureFence(),1)));
+                checkpoints.put(table,new io.tapstate.spi.store.SrsTableCheckpoint(refs.get(table),0));
+            }
+            var checkpoint=new io.tapstate.spi.store.SrsCaptureCheckpoint(new ChainPosition(new SourceOrder(1,0),"captured"),checkpoints);
+            f.chains().checkpoint(CHAIN,0,checkpoint,f.captureFence()).orElseThrow();
+            var member=f.consumers().attach(A,0,tables,f.fenceA()).orElseThrow();
+            assertThat(f.consumers().pinSnapshot(A,member.revision(),0,new SrsSnapshotPin(1,"captured",refs),f.fenceA())).isTrue();
+            var roster=new java.util.HashMap<String,List<String>>();tables.forEach(table->roster.put(table,List.of("writer-0","writer-1","writer-2","writer-3")));
+            assertThat(f.consumers().beginWriterRun(A,member.revision(),"original-run",roster,f.fenceA())).isTrue();
+            var counts=new java.util.HashMap<String,Integer>();var transactions=new java.util.HashSet<String>();
+            var enabled=new java.util.concurrent.atomic.AtomicBoolean();var unbound=new java.util.concurrent.atomic.AtomicBoolean();
+            var listener=new com.mongodb.event.CommandListener(){
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event){
+                    if(!enabled.get()||!event.getDatabaseName().equals(f.database().getName())||!event.getCommandName().equals("find"))return;
+                    counts.merge(event.getCommand().getString("find").getValue(),1,Integer::sum);
+                    if(!event.getCommand().containsKey("txnNumber"))unbound.set(true);else transactions.add(event.getCommand().get("txnNumber").toString());
+                }
+            };
+            try(var observed=MongoClients.create(com.mongodb.MongoClientSettings.builder().applyConnectionString(
+                    new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl())).addCommandListener(listener).build())) {
+                var consumers=new MongoSrsConsumerStore(observed,observed.getDatabase(f.database().getName()),SCOPE);
+                String table=tables.stream().sorted().findFirst().orElseThrow();enabled.set(true);
+                assertThat(consumers.advanceWriter(A,member.revision(),"original-run",table,"writer-0",point(1,-1,null),f.fenceA())).isTrue();
+                enabled.set(false);assertThat(unbound).isFalse();assertThat(transactions).hasSize(1);
+                assertThat(counts.getOrDefault(SystemCollections.SRS_MODELS.collectionName(),0))
+                        .as("checkpoint and snapshot proofs must not be reopened for each event; finds=%s",counts).isLessThanOrEqualTo(4);
+                var eventId=new Document("_id",new Document("ring",ring(table)).append("seq",0L));
+                var events=SystemCollections.SRS_EVENTS.on(f.database());var original=events.find(eventId).first();
+                var controls=controlRows(f);var pipeline=SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).find(new Document("_id",A.key().pipelineId())).first();
+                events.updateOne(eventId,new Document("$set",new Document("schemaVer",999L)));
+                assertThatThrownBy(()->consumers.advanceWriter(A,member.revision(),"original-run",table,"writer-1",point(1,-1,null),f.fenceA()))
+                        .satisfies(error->code(error,IoError.SRS_EVENT_MODEL_UNAVAILABLE));
+                events.replaceOne(eventId,original);
+                events.updateOne(eventId,new Document("$set",new Document("captureFence.ownerBootId","foreign-boot")));
+                assertThatThrownBy(()->consumers.advanceWriter(A,member.revision(),"original-run",table,"writer-1",point(1,-1,null),f.fenceA()))
+                        .satisfies(error->code(error,IoError.WORKLOAD_CLAIM_FENCED));
+                events.deleteOne(eventId);
+                assertThatThrownBy(()->consumers.advanceWriter(A,member.revision(),"original-run",table,"writer-1",point(1,-1,null),f.fenceA()))
+                        .satisfies(error->code(error,IoError.SRS_CHECKPOINT_UNPROVEN));
+                assertThat(controlRows(f)).isEqualTo(controls);
+                assertThat(SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).find(new Document("_id",A.key().pipelineId())).first()).isEqualTo(pipeline);
+                events.insertOne(original);
+                var nextModel=new SrsModelKey(CHAIN,table,SCOPE.cacheIncarnation(),1,1);
+                models(f).publish(new SrsModel(nextModel,ring(table),new SourceTable(table,
+                        List.of(new SourceField("id","int"),new SourceField("note","string")),List.of(),List.of()),1),f.captureFence());
+                var boundaryTables=new java.util.HashMap<>(checkpoints);
+                boundaryTables.put(table,new io.tapstate.spi.store.SrsTableCheckpoint(nextModel,0));
+                var boundary=new io.tapstate.spi.store.SrsCaptureCheckpoint(new ChainPosition(new SourceOrder(1,1),"next-captured"),boundaryTables);
+                assertThat(f.chains().checkpoint(CHAIN,1,boundary,f.captureFence())).isPresent();
+                // Sequence zero precedes the new model's first event. Its original model remains valid.
+                assertThat(consumers.advanceWriter(A,member.revision(),"original-run",table,"writer-1",point(1,-1,null),f.fenceA())).isTrue();
+            }
+        });
+    }
 
     @Test void anAttachedSnapshotKeepsItsClosedModelContextUntilItsOwnDetach() {
         withBusiness(f -> {
