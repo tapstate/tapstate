@@ -104,6 +104,26 @@ class StorageInitializationProgressTest {
         assertThat(view().connectionChecks()).isEmpty();
     }
 
+    @Test void aKnownQuotaFailureSurvivesGenericRetryFailuresOnlyWithinItsOriginalStageAndScope() {
+        progress.begin(SCOPE, 1, true);
+        progress.failed(SCOPE, new TapstateException(io.tapstate.spi.store.IoError.STORE_QUOTA_EXCEEDED,
+                Map.of("secret", "private-value"), new IllegalArgumentException("private-cause")));
+        progress.begin(SCOPE, 1, true);
+        progress.failed(SCOPE, new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), null));
+        assertThat(view().milestones().get(1).errorCode()).isEqualTo("io.store-quota-exceeded");
+        assertThat(view().toString()).doesNotContain("private-value", "private-cause");
+        progress.begin(SCOPE, 1, true);
+        progress.completed(SCOPE, StorageInitializationProgress.Stage.PREPARE_STORAGE);
+        assertThat(progress.quotaExceeded()).isFalse();
+        progress.started(SCOPE, StorageInitializationProgress.Stage.START_RUNTIME);
+        progress.failed(SCOPE, new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), null));
+        assertThat(view().milestones().get(2).errorCode()).isEqualTo("control.storage-unavailable");
+        var other = new StorageSetupScope("cluster", "installation", "other", 2);
+        progress.begin(other, 1, true);
+        progress.failed(other, new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), null));
+        assertThat(progress.snapshot(other).orElseThrow().milestones().get(1).errorCode()).isEqualTo("control.storage-unavailable");
+    }
+
     @Test void readinessIsPublishedOnlyAfterAllActualStagesFinish() {
         progress.begin(SCOPE, 0, false);
         assertThatThrownBy(() -> progress.started(SCOPE, StorageInitializationProgress.Stage.PUBLISH_READY))

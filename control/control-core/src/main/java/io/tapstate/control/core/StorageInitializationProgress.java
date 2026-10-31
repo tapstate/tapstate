@@ -44,6 +44,7 @@ public final class StorageInitializationProgress {
     private long started;
     private long finished;
     private boolean restored;
+    private Stage quotaStage;
 
     public StorageInitializationProgress(Clock clock) { this(clock, System::nanoTime); }
     StorageInitializationProgress(Clock clock, LongSupplier ticker) {
@@ -63,6 +64,7 @@ public final class StorageInitializationProgress {
         verifiedChecks = Map.copyOf(verifiedChecks);
         if (completedPrefix < 0 || completedPrefix > 2) throw new IllegalArgumentException("invalid initialization prefix");
         boolean same = original.equals(scope);
+        if (!same || completedPrefix == 0 || quotaStage != null && quotaStage.ordinal() < completedPrefix) quotaStage = null;
         if (same && (state == State.RUNNING || state == State.COMPLETE)) return;
         long now = ticker.getAsLong();
         if (!same) started = now;
@@ -111,6 +113,7 @@ public final class StorageInitializationProgress {
         long now = ticker.getAsLong();
         timing.elapsed = elapsed(timing.started, now);
         timing.state = State.COMPLETE;
+        if (stage == quotaStage) quotaStage = null;
         if (stage == Stage.PUBLISH_READY) {
             state = State.COMPLETE;
             finished = now;
@@ -132,19 +135,38 @@ public final class StorageInitializationProgress {
             if (timing.state != State.RUNNING) continue;
             timing.state = State.FAILED;
             timing.elapsed = elapsed(timing.started, now);
-            timing.errorCode = failure instanceof TapstateException coded ? coded.code().code() : null;
+            timing.errorCode = failureCode(failure, stageOf(timing));
             recorded = true;
         }
         if (!recorded) {
             for (Timing timing : timings.values()) {
                 if (timing.state != State.PENDING) continue;
                 timing.state = State.FAILED;
-                timing.errorCode = failure instanceof TapstateException coded ? coded.code().code() : null;
+                timing.errorCode = failureCode(failure, stageOf(timing));
                 break;
             }
         }
         state = State.FAILED;
         finished = now;
+    }
+
+    /** A bounded diagnostic from this process and original operation, never a preparation or access grant. */
+    public synchronized boolean quotaExceeded() { return quotaStage != null; }
+
+    private Stage stageOf(Timing timing) {
+        for (var entry : timings.entrySet()) if (entry.getValue() == timing) return entry.getKey();
+        throw new IllegalStateException("initialization timing has no stage");
+    }
+
+    private String failureCode(Throwable failure, Stage stage) {
+        if (!(failure instanceof TapstateException coded)) { quotaStage = null; return null; }
+        var code = coded.code();
+        if (code == io.tapstate.spi.store.IoError.STORE_QUOTA_EXCEEDED || code == ControlError.STORAGE_QUOTA_EXCEEDED)
+            quotaStage = stage;
+        else if (code != io.tapstate.spi.store.IoError.STORE_UNAVAILABLE && code != ControlError.STORAGE_UNAVAILABLE
+                && code != io.tapstate.spi.store.IoError.CACHE_AUTH_FENCED && code != io.tapstate.spi.store.IoError.CACHE_BUSINESS_FENCED)
+            quotaStage = null;
+        return quotaStage == stage ? io.tapstate.spi.store.IoError.STORE_QUOTA_EXCEEDED.code() : code.code();
     }
 
     public synchronized Optional<View> snapshot() { return scope == null ? Optional.empty() : snapshot(scope); }

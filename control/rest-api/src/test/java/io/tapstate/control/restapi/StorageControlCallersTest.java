@@ -51,6 +51,26 @@ class StorageControlCallersTest {
                 .extracting(error -> ((TapstateException)error).code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE);
     }
 
+    @Test void quotaAuthenticationFailureExposesOnlyItsCoarse503CodeAndNeverCreatesAPrincipal() throws Exception {
+        var credentials = new CredentialAuthenticator(raw -> {
+            throw new TapstateException(IoError.STORE_QUOTA_EXCEEDED, Map.of("detail", "private-credential-sentinel"),
+                    new IllegalArgumentException("private-cause-sentinel"));
+        });
+        var failure = catchThrowable(() -> new TapstateCredentialAuthenticationProvider(credentials)
+                .authenticate(new TapstateCredentialAuthenticationToken("credential")));
+        assertThat(failure).isInstanceOf(CodedAuthenticationFailure.class);
+        assertThat(failure.getCause()).isNull();
+        assertThat(SecurityContextHolder.getContext().getAuthentication()).isNull();
+        var response = new org.springframework.mock.web.MockHttpServletResponse();
+        new CodedAuthenticationEntryPoint(new ApiSecurityErrorWriter(io.tapstate.messages.MessageCatalog.bundled(),
+                tools.jackson.databind.json.JsonMapper.builder().build())).commence(
+                new org.springframework.mock.web.MockHttpServletRequest(), response,
+                (org.springframework.security.core.AuthenticationException) failure);
+        assertThat(response.getStatus()).isEqualTo(503);
+        assertThat(response.getContentAsString()).contains("control.storage-quota-exceeded", "\"params\":{}")
+                .doesNotContain("private-credential-sentinel", "private-cause-sentinel", "clusterId", "operationId");
+    }
+
     @Test void unavailableAuthenticationDependencyUsesTheSecurityFailureChannelWithoutItsDriverCause() throws Exception {
         var credentials = new CredentialAuthenticator(raw -> {
             throw new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), new IllegalStateException("secret-driver-detail"));

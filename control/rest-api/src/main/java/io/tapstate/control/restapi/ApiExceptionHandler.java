@@ -47,6 +47,8 @@ class ApiExceptionHandler {
 
     @ExceptionHandler(TapstateException.class)
     ResponseEntity<ApiError> handle(TapstateException e) {
+        if (e.code() == io.tapstate.spi.store.IoError.STORE_QUOTA_EXCEEDED || e.code() == ControlError.STORAGE_QUOTA_EXCEEDED)
+            e = new TapstateException(ControlError.STORAGE_QUOTA_EXCEEDED, Map.of(), null);
         markCloudError(e.code());
         MessageCatalog.Rendered rendered = catalog.render(e.code(), e.args());
         // Sorted so the params render identically regardless of throw-site order (a stable machine contract).
@@ -125,6 +127,8 @@ class ApiExceptionHandler {
             Map.entry("control.storage-test-failed", HttpStatus.BAD_REQUEST),
             Map.entry("control.storage-test-required", HttpStatus.CONFLICT),
             Map.entry("control.storage-unavailable", HttpStatus.SERVICE_UNAVAILABLE),
+            Map.entry("control.storage-quota-exceeded", HttpStatus.SERVICE_UNAVAILABLE),
+            Map.entry("io.store-quota-exceeded", HttpStatus.SERVICE_UNAVAILABLE),
             Map.entry("dsl", HttpStatus.BAD_REQUEST),
             Map.entry("io.configuration-import-refused", HttpStatus.CONFLICT),
             Map.entry("io.pipeline-state-rebuild-required", HttpStatus.CONFLICT),

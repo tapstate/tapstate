@@ -38,6 +38,18 @@ class ApiExceptionHandlerTest {
 
     private final ApiExceptionHandler handler = new ApiExceptionHandler(MessageCatalog.bundled());
 
+    @Test void quotaResponsesAreCoarse503DiagnosticsWithoutDriverParametersOrCauses() throws Exception {
+        for (var code : List.of(IoError.STORE_QUOTA_EXCEEDED, ControlError.STORAGE_QUOTA_EXCEEDED)) {
+            var failure = new TapstateException(code, Map.of("detail", "mongodb://u:secret@host/private"),
+                    new IllegalArgumentException("private-cause"));
+            var response = handler.handle(failure);
+            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+            assertThat(response.getBody().code()).isEqualTo(ControlError.STORAGE_QUOTA_EXCEEDED.code());
+            assertThat(response.getBody().params()).isEmpty();
+            assertThat(response.getBody().message()).doesNotContain("secret", "private-cause", "host");
+        }
+    }
+
     @Test void aKnownPipelineRequiringAnExplicitStateRebuildIsAStateConflict() {
         var response=handler.handle(new TapstateException(IoError.PIPELINE_STATE_REBUILD_REQUIRED,Map.of("pipeline","flow"),null));
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);

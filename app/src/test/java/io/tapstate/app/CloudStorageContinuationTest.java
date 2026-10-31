@@ -144,6 +144,58 @@ class CloudStorageContinuationTest {
         }
     }
 
+    @Test void aRecordedQuotaFailureSurvivesTheRealRootCredentialBoundaryWithoutGrantingAPrincipal() {
+        try (var f = new Fixture()) {
+            doThrow(new TapstateException(IoError.STORE_QUOTA_EXCEEDED, Map.of(), null)).when(f.cache).prepareFirstAuth(f.grant);
+            var business = f.business();
+            assertThatThrownBy(() -> f.continueWith(business)).isInstanceOf(TapstateException.class);
+            when(f.states.load()).thenThrow(StorageRuntime.unavailable());
+            assertThatThrownBy(() -> f.root.authenticateCredentials("unverified-cookie"))
+                    .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                        assertThat(failure.code()).isEqualTo(ControlError.STORAGE_QUOTA_EXCEEDED);
+                        assertThat(failure.args()).isEmpty(); assertThat(failure.getCause()).isNull();
+                    });
+            verify(f.cache, times(1)).prepareFirstAuth(f.grant);
+            verify(business, never()).start(); verify(f.bindings, never()).complete(any());
+        }
+    }
+
+    @Test void aGenericFailureWithoutQuotaEvidenceAndARecoveredRuntimeDoNotClaimQuota() {
+        try (var f = new Fixture()) {
+            when(f.states.load()).thenThrow(StorageRuntime.unavailable());
+            assertThatThrownBy(() -> f.root.authenticateCredentials("unverified-cookie"))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE));
+        }
+        try (var f = new Fixture()) {
+            doThrow(new TapstateException(IoError.STORE_QUOTA_EXCEEDED, Map.of(), null)).when(f.cache).prepareFirstAuth(f.grant);
+            var business = f.business();
+            assertThatThrownBy(() -> f.continueWith(business)).isInstanceOf(TapstateException.class);
+            f.continueWith(business);
+            assertThat(f.root.initializationProgress().quotaExceeded()).isFalse();
+            doThrow(StorageRuntime.unavailable()).when(f.configuration).requireAuthenticationPublished(eq(PREPARATION), any(MongoReadBudget.class));
+            assertThatThrownBy(() -> f.root.authenticateCredentials("unverified-cookie"))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE));
+            verify(f.cache, times(1)).prepareFirstAuth(f.grant); verify(business, times(1)).start();
+        }
+    }
+
+    @Test void quotaFailureKeepsItsOriginalStageAcrossRetryWithoutReplayingCreation() {
+        try (var f = new Fixture()) {
+            doThrow(new TapstateException(IoError.STORE_QUOTA_EXCEEDED, Map.of(), null)).when(f.cache).prepareFirstAuth(f.grant);
+            doThrow(StorageRuntime.unavailable()).when(f.cache).resumeInitialAuth(eq(PREPARATION), any());
+            var business = f.business();
+            assertThatThrownBy(() -> f.continueWith(business)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> f.continueWith(business)).isInstanceOf(TapstateException.class);
+            var progress = f.root.initializationProgress().snapshot(SETUP).orElseThrow();
+            assertThat(progress.milestones().get(1).errorCode()).isEqualTo(IoError.STORE_QUOTA_EXCEEDED.code());
+            verify(f.cache, times(1)).prepareFirstAuth(f.grant);
+            verify(f.cache, times(1)).resumeInitialAuth(eq(PREPARATION), any());
+            verify(f.bindings, never()).complete(any()); verify(business, never()).start();
+        }
+    }
+
     @Test void completionUsesSavedTrustClosesTemporaryAuthenticationAndStartsOnlyOneBusinessOwner() {
         try (var f = new Fixture()) {
             var temporary = f.root.managedAuthentication(); var business = f.business();

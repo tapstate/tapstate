@@ -28,6 +28,8 @@ final class TapstateCredentialAuthenticationProvider implements AuthenticationPr
         catch (TapstateException failure) {
             if (failure.code() == ControlError.UNAUTHENTICATED || failure.code() == ControlError.AUTH_FAILED)
                 throw new BadCredentialsException("invalid bearer credential");
+            if (failure.code() == io.tapstate.spi.store.IoError.STORE_QUOTA_EXCEEDED || failure.code() == ControlError.STORAGE_QUOTA_EXCEEDED)
+                throw new CodedAuthenticationFailure(ControlError.STORAGE_QUOTA_EXCEEDED);
             throw new CodedAuthenticationFailure(failure.code() == ControlError.CLOUD_AUTH_UNAVAILABLE
                     ? ControlError.CLOUD_AUTH_UNAVAILABLE : ControlError.STORAGE_UNAVAILABLE);
         }

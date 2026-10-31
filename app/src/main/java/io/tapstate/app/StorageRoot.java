@@ -49,6 +49,7 @@ final class StorageRoot implements AutoCloseable {
     private volatile RecoveryFailure recoveryFailure;
     private final Runnable installationActive;
     private final StorageInitializationProgress initializationProgress;
+    private volatile boolean configurationQuotaExceeded;
 
     StorageRoot(MongoProperties mongo, CloudRuntimeSettings cloud, CloudSdkBridge bridge, BootId boot,
             MetricsHistoryProperties history, TokenSecrets secrets, Clock clock, byte[] signingKey) {
@@ -106,12 +107,32 @@ final class StorageRoot implements AutoCloseable {
             var nextAuthentication = authentications.apply(candidate);
             authentication.close(); runtime.close();
             runtime = nextRuntime; authentication = nextAuthentication; phase = Phase.SETUP_REQUIRED;
+            configurationQuotaExceeded = false;
         } catch (RuntimeException | Error failure) {
             if (candidate != null) try { candidate.close(); }
             catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
-            if (!(failure instanceof TapstateException)) throw failure;
+            if (!(failure instanceof TapstateException coded)) throw failure;
+            if (quota(coded)) configurationQuotaExceeded = true;
             phase = Phase.CONFIGURATION_UNAVAILABLE;
         }
+    }
+
+    private static boolean quota(TapstateException failure) {
+        return failure.code() == IoError.STORE_QUOTA_EXCEEDED || failure.code() == ControlError.STORAGE_QUOTA_EXCEEDED;
+    }
+
+    private TapstateException initializationDiagnostic(TapstateException failure) {
+        if (quota(failure) || (configurationQuotaExceeded || initializationProgress.quotaExceeded())
+                && (failure.code() == ControlError.STORAGE_UNAVAILABLE || failure.code() == IoError.STORE_UNAVAILABLE
+                    || failure.code() == IoError.CACHE_AUTH_FENCED || failure.code() == IoError.CACHE_BUSINESS_FENCED))
+            return new TapstateException(ControlError.STORAGE_QUOTA_EXCEEDED, Map.of(), null);
+        return failure;
+    }
+
+    Optional<CredentialAuthentication> authenticateCredentials(String presented) {
+        requireOpen();
+        try { return authentication.credentials().authenticateContext(presented); }
+        catch (TapstateException failure) { throw initializationDiagnostic(failure); }
     }
 
     Phase phase() { requireOpen(); return phase; }
@@ -310,18 +331,20 @@ final class StorageRoot implements AutoCloseable {
         T result;
         try { result = selectAuthentication(select, budget); }
         catch (TapstateException unavailable) {
-            if (unavailable.code() != ControlError.STORAGE_UNAVAILABLE) throw unavailable;
+            if (unavailable.code() != ControlError.STORAGE_UNAVAILABLE && !quota(unavailable)) throw unavailable;
             var pending = continueAuthentication();
             try { pending.get(Math.max(0, deadline - System.nanoTime()), java.util.concurrent.TimeUnit.NANOSECONDS); }
             catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt(); throw StorageRuntime.unavailable();
-            } catch (java.util.concurrent.TimeoutException timeout) { throw StorageRuntime.unavailable(); }
+            } catch (java.util.concurrent.TimeoutException timeout) { throw initializationDiagnostic(StorageRuntime.unavailable()); }
             catch (java.util.concurrent.ExecutionException failed) {
+                if (failed.getCause() instanceof TapstateException coded) throw initializationDiagnostic(coded);
                 if (failed.getCause() instanceof RuntimeException failure) throw failure;
                 if (failed.getCause() instanceof Error failure) throw failure;
                 throw new IllegalStateException("authentication continuation failed", failed.getCause());
             }
-            result = selectAuthentication(select, budget);
+            try { result = selectAuthentication(select, budget); }
+            catch (TapstateException failure) { throw initializationDiagnostic(failure); }
         }
         if (System.nanoTime() >= deadline) throw StorageRuntime.unavailable();
         continueAuthentication();

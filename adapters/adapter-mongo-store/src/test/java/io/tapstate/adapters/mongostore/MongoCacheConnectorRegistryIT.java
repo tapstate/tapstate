@@ -76,6 +76,33 @@ class MongoCacheConnectorRegistryIT {
         });
     }
 
+    @Test void aRealGridFsQuotaRefusalKeepsTheBindingAndExistingArtifactAndNeverPublishesTheFailedUpload() {
+        withFixture(f -> {
+            var registry = f.registry();
+            registry.register("existing", "1", RegistrationSource.SEED, JAR);
+            byte[] next = "next-connector-bytes".getBytes(StandardCharsets.UTF_8);
+            String nextHash = ContentHash.of(next);
+            var identityBefore = SystemCollections.CACHE_IDENTITY.on(f.database).find().first();
+            f.client.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand")
+                    .append("mode", new Document("times", 1)).append("data", new Document("failCommands", List.of("insert"))
+                            .append("writeConcernError", new Document("code", 8000).append("codeName", "AtlasError")
+                                    .append("errmsg", "you are over your space quota, using 513 MB of 512 MB"))));
+            try {
+                assertThatThrownBy(() -> registry.register("next", "1", RegistrationSource.SEED, next))
+                        .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                            assertThat(failure.code()).isEqualTo(IoError.STORE_QUOTA_EXCEEDED);
+                            assertThat(failure.args()).isEmpty(); assertThat(failure.getCause()).isNull();
+                            assertThat(failure.toString()).doesNotContain("513 MB", "512 MB");
+                        });
+            } finally { clearFailpoint(f.client); }
+            assertThat(registry.artifact(HASH)).contains(JAR);
+            assertThat(registry.hasArtifact(nextHash)).isFalse();
+            assertThat(registry.findAll("next")).isEmpty();
+            assertThat(SystemCollections.CACHE_IDENTITY.on(f.database).find().first()).isEqualTo(identityBefore);
+            assertThat(f.binding.database()).isEqualTo(f.database.getName());
+        });
+    }
+
     @Test void multipleHashesForOneConnectorRemainVisibleInStableHashOrder() {
         withFixture(f -> {
             var registry = f.registry(); registry.register("example", "1", RegistrationSource.SEED, JAR);
