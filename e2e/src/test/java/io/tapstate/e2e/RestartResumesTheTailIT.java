@@ -86,15 +86,14 @@ class RestartResumesTheTailIT {
 
         // One store per tier, and the restart reuses it -- that reuse is the whole subject: the position
         // the first run recorded is only there to be resumed from if the second run reads the same store.
-        String storeUri = SharedMongo.replicaSetUrl("restart_tail_state_" + suffix);
         String targetUri = SharedMongo.replicaSetUrl("restart_tail_target_" + suffix);
         EndpointAddress target = EndpointAddress.uri(targetUri);
 
         long droveBefore;
-        try (MongoEndpoints mongo = new MongoEndpoints()) {
-            try (ServerHandle server = tier.launch(storeUri)) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints()) {
+            try (ServerHandle server = tier.launch(storage)) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
-                control.bootstrapAndLogin("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
                 control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
                 control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 
@@ -121,11 +120,10 @@ class RestartResumesTheTailIT {
             // by a run that comes back and reads on from where the last one stopped.
             update(source, 2, DURING_DOWNTIME);
 
-            try (ServerHandle server = tier.launch(storeUri)) {
+            try (ServerHandle server = tier.launch(storage)) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
-                // The admin already exists in the store this restart reuses, so this logs in rather than
-                // bootstrapping -- bootstrapping again would be a different server, not a restart.
-                control.login("e2e", "e2e-password");
+                // The admin and every storage domain belong to the installation that outlived the server.
+                storage.loginAndAwaitBusiness(control);
                 // No start verb here: the pipeline's desired state is in the store the restart reopened,
                 // so the converge loop brings it back on its own -- issuing start is refused outright as
                 // an illegal transition out of RUNNING. Whether it really came back is what the guard on
@@ -160,13 +158,12 @@ class RestartResumesTheTailIT {
         String pipelineId = "restart_verb_keep";
         Map<String, Object> source = SharedMySql.settings("restart_keep_src_" + suffix);
         seed(source);
-        String storeUri = SharedMongo.replicaSetUrl("restart_keep_state_" + suffix);
         String targetUri = SharedMongo.replicaSetUrl("restart_keep_target_" + suffix);
         EndpointAddress target = EndpointAddress.uri(targetUri);
 
-        try (MongoEndpoints mongo = new MongoEndpoints();
-                ServerHandle server = tier.launch(storeUri)) {
-            ControlPlane control = startedPipeline(server, source, targetUri, pipelineId);
+        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints();
+                ServerHandle server = tier.launch(storage)) {
+            ControlPlane control = startedPipeline(server, storage, source, targetUri, pipelineId);
 
             awaitCount(mongo, target, SEEDED_ROWS, "the snapshot of the seeded rows");
             // A change after the snapshot, so the run ends with a recorded position rather than only a
@@ -207,13 +204,12 @@ class RestartResumesTheTailIT {
         String pipelineId = "restart_verb_rerun";
         Map<String, Object> source = SharedMySql.settings("restart_rerun_src_" + suffix);
         seed(source);
-        String storeUri = SharedMongo.replicaSetUrl("restart_rerun_state_" + suffix);
         String targetUri = SharedMongo.replicaSetUrl("restart_rerun_target_" + suffix);
         EndpointAddress target = EndpointAddress.uri(targetUri);
 
-        try (MongoEndpoints mongo = new MongoEndpoints();
-                ServerHandle server = tier.launch(storeUri)) {
-            ControlPlane control = startedPipeline(server, source, targetUri, pipelineId);
+        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints();
+                ServerHandle server = tier.launch(storage)) {
+            ControlPlane control = startedPipeline(server, storage, source, targetUri, pipelineId);
 
             awaitCount(mongo, target, SEEDED_ROWS, "the snapshot of the seeded rows");
             update(source, 1, BEFORE_STOP);
@@ -236,9 +232,9 @@ class RestartResumesTheTailIT {
 
     /** Everything up to and including the start, which the three cases here do identically. */
     private static ControlPlane startedPipeline(
-            ServerHandle server, Map<String, Object> source, String targetUri, String pipelineId) {
+            ServerHandle server, PreparedNativeStore storage, Map<String, Object> source, String targetUri, String pipelineId) {
         ControlPlane control = new ControlPlane(server.baseUrl());
-        control.bootstrapAndLogin("e2e", "e2e-password");
+        storage.loginAndAwaitBusiness(control);
         control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
         control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 

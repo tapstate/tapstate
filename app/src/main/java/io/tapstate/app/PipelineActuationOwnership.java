@@ -16,6 +16,7 @@ import io.tapstate.spi.store.WorkloadOwner;
 import java.time.Duration;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -132,15 +133,21 @@ final class PipelineActuationOwnership {
         }
     }
     private final Map<String, Pass> passes = new HashMap<>();
+    private final Set<String> waitingControls = new HashSet<>();
     final class Pass implements AutoCloseable {
         private final String pipeline;
+        private final Thread thread = Thread.currentThread();
         private Pass(String pipeline) { this.pipeline = pipeline; }
         @Override public void close() {
-            synchronized (PipelineActuationOwnership.this) { passes.remove(pipeline, this); }
+            synchronized (PipelineActuationOwnership.this) {
+                passes.remove(pipeline, this);
+                PipelineActuationOwnership.this.notifyAll();
+            }
         }
     }
     synchronized Pass enterPass(PipelineIntentScope scope) {
-        if (closing || !accepts(scope) || controls.containsKey(scope.pipelineId()) || passes.containsKey(scope.pipelineId())) throw ThreeLayerStorePort.refused();
+        if (closing || !accepts(scope) || controls.containsKey(scope.pipelineId()) || passes.containsKey(scope.pipelineId())
+                || waitingControls.contains(scope.pipelineId())) throw ThreeLayerStorePort.refused();
         var pass = new Pass(scope.pipelineId()); passes.put(scope.pipelineId(), pass); return pass;
     }
     synchronized Control control(PipelineIntentScope scope) {
@@ -149,6 +156,31 @@ final class PipelineActuationOwnership {
         if (!admitted.granted() || admitted.claim() == null) throw ThreeLayerStorePort.refused();
         var command = new Control(scope, WorkloadClaimFence.from(admitted.claim()));
         controls.put(scope.pipelineId(), command); return command;
+    }
+    /** Waits only for a local pass; the original durable admission is attempted once after it returns. */
+    synchronized Control controlAfterPass(PipelineIntentScope scope, boolean unprepared, Duration timeout) {
+        long budget = Objects.requireNonNull(timeout, "timeout").toNanos();
+        if (budget < 0) throw new IllegalArgumentException("the local pass wait must not be negative");
+        String pipeline = scope.pipelineId();
+        if (closing || !accepts(scope) || controls.containsKey(pipeline) || !membership.businessEligible()
+                || !waitingControls.add(pipeline)) throw ThreeLayerStorePort.refused();
+        long started = System.nanoTime();
+        try {
+            while (passes.containsKey(pipeline)) {
+                long remaining = budget - (System.nanoTime() - started);
+                if (closing || !membership.businessEligible() || passes.get(pipeline).thread == Thread.currentThread()
+                        || remaining <= 0) throw ThreeLayerStorePort.refused();
+                try { java.util.concurrent.TimeUnit.NANOSECONDS.timedWait(this, remaining); }
+                catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw ThreeLayerStorePort.refused();
+                }
+            }
+            if (closing || !accepts(scope) || !membership.businessEligible()) throw ThreeLayerStorePort.refused();
+            return unprepared ? unpreparedControl(scope) : control(scope);
+        } finally {
+            waitingControls.remove(pipeline);
+        }
     }
     /** Holds a proven ended tuple locally without acquiring another durable tenure or execution permission. */
     synchronized Control retiredControl(PipelineIntentScope scope,WorkloadClaimFence original) {
@@ -926,6 +958,7 @@ final class PipelineActuationOwnership {
     @EventListener(ContextClosedEvent.class)
     synchronized void stopForShutdown() {
         closing = true;
+        notifyAll();
     }
 
     /**

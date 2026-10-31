@@ -75,8 +75,9 @@ class AWriteTheTargetHoldsButNeverConfirmedIsWrittenAgainIT {
 
         try (MongoEndpoints mongo = new MongoEndpoints(); FileEndpoints file = new FileEndpoints()) {
             mongo.seed(sourceAddress, TABLE, SeedRows.generated(SEEDED_ROWS));
-            String store = SharedMongo.replicaSetUrl("e2e_unconfirmed_cluster");
-            try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-unconfirmed")) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                    TwoMemberCluster cluster = TwoMemberCluster.startPreparedSequentially(storage)) {
+                String store = storage.cacheUri();
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.first();
                 control.registerConnector(CONNECTOR, ConnectorJars.bytesFor(CONNECTOR));

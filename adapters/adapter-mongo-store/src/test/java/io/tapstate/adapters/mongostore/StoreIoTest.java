@@ -1,20 +1,31 @@
 package io.tapstate.adapters.mongostore;
 
 import com.mongodb.MongoCredential;
+import com.mongodb.MongoCommandException;
 import com.mongodb.MongoException;
+import com.mongodb.MongoBulkWriteException;
+import com.mongodb.bulk.BulkWriteError;
+import com.mongodb.bulk.BulkWriteResult;
+import com.mongodb.bulk.WriteConcernError;
 import com.mongodb.MongoSecurityException;
 import com.mongodb.MongoWriteException;
+import com.mongodb.MongoWriteConcernException;
 import com.mongodb.ServerAddress;
 import com.mongodb.WriteError;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.IoError;
 import org.bson.BsonDocument;
+import org.bson.BsonInt32;
+import org.bson.BsonString;
 import org.bson.BsonMaximumSizeExceededException;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.util.Set;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -28,6 +39,126 @@ import static org.assertj.core.api.Assertions.catchThrowable;
  * not be relabelled a driver failure.
  */
 class StoreIoTest {
+
+    private static final String PRIVATE_PAYLOAD = "row-secret";
+
+    @Test
+    void atlasQuotaCommandAndWriteRefusalsHaveOneSecretFreeDiagnostic() {
+        String message = "you are over your space quota, using 513 MB of 512 MB";
+        var response = new BsonDocument("ok", new BsonInt32(0)).append("code", new BsonInt32(8000))
+                .append("codeName", new BsonString("AtlasError")).append("errmsg", new BsonString(message));
+        var command = new MongoCommandException(response, new ServerAddress());
+        var write = new MongoWriteException(new WriteError(8000, message, new BsonDocument()), new ServerAddress(), Set.of());
+        var bulk = bulk(List.of(new BulkWriteError(11000, "duplicate private-row", new BsonDocument(), 0),
+                new BulkWriteError(8000, message, new BsonDocument(), 1)), null);
+        var concern = bulk(List.of(), new WriteConcernError(8000, "AtlasError", message, new BsonDocument()));
+        for (MongoException driver : List.of(command, write, bulk, concern, new MongoWriteConcernException(
+                new WriteConcernError(8000, "AtlasError", message, new BsonDocument()), new ServerAddress()))) {
+            TapstateException failure = (TapstateException) catchThrowable(() -> StoreIo.run(() -> { throw driver; }));
+            assertThat(failure.code().code()).isEqualTo("io.store-quota-exceeded");
+            assertThat(failure.args()).isEmpty();
+            assertThat(failure.getCause()).isNull();
+            assertThat(failure.getSuppressed()).isEmpty();
+            assertThat(failure.toString()).doesNotContain(message, "private-row", "513");
+        }
+    }
+
+    @Test
+    void longAtlasQuotaInstructionsKeepTheirConfirmedClassificationWithoutRetainingTheirText() {
+        String message = "you are over your space quota, using 617.25 MB of 512 MB. Writes are blocked on your cluster. "
+                + "Review storage usage with the deployment administrator and follow the capacity guidance for this deployment. "
+                + "Administrator documentation: https://www.mongodb.com/docs/atlas/reference/faq/storage/. "
+                + "Keep the original databases and initialization operation while restoring capacity.";
+        assertThat(message.length()).isGreaterThan(256);
+        var command = new MongoCommandException(new BsonDocument("ok", new BsonInt32(0))
+                .append("code", new BsonInt32(8000)).append("codeName", new BsonString("AtlasError"))
+                .append("errmsg", new BsonString(message)), new ServerAddress());
+        var failure = StoreIo.coded(command);
+        assertThat(failure.code()).isEqualTo(IoError.STORE_QUOTA_EXCEEDED);
+        assertThat(failure.args()).isEmpty(); assertThat(failure.getCause()).isNull();
+        assertThat(failure.toString()).doesNotContain(message, "617.25", "https://");
+    }
+
+    @Test
+    void quotaSizesMayBeDecimalButNeverBecomeErrorParameters() {
+        var driver = new MongoWriteException(new WriteError(8000,
+                "you are over your space quota, using 513.25 MB of 512.0 MB", new BsonDocument()), new ServerAddress(), Set.of());
+        var failure = StoreIo.coded(driver);
+        assertThat(failure.code()).isEqualTo(IoError.STORE_QUOTA_EXCEEDED);
+        assertThat(failure.args()).isEmpty();
+    }
+
+    @Test
+    void otherAtlasErrorsAndUntrustedDetailsCannotBecomeQuotaDiagnosticsOrLeak() {
+        for (String message : List.of("bad auth : authentication failed", "CMD_NOT_ALLOWED: reIndex", "quota",
+                "write failed: you are over your space quota", "you are over your space quota\nforged-log mongodb://u:secret@db/",
+                "you are over your space quota, using 513 MB of 512 MB secret",
+                "you are over your space quota, using 513 MB of 512 MB. Authentication failed.",
+                "you are over your space quota, using 513 MB of 512 MB. Writes are blocked on your cluster.\nforged-log",
+                "request document: you are over your space quota, using 513 MB of 512 MB. Writes are blocked on your cluster.")) {
+            var driver = new MongoWriteException(new WriteError(8000, message, new BsonDocument()), new ServerAddress(), Set.of());
+            var failure = StoreIo.coded(driver);
+            assertThat(failure.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+            assertThat(failure.args()).containsEntry("detail", "MongoWriteException code=8000");
+            StringWriter stack = new StringWriter(); failure.printStackTrace(new PrintWriter(stack));
+            assertThat(stack.toString()).doesNotContain(message, "mongodb://", "forged-log");
+        }
+        var security = new MongoSecurityException(MongoCredential.createCredential("u", "admin", "secret".toCharArray()),
+                "you are over your space quota");
+        assertThat(StoreIo.coded(security).code()).isEqualTo(IoError.STORE_UNAUTHORIZED);
+        var wrongCode = new MongoWriteException(new WriteError(123, "you are over your space quota", new BsonDocument()),
+                new ServerAddress(), Set.of());
+        assertThat(StoreIo.coded(wrongCode).code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {10334, 17419})
+    void bulkEndpointSizeRefusalsKeepTheSingleWriteDiagnostic(int code) {
+        MongoBulkWriteException driver = bulk(List.of(new BulkWriteError(code,
+                PRIVATE_PAYLOAD, new BsonDocument(), 0)), null);
+        TapstateException failure = (TapstateException) catchThrowable(() -> StoreIo.run("orders", () -> {
+            throw driver;
+        }));
+        assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_TOO_LARGE);
+        assertThat(failure.args()).containsEntry("id", "orders");
+        assertThat(failure.getCause()).isNull();
+        assertThat(failure.toString()).doesNotContain(PRIVATE_PAYLOAD);
+        assertThat(StoreIo.coded(driver).code()).isEqualTo(IoError.DOCUMENT_TOO_LARGE);
+    }
+
+    @Test
+    void aSizeRefusalIsRecognizedEvenAfterAnotherBulkError() {
+        MongoBulkWriteException driver = bulk(List.of(
+                new BulkWriteError(11000, "duplicate row-secret", new BsonDocument(), 0),
+                new BulkWriteError(10334, "large row-secret", new BsonDocument(), 1)), null);
+        assertThat(StoreIo.coded(driver).code()).isEqualTo(IoError.DOCUMENT_TOO_LARGE);
+    }
+
+    @Test
+    void otherBulkFailuresKeepOnlySafeTypeAndNumericCode() {
+        MongoBulkWriteException driver = bulk(List.of(
+                new BulkWriteError(11000, PRIVATE_PAYLOAD, new BsonDocument(), 0)), null);
+        TapstateException failure = StoreIo.coded(driver);
+        assertThat(failure.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+        assertThat(failure.args()).containsEntry("detail", "MongoBulkWriteException code=11000");
+        assertThat(failure.getCause()).isNull();
+        assertThat(failure.toString()).doesNotContain(PRIVATE_PAYLOAD);
+    }
+
+    @Test
+    void aBulkWriteConcernFailureWithoutPerDocumentErrorsKeepsItsCode() {
+        MongoBulkWriteException driver = bulk(List.of(),
+                new WriteConcernError(64, "WriteConcernFailed", PRIVATE_PAYLOAD, new BsonDocument()));
+        TapstateException failure = StoreIo.coded(driver);
+        assertThat(failure.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+        assertThat(failure.args()).containsEntry("detail", "MongoBulkWriteException code=64");
+        assertThat(failure.getCause()).isNull();
+    }
+
+    private static MongoBulkWriteException bulk(List<BulkWriteError> errors, WriteConcernError concern) {
+        return new MongoBulkWriteException(BulkWriteResult.acknowledged(0, 0, 0, 0, List.of(), List.of()),
+                errors, concern, new ServerAddress(), Set.of());
+    }
 
     @Test
     void returnsTheOperationResultOnSuccess() {

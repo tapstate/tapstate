@@ -39,6 +39,26 @@ class OperatorMapBindingsTest {
         assertThat(first.placement()).isEqualTo(second.placement());
     }
 
+    @Test void batchedWritesReachTheOriginalBackendThroughBothHandles() {
+        var original = binding(placement(OperatorPlacement.Resource.NEST_STATE, "root"), 1);
+        var cold = new RecordingStore();
+        var registry = OperatorMapBindings.bindTo(member(), (binding, active) -> cold);
+        var pending = registry.initializingNest(original.mapName(), "cache");
+        var states = Map.of("first", new byte[]{1}, "second", new byte[]{2});
+        fenced(() -> pending.saveAll(original.mapName(), states));
+        registry.install(List.of(original));
+        var hot = registry.nest(original.mapName(), "cache");
+        pending.saveAll(original.mapName(), states);
+        hot.saveAll(original.mapName(), states);
+        assertThat(cold.calls).extracting(Call::operation).containsExactly("saveAll", "saveAll");
+        assertThat(cold.calls).extracting(Call::namespace).containsOnly(original.placement().mapName());
+        fenced(() -> hot.saveAll("foreign", states));
+        assertThat(registry.release(original)).isTrue();
+        fenced(() -> pending.saveAll(original.mapName(), states));
+        fenced(() -> hot.saveAll(original.mapName(), states));
+        assertThat(cold.calls).hasSize(2);
+    }
+
     @Test void everyMapStoreCallUsesTheOriginalColdNamespace() {
         var member = member(); var cold = new RecordingStore(); var original = binding(placement(OperatorPlacement.Resource.NEST_STATE,"root"),1);
         var registry = OperatorMapBindings.bindTo(member,(binding,active) -> { active.run(); return cold; }); registry.install(List.of(original));
@@ -207,6 +227,7 @@ class OperatorMapBindingsTest {
     private record Call(String operation,String namespace) {}
     private static final class RecordingStore implements KeyedStateStore {
         final List<Call> calls = new ArrayList<>();
+        @Override public void saveAll(String namespace, Map<String, byte[]> values) { calls.add(new Call("saveAll", namespace)); }
         @Override public Optional<byte[]> load(String ns,String key) { calls.add(new Call("load",ns)); return Optional.empty(); }
         @Override public Map<String,byte[]> loadAll(String ns,Collection<String> keys) { calls.add(new Call("loadAll",ns)); return Map.of(); }
         @Override public void save(String ns,String key,byte[] value) { calls.add(new Call("save",ns)); }

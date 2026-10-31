@@ -56,14 +56,14 @@ class APipelineKeepsItsChangesWhenTheMemberTailingItsSourceLetsGoIT {
     @Test
     void thePipelineLeftReadingACaptureNobodyElseNeedsTakesItsTailOver() {
         String sourceUri = SharedMongo.replicaSetUrl("e2e_let_go_src");
-        String store = SharedMongo.replicaSetUrl("e2e_let_go_cluster");
 
         try (MongoEndpoints mongo = new MongoEndpoints()) {
             EndpointAddress source = EndpointAddress.uri(sourceUri);
             mongo.seed(source, TABLE, SeedRows.generated(SEEDED_ROWS));
 
-            try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-let-go");
-                    StoreDocuments documents = StoreDocuments.at(store)) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                    TwoMemberCluster cluster = TwoMemberCluster.startPreparedSequentially(storage);
+                    StoreDocuments documents = StoreDocuments.nativeSrsAt(storage.cacheUri())) {
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.first();
                 control.registerConnector(CONNECTOR, ConnectorJars.bytesFor(CONNECTOR));

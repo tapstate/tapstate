@@ -56,16 +56,14 @@ class AnAppendViewWritesLikeAnAppendSyncIT {
         execute(mysql, "DROP TABLE IF EXISTS " + TABLE,
                 "CREATE TABLE " + TABLE + " (id INT PRIMARY KEY, name VARCHAR(64))",
                 "INSERT INTO " + TABLE + " (id, name) VALUES (1, 'one'), (2, 'two'), (3, 'three')");
-        String storeUri = SharedMongo.replicaSetUrl("append_parity_store");
         String targetUri = SharedMongo.replicaSetUrl("append_parity_target");
-        String viewUri = SharedMongo.replicaSetUrl("append_parity_views");
         EndpointAddress target = EndpointAddress.uri(targetUri);
-        EndpointAddress views = EndpointAddress.uri(viewUri);
-
-        try (ServerHandle server = InProcessServer.start(storeUri);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = InProcessServer.startPrepared(storage);
                 MongoEndpoints mongo = new MongoEndpoints()) {
+            EndpointAddress views = EndpointAddress.uri(storage.masterUri());
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
             control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
             Map<String, String> resources = new LinkedHashMap<>();
@@ -80,7 +78,6 @@ class AnAppendViewWritesLikeAnAppendSyncIT {
                     """.formatted(mysql.get("host"), mysql.get("port"), mysql.get("database"),
                     mysql.get("username"), mysql.get("password"), TABLE));
             resources.put("tgt_mongo.tap.yml", mongoYaml("tgt_mongo", targetUri));
-            resources.put("views.tap.yml", mongoYaml("views", viewUri));
             resources.put(PIPELINE + ".tap.yml", """
                     version: tapstate/v1
                     kind: pipeline

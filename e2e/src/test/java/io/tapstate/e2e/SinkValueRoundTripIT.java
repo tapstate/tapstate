@@ -78,13 +78,13 @@ class SinkValueRoundTripIT {
 
     @Test
     void anIdentityABinaryColumnAnIntegerAndAnIdentityInsideAnArrayKeepTheirTypesAcrossAnUntouchedJavascriptStep() {
-        String storeUri = SharedMongo.replicaSetUrl("e2e_round_trip_store");
         String sourceUri = SharedMongo.replicaSetUrl(SOURCE_DATABASE);
         String targetUri = SharedMongo.replicaSetUrl(TARGET_DATABASE);
         EndpointAddress source = EndpointAddress.uri(sourceUri);
         EndpointAddress target = EndpointAddress.uri(targetUri);
 
-        try (ServerHandle server = InProcessServer.start(storeUri);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = InProcessServer.startPrepared(storage);
                 MongoEndpoints mongo = new MongoEndpoints()) {
             // One the array carries, which no schema names a place for, beside the document's own
             // identity below - which the driver assigns, and which the schema does name.
@@ -99,7 +99,7 @@ class SinkValueRoundTripIT {
             ObjectId identity = seeded.getObjectId("_id");
 
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
             control.apply(Map.of(
                     "src_mongo.tap.yml", sourceYaml(sourceUri),

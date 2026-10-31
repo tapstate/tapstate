@@ -1347,3 +1347,9 @@ io.source-identity-exhausted:
 store.ai-provider-schema-unsupported:
   message: "AI provider settings require configuration schema {required}."
   solution: "Keep using the existing non-AI configuration, or explicitly initialize a supported configuration database. No automatic upgrade is performed."
+
+io.store-quota-exceeded:
+  message: "The storage endpoint refused a write because its space quota is exhausted."
+  solution: "Ask the storage administrator to restore capacity, then query the original operation. Do not delete initialized storage or repeat setup."
+control.storage-quota-exceeded:
+  message: "Initialization cannot complete because the storage endpoint has reached its space quota. Restore capacity and check the original operation; do not submit setup again."

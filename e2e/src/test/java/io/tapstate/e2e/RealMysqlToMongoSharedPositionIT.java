@@ -2,8 +2,6 @@ package io.tapstate.e2e;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.mongodb.client.MongoClient;
-import com.mongodb.client.MongoClients;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.testsupport.DockerGate;
@@ -13,8 +11,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import org.bson.Document;
-import org.bson.types.Binary;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
@@ -39,7 +35,6 @@ class RealMysqlToMongoSharedPositionIT {
     private static final String SERVER_NAME = "SERVER_NAME";
 
     /** Where a shared capture's connector notes are kept, before the chain the capture reads. */
-    private static final String CHAIN_NAMESPACE_PREFIX = "pdk.chain.";
 
     @BeforeAll
     static void requireConnectors() {
@@ -58,15 +53,14 @@ class RealMysqlToMongoSharedPositionIT {
                 "CREATE TABLE later_orders (id INT PRIMARY KEY, name VARCHAR(64))",
                 "INSERT INTO orders VALUES (1, 'seeded')",
                 "INSERT INTO later_orders VALUES (1, 'before-cdc')");
-        String store = SharedMongo.replicaSetUrl("reader_position_store_" + suffix);
         String targetUri = SharedMongo.replicaSetUrl("reader_position_target_" + suffix);
         EndpointAddress target = EndpointAddress.uri(targetUri);
         byte[] minted;
 
-        try (MongoEndpoints mongo = new MongoEndpoints()) {
-            try (ServerHandle server = tier.launch(store); StoreDocuments documents = StoreDocuments.at(store)) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints()) {
+            try (ServerHandle server = tier.launch(storage); StoreDocuments documents = StoreDocuments.nativeSrsAt(storage.cacheUri())) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
-                control.bootstrapAndLogin("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
                 control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
                 control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
                 apply(control, mysql, targetUri, first, "first_source", "orders", "snapshot_and_cdc");
@@ -77,8 +71,8 @@ class RealMysqlToMongoSharedPositionIT {
                 Await.until("the first pipeline's tail position", () -> !control.resumePoint(first).isEmpty(),
                         () -> control.logs(first));
                 Await.until("the connector to have filed the identity it minted",
-                        () -> identity(store, documents) != null, () -> "chains=" + documents.miningChainIds());
-                minted = identity(store, documents);
+                        () -> identity(storage, documents) != null, () -> "chains=" + documents.miningChainIds());
+                minted = identity(storage, documents);
 
                 // The second pipeline reads the same database the same way, so it joins the chain the first
                 // started, and the capture widens to its table and restarts from that chain's position. A new
@@ -87,7 +81,7 @@ class RealMysqlToMongoSharedPositionIT {
                 sql(mysql, "INSERT INTO later_orders VALUES (2, 'second-tail')");
                 awaitIds(control, second, mongo, target, "later_orders", List.of(2L));
                 assertThat(documents.miningChainIds()).as("both pipelines read through one chain").hasSize(1);
-                assertThat(identity(store, documents))
+                assertThat(identity(storage, documents))
                         .as("the capture that widened to the second pipeline's table reads under the identity the "
                                 + "first run minted, rather than one minted for a reader it never starts")
                         .isEqualTo(minted);
@@ -96,16 +90,16 @@ class RealMysqlToMongoSharedPositionIT {
 
             sql(mysql, "DELETE FROM orders WHERE id=1", "DELETE FROM later_orders WHERE id=2",
                     "INSERT INTO later_orders VALUES (3, 'during-downtime')");
-            try (ServerHandle server = tier.launch(store); StoreDocuments documents = StoreDocuments.at(store)) {
+            try (ServerHandle server = tier.launch(storage); StoreDocuments documents = StoreDocuments.nativeSrsAt(storage.cacheUri())) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
-                control.login("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
                 sql(mysql, "INSERT INTO orders VALUES (99, 'after-restart')",
                         "INSERT INTO later_orders VALUES (99, 'after-restart')");
                 // The old target rows must disappear, and genuinely new rows must arrive on both
                 // paths. RUNNING alone could have been an observation left by the previous process.
                 awaitIds(control, first, mongo, target, "orders", List.of(99L));
                 awaitIds(control, second, mongo, target, "later_orders", List.of(3L, 99L));
-                assertThat(identity(store, documents))
+                assertThat(identity(storage, documents))
                         .as("the run that came back reads under the identity the first run minted")
                         .isEqualTo(minted);
                 assertThat(control.errorCount(first)).contains(0L);
@@ -168,15 +162,9 @@ class RealMysqlToMongoSharedPositionIT {
      * The identity the chain's connector filed under the one chain this tier's store holds, or null while it has
      * filed none.
      */
-    private static byte[] identity(String store, StoreDocuments documents) {
+    private static byte[] identity(PreparedNativeStore storage, StoreDocuments documents) {
         assertThat(documents.miningChainIds()).as("one chain in this tier's store").hasSize(1);
-        String namespace = CHAIN_NAMESPACE_PREFIX + documents.miningChainIds().iterator().next();
-        try (MongoClient client = MongoClients.create(store)) {
-            Document id = new Document("ns", namespace).append("k", SERVER_NAME);
-            Document record = client.getDatabase("tapstate_nest").getCollection("operator_state")
-                    .find(new Document("_id", id)).first();
-            return record == null ? null : record.get("state", Binary.class).getData();
-        }
+        return storage.chainNote(documents.miningChainIds().iterator().next(), SERVER_NAME).orElse(null);
     }
 
     private static void sql(Map<String, Object> mysql, String... statements) throws Exception {

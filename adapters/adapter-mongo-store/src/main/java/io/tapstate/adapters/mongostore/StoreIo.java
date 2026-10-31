@@ -1,8 +1,11 @@
 package io.tapstate.adapters.mongostore;
 
 import com.mongodb.MongoException;
+import com.mongodb.MongoCommandException;
+import com.mongodb.MongoBulkWriteException;
 import com.mongodb.MongoSecurityException;
 import com.mongodb.MongoWriteException;
+import com.mongodb.MongoWriteConcernException;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.IoError;
 import org.bson.BsonMaximumSizeExceededException;
@@ -17,6 +20,7 @@ import java.util.function.Supplier;
  * and no driver type escapes the module (rule R3). A security failure maps to
  * {@code io.store-unauthorized}; a document the store will not take for its size maps to
  * {@code io.document-too-large}, whether the driver refused it or the endpoint did; any other driver
+ * explicitly confirmed quota refusal maps to {@code io.store-quota-exceeded}; another driver
  * failure maps to {@code io.store-unavailable}
  * carrying only a safe driver type and numeric code. Driver messages and causes may contain
  * connection credentials or document values and never cross this boundary. A non-driver throwable
@@ -39,6 +43,10 @@ final class StoreIo {
      * check a store that is healthy, the misreading {@code io.document-too-large} exists to stop.
      */
     private static final Set<Integer> DOCUMENT_TOO_LARGE_CODES = Set.of(17419, 10334);
+
+    private static final java.util.regex.Pattern ATLAS_QUOTA_MESSAGE = java.util.regex.Pattern.compile(
+            "you are over your space quota(?:, using [0-9]+(?:\\.[0-9]+)? (?:bytes|KB|MB|GB|TB) of [0-9]+(?:\\.[0-9]+)? (?:bytes|KB|MB|GB|TB))?",
+            java.util.regex.Pattern.CASE_INSENSITIVE);
 
     private StoreIo() {
     }
@@ -83,16 +91,59 @@ final class StoreIo {
         if (e instanceof MongoSecurityException) {
             return new TapstateException(IoError.STORE_UNAUTHORIZED, Map.of(), null);
         }
+        if (quotaExceeded(e)) return new TapstateException(IoError.STORE_QUOTA_EXCEEDED, Map.of(), null);
         return new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", detail(e)), null);
+    }
+
+    /** Inspect only structured server errors; no server message, response document or cause leaves this adapter. */
+    private static boolean quotaExceeded(MongoException failure) {
+        if (failure instanceof MongoCommandException command)
+            return quotaMessage(command.getErrorCode(), command.getErrorMessage());
+        if (failure instanceof MongoWriteException write)
+            return quotaMessage(write.getError().getCode(), write.getError().getMessage());
+        if (failure instanceof MongoWriteConcernException concern)
+            return quotaMessage(concern.getWriteConcernError().getCode(), concern.getWriteConcernError().getMessage());
+        if (failure instanceof MongoBulkWriteException bulk) {
+            for (var error : bulk.getWriteErrors())
+                if (quotaMessage(error.getCode(), error.getMessage())) return true;
+            var concern = bulk.getWriteConcernError();
+            return concern != null && quotaMessage(concern.getCode(), concern.getMessage());
+        }
+        return false;
+    }
+
+    private static boolean quotaMessage(int code, String message) {
+        if (code != 8000 || message == null || message.length() > 8192
+                || message.chars().anyMatch(value -> value < 32 || value == 127 || value == 133 || value == 8232 || value == 8233))
+            return false;
+        var prefix = ATLAS_QUOTA_MESSAGE.matcher(message);
+        if (!prefix.lookingAt()) return false;
+        if (prefix.end() == message.length()) return true;
+        // Atlas may append deployment-specific advice and links. Confirm its fixed blocked-write
+        // sentence after the exact quota prefix, but never retain or forward the explanatory tail.
+        return message.startsWith(". Writes are blocked on your cluster.", prefix.end());
     }
 
     /**
      * The code the endpoint answered with. A write failure carries it on the write error it reports rather
-     * than on the exception, so both are read: taking only the exception's own code reads a refused write
-     * as code zero, which matches nothing.
+     * than on the exception. Bulk failures likewise carry per-document codes below their wrapper;
+     * the outer code alone cannot classify the endpoint refusal.
      */
     private static int errorCode(MongoException e) {
-        return e instanceof MongoWriteException write ? write.getError().getCode() : e.getCode();
+        if (e instanceof MongoWriteException write) return write.getError().getCode();
+        if (e instanceof MongoBulkWriteException bulk) return bulkErrorCode(bulk);
+        if (e instanceof MongoWriteConcernException concern) return concern.getWriteConcernError().getCode();
+        return e.getCode();
+    }
+
+    private static int bulkErrorCode(MongoBulkWriteException bulk) {
+        // The bulk wrapper's code is not the server's per-document refusal. Any size refusal makes
+        // replaying the unchanged batch impossible; retain that diagnostic even among other errors.
+        for (var error : bulk.getWriteErrors()) {
+            if (DOCUMENT_TOO_LARGE_CODES.contains(error.getCode())) return error.getCode();
+        }
+        if (!bulk.getWriteErrors().isEmpty()) return bulk.getWriteErrors().getFirst().getCode();
+        return bulk.getWriteConcernError() == null ? bulk.getCode() : bulk.getWriteConcernError().getCode();
     }
 
     /** Stable diagnostic metadata from the driver, without untrusted message or cause content. */

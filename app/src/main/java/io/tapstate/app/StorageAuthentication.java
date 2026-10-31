@@ -181,6 +181,8 @@ final class StorageAuthentication implements AutoCloseable {
         } catch (TapstateException failure) {
             if (failure.code() == IoError.CACHE_AUTH_FENCED || failure.code() == IoError.STORE_UNAVAILABLE)
                 throw StorageRuntime.unavailable();
+            if (failure.code() == IoError.STORE_QUOTA_EXCEEDED)
+                throw new TapstateException(ControlError.STORAGE_QUOTA_EXCEEDED, Map.of(), null);
             original.requireActive(budget);
             throw failure;
         }
@@ -286,6 +288,8 @@ final class StorageAuthentication implements AutoCloseable {
             }
             catch (TapstateException unavailable) {
                 LOG.warn("Storage authentication check failed [stage=cache-authentication-scope, error_code={}]", unavailable.code().code());
+                if (unavailable.code() == IoError.STORE_QUOTA_EXCEEDED)
+                    throw new TapstateException(ControlError.STORAGE_QUOTA_EXCEEDED, Map.of(), null);
                 throw StorageRuntime.unavailable();
             }
             requireLocallyActive();
@@ -297,6 +301,8 @@ final class StorageAuthentication implements AutoCloseable {
             }
             catch (TapstateException unavailable) {
                 LOG.warn("Storage authentication check failed [stage=configuration-publication, error_code={}]", unavailable.code().code());
+                if (unavailable.code() == IoError.STORE_QUOTA_EXCEEDED)
+                    throw new TapstateException(ControlError.STORAGE_QUOTA_EXCEEDED, Map.of(), null);
                 throw StorageRuntime.unavailable();
             }
             requireLocallyActive();

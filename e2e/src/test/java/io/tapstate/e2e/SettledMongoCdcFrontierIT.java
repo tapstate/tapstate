@@ -36,16 +36,16 @@ class SettledMongoCdcFrontierIT {
     void reconciledSnapshotAndChangesDoNotLeaveAQuietFrontierPinned() {
         String sourceUri = SharedMongo.replicaSetUrl(SOURCE_DB);
         String targetUri = SharedMongo.replicaSetUrl(TARGET_DB);
-        String storeUri = SharedMongo.replicaSetUrl("settled_frontier_store");
-        try (MongoClient sourceClient = MongoClients.create(sourceUri);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                MongoClient sourceClient = MongoClients.create(sourceUri);
                 MongoClient targetClient = MongoClients.create(targetUri);
-                ServerHandle server = Tiers.IN_PROCESS.launch(storeUri, "settled_frontier_state")) {
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             MongoCollection<Document> source = sourceClient.getDatabase(SOURCE_DB).getCollection("orders");
             MongoCollection<Document> target = targetClient.getDatabase(TARGET_DB).getCollection("orders");
             source.insertMany(List.of(row("one", "first"), row("two", "second")));
 
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
             Map<String, String> resources = new LinkedHashMap<>();
             resources.put("source.tap.yml", """

@@ -83,7 +83,9 @@ public final class IndexEnsure {
     /** Empty collections may receive their declared indexes in the same local-read schema transaction. */
     static void createInTransaction(com.mongodb.client.ClientSession session, MongoCollection<Document> collection,
             SystemCollections.IndexSpec index) {
-        create(java.util.Objects.requireNonNull(session, "session"), collection, index);
+        // The commit owns write concern; a schema command inside the transaction must omit it.
+        create(java.util.Objects.requireNonNull(session, "session"),
+                collection.withWriteConcern(com.mongodb.WriteConcern.ACKNOWLEDGED), index);
     }
 
     private static void create(com.mongodb.client.ClientSession session, MongoCollection<Document> collection, SystemCollections.IndexSpec index) {

@@ -370,16 +370,19 @@ class PipelineFirstStatePreparerIT {
                     var pending = new ArrayList<java.util.concurrent.Future<?>>();
                     try {
                         for (var binding : originals) {
-                            var callbacks = mapStore(member, binding);
-                            for (org.assertj.core.api.ThrowableAssert.ThrowingCallable action : List.<org.assertj.core.api.ThrowableAssert.ThrowingCallable>of(
-                                    () -> callbacks.store("key", "late"), () -> callbacks.storeAll(Map.of("key", "late")),
-                                    () -> callbacks.delete("key"), () -> callbacks.deleteAll(List.of("key"))))
+                            for (var action : List.<java.util.function.Consumer<com.hazelcast.map.MapStore<Object, Object>>>of(
+                                    callbacks -> callbacks.store("key", "late"), callbacks -> callbacks.storeAll(Map.of("key", "late")),
+                                    callbacks -> callbacks.delete("key"), callbacks -> callbacks.deleteAll(List.of("key")))) {
+                                // Independent loaders let every callback cross the original guard. Calls on one
+                                // Nest loader intentionally queue behind its in-flight backend write.
+                                var callbacks = mapStore(member, binding);
                                 pending.add(workers.submit(() -> {
                                     callbackThread.set(true);
-                                    try { assertThatThrownBy(action).isInstanceOfSatisfying(TapstateException.class, failure ->
+                                    try { assertThatThrownBy(() -> action.accept(callbacks)).isInstanceOfSatisfying(TapstateException.class, failure ->
                                             assertThat(failure.code()).isIn(IoError.WORKLOAD_CLAIM_FENCED, io.tapstate.runtime.engine.EngineError.EXECUTION_NOT_AUTHORIZED)); }
                                     finally { callbackThread.remove(); }
                                 }));
+                            }
                         }
                         assertThat(entered.await(10, java.util.concurrent.TimeUnit.SECONDS)).as("all twenty actual MapStore callbacks have passed their original binding guard").isTrue();
                         var hot = new HazelcastOperatorReadiness(member, Duration.ofSeconds(10)); hot.releaseHot(manifest);
@@ -685,8 +688,9 @@ class PipelineFirstStatePreparerIT {
                 var assembled = io.tapstate.runtime.engine.nest.NestDag.attach(dag,topology,"step","customer","out",
                         alias -> List.of(inputs.get(alias)),binding,vertex -> ordinal.merge(vertex,1,Integer::sum)-1,null,
                         new io.tapstate.runtime.engine.NodeWidth("step",2,1,null));
-                var sink = dag.newVertex("collected",com.hazelcast.jet.core.processor.SinkProcessors.writeListP("recovered-documents"));
-                dag.edge(com.hazelcast.jet.core.Edge.between(assembled,sink));
+                var sink = dag.newVertex("collected",RecoveredNestDocuments.sink("recovered-documents"));
+                dag.edge(com.hazelcast.jet.core.Edge.between(assembled,sink)
+                        .partitioned((io.tapstate.core.event.Envelope event) -> RecoveredNestDocuments.key(event)));
                 member.getJet().newJob(dag).getFuture().toCompletableFuture().get(20,java.util.concurrent.TimeUnit.SECONDS);
                 for (int key = 1; key <= 2; key++) {
                     var restored = member.<Object,io.tapstate.runtime.engine.nest.RootAssembly>getMap(rootName).get(List.of("C"+key));
@@ -697,7 +701,7 @@ class PipelineFirstStatePreparerIT {
                     assertThat(children).hasSize(1);
                     assertThat(((Map<?,?>)children.getFirst()).get("value")).isEqualTo(1);
                 }
-                assertThat(member.getList("recovered-documents")).hasSize(2);
+                RecoveredNestDocuments.assertRecovered(member,"recovered-documents");
             } finally { member.shutdown(); }
         });
     }

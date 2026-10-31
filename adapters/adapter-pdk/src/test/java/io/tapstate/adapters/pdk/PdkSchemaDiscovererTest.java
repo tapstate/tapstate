@@ -104,6 +104,24 @@ class PdkSchemaDiscovererTest {
         assertThat(orders.fields()).extracting(SourceField::dataType).containsExactly("int", "decimal");
     }
 
+    @Test
+    void realGateSnapshotDeclarationDoesNotBlockSchemaDiscovery(@TempDir Path dir) {
+        // Isolate the declaration that changed between the green and failing real-connector runs.
+        // This fixture reproduces admission only; it does not establish upstream binary compatibility.
+        Path jar = Synthetic.discoverableSource(dir);
+        ConnectionConfig input = new ConnectionConfig("source", "mysql", Map.of());
+        ConnectorRef lastGreen = new ConnectorRef(
+                List.of(jar), "synthetic.Discoverable", "2.0.9-SNAPSHOT", null);
+        SourceModel baseline = new PdkSchemaDiscoverer(id -> lastGreen).discover(input);
+        assertThat(baseline.tables()).extracting(SourceTable::name).containsExactly("orders");
+
+        ConnectorRef failingRun = new ConnectorRef(
+                List.of(jar), "synthetic.Discoverable", "2.0.11-SNAPSHOT", null);
+        SourceModel discovered = new PdkSchemaDiscoverer(id -> failingRun).discover(input);
+
+        assertThat(discovered).isEqualTo(baseline);
+    }
+
     /** A connector declaring both of the discoverable source's column types, in its own spec's shape. */
     private static final String SPEC = """
             {"dataTypes": {"int": {"to": "TapNumber", "bit": 32},\

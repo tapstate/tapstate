@@ -6,8 +6,9 @@ import io.tapstate.spi.store.SrsConsumerId;
 import io.tapstate.testsupport.DockerGate;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -30,8 +31,9 @@ class AMovedMultiSinkPositionCanRestartAfterItsLoadIT {
         DockerGate.require();
     }
 
-    @Test
-    void aPositionMovedAfterBothSinksLoadIsAnAcceptedStartingPoint(@TempDir Path temporary)
+    @ParameterizedTest
+    @ValueSource(ints = {1000, 10})
+    void aPositionMovedAfterBothSinksLoadIsAnAcceptedStartingPoint(int convergeIntervalMillis, @TempDir Path temporary)
             throws Exception {
         Path source = Files.createDirectory(temporary.resolve("source"));
         Path firstTarget = Files.createDirectory(temporary.resolve("first-target"));
@@ -44,7 +46,8 @@ class AMovedMultiSinkPositionCanRestartAfterItsLoadIT {
 
         try (files; PreparedNativeStore storage = PreparedNativeStore.create();
                 NativeSrsDocuments documents = new NativeSrsDocuments(storage);
-                ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
+                ServerHandle server = InProcessServer.startPrepared(storage,
+                        List.of("--tapstate.converge.interval-ms=" + convergeIntervalMillis))) {
             ControlPlane control = new ControlPlane(server.baseUrl());
             storage.loginAndAwaitBusiness(control);
             control.registerConnector(E2eConnectorJar.CONNECTOR_ID,

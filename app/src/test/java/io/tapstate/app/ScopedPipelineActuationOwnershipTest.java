@@ -109,6 +109,152 @@ class ScopedPipelineActuationOwnershipTest {
         assertThat(owner.beginExecution(FIRST, original).allowed()).isTrue();
     }
 
+    @Test void aPositionCommandWaitsForTheCurrentPassBeforeProvingItsOriginalClaim() throws Exception {
+        var owner = ownership();
+        var original = WorkloadClaimFence.from(owner.permit(FIRST).claim());
+        var command = new java.util.concurrent.FutureTask<WorkloadClaimFence>(() -> {
+            try (var control = owner.controlAfterPass(FIRST, false, Duration.ofSeconds(5))) {
+                control.requireActive();
+                return control.claim();
+            }
+        });
+        var thread = new Thread(command, "position-command");
+        try {
+            try (var pass = owner.enterPass(FIRST)) {
+                thread.start();
+                awaitPositionWait(thread, command);
+            }
+            assertThat(command.get(5, java.util.concurrent.TimeUnit.SECONDS)).isEqualTo(original);
+        } finally {
+            if (!command.isDone()) thread.interrupt();
+            thread.join(5000);
+        }
+    }
+
+    @Test void aPositionWaitTimesOutWithoutContactingTheClaimStoreOrLeakingItsReservation() throws Exception {
+        var owner = ownership();
+        var original = WorkloadClaimFence.from(owner.permit(FIRST).claim());
+        int acquired = acquisitions.get(), read = reads.get();
+        try (var pass = owner.enterPass(FIRST)) {
+            var command = new java.util.concurrent.FutureTask<>(() ->
+                    owner.controlAfterPass(FIRST, false, Duration.ZERO));
+            var thread = new Thread(command, "position-timeout");
+            thread.start();
+            try {
+                assertThatThrownBy(() -> command.get(5, java.util.concurrent.TimeUnit.SECONDS))
+                        .hasCauseInstanceOf(TapstateException.class)
+                        .satisfies(failure -> assertThat(((TapstateException) failure.getCause()).code())
+                                .isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+                assertThat(acquisitions).hasValue(acquired);
+                assertThat(reads).hasValue(read);
+            } finally {
+                if (!command.isDone()) thread.interrupt();
+                thread.join(5000);
+            }
+        }
+        try (var control = owner.controlAfterPass(FIRST, false, Duration.ZERO)) {
+            assertThat(control.claim()).isEqualTo(original);
+            control.requireActive();
+        }
+    }
+
+    @Test void aWaitingPositionCommandHasPriorityOverTheNextPublishingPass() throws Exception {
+        var owner = ownership();
+        owner.permit(FIRST);
+        var command = new java.util.concurrent.FutureTask<>(() -> owner.controlAfterPass(FIRST, false, Duration.ofSeconds(5)));
+        var thread = new Thread(command, "position-priority");
+        var pass = owner.enterPass(FIRST);
+        try {
+            thread.start();
+            awaitPositionWait(thread, command);
+            synchronized (owner) {
+                pass.close();
+                assertThatThrownBy(() -> owner.enterPass(FIRST))
+                        .as("a new publishing tick cannot overtake the already-waiting position command")
+                        .isInstanceOf(TapstateException.class);
+            }
+            try (var control = command.get(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                control.requireActive();
+                assertThatThrownBy(() -> owner.enterPass(FIRST)).isInstanceOf(TapstateException.class);
+            }
+        } finally {
+            pass.close();
+            if (!command.isDone()) thread.interrupt();
+            thread.join(5000);
+        }
+        try (var next = owner.enterPass(FIRST)) { assertThat(next).isNotNull(); }
+    }
+
+    @Test void aPositionWaitRechecksMembershipBeforeAcquiringControl() throws Exception {
+        var owner = ownership();
+        owner.permit(FIRST);
+        int acquired = acquisitions.get();
+        var command = new java.util.concurrent.FutureTask<>(() -> owner.controlAfterPass(FIRST, false, Duration.ofSeconds(5)));
+        var thread = new Thread(command, "position-membership");
+        var pass = owner.enterPass(FIRST);
+        try {
+            thread.start();
+            awaitPositionWait(thread, command);
+            assertThat(membership.canCommit(Set.of("node-a"))).isFalse();
+            pass.close();
+            assertThatThrownBy(() -> command.get(5, java.util.concurrent.TimeUnit.SECONDS))
+                    .hasCauseInstanceOf(TapstateException.class);
+            assertThat(acquisitions).hasValue(acquired);
+        } finally {
+            pass.close();
+            if (!command.isDone()) thread.interrupt();
+            thread.join(5000);
+        }
+    }
+
+    @Test void aPositionCommandNeverWaitsForItsOwnConvergencePass() {
+        var owner = ownership();
+        owner.permit(FIRST);
+        try (var pass = owner.enterPass(FIRST)) {
+            assertThatThrownBy(() -> owner.controlAfterPass(FIRST, false, Duration.ofSeconds(5)))
+                    .isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> owner.control(FIRST)).isInstanceOf(TapstateException.class);
+        }
+        try (var control = owner.control(FIRST)) { control.requireActive(); }
+    }
+
+    @Test void aPositionCommandDoesNotRetryARefusedDurableAdmission() {
+        var owner = ownership();
+        var original = fenced();
+        doThrow(original).when(store).acquirePipeline(any(), any(), anyLong(), any());
+        assertThatThrownBy(() -> owner.controlAfterPass(FIRST, false, Duration.ofSeconds(5)))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        refused -> assertThat(refused.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+        verify(store, times(1)).acquirePipeline(any(), any(), anyLong(), any());
+        try (var pass = owner.enterPass(FIRST)) {
+            assertThat(pass).isNotNull();
+        }
+    }
+
+    @Test void anInterruptedPositionWaitKeepsTheInterruptAndReleasesItsReservation() throws Exception {
+        var owner = ownership();
+        owner.permit(FIRST);
+        var command = new java.util.concurrent.FutureTask<>(() -> {
+            try (var ignored = owner.controlAfterPass(FIRST, false, Duration.ofSeconds(5))) {
+                throw new AssertionError("the interrupted command must not acquire control");
+            } catch (TapstateException refused) {
+                assertThat(refused.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED);
+                return Thread.currentThread().isInterrupted();
+            }
+        });
+        var thread = new Thread(command, "position-interrupt");
+        try (var pass = owner.enterPass(FIRST)) {
+            thread.start();
+            awaitPositionWait(thread, command);
+            thread.interrupt();
+            assertThat(command.get(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+        } finally {
+            if (!command.isDone()) thread.interrupt();
+            thread.join(5000);
+        }
+        try (var pass = owner.enterPass(FIRST)) { assertThat(pass).isNotNull(); }
+    }
+
     @Test void endingTheExactActuationTenureKeepsTheLocalControlBarrierUntilClose() {
         var owner=ownership();var permit=owner.permit(FIRST);
         var run=owner.beginExecution(FIRST,WorkloadClaimFence.from(permit.claim()));
@@ -667,6 +813,23 @@ class ScopedPipelineActuationOwnershipTest {
                 run.claimFence().claimGeneration(), run.claimFence().executionGeneration(), 7);
         assertThatThrownBy(() -> new PipelineActuationOwnership.Execution(true, run.fence(), 7L, wrong))
                 .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    private static void awaitPositionWait(Thread thread, java.util.concurrent.FutureTask<?> command) throws Exception {
+        long started = System.nanoTime();
+        while (!command.isDone() && thread.getState() != Thread.State.TIMED_WAITING
+                && System.nanoTime() - started < Duration.ofSeconds(5).toNanos()) Thread.yield();
+        if (command.isDone()) {
+            try {
+                Object result = command.get();
+                if (result instanceof AutoCloseable resource) resource.close();
+            } catch (java.util.concurrent.ExecutionException failed) {
+                throw new AssertionError("the position command failed before the local pass returned", failed.getCause());
+            }
+            throw new AssertionError("the position command entered before the local pass returned");
+        }
+        assertThat(thread.getState()).as("the command reached its bounded wait while the pass remains held")
+                .isEqualTo(Thread.State.TIMED_WAITING);
     }
 
     private static PipelineIntentScope scope(long generation) {

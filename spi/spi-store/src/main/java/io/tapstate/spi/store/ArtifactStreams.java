@@ -2,6 +2,7 @@ package io.tapstate.spi.store;
 
 import io.tapstate.core.common.TapstateException;
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.security.MessageDigest;
@@ -47,6 +48,7 @@ public final class ArtifactStreams {
         byte[] captured = new byte[readBuffer.length];
         long remaining = length;
         while (remaining > 0) {
+            if (Thread.currentThread().isInterrupted()) throw new InterruptedIOException("Artifact transfer interrupted");
             int count = source.read(readBuffer, 0, (int) Math.min(readBuffer.length, remaining));
             if (count == -1) throw unreadable(hash);
             if (count == 0) continue;
