@@ -14,11 +14,11 @@ public final class ValidationMetadataBudget {
     public static final long RESERVED_BYTES=64L*1024*1024;
     private final Semaphore slots=new Semaphore(FRAMES);
     private enum Kind { CONTROL,WORK,MAINTENANCE,RETAINED }
-    private int backgroundFrames,workFrames;
+    private int retainedFrames,workFrames;
     public Lease acquire(Object owner){return acquire(owner,Kind.CONTROL,1).getFirst();}
     /** Retryable discovery and history leave room for a foreground response and native probe. */
     public Lease acquireMaintenance(Object owner){return acquire(owner,Kind.MAINTENANCE,1).getFirst();}
-    /** Long-lived definitions and quotas share the background allowance, preserving control headroom. */
+    /** Long-lived definitions and quotas retain at most two slots, preserving control headroom. */
     public Lease acquireRetained(Object owner){return acquireRetainedBundle(owner,1).getFirst();}
     /** Preparation and native probes keep a control slot even when their cleanup remains unresolved. */
     public Lease acquireWork(Object owner){return acquire(owner,Kind.WORK,1).getFirst();}
@@ -27,11 +27,11 @@ public final class ValidationMetadataBudget {
     private synchronized List<Lease> acquire(Object owner,Kind kind,int frames){
         Objects.requireNonNull(owner,"metadata owner");
         if(frames<1||frames>FRAMES-2||frames!=1&&kind!=Kind.RETAINED)throw new IllegalArgumentException("invalid metadata frame bundle");
-        boolean background=kind==Kind.MAINTENANCE||kind==Kind.RETAINED,work=kind!=Kind.CONTROL;
-        if((background&&backgroundFrames>FRAMES-2-frames)||(work&&workFrames>FRAMES-1-frames)
+        boolean retained=kind==Kind.RETAINED,work=kind!=Kind.CONTROL;
+        if((retained&&retainedFrames>FRAMES-2-frames)||(work&&workFrames>FRAMES-1-frames)
                 ||(kind==Kind.MAINTENANCE&&slots.availablePermits()<3)||!slots.tryAcquire(frames))
             throw new TapstateException(ValidationError.VALUE_LIMIT_EXCEEDED,Map.of("limit","validation.metadataFrames"),null);
-        if(background)backgroundFrames+=frames;if(work)workFrames+=frames;
+        if(retained)retainedFrames+=frames;if(work)workFrames+=frames;
         var leases=new ArrayList<Lease>(frames);for(int index=0;index<frames;index++)leases.add(new Lease(owner,kind));
         return List.copyOf(leases);
     }
@@ -44,6 +44,6 @@ public final class ValidationMetadataBudget {
             if(expected==null||owner.get()!=expected)throw new TapstateException(ValidationError.INVALID_CONTRACT,Map.of("field","resources.metadataOwner"),null);
         }
         /** The caller first relinquishes every decoded value, in-flight body and serialized response. */
-        @Override public void close(){if(owner.getAndSet(null)!=null)synchronized(ValidationMetadataBudget.this){if(kind==Kind.MAINTENANCE||kind==Kind.RETAINED)backgroundFrames--;if(kind!=Kind.CONTROL)workFrames--;slots.release();}}
+        @Override public void close(){if(owner.getAndSet(null)!=null)synchronized(ValidationMetadataBudget.this){if(kind==Kind.RETAINED)retainedFrames--;if(kind!=Kind.CONTROL)workFrames--;slots.release();}}
     }
 }

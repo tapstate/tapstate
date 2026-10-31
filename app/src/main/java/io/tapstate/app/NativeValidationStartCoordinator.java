@@ -85,20 +85,24 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
     }
     private final class ResponseScope implements AutoCloseable {
         private final ValidationMemberResources.Metadata frame=resources.admitMetadata();
-        private final Set<ValidationMemberResources.Control> controls=new HashSet<>();private boolean retiring,returned;
+        private final Set<ValidationMemberResources.Control> controls=new HashSet<>(),continuations=new HashSet<>();private boolean retiring,returned;
         synchronized void require(){frame.requireRetained(resources);if(retiring)throw invalid("entry.responseClosed");}
-        ValidationMemberResources.Control control(){
+        ValidationMemberResources.Control control(){return control(false);}
+        ValidationMemberResources.Control entryControl(){return control(true);}
+        private ValidationMemberResources.Control control(boolean continuesAfterResponse){
             require();var control=resources.admitControl(frame);boolean accept;
-            synchronized(this){accept=!retiring;if(accept)controls.add(control);}
+            synchronized(this){accept=!retiring;if(accept){controls.add(control);if(continuesAfterResponse)continuations.add(control);}}
             if(!accept){control.close();throw invalid("entry.responseClosed");}
-            control.released().whenComplete((ignored,failed)->{synchronized(ResponseScope.this){controls.remove(control);}release();});return control;
+            control.released().whenComplete((ignored,failed)->{synchronized(ResponseScope.this){controls.remove(control);continuations.remove(control);}release();});return control;
         }
         private void release(){
             boolean release;synchronized(this){release=retiring&&!returned&&controls.isEmpty();if(release)returned=true;}
             if(release)frame.close();
         }
         @Override public void close(){
-            List<ValidationMemberResources.Control> original;synchronized(this){if(retiring)return;retiring=true;original=List.copyOf(controls);}
+            List<ValidationMemberResources.Control> original;synchronized(this){if(retiring)return;retiring=true;original=controls.stream().filter(control->!continuations.contains(control)).toList();}
+            // A normal PENDING response does not cancel its asynchronous original entry. The same
+            // frame remains charged through its physical body exit and the response's own close.
             original.forEach(ValidationMemberResources.Control::close);release();
         }
     }
@@ -120,7 +124,7 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
             if(!context.equals(original.context()))return checked.known()!=null?checked.known().passive():status(original,Outcome.REJECTED,null);
             if(checked.known()!=null)return paid(scope,()->original(original,verb,checked.known()));
             if(needsReceipt(original))return originalReceipt(original,verb,scope);
-            return verb==Verb.START&&latest!=null?scheduled(original,checked.fence(),latest,scope):accept(original,verb,checked.fence(),latest);
+            return verb==Verb.START&&latest!=null?scheduled(original,checked.fence(),latest,scope):accept(original,verb,checked.fence(),latest,true,false,scope);
         }
         try{
             var result=member.getExecutorService(ValidationOwnerRouter.EXECUTOR)
@@ -140,6 +144,9 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
         return accept(original,verb,fence,latest,dispatch,false);
     }
     private Status accept(ValidationOperation original,Verb verb,Fence fence,java.time.Instant latest,boolean dispatch,boolean known){
+        return accept(original,verb,fence,latest,dispatch,known,null);
+    }
+    private Status accept(ValidationOperation original,Verb verb,Fence fence,java.time.Instant latest,boolean dispatch,boolean known,ResponseScope scope){
         require();if(!context.equals(original.context()))return status(original,Outcome.REJECTED,null);
         Entry entry;
         synchronized(entries){
@@ -156,7 +163,7 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
             if(known)entry.reservationAttempted=true;
             if(verb==Verb.START&&entry.inFlight)entry.retryStart=true;
             if(verb==Verb.STOP){entry.stop=true;entry.retryStart=false;}
-            if(dispatch&&entry.observed.drain()!=Drain.DRAINED&&(known||verb!=Verb.READ||entry.owner!=null))dispatch(entry,verb,known);return entry.observed;
+            if(dispatch&&entry.observed.drain()!=Drain.DRAINED&&(known||verb!=Verb.READ||entry.owner!=null))dispatch(entry,verb,known,scope);return entry.observed;
         }
     }
     private boolean needsReceipt(ValidationOperation original){
@@ -274,11 +281,12 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
     }
     /** Called only while holding entries; submission does not execute nested Hazelcast RPC on its worker. */
     private void dispatch(Entry entry,Verb verb){dispatch(entry,verb,false);}
-    private void dispatch(Entry entry,Verb verb,boolean known){
+    private void dispatch(Entry entry,Verb verb,boolean known){dispatch(entry,verb,known,null);}
+    private void dispatch(Entry entry,Verb verb,boolean known,ResponseScope scope){
         if(entry.inFlight||closed)return;
         if(entry.reservationAttempted&&entry.owner==null&&!known)return;
         ValidationMemberResources.Control body;
-        try{body=resources.admitControl();}
+        try{body=scope==null?resources.admitControl():scope.entryControl();}
         catch(TapstateException refused){entry.observed=status(entry.original,Outcome.CAPACITY,refused.code().code());return;}
         entry.inFlight=true;entry.body=body;
         try{body.execute(()->advance(entry,verb));}

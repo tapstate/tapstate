@@ -31,9 +31,9 @@ class ValidationMetadataBudgetTest {
         }
         assertThat(budget.inUse()).isZero();
     }
-    @Test void retainedDefinitionsAndMaintenanceTogetherLeaveTwoControlFrames(){
+    @Test void retainedDefinitionsLeaveTwoControlFrames(){
         var budget=new ValidationMetadataBudget();var owner=new Object();
-        try(var retained=budget.acquireRetained(owner);var maintenance=budget.acquireMaintenance(owner)){
+        try(var retained=budget.acquireRetained(owner);var second=budget.acquireRetained(owner)){
             assertThat(budget.inUse()).isEqualTo(2);
             assertThatThrownBy(()->budget.acquireRetained(owner)).isInstanceOf(TapstateException.class);
             assertThatThrownBy(()->budget.acquireMaintenance(owner)).isInstanceOf(TapstateException.class);
@@ -49,6 +49,18 @@ class ValidationMetadataBudgetTest {
                 assertThat(budget.inUse()).isEqualTo(2);
                 assertThatThrownBy(()->budget.acquireRetained(owner)).isInstanceOf(TapstateException.class);
             }
+        }
+        assertThat(budget.inUse()).isZero();
+    }
+    @Test void maintenanceCanDispatchACompleteRootBundleAndStillLeaveControl(){
+        var budget=new ValidationMetadataBudget();var owner=new Object();
+        try(var maintenance=budget.acquireMaintenance(owner)){
+            var pair=budget.acquireRetainedBundle(owner,2);
+            try{
+                assertThat(budget.inUse()).isEqualTo(3);
+                assertThatThrownBy(()->budget.acquireWork(owner)).isInstanceOf(TapstateException.class);
+                try(var response=budget.acquire(owner)){assertThat(budget.inUse()).isEqualTo(4);}
+            }finally{pair.forEach(ValidationMetadataBudget.Lease::close);}
         }
         assertThat(budget.inUse()).isZero();
     }

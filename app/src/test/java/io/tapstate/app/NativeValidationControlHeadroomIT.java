@@ -105,6 +105,25 @@ class NativeValidationControlHeadroomIT {
                         assertThat(resources.snapshot().metadataFrames()).isZero();
                     });
                 }finally{admin.runCommand(new Document("configureFailPoint","failCommand").append("mode","off"));}
+                var rootInput=Map.of("pipelineId","flow_a","taskId","rows","expectedRevision","0","method","FULL_COLUMN",
+                        "mappings",List.of(Map.of("mappingId","orders","outputId","out","sourceId","input","table","orders")),
+                        "confirmations",Map.of("orders",Map.of("id",UUID.randomUUID().toString(),"fields",List.of(Map.of("source","id","target","id")))));
+                var evaluated=post(http,token,"evaluate",rootInput);
+                var saved=post(http,token,"save",Map.of("input",rootInput,"fingerprint",evaluated.get("fingerprint"),"commandId",UUID.randomUUID().toString(),"historyLimit",10,"scheduleEnabled",false));
+                assertThat(saved).containsEntry("outcome","APPLIED");
+                var coordinator=child.getBean(NativeValidationStartCoordinator.class);
+                var original=new io.tapstate.runtime.probe.ValidationOperation(coordinator.context(),"flow_a","rows",UUID.fromString((String)saved.get("taskGeneration")),1,1,UUID.randomUUID());
+                var hz=child.getBean(com.hazelcast.core.HazelcastInstance.class);int jobs=hz.getJet().getJobs().size();
+                // A held response and a maintenance caller must leave room for the complete root
+                // allocation. Observing Job creation here does not allocate another response frame.
+                try(var maintenance=child.getBean(ValidationMemberResources.Member.class).admitMaintenanceMetadata();var response=coordinator.start(original)){
+                    assertThat(response.value().outcome()).isIn(io.tapstate.runtime.probe.ValidationOperation.Outcome.PENDING,io.tapstate.runtime.probe.ValidationOperation.Outcome.ACCEPTED);
+                    org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(8)).untilAsserted(()->assertThat(hz.getJet().getJobs()).hasSize(jobs+1));
+                }
+                var rootOperation=Map.of("context",evaluated.get("context"),"pipeline","flow_a","task","rows","taskGeneration",saved.get("taskGeneration"),"revision","1","sequence","1","command",original.command().toString());
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(20)).untilAsserted(()->
+                        assertThat(post(http,token,"progress",rootOperation)).containsEntry("state","COMPLETED").containsEntry("drain","DRAINED"));
+
             }finally{business.getDatabase(data).drop();for(var name:List.of(storage.configurationDatabase(),storage.cacheDatabase(),storage.masterDatabase()))observer.getDatabase(name).drop();}
         }
     }
