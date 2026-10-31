@@ -2,6 +2,11 @@ package io.tapstate.e2e;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.tapstate.adapters.mongostore.MongoCacheDomain;
+import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
+import io.tapstate.adapters.mongostore.MongoConnectionSettings;
+import io.tapstate.runtime.engine.OperatorMapCoordinates;
+import io.tapstate.spi.store.StorageBinding;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.testsupport.DockerGate;
@@ -10,6 +15,7 @@ import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
+import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -64,6 +70,109 @@ class ANestFirstFilingPublishesEachDocumentOnceIT {
 
     @ParameterizedTest
     @EnumSource(Tiers.class)
+    void customersReadFirstFromOneSourceStillReachOrdersAfterCdcAndRestart(Tiers tier) throws Exception {
+        String suffix = tier.name().toLowerCase(Locale.ROOT);
+        Map<String, Object> mysql = SharedMySql.settings("nest_customer_first_" + suffix);
+        seed(mysql);
+        String pipelineId = "customer_first_" + suffix;
+        String targetUri = SharedMongo.replicaSetUrl("nest_customer_first_target_" + suffix);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = tier.launch(storage); MongoEndpoints mongo = new MongoEndpoints()) {
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            storage.loginAndAwaitBusiness(control);
+            control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
+            control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+            Map<String, String> resources = new LinkedHashMap<>();
+            resources.put("src_all.tap.yml", sourceYaml("src_all", CUSTOMERS + ", " + ORDERS, mysql));
+            resources.put("tgt_mongo.tap.yml", targetYaml(targetUri));
+            resources.put("pipeline.tap.yml", pipelineYaml(pipelineId, "src_all", "snapshot_and_cdc"));
+            control.apply(resources);
+            control.discoverSchema("src_all", "mysql", mysql);
+            control.lifecycle(pipelineId, LifecycleVerb.START);
+            EndpointAddress target = EndpointAddress.uri(targetUri);
+            Await.until("all orders after the customer-only snapshot prefix",
+                    () -> mongo.count(target, ORDERS) == ROWS,
+                    () -> mongo.count(target, ORDERS) + " orders");
+            assertCompleted(mongo, target, 1);
+            assertCompleted(mongo, target, ROWS);
+            assertCustomerSnapshotWasBatched(control, pipelineId, storage);
+
+            updateCustomer(mysql, "after-snapshot");
+            awaitCustomerName(mongo, target, "after-snapshot");
+            control.stop(pipelineId, false);
+            Await.until("the pipeline to stop before its state is reused",
+                    () -> control.state(pipelineId).filter(PipelineState.STOPPED::equals).isPresent(),
+                    () -> String.valueOf(control.state(pipelineId)));
+            control.lifecycle(pipelineId, LifecycleVerb.START);
+            Await.until("the pipeline to resume with its retained references",
+                    () -> control.state(pipelineId).filter(PipelineState.RUNNING::equals).isPresent(),
+                    () -> String.valueOf(control.state(pipelineId)));
+            updateCustomer(mysql, "after-restart");
+            awaitCustomerName(mongo, target, "after-restart");
+            assertThat(mongo.count(target, ORDERS)).isEqualTo(ROWS);
+        }
+    }
+
+    private static void updateCustomer(Map<String, Object> mysql, String name) throws Exception {
+        try (Connection connection = SharedMySql.connect(mysql);
+                PreparedStatement update = connection.prepareStatement("UPDATE customers SET name = ? WHERE id = 1")) {
+            update.setString(1, name);
+            assertThat(update.executeUpdate()).isEqualTo(1);
+        }
+    }
+
+    private static void assertCustomerSnapshotWasBatched(ControlPlane control, String pipelineId,
+            PreparedNativeStore storage) {
+        String namespace = countedCustomerReferences(storage, pipelineId);
+        long[] settled = {-1L};
+        long[] unchangedSince = {System.nanoTime()};
+        Await.until("the completed snapshot cost reading to catch up and settle",
+                () -> {
+                    long current = control.metricTotal(pipelineId,
+                            "nestStateAccesses." + namespace + ".run.").orElse(0L);
+                    if (current != settled[0]) {
+                        settled[0] = current;
+                        unchangedSince[0] = System.nanoTime();
+                        return false;
+                    }
+                    return current >= ROWS && System.nanoTime() - unchangedSince[0] >= Duration.ofSeconds(8).toNanos();
+                }, () -> "reference accesses " + settled[0]);
+        long accesses = settled[0];
+        // Registrations still cost one access each. Customer wake reads must fold across rows; the
+        // old row-at-a-time path costs another ROWS accesses while producing identical target data.
+        assertThat(accesses).as("reference accesses after the customer-first snapshot")
+                .isGreaterThanOrEqualTo(ROWS).isLessThanOrEqualTo(ROWS + ROWS / 2);
+    }
+
+    private static String countedCustomerReferences(PreparedNativeStore storage, String pipelineId) {
+        try (var configuration = MongoConfigurationDomain.openExisting(
+                new MongoConnectionSettings(storage.configurationUri(), null, Duration.ofSeconds(5)));
+                var cache = MongoCacheDomain.connect(new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,
+                        storage.cacheUri(), storage.cacheDatabase(), null), Duration.ofSeconds(5), "nest-cost-reader")) {
+            var scope = configuration.preparations().read(pipelineId).orElseThrow().scope();
+            var lookup = OperatorMapCoordinates.nest(scope, storage.cacheDatabase(), "order_doc", List.of("customer"),
+                    OperatorMapCoordinates.NestMap.LOOKUP, "c");
+            var references = OperatorMapCoordinates.nest(scope, storage.cacheDatabase(), "order_doc", List.of("customer"),
+                    OperatorMapCoordinates.NestMap.REFERENCES, "c");
+            var customers = cache.operatorState(lookup);
+            var registrations = cache.operatorState(references);
+            Await.until("every customer and reverse registration to be durably counted",
+                    () -> customers.count(lookup.mapName()) == ROWS && registrations.count(references.mapName()) == ROWS,
+                    () -> "customers=" + customers.count(lookup.mapName()) + ", references=" + registrations.count(references.mapName()));
+            return references.mapName();
+        }
+    }
+
+    private static void awaitCustomerName(MongoEndpoints mongo, EndpointAddress target, String name) {
+        Await.until("the customer update " + name + " to reach its order",
+                () -> mongo.fetch(target, ORDERS, Map.of("id", 1))
+                        .map(order -> order.get("customer") instanceof Document customer
+                                && name.equals(customer.getString("name"))).orElse(false),
+                () -> String.valueOf(mongo.fetch(target, ORDERS, Map.of("id", 1))));
+    }
+
+    @ParameterizedTest
+    @EnumSource(Tiers.class)
     void aFiledCustomerAlreadyReadByItsOrderDoesNotPublishThatOrderAgain(Tiers tier) throws Exception {
         String suffix = tier.name().toLowerCase(Locale.ROOT);
         Map<String, Object> mysql = SharedMySql.settings("nest_first_filing_" + suffix);
@@ -73,7 +182,8 @@ class ANestFirstFilingPublishesEachDocumentOnceIT {
         String targetUri = SharedMongo.replicaSetUrl("nest_first_filing_target_" + suffix);
         Path witness = directory.resolve("writes-" + suffix + ".tsv");
 
-        try (PreparedNativeStore storage = PreparedNativeStore.create(); ServerHandle server = tier.launch(storage);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = tier.launch(storage);
                 MongoEndpoints mongo = new MongoEndpoints()) {
             ControlPlane control = new ControlPlane(server.baseUrl());
             storage.loginAndAwaitBusiness(control);
@@ -188,12 +298,16 @@ class ANestFirstFilingPublishesEachDocumentOnceIT {
     }
 
     private static String pipelineYaml(String pipelineId) {
+        return pipelineYaml(pipelineId, "src_orders, src_customers", "snapshot_only");
+    }
+
+    private static String pipelineYaml(String pipelineId, String sources, String readMode) {
         return """
                 version: tapstate/v1
                 kind: pipeline
                 id: %s
-                source: [ src_orders, src_customers ]
-                settings: { read_mode: snapshot_only }
+                source: [ %s ]
+                settings: { read_mode: %s }
                 transforms:
                   - id: order_doc
                     type: nest
@@ -208,6 +322,6 @@ class ANestFirstFilingPublishesEachDocumentOnceIT {
                   sync:
                     - source: tgt_mongo
                 """
-                .formatted(pipelineId);
+                .formatted(pipelineId, sources, readMode);
     }
 }
