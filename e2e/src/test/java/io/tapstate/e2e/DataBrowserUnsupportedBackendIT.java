@@ -65,10 +65,10 @@ class DataBrowserUnsupportedBackendIT {
             mysql.start();
             seed(mysql);
 
-            try (ServerHandle server =
-                    InProcessServer.start(SharedMongo.replicaSetUrl("e2e_unsupported_backend"))) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                    ServerHandle server = InProcessServer.startPrepared(storage)) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
-                control.bootstrapAndLogin("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
                 control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
                 control.apply(Map.of("src_mysql.tap.yml", sourceYaml(mysql)));
 

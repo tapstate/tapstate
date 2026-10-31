@@ -86,9 +86,9 @@ final class NumericSource {
     }
 
     /** A logged-in control plane with both real connectors registered. */
-    static ControlPlane connected(ServerHandle server) {
+    static ControlPlane connected(ServerHandle server, PreparedNativeStore storage) {
         ControlPlane control = new ControlPlane(server.baseUrl());
-        control.bootstrapAndLogin("e2e", "e2e-password");
+        storage.loginAndAwaitBusiness(control);
         control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
         control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
         return control;

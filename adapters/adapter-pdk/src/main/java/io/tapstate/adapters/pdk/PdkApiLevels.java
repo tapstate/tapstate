@@ -28,16 +28,21 @@ public final class PdkApiLevels {
      * {@code 2.0.9} PDK API artifact contains the same class bytes as the baseline. In the audited
      * {@code 2.0.6} artifact every public and protected member is also present in the baseline, which
      * only adds the alter-table-TTL function, so a connector declaring it links against the baseline.
+     * The 2.0.11-20261019.093332-6 PDK API has the same 174 class bytes as the old 2.0.8
+     * baseline, but its entity companion adds 25 classes and changes 16 from 2.0.9. Level 2
+     * includes that expanded entity/codec contract; API-jar equality alone does not imply level 1.
+     * The host therefore supplies the matching 2.0.11 entity and 2.11 runner/common line.
      */
     private static final Map<String, Integer> LEVELS = Map.of(
             "2.0.5", 1,
             "2.0.6", 1,
             "2.0.7", 1,
             "2.0.8", 1,
-            "2.0.9", 1);
+            "2.0.9", 1,
+            "2.0.11", 2);
 
     /** The frozen baseline the bridge compiles and runs against. */
-    private static final String ENGINE_VERSION = "2.0.8";
+    private static final String ENGINE_VERSION = "2.0.11";
 
     /** The level this bridge provides — the level of the baseline it is built against. */
     public static final int ENGINE_LEVEL = level(ENGINE_VERSION);

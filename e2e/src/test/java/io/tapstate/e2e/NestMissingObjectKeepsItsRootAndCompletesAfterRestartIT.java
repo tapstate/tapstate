@@ -39,16 +39,14 @@ class NestMissingObjectKeepsItsRootAndCompletesAfterRestartIT {
         String suffix = tier.name().toLowerCase(Locale.ROOT);
         Map<String, Object> mysql = SharedMySql.settings("nest_missing_src_" + suffix);
         seed(mysql);
-        String store = SharedMongo.replicaSetUrl("nest_missing_store_" + suffix);
         String targetUri = SharedMongo.replicaSetUrl("nest_missing_target_" + suffix);
-        String stateDatabase = "nest_missing_state_" + suffix;
         String pipeline = "acc_nest_mysql_" + suffix;
         EndpointAddress target = EndpointAddress.uri(targetUri);
 
-        try (MongoEndpoints mongo = new MongoEndpoints()) {
-            try (ServerHandle server = tier.launch(store, stateDatabase)) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints()) {
+            try (ServerHandle server = tier.launch(storage)) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
-                control.bootstrapAndLogin("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
                 control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
                 control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
                 Map<String, String> resources = new LinkedHashMap<>();
@@ -76,9 +74,9 @@ class NestMissingObjectKeepsItsRootAndCompletesAfterRestartIT {
 
             // Restart the running deployment, as the existing restart witnesses do. A pause/resume
             // addresses a suspended Jet job in the same cluster, not a job in a cluster that has ended.
-            try (ServerHandle server = tier.launch(store, stateDatabase)) {
+            try (ServerHandle server = tier.launch(storage)) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
-                control.login("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
                 Await.until("the restarted server to adopt the existing continuous nest", () -> control.state(pipeline).filter(
                         PipelineState.RUNNING::equals).isPresent(), () -> String.valueOf(control.state(pipeline)));
                 try (Connection connection = SharedMySql.connect(mysql);
