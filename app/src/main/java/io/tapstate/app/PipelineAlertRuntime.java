@@ -416,44 +416,48 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     }
     private void accept(AlertEvaluationHost.Binding binding,long sequence,AlertInput input,boolean shared) {
         var outcome = services.evaluator().accept(binding, sequence, input);
-        if(outcome==AlertEvaluationHost.Result.BUSY && (shared || deferHealthyCacheHeartbeat(binding,input)))return;
+        String deferral = outcome==AlertEvaluationHost.Result.BUSY ? (shared ? null : cacheHeartbeatDeferralRefusal(binding,input)) : "not-busy";
+        if(outcome==AlertEvaluationHost.Result.BUSY && deferral==null)return;
         if (outcome == AlertEvaluationHost.Result.CONFLICT || outcome == AlertEvaluationHost.Result.BUSY) {
             var refusal=refused("state-contention");
             long second=clock.instant().getEpochSecond(),previous=lastLogged.get();
             if((previous==Long.MIN_VALUE||second-previous>=60)&&lastLogged.compareAndSet(previous,second))
-                LOG.warn("Alert collection is degraded [{}] [resourceKind={},type={},outcome={},capability={},succeeded={}]",
+                LOG.warn("Alert collection is degraded [{}] [resourceKind={},type={},outcome={},capability={},succeeded={},deferralRefusal={}]",
                         refusal.code().code(),binding.resource().kind(),binding.definition().typeId(),outcome,
                         input instanceof AlertInput.Operational op?op.capability():null,
-                        input instanceof AlertInput.Operational op?op.succeeded():null);
+                        input instanceof AlertInput.Operational op?op.succeeded():null,deferral);
             throw refusal;
         }
     }
     /** Deferral is not acceptance: no timestamp, sequence, capability or ownership is changed. */
-    private boolean deferHealthyCacheHeartbeat(AlertEvaluationHost.Binding binding,AlertInput input) {
+    private String cacheHeartbeatDeferralRefusal(AlertEvaluationHost.Binding binding,AlertInput input) {
         if(!(input instanceof AlertInput.Operational op)||!op.succeeded()||op.domainToken()!=null||binding.domainToken()!=null
                 ||!Set.of(OperationalEvidence.Capability.CACHE_READ,OperationalEvidence.Capability.CACHE_WRITE).contains(op.capability())
                 ||!binding.resource().kind().equals("cluster-storage")||!binding.resource().id().equals("cache")
-                ||!binding.definition().typeId().equals("cluster.storage-unavailable")||binding.sourceBindingRevision()!=0)return false;
+                ||!binding.definition().typeId().equals("cluster.storage-unavailable")||binding.sourceBindingRevision()!=0)return "ineligible-input";
         binding.requireCurrent().run();
         var current=services.store().definition(AlertConfiguration.Kind.RULE,binding.definition().header().identity().id(),null);
-        if(current.isEmpty()||!current.orElseThrow().equals(binding.definition()))return false;
+        if(current.isEmpty()||!current.orElseThrow().equals(binding.definition()))return "rule-changed";
         var retained=services.store().state(binding.key(),new AlertStore.ReadAccess(true,Set.of(),active));
-        binding.requireCurrent().run();if(retained.isEmpty())return false;
+        binding.requireCurrent().run();if(retained.isEmpty())return "head-missing";
         var head=retained.orElseThrow().value();var snapshot=head.snapshot();var evidence=head.operationalEvidence();var now=clock.instant();
-        if(head.retiredAt()!=null||!snapshot.enabled()||!binding.definition().header().active()||!binding.definition().enabled()
-                ||!Set.of(AlertSnapshot.Status.CLEAR,AlertSnapshot.Status.RESOLVED).contains(snapshot.status())
-                ||snapshot.quality()!=AlertSnapshot.Quality.VALID||snapshot.pendingSince()!=null||snapshot.recoverySince()!=null
-                ||!head.owner().activeAt(now)||head.binding()==null
-                ||!head.binding().ruleIdentity().equals(binding.definition().header().identity())
+        if(head.retiredAt()!=null||!snapshot.enabled()||!binding.definition().header().active()||!binding.definition().enabled())return "inactive";
+        if(!Set.of(AlertSnapshot.Status.CLEAR,AlertSnapshot.Status.RESOLVED).contains(snapshot.status())
+                ||snapshot.quality()!=AlertSnapshot.Quality.VALID||snapshot.pendingSince()!=null||snapshot.recoverySince()!=null)return "unhealthy-state";
+        if(!head.owner().activeAt(now))return "owner-expired";
+        if(head.binding()==null||!head.binding().ruleIdentity().equals(binding.definition().header().identity())
                 ||head.binding().sourceBindingRevision()!=binding.sourceBindingRevision()
                 ||snapshot.rule().revision()!=binding.definition().evaluationRevision()
-                ||!snapshot.rule().producerIncarnation().equals(binding.producer())
-                ||evidence==null||evidence.version()!=1||evidence.failedCapabilities()!=0
-                ||!evidence.bindingDigest().equals(op.bindingDigest()))return false;
+                ||!snapshot.rule().producerIncarnation().equals(binding.producer()))return "binding-changed";
+        if(evidence==null||evidence.version()!=1||evidence.failedCapabilities()!=0
+                ||!evidence.bindingDigest().equals(op.bindingDigest()))return "evidence-changed";
         var observed=snapshot.lastObservedAt();var rule=snapshot.rule();
-        return observed!=null&&!observed.isAfter(now)&&!op.observedAt().isAfter(now)
-                &&!observed.plus(rule.maxAge()).isBefore(now)&&!op.observedAt().plus(rule.maxAge()).isBefore(now)
-                &&!observed.plus(rule.maxGap()).isBefore(op.observedAt());
+        if(observed==null)return "observation-missing";
+        if(observed.isAfter(now)||op.observedAt().isAfter(now))return "future-observation";
+        if(observed.plus(rule.maxAge()).isBefore(now))return "retained-observation-too-old";
+        if(op.observedAt().plus(rule.maxAge()).isBefore(now))return "input-too-old";
+        if(observed.plus(rule.maxGap()).isBefore(op.observedAt()))return "continuity-gap";
+        return null;
     }
     private void submit(Slot slot, int bytes, Runnable action) { submit(slot, bytes, action, () -> { }); }
     private void submit(Slot slot, int bytes, Runnable action, Runnable refused) {
