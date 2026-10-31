@@ -91,12 +91,13 @@ class RestartKeepsThePositionIT {
     void thePlainRestartCarriesOnWithoutReadingTheCollectionAgain(Tiers tier) throws Exception {
         Fixture fixture = Fixture.forCase("restart_keep", tier);
 
-        try (MongoClient source = fixture.openSource();
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                MongoClient source = fixture.openSource();
                 MongoEndpoints mongo = new MongoEndpoints();
-                ServerHandle server = tier.launch(fixture.storeUri())) {
+                ServerHandle server = tier.launch(storage)) {
 
             fixture.seed(source);
-            ControlPlane control = fixture.start(server);
+            ControlPlane control = fixture.start(server, storage);
 
             awaitCount(mongo, fixture.target(), SEEDED_ROWS, "the full load of the seeded documents");
             // A change after the full load, so the run ends holding a recorded stream position rather
@@ -145,12 +146,13 @@ class RestartKeepsThePositionIT {
     void aRerunReadsTheWholeCollectionAgain(Tiers tier) throws Exception {
         Fixture fixture = Fixture.forCase("restart_rerun", tier);
 
-        try (MongoClient source = fixture.openSource();
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                MongoClient source = fixture.openSource();
                 MongoEndpoints mongo = new MongoEndpoints();
-                ServerHandle server = tier.launch(fixture.storeUri())) {
+                ServerHandle server = tier.launch(storage)) {
 
             fixture.seed(source);
-            ControlPlane control = fixture.start(server);
+            ControlPlane control = fixture.start(server, storage);
 
             awaitCount(mongo, fixture.target(), SEEDED_ROWS, "the full load of the seeded documents");
             // The same recorded position the other case carries on from. It is seeded here as well, so
@@ -184,15 +186,14 @@ class RestartKeepsThePositionIT {
      * reason -- which is the failure this file would be least able to see, both readings being what the
      * case expects.
      */
-    private record Fixture(String pipelineId, String sourceUri, String targetUri, String storeUri) {
+    private record Fixture(String pipelineId, String sourceUri, String targetUri) {
 
         static Fixture forCase(String name, Tiers tier) {
             String suffix = name + "_" + tier.name().toLowerCase(Locale.ROOT);
             return new Fixture(
                     suffix,
                     SharedMongo.replicaSetUrl(suffix + "_src"),
-                    SharedMongo.replicaSetUrl(suffix + "_tgt"),
-                    SharedMongo.replicaSetUrl(suffix + "_state"));
+                    SharedMongo.replicaSetUrl(suffix + "_tgt"));
         }
 
         String sourceDatabase() {
@@ -226,9 +227,9 @@ class RestartKeepsThePositionIT {
         }
 
         /** Everything up to and including the start, which both cases here do identically. */
-        ControlPlane start(ServerHandle server) {
+        ControlPlane start(ServerHandle server, PreparedNativeStore storage) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 
             Map<String, String> resources = new LinkedHashMap<>();

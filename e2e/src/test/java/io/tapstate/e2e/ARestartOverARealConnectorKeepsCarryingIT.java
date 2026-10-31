@@ -65,14 +65,13 @@ class ARestartOverARealConnectorKeepsCarryingIT {
         Map<String, Object> mysql = SharedMySql.settings(DATABASE);
         seedOneRow(mysql);
 
-        String storeUri = SharedMongo.replicaSetUrl("restart_real_store");
         String targetUri = SharedMongo.replicaSetUrl("restart_real_target");
         EndpointAddress target = EndpointAddress.uri(targetUri);
 
-        try (MongoEndpoints mongo = new MongoEndpoints()) {
-            try (ServerHandle first = Tiers.IN_PROCESS.launch(storeUri)) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints()) {
+            try (ServerHandle first = Tiers.IN_PROCESS.launch(storage)) {
                 ControlPlane control = new ControlPlane(first.baseUrl());
-                control.bootstrapAndLogin("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
                 control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
                 control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 
@@ -92,9 +91,9 @@ class ARestartOverARealConnectorKeepsCarryingIT {
 
             // The process is gone. The store it wrote, the source database and the target are not, and the
             // jar that comes back up is the same one that went down.
-            try (ServerHandle second = Tiers.IN_PROCESS.launch(storeUri)) {
+            try (ServerHandle second = Tiers.IN_PROCESS.launch(storage)) {
                 ControlPlane control = new ControlPlane(second.baseUrl());
-                control.login("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
 
                 assertThat(control.state(PIPELINE_ID))
                         .as("the pipeline the restarted server adopted from the store it read")
