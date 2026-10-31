@@ -14,6 +14,65 @@ import static org.assertj.core.api.Assertions.*;
 @RequiresDocker
 class AlertMaintenanceRoundIT {
     @Container static final org.testcontainers.containers.MongoDBContainer MONGO=AlertEvaluationHostIT.MONGO;
+    @Test void aTransientConflictThenConfirmedProtectionDoesNotInventOverdueWork() {
+        AlertEvaluationHostIT.withFixture(f->{
+            AlertDeliveryRuntimeIT.seed(f);var first=AlertNotificationPlannerIT.intents(f).getFirst();
+            var pending=AlertNotificationPlannerIT.grant(f,first);var permit=pending.state().attempts().getFirst().permit();
+            var before=f.store().intent(first.value().frozen().identity(),null).orElseThrow();
+            var until=f.clock().instant().plusSeconds(1);
+            var result=io.tapstate.core.alerting.AlertDeliveryProgress.result(before.value(),permit,
+                    io.tapstate.core.alerting.DeliveryEvidence.Outcome.UNKNOWN,
+                    new io.tapstate.core.alerting.AlertIntent.Protocol(io.tapstate.core.alerting.AlertIntent.Phase.FINAL_RESPONSE,
+                            io.tapstate.core.alerting.AlertIntent.Action.RETRY,429,"smtp",until),null,f.clock().instant(),0);
+            assertThat(f.store().commit(new io.tapstate.spi.store.AlertStore.Commit(io.tapstate.spi.store.AlertStore.CommitKind.RESULT,
+                    null,List.of(new io.tapstate.spi.store.AlertStore.IntentChange(before,result)),List.of())))
+                    .isEqualTo(io.tapstate.spi.store.AlertStore.Outcome.STAGED);
+            f.now().set(f.clock().instant().plusSeconds(7200));
+            try(var client=MongoClients.create(f.settings().uri())) {
+                var db=client.getDatabase(new com.mongodb.ConnectionString(f.settings().uri()).getDatabase());
+                long limits=db.getCollection("alert_target_limits").countDocuments();assertThat(limits).isPositive();
+                var protectedAt=db.getCollection("alert_target_limits").find().sort(new Document("cleanupAt",1))
+                        .first().getDate("cleanupAt").toInstant();
+                var admin=client.getDatabase("admin");
+                admin.runCommand(new Document("configureFailPoint","failCommand").append("mode",new Document("times",1))
+                        .append("data",new Document("failCommands",List.of("update")).append("errorCode",112)
+                                .append("errorLabels",List.of("TransientTransactionError"))));
+                try {
+                    var batch=f.store().maintenance().orElseThrow().maintain(new AlertMaintenance.Cursor(9,null,null),
+                            200,4L*1024*1024,Duration.ofSeconds(10));
+                    assertThat(batch.skipped()).containsEntry("conflict",1L).containsEntry("target-reference",limits);
+                    assertThat(batch.changed()).isZero();assertThat(batch.oldestCandidate()).isNull();
+                    assertThat(batch.oldestProtected()).isEqualTo(protectedAt);
+                    assertThat(db.getCollection("alert_target_limits").countDocuments()).isEqualTo(limits);
+                } finally {admin.runCommand(new Document("configureFailPoint","failCommand").append("mode","off"));}
+            }
+        });
+    }
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(ints={110,140})
+    void anUnresolvedConflictRetainsItsAgeWhenTheBatchBudgetEnds(int budget) {
+        AlertEvaluationHostIT.withFixture(f->{
+            var scope=f.storeHost().scope();var minute=f.clock().instant().minusSeconds(7200).truncatedTo(java.time.temporal.ChronoUnit.MINUTES);
+            var cutoff=minute.plusSeconds(3660);
+            try(var client=MongoClients.create(f.settings().uri())) {
+                var db=client.getDatabase(new com.mongodb.ConnectionString(f.settings().uri()).getDatabase());
+                var id=new Document("authorityId",scope.authorityId()).append("clusterId",scope.clusterId()).append("minute",minute.toString());
+                db.getCollection("alert_test_quotas").insertOne(new Document("_id",id).append("formatVersion",1).append("recordRevision",1L)
+                        .append("cleanupAt",Date.from(cutoff)).append("body",new Document("actors",List.of(new Document("actor","original-actor").append("accepted",1)))));
+                var admin=client.getDatabase("admin");
+                admin.runCommand(new Document("configureFailPoint","failCommand").append("mode",new Document("times",1))
+                        .append("data",new Document("failCommands",List.of("update")).append("errorCode",112)
+                                .append("errorLabels",List.of("TransientTransactionError"))));
+                try {
+                    var batch=f.store().maintenance().orElseThrow().maintain(new AlertMaintenance.Cursor(10,null,null),
+                            budget,4L*1024*1024,Duration.ofSeconds(10));
+                    assertThat(batch.skipped()).containsEntry("conflict",1L);assertThat(batch.changed()).isZero();
+                    assertThat(batch.oldestCandidate()).isEqualTo(cutoff);assertThat(batch.next()).isNotNull();
+                    assertThat(db.getCollection("alert_test_quotas").countDocuments(new Document("_id",id))).isOne();
+                } finally {admin.runCommand(new Document("configureFailPoint","failCommand").append("mode","off"));}
+            }
+        });
+    }
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(ints={0,4})
     void oneRoundKeepsUpWithTwentyAcceptedPayloadsAndFiveQuotasBesideLiveConfiguration(int conflicts){

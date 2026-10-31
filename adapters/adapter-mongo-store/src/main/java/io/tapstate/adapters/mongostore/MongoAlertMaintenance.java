@@ -58,9 +58,14 @@ final class MongoAlertMaintenance implements AlertMaintenance {
     private static final class Budget {
         final int rows; final long bytes, until; int used; long encoded;int proofSteps;boolean isolationChecked,isolated;
         Instant currentCandidate,oldestEligible,oldestProtected;
+        final Map<Object,Instant> retryingCandidates=new HashMap<>();
         List<PendingMutation> staged;
         void eligible(Instant at){if(at!=null&&(oldestEligible==null||at.isBefore(oldestEligible)))oldestEligible=at;}
         void protect(Instant at){if(at!=null&&(oldestProtected==null||at.isBefore(oldestProtected)))oldestProtected=at;}
+        void retrying(Object key,Instant at){if(at!=null)retryingCandidates.merge(key,at,(a,b)->a.isBefore(b)?a:b);}
+        void classified(Object key){retryingCandidates.remove(key);}
+        Instant eligibleAt(){return java.util.stream.Stream.concat(java.util.stream.Stream.ofNullable(oldestEligible),retryingCandidates.values().stream())
+                .min(Comparator.naturalOrder()).orElse(null);}
         Budget(int rows,long bytes,Duration time) { this.rows=rows;this.bytes=bytes;this.until=System.nanoTime()+time.toNanos(); }
         void require(int operations,long size) { if (operations>rows-used || size>bytes-encoded || System.nanoTime()>=until) throw new Yield(); }
         void use(long size) { use(1,size); }
@@ -88,6 +93,7 @@ final class MongoAlertMaintenance implements AlertMaintenance {
                     b.use(22,32*1024);
                     var group=transactions.run(true,b.remaining(),session->hotGroup(session,index,collection,candidates,b));
                     for(var row:group.rows()) {
+                        b.classified(row.key());
                         cursor=row.cursor();
                         if(row.outcome().equals("changed"))changed++;
                         else {skipped.merge(row.outcome(),1L,Long::sum);
@@ -99,7 +105,7 @@ final class MongoAlertMaintenance implements AlertMaintenance {
                 }catch(Yield end){skipped.merge("budget",1L,Long::sum);b.eligible(candidateTime(candidates.getFirst()));
                     pendingCandidate[index]=candidates.getFirst().get("_id");cursor=original;break;}
                 catch(MongoReadBudget.MaintenanceConflict conflict){
-                    conflict();skipped.merge("conflict",1L,Long::sum);b.eligible(candidateTime(candidates.getFirst()));
+                    conflict();skipped.merge("conflict",1L,Long::sum);b.retrying(candidates.getFirst().get("_id"),candidateTime(candidates.getFirst()));
                     pendingCandidate[index]=candidates.getFirst().get("_id");cursor=original;
                     if(++conflicts>3){skipped.merge("contention-yield",1L,Long::sum);break;}
                 }
@@ -117,12 +123,25 @@ final class MongoAlertMaintenance implements AlertMaintenance {
             try {
                 // Reserve before entering authority validation. Every attempted transaction is billed once,
                 // including commit/abort allowance; maintenance does not run hidden callback retries.
-                b.use(22,32*1024);
-                String result=transactions.run(true,b.remaining(),s->{
-                    Document row=read(s,collection,new Document("_id",candidate.get("_id")),b);
-                    if(row==null)return "conflict";
-                    return clean(s,collection,row,b);
-                });
+                String protection=null;
+                if(collection==SystemCollections.ALERT_NODE_LIFECYCLES) {
+                    // A protected read needs no write fence. Deletion still repeats every check below.
+                    b.use(18,32*1024);
+                    protection=transactions.run(false,b.remaining(),s->{
+                        var row=read(s,collection,new Document("_id",candidate.get("_id")),b);
+                        return row==null?"conflict":nodeProtection(s,MongoAlertNodeLifecycleStore.decode(row),b);
+                    });
+                }
+                String result=protection;
+                if(result==null) {
+                    b.use(22,32*1024);
+                    result=transactions.run(true,b.remaining(),s->{
+                        Document row=read(s,collection,new Document("_id",candidate.get("_id")),b);
+                        if(row==null)return "conflict";
+                        return clean(s,collection,row,b);
+                    });
+                }
+                b.classified(candidate.get("_id"));
                 if(result.equals("changed"))changed++;else {skipped.merge(result,1L,Long::sum);
                     if(result.equals("conflict"))b.eligible(b.currentCandidate);else b.protect(b.currentCandidate);}
                 pendingCandidate[index]=null;cursor=scanned;
@@ -132,7 +151,7 @@ final class MongoAlertMaintenance implements AlertMaintenance {
                 b.eligible(b.currentCandidate);pendingCandidate[index]=candidate.get("_id");cursor=original;yielded=true;break;}
             catch(MongoReadBudget.MaintenanceConflict conflict){
                 conflict();skipped.merge("conflict",1L,Long::sum);
-                b.eligible(b.currentCandidate);
+                b.retrying(candidate.get("_id"),b.currentCandidate);
                 if(++conflicts>3){
                     skipped.merge("contention-yield",1L,Long::sum);pendingCandidate[index]=candidate.get("_id");
                     cursor=original;yielded=true;break;
@@ -141,9 +160,9 @@ final class MongoAlertMaintenance implements AlertMaintenance {
             }
             catch(IllegalArgumentException | ClassCastException | NullPointerException invalid) {
                 // A malformed or unsupported record is retained, and its scanned key still advances.
-                skipped.merge("unreadable",1L,Long::sum);b.protect(b.currentCandidate);pendingCandidate[index]=null;cursor=scanned;
+                b.classified(candidate.get("_id"));skipped.merge("unreadable",1L,Long::sum);b.protect(b.currentCandidate);pendingCandidate[index]=null;cursor=scanned;
             }catch(io.tapstate.core.common.TapstateException invalid){
-                if(invalid.code()!=IoError.DOCUMENT_UNREADABLE)throw invalid;skipped.merge("unreadable",1L,Long::sum);b.protect(b.currentCandidate);pendingCandidate[index]=null;cursor=scanned;
+                if(invalid.code()!=IoError.DOCUMENT_UNREADABLE)throw invalid;b.classified(candidate.get("_id"));skipped.merge("unreadable",1L,Long::sum);b.protect(b.currentCandidate);pendingCandidate[index]=null;cursor=scanned;
             }
             }
             if(yielded)break;
@@ -151,10 +170,10 @@ final class MongoAlertMaintenance implements AlertMaintenance {
             if(candidates.size()<DISCOVERY_KEYS){exhausted=true;break;}
         }
         if(b.isolated)skipped.merge("unreadable",1L,Long::sum);
-        return new Batch(exhausted?null:cursor,b.used,changed,b.encoded,skipped,b.oldestEligible,b.oldestProtected);
+        return new Batch(exhausted?null:cursor,b.used,changed,b.encoded,skipped,b.eligibleAt(),b.oldestProtected);
     }
     private record PendingMutation(SystemCollections collection,Document original,Document replacement) { }
-    private record CleanedRow(Cursor cursor,String outcome,Instant at) { }
+    private record CleanedRow(Cursor cursor,String outcome,Instant at,Object key) { }
     private record HotGroup(List<CleanedRow> rows,String stop,Object pending,Instant at) { }
     private static Instant candidateTime(Document candidate) {return candidate.get("cleanupAt") instanceof Date at?at.toInstant():null;}
     private static Cursor candidateCursor(int index,Document candidate) {
@@ -190,7 +209,7 @@ final class MongoAlertMaintenance implements AlertMaintenance {
                     if(invalid.code()!=IoError.DOCUMENT_UNREADABLE)throw invalid;
                     budget.staged.subList(before,budget.staged.size()).clear();outcome="unreadable";
                 }
-                rows.add(new CleanedRow(scanned,outcome,budget.currentCandidate));
+                rows.add(new CleanedRow(scanned,outcome,budget.currentCandidate,candidate.get("_id")));
             }
             // No row mutation occurs until its complete read/validation and byte/operation
             // reservation succeeded. A later budget boundary can commit only earlier whole rows.
@@ -404,12 +423,15 @@ final class MongoAlertMaintenance implements AlertMaintenance {
             return remove(s,c,row,b);
         }
         if(c==SystemCollections.ALERT_NODE_LIFECYCLES) {
-            var value=MongoAlertNodeLifecycleStore.decode(row);b.use(16,32*1024);if(nodeExpected.test(s,value))return "expected-node";
-            var r=value.registration().key().resource();
-            if(resourceReferences(s,r,b))return "node-reference";
+            var value=MongoAlertNodeLifecycleStore.decode(row);String protection=nodeProtection(s,value,b);
+            if(protection!=null)return protection;
             b.use(16,32*1024);String removed=remove(s,c,row,b);if(nodeExpected.test(s,value))throw new IllegalStateException("node monitoring changed during cleanup");return removed;
         }
         return "unsupported";
+    }
+    private String nodeProtection(ClientSession session,AlertNodeLifecycleStore.Row value,Budget budget) {
+        budget.use(16,32*1024);if(nodeExpected.test(session,value))return "expected-node";
+        return resourceReferences(session,value.registration().key().resource(),budget)?"node-reference":null;
     }
     private final Map<String,TargetScan> targetScans=new LinkedHashMap<>() {
         @Override protected boolean removeEldestEntry(Map.Entry<String,TargetScan> entry){return size()>16;}
