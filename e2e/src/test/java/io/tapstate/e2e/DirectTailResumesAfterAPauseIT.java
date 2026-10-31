@@ -51,11 +51,12 @@ class DirectTailResumesAfterAPauseIT {
         Path tail = temporary.resolve("mongo-writes.tail");
         byte[] connector = ObservedMongoConnectorJar.build(ConnectorJars.bytesFor("mongodb"), witness);
         EndpointAddress target = EndpointAddress.uri(targetUri);
-        try (MongoClient source = MongoClients.create(sourceUri);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                MongoClient source = MongoClients.create(sourceUri);
                 MongoEndpoints mongo = new MongoEndpoints();
-                ServerHandle server = tier.launch(SharedMongo.replicaSetUrl(suffix + "_state"))) {
+                ServerHandle server = tier.launch(storage)) {
             seed(source, database);
-            ControlPlane control = start(server, suffix, sourceUri, targetUri, connector);
+            ControlPlane control = start(server, storage, suffix, sourceUri, targetUri, connector);
             awaitCount(mongo, target, "the seeded load");
             rename(source, database, CHANGED_BEFORE, BEFORE_PAUSE);
             awaitName(mongo, target, CHANGED_BEFORE, BEFORE_PAUSE, "the running tail");
@@ -123,15 +124,15 @@ class DirectTailResumesAfterAPauseIT {
         String database = suffix + "_src";
         String sourceUri = SharedMongo.replicaSetUrl(database);
         String targetUri = SharedMongo.replicaSetUrl(suffix + "_tgt");
-        String storeUri = SharedMongo.replicaSetUrl(suffix + "_state");
         EndpointAddress target = EndpointAddress.uri(targetUri);
 
-        try (MongoClient source = MongoClients.create(new ConnectionString(sourceUri));
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                MongoClient source = MongoClients.create(new ConnectionString(sourceUri));
                 MongoEndpoints mongo = new MongoEndpoints();
-                ServerHandle server = tier.launch(storeUri)) {
+                ServerHandle server = tier.launch(storage)) {
 
             seed(source, database);
-            ControlPlane control = start(server, suffix, sourceUri, targetUri);
+            ControlPlane control = start(server, storage, suffix, sourceUri, targetUri);
 
             awaitCount(mongo, target, "the full load of the seeded documents");
             // A change while it is running, so the run ends holding a position it confirmed rather than
@@ -155,14 +156,14 @@ class DirectTailResumesAfterAPauseIT {
 
     /** Everything up to and including the start. */
     private static ControlPlane start(
-            ServerHandle server, String pipelineId, String sourceUri, String targetUri) {
-        return start(server, pipelineId, sourceUri, targetUri, ConnectorJars.bytesFor("mongodb"));
+            ServerHandle server, PreparedNativeStore storage, String pipelineId, String sourceUri, String targetUri) {
+        return start(server, storage, pipelineId, sourceUri, targetUri, ConnectorJars.bytesFor("mongodb"));
     }
 
     private static ControlPlane start(
-            ServerHandle server, String pipelineId, String sourceUri, String targetUri, byte[] connector) {
+            ServerHandle server, PreparedNativeStore storage, String pipelineId, String sourceUri, String targetUri, byte[] connector) {
         ControlPlane control = new ControlPlane(server.baseUrl());
-        control.bootstrapAndLogin("e2e", "e2e-password");
+        storage.loginAndAwaitBusiness(control);
         control.registerConnector("mongodb", connector);
 
         Map<String, String> resources = new LinkedHashMap<>();

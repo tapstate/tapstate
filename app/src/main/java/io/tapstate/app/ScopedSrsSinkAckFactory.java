@@ -87,6 +87,9 @@ final class ScopedSrsSinkAckFactory implements SinkAckFactory {
     private final class Writer implements SinkAck {
         private static final long serialVersionUID = 1L;
         private final transient Map<SrsConsumerRun,Bound> bound;
+        // A settled row and its bound can report the same order. Keep successful receipts per writer,
+        // so those bounds do not repeat the store transaction while other tables are waiting to write.
+        private final transient Map<String,SourceOrder> reported = new HashMap<>();
         private final String writer;
         private final SinkAck direct;
         Writer(Map<SrsConsumerRun,Bound> bound,String writer,SinkAck direct) { this.bound = bound; this.writer = writer; this.direct = direct; }
@@ -108,7 +111,9 @@ final class ScopedSrsSinkAckFactory implements SinkAckFactory {
                 return;
             }
             var source = source(stream); var run = source.run(); var handle = bound.get(run); handle.requireClaim(claimed);
+            if (progress.lastTokened() == null && progress.durableThrough().equals(reported.get(stream))) return;
             if (!handle.store().advanceWriter(run.context(),run.membershipRevision(),runId,source.table(),writer,progress,run.originalClaim())) throw refused(run);
+            reported.put(stream,progress.durableThrough());
         }
     }
 }

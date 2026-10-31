@@ -96,6 +96,7 @@ public final class RootAssembly implements Serializable {
     private static final long serialVersionUID = 2L;
 
     private Map<String, Object> rootFields;
+
     private SourceOrder rootOrder;
     private boolean rootPresent;
 
@@ -963,6 +964,11 @@ public final class RootAssembly implements Serializable {
      */
     public long tombstones() {
         return deletionsIn(children);
+    }
+
+    /** Logical root payload retained even when an embed shadows a raw field in the rendered document. */
+    long rootPayloadBytes() {
+        return io.tapstate.core.event.PayloadBytes.ofRow(rootFields);
     }
 
     /**

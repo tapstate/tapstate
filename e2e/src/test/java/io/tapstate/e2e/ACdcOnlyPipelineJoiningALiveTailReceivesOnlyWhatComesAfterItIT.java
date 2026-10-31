@@ -64,13 +64,14 @@ class ACdcOnlyPipelineJoiningALiveTailReceivesOnlyWhatComesAfterItIT {
         String firstTargetUri = SharedMongo.replicaSetUrl("live_tail_first_target_" + suffix);
         String secondTargetUri = SharedMongo.replicaSetUrl("live_tail_second_target_" + suffix);
 
-        try (MongoClient source = MongoClients.create(sourceUri);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                MongoClient source = MongoClients.create(sourceUri);
                 MongoEndpoints mongo = new MongoEndpoints();
-                ServerHandle server = tier.launch(SharedMongo.replicaSetUrl("live_tail_store_" + suffix))) {
+                ServerHandle server = tier.launch(storage)) {
             source.getDatabase(sourceDatabase).getCollection(COLLECTION).drop();
             insert(source, sourceDatabase, 1, "seeded");
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
             control.apply(resources(sourceUri, firstTargetUri, secondTargetUri));
             control.discoverSchema(SOURCE, "mongodb", Map.of("uri", sourceUri, "database", sourceDatabase));

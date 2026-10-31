@@ -30,6 +30,7 @@ import java.sql.DriverManager;
 import java.sql.Statement;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -86,7 +87,6 @@ class PipelineObservabilityLiveIT {
             SharedMySql.grantReplication(mysql);
             seed(mysql);
 
-            String storeUri = SharedMongo.replicaSetUrl("observability_live_store");
             String targetUri = SharedMongo.replicaSetUrl("observability_live_target");
             EndpointAddress target = EndpointAddress.uri(targetUri);
             List<String> serverSettings = List.of(
@@ -94,113 +94,125 @@ class PipelineObservabilityLiveIT {
 
             RealProcessServer first = null;
             RealProcessServer second = null;
-            try {
-                first = RealProcessServer.start(storeUri, serverSettings);
-                ControlPlane control = new ControlPlane(first.baseUrl());
-                control.bootstrapAndLogin(USER, PASSWORD);
-                control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
-                control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+            try (PreparedNativeStore storage = PreparedNativeStore.create(USER, PASSWORD)) {
+                try {
+                    first = start(storage, serverSettings);
+                    ControlPlane control = new ControlPlane(first.baseUrl());
+                    storage.loginAndAwaitBusiness(control);
+                    control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
+                    control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 
-                Map<String, Object> mysqlConfig = mysqlConfig(mysql);
-                control.apply(resources(mysqlConfig, targetUri));
-                control.discoverSchema("src_mysql", "mysql", mysqlConfig);
-                control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
-                awaitState(control, PipelineState.RUNNING);
-                awaitCustomer(mongo, target, "seeded", "the snapshot to reach the real Mongo target");
+                    Map<String, Object> mysqlConfig = mysqlConfig(mysql);
+                    control.apply(resources(mysqlConfig, targetUri));
+                    control.discoverSchema("src_mysql", "mysql", mysqlConfig);
+                    control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
+                    awaitState(control, PipelineState.RUNNING);
+                    awaitCustomer(mongo, target, "seeded", "the snapshot to reach the real Mongo target");
 
-                awaitHistory(first.baseUrl(), control.credential(), from,
-                        history -> pointCount(history) >= 1, "the first retained sample");
-                update(mysql, "moving");
-                awaitCustomer(mongo, target, "moving", "a CDC update before the restart");
-                Map<String, Object> baseline = awaitHistory(first.baseUrl(), control.credential(), from,
-                        history -> startReasons(history).contains("COUNTER_RESET"),
-                        "the first delivery counter baseline");
-                int resetsBeforeRestart = reasonCount(baseline, "COUNTER_RESET");
-                update(mysql, "moving-again");
-                awaitCustomer(mongo, target, "moving-again", "a second CDC update after the counter baseline");
-                Map<String, Object> moving = awaitHistory(first.baseUrl(), control.credential(), from,
-                        PipelineObservabilityLiveIT::hasPositiveOutputDelta,
-                        "a positive target-acknowledged output interval");
-                assertThat(lagReadings(moving)).isNotEmpty();
+                    awaitHistory(first.baseUrl(), control.credential(), from,
+                            history -> pointCount(history) >= 1, "the first retained sample");
+                    update(mysql, "moving");
+                    awaitCustomer(mongo, target, "moving", "a CDC update before the restart");
+                    Map<String, Object> baseline = awaitHistory(first.baseUrl(), control.credential(), from,
+                            history -> startReasons(history).contains("COUNTER_RESET"),
+                            "the first delivery counter baseline");
+                    int resetsBeforeRestart = reasonCount(baseline, "COUNTER_RESET");
+                    update(mysql, "moving-again");
+                    awaitCustomer(mongo, target, "moving-again", "a second CDC update after the counter baseline");
+                    Map<String, Object> moving = awaitHistory(first.baseUrl(), control.credential(), from,
+                            PipelineObservabilityLiveIT::hasPositiveOutputDelta,
+                            "a positive target-acknowledged output interval");
+                    assertThat(lagReadings(moving)).isNotEmpty();
 
-                Map<String, Object> normal = awaitExplanation(first.baseUrl(), control.credential(),
-                        kind -> !"OBSERVATION_STALE".equals(kind) && !"CODED_FAILURE".equals(kind),
-                        "a current non-failure explanation");
-                assertThat(normal).containsEntry("state", "RUNNING");
+                    Map<String, Object> normal = awaitExplanation(first.baseUrl(), control.credential(),
+                            kind -> !"OBSERVATION_STALE".equals(kind) && !"CODED_FAILURE".equals(kind),
+                            "a current non-failure explanation");
+                    assertThat(normal).containsEntry("state", "RUNNING");
 
-                control.stop(PIPELINE_ID, false);
-                awaitState(control, PipelineState.STOPPED);
-                control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
-                awaitState(control, PipelineState.RUNNING);
-                update(mysql, "after-counter-reset");
-                awaitCustomer(mongo, target, "after-counter-reset", "a CDC update after the run reset");
-                awaitHistory(first.baseUrl(), control.credential(), from,
-                        history -> reasonCount(history, "COUNTER_RESET") > resetsBeforeRestart,
-                        "a counter-reset segment after stop/start");
+                    control.stop(PIPELINE_ID, false);
+                    awaitState(control, PipelineState.STOPPED);
+                    control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
+                    awaitState(control, PipelineState.RUNNING);
+                    update(mysql, "after-counter-reset");
+                    awaitCustomer(mongo, target, "after-counter-reset", "a CDC update after the run reset");
+                    awaitHistory(first.baseUrl(), control.credential(), from,
+                            history -> reasonCount(history, "COUNTER_RESET") > resetsBeforeRestart,
+                            "a counter-reset segment after stop/start");
 
-                first.close();
-                first = null;
-                awaitMissingSampleInterval();
-
-                second = RealProcessServer.start(storeUri, serverSettings);
-                control = new ControlPlane(second.baseUrl());
-                control.login(USER, PASSWORD);
-                awaitState(control, PipelineState.RUNNING);
-                update(mysql, "after-server-restart");
-                awaitCustomer(mongo, target, "after-server-restart", "a CDC update after server restart");
-                awaitHistory(second.baseUrl(), control.credential(), from,
-                        history -> startReasons(history).contains("GAP"),
-                        "an explicit sample gap across process downtime");
-
-                control.stop(PIPELINE_ID, false);
-                awaitState(control, PipelineState.STOPPED);
-                control.apply(Map.of("tgt_mongo.tap.yml", targetYaml(
-                        "mongodb://127.0.0.1:1/broken?serverSelectionTimeoutMS=500&connectTimeoutMS=500")));
-                control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
-                Map<String, Object> coded = awaitExplanation(second.baseUrl(), control.credential(),
-                        kind -> "CODED_FAILURE".equals(kind), "the real target refusal to become coded");
-                assertThat(coded).containsEntry("state", "FAILED");
-
-                // Put the comparison window firmly in the past. A future bound is clipped independently
-                // by each request's serverNow, so two correct sequential readers would freeze different
-                // effectiveTo values and there would be no single window to compare.
-                Instant to = Instant.now().minusSeconds(1);
-                Map<String, Object> restHistory = history(
-                        second.baseUrl(), control.credential(), from, to);
-                Map<String, Object> restExplain = explanation(second.baseUrl(), control.credential());
-                McpReads mcp = readThroughMcp(second.baseUrl(), control.mintToken("read"), from, to);
-
-                CliOnce.Run cliExplain = CliOnce.runWithPassword(PASSWORD,
-                        "-c", second.baseUrl().toString(), "-u", USER, "explain", PIPELINE_ID);
-                CliOnce.Run cliHistory = CliOnce.runWithPassword(PASSWORD,
-                        "-c", second.baseUrl().toString(), "-u", USER,
-                        "metrics", PIPELINE_ID,
-                        "--from", from.toString(), "--to", to.toString(),
-                        "--resolution", "raw", "--limit", "1000", "--table", TABLE);
-
-                assertThat(cliExplain.exitCode()).isZero();
-                assertThat(cliExplain.stdout()).contains("kind       CODED_FAILURE", "engine.job-failed");
-                assertThat(cliHistory.exitCode()).isZero();
-                assertThat(cliHistory.stdout()).contains(
-                        "counter_reset", "gap", "consistency eventual", "lag.orders=");
-
-                assertThat(explanationContract(mcp.explanation()))
-                        .isEqualTo(explanationContract(restExplain));
-                assertThat(historyContract(mcp.history())).isEqualTo(historyContract(restHistory));
-                assertThat(startReasons(restHistory)).contains("COUNTER_RESET", "GAP");
-                assertThat(lagReadings(restHistory)).isNotEmpty();
-
-                writeEvidence(control.version(), from, to, restHistory, restExplain, mcp,
-                        cliHistory, cliExplain);
-            } finally {
-                if (first != null) {
                     first.close();
-                }
-                if (second != null) {
-                    second.close();
+                    first = null;
+                    awaitMissingSampleInterval();
+
+                    second = start(storage, serverSettings);
+                    control = new ControlPlane(second.baseUrl());
+                    storage.loginAndAwaitBusiness(control);
+                    awaitState(control, PipelineState.RUNNING);
+                    update(mysql, "after-server-restart");
+                    awaitCustomer(mongo, target, "after-server-restart", "a CDC update after server restart");
+                    awaitHistory(second.baseUrl(), control.credential(), from,
+                            history -> startReasons(history).contains("GAP"),
+                            "an explicit sample gap across process downtime");
+
+                    control.stop(PIPELINE_ID, false);
+                    awaitState(control, PipelineState.STOPPED);
+                    control.apply(Map.of("tgt_mongo.tap.yml", targetYaml(
+                            "mongodb://127.0.0.1:1/broken?serverSelectionTimeoutMS=500&connectTimeoutMS=500")));
+                    control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
+                    Map<String, Object> coded = awaitExplanation(second.baseUrl(), control.credential(),
+                            kind -> "CODED_FAILURE".equals(kind), "the real target refusal to become coded");
+                    assertThat(coded).containsEntry("state", "FAILED");
+
+                    // Put the comparison window firmly in the past. A future bound is clipped independently
+                    // by each request's serverNow, so two correct sequential readers would freeze different
+                    // effectiveTo values and there would be no single window to compare.
+                    Instant to = Instant.now().minusSeconds(1);
+                    Map<String, Object> restHistory = history(
+                            second.baseUrl(), control.credential(), from, to);
+                    Map<String, Object> restExplain = explanation(second.baseUrl(), control.credential());
+                    McpReads mcp = readThroughMcp(second.baseUrl(), control.mintToken("read"), from, to);
+
+                    CliOnce.Run cliExplain = CliOnce.runWithPassword(PASSWORD,
+                            "-c", second.baseUrl().toString(), "-u", USER, "explain", PIPELINE_ID);
+                    CliOnce.Run cliHistory = CliOnce.runWithPassword(PASSWORD,
+                            "-c", second.baseUrl().toString(), "-u", USER,
+                            "metrics", PIPELINE_ID,
+                            "--from", from.toString(), "--to", to.toString(),
+                            "--resolution", "raw", "--limit", "1000", "--table", TABLE);
+
+                    assertThat(cliExplain.exitCode()).isZero();
+                    assertThat(cliExplain.stdout()).contains("kind       CODED_FAILURE", "engine.job-failed");
+                    assertThat(cliHistory.exitCode()).isZero();
+                    assertThat(cliHistory.stdout()).contains(
+                            "counter_reset", "gap", "consistency eventual", "lag.orders=");
+
+                    assertThat(explanationContract(mcp.explanation()))
+                            .isEqualTo(explanationContract(restExplain));
+                    assertThat(historyContract(mcp.history())).isEqualTo(historyContract(restHistory));
+                    assertThat(startReasons(restHistory)).contains("COUNTER_RESET", "GAP");
+                    assertThat(lagReadings(restHistory)).isNotEmpty();
+
+                    writeEvidence(control.version(), from, to, restHistory, restExplain, mcp,
+                            cliHistory, cliExplain);
+                } finally {
+                    if (first != null) {
+                        first.close();
+                    }
+                    if (second != null) {
+                        second.close();
+                    }
                 }
             }
         }
+    }
+
+    private static RealProcessServer start(PreparedNativeStore storage, List<String> settings) {
+        return RealProcessServer.startPrepared(storage.configurationUri(), "127.0.0.1", port -> {
+            var arguments = new ArrayList<>(settings);
+            arguments.add("--tapstate.cluster.id=" + storage.clusterId());
+            arguments.add("--tapstate.hz.member-port=0");
+            arguments.add("--tapstate.hz.jet.cooperative-thread-count=2");
+            return arguments;
+        });
     }
 
     private static Map<String, String> resources(Map<String, Object> mysql, String targetUri) {

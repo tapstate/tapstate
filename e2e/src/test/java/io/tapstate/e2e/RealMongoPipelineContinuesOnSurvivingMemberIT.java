@@ -72,14 +72,14 @@ class RealMongoPipelineContinuesOnSurvivingMemberIT {
     void theCapturePickedUpBySurvivingMemberCarriesChangesMadeAfterTheKill() {
         String sourceUri = SharedMongo.replicaSetUrl("e2e_real_failover_src");
         String targetUri = SharedMongo.replicaSetUrl("e2e_real_failover_tgt");
-        String store = SharedMongo.replicaSetUrl("e2e_real_failover_cluster");
 
         try (MongoEndpoints mongo = new MongoEndpoints()) {
             EndpointAddress source = EndpointAddress.uri(sourceUri);
             EndpointAddress target = EndpointAddress.uri(targetUri);
             mongo.seed(source, TABLE, SeedRows.generated(SEEDED_ROWS));
 
-            try (TwoMemberCluster cluster = TwoMemberCluster.start(store, "e2e-real-failover")) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                    TwoMemberCluster cluster = TwoMemberCluster.startPreparedSequentially(storage)) {
                 cluster.awaitBothMembers();
                 ControlPlane control = cluster.first();
                 // Registered on one member only, as an operator would: the other has to fetch it.

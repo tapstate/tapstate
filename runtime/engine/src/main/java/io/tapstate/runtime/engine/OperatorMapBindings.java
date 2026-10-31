@@ -228,6 +228,7 @@ public final class OperatorMapBindings implements AutoCloseable {
         @Override public Optional<byte[]> load(String namespace, String key) { return delegate(namespace).load(namespace, key); }
         @Override public Map<String, byte[]> loadAll(String namespace, Collection<String> keys) { return delegate(namespace).loadAll(namespace, keys); }
         @Override public void save(String namespace, String key, byte[] value) { delegate(namespace).save(namespace, key, value); }
+        @Override public void saveAll(String namespace, Map<String, byte[]> values) { delegate(namespace).saveAll(namespace, values); }
         @Override public Optional<byte[]> saveIfAbsent(String namespace, String key, byte[] value) { return delegate(namespace).saveIfAbsent(namespace, key, value); }
         @Override public void delete(String namespace, String key) { delegate(namespace).delete(namespace, key); }
         @Override public void dropNamespace(String namespace) { delegate(namespace).dropNamespace(namespace); }
@@ -266,6 +267,7 @@ public final class OperatorMapBindings implements AutoCloseable {
             @Override public Optional<byte[]> load(String namespace, String key) { check(namespace); return cold.load(coldName, key); }
             @Override public Map<String, byte[]> loadAll(String namespace, Collection<String> keys) { check(namespace); return cold.loadAll(coldName, keys); }
             @Override public void save(String namespace, String key, byte[] value) { check(namespace); cold.save(coldName, key, value); }
+            @Override public void saveAll(String namespace, Map<String, byte[]> values) { check(namespace); cold.saveAll(coldName, values); }
             @Override public Optional<byte[]> saveIfAbsent(String namespace, String key, byte[] value) { check(namespace); return cold.saveIfAbsent(coldName, key, value); }
             @Override public void delete(String namespace, String key) { check(namespace); cold.delete(coldName, key); }
             @Override public void dropNamespace(String namespace) { check(namespace); cold.dropNamespace(coldName); }
