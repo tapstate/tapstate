@@ -1,15 +1,24 @@
 package io.tapstate.e2e;
 
-import io.tapstate.adapters.mongostore.MongoConnection;
+import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoDatabase;
+import io.tapstate.adapters.mongostore.MongoCacheDomain;
+import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
-import io.tapstate.adapters.mongostore.MongoStorePort;
+import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
-import io.tapstate.spi.store.KeyedStateStore;
+import io.tapstate.runtime.engine.OperatorMapCoordinates;
+import io.tapstate.spi.store.OperatorPlacement;
+import io.tapstate.spi.store.PipelineIntentScope;
+import io.tapstate.spi.store.WorkloadClaimFence;
+import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.testsupport.DockerGate;
 
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.bson.Document;
 
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
@@ -68,13 +77,7 @@ class AStoppedPipelineLetsGoOfItsJoinStateIT {
     private static final String STEP_ID = "widen";
     private static final String TARGET = "order_state";
 
-    /** The three namespaces one join step keeps, under the alias its {@code from:} declares. */
-    private static final String FACT_NAMESPACE = "join." + PIPELINE_ID + "." + STEP_ID + ".fact";
-    private static final String DIMENSION_NAMESPACE = "join." + PIPELINE_ID + "." + STEP_ID + ".dim.c";
-    private static final String INDEX_NAMESPACE = "join." + PIPELINE_ID + "." + STEP_ID + ".index.c";
-
-    /** A namespace shaped like one of ours but belonging to a pipeline nobody stopped. */
-    private static final String OTHER_PIPELINE_NAMESPACE = "join.other_pipeline." + STEP_ID + ".dim.c";
+    private static final String OTHER_PIPELINE = "other_pipeline";
 
     /** Bytes nobody reads: what is asked of the neighbour's entry is presence, not content. */
     private static final byte[] HELD = "a-neighbour-mid-run".getBytes(StandardCharsets.UTF_8);
@@ -91,44 +94,58 @@ class AStoppedPipelineLetsGoOfItsJoinStateIT {
         Map<String, Object> mysql = SharedMySql.settings(DATABASE);
         seed(mysql);
 
-        String storeUri = SharedMongo.replicaSetUrl("join_teardown_store");
-        String targetUri = SharedMongo.replicaSetUrl("join_teardown_target");
-        EndpointAddress target = EndpointAddress.uri(targetUri);
-
-        try (MongoEndpoints mongo = new MongoEndpoints();
-                ServerHandle server = Tiers.IN_PROCESS.launch(storeUri);
-                MongoConnection connection = new MongoConnection(
-                        new MongoConnectionSettings(storeUri, null, Duration.ofSeconds(5)))) {
-            connection.verify();
-            KeyedStateStore state =
-                    new MongoStorePort(connection, SharedMongo.OPERATOR_STATE_DATABASE).keyedState();
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                MongoEndpoints mongo = new MongoEndpoints();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage);
+                MongoConfigurationDomain configuration = MongoConfigurationDomain.openExisting(
+                        new MongoConnectionSettings(storage.configurationUri(), null, Duration.ofSeconds(5)));
+                MongoCacheDomain cache = MongoCacheDomain.connect(configuration.bindings().load().orElseThrow().cache(),
+                        Duration.ofSeconds(5), "join-teardown-witness");
+                var reader = MongoClients.create(storage.cacheUri())) {
+            EndpointAddress target = EndpointAddress.uri(storage.masterUri());
+            MongoDatabase database = reader.getDatabase(storage.cacheDatabase());
 
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
             control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 
             Map<String, String> resources = new LinkedHashMap<>();
             resources.put("shop_db.tap.yml", sourceYaml(mysql));
-            resources.put("views.tap.yml", targetYaml(targetUri));
-            resources.put("join_pipeline.tap.yml", pipelineYaml());
+            resources.put("join_pipeline.tap.yml", pipelineYaml(PIPELINE_ID, "order_state"));
+            resources.put("neighbor.tap.yml", pipelineYaml(OTHER_PIPELINE, "neighbor_state"));
             control.apply(resources);
             control.discoverSchema("shop_db", "mysql", mysql);
             control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
+            control.lifecycle(OTHER_PIPELINE, LifecycleVerb.START);
 
             awaitName(mongo, target, 10, "ada", "the snapshot to reach the target");
             awaitName(mongo, target, 11, "bo", "the second order to reach the target");
 
             // Belongs to nobody this stop is about. Seeded while the run is up, so what is read back
             // afterwards is a difference the stop did not make rather than an entry written after it.
-            state.save(OTHER_PIPELINE_NAMESPACE, KEY, HELD);
+            Await.until("the neighboring pipeline to retain its own dimension state", () ->
+                    SystemCollections.CACHE_JOIN_DIMENSIONS.on(database).countDocuments(
+                            new Document("_id.placement.scope.pipelineId", OTHER_PIPELINE)) > 0,
+                    () -> control.state(OTHER_PIPELINE).toString());
+            var business = configuration.bindings().cachePreparation().orElseThrow().businessScope();
+            var mapping = configuration.pipelineStates().read(OTHER_PIPELINE).orElseThrow();
+            var scope = new PipelineIntentScope(business.clusterId(), business.bindingVersion(), business.cacheIncarnation(),
+                    OTHER_PIPELINE, mapping.stateGeneration());
+            var neighborPlacement = OperatorMapCoordinates.join(scope, storage.cacheDatabase(), STEP_ID,
+                    OperatorPlacement.Resource.JOIN_DIMENSIONS, "c");
+            var claim = cache.workloadClaims(business).read(new WorkloadClaimKey(business.clusterId(),
+                    WorkloadClaimType.PIPELINE_ACTUATION, OTHER_PIPELINE))
+                    .filter(reading -> reading.leased()).orElseThrow().claim();
+            var neighbor = cache.operatorState(neighborPlacement, WorkloadClaimFence.from(claim), () -> {});
+            neighbor.save(neighborPlacement.mapName(), KEY, HELD);
 
             // Read before the stop: "gone afterwards" means nothing at all unless something was there.
             // Each namespace separately, because the dimension side is what carries a stale value and a
             // reading over the fact mirror alone would pass with the other two untouched.
-            awaitHeld(state, FACT_NAMESPACE, "the fact mirror to hold the driving rows");
-            awaitHeld(state, DIMENSION_NAMESPACE, "the dimension mirror to hold the customers");
-            awaitHeld(state, INDEX_NAMESPACE, "the reverse index to hold a bucket per customer");
+            awaitHeld(database, SystemCollections.CACHE_JOIN_FACTS, "the fact mirror to hold the driving rows");
+            awaitHeld(database, SystemCollections.CACHE_JOIN_DIMENSIONS, "the dimension mirror to hold the customers");
+            awaitHeld(database, SystemCollections.CACHE_JOIN_INDEXES, "the reverse index to hold a bucket per customer");
 
             // Asked to clear. A stop that was asked to keep leaves all of this standing, which is the
             // point of the flag; what is under test here is that clearing reaches the join at all.
@@ -138,18 +155,18 @@ class AStoppedPipelineLetsGoOfItsJoinStateIT {
                     () -> control.state(PIPELINE_ID).filter(PipelineState.STOPPED::equals).isPresent(),
                     () -> String.valueOf(control.state(PIPELINE_ID)));
 
-            assertThat(state.count(FACT_NAMESPACE))
+            assertThat(held(database, SystemCollections.CACHE_JOIN_FACTS))
                     .as("the fact mirror after the stop")
                     .isZero();
-            assertThat(state.count(DIMENSION_NAMESPACE))
+            assertThat(held(database, SystemCollections.CACHE_JOIN_DIMENSIONS))
                     .as("the dimension mirror after the stop - the one that serves a rebuilt run values "
                             + "its source no longer holds")
                     .isZero();
-            assertThat(state.count(INDEX_NAMESPACE))
+            assertThat(held(database, SystemCollections.CACHE_JOIN_INDEXES))
                     .as("the reverse index after the stop")
                     .isZero();
-            assertThat(state.load(OTHER_PIPELINE_NAMESPACE, KEY))
-                    .as("a stop lets go of what this pipeline named, never of what merely looks like it")
+            assertThat(neighbor.load(neighborPlacement.mapName(), KEY))
+                    .as("a stop lets go of this pipeline's placements, never a neighboring pipeline's")
                     .isPresent();
 
             // Everything above is still satisfied by a takedown that broke the join outright. What
@@ -190,8 +207,12 @@ class AStoppedPipelineLetsGoOfItsJoinStateIT {
      * Waits for a namespace to hold something. Polled rather than read once: the target row reaching Mongo
      * says the join emitted, and the write through to the layer behind the map is a separate journey.
      */
-    private static void awaitHeld(KeyedStateStore state, String namespace, String what) {
-        Await.until(what, () -> state.count(namespace) > 0, () -> namespace + " holds 0 entries");
+    private static void awaitHeld(MongoDatabase database, SystemCollections table, String what) {
+        Await.until(what, () -> held(database, table) > 0, () -> table.collectionName() + " holds 0 entries");
+    }
+
+    private static long held(MongoDatabase database, SystemCollections table) {
+        return table.on(database).countDocuments(new Document("_id.placement.scope.pipelineId", PIPELINE_ID));
     }
 
     private static void awaitName(
@@ -234,11 +255,11 @@ class AStoppedPipelineLetsGoOfItsJoinStateIT {
     }
 
     /** One join step, one dimension, aliased c - which is the alias the namespaces above are named for. */
-    private static String pipelineYaml() {
+    private static String pipelineYaml(String pipeline, String view) {
         return """
                 version: tapstate/v1
                 kind: pipeline
-                id: order_pipeline
+                id: %s
                 source: shop_db
                 settings: { read_mode: snapshot_and_cdc }
                 transforms:
@@ -250,9 +271,9 @@ class AStoppedPipelineLetsGoOfItsJoinStateIT {
                       SELECT o.id AS order_id, o.qty AS qty, c.name AS customer_name
                       FROM o JOIN c ON o.customer_id = c.id
                 view:
-                  id: order_state
+                  id: %s
                   from: widen
                   primary_key: order_id
-                """;
+                """.formatted(pipeline, view);
     }
 }

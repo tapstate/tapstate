@@ -67,14 +67,13 @@ class ADeleteDuringDowntimeReachesTheTargetIT {
         Map<String, Object> source = SharedMySql.settings("downtime_delete_src_" + suffix);
         seed(source);
 
-        String storeUri = SharedMongo.replicaSetUrl("downtime_delete_state_" + suffix);
         String targetUri = SharedMongo.replicaSetUrl("downtime_delete_target_" + suffix);
         EndpointAddress target = EndpointAddress.uri(targetUri);
 
-        try (MongoEndpoints mongo = new MongoEndpoints()) {
-            try (ServerHandle server = tier.launch(storeUri)) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints()) {
+            try (ServerHandle server = tier.launch(storage)) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
-                control.bootstrapAndLogin("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
                 control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
                 control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 
@@ -97,9 +96,9 @@ class ADeleteDuringDowntimeReachesTheTargetIT {
             // The downtime window. A delete leaves nothing behind in the table to be found later.
             delete(source, DELETED_ID);
 
-            try (ServerHandle server = tier.launch(storeUri)) {
+            try (ServerHandle server = tier.launch(storage)) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
-                control.login("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
                 // No start verb here: the pipeline's desired state is in the store the restart reopened,
                 // so the converge loop brings it back on its own -- issuing start is refused outright as
                 // an illegal transition out of RUNNING.

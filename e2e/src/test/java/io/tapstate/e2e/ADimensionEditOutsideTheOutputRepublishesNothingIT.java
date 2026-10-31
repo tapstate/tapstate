@@ -69,14 +69,13 @@ class ADimensionEditOutsideTheOutputRepublishesNothingIT {
         Map<String, Object> mysql = SharedMySql.settings(DATABASE);
         seed(mysql);
 
-        String storeUri = SharedMongo.replicaSetUrl("admission_store");
         String targetUri = SharedMongo.replicaSetUrl("admission_target");
         EndpointAddress target = EndpointAddress.uri(targetUri);
 
-        try (MongoEndpoints mongo = new MongoEndpoints();
-                ServerHandle server = Tiers.IN_PROCESS.launch(storeUri)) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
             ControlPlane control = new ControlPlane(server.baseUrl());
-            control.bootstrapAndLogin("e2e", "e2e-password");
+            storage.loginAndAwaitBusiness(control);
             control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
             control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 

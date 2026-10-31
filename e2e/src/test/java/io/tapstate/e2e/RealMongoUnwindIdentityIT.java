@@ -35,16 +35,13 @@ class RealMongoUnwindIdentityIT {
         String suffix = UUID.randomUUID().toString().replace("-", "");
         String sourceDb = "unwind_src_" + suffix;
         String targetDb = "unwind_tgt_" + suffix;
-        String metadataDb = "unwind_meta_" + suffix;
-        String operatorDb = "unwind_ops_" + suffix;
         String sourceUri = SharedMongo.replicaSetUrl(sourceDb);
         String targetUri = SharedMongo.replicaSetUrl(targetDb);
-        String storeUri = SharedMongo.replicaSetUrl(metadataDb);
         String pipeline = "unwind_" + suffix;
         String preserved = tier == Tiers.IN_PROCESS ? "_unwind_source_id" : "original_order_id";
         boolean objectIds = tier == Tiers.REAL_PROCESS;
-        try (var source = MongoClients.create(sourceUri); var target = MongoClients.create(targetUri);
-                var metadata = MongoClients.create(storeUri)) {
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                var source = MongoClients.create(sourceUri); var target = MongoClients.create(targetUri)) {
             var sourceDatabase = source.getDatabase(sourceDb);
             var targetDatabase = target.getDatabase(targetDb);
             try {
@@ -58,9 +55,9 @@ class RealMongoUnwindIdentityIT {
                 parents.insertMany(seeded);
                 String acknowledged;
                 Object stableId;
-                try (ServerHandle server = tier.launch(storeUri, operatorDb)) {
+                try (ServerHandle server = tier.launch(storage)) {
                     ControlPlane control = new ControlPlane(server.baseUrl());
-                    control.bootstrapAndLogin("e2e", "e2e-password");
+                    storage.loginAndAwaitBusiness(control);
                     control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
                     Map<String, String> resources = new LinkedHashMap<>();
                     resources.put("source.tap.yml", """
@@ -124,9 +121,9 @@ class RealMongoUnwindIdentityIT {
                 parents.insertOne(parent(PARENTS, objectIds, List.of("new-a", "new-b")));
                 assertThat(actual(children, preserved)).isEqualTo(beforeDowntime);
                 // No reapply, register or START: the persisted desired state and source acknowledgement are reused.
-                try (ServerHandle server = tier.launch(storeUri, operatorDb)) {
+                try (ServerHandle server = tier.launch(storage)) {
                     ControlPlane control = new ControlPlane(server.baseUrl());
-                    control.login("e2e", "e2e-password");
+                    storage.loginAndAwaitBusiness(control);
                     Await.until("downtime changes replayed after runtime restart", TIMEOUT,
                             () -> actual(children, preserved).equals(expected(parents)), () -> control.logs(pipeline));
                     String replayAck = Await.answered("replayed changes acknowledged", TIMEOUT,
@@ -144,8 +141,6 @@ class RealMongoUnwindIdentityIT {
             } finally {
                 sourceDatabase.drop();
                 targetDatabase.drop();
-                metadata.getDatabase(metadataDb).drop();
-                metadata.getDatabase(operatorDb).drop();
             }
         }
     }
