@@ -17,6 +17,8 @@ final class BuiltinResourceSignals {
     private final CacheAuthScope cache;
     private final Runnable active;
     private final Clock clock;
+    private final Object cacheSampling = new Object();
+    private Instant lastHealthyCacheRead, lastHealthyCacheWrite;
     private final Map<AlarmKey.Resource,AlertStore.ResourceEvidence> evidence = new java.util.concurrent.ConcurrentHashMap<>();
     BuiltinResourceSignals(Supplier<PipelineAlertRuntime> runtime,Supplier<StorageBinding> storage,
             CacheAuthScope cache,Runnable active,Clock clock){
@@ -83,10 +85,17 @@ final class BuiltinResourceSignals {
     }
     void cacheOperation(boolean write,Throwable failure){
         if(failure!=null&&(!(failure instanceof TapstateException e)||e.code()!=IoError.STORE_UNAVAILABLE&&e.code()!=IoError.STORE_UNAUTHORIZED))return;
-        String binding=digest(cache.clusterId(),cache.cacheIncarnation(),Long.toString(cache.bindingVersion()),Long.toString(cache.authGeneration()));
-        runtime.get().resourceInput(new AlarmKey.Resource("cluster-storage","cache",cache.cacheIncarnation()+":"+cache.bindingVersion()),
-                "cluster.storage-unavailable",0,binding,active,new AlertInput.Operational(clock.instant(),binding,
-                        write?OperationalEvidence.Capability.CACHE_WRITE:OperationalEvidence.Capability.CACHE_READ,failure==null));
+        synchronized(cacheSampling){
+            Instant now=clock.instant(),previous=write?lastHealthyCacheWrite:lastHealthyCacheRead;
+            // Keep periodic health without letting ordinary claim traffic consume the alert queue.
+            if(failure==null&&previous!=null&&!now.isBefore(previous)&&now.isBefore(previous.plusSeconds(1)))return;
+            String binding=digest(cache.clusterId(),cache.cacheIncarnation(),Long.toString(cache.bindingVersion()),Long.toString(cache.authGeneration()));
+            runtime.get().resourceInput(new AlarmKey.Resource("cluster-storage","cache",cache.cacheIncarnation()+":"+cache.bindingVersion()),
+                    "cluster.storage-unavailable",0,binding,active,new AlertInput.Operational(now,binding,
+                            write?OperationalEvidence.Capability.CACHE_WRITE:OperationalEvidence.Capability.CACHE_READ,failure==null));
+            // This records attempted publication only; all failures and the next success remain immediate.
+            if(write)lastHealthyCacheWrite=failure==null?now:null;else lastHealthyCacheRead=failure==null?now:null;
+        }
     }
     static boolean connectionFailure(Throwable failure){
         var seen=Collections.newSetFromMap(new IdentityHashMap<Throwable,Boolean>());

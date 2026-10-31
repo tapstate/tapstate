@@ -48,6 +48,72 @@ class PipelineAlertRuntimeTest {
     static Observation observation(String id, Instant at, PipelineState state) {
         return new Observation(id, state, Map.of(), Map.of(), Map.of(), null, at, List.of());
     }
+    @Test void aWrappedCodedFailureKeepsItsCodeWithoutExceptionMessagesOrArguments() {
+        var coded = new io.tapstate.core.common.TapstateException(io.tapstate.runtime.engine.EngineError.JOB_FAILED,
+                Map.of("pipeline", "private-argument-sentinel", "cause", "private-cause-argument"),
+                new IllegalStateException("private-driver-message"));
+        var failure = new RuntimeException("private-wrapper-message", coded);
+        var observation = new Observation("orders", PipelineState.FAILED, Map.of(), Map.of(), Map.of(),
+                PipelineFailures.of("orders", failure), T, List.of());
+        try (var runtime = runtime()) {
+            runtime.tick(); await().atMost(Duration.ofSeconds(3)).until(() -> !runtime.health().degraded());
+            runtime.published(pass("orders"), observation, failure);
+            await().atMost(Duration.ofSeconds(3)).until(() -> !rows.isEmpty());
+            var trace = rows.values().iterator().next().value().episode().diagnostics().history().first().trace();
+            assertThat(trace.text()).contains(coded.code().code())
+                    .doesNotContain("private-argument-sentinel", "private-cause-argument",
+                            "private-driver-message", "private-wrapper-message");
+            assertThat(trace.text().getBytes(java.nio.charset.StandardCharsets.UTF_8).length)
+                    .isLessThanOrEqualTo(AlarmDiagnostics.MAX_TEXT_BYTES);
+        }
+    }
+    @Test void healthyCacheReadBurstsLeaveRoomForFailureAndCapabilitySpecificRecovery() throws Exception {
+        var original=AlertEvaluationHostTest.definition("pipeline.failed");
+        var rule=new AlertConfiguration.Rule(original.header(),"Cache health","cluster.storage-unavailable",1,
+                new AlertConfiguration.Resources(Set.of("cluster-storage"),true,Set.of()),Map.of(),null,true,null)
+                .validated(BuiltinAlarmTypes.catalog());
+        when(fixture.store.evaluationRules(any(),anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule),null));
+        var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var first=new AtomicBoolean(true);
+        doAnswer(call->{
+            if(first.compareAndSet(true,false)){
+                entered.countDown();
+                try {assertThat(release.await(5,TimeUnit.SECONDS)).isTrue();}
+                catch(InterruptedException interrupted){Thread.currentThread().interrupt();return Optional.empty();}
+            }
+            return Optional.ofNullable(rows.get(call.getArgument(0)));
+        }).when(fixture.store).state(any(),any());
+        var claims=mock(WorkloadClaimStore.class);
+        var key=new WorkloadClaimKey("cluster",WorkloadClaimType.PIPELINE_ACTUATION,"orders");
+        when(claims.read(key)).thenReturn(Optional.empty());
+        try(var runtime=new PipelineAlertRuntime(()->new PipelineAlertRuntime.Services(fixture.store,fixture.host,
+                BuiltinAlarmTypes.catalog(),null,null,Set.of("cluster-storage-health")),intentStore,
+                (scope,claim)->Optional.of(()->{}),()->{},fixture.clock)){
+            runtime.tick();await().atMost(Duration.ofSeconds(3)).until(()->!runtime.health().degraded());
+            var signals=new BuiltinResourceSignals(()->runtime,()->null,
+                    new CacheAuthScope("cluster",1,StorageBinding.Mode.OP,"cache",1),()->{},fixture.clock);
+            var observed=new ObservedWorkloadClaims(claims,signals::cacheOperation);
+            observed.read(key);assertThat(entered.await(3,TimeUnit.SECONDS)).isTrue();
+            try {
+                for(int i=0;i<200;i++)observed.read(key);
+                assertThat(runtime.health().rejected()).isZero();
+                fixture.now.set(T.plusMillis(100));
+                doThrow(new io.tapstate.core.common.TapstateException(IoError.STORE_UNAVAILABLE,Map.of(),null))
+                        .when(claims).read(key);
+                assertThatThrownBy(()->observed.read(key)).isInstanceOf(io.tapstate.core.common.TapstateException.class);
+                fixture.now.set(T.plusMillis(200));observed.release(null);
+                assertThat(runtime.health().queuedInputs()).isLessThanOrEqualTo(3);
+            } finally {release.countDown();}
+            drained(runtime);assertThat(runtime.health().rejected()).isZero();
+            var afterWrite=rows.values().iterator().next().value();
+            assertThat(afterWrite.snapshot().status()).isEqualTo(AlertSnapshot.Status.FIRING);
+            assertThat(afterWrite.operationalEvidence().failedCapabilities()).isEqualTo(1<<OperationalEvidence.Capability.CACHE_READ.ordinal());
+            fixture.now.set(T.plusMillis(300));doReturn(Optional.empty()).when(claims).read(key);observed.read(key);drained(runtime);
+            var last=rows.values().iterator().next().value();
+            assertThat(last.snapshot().status()).isEqualTo(AlertSnapshot.Status.RESOLVED);
+            assertThat(last.episode().value().recoveredAt()).isEqualTo(T.plusMillis(300));
+            assertThat(last.operationalEvidence().failedCapabilities()).isZero();
+        } finally {release.countDown();}
+    }
     @Test void oneBlockedObjectDoesNotOccupyBothWorkersAndStarveAnotherObject() throws Exception {
         var entered = new CountDownLatch(1); var release = new CountDownLatch(1);
         doAnswer(c -> {

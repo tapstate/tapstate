@@ -12,6 +12,32 @@ import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class BuiltinResourceSignalsTest {
+    @Test void cacheSuccessSamplingKeepsBoundariesClockRollbackAndEveryFailureEdge(){
+        var runtime=mock(PipelineAlertRuntime.class);var now=new java.util.concurrent.atomic.AtomicReference<>(Instant.EPOCH);
+        var clock=new Clock(){public ZoneId getZone(){return ZoneOffset.UTC;}public Clock withZone(ZoneId zone){return this;}public Instant instant(){return now.get();}};
+        var signals=new BuiltinResourceSignals(()->runtime,()->null,new CacheAuthScope("cluster",1,StorageBinding.Mode.OP,"cache",1),()->{},clock);
+        signals.cacheOperation(false,null);
+        for(int i=0;i<200;i++)signals.cacheOperation(false,null);
+        signals.cacheOperation(true,null);
+        now.set(Instant.EPOCH.plusMillis(999));signals.cacheOperation(false,null);
+        now.set(Instant.EPOCH.plusSeconds(1));signals.cacheOperation(false,null);
+        var unavailable=new TapstateException(IoError.STORE_UNAVAILABLE,Map.of(),null);
+        now.set(Instant.EPOCH.plusMillis(1100));signals.cacheOperation(false,unavailable);signals.cacheOperation(false,unavailable);
+        now.set(Instant.EPOCH.plusMillis(1200));signals.cacheOperation(false,null);
+        now.set(Instant.EPOCH.plusMillis(500));signals.cacheOperation(false,null);
+        now.set(Instant.EPOCH.plusMillis(600));signals.cacheOperation(false,null);
+        now.set(Instant.EPOCH.plusMillis(1500));signals.cacheOperation(false,null);
+        now.set(Instant.EPOCH.plusMillis(1600));signals.cacheOperation(false,unavailable);
+        now.set(Instant.EPOCH.plusMillis(1700));signals.cacheOperation(false,null);
+        var input=org.mockito.ArgumentCaptor.forClass(AlertInput.class);
+        verify(runtime,times(10)).resourceInput(any(),eq("cluster.storage-unavailable"),eq(0L),anyString(),any(),input.capture());
+        var values=input.getAllValues().stream().map(v->(AlertInput.Operational)v).toList();
+        assertThat(values.stream().filter(v->!v.succeeded()).count()).isEqualTo(3);
+        assertThat(values.get(1).capability()).isEqualTo(OperationalEvidence.Capability.CACHE_WRITE);
+        assertThat(values.get(2).observedAt()).isEqualTo(Instant.EPOCH.plusSeconds(1));
+        assertThat(values.get(6).observedAt()).isEqualTo(Instant.EPOCH.plusMillis(500));
+        assertThat(values.getLast().succeeded()).isTrue();
+    }
     @Test void onlyClassifiedConnectionFailuresAreOperationalEvidence(){
         assertThat(BuiltinResourceSignals.connectionFailure(new java.sql.SQLException("private","08001"))).isTrue();
         assertThat(BuiltinResourceSignals.connectionFailure(new java.sql.SQLException("private","28000"))).isTrue();

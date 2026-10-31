@@ -125,7 +125,8 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         }
         var original = new Observation(observation.pipelineId(), observation.state(), Map.of(), Map.of(), Map.of(),
                 null, observation.observedAt(), observation.facts());
-        var trace = AlarmDiagnosticCapture.capture(cause, List.of()).orElse(null);
+        var trace = AlarmDiagnosticCapture.capture(cause, List.of(), failure -> failure instanceof TapstateException coded
+                ? Optional.of(coded.code().code()) : Optional.empty()).orElse(null);
         var capturedRules = rules;
         submit(slot, bytes + 16 * 1024, () -> {
             requireCurrent(slot);
