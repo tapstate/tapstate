@@ -86,7 +86,7 @@ class MongoCacheConnectorRegistryIT {
             f.client.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand")
                     .append("mode", new Document("times", 1)).append("data", new Document("failCommands", List.of("insert"))
                             .append("writeConcernError", new Document("code", 8000).append("codeName", "AtlasError")
-                                    .append("errmsg", "you are over your space quota, using 513 MB of 512 MB"))));
+                                    .append("errmsg", "you are over your space quota, using 513 MB of 512 MB. Writes are blocked on your cluster. Review capacity with the deployment administrator before continuing this original operation. Administrator guidance is available at https://www.mongodb.com/docs/atlas/reference/faq/storage/. Preserve existing databases and saved initialization authority."))));
             try {
                 assertThatThrownBy(() -> registry.register("next", "1", RegistrationSource.SEED, next))
                         .isInstanceOfSatisfying(TapstateException.class, failure -> {
@@ -100,6 +100,28 @@ class MongoCacheConnectorRegistryIT {
             assertThat(registry.findAll("next")).isEmpty();
             assertThat(SystemCollections.CACHE_IDENTITY.on(f.database).find().first()).isEqualTo(identityBefore);
             assertThat(f.binding.database()).isEqualTo(f.database.getName());
+        });
+    }
+
+    @Test void aQuotaRefusalDuringTheRealPermissionProbeIsNotMisreportedAsPermissions() {
+        withFixture(f -> {
+            var names = f.database.listCollectionNames().into(new ArrayList<>());
+            try (var connection = MongoConnection.forCache(f.binding, Duration.ofSeconds(5), "quota-probe")) {
+                connection.verifyConnectivity();
+                for (boolean quota : new boolean[]{true, false}) {
+                    var data = new Document("failCommands", List.of("insert"));
+                    if (quota) data.append("writeConcernError", new Document("code", 8000).append("codeName", "AtlasError")
+                            .append("errmsg", "you are over your space quota, using 513 MB of 512 MB. Writes are blocked on your cluster. Review storage usage with the administrator before continuing the original operation. Guidance: https://www.mongodb.com/docs/atlas/reference/faq/storage/. Preserve existing databases and initialization authority."));
+                    else data.append("errorCode", 13);
+                    f.client.getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand")
+                            .append("mode", new Document("times", 1)).append("data", data));
+                    try {
+                        assertThatThrownBy(connection::verifyStoragePermissions).isInstanceOfSatisfying(TapstateException.class,
+                                failure -> assertThat(failure.code()).isEqualTo(quota ? IoError.STORE_QUOTA_EXCEEDED : StoreError.DATABASE_ACCESS_FAILED));
+                    } finally { clearFailpoint(f.client); }
+                    assertThat(f.database.listCollectionNames().into(new ArrayList<>())).containsExactlyInAnyOrderElementsOf(names);
+                }
+            }
         });
     }
 

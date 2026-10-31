@@ -112,7 +112,11 @@ final class StorageRoot implements AutoCloseable {
             if (candidate != null) try { candidate.close(); }
             catch (RuntimeException | Error cleanup) { if (cleanup != failure) failure.addSuppressed(cleanup); }
             if (!(failure instanceof TapstateException coded)) throw failure;
-            if (quota(coded)) configurationQuotaExceeded = true;
+            // Generic reachability and refusal to replay may obscure the first failure; a new
+            // specific diagnosis supersedes it even while configuration remains unavailable.
+            boolean secondaryRefusal = coded.code() == ControlError.STORAGE_UNAVAILABLE || coded.code() == IoError.STORE_UNAVAILABLE
+                    || coded.code() == StoreError.INITIALIZATION_REFUSED;
+            configurationQuotaExceeded = quota(coded) || configurationQuotaExceeded && secondaryRefusal;
             phase = Phase.CONFIGURATION_UNAVAILABLE;
         }
     }

@@ -144,6 +144,24 @@ class CloudStorageContinuationTest {
         }
     }
 
+    @Test void aSpecificConfigAuthenticationFailureRetiresEarlierQuotaEvidence() {
+        try (var f = new Fixture(true)) {
+            var loads = new java.util.concurrent.atomic.AtomicInteger();
+            java.util.function.Supplier<MongoConfigurationDomain> loader = () -> {
+                if (loads.getAndIncrement() == 0)
+                    throw new TapstateException(IoError.STORE_QUOTA_EXCEEDED, Map.of(), null);
+                throw new TapstateException(IoError.STORE_UNAUTHORIZED, Map.of(), null);
+            };
+            org.springframework.test.util.ReflectionTestUtils.setField(f.root, "configurationLoader", loader);
+            org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.root, "loadConfiguration");
+            assertThatThrownBy(f.root::managedAuthentication).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE));
+            assertThat(loads.get()).isGreaterThanOrEqualTo(2);
+            assertThat(f.root.runtime().configuration()).isEmpty();
+            verify(f.cache, never()).prepareFirstAuth(any());
+        }
+    }
+
     @Test void aRecordedQuotaFailureSurvivesTheRealRootCredentialBoundaryWithoutGrantingAPrincipal() {
         try (var f = new Fixture()) {
             doThrow(new TapstateException(IoError.STORE_QUOTA_EXCEEDED, Map.of(), null)).when(f.cache).prepareFirstAuth(f.grant);

@@ -64,7 +64,8 @@ public final class StorageInitializationProgress {
         verifiedChecks = Map.copyOf(verifiedChecks);
         if (completedPrefix < 0 || completedPrefix > 2) throw new IllegalArgumentException("invalid initialization prefix");
         boolean same = original.equals(scope);
-        if (!same || completedPrefix == 0 || quotaStage != null && quotaStage.ordinal() < completedPrefix) quotaStage = null;
+        // Retrying SAVE_SETTINGS is still the same operation; only new scope or proven progress retires its cause.
+        if (!same || quotaStage != null && quotaStage.ordinal() < completedPrefix) quotaStage = null;
         if (same && (state == State.RUNNING || state == State.COMPLETE)) return;
         long now = ticker.getAsLong();
         if (!same) started = now;
@@ -161,11 +162,8 @@ public final class StorageInitializationProgress {
     private String failureCode(Throwable failure, Stage stage) {
         if (!(failure instanceof TapstateException coded)) { quotaStage = null; return null; }
         var code = coded.code();
-        if (code == io.tapstate.spi.store.IoError.STORE_QUOTA_EXCEEDED || code == ControlError.STORAGE_QUOTA_EXCEEDED)
-            quotaStage = stage;
-        else if (code != io.tapstate.spi.store.IoError.STORE_UNAVAILABLE && code != ControlError.STORAGE_UNAVAILABLE
-                && code != io.tapstate.spi.store.IoError.CACHE_AUTH_FENCED && code != io.tapstate.spi.store.IoError.CACHE_BUSINESS_FENCED)
-            quotaStage = null;
+        if (StorageQuota.confirmed(coded)) quotaStage = stage;
+        else if (!StorageQuota.obscuresCause(coded)) quotaStage = null;
         return quotaStage == stage ? io.tapstate.spi.store.IoError.STORE_QUOTA_EXCEEDED.code() : code.code();
     }
 

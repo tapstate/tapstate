@@ -113,7 +113,15 @@ final class StoreIo {
     }
 
     private static boolean quotaMessage(int code, String message) {
-        return code == 8000 && message != null && message.length() <= 256 && ATLAS_QUOTA_MESSAGE.matcher(message).matches();
+        if (code != 8000 || message == null || message.length() > 8192
+                || message.chars().anyMatch(value -> value < 32 || value == 127 || value == 133 || value == 8232 || value == 8233))
+            return false;
+        var prefix = ATLAS_QUOTA_MESSAGE.matcher(message);
+        if (!prefix.lookingAt()) return false;
+        if (prefix.end() == message.length()) return true;
+        // Atlas may append deployment-specific advice and links. Confirm its fixed blocked-write
+        // sentence after the exact quota prefix, but never retain or forward the explanatory tail.
+        return message.startsWith(". Writes are blocked on your cluster.", prefix.end());
     }
 
     /**

@@ -38,6 +38,24 @@ class ApiExceptionHandlerTest {
 
     private final ApiExceptionHandler handler = new ApiExceptionHandler(MessageCatalog.bundled());
 
+    @Test void dispatcherQuotaSanitizationReachesTheHttpResponseWithoutPrivateMetadata() {
+        var scope = new io.tapstate.spi.store.StorageSetupScope("cluster", "installation", "setup", 1);
+        var caller = io.tapstate.control.core.StorageControlAccess.ordinary(io.tapstate.spi.store.StorageBinding.Mode.OP, scope,
+                new io.tapstate.spi.store.CacheAuthScope("cluster", 1, io.tapstate.spi.store.StorageBinding.Mode.OP, "incarnation", 1),
+                io.tapstate.control.core.TapstatePrincipal.humanJwt(new io.tapstate.control.core.VerifiedToken("operator", io.tapstate.control.core.Scope.ADMIN)), null, () -> {});
+        var dispatcher = io.tapstate.control.core.StorageControlDispatcher.staged(io.tapstate.control.core.ControlOperations.registry(),
+                () -> null, () -> null, () -> null, (selected, active) -> {
+                    throw new TapstateException(IoError.STORE_QUOTA_EXCEEDED, Map.of("detail", "private-value-sentinel"), new IllegalArgumentException("private-cause"));
+                });
+        var failure = org.assertj.core.api.Assertions.catchThrowable(() -> dispatcher.dispatch("storage.status", caller, Map.of()));
+        assertThat(failure).isInstanceOf(TapstateException.class);
+        var response = handler.handle((TapstateException) failure);
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+        assertThat(response.getBody().code()).isEqualTo(ControlError.STORAGE_QUOTA_EXCEEDED.code());
+        assertThat(response.getBody().params()).isEmpty();
+        assertThat(response.getBody().toString()).doesNotContain("private-value-sentinel", "private-cause", "operator", "installation");
+    }
+
     @Test void quotaResponsesAreCoarse503DiagnosticsWithoutDriverParametersOrCauses() throws Exception {
         for (var code : List.of(IoError.STORE_QUOTA_EXCEEDED, ControlError.STORAGE_QUOTA_EXCEEDED)) {
             var failure = new TapstateException(code, Map.of("detail", "mongodb://u:secret@host/private"),

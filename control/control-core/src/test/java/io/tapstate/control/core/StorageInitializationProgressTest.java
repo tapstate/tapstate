@@ -104,6 +104,32 @@ class StorageInitializationProgressTest {
         assertThat(view().connectionChecks()).isEmpty();
     }
 
+    @Test void aSaveSettingsQuotaFailureSurvivesSameScopeRetryButNotANewScopeOrActualSuccess() {
+        var quota = new TapstateException(io.tapstate.spi.store.IoError.STORE_QUOTA_EXCEEDED, Map.of(), null);
+        var unavailable = new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), null);
+        progress.begin(SCOPE, 0, false); progress.failed(SCOPE, quota);
+        progress.begin(SCOPE, 0, false); progress.failed(SCOPE, unavailable);
+        assertThat(view().milestones().get(0).errorCode()).isEqualTo("io.store-quota-exceeded");
+        progress.begin(SCOPE, 0, false);
+        progress.completed(SCOPE, StorageInitializationProgress.Stage.SAVE_SETTINGS);
+        assertThat(progress.quotaExceeded()).isFalse();
+        progress.started(SCOPE, StorageInitializationProgress.Stage.PREPARE_STORAGE); progress.failed(SCOPE, unavailable);
+        assertThat(view().milestones().get(1).errorCode()).isEqualTo("control.storage-unavailable");
+        var nextGeneration = new StorageSetupScope("cluster", "installation", "setup", 2);
+        progress.begin(SCOPE, 0, false); progress.failed(SCOPE, quota);
+        progress.begin(nextGeneration, 0, false); progress.failed(nextGeneration, unavailable);
+        assertThat(progress.snapshot(nextGeneration).orElseThrow().milestones().get(0).errorCode()).isEqualTo("control.storage-unavailable");
+        var nextOperation = new StorageSetupScope("cluster", "installation", "different", 2);
+        progress.begin(nextGeneration, 0, false); progress.failed(nextGeneration, quota);
+        progress.begin(nextOperation, 0, false); progress.failed(nextOperation, unavailable);
+        assertThat(progress.snapshot(nextOperation).orElseThrow().milestones().get(0).errorCode()).isEqualTo("control.storage-unavailable");
+        progress.begin(nextOperation, 0, false); progress.failed(nextOperation, quota);
+        progress.begin(nextOperation, 0, false);
+        progress.failed(nextOperation, new TapstateException(ControlError.STORAGE_TEST_REQUIRED, Map.of(), null));
+        assertThat(progress.quotaExceeded()).isFalse();
+        assertThat(progress.snapshot(nextOperation).orElseThrow().milestones().get(0).errorCode()).isEqualTo("control.storage-test-required");
+    }
+
     @Test void aKnownQuotaFailureSurvivesGenericRetryFailuresOnlyWithinItsOriginalStageAndScope() {
         progress.begin(SCOPE, 1, true);
         progress.failed(SCOPE, new TapstateException(io.tapstate.spi.store.IoError.STORE_QUOTA_EXCEEDED,

@@ -64,6 +64,22 @@ class StoreIoTest {
     }
 
     @Test
+    void longAtlasQuotaInstructionsKeepTheirConfirmedClassificationWithoutRetainingTheirText() {
+        String message = "you are over your space quota, using 617.25 MB of 512 MB. Writes are blocked on your cluster. "
+                + "Review storage usage with the deployment administrator and follow the capacity guidance for this deployment. "
+                + "Administrator documentation: https://www.mongodb.com/docs/atlas/reference/faq/storage/. "
+                + "Keep the original databases and initialization operation while restoring capacity.";
+        assertThat(message.length()).isGreaterThan(256);
+        var command = new MongoCommandException(new BsonDocument("ok", new BsonInt32(0))
+                .append("code", new BsonInt32(8000)).append("codeName", new BsonString("AtlasError"))
+                .append("errmsg", new BsonString(message)), new ServerAddress());
+        var failure = StoreIo.coded(command);
+        assertThat(failure.code()).isEqualTo(IoError.STORE_QUOTA_EXCEEDED);
+        assertThat(failure.args()).isEmpty(); assertThat(failure.getCause()).isNull();
+        assertThat(failure.toString()).doesNotContain(message, "617.25", "https://");
+    }
+
+    @Test
     void quotaSizesMayBeDecimalButNeverBecomeErrorParameters() {
         var driver = new MongoWriteException(new WriteError(8000,
                 "you are over your space quota, using 513.25 MB of 512.0 MB", new BsonDocument()), new ServerAddress(), Set.of());
@@ -76,7 +92,10 @@ class StoreIoTest {
     void otherAtlasErrorsAndUntrustedDetailsCannotBecomeQuotaDiagnosticsOrLeak() {
         for (String message : List.of("bad auth : authentication failed", "CMD_NOT_ALLOWED: reIndex", "quota",
                 "write failed: you are over your space quota", "you are over your space quota\nforged-log mongodb://u:secret@db/",
-                "you are over your space quota, using 513 MB of 512 MB secret")) {
+                "you are over your space quota, using 513 MB of 512 MB secret",
+                "you are over your space quota, using 513 MB of 512 MB. Authentication failed.",
+                "you are over your space quota, using 513 MB of 512 MB. Writes are blocked on your cluster.\nforged-log",
+                "request document: you are over your space quota, using 513 MB of 512 MB. Writes are blocked on your cluster.")) {
             var driver = new MongoWriteException(new WriteError(8000, message, new BsonDocument()), new ServerAddress(), Set.of());
             var failure = StoreIo.coded(driver);
             assertThat(failure.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
