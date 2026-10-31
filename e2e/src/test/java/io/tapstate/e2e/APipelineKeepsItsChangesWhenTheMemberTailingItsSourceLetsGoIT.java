@@ -15,18 +15,16 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 /**
- * A pipeline goes on receiving its source's changes when the member tailing that source stops the last
- * of its own pipelines on it.
+ * Remote consumers keep a shared capture alive through local clears and take it over after its owner exits.
  *
  * <p>One member tails a source for every pipeline reading it, wherever those pipelines are driven. That
- * member lets the capture go with the last pipeline of its own that reads it, and a pipeline another
- * member drives over the same source is then running over a ring nobody writes: healthy, and receiving
- * nothing, because a different pipeline was stopped somewhere else. The member still reading the capture
- * takes the tail over instead, from where the last one had got to.
+ * member keeps the independent capture while another member still needs it. Clearing its own pipeline
+ * must not leave that consumer without a tail. Once the actual capture-owning process exits, the
+ * surviving consumer's member takes the tail over from its durable position.
  *
- * <p>Pipelines are added over the same source until two land on the member not holding the capture. Its
+ * <p>Two pipelines are prepared through the member not holding the capture, and their claims are checked. Its
  * first joiner is stopped with its state cleared before the pipelines driven by the holder are stopped
- * the same way. A change made afterwards has to reach the one left, and taking the tail over must not
+ * the same way. Changes before and after the owner's exit have to reach the one left, and taking the tail over must not
  * attach the stopped first joiner to the chain again.
  * The source and the targets are real Mongo: the harness's own connector replays its whole table through
  * the ring on every run, which a pipeline left without a tail would receive anyway.
@@ -76,6 +74,12 @@ class APipelineKeepsItsChangesWhenTheMemberTailingItsSourceLetsGoIT {
                         () -> "rows at the first target = " + mongo.count(firstTarget, TABLE));
                 String holder = Await.answered("the cluster to name the member reading the source",
                         () -> control.captureOwnersOf(first).values().stream().findFirst());
+                assertThat(control.pipelineControllerOf(first)).as("the first pipeline established the capture locally")
+                        .contains(holder);
+                ControlPlane remote = cluster.memberOtherThan(holder);
+                remote.registerConnector(CONNECTOR, ConnectorJars.bytesFor(CONNECTOR));
+                String remoteMember = holder.equals(TwoMemberCluster.NODE_A)
+                        ? TwoMemberCluster.NODE_B : TwoMemberCluster.NODE_A;
 
                 List<String> onTheHolder = new ArrayList<>(List.of(first));
                 Map<String, String> driversByPipeline = new LinkedHashMap<>();
@@ -83,14 +87,11 @@ class APipelineKeepsItsChangesWhenTheMemberTailingItsSourceLetsGoIT {
                 String firstJoiner = null;
                 for (int n = 2; n <= MOST_PIPELINES; n++) {
                     String pipeline = pipelineId(n);
-                    EndpointAddress target = startPipelineInto(control, n, sourceUri);
+                    EndpointAddress target = startPipelineInto(remote, n, sourceUri);
                     String driver = Await.answered("the cluster to name the member driving " + pipeline,
-                            () -> control.pipelineControllerOf(pipeline));
+                            () -> remote.pipelineControllerOf(pipeline));
                     driversByPipeline.put(pipeline, driver);
-                    if (driver.equals(holder)) {
-                        onTheHolder.add(pipeline);
-                        continue;
-                    }
+                    assertThat(driver).as("the native claim was prepared on the other member").isEqualTo(remoteMember);
                     Await.until(pipeline + " to receive its load",
                             () -> mongo.count(target, TABLE) >= SEEDED_ROWS,
                             () -> "rows at its target = " + mongo.count(target, TABLE) + " of " + SEEDED_ROWS);
@@ -108,28 +109,32 @@ class APipelineKeepsItsChangesWhenTheMemberTailingItsSourceLetsGoIT {
                                     .filter(id -> documents.consumersOf(id)
                                             .containsAll(List.of(stoppedConsumer, remainingConsumer)))
                                     .findFirst());
-                    control.stop(stoppedJoiner, true);
-                    Await.until(stoppedJoiner + " to stop",
-                            () -> control.state(stoppedJoiner).filter(PipelineState.STOPPED::equals).isPresent(),
-                            () -> String.valueOf(control.state(stoppedJoiner)));
+                    var stoppedScope = NativePipelineScopes.current(storage, stoppedJoiner);
+                    remote.stop(stoppedJoiner, true);
+                    NativePipelineScopes.awaitCleared(remote, storage, stoppedScope, Duration.ofSeconds(60));
                     Await.until("the stopped first joiner's cursor to be cleared before takeover",
                             () -> !documents.consumersOf(chain).contains(stoppedConsumer),
                             () -> "consumers on " + chain + " = " + documents.consumersOf(chain));
 
-                    // Stopped with their state cleared, which is also the stop that decides whether the
-                    // chain's record goes with them: it must not, while this pipeline is still on it.
+                    // A shared capture remains needed even after its owner's own pipelines are cleared.
                     for (String stopping : onTheHolder) {
-                        control.stop(stopping, true);
-                    }
-                    for (String stopping : onTheHolder) {
-                        Await.until(stopping + " to stop",
-                                () -> control.state(stopping).filter(PipelineState.STOPPED::equals).isPresent(),
-                                () -> String.valueOf(control.state(stopping)));
+                        var original = NativePipelineScopes.current(storage, stopping);
+                        remote.stop(stopping, true);
+                        NativePipelineScopes.awaitCleared(remote, storage, original, Duration.ofSeconds(60));
                     }
 
+                    assertThat(remote.captureOwnersOf(remainingPipeline).values())
+                            .as("clearing local pipelines does not retire another consumer's capture").containsOnly(holder);
+                    long beforeExit = mongo.count(target, TABLE);
+                    mongo.cdc(source, TABLE, CdcOp.INSERT, 1);
+                    Await.until("the original shared tail to remain live after its local pipelines clear", HANDOVER,
+                            () -> mongo.count(target, TABLE) > beforeExit,
+                            () -> "rows=" + mongo.count(target, TABLE) + ", owner=" + remote.captureOwnersOf(remainingPipeline));
+
+                    cluster.processCarrying(holder).kill();
                     Await.until("the remaining joiner's member to take the capture over", HANDOVER,
-                            () -> control.captureOwnersOf(remainingPipeline).containsValue(driver),
-                            () -> "capture owners = " + control.captureOwnersOf(remainingPipeline));
+                            () -> remote.captureOwnersOf(remainingPipeline).containsValue(driver),
+                            () -> "capture owners = " + remote.captureOwnersOf(remainingPipeline));
 
                     long rowsBefore = mongo.count(target, TABLE);
                     mongo.cdc(source, TABLE, CdcOp.INSERT, 1);
@@ -137,12 +142,12 @@ class APipelineKeepsItsChangesWhenTheMemberTailingItsSourceLetsGoIT {
                             HANDOVER,
                             () -> mongo.count(target, TABLE) > rowsBefore,
                             () -> "rows at its target = " + mongo.count(target, TABLE) + ", was " + rowsBefore
-                                    + "; it is " + control.state(remainingPipeline) + " and its capture is owned by "
-                                    + control.captureOwnersOf(remainingPipeline).values());
-                    assertThat(control.state(remainingPipeline))
+                                    + "; it is " + remote.state(remainingPipeline) + " and its capture is owned by "
+                                    + remote.captureOwnersOf(remainingPipeline).values());
+                    assertThat(remote.state(remainingPipeline))
                             .describedAs("it ran throughout, and nobody asked it to do anything")
                             .contains(PipelineState.RUNNING);
-                    assertThat(control.captureOwnersOf(remainingPipeline).values())
+                    assertThat(remote.captureOwnersOf(remainingPipeline).values())
                             .describedAs("its source is now tailed by the member driving it")
                             .containsOnly(driver);
                     assertThat(documents.consumersOf(chain))

@@ -86,9 +86,7 @@ class AJoinKeyIsTheValueRatherThanTheCarrierItArrivedInIT {
     @Test
     void aDimensionKeyedByTheDriversOwnTypeMatchesTheFactThatNamesItAsText() {
         String dataUri = SharedMongo.replicaSetUrl(DATABASE);
-        String targetUri = SharedMongo.replicaSetUrl("join_carrier_target");
         EndpointAddress data = EndpointAddress.uri(dataUri);
-        EndpointAddress target = EndpointAddress.uri(targetUri);
 
         // The driver's own key type, generated the way a collection ordinarily holds one. The fact side
         // names the very same identifier as the text everybody knows it by, which is the pairing.
@@ -98,6 +96,7 @@ class AJoinKeyIsTheValueRatherThanTheCarrierItArrivedInIT {
 
         try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints();
                 ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
+            EndpointAddress target = EndpointAddress.uri(storage.masterUri());
             mongo.insert(data, CUSTOMERS, new Document("customer_key", ada).append("name", "ada"));
             mongo.insert(data, CUSTOMERS, new Document("customer_key", bo).append("name", "bo"));
             mongo.insert(data, ORDERS,
@@ -114,7 +113,6 @@ class AJoinKeyIsTheValueRatherThanTheCarrierItArrivedInIT {
 
             Map<String, String> resources = new LinkedHashMap<>();
             resources.put("shop_db.tap.yml", sourceYaml(dataUri));
-            resources.put("views.tap.yml", targetYaml(targetUri));
             resources.put("join_pipeline.tap.yml", pipelineYaml());
             control.apply(resources);
             control.discoverSchema(SOURCE_ID, "mongodb", Map.of("uri", dataUri));
@@ -164,17 +162,6 @@ class AJoinKeyIsTheValueRatherThanTheCarrierItArrivedInIT {
                 tables: [ orders, customers ]
                 """
                 .formatted(dataUri);
-    }
-
-    private static String targetYaml(String targetUri) {
-        return """
-                version: tapstate/v1
-                kind: source
-                id: views
-                connector: mongodb
-                config: { uri: "%s" }
-                """
-                .formatted(targetUri);
     }
 
     /** One join step, one dimension, outer so that an unmatched fact row is published rather than dropped. */

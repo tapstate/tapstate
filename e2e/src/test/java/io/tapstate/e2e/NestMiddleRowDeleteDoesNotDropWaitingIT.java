@@ -2,9 +2,13 @@ package io.tapstate.e2e;
 
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.adapters.mongostore.SystemCollections;
+import io.tapstate.runtime.engine.nest.NestElement;
+import io.tapstate.runtime.engine.nest.ResolverState;
 import io.tapstate.testsupport.DockerGate;
 
 import org.bson.Document;
+import org.bson.types.Binary;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
@@ -12,6 +16,8 @@ import org.testcontainers.containers.MySQLContainer;
 import org.testcontainers.utility.DockerImageName;
 
 import java.sql.Connection;
+import java.io.ByteArrayInputStream;
+import java.io.ObjectInputStream;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
@@ -26,26 +32,19 @@ import java.util.function.BooleanSupplier;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * A row arriving under a middle-level parent that has been deleted is counted as unplaceable, not
- * dropped - and the record of that deletion is what makes the difference.
+ * A row arriving under a deleted middle parent waits durably and is released when that parent returns.
  *
- * <p>Deleting a row in the middle of a tree ends a mapping that everything below it was routed by. What
- * the level does with that mapping decides what happens to the rows still coming: keep a record that the
- * key is gone and a later child can be recognised as belonging nowhere; remove the mapping outright and
- * that same child looks exactly like one whose parent has not arrived yet, so it is held - forever, since
- * nothing will ever declare that key again - and the position it came in at is held with it.
+ * <p>A deletion does not prove that a parent key will never be declared again. The original deletion
+ * order and later child must survive in the state store. A newer declaration restores the mapping and
+ * releases that child without rereading it from the source or replacing its original position.
  *
- * <p><b>Why the target says nothing here.</b> The child was never going to appear in any document: its
- * parent is gone, so a run that discarded it, a run still holding it, and a run that never saw it all
- * leave byte-identical documents behind. Every assertion about the target is satisfied by all three. That
- * is exactly what the count of what a nest could not place exists for, and it is the reading this rests
- * on. A run holding the row reports zero.
+ * <p>The target alone cannot distinguish waiting from dropping while the parent is absent. This case
+ * first reads the actual durable waiting child, then restores only the parent and requires that child
+ * in the target. A run that drops the child cannot satisfy both checks.
  *
- * <p>The other half is that the run is still alive while that reading is taken. Ending the job would
- * satisfy a count of one and destroy the property: a source deleting a row whose children are still in
- * flight is ordinary, and the whole point is that ordinary data does not stop a pipeline. So the state and
- * the error count are read in the same breath, and the surviving document is read too - the deletion has
- * to have taken the middle row out of it without taking anything else.
+ * <p>The run must stay alive without errors or dead letters while waiting and after release. The
+ * surviving middle row is checked before and after the newer declaration, so deleting one parent cannot
+ * remove its neighbour or route the waiting child under the wrong parent.
  *
  * <p>Gated on Docker and on a directory of real connector jars, like its siblings. Run it with:
  *
@@ -86,7 +85,7 @@ class NestMiddleRowDeleteDoesNotDropWaitingIT {
 
     @ParameterizedTest
     @EnumSource(Tiers.class)
-    void aChildArrivingUnderADeletedMiddleRowIsCountedRatherThanHeld(Tiers tier) throws Exception {
+    void aChildArrivingUnderADeletedMiddleRowWaitsDurablyForItsReturn(Tiers tier) throws Exception {
         try (MySQLContainer<?> mysql = new MySQLContainer<>(DockerImageName.parse("mysql:8.0"))) {
             mysql.start();
             seedMysql(mysql);
@@ -133,17 +132,13 @@ class NestMiddleRowDeleteDoesNotDropWaitingIT {
                 await(() -> middleIds(mongo.documents(EndpointAddress.uri(targetUri), ROOT_TABLE))
                         .equals(List.of(SURVIVING_MIDDLE)));
 
-                // The row that can never be placed, arriving after its parent is gone.
+                // The child is still placeable if a newer parent declaration arrives.
                 insertLateLeaf(mysql);
-                await(() -> control.deadLettered(pipelineId).orElse(0L) >= 1L);
-
-                assertThat(control.deadLettered(pipelineId).orElse(0L))
-                        .as("changes the nest could not place: the leaf naming middle row %d, whose parent "
-                                + "is gone. A level that removed the mapping instead of recording the "
-                                + "deletion holds this row forever and reports zero.%n  documents: %s%n"
-                                + "  metrics: %s", DELETED_MIDDLE,
-                                mongo.documents(EndpointAddress.uri(targetUri), ROOT_TABLE), control.metrics(pipelineId))
-                        .isGreaterThanOrEqualTo(1L);
+                await(() -> waitingLeaf(mongo, storage, pipelineId) != null);
+                NestElement waiting = waitingLeaf(mongo, storage, pipelineId);
+                assertThat(waiting).as("the deleted parent's child is in durable waiting").isNotNull();
+                assertThat(waiting.positions()).as("the waiting child retains its original source position").isNotEmpty();
+                assertThat(control.deadLettered(pipelineId)).contains(0L);
 
                 assertThat(control.state(pipelineId))
                         .as("a source deleting a row whose children are in flight is ordinary")
@@ -155,9 +150,20 @@ class NestMiddleRowDeleteDoesNotDropWaitingIT {
                         .as("the deletion took the row it named out of the document, and nothing else")
                         .containsExactly(SURVIVING_MIDDLE);
                 assertThat(leafIds(mongo.documents(EndpointAddress.uri(targetUri), ROOT_TABLE), SURVIVING_MIDDLE))
-                        .as("the leaf that arrived late names the deleted row, so it belongs nowhere - "
-                                + "least of all under the row that survived")
+                        .as("the late leaf waits for its deleted parent and cannot appear under the survivor")
                         .isEmpty();
+
+                restoreMiddleRow(mysql);
+                await(() -> leafIds(mongo.documents(EndpointAddress.uri(targetUri), ROOT_TABLE), DELETED_MIDDLE)
+                        .equals(List.of(LATE_LEAF)));
+                assertThat(middleIds(mongo.documents(EndpointAddress.uri(targetUri), ROOT_TABLE)))
+                        .containsExactly(DELETED_MIDDLE, SURVIVING_MIDDLE);
+                assertThat(leafIds(mongo.documents(EndpointAddress.uri(targetUri), ROOT_TABLE), DELETED_MIDDLE))
+                        .as("only restoring the parent releases the original waiting child").containsExactly(LATE_LEAF);
+                assertThat(leafIds(mongo.documents(EndpointAddress.uri(targetUri), ROOT_TABLE), SURVIVING_MIDDLE)).isEmpty();
+                assertThat(control.deadLettered(pipelineId)).contains(0L);
+                assertThat(control.errorCount(pipelineId)).contains(0L);
+                assertThat(control.state(pipelineId)).contains(PipelineState.RUNNING);
             }
         }
     }
@@ -285,7 +291,36 @@ class NestMiddleRowDeleteDoesNotDropWaitingIT {
         }
     }
 
-    /** The row that can never be placed: it names the middle row the source has already removed. */
+    private static void restoreMiddleRow(MySQLContainer<?> mysql) throws Exception {
+        try (Connection connection = DriverManager.getConnection(mysql.getJdbcUrl(), mysql.getUsername(), mysql.getPassword());
+                PreparedStatement insert = connection.prepareStatement(
+                        "INSERT INTO " + MIDDLE_TABLE + " (id, customer_id, code) VALUES (?, ?, ?)")) {
+            insert.setLong(1, DELETED_MIDDLE);
+            insert.setLong(2, ROOT_ID);
+            insert.setString(3, "order-returned");
+            insert.executeUpdate();
+        }
+    }
+
+    private static NestElement waitingLeaf(MongoEndpoints mongo, PreparedNativeStore storage, String pipeline) {
+        for (Document row : mongo.documents(EndpointAddress.uri(storage.cacheUri()),
+                SystemCollections.CACHE_NEST_STATE.collectionName())) {
+            if (!(row.get("_id") instanceof Document id) || !(id.get("placement") instanceof Document placement)
+                    || !(placement.get("scope") instanceof Document scope) || !pipeline.equals(scope.getString("pipelineId"))) continue;
+            Binary bytes = row.get("state", Binary.class);
+            try (var input = new ObjectInputStream(new ByteArrayInputStream(bytes.getData()))) {
+                if (!(input.readObject() instanceof ResolverState state) || !state.deleted()) continue;
+                for (NestElement child : state.waiting()) {
+                    if (child.fields().get("id") instanceof Number value && value.longValue() == LATE_LEAF) return child;
+                }
+            } catch (java.io.IOException | ClassNotFoundException invalid) {
+                throw new AssertionError("the native waiting state could not be read", invalid);
+            }
+        }
+        return null;
+    }
+
+    /** The late child names a parent that is absent until the newer insert below. */
     private static void insertLateLeaf(MySQLContainer<?> mysql) throws Exception {
         try (Connection connection =
                         DriverManager.getConnection(mysql.getJdbcUrl(), mysql.getUsername(), mysql.getPassword());

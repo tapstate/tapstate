@@ -17,6 +17,7 @@ import java.io.IOException;
 import java.io.OutputStreamWriter;
 import java.io.UncheckedIOException;
 import java.io.Writer;
+import java.net.ServerSocket;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
@@ -47,8 +48,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p>The history interval is shortened only to keep this acceptance bounded. Its reset and gap rules
  * still come from that interval: a stop/start is kept below twice the interval, while the process is
  * deliberately absent for longer than that before it is restarted. The final target refusal uses the
- * same real Mongo connector with an unreachable address, so the coded failure is produced by the
- * running product rather than placed into a fixture.
+ * same real Mongo connector through a case-owned relay that is closed without changing the target
+ * configuration, so the coded failure is produced by the running product rather than a fixture.
  *
  * <p>Run with a packaged app and MCP sidecar, Docker, and real connector jars:
  *
@@ -89,12 +90,26 @@ class PipelineObservabilityLiveIT {
 
             String targetUri = SharedMongo.replicaSetUrl("observability_live_target");
             EndpointAddress target = EndpointAddress.uri(targetUri);
+            URI targetAddress = URI.create(targetUri);
+            int targetLinkPort;
+            try (ServerSocket reservation = new ServerSocket(0)) {
+                targetLinkPort = reservation.getLocalPort();
+            }
+            String query = targetAddress.getQuery();
+            String connectorTargetUri = new URI(targetAddress.getScheme(), targetAddress.getUserInfo(),
+                    "127.0.0.1", targetLinkPort, targetAddress.getPath(),
+                    (query == null || query.isEmpty() ? "" : query + "&")
+                            + "directConnection=true&serverSelectionTimeoutMS=500&connectTimeoutMS=500",
+                    targetAddress.getFragment()).toString();
             List<String> serverSettings = List.of(
                     "--tapstate.metrics.history.sample-interval=" + SAMPLE_INTERVAL.toSeconds() + "s");
 
             RealProcessServer first = null;
             RealProcessServer second = null;
-            try (PreparedNativeStore storage = PreparedNativeStore.create(USER, PASSWORD)) {
+            try (CuttableLink targetLink = CuttableLink.open(targetLinkPort, targetAddress.getHost(),
+                    targetAddress.getPort() < 0 ? 27017 : targetAddress.getPort(),
+                    Map.of("target", new int[] {0, 65535}));
+                    PreparedNativeStore storage = PreparedNativeStore.create(USER, PASSWORD)) {
                 try {
                     first = start(storage, serverSettings);
                     ControlPlane control = new ControlPlane(first.baseUrl());
@@ -103,7 +118,7 @@ class PipelineObservabilityLiveIT {
                     control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
 
                     Map<String, Object> mysqlConfig = mysqlConfig(mysql);
-                    control.apply(resources(mysqlConfig, targetUri));
+                    control.apply(resources(mysqlConfig, connectorTargetUri));
                     control.discoverSchema("src_mysql", "mysql", mysqlConfig);
                     control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
                     awaitState(control, PipelineState.RUNNING);
@@ -155,9 +170,12 @@ class PipelineObservabilityLiveIT {
 
                     control.stop(PIPELINE_ID, false);
                     awaitState(control, PipelineState.STOPPED);
-                    control.apply(Map.of("tgt_mongo.tap.yml", targetYaml(
-                            "mongodb://127.0.0.1:1/broken?serverSelectionTimeoutMS=500&connectTimeoutMS=500")));
+                    assertThat(targetLink.carried()).as("the real Mongo target was reached through the relay")
+                            .isPositive();
+                    assertThat(targetLink.unattributed()).isZero();
+                    targetLink.close();
                     control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
+                    update(mysql, "target-refused");
                     Map<String, Object> coded = awaitExplanation(second.baseUrl(), control.credential(),
                             kind -> "CODED_FAILURE".equals(kind), "the real target refusal to become coded");
                     assertThat(coded).containsEntry("state", "FAILED");

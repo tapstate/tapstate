@@ -1,9 +1,12 @@
 package io.tapstate.e2e;
 
+import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.testsupport.DockerGate;
 
+import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
@@ -24,9 +27,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p>The neighbouring case says what a clearing stop does to the chain's own record and to the counters,
  * and says the rows already written are not its to take. It cannot say anything about the third kind of
  * state a pipeline holds, because the pipeline it drives has no step that holds any: assembly state is
- * what a nest keeps between changes, and unlike everything else it lives under a name fixed by the
- * deployment rather than one the run chose. So this case drives a pipeline that assembles, and reads
- * that name.
+ * what a nest keeps between changes. Native clearing retires the original scope and prepares an empty
+ * successor; retired payload bytes can remain until their separate cleanup. This case therefore checks
+ * the completed successor and the original scope's retirement, rather than treating all historical
+ * payload rows as current assembly state.
  *
  * <p>Both directions are asserted, and the first is not ceremony. Assembly state is created lazily -- a
  * pipeline that never assembled anything holds none -- so "it is gone afterwards" is satisfied by a run
@@ -108,15 +112,20 @@ class AStopThatClearsTakesTheAssemblyStateWithItIT {
                     () -> "the shared state store held " + mongo.collections(assemblyStateUri)
                             + " with " + heldBy(mongo, assemblyStateUri, suffix).size() + " of this run\u0027s");
             long documentsBeforeTheStop = mongo.count(target, PARENT_TABLE);
+            PipelineIntentScope original = NativePipelineScopes.current(storage, suffix);
+            assertThat(heldBy(mongo, assemblyStateUri, original)).isNotEmpty();
 
             control.stop(suffix, true);
-            awaitState(control, suffix, PipelineState.STOPPED);
+            PipelineIntentScope successor = NativePipelineScopes.awaitCleared(control, storage, original, TIMEOUT);
 
-            assertThat(heldBy(mongo, assemblyStateUri, suffix))
-                    .as("the assembly state this pipeline held, after a stop that was asked to clear -- "
-                            + "shown above to have been there, so its absence is the clearing and not a "
-                            + "pipeline that never assembled anything")
+            assertThat(heldBy(mongo, assemblyStateUri, successor))
+                    .as("the completed successor has no assembly state from the original run")
                     .isEmpty();
+            Document retirement = mongo.documents(EndpointAddress.uri(assemblyStateUri),
+                            SystemCollections.CACHE_OPERATOR_CLEANUP.collectionName()).stream()
+                    .filter(row -> NativePipelineScopes.document(original).equals(row.get("_id")))
+                    .map(row -> row.get("retirement", Document.class)).findFirst().orElseThrow();
+            assertThat(retirement).containsEntry("phase", "RETIRED").containsEntry("targetScope", NativePipelineScopes.document(successor));
             assertThat(mongo.count(target, PARENT_TABLE))
                     .as("the documents already written to the user's own database, which a stop does not "
                             + "reach however much of the product's own state it is asked to take")
@@ -207,9 +216,8 @@ class AStopThatClearsTakesTheAssemblyStateWithItIT {
      * What the shared state store holds for this pipeline.
      *
      * <p>The store keeps every pipeline's assembly state in one collection, keyed within it rather than
-     * split by collection -- measured, after looking for a collection per pipeline and finding a single
-     * {@code nest_state}. So a clearing stop has to take this pipeline's entries out of a collection
-     * other pipelines are still using, which is a sharper claim than dropping something of its own.
+     * split by collection. This raw inventory is used before stopping and for retained-state checks;
+     * a completed clear is checked separately against its exact successor scope and retirement receipt.
      *
      * <p>Matched on the pipeline's id appearing anywhere in the entry rather than on a key this case
      * composes: how a namespace is built from the pipeline and the step is the product's affair, and what
@@ -221,6 +229,14 @@ class AStopThatClearsTakesTheAssemblyStateWithItIT {
                 .map(String::valueOf)
                 .filter(entry -> entry.contains(pipelineId))
                 .toList();
+    }
+
+    private static List<String> heldBy(MongoEndpoints mongo, String stateUri, PipelineIntentScope expected) {
+        return mongo.documents(EndpointAddress.uri(stateUri), ASSEMBLY_STATE).stream()
+                .filter(row -> row.get("_id") instanceof Document id
+                        && id.get("placement") instanceof Document placement
+                        && NativePipelineScopes.document(expected).equals(placement.get("scope")))
+                .map(String::valueOf).toList();
     }
 
     /** Everything up to and including the start. */

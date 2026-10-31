@@ -56,7 +56,10 @@ final class AtlasRuntime implements AutoCloseable {
         this(mode, storeUri, null);
     }
     AtlasRuntime(PreparedNativeStore prepared) throws IOException, GeneralSecurityException {
-        this(Mode.CLOUD, prepared.configurationUri(), prepared);
+        this(Mode.CLOUD, prepared);
+    }
+    AtlasRuntime(Mode mode, PreparedNativeStore prepared) throws IOException, GeneralSecurityException {
+        this(mode, prepared.configurationUri(), prepared);
     }
     private AtlasRuntime(Mode mode, String storeUri, PreparedNativeStore prepared) throws IOException, GeneralSecurityException {
         this.prepared = prepared;
@@ -137,7 +140,8 @@ final class AtlasRuntime implements AutoCloseable {
     ControlPlane control(ServerHandle server, boolean firstBoot) {
         ControlPlane control = new ControlPlane(server.baseUrl());
         if (mode == Mode.ON_PREM) {
-            if (firstBoot) control.bootstrapAndLogin("e2e", "e2e-password");
+            if (prepared != null) control.login(prepared.username(), prepared.password());
+            else if (firstBoot) control.bootstrapAndLogin("e2e", "e2e-password");
             else control.login("e2e", "e2e-password");
         } else if (cookie == null) {
             String code = UUID.randomUUID().toString();
