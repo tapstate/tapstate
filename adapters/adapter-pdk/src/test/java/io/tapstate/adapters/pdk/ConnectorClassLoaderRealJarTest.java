@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -48,6 +49,34 @@ class ConnectorClassLoaderRealJarTest {
             Class<?> contractViaA = a.load("io.tapdata.pdk.apis.TapConnector");
             Class<?> contractViaB = b.load("io.tapdata.pdk.apis.TapConnector");
             assertThat(contractViaA).isSameAs(TapConnector.class).isSameAs(contractViaB);
+            // New entity classes must resolve to the host even if a connector bundles another copy.
+            assertThat(a.load("io.tapdata.entity.schema.type.TapFloat"))
+                    .isSameAs(io.tapdata.entity.schema.type.TapFloat.class);
+            assertThat(b.load("io.tapdata.entity.schema.type.TapDouble"))
+                    .isSameAs(io.tapdata.entity.schema.type.TapDouble.class);
+            assertThat(a.load("io.tapdata.entity.schema.value.TapFloatValue"))
+                    .isSameAs(io.tapdata.entity.schema.value.TapFloatValue.class);
+            assertThat(b.load("io.tapdata.entity.schema.value.TapDoubleValue"))
+                    .isSameAs(io.tapdata.entity.schema.value.TapDoubleValue.class);
+        }
+    }
+
+    @Test
+    void realConnectorsInitializeAgainstTheHostRuntimeAndCommonLibrary() throws Exception {
+        for (String suffix : new String[] {"A", "B"}) {
+            String jar = System.getProperty("tapstate.pdk.it.jar" + suffix);
+            String className = System.getProperty("tapstate.pdk.it.class" + suffix);
+            assumeTrue(jar != null && className != null, "real connector artifacts were not supplied");
+            String version;
+            try (var archive = new java.util.jar.JarFile(jar)) {
+                version = archive.getManifest().getMainAttributes().getValue("PDK-API-Version");
+            }
+            assertThat(version).as("the artifact's real declaration").isNotBlank();
+            ConnectorRef ref = new ConnectorRef(List.of(Path.of(jar)), className, version, null);
+            try (PdkConnector connector = PdkConnector.open("real-" + suffix, ref, Map.of())) {
+                assertThat(connector.connector().getClass().getName()).isEqualTo(className);
+                assertThat(connector.context()).isNotNull();
+            }
         }
     }
 }

@@ -53,10 +53,10 @@ class PostgresWithoutLogicalDecodingStillPassesConnectionTestIT {
                 new PostgreSQLContainer<>(DockerImageName.parse("postgres:16"))) {
             postgres.start();
 
-            String storeUri = SharedMongo.replicaSetUrl("pg_connection_test");
-            try (ServerHandle server = Tiers.IN_PROCESS.launch(storeUri)) {
+            try (PreparedNativeStore storage = PreparedNativeStore.create();
+                    ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
-                control.bootstrapAndLogin("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
                 control.registerConnector("postgres", ConnectorJars.bytesFor("postgres"));
 
                 ControlPlane.ConnectionTest report =

@@ -104,10 +104,15 @@ final class E2eConnectorJar {
      * that its id is one this release does not support.
      */
     static Path buildInto(Path directory, String connectorId) {
+        return buildInto(directory, connectorId, PDK_API_VERSION);
+    }
+
+    /** Keeps version-compatibility witnesses on the same packaging path as every other case. */
+    static Path buildInto(Path directory, String connectorId, String pdkApiVersion) {
         Path jar = directory.resolve(connectorId + ".jar");
         Path classes = packageDirectory();
         try (OutputStream out = Files.newOutputStream(jar);
-                JarOutputStream jos = new JarOutputStream(out, manifest())) {
+                JarOutputStream jos = new JarOutputStream(out, manifest(pdkApiVersion))) {
             for (Path file : classFiles(classes)) {
                 jos.putNextEntry(new JarEntry(PACKAGE_PATH + file.getFileName()));
                 Files.copy(file, jos);
@@ -151,11 +156,11 @@ final class E2eConnectorJar {
         }
     }
 
-    private static Manifest manifest() {
+    private static Manifest manifest(String pdkApiVersion) {
         Manifest manifest = new Manifest();
         Attributes attributes = manifest.getMainAttributes();
         attributes.put(Attributes.Name.MANIFEST_VERSION, "1.0");
-        attributes.put(new Attributes.Name("PDK-API-Version"), PDK_API_VERSION);
+        attributes.put(new Attributes.Name("PDK-API-Version"), pdkApiVersion);
         return manifest;
     }
 }

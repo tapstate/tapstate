@@ -5,6 +5,8 @@ import com.hazelcast.map.IMap;
 import io.tapstate.runtime.engine.ProtectedMap;
 import java.io.Serializable;
 import java.util.Collection;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Objects;
@@ -158,6 +160,20 @@ final class MapNestStore<S> implements NestStore<S> {
         publishReading();
     }
 
+    /** Callers bound independent replacement waves; owned subtree handovers keep their carried writes. */
+    @Override
+    public void saveAll(Map<Object, S> states, Set<Object> firstFilings) {
+        if (states.isEmpty()) return;
+        if (states.size() == 1) {
+            Map.Entry<Object, S> only = states.entrySet().iterator().next();
+            save(only.getKey(), only.getValue(), firstFilings.contains(only.getKey()));
+            return;
+        }
+        states.keySet().forEach(ignored -> countAccess());
+        map.setAll(states);
+        publishReading();
+    }
+
     /**
      * Grows the set at its own key rather than across the map, the same way a state is written: what
      * travels is the one element being added, so registering a row costs the same whether it is the first
@@ -167,6 +183,19 @@ final class MapNestStore<S> implements NestStore<S> {
     public void add(Object key, Object element) {
         countAccess();
         map.executeOnKey(key, new Grown<>(element));
+        publishReading();
+    }
+
+    @Override
+    public void addAll(Map<Object, Set<Object>> additions) {
+        if (additions.isEmpty()) return;
+        Map<Object, Set<Object>> snapshot = new LinkedHashMap<>();
+        additions.forEach((key, elements) -> snapshot.put(key,
+                Collections.unmodifiableSet(new LinkedHashSet<>(elements))));
+        snapshot.keySet().forEach(ignored -> countAccess());
+        // ADD-only union is idempotent across a partial protected retry. The lookup owns these keys
+        // and cannot handle a later removal while this synchronous operation is still in progress.
+        map.executeOnKeys(snapshot.keySet(), new GrownBatch<>(snapshot));
         publishReading();
     }
 
@@ -269,18 +298,38 @@ final class MapNestStore<S> implements NestStore<S> {
         }
 
         @Override
-        @SuppressWarnings("unchecked")
         public Void process(Map.Entry<Object, S> entry) {
-            Set<Object> held = (Set<Object>) entry.getValue();
-            Set<Object> grown = held == null ? new LinkedHashSet<>() : new LinkedHashSet<>(held);
-            if (grown.add(element)) {
-                entry.setValue((S) grown);
-            }
+            grow(entry, Collections.singleton(element));
             return null;
         }
 
         @Override
         public EntryProcessor<Object, S, Void> getBackupProcessor() {
+            return null;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static <S> void grow(Map.Entry<Object, S> entry, Collection<?> additions) {
+        Set<Object> held = (Set<Object>) entry.getValue();
+        Set<Object> grown = held == null ? new LinkedHashSet<>() : new LinkedHashSet<>(held);
+        if (grown.addAll(additions)) entry.setValue((S) grown);
+    }
+
+    private static final class GrownBatch<S> implements EntryProcessor<Object, S, Void>, Serializable {
+        private static final long serialVersionUID = 1L;
+        private final LinkedHashMap<Object, Set<Object>> additions = new LinkedHashMap<>();
+
+        GrownBatch(Map<Object, Set<Object>> additions) {
+            this.additions.putAll(additions);
+        }
+
+        @Override public Void process(Map.Entry<Object, S> entry) {
+            grow(entry, additions.get(entry.getKey()));
+            return null;
+        }
+
+        @Override public EntryProcessor<Object, S, Void> getBackupProcessor() {
             return null;
         }
     }

@@ -73,12 +73,20 @@ public final class NestColdLayerWatch {
 
     private void judge(String pipelineId, Map<String, Seen> held, String namespace, NestStateReading reading) {
         Seen before = held.get(namespace);
-        NestStateWindow window = before == null
-                ? NestStateWindow.fromStart(reading)
-                : NestStateWindow.between(before.reading(), reading);
-        boolean nowOver = pressure.isOver(window);
         boolean wasOver = before != null && before.over();
-        held.put(namespace, new Seen(reading, nowOver));
+        NestStateReading baseline = before == null || restarted(before.latest(), reading)
+                ? null : before.baseline();
+        NestStateWindow window = baseline == null
+                ? NestStateWindow.fromStart(reading)
+                : NestStateWindow.between(baseline, reading);
+        if (window.accesses() < pressure.leastAccesses()) {
+            // Retain the last judged boundary, so several small samples can make a real window.
+            // An idle or undersized sample says nothing about recovery from the previous pressure.
+            held.put(namespace, new Seen(reading, baseline, wasOver));
+            return;
+        }
+        boolean nowOver = pressure.isOver(window);
+        held.put(namespace, new Seen(reading, reading, nowOver));
         if (nowOver && !wasOver) {
             alert.crossed(pipelineId, namespace, window);
         } else if (!nowOver && wasOver) {
@@ -86,7 +94,13 @@ public final class NestColdLayerWatch {
         }
     }
 
-    /** The last reading of one namespace and whether it was over then, which is what makes an edge an edge. */
-    private record Seen(NestStateReading reading, boolean over) {
+    private static boolean restarted(NestStateReading previous, NestStateReading current) {
+        return current.accesses() < previous.accesses()
+                || current.backfills() < previous.backfills()
+                || current.backfillMillis() < previous.backfillMillis();
+    }
+
+    /** Observe resets on every sample while accumulating traffic since the last judged boundary. */
+    private record Seen(NestStateReading latest, NestStateReading baseline, boolean over) {
     }
 }

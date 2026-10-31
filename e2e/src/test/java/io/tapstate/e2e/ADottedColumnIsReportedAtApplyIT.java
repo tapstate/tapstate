@@ -49,8 +49,9 @@ class ADottedColumnIsReportedAtApplyIT {
     @Test
     @DisplayName("a real column named price.usd is applied to a document store, and reported on")
     void aColumnWhoseNameHoldsADotIsAppliedAndReportedOn() throws Exception {
-        try (ServerHandle server = Tiers.IN_PROCESS.launch(SharedMongo.replicaSetUrl("dotted_column"))) {
-            ControlPlane control = NumericSource.connected(server);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
+            ControlPlane control = NumericSource.connected(server, storage);
             Map<String, Object> config = mysql;
             String target = SharedMongo.replicaSetUrl("dotted_column_target");
 
