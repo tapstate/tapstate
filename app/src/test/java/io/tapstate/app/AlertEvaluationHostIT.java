@@ -127,6 +127,30 @@ class AlertEvaluationHostIT {
             assertThat(f.store.active(null,10,f.reads()).total()).isZero();
         });
     }
+    @Test void aProductionPublicationCannotCommitAfterItsOriginalIntentChanges() {
+        withFixture(f->{
+            var changed=new AtomicBoolean();
+            var store=mock(AlertStore.class,org.mockito.AdditionalAnswers.delegatesTo(f.store));
+            doAnswer(call->{
+                if(changed.compareAndSet(false,true))assertThat(f.configuration.intents().compareAndSet(f.intent.scope(),f.intent.intentRevision(),
+                        new DesiredState("orders",PipelineState.STOPPED,f.intent.desired().revision()))).isTrue();
+                return f.store.commit(call.getArgument(0));
+            }).when(store).commit(any());
+            var evaluator=new AlertEvaluationHost(store,BuiltinAlarmTypes.catalog(),f.storeHost.deployment(),f.clock,"original-intent-control",ACTIVE);
+            try(var runtime=new PipelineAlertRuntime(()->new PipelineAlertRuntime.Services(store,evaluator),f.configuration.intents(),
+                    (scope,claim)->Optional.of(ACTIVE),ACTIVE,f.clock)) {
+                runtime.tick();await().atMost(Duration.ofSeconds(10)).until(()->runtime.health().queuedInputs()==0);
+                var pass=mock(PipelineConvergencePass.class);when(pass.scope()).thenReturn(f.intent.scope());
+                when(pass.intent()).thenReturn(f.intent);when(pass.claim()).thenReturn(WorkloadClaimFence.from(f.claim));
+                runtime.published(pass,new Observation("orders",PipelineState.FAILED,Map.of(),Map.of(),Map.of(),null,T,List.of()),null);
+                await().atMost(Duration.ofSeconds(10)).until(()->runtime.health().queuedInputs()==0);
+                assertThat(changed).isTrue();assertThat(runtime.health().degraded()).isTrue();
+                assertThat(f.store.active(null,10,f.reads()).total()).isZero();
+                var key=new AlarmKey(f.storeHost.scope(),new AlarmKey.Resource("pipeline","orders","1"),"pipeline.failed",f.rule.header().identity().incarnation());
+                assertThat(f.store.state(key,f.reads())).isEmpty();
+            }
+        });
+    }
     @Test void asynchronousProductionFeedUsesActualConfigIntentAndCacheLeaseWithoutAnyExporter() {
         withFixture(f->{
             try(var runtime=new PipelineAlertRuntime(()->new PipelineAlertRuntime.Services(f.store,f.evaluator),f.configuration.intents(),(scope,expected)->{

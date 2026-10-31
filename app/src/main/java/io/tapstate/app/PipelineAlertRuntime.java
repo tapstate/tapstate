@@ -145,6 +145,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
                                 ? AlertSignal.Condition.GOOD : AlertSignal.Condition.UNKNOWN, trace);
                 accept(binding, sequence, input);
             }
+            requireCurrent(slot);
             slot.recoveredInterruption = interruption;
         });
     }
@@ -208,6 +209,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
                             AlertEvaluationHost.requireResult(services.evaluator().tick(binding));
                         }
                     }
+                    requireCurrent(slot);
                     slot.recoveredInterruption=interruption;
                 } finally { slot.tickQueued.set(false); }
             }, () -> slot.tickQueued.set(false));
@@ -377,7 +379,11 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     private AlertEvaluationHost.Binding binding(Slot slot, AlertConfiguration.Rule rule) {
         String producer = fingerprint(List.of(slot.producer.incarnation(),
                 rule.typeId().equals("pipeline.observation-stale") ? "freshness" : "publication", runtimeId));
-        return new AlertEvaluationHost.Binding(rule, resource(slot), producer, 0, () -> requireCurrent(slot), () -> {
+        // Active state updates carry the exact intent into the CONFIG transaction. The work
+        // checks actuation before and after evaluation; intermediate guards keep local identity.
+        // Administrative END carries no producer proof, so it retains the full remote guard.
+        Runnable current=rule.header().active()&&rule.enabled()?()->requireLocal(slot):()->requireCurrent(slot);
+        return new AlertEvaluationHost.Binding(rule, resource(slot), producer, 0, current, () -> {
             Runnable lease=claimProof.apply(slot.producer.scope(),slot.producer.claim()).orElseThrow(()->refused("original-lease"));
             return new AlertStore.EvaluationProof(slot.producer.intent(),()->{
                 active.run();lease.run();if(closed.get()||slots.get(slot.producer.scope().pipelineId())!=slot)throw refused("original-producer");
@@ -386,6 +392,10 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     }
     private AlarmKey.Resource resource(Slot slot) {
         return new AlarmKey.Resource("pipeline", slot.producer.scope().pipelineId(), Long.toString(slot.producer.scope().stateGeneration()));
+    }
+    private void requireLocal(Slot slot) {
+        active.run();
+        if(closed.get()||slots.get(slot.producer.scope().pipelineId())!=slot)throw refused("original-producer");
     }
     private void requireCurrent(Slot slot) {
         active.run();

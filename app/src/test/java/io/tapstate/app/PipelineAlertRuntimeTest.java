@@ -88,6 +88,48 @@ class PipelineAlertRuntimeTest {
     static Observation observation(String id, Instant at, PipelineState state) {
         return new Observation(id, state, Map.of(), Map.of(), Map.of(), null, at, List.of());
     }
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(value=PipelineState.class,names={"RUNNING","FAILED"})
+    void onePublicationBoundsRemoteActuationReadsWhileKeepingTheOriginalCommitProof(PipelineState state) {
+        try(var runtime=runtime()) {
+            runtime.tick();drained(runtime);var original=pass("orders");clearInvocations(intentStore);
+            runtime.published(original,observation("orders",T,state),null);drained(runtime);
+            assertThat(rows).hasSize(1);assertThat(runtime.health().degraded()).isFalse();
+            verify(intentStore,atMost(2)).loadForActuation("orders");
+            verify(fixture.store).commit(argThat(c->c.state()!=null && c.state().proof()!=null
+                    && c.state().proof().pipeline().equals(original.intent())));
+        }
+    }
+    @Test void anIgnoredPublicationStillChecksTheOriginalIntentAfterItsWork() {
+        try(var runtime=runtime()) {
+            runtime.tick();drained(runtime);var original=pass("orders");var first=new AtomicBoolean(true);
+            when(intentStore.loadForActuation("orders")).thenAnswer(call->{
+                var value=intents.get("orders");if(first.compareAndSet(true,false))intents.remove("orders");return Optional.ofNullable(value);
+            });
+            runtime.published(original,observation("orders",T.minusMillis(1),PipelineState.RUNNING),null);drained(runtime);
+            assertThat(rows).isEmpty();assertThat(runtime.health().degraded()).isTrue();
+        }
+    }
+    @Test void aDisabledRuleKeepsRemoteGuardsForItsAdministrativeEnd() {
+        var rule=AlertEvaluationHostTest.definition("pipeline.failed");
+        var disabled=new AlertConfiguration.Rule(rule.header(),rule.name(),rule.typeId(),rule.typeVersion(),rule.resources(),
+                rule.parameters(),rule.severityOverride(),false,rule.metric());
+        when(fixture.store.evaluationRules(any(),anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule),null));
+        try(var runtime=runtime()) {
+            runtime.tick();drained(runtime);var original=pass("orders");
+            runtime.published(original,observation("orders",T,PipelineState.FAILED),null);drained(runtime);
+            var retained=rows.entrySet().iterator().next();rows.clear();
+            when(fixture.store.evaluationRules(any(),anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(disabled),null));
+            runtime.tick();drained(runtime);
+            // The disabled definition is now visible while this original active head still awaits its END.
+            rows.put(retained.getKey(),retained.getValue());clearInvocations(intentStore,fixture.store);
+            runtime.published(original,observation("orders",T,PipelineState.RUNNING),null);drained(runtime);
+            verify(intentStore,atLeast(3)).loadForActuation("orders");
+            verify(fixture.store).commit(argThat(c->c.kind()==AlertStore.CommitKind.END && c.state().proof()==null));
+            assertThat(rows.get(retained.getKey()).value().snapshot().enabled()).isFalse();
+            assertThat(runtime.health().degraded()).isFalse();
+        }
+    }
     @Test void aWrappedCodedFailureKeepsItsCodeWithoutExceptionMessagesOrArguments() {
         var coded = new io.tapstate.core.common.TapstateException(io.tapstate.runtime.engine.EngineError.JOB_FAILED,
                 Map.of("pipeline", "private-argument-sentinel", "cause", "private-cause-argument"),
